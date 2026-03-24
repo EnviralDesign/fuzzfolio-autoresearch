@@ -59,6 +59,17 @@ def build_attempt_score(
         adjustments["low_trade_count_penalty"] = penalty
         composite_score += penalty
 
+    signal_count = int(best.get("signal_count") or 0)
+    if (
+        adjustments_config.low_signal_count_threshold > 0
+        and signal_count < adjustments_config.low_signal_count_threshold
+    ):
+        gap = adjustments_config.low_signal_count_threshold - signal_count
+        ratio = gap / adjustments_config.low_signal_count_threshold
+        penalty = -adjustments_config.low_signal_count_penalty * ratio
+        adjustments["low_signal_count_penalty"] = penalty
+        composite_score += penalty
+
     matrix_summary = best.get("matrix_summary") or {}
     positive_ratio = _safe_float(matrix_summary.get("positive_cell_ratio")) or 0.0
     if (

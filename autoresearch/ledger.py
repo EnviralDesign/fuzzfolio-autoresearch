@@ -51,6 +51,13 @@ def append_attempt(path: Path, record: AttemptRecord) -> None:
         handle.write(json.dumps(asdict(record), ensure_ascii=True) + "\n")
 
 
+def write_attempts(path: Path, attempts: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for attempt in attempts:
+            handle.write(json.dumps(attempt, ensure_ascii=True) + "\n")
+
+
 def attempt_exists(path: Path, artifact_dir: Path) -> bool:
     target = str(artifact_dir.resolve()).lower()
     for row in load_attempts(path):

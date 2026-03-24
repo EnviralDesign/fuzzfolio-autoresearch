@@ -45,14 +45,18 @@ class OpenAICompatibleProvider:
         raise ProviderError("Provider response did not contain text content.")
 
     def _parse_json_object(self, text: str) -> dict[str, Any]:
+        decoder = json.JSONDecoder()
         text = text.strip()
         try:
-            return json.loads(text)
+            value, _ = decoder.raw_decode(text)
+            if isinstance(value, dict):
+                return value
         except json.JSONDecodeError:
             start = text.find("{")
-            end = text.rfind("}")
-            if start >= 0 and end > start:
-                return json.loads(text[start : end + 1])
+            if start >= 0:
+                value, _ = decoder.raw_decode(text[start:])
+                if isinstance(value, dict):
+                    return value
         raise ProviderError(f"Provider did not return valid JSON. Raw response: {text[:800]}")
 
     def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
@@ -64,7 +68,7 @@ class OpenAICompatibleProvider:
             "model": self.config.model,
             "messages": [{"role": message.role, "content": message.content} for message in messages],
             "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
+            "max_completion_tokens": self.config.max_tokens,
         }
         response = self.session.post(
             self._build_url(),

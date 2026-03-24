@@ -14,7 +14,7 @@ SECRETS_FILE_NAME = ".agentsecrets"
 @dataclass
 class ProviderConfig:
     api_base: str = "https://api.openai.com/v1"
-    model: str = "gpt-4.1-mini"
+    model: str = "gpt-5.4-mini"
     api_key: str | None = None
     temperature: float = 0.2
     max_tokens: int = 1400
@@ -34,10 +34,12 @@ class FuzzfolioConfig:
 
 @dataclass
 class ScoreAdjustmentConfig:
-    low_trade_count_threshold: int = 0
-    low_trade_count_penalty: float = 0.0
-    low_positive_cell_ratio_threshold: float = 0.0
-    low_positive_cell_ratio_penalty: float = 0.0
+    low_trade_count_threshold: int = 75
+    low_trade_count_penalty: float = 80.0
+    low_signal_count_threshold: int = 20
+    low_signal_count_penalty: float = 40.0
+    low_positive_cell_ratio_threshold: float = 0.15
+    low_positive_cell_ratio_penalty: float = 20.0
 
 
 @dataclass
@@ -51,6 +53,15 @@ class ResearchConfig:
 
 
 @dataclass
+class SupervisorConfig:
+    max_steps: int | None = None
+    window_start: str | None = None
+    window_end: str | None = None
+    timezone: str = "America/Chicago"
+    stop_mode: str = "after_step"
+
+
+@dataclass
 class AppConfig:
     repo_root: Path
     config_path: Path
@@ -58,6 +69,7 @@ class AppConfig:
     provider: ProviderConfig
     fuzzfolio: FuzzfolioConfig
     research: ResearchConfig
+    supervisor: SupervisorConfig
 
     @property
     def runs_root(self) -> Path:
@@ -115,13 +127,13 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     fuzzfolio_cfg = raw_config.get("fuzzfolio", {})
     fuzzfolio_secrets = raw_secrets.get("fuzzfolio", {})
     research_cfg = raw_config.get("research", {})
+    supervisor_cfg = raw_config.get("supervisor", {})
     adjustments_cfg = research_cfg.get("adjustments", {})
 
     provider = ProviderConfig(
         api_base=_env_or_value("AUTORESEARCH_PROVIDER_BASE_URL", fallback=provider_cfg.get("api_base"))
         or ProviderConfig.api_base,
-        model=_env_or_value("AUTORESEARCH_PROVIDER_MODEL", fallback=provider_cfg.get("model"))
-        or ProviderConfig.model,
+        model=ProviderConfig.model,
         api_key=_env_or_value(
             "AUTORESEARCH_PROVIDER_API_KEY",
             "OPENAI_API_KEY",
@@ -162,10 +174,42 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     )
 
     adjustments = ScoreAdjustmentConfig(
-        low_trade_count_threshold=int(adjustments_cfg.get("low_trade_count_threshold", 0)),
-        low_trade_count_penalty=float(adjustments_cfg.get("low_trade_count_penalty", 0.0)),
-        low_positive_cell_ratio_threshold=float(adjustments_cfg.get("low_positive_cell_ratio_threshold", 0.0)),
-        low_positive_cell_ratio_penalty=float(adjustments_cfg.get("low_positive_cell_ratio_penalty", 0.0)),
+        low_trade_count_threshold=int(
+            adjustments_cfg.get(
+                "low_trade_count_threshold",
+                ScoreAdjustmentConfig.low_trade_count_threshold,
+            )
+        ),
+        low_trade_count_penalty=float(
+            adjustments_cfg.get(
+                "low_trade_count_penalty",
+                ScoreAdjustmentConfig.low_trade_count_penalty,
+            )
+        ),
+        low_signal_count_threshold=int(
+            adjustments_cfg.get(
+                "low_signal_count_threshold",
+                ScoreAdjustmentConfig.low_signal_count_threshold,
+            )
+        ),
+        low_signal_count_penalty=float(
+            adjustments_cfg.get(
+                "low_signal_count_penalty",
+                ScoreAdjustmentConfig.low_signal_count_penalty,
+            )
+        ),
+        low_positive_cell_ratio_threshold=float(
+            adjustments_cfg.get(
+                "low_positive_cell_ratio_threshold",
+                ScoreAdjustmentConfig.low_positive_cell_ratio_threshold,
+            )
+        ),
+        low_positive_cell_ratio_penalty=float(
+            adjustments_cfg.get(
+                "low_positive_cell_ratio_penalty",
+                ScoreAdjustmentConfig.low_positive_cell_ratio_penalty,
+            )
+        ),
     )
     research = ResearchConfig(
         max_steps=int(research_cfg.get("max_steps", ResearchConfig.max_steps)),
@@ -175,6 +219,17 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
         plot_lower_is_better=bool(research_cfg.get("plot_lower_is_better", ResearchConfig.plot_lower_is_better)),
         adjustments=adjustments,
     )
+    supervisor = SupervisorConfig(
+        max_steps=(
+            int(supervisor_cfg["max_steps"])
+            if supervisor_cfg.get("max_steps") is not None
+            else None
+        ),
+        window_start=supervisor_cfg.get("window_start"),
+        window_end=supervisor_cfg.get("window_end"),
+        timezone=supervisor_cfg.get("timezone", SupervisorConfig.timezone),
+        stop_mode=supervisor_cfg.get("stop_mode", SupervisorConfig.stop_mode),
+    )
 
     return AppConfig(
         repo_root=root,
@@ -183,4 +238,5 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
         provider=provider,
         fuzzfolio=fuzzfolio,
         research=research,
+        supervisor=supervisor,
     )

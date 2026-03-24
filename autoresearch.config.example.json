@@ -1,7 +1,7 @@
 {
   "provider": {
     "api_base": "https://api.openai.com/v1",
-    "model": "gpt-4.1-mini",
+    "model": "gpt-5.4-mini",
     "temperature": 0.2,
     "max_tokens": 1400,
     "timeout_seconds": 120
@@ -18,10 +18,19 @@
     "auto_seed_prompt": true,
     "plot_lower_is_better": false,
     "adjustments": {
-      "low_trade_count_threshold": 0,
-      "low_trade_count_penalty": 0.0,
-      "low_positive_cell_ratio_threshold": 0.0,
-      "low_positive_cell_ratio_penalty": 0.0
+      "low_trade_count_threshold": 75,
+      "low_trade_count_penalty": 80.0,
+      "low_signal_count_threshold": 20,
+      "low_signal_count_penalty": 40.0,
+      "low_positive_cell_ratio_threshold": 0.15,
+      "low_positive_cell_ratio_penalty": 20.0
     }
+  },
+  "supervisor": {
+    "max_steps": 200,
+    "window_start": "23:00",
+    "window_end": "05:00",
+    "timezone": "America/Chicago",
+    "stop_mode": "after_step"
   }
 }

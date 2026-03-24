@@ -1,0 +1,50 @@
+{
+  "format": "fuzzfolio.scoring-profile",
+  "formatVersion": 1,
+  "profile": {
+    "name": "Seeded Run Candidate",
+    "description": "Replace this with a seed-guided hypothesis for the current run.",
+    "instruments": [
+      "EURUSD"
+    ],
+    "indicators": [
+      {
+        "meta": {
+          "id": "RSI_MEAN_REVERSION",
+          "instanceId": "seeded-run-rsi-1"
+        },
+        "config": {
+          "label": "RSI mean reversion",
+          "isActive": true,
+          "isTrendFollowing": false,
+          "weight": 1,
+          "timeframe": "M15",
+          "lookbackBars": 1,
+          "useFormingBar": false,
+          "ranges": {
+            "buy": [
+              20,
+              45
+            ],
+            "sell": [
+              55,
+              80
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 14
+            }
+          ],
+          "normalizationMode": "none",
+          "scale": 1
+        }
+      }
+    ],
+    "isActive": false,
+    "notificationThreshold": 80,
+    "directionMode": "both",
+    "version": "v1"
+  }
+}

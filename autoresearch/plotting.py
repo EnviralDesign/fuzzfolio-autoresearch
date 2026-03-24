@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -87,3 +88,21 @@ def render_progress_plot(
     plt.tight_layout()
     plt.savefig(output_path, dpi=160)
     plt.close()
+
+
+def render_progress_artifacts(
+    attempts: list[dict[str, Any]],
+    primary_output_path: Path,
+    *,
+    lower_is_better: bool = False,
+    mirror_output_path: Path | None = None,
+) -> None:
+    render_progress_plot(
+        attempts,
+        primary_output_path,
+        lower_is_better=lower_is_better,
+    )
+    if mirror_output_path is None:
+        return
+    mirror_output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(primary_output_path, mirror_output_path)

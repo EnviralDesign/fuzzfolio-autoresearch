@@ -3,13 +3,35 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+from typing import Any
 
-from .config import load_config
-from .controller import ResearchController
-from .fuzzfolio import FuzzfolioCli
-from .ledger import append_attempt, load_attempts, make_attempt_record
-from .plotting import render_progress_plot
-from .scoring import build_attempt_score
+from rich import box
+from rich.console import Console, Group
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+
+if __package__ in {None, ""}:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from autoresearch.config import load_config
+    from autoresearch.controller import ResearchController, RunPolicy
+    from autoresearch.fuzzfolio import FuzzfolioCli
+    from autoresearch.ledger import append_attempt, load_attempts, make_attempt_record, write_attempts
+    from autoresearch.plotting import render_progress_artifacts
+    from autoresearch.scoring import build_attempt_score
+else:
+    from .config import load_config
+    from .controller import ResearchController, RunPolicy
+    from .fuzzfolio import FuzzfolioCli
+    from .ledger import append_attempt, load_attempts, make_attempt_record, write_attempts
+    from .plotting import render_progress_artifacts
+    from .scoring import build_attempt_score
+
+
+console = Console()
+DISPLAY_CONTEXT: dict[str, Path | None] = {"repo_root": None, "run_dir": None}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -21,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="Run the autonomous research controller.")
     run.add_argument("--max-steps", type=int, default=None)
+    run.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
+
+    supervise = subparsers.add_parser("supervise", help="Run the supervised controller with config-backed policy defaults.")
+    supervise.add_argument("--max-steps", type=int, default=None)
+    supervise.add_argument("--window", default=None, help="Operating window in HH:MM-HH:MM format.")
+    supervise.add_argument("--timezone", default=None, help="IANA timezone for the operating window, e.g. America/Chicago.")
+    supervise.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
 
     subparsers.add_parser("plot", help="Regenerate the progress plot from the attempts ledger.")
 
@@ -33,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--run-id", default="manual")
     record.add_argument("--profile-ref", default=None)
     record.add_argument("--note", default=None)
+
+    subparsers.add_parser(
+        "rescore-attempts",
+        help="Recompute scores for the existing attempts ledger using the current scoring config.",
+    )
 
     return parser
 
@@ -52,6 +86,10 @@ def cmd_doctor() -> int:
         "provider_model": config.provider.model,
         "provider_api_base": config.provider.api_base,
         "provider_has_api_key": bool(config.provider.api_key),
+        "supervisor_max_steps": config.supervisor.max_steps,
+        "supervisor_window_start": config.supervisor.window_start,
+        "supervisor_window_end": config.supervisor.window_end,
+        "supervisor_timezone": config.supervisor.timezone,
         "auth_ok": auth.returncode == 0,
         "seed_ok": seed.returncode == 0,
     }
@@ -59,23 +97,358 @@ def cmd_doctor() -> int:
     return 0
 
 
-def cmd_run(max_steps: int | None) -> int:
+def _short_text(value: str, limit: int = 140) -> str:
+    compact = " ".join(value.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _set_display_context(*, repo_root: Path | None = None, run_dir: Path | None = None) -> None:
+    if repo_root is not None:
+        DISPLAY_CONTEXT["repo_root"] = repo_root
+    if run_dir is not None:
+        DISPLAY_CONTEXT["run_dir"] = run_dir
+
+
+def _display_path(value: str) -> str:
+    path = Path(value)
+    run_dir = DISPLAY_CONTEXT.get("run_dir")
+    repo_root = DISPLAY_CONTEXT.get("repo_root")
+    if run_dir:
+        if path == run_dir:
+            return str(Path("runs") / run_dir.name)
+        try:
+            return str(Path("run") / path.relative_to(run_dir))
+        except ValueError:
+            pass
+    if repo_root:
+        try:
+            return str(path.relative_to(repo_root))
+        except ValueError:
+            pass
+    if path.is_absolute() and len(path.parts) > 4:
+        return str(Path(*path.parts[-4:]))
+    return str(path)
+
+
+def _display_value(value: str) -> str:
+    if "\\" in value or "/" in value or (":" in value and len(value) > 2):
+        return _display_path(value)
+    return value
+
+
+def _parse_window(window_text: str | None) -> tuple[str | None, str | None]:
+    if not window_text:
+        return None, None
+    if "-" not in window_text:
+        raise ValueError("Window must be formatted as HH:MM-HH:MM.")
+    start, end = (part.strip() for part in window_text.split("-", 1))
+    if not start or not end:
+        raise ValueError("Window must be formatted as HH:MM-HH:MM.")
+    return start, end
+
+
+def _resolve_supervise_policy(
+    config,
+    *,
+    max_steps: int | None,
+    window: str | None,
+    timezone_name: str | None,
+) -> tuple[int, RunPolicy]:
+    cfg = config.supervisor
+    window_start, window_end = _parse_window(window)
+    effective_max_steps = max_steps or cfg.max_steps or config.research.max_steps
+    effective_window_start = window_start if window_start is not None else cfg.window_start
+    effective_window_end = window_end if window_end is not None else cfg.window_end
+    effective_timezone = timezone_name or cfg.timezone
+    return effective_max_steps, RunPolicy(
+        allow_finish=False,
+        window_start=effective_window_start,
+        window_end=effective_window_end,
+        timezone_name=effective_timezone,
+        stop_mode=cfg.stop_mode,
+        mode_name="supervise",
+    )
+
+
+def _summarize_action(action: dict[str, object]) -> str:
+    tool = str(action.get("tool", "unknown"))
+    if tool == "run_cli":
+        args = action.get("args")
+        if isinstance(args, list) and args:
+            return f"run_cli {' '.join(_display_value(str(item)) for item in args[:14])}"
+        command = action.get("command")
+        if isinstance(command, str) and command.strip():
+            return f"run_cli {_short_text(command, 100)}"
+    if tool == "write_file":
+        path = str(action.get("path", ""))
+        return f"write_file {_display_path(path)}"
+    if tool == "read_file":
+        path = str(action.get("path", ""))
+        return f"read_file {_display_path(path)}"
+    if tool == "list_dir":
+        path = str(action.get("path", ""))
+        return f"list_dir {_display_path(path)}"
+    if tool == "log_attempt":
+        return f"log_attempt {_display_path(str(action.get('artifact_dir', '')))}"
+    if tool == "finish":
+        return "finish"
+    return tool
+
+
+def _summarize_result(result: dict[str, object]) -> str:
+    tool = str(result.get("tool", "unknown"))
+    if tool == "run_cli":
+        ok = bool(result.get("ok"))
+        status = "ok" if ok else "failed"
+        parts = [f"run_cli {status}"]
+        created_profile_ref = result.get("created_profile_ref")
+        if created_profile_ref:
+            parts.append(f"profile={created_profile_ref}")
+        auto_log = result.get("auto_log")
+        if isinstance(auto_log, dict):
+            if auto_log.get("status") == "logged":
+                parts.append(
+                    f"attempt={auto_log.get('attempt_id')} score={auto_log.get('composite_score')}"
+                )
+            elif auto_log.get("status") == "existing":
+                attempt = auto_log.get("attempt")
+                if isinstance(attempt, dict):
+                    parts.append(f"attempt=existing score={attempt.get('composite_score')}")
+        payload = result.get("result")
+        if isinstance(payload, dict):
+            stdout = payload.get("stdout")
+            if isinstance(stdout, str) and "Auto-adjusted timeframe from" in stdout:
+                parts.append("timeframe=auto-adjusted")
+            stderr = payload.get("stderr")
+            if isinstance(stderr, str) and stderr.strip() and not ok:
+                parts.append(f"error={_short_text(stderr, 120)}")
+        return " | ".join(parts)
+    if tool == "write_file":
+        path = str(result.get("path", ""))
+        return f"write_file ok | {_display_path(path)}"
+    if tool == "read_file":
+        path = str(result.get("path", ""))
+        return f"read_file ok | {_display_path(path)}"
+    if tool == "list_dir":
+        count = len(result.get("items", [])) if isinstance(result.get("items"), list) else 0
+        return f"list_dir ok | items={count}"
+    if tool == "log_attempt":
+        payload = result.get("result")
+        if isinstance(payload, dict):
+            if payload.get("status") == "existing":
+                attempt = payload.get("attempt")
+                if isinstance(attempt, dict):
+                    return f"log_attempt existing | score={attempt.get('composite_score')}"
+            return f"log_attempt {payload.get('status')} | score={payload.get('composite_score')}"
+    if tool == "yield_guard":
+        return f"yield_guard | {_short_text(str(result.get('message', '')), 120)}"
+    if tool == "finish":
+        return f"finish | {_short_text(str(result.get('summary', '')), 120)}"
+    if result.get("error"):
+        return f"{tool} failed | {_short_text(str(result.get('error')), 120)}"
+    return tool
+
+
+def _result_style(result: dict[str, object]) -> str:
+    tool = str(result.get("tool", "unknown"))
+    if tool == "yield_guard":
+        return "yellow"
+    if result.get("error"):
+        return "bold red"
+    if tool == "run_cli":
+        return "green" if bool(result.get("ok")) else "bold red"
+    return "cyan"
+
+
+def _action_style(action: dict[str, object]) -> str:
+    tool = str(action.get("tool", "unknown"))
+    if tool == "finish":
+        return "magenta"
+    if tool == "run_cli":
+        return "cyan"
+    return "white"
+
+
+def _render_run_header(event: dict[str, object]) -> None:
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(style="bold cyan", justify="right")
+    grid.add_column(style="white")
+    grid.add_row("Run", str(event.get("run_id")))
+    grid.add_row("Mode", str(event.get("mode") or "run"))
+    grid.add_row("Steps", str(event.get("max_steps")))
+    grid.add_row("Dir", _display_path(str(event.get("run_dir"))))
+    grid.add_row("Run Plot", _display_path(str(event.get("run_progress_plot"))))
+    grid.add_row("Global Plot", _display_path(str(event.get("progress_plot"))))
+    console.print(
+        Panel(
+            grid,
+            title="[bold green]Autoresearch Run[/bold green]",
+            border_style="green",
+            box=box.ROUNDED,
+        )
+    )
+
+
+def _render_step(step_payload: dict[str, Any]) -> None:
+    step = step_payload.get("step")
+    reasoning = _short_text(str(step_payload.get("reasoning", "")), 220)
+    reasoning_panel = Panel(
+        Text(reasoning, style="white"),
+        title=f"[bold blue]Step {step}[/bold blue]",
+        border_style="blue",
+        box=box.ROUNDED,
+    )
+
+    body: list[Any] = [reasoning_panel]
+
+    actions = step_payload.get("actions")
+    if isinstance(actions, list) and actions:
+        action_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+        action_table.add_column("Action", style="bold cyan", width=10)
+        action_table.add_column("Detail", style="white")
+        for action in actions:
+            if isinstance(action, dict):
+                action_table.add_row(
+                    Text("plan", style=_action_style(action)),
+                    Text(_summarize_action(action), style=_action_style(action)),
+                )
+        body.append(action_table)
+
+    results = step_payload.get("results")
+    if isinstance(results, list) and results:
+        result_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+        result_table.add_column("Result", style="bold", width=10)
+        result_table.add_column("Detail", style="white")
+        for result in results:
+            if isinstance(result, dict):
+                style = _result_style(result)
+                label = "ok"
+                if result.get("error"):
+                    label = "error"
+                elif str(result.get("tool", "")) == "yield_guard":
+                    label = "guard"
+                elif str(result.get("tool", "")) == "finish":
+                    label = "finish"
+                result_table.add_row(Text(label, style=style), Text(_summarize_result(result), style=style))
+        body.append(result_table)
+
+    console.print(Group(*body))
+
+
+def _render_run_footer(result: dict[str, object]) -> None:
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(style="bold green", justify="right")
+    grid.add_column(style="white")
+    grid.add_row("Status", str(result.get("status")))
+    grid.add_row("Run", str(result.get("run_id")))
+    grid.add_row("Dir", _display_path(str(result.get("run_dir"))))
+    grid.add_row("Run Plot", _display_path(str(result.get("run_progress_plot"))))
+    grid.add_row("Global Plot", _display_path(str(result.get("progress_plot"))))
+    summary = result.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        grid.add_row("Summary", _short_text(summary, 260))
+    console.print(
+        Panel(
+            grid,
+            title="[bold green]Run Complete[/bold green]",
+            border_style="green",
+            box=box.ROUNDED,
+        )
+    )
+
+
+def _emit_run_progress(event: dict[str, object]) -> None:
+    kind = event.get("event")
+    if kind == "run_started":
+        run_dir = event.get("run_dir")
+        if isinstance(run_dir, str):
+            _set_display_context(run_dir=Path(run_dir))
+        _render_run_header(event)
+        return
+    if kind == "window_closed":
+        result = event.get("result")
+        if isinstance(result, dict):
+            _render_run_footer(result)
+        return
+    if kind != "step_completed":
+        return
+    step_payload = event.get("step_payload")
+    if not isinstance(step_payload, dict):
+        return
+    _render_step(step_payload)
+
+
+def cmd_run(max_steps: int | None, *, as_json: bool) -> int:
     config = load_config()
+    _set_display_context(repo_root=config.repo_root, run_dir=None)
     controller = ResearchController(config)
-    result = controller.run(max_steps=max_steps)
-    print(json.dumps(result, ensure_ascii=True, indent=2))
+    result = controller.run(
+        max_steps=max_steps,
+        progress_callback=None if as_json else _emit_run_progress,
+        policy=RunPolicy(mode_name="run"),
+    )
+    if as_json:
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+        return 0
+    _render_run_footer(result)
+    return 0
+
+
+def cmd_supervise(
+    max_steps: int | None,
+    *,
+    window: str | None,
+    timezone_name: str | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    _set_display_context(repo_root=config.repo_root, run_dir=None)
+    effective_max_steps, policy = _resolve_supervise_policy(
+        config,
+        max_steps=max_steps,
+        window=window,
+        timezone_name=timezone_name,
+    )
+    controller = ResearchController(config)
+    result = controller.run(
+        max_steps=effective_max_steps,
+        progress_callback=None if as_json else _emit_run_progress,
+        policy=policy,
+    )
+    if as_json:
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+        return 0
+    _render_run_footer(result)
     return 0
 
 
 def cmd_plot() -> int:
     config = load_config()
     attempts = load_attempts(config.attempts_path)
-    render_progress_plot(
+    latest_run_path = None
+    if config.latest_run_link.exists():
+        latest_run_text = config.latest_run_link.read_text(encoding="utf-8").strip()
+        if latest_run_text:
+            latest_run_path = Path(latest_run_text) / "progress.png"
+    render_progress_artifacts(
         attempts,
-        config.progress_plot_path,
+        latest_run_path or config.progress_plot_path,
         lower_is_better=config.research.plot_lower_is_better,
+        mirror_output_path=config.progress_plot_path if latest_run_path else None,
     )
-    print(json.dumps({"attempts": len(attempts), "plot": str(config.progress_plot_path)}, ensure_ascii=True, indent=2))
+    print(
+        json.dumps(
+            {
+                "attempts": len(attempts),
+                "plot": str(config.progress_plot_path),
+                "latest_run_plot": str(latest_run_path) if latest_run_path else None,
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -124,10 +497,16 @@ def cmd_record_attempt(
     )
     append_attempt(config.attempts_path, record)
     attempts = load_attempts(config.attempts_path)
-    render_progress_plot(
+    latest_run_path = None
+    if config.latest_run_link.exists():
+        latest_run_text = config.latest_run_link.read_text(encoding="utf-8").strip()
+        if latest_run_text:
+            latest_run_path = Path(latest_run_text) / "progress.png"
+    render_progress_artifacts(
         attempts,
-        config.progress_plot_path,
+        latest_run_path or config.progress_plot_path,
         lower_is_better=config.research.plot_lower_is_better,
+        mirror_output_path=config.progress_plot_path if latest_run_path else None,
     )
     print(
         json.dumps(
@@ -145,13 +524,71 @@ def cmd_record_attempt(
     return 0
 
 
+def cmd_rescore_attempts() -> int:
+    config = load_config()
+    cli = FuzzfolioCli(config.fuzzfolio)
+    attempts = load_attempts(config.attempts_path)
+    rescored: list[dict[str, object]] = []
+    updated = 0
+    skipped = 0
+
+    for attempt in attempts:
+        artifact_dir = Path(str(attempt.get("artifact_dir", "")))
+        if not artifact_dir.exists():
+            rescored.append(attempt)
+            skipped += 1
+            continue
+        compare_payload = cli.score_artifact(artifact_dir.resolve())
+        score = build_attempt_score(compare_payload, config.research.adjustments)
+        refreshed = dict(attempt)
+        refreshed["primary_score"] = score.primary_score
+        refreshed["composite_score"] = score.composite_score
+        refreshed["adjustments"] = score.adjustments
+        refreshed["best_summary"] = score.best_summary
+        rescored.append(refreshed)
+        updated += 1
+
+    write_attempts(config.attempts_path, rescored)
+    latest_run_path = None
+    if config.latest_run_link.exists():
+        latest_run_text = config.latest_run_link.read_text(encoding="utf-8").strip()
+        if latest_run_text:
+            latest_run_path = Path(latest_run_text) / "progress.png"
+    render_progress_artifacts(
+        rescored,
+        latest_run_path or config.progress_plot_path,
+        lower_is_better=config.research.plot_lower_is_better,
+        mirror_output_path=config.progress_plot_path if latest_run_path else None,
+    )
+    print(
+        json.dumps(
+            {
+                "updated": updated,
+                "skipped": skipped,
+                "attempts": len(rescored),
+                "progress_plot": str(config.progress_plot_path),
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     if args.command == "doctor":
         return cmd_doctor()
     if args.command == "run":
-        return cmd_run(max_steps=args.max_steps)
+        return cmd_run(max_steps=args.max_steps, as_json=bool(args.json))
+    if args.command == "supervise":
+        return cmd_supervise(
+            max_steps=args.max_steps,
+            window=args.window,
+            timezone_name=args.timezone,
+            as_json=bool(args.json),
+        )
     if args.command == "plot":
         return cmd_plot()
     if args.command == "score":
@@ -164,6 +601,8 @@ def main() -> int:
             args.profile_ref,
             args.note,
         )
+    if args.command == "rescore-attempts":
+        return cmd_rescore_attempts()
     parser.error(f"Unknown command: {args.command}")
     return 2
 
