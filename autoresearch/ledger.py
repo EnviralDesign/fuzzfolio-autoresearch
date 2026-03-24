@@ -22,7 +22,8 @@ class AttemptRecord:
     profile_path: str | None
     primary_score: float
     composite_score: float
-    adjustments: dict[str, float]
+    score_basis: str
+    metrics: dict[str, float | None]
     best_summary: dict[str, Any]
     sensitivity_snapshot_path: str | None
     note: str | None = None
@@ -92,7 +93,8 @@ def make_attempt_record(
         profile_path=str(profile_path.resolve()) if profile_path else None,
         primary_score=score.primary_score,
         composite_score=score.composite_score,
-        adjustments=score.adjustments,
+        score_basis=score.score_basis,
+        metrics=score.metrics,
         best_summary=score.best_summary,
         sensitivity_snapshot_path=str(sensitivity_snapshot_path.resolve()) if sensitivity_snapshot_path else None,
         note=note,

@@ -70,5 +70,5 @@ When rejecting or moving away from a branch, prefer a short explicit failure lab
 - Keep paths absolute.
 - Keep scratch artifacts under the current run directory.
 - Use the CLI's saved auth profile when available; fall back to `.agentsecrets` only when login is required.
-- The current scoring system is temporary. Treat `rank_score` as the primary metric for now, with only light modular adjustments.
+- Treat CLI probabilistic metrics as authoritative. Prefer `dsr` when available, otherwise `psr`, with `rank_score` as a fallback/secondary view.
 - Existing saved profiles can be inspected only if the user explicitly asks. They are not the candidate pool for autonomous runs.

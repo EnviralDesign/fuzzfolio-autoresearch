@@ -5,14 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import ScoreAdjustmentConfig
-
-
 @dataclass
 class AttemptScore:
     primary_score: float
     composite_score: float
-    adjustments: dict[str, float]
+    score_basis: str
+    metrics: dict[str, float | None]
     best_summary: dict[str, Any]
 
 
@@ -35,57 +33,130 @@ def _best_summary(compare_payload: dict[str, Any]) -> dict[str, Any]:
     raise ValueError("compare-sensitivity payload did not include a best or ranked summary.")
 
 
+def _get_nested(payload: dict[str, Any] | None, path: list[str]) -> Any:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _find_numeric_by_key(payload: Any, key: str) -> float | None:
+    if isinstance(payload, dict):
+        if key in payload:
+            value = _safe_float(payload.get(key))
+            if value is not None:
+                return value
+        for value in payload.values():
+            found = _find_numeric_by_key(value, key)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _find_numeric_by_key(item, key)
+            if found is not None:
+                return found
+    return None
+
+
+def _extract_metric(
+    key: str,
+    *,
+    best_summary: dict[str, Any],
+    compare_payload: dict[str, Any],
+    sensitivity_snapshot: dict[str, Any] | None,
+    preferred_paths: list[list[str]],
+) -> float | None:
+    for source in [best_summary, compare_payload, sensitivity_snapshot]:
+        if not isinstance(source, dict):
+            continue
+        for path in preferred_paths:
+            value = _safe_float(_get_nested(source, path))
+            if value is not None:
+                return value
+        found = _find_numeric_by_key(source, key)
+        if found is not None:
+            return found
+    return None
+
+
 def build_attempt_score(
     compare_payload: dict[str, Any],
-    adjustments_config: ScoreAdjustmentConfig,
+    sensitivity_snapshot: dict[str, Any] | None = None,
 ) -> AttemptScore:
     best = _best_summary(compare_payload)
-    primary_score = _safe_float(best.get("rank_score"))
-    if primary_score is None:
+    rank_score = _safe_float(best.get("rank_score"))
+    if rank_score is None:
         raise ValueError("compare-sensitivity summary did not contain rank_score.")
 
-    adjustments: dict[str, float] = {}
-    composite_score = primary_score
-
-    best_cell = best.get("best_cell") or {}
-    resolved_trades = int(best_cell.get("resolved_trades") or 0)
-    if (
-        adjustments_config.low_trade_count_threshold > 0
-        and resolved_trades < adjustments_config.low_trade_count_threshold
-    ):
-        gap = adjustments_config.low_trade_count_threshold - resolved_trades
-        ratio = gap / adjustments_config.low_trade_count_threshold
-        penalty = -adjustments_config.low_trade_count_penalty * ratio
-        adjustments["low_trade_count_penalty"] = penalty
-        composite_score += penalty
-
-    signal_count = int(best.get("signal_count") or 0)
-    if (
-        adjustments_config.low_signal_count_threshold > 0
-        and signal_count < adjustments_config.low_signal_count_threshold
-    ):
-        gap = adjustments_config.low_signal_count_threshold - signal_count
-        ratio = gap / adjustments_config.low_signal_count_threshold
-        penalty = -adjustments_config.low_signal_count_penalty * ratio
-        adjustments["low_signal_count_penalty"] = penalty
-        composite_score += penalty
-
-    matrix_summary = best.get("matrix_summary") or {}
-    positive_ratio = _safe_float(matrix_summary.get("positive_cell_ratio")) or 0.0
-    if (
-        adjustments_config.low_positive_cell_ratio_threshold > 0
-        and positive_ratio < adjustments_config.low_positive_cell_ratio_threshold
-    ):
-        gap = adjustments_config.low_positive_cell_ratio_threshold - positive_ratio
-        ratio = gap / max(adjustments_config.low_positive_cell_ratio_threshold, 1e-9)
-        penalty = -adjustments_config.low_positive_cell_ratio_penalty * ratio
-        adjustments["low_positive_cell_ratio_penalty"] = penalty
-        composite_score += penalty
+    psr = _extract_metric(
+        "psr",
+        best_summary=best,
+        compare_payload=compare_payload,
+        sensitivity_snapshot=sensitivity_snapshot,
+        preferred_paths=[
+            ["best_cell_path_metrics", "psr"],
+            ["data", "aggregate", "best_cell_path_metrics", "psr"],
+            ["data", "best_cell_path_metrics", "psr"],
+        ],
+    )
+    dsr = _extract_metric(
+        "dsr",
+        best_summary=best,
+        compare_payload=compare_payload,
+        sensitivity_snapshot=sensitivity_snapshot,
+        preferred_paths=[
+            ["dsr"],
+            ["data", "aggregate", "dsr"],
+            ["data", "dsr"],
+            ["aggregate", "dsr"],
+        ],
+    )
+    k_ratio = _extract_metric(
+        "k_ratio",
+        best_summary=best,
+        compare_payload=compare_payload,
+        sensitivity_snapshot=sensitivity_snapshot,
+        preferred_paths=[
+            ["best_cell_path_metrics", "k_ratio"],
+            ["data", "aggregate", "best_cell_path_metrics", "k_ratio"],
+            ["data", "best_cell_path_metrics", "k_ratio"],
+        ],
+    )
+    sharpe_r = _extract_metric(
+        "sharpe_r",
+        best_summary=best,
+        compare_payload=compare_payload,
+        sensitivity_snapshot=sensitivity_snapshot,
+        preferred_paths=[
+            ["best_cell_path_metrics", "sharpe_r"],
+            ["data", "aggregate", "best_cell_path_metrics", "sharpe_r"],
+            ["data", "best_cell_path_metrics", "sharpe_r"],
+        ],
+    )
+    metrics = {
+        "rank_score": rank_score,
+        "dsr": dsr,
+        "psr": psr,
+        "k_ratio": k_ratio,
+        "sharpe_r": sharpe_r,
+    }
+    if dsr is not None:
+        composite_score = dsr
+        score_basis = "dsr"
+    elif psr is not None:
+        composite_score = psr
+        score_basis = "psr"
+    else:
+        composite_score = rank_score
+        score_basis = "rank_score"
 
     return AttemptScore(
-        primary_score=primary_score,
+        primary_score=rank_score,
         composite_score=composite_score,
-        adjustments=adjustments,
+        score_basis=score_basis,
+        metrics=metrics,
         best_summary=best,
     )
 

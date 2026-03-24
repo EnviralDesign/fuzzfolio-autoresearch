@@ -79,6 +79,10 @@ Return JSON with this shape only:
 }
 """
 
+SUMMARY_PREFIX = """Another language model started to solve this problem and produced a summary of its thinking process.
+Use the summary below to continue the same autonomous Fuzzfolio research run without repeating old work.
+"""
+
 
 @dataclass
 class ToolContext:
@@ -219,7 +223,8 @@ class ResearchController:
         for attempt in recent:
             lines.append(
                 f"{attempt['sequence']}: {attempt.get('candidate_name')} "
-                f"score={attempt.get('composite_score')} artifact={attempt.get('artifact_dir')}"
+                f"score={attempt.get('composite_score')} basis={attempt.get('score_basis', 'n/a')} "
+                f"artifact={attempt.get('artifact_dir')}"
             )
         return "\n".join(lines)
 
@@ -239,6 +244,7 @@ class ResearchController:
         lines: list[str] = []
         current_best = frontier[-1]
         best_summary = current_best.get("best_summary") if isinstance(current_best.get("best_summary"), dict) else {}
+        current_metrics = current_best.get("metrics") if isinstance(current_best.get("metrics"), dict) else {}
         best_cell = best_summary.get("best_cell") if isinstance(best_summary.get("best_cell"), dict) else {}
         positive_ratio = None
         matrix_summary = best_summary.get("matrix_summary") if isinstance(best_summary.get("matrix_summary"), dict) else {}
@@ -249,16 +255,21 @@ class ResearchController:
         lines.append(
             f"- seq={current_best.get('sequence')} score={current_best.get('composite_score')} "
             f"candidate={current_best.get('candidate_name')} profile_ref={current_best.get('profile_ref') or 'n/a'} "
-            f"resolved_trades={best_cell.get('resolved_trades', 'n/a')} positive_cell_ratio={positive_ratio if positive_ratio is not None else 'n/a'}"
+            f"basis={current_best.get('score_basis', 'n/a')} dsr={current_metrics.get('dsr', 'n/a')} "
+            f"psr={current_metrics.get('psr', 'n/a')} resolved_trades={best_cell.get('resolved_trades', 'n/a')} "
+            f"positive_cell_ratio={positive_ratio if positive_ratio is not None else 'n/a'}"
         )
 
         lines.append("Recent frontier points:")
         for attempt in frontier[-10:]:
             summary = attempt.get("best_summary") if isinstance(attempt.get("best_summary"), dict) else {}
+            metrics = attempt.get("metrics") if isinstance(attempt.get("metrics"), dict) else {}
             cell = summary.get("best_cell") if isinstance(summary.get("best_cell"), dict) else {}
             lines.append(
                 f"- seq={attempt.get('sequence')} score={attempt.get('composite_score')} "
-                f"candidate={attempt.get('candidate_name')} trades={cell.get('resolved_trades', 'n/a')} "
+                f"basis={attempt.get('score_basis', 'n/a')} dsr={metrics.get('dsr', 'n/a')} "
+                f"psr={metrics.get('psr', 'n/a')} candidate={attempt.get('candidate_name')} "
+                f"trades={cell.get('resolved_trades', 'n/a')} "
                 f"artifact={attempt.get('artifact_dir')}"
             )
 
@@ -270,9 +281,12 @@ class ResearchController:
             )
             lines.append("Top scored attempts fallback:")
             for attempt in scored[:5]:
+                metrics = attempt.get("metrics") if isinstance(attempt.get("metrics"), dict) else {}
                 lines.append(
                     f"- seq={attempt.get('sequence')} score={attempt.get('composite_score')} "
-                    f"candidate={attempt.get('candidate_name')} artifact={attempt.get('artifact_dir')}"
+                    f"basis={attempt.get('score_basis', 'n/a')} dsr={metrics.get('dsr', 'n/a')} "
+                    f"psr={metrics.get('psr', 'n/a')} candidate={attempt.get('candidate_name')} "
+                    f"artifact={attempt.get('artifact_dir')}"
                 )
 
         return "\n".join(lines)
@@ -317,6 +331,16 @@ class ResearchController:
 
     def _checkpoint_path(self, tool_context: ToolContext) -> Path:
         return tool_context.run_dir / "checkpoint-summary.txt"
+
+    def _approx_token_count(self, text: str) -> int:
+        compact = " ".join(text.split())
+        return max(1, len(compact) // 4)
+
+    def _approx_message_tokens(self, messages: list[ChatMessage]) -> int:
+        total = 0
+        for message in messages:
+            total += self._approx_token_count(message.content) + 8
+        return total
 
     def _profile_template_text(self, tool_context: ToolContext) -> str:
         if not tool_context.profile_template_path.exists():
@@ -462,6 +486,93 @@ class ResearchController:
             return json.dumps(result, ensure_ascii=True)
         return str(result)
 
+    def _history_action_summary(self, action: dict[str, Any]) -> dict[str, Any]:
+        tool = str(action.get("tool", "unknown"))
+        if tool == "write_file":
+            content = action.get("content")
+            return {
+                "tool": tool,
+                "path": str(action.get("path", "")),
+                "content_bytes": len(content.encode("utf-8")) if isinstance(content, str) else 0,
+            }
+        if tool == "run_cli":
+            args = action.get("args")
+            if isinstance(args, list):
+                return {"tool": tool, "args": [str(item) for item in args[:20]]}
+            command = action.get("command")
+            if isinstance(command, str):
+                return {"tool": tool, "command": command[:400]}
+        if tool in {"read_file", "list_dir", "log_attempt", "finish"}:
+            return {key: value for key, value in action.items() if key != "content"}
+        return {key: value for key, value in action.items() if key != "content"}
+
+    def _history_result_summary(self, result: dict[str, Any]) -> dict[str, Any]:
+        tool = str(result.get("tool", "unknown"))
+        if tool == "run_cli":
+            payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+            summarized: dict[str, Any] = {
+                "tool": tool,
+                "ok": bool(result.get("ok")),
+            }
+            if result.get("created_profile_ref"):
+                summarized["created_profile_ref"] = result.get("created_profile_ref")
+            if result.get("auto_log") is not None:
+                summarized["auto_log"] = result.get("auto_log")
+            if isinstance(payload, dict):
+                returncode = payload.get("returncode")
+                if returncode is not None:
+                    summarized["returncode"] = returncode
+                stdout = payload.get("stdout")
+                stderr = payload.get("stderr")
+                parsed = payload.get("parsed_json")
+                if isinstance(parsed, dict):
+                    preview_keys = [
+                        "data",
+                        "id",
+                        "requested_timeframe",
+                        "effective_timeframe",
+                        "status",
+                    ]
+                    summarized["parsed_json_keys"] = [key for key in preview_keys if key in parsed][:8]
+                if isinstance(stdout, str) and "Auto-adjusted timeframe from" in stdout:
+                    summarized["timeframe_auto_adjusted"] = True
+                if isinstance(stderr, str) and stderr.strip() and not bool(result.get("ok")):
+                    summarized["stderr"] = stderr[:500]
+            return summarized
+        if tool == "read_file":
+            content = str(result.get("content", ""))
+            return {
+                "tool": tool,
+                "path": str(result.get("path", "")),
+                "content_preview": content[:1200],
+            }
+        if tool == "list_dir":
+            items = result.get("items")
+            return {
+                "tool": tool,
+                "path": str(result.get("path", "")),
+                "items": items[:40] if isinstance(items, list) else [],
+            }
+        if tool == "write_file":
+            return {
+                "tool": tool,
+                "path": str(result.get("path", "")),
+                "bytes": result.get("bytes"),
+            }
+        if tool == "log_attempt":
+            return {
+                "tool": tool,
+                "result": result.get("result"),
+            }
+        if tool in {"yield_guard", "finish"}:
+            return result
+        if result.get("error"):
+            return {
+                "tool": tool,
+                "error": str(result.get("error"))[:500],
+            }
+        return result
+
     def _extract_profile_ref(self, payload: dict[str, Any]) -> str | None:
         if "id" in payload and isinstance(payload["id"], str):
             return payload["id"]
@@ -507,8 +618,13 @@ class ResearchController:
             return {"status": "existing", "attempt": existing}
 
         compare_payload = self.cli.score_artifact(artifact_dir)
-        score = build_attempt_score(compare_payload, self.config.research.adjustments)
         sensitivity_snapshot_path = artifact_dir / "sensitivity-response.json"
+        sensitivity_snapshot = (
+            load_sensitivity_snapshot(artifact_dir)
+            if sensitivity_snapshot_path.exists()
+            else None
+        )
+        score = build_attempt_score(compare_payload, sensitivity_snapshot)
         record = make_attempt_record(
             self.config,
             tool_context.run_id,
@@ -527,16 +643,17 @@ class ResearchController:
             lower_is_better=self.config.research.plot_lower_is_better,
             mirror_output_path=self.config.progress_plot_path,
         )
-        snapshot = load_sensitivity_snapshot(artifact_dir)
         return {
             "status": "logged",
             "attempt_id": record.attempt_id,
             "composite_score": record.composite_score,
             "primary_score": record.primary_score,
+            "score_basis": record.score_basis,
+            "metrics": record.metrics,
             "artifact_dir": record.artifact_dir,
             "run_progress_plot": str(tool_context.progress_plot_path),
             "progress_plot": str(self.config.progress_plot_path),
-            "sensitivity_snapshot_loaded": snapshot is not None,
+            "sensitivity_snapshot_loaded": sensitivity_snapshot is not None,
         }
 
     def _refresh_progress_artifacts(self, tool_context: ToolContext) -> None:
@@ -652,28 +769,62 @@ class ResearchController:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
-    def _checkpoint_messages(self, tool_context: ToolContext, policy: RunPolicy) -> list[ChatMessage]:
-        step_log_path = self._step_log_path(tool_context)
-        log_tail = step_log_path.read_text(encoding="utf-8")[-12000:] if step_log_path.exists() else ""
+    def _checkpoint_messages(self, history_messages: list[ChatMessage]) -> list[ChatMessage]:
+        serialized_history = [
+            {"role": message.role, "content": message.content}
+            for message in history_messages
+        ]
         return [
             ChatMessage(role="system", content=COMPACTION_PROMPT),
             ChatMessage(
                 role="user",
                 content=(
-                    f"Run state:\n{self._run_state_prompt(tool_context, policy)}\n\n"
-                    f"Recent controller log tail:\n{log_tail}"
+                    "Summarize this controller history for the next continuation turn.\n\n"
+                    + json.dumps(serialized_history, ensure_ascii=True)
                 ),
             ),
         ]
 
-    def _refresh_checkpoint(self, tool_context: ToolContext, policy: RunPolicy) -> None:
+    def _compact_message_history(
+        self,
+        messages: list[ChatMessage],
+        tool_context: ToolContext,
+        policy: RunPolicy,
+    ) -> list[ChatMessage]:
+        history_messages = messages[2:]
+        if not history_messages:
+            return messages
         try:
-            payload = self.provider.complete_json(self._checkpoint_messages(tool_context, policy))
+            payload = self.provider.complete_json(self._checkpoint_messages(history_messages))
         except ProviderError:
-            return
+            return messages
         summary = payload.get("checkpoint_summary")
-        if isinstance(summary, str) and summary.strip():
-            self._checkpoint_path(tool_context).write_text(summary.strip(), encoding="utf-8")
+        if not isinstance(summary, str) or not summary.strip():
+            return messages
+
+        checkpoint_text = f"{SUMMARY_PREFIX}\n{summary.strip()}"
+        self._checkpoint_path(tool_context).write_text(checkpoint_text, encoding="utf-8")
+
+        keep = max(0, self.config.research.compact_keep_recent_messages)
+        recent_tail = history_messages[-keep:] if keep else []
+        return [
+            ChatMessage(role="system", content=self._system_protocol_text(policy)),
+            ChatMessage(role="user", content=self._run_state_prompt(tool_context, policy)),
+            *recent_tail,
+        ]
+
+    def _maybe_compact_messages(
+        self,
+        messages: list[ChatMessage],
+        tool_context: ToolContext,
+        policy: RunPolicy,
+    ) -> list[ChatMessage]:
+        trigger = self.config.research.compact_trigger_tokens
+        if trigger <= 0:
+            return messages
+        if self._approx_message_tokens(messages) < trigger:
+            return messages
+        return self._compact_message_history(messages, tool_context, policy)
 
     def _allow_finish(
         self,
@@ -747,6 +898,7 @@ class ResearchController:
 
         step_limit = max_steps or self.config.research.max_steps
         for step in range(1, step_limit + 1):
+            self.last_created_profile_ref = None
             if step > 1 and not self._within_operating_window(policy):
                 result = {
                     "status": "window_closed",
@@ -758,8 +910,7 @@ class ResearchController:
                 if progress_callback:
                     progress_callback({"event": "window_closed", "result": result})
                 return result
-            if step > 1 and step % 8 == 0:
-                self._refresh_checkpoint(tool_context, policy)
+            messages = self._maybe_compact_messages(messages, tool_context, policy)
             try:
                 response = self.provider.complete_json(messages)
             except (ProviderError, CliError) as exc:
@@ -819,11 +970,25 @@ class ResearchController:
                         "step_payload": step_payload,
                     }
                 )
-            messages.append(ChatMessage(role="assistant", content=json.dumps(response, ensure_ascii=True)))
+            compact_assistant = {
+                "reasoning": reasoning,
+                "actions": [self._history_action_summary(action) for action in actions if isinstance(action, dict)],
+            }
+            messages.append(ChatMessage(role="assistant", content=json.dumps(compact_assistant, ensure_ascii=True)))
             messages.append(
                 ChatMessage(
                     role="user",
-                    content="Tool results:\n" + json.dumps(step_payload["results"], ensure_ascii=True),
+                    content=(
+                        "Tool results:\n"
+                        + json.dumps(
+                            [
+                                self._history_result_summary(result)
+                                for result in step_payload["results"]
+                                if isinstance(result, dict)
+                            ],
+                            ensure_ascii=True,
+                        )
+                    ),
                 )
             )
 

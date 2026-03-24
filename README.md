@@ -25,6 +25,7 @@ The new runtime lives in `autoresearch/` and exposes:
 - `autoresearch score <artifact_dir>`
 - `autoresearch record-attempt <artifact_dir>`
 - `autoresearch plot`
+- `autoresearch reset-runs`
 
 ## Local config
 
@@ -52,6 +53,7 @@ Keep both untracked. `.agentsecrets` is the place for the provider key and fallb
 uv run autoresearch doctor
 uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
+uv run autoresearch reset-runs
 ```
 
 By default, `run` prints a compact live console trace so you can watch the controller think, act, and log attempts in real time.
@@ -62,6 +64,8 @@ uv run autoresearch run --max-steps 20 --json
 ```
 
 The default live trace uses `rich` for colored panels and step/result tables so it is easier to watch during longer managed runs.
+The default provider completion budget is intentionally a bit roomy because the agent sometimes needs to emit a full portable profile JSON in one action.
+The controller also uses threshold-triggered context compaction modeled after `codex-rs`: once the live prompt estimate crosses the configured token threshold, it writes a checkpoint summary and rebuilds the active history from fresh run state plus a short recent tail.
 
 ## Supervised Runs
 
@@ -147,20 +151,21 @@ uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
 uv run autoresearch plot
 uv run autoresearch rescore-attempts
+uv run autoresearch reset-runs
 ```
 
 ## Scoring
 
-For now the primary score is `rank_score` from `fuzzfolio-agent-cli compare-sensitivity`.
+The runtime now treats the CLI's scoring surface as authoritative:
 
-Any extra scoring adjustments are intentionally light and modular so they can be replaced when better backend metrics land.
+- `primary_score` is the CLI `rank_score`
+- `composite_score` is `dsr` when present, otherwise `psr`, otherwise `rank_score`
+- each attempt record also stores `psr`, `dsr`, `k_ratio`, and `sharpe_r` when available
+
+The Python side no longer applies ad hoc penalties for trade count, signal count, or positive-cell coverage.
 
 ## Long-running behavior
 
 The controller includes:
 - a yield guard so the model cannot immediately declare success without logging meaningful work
 - periodic checkpoint compaction so prompt state stays bounded over longer runs
-
-## Legacy files
-
-The original upstream training files are still present in the repo for reference during the transition, but the active runtime is now the Fuzzfolio operator flow.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -20,14 +21,14 @@ if __package__ in {None, ""}:
     from autoresearch.fuzzfolio import FuzzfolioCli
     from autoresearch.ledger import append_attempt, load_attempts, make_attempt_record, write_attempts
     from autoresearch.plotting import render_progress_artifacts
-    from autoresearch.scoring import build_attempt_score
+    from autoresearch.scoring import build_attempt_score, load_sensitivity_snapshot
 else:
     from .config import load_config
     from .controller import ResearchController, RunPolicy
     from .fuzzfolio import FuzzfolioCli
     from .ledger import append_attempt, load_attempts, make_attempt_record, write_attempts
     from .plotting import render_progress_artifacts
-    from .scoring import build_attempt_score
+    from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 
 console = Console()
@@ -52,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     supervise.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
 
     subparsers.add_parser("plot", help="Regenerate the progress plot from the attempts ledger.")
+    subparsers.add_parser("reset-runs", help="Delete all run artifacts and recreate a clean empty runs state.")
 
     score = subparsers.add_parser("score", help="Score one sensitivity artifact directory.")
     score.add_argument("artifact_dir", type=Path)
@@ -452,18 +454,54 @@ def cmd_plot() -> int:
     return 0
 
 
+def cmd_reset_runs() -> int:
+    config = load_config()
+    cleared: list[str] = []
+    config.runs_root.mkdir(parents=True, exist_ok=True)
+
+    for child in sorted(config.runs_root.iterdir()):
+        cleared.append(str(child))
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+    write_attempts(config.attempts_path, [])
+    render_progress_artifacts(
+        [],
+        config.progress_plot_path,
+        lower_is_better=config.research.plot_lower_is_better,
+    )
+
+    print(
+        json.dumps(
+            {
+                "runs_root": str(config.runs_root),
+                "cleared_entries": len(cleared),
+                "attempts_path": str(config.attempts_path),
+                "progress_plot": str(config.progress_plot_path),
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_score(artifact_dir: Path) -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
     compare_payload = cli.score_artifact(artifact_dir.resolve())
-    score = build_attempt_score(compare_payload, config.research.adjustments)
+    snapshot = load_sensitivity_snapshot(artifact_dir.resolve())
+    score = build_attempt_score(compare_payload, snapshot)
     print(
         json.dumps(
             {
                 "artifact_dir": str(artifact_dir.resolve()),
                 "primary_score": score.primary_score,
                 "composite_score": score.composite_score,
-                "adjustments": score.adjustments,
+                "score_basis": score.score_basis,
+                "metrics": score.metrics,
                 "best_summary": score.best_summary,
             },
             ensure_ascii=True,
@@ -483,8 +521,9 @@ def cmd_record_attempt(
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
     compare_payload = cli.score_artifact(artifact_dir.resolve())
-    score = build_attempt_score(compare_payload, config.research.adjustments)
     snapshot_path = artifact_dir.resolve() / "sensitivity-response.json"
+    snapshot = load_sensitivity_snapshot(artifact_dir.resolve()) if snapshot_path.exists() else None
+    score = build_attempt_score(compare_payload, snapshot)
     record = make_attempt_record(
         config,
         run_id,
@@ -515,6 +554,8 @@ def cmd_record_attempt(
                 "sequence": record.sequence,
                 "candidate_name": record.candidate_name,
                 "composite_score": record.composite_score,
+                "score_basis": record.score_basis,
+                "metrics": record.metrics,
                 "progress_plot": str(config.progress_plot_path),
             },
             ensure_ascii=True,
@@ -539,11 +580,13 @@ def cmd_rescore_attempts() -> int:
             skipped += 1
             continue
         compare_payload = cli.score_artifact(artifact_dir.resolve())
-        score = build_attempt_score(compare_payload, config.research.adjustments)
+        snapshot = load_sensitivity_snapshot(artifact_dir.resolve())
+        score = build_attempt_score(compare_payload, snapshot)
         refreshed = dict(attempt)
         refreshed["primary_score"] = score.primary_score
         refreshed["composite_score"] = score.composite_score
-        refreshed["adjustments"] = score.adjustments
+        refreshed["score_basis"] = score.score_basis
+        refreshed["metrics"] = score.metrics
         refreshed["best_summary"] = score.best_summary
         rescored.append(refreshed)
         updated += 1
@@ -591,6 +634,8 @@ def main() -> int:
         )
     if args.command == "plot":
         return cmd_plot()
+    if args.command == "reset-runs":
+        return cmd_reset_runs()
     if args.command == "score":
         return cmd_score(args.artifact_dir)
     if args.command == "record-attempt":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +17,7 @@ class ProviderConfig:
     model: str = "gpt-5.4-mini"
     api_key: str | None = None
     temperature: float = 0.2
-    max_tokens: int = 1400
+    max_tokens: int = 3200
     timeout_seconds: int = 120
 
 
@@ -33,23 +33,14 @@ class FuzzfolioConfig:
 
 
 @dataclass
-class ScoreAdjustmentConfig:
-    low_trade_count_threshold: int = 75
-    low_trade_count_penalty: float = 80.0
-    low_signal_count_threshold: int = 20
-    low_signal_count_penalty: float = 40.0
-    low_positive_cell_ratio_threshold: float = 0.15
-    low_positive_cell_ratio_penalty: float = 20.0
-
-
-@dataclass
 class ResearchConfig:
     max_steps: int = 40
     recent_attempts_window: int = 16
     label_prefix: str = "agentic"
     auto_seed_prompt: bool = True
     plot_lower_is_better: bool = False
-    adjustments: ScoreAdjustmentConfig = field(default_factory=ScoreAdjustmentConfig)
+    compact_trigger_tokens: int = 12000
+    compact_keep_recent_messages: int = 4
 
 
 @dataclass
@@ -128,8 +119,6 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     fuzzfolio_secrets = raw_secrets.get("fuzzfolio", {})
     research_cfg = raw_config.get("research", {})
     supervisor_cfg = raw_config.get("supervisor", {})
-    adjustments_cfg = research_cfg.get("adjustments", {})
-
     provider = ProviderConfig(
         api_base=_env_or_value("AUTORESEARCH_PROVIDER_BASE_URL", fallback=provider_cfg.get("api_base"))
         or ProviderConfig.api_base,
@@ -173,51 +162,21 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
         password=_env_or_value("AUTORESEARCH_FUZZFOLIO_PASSWORD", fallback=fuzzfolio_secrets.get("password")),
     )
 
-    adjustments = ScoreAdjustmentConfig(
-        low_trade_count_threshold=int(
-            adjustments_cfg.get(
-                "low_trade_count_threshold",
-                ScoreAdjustmentConfig.low_trade_count_threshold,
-            )
-        ),
-        low_trade_count_penalty=float(
-            adjustments_cfg.get(
-                "low_trade_count_penalty",
-                ScoreAdjustmentConfig.low_trade_count_penalty,
-            )
-        ),
-        low_signal_count_threshold=int(
-            adjustments_cfg.get(
-                "low_signal_count_threshold",
-                ScoreAdjustmentConfig.low_signal_count_threshold,
-            )
-        ),
-        low_signal_count_penalty=float(
-            adjustments_cfg.get(
-                "low_signal_count_penalty",
-                ScoreAdjustmentConfig.low_signal_count_penalty,
-            )
-        ),
-        low_positive_cell_ratio_threshold=float(
-            adjustments_cfg.get(
-                "low_positive_cell_ratio_threshold",
-                ScoreAdjustmentConfig.low_positive_cell_ratio_threshold,
-            )
-        ),
-        low_positive_cell_ratio_penalty=float(
-            adjustments_cfg.get(
-                "low_positive_cell_ratio_penalty",
-                ScoreAdjustmentConfig.low_positive_cell_ratio_penalty,
-            )
-        ),
-    )
     research = ResearchConfig(
         max_steps=int(research_cfg.get("max_steps", ResearchConfig.max_steps)),
         recent_attempts_window=int(research_cfg.get("recent_attempts_window", ResearchConfig.recent_attempts_window)),
         label_prefix=research_cfg.get("label_prefix", ResearchConfig.label_prefix),
         auto_seed_prompt=bool(research_cfg.get("auto_seed_prompt", ResearchConfig.auto_seed_prompt)),
         plot_lower_is_better=bool(research_cfg.get("plot_lower_is_better", ResearchConfig.plot_lower_is_better)),
-        adjustments=adjustments,
+        compact_trigger_tokens=int(
+            research_cfg.get("compact_trigger_tokens", ResearchConfig.compact_trigger_tokens)
+        ),
+        compact_keep_recent_messages=int(
+            research_cfg.get(
+                "compact_keep_recent_messages",
+                ResearchConfig.compact_keep_recent_messages,
+            )
+        ),
     )
     supervisor = SupervisorConfig(
         max_steps=(
