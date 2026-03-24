@@ -66,6 +66,7 @@ uv run autoresearch run --max-steps 20 --json
 The default live trace uses `rich` for colored panels and step/result tables so it is easier to watch during longer managed runs.
 The default provider completion budget is intentionally a bit roomy because the agent sometimes needs to emit a full portable profile JSON in one action.
 The controller also uses threshold-triggered context compaction modeled after `codex-rs`: once the live prompt estimate crosses the configured token threshold, it writes a checkpoint summary and rebuilds the active history from fresh run state plus a short recent tail.
+By default, the main explorer loop uses `gpt-5.4-mini`, while the finish-denial supervisor guidance path uses `gpt-5.4`. You can override these with `provider.model` and `provider.supervisor_model`.
 
 ## Supervised Runs
 

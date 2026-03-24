@@ -2,6 +2,7 @@
   "provider": {
     "api_base": "https://api.openai.com/v1",
     "model": "gpt-5.4-mini",
+    "supervisor_model": "gpt-5.4",
     "temperature": 0.2,
     "max_tokens": 3200,
     "timeout_seconds": 120
@@ -18,7 +19,8 @@
     "auto_seed_prompt": true,
     "plot_lower_is_better": false,
     "compact_trigger_tokens": 12000,
-    "compact_keep_recent_messages": 4
+    "compact_keep_recent_messages": 4,
+    "supervisor_recent_steps": 6
   },
   "supervisor": {
     "max_steps": 200,

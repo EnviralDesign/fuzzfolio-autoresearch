@@ -86,6 +86,7 @@ def cmd_doctor() -> int:
         "cli_command": config.fuzzfolio.cli_command,
         "cli_resolved_path": cli_path,
         "provider_model": config.provider.model,
+        "supervisor_model": config.provider.supervisor_model,
         "provider_api_base": config.provider.api_base,
         "provider_has_api_key": bool(config.provider.api_key),
         "supervisor_max_steps": config.supervisor.max_steps,
@@ -247,7 +248,15 @@ def _summarize_result(result: dict[str, object]) -> str:
                     return f"log_attempt existing | score={attempt.get('composite_score')}"
             return f"log_attempt {payload.get('status')} | score={payload.get('composite_score')}"
     if tool == "yield_guard":
-        return f"yield_guard | {_short_text(str(result.get('message', '')), 120)}"
+        base = str(result.get("supervisor_message") or result.get("message", ""))
+        parts = [f"yield_guard | {_short_text(base, 160)}"]
+        questions = result.get("questions")
+        if isinstance(questions, list) and questions:
+            parts.append("q: " + " / ".join(_short_text(str(item), 70) for item in questions[:2]))
+        next_moves = result.get("next_moves")
+        if isinstance(next_moves, list) and next_moves:
+            parts.append("next: " + _short_text(str(next_moves[0]), 80))
+        return " | ".join(parts)
     if tool == "step_guard":
         return f"step_guard | {_short_text(str(result.get('message', '')), 120)}"
     if tool == "response_guard":

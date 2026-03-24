@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -41,6 +41,10 @@ Rules:
 - Use only real CLI commands and subcommands. Do not invent near-miss names.
 - Existing saved profiles from outside this run are off-limits as candidate seeds. Do not call profiles list/get/export to mine old profiles unless the user explicitly asks.
 - Start from the current run's seed hand and write fresh portable profile JSON files under the current run's profiles directory.
+- Prefer `profiles scaffold` to generate a valid starter profile from seeded indicator ids instead of hand-writing the whole schema from scratch.
+- Prefer `profiles clone-local` to normalize/copy an existing local profile into a fresh run-owned portable document before branching.
+- Prefer `profiles patch` for bounded edits to local profile files instead of rewriting whole JSON documents when only a few fields need to change.
+- Prefer `profiles validate --file <ABS_FILE>` as a cheap preflight after materially editing a profile file.
 - Only update profile refs that were created during this run.
 - In profile JSON, `indicator.meta.id` must be an exact id from the sticky indicator catalog. Seed phrases and concept labels are not valid ids.
 - After `profiles create`, use the returned profile id for later `--profile-ref` calls. A local `*.created.json` file is not itself a profile ref.
@@ -84,6 +88,26 @@ Return JSON with this shape only:
 {
   "checkpoint_summary": "concise multi-line summary"
 }
+"""
+
+SUPERVISOR_PROMPT = """You are the supervisor for an autonomous Fuzzfolio research run.
+
+Your job is to redirect the explorer away from low-value wandering when it tries to stop early or gets stuck.
+Be sharp, adventurous, concrete, and Socratic. Push for better branch quality, not just more steps.
+
+Return JSON only in this exact shape:
+{
+  "message": "2-4 sentences of direct coaching",
+  "questions": ["short question 1", "short question 2"],
+  "next_moves": ["concrete move 1", "concrete move 2", "concrete move 3"]
+}
+
+Rules:
+- Keep it compact.
+- Work only within the current run, its seed hand, and run-owned artifacts.
+- Do not suggest invalid CLI syntax or invalid instruments like __BASKET__.
+- Prefer hypothesis pivots, contrast branches, and meaningful parameter or timeframe shifts over repetitive retries.
+- If the explorer is drifting, say so plainly.
 """
 
 SUMMARY_PREFIX = """Another language model started to solve this problem and produced a summary of its thinking process.
@@ -135,6 +159,12 @@ class ResearchController:
     def __init__(self, app_config: AppConfig):
         self.config = app_config
         self.provider = OpenAICompatibleProvider(app_config.provider)
+        self.supervisor_provider = OpenAICompatibleProvider(
+            replace(
+                app_config.provider,
+                model=app_config.provider.supervisor_model or app_config.provider.model,
+            )
+        )
         self.cli = FuzzfolioCli(app_config.fuzzfolio)
         self.profile_sources: dict[str, Path] = {}
         self.last_created_profile_ref: str | None = None
@@ -194,6 +224,9 @@ class ResearchController:
         args = action.get("args")
         if isinstance(args, list) and args:
             normalized = [str(item) for item in args]
+            if normalized and any(char.isspace() for char in normalized[0].strip()):
+                expanded_head = shlex.split(normalized[0], posix=False)
+                normalized = [*expanded_head, *normalized[1:]]
             first = Path(normalized[0]).name.lower()
             if first in executable_names:
                 normalized = normalized[1:]
@@ -531,14 +564,22 @@ class ResearchController:
         )
         cli_guide = (
             "Important CLI command shapes:\n"
+            '- profiles clone-local --file <ABS_FILE> --out <ABS_FILE>\n'
+            '- profiles patch --file <ABS_FILE> --set profile.name="..." --set profile.indicators[0].config.timeframe="H1" --out <ABS_FILE>\n'
+            '- profiles scaffold --indicator <ID> --indicator <ID> --instrument <SYMBOL> --out <ABS_FILE>\n'
+            '- profiles validate --file <ABS_FILE> --pretty\n'
             '- profiles create --file <ABS_FILE> --out <ABS_FILE>\n'
             '- profiles update --profile-ref <REF> --file <ABS_FILE> --out <ABS_FILE>\n'
             '- sweep submit --definition <ABS_FILE_OR_INLINE_JSON> --out <ABS_FILE> --pretty\n'
             '- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --output-dir <ABS_DIR>\n'
             '- compare-sensitivity --input <ABS_DIR> --pretty\n'
             "Notes:\n"
+            "- profiles scaffold generates a valid portable profile from live indicator templates and is preferred for fresh candidate bootstrapping.\n"
+            "- profiles clone-local normalizes/copies an existing local profile into a fresh portable document for safe local branching.\n"
+            "- profiles patch applies deterministic path=value edits to a local profile file and is preferred for small branch mutations.\n"
+            "- profiles validate performs a local schema/instrument preflight and is preferred before create when you materially edited a profile.\n"
             "- profiles create/update require --file. They do not accept branch/indicator/timeframe flags.\n"
-            "- Create fresh run-owned profile JSON from the portable template, then call profiles create.\n"
+            "- Create fresh run-owned profile JSON from scaffold output, clone-local output, or the portable template, then call profiles create.\n"
             "- Only exact indicator ids from the sticky indicator catalog are valid in indicator.meta.id.\n"
             "- The seed prompt is backed by the live indicator catalog, but seed concepts are still ideas, not ids.\n"
             "- Use the seed-to-valid-id hints when the seed uses semantic phrases instead of exact ids.\n"
@@ -990,6 +1031,101 @@ class ResearchController:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
 
+    def _load_recent_step_payloads(self, tool_context: ToolContext, limit: int) -> list[dict[str, Any]]:
+        path = self._step_log_path(tool_context)
+        if not path.exists() or limit <= 0:
+            return []
+        lines = path.read_text(encoding="utf-8").splitlines()
+        payloads: list[dict[str, Any]] = []
+        for line in lines[-limit:]:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                payloads.append(item)
+        return payloads
+
+    def _recent_step_window_text(
+        self,
+        tool_context: ToolContext,
+        current_step_payload: dict[str, Any] | None = None,
+    ) -> str:
+        limit = max(1, self.config.research.supervisor_recent_steps)
+        payloads = self._load_recent_step_payloads(tool_context, limit)
+        if current_step_payload is not None:
+            payloads.append(current_step_payload)
+        if not payloads:
+            return "No recent step history is available."
+        lines: list[str] = []
+        for payload in payloads[-limit:]:
+            step = payload.get("step")
+            reasoning = _short = " ".join(str(payload.get("reasoning", "")).split())
+            if len(_short) > 180:
+                _short = _short[:177] + "..."
+            lines.append(f"Step {step}: { _short or 'n/a' }")
+            actions = payload.get("actions")
+            if isinstance(actions, list):
+                for action in actions[:3]:
+                    if isinstance(action, dict):
+                        lines.append(f"  action: {self._history_action_summary(action)}")
+            results = payload.get("results")
+            if isinstance(results, list):
+                for result in results[:4]:
+                    if isinstance(result, dict):
+                        summary = self._history_result_summary(result)
+                        lines.append(f"  result: {json.dumps(summary, ensure_ascii=True)[:240]}")
+        return "\n".join(lines)
+
+    def _supervisor_guidance(
+        self,
+        tool_context: ToolContext,
+        step: int,
+        step_limit: int,
+        finish_summary: str,
+        denial_message: str,
+        current_step_payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        attempts = [
+            attempt
+            for attempt in load_attempts(self.config.attempts_path)
+            if str(attempt.get("run_id", "")) == tool_context.run_id
+        ]
+        attempt_lines: list[str] = []
+        for attempt in attempts[-6:]:
+            attempt_lines.append(
+                f"- seq={attempt.get('sequence')} candidate={attempt.get('candidate_name')} "
+                f"score={attempt.get('composite_score')} basis={attempt.get('score_basis')}"
+            )
+        prompt = (
+            f"Step: {step}/{step_limit}\n"
+            f"Finish denial count: {self.finish_denials + 1}\n"
+            f"Denied finish summary: {finish_summary or 'n/a'}\n"
+            f"Controller denial: {denial_message}\n\n"
+            f"Frontier snapshot:\n{self._frontier_snapshot_text()}\n\n"
+            f"Recent run attempts:\n{chr(10).join(attempt_lines) if attempt_lines else 'No attempts yet.'}\n\n"
+            f"Recent step window:\n{self._recent_step_window_text(tool_context, current_step_payload)}\n"
+        )
+        try:
+            payload = self.supervisor_provider.complete_json(
+                [
+                    ChatMessage(role="system", content=SUPERVISOR_PROMPT),
+                    ChatMessage(role="user", content=prompt),
+                ]
+            )
+        except ProviderError:
+            return None
+        message = payload.get("message")
+        questions = payload.get("questions")
+        next_moves = payload.get("next_moves")
+        if not isinstance(message, str) or not message.strip():
+            return None
+        return {
+            "message": message.strip(),
+            "questions": [str(item).strip() for item in questions[:3]] if isinstance(questions, list) else [],
+            "next_moves": [str(item).strip() for item in next_moves[:3]] if isinstance(next_moves, list) else [],
+        }
+
     def _checkpoint_messages(self, history_messages: list[ChatMessage]) -> list[ChatMessage]:
         serialized_history = [
             {"role": message.role, "content": message.content}
@@ -1229,13 +1365,24 @@ class ResearchController:
                         finish_summary = proposed_summary
                     else:
                         self.finish_denials += 1
-                        step_payload["results"].append(
-                            {
-                                "tool": "yield_guard",
-                                "message": message,
-                                "finish_denials": self.finish_denials,
-                            }
+                        supervisor = self._supervisor_guidance(
+                            tool_context,
+                            step,
+                            step_limit,
+                            proposed_summary,
+                            message,
+                            step_payload,
                         )
+                        guard_payload: dict[str, Any] = {
+                            "tool": "yield_guard",
+                            "message": message,
+                            "finish_denials": self.finish_denials,
+                        }
+                        if supervisor:
+                            guard_payload["supervisor_message"] = supervisor.get("message")
+                            guard_payload["questions"] = supervisor.get("questions", [])
+                            guard_payload["next_moves"] = supervisor.get("next_moves", [])
+                        step_payload["results"].append(guard_payload)
                     break
 
             self._append_step_log(tool_context, step_payload)

@@ -15,6 +15,7 @@ SECRETS_FILE_NAME = ".agentsecrets"
 class ProviderConfig:
     api_base: str = "https://api.openai.com/v1"
     model: str = "gpt-5.4-mini"
+    supervisor_model: str = "gpt-5.4"
     api_key: str | None = None
     temperature: float = 0.2
     max_tokens: int = 3200
@@ -41,6 +42,7 @@ class ResearchConfig:
     plot_lower_is_better: bool = False
     compact_trigger_tokens: int = 12000
     compact_keep_recent_messages: int = 4
+    supervisor_recent_steps: int = 6
 
 
 @dataclass
@@ -122,7 +124,13 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     provider = ProviderConfig(
         api_base=_env_or_value("AUTORESEARCH_PROVIDER_BASE_URL", fallback=provider_cfg.get("api_base"))
         or ProviderConfig.api_base,
-        model=ProviderConfig.model,
+        model=_env_or_value("AUTORESEARCH_PROVIDER_MODEL", fallback=provider_cfg.get("model"))
+        or ProviderConfig.model,
+        supervisor_model=_env_or_value(
+            "AUTORESEARCH_SUPERVISOR_MODEL",
+            fallback=provider_cfg.get("supervisor_model"),
+        )
+        or ProviderConfig.supervisor_model,
         api_key=_env_or_value(
             "AUTORESEARCH_PROVIDER_API_KEY",
             "OPENAI_API_KEY",
@@ -175,6 +183,12 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             research_cfg.get(
                 "compact_keep_recent_messages",
                 ResearchConfig.compact_keep_recent_messages,
+            )
+        ),
+        supervisor_recent_steps=int(
+            research_cfg.get(
+                "supervisor_recent_steps",
+                ResearchConfig.supervisor_recent_steps,
             )
         ),
     )
