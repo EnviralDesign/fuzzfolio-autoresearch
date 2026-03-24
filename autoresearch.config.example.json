@@ -1,0 +1,27 @@
+{
+  "provider": {
+    "api_base": "https://api.openai.com/v1",
+    "model": "gpt-4.1-mini",
+    "temperature": 0.2,
+    "max_tokens": 1400,
+    "timeout_seconds": 120
+  },
+  "fuzzfolio": {
+    "cli_command": "fuzzfolio-agent-cli",
+    "base_url": "http://localhost:7946/api/dev",
+    "auth_profile": "robot"
+  },
+  "research": {
+    "max_steps": 40,
+    "recent_attempts_window": 16,
+    "label_prefix": "agentic",
+    "auto_seed_prompt": true,
+    "plot_lower_is_better": false,
+    "adjustments": {
+      "low_trade_count_threshold": 0,
+      "low_trade_count_penalty": 0.0,
+      "low_positive_cell_ratio_threshold": 0.0,
+      "low_positive_cell_ratio_penalty": 0.0
+    }
+  }
+}

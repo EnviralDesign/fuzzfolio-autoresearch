@@ -11,6 +11,7 @@ wheels/
 worktrees/
 results/
 queue/
+runs/
 
 # Agent prompt files (generated per-session by launchers)
 CLAUDE.md
@@ -21,3 +22,7 @@ dev/
 
 # Results file
 results.tsv
+
+# Local runtime config/secrets
+.agentsecrets
+autoresearch.config.json
