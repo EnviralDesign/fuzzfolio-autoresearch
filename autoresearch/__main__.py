@@ -201,6 +201,8 @@ def _summarize_action(action: dict[str, object]) -> str:
 
 def _summarize_result(result: dict[str, object]) -> str:
     tool = str(result.get("tool", "unknown"))
+    if result.get("error"):
+        return f"{tool} failed | {_short_text(str(result.get('error')), 120)}"
     if tool == "run_cli":
         ok = bool(result.get("ok"))
         status = "ok" if ok else "failed"
@@ -246,10 +248,12 @@ def _summarize_result(result: dict[str, object]) -> str:
             return f"log_attempt {payload.get('status')} | score={payload.get('composite_score')}"
     if tool == "yield_guard":
         return f"yield_guard | {_short_text(str(result.get('message', '')), 120)}"
+    if tool == "step_guard":
+        return f"step_guard | {_short_text(str(result.get('message', '')), 120)}"
+    if tool == "response_guard":
+        return f"response_guard | {_short_text(str(result.get('error', '')), 120)}"
     if tool == "finish":
         return f"finish | {_short_text(str(result.get('summary', '')), 120)}"
-    if result.get("error"):
-        return f"{tool} failed | {_short_text(str(result.get('error')), 120)}"
     return tool
 
 
@@ -257,6 +261,8 @@ def _result_style(result: dict[str, object]) -> str:
     tool = str(result.get("tool", "unknown"))
     if tool == "yield_guard":
         return "yellow"
+    if tool in {"step_guard", "response_guard"}:
+        return "bold yellow"
     if result.get("error"):
         return "bold red"
     if tool == "run_cli":

@@ -48,6 +48,7 @@ Rules:
 - Runtime placeholders like `<created_profile_ref>` may appear in tool arguments. Reuse them exactly when provided; the controller will substitute the real value.
 - After `sensitivity-basket`, the expected artifact files are `sensitivity-response.json`, `deep-replay-job.json`, and sometimes `best-cell-path-detail.json`. Do not look for `summary.json`.
 - `sensitivity` and `sensitivity-basket` now expose `requested_timeframe` and `effective_timeframe` in JSON output when you inspect stdout or saved responses.
+- `__BASKET__` may appear inside saved analysis summaries as an aggregate label. It is not a valid CLI instrument argument. Use exact catalog symbols like EURUSD.
 - `finish` is terminal for the whole run. Never use it to mean "continue" or "step complete".
 - Only call `finish` when you intend to stop the run now and can provide a concise non-empty final summary.
 - This is an iterative research session, not a one-shot evaluation. Keep exploring unless you have reached the step limit or the controller explicitly allows finish.
@@ -56,6 +57,12 @@ Rules:
 - For run_cli, prefer this shape:
   { "tool": "run_cli", "args": ["auth", "whoami", "--pretty"] }
 - A legacy string command may also work, but args arrays are preferred.
+- For write_file, always include both:
+  { "tool": "write_file", "path": "C:\\abs\\file.json", "content": "{...full file text...}" }
+- Never emit write_file without a full non-empty string `content` field.
+- If a file body is too large to fit comfortably, emit fewer actions in that step. Do not omit `content`.
+- Do not call `profiles create` or `profiles update` for a profile JSON path unless that file already exists on disk or you wrote it earlier in the same step.
+- If `profiles create` fails, recover by fixing the profile JSON first. Do not continue to `sensitivity-basket` in the same step.
 """
 
 SUPERVISED_EXTRA_RULES = """
@@ -83,6 +90,21 @@ SUMMARY_PREFIX = """Another language model started to solve this problem and pro
 Use the summary below to continue the same autonomous Fuzzfolio research run without repeating old work.
 """
 
+RESPONSE_REPAIR_PROMPT = """Your previous JSON response was structurally invalid for the controller.
+
+Return a corrected full replacement response in the exact required top-level shape:
+{
+  "reasoning": "one short paragraph",
+  "actions": [{ ... }]
+}
+
+Hard requirements:
+- Every write_file action must include a full non-empty string `content` field.
+- If you cannot fit all planned work, reduce the number of actions.
+- Do not omit required fields.
+- Return raw JSON only.
+"""
+
 
 @dataclass
 class ToolContext:
@@ -95,6 +117,7 @@ class ToolContext:
     seed_prompt_path: Path | None
     profile_template_path: Path
     indicator_catalog_summary: str | None
+    seed_indicator_parameter_hints: str | None
     instrument_catalog_summary: str | None
 
 
@@ -122,6 +145,26 @@ class ResearchController:
         if policy.allow_finish:
             return SYSTEM_PROTOCOL
         return SYSTEM_PROTOCOL + "\n" + SUPERVISED_EXTRA_RULES
+
+    def _normalize_model_response(self, payload: dict[str, Any] | list[Any]) -> dict[str, Any]:
+        if isinstance(payload, dict):
+            if isinstance(payload.get("actions"), list):
+                reasoning = payload.get("reasoning")
+                return {
+                    "reasoning": str(reasoning).strip() if isinstance(reasoning, str) else "",
+                    "actions": payload.get("actions"),
+                }
+            if payload.get("tool"):
+                reasoning = payload.get("reasoning")
+                action = dict(payload)
+                action.pop("reasoning", None)
+                return {
+                    "reasoning": str(reasoning).strip() if isinstance(reasoning, str) else "",
+                    "actions": [action],
+                }
+        if isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
+            return {"reasoning": "", "actions": payload}
+        raise RuntimeError(f"Model returned invalid actions payload: {payload}")
 
     def _parse_wall_time(self, value: str) -> time:
         parsed = datetime.strptime(value, "%H:%M")
@@ -191,7 +234,9 @@ class ResearchController:
         seed_prompt_path = run_dir / "seed-prompt.json"
         if self.config.research.auto_seed_prompt:
             self.cli.seed_prompt(seed_prompt_path)
-        indicator_catalog_summary = self._indicator_catalog_summary()
+        seed_indicator_ids = self._seed_indicator_ids(seed_prompt_path if seed_prompt_path.exists() else None)
+        indicator_catalog_summary = self._indicator_catalog_summary(seed_indicator_ids)
+        seed_indicator_parameter_hints = self._seed_indicator_parameter_hints(seed_indicator_ids)
         instrument_catalog_summary = self._instrument_catalog_summary()
         return ToolContext(
             run_id=run_id,
@@ -203,6 +248,7 @@ class ResearchController:
             seed_prompt_path=seed_prompt_path if seed_prompt_path.exists() else None,
             profile_template_path=self.profile_template_path,
             indicator_catalog_summary=indicator_catalog_summary,
+            seed_indicator_parameter_hints=seed_indicator_parameter_hints,
             instrument_catalog_summary=instrument_catalog_summary,
         )
 
@@ -291,27 +337,99 @@ class ResearchController:
 
         return "\n".join(lines)
 
-    def _indicator_catalog_summary(self) -> str:
+    def _seed_indicator_ids(self, seed_prompt_path: Path | None) -> list[str]:
+        if not seed_prompt_path or not seed_prompt_path.exists():
+            return []
+        try:
+            payload = json.loads(seed_prompt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        indicators = payload.get("indicators")
+        if not isinstance(indicators, list):
+            return []
+        result: list[str] = []
+        for item in indicators:
+            if isinstance(item, str) and item.strip():
+                result.append(item.strip())
+        return result
+
+    def _indicator_catalog_summary(self, seed_indicator_ids: list[str]) -> str:
         result = self.cli.run(["indicators", "--mode", "index"], check=False)
         if result.returncode != 0 or not isinstance(result.parsed_json, dict):
             return "Indicator catalog snapshot unavailable."
         data = result.parsed_json.get("data")
         if not isinstance(data, dict):
             return "Indicator catalog snapshot unavailable."
-        ids = data.get("ids") if isinstance(data.get("ids"), list) else []
         timeframes = data.get("timeframes") if isinstance(data.get("timeframes"), list) else []
         tf_values = [
             str(item.get("value"))
             for item in timeframes
             if isinstance(item, dict) and item.get("value")
         ]
-        indicator_preview = ", ".join(str(item) for item in ids) if ids else "unavailable"
         timeframe_preview = ", ".join(tf_values) if tf_values else "unavailable"
+        seed_preview = ", ".join(seed_indicator_ids) if seed_indicator_ids else "none"
         return (
             f"Supported timeframes: {timeframe_preview}\n"
-            "Only use exact ids from this catalog in indicator.meta.id. Do not invent ids from seed wording.\n"
-            f"Indicator ids: {indicator_preview}"
+            "Only use exact ids from the current seed hand in indicator.meta.id. Do not invent ids from seed wording.\n"
+            f"Seeded indicator ids for this run: {seed_preview}"
         )
+
+    def _seed_indicator_parameter_hints(self, seed_indicator_ids: list[str]) -> str:
+        if not seed_indicator_ids:
+            return "No seeded indicator ids were found for this run."
+        args = ["indicators", "--mode", "detail"]
+        for indicator_id in seed_indicator_ids:
+            args.extend(["--id", indicator_id])
+        result = self.cli.run(args, check=False)
+        if result.returncode != 0 or not isinstance(result.parsed_json, dict):
+            return "Seeded indicator parameter hints unavailable."
+        data = result.parsed_json.get("data")
+        if not isinstance(data, dict):
+            return "Seeded indicator parameter hints unavailable."
+        indicators = data.get("indicators")
+        if not isinstance(indicators, list) or not indicators:
+            return "Seeded indicator parameter hints unavailable."
+        lines: list[str] = []
+        for item in indicators:
+            if not isinstance(item, dict):
+                continue
+            indicator_id = str(item.get("id") or item.get("meta", {}).get("id") or "").strip()
+            if not indicator_id:
+                continue
+            meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+            defaults = item.get("configDefaults") if isinstance(item.get("configDefaults"), dict) else {}
+            talib_meta = meta.get("talibMeta") if isinstance(meta.get("talibMeta"), list) else []
+            talib_parts: list[str] = []
+            for param in talib_meta[:8]:
+                if not isinstance(param, dict):
+                    continue
+                name = str(param.get("name", "")).strip()
+                if not name:
+                    continue
+                default = param.get("default")
+                if default is None:
+                    talib_parts.append(name)
+                else:
+                    talib_parts.append(f"{name}={default}")
+            ranges = defaults.get("ranges") if isinstance(defaults.get("ranges"), dict) else {}
+            buy_range = ranges.get("buy")
+            sell_range = ranges.get("sell")
+            range_text = ""
+            if isinstance(buy_range, list) and isinstance(sell_range, list):
+                range_text = f" | default ranges buy={buy_range} sell={sell_range}"
+            timeframe = defaults.get("timeframe")
+            description = str(meta.get("description", "")).strip()
+            if len(description) > 140:
+                description = description[:137] + "..."
+            lines.append(
+                f"- {indicator_id}: tf_default={timeframe or 'n/a'}"
+                f" | talib={', '.join(talib_parts) if talib_parts else 'none'}"
+                f"{range_text}"
+                f" | note={description or 'n/a'}"
+            )
+        if not lines:
+            return "Seeded indicator parameter hints unavailable."
+        return "\n".join(lines)
 
     def _instrument_catalog_summary(self) -> str:
         result = self.cli.run(["instruments", "--mode", "index"], check=False)
@@ -356,21 +474,18 @@ class ResearchController:
             "Use compare-sensitivity for compact scoring. Do not expect summary.json."
         )
 
-    def _seed_to_catalog_hints_text(self) -> str:
+    def _seed_to_catalog_hints_text(self, seed_indicator_ids: list[str]) -> str:
+        if not seed_indicator_ids:
+            return (
+                "Seed indicator guidance:\n"
+                "- No seeded indicator ids were available for this run.\n"
+                "- If the seed hand lacks explicit ids, inspect the seed file first before drafting profiles."
+            )
         return (
-            "Seed phrase to valid-id hints:\n"
-            "- trend strength -> ADX\n"
-            "- stochastic trend / stochastic signal trend -> STOCH_TREND or STOCH_CROSSOVER\n"
-            "- MACD signal / MACD cross -> MACD_CROSSOVER\n"
-            "- MACD histogram momentum -> MACD_HISTOGRAM_PIPS_TREND\n"
-            "- volatility filter / breakout volatility -> ATR_VOLATILITY_FILTER\n"
-            "- bollinger mean reversion -> BBANDS_POSITION_MEAN_REVERSION\n"
-            "- bollinger trend / expansion-style trend proxy -> BBANDS_POSITION_TREND\n"
-            "- MA spread trend -> MA_SPREAD_TREND\n"
-            "- momentum trend -> MOM_TREND\n"
-            "- RSI trend -> RSI_TREND\n"
-            "- RSI mean reversion -> RSI_MEAN_REVERSION\n"
-            "If a seed phrase is not an exact catalog id, translate it to one of the valid ids above or from the catalog."
+            "Seed indicator guidance:\n"
+            f"- Use only these exact seeded indicator ids unless the user explicitly expands scope: {', '.join(seed_indicator_ids)}\n"
+            "- Seed concepts are not alternate ids; indicator.meta.id must match one of the exact seeded ids.\n"
+            "- Parameter hints below are only for the seeded ids in this run."
         )
 
     def _run_owned_profiles_summary(self, tool_context: ToolContext) -> str:
@@ -390,6 +505,18 @@ class ResearchController:
                 lines.append(f"- {profile_ref}: {name}")
         if not lines:
             return "No run-owned profiles created yet."
+        return "\n".join(lines)
+
+    def _profile_files_summary(self, tool_context: ToolContext) -> str:
+        files = sorted(tool_context.profiles_dir.glob("*.json"))
+        if not files:
+            return "No profile JSON files exist yet."
+        lines: list[str] = []
+        for path in files[:40]:
+            suffix = ""
+            if path.name.endswith(".created.json"):
+                suffix = " (created metadata)"
+            lines.append(f"- {path}{suffix}")
         return "\n".join(lines)
 
     def _step_log_path(self, tool_context: ToolContext) -> Path:
@@ -421,6 +548,7 @@ class ResearchController:
             "- sensitivity-basket writes a directory when using --output-dir.\n"
             "- sensitivity-basket may auto-adjust the timeframe down to the profile's lowest active indicator timeframe.\n"
             "- Saved sensitivity responses now include requested_timeframe and effective_timeframe fields.\n"
+            "- `__BASKET__` may appear in saved summaries as an aggregate label. Never pass it as --instrument.\n"
             "- Invalid instrument aliases now fail fast with close-match suggestions.\n"
             "- A normal managed run should explore multiple candidates. Do not stop after the first strong score; branch and test at least a few follow-up ideas.\n"
             "- Do not finish the run as soon as the minimum threshold is reached if there is still room in the step budget for a couple more meaningful contrasts.\n"
@@ -429,6 +557,10 @@ class ResearchController:
             "- Post-eval files are sensitivity-response.json, deep-replay-job.json, and best-cell-path-detail.json when available.\n"
             "- Do not try to read summary.json after sensitivity-basket.\n"
             "- Do not use old saved profiles as candidate seeds for this run.\n"
+            "- If you need a new profile, write the profile JSON first, then create it, then evaluate it.\n"
+            "- If a profile create fails, do not evaluate that profile ref in the same step.\n"
+            "- Reuse successful profile JSON patterns and valid TA-Lib parameter names from prior successful create results when branching.\n"
+            "- MA_CROSSOVER uses fastperiod, slowperiod, and optional matype. It does not use signalperiod.\n"
         )
         return (
             f"Repo root: {self.config.repo_root}\n"
@@ -449,9 +581,11 @@ class ResearchController:
             f"Portable profile template path: {tool_context.profile_template_path}\n"
             f"Portable profile template:\n{self._profile_template_text(tool_context)}\n\n"
             f"Sticky indicator context:\n{tool_context.indicator_catalog_summary or 'Unavailable'}\n\n"
+            f"Seeded indicator parameter hints:\n{tool_context.seed_indicator_parameter_hints or 'Unavailable'}\n\n"
             f"Sticky instrument context:\n{tool_context.instrument_catalog_summary or 'Unavailable'}\n\n"
-            f"{self._seed_to_catalog_hints_text()}\n\n"
+            f"{self._seed_to_catalog_hints_text(self._seed_indicator_ids(tool_context.seed_prompt_path))}\n\n"
             f"{self._artifact_layout_text()}\n\n"
+            f"Profile JSON files currently on disk:\n{self._profile_files_summary(tool_context)}\n\n"
             f"Run-owned profiles so far:\n{self._run_owned_profiles_summary(tool_context)}\n\n"
             f"Sticky frontier snapshot:\n{self._frontier_snapshot_text()}\n\n"
             f"Checkpoint summary:\n{checkpoint}\n\n"
@@ -486,28 +620,28 @@ class ResearchController:
             return json.dumps(result, ensure_ascii=True)
         return str(result)
 
-    def _history_action_summary(self, action: dict[str, Any]) -> dict[str, Any]:
+    def _history_action_summary(self, action: dict[str, Any]) -> str:
         tool = str(action.get("tool", "unknown"))
         if tool == "write_file":
-            content = action.get("content")
-            return {
-                "tool": tool,
-                "path": str(action.get("path", "")),
-                "content_bytes": len(content.encode("utf-8")) if isinstance(content, str) else 0,
-            }
+            return f"write_file path={action.get('path', '')}"
         if tool == "run_cli":
             args = action.get("args")
             if isinstance(args, list):
-                return {"tool": tool, "args": [str(item) for item in args[:20]]}
+                return "run_cli " + " ".join(str(item) for item in args[:20])
             command = action.get("command")
             if isinstance(command, str):
-                return {"tool": tool, "command": command[:400]}
+                return f"run_cli {command[:400]}"
         if tool in {"read_file", "list_dir", "log_attempt", "finish"}:
-            return {key: value for key, value in action.items() if key != "content"}
-        return {key: value for key, value in action.items() if key != "content"}
+            return json.dumps({key: value for key, value in action.items() if key != "content"}, ensure_ascii=True)
+        return json.dumps({key: value for key, value in action.items() if key != "content"}, ensure_ascii=True)
 
     def _history_result_summary(self, result: dict[str, Any]) -> dict[str, Any]:
         tool = str(result.get("tool", "unknown"))
+        if result.get("error") and tool not in {"yield_guard", "finish"}:
+            return {
+                "tool": tool,
+                "error": str(result.get("error"))[:500],
+            }
         if tool == "run_cli":
             payload = result.get("result") if isinstance(result.get("result"), dict) else {}
             summarized: dict[str, Any] = {
@@ -566,12 +700,99 @@ class ResearchController:
             }
         if tool in {"yield_guard", "finish"}:
             return result
-        if result.get("error"):
-            return {
-                "tool": tool,
-                "error": str(result.get("error"))[:500],
-            }
         return result
+
+    def _validate_action(self, action: Any) -> str | None:
+        if not isinstance(action, dict):
+            return "Action must be an object."
+        tool = str(action.get("tool", "")).strip()
+        if not tool:
+            return "Action is missing tool."
+        if tool not in {"run_cli", "write_file", "read_file", "list_dir", "log_attempt", "finish"}:
+            return f"Unknown tool: {tool}"
+        if tool == "write_file":
+            path = action.get("path")
+            if not isinstance(path, str) or not path.strip():
+                return "write_file requires a non-empty string path."
+            content = action.get("content")
+            if not isinstance(content, str) or not content.strip():
+                return "write_file requires a non-empty string content field."
+            return None
+        if tool in {"read_file", "list_dir"}:
+            path = action.get("path")
+            if not isinstance(path, str) or not path.strip():
+                return f"{tool} requires a non-empty string path."
+            return None
+        if tool == "log_attempt":
+            artifact_dir = action.get("artifact_dir")
+            if not isinstance(artifact_dir, str) or not artifact_dir.strip():
+                return "log_attempt requires a non-empty string artifact_dir."
+            return None
+        if tool == "finish":
+            summary = action.get("summary", "")
+            if summary is not None and not isinstance(summary, str):
+                return "finish summary must be a string."
+            return None
+        try:
+            self._normalize_cli_args(action)
+        except Exception as exc:
+            return str(exc)
+        return None
+
+    def _validate_actions(self, actions: Any) -> list[str]:
+        if not isinstance(actions, list) or not actions:
+            return ["Response must include a non-empty actions array."]
+        if len(actions) > 3:
+            return [f"Response must include at most 3 actions, got {len(actions)}."]
+        errors: list[str] = []
+        for index, action in enumerate(actions, start=1):
+            error = self._validate_action(action)
+            if error:
+                errors.append(f"Action {index}: {error}")
+        return errors
+
+    def _repair_invalid_response(
+        self,
+        messages: list[ChatMessage],
+        reasoning: str,
+        actions: list[Any],
+        errors: list[str],
+    ) -> dict[str, Any] | None:
+        action_summaries = []
+        for action in actions:
+            if isinstance(action, dict):
+                action_summaries.append(self._history_action_summary(action))
+            else:
+                action_summaries.append(str(action))
+        repair_messages = [
+            *messages,
+            ChatMessage(
+                role="assistant",
+                content=(
+                    f"Reasoning: {reasoning or '(empty)'}\n"
+                    "Planned actions:\n"
+                    + "\n".join(f"- {summary}" for summary in action_summaries)
+                ),
+            ),
+            ChatMessage(
+                role="user",
+                content=(
+                    f"{RESPONSE_REPAIR_PROMPT}\n\n"
+                    "Problems:\n"
+                    + "\n".join(f"- {error}" for error in errors)
+                ),
+            ),
+        ]
+        try:
+            repaired = self.provider.complete_json(repair_messages)
+            normalized = self._normalize_model_response(repaired)
+        except ProviderError:
+            return None
+        repaired_actions = normalized.get("actions")
+        repaired_errors = self._validate_actions(repaired_actions)
+        if repaired_errors:
+            return None
+        return normalized
 
     def _extract_profile_ref(self, payload: dict[str, Any]) -> str | None:
         if "id" in payload and isinstance(payload["id"], str):
@@ -912,16 +1133,62 @@ class ResearchController:
                 return result
             messages = self._maybe_compact_messages(messages, tool_context, policy)
             try:
-                response = self.provider.complete_json(messages)
+                raw_response = self.provider.complete_json(messages)
+                response = self._normalize_model_response(raw_response)
             except (ProviderError, CliError) as exc:
                 raise RuntimeError(str(exc)) from exc
 
             actions = response.get("actions")
             reasoning = str(response.get("reasoning", "")).strip()
-            if not isinstance(actions, list) or not actions:
-                raise RuntimeError(f"Model returned invalid actions payload: {response}")
-            if len(actions) > 3:
-                raise RuntimeError(f"Model returned too many actions in one step: {len(actions)}")
+            validation_errors = self._validate_actions(actions)
+            if validation_errors:
+                repaired = self._repair_invalid_response(messages, reasoning, actions if isinstance(actions, list) else [], validation_errors)
+                if repaired is not None:
+                    response = repaired
+                    actions = response.get("actions")
+                    reasoning = str(response.get("reasoning", "")).strip()
+                    validation_errors = self._validate_actions(actions)
+            if validation_errors:
+                step_payload = {
+                    "step": step,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "reasoning": reasoning,
+                    "actions": actions if isinstance(actions, list) else [],
+                    "results": [
+                        {
+                            "tool": "response_guard",
+                            "ok": False,
+                            "error": " ; ".join(validation_errors),
+                        }
+                    ],
+                }
+                self._append_step_log(tool_context, step_payload)
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "event": "step_completed",
+                            "run_id": tool_context.run_id,
+                            "run_dir": str(tool_context.run_dir),
+                            "step_payload": step_payload,
+                        }
+                    )
+                messages.append(
+                    ChatMessage(
+                        role="assistant",
+                        content=f"Reasoning: {reasoning}",
+                    )
+                )
+                messages.append(
+                    ChatMessage(
+                        role="user",
+                        content="Tool results:\n"
+                        + json.dumps(
+                            [self._history_result_summary(step_payload["results"][0])],
+                            ensure_ascii=True,
+                        ),
+                    )
+                )
+                continue
 
             step_payload: dict[str, Any] = {
                 "step": step,
@@ -943,6 +1210,17 @@ class ResearchController:
                         "error": str(exc),
                     }
                 step_payload["results"].append(result)
+                hard_failure = bool(result.get("error"))
+                if result.get("tool") == "run_cli" and not bool(result.get("ok", True)):
+                    hard_failure = True
+                if hard_failure:
+                    step_payload["results"].append(
+                        {
+                            "tool": "step_guard",
+                            "message": "Stopped executing remaining actions after the first failed action in this step.",
+                        }
+                    )
+                    break
                 if result.get("tool") == "finish":
                     proposed_summary = str(result.get("summary", ""))
                     allow, message = self._allow_finish(tool_context, step, step_limit, proposed_summary, policy)
@@ -970,11 +1248,21 @@ class ResearchController:
                         "step_payload": step_payload,
                     }
                 )
-            compact_assistant = {
-                "reasoning": reasoning,
-                "actions": [self._history_action_summary(action) for action in actions if isinstance(action, dict)],
-            }
-            messages.append(ChatMessage(role="assistant", content=json.dumps(compact_assistant, ensure_ascii=True)))
+            action_summaries = [
+                self._history_action_summary(action)
+                for action in actions
+                if isinstance(action, dict)
+            ]
+            assistant_summary_lines = [f"Reasoning: {reasoning}"]
+            if action_summaries:
+                assistant_summary_lines.append("Planned actions:")
+                assistant_summary_lines.extend(f"- {item}" for item in action_summaries)
+            messages.append(
+                ChatMessage(
+                    role="assistant",
+                    content="\n".join(assistant_summary_lines),
+                )
+            )
             messages.append(
                 ChatMessage(
                     role="user",
