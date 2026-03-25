@@ -19,16 +19,34 @@ if __package__ in {None, ""}:
     from autoresearch.config import load_config
     from autoresearch.controller import ResearchController, RunPolicy
     from autoresearch.fuzzfolio import FuzzfolioCli
-    from autoresearch.ledger import append_attempt, load_attempts, make_attempt_record, write_attempts
-    from autoresearch.plotting import render_progress_artifacts
+    from autoresearch.ledger import (
+        append_attempt,
+        attempts_path_for_run_dir,
+        latest_run_dir,
+        load_all_run_attempts,
+        load_attempts,
+        load_run_attempts,
+        make_attempt_record,
+        write_attempts,
+    )
+    from autoresearch.plotting import render_leaderboard_artifacts, render_progress_artifacts
     from autoresearch.provider import ChatMessage, ProviderError, create_provider
     from autoresearch.scoring import build_attempt_score, load_sensitivity_snapshot
 else:
     from .config import load_config
     from .controller import ResearchController, RunPolicy
     from .fuzzfolio import FuzzfolioCli
-    from .ledger import append_attempt, load_attempts, make_attempt_record, write_attempts
-    from .plotting import render_progress_artifacts
+    from .ledger import (
+        append_attempt,
+        attempts_path_for_run_dir,
+        latest_run_dir,
+        load_all_run_attempts,
+        load_attempts,
+        load_run_attempts,
+        make_attempt_record,
+        write_attempts,
+    )
+    from .plotting import render_leaderboard_artifacts, render_progress_artifacts
     from .provider import ChatMessage, ProviderError, create_provider
     from .scoring import build_attempt_score, load_sensitivity_snapshot
 
@@ -70,7 +88,11 @@ def build_parser() -> argparse.ArgumentParser:
     supervise.add_argument("--supervisor-profile", default=None, help="Override the configured supervisor provider profile for this run.")
     supervise.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
 
-    subparsers.add_parser("plot", help="Regenerate the progress plot from the attempts ledger.")
+    plot = subparsers.add_parser("plot", help="Generate a run-local or all-runs derived progress plot.")
+    plot.add_argument("--run-id", default=None, help="Specific run id to render. Defaults to latest discovered run.")
+    plot.add_argument("--all-runs", action="store_true", help="Render a derived aggregate plot across all runs.")
+    leaderboard = subparsers.add_parser("leaderboard", help="Generate a derived best-per-run leaderboard image and JSON.")
+    leaderboard.add_argument("--limit", type=int, default=15, help="Maximum number of runs to include.")
     subparsers.add_parser("reset-runs", help="Delete all run artifacts and recreate a clean empty runs state.")
 
     score = subparsers.add_parser("score", help="Score one sensitivity artifact directory.")
@@ -300,12 +322,9 @@ def _parse_window(window_text: str | None) -> tuple[str | None, str | None]:
 
 
 def _latest_run_context(config) -> tuple[Path | None, str | None]:
-    if not config.latest_run_link.exists():
+    run_dir = latest_run_dir(config.runs_root)
+    if run_dir is None:
         return None, None
-    latest_run_text = config.latest_run_link.read_text(encoding="utf-8").strip()
-    if not latest_run_text:
-        return None, None
-    run_dir = Path(latest_run_text)
     return run_dir / "progress.png", run_dir.name
 
 
@@ -487,8 +506,10 @@ def _render_run_header(event: dict[str, object]) -> None:
     if isinstance(score_target, str) and score_target.strip():
         grid.add_row("Target", _short_text(score_target, 110))
     grid.add_row("Dir", _display_path(str(event.get("run_dir"))))
+    attempts_path = event.get("attempts_path")
+    if isinstance(attempts_path, str) and attempts_path.strip():
+        grid.add_row("Ledger", _display_path(attempts_path))
     grid.add_row("Run Plot", _display_path(str(event.get("run_progress_plot"))))
-    grid.add_row("Global Plot", _display_path(str(event.get("progress_plot"))))
     console.print(
         Panel(
             grid,
@@ -565,8 +586,10 @@ def _render_run_footer(result: dict[str, object]) -> None:
     grid.add_row("Status", str(result.get("status")))
     grid.add_row("Run", str(result.get("run_id")))
     grid.add_row("Dir", _display_path(str(result.get("run_dir"))))
+    attempts_path = result.get("attempts_path")
+    if isinstance(attempts_path, str) and attempts_path.strip():
+        grid.add_row("Ledger", _display_path(attempts_path))
     grid.add_row("Run Plot", _display_path(str(result.get("run_progress_plot"))))
-    grid.add_row("Global Plot", _display_path(str(result.get("progress_plot"))))
     summary = result.get("summary")
     if isinstance(summary, str) and summary.strip():
         grid.add_row("Summary", _short_text(summary, 420))
@@ -659,28 +682,75 @@ def cmd_supervise(
     return 0
 
 
-def cmd_plot() -> int:
+def _resolve_run_dir(config, run_id: str | None) -> Path:
+    if run_id:
+        run_dir = config.runs_root / run_id
+        if not run_dir.exists():
+            raise SystemExit(f"Run directory does not exist: {run_dir}")
+        return run_dir
+    run_dir = latest_run_dir(config.runs_root)
+    if run_dir is None:
+        raise SystemExit("No run directories exist yet.")
+    return run_dir
+
+
+def cmd_plot(*, run_id: str | None, all_runs: bool) -> int:
     config = load_config()
-    attempts = load_attempts(config.attempts_path)
-    latest_run_path, latest_run_id = _latest_run_context(config)
-    latest_run_attempts = (
-        [attempt for attempt in attempts if str(attempt.get("run_id", "")) == latest_run_id]
-        if latest_run_id
-        else None
-    )
+    if all_runs:
+        attempts = load_all_run_attempts(config.runs_root)
+        output_path = config.aggregate_plot_path
+        render_progress_artifacts(
+            attempts,
+            output_path,
+            lower_is_better=config.research.plot_lower_is_better,
+        )
+        payload = {
+            "mode": "all_runs",
+            "attempts": len(attempts),
+            "plot": str(output_path),
+        }
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    run_dir = _resolve_run_dir(config, run_id)
+    attempts = load_run_attempts(run_dir)
+    output_path = run_dir / "progress.png"
     render_progress_artifacts(
-        latest_run_attempts if latest_run_attempts is not None else attempts,
-        latest_run_path or config.progress_plot_path,
+        attempts,
+        output_path,
         lower_is_better=config.research.plot_lower_is_better,
-        mirror_output_path=config.progress_plot_path if latest_run_path else None,
-        mirror_attempts=attempts if latest_run_path else None,
     )
     print(
         json.dumps(
             {
+                "mode": "run",
+                "run_id": run_dir.name,
                 "attempts": len(attempts),
-                "plot": str(config.progress_plot_path),
-                "latest_run_plot": str(latest_run_path) if latest_run_path else None,
+                "plot": str(output_path),
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_leaderboard(*, limit: int) -> int:
+    config = load_config()
+    attempts = load_all_run_attempts(config.runs_root)
+    ranked = render_leaderboard_artifacts(
+        attempts,
+        config.leaderboard_plot_path,
+        config.leaderboard_json_path,
+        lower_is_better=config.research.plot_lower_is_better,
+        limit=limit,
+    )
+    print(
+        json.dumps(
+            {
+                "runs_ranked": len(ranked),
+                "leaderboard_plot": str(config.leaderboard_plot_path),
+                "leaderboard_json": str(config.leaderboard_json_path),
             },
             ensure_ascii=True,
             indent=2,
@@ -705,26 +775,12 @@ def cmd_reset_runs() -> int:
         except OSError as exc:
             blocked.append({"path": str(child), "error": str(exc)})
 
-    write_attempts(config.attempts_path, [])
-    if config.latest_run_link.exists():
-        try:
-            config.latest_run_link.unlink()
-        except OSError as exc:
-            blocked.append({"path": str(config.latest_run_link), "error": str(exc)})
-    render_progress_artifacts(
-        [],
-        config.progress_plot_path,
-        lower_is_better=config.research.plot_lower_is_better,
-    )
-
     print(
         json.dumps(
             {
                 "runs_root": str(config.runs_root),
                 "cleared_entries": len(cleared),
                 "blocked_entries": blocked,
-                "attempts_path": str(config.attempts_path),
-                "progress_plot": str(config.progress_plot_path),
             },
             ensure_ascii=True,
             indent=2,
@@ -765,12 +821,17 @@ def cmd_record_attempt(
 ) -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
+    run_dir = config.runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    attempts_path = attempts_path_for_run_dir(run_dir)
+    progress_plot_path = run_dir / "progress.png"
     compare_payload = cli.score_artifact(artifact_dir.resolve())
     snapshot_path = artifact_dir.resolve() / "sensitivity-response.json"
     snapshot = load_sensitivity_snapshot(artifact_dir.resolve()) if snapshot_path.exists() else None
     score = build_attempt_score(compare_payload, snapshot)
     record = make_attempt_record(
         config,
+        attempts_path,
         run_id,
         artifact_dir.resolve(),
         score,
@@ -779,20 +840,12 @@ def cmd_record_attempt(
         sensitivity_snapshot_path=snapshot_path if snapshot_path.exists() else None,
         note=note,
     )
-    append_attempt(config.attempts_path, record)
-    attempts = load_attempts(config.attempts_path)
-    latest_run_path, latest_run_id = _latest_run_context(config)
-    latest_run_attempts = (
-        [attempt for attempt in attempts if str(attempt.get("run_id", "")) == latest_run_id]
-        if latest_run_id
-        else None
-    )
+    append_attempt(attempts_path, record)
+    attempts = load_attempts(attempts_path)
     render_progress_artifacts(
-        latest_run_attempts if latest_run_attempts is not None else attempts,
-        latest_run_path or config.progress_plot_path,
+        attempts,
+        progress_plot_path,
         lower_is_better=config.research.plot_lower_is_better,
-        mirror_output_path=config.progress_plot_path if latest_run_path else None,
-        mirror_attempts=attempts if latest_run_path else None,
     )
     print(
         json.dumps(
@@ -803,7 +856,8 @@ def cmd_record_attempt(
                 "composite_score": record.composite_score,
                 "score_basis": record.score_basis,
                 "metrics": record.metrics,
-                "progress_plot": str(config.progress_plot_path),
+                "attempts_path": str(attempts_path),
+                "progress_plot": str(progress_plot_path),
             },
             ensure_ascii=True,
             indent=2,
@@ -815,50 +869,50 @@ def cmd_record_attempt(
 def cmd_rescore_attempts() -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
-    attempts = load_attempts(config.attempts_path)
     rescored: list[dict[str, object]] = []
     updated = 0
     skipped = 0
+    run_count = 0
 
-    for attempt in attempts:
-        artifact_dir = Path(str(attempt.get("artifact_dir", "")))
-        if not artifact_dir.exists():
-            rescored.append(attempt)
-            skipped += 1
+    for run_dir in [path for path in config.runs_root.iterdir() if path.is_dir() and path.name != "derived"]:
+        attempts_path = attempts_path_for_run_dir(run_dir)
+        attempts = load_attempts(attempts_path)
+        if not attempts:
             continue
-        compare_payload = cli.score_artifact(artifact_dir.resolve())
-        snapshot = load_sensitivity_snapshot(artifact_dir.resolve())
-        score = build_attempt_score(compare_payload, snapshot)
-        refreshed = dict(attempt)
-        refreshed["primary_score"] = score.primary_score
-        refreshed["composite_score"] = score.composite_score
-        refreshed["score_basis"] = score.score_basis
-        refreshed["metrics"] = score.metrics
-        refreshed["best_summary"] = score.best_summary
-        rescored.append(refreshed)
-        updated += 1
-
-    write_attempts(config.attempts_path, rescored)
-    latest_run_path, latest_run_id = _latest_run_context(config)
-    latest_run_attempts = (
-        [attempt for attempt in rescored if str(attempt.get("run_id", "")) == latest_run_id]
-        if latest_run_id
-        else None
-    )
-    render_progress_artifacts(
-        latest_run_attempts if latest_run_attempts is not None else rescored,
-        latest_run_path or config.progress_plot_path,
-        lower_is_better=config.research.plot_lower_is_better,
-        mirror_output_path=config.progress_plot_path if latest_run_path else None,
-        mirror_attempts=rescored if latest_run_path else None,
-    )
+        run_count += 1
+        run_rescored: list[dict[str, object]] = []
+        for attempt in attempts:
+            artifact_dir = Path(str(attempt.get("artifact_dir", "")))
+            if not artifact_dir.exists():
+                run_rescored.append(attempt)
+                rescored.append(attempt)
+                skipped += 1
+                continue
+            compare_payload = cli.score_artifact(artifact_dir.resolve())
+            snapshot = load_sensitivity_snapshot(artifact_dir.resolve())
+            score = build_attempt_score(compare_payload, snapshot)
+            refreshed = dict(attempt)
+            refreshed["primary_score"] = score.primary_score
+            refreshed["composite_score"] = score.composite_score
+            refreshed["score_basis"] = score.score_basis
+            refreshed["metrics"] = score.metrics
+            refreshed["best_summary"] = score.best_summary
+            run_rescored.append(refreshed)
+            rescored.append(refreshed)
+            updated += 1
+        write_attempts(attempts_path, run_rescored)
+        render_progress_artifacts(
+            run_rescored,
+            run_dir / "progress.png",
+            lower_is_better=config.research.plot_lower_is_better,
+        )
     print(
         json.dumps(
             {
+                "runs_updated": run_count,
                 "updated": updated,
                 "skipped": skipped,
                 "attempts": len(rescored),
-                "progress_plot": str(config.progress_plot_path),
             },
             ensure_ascii=True,
             indent=2,
@@ -891,7 +945,9 @@ def main() -> int:
             as_json=bool(args.json),
         )
     if args.command == "plot":
-        return cmd_plot()
+        return cmd_plot(run_id=args.run_id, all_runs=bool(args.all_runs))
+    if args.command == "leaderboard":
+        return cmd_leaderboard(limit=args.limit)
     if args.command == "reset-runs":
         return cmd_reset_runs()
     if args.command == "score":

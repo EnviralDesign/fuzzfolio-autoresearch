@@ -95,16 +95,20 @@ class AppConfig:
         return self.repo_root / "runs"
 
     @property
-    def attempts_path(self) -> Path:
-        return self.runs_root / "attempts.jsonl"
+    def derived_root(self) -> Path:
+        return self.runs_root / "derived"
 
     @property
-    def progress_plot_path(self) -> Path:
-        return self.runs_root / "progress.png"
+    def aggregate_plot_path(self) -> Path:
+        return self.derived_root / "progress-all-runs.png"
 
     @property
-    def latest_run_link(self) -> Path:
-        return self.runs_root / "latest-run.txt"
+    def leaderboard_plot_path(self) -> Path:
+        return self.derived_root / "leaderboard.png"
+
+    @property
+    def leaderboard_json_path(self) -> Path:
+        return self.derived_root / "leaderboard.json"
 
     @property
     def program_path(self) -> Path:

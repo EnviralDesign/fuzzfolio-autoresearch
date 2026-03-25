@@ -11,7 +11,14 @@ from zoneinfo import ZoneInfo
 
 from .config import AppConfig
 from .fuzzfolio import CliError, CommandResult, FuzzfolioCli
-from .ledger import append_attempt, attempt_exists, load_attempts, make_attempt_record
+from .ledger import (
+    append_attempt,
+    attempt_exists,
+    attempts_path_for_run_dir,
+    load_attempts,
+    load_run_attempts,
+    make_attempt_record,
+)
 from .plotting import compute_frontier, render_progress_artifacts
 from .provider import ChatMessage, ProviderError, create_provider
 from .scoring import build_attempt_score, load_sensitivity_snapshot
@@ -142,6 +149,7 @@ Hard requirements:
 class ToolContext:
     run_id: str
     run_dir: Path
+    attempts_path: Path
     profiles_dir: Path
     evals_dir: Path
     notes_dir: Path
@@ -344,14 +352,13 @@ class ResearchController:
     def create_run_context(self) -> ToolContext:
         run_id = f"{self._timestamp()}-{self.config.research.label_prefix}-{uuid4().hex[:6]}"
         run_dir = self.config.runs_root / run_id
+        attempts_path = attempts_path_for_run_dir(run_dir)
         profiles_dir = run_dir / "profiles"
         evals_dir = run_dir / "evals"
         notes_dir = run_dir / "notes"
         progress_plot_path = run_dir / "progress.png"
         for path in [profiles_dir, evals_dir, notes_dir]:
             path.mkdir(parents=True, exist_ok=True)
-        self.config.latest_run_link.parent.mkdir(parents=True, exist_ok=True)
-        self.config.latest_run_link.write_text(str(run_dir.resolve()), encoding="utf-8")
         seed_prompt_path = run_dir / "seed-prompt.json"
         if self.config.research.auto_seed_prompt:
             self.cli.seed_prompt(seed_prompt_path)
@@ -362,6 +369,7 @@ class ResearchController:
         return ToolContext(
             run_id=run_id,
             run_dir=run_dir,
+            attempts_path=attempts_path,
             profiles_dir=profiles_dir,
             evals_dir=evals_dir,
             notes_dir=notes_dir,
@@ -381,10 +389,10 @@ class ResearchController:
             return "No seed prompt file exists for this run."
         return tool_context.seed_prompt_path.read_text(encoding="utf-8")
 
-    def _recent_attempts_summary(self) -> str:
-        attempts = load_attempts(self.config.attempts_path)
+    def _recent_attempts_summary(self, tool_context: ToolContext) -> str:
+        attempts = load_run_attempts(tool_context.run_dir)
         if not attempts:
-            return "No attempts have been logged yet."
+            return "No attempts have been logged yet in this run."
         recent = attempts[-self.config.research.recent_attempts_window :]
         lines = []
         for attempt in recent:
@@ -396,25 +404,14 @@ class ResearchController:
         return "\n".join(lines)
 
     def _run_attempts(self, run_id: str) -> list[dict[str, Any]]:
-        return [
-            attempt
-            for attempt in load_attempts(self.config.attempts_path)
-            if str(attempt.get("run_id", "")) == run_id
-        ]
+        return load_run_attempts(self.config.runs_root / run_id)
 
-    def _render_run_and_global_progress(self, tool_context: ToolContext) -> None:
-        all_attempts = load_attempts(self.config.attempts_path)
-        run_attempts = [
-            attempt
-            for attempt in all_attempts
-            if str(attempt.get("run_id", "")) == tool_context.run_id
-        ]
+    def _render_run_progress(self, tool_context: ToolContext) -> None:
+        run_attempts = load_run_attempts(tool_context.run_dir)
         render_progress_artifacts(
             run_attempts,
             tool_context.progress_plot_path,
             lower_is_better=self.config.research.plot_lower_is_better,
-            mirror_output_path=self.config.progress_plot_path,
-            mirror_attempts=all_attempts,
         )
 
     def _scored_attempts(self, attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -540,44 +537,19 @@ class ResearchController:
 
     def _score_target_snapshot(self, tool_context: ToolContext) -> dict[str, Any]:
         run_best = self._best_attempt(self._run_attempts(tool_context.run_id))
-        global_best = self._best_attempt(load_attempts(self.config.attempts_path))
 
         current_score = (
             float(run_best.get("composite_score"))
             if isinstance(run_best, dict) and run_best.get("composite_score") is not None
             else None
         )
-        global_score = (
-            float(global_best.get("composite_score"))
-            if isinstance(global_best, dict) and global_best.get("composite_score") is not None
-            else None
-        )
 
         target_score: float | None = None
         rationale: str
-        if current_score is not None and global_score is not None:
-            if self._score_better(current_score, global_score):
-                delta = max(3.0, abs(current_score) * 0.05)
-                target_score = current_score - delta if self.config.research.plot_lower_is_better else current_score + delta
-                rationale = "current run already leads the frontier, so the next target is a modest new best"
-            else:
-                gap = (current_score - global_score) if self.config.research.plot_lower_is_better else (global_score - current_score)
-                move = max(3.0, gap * 0.6)
-                if self.config.research.plot_lower_is_better:
-                    target_score = max(global_score, current_score - move)
-                else:
-                    target_score = min(global_score, current_score + move)
-                rationale = "bridge most of the gap toward the current frontier leader before wrap-up"
-        elif current_score is not None:
+        if current_score is not None:
             delta = max(3.0, abs(current_score) * 0.05)
             target_score = current_score - delta if self.config.research.plot_lower_is_better else current_score + delta
             rationale = "push past the current run leader with one believable improvement"
-        elif global_score is not None:
-            if self.config.research.plot_lower_is_better:
-                target_score = global_score + max(3.0, abs(global_score) * 0.2)
-            else:
-                target_score = global_score * 0.85 if global_score > 0 else global_score + 3.0
-            rationale = "land a first credible point within reach of the current global frontier"
         else:
             rationale = "log the first credible scored candidate before chasing higher targets"
 
@@ -586,36 +558,36 @@ class ResearchController:
         elif self.config.research.plot_lower_is_better:
             summary = (
                 f"Next target: get quality_score <= {self._format_score(target_score)}. "
-                f"Current run best={self._format_score(current_score)}; global frontier best={self._format_score(global_score)}."
+                f"Current run best={self._format_score(current_score)}."
             )
         else:
             summary = (
                 f"Next target: get quality_score >= {self._format_score(target_score)}. "
-                f"Current run best={self._format_score(current_score)}; global frontier best={self._format_score(global_score)}."
+                f"Current run best={self._format_score(current_score)}."
             )
 
         return {
             "target_score": target_score,
             "current_run_best_score": current_score,
             "current_run_best_candidate": run_best.get("candidate_name") if isinstance(run_best, dict) else None,
-            "global_best_score": global_score,
-            "global_best_candidate": global_best.get("candidate_name") if isinstance(global_best, dict) else None,
+            "global_best_score": None,
+            "global_best_candidate": None,
             "summary": summary,
             "rationale": rationale,
         }
 
-    def _frontier_snapshot_text(self) -> str:
-        attempts = load_attempts(self.config.attempts_path)
+    def _frontier_snapshot_text(self, tool_context: ToolContext) -> str:
+        attempts = load_run_attempts(tool_context.run_dir)
         valid = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
         if not valid:
-            return "No frontier points exist yet."
+            return "No scored frontier points exist yet in this run."
 
         frontier, _ = compute_frontier(
             valid,
             lower_is_better=self.config.research.plot_lower_is_better,
         )
         if not frontier:
-            return "No frontier points exist yet."
+            return "No scored frontier points exist yet in this run."
 
         lines: list[str] = []
         current_best = frontier[-1]
@@ -627,7 +599,7 @@ class ResearchController:
         if matrix_summary:
             positive_ratio = matrix_summary.get("positive_cell_ratio")
 
-        lines.append("Current best frontier point:")
+        lines.append("Current best run-local frontier point:")
         lines.append(
             f"- seq={current_best.get('sequence')} score={current_best.get('composite_score')} "
             f"candidate={current_best.get('candidate_name')} profile_ref={current_best.get('profile_ref') or 'n/a'} "
@@ -935,9 +907,8 @@ class ResearchController:
             f"Profiles dir: {tool_context.profiles_dir}\n"
             f"Evals dir: {tool_context.evals_dir}\n"
             f"Notes dir: {tool_context.notes_dir}\n"
-            f"Attempts ledger: {self.config.attempts_path}\n"
+            f"Run attempts ledger: {tool_context.attempts_path}\n"
             f"Run progress plot: {tool_context.progress_plot_path}\n"
-            f"Global progress plot: {self.config.progress_plot_path}\n"
             f"Program:\n{self._program_text()}\n\n"
             f"Current seed hand:\n{self._seed_text(tool_context)}\n\n"
             f"Portable profile template path: {tool_context.profile_template_path}\n"
@@ -949,9 +920,9 @@ class ResearchController:
             f"{self._artifact_layout_text()}\n\n"
             f"Profile JSON files currently on disk:\n{self._profile_files_summary(tool_context)}\n\n"
             f"Run-owned profiles so far:\n{self._run_owned_profiles_summary(tool_context)}\n\n"
-            f"Sticky frontier snapshot:\n{self._frontier_snapshot_text()}\n\n"
+            f"Sticky frontier snapshot:\n{self._frontier_snapshot_text(tool_context)}\n\n"
             f"Checkpoint summary:\n{checkpoint}\n\n"
-            f"Recent attempts:\n{self._recent_attempts_summary()}\n"
+            f"Recent attempts:\n{self._recent_attempts_summary(tool_context)}\n"
             f"\nCLI guide:\n{cli_guide}\n"
         )
 
@@ -1193,8 +1164,8 @@ class ResearchController:
         note: str | None = None,
     ) -> dict[str, Any]:
         artifact_dir = artifact_dir.resolve()
-        if attempt_exists(self.config.attempts_path, artifact_dir):
-            attempts = load_attempts(self.config.attempts_path)
+        if attempt_exists(tool_context.attempts_path, artifact_dir):
+            attempts = load_attempts(tool_context.attempts_path)
             existing = next(
                 attempt for attempt in attempts if str(attempt.get("artifact_dir", "")).lower() == str(artifact_dir).lower()
             )
@@ -1210,6 +1181,7 @@ class ResearchController:
         score = build_attempt_score(compare_payload, sensitivity_snapshot)
         record = make_attempt_record(
             self.config,
+            tool_context.attempts_path,
             tool_context.run_id,
             artifact_dir,
             score,
@@ -1219,8 +1191,8 @@ class ResearchController:
             sensitivity_snapshot_path=sensitivity_snapshot_path if sensitivity_snapshot_path.exists() else None,
             note=note,
         )
-        append_attempt(self.config.attempts_path, record)
-        self._render_run_and_global_progress(tool_context)
+        append_attempt(tool_context.attempts_path, record)
+        self._render_run_progress(tool_context)
         return {
             "status": "logged",
             "attempt_id": record.attempt_id,
@@ -1230,12 +1202,11 @@ class ResearchController:
             "metrics": record.metrics,
             "artifact_dir": record.artifact_dir,
             "run_progress_plot": str(tool_context.progress_plot_path),
-            "progress_plot": str(self.config.progress_plot_path),
             "sensitivity_snapshot_loaded": sensitivity_snapshot is not None,
         }
 
     def _refresh_progress_artifacts(self, tool_context: ToolContext) -> None:
-        self._render_run_and_global_progress(tool_context)
+        self._render_run_progress(tool_context)
 
     def _maybe_auto_log_attempt(
         self,
@@ -1434,7 +1405,7 @@ class ResearchController:
             f"Controller denial: {denial_message}\n\n"
             f"Score target:\n{score_target['summary']}\n"
             f"Target rationale: {score_target['rationale']}\n\n"
-            f"Frontier snapshot:\n{self._frontier_snapshot_text()}\n\n"
+            f"Frontier snapshot:\n{self._frontier_snapshot_text(tool_context)}\n\n"
             f"Recent run attempts:\n{chr(10).join(attempt_lines) if attempt_lines else 'No attempts yet.'}\n\n"
             f"Recent step window:\n{self._recent_step_window_text(tool_context, current_step_payload)}\n"
         )
@@ -1578,8 +1549,8 @@ class ResearchController:
                     "event": "run_started",
                     "run_id": tool_context.run_id,
                     "run_dir": str(tool_context.run_dir),
+                    "attempts_path": str(tool_context.attempts_path),
                     "run_progress_plot": str(tool_context.progress_plot_path),
-                    "progress_plot": str(self.config.progress_plot_path),
                     "max_steps": effective_step_limit,
                     "mode": policy.mode_name,
                     "phase": initial_phase["name"],
@@ -1592,8 +1563,8 @@ class ResearchController:
                 "status": "window_closed",
                 "run_id": tool_context.run_id,
                 "run_dir": str(tool_context.run_dir),
+                "attempts_path": str(tool_context.attempts_path),
                 "run_progress_plot": str(tool_context.progress_plot_path),
-                "progress_plot": str(self.config.progress_plot_path),
             }
             if progress_callback:
                 progress_callback({"event": "window_closed", "result": result})
@@ -1615,8 +1586,8 @@ class ResearchController:
                     "status": "window_closed",
                     "run_id": tool_context.run_id,
                     "run_dir": str(tool_context.run_dir),
+                    "attempts_path": str(tool_context.attempts_path),
                     "run_progress_plot": str(tool_context.progress_plot_path),
-                    "progress_plot": str(self.config.progress_plot_path),
                 }
                 if progress_callback:
                     progress_callback({"event": "window_closed", "result": result})
@@ -1804,8 +1775,8 @@ class ResearchController:
                     "status": "finished",
                     "run_id": tool_context.run_id,
                     "run_dir": str(tool_context.run_dir),
+                    "attempts_path": str(tool_context.attempts_path),
                     "run_progress_plot": str(tool_context.progress_plot_path),
-                    "progress_plot": str(self.config.progress_plot_path),
                     "summary": finish_summary,
                 }
 
@@ -1813,6 +1784,6 @@ class ResearchController:
             "status": "step_limit_reached",
             "run_id": tool_context.run_id,
             "run_dir": str(tool_context.run_dir),
+            "attempts_path": str(tool_context.attempts_path),
             "run_progress_plot": str(tool_context.progress_plot_path),
-            "progress_plot": str(self.config.progress_plot_path),
         }

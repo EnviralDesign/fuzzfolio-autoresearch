@@ -9,6 +9,8 @@ from typing import Any
 from .config import AppConfig
 from .scoring import AttemptScore
 
+ATTEMPTS_FILE_NAME = "attempts.jsonl"
+
 
 @dataclass
 class AttemptRecord:
@@ -46,6 +48,39 @@ def load_attempts(path: Path) -> list[dict[str, Any]]:
     return _read_jsonl(path)
 
 
+def attempts_path_for_run_dir(run_dir: Path) -> Path:
+    return run_dir / ATTEMPTS_FILE_NAME
+
+
+def load_run_attempts(run_dir: Path) -> list[dict[str, Any]]:
+    return load_attempts(attempts_path_for_run_dir(run_dir))
+
+
+def list_run_dirs(runs_root: Path) -> list[Path]:
+    if not runs_root.exists():
+        return []
+    run_dirs = [
+        path
+        for path in runs_root.iterdir()
+        if path.is_dir() and path.name != "derived"
+    ]
+    return sorted(run_dirs)
+
+
+def latest_run_dir(runs_root: Path) -> Path | None:
+    run_dirs = list_run_dirs(runs_root)
+    if not run_dirs:
+        return None
+    return run_dirs[-1]
+
+
+def load_all_run_attempts(runs_root: Path) -> list[dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    for run_dir in list_run_dirs(runs_root):
+        attempts.extend(load_run_attempts(run_dir))
+    return attempts
+
+
 def append_attempt(path: Path, record: AttemptRecord) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
@@ -69,6 +104,7 @@ def attempt_exists(path: Path, artifact_dir: Path) -> bool:
 
 def make_attempt_record(
     app_config: AppConfig,
+    attempts_path: Path,
     run_id: str,
     artifact_dir: Path,
     score: AttemptScore,
@@ -79,9 +115,9 @@ def make_attempt_record(
     sensitivity_snapshot_path: Path | None = None,
     note: str | None = None,
 ) -> AttemptRecord:
-    existing = load_attempts(app_config.attempts_path)
+    existing = load_attempts(attempts_path)
     sequence = len(existing) + 1
-    attempt_id = f"attempt-{sequence:05d}"
+    attempt_id = f"{run_id}-attempt-{sequence:05d}"
     return AttemptRecord(
         attempt_id=attempt_id,
         sequence=sequence,

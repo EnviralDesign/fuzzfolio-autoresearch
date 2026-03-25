@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+import json
 
 
 def compute_frontier(
@@ -114,3 +115,74 @@ def render_progress_artifacts(
         mirror_output_path,
         lower_is_better=lower_is_better,
     )
+
+
+def render_leaderboard_artifacts(
+    attempts: list[dict[str, Any]],
+    png_output_path: Path,
+    json_output_path: Path,
+    *,
+    lower_is_better: bool = False,
+    limit: int = 15,
+) -> list[dict[str, Any]]:
+    scored = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+    best_by_run: dict[str, dict[str, Any]] = {}
+
+    for attempt in scored:
+        run_id = str(attempt.get("run_id", "")).strip()
+        if not run_id:
+            continue
+        existing = best_by_run.get(run_id)
+        if existing is None:
+            best_by_run[run_id] = attempt
+            continue
+        left = float(attempt.get("composite_score"))
+        right = float(existing.get("composite_score"))
+        improved = left < right if lower_is_better else left > right
+        if improved:
+            best_by_run[run_id] = attempt
+
+    ranked = sorted(
+        best_by_run.values(),
+        key=lambda attempt: float(attempt.get("composite_score")),
+        reverse=not lower_is_better,
+    )[:limit]
+
+    json_output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_output_path.write_text(json.dumps(ranked, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    png_output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(16, max(6, min(14, len(ranked) * 0.65 + 2))))
+    if not ranked:
+        plt.title("Autoresearch Leaderboard: No Scored Runs Yet")
+        plt.xlabel("Quality Score")
+        plt.tight_layout()
+        plt.savefig(png_output_path, dpi=160)
+        plt.close()
+        return ranked
+
+    labels = []
+    scores = []
+    for attempt in ranked:
+        run_id = str(attempt.get("run_id", "run"))
+        label = f"{run_id} | {attempt.get('candidate_name', 'candidate')}"
+        if len(label) > 72:
+            label = label[:69] + "..."
+        labels.append(label)
+        scores.append(float(attempt.get("composite_score")))
+
+    positions = list(range(len(ranked)))
+    colors = ["#2ecc71"] + ["#8ecae6"] * max(0, len(ranked) - 1)
+    plt.barh(positions, scores, color=colors)
+    plt.yticks(positions, labels, fontsize=8)
+    plt.gca().invert_yaxis()
+    plt.xlabel("Quality Score")
+    plt.title(f"Autoresearch Leaderboard: Best Candidate Per Run ({len(ranked)} runs)")
+
+    for index, score in enumerate(scores):
+        plt.text(score, index, f" {score:.3f}", va="center", fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(png_output_path, dpi=160)
+    plt.close()
+    return ranked

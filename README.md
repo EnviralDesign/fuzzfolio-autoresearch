@@ -11,9 +11,10 @@ The core idea from the original `autoresearch` project is preserved:
 What changed is the search surface. Instead of mutating a training script and optimizing a validation metric, the controller now:
 - uses `fuzzfolio-agent-cli`
 - evaluates scoring-profile candidates
-- logs scored attempts to an append-only ledger
-- computes frontier points procedurally from that ledger
-- renders progress artifacts for each run and mirrors the latest one to `runs/progress.png`
+- logs scored attempts to a per-run ledger
+- computes frontier points procedurally from that run-local ledger
+- renders progress artifacts per run
+- generates all-runs aggregate views only on demand
 
 ## Current runtime
 
@@ -26,6 +27,7 @@ The new runtime lives in `autoresearch/` and exposes:
 - `autoresearch score <artifact_dir>`
 - `autoresearch record-attempt <artifact_dir>`
 - `autoresearch plot`
+- `autoresearch leaderboard`
 - `autoresearch reset-runs`
 
 ## Local config
@@ -55,6 +57,7 @@ uv run autoresearch doctor
 uv run autoresearch test-providers
 uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
+uv run autoresearch leaderboard
 uv run autoresearch reset-runs
 ```
 
@@ -194,6 +197,7 @@ Every `autoresearch run` invocation creates a fresh timestamped run directory un
 
 Each run keeps its own artifacts:
 
+- `attempts.jsonl`
 - `profiles/`
 - `evals/`
 - `notes/`
@@ -201,28 +205,33 @@ Each run keeps its own artifacts:
 - `controller-log.jsonl`
 - `progress.png`
 
-The latest run directory is also written to:
-
-- `runs/latest-run.txt`
-
-## Attempts and plot
-
-All attempts are appended to:
-
-- `runs/attempts.jsonl`
-
 Each run writes its own first-class progress image at:
 
 - `runs/<run-id>/progress.png`
 
-The latest generated run image is then mirrored to:
-
-- `runs/progress.png`
-
-The renderer uses one ledger only:
+The renderer uses one run-local ledger only:
 - every scored attempt is a point
 - frontier points are computed as the running best score
 - non-frontier attempts are shown as faint gray dots
+
+There is no live global ledger or live global progress image anymore. That makes concurrent runs much cleaner.
+
+## Derived aggregate views
+
+When you want a cross-run view, generate it explicitly:
+
+```powershell
+uv run autoresearch plot --all-runs
+uv run autoresearch leaderboard
+```
+
+These write derived artifacts under:
+
+- `runs/derived/progress-all-runs.png`
+- `runs/derived/leaderboard.png`
+- `runs/derived/leaderboard.json`
+
+The leaderboard is best-per-run, sorted by `quality_score`.
 
 Useful commands:
 
@@ -230,7 +239,8 @@ Useful commands:
 uv run autoresearch test-providers
 uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
-uv run autoresearch plot
+uv run autoresearch plot --all-runs
+uv run autoresearch leaderboard
 uv run autoresearch rescore-attempts
 uv run autoresearch reset-runs
 ```
