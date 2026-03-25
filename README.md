@@ -20,6 +20,7 @@ What changed is the search surface. Instead of mutating a training script and op
 The new runtime lives in `autoresearch/` and exposes:
 
 - `autoresearch doctor`
+- `autoresearch test-providers`
 - `autoresearch run`
 - `autoresearch supervise`
 - `autoresearch score <artifact_dir>`
@@ -51,6 +52,7 @@ Keep both untracked. `.agentsecrets` is the place for per-profile provider keys 
 
 ```powershell
 uv run autoresearch doctor
+uv run autoresearch test-providers
 uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
 uv run autoresearch reset-runs
@@ -104,12 +106,25 @@ Secrets are matched by profile name in `.agentsecrets`:
 
 ```json
 {
-  "providers": {
-    "openai-mini": { "api_key": "..." },
-    "xai-grok": { "api_key": "..." }
+  "api_keys": {
+    "openai_main": "...",
+    "xai_main": "..."
   }
 }
 ```
+
+Profiles can reference those shared keys with `api_key_ref`:
+
+```json
+{
+  "providers": {
+    "openai-mini": { "type": "openai", "api_key_ref": "openai_main" },
+    "xai-grok": { "type": "xai", "api_key_ref": "xai_main" }
+  }
+}
+```
+
+You can still set `providers.<profile>.api_key` directly in `.agentsecrets` if you want profile-specific overrides. `api_key_ref` is just the cleaner shared-key path.
 
 The current provider types are:
 
@@ -117,6 +132,13 @@ The current provider types are:
 - `xai`
 - `openrouter`
 - `openai_compatible`
+
+Profiles may also choose a transport explicitly when needed:
+
+- `chat_completions`
+- `responses`
+
+This matters most for xAI multi-agent models, which require `transport: "responses"`.
 
 ## Supervised Runs
 
@@ -198,6 +220,7 @@ The renderer uses one ledger only:
 Useful commands:
 
 ```powershell
+uv run autoresearch test-providers
 uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
 uv run autoresearch plot

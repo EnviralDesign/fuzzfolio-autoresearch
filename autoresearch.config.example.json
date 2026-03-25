@@ -7,6 +7,7 @@
     "openai-mini": {
       "type": "openai",
       "api_base": "https://api.openai.com/v1",
+      "api_key_ref": "openai_main",
       "model": "gpt-5.4-mini",
       "temperature": 0.2,
       "max_tokens": 3200,
@@ -15,10 +16,30 @@
     "xai-grok": {
       "type": "xai",
       "api_base": "https://api.x.ai/v1",
+      "api_key_ref": "xai_main",
       "model": "grok-4.20-reasoning",
       "temperature": 0.2,
       "max_tokens": 3200,
       "timeout_seconds": 180
+    },
+    "xai-multi-agent-sample": {
+      "type": "xai",
+      "api_base": "https://api.x.ai/v1",
+      "api_key_ref": "xai_main",
+      "model": "grok-4.20-multi-agent",
+      "transport": "responses",
+      "temperature": 0.2,
+      "max_tokens": 3200,
+      "timeout_seconds": 180
+    },
+    "openrouter-sample": {
+      "type": "openrouter",
+      "api_base": "https://openrouter.ai/api/v1",
+      "api_key_ref": "openrouter_main",
+      "model": "openai/gpt-4.1-mini",
+      "temperature": 0.2,
+      "max_tokens": 3200,
+      "timeout_seconds": 120
     }
   },
   "fuzzfolio": {

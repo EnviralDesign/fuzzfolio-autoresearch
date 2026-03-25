@@ -21,6 +21,7 @@ if __package__ in {None, ""}:
     from autoresearch.fuzzfolio import FuzzfolioCli
     from autoresearch.ledger import append_attempt, load_attempts, make_attempt_record, write_attempts
     from autoresearch.plotting import render_progress_artifacts
+    from autoresearch.provider import ChatMessage, ProviderError, create_provider
     from autoresearch.scoring import build_attempt_score, load_sensitivity_snapshot
 else:
     from .config import load_config
@@ -28,6 +29,7 @@ else:
     from .fuzzfolio import FuzzfolioCli
     from .ledger import append_attempt, load_attempts, make_attempt_record, write_attempts
     from .plotting import render_progress_artifacts
+    from .provider import ChatMessage, ProviderError, create_provider
     from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 
@@ -41,6 +43,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = subparsers.add_parser("doctor", help="Verify config, CLI, auth, and seed prompt.")
     doctor.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+
+    provider_test = subparsers.add_parser(
+        "test-providers",
+        help="Smoke-test configured LLM provider profiles against a few one-shot JSON scenarios.",
+    )
+    provider_test.add_argument(
+        "--profile",
+        action="append",
+        default=None,
+        help="Only test the named provider profile. Can be repeated.",
+    )
+    provider_test.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
 
     run = subparsers.add_parser("run", help="Run the autonomous research controller.")
     run.add_argument("--max-steps", type=int, default=None)
@@ -104,6 +118,129 @@ def cmd_doctor() -> int:
     }
     print(json.dumps(payload, ensure_ascii=True, indent=2))
     return 0
+
+
+def _provider_test_scenarios() -> list[tuple[str, list[ChatMessage], Callable[[dict[str, Any]], str | None]]]:
+    def validate_minimal(payload: dict[str, Any]) -> str | None:
+        if payload.get("probe") != "json_minimal":
+            return "expected probe=json_minimal"
+        if payload.get("status") != "ok":
+            return "expected status=ok"
+        if payload.get("value") != 7:
+            return "expected value=7"
+        return None
+
+    def validate_runtime(payload: dict[str, Any]) -> str | None:
+        reasoning = payload.get("reasoning")
+        actions = payload.get("actions")
+        if not isinstance(reasoning, str) or not reasoning.strip():
+            return "expected non-empty reasoning string"
+        if not isinstance(actions, list):
+            return "expected actions list"
+        if actions:
+            return "expected empty actions list"
+        mode = payload.get("mode")
+        if mode != "runtime_shape":
+            return "expected mode=runtime_shape"
+        return None
+
+    return [
+        (
+            "json_minimal",
+            [
+                ChatMessage(
+                    role="system",
+                    content="Return raw JSON only. No markdown.",
+                ),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        'Return exactly this JSON object and nothing else: '
+                        '{"probe":"json_minimal","status":"ok","value":7}'
+                    ),
+                ),
+            ],
+            validate_minimal,
+        ),
+        (
+            "runtime_shape",
+            [
+                ChatMessage(
+                    role="system",
+                    content="Return raw JSON only. No markdown.",
+                ),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        'Return a JSON object with exactly these top-level fields: '
+                        '{"mode":"runtime_shape","reasoning":"one short sentence","actions":[]}. '
+                        "Keep reasoning non-empty and actions as an empty array."
+                    ),
+                ),
+            ],
+            validate_runtime,
+        ),
+    ]
+
+
+def cmd_test_providers(
+    *,
+    profile_names: list[str] | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    requested = set(profile_names or [])
+    selected = {
+        name: profile
+        for name, profile in config.providers.items()
+        if not requested or name in requested
+    }
+    if requested:
+        missing = sorted(requested - set(selected.keys()))
+        if missing:
+            raise SystemExit(f"Unknown provider profile(s): {', '.join(missing)}")
+    scenarios = _provider_test_scenarios()
+    results: list[dict[str, Any]] = []
+    overall_ok = True
+
+    for profile_name, profile in selected.items():
+        provider = create_provider(profile)
+        profile_result: dict[str, Any] = {
+            "profile": profile_name,
+            "provider_type": profile.provider_type,
+            "model": profile.model,
+            "api_base": profile.api_base,
+            "has_api_key": bool(profile.api_key),
+            "scenarios": [],
+            "ok": True,
+        }
+        for scenario_name, messages, validator in scenarios:
+            scenario_result: dict[str, Any] = {"name": scenario_name}
+            try:
+                payload = provider.complete_json(messages)
+                scenario_result["payload"] = payload
+                validation_error = validator(payload)
+                if validation_error:
+                    scenario_result["ok"] = False
+                    scenario_result["error"] = validation_error
+                    profile_result["ok"] = False
+                    overall_ok = False
+                else:
+                    scenario_result["ok"] = True
+            except ProviderError as exc:
+                scenario_result["ok"] = False
+                scenario_result["error"] = str(exc)
+                profile_result["ok"] = False
+                overall_ok = False
+            profile_result["scenarios"].append(scenario_result)
+        results.append(profile_result)
+
+    payload = {"ok": overall_ok, "profiles": results}
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+    else:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0 if overall_ok else 1
 
 
 def _short_text(value: str, limit: int = 220) -> str:
@@ -669,6 +806,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "doctor":
         return cmd_doctor()
+    if args.command == "test-providers":
+        return cmd_test_providers(profile_names=args.profile, as_json=bool(args.json))
     if args.command == "run":
         return cmd_run(max_steps=args.max_steps, as_json=bool(args.json))
     if args.command == "supervise":

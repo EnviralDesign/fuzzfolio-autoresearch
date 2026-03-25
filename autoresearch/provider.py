@@ -166,7 +166,7 @@ class OpenRouterProvider(ChatCompletionsJsonProvider):
     pass
 
 
-class XAIProvider(ChatCompletionsJsonProvider):
+class XAIChatProvider(ChatCompletionsJsonProvider):
     def _completion_budget_fields(self, max_completion_tokens: int) -> dict[str, Any]:
         return {"max_tokens": max_completion_tokens}
 
@@ -176,10 +176,131 @@ class XAIProvider(ChatCompletionsJsonProvider):
         return None
 
 
+class ResponsesJsonProvider:
+    def __init__(self, config: ProviderProfileConfig):
+        self.config = config
+        self.session = requests.Session()
+
+    def _build_url(self) -> str:
+        api_base = (self.config.api_base or "").rstrip("/")
+        if not api_base:
+            raise ProviderError(
+                f"Provider {self.config.provider_type!r} is missing api_base."
+            )
+        return api_base + "/responses"
+
+    def _build_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _build_body(
+        self,
+        messages: list[ChatMessage],
+        max_completion_tokens: int,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self.config.model,
+            "input": [{"role": message.role, "content": message.content} for message in messages],
+            "temperature": self.config.temperature,
+        }
+        body.update(self._completion_budget_fields(max_completion_tokens))
+        return body
+
+    def _completion_budget_fields(self, max_completion_tokens: int) -> dict[str, Any]:
+        return {"max_output_tokens": max_completion_tokens}
+
+    def _extract_content(self, payload: dict[str, Any]) -> str:
+        output_text = payload.get("output_text")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text
+        output = payload.get("output")
+        if isinstance(output, list):
+            parts: list[str] = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") != "message":
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for content_item in content:
+                    if not isinstance(content_item, dict):
+                        continue
+                    content_type = content_item.get("type")
+                    if content_type in {"output_text", "text"}:
+                        parts.append(str(content_item.get("text", "")))
+            combined = "".join(parts).strip()
+            if combined:
+                return combined
+        raise ProviderError("Provider response did not contain text content.")
+
+    def _parse_json_object(self, text: str) -> dict[str, Any]:
+        decoder = json.JSONDecoder()
+        text = text.strip()
+        try:
+            value, _ = decoder.raw_decode(text)
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            start = text.find("{")
+            if start >= 0:
+                try:
+                    value, _ = decoder.raw_decode(text[start:])
+                    if isinstance(value, dict):
+                        return value
+                except json.JSONDecodeError:
+                    pass
+        raise ProviderError(f"Provider did not return valid JSON. Raw response: {text[:800]}")
+
+    def _request_json(
+        self,
+        messages: list[ChatMessage],
+        max_completion_tokens: int,
+    ) -> dict[str, Any]:
+        body = self._build_body(messages, max_completion_tokens)
+        response = self.session.post(
+            self._build_url(),
+            headers=self._build_headers(),
+            json=body,
+            timeout=self.config.timeout_seconds,
+        )
+        if response.status_code >= 400:
+            raise ProviderError(
+                f"Provider request failed with {response.status_code}: {response.text[:800]}"
+            )
+        return response.json()
+
+    def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
+        if not self.config.api_key:
+            env_hint = self.config.api_key_env or "provider-specific env var"
+            raise ProviderError(
+                f"No API key configured for provider profile using model {self.config.model!r}. "
+                f"Put it in .agentsecrets under providers.<profile>.api_key or set {env_hint}."
+            )
+        payload = self._request_json(messages, self.config.max_tokens)
+        return self._parse_json_object(self._extract_content(payload))
+
+
+class XAIResponsesProvider(ResponsesJsonProvider):
+    def _completion_budget_fields(self, max_completion_tokens: int) -> dict[str, Any]:
+        # xAI multi-agent explicitly does not support output-token caps.
+        if "multi-agent" in self.config.model:
+            return {}
+        return {"max_output_tokens": max_completion_tokens}
+
+
 def create_provider(config: ProviderProfileConfig) -> JsonCompletionProvider:
     normalized = (config.provider_type or "openai").strip().lower()
+    transport = (config.transport or "chat_completions").strip().lower()
     if normalized == "xai":
-        return XAIProvider(config)
+        if transport == "responses":
+            return XAIResponsesProvider(config)
+        return XAIChatProvider(config)
+    if transport == "responses":
+        return ResponsesJsonProvider(config)
     if normalized == "openrouter":
         return OpenRouterProvider(config)
     if normalized == "openai_compatible":

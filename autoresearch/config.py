@@ -17,6 +17,7 @@ class ProviderProfileConfig:
     api_base: str | None = None
     model: str = "gpt-5.4-mini"
     api_key: str | None = None
+    api_key_ref: str | None = None
     api_key_env: str | None = None
     temperature: float = 0.2
     max_tokens: int = 3200
@@ -171,6 +172,7 @@ def _load_provider_profiles(
     llm_cfg = raw_config.get("llm", {})
     providers_cfg = raw_config.get("providers", {})
     provider_secrets_map = raw_secrets.get("providers", {})
+    api_keys_map = raw_secrets.get("api_keys", {})
 
     if providers_cfg:
         profiles: dict[str, ProviderProfileConfig] = {}
@@ -184,6 +186,15 @@ def _load_provider_profiles(
                 if isinstance(provider_secrets_map.get(profile_name, {}), dict)
                 else {}
             )
+            api_key_ref = (
+                str(secret_cfg.get("api_key_ref") or profile_cfg.get("api_key_ref") or "").strip()
+                or None
+            )
+            referenced_api_key = None
+            if api_key_ref and isinstance(api_keys_map, dict):
+                candidate = api_keys_map.get(api_key_ref)
+                if candidate:
+                    referenced_api_key = str(candidate)
             api_key_env = str(profile_cfg.get("api_key_env") or defaults["api_key_env"])
             profiles[profile_name] = ProviderProfileConfig(
                 provider_type=provider_type,
@@ -199,8 +210,9 @@ def _load_provider_profiles(
                 api_key=_env_or_value(
                     f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_API_KEY",
                     api_key_env,
-                    fallback=secret_cfg.get("api_key") or profile_cfg.get("api_key"),
+                    fallback=secret_cfg.get("api_key") or profile_cfg.get("api_key") or referenced_api_key,
                 ),
+                api_key_ref=api_key_ref,
                 api_key_env=api_key_env,
                 temperature=float(profile_cfg.get("temperature", ProviderProfileConfig.temperature)),
                 max_tokens=int(profile_cfg.get("max_tokens", ProviderProfileConfig.max_tokens)),
