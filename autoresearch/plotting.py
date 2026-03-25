@@ -96,6 +96,7 @@ def render_progress_artifacts(
     *,
     lower_is_better: bool = False,
     mirror_output_path: Path | None = None,
+    mirror_attempts: list[dict[str, Any]] | None = None,
 ) -> None:
     render_progress_plot(
         attempts,
@@ -105,4 +106,11 @@ def render_progress_artifacts(
     if mirror_output_path is None:
         return
     mirror_output_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(primary_output_path, mirror_output_path)
+    if mirror_attempts is None:
+        shutil.copy2(primary_output_path, mirror_output_path)
+        return
+    render_progress_plot(
+        mirror_attempts,
+        mirror_output_path,
+        lower_is_better=lower_is_better,
+    )

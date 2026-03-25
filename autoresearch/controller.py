@@ -350,6 +350,21 @@ class ResearchController:
             if str(attempt.get("run_id", "")) == run_id
         ]
 
+    def _render_run_and_global_progress(self, tool_context: ToolContext) -> None:
+        all_attempts = load_attempts(self.config.attempts_path)
+        run_attempts = [
+            attempt
+            for attempt in all_attempts
+            if str(attempt.get("run_id", "")) == tool_context.run_id
+        ]
+        render_progress_artifacts(
+            run_attempts,
+            tool_context.progress_plot_path,
+            lower_is_better=self.config.research.plot_lower_is_better,
+            mirror_output_path=self.config.progress_plot_path,
+            mirror_attempts=all_attempts,
+        )
+
     def _scored_attempts(self, attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [attempt for attempt in attempts if attempt.get("composite_score") is not None]
 
@@ -1153,12 +1168,7 @@ class ResearchController:
             note=note,
         )
         append_attempt(self.config.attempts_path, record)
-        render_progress_artifacts(
-            load_attempts(self.config.attempts_path),
-            tool_context.progress_plot_path,
-            lower_is_better=self.config.research.plot_lower_is_better,
-            mirror_output_path=self.config.progress_plot_path,
-        )
+        self._render_run_and_global_progress(tool_context)
         return {
             "status": "logged",
             "attempt_id": record.attempt_id,
@@ -1173,12 +1183,7 @@ class ResearchController:
         }
 
     def _refresh_progress_artifacts(self, tool_context: ToolContext) -> None:
-        render_progress_artifacts(
-            load_attempts(self.config.attempts_path),
-            tool_context.progress_plot_path,
-            lower_is_better=self.config.research.plot_lower_is_better,
-            mirror_output_path=self.config.progress_plot_path,
-        )
+        self._render_run_and_global_progress(tool_context)
 
     def _maybe_auto_log_attempt(
         self,

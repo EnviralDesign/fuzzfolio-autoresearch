@@ -295,6 +295,16 @@ def _parse_window(window_text: str | None) -> tuple[str | None, str | None]:
     return start, end
 
 
+def _latest_run_context(config) -> tuple[Path | None, str | None]:
+    if not config.latest_run_link.exists():
+        return None, None
+    latest_run_text = config.latest_run_link.read_text(encoding="utf-8").strip()
+    if not latest_run_text:
+        return None, None
+    run_dir = Path(latest_run_text)
+    return run_dir / "progress.png", run_dir.name
+
+
 def _resolve_supervise_policy(
     config,
     *,
@@ -612,16 +622,18 @@ def cmd_supervise(
 def cmd_plot() -> int:
     config = load_config()
     attempts = load_attempts(config.attempts_path)
-    latest_run_path = None
-    if config.latest_run_link.exists():
-        latest_run_text = config.latest_run_link.read_text(encoding="utf-8").strip()
-        if latest_run_text:
-            latest_run_path = Path(latest_run_text) / "progress.png"
+    latest_run_path, latest_run_id = _latest_run_context(config)
+    latest_run_attempts = (
+        [attempt for attempt in attempts if str(attempt.get("run_id", "")) == latest_run_id]
+        if latest_run_id
+        else None
+    )
     render_progress_artifacts(
-        attempts,
+        latest_run_attempts if latest_run_attempts is not None else attempts,
         latest_run_path or config.progress_plot_path,
         lower_is_better=config.research.plot_lower_is_better,
         mirror_output_path=config.progress_plot_path if latest_run_path else None,
+        mirror_attempts=attempts if latest_run_path else None,
     )
     print(
         json.dumps(
@@ -719,16 +731,18 @@ def cmd_record_attempt(
     )
     append_attempt(config.attempts_path, record)
     attempts = load_attempts(config.attempts_path)
-    latest_run_path = None
-    if config.latest_run_link.exists():
-        latest_run_text = config.latest_run_link.read_text(encoding="utf-8").strip()
-        if latest_run_text:
-            latest_run_path = Path(latest_run_text) / "progress.png"
+    latest_run_path, latest_run_id = _latest_run_context(config)
+    latest_run_attempts = (
+        [attempt for attempt in attempts if str(attempt.get("run_id", "")) == latest_run_id]
+        if latest_run_id
+        else None
+    )
     render_progress_artifacts(
-        attempts,
+        latest_run_attempts if latest_run_attempts is not None else attempts,
         latest_run_path or config.progress_plot_path,
         lower_is_better=config.research.plot_lower_is_better,
         mirror_output_path=config.progress_plot_path if latest_run_path else None,
+        mirror_attempts=attempts if latest_run_path else None,
     )
     print(
         json.dumps(
@@ -775,16 +789,18 @@ def cmd_rescore_attempts() -> int:
         updated += 1
 
     write_attempts(config.attempts_path, rescored)
-    latest_run_path = None
-    if config.latest_run_link.exists():
-        latest_run_text = config.latest_run_link.read_text(encoding="utf-8").strip()
-        if latest_run_text:
-            latest_run_path = Path(latest_run_text) / "progress.png"
+    latest_run_path, latest_run_id = _latest_run_context(config)
+    latest_run_attempts = (
+        [attempt for attempt in rescored if str(attempt.get("run_id", "")) == latest_run_id]
+        if latest_run_id
+        else None
+    )
     render_progress_artifacts(
-        rescored,
+        latest_run_attempts if latest_run_attempts is not None else rescored,
         latest_run_path or config.progress_plot_path,
         lower_is_better=config.research.plot_lower_is_better,
         mirror_output_path=config.progress_plot_path if latest_run_path else None,
+        mirror_attempts=rescored if latest_run_path else None,
     )
     print(
         json.dumps(
