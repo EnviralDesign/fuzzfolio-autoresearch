@@ -652,16 +652,25 @@ def cmd_plot() -> int:
 def cmd_reset_runs() -> int:
     config = load_config()
     cleared: list[str] = []
+    blocked: list[dict[str, str]] = []
     config.runs_root.mkdir(parents=True, exist_ok=True)
 
     for child in sorted(config.runs_root.iterdir()):
-        cleared.append(str(child))
-        if child.is_dir():
-            shutil.rmtree(child)
-        else:
-            child.unlink()
+        try:
+            cleared.append(str(child))
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        except OSError as exc:
+            blocked.append({"path": str(child), "error": str(exc)})
 
     write_attempts(config.attempts_path, [])
+    if config.latest_run_link.exists():
+        try:
+            config.latest_run_link.unlink()
+        except OSError as exc:
+            blocked.append({"path": str(config.latest_run_link), "error": str(exc)})
     render_progress_artifacts(
         [],
         config.progress_plot_path,
@@ -673,6 +682,7 @@ def cmd_reset_runs() -> int:
             {
                 "runs_root": str(config.runs_root),
                 "cleared_entries": len(cleared),
+                "blocked_entries": blocked,
                 "attempts_path": str(config.attempts_path),
                 "progress_plot": str(config.progress_plot_path),
             },

@@ -20,8 +20,8 @@ class AttemptRecord:
     artifact_dir: str
     profile_ref: str | None
     profile_path: str | None
-    primary_score: float
-    composite_score: float
+    primary_score: float | None
+    composite_score: float | None
     score_basis: str
     metrics: dict[str, float | None]
     best_summary: dict[str, Any]

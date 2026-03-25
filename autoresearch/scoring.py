@@ -7,8 +7,8 @@ from typing import Any
 
 @dataclass
 class AttemptScore:
-    primary_score: float
-    composite_score: float
+    primary_score: float | None
+    composite_score: float | None
     score_basis: str
     metrics: dict[str, float | None]
     best_summary: dict[str, Any]
@@ -86,9 +86,46 @@ def build_attempt_score(
     sensitivity_snapshot: dict[str, Any] | None = None,
 ) -> AttemptScore:
     best = _best_summary(compare_payload)
-    rank_score = _safe_float(best.get("rank_score"))
-    if rank_score is None:
-        raise ValueError("compare-sensitivity summary did not contain rank_score.")
+    quality_score = _extract_metric(
+        "quality_score",
+        best_summary=best,
+        compare_payload=compare_payload,
+        sensitivity_snapshot=sensitivity_snapshot,
+        preferred_paths=[
+            ["quality_score"],
+            ["quality_score", "score"],
+            ["data", "aggregate", "quality_score"],
+            ["data", "aggregate", "quality_score", "score"],
+            ["data", "quality_score"],
+            ["data", "quality_score", "score"],
+        ],
+    )
+    quality_score_version = (
+        _get_nested(best, ["quality_score_version"])
+        or _get_nested(compare_payload, ["quality_score_version"])
+        or _get_nested(sensitivity_snapshot or {}, ["data", "aggregate", "quality_score", "version"])
+        or _get_nested(sensitivity_snapshot or {}, ["data", "quality_score", "version"])
+    )
+    quality_score_belief_basis = (
+        _get_nested(best, ["quality_score_belief_basis"])
+        or _get_nested(compare_payload, ["quality_score_belief_basis"])
+        or _get_nested(sensitivity_snapshot or {}, ["data", "aggregate", "quality_score", "belief_basis"])
+        or _get_nested(sensitivity_snapshot or {}, ["data", "quality_score", "belief_basis"])
+    )
+    legacy_rank_score = _extract_metric(
+        "legacy_rank_score",
+        best_summary=best,
+        compare_payload=compare_payload,
+        sensitivity_snapshot=sensitivity_snapshot,
+        preferred_paths=[
+            ["legacy_rank_score"],
+            ["rank_score"],
+            ["data", "aggregate", "legacy_rank_score"],
+            ["data", "aggregate", "rank_score"],
+            ["data", "legacy_rank_score"],
+            ["data", "rank_score"],
+        ],
+    )
 
     psr = _extract_metric(
         "psr",
@@ -136,24 +173,31 @@ def build_attempt_score(
         ],
     )
     metrics = {
-        "rank_score": rank_score,
+        "quality_score": quality_score,
+        "legacy_rank_score": legacy_rank_score,
         "dsr": dsr,
         "psr": psr,
         "k_ratio": k_ratio,
         "sharpe_r": sharpe_r,
     }
-    if dsr is not None:
-        composite_score = dsr
-        score_basis = "dsr"
-    elif psr is not None:
-        composite_score = psr
-        score_basis = "psr"
+    composite_score = quality_score
+    if composite_score is not None:
+        version_text = (
+            str(quality_score_version).strip()
+            if isinstance(quality_score_version, str) and quality_score_version.strip()
+            else "quality"
+        )
+        belief_text = (
+            str(quality_score_belief_basis).strip()
+            if isinstance(quality_score_belief_basis, str) and quality_score_belief_basis.strip()
+            else "unknown"
+        )
+        score_basis = f"{version_text}:{belief_text}"
     else:
-        composite_score = rank_score
-        score_basis = "rank_score"
+        score_basis = "unscored"
 
     return AttemptScore(
-        primary_score=rank_score,
+        primary_score=composite_score,
         composite_score=composite_score,
         score_basis=score_basis,
         metrics=metrics,

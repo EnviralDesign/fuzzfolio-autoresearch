@@ -43,7 +43,7 @@ def render_progress_plot(
     if not valid:
         plt.title("Autoresearch Progress: No Attempts Yet")
         plt.xlabel("Attempt #")
-        plt.ylabel("Frontier Score")
+        plt.ylabel("Quality Score")
         plt.grid(True, alpha=0.25)
         plt.tight_layout()
         plt.savefig(output_path, dpi=160)
@@ -82,7 +82,7 @@ def render_progress_plot(
     direction = "lower is better" if lower_is_better else "higher is better"
     plt.title(f"Autoresearch Progress: {len(valid)} Attempts, {len(frontier)} Frontier Points")
     plt.xlabel("Attempt #")
-    plt.ylabel(f"Frontier Score ({direction})")
+    plt.ylabel(f"Quality Score ({direction})")
     plt.grid(True, alpha=0.25)
     plt.legend()
     plt.tight_layout()

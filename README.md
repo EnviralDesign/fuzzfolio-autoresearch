@@ -233,10 +233,10 @@ uv run autoresearch reset-runs
 The runtime now treats the CLI's scoring surface as authoritative:
 
 - `primary_score` is the CLI `rank_score`
-- `composite_score` is `dsr` when present, otherwise `psr`, otherwise `rank_score`
+- `composite_score` is `dsr` when present, otherwise `psr`
 - each attempt record also stores `psr`, `dsr`, `k_ratio`, and `sharpe_r` when available
 
-The Python side no longer applies ad hoc penalties for trade count, signal count, or positive-cell coverage.
+Attempts without probabilistic metrics are kept for observability, but they are not treated as scored frontier points. The Python side no longer applies ad hoc penalties for trade count, signal count, or positive-cell coverage.
 
 ## Long-running behavior
 

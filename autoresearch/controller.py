@@ -279,12 +279,63 @@ class ResearchController:
         lookback_months = str(horizon_policy["lookback_months"])
         if args[0] in {"sensitivity", "sensitivity-basket"}:
             effective = self._strip_cli_flag(list(args), "--bar-limit")
+            if "--timeframe" not in effective:
+                inferred_timeframe = self._infer_timeframe_for_sensitivity_args(effective)
+                if inferred_timeframe:
+                    effective.extend(["--timeframe", inferred_timeframe])
             if "--lookback-months" not in effective:
                 effective.extend(["--lookback-months", lookback_months])
             return effective
         if command_head == ["deep-replay", "cell-detail"]:
             return self._strip_cli_flag(list(args), "--bar-limit")
         return args
+
+    def _infer_timeframe_for_sensitivity_args(self, args: list[str]) -> str | None:
+        profile_ref = None
+        if "--profile-ref" in args:
+            index = args.index("--profile-ref") + 1
+            if index < len(args):
+                profile_ref = str(args[index]).strip()
+        if profile_ref:
+            profile_path = self.profile_sources.get(profile_ref)
+            inferred = self._infer_profile_timeframe_from_file(profile_path)
+            if inferred:
+                return inferred
+        return "M5"
+
+    def _infer_profile_timeframe_from_file(self, path: Path | None) -> str | None:
+        if path is None or not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else payload
+        indicators = profile.get("indicators") if isinstance(profile, dict) else None
+        if not isinstance(indicators, list):
+            return None
+        timeframe_order = {
+            "M1": 1,
+            "M5": 5,
+            "M15": 15,
+            "M30": 30,
+            "H1": 60,
+            "H4": 240,
+            "D1": 1440,
+        }
+        timeframes: list[str] = []
+        for indicator in indicators:
+            if not isinstance(indicator, dict):
+                continue
+            config = indicator.get("config") if isinstance(indicator.get("config"), dict) else {}
+            if config.get("isActive") is False:
+                continue
+            timeframe = str(config.get("timeframe") or "").strip().upper()
+            if timeframe in timeframe_order:
+                timeframes.append(timeframe)
+        if not timeframes:
+            return None
+        return min(timeframes, key=lambda item: timeframe_order.get(item, 999999))
 
     def _timestamp(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
