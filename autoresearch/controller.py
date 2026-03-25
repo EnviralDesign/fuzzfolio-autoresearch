@@ -114,6 +114,7 @@ Rules:
 - Early phase should screen cheaply, mid phase should deepen evidence, and late phase should pressure-test survivors over longer horizons.
 - If the explorer is drifting, say so plainly.
 - If the controller provides a score target, use it as a believable next stretch goal instead of vague encouragement.
+- The controller's score target refers to `quality_score`, the aggregate source-of-truth metric. Do not describe it as PSR. You may mention PSR, DSR, drawdown, robustness, or other inputs separately as reasons why quality_score moved.
 - During exploration phase, do not encourage finish or summary-writing.
 """
 
@@ -584,12 +585,12 @@ class ResearchController:
             summary = "Next target: log the first credible scored candidate for this run."
         elif self.config.research.plot_lower_is_better:
             summary = (
-                f"Next target: get composite_score <= {self._format_score(target_score)}. "
+                f"Next target: get quality_score <= {self._format_score(target_score)}. "
                 f"Current run best={self._format_score(current_score)}; global frontier best={self._format_score(global_score)}."
             )
         else:
             summary = (
-                f"Next target: get composite_score >= {self._format_score(target_score)}. "
+                f"Next target: get quality_score >= {self._format_score(target_score)}. "
                 f"Current run best={self._format_score(current_score)}; global frontier best={self._format_score(global_score)}."
             )
 

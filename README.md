@@ -232,11 +232,11 @@ uv run autoresearch reset-runs
 
 The runtime now treats the CLI's scoring surface as authoritative:
 
-- `primary_score` is the CLI `rank_score`
-- `composite_score` is `dsr` when present, otherwise `psr`
-- each attempt record also stores `psr`, `dsr`, `k_ratio`, and `sharpe_r` when available
+- `quality_score` is the source-of-truth aggregate metric computed in Fuzzfolio itself
+- `primary_score` and `composite_score` mirror that propagated `quality_score`
+- each attempt record also stores supporting fields like `psr`, `dsr`, `k_ratio`, `sharpe_r`, and `legacy_rank_score` when available
 
-Attempts without probabilistic metrics are kept for observability, but they are not treated as scored frontier points. The Python side no longer applies ad hoc penalties for trade count, signal count, or positive-cell coverage.
+Attempts without a usable `quality_score` are kept for observability, but they are not treated as scored frontier points. The Python side no longer invents its own temporary scoring formula.
 
 ## Long-running behavior
 
