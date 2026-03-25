@@ -60,6 +60,9 @@ class ResearchConfig:
     horizon_mid_months: int = 12
     horizon_late_months: int = 24
     horizon_wrap_up_months: int = 36
+    coverage_reference_timeframe: str = "M15"
+    coverage_min_mid_months: int = 11
+    coverage_min_wrap_up_months: int = 34
 
 
 @dataclass
@@ -404,6 +407,25 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             research_cfg.get(
                 "horizon_wrap_up_months",
                 ResearchConfig.horizon_wrap_up_months,
+            )
+        ),
+        coverage_reference_timeframe=str(
+            research_cfg.get(
+                "coverage_reference_timeframe",
+                ResearchConfig.coverage_reference_timeframe,
+            )
+        ).strip().upper()
+        or ResearchConfig.coverage_reference_timeframe,
+        coverage_min_mid_months=int(
+            research_cfg.get(
+                "coverage_min_mid_months",
+                ResearchConfig.coverage_min_mid_months,
+            )
+        ),
+        coverage_min_wrap_up_months=int(
+            research_cfg.get(
+                "coverage_min_wrap_up_months",
+                ResearchConfig.coverage_min_wrap_up_months,
             )
         ),
     )

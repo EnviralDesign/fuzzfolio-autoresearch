@@ -321,13 +321,6 @@ def _parse_window(window_text: str | None) -> tuple[str | None, str | None]:
     return start, end
 
 
-def _latest_run_context(config) -> tuple[Path | None, str | None]:
-    run_dir = latest_run_dir(config.runs_root)
-    if run_dir is None:
-        return None, None
-    return run_dir / "progress.png", run_dir.name
-
-
 def _load_runtime_config(
     *,
     explorer_profile: str | None = None,
@@ -874,7 +867,11 @@ def cmd_rescore_attempts() -> int:
     skipped = 0
     run_count = 0
 
-    for run_dir in [path for path in config.runs_root.iterdir() if path.is_dir() and path.name != "derived"]:
+    if not config.runs_root.exists():
+        print(json.dumps({"runs_updated": 0, "updated": 0, "skipped": 0, "attempts": 0}, ensure_ascii=True, indent=2))
+        return 0
+
+    for run_dir in sorted(path for path in config.runs_root.iterdir() if path.is_dir() and path.name != "derived"):
         attempts_path = attempts_path_for_run_dir(run_dir)
         attempts = load_attempts(attempts_path)
         if not attempts:

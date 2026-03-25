@@ -52,6 +52,8 @@ Rules:
 - Prefer `profiles clone-local` to normalize/copy an existing local profile into a fresh run-owned portable document before branching.
 - Prefer `profiles patch` for bounded edits to local profile files instead of rewriting whole JSON documents when only a few fields need to change.
 - Prefer `profiles validate --file <ABS_FILE>` as a cheap preflight after materially editing a profile file.
+- Use sweeps as a normal research tool, not a rare last resort.
+- Prefer `sweep scaffold`, `sweep patch`, and `sweep validate` when you need a sweep definition instead of hand-writing raw sweep JSON.
 - Only update profile refs that were created during this run.
 - In profile JSON, `indicator.meta.id` must be an exact id from the sticky indicator catalog. Seed phrases and concept labels are not valid ids.
 - After `profiles create`, use the returned profile id for later `--profile-ref` calls. A local `*.created.json` file is not itself a profile ref.
@@ -59,6 +61,7 @@ Rules:
 - Runtime placeholders like `<created_profile_ref>` may appear in tool arguments. Reuse them exactly when provided; the controller will substitute the real value.
 - After `sensitivity-basket`, the expected artifact files are `sensitivity-response.json`, `deep-replay-job.json`, and sometimes `best-cell-path-detail.json`. Do not look for `summary.json`.
 - `sensitivity` and `sensitivity-basket` now expose `requested_timeframe` and `effective_timeframe` in JSON output when you inspect stdout or saved responses.
+- Saved analysis artifacts may also expose `effective_window_start`, `effective_window_end`, `effective_window_days`, and `effective_window_months`. Use those to judge whether a requested horizon was actually satisfied.
 - Think in weeks, months, and years of evidence, not in raw bars.
 - The controller owns default horizon policy and may inject phase-appropriate `--lookback-months` into sensitivity runs when you omit it.
 - Do not use `--bar-limit` as a research lever unless the user explicitly asks. Treat bar counts as implementation detail, not strategy.
@@ -117,7 +120,9 @@ Rules:
 - Work only within the current run, its seed hand, and run-owned artifacts.
 - Do not suggest invalid CLI syntax or invalid instruments like __BASKET__.
 - Prefer hypothesis pivots, contrast branches, and meaningful parameter or timeframe shifts over repetitive retries.
+- Treat sweeps as first-class. If the explorer is doing repeated manual branch edits without any sweep support, push it toward a bounded sweep around the current promising family.
 - Horizon policy belongs to you and the controller, not the explorer. Push the run to think in months and years, not bars.
+- If an analysis window came back truncated, focus on the missing effective months/days, not the raw bar machinery.
 - Early phase should screen cheaply, mid phase should deepen evidence, and late phase should pressure-test survivors over longer horizons.
 - If the explorer is drifting, say so plainly.
 - If the controller provides a score target, use it as a believable next stretch goal instead of vague encouragement.
@@ -472,13 +477,16 @@ class ResearchController:
                 phase_name = "late"
         summaries = {
             "early": (
-                f"Early phase: branch broadly, reject weak ideas cheaply, and prioritize fresh contrasts until step {wrap_up_start}."
+                f"Early phase: branch broadly, reject weak ideas cheaply, and prioritize fresh contrasts until step {wrap_up_start}. "
+                "Use permissive screening first, and include at least one bounded sweep around a promising family before locking into manual tweaks only."
             ),
             "mid": (
-                f"Mid phase: narrow onto the strongest families, deepen evidence, and prefer systematic follow-up over random wandering before wrap-up at step {wrap_up_start}."
+                f"Mid phase: narrow onto the strongest families, deepen evidence, and prefer systematic follow-up over random wandering before wrap-up at step {wrap_up_start}. "
+                "Targeted sweeps should be a normal part of refinement in this phase."
             ),
             "late": (
-                f"Late phase: stop spraying branches, focus on one or two survivors, and pressure-test them before wrap-up begins at step {wrap_up_start}."
+                f"Late phase: stop spraying branches, focus on one or two survivors, and pressure-test them before wrap-up begins at step {wrap_up_start}. "
+                "Use surgical sweeps around the surviving profile when manual patching alone is no longer yielding much."
             ),
         }
         return {
@@ -743,9 +751,50 @@ class ResearchController:
         symbols = data.get("symbols") if isinstance(data.get("symbols"), list) else []
         asset_classes = data.get("asset_classes") if isinstance(data.get("asset_classes"), list) else []
         fx_jpy = [str(symbol) for symbol in symbols if isinstance(symbol, str) and symbol.endswith("JPY")]
+        coverage_lines: list[str] = []
+        coverage_result = self.cli.run(
+            [
+                "market",
+                "coverage",
+                "--timeframe",
+                self.config.research.coverage_reference_timeframe,
+            ],
+            check=False,
+        )
+        if coverage_result.returncode == 0 and isinstance(coverage_result.parsed_json, dict):
+            coverage_data = coverage_result.parsed_json.get("data")
+            if isinstance(coverage_data, dict):
+                eligible_mid: list[str] = []
+                eligible_wrap: list[str] = []
+                for symbol, payload in coverage_data.items():
+                    if not isinstance(symbol, str) or not isinstance(payload, dict):
+                        continue
+                    months = payload.get("effective_window_months")
+                    if not isinstance(months, (int, float)):
+                        continue
+                    if float(months) >= float(self.config.research.coverage_min_mid_months):
+                        eligible_mid.append(symbol)
+                    if float(months) >= float(self.config.research.coverage_min_wrap_up_months):
+                        eligible_wrap.append(symbol)
+                if eligible_mid or eligible_wrap:
+                    coverage_lines.append(
+                        f"Coverage-qualified symbols ({self.config.research.coverage_reference_timeframe} reference): "
+                        f">= {self.config.research.coverage_min_mid_months} months: "
+                        f"{', '.join(sorted(eligible_mid)[:20]) if eligible_mid else 'none'}"
+                    )
+                    coverage_lines.append(
+                        f"Long-horizon symbols ({self.config.research.coverage_reference_timeframe} reference): "
+                        f">= {self.config.research.coverage_min_wrap_up_months} months: "
+                        f"{', '.join(sorted(eligible_wrap)[:20]) if eligible_wrap else 'none'}"
+                    )
+                    coverage_lines.append(
+                        "Prefer coverage-qualified symbols first so late-phase horizon checks are less likely to be silently truncated."
+                    )
+        coverage_block = ("\n".join(coverage_lines) + "\n") if coverage_lines else ""
         return (
             f"Asset classes: {', '.join(str(item) for item in asset_classes)}\n"
             f"JPY-related exact symbols: {', '.join(fx_jpy[:8]) if fx_jpy else 'none'}\n"
+            f"{coverage_block}"
             "Use exact symbols from the catalog. Do not assume aliases like JPY are valid instruments."
         )
 
@@ -851,6 +900,9 @@ class ResearchController:
             '- profiles validate --file <ABS_FILE> --pretty\n'
             '- profiles create --file <ABS_FILE> --out <ABS_FILE>\n'
             '- profiles update --profile-ref <REF> --file <ABS_FILE> --out <ABS_FILE>\n'
+            '- sweep scaffold --profile-ref <REF> --instrument <SYMBOL> --axis profile.notificationThreshold=70,75,80 --axis indicator[0].config.lookbackBars=1,2,3 --out <ABS_FILE>\n'
+            '- sweep patch --definition <ABS_FILE> --set fitness_metric="quality_score" --out <ABS_FILE>\n'
+            '- sweep validate --definition <ABS_FILE> --pretty\n'
             '- sweep submit --definition <ABS_FILE_OR_INLINE_JSON> --out <ABS_FILE> --pretty\n'
             '- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --lookback-months <MONTHS> --output-dir <ABS_DIR>\n'
             '- compare-sensitivity --input <ABS_DIR> --pretty\n'
@@ -861,6 +913,9 @@ class ResearchController:
             "- profiles validate performs a local schema/instrument preflight and is preferred before create when you materially edited a profile.\n"
             "- profiles create/update require --file. They do not accept branch/indicator/timeframe flags.\n"
             "- Create fresh run-owned profile JSON from scaffold output, clone-local output, or the portable template, then call profiles create.\n"
+            "- sweep scaffold builds a valid sweep definition around an existing saved profile using simple axis expressions. Prefer it over hand-writing sweep JSON.\n"
+            "- sweep patch applies deterministic edits to a local sweep definition file.\n"
+            "- sweep validate performs a local structural preflight before sweep submit.\n"
             "- Only exact indicator ids from the sticky indicator catalog are valid in indicator.meta.id.\n"
             "- The seed prompt is backed by the live indicator catalog, but seed concepts are still ideas, not ids.\n"
             "- Use the seed-to-valid-id hints when the seed uses semantic phrases instead of exact ids.\n"
@@ -872,13 +927,14 @@ class ResearchController:
             "- Do not use --bar-limit as a research lever. The controller strips it unless the user explicitly asks.\n"
             "- sensitivity-basket may auto-adjust the timeframe down to the profile's lowest active indicator timeframe.\n"
             "- Saved sensitivity responses now include requested_timeframe and effective_timeframe fields.\n"
-            "- Internal artifact fields like bar_limit, effective_bar_limit, and window_truncated are implementation detail. Do not reason about them as strategy.\n"
+            "- Raw bar-count mechanics are implementation detail. Prefer effective_window_days and effective_window_months when judging whether a requested horizon was really satisfied.\n"
             "- `__BASKET__` may appear in saved summaries as an aggregate label. Never pass it as --instrument.\n"
             "- Invalid instrument aliases now fail fast with close-match suggestions.\n"
             "- A normal managed run should explore multiple candidates. Do not stop after the first strong score; branch and test at least a few follow-up ideas.\n"
             "- Do not finish the run as soon as the minimum threshold is reached if there is still room in the step budget for a couple more meaningful contrasts.\n"
             "- If a sensitivity run already auto-logged the attempt, avoid redundant log_attempt unless you are recovering from a missing ledger entry.\n"
             "- Use compare-sensitivity when comparing artifact directories or inspecting score details, not as a mandatory step after every successful sensitivity run.\n"
+            "- Sweeps are a required part of healthy search, especially in early and mid phases. Do not spend the whole run on manual one-off edits only.\n"
             "- Post-eval files are sensitivity-response.json, deep-replay-job.json, and best-cell-path-detail.json when available.\n"
             "- Do not try to read summary.json after sensitivity-basket.\n"
             "- Do not use old saved profiles as candidate seeds for this run.\n"

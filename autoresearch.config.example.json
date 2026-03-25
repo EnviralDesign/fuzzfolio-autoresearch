@@ -63,7 +63,10 @@
     "horizon_early_months": 3,
     "horizon_mid_months": 12,
     "horizon_late_months": 24,
-    "horizon_wrap_up_months": 36
+    "horizon_wrap_up_months": 36,
+    "coverage_reference_timeframe": "M15",
+    "coverage_min_mid_months": 11,
+    "coverage_min_wrap_up_months": 34
   },
   "supervisor": {
     "max_steps": 200,

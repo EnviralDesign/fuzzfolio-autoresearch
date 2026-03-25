@@ -19,6 +19,7 @@ Use the available tools to keep exploring the scoring-profile search space, eval
    - non-frontier attempts become faint gray dots
 8. Do not stop early just because you feel like you have a decent candidate.
 9. If you think you are done, verify that you have actually logged meaningful attempts and met the run goal.
+10. Sweeps are a normal part of healthy search. Do not spend the whole run on one-off manual edits only.
 
 ## Workflow
 
@@ -26,23 +27,30 @@ Use the available tools to keep exploring the scoring-profile search space, eval
 2. Treat the dealt hand as a real constraint set, not loose inspiration.
 3. If the hand is clearly redundant or poor, reshuffle at most once and record that choice in the run notes.
 4. After a reshuffle, fully commit to the new hand. Do not half-follow two different hands.
-5. Author a new portable profile JSON under the current run directory using only the seed-guided idea space for this run.
-6. Create the profile through the CLI.
-7. Evaluate candidates with `sensitivity` or `sensitivity-basket`.
-8. Update only the profiles created during this run when branching or refining.
-9. Log evaluated attempts so the ledger and plot stay current.
-10. Continue until the controller or the user explicitly stops the run.
+5. In the early phase, be permissive: branch broadly, screen cheaply, and accept rough-looking ideas as long as they teach you something.
+6. Author a new portable profile JSON under the current run directory using only the seed-guided idea space for this run.
+7. Create the profile through the CLI.
+8. Evaluate candidates with `sensitivity` or `sensitivity-basket`.
+9. Use deterministic sweep helpers to probe promising families, especially in early and mid phases, before overcommitting to hand-tuned one-off variants.
+10. Update only the profiles created during this run when branching or refining.
+11. As evidence accumulates, become more restrictive: fewer families, tighter hypotheses, longer horizons, and stronger robustness demands.
+12. Log evaluated attempts so the ledger and plot stay current.
+13. Continue until the controller or the user explicitly stops the run.
 
 ## Research Heuristics
 
 - Prefer coherent candidate families over random indicator piles.
 - Start from a market-behavior hypothesis, not just a list of indicators.
+- A good early run can start with one high-timeframe condition doing broad regime selection, then add a lower-timeframe condition for entry timing or confirmation.
+- Use early phase to discover where entries want to live. Use mid and late phases to tighten, layer, and pressure-test that idea rather than endlessly inventing unrelated profiles.
 - Prefer clustered positive expectancy and supportive neighboring cells over isolated local spikes.
 - Prefer sensible selectivity. Be skeptical of profiles that are too sparse to trust or so dense they look saturated.
+- Sparse early peaks are acceptable as discovery hints, but they should usually trigger broader follow-up, not immediate trust.
 - Treat path quality as separate from raw expectancy. A candidate with attractive score but ugly drawdown behavior is suspect.
 - Use contrast branches intentionally. If one branch is sharp and selective, test a steadier counterweight rather than minor cosmetic variants only.
 - Existing saved profiles may be inspected only if the user explicitly asks. They are not the candidate pool for autonomous runs.
 - If you need a benchmark, evaluate it again inside the current run. Do not rely on prior-run artifacts as the current decision surface.
+- Pay attention to the effective tested window. If the requested horizon was not actually satisfied, treat that as an evidence limit and respond accordingly.
 
 ## Failure Labels
 

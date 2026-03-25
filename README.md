@@ -81,6 +81,8 @@ The controller also uses threshold-triggered context compaction modeled after `c
 The runtime now uses named LLM provider profiles instead of one global provider block. By default in the example config, the main explorer loop uses the `openai-mini` profile (`gpt-5.4-mini`) while the supervisor guidance path uses the `xai-grok` profile (`grok-4.20-reasoning`).
 In plain `run` mode, the controller now uses an explicit phase policy: most of the run is exploration with finish disabled, and only the last few steps become wrap-up. The prompt also carries a rolling next-score target so the explorer has a concrete stretch goal instead of repeatedly trying to stop.
 The controller now also owns horizon policy by phase: early runs screen over shorter month-based windows, mid runs deepen evidence around one year, and late/wrap-up phases push survivors toward 2-3 year pressure tests. The worker is guided to think in weeks/months/years, not bars.
+The controller now treats sweeps as first-class search behavior instead of an optional side path. Early and mid phases explicitly encourage `sweep scaffold`, `sweep patch`, `sweep validate`, and then `sweep submit` around promising families before the run settles into manual profile tweaking only.
+Instrument context is also coverage-aware now. The runtime asks the CLI for market coverage at a reference timeframe and surfaces buffered shortlist hints such as roughly `11` months for mid-phase work and `34` months for long-horizon wrap-up, so the agent naturally favors symbols that can actually satisfy the requested evidence horizon.
 
 ## Multi-provider config
 
@@ -149,6 +151,28 @@ Profiles may also choose a transport explicitly when needed:
 - `responses`
 
 This matters most for xAI multi-agent models, which require `transport: "responses"`.
+
+## Sweep-Aware Search
+
+The preferred deterministic sweep workflow is now:
+
+```powershell
+fuzzfolio-agent-cli sweep scaffold --profile-ref <PROFILE_ID> --instrument EURUSD --axis profile.notificationThreshold=70,75,80 --axis indicator[0].config.lookbackBars=1,2,3 --out .\sweep.json
+fuzzfolio-agent-cli sweep patch --definition .\sweep.json --set lookback_months=3 --set top_n=8 --out .\sweep.tuned.json
+fuzzfolio-agent-cli sweep validate --definition .\sweep.tuned.json
+fuzzfolio-agent-cli sweep submit --definition .\sweep.tuned.json
+```
+
+This is intentionally easier than writing raw sweep JSON by hand. It lets the agent express sweep intent in terms of profile fields, indicator config fields, and TA-Lib params.
+
+Two important knobs that are now easy to sweep:
+
+- `profile.notificationThreshold`
+  - the aggregate score threshold for triggering entries
+- `indicator[N].config.lookbackBars`
+  - signal persistence / how long a qualifying condition must persist
+
+These are useful both for permissive early screening and for later hardening around a surviving family.
 
 ## Supervised Runs
 
@@ -254,6 +278,19 @@ The runtime now treats the CLI's scoring surface as authoritative:
 - each attempt record also stores supporting fields like `psr`, `dsr`, `k_ratio`, `sharpe_r`, and `legacy_rank_score` when available
 
 Attempts without a usable `quality_score` are kept for observability, but they are not treated as scored frontier points. The Python side no longer invents its own temporary scoring formula.
+
+## Horizon Validity
+
+Saved sensitivity artifacts now expose both requested and effective window information under `market_data_window`, including:
+
+- `requested_window_start`
+- `requested_window_end`
+- `effective_window_start`
+- `effective_window_end`
+- `effective_window_days`
+- `effective_window_months`
+
+That means the worker and supervisor can reason about evidence horizon in months and days instead of bars. If a requested 24-month test only delivered 2.8 effective months, the run can now see that directly without digging through raw bar mechanics.
 
 ## Long-running behavior
 
