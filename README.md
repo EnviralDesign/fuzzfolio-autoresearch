@@ -39,13 +39,13 @@ Local-only files the runtime reads:
 - `autoresearch.config.json`
 - `.agentsecrets`
 
-Keep both untracked. `.agentsecrets` is the place for the provider key and fallback Fuzzfolio login credentials.
+Keep both untracked. `.agentsecrets` is the place for per-profile provider keys and fallback Fuzzfolio login credentials.
 
 ## Quick start
 
 1. Copy `autoresearch.config.example.json` to `autoresearch.config.json`.
 2. Copy `.agentsecrets.example` to `.agentsecrets`.
-3. Fill in the provider API key.
+3. Fill in the provider API keys you want to use.
 4. Adjust Fuzzfolio settings if your local stack differs from defaults.
 5. Run:
 
@@ -66,7 +66,57 @@ uv run autoresearch run --max-steps 20 --json
 The default live trace uses `rich` for colored panels and step/result tables so it is easier to watch during longer managed runs.
 The default provider completion budget is intentionally a bit roomy because the agent sometimes needs to emit a full portable profile JSON in one action.
 The controller also uses threshold-triggered context compaction modeled after `codex-rs`: once the live prompt estimate crosses the configured token threshold, it writes a checkpoint summary and rebuilds the active history from fresh run state plus a short recent tail.
-By default, the main explorer loop uses `gpt-5.4-mini`, while the finish-denial supervisor guidance path uses `gpt-5.4`. You can override these with `provider.model` and `provider.supervisor_model`.
+The runtime now uses named LLM provider profiles instead of one global provider block. By default in the example config, the main explorer loop uses the `openai-mini` profile (`gpt-5.4-mini`) while the supervisor guidance path uses the `xai-grok` profile (`grok-4.20-reasoning`).
+In plain `run` mode, the controller now uses an explicit phase policy: most of the run is exploration with finish disabled, and only the last few steps become wrap-up. The prompt also carries a rolling next-score target so the explorer has a concrete stretch goal instead of repeatedly trying to stop.
+The controller now also owns horizon policy by phase: early runs screen over shorter month-based windows, mid runs deepen evidence around one year, and late/wrap-up phases push survivors toward 2-3 year pressure tests. The worker is guided to think in weeks/months/years, not bars.
+
+## Multi-provider config
+
+Provider selection now lives in two places:
+
+- `llm.explorer_profile`
+- `llm.supervisor_profile`
+
+Each named profile is defined under `providers`.
+
+Example:
+
+```json
+{
+  "llm": {
+    "explorer_profile": "openai-mini",
+    "supervisor_profile": "xai-grok"
+  },
+  "providers": {
+    "openai-mini": {
+      "type": "openai",
+      "model": "gpt-5.4-mini"
+    },
+    "xai-grok": {
+      "type": "xai",
+      "model": "grok-4.20-reasoning"
+    }
+  }
+}
+```
+
+Secrets are matched by profile name in `.agentsecrets`:
+
+```json
+{
+  "providers": {
+    "openai-mini": { "api_key": "..." },
+    "xai-grok": { "api_key": "..." }
+  }
+}
+```
+
+The current provider types are:
+
+- `openai`
+- `xai`
+- `openrouter`
+- `openai_compatible`
 
 ## Supervised Runs
 
@@ -170,3 +220,4 @@ The Python side no longer applies ad hoc penalties for trade count, signal count
 The controller includes:
 - a yield guard so the model cannot immediately declare success without logging meaningful work
 - periodic checkpoint compaction so prompt state stays bounded over longer runs
+- controller-owned horizon injection for sensitivity runs, so phase-appropriate `--lookback-months` is added automatically when the model omits it

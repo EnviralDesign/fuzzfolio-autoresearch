@@ -85,10 +85,16 @@ def cmd_doctor() -> int:
         "secrets_path": str(config.secrets_path),
         "cli_command": config.fuzzfolio.cli_command,
         "cli_resolved_path": cli_path,
-        "provider_model": config.provider.model,
-        "supervisor_model": config.provider.supervisor_model,
-        "provider_api_base": config.provider.api_base,
-        "provider_has_api_key": bool(config.provider.api_key),
+        "explorer_profile": config.llm.explorer_profile,
+        "explorer_provider_type": config.provider.provider_type,
+        "explorer_model": config.provider.model,
+        "explorer_api_base": config.provider.api_base,
+        "explorer_has_api_key": bool(config.provider.api_key),
+        "supervisor_profile": config.llm.supervisor_profile,
+        "supervisor_provider_type": config.supervisor_provider.provider_type,
+        "supervisor_model": config.supervisor_provider.model,
+        "supervisor_api_base": config.supervisor_provider.api_base,
+        "supervisor_has_api_key": bool(config.supervisor_provider.api_key),
         "supervisor_max_steps": config.supervisor.max_steps,
         "supervisor_window_start": config.supervisor.window_start,
         "supervisor_window_end": config.supervisor.window_end,
@@ -100,7 +106,7 @@ def cmd_doctor() -> int:
     return 0
 
 
-def _short_text(value: str, limit: int = 140) -> str:
+def _short_text(value: str, limit: int = 220) -> str:
     compact = " ".join(value.split())
     if len(compact) <= limit:
         return compact
@@ -203,7 +209,7 @@ def _summarize_action(action: dict[str, object]) -> str:
 def _summarize_result(result: dict[str, object]) -> str:
     tool = str(result.get("tool", "unknown"))
     if result.get("error"):
-        return f"{tool} failed | {_short_text(str(result.get('error')), 120)}"
+        return f"{tool} failed | {_short_text(str(result.get('error')), 220)}"
     if tool == "run_cli":
         ok = bool(result.get("ok"))
         status = "ok" if ok else "failed"
@@ -228,7 +234,7 @@ def _summarize_result(result: dict[str, object]) -> str:
                 parts.append("timeframe=auto-adjusted")
             stderr = payload.get("stderr")
             if isinstance(stderr, str) and stderr.strip() and not ok:
-                parts.append(f"error={_short_text(stderr, 120)}")
+                parts.append(f"error={_short_text(stderr, 220)}")
         return " | ".join(parts)
     if tool == "write_file":
         path = str(result.get("path", ""))
@@ -249,20 +255,23 @@ def _summarize_result(result: dict[str, object]) -> str:
             return f"log_attempt {payload.get('status')} | score={payload.get('composite_score')}"
     if tool == "yield_guard":
         base = str(result.get("supervisor_message") or result.get("message", ""))
-        parts = [f"yield_guard | {_short_text(base, 160)}"]
+        parts = [f"yield_guard | {_short_text(base, 300)}"]
+        score_target = result.get("score_target")
+        if isinstance(score_target, str) and score_target.strip():
+            parts.append("target: " + _short_text(score_target, 140))
         questions = result.get("questions")
         if isinstance(questions, list) and questions:
-            parts.append("q: " + " / ".join(_short_text(str(item), 70) for item in questions[:2]))
+            parts.append("q: " + " / ".join(_short_text(str(item), 120) for item in questions[:2]))
         next_moves = result.get("next_moves")
         if isinstance(next_moves, list) and next_moves:
-            parts.append("next: " + _short_text(str(next_moves[0]), 80))
+            parts.append("next: " + _short_text(str(next_moves[0]), 160))
         return " | ".join(parts)
     if tool == "step_guard":
-        return f"step_guard | {_short_text(str(result.get('message', '')), 120)}"
+        return f"step_guard | {_short_text(str(result.get('message', '')), 220)}"
     if tool == "response_guard":
-        return f"response_guard | {_short_text(str(result.get('error', '')), 120)}"
+        return f"response_guard | {_short_text(str(result.get('error', '')), 220)}"
     if tool == "finish":
-        return f"finish | {_short_text(str(result.get('summary', '')), 120)}"
+        return f"finish | {_short_text(str(result.get('summary', '')), 240)}"
     return tool
 
 
@@ -295,6 +304,15 @@ def _render_run_header(event: dict[str, object]) -> None:
     grid.add_row("Run", str(event.get("run_id")))
     grid.add_row("Mode", str(event.get("mode") or "run"))
     grid.add_row("Steps", str(event.get("max_steps")))
+    phase = event.get("phase")
+    if isinstance(phase, str) and phase.strip():
+        grid.add_row("Phase", phase)
+    horizon_target = event.get("horizon_target")
+    if isinstance(horizon_target, str) and horizon_target.strip():
+        grid.add_row("Horizon", _short_text(horizon_target, 110))
+    score_target = event.get("score_target")
+    if isinstance(score_target, str) and score_target.strip():
+        grid.add_row("Target", _short_text(score_target, 110))
     grid.add_row("Dir", _display_path(str(event.get("run_dir"))))
     grid.add_row("Run Plot", _display_path(str(event.get("run_progress_plot"))))
     grid.add_row("Global Plot", _display_path(str(event.get("progress_plot"))))
@@ -310,9 +328,22 @@ def _render_run_header(event: dict[str, object]) -> None:
 
 def _render_step(step_payload: dict[str, Any]) -> None:
     step = step_payload.get("step")
-    reasoning = _short_text(str(step_payload.get("reasoning", "")), 220)
+    reasoning = _short_text(str(step_payload.get("reasoning", "")), 420)
+    meta_bits: list[str] = []
+    phase = step_payload.get("phase")
+    if isinstance(phase, str) and phase.strip():
+        meta_bits.append(f"phase={phase}")
+    horizon_target = step_payload.get("horizon_target")
+    if isinstance(horizon_target, str) and horizon_target.strip():
+        meta_bits.append(_short_text(horizon_target, 120))
+    score_target = step_payload.get("score_target")
+    if isinstance(score_target, str) and score_target.strip():
+        meta_bits.append(_short_text(score_target, 120))
+    panel_body = reasoning
+    if meta_bits:
+        panel_body = panel_body + "\n\n" + " | ".join(meta_bits)
     reasoning_panel = Panel(
-        Text(reasoning, style="white"),
+        Text(panel_body, style="white"),
         title=f"[bold blue]Step {step}[/bold blue]",
         border_style="blue",
         box=box.ROUNDED,
@@ -365,7 +396,7 @@ def _render_run_footer(result: dict[str, object]) -> None:
     grid.add_row("Global Plot", _display_path(str(result.get("progress_plot"))))
     summary = result.get("summary")
     if isinstance(summary, str) and summary.strip():
-        grid.add_row("Summary", _short_text(summary, 260))
+        grid.add_row("Summary", _short_text(summary, 420))
     console.print(
         Panel(
             grid,

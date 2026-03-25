@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, time, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -13,7 +13,7 @@ from .config import AppConfig
 from .fuzzfolio import CliError, CommandResult, FuzzfolioCli
 from .ledger import append_attempt, attempt_exists, load_attempts, make_attempt_record
 from .plotting import compute_frontier, render_progress_artifacts
-from .provider import ChatMessage, OpenAICompatibleProvider, ProviderError
+from .provider import ChatMessage, ProviderError, create_provider
 from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 
@@ -52,6 +52,9 @@ Rules:
 - Runtime placeholders like `<created_profile_ref>` may appear in tool arguments. Reuse them exactly when provided; the controller will substitute the real value.
 - After `sensitivity-basket`, the expected artifact files are `sensitivity-response.json`, `deep-replay-job.json`, and sometimes `best-cell-path-detail.json`. Do not look for `summary.json`.
 - `sensitivity` and `sensitivity-basket` now expose `requested_timeframe` and `effective_timeframe` in JSON output when you inspect stdout or saved responses.
+- Think in weeks, months, and years of evidence, not in raw bars.
+- The controller owns default horizon policy and may inject phase-appropriate `--lookback-months` into sensitivity runs when you omit it.
+- Do not use `--bar-limit` as a research lever unless the user explicitly asks. Treat bar counts as implementation detail, not strategy.
 - `__BASKET__` may appear inside saved analysis summaries as an aggregate label. It is not a valid CLI instrument argument. Use exact catalog symbols like EURUSD.
 - `finish` is terminal for the whole run. Never use it to mean "continue" or "step complete".
 - Only call `finish` when you intend to stop the run now and can provide a concise non-empty final summary.
@@ -107,7 +110,11 @@ Rules:
 - Work only within the current run, its seed hand, and run-owned artifacts.
 - Do not suggest invalid CLI syntax or invalid instruments like __BASKET__.
 - Prefer hypothesis pivots, contrast branches, and meaningful parameter or timeframe shifts over repetitive retries.
+- Horizon policy belongs to you and the controller, not the explorer. Push the run to think in months and years, not bars.
+- Early phase should screen cheaply, mid phase should deepen evidence, and late phase should pressure-test survivors over longer horizons.
 - If the explorer is drifting, say so plainly.
+- If the controller provides a score target, use it as a believable next stretch goal instead of vague encouragement.
+- During exploration phase, do not encourage finish or summary-writing.
 """
 
 SUMMARY_PREFIX = """Another language model started to solve this problem and produced a summary of its thinking process.
@@ -158,13 +165,8 @@ class RunPolicy:
 class ResearchController:
     def __init__(self, app_config: AppConfig):
         self.config = app_config
-        self.provider = OpenAICompatibleProvider(app_config.provider)
-        self.supervisor_provider = OpenAICompatibleProvider(
-            replace(
-                app_config.provider,
-                model=app_config.provider.supervisor_model or app_config.provider.model,
-            )
-        )
+        self.provider = create_provider(app_config.provider)
+        self.supervisor_provider = create_provider(app_config.supervisor_provider)
         self.cli = FuzzfolioCli(app_config.fuzzfolio)
         self.profile_sources: dict[str, Path] = {}
         self.last_created_profile_ref: str | None = None
@@ -250,6 +252,40 @@ class ResearchController:
             raise ValueError("run_cli command string only contained the CLI executable name.")
         return parts
 
+    def _strip_cli_flag(self, args: list[str], flag: str) -> list[str]:
+        stripped: list[str] = []
+        index = 0
+        while index < len(args):
+            token = str(args[index])
+            if token == flag:
+                index += 2
+                continue
+            stripped.append(token)
+            index += 1
+        return stripped
+
+    def _apply_horizon_policy_to_cli_args(
+        self,
+        args: list[str],
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> list[str]:
+        if not args:
+            return args
+        command_head = args[:2]
+        horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
+        lookback_months = str(horizon_policy["lookback_months"])
+        if args[0] in {"sensitivity", "sensitivity-basket"}:
+            effective = self._strip_cli_flag(list(args), "--bar-limit")
+            if "--lookback-months" not in effective:
+                effective.extend(["--lookback-months", lookback_months])
+            return effective
+        if command_head == ["deep-replay", "cell-detail"]:
+            return self._strip_cli_flag(list(args), "--bar-limit")
+        return args
+
     def _timestamp(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
@@ -306,6 +342,200 @@ class ResearchController:
                 f"artifact={attempt.get('artifact_dir')}"
             )
         return "\n".join(lines)
+
+    def _run_attempts(self, run_id: str) -> list[dict[str, Any]]:
+        return [
+            attempt
+            for attempt in load_attempts(self.config.attempts_path)
+            if str(attempt.get("run_id", "")) == run_id
+        ]
+
+    def _scored_attempts(self, attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+
+    def _score_better(self, left: float, right: float) -> bool:
+        if self.config.research.plot_lower_is_better:
+            return left < right
+        return left > right
+
+    def _best_attempt(self, attempts: list[dict[str, Any]]) -> dict[str, Any] | None:
+        scored = self._scored_attempts(attempts)
+        if not scored:
+            return None
+        return min(
+            scored,
+            key=lambda attempt: float(attempt.get("composite_score")),
+        ) if self.config.research.plot_lower_is_better else max(
+            scored,
+            key=lambda attempt: float(attempt.get("composite_score")),
+        )
+
+    def _format_score(self, value: Any) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "n/a"
+        text = f"{number:.3f}"
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text
+
+    def _run_phase_info(self, step: int, step_limit: int, policy: RunPolicy) -> dict[str, Any]:
+        wrap_up_steps = max(1, min(step_limit, self.config.research.run_wrap_up_steps))
+        wrap_up_start = max(1, step_limit - wrap_up_steps + 1)
+        if step >= wrap_up_start:
+            return {
+                "name": "wrap_up",
+                "wrap_up_start": wrap_up_start,
+                "finish_enabled": policy.allow_finish,
+                "summary": (
+                    f"Wrap-up phase: use the remaining {step_limit - step + 1} step(s) to validate the likely winner "
+                    f"over the longest horizon and close obvious evidence gaps."
+                ),
+            }
+        exploration_steps = max(1, wrap_up_start - 1)
+        if exploration_steps <= 1:
+            phase_name = "mid"
+        else:
+            progress = (step - 1) / max(1, exploration_steps - 1)
+            early_cutoff = min(max(self.config.research.phase_early_ratio, 0.05), 0.9)
+            late_cutoff = min(max(self.config.research.phase_late_ratio, early_cutoff + 0.05), 0.98)
+            if progress < early_cutoff:
+                phase_name = "early"
+            elif progress < late_cutoff:
+                phase_name = "mid"
+            else:
+                phase_name = "late"
+        summaries = {
+            "early": (
+                f"Early phase: branch broadly, reject weak ideas cheaply, and prioritize fresh contrasts until step {wrap_up_start}."
+            ),
+            "mid": (
+                f"Mid phase: narrow onto the strongest families, deepen evidence, and prefer systematic follow-up over random wandering before wrap-up at step {wrap_up_start}."
+            ),
+            "late": (
+                f"Late phase: stop spraying branches, focus on one or two survivors, and pressure-test them before wrap-up begins at step {wrap_up_start}."
+            ),
+        }
+        return {
+            "name": phase_name,
+            "wrap_up_start": wrap_up_start,
+            "finish_enabled": False,
+            "summary": summaries[phase_name],
+        }
+
+    def _horizon_policy_snapshot(
+        self,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> dict[str, Any]:
+        phase_info = self._run_phase_info(step, step_limit, policy)
+        phase_name = str(phase_info.get("name") or "mid")
+        phase_months = {
+            "early": self.config.research.horizon_early_months,
+            "mid": self.config.research.horizon_mid_months,
+            "late": self.config.research.horizon_late_months,
+            "wrap_up": self.config.research.horizon_wrap_up_months,
+            "managed": self.config.research.horizon_mid_months,
+        }
+        months = int(phase_months.get(phase_name, self.config.research.horizon_mid_months))
+        if phase_name == "early":
+            rationale = "cheap early screening: test broad branches over a shorter horizon before spending more compute"
+            guidance = (
+                f"Target about {months} months of evidence. Favor cheap branch-heavy screening and reject weak ideas quickly."
+            )
+        elif phase_name == "mid":
+            rationale = "deepen evidence on the strongest branches before full pressure testing"
+            guidance = (
+                f"Target about {months} months of evidence. Narrow onto top branches and start validating that the edge persists."
+            )
+        elif phase_name == "late":
+            rationale = "pressure-test one or two survivors over longer history before wrap-up"
+            guidance = (
+                f"Target about {months} months of evidence. Prefer robustness, portability, and structured follow-up over novelty."
+            )
+        else:
+            rationale = "final validation should use the longest horizon in the session"
+            guidance = (
+                f"Target about {months} months of evidence. Use the last steps to validate the likely winner over the longest believable horizon."
+            )
+        return {
+            "phase": phase_name,
+            "lookback_months": months,
+            "summary": (
+                f"Controller horizon target: use about {months} months of history in this phase. "
+                "Think in weeks/months/years, not bars."
+            ),
+            "guidance": guidance,
+            "rationale": rationale,
+        }
+
+    def _score_target_snapshot(self, tool_context: ToolContext) -> dict[str, Any]:
+        run_best = self._best_attempt(self._run_attempts(tool_context.run_id))
+        global_best = self._best_attempt(load_attempts(self.config.attempts_path))
+
+        current_score = (
+            float(run_best.get("composite_score"))
+            if isinstance(run_best, dict) and run_best.get("composite_score") is not None
+            else None
+        )
+        global_score = (
+            float(global_best.get("composite_score"))
+            if isinstance(global_best, dict) and global_best.get("composite_score") is not None
+            else None
+        )
+
+        target_score: float | None = None
+        rationale: str
+        if current_score is not None and global_score is not None:
+            if self._score_better(current_score, global_score):
+                delta = max(3.0, abs(current_score) * 0.05)
+                target_score = current_score - delta if self.config.research.plot_lower_is_better else current_score + delta
+                rationale = "current run already leads the frontier, so the next target is a modest new best"
+            else:
+                gap = (current_score - global_score) if self.config.research.plot_lower_is_better else (global_score - current_score)
+                move = max(3.0, gap * 0.6)
+                if self.config.research.plot_lower_is_better:
+                    target_score = max(global_score, current_score - move)
+                else:
+                    target_score = min(global_score, current_score + move)
+                rationale = "bridge most of the gap toward the current frontier leader before wrap-up"
+        elif current_score is not None:
+            delta = max(3.0, abs(current_score) * 0.05)
+            target_score = current_score - delta if self.config.research.plot_lower_is_better else current_score + delta
+            rationale = "push past the current run leader with one believable improvement"
+        elif global_score is not None:
+            if self.config.research.plot_lower_is_better:
+                target_score = global_score + max(3.0, abs(global_score) * 0.2)
+            else:
+                target_score = global_score * 0.85 if global_score > 0 else global_score + 3.0
+            rationale = "land a first credible point within reach of the current global frontier"
+        else:
+            rationale = "log the first credible scored candidate before chasing higher targets"
+
+        if target_score is None:
+            summary = "Next target: log the first credible scored candidate for this run."
+        elif self.config.research.plot_lower_is_better:
+            summary = (
+                f"Next target: get composite_score <= {self._format_score(target_score)}. "
+                f"Current run best={self._format_score(current_score)}; global frontier best={self._format_score(global_score)}."
+            )
+        else:
+            summary = (
+                f"Next target: get composite_score >= {self._format_score(target_score)}. "
+                f"Current run best={self._format_score(current_score)}; global frontier best={self._format_score(global_score)}."
+            )
+
+        return {
+            "target_score": target_score,
+            "current_run_best_score": current_score,
+            "current_run_best_candidate": run_best.get("candidate_name") if isinstance(run_best, dict) else None,
+            "global_best_score": global_score,
+            "global_best_candidate": global_best.get("candidate_name") if isinstance(global_best, dict) else None,
+            "summary": summary,
+            "rationale": rationale,
+        }
 
     def _frontier_snapshot_text(self) -> str:
         attempts = load_attempts(self.config.attempts_path)
@@ -555,13 +785,25 @@ class ResearchController:
     def _step_log_path(self, tool_context: ToolContext) -> Path:
         return tool_context.run_dir / "controller-log.jsonl"
 
-    def _run_state_prompt(self, tool_context: ToolContext, policy: RunPolicy) -> str:
+    def _run_state_prompt(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int | None = None,
+        step_limit: int | None = None,
+    ) -> str:
         checkpoint_path = self._checkpoint_path(tool_context)
         checkpoint = (
             checkpoint_path.read_text(encoding="utf-8")
             if checkpoint_path.exists()
             else "No checkpoint summary exists yet."
         )
+        effective_step = step or 1
+        effective_step_limit = step_limit or self.config.research.max_steps
+        phase_info = self._run_phase_info(effective_step, effective_step_limit, policy)
+        horizon_policy = self._horizon_policy_snapshot(effective_step, effective_step_limit, policy)
+        score_target = self._score_target_snapshot(tool_context)
         cli_guide = (
             "Important CLI command shapes:\n"
             '- profiles clone-local --file <ABS_FILE> --out <ABS_FILE>\n'
@@ -571,7 +813,7 @@ class ResearchController:
             '- profiles create --file <ABS_FILE> --out <ABS_FILE>\n'
             '- profiles update --profile-ref <REF> --file <ABS_FILE> --out <ABS_FILE>\n'
             '- sweep submit --definition <ABS_FILE_OR_INLINE_JSON> --out <ABS_FILE> --pretty\n'
-            '- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --output-dir <ABS_DIR>\n'
+            '- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --lookback-months <MONTHS> --output-dir <ABS_DIR>\n'
             '- compare-sensitivity --input <ABS_DIR> --pretty\n'
             "Notes:\n"
             "- profiles scaffold generates a valid portable profile from live indicator templates and is preferred for fresh candidate bootstrapping.\n"
@@ -587,8 +829,11 @@ class ResearchController:
             "- The controller also returns created_profile_ref explicitly in the tool result. Prefer that field.\n"
             "- sensitivity and sensitivity-basket accept --pretty when printing JSON to stdout.\n"
             "- sensitivity-basket writes a directory when using --output-dir.\n"
+            "- If you omit --lookback-months on sensitivity commands, the controller will inject the phase-appropriate horizon automatically.\n"
+            "- Do not use --bar-limit as a research lever. The controller strips it unless the user explicitly asks.\n"
             "- sensitivity-basket may auto-adjust the timeframe down to the profile's lowest active indicator timeframe.\n"
             "- Saved sensitivity responses now include requested_timeframe and effective_timeframe fields.\n"
+            "- Internal artifact fields like bar_limit, effective_bar_limit, and window_truncated are implementation detail. Do not reason about them as strategy.\n"
             "- `__BASKET__` may appear in saved summaries as an aggregate label. Never pass it as --instrument.\n"
             "- Invalid instrument aliases now fail fast with close-match suggestions.\n"
             "- A normal managed run should explore multiple candidates. Do not stop after the first strong score; branch and test at least a few follow-up ideas.\n"
@@ -602,6 +847,7 @@ class ResearchController:
             "- If a profile create fails, do not evaluate that profile ref in the same step.\n"
             "- Reuse successful profile JSON patterns and valid TA-Lib parameter names from prior successful create results when branching.\n"
             "- MA_CROSSOVER uses fastperiod, slowperiod, and optional matype. It does not use signalperiod.\n"
+            "- Horizon strategy is phase-driven: early = cheap screening, mid = deeper confirmation, late/wrap-up = long-horizon pressure test.\n"
         )
         return (
             f"Repo root: {self.config.repo_root}\n"
@@ -610,6 +856,14 @@ class ResearchController:
             f"Run dir: {tool_context.run_dir}\n"
             "Auth status: already verified by controller at run start.\n"
             f"Allow finish: {policy.allow_finish}\n"
+            f"Step: {effective_step}/{effective_step_limit}\n"
+            f"Run phase: {phase_info['name']}\n"
+            f"Phase guidance: {phase_info['summary']}\n"
+            f"Horizon target: {horizon_policy['summary']}\n"
+            f"Horizon guidance: {horizon_policy['guidance']}\n"
+            f"Horizon rationale: {horizon_policy['rationale']}\n"
+            f"Score target: {score_target['summary']}\n"
+            f"Score target rationale: {score_target['rationale']}\n"
             f"Operating window: {policy.window_start or 'none'} -> {policy.window_end or 'none'} ({policy.timezone_name})\n"
             f"Profiles dir: {tool_context.profiles_dir}\n"
             f"Evals dir: {tool_context.evals_dir}\n"
@@ -945,13 +1199,27 @@ class ResearchController:
                 profile_ref = str(args[profile_index])
         return self._record_attempt_from_artifact(tool_context, artifact_dir, profile_ref=profile_ref)
 
-    def _execute_action(self, tool_context: ToolContext, action: dict[str, Any]) -> dict[str, Any]:
+    def _execute_action(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> dict[str, Any]:
         tool = action.get("tool")
         if tool == "run_cli":
             args = [
                 self._substitute_runtime_placeholders(str(item))
                 for item in self._normalize_cli_args(action)
             ]
+            args = self._apply_horizon_policy_to_cli_args(
+                args,
+                step=step,
+                step_limit=step_limit,
+                policy=policy,
+            )
             if "--profile-ref" in args:
                 profile_index = args.index("--profile-ref") + 1
                 if profile_index < len(args):
@@ -1082,26 +1350,33 @@ class ResearchController:
         tool_context: ToolContext,
         step: int,
         step_limit: int,
+        policy: RunPolicy,
         finish_summary: str,
         denial_message: str,
         current_step_payload: dict[str, Any],
     ) -> dict[str, Any] | None:
-        attempts = [
-            attempt
-            for attempt in load_attempts(self.config.attempts_path)
-            if str(attempt.get("run_id", "")) == tool_context.run_id
-        ]
+        attempts = self._run_attempts(tool_context.run_id)
         attempt_lines: list[str] = []
         for attempt in attempts[-6:]:
             attempt_lines.append(
                 f"- seq={attempt.get('sequence')} candidate={attempt.get('candidate_name')} "
                 f"score={attempt.get('composite_score')} basis={attempt.get('score_basis')}"
             )
+        phase_info = self._run_phase_info(step, step_limit, policy)
+        horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
+        score_target = self._score_target_snapshot(tool_context)
         prompt = (
             f"Step: {step}/{step_limit}\n"
+            f"Run phase: {phase_info['name']}\n"
+            f"Phase guidance: {phase_info['summary']}\n"
+            f"Horizon target: {horizon_policy['summary']}\n"
+            f"Horizon guidance: {horizon_policy['guidance']}\n"
+            f"Horizon rationale: {horizon_policy['rationale']}\n"
             f"Finish denial count: {self.finish_denials + 1}\n"
             f"Denied finish summary: {finish_summary or 'n/a'}\n"
             f"Controller denial: {denial_message}\n\n"
+            f"Score target:\n{score_target['summary']}\n"
+            f"Target rationale: {score_target['rationale']}\n\n"
             f"Frontier snapshot:\n{self._frontier_snapshot_text()}\n\n"
             f"Recent run attempts:\n{chr(10).join(attempt_lines) if attempt_lines else 'No attempts yet.'}\n\n"
             f"Recent step window:\n{self._recent_step_window_text(tool_context, current_step_payload)}\n"
@@ -1147,6 +1422,8 @@ class ResearchController:
         messages: list[ChatMessage],
         tool_context: ToolContext,
         policy: RunPolicy,
+        step: int,
+        step_limit: int,
     ) -> list[ChatMessage]:
         history_messages = messages[2:]
         if not history_messages:
@@ -1166,7 +1443,7 @@ class ResearchController:
         recent_tail = history_messages[-keep:] if keep else []
         return [
             ChatMessage(role="system", content=self._system_protocol_text(policy)),
-            ChatMessage(role="user", content=self._run_state_prompt(tool_context, policy)),
+            ChatMessage(role="user", content=self._run_state_prompt(tool_context, policy, step=step, step_limit=step_limit)),
             *recent_tail,
         ]
 
@@ -1175,13 +1452,15 @@ class ResearchController:
         messages: list[ChatMessage],
         tool_context: ToolContext,
         policy: RunPolicy,
+        step: int,
+        step_limit: int,
     ) -> list[ChatMessage]:
         trigger = self.config.research.compact_trigger_tokens
         if trigger <= 0:
             return messages
         if self._approx_message_tokens(messages) < trigger:
             return messages
-        return self._compact_message_history(messages, tool_context, policy)
+        return self._compact_message_history(messages, tool_context, policy, step, step_limit)
 
     def _allow_finish(
         self,
@@ -1195,23 +1474,30 @@ class ResearchController:
             return False, "Finish is disabled in supervised mode. Keep working until the supervisor stops prompting you."
         if not summary.strip():
             return False, "Do not use finish as a continue marker. Finish is terminal and requires a non-empty summary."
-        attempts = [
-            attempt
-            for attempt in load_attempts(self.config.attempts_path)
-            if str(attempt.get("run_id", "")) == tool_context.run_id
-        ]
-        min_attempts_before_finish = min(4, step_limit)
-        min_step_before_finish = min(step_limit, max(6, step_limit - 2))
-        if len(attempts) >= min_attempts_before_finish and step >= min_step_before_finish:
+        attempts = self._run_attempts(tool_context.run_id)
+        min_attempts_before_finish = min(self.config.research.finish_min_attempts, step_limit)
+        phase_info = self._run_phase_info(step, step_limit, policy)
+        score_target = self._score_target_snapshot(tool_context)
+        if phase_info["name"] != "wrap_up":
+            wrap_up_start = phase_info.get("wrap_up_start")
+            wrap_up_text = f"Wrap-up begins at step {wrap_up_start}." if wrap_up_start else "Stay in exploration mode."
+            return (
+                False,
+                (
+                    f"You are still in {phase_info['name']} phase. {phase_info['summary']} "
+                    f"{wrap_up_text} {score_target['summary']}"
+                ),
+            )
+        if len(attempts) >= min_attempts_before_finish:
             return True, ""
         if step >= step_limit:
             return True, ""
         return (
             False,
             (
-                "Do not finish yet. This run should explore multiple candidates before stopping. "
+                "Do not finish yet. Wrap-up is open, but this run still needs more evidence before stopping. "
                 f"Keep working until you have logged at least {min_attempts_before_finish} evaluated candidates "
-                f"and reached about step {min_step_before_finish}, or hit the step limit."
+                f"or hit the step limit. {score_target['summary']}"
             ),
         )
 
@@ -1225,7 +1511,11 @@ class ResearchController:
         self.cli.ensure_login()
         tool_context = self.create_run_context()
         self._refresh_progress_artifacts(tool_context)
+        effective_step_limit = max_steps or self.config.research.max_steps
         if progress_callback:
+            initial_phase = self._run_phase_info(1, effective_step_limit, policy)
+            initial_horizon = self._horizon_policy_snapshot(1, effective_step_limit, policy)
+            initial_target = self._score_target_snapshot(tool_context)
             progress_callback(
                 {
                     "event": "run_started",
@@ -1233,8 +1523,11 @@ class ResearchController:
                     "run_dir": str(tool_context.run_dir),
                     "run_progress_plot": str(tool_context.progress_plot_path),
                     "progress_plot": str(self.config.progress_plot_path),
-                    "max_steps": max_steps or self.config.research.max_steps,
+                    "max_steps": effective_step_limit,
                     "mode": policy.mode_name,
+                    "phase": initial_phase["name"],
+                    "horizon_target": initial_horizon["summary"],
+                    "score_target": initial_target["summary"],
                 }
             )
         if not self._within_operating_window(policy):
@@ -1250,12 +1543,16 @@ class ResearchController:
             return result
         messages: list[ChatMessage] = [
             ChatMessage(role="system", content=self._system_protocol_text(policy)),
-            ChatMessage(role="user", content=self._run_state_prompt(tool_context, policy)),
+            ChatMessage(role="user", content=self._run_state_prompt(tool_context, policy, step=1, step_limit=effective_step_limit)),
         ]
 
-        step_limit = max_steps or self.config.research.max_steps
+        step_limit = effective_step_limit
         for step in range(1, step_limit + 1):
             self.last_created_profile_ref = None
+            messages[1] = ChatMessage(
+                role="user",
+                content=self._run_state_prompt(tool_context, policy, step=step, step_limit=step_limit),
+            )
             if step > 1 and not self._within_operating_window(policy):
                 result = {
                     "status": "window_closed",
@@ -1267,7 +1564,7 @@ class ResearchController:
                 if progress_callback:
                     progress_callback({"event": "window_closed", "result": result})
                 return result
-            messages = self._maybe_compact_messages(messages, tool_context, policy)
+            messages = self._maybe_compact_messages(messages, tool_context, policy, step, step_limit)
             try:
                 raw_response = self.provider.complete_json(messages)
                 response = self._normalize_model_response(raw_response)
@@ -1285,9 +1582,13 @@ class ResearchController:
                     reasoning = str(response.get("reasoning", "")).strip()
                     validation_errors = self._validate_actions(actions)
             if validation_errors:
+                horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
                 step_payload = {
                     "step": step,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "phase": self._run_phase_info(step, step_limit, policy)["name"],
+                    "horizon_target": horizon_policy["summary"],
+                    "score_target": self._score_target_snapshot(tool_context)["summary"],
                     "reasoning": reasoning,
                     "actions": actions if isinstance(actions, list) else [],
                     "results": [
@@ -1326,9 +1627,13 @@ class ResearchController:
                 )
                 continue
 
+            horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
             step_payload: dict[str, Any] = {
                 "step": step,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
+                "phase": self._run_phase_info(step, step_limit, policy)["name"],
+                "horizon_target": horizon_policy["summary"],
+                "score_target": self._score_target_snapshot(tool_context)["summary"],
                 "reasoning": reasoning,
                 "actions": actions,
                 "results": [],
@@ -1338,7 +1643,13 @@ class ResearchController:
             finish_summary = ""
             for action in actions:
                 try:
-                    result = self._execute_action(tool_context, action)
+                    result = self._execute_action(
+                        tool_context,
+                        action,
+                        step=step,
+                        step_limit=step_limit,
+                        policy=policy,
+                    )
                 except Exception as exc:
                     result = {
                         "tool": str(action.get("tool", "unknown")),
@@ -1369,6 +1680,7 @@ class ResearchController:
                             tool_context,
                             step,
                             step_limit,
+                            policy,
                             proposed_summary,
                             message,
                             step_payload,
@@ -1377,6 +1689,9 @@ class ResearchController:
                             "tool": "yield_guard",
                             "message": message,
                             "finish_denials": self.finish_denials,
+                            "phase": step_payload.get("phase"),
+                            "horizon_target": step_payload.get("horizon_target"),
+                            "score_target": step_payload.get("score_target"),
                         }
                         if supervisor:
                             guard_payload["supervisor_message"] = supervisor.get("message")

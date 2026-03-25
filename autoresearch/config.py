@@ -12,14 +12,22 @@ SECRETS_FILE_NAME = ".agentsecrets"
 
 
 @dataclass
-class ProviderConfig:
-    api_base: str = "https://api.openai.com/v1"
+class ProviderProfileConfig:
+    provider_type: str = "openai"
+    api_base: str | None = None
     model: str = "gpt-5.4-mini"
-    supervisor_model: str = "gpt-5.4"
     api_key: str | None = None
+    api_key_env: str | None = None
     temperature: float = 0.2
     max_tokens: int = 3200
     timeout_seconds: int = 120
+    transport: str = "chat_completions"
+
+
+@dataclass
+class LlmConfig:
+    explorer_profile: str = "openai-mini"
+    supervisor_profile: str = "openai-supervisor"
 
 
 @dataclass
@@ -43,6 +51,14 @@ class ResearchConfig:
     compact_trigger_tokens: int = 12000
     compact_keep_recent_messages: int = 4
     supervisor_recent_steps: int = 6
+    finish_min_attempts: int = 4
+    run_wrap_up_steps: int = 3
+    phase_early_ratio: float = 0.35
+    phase_late_ratio: float = 0.75
+    horizon_early_months: int = 3
+    horizon_mid_months: int = 12
+    horizon_late_months: int = 24
+    horizon_wrap_up_months: int = 36
 
 
 @dataclass
@@ -59,10 +75,19 @@ class AppConfig:
     repo_root: Path
     config_path: Path
     secrets_path: Path
-    provider: ProviderConfig
+    llm: LlmConfig
+    providers: dict[str, ProviderProfileConfig]
     fuzzfolio: FuzzfolioConfig
     research: ResearchConfig
     supervisor: SupervisorConfig
+
+    @property
+    def provider(self) -> ProviderProfileConfig:
+        return self.providers[self.llm.explorer_profile]
+
+    @property
+    def supervisor_provider(self) -> ProviderProfileConfig:
+        return self.providers[self.llm.supervisor_profile]
 
     @property
     def runs_root(self) -> Path:
@@ -108,6 +133,152 @@ def _env_or_value(*keys: str, fallback: str | None = None) -> str | None:
     return fallback
 
 
+def _provider_defaults(provider_type: str) -> dict[str, Any]:
+    normalized = (provider_type or "openai").strip().lower()
+    if normalized == "xai":
+        return {
+            "api_base": "https://api.x.ai/v1",
+            "api_key_env": "XAI_API_KEY",
+            "timeout_seconds": 180,
+            "transport": "chat_completions",
+        }
+    if normalized == "openrouter":
+        return {
+            "api_base": "https://openrouter.ai/api/v1",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "timeout_seconds": 120,
+            "transport": "chat_completions",
+        }
+    if normalized == "openai_compatible":
+        return {
+            "api_base": None,
+            "api_key_env": "AUTORESEARCH_PROVIDER_API_KEY",
+            "timeout_seconds": 120,
+            "transport": "chat_completions",
+        }
+    return {
+        "api_base": "https://api.openai.com/v1",
+        "api_key_env": "OPENAI_API_KEY",
+        "timeout_seconds": 120,
+        "transport": "chat_completions",
+    }
+
+
+def _load_provider_profiles(
+    raw_config: dict[str, Any],
+    raw_secrets: dict[str, Any],
+) -> tuple[LlmConfig, dict[str, ProviderProfileConfig]]:
+    llm_cfg = raw_config.get("llm", {})
+    providers_cfg = raw_config.get("providers", {})
+    provider_secrets_map = raw_secrets.get("providers", {})
+
+    if providers_cfg:
+        profiles: dict[str, ProviderProfileConfig] = {}
+        for profile_name, profile_cfg in providers_cfg.items():
+            if not isinstance(profile_cfg, dict):
+                continue
+            provider_type = str(profile_cfg.get("type") or "openai")
+            defaults = _provider_defaults(provider_type)
+            secret_cfg = (
+                provider_secrets_map.get(profile_name, {})
+                if isinstance(provider_secrets_map.get(profile_name, {}), dict)
+                else {}
+            )
+            api_key_env = str(profile_cfg.get("api_key_env") or defaults["api_key_env"])
+            profiles[profile_name] = ProviderProfileConfig(
+                provider_type=provider_type,
+                api_base=_env_or_value(
+                    f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_BASE_URL",
+                    fallback=profile_cfg.get("api_base") or defaults["api_base"],
+                ),
+                model=_env_or_value(
+                    f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_MODEL",
+                    fallback=profile_cfg.get("model"),
+                )
+                or ProviderProfileConfig.model,
+                api_key=_env_or_value(
+                    f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_API_KEY",
+                    api_key_env,
+                    fallback=secret_cfg.get("api_key") or profile_cfg.get("api_key"),
+                ),
+                api_key_env=api_key_env,
+                temperature=float(profile_cfg.get("temperature", ProviderProfileConfig.temperature)),
+                max_tokens=int(profile_cfg.get("max_tokens", ProviderProfileConfig.max_tokens)),
+                timeout_seconds=int(profile_cfg.get("timeout_seconds", defaults["timeout_seconds"])),
+                transport=str(profile_cfg.get("transport") or defaults["transport"]),
+            )
+
+        explorer_profile = _env_or_value(
+            "AUTORESEARCH_EXPLORER_PROFILE",
+            fallback=llm_cfg.get("explorer_profile"),
+        ) or next(iter(profiles.keys()), LlmConfig.explorer_profile)
+        supervisor_profile = _env_or_value(
+            "AUTORESEARCH_SUPERVISOR_PROFILE",
+            fallback=llm_cfg.get("supervisor_profile"),
+        ) or explorer_profile
+
+        if explorer_profile not in profiles:
+            raise KeyError(f"Configured explorer_profile {explorer_profile!r} is not defined in providers.")
+        if supervisor_profile not in profiles:
+            raise KeyError(f"Configured supervisor_profile {supervisor_profile!r} is not defined in providers.")
+
+        return LlmConfig(
+            explorer_profile=explorer_profile,
+            supervisor_profile=supervisor_profile,
+        ), profiles
+
+    legacy_provider_cfg = raw_config.get("provider", {})
+    legacy_provider_secrets = raw_secrets.get("provider", {})
+    provider_type = str(legacy_provider_cfg.get("type") or "openai")
+    defaults = _provider_defaults(provider_type)
+    shared_api_key = _env_or_value(
+        "AUTORESEARCH_PROVIDER_API_KEY",
+        defaults["api_key_env"],
+        fallback=legacy_provider_secrets.get("api_key") or legacy_provider_cfg.get("api_key"),
+    )
+    shared_api_base = _env_or_value(
+        "AUTORESEARCH_PROVIDER_BASE_URL",
+        fallback=legacy_provider_cfg.get("api_base") or defaults["api_base"],
+    )
+    shared_temperature = float(legacy_provider_cfg.get("temperature", ProviderProfileConfig.temperature))
+    shared_max_tokens = int(legacy_provider_cfg.get("max_tokens", ProviderProfileConfig.max_tokens))
+    shared_timeout = int(legacy_provider_cfg.get("timeout_seconds", defaults["timeout_seconds"]))
+    explorer_model = _env_or_value(
+        "AUTORESEARCH_PROVIDER_MODEL",
+        fallback=legacy_provider_cfg.get("model"),
+    ) or ProviderProfileConfig.model
+    supervisor_model = _env_or_value(
+        "AUTORESEARCH_SUPERVISOR_MODEL",
+        fallback=legacy_provider_cfg.get("supervisor_model"),
+    ) or "gpt-5.4"
+
+    profiles = {
+        "openai-mini": ProviderProfileConfig(
+            provider_type=provider_type,
+            api_base=shared_api_base,
+            model=explorer_model,
+            api_key=shared_api_key,
+            api_key_env=str(defaults["api_key_env"]),
+            temperature=shared_temperature,
+            max_tokens=shared_max_tokens,
+            timeout_seconds=shared_timeout,
+            transport=str(defaults["transport"]),
+        ),
+        "openai-supervisor": ProviderProfileConfig(
+            provider_type=provider_type,
+            api_base=shared_api_base,
+            model=supervisor_model,
+            api_key=shared_api_key,
+            api_key_env=str(defaults["api_key_env"]),
+            temperature=shared_temperature,
+            max_tokens=shared_max_tokens,
+            timeout_seconds=shared_timeout,
+            transport=str(defaults["transport"]),
+        ),
+    }
+    return LlmConfig(), profiles
+
+
 def load_config(repo_root: Path | None = None) -> AppConfig:
     root = find_repo_root(repo_root)
     config_path = root / CONFIG_FILE_NAME
@@ -115,31 +286,11 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     raw_config = load_json_file(config_path)
     raw_secrets = load_json_file(secrets_path)
 
-    provider_cfg = raw_config.get("provider", {})
-    provider_secrets = raw_secrets.get("provider", {})
     fuzzfolio_cfg = raw_config.get("fuzzfolio", {})
     fuzzfolio_secrets = raw_secrets.get("fuzzfolio", {})
     research_cfg = raw_config.get("research", {})
     supervisor_cfg = raw_config.get("supervisor", {})
-    provider = ProviderConfig(
-        api_base=_env_or_value("AUTORESEARCH_PROVIDER_BASE_URL", fallback=provider_cfg.get("api_base"))
-        or ProviderConfig.api_base,
-        model=_env_or_value("AUTORESEARCH_PROVIDER_MODEL", fallback=provider_cfg.get("model"))
-        or ProviderConfig.model,
-        supervisor_model=_env_or_value(
-            "AUTORESEARCH_SUPERVISOR_MODEL",
-            fallback=provider_cfg.get("supervisor_model"),
-        )
-        or ProviderConfig.supervisor_model,
-        api_key=_env_or_value(
-            "AUTORESEARCH_PROVIDER_API_KEY",
-            "OPENAI_API_KEY",
-            fallback=provider_secrets.get("api_key") or provider_cfg.get("api_key"),
-        ),
-        temperature=float(provider_cfg.get("temperature", ProviderConfig.temperature)),
-        max_tokens=int(provider_cfg.get("max_tokens", ProviderConfig.max_tokens)),
-        timeout_seconds=int(provider_cfg.get("timeout_seconds", ProviderConfig.timeout_seconds)),
-    )
+    llm, providers = _load_provider_profiles(raw_config, raw_secrets)
 
     fuzzfolio = FuzzfolioConfig(
         cli_command=_env_or_value("AUTORESEARCH_FUZZFOLIO_CLI", fallback=fuzzfolio_cfg.get("cli_command"))
@@ -191,6 +342,54 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                 ResearchConfig.supervisor_recent_steps,
             )
         ),
+        finish_min_attempts=int(
+            research_cfg.get(
+                "finish_min_attempts",
+                ResearchConfig.finish_min_attempts,
+            )
+        ),
+        run_wrap_up_steps=int(
+            research_cfg.get(
+                "run_wrap_up_steps",
+                ResearchConfig.run_wrap_up_steps,
+            )
+        ),
+        phase_early_ratio=float(
+            research_cfg.get(
+                "phase_early_ratio",
+                ResearchConfig.phase_early_ratio,
+            )
+        ),
+        phase_late_ratio=float(
+            research_cfg.get(
+                "phase_late_ratio",
+                ResearchConfig.phase_late_ratio,
+            )
+        ),
+        horizon_early_months=int(
+            research_cfg.get(
+                "horizon_early_months",
+                ResearchConfig.horizon_early_months,
+            )
+        ),
+        horizon_mid_months=int(
+            research_cfg.get(
+                "horizon_mid_months",
+                ResearchConfig.horizon_mid_months,
+            )
+        ),
+        horizon_late_months=int(
+            research_cfg.get(
+                "horizon_late_months",
+                ResearchConfig.horizon_late_months,
+            )
+        ),
+        horizon_wrap_up_months=int(
+            research_cfg.get(
+                "horizon_wrap_up_months",
+                ResearchConfig.horizon_wrap_up_months,
+            )
+        ),
     )
     supervisor = SupervisorConfig(
         max_steps=(
@@ -208,7 +407,8 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
         repo_root=root,
         config_path=config_path,
         secrets_path=secrets_path,
-        provider=provider,
+        llm=llm,
+        providers=providers,
         fuzzfolio=fuzzfolio,
         research=research,
         supervisor=supervisor,

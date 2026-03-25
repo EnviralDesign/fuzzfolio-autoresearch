@@ -1,11 +1,25 @@
 {
-  "provider": {
-    "api_base": "https://api.openai.com/v1",
-    "model": "gpt-5.4-mini",
-    "supervisor_model": "gpt-5.4",
-    "temperature": 0.2,
-    "max_tokens": 3200,
-    "timeout_seconds": 120
+  "llm": {
+    "explorer_profile": "openai-mini",
+    "supervisor_profile": "xai-grok"
+  },
+  "providers": {
+    "openai-mini": {
+      "type": "openai",
+      "api_base": "https://api.openai.com/v1",
+      "model": "gpt-5.4-mini",
+      "temperature": 0.2,
+      "max_tokens": 3200,
+      "timeout_seconds": 120
+    },
+    "xai-grok": {
+      "type": "xai",
+      "api_base": "https://api.x.ai/v1",
+      "model": "grok-4.20-reasoning",
+      "temperature": 0.2,
+      "max_tokens": 3200,
+      "timeout_seconds": 180
+    }
   },
   "fuzzfolio": {
     "cli_command": "fuzzfolio-agent-cli",
@@ -20,7 +34,15 @@
     "plot_lower_is_better": false,
     "compact_trigger_tokens": 12000,
     "compact_keep_recent_messages": 4,
-    "supervisor_recent_steps": 6
+    "supervisor_recent_steps": 6,
+    "finish_min_attempts": 4,
+    "run_wrap_up_steps": 3,
+    "phase_early_ratio": 0.35,
+    "phase_late_ratio": 0.75,
+    "horizon_early_months": 3,
+    "horizon_mid_months": 12,
+    "horizon_late_months": 24,
+    "horizon_wrap_up_months": 36
   },
   "supervisor": {
     "max_steps": 200,

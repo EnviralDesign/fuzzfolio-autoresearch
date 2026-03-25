@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 import requests
 
-from .config import ProviderConfig
+from .config import ProviderProfileConfig
 
 
 class ProviderError(RuntimeError):
@@ -19,13 +19,51 @@ class ChatMessage:
     content: str
 
 
-class OpenAICompatibleProvider:
-    def __init__(self, config: ProviderConfig):
+class JsonCompletionProvider(Protocol):
+    def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
+        ...
+
+
+class ChatCompletionsJsonProvider:
+    def __init__(self, config: ProviderProfileConfig):
         self.config = config
         self.session = requests.Session()
 
     def _build_url(self) -> str:
-        return self.config.api_base.rstrip("/") + "/chat/completions"
+        api_base = (self.config.api_base or "").rstrip("/")
+        if not api_base:
+            raise ProviderError(
+                f"Provider {self.config.provider_type!r} is missing api_base."
+            )
+        return api_base + "/chat/completions"
+
+    def _build_headers(self) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {self.config.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _build_body(
+        self,
+        messages: list[ChatMessage],
+        max_completion_tokens: int,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": [{"role": message.role, "content": message.content} for message in messages],
+            "temperature": self.config.temperature,
+        }
+        body.update(self._completion_budget_fields(max_completion_tokens))
+        response_format = self._response_format()
+        if response_format is not None:
+            body["response_format"] = response_format
+        return body
+
+    def _completion_budget_fields(self, max_completion_tokens: int) -> dict[str, Any]:
+        return {"max_completion_tokens": max_completion_tokens}
+
+    def _response_format(self) -> dict[str, Any] | None:
+        return {"type": "json_object"}
 
     def _extract_content(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices") or []
@@ -60,25 +98,23 @@ class OpenAICompatibleProvider:
         except json.JSONDecodeError:
             start = text.find("{")
             if start >= 0:
-                value, _ = decoder.raw_decode(text[start:])
-                if isinstance(value, dict):
-                    return value
+                try:
+                    value, _ = decoder.raw_decode(text[start:])
+                    if isinstance(value, dict):
+                        return value
+                except json.JSONDecodeError:
+                    pass
         raise ProviderError(f"Provider did not return valid JSON. Raw response: {text[:800]}")
 
-    def _request_json(self, messages: list[ChatMessage], max_completion_tokens: int) -> dict[str, Any]:
-        body = {
-            "model": self.config.model,
-            "messages": [{"role": message.role, "content": message.content} for message in messages],
-            "temperature": self.config.temperature,
-            "max_completion_tokens": max_completion_tokens,
-            "response_format": {"type": "json_object"},
-        }
+    def _request_json(
+        self,
+        messages: list[ChatMessage],
+        max_completion_tokens: int,
+    ) -> dict[str, Any]:
+        body = self._build_body(messages, max_completion_tokens)
         response = self.session.post(
             self._build_url(),
-            headers={
-                "Authorization": f"Bearer {self.config.api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=self._build_headers(),
             json=body,
             timeout=self.config.timeout_seconds,
         )
@@ -90,8 +126,10 @@ class OpenAICompatibleProvider:
 
     def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
         if not self.config.api_key:
+            env_hint = self.config.api_key_env or "provider-specific env var"
             raise ProviderError(
-                "No provider API key configured. Put it in .agentsecrets under provider.api_key or set OPENAI_API_KEY."
+                f"No API key configured for provider profile using model {self.config.model!r}. "
+                f"Put it in .agentsecrets under providers.<profile>.api_key or set {env_hint}."
             )
         budgets = [self.config.max_tokens, max(self.config.max_tokens * 2, 4800)]
         last_error: ProviderError | None = None
@@ -114,3 +152,38 @@ class OpenAICompatibleProvider:
                     continue
                 raise
         raise last_error or ProviderError("Provider request failed without a specific error.")
+
+
+class OpenAIProvider(ChatCompletionsJsonProvider):
+    pass
+
+
+class OpenAICompatibleProvider(ChatCompletionsJsonProvider):
+    pass
+
+
+class OpenRouterProvider(ChatCompletionsJsonProvider):
+    pass
+
+
+class XAIProvider(ChatCompletionsJsonProvider):
+    def _completion_budget_fields(self, max_completion_tokens: int) -> dict[str, Any]:
+        return {"max_tokens": max_completion_tokens}
+
+    def _response_format(self) -> dict[str, Any] | None:
+        # xAI supports structured outputs, but the current runtime only needs
+        # a raw JSON object string. Keep the prompt contract authoritative here.
+        return None
+
+
+def create_provider(config: ProviderProfileConfig) -> JsonCompletionProvider:
+    normalized = (config.provider_type or "openai").strip().lower()
+    if normalized == "xai":
+        return XAIProvider(config)
+    if normalized == "openrouter":
+        return OpenRouterProvider(config)
+    if normalized == "openai_compatible":
+        return OpenAICompatibleProvider(config)
+    if normalized == "openai":
+        return OpenAIProvider(config)
+    raise ProviderError(f"Unsupported provider type: {config.provider_type!r}")
