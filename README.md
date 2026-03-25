@@ -65,6 +65,13 @@ If you want machine-readable output instead, use:
 uv run autoresearch run --max-steps 20 --json
 ```
 
+You can also override the configured provider profiles per invocation:
+
+```powershell
+uv run autoresearch run --max-steps 20 --explorer-profile openai-mini --supervisor-profile xai-grok
+uv run autoresearch supervise --explorer-profile grok-fast --supervisor-profile grok-420-multi-agent-0309
+```
+
 The default live trace uses `rich` for colored panels and step/result tables so it is easier to watch during longer managed runs.
 The default provider completion budget is intentionally a bit roomy because the agent sometimes needs to emit a full portable profile JSON in one action.
 The controller also uses threshold-triggered context compaction modeled after `codex-rs`: once the live prompt estimate crosses the configured token threshold, it writes a checkpoint summary and rebuilds the active history from fresh run state plus a short recent tail.

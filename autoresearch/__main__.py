@@ -58,12 +58,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="Run the autonomous research controller.")
     run.add_argument("--max-steps", type=int, default=None)
+    run.add_argument("--explorer-profile", default=None, help="Override the configured explorer provider profile for this run.")
+    run.add_argument("--supervisor-profile", default=None, help="Override the configured supervisor provider profile for this run.")
     run.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
 
     supervise = subparsers.add_parser("supervise", help="Run the supervised controller with config-backed policy defaults.")
     supervise.add_argument("--max-steps", type=int, default=None)
     supervise.add_argument("--window", default=None, help="Operating window in HH:MM-HH:MM format.")
     supervise.add_argument("--timezone", default=None, help="IANA timezone for the operating window, e.g. America/Chicago.")
+    supervise.add_argument("--explorer-profile", default=None, help="Override the configured explorer provider profile for this run.")
+    supervise.add_argument("--supervisor-profile", default=None, help="Override the configured supervisor provider profile for this run.")
     supervise.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
 
     subparsers.add_parser("plot", help="Regenerate the progress plot from the attempts ledger.")
@@ -303,6 +307,28 @@ def _latest_run_context(config) -> tuple[Path | None, str | None]:
         return None, None
     run_dir = Path(latest_run_text)
     return run_dir / "progress.png", run_dir.name
+
+
+def _load_runtime_config(
+    *,
+    explorer_profile: str | None = None,
+    supervisor_profile: str | None = None,
+):
+    config = load_config()
+    effective_explorer = explorer_profile or config.llm.explorer_profile
+    effective_supervisor = supervisor_profile or config.llm.supervisor_profile
+
+    missing: list[str] = []
+    if effective_explorer not in config.providers:
+        missing.append(f"explorer profile {effective_explorer!r}")
+    if effective_supervisor not in config.providers:
+        missing.append(f"supervisor profile {effective_supervisor!r}")
+    if missing:
+        raise SystemExit(f"Unknown provider profile override(s): {', '.join(missing)}")
+
+    config.llm.explorer_profile = effective_explorer
+    config.llm.supervisor_profile = effective_supervisor
+    return config
 
 
 def _resolve_supervise_policy(
@@ -575,8 +601,17 @@ def _emit_run_progress(event: dict[str, object]) -> None:
     _render_step(step_payload)
 
 
-def cmd_run(max_steps: int | None, *, as_json: bool) -> int:
-    config = load_config()
+def cmd_run(
+    max_steps: int | None,
+    *,
+    explorer_profile: str | None,
+    supervisor_profile: str | None,
+    as_json: bool,
+) -> int:
+    config = _load_runtime_config(
+        explorer_profile=explorer_profile,
+        supervisor_profile=supervisor_profile,
+    )
     _set_display_context(repo_root=config.repo_root, run_dir=None)
     controller = ResearchController(config)
     result = controller.run(
@@ -596,9 +631,14 @@ def cmd_supervise(
     *,
     window: str | None,
     timezone_name: str | None,
+    explorer_profile: str | None,
+    supervisor_profile: str | None,
     as_json: bool,
 ) -> int:
-    config = load_config()
+    config = _load_runtime_config(
+        explorer_profile=explorer_profile,
+        supervisor_profile=supervisor_profile,
+    )
     _set_display_context(repo_root=config.repo_root, run_dir=None)
     effective_max_steps, policy = _resolve_supervise_policy(
         config,
@@ -835,12 +875,19 @@ def main() -> int:
     if args.command == "test-providers":
         return cmd_test_providers(profile_names=args.profile, as_json=bool(args.json))
     if args.command == "run":
-        return cmd_run(max_steps=args.max_steps, as_json=bool(args.json))
+        return cmd_run(
+            max_steps=args.max_steps,
+            explorer_profile=args.explorer_profile,
+            supervisor_profile=args.supervisor_profile,
+            as_json=bool(args.json),
+        )
     if args.command == "supervise":
         return cmd_supervise(
             max_steps=args.max_steps,
             window=args.window,
             timezone_name=args.timezone,
+            explorer_profile=args.explorer_profile,
+            supervisor_profile=args.supervisor_profile,
             as_json=bool(args.json),
         )
     if args.command == "plot":
