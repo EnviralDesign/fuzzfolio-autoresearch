@@ -181,7 +181,10 @@ These are useful both for permissive early screening and for later hardening aro
 - It reads defaults from `autoresearch.config.json` if you do not pass flags.
 - CLI flags override config values when you do pass them.
 - The supervisor, not the agent, owns termination in this mode.
-- The run stops only on controller-owned conditions such as `max_steps`, fatal error, or the operating window closing at a step boundary.
+- `max_steps` is a per-session cap in this mode, not a whole-night cap.
+- When a supervised session hits its step cap, supervise starts a brand-new isolated session if the outer time window is still open.
+- New supervised sessions do not carry over prior conversation state; each one starts boxed-in and fresh with its own run directory.
+- The outer supervise loop stops starting new sessions when the operating window closes or enters the configured soft-wrap zone.
 
 Example:
 
@@ -199,12 +202,13 @@ Config-backed example:
     "window_start": "23:00",
     "window_end": "05:00",
     "timezone": "America/Chicago",
-    "stop_mode": "after_step"
+    "stop_mode": "after_step",
+    "soft_wrap_minutes": 30
   }
 }
 ```
 
-The operating window is checked at step boundaries. If the window closes while a model/tool step is already in flight, the controller lets that step finish cleanly, writes logs/checkpoints, and then stops before prompting again.
+The operating window is checked at step boundaries. If the window closes while a model/tool step is already in flight, the controller lets that step finish cleanly and then stops before prompting again. Near the end of the window, the worker also gets a soft wrap-soon note so highly autonomous models start winding down instead of opening broad fresh exploration.
 
 You can still use the module form if you want:
 
@@ -275,7 +279,7 @@ The runtime now treats the CLI's scoring surface as authoritative:
 
 - `quality_score` is the source-of-truth aggregate metric computed in Fuzzfolio itself
 - `primary_score` and `composite_score` mirror that propagated `quality_score`
-- each attempt record also stores supporting fields like `psr`, `dsr`, `k_ratio`, `sharpe_r`, and `legacy_rank_score` when available
+- each attempt record also stores supporting fields like `psr`, `dsr`, `k_ratio`, and `sharpe_r` when available
 
 Attempts without a usable `quality_score` are kept for observability, but they are not treated as scored frontier points. The Python side no longer invents its own temporary scoring formula.
 

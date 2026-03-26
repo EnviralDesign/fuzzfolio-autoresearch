@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from rich import box
 from rich.console import Console, Group
@@ -81,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
 
     supervise = subparsers.add_parser("supervise", help="Run the supervised controller with config-backed policy defaults.")
-    supervise.add_argument("--max-steps", type=int, default=None)
+    supervise.add_argument("--max-steps", type=int, default=None, help="Per-session step cap before supervise starts a fresh isolated session.")
     supervise.add_argument("--window", default=None, help="Operating window in HH:MM-HH:MM format.")
     supervise.add_argument("--timezone", default=None, help="IANA timezone for the operating window, e.g. America/Chicago.")
     supervise.add_argument("--explorer-profile", default=None, help="Override the configured explorer provider profile for this run.")
@@ -139,6 +141,7 @@ def cmd_doctor() -> int:
         "supervisor_window_start": config.supervisor.window_start,
         "supervisor_window_end": config.supervisor.window_end,
         "supervisor_timezone": config.supervisor.timezone,
+        "supervisor_soft_wrap_minutes": config.supervisor.soft_wrap_minutes,
         "auth_ok": auth.returncode == 0,
         "seed_ok": seed.returncode == 0,
     }
@@ -363,7 +366,37 @@ def _resolve_supervise_policy(
         timezone_name=effective_timezone,
         stop_mode=cfg.stop_mode,
         mode_name="supervise",
+        soft_wrap_minutes=cfg.soft_wrap_minutes,
     )
+
+
+def _parse_wall_time(value: str) -> time:
+    return datetime.strptime(value, "%H:%M").time()
+
+
+def _window_state(policy: RunPolicy) -> tuple[bool, float | None]:
+    if not policy.window_start or not policy.window_end:
+        return True, None
+    tz = ZoneInfo(policy.timezone_name)
+    now_local = datetime.now(tz)
+    start = _parse_wall_time(policy.window_start)
+    end = _parse_wall_time(policy.window_end)
+    current = now_local.time().replace(tzinfo=None)
+    if start == end:
+        return True, None
+    if start < end:
+        within = start <= current < end
+        if not within:
+            return False, None
+        end_dt = datetime.combine(now_local.date(), end, tz)
+    else:
+        within = current >= start or current < end
+        if not within:
+            return False, None
+        end_dt = datetime.combine(now_local.date(), end, tz)
+        if current >= start:
+            end_dt += timedelta(days=1)
+    return True, max(0.0, (end_dt - now_local).total_seconds() / 60.0)
 
 
 def _summarize_action(action: dict[str, object]) -> str:
@@ -488,6 +521,9 @@ def _render_run_header(event: dict[str, object]) -> None:
     grid.add_column(style="white")
     grid.add_row("Run", str(event.get("run_id")))
     grid.add_row("Mode", str(event.get("mode") or "run"))
+    session_index = event.get("session_index")
+    if session_index is not None:
+        grid.add_row("Session", str(session_index))
     grid.add_row("Steps", str(event.get("max_steps")))
     phase = event.get("phase")
     if isinstance(phase, str) and phase.strip():
@@ -577,12 +613,21 @@ def _render_run_footer(result: dict[str, object]) -> None:
     grid.add_column(style="bold green", justify="right")
     grid.add_column(style="white")
     grid.add_row("Status", str(result.get("status")))
-    grid.add_row("Run", str(result.get("run_id")))
-    grid.add_row("Dir", _display_path(str(result.get("run_dir"))))
+    session_count = result.get("session_count")
+    if session_count is not None:
+        grid.add_row("Sessions", str(session_count))
+    run_id = result.get("run_id")
+    if isinstance(run_id, str) and run_id.strip():
+        grid.add_row("Run", run_id)
+    run_dir = result.get("run_dir")
+    if isinstance(run_dir, str) and run_dir.strip():
+        grid.add_row("Dir", _display_path(run_dir))
     attempts_path = result.get("attempts_path")
     if isinstance(attempts_path, str) and attempts_path.strip():
         grid.add_row("Ledger", _display_path(attempts_path))
-    grid.add_row("Run Plot", _display_path(str(result.get("run_progress_plot"))))
+    run_plot = result.get("run_progress_plot")
+    if isinstance(run_plot, str) and run_plot.strip():
+        grid.add_row("Run Plot", _display_path(run_plot))
     summary = result.get("summary")
     if isinstance(summary, str) and summary.strip():
         grid.add_row("Summary", _short_text(summary, 420))
@@ -656,18 +701,79 @@ def cmd_supervise(
         supervisor_profile=supervisor_profile,
     )
     _set_display_context(repo_root=config.repo_root, run_dir=None)
-    effective_max_steps, policy = _resolve_supervise_policy(
+    session_max_steps, policy = _resolve_supervise_policy(
         config,
         max_steps=max_steps,
         window=window,
         timezone_name=timezone_name,
     )
-    controller = ResearchController(config)
-    result = controller.run(
-        max_steps=effective_max_steps,
-        progress_callback=None if as_json else _emit_run_progress,
-        policy=policy,
-    )
+    session_results: list[dict[str, Any]] = []
+    stop_reason = "window_closed"
+    while True:
+        within_window, minutes_remaining = _window_state(policy)
+        if not within_window:
+            stop_reason = "window_closed"
+            break
+        if session_results and policy.soft_wrap_minutes > 0:
+            if minutes_remaining is not None and minutes_remaining <= policy.soft_wrap_minutes:
+                stop_reason = "soft_wrap_reached"
+                break
+        session_index = len(session_results) + 1
+        controller = ResearchController(config)
+
+        def emit_progress(event: dict[str, object]) -> None:
+            if as_json:
+                return
+            payload = dict(event)
+            if payload.get("event") == "window_closed":
+                return
+            if payload.get("event") == "run_started":
+                payload["session_index"] = session_index
+                payload["mode"] = "supervise"
+                payload["max_steps"] = session_max_steps
+            _emit_run_progress(payload)
+
+        result = controller.run(
+            max_steps=session_max_steps,
+            progress_callback=None if as_json else emit_progress,
+            policy=policy,
+        )
+        result["session_index"] = session_index
+        session_results.append(result)
+        if not as_json and result.get("status") == "step_limit_reached":
+            rollover_footer = dict(result)
+            rollover_footer["summary"] = (
+                "This supervised session reached its per-session step cap. "
+                "Supervise will start a fresh isolated session if time remains in the outer window."
+            )
+            _render_run_footer(rollover_footer)
+        if result.get("status") != "step_limit_reached":
+            stop_reason = str(result.get("status") or "supervise_stopped")
+            break
+
+    last_result = session_results[-1] if session_results else {}
+    if stop_reason == "soft_wrap_reached":
+        summary = (
+            f"Completed {len(session_results)} isolated supervise session(s). "
+            "The outer supervise window entered soft-wrap territory, so no new session was started."
+        )
+    elif session_results:
+        summary = (
+            f"Completed {len(session_results)} isolated supervise session(s). "
+            f"Stopped because {stop_reason}."
+        )
+    else:
+        summary = "The supervise window is currently closed, so no session was started."
+    result = {
+        "status": stop_reason,
+        "session_count": len(session_results),
+        "sessions": session_results,
+        "run_id": last_result.get("run_id"),
+        "run_dir": last_result.get("run_dir"),
+        "attempts_path": last_result.get("attempts_path"),
+        "run_progress_plot": last_result.get("run_progress_plot"),
+        "summary": summary,
+    }
     if as_json:
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0

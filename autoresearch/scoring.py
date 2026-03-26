@@ -112,21 +112,6 @@ def build_attempt_score(
         or _get_nested(sensitivity_snapshot or {}, ["data", "aggregate", "quality_score", "belief_basis"])
         or _get_nested(sensitivity_snapshot or {}, ["data", "quality_score", "belief_basis"])
     )
-    legacy_rank_score = _extract_metric(
-        "legacy_rank_score",
-        best_summary=best,
-        compare_payload=compare_payload,
-        sensitivity_snapshot=sensitivity_snapshot,
-        preferred_paths=[
-            ["legacy_rank_score"],
-            ["rank_score"],
-            ["data", "aggregate", "legacy_rank_score"],
-            ["data", "aggregate", "rank_score"],
-            ["data", "legacy_rank_score"],
-            ["data", "rank_score"],
-        ],
-    )
-
     psr = _extract_metric(
         "psr",
         best_summary=best,
@@ -174,7 +159,6 @@ def build_attempt_score(
     )
     metrics = {
         "quality_score": quality_score,
-        "legacy_rank_score": legacy_rank_score,
         "dsr": dsr,
         "psr": psr,
         "k_ratio": k_ratio,

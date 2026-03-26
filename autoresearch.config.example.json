@@ -73,6 +73,7 @@
     "window_start": "23:00",
     "window_end": "05:00",
     "timezone": "America/Chicago",
-    "stop_mode": "after_step"
+    "stop_mode": "after_step",
+    "soft_wrap_minutes": 30
   }
 }

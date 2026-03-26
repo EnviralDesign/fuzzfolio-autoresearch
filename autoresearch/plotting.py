@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import shutil
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ def render_progress_plot(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     valid = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+    total_logged = len(attempts)
 
     plt.figure(figsize=(16, 8))
     if not valid:
@@ -67,7 +69,7 @@ def render_progress_plot(
     plt.scatter(x_front, y_front, c="#2ecc71", edgecolors="#2d6a4f", s=46, zorder=3, label="Frontier")
 
     for attempt in frontier:
-        label = str(attempt.get("candidate_name", "candidate"))
+        label = _attempt_plot_label(attempt)
         if len(label) > 40:
             label = label[:37] + "..."
         plt.annotate(
@@ -81,7 +83,9 @@ def render_progress_plot(
         )
 
     direction = "lower is better" if lower_is_better else "higher is better"
-    plt.title(f"Autoresearch Progress: {len(valid)} Attempts, {len(frontier)} Frontier Points")
+    plt.title(
+        f"Autoresearch Progress: {len(valid)} Scored / {total_logged} Logged, {len(frontier)} Frontier Points"
+    )
     plt.xlabel("Attempt #")
     plt.ylabel(f"Quality Score ({direction})")
     plt.grid(True, alpha=0.25)
@@ -89,6 +93,67 @@ def render_progress_plot(
     plt.tight_layout()
     plt.savefig(output_path, dpi=160)
     plt.close()
+
+
+def _profile_file_label(attempt: dict[str, Any]) -> str | None:
+    raw = attempt.get("profile_path")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return Path(raw).stem
+
+
+def _attempt_plot_label(attempt: dict[str, Any]) -> str:
+    sequence = attempt.get("sequence")
+    prefix = f"#{sequence} " if sequence is not None else ""
+    profile_label = _profile_file_label(attempt)
+    if profile_label:
+        return prefix + profile_label
+    candidate_name = str(attempt.get("candidate_name", "candidate")).strip() or "candidate"
+    return prefix + candidate_name
+
+
+def _progress_index_rows(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for attempt in attempts:
+        rows.append(
+            {
+                "sequence": attempt.get("sequence"),
+                "attempt_id": attempt.get("attempt_id"),
+                "plot_label": _attempt_plot_label(attempt),
+                "candidate_name": attempt.get("candidate_name"),
+                "profile_file": Path(str(attempt["profile_path"])).name if attempt.get("profile_path") else None,
+                "profile_path": attempt.get("profile_path"),
+                "profile_ref": attempt.get("profile_ref"),
+                "composite_score": attempt.get("composite_score"),
+                "score_basis": attempt.get("score_basis"),
+                "artifact_dir": attempt.get("artifact_dir"),
+            }
+        )
+    return rows
+
+
+def write_progress_index(attempts: list[dict[str, Any]], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = _progress_index_rows(attempts)
+    output_path.write_text(json.dumps(rows, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    csv_path = output_path.with_suffix(".csv")
+    fieldnames = [
+        "sequence",
+        "attempt_id",
+        "plot_label",
+        "candidate_name",
+        "profile_file",
+        "profile_path",
+        "profile_ref",
+        "composite_score",
+        "score_basis",
+        "artifact_dir",
+    ]
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def render_progress_artifacts(
@@ -104,17 +169,27 @@ def render_progress_artifacts(
         primary_output_path,
         lower_is_better=lower_is_better,
     )
+    write_progress_index(attempts, primary_output_path.with_name(f"{primary_output_path.stem}-index.json"))
     if mirror_output_path is None:
         return
     mirror_output_path.parent.mkdir(parents=True, exist_ok=True)
     if mirror_attempts is None:
         shutil.copy2(primary_output_path, mirror_output_path)
+        source_index = primary_output_path.with_name(f"{primary_output_path.stem}-index.json")
+        target_index = mirror_output_path.with_name(f"{mirror_output_path.stem}-index.json")
+        if source_index.exists():
+            shutil.copy2(source_index, target_index)
+            source_csv = source_index.with_suffix(".csv")
+            target_csv = target_index.with_suffix(".csv")
+            if source_csv.exists():
+                shutil.copy2(source_csv, target_csv)
         return
     render_progress_plot(
         mirror_attempts,
         mirror_output_path,
         lower_is_better=lower_is_better,
     )
+    write_progress_index(mirror_attempts, mirror_output_path.with_name(f"{mirror_output_path.stem}-index.json"))
 
 
 def render_leaderboard_artifacts(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shlex
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
@@ -174,6 +174,7 @@ class RunPolicy:
     timezone_name: str = "America/Chicago"
     stop_mode: str = "after_step"
     mode_name: str = "run"
+    soft_wrap_minutes: int = 0
 
 
 class ResearchController:
@@ -230,6 +231,41 @@ class ResearchController:
             return start <= current < end
         return current >= start or current < end
 
+    def _minutes_until_window_close(self, policy: RunPolicy) -> float | None:
+        if not policy.window_start or not policy.window_end:
+            return None
+        tz = ZoneInfo(policy.timezone_name)
+        now_local = datetime.now(tz)
+        start = self._parse_wall_time(policy.window_start)
+        end = self._parse_wall_time(policy.window_end)
+        current = now_local.time().replace(tzinfo=None)
+        if start == end:
+            return None
+        if start < end:
+            if not (start <= current < end):
+                return None
+            end_dt = datetime.combine(now_local.date(), end, tz)
+        else:
+            if not (current >= start or current < end):
+                return None
+            end_dt = datetime.combine(now_local.date(), end, tz)
+            if current >= start:
+                end_dt += timedelta(days=1)
+        return max(0.0, (end_dt - now_local).total_seconds() / 60.0)
+
+    def _soft_wrap_note(self, policy: RunPolicy) -> str | None:
+        if policy.soft_wrap_minutes <= 0:
+            return None
+        minutes_remaining = self._minutes_until_window_close(policy)
+        if minutes_remaining is None or minutes_remaining > policy.soft_wrap_minutes:
+            return None
+        rounded = max(1, int(round(minutes_remaining)))
+        return (
+            f"Schedule note: the supervise window is ending soon and about {rounded} minute(s) remain. "
+            "Finish the current line of inquiry cleanly, avoid starting broad new branches or large fresh searches, "
+            "and prefer consolidating evidence over opening new exploration."
+        )
+
     def _normalize_cli_args(self, action: dict[str, Any]) -> list[str]:
         executable_names = {
             self.config.fuzzfolio.cli_command.lower(),
@@ -248,7 +284,7 @@ class ResearchController:
                 normalized = normalized[1:]
             if not normalized:
                 raise ValueError("run_cli args list only contained the CLI executable name.")
-            return normalized
+            return self._canonicalize_cli_args(normalized)
         if isinstance(args, str) and args.strip():
             command_text = args.strip()
         else:
@@ -264,7 +300,24 @@ class ResearchController:
             parts = parts[1:]
         if not parts:
             raise ValueError("run_cli command string only contained the CLI executable name.")
-        return parts
+        return self._canonicalize_cli_args(parts)
+
+    def _canonicalize_cli_args(self, args: list[str]) -> list[str]:
+        normalized = [str(item) for item in args]
+        if len(normalized) >= 4 and normalized[0] == "sweep":
+            subcommand = normalized[1]
+            if subcommand in {"validate", "patch"}:
+                canonicalized: list[str] = normalized[:2]
+                index = 2
+                while index < len(normalized):
+                    token = normalized[index]
+                    if token == "--file":
+                        canonicalized.append("--definition")
+                    else:
+                        canonicalized.append(token)
+                    index += 1
+                normalized = canonicalized
+        return normalized
 
     def _strip_cli_flag(self, args: list[str], flag: str) -> list[str]:
         stripped: list[str] = []
@@ -892,6 +945,7 @@ class ResearchController:
         phase_info = self._run_phase_info(effective_step, effective_step_limit, policy)
         horizon_policy = self._horizon_policy_snapshot(effective_step, effective_step_limit, policy)
         score_target = self._score_target_snapshot(tool_context)
+        soft_wrap_note = self._soft_wrap_note(policy)
         cli_guide = (
             "Important CLI command shapes:\n"
             '- profiles clone-local --file <ABS_FILE> --out <ABS_FILE>\n'
@@ -960,6 +1014,7 @@ class ResearchController:
             f"Score target: {score_target['summary']}\n"
             f"Score target rationale: {score_target['rationale']}\n"
             f"Operating window: {policy.window_start or 'none'} -> {policy.window_end or 'none'} ({policy.timezone_name})\n"
+            f"{soft_wrap_note + chr(10) if soft_wrap_note else ''}"
             f"Profiles dir: {tool_context.profiles_dir}\n"
             f"Evals dir: {tool_context.evals_dir}\n"
             f"Notes dir: {tool_context.notes_dir}\n"
@@ -1592,6 +1647,9 @@ class ResearchController:
         policy: RunPolicy | None = None,
     ) -> dict[str, Any]:
         policy = policy or RunPolicy()
+        self.profile_sources = {}
+        self.last_created_profile_ref = None
+        self.finish_denials = 0
         self.cli.ensure_login()
         tool_context = self.create_run_context()
         self._refresh_progress_artifacts(tool_context)

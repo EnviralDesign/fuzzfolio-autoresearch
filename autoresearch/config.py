@@ -72,6 +72,7 @@ class SupervisorConfig:
     window_end: str | None = None
     timezone: str = "America/Chicago"
     stop_mode: str = "after_step"
+    soft_wrap_minutes: int = 30
 
 
 @dataclass
@@ -439,6 +440,12 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
         window_end=supervisor_cfg.get("window_end"),
         timezone=supervisor_cfg.get("timezone", SupervisorConfig.timezone),
         stop_mode=supervisor_cfg.get("stop_mode", SupervisorConfig.stop_mode),
+        soft_wrap_minutes=int(
+            supervisor_cfg.get(
+                "soft_wrap_minutes",
+                SupervisorConfig.soft_wrap_minutes,
+            )
+        ),
     )
 
     return AppConfig(
