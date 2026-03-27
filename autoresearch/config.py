@@ -23,6 +23,7 @@ class ProviderProfileConfig:
     max_tokens: int = 3200
     timeout_seconds: int = 120
     transport: str = "chat_completions"
+    compact_trigger_tokens: int | None = None
 
 
 @dataclass
@@ -94,6 +95,12 @@ class AppConfig:
     @property
     def supervisor_provider(self) -> ProviderProfileConfig:
         return self.providers[self.llm.supervisor_profile]
+
+    def compact_trigger_tokens_for(self, profile_name: str) -> int:
+        profile = self.providers[profile_name]
+        if profile.compact_trigger_tokens is not None:
+            return int(profile.compact_trigger_tokens)
+        return int(self.research.compact_trigger_tokens)
 
     @property
     def runs_root(self) -> Path:
@@ -227,6 +234,11 @@ def _load_provider_profiles(
                 max_tokens=int(profile_cfg.get("max_tokens", ProviderProfileConfig.max_tokens)),
                 timeout_seconds=int(profile_cfg.get("timeout_seconds", defaults["timeout_seconds"])),
                 transport=str(profile_cfg.get("transport") or defaults["transport"]),
+                compact_trigger_tokens=(
+                    int(profile_cfg["compact_trigger_tokens"])
+                    if profile_cfg.get("compact_trigger_tokens") is not None
+                    else None
+                ),
             )
 
         explorer_profile = _env_or_value(
@@ -284,6 +296,7 @@ def _load_provider_profiles(
             max_tokens=shared_max_tokens,
             timeout_seconds=shared_timeout,
             transport=str(defaults["transport"]),
+            compact_trigger_tokens=None,
         ),
         "openai-supervisor": ProviderProfileConfig(
             provider_type=provider_type,
@@ -295,6 +308,7 @@ def _load_provider_profiles(
             max_tokens=shared_max_tokens,
             timeout_seconds=shared_timeout,
             transport=str(defaults["transport"]),
+            compact_trigger_tokens=None,
         ),
     }
     return LlmConfig(), profiles

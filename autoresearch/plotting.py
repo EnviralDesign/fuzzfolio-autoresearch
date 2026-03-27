@@ -8,6 +8,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import json
 
+from .ledger import load_run_metadata
 
 def compute_frontier(
     attempts: list[dict[str, Any]],
@@ -32,19 +33,48 @@ def compute_frontier(
     return frontier, non_frontier
 
 
+def _metadata_model_summary(run_metadata: dict[str, Any] | None) -> str | None:
+    if not isinstance(run_metadata, dict) or not run_metadata:
+        return None
+    explorer_profile = str(run_metadata.get("explorer_profile") or "").strip()
+    explorer_model = str(run_metadata.get("explorer_model") or "").strip()
+    supervisor_profile = str(run_metadata.get("supervisor_profile") or "").strip()
+    supervisor_model = str(run_metadata.get("supervisor_model") or "").strip()
+    quality_score_preset = str(run_metadata.get("quality_score_preset") or "").strip()
+    parts: list[str] = []
+    if explorer_model or explorer_profile:
+        explorer = explorer_model or explorer_profile
+        if explorer_profile and explorer_model and explorer_profile != explorer_model:
+            explorer = f"{explorer_profile} / {explorer_model}"
+        parts.append(f"Explorer: {explorer}")
+    if supervisor_model or supervisor_profile:
+        supervisor = supervisor_model or supervisor_profile
+        if supervisor_profile and supervisor_model and supervisor_profile != supervisor_model:
+            supervisor = f"{supervisor_profile} / {supervisor_model}"
+        parts.append(f"Supervisor: {supervisor}")
+    if quality_score_preset:
+        parts.append(f"Preset: {quality_score_preset}")
+    return " | ".join(parts) if parts else None
+
+
 def render_progress_plot(
     attempts: list[dict[str, Any]],
     output_path: Path,
     *,
+    run_metadata: dict[str, Any] | None = None,
     lower_is_better: bool = False,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     valid = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
     total_logged = len(attempts)
+    model_summary = _metadata_model_summary(run_metadata)
 
     plt.figure(figsize=(16, 8))
     if not valid:
-        plt.title("Autoresearch Progress: No Attempts Yet")
+        title = "Autoresearch Progress: No Attempts Yet"
+        if model_summary:
+            title = f"{title}\n{model_summary}"
+        plt.title(title)
         plt.xlabel("Attempt #")
         plt.ylabel("Quality Score")
         plt.grid(True, alpha=0.25)
@@ -83,9 +113,10 @@ def render_progress_plot(
         )
 
     direction = "lower is better" if lower_is_better else "higher is better"
-    plt.title(
-        f"Autoresearch Progress: {len(valid)} Scored / {total_logged} Logged, {len(frontier)} Frontier Points"
-    )
+    title = f"Autoresearch Progress: {len(valid)} Scored / {total_logged} Logged, {len(frontier)} Frontier Points"
+    if model_summary:
+        title = f"{title}\n{model_summary}"
+    plt.title(title)
     plt.xlabel("Attempt #")
     plt.ylabel(f"Quality Score ({direction})")
     plt.grid(True, alpha=0.25)
@@ -112,7 +143,7 @@ def _attempt_plot_label(attempt: dict[str, Any]) -> str:
     return prefix + candidate_name
 
 
-def _progress_index_rows(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _progress_index_rows(attempts: list[dict[str, Any]], run_metadata: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for attempt in attempts:
         rows.append(
@@ -127,14 +158,24 @@ def _progress_index_rows(attempts: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "composite_score": attempt.get("composite_score"),
                 "score_basis": attempt.get("score_basis"),
                 "artifact_dir": attempt.get("artifact_dir"),
+                "explorer_profile": run_metadata.get("explorer_profile") if isinstance(run_metadata, dict) else None,
+                "explorer_model": run_metadata.get("explorer_model") if isinstance(run_metadata, dict) else None,
+                "supervisor_profile": run_metadata.get("supervisor_profile") if isinstance(run_metadata, dict) else None,
+                "supervisor_model": run_metadata.get("supervisor_model") if isinstance(run_metadata, dict) else None,
+                "quality_score_preset": run_metadata.get("quality_score_preset") if isinstance(run_metadata, dict) else None,
             }
         )
     return rows
 
 
-def write_progress_index(attempts: list[dict[str, Any]], output_path: Path) -> None:
+def write_progress_index(
+    attempts: list[dict[str, Any]],
+    output_path: Path,
+    *,
+    run_metadata: dict[str, Any] | None = None,
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    rows = _progress_index_rows(attempts)
+    rows = _progress_index_rows(attempts, run_metadata)
     output_path.write_text(json.dumps(rows, ensure_ascii=True, indent=2), encoding="utf-8")
 
     csv_path = output_path.with_suffix(".csv")
@@ -149,6 +190,11 @@ def write_progress_index(attempts: list[dict[str, Any]], output_path: Path) -> N
         "composite_score",
         "score_basis",
         "artifact_dir",
+        "explorer_profile",
+        "explorer_model",
+        "supervisor_profile",
+        "supervisor_model",
+        "quality_score_preset",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -160,16 +206,24 @@ def render_progress_artifacts(
     attempts: list[dict[str, Any]],
     primary_output_path: Path,
     *,
+    run_metadata_path: Path | None = None,
     lower_is_better: bool = False,
     mirror_output_path: Path | None = None,
     mirror_attempts: list[dict[str, Any]] | None = None,
+    mirror_run_metadata_path: Path | None = None,
 ) -> None:
+    run_metadata = load_run_metadata(run_metadata_path.parent) if run_metadata_path and run_metadata_path.exists() else None
     render_progress_plot(
         attempts,
         primary_output_path,
+        run_metadata=run_metadata,
         lower_is_better=lower_is_better,
     )
-    write_progress_index(attempts, primary_output_path.with_name(f"{primary_output_path.stem}-index.json"))
+    write_progress_index(
+        attempts,
+        primary_output_path.with_name(f"{primary_output_path.stem}-index.json"),
+        run_metadata=run_metadata,
+    )
     if mirror_output_path is None:
         return
     mirror_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -187,9 +241,36 @@ def render_progress_artifacts(
     render_progress_plot(
         mirror_attempts,
         mirror_output_path,
+        run_metadata=(
+            load_run_metadata(mirror_run_metadata_path.parent)
+            if mirror_run_metadata_path and mirror_run_metadata_path.exists()
+            else None
+        ),
         lower_is_better=lower_is_better,
     )
-    write_progress_index(mirror_attempts, mirror_output_path.with_name(f"{mirror_output_path.stem}-index.json"))
+    write_progress_index(
+        mirror_attempts,
+        mirror_output_path.with_name(f"{mirror_output_path.stem}-index.json"),
+        run_metadata=(
+            load_run_metadata(mirror_run_metadata_path.parent)
+            if mirror_run_metadata_path and mirror_run_metadata_path.exists()
+            else None
+        ),
+    )
+
+
+def _leaderboard_label(attempt: dict[str, Any], run_metadata: dict[str, Any] | None) -> str:
+    run_id = str(attempt.get("run_id", "run")).strip() or "run"
+    candidate_name = str(attempt.get("candidate_name", "candidate")).strip() or "candidate"
+    explorer_model = str((run_metadata or {}).get("explorer_model") or "").strip()
+    explorer_profile = str((run_metadata or {}).get("explorer_profile") or "").strip()
+    model_label = explorer_model or explorer_profile
+    label = f"{run_id} | {candidate_name}"
+    if model_label:
+        label = f"{run_id} | {model_label} | {candidate_name}"
+    if len(label) > 72:
+        label = label[:69] + "..."
+    return label
 
 
 def render_leaderboard_artifacts(
@@ -197,6 +278,7 @@ def render_leaderboard_artifacts(
     png_output_path: Path,
     json_output_path: Path,
     *,
+    run_metadata_by_run_id: dict[str, dict[str, Any]] | None = None,
     lower_is_better: bool = False,
     limit: int = 15,
 ) -> list[dict[str, Any]]:
@@ -223,36 +305,41 @@ def render_leaderboard_artifacts(
         reverse=not lower_is_better,
     )[:limit]
 
+    enriched_ranked: list[dict[str, Any]] = []
+    for attempt in ranked:
+        run_id = str(attempt.get("run_id", "")).strip()
+        run_metadata = (run_metadata_by_run_id or {}).get(run_id, {})
+        enriched = dict(attempt)
+        enriched["run_metadata"] = run_metadata
+        enriched["leaderboard_label"] = _leaderboard_label(attempt, run_metadata)
+        enriched_ranked.append(enriched)
+
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
-    json_output_path.write_text(json.dumps(ranked, ensure_ascii=True, indent=2), encoding="utf-8")
+    json_output_path.write_text(json.dumps(enriched_ranked, ensure_ascii=True, indent=2), encoding="utf-8")
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.figure(figsize=(16, max(6, min(14, len(ranked) * 0.65 + 2))))
-    if not ranked:
+    plt.figure(figsize=(16, max(6, min(14, len(enriched_ranked) * 0.65 + 2))))
+    if not enriched_ranked:
         plt.title("Autoresearch Leaderboard: No Scored Runs Yet")
         plt.xlabel("Quality Score")
         plt.tight_layout()
         plt.savefig(png_output_path, dpi=160)
         plt.close()
-        return ranked
+        return enriched_ranked
 
     labels = []
     scores = []
-    for attempt in ranked:
-        run_id = str(attempt.get("run_id", "run"))
-        label = f"{run_id} | {attempt.get('candidate_name', 'candidate')}"
-        if len(label) > 72:
-            label = label[:69] + "..."
-        labels.append(label)
+    for attempt in enriched_ranked:
+        labels.append(str(attempt.get("leaderboard_label") or "run"))
         scores.append(float(attempt.get("composite_score")))
 
-    positions = list(range(len(ranked)))
-    colors = ["#2ecc71"] + ["#8ecae6"] * max(0, len(ranked) - 1)
+    positions = list(range(len(enriched_ranked)))
+    colors = ["#2ecc71"] + ["#8ecae6"] * max(0, len(enriched_ranked) - 1)
     plt.barh(positions, scores, color=colors)
     plt.yticks(positions, labels, fontsize=8)
     plt.gca().invert_yaxis()
     plt.xlabel("Quality Score")
-    plt.title(f"Autoresearch Leaderboard: Best Candidate Per Run ({len(ranked)} runs)")
+    plt.title(f"Autoresearch Leaderboard: Best Candidate Per Run ({len(enriched_ranked)} runs)")
 
     for index, score in enumerate(scores):
         plt.text(score, index, f" {score:.3f}", va="center", fontsize=8)
@@ -260,4 +347,4 @@ def render_leaderboard_artifacts(
     plt.tight_layout()
     plt.savefig(png_output_path, dpi=160)
     plt.close()
-    return ranked
+    return enriched_ranked

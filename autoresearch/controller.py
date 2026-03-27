@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
+from difflib import get_close_matches
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -18,6 +20,7 @@ from .ledger import (
     load_attempts,
     load_run_attempts,
     make_attempt_record,
+    write_run_metadata,
 )
 from .plotting import compute_frontier, render_progress_artifacts
 from .provider import ChatMessage, ProviderError, create_provider
@@ -157,10 +160,12 @@ class ToolContext:
     run_id: str
     run_dir: Path
     attempts_path: Path
+    run_metadata_path: Path
     profiles_dir: Path
     evals_dir: Path
     notes_dir: Path
     progress_plot_path: Path
+    cli_help_catalog_path: Path
     seed_prompt_path: Path | None
     profile_template_path: Path
     indicator_catalog_summary: str | None
@@ -189,6 +194,7 @@ class ResearchController:
         self.last_created_profile_ref: str | None = None
         self.finish_denials = 0
         self.profile_template_path = self.config.repo_root / "portable_profile_template.json"
+        self._cli_help_catalog_cache: dict[str, Any] | None = None
 
     def _system_protocol_text(self, policy: RunPolicy) -> str:
         if policy.allow_finish:
@@ -197,14 +203,16 @@ class ResearchController:
 
     def _normalize_model_response(self, payload: dict[str, Any] | list[Any]) -> dict[str, Any]:
         if isinstance(payload, dict):
-            if isinstance(payload.get("actions"), list):
-                reasoning = payload.get("reasoning")
-                return {
-                    "reasoning": str(reasoning).strip() if isinstance(reasoning, str) else "",
-                    "actions": payload.get("actions"),
-                }
+            reasoning = payload.get("reasoning")
+            action_keys = ("actions", "planned_actions", "tool_calls", "steps")
+            for key in action_keys:
+                candidate_actions = payload.get(key)
+                if isinstance(candidate_actions, list) and all(isinstance(item, dict) for item in candidate_actions):
+                    return {
+                        "reasoning": str(reasoning).strip() if isinstance(reasoning, str) else "",
+                        "actions": candidate_actions,
+                    }
             if payload.get("tool"):
-                reasoning = payload.get("reasoning")
                 action = dict(payload)
                 action.pop("reasoning", None)
                 return {
@@ -320,6 +328,120 @@ class ResearchController:
                     index += 1
                 normalized = canonicalized
         return normalized
+
+    def _parse_cli_help_commands(self, help_text: str) -> dict[str, str]:
+        commands: dict[str, str] = {}
+        in_commands = False
+        for raw_line in help_text.splitlines():
+            line = raw_line.rstrip()
+            stripped = line.strip()
+            if not in_commands:
+                if stripped == "Commands:":
+                    in_commands = True
+                continue
+            if not stripped:
+                if commands:
+                    break
+                continue
+            if re.match(r"^(Options|Arguments):$", stripped):
+                break
+            match = re.match(r"^\s{2,}([A-Za-z0-9][A-Za-z0-9_-]*)\s{2,}(.*)$", line)
+            if not match:
+                continue
+            commands[match.group(1)] = match.group(2).strip()
+        return commands
+
+    def _build_cli_help_catalog(self) -> dict[str, Any]:
+        if self._cli_help_catalog_cache is not None:
+            return self._cli_help_catalog_cache
+        top_level_help = self.cli.help_text()
+        top_level_commands = self._parse_cli_help_commands(top_level_help)
+        subcommands: dict[str, dict[str, str]] = {}
+        for command_name in top_level_commands:
+            help_text = self.cli.help_text([command_name])
+            parsed = self._parse_cli_help_commands(help_text)
+            if parsed:
+                subcommands[command_name] = parsed
+        self._cli_help_catalog_cache = {
+            "top_level": top_level_commands,
+            "subcommands": subcommands,
+        }
+        return self._cli_help_catalog_cache
+
+    def _write_cli_help_catalog(self, run_dir: Path) -> Path:
+        path = run_dir / "cli-help-catalog.json"
+        try:
+            catalog = self._build_cli_help_catalog()
+        except Exception:
+            path.write_text("{}", encoding="utf-8")
+            return path
+        path.write_text(json.dumps(catalog, ensure_ascii=True, indent=2), encoding="utf-8")
+        return path
+
+    def _format_cli_guard_error(
+        self,
+        *,
+        invalid: str,
+        message: str,
+        valid_choices: list[str],
+        suggested_help: list[str],
+    ) -> str:
+        details = [message]
+        if valid_choices:
+            details.append("Valid choices: " + ", ".join(valid_choices[:12]))
+        if suggested_help:
+            rendered_help = " ".join(suggested_help)
+            details.append(f"Use `run_cli {rendered_help}` for help.")
+        return " ".join(details)
+
+    def _guard_cli_args(self, args: list[str]) -> str | None:
+        if not args:
+            return "No CLI command tokens were provided."
+        first = str(args[0]).strip()
+        if not first:
+            return "No CLI command tokens were provided."
+        if first.startswith("-"):
+            return None
+        try:
+            catalog = self._build_cli_help_catalog()
+        except Exception:
+            return None
+        top_level = catalog.get("top_level", {}) if isinstance(catalog, dict) else {}
+        subcommands = catalog.get("subcommands", {}) if isinstance(catalog, dict) else {}
+        if first not in top_level:
+            valid = sorted(str(item) for item in top_level.keys())
+            closest = get_close_matches(first, valid, n=3, cutoff=0.45)
+            choices = closest or valid
+            return self._format_cli_guard_error(
+                invalid=first,
+                message=f"Invalid CLI command family `{first}`.",
+                valid_choices=choices,
+                suggested_help=["help"],
+            )
+        allowed_subcommands = subcommands.get(first, {})
+        if not isinstance(allowed_subcommands, dict) or not allowed_subcommands:
+            return None
+        if len(args) == 1 or str(args[1]).startswith("-"):
+            return self._format_cli_guard_error(
+                invalid=first,
+                message=f"CLI command family `{first}` requires a subcommand.",
+                valid_choices=sorted(str(item) for item in allowed_subcommands.keys()),
+                suggested_help=["help", first],
+            )
+        second = str(args[1]).strip()
+        if second in {"help", "--help", "-h"}:
+            return None
+        if second not in allowed_subcommands:
+            valid = sorted(str(item) for item in allowed_subcommands.keys())
+            closest = get_close_matches(second, valid, n=4, cutoff=0.45)
+            choices = closest or valid
+            return self._format_cli_guard_error(
+                invalid=second,
+                message=f"Invalid subcommand `{first} {second}`.",
+                valid_choices=choices,
+                suggested_help=["help", first],
+            )
+        return None
 
     def _strip_cli_flag(self, args: list[str], flag: str) -> list[str]:
         stripped: list[str] = []
@@ -447,12 +569,25 @@ class ResearchController:
         run_id = f"{self._timestamp()}-{self.config.research.label_prefix}-{uuid4().hex[:6]}"
         run_dir = self.config.runs_root / run_id
         attempts_path = attempts_path_for_run_dir(run_dir)
+        run_metadata = {
+            "run_id": run_id,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "explorer_profile": self.config.llm.explorer_profile,
+            "explorer_provider_type": self.config.provider.provider_type,
+            "explorer_model": self.config.provider.model,
+            "supervisor_profile": self.config.llm.supervisor_profile,
+            "supervisor_provider_type": self.config.supervisor_provider.provider_type,
+            "supervisor_model": self.config.supervisor_provider.model,
+            "quality_score_preset": self.config.research.quality_score_preset,
+        }
         profiles_dir = run_dir / "profiles"
         evals_dir = run_dir / "evals"
         notes_dir = run_dir / "notes"
         progress_plot_path = run_dir / "progress.png"
+        cli_help_catalog_path = self._write_cli_help_catalog(run_dir)
         for path in [profiles_dir, evals_dir, notes_dir]:
             path.mkdir(parents=True, exist_ok=True)
+        run_metadata_path = write_run_metadata(run_dir, run_metadata)
         seed_prompt_path = run_dir / "seed-prompt.json"
         if self.config.research.auto_seed_prompt:
             self.cli.seed_prompt(seed_prompt_path)
@@ -464,10 +599,12 @@ class ResearchController:
             run_id=run_id,
             run_dir=run_dir,
             attempts_path=attempts_path,
+            run_metadata_path=run_metadata_path,
             profiles_dir=profiles_dir,
             evals_dir=evals_dir,
             notes_dir=notes_dir,
             progress_plot_path=progress_plot_path,
+            cli_help_catalog_path=cli_help_catalog_path,
             seed_prompt_path=seed_prompt_path if seed_prompt_path.exists() else None,
             profile_template_path=self.profile_template_path,
             indicator_catalog_summary=indicator_catalog_summary,
@@ -505,6 +642,7 @@ class ResearchController:
         render_progress_artifacts(
             run_attempts,
             tool_context.progress_plot_path,
+            run_metadata_path=tool_context.run_metadata_path,
             lower_is_better=self.config.research.plot_lower_is_better,
         )
 
@@ -1018,6 +1156,7 @@ class ResearchController:
             "- sensitivity-basket may auto-adjust the timeframe down to the profile's lowest active indicator timeframe.\n"
             "- Saved sensitivity responses now include requested_timeframe and effective_timeframe fields.\n"
             "- Raw bar-count mechanics are implementation detail. Prefer effective_window_days and effective_window_months when judging whether a requested horizon was really satisfied.\n"
+            "- If command syntax drifts, use run_cli [\"help\"] or run_cli [\"help\", \"profiles\"] instead of guessing.\n"
             "- `__BASKET__` may appear in saved summaries as an aggregate label. Never pass it as --instrument.\n"
             "- Invalid instrument aliases now fail fast with close-match suggestions.\n"
             "- A normal managed run should explore multiple candidates. Do not stop after the first strong score; branch and test at least a few follow-up ideas.\n"
@@ -1056,6 +1195,7 @@ class ResearchController:
             f"Notes dir: {tool_context.notes_dir}\n"
             f"Run attempts ledger: {tool_context.attempts_path}\n"
             f"Run progress plot: {tool_context.progress_plot_path}\n"
+            f"CLI help catalog path: {tool_context.cli_help_catalog_path}\n"
             f"Program:\n{self._program_text()}\n\n"
             f"Current seed hand:\n{self._seed_text(tool_context)}\n\n"
             f"Portable profile template path: {tool_context.profile_template_path}\n"
@@ -1395,6 +1535,22 @@ class ResearchController:
                 step_limit=step_limit,
                 policy=policy,
             )
+            guard_error = self._guard_cli_args(args)
+            if guard_error:
+                return {
+                    "tool": "run_cli",
+                    "ok": False,
+                    "created_profile_ref": None,
+                    "source_profile_file": None,
+                    "result": {
+                        "argv": [*self.cli.build_base_argv(), *args],
+                        "cwd": str(Path(action["cwd"]).resolve()) if action.get("cwd") else str((self.config.fuzzfolio.workspace_root or Path.cwd()).resolve()),
+                        "returncode": 2,
+                        "stdout": "",
+                        "stderr": guard_error,
+                    },
+                    "auto_log": None,
+                }
             if "--profile-ref" in args:
                 profile_index = args.index("--profile-ref") + 1
                 if profile_index < len(args):
@@ -1630,7 +1786,7 @@ class ResearchController:
         step: int,
         step_limit: int,
     ) -> list[ChatMessage]:
-        trigger = self.config.research.compact_trigger_tokens
+        trigger = self.config.compact_trigger_tokens_for(self.config.llm.explorer_profile)
         if trigger <= 0:
             return messages
         if self._approx_message_tokens(messages) < trigger:

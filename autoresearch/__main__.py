@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
+import subprocess
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,7 @@ if __package__ in {None, ""}:
         latest_run_dir,
         load_all_run_attempts,
         load_attempts,
+        load_run_metadata,
         load_run_attempts,
         make_attempt_record,
         write_attempts,
@@ -44,6 +47,7 @@ else:
         latest_run_dir,
         load_all_run_attempts,
         load_attempts,
+        load_run_metadata,
         load_run_attempts,
         make_attempt_record,
         write_attempts,
@@ -96,6 +100,32 @@ def build_parser() -> argparse.ArgumentParser:
     leaderboard = subparsers.add_parser("leaderboard", help="Generate a derived best-per-run leaderboard image and JSON.")
     leaderboard.add_argument("--limit", type=int, default=15, help="Maximum number of runs to include.")
     subparsers.add_parser("reset-runs", help="Delete all run artifacts and recreate a clean empty runs state.")
+    stop_all = subparsers.add_parser(
+        "stop-all-runs",
+        help="Clear local queued Fuzzfolio research work and optionally stop local autoresearch processes.",
+    )
+    stop_all.add_argument(
+        "--stop-autoresearch",
+        action="store_true",
+        help="Also stop local autoresearch run/supervise Python processes.",
+    )
+    stop_all.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    purge_profiles = subparsers.add_parser(
+        "purge-cloud-profiles",
+        help="Delete saved scoring profiles from the currently configured Fuzzfolio account.",
+    )
+    purge_profiles.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually delete the listed cloud profiles. Without this flag the command only performs a dry run.",
+    )
+    purge_profiles.add_argument(
+        "--preview",
+        type=int,
+        default=10,
+        help="How many profiles to include in the preview output.",
+    )
+    purge_profiles.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
 
     score = subparsers.add_parser("score", help="Score one sensitivity artifact directory.")
     score.add_argument("artifact_dir", type=Path)
@@ -132,11 +162,13 @@ def cmd_doctor() -> int:
         "explorer_model": config.provider.model,
         "explorer_api_base": config.provider.api_base,
         "explorer_has_api_key": bool(config.provider.api_key),
+        "explorer_compact_trigger_tokens": config.compact_trigger_tokens_for(config.llm.explorer_profile),
         "supervisor_profile": config.llm.supervisor_profile,
         "supervisor_provider_type": config.supervisor_provider.provider_type,
         "supervisor_model": config.supervisor_provider.model,
         "supervisor_api_base": config.supervisor_provider.api_base,
         "supervisor_has_api_key": bool(config.supervisor_provider.api_key),
+        "supervisor_compact_trigger_tokens": config.compact_trigger_tokens_for(config.llm.supervisor_profile),
         "supervisor_max_steps": config.supervisor.max_steps,
         "supervisor_window_start": config.supervisor.window_start,
         "supervisor_window_end": config.supervisor.window_end,
@@ -147,6 +179,174 @@ def cmd_doctor() -> int:
     }
     print(json.dumps(payload, ensure_ascii=True, indent=2))
     return 0
+
+
+def _run_powershell_json(script: str) -> Any:
+    completed = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stdout = (completed.stdout or "").strip()
+    if not stdout:
+        return None
+    return json.loads(stdout)
+
+
+def _stop_local_autoresearch_processes() -> list[dict[str, Any]]:
+    current_pid = os.getpid()
+    script = rf"""
+$current = {current_pid}
+$targets = Get-CimInstance Win32_Process -Filter "name = 'python.exe'" |
+    Where-Object {{
+        $_.ProcessId -ne $current -and (
+            $_.CommandLine -like '*autoresearch run*' -or
+            $_.CommandLine -like '*autoresearch supervise*'
+        )
+    }} |
+    Select-Object ProcessId, CommandLine
+$stopped = @()
+foreach ($proc in $targets) {{
+    Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+    $stopped += [PSCustomObject]@{{
+        pid = [int]$proc.ProcessId
+        command = [string]$proc.CommandLine
+    }}
+}}
+$stopped | ConvertTo-Json -Depth 4
+"""
+    payload = _run_powershell_json(script)
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    return [payload]
+
+
+def _fuzzfolio_harness_dir(repo_root: Path) -> Path | None:
+    candidate = repo_root.parent / "Trading-Dashboard" / "harness"
+    if candidate.exists():
+        return candidate
+    return None
+
+
+def _drain_local_fuzzfolio_queues(repo_root: Path) -> dict[str, Any]:
+    harness_dir = _fuzzfolio_harness_dir(repo_root)
+    if harness_dir is None:
+        return {"ok": False, "warning": "Trading-Dashboard harness directory was not found."}
+
+    queue_keys = ["QUEUE:sweep_jobs", "QUEUE:deep_replay_jobs", "QUEUE:sim_jobs"]
+    deleted: list[dict[str, Any]] = []
+    for key in queue_keys:
+        completed = subprocess.run(
+            ["uv", "run", "cli.py", "--env", ".env.redis", "redis", "kv", "del", "--key", key],
+            cwd=harness_dir,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        stdout = (completed.stdout or "").strip()
+        payload = json.loads(stdout) if stdout else {}
+        data = payload.get("data") if isinstance(payload, dict) else None
+        deleted.append(
+            {
+                "key": key,
+                "deleted": int((data or {}).get("deleted") or 0),
+            }
+        )
+    return {"ok": True, "deleted_keys": deleted}
+
+
+def cmd_stop_all_runs(*, stop_autoresearch: bool, as_json: bool) -> int:
+    config = load_config()
+    payload: dict[str, Any] = {}
+    if stop_autoresearch:
+        payload["stopped_autoresearch_processes"] = _stop_local_autoresearch_processes()
+    else:
+        payload["stopped_autoresearch_processes"] = {"ok": True, "skipped": True}
+
+    payload["queue_drain"] = _drain_local_fuzzfolio_queues(config.repo_root)
+    if not stop_autoresearch:
+        payload["note"] = (
+            "Only local Fuzzfolio queued work was cleared. "
+            "Autoresearch controller processes were left running."
+        )
+
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    console.print_json(json.dumps(payload, ensure_ascii=True))
+    return 0
+
+
+def _extract_cloud_profiles(payload: dict[str, Any] | list[Any] | None) -> list[dict[str, Any]]:
+    if isinstance(payload, dict):
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def _profile_preview_row(item: dict[str, Any]) -> dict[str, Any]:
+    profile = item.get("profile") if isinstance(item.get("profile"), dict) else {}
+    return {
+        "id": str(item.get("id") or ""),
+        "name": str(profile.get("name") or ""),
+        "created_at": item.get("$createdAt"),
+        "updated_at": item.get("$updatedAt"),
+        "is_active": bool(profile.get("isActive")) if isinstance(profile.get("isActive"), bool) else None,
+    }
+
+
+def cmd_purge_cloud_profiles(*, execute: bool, preview: int, as_json: bool) -> int:
+    config = load_config()
+    cli = FuzzfolioCli(config.fuzzfolio)
+    result = cli.run(["profiles", "list", "--pretty"])
+    profiles = _extract_cloud_profiles(result.parsed_json)
+    preview_items = [_profile_preview_row(item) for item in profiles[: max(0, preview)]]
+
+    payload: dict[str, Any] = {
+        "auth_profile": config.fuzzfolio.auth_profile,
+        "count": len(profiles),
+        "dry_run": not execute,
+        "preview": preview_items,
+    }
+
+    if not execute:
+        payload["message"] = "Dry run only. Re-run with --yes to delete these saved cloud profiles."
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0
+        console.print_json(json.dumps(payload, ensure_ascii=True))
+        return 0
+
+    deleted: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for item in profiles:
+        profile_id = str(item.get("id") or "").strip()
+        if not profile_id:
+            continue
+        try:
+            cli.run(["profiles", "delete", "--profile-ref", profile_id, "--pretty"])
+            deleted.append({"id": profile_id, "name": str((item.get("profile") or {}).get("name") or "")})
+        except Exception as exc:
+            failures.append({"id": profile_id, "error": str(exc)})
+
+    payload["deleted_count"] = len(deleted)
+    payload["failed_count"] = len(failures)
+    payload["deleted_preview"] = deleted[: max(0, preview)]
+    if failures:
+        payload["failures_preview"] = failures[: max(0, preview)]
+
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0 if not failures else 1
+    console.print_json(json.dumps(payload, ensure_ascii=True))
+    return 0 if not failures else 1
 
 
 def _provider_test_scenarios() -> list[tuple[str, list[ChatMessage], Callable[[dict[str, Any]], str | None]]]:
@@ -817,6 +1017,7 @@ def cmd_plot(*, run_id: str | None, all_runs: bool) -> int:
     render_progress_artifacts(
         attempts,
         output_path,
+        run_metadata_path=run_dir / "run-metadata.json",
         lower_is_better=config.research.plot_lower_is_better,
     )
     print(
@@ -837,10 +1038,15 @@ def cmd_plot(*, run_id: str | None, all_runs: bool) -> int:
 def cmd_leaderboard(*, limit: int) -> int:
     config = load_config()
     attempts = load_all_run_attempts(config.runs_root)
+    run_metadata_by_run_id = {
+        run_dir.name: load_run_metadata(run_dir)
+        for run_dir in sorted(path for path in config.runs_root.iterdir() if path.is_dir() and path.name != "derived")
+    } if config.runs_root.exists() else {}
     ranked = render_leaderboard_artifacts(
         attempts,
         config.leaderboard_plot_path,
         config.leaderboard_json_path,
+        run_metadata_by_run_id=run_metadata_by_run_id,
         lower_is_better=config.research.plot_lower_is_better,
         limit=limit,
     )
@@ -944,6 +1150,7 @@ def cmd_record_attempt(
     render_progress_artifacts(
         attempts,
         progress_plot_path,
+        run_metadata_path=run_dir / "run-metadata.json",
         lower_is_better=config.research.plot_lower_is_better,
     )
     print(
@@ -1007,6 +1214,7 @@ def cmd_rescore_attempts() -> int:
         render_progress_artifacts(
             run_rescored,
             run_dir / "progress.png",
+            run_metadata_path=run_dir / "run-metadata.json",
             lower_is_better=config.research.plot_lower_is_better,
         )
     print(
@@ -1053,6 +1261,17 @@ def main() -> int:
         return cmd_leaderboard(limit=args.limit)
     if args.command == "reset-runs":
         return cmd_reset_runs()
+    if args.command == "stop-all-runs":
+        return cmd_stop_all_runs(
+            stop_autoresearch=bool(args.stop_autoresearch),
+            as_json=bool(args.json),
+        )
+    if args.command == "purge-cloud-profiles":
+        return cmd_purge_cloud_profiles(
+            execute=bool(args.yes),
+            preview=int(args.preview),
+            as_json=bool(args.json),
+        )
     if args.command == "score":
         return cmd_score(args.artifact_dir)
     if args.command == "record-attempt":

@@ -1,0 +1,99 @@
+{
+  "format": "fuzzfolio.scoring-profile",
+  "formatVersion": 1,
+  "profile": {
+    "description": "Survivor variant: align PLUS_DI H1- with STOCH for increased signal density on EURUSD while preserving sharp selective growth",
+    "directionMode": "both",
+    "indicators": [
+      {
+        "config": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "Stoch Cross (Stochastic Crossover)",
+          "lookbackBars": 1,
+          "normalizationMode": "none",
+          "ranges": {
+            "buy": [
+              0.0,
+              1.0
+            ],
+            "sell": [
+              0.0,
+              1.0
+            ]
+          },
+          "scale": 1.0,
+          "talibConfig": [
+            {
+              "name": "fastk_period",
+              "value": 5
+            },
+            {
+              "name": "slowk_period",
+              "value": 3
+            },
+            {
+              "name": "slowk_matype",
+              "value": 0
+            },
+            {
+              "name": "slowd_period",
+              "value": 3
+            },
+            {
+              "name": "slowd_matype",
+              "value": 0
+            }
+          ],
+          "timeframe": "M15",
+          "useFormingBar": false,
+          "weight": 1.0
+        },
+        "meta": {
+          "id": "STOCH_CROSSOVER",
+          "instanceId": "scaffold-stoch-crossover-1"
+        }
+      },
+      {
+        "config": {
+          "isActive": true,
+          "isTrendFollowing": true,
+          "label": "+DI",
+          "lookbackBars": 1,
+          "normalizationMode": "none",
+          "ranges": {
+            "buy": [
+              25.0,
+              40.0
+            ],
+            "sell": [
+              0.0,
+              15.0
+            ]
+          },
+          "scale": 1.0,
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 14
+            }
+          ],
+          "timeframe": "M15",
+          "useFormingBar": false,
+          "weight": 1.0
+        },
+        "meta": {
+          "id": "PLUS_DI_TREND",
+          "instanceId": "scaffold-plus-di-trend-2"
+        }
+      }
+    ],
+    "instruments": [
+      "EURUSD"
+    ],
+    "isActive": false,
+    "name": "Sharp Growth 31 (STOCH+PLUS M15 aligned)",
+    "notificationThreshold": 80,
+    "version": "v1"
+  }
+}

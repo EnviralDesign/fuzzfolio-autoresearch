@@ -10,6 +10,7 @@ from .config import AppConfig
 from .scoring import AttemptScore
 
 ATTEMPTS_FILE_NAME = "attempts.jsonl"
+RUN_METADATA_FILE_NAME = "run-metadata.json"
 
 
 @dataclass
@@ -50,6 +51,26 @@ def load_attempts(path: Path) -> list[dict[str, Any]]:
 
 def attempts_path_for_run_dir(run_dir: Path) -> Path:
     return run_dir / ATTEMPTS_FILE_NAME
+
+
+def run_metadata_path_for_run_dir(run_dir: Path) -> Path:
+    return run_dir / RUN_METADATA_FILE_NAME
+
+
+def load_run_metadata(run_dir: Path) -> dict[str, Any]:
+    path = run_metadata_path_for_run_dir(run_dir)
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return payload if isinstance(payload, dict) else {}
+
+
+def write_run_metadata(run_dir: Path, metadata: dict[str, Any]) -> Path:
+    path = run_metadata_path_for_run_dir(run_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(metadata, ensure_ascii=True, indent=2), encoding="utf-8")
+    return path
 
 
 def load_run_attempts(run_dir: Path) -> list[dict[str, Any]]:

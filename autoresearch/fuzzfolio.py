@@ -131,3 +131,9 @@ class FuzzfolioCli:
         if not isinstance(result.parsed_json, dict):
             raise CliError(f"compare-sensitivity did not emit JSON for {artifact_dir}")
         return result.parsed_json
+
+    def help_text(self, args: list[str] | None = None) -> str:
+        result = self.run([*(args or []), "--help"], check=False)
+        stdout = result.stdout.strip()
+        stderr = result.stderr.strip()
+        return stdout or stderr

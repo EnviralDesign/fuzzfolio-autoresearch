@@ -19,6 +19,80 @@ class ChatMessage:
     content: str
 
 
+JSON_REPAIR_PROMPT = """Your previous assistant response was invalid or incomplete JSON.
+
+Return one complete corrected JSON object only.
+Preserve the original intent, reasoning, and planned actions.
+Do not add Markdown or explanations.
+Escape Windows paths correctly inside JSON strings.
+"""
+
+
+def _escape_invalid_json_backslashes(text: str) -> str:
+    result: list[str] = []
+    in_string = False
+    string_quote = '"'
+    index = 0
+    length = len(text)
+    while index < length:
+        ch = text[index]
+        if not in_string:
+            result.append(ch)
+            if ch == '"':
+                in_string = True
+                string_quote = ch
+            index += 1
+            continue
+
+        if ch == "\\":
+            next_ch = text[index + 1] if index + 1 < length else ""
+            if next_ch in {'"', "\\", "/"}:
+                result.append(ch)
+                result.append(next_ch)
+                index += 2
+                continue
+            result.append("\\\\")
+            index += 1
+            continue
+
+        result.append(ch)
+        if ch == string_quote:
+            backslashes = 0
+            lookback = index - 1
+            while lookback >= 0 and text[lookback] == "\\":
+                backslashes += 1
+                lookback -= 1
+            if backslashes % 2 == 0:
+                in_string = False
+        index += 1
+    return "".join(result)
+
+
+def _parse_provider_json_object(text: str) -> dict[str, Any]:
+    decoder = json.JSONDecoder()
+    trimmed = text.strip()
+    candidates = [trimmed]
+    start = trimmed.find("{")
+    if start > 0:
+        candidates.append(trimmed[start:])
+
+    for candidate in candidates:
+        try:
+            value, _ = decoder.raw_decode(candidate)
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            sanitized = _escape_invalid_json_backslashes(candidate)
+            if sanitized != candidate:
+                try:
+                    value, _ = decoder.raw_decode(sanitized)
+                    if isinstance(value, dict):
+                        return value
+                except json.JSONDecodeError:
+                    pass
+    raise ProviderError(f"Provider did not return valid JSON. Raw response: {trimmed[:800]}")
+
+
 class JsonCompletionProvider(Protocol):
     def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
         ...
@@ -89,22 +163,7 @@ class ChatCompletionsJsonProvider:
         raise ProviderError("Provider response did not contain text content.")
 
     def _parse_json_object(self, text: str) -> dict[str, Any]:
-        decoder = json.JSONDecoder()
-        text = text.strip()
-        try:
-            value, _ = decoder.raw_decode(text)
-            if isinstance(value, dict):
-                return value
-        except json.JSONDecodeError:
-            start = text.find("{")
-            if start >= 0:
-                try:
-                    value, _ = decoder.raw_decode(text[start:])
-                    if isinstance(value, dict):
-                        return value
-                except json.JSONDecodeError:
-                    pass
-        raise ProviderError(f"Provider did not return valid JSON. Raw response: {text[:800]}")
+        return _parse_provider_json_object(text)
 
     def _request_json(
         self,
@@ -124,6 +183,23 @@ class ChatCompletionsJsonProvider:
             )
         return response.json()
 
+    def _repair_invalid_json(
+        self,
+        messages: list[ChatMessage],
+        raw_text: str,
+        max_completion_tokens: int,
+    ) -> dict[str, Any] | None:
+        repair_messages = [
+            *messages,
+            ChatMessage(role="assistant", content=raw_text),
+            ChatMessage(role="user", content=JSON_REPAIR_PROMPT),
+        ]
+        try:
+            payload = self._request_json(repair_messages, max_completion_tokens)
+            return self._parse_json_object(self._extract_content(payload))
+        except ProviderError:
+            return None
+
     def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
         if not self.config.api_key:
             env_hint = self.config.api_key_env or "provider-specific env var"
@@ -135,21 +211,29 @@ class ChatCompletionsJsonProvider:
         last_error: ProviderError | None = None
         for index, budget in enumerate(budgets):
             payload = self._request_json(messages, budget)
+            raw_text: str | None = None
+            choices = payload.get("choices") or []
+            finish_reason = None
+            if choices and isinstance(choices[0], dict):
+                finish_reason = choices[0].get("finish_reason")
             try:
-                return self._parse_json_object(self._extract_content(payload))
+                raw_text = self._extract_content(payload)
+                return self._parse_json_object(raw_text)
             except ProviderError as exc:
                 last_error = exc
-                choices = payload.get("choices") or []
-                finish_reason = None
-                if choices and isinstance(choices[0], dict):
-                    finish_reason = choices[0].get("finish_reason")
                 should_retry = (
                     index < len(budgets) - 1
-                    and "empty content" in str(exc).lower()
-                    and finish_reason == "length"
+                    and (
+                        (raw_text is None and "empty content" in str(exc).lower() and finish_reason == "length")
+                        or (raw_text is not None and finish_reason == "length")
+                    )
                 )
                 if should_retry:
                     continue
+                if raw_text:
+                    repaired = self._repair_invalid_json(messages, raw_text, max(budget, budgets[-1]))
+                    if repaired is not None:
+                        return repaired
                 raise
         raise last_error or ProviderError("Provider request failed without a specific error.")
 
@@ -163,7 +247,8 @@ class OpenAICompatibleProvider(ChatCompletionsJsonProvider):
 
 
 class OpenRouterProvider(ChatCompletionsJsonProvider):
-    pass
+    def _completion_budget_fields(self, max_completion_tokens: int) -> dict[str, Any]:
+        return {"max_tokens": max_completion_tokens}
 
 
 class XAIChatProvider(ChatCompletionsJsonProvider):
@@ -238,22 +323,7 @@ class ResponsesJsonProvider:
         raise ProviderError("Provider response did not contain text content.")
 
     def _parse_json_object(self, text: str) -> dict[str, Any]:
-        decoder = json.JSONDecoder()
-        text = text.strip()
-        try:
-            value, _ = decoder.raw_decode(text)
-            if isinstance(value, dict):
-                return value
-        except json.JSONDecodeError:
-            start = text.find("{")
-            if start >= 0:
-                try:
-                    value, _ = decoder.raw_decode(text[start:])
-                    if isinstance(value, dict):
-                        return value
-                except json.JSONDecodeError:
-                    pass
-        raise ProviderError(f"Provider did not return valid JSON. Raw response: {text[:800]}")
+        return _parse_provider_json_object(text)
 
     def _request_json(
         self,
@@ -273,6 +343,23 @@ class ResponsesJsonProvider:
             )
         return response.json()
 
+    def _repair_invalid_json(
+        self,
+        messages: list[ChatMessage],
+        raw_text: str,
+        max_completion_tokens: int,
+    ) -> dict[str, Any] | None:
+        repair_messages = [
+            *messages,
+            ChatMessage(role="assistant", content=raw_text),
+            ChatMessage(role="user", content=JSON_REPAIR_PROMPT),
+        ]
+        try:
+            payload = self._request_json(repair_messages, max_completion_tokens)
+            return self._parse_json_object(self._extract_content(payload))
+        except ProviderError:
+            return None
+
     def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
         if not self.config.api_key:
             env_hint = self.config.api_key_env or "provider-specific env var"
@@ -280,8 +367,26 @@ class ResponsesJsonProvider:
                 f"No API key configured for provider profile using model {self.config.model!r}. "
                 f"Put it in .agentsecrets under providers.<profile>.api_key or set {env_hint}."
             )
-        payload = self._request_json(messages, self.config.max_tokens)
-        return self._parse_json_object(self._extract_content(payload))
+        budgets = [self.config.max_tokens, max(self.config.max_tokens * 2, 4800)]
+        last_error: ProviderError | None = None
+        for index, budget in enumerate(budgets):
+            payload = self._request_json(messages, budget)
+            raw_text: str | None = None
+            finish_reason = payload.get("status")
+            try:
+                raw_text = self._extract_content(payload)
+                return self._parse_json_object(raw_text)
+            except ProviderError as exc:
+                last_error = exc
+                should_retry = index < len(budgets) - 1 and finish_reason == "incomplete"
+                if should_retry:
+                    continue
+                if raw_text:
+                    repaired = self._repair_invalid_json(messages, raw_text, max(budget, budgets[-1]))
+                    if repaired is not None:
+                        return repaired
+                raise
+        raise last_error or ProviderError("Provider request failed without a specific error.")
 
 
 class XAIResponsesProvider(ResponsesJsonProvider):

@@ -9,6 +9,7 @@
       "api_base": "https://api.openai.com/v1",
       "api_key_ref": "openai_main",
       "model": "gpt-5.4-mini",
+      "compact_trigger_tokens": 12000,
       "temperature": 0.2,
       "max_tokens": 3200,
       "timeout_seconds": 120
@@ -18,6 +19,7 @@
       "api_base": "https://api.x.ai/v1",
       "api_key_ref": "xai_main",
       "model": "grok-4.20-reasoning",
+      "compact_trigger_tokens": 40000,
       "temperature": 0.2,
       "max_tokens": 3200,
       "timeout_seconds": 180

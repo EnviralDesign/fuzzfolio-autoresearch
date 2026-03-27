@@ -24,6 +24,8 @@ The new runtime lives in `autoresearch/` and exposes:
 - `autoresearch test-providers`
 - `autoresearch run`
 - `autoresearch supervise`
+- `autoresearch stop-all-runs`
+- `autoresearch purge-cloud-profiles`
 - `autoresearch score <artifact_dir>`
 - `autoresearch record-attempt <artifact_dir>`
 - `autoresearch plot`
@@ -57,6 +59,8 @@ uv run autoresearch doctor
 uv run autoresearch test-providers
 uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
+uv run autoresearch stop-all-runs
+uv run autoresearch purge-cloud-profiles
 uv run autoresearch leaderboard
 uv run autoresearch reset-runs
 ```
@@ -78,12 +82,14 @@ uv run autoresearch supervise --explorer-profile grok-fast --supervisor-profile 
 The default live trace uses `rich` for colored panels and step/result tables so it is easier to watch during longer managed runs.
 The default provider completion budget is intentionally a bit roomy because the agent sometimes needs to emit a full portable profile JSON in one action.
 The controller also uses threshold-triggered context compaction modeled after `codex-rs`: once the live prompt estimate crosses the configured token threshold, it writes a checkpoint summary and rebuilds the active history from fresh run state plus a short recent tail.
+Compaction thresholds can now also be set per provider profile with `providers.<name>.compact_trigger_tokens`. If omitted, the runtime falls back to the global `research.compact_trigger_tokens`.
 The runtime now uses named LLM provider profiles instead of one global provider block. By default in the example config, the main explorer loop uses the `openai-mini` profile (`gpt-5.4-mini`) while the supervisor guidance path uses the `xai-grok` profile (`grok-4.20-reasoning`).
 In plain `run` mode, the controller now uses an explicit phase policy: most of the run is exploration with finish disabled, and only the last few steps become wrap-up. The prompt also carries a rolling next-score target so the explorer has a concrete stretch goal instead of repeatedly trying to stop.
 The controller now also owns horizon policy by phase: early runs screen over shorter month-based windows, mid runs deepen evidence around one year, and late/wrap-up phases push survivors toward 2-3 year pressure tests. The worker is guided to think in weeks/months/years, not bars.
 The controller also owns the active quality-score preset. By default it injects the `profile-drop` preset into deep-replay-backed evaluations and scaffolded sweeps so the agent does not need to remember or reason about preset selection mid-run.
 The controller now treats sweeps as first-class search behavior instead of an optional side path. Early and mid phases explicitly encourage `sweep scaffold`, `sweep patch`, `sweep validate`, and then `sweep submit` around promising families before the run settles into manual profile tweaking only.
 Instrument context is also coverage-aware now. The runtime asks the CLI for market coverage at a reference timeframe and surfaces buffered shortlist hints such as roughly `11` months for mid-phase work and `34` months for long-horizon wrap-up, so the agent naturally favors symbols that can actually satisfy the requested evidence horizon.
+New runs also persist `run-metadata.json` with the active explorer/supervisor profile and model names. Progress plots, progress indexes, and the derived leaderboard use that file when present so you can tell which models produced which runs.
 
 If you want to change that preset later, set `research.quality_score_preset` in `autoresearch.config.json`.
 
@@ -107,15 +113,19 @@ Example:
   "providers": {
     "openai-mini": {
       "type": "openai",
-      "model": "gpt-5.4-mini"
+      "model": "gpt-5.4-mini",
+      "compact_trigger_tokens": 12000
     },
     "xai-grok": {
       "type": "xai",
-      "model": "grok-4.20-reasoning"
+      "model": "grok-4.20-reasoning",
+      "compact_trigger_tokens": 40000
     }
   }
 }
 ```
+
+That profile-level compaction override is useful when one model has a much larger context window, a very different token cost, or a different quality/latency tradeoff than another.
 
 Secrets are matched by profile name in `.agentsecrets`:
 
@@ -196,6 +206,29 @@ uv run autoresearch supervise
 uv run autoresearch supervise --max-steps 300 --window 23:00-05:00 --timezone America/Chicago
 ```
 
+If you need to halt local research work manually, use:
+
+```powershell
+uv run autoresearch stop-all-runs
+uv run autoresearch stop-all-runs --stop-autoresearch
+```
+
+`stop-all-runs` is a local operator command. It does not use a remote server API key. By default it:
+
+- clears the local dev Redis sweep/deep-replay/sim queues through the Trading-Dashboard harness
+- leaves local autoresearch controller processes alone
+
+Use `--stop-autoresearch` if you also want to kill local `autoresearch run` / `autoresearch supervise` Python processes.
+
+If you want to wipe saved scoring profiles from the currently configured robot/cloud account, use:
+
+```powershell
+uv run autoresearch purge-cloud-profiles
+uv run autoresearch purge-cloud-profiles --yes
+```
+
+This command uses the existing configured Fuzzfolio auth profile and CLI session. It is a dry run by default and only deletes when `--yes` is supplied.
+
 Config-backed example:
 
 ```json
@@ -225,6 +258,16 @@ uv run -- python -m autoresearch run --max-steps 20
 Every `autoresearch run` invocation creates a fresh timestamped run directory under `runs/`, for example:
 
 - `runs/20260324T181958Z-agentic`
+
+Each run directory now carries:
+
+- `attempts.jsonl`
+- `progress.png`
+- `progress-index.json`
+- `progress-index.csv`
+- `run-metadata.json`
+
+`run-metadata.json` is the forward-looking source of truth for model tracking. Older runs created before this file existed still render normally, but they cannot be tagged reliably after the fact because the runtime did not persist model identity for them.
 
 Each run keeps its own artifacts:
 
