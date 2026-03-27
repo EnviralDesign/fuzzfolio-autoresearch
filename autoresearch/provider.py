@@ -32,6 +32,7 @@ Escape Windows paths correctly inside JSON strings.
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = [15, 30, 60, 120, 180, 240, 300]
 DEFAULT_RATE_LIMIT_MAX_RETRIES = 18
 DEFAULT_TRANSIENT_MAX_RETRIES = 4
+DEFAULT_MALFORMED_SUCCESS_RETRIES = 2
 TRANSIENT_STATUS_CODES = {408, 425, 500, 502, 503, 504}
 RATE_LIMIT_STATUS_CODES = {429, 529}
 HARD_QUOTA_MARKERS = (
@@ -153,6 +154,15 @@ def _looks_like_hard_quota(text: str) -> bool:
 def _looks_like_rate_limit(text: str) -> bool:
     lowered = text.lower()
     return any(marker in lowered for marker in RATE_LIMIT_MARKERS)
+
+
+def _is_malformed_success_error(error: ProviderError) -> bool:
+    lowered = str(error).lower()
+    return (
+        "no choices" in lowered
+        or "did not contain text content" in lowered
+        or "empty content" in lowered
+    )
 
 
 def _classify_retryable_response(response: requests.Response) -> tuple[str, int | None] | None:
@@ -294,7 +304,12 @@ class ChatCompletionsJsonProvider:
     def _extract_content(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices") or []
         if not choices:
-            raise ProviderError("Provider response had no choices.")
+            error_payload = payload.get("error")
+            if isinstance(error_payload, dict):
+                detail = json.dumps(error_payload, ensure_ascii=True)[:800]
+                raise ProviderError(f"Provider response had no choices. error={detail}")
+            preview = json.dumps(payload, ensure_ascii=True)[:800]
+            raise ProviderError(f"Provider response had no choices. payload={preview}")
         choice = choices[0]
         message = choice.get("message") or {}
         content = message.get("content")
@@ -308,11 +323,19 @@ class ChatCompletionsJsonProvider:
         if isinstance(content, list):
             parts: list[str] = []
             for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "")
+                if item_type in {"text", "output_text"}:
                     parts.append(str(item.get("text", "")))
+                    continue
+                text_payload = item.get("text")
+                if isinstance(text_payload, str) and text_payload.strip():
+                    parts.append(text_payload)
             if parts:
                 return "".join(parts)
-        raise ProviderError("Provider response did not contain text content.")
+        preview = json.dumps(payload, ensure_ascii=True)[:800]
+        raise ProviderError(f"Provider response did not contain text content. payload={preview}")
 
     def _parse_json_object(self, text: str) -> dict[str, Any]:
         return _parse_provider_json_object(text)
@@ -359,31 +382,43 @@ class ChatCompletionsJsonProvider:
         budgets = [self.config.max_tokens, max(self.config.max_tokens * 2, 4800)]
         last_error: ProviderError | None = None
         for index, budget in enumerate(budgets):
-            payload = self._request_json(messages, budget)
-            raw_text: str | None = None
-            choices = payload.get("choices") or []
-            finish_reason = None
-            if choices and isinstance(choices[0], dict):
-                finish_reason = choices[0].get("finish_reason")
-            try:
-                raw_text = self._extract_content(payload)
-                return self._parse_json_object(raw_text)
-            except ProviderError as exc:
-                last_error = exc
-                should_retry = (
-                    index < len(budgets) - 1
-                    and (
-                        (raw_text is None and "empty content" in str(exc).lower() and finish_reason == "length")
-                        or (raw_text is not None and finish_reason == "length")
+            malformed_attempts = 0
+            while True:
+                payload = self._request_json(messages, budget)
+                raw_text: str | None = None
+                choices = payload.get("choices") or []
+                finish_reason = None
+                if choices and isinstance(choices[0], dict):
+                    finish_reason = choices[0].get("finish_reason")
+                try:
+                    raw_text = self._extract_content(payload)
+                    return self._parse_json_object(raw_text)
+                except ProviderError as exc:
+                    last_error = exc
+                    error_text = str(exc).lower()
+                    malformed_retry = (
+                        raw_text is None
+                        and _is_malformed_success_error(exc)
+                        and malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES
                     )
-                )
-                if should_retry:
-                    continue
-                if raw_text:
-                    repaired = self._repair_invalid_json(messages, raw_text, max(budget, budgets[-1]))
-                    if repaired is not None:
-                        return repaired
-                raise
+                    if malformed_retry:
+                        malformed_attempts += 1
+                        continue
+                    should_retry = (
+                        index < len(budgets) - 1
+                        and (
+                            (raw_text is None and "empty content" in error_text and finish_reason == "length")
+                            or (raw_text is not None and finish_reason == "length")
+                            or (raw_text is None and _is_malformed_success_error(exc))
+                        )
+                    )
+                    if should_retry:
+                        break
+                    if raw_text:
+                        repaired = self._repair_invalid_json(messages, raw_text, max(budget, budgets[-1]))
+                        if repaired is not None:
+                            return repaired
+                    raise
         raise last_error or ProviderError("Provider request failed without a specific error.")
 
 
