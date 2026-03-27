@@ -1274,6 +1274,9 @@ class ResearchController:
             if result.get("auto_log") is not None:
                 summarized["auto_log"] = result.get("auto_log")
             if isinstance(payload, dict):
+                argv = payload.get("argv")
+                cli_args = argv if isinstance(argv, list) else []
+                command_head = [str(item) for item in cli_args[-3:]]
                 returncode = payload.get("returncode")
                 if returncode is not None:
                     summarized["returncode"] = returncode
@@ -1289,6 +1292,34 @@ class ResearchController:
                         "status",
                     ]
                     summarized["parsed_json_keys"] = [key for key in preview_keys if key in parsed][:8]
+                    if len(cli_args) >= 1:
+                        if "compare-sensitivity" in cli_args:
+                            best = parsed.get("best")
+                            if isinstance(best, dict):
+                                best_cell = best.get("best_cell")
+                                best_path = best.get("best_cell_path_metrics")
+                                market_window = best.get("market_data_window")
+                                matrix_summary = best.get("matrix_summary")
+                                compare_summary: dict[str, Any] = {
+                                    "quality_score": best.get("quality_score"),
+                                    "signal_count": best.get("signal_count"),
+                                    "timeframe": best.get("timeframe"),
+                                }
+                                if isinstance(best_cell, dict):
+                                    compare_summary["resolved_trades"] = best_cell.get("resolved_trades")
+                                    compare_summary["avg_net_r_per_closed_trade"] = best_cell.get("avg_net_r_per_closed_trade")
+                                if isinstance(best_path, dict):
+                                    compare_summary["psr"] = best_path.get("psr")
+                                    compare_summary["dsr"] = best.get("dsr")
+                                    compare_summary["k_ratio"] = best_path.get("k_ratio")
+                                    compare_summary["sharpe_r"] = best_path.get("sharpe_r")
+                                    compare_summary["max_drawdown_r"] = best_path.get("max_drawdown_r")
+                                if isinstance(market_window, dict):
+                                    compare_summary["effective_window_months"] = market_window.get("effective_window_months")
+                                    compare_summary["window_truncated"] = market_window.get("window_truncated")
+                                if isinstance(matrix_summary, dict):
+                                    compare_summary["positive_cell_ratio"] = matrix_summary.get("positive_cell_ratio")
+                                summarized["compare_summary"] = compare_summary
                 if isinstance(stdout, str) and "Auto-adjusted timeframe from" in stdout:
                     summarized["timeframe_auto_adjusted"] = True
                 if isinstance(stderr, str) and stderr.strip() and not bool(result.get("ok")):
@@ -1481,6 +1512,20 @@ class ResearchController:
         )
         append_attempt(tool_context.attempts_path, record)
         self._render_run_progress(tool_context)
+        signal_count = None
+        resolved_trades = None
+        effective_window_months = None
+        if isinstance(record.best_summary, dict):
+            signal_count = record.best_summary.get("signal_count")
+            best_cell = record.best_summary.get("best_cell")
+            if isinstance(best_cell, dict):
+                resolved_trades = best_cell.get("resolved_trades")
+            market_window = record.best_summary.get("market_data_window")
+            if isinstance(market_window, dict):
+                effective_window_months = market_window.get("effective_window_months")
+        auto_log_reason = None
+        if record.composite_score is None:
+            auto_log_reason = "quality_score was null in the evaluation artifacts"
         return {
             "status": "logged",
             "attempt_id": record.attempt_id,
@@ -1488,6 +1533,10 @@ class ResearchController:
             "primary_score": record.primary_score,
             "score_basis": record.score_basis,
             "metrics": record.metrics,
+            "signal_count": signal_count,
+            "resolved_trades": resolved_trades,
+            "effective_window_months": effective_window_months,
+            "reason": auto_log_reason,
             "artifact_dir": record.artifact_dir,
             "run_progress_plot": str(tool_context.progress_plot_path),
             "sensitivity_snapshot_loaded": sensitivity_snapshot is not None,

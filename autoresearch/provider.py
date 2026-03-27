@@ -32,7 +32,8 @@ Escape Windows paths correctly inside JSON strings.
 DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = [15, 30, 60, 120, 180, 240, 300]
 DEFAULT_RATE_LIMIT_MAX_RETRIES = 18
 DEFAULT_TRANSIENT_MAX_RETRIES = 4
-DEFAULT_MALFORMED_SUCCESS_RETRIES = 2
+DEFAULT_MALFORMED_SUCCESS_RETRIES = 5
+DEFAULT_MALFORMED_SUCCESS_BACKOFF_SECONDS = [2, 5, 10, 20, 30]
 TRANSIENT_STATUS_CODES = {408, 425, 500, 502, 503, 504}
 RATE_LIMIT_STATUS_CODES = {429, 529}
 HARD_QUOTA_MARKERS = (
@@ -165,6 +166,16 @@ def _is_malformed_success_error(error: ProviderError) -> bool:
     )
 
 
+def _is_invalid_json_error(error: ProviderError) -> bool:
+    return "did not return valid json" in str(error).lower()
+
+
+def _malformed_success_delay_seconds(attempt_index: int) -> int:
+    if attempt_index < len(DEFAULT_MALFORMED_SUCCESS_BACKOFF_SECONDS):
+        return DEFAULT_MALFORMED_SUCCESS_BACKOFF_SECONDS[attempt_index]
+    return DEFAULT_MALFORMED_SUCCESS_BACKOFF_SECONDS[-1]
+
+
 def _classify_retryable_response(response: requests.Response) -> tuple[str, int | None] | None:
     status = int(response.status_code)
     body_text = response.text[:1200] if response.text else ""
@@ -279,6 +290,13 @@ class ChatCompletionsJsonProvider:
             "Content-Type": "application/json",
         }
 
+    def _refresh_session(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = requests.Session()
+
     def _build_body(
         self,
         messages: list[ChatMessage],
@@ -334,8 +352,18 @@ class ChatCompletionsJsonProvider:
                     parts.append(text_payload)
             if parts:
                 return "".join(parts)
+        route_provider = payload.get("provider")
+        finish_reason = choice.get("finish_reason")
+        completion_tokens = None
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            completion_tokens = usage.get("completion_tokens")
         preview = json.dumps(payload, ensure_ascii=True)[:800]
-        raise ProviderError(f"Provider response did not contain text content. payload={preview}")
+        raise ProviderError(
+            "Provider response did not contain text content. "
+            f"provider={route_provider!r} finish_reason={finish_reason!r} "
+            f"completion_tokens={completion_tokens!r} payload={preview}"
+        )
 
     def _parse_json_object(self, text: str) -> dict[str, Any]:
         return _parse_provider_json_object(text)
@@ -396,12 +424,27 @@ class ChatCompletionsJsonProvider:
                 except ProviderError as exc:
                     last_error = exc
                     error_text = str(exc).lower()
+                    invalid_json = raw_text is not None and _is_invalid_json_error(exc)
                     malformed_retry = (
-                        raw_text is None
-                        and _is_malformed_success_error(exc)
-                        and malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES
+                        (
+                            raw_text is None
+                            and _is_malformed_success_error(exc)
+                        )
+                        or invalid_json
+                    ) and (
+                        malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES
                     )
                     if malformed_retry:
+                        self._refresh_session()
+                        if invalid_json and raw_text:
+                            repaired = self._repair_invalid_json(
+                                messages,
+                                raw_text,
+                                max(budget, budgets[-1]),
+                            )
+                            if repaired is not None:
+                                return repaired
+                        time.sleep(_malformed_success_delay_seconds(malformed_attempts))
                         malformed_attempts += 1
                         continue
                     should_retry = (
@@ -410,6 +453,7 @@ class ChatCompletionsJsonProvider:
                             (raw_text is None and "empty content" in error_text and finish_reason == "length")
                             or (raw_text is not None and finish_reason == "length")
                             or (raw_text is None and _is_malformed_success_error(exc))
+                            or invalid_json
                         )
                     )
                     if should_retry:
@@ -445,6 +489,10 @@ class XAIChatProvider(ChatCompletionsJsonProvider):
         return None
 
 
+class GroqProvider(ChatCompletionsJsonProvider):
+    pass
+
+
 class ResponsesJsonProvider:
     def __init__(self, config: ProviderProfileConfig):
         self.config = config
@@ -463,6 +511,13 @@ class ResponsesJsonProvider:
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
         }
+
+    def _refresh_session(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        self.session = requests.Session()
 
     def _build_body(
         self,
@@ -551,22 +606,49 @@ class ResponsesJsonProvider:
         budgets = [self.config.max_tokens, max(self.config.max_tokens * 2, 4800)]
         last_error: ProviderError | None = None
         for index, budget in enumerate(budgets):
-            payload = self._request_json(messages, budget)
-            raw_text: str | None = None
-            finish_reason = payload.get("status")
-            try:
-                raw_text = self._extract_content(payload)
-                return self._parse_json_object(raw_text)
-            except ProviderError as exc:
-                last_error = exc
-                should_retry = index < len(budgets) - 1 and finish_reason == "incomplete"
-                if should_retry:
-                    continue
-                if raw_text:
-                    repaired = self._repair_invalid_json(messages, raw_text, max(budget, budgets[-1]))
-                    if repaired is not None:
-                        return repaired
-                raise
+            malformed_attempts = 0
+            while True:
+                payload = self._request_json(messages, budget)
+                raw_text: str | None = None
+                finish_reason = payload.get("status")
+                try:
+                    raw_text = self._extract_content(payload)
+                    return self._parse_json_object(raw_text)
+                except ProviderError as exc:
+                    last_error = exc
+                    invalid_json = raw_text is not None and _is_invalid_json_error(exc)
+                    malformed_retry = (
+                        (
+                            raw_text is None
+                            and _is_malformed_success_error(exc)
+                        )
+                        or invalid_json
+                    ) and (
+                        malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES
+                    )
+                    if malformed_retry:
+                        self._refresh_session()
+                        if invalid_json and raw_text:
+                            repaired = self._repair_invalid_json(
+                                messages,
+                                raw_text,
+                                max(budget, budgets[-1]),
+                            )
+                            if repaired is not None:
+                                return repaired
+                        time.sleep(_malformed_success_delay_seconds(malformed_attempts))
+                        malformed_attempts += 1
+                        continue
+                    should_retry = index < len(budgets) - 1 and (
+                        finish_reason == "incomplete" or invalid_json
+                    )
+                    if should_retry:
+                        break
+                    if raw_text:
+                        repaired = self._repair_invalid_json(messages, raw_text, max(budget, budgets[-1]))
+                        if repaired is not None:
+                            return repaired
+                    raise
         raise last_error or ProviderError("Provider request failed without a specific error.")
 
 
@@ -585,6 +667,10 @@ def create_provider(config: ProviderProfileConfig) -> JsonCompletionProvider:
         if transport == "responses":
             return XAIResponsesProvider(config)
         return XAIChatProvider(config)
+    if normalized == "groq":
+        if transport == "responses":
+            return ResponsesJsonProvider(config)
+        return GroqProvider(config)
     if transport == "responses":
         return ResponsesJsonProvider(config)
     if normalized == "openrouter":

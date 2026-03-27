@@ -161,6 +161,13 @@ def _provider_defaults(provider_type: str) -> dict[str, Any]:
             "timeout_seconds": 180,
             "transport": "chat_completions",
         }
+    if normalized == "groq":
+        return {
+            "api_base": "https://api.groq.com/openai/v1",
+            "api_key_env": "GROQ_API_KEY",
+            "timeout_seconds": 120,
+            "transport": "chat_completions",
+        }
     if normalized == "openrouter":
         return {
             "api_base": "https://openrouter.ai/api/v1",

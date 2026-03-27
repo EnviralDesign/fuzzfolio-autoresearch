@@ -151,7 +151,8 @@ Profiles can reference those shared keys with `api_key_ref`:
 {
   "providers": {
     "openai-mini": { "type": "openai", "api_key_ref": "openai_main" },
-    "xai-grok": { "type": "xai", "api_key_ref": "xai_main" }
+    "xai-grok": { "type": "xai", "api_key_ref": "xai_main" },
+    "groq-oss-20b": { "type": "groq", "api_key_ref": "groq_main", "model": "openai/gpt-oss-20b" }
   }
 }
 ```
@@ -162,8 +163,17 @@ The current provider types are:
 
 - `openai`
 - `xai`
+- `groq`
 - `openrouter`
 - `openai_compatible`
+
+`groq` is a first-class direct provider that defaults to:
+
+- `api_base = "https://api.groq.com/openai/v1"`
+- `api_key_env = "GROQ_API_KEY"`
+- `transport = "chat_completions"`
+
+That is the preferred path when you want Groq-hosted OSS models without going through OpenRouter routing.
 
 Profiles may also choose a transport explicitly when needed:
 
