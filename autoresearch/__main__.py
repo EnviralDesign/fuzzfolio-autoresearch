@@ -105,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--explorer-profile", default=None, help="Override the configured explorer provider profile for this run.")
     run.add_argument("--supervisor-profile", default=None, help="Override the configured supervisor provider profile for this run.")
     run.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
+    run.add_argument("--plain-progress", action="store_true", help="Use plain line-oriented progress output instead of Rich panels.")
 
     supervise = subparsers.add_parser("supervise", help="Run the supervised controller with config-backed policy defaults.")
     supervise.add_argument("--max-steps", type=int, default=None, help="Per-session step cap before supervise starts a fresh isolated session.")
@@ -113,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     supervise.add_argument("--explorer-profile", default=None, help="Override the configured explorer provider profile for this run.")
     supervise.add_argument("--supervisor-profile", default=None, help="Override the configured supervisor provider profile for this run.")
     supervise.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
+    supervise.add_argument("--plain-progress", action="store_true", help="Use plain line-oriented progress output instead of Rich panels.")
 
     plot = subparsers.add_parser("plot", help="Generate a run-local or all-runs derived progress plot.")
     plot.add_argument("--run-id", default=None, help="Specific run id to render. Defaults to latest discovered run.")
@@ -209,6 +211,20 @@ def _use_plain_progress() -> None:
     PLAIN_PROGRESS_MODE = True
 
 
+def _set_plain_progress_mode(enabled: bool) -> None:
+    global PLAIN_PROGRESS_MODE
+    PLAIN_PROGRESS_MODE = bool(enabled)
+
+
+def _plain_separator(label: str | None = None) -> str:
+    width = 78
+    if not label:
+        return "-" * width
+    compact = _short_text(label, 28)
+    decorated = f"---- {compact} "
+    return decorated + ("-" * max(0, width - len(decorated)))
+
+
 def _safe_render(console_renderer: Any, plain_renderer: Any) -> None:
     if PLAIN_PROGRESS_MODE:
         plain_renderer()
@@ -221,6 +237,7 @@ def _safe_render(console_renderer: Any, plain_renderer: Any) -> None:
 
 
 def _render_run_header_plain(event: dict[str, object]) -> None:
+    _write_plain_line(_plain_separator("Autoresearch Run"))
     _write_plain_line(
         f"Run {event.get('run_id')} | mode={event.get('mode') or 'run'} | steps={event.get('max_steps')} | dir={_display_path(str(event.get('run_dir')))}"
     )
@@ -233,6 +250,7 @@ def _render_run_header_plain(event: dict[str, object]) -> None:
 
 
 def _render_step_plain(step_payload: dict[str, Any]) -> None:
+    _write_plain_line(_plain_separator(f"Step {step_payload.get('step')}"))
     _write_plain_line(f"Step {step_payload.get('step')}: {_short_text(str(step_payload.get('reasoning', '')), 420)}")
     actions = step_payload.get("actions")
     if isinstance(actions, list):
@@ -247,6 +265,7 @@ def _render_step_plain(step_payload: dict[str, Any]) -> None:
 
 
 def _render_run_footer_plain(result: dict[str, object]) -> None:
+    _write_plain_line(_plain_separator("Run Complete"))
     _write_plain_line(
         f"Run complete | status={result.get('status')} | run={result.get('run_id')} | dir={_display_path(str(result.get('run_dir')))}"
     )
@@ -1086,7 +1105,9 @@ def cmd_run(
     explorer_profile: str | None,
     supervisor_profile: str | None,
     as_json: bool,
+    plain_progress: bool,
 ) -> int:
+    _set_plain_progress_mode(plain_progress and not as_json)
     config = _load_runtime_config(
         explorer_profile=explorer_profile,
         supervisor_profile=supervisor_profile,
@@ -1113,7 +1134,9 @@ def cmd_supervise(
     explorer_profile: str | None,
     supervisor_profile: str | None,
     as_json: bool,
+    plain_progress: bool,
 ) -> int:
+    _set_plain_progress_mode(plain_progress and not as_json)
     config = _load_runtime_config(
         explorer_profile=explorer_profile,
         supervisor_profile=supervisor_profile,
@@ -1463,6 +1486,7 @@ def main() -> int:
             explorer_profile=args.explorer_profile,
             supervisor_profile=args.supervisor_profile,
             as_json=bool(args.json),
+            plain_progress=bool(args.plain_progress),
         )
     if args.command == "supervise":
         return cmd_supervise(
@@ -1472,6 +1496,7 @@ def main() -> int:
             explorer_profile=args.explorer_profile,
             supervisor_profile=args.supervisor_profile,
             as_json=bool(args.json),
+            plain_progress=bool(args.plain_progress),
         )
     if args.command == "plot":
         return cmd_plot(run_id=args.run_id, all_runs=bool(args.all_runs))

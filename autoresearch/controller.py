@@ -1404,6 +1404,36 @@ class ResearchController:
                 errors.append(f"Action {index}: {error}")
         return errors
 
+    def _validate_finish_timing(
+        self,
+        tool_context: ToolContext,
+        actions: Any,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> list[str]:
+        if not isinstance(actions, list):
+            return []
+        errors: list[str] = []
+        for index, action in enumerate(actions, start=1):
+            if not isinstance(action, dict):
+                continue
+            if str(action.get("tool", "")).strip() != "finish":
+                continue
+            summary = action.get("summary", "")
+            if summary is not None and not isinstance(summary, str):
+                continue
+            allow, message = self._allow_finish(
+                tool_context,
+                step,
+                step_limit,
+                str(summary or ""),
+                policy,
+            )
+            if not allow:
+                errors.append(f"Action {index}: finish is not allowed now. {message}")
+        return errors
+
     def _repair_invalid_response(
         self,
         messages: list[ChatMessage],
@@ -1679,12 +1709,22 @@ class ResearchController:
 
         if tool == "read_file":
             path = Path(str(action.get("path", ""))).resolve()
+            if not path.exists():
+                raise FileNotFoundError(f"read_file failed: path does not exist: {path}")
+            if path.is_dir():
+                raise IsADirectoryError(f"read_file failed: path is a directory, not a file: {path}. Use list_dir instead.")
             max_chars = int(action.get("max_chars", 6000))
             content = path.read_text(encoding="utf-8")
             return {"tool": "read_file", "path": str(path), "content": content[:max_chars]}
 
         if tool == "list_dir":
             path = Path(str(action.get("path", ""))).resolve()
+            if not path.exists():
+                raise FileNotFoundError(f"list_dir failed: path does not exist: {path}")
+            if path.is_file():
+                raise NotADirectoryError(
+                    f"list_dir failed: path is a file, not a directory: {path}. Use read_file instead."
+                )
             recursive = bool(action.get("recursive", False))
             if recursive:
                 items = [str(item) for item in sorted(path.rglob("*"))[:300]]
@@ -2001,6 +2041,15 @@ class ResearchController:
             actions = response.get("actions")
             reasoning = str(response.get("reasoning", "")).strip()
             validation_errors = self._validate_actions(actions)
+            validation_errors.extend(
+                self._validate_finish_timing(
+                    tool_context,
+                    actions,
+                    step,
+                    step_limit,
+                    policy,
+                )
+            )
             if validation_errors:
                 repaired = self._repair_invalid_response(messages, reasoning, actions if isinstance(actions, list) else [], validation_errors)
                 if repaired is not None:
@@ -2008,6 +2057,15 @@ class ResearchController:
                     actions = response.get("actions")
                     reasoning = str(response.get("reasoning", "")).strip()
                     validation_errors = self._validate_actions(actions)
+                    validation_errors.extend(
+                        self._validate_finish_timing(
+                            tool_context,
+                            actions,
+                            step,
+                            step_limit,
+                            policy,
+                        )
+                    )
             if validation_errors:
                 horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
                 step_payload = {

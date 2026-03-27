@@ -74,6 +74,15 @@ If you want machine-readable output instead, use:
 uv run autoresearch run --max-steps 20 --json
 ```
 
+If you want proc-man-friendly line-oriented output instead of Rich panels, use:
+
+```powershell
+uv run autoresearch run --max-steps 20 --plain-progress
+uv run autoresearch supervise --plain-progress
+```
+
+`--plain-progress` keeps the live trace human-readable, but renders it as simple newline-delimited logs with dashed separators so log capture tools can follow it more reliably.
+
 You can also override the configured provider profiles per invocation:
 
 ```powershell
