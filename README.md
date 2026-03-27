@@ -90,6 +90,7 @@ The controller also owns the active quality-score preset. By default it injects 
 The controller now treats sweeps as first-class search behavior instead of an optional side path. Early and mid phases explicitly encourage `sweep scaffold`, `sweep patch`, `sweep validate`, and then `sweep submit` around promising families before the run settles into manual profile tweaking only.
 Instrument context is also coverage-aware now. The runtime asks the CLI for market coverage at a reference timeframe and surfaces buffered shortlist hints such as roughly `11` months for mid-phase work and `34` months for long-horizon wrap-up, so the agent naturally favors symbols that can actually satisfy the requested evidence horizon.
 New runs also persist `run-metadata.json` with the active explorer/supervisor profile and model names. Progress plots, progress indexes, and the derived leaderboard use that file when present so you can tell which models produced which runs.
+The controller now also writes `cli-help-catalog.json` per run from the real `fuzzfolio-agent-cli --help` surface. It uses that catalog as a shallow front-door guard for invalid command families and subcommands, and the agent can explicitly recover with `run_cli ["help"]` or `run_cli ["help", "<family>"]`.
 
 If you want to change that preset later, set `research.quality_score_preset` in `autoresearch.config.json`.
 
@@ -126,6 +127,12 @@ Example:
 ```
 
 That profile-level compaction override is useful when one model has a much larger context window, a very different token cost, or a different quality/latency tradeoff than another.
+Provider profiles can also tune generic rate-limit behavior with:
+
+- `rate_limit_backoff_seconds`
+- `rate_limit_max_retries`
+
+If omitted, the runtime uses a provider-agnostic default backoff ladder of `15, 30, 60, 120, 180, 240, 300` seconds and then keeps retrying every `300` seconds until the configured retry ceiling is reached. Temporary rate-limit signals honor `Retry-After` when providers send it. Clear hard-quota/billing failures still fail fast instead of sleeping forever.
 
 Secrets are matched by profile name in `.agentsecrets`:
 
@@ -266,6 +273,7 @@ Each run directory now carries:
 - `progress-index.json`
 - `progress-index.csv`
 - `run-metadata.json`
+- `cli-help-catalog.json`
 
 `run-metadata.json` is the forward-looking source of truth for model tracking. Older runs created before this file existed still render normally, but they cannot be tagged reliably after the fact because the runtime did not persist model identity for them.
 

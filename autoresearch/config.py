@@ -24,6 +24,8 @@ class ProviderProfileConfig:
     timeout_seconds: int = 120
     transport: str = "chat_completions"
     compact_trigger_tokens: int | None = None
+    rate_limit_backoff_seconds: list[int] | None = None
+    rate_limit_max_retries: int | None = None
 
 
 @dataclass
@@ -239,6 +241,16 @@ def _load_provider_profiles(
                     if profile_cfg.get("compact_trigger_tokens") is not None
                     else None
                 ),
+                rate_limit_backoff_seconds=(
+                    [int(item) for item in profile_cfg.get("rate_limit_backoff_seconds", [])]
+                    if profile_cfg.get("rate_limit_backoff_seconds") is not None
+                    else None
+                ),
+                rate_limit_max_retries=(
+                    int(profile_cfg["rate_limit_max_retries"])
+                    if profile_cfg.get("rate_limit_max_retries") is not None
+                    else None
+                ),
             )
 
         explorer_profile = _env_or_value(
@@ -297,6 +309,8 @@ def _load_provider_profiles(
             timeout_seconds=shared_timeout,
             transport=str(defaults["transport"]),
             compact_trigger_tokens=None,
+            rate_limit_backoff_seconds=None,
+            rate_limit_max_retries=None,
         ),
         "openai-supervisor": ProviderProfileConfig(
             provider_type=provider_type,
@@ -309,6 +323,8 @@ def _load_provider_profiles(
             timeout_seconds=shared_timeout,
             transport=str(defaults["transport"]),
             compact_trigger_tokens=None,
+            rate_limit_backoff_seconds=None,
+            rate_limit_max_retries=None,
         ),
     }
     return LlmConfig(), profiles

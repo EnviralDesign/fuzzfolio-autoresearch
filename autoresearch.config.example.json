@@ -10,6 +10,8 @@
       "api_key_ref": "openai_main",
       "model": "gpt-5.4-mini",
       "compact_trigger_tokens": 12000,
+      "rate_limit_backoff_seconds": [15, 30, 60, 120, 180, 240, 300],
+      "rate_limit_max_retries": 18,
       "temperature": 0.2,
       "max_tokens": 3200,
       "timeout_seconds": 120
@@ -20,6 +22,8 @@
       "api_key_ref": "xai_main",
       "model": "grok-4.20-reasoning",
       "compact_trigger_tokens": 40000,
+      "rate_limit_backoff_seconds": [15, 30, 60, 120, 180, 240, 300],
+      "rate_limit_max_retries": 18,
       "temperature": 0.2,
       "max_tokens": 3200,
       "timeout_seconds": 180

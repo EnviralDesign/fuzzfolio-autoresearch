@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import time
+from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -26,6 +28,28 @@ Preserve the original intent, reasoning, and planned actions.
 Do not add Markdown or explanations.
 Escape Windows paths correctly inside JSON strings.
 """
+
+DEFAULT_RATE_LIMIT_BACKOFF_SECONDS = [15, 30, 60, 120, 180, 240, 300]
+DEFAULT_RATE_LIMIT_MAX_RETRIES = 18
+DEFAULT_TRANSIENT_MAX_RETRIES = 4
+TRANSIENT_STATUS_CODES = {408, 425, 500, 502, 503, 504}
+RATE_LIMIT_STATUS_CODES = {429, 529}
+HARD_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "quota exceeded",
+    "exceeded your current quota",
+    "out of credits",
+    "credit balance is too low",
+    "billing",
+    "payment required",
+)
+RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "too many requests",
+    "retry after",
+    "requests rate limit",
+    "temporarily rate limited",
+)
 
 
 def _escape_invalid_json_backslashes(text: str) -> str:
@@ -91,6 +115,134 @@ def _parse_provider_json_object(text: str) -> dict[str, Any]:
                 except json.JSONDecodeError:
                     pass
     raise ProviderError(f"Provider did not return valid JSON. Raw response: {trimmed[:800]}")
+
+
+def _configured_rate_limit_backoff_seconds(config: ProviderProfileConfig) -> list[int]:
+    values = config.rate_limit_backoff_seconds or DEFAULT_RATE_LIMIT_BACKOFF_SECONDS
+    cleaned = [max(1, int(item)) for item in values]
+    return cleaned or list(DEFAULT_RATE_LIMIT_BACKOFF_SECONDS)
+
+
+def _configured_rate_limit_max_retries(config: ProviderProfileConfig) -> int:
+    if config.rate_limit_max_retries is not None:
+        return max(1, int(config.rate_limit_max_retries))
+    return DEFAULT_RATE_LIMIT_MAX_RETRIES
+
+
+def _parse_retry_after_seconds(response: requests.Response) -> int | None:
+    header = response.headers.get("Retry-After")
+    if not header:
+        return None
+    value = header.strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return max(1, int(value))
+    try:
+        retry_at = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    return max(1, int(retry_at.timestamp() - time.time()))
+
+
+def _looks_like_hard_quota(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in HARD_QUOTA_MARKERS)
+
+
+def _looks_like_rate_limit(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in RATE_LIMIT_MARKERS)
+
+
+def _classify_retryable_response(response: requests.Response) -> tuple[str, int | None] | None:
+    status = int(response.status_code)
+    body_text = response.text[:1200] if response.text else ""
+    retry_after = _parse_retry_after_seconds(response)
+    if status in RATE_LIMIT_STATUS_CODES:
+        if _looks_like_hard_quota(body_text):
+            return None
+        return ("rate_limit", retry_after)
+    if _looks_like_rate_limit(body_text):
+        if _looks_like_hard_quota(body_text):
+            return None
+        return ("rate_limit", retry_after)
+    if status in TRANSIENT_STATUS_CODES:
+        return ("transient", retry_after)
+    return None
+
+
+def _rate_limit_delay_seconds(config: ProviderProfileConfig, attempt_index: int, retry_after: int | None) -> int:
+    if retry_after is not None and retry_after > 0:
+        return retry_after
+    schedule = _configured_rate_limit_backoff_seconds(config)
+    if attempt_index < len(schedule):
+        return schedule[attempt_index]
+    return schedule[-1]
+
+
+def _transient_delay_seconds(config: ProviderProfileConfig, attempt_index: int, retry_after: int | None) -> int:
+    if retry_after is not None and retry_after > 0:
+        return retry_after
+    schedule = _configured_rate_limit_backoff_seconds(config)
+    capped_index = min(attempt_index, max(0, min(2, len(schedule) - 1)))
+    return schedule[capped_index]
+
+
+def _post_json_with_retry(
+    session: requests.Session,
+    *,
+    url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    timeout_seconds: int,
+    config: ProviderProfileConfig,
+) -> dict[str, Any]:
+    rate_limit_retries = 0
+    transient_retries = 0
+    while True:
+        try:
+            response = session.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            transient_retries += 1
+            if transient_retries > DEFAULT_TRANSIENT_MAX_RETRIES:
+                raise ProviderError(
+                    f"Provider request failed after {transient_retries} transient retries: {exc}"
+                ) from exc
+            time.sleep(_transient_delay_seconds(config, transient_retries - 1, None))
+            continue
+
+        classification = _classify_retryable_response(response)
+        if classification is not None:
+            retry_kind, retry_after = classification
+            if retry_kind == "rate_limit":
+                rate_limit_retries += 1
+                if rate_limit_retries > _configured_rate_limit_max_retries(config):
+                    raise ProviderError(
+                        f"Provider remained rate-limited after {rate_limit_retries} retries: "
+                        f"{response.status_code} {response.text[:800]}"
+                    )
+                time.sleep(_rate_limit_delay_seconds(config, rate_limit_retries - 1, retry_after))
+                continue
+            transient_retries += 1
+            if transient_retries > DEFAULT_TRANSIENT_MAX_RETRIES:
+                raise ProviderError(
+                    f"Provider request kept failing transiently after {transient_retries} retries: "
+                    f"{response.status_code} {response.text[:800]}"
+                )
+            time.sleep(_transient_delay_seconds(config, transient_retries - 1, retry_after))
+            continue
+
+        if response.status_code >= 400:
+            raise ProviderError(
+                f"Provider request failed with {response.status_code}: {response.text[:800]}"
+            )
+        return response.json()
 
 
 class JsonCompletionProvider(Protocol):
@@ -171,17 +323,14 @@ class ChatCompletionsJsonProvider:
         max_completion_tokens: int,
     ) -> dict[str, Any]:
         body = self._build_body(messages, max_completion_tokens)
-        response = self.session.post(
-            self._build_url(),
+        return _post_json_with_retry(
+            self.session,
+            url=self._build_url(),
             headers=self._build_headers(),
-            json=body,
-            timeout=self.config.timeout_seconds,
+            body=body,
+            timeout_seconds=self.config.timeout_seconds,
+            config=self.config,
         )
-        if response.status_code >= 400:
-            raise ProviderError(
-                f"Provider request failed with {response.status_code}: {response.text[:800]}"
-            )
-        return response.json()
 
     def _repair_invalid_json(
         self,
@@ -331,17 +480,14 @@ class ResponsesJsonProvider:
         max_completion_tokens: int,
     ) -> dict[str, Any]:
         body = self._build_body(messages, max_completion_tokens)
-        response = self.session.post(
-            self._build_url(),
+        return _post_json_with_retry(
+            self.session,
+            url=self._build_url(),
             headers=self._build_headers(),
-            json=body,
-            timeout=self.config.timeout_seconds,
+            body=body,
+            timeout_seconds=self.config.timeout_seconds,
+            config=self.config,
         )
-        if response.status_code >= 400:
-            raise ProviderError(
-                f"Provider request failed with {response.status_code}: {response.text[:800]}"
-            )
-        return response.json()
 
     def _repair_invalid_json(
         self,

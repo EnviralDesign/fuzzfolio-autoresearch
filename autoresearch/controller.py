@@ -370,6 +370,7 @@ class ResearchController:
 
     def _write_cli_help_catalog(self, run_dir: Path) -> Path:
         path = run_dir / "cli-help-catalog.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
         try:
             catalog = self._build_cli_help_catalog()
         except Exception:
@@ -584,9 +585,9 @@ class ResearchController:
         evals_dir = run_dir / "evals"
         notes_dir = run_dir / "notes"
         progress_plot_path = run_dir / "progress.png"
-        cli_help_catalog_path = self._write_cli_help_catalog(run_dir)
         for path in [profiles_dir, evals_dir, notes_dir]:
             path.mkdir(parents=True, exist_ok=True)
+        cli_help_catalog_path = self._write_cli_help_catalog(run_dir)
         run_metadata_path = write_run_metadata(run_dir, run_metadata)
         seed_prompt_path = run_dir / "seed-prompt.json"
         if self.config.research.auto_seed_prompt:
