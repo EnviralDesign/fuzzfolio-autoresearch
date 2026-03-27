@@ -26,6 +26,7 @@ The new runtime lives in `autoresearch/` and exposes:
 - `autoresearch supervise`
 - `autoresearch stop-all-runs`
 - `autoresearch purge-cloud-profiles`
+- `autoresearch prune-runs`
 - `autoresearch score <artifact_dir>`
 - `autoresearch record-attempt <artifact_dir>`
 - `autoresearch plot`
@@ -61,6 +62,7 @@ uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
 uv run autoresearch stop-all-runs
 uv run autoresearch purge-cloud-profiles
+uv run autoresearch prune-runs
 uv run autoresearch leaderboard
 uv run autoresearch reset-runs
 ```
@@ -277,6 +279,15 @@ uv run autoresearch purge-cloud-profiles --yes
 ```
 
 This command uses the existing configured Fuzzfolio auth profile and CLI session. It is a dry run by default and only deletes when `--yes` is supplied.
+
+If you want to prune local run directories that never really got off the ground, use:
+
+```powershell
+uv run autoresearch prune-runs
+uv run autoresearch prune-runs --min-mapped-points 2 --yes
+```
+
+`mapped points` means scored attempts with a non-null `composite_score`, which matches what the progress plot can actually map. The command is a dry run by default and deletes matched runs only when `--yes` is supplied.
 
 Config-backed example:
 

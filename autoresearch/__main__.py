@@ -25,6 +25,7 @@ if __package__ in {None, ""}:
     from autoresearch.ledger import (
         append_attempt,
         attempts_path_for_run_dir,
+        list_run_dirs,
         latest_run_dir,
         load_all_run_attempts,
         load_attempts,
@@ -43,6 +44,7 @@ else:
     from .ledger import (
         append_attempt,
         attempts_path_for_run_dir,
+        list_run_dirs,
         latest_run_dir,
         load_all_run_attempts,
         load_attempts,
@@ -118,6 +120,28 @@ def build_parser() -> argparse.ArgumentParser:
     leaderboard = subparsers.add_parser("leaderboard", help="Generate a derived best-per-run leaderboard image and JSON.")
     leaderboard.add_argument("--limit", type=int, default=15, help="Maximum number of runs to include.")
     subparsers.add_parser("reset-runs", help="Delete all run artifacts and recreate a clean empty runs state.")
+    prune_runs = subparsers.add_parser(
+        "prune-runs",
+        help="Delete low-signal run directories, such as smoke tests or early dead runs.",
+    )
+    prune_runs.add_argument(
+        "--min-mapped-points",
+        type=int,
+        default=2,
+        help="Keep runs with at least this many mapped points (scored attempts). Default: 2.",
+    )
+    prune_runs.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually delete the matched runs. Without this flag the command only performs a dry run.",
+    )
+    prune_runs.add_argument(
+        "--preview",
+        type=int,
+        default=20,
+        help="How many matched runs to include in the preview output.",
+    )
+    prune_runs.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     stop_all = subparsers.add_parser(
         "stop-all-runs",
         help="Clear local queued Fuzzfolio research work and optionally stop local autoresearch processes.",
@@ -449,6 +473,82 @@ def cmd_purge_cloud_profiles(*, execute: bool, preview: int, as_json: bool) -> i
         return 0 if not failures else 1
     _print_json_payload(payload)
     return 0 if not failures else 1
+
+
+def _mapped_point_count(attempts: list[dict[str, Any]]) -> int:
+    return sum(1 for attempt in attempts if attempt.get("composite_score") is not None)
+
+
+def cmd_prune_runs(
+    *,
+    min_mapped_points: int,
+    execute: bool,
+    preview: int,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    runs = list_run_dirs(config.runs_root)
+    matched: list[dict[str, Any]] = []
+    for run_dir in runs:
+        attempts = load_run_attempts(run_dir)
+        mapped_points = _mapped_point_count(attempts)
+        if mapped_points >= min_mapped_points:
+            continue
+        matched.append(
+            {
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
+                "logged_attempts": len(attempts),
+                "mapped_points": mapped_points,
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "runs_root": str(config.runs_root),
+        "min_mapped_points": int(min_mapped_points),
+        "total_runs": len(runs),
+        "matched_runs": len(matched),
+        "dry_run": not execute,
+        "preview": matched[: max(0, preview)],
+    }
+
+    if not execute:
+        payload["message"] = (
+            "Dry run only. Re-run with --yes to delete the matched low-signal runs."
+        )
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0
+        _print_json_payload(payload)
+        return 0
+
+    deleted: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for item in matched:
+        run_dir = Path(str(item["run_dir"]))
+        try:
+            shutil.rmtree(run_dir)
+            deleted.append(item)
+        except OSError as exc:
+            blocked.append(
+                {
+                    "run_id": item["run_id"],
+                    "run_dir": item["run_dir"],
+                    "error": str(exc),
+                }
+            )
+
+    payload["deleted_runs"] = len(deleted)
+    payload["blocked_runs"] = len(blocked)
+    payload["deleted_preview"] = deleted[: max(0, preview)]
+    if blocked:
+        payload["blocked_preview"] = blocked[: max(0, preview)]
+
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0 if not blocked else 1
+    _print_json_payload(payload)
+    return 0 if not blocked else 1
 
 
 def _provider_test_scenarios() -> list[tuple[str, list[ChatMessage], Callable[[dict[str, Any]], str | None]]]:
@@ -1379,6 +1479,13 @@ def main() -> int:
         return cmd_leaderboard(limit=args.limit)
     if args.command == "reset-runs":
         return cmd_reset_runs()
+    if args.command == "prune-runs":
+        return cmd_prune_runs(
+            min_mapped_points=int(args.min_mapped_points),
+            execute=bool(args.yes),
+            preview=int(args.preview),
+            as_json=bool(args.json),
+        )
     if args.command == "stop-all-runs":
         return cmd_stop_all_runs(
             stop_autoresearch=bool(args.stop_autoresearch),

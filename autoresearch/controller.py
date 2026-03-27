@@ -1439,7 +1439,7 @@ class ResearchController:
         try:
             repaired = self.provider.complete_json(repair_messages)
             normalized = self._normalize_model_response(repaired)
-        except ProviderError:
+        except (ProviderError, RuntimeError, TypeError, ValueError):
             return None
         repaired_actions = normalized.get("actions")
         repaired_errors = self._validate_actions(repaired_actions)

@@ -145,8 +145,10 @@ def load_json_file(path: Path) -> dict[str, Any]:
         return json.load(handle)
 
 
-def _env_or_value(*keys: str, fallback: str | None = None) -> str | None:
+def _env_or_value(*keys: str | None, fallback: str | None = None) -> str | None:
     for key in keys:
+        if not key or not isinstance(key, str):
+            continue
         value = os.environ.get(key)
         if value:
             return value
