@@ -52,6 +52,14 @@ RATE_LIMIT_MARKERS = (
     "requests rate limit",
     "temporarily rate limited",
 )
+TOOL_USE_FAILED_MARKERS = (
+    "tool_use_failed",
+    "tool choice is none, but model called a tool",
+)
+JSON_VALIDATE_FAILED_MARKERS = (
+    "json_validate_failed",
+    "failed to generate json",
+)
 
 
 def _escape_invalid_json_backslashes(text: str) -> str:
@@ -170,6 +178,26 @@ def _is_invalid_json_error(error: ProviderError) -> bool:
     return "did not return valid json" in str(error).lower()
 
 
+def _is_tool_use_failed_error(error: ProviderError) -> bool:
+    lowered = str(error).lower()
+    return any(marker in lowered for marker in TOOL_USE_FAILED_MARKERS)
+
+
+def _is_json_validate_failed_error(error: ProviderError) -> bool:
+    lowered = str(error).lower()
+    return any(marker in lowered for marker in JSON_VALIDATE_FAILED_MARKERS)
+
+
+def _extract_failed_generation_text(error: ProviderError) -> str | None:
+    marker = "failed_generation="
+    text = str(error)
+    index = text.find(marker)
+    if index < 0:
+        return None
+    failed_generation = text[index + len(marker):].strip()
+    return failed_generation or None
+
+
 def _malformed_success_delay_seconds(attempt_index: int) -> int:
     if attempt_index < len(DEFAULT_MALFORMED_SUCCESS_BACKOFF_SECONDS):
         return DEFAULT_MALFORMED_SUCCESS_BACKOFF_SECONDS[attempt_index]
@@ -189,6 +217,27 @@ def _classify_retryable_response(response: requests.Response) -> tuple[str, int 
             return None
         return ("rate_limit", retry_after)
     if status in TRANSIENT_STATUS_CODES:
+        return ("transient", retry_after)
+    return None
+
+
+def _classify_retryable_success_payload(payload: Any) -> tuple[str, int | None] | None:
+    if not isinstance(payload, dict):
+        return None
+    error_payload = payload.get("error")
+    if not isinstance(error_payload, dict):
+        return None
+    message = str(error_payload.get("message") or "")
+    code_value = error_payload.get("code")
+    code_text = str(code_value or "").strip().lower()
+    retry_after = None
+    if code_text in {"429", "529"} or _looks_like_rate_limit(message):
+        if _looks_like_hard_quota(message):
+            return None
+        return ("rate_limit", retry_after)
+    if code_text in {"408", "425", "500", "502", "503", "504"}:
+        return ("transient", retry_after)
+    if "upstream error" in message.lower() or "server had an error" in message.lower():
         return ("transient", retry_after)
     return None
 
@@ -260,10 +309,48 @@ def _post_json_with_retry(
             continue
 
         if response.status_code >= 400:
+            if response.status_code == 400:
+                try:
+                    error_payload = response.json().get("error")
+                except Exception:
+                    error_payload = None
+                if isinstance(error_payload, dict):
+                    error_code = str(error_payload.get("code") or "")
+                    failed_generation = error_payload.get("failed_generation")
+                    if (
+                        error_code == "json_validate_failed"
+                        and isinstance(failed_generation, str)
+                        and failed_generation.strip()
+                    ):
+                        raise ProviderError(
+                            "Provider request failed with 400: "
+                            f"json_validate_failed failed_generation={failed_generation[:4000]}"
+                        )
             raise ProviderError(
                 f"Provider request failed with {response.status_code}: {response.text[:800]}"
             )
-        return response.json()
+        payload = response.json()
+        payload_classification = _classify_retryable_success_payload(payload)
+        if payload_classification is not None:
+            retry_kind, retry_after = payload_classification
+            if retry_kind == "rate_limit":
+                rate_limit_retries += 1
+                if rate_limit_retries > _configured_rate_limit_max_retries(config):
+                    raise ProviderError(
+                        f"Provider remained rate-limited after {rate_limit_retries} retries: "
+                        f"{json.dumps(payload, ensure_ascii=True)[:800]}"
+                    )
+                time.sleep(_rate_limit_delay_seconds(config, rate_limit_retries - 1, retry_after))
+                continue
+            transient_retries += 1
+            if transient_retries > DEFAULT_TRANSIENT_MAX_RETRIES:
+                raise ProviderError(
+                    f"Provider kept returning transient upstream error payloads after {transient_retries} retries: "
+                    f"{json.dumps(payload, ensure_ascii=True)[:800]}"
+                )
+            time.sleep(_transient_delay_seconds(config, transient_retries - 1, retry_after))
+            continue
+        return payload
 
 
 class JsonCompletionProvider(Protocol):
@@ -318,6 +405,18 @@ class ChatCompletionsJsonProvider:
 
     def _response_format(self) -> dict[str, Any] | None:
         return {"type": "json_object"}
+
+    def _messages_for_tool_retry(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        return [
+            *messages,
+            ChatMessage(
+                role="system",
+                content=(
+                    "Do not call any native tools, function calls, provider tools, MCP tools, "
+                    "or built-in tools. Return plain assistant text containing only the required JSON object."
+                ),
+            ),
+        ]
 
     def _extract_content(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices") or []
@@ -411,8 +510,30 @@ class ChatCompletionsJsonProvider:
         last_error: ProviderError | None = None
         for index, budget in enumerate(budgets):
             malformed_attempts = 0
+            tool_use_attempts = 0
+            request_messages = messages
             while True:
-                payload = self._request_json(messages, budget)
+                try:
+                    payload = self._request_json(request_messages, budget)
+                except ProviderError as exc:
+                    last_error = exc
+                    if _is_json_validate_failed_error(exc):
+                        failed_generation = _extract_failed_generation_text(exc)
+                        if failed_generation:
+                            repaired = self._repair_invalid_json(
+                                request_messages,
+                                failed_generation,
+                                max(budget, budgets[-1]),
+                            )
+                            if repaired is not None:
+                                return repaired
+                    if _is_tool_use_failed_error(exc) and tool_use_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
+                        self._refresh_session()
+                        request_messages = self._messages_for_tool_retry(messages)
+                        time.sleep(_malformed_success_delay_seconds(tool_use_attempts))
+                        tool_use_attempts += 1
+                        continue
+                    raise
                 raw_text: str | None = None
                 choices = payload.get("choices") or []
                 finish_reason = None
@@ -490,7 +611,15 @@ class XAIChatProvider(ChatCompletionsJsonProvider):
 
 
 class GroqProvider(ChatCompletionsJsonProvider):
-    pass
+    def _build_body(
+        self,
+        messages: list[ChatMessage],
+        max_completion_tokens: int,
+    ) -> dict[str, Any]:
+        body = super()._build_body(messages, max_completion_tokens)
+        body["tool_choice"] = "none"
+        body["parallel_tool_calls"] = False
+        return body
 
 
 class ResponsesJsonProvider:

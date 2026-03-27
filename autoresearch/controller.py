@@ -46,6 +46,7 @@ Rules:
 - Keep actions bounded. Use at most 3 actions per response.
 - Every evaluated candidate should end up in the attempts ledger. You may rely on automatic logging after sensitivity runs, or call log_attempt explicitly.
 - Do not emit Markdown. Return raw JSON only.
+- Do not return a raw scoring-profile document as the top-level response. If you want to create or edit a profile, do it through actions such as `write_file`, `profiles scaffold`, or `profiles patch`.
 - The controller already handled auth bootstrap and created the run seed file before this conversation started. Do not spend steps repeating auth or seed unless a prior tool result shows a failure that requires recovery.
 - Auth is already verified at run start. Do not call `auth whoami` unless you are recovering from an auth-related tool failure.
 - Use only real CLI commands and subcommands. Do not invent near-miss names.
@@ -1446,6 +1447,38 @@ class ResearchController:
             return None
         return normalized
 
+    def _repair_invalid_payload_shape(
+        self,
+        messages: list[ChatMessage],
+        payload: Any,
+        error: str,
+    ) -> dict[str, Any] | None:
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        repair_messages = [
+            *messages,
+            ChatMessage(role="assistant", content=payload_text),
+            ChatMessage(
+                role="user",
+                content=(
+                    f"{RESPONSE_REPAIR_PROMPT}\n\n"
+                    "The previous response was valid JSON but had the wrong top-level shape for the controller.\n"
+                    f"Problem:\n- {error}\n\n"
+                    "Use the same intent, but convert it into controller actions. "
+                    "Do not return a raw scoring-profile JSON document as the top-level response."
+                ),
+            ),
+        ]
+        try:
+            repaired = self.provider.complete_json(repair_messages)
+            normalized = self._normalize_model_response(repaired)
+        except (ProviderError, RuntimeError):
+            return None
+        repaired_actions = normalized.get("actions")
+        repaired_errors = self._validate_actions(repaired_actions)
+        if repaired_errors:
+            return None
+        return normalized
+
     def _extract_profile_ref(self, payload: dict[str, Any]) -> str | None:
         if "id" in payload and isinstance(payload["id"], str):
             return payload["id"]
@@ -1951,7 +1984,17 @@ class ResearchController:
             messages = self._maybe_compact_messages(messages, tool_context, policy, step, step_limit)
             try:
                 raw_response = self.provider.complete_json(messages)
-                response = self._normalize_model_response(raw_response)
+                try:
+                    response = self._normalize_model_response(raw_response)
+                except RuntimeError as exc:
+                    repaired_shape = self._repair_invalid_payload_shape(
+                        messages,
+                        raw_response,
+                        str(exc),
+                    )
+                    if repaired_shape is None:
+                        raise
+                    response = repaired_shape
             except (ProviderError, CliError) as exc:
                 raise RuntimeError(str(exc)) from exc
 
