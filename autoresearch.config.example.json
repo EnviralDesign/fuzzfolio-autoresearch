@@ -52,6 +52,7 @@
     "recent_attempts_window": 16,
     "label_prefix": "agentic",
     "auto_seed_prompt": true,
+    "quality_score_preset": "profile-drop",
     "plot_lower_is_better": false,
     "compact_trigger_tokens": 12000,
     "compact_keep_recent_messages": 4,

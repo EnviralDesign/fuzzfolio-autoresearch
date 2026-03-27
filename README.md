@@ -81,8 +81,11 @@ The controller also uses threshold-triggered context compaction modeled after `c
 The runtime now uses named LLM provider profiles instead of one global provider block. By default in the example config, the main explorer loop uses the `openai-mini` profile (`gpt-5.4-mini`) while the supervisor guidance path uses the `xai-grok` profile (`grok-4.20-reasoning`).
 In plain `run` mode, the controller now uses an explicit phase policy: most of the run is exploration with finish disabled, and only the last few steps become wrap-up. The prompt also carries a rolling next-score target so the explorer has a concrete stretch goal instead of repeatedly trying to stop.
 The controller now also owns horizon policy by phase: early runs screen over shorter month-based windows, mid runs deepen evidence around one year, and late/wrap-up phases push survivors toward 2-3 year pressure tests. The worker is guided to think in weeks/months/years, not bars.
+The controller also owns the active quality-score preset. By default it injects the `profile-drop` preset into deep-replay-backed evaluations and scaffolded sweeps so the agent does not need to remember or reason about preset selection mid-run.
 The controller now treats sweeps as first-class search behavior instead of an optional side path. Early and mid phases explicitly encourage `sweep scaffold`, `sweep patch`, `sweep validate`, and then `sweep submit` around promising families before the run settles into manual profile tweaking only.
 Instrument context is also coverage-aware now. The runtime asks the CLI for market coverage at a reference timeframe and surfaces buffered shortlist hints such as roughly `11` months for mid-phase work and `34` months for long-horizon wrap-up, so the agent naturally favors symbols that can actually satisfy the requested evidence horizon.
+
+If you want to change that preset later, set `research.quality_score_preset` in `autoresearch.config.json`.
 
 ## Multi-provider config
 

@@ -48,6 +48,7 @@ class ResearchConfig:
     recent_attempts_window: int = 16
     label_prefix: str = "agentic"
     auto_seed_prompt: bool = True
+    quality_score_preset: str = "profile-drop"
     plot_lower_is_better: bool = False
     compact_trigger_tokens: int = 12000
     compact_keep_recent_messages: int = 4
@@ -346,6 +347,10 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
         recent_attempts_window=int(research_cfg.get("recent_attempts_window", ResearchConfig.recent_attempts_window)),
         label_prefix=research_cfg.get("label_prefix", ResearchConfig.label_prefix),
         auto_seed_prompt=bool(research_cfg.get("auto_seed_prompt", ResearchConfig.auto_seed_prompt)),
+        quality_score_preset=str(
+            research_cfg.get("quality_score_preset", ResearchConfig.quality_score_preset)
+        ).strip()
+        or ResearchConfig.quality_score_preset,
         plot_lower_is_better=bool(research_cfg.get("plot_lower_is_better", ResearchConfig.plot_lower_is_better)),
         compact_trigger_tokens=int(
             research_cfg.get("compact_trigger_tokens", ResearchConfig.compact_trigger_tokens)

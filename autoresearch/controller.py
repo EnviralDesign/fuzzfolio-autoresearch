@@ -64,6 +64,7 @@ Rules:
 - Saved analysis artifacts may also expose `effective_window_start`, `effective_window_end`, `effective_window_days`, and `effective_window_months`. Use those to judge whether a requested horizon was actually satisfied.
 - Think in weeks, months, and years of evidence, not in raw bars.
 - The controller owns default horizon policy and may inject phase-appropriate `--lookback-months` into sensitivity runs when you omit it.
+- The controller also owns the active quality-score preset and injects it into deep-replay-backed evaluations and scaffolded sweeps. Do not try to vary or omit it yourself.
 - Do not use `--bar-limit` as a research lever unless the user explicitly asks. Treat bar counts as implementation detail, not strategy.
 - `__BASKET__` may appear inside saved analysis summaries as an aggregate label. It is not a valid CLI instrument argument. Use exact catalog symbols like EURUSD.
 - `finish` is terminal for the whole run. Never use it to mean "continue" or "step complete".
@@ -122,6 +123,7 @@ Rules:
 - Prefer hypothesis pivots, contrast branches, and meaningful parameter or timeframe shifts over repetitive retries.
 - Treat sweeps as first-class. If the explorer is doing repeated manual branch edits without any sweep support, push it toward a bounded sweep around the current promising family.
 - Horizon policy belongs to you and the controller, not the explorer. Push the run to think in months and years, not bars.
+- Quality-score preset choice also belongs to the controller. Assume evaluations are using the current preset consistently and do not ask the explorer to vary it.
 - If an analysis window came back truncated, focus on the missing effective months/days, not the raw bar machinery.
 - Early phase should screen cheaply, mid phase should deepen evidence, and late phase should pressure-test survivors over longer horizons.
 - If the explorer is drifting, say so plainly.
@@ -331,6 +333,22 @@ class ResearchController:
             index += 1
         return stripped
 
+    def _upsert_cli_flag(self, args: list[str], flag: str, value: str) -> list[str]:
+        updated = list(args)
+        if flag in updated:
+            index = updated.index(flag) + 1
+            if index < len(updated):
+                updated[index] = value
+                return updated
+        updated.extend([flag, value])
+        return updated
+
+    def _configured_quality_score_preset(self) -> str:
+        preset = str(self.config.research.quality_score_preset or "").strip()
+        if preset in {"profile-drop", "profile_drop"}:
+            return "profile-drop"
+        return preset or "profile-drop"
+
     def _apply_horizon_policy_to_cli_args(
         self,
         args: list[str],
@@ -344,6 +362,7 @@ class ResearchController:
         command_head = args[:2]
         horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
         lookback_months = str(horizon_policy["lookback_months"])
+        quality_score_preset = self._configured_quality_score_preset()
         if args[0] in {"sensitivity", "sensitivity-basket"}:
             effective = self._strip_cli_flag(list(args), "--bar-limit")
             if "--timeframe" not in effective:
@@ -352,7 +371,24 @@ class ResearchController:
                     effective.extend(["--timeframe", inferred_timeframe])
             if "--lookback-months" not in effective:
                 effective.extend(["--lookback-months", lookback_months])
+            effective = self._upsert_cli_flag(
+                effective, "--quality-score-preset", quality_score_preset
+            )
             return effective
+        if command_head == ["deep-replay", "submit"]:
+            effective = self._strip_cli_flag(list(args), "--bar-limit")
+            return self._upsert_cli_flag(
+                effective, "--quality-score-preset", quality_score_preset
+            )
+        if command_head == ["sweep", "scaffold"]:
+            return self._upsert_cli_flag(
+                list(args), "--quality-score-preset", quality_score_preset
+            )
+        if args[0] == "package":
+            effective = self._strip_cli_flag(list(args), "--bar-limit")
+            return self._upsert_cli_flag(
+                effective, "--quality-score-preset", quality_score_preset
+            )
         if command_head == ["deep-replay", "cell-detail"]:
             return self._strip_cli_flag(list(args), "--bar-limit")
         return args
