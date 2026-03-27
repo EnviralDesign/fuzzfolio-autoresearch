@@ -26,3 +26,7 @@ results.tsv
 # Local runtime config/secrets
 .agentsecrets
 autoresearch.config.json
+
+# Local process-manager bundle
+scripts/simple-rust-process-manager.exe
+scripts/processes.json

@@ -55,6 +55,14 @@
       "temperature": 0.2,
       "max_tokens": 3200,
       "timeout_seconds": 120
+    },
+    "codex-sample": {
+      "type": "codex",
+      "command": "codex",
+      "model": "gpt-5.4-mini",
+      "temperature": 0.2,
+      "max_tokens": 3200,
+      "timeout_seconds": 180
     }
   },
   "fuzzfolio": {

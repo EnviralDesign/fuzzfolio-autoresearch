@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,6 @@ from rich.table import Table
 from rich.text import Text
 
 if __package__ in {None, ""}:
-    import sys
-
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from autoresearch.config import load_config
     from autoresearch.controller import ResearchController, RunPolicy
@@ -57,8 +56,27 @@ else:
     from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 
-console = Console()
+console = Console(safe_box=True)
 DISPLAY_CONTEXT: dict[str, Path | None] = {"repo_root": None, "run_dir": None}
+PLAIN_PROGRESS_MODE = False
+DISPLAY_ENCODING = getattr(getattr(console, "file", None), "encoding", None) or "utf-8"
+DISPLAY_CHAR_REPLACEMENTS = str.maketrans(
+    {
+        "\u2010": "-",
+        "\u2011": "-",
+        "\u2012": "-",
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2015": "-",
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2022": "*",
+        "\u2026": "...",
+        "\u00a0": " ",
+    }
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -145,6 +163,86 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _write_plain_line(text: str) -> None:
+    normalized = _short_text(text, limit=2000)
+    _write_plain_text(normalized + "\n")
+
+
+def _write_plain_text(text: str) -> None:
+    for stream in (sys.stdout, getattr(sys, "__stdout__", None)):
+        if stream is None:
+            continue
+        try:
+            stream.write(text)
+            stream.flush()
+            return
+        except OSError:
+            continue
+
+
+def _use_plain_progress() -> None:
+    global PLAIN_PROGRESS_MODE
+    PLAIN_PROGRESS_MODE = True
+
+
+def _safe_render(console_renderer: Any, plain_renderer: Any) -> None:
+    if PLAIN_PROGRESS_MODE:
+        plain_renderer()
+        return
+    try:
+        console_renderer()
+    except OSError:
+        _use_plain_progress()
+        plain_renderer()
+
+
+def _render_run_header_plain(event: dict[str, object]) -> None:
+    _write_plain_line(
+        f"Run {event.get('run_id')} | mode={event.get('mode') or 'run'} | steps={event.get('max_steps')} | dir={_display_path(str(event.get('run_dir')))}"
+    )
+    horizon_target = event.get("horizon_target")
+    if isinstance(horizon_target, str) and horizon_target.strip():
+        _write_plain_line(f"Horizon: {horizon_target}")
+    score_target = event.get("score_target")
+    if isinstance(score_target, str) and score_target.strip():
+        _write_plain_line(f"Target: {score_target}")
+
+
+def _render_step_plain(step_payload: dict[str, Any]) -> None:
+    _write_plain_line(f"Step {step_payload.get('step')}: {_short_text(str(step_payload.get('reasoning', '')), 420)}")
+    actions = step_payload.get("actions")
+    if isinstance(actions, list):
+        for action in actions:
+            if isinstance(action, dict):
+                _write_plain_line(f"  plan: {_summarize_action(action)}")
+    results = step_payload.get("results")
+    if isinstance(results, list):
+        for result in results:
+            if isinstance(result, dict):
+                _write_plain_line(f"  result: {_summarize_result(result)}")
+
+
+def _render_run_footer_plain(result: dict[str, object]) -> None:
+    _write_plain_line(
+        f"Run complete | status={result.get('status')} | run={result.get('run_id')} | dir={_display_path(str(result.get('run_dir')))}"
+    )
+    summary = result.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        _write_plain_line(f"Summary: {summary}")
+
+
+def _print_json_payload(payload: Any) -> None:
+    text = json.dumps(payload, ensure_ascii=True, indent=2)
+    if PLAIN_PROGRESS_MODE:
+        _write_plain_text(text + "\n")
+        return
+    try:
+        console.print_json(text)
+    except OSError:
+        _use_plain_progress()
+        _write_plain_text(text + "\n")
+
+
 def cmd_doctor() -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
@@ -161,13 +259,17 @@ def cmd_doctor() -> int:
         "explorer_provider_type": config.provider.provider_type,
         "explorer_model": config.provider.model,
         "explorer_api_base": config.provider.api_base,
+        "explorer_command": config.provider.command,
         "explorer_has_api_key": bool(config.provider.api_key),
+        "explorer_uses_managed_auth": config.provider.provider_type.strip().lower() == "codex",
         "explorer_compact_trigger_tokens": config.compact_trigger_tokens_for(config.llm.explorer_profile),
         "supervisor_profile": config.llm.supervisor_profile,
         "supervisor_provider_type": config.supervisor_provider.provider_type,
         "supervisor_model": config.supervisor_provider.model,
         "supervisor_api_base": config.supervisor_provider.api_base,
+        "supervisor_command": config.supervisor_provider.command,
         "supervisor_has_api_key": bool(config.supervisor_provider.api_key),
+        "supervisor_uses_managed_auth": config.supervisor_provider.provider_type.strip().lower() == "codex",
         "supervisor_compact_trigger_tokens": config.compact_trigger_tokens_for(config.llm.supervisor_profile),
         "supervisor_max_steps": config.supervisor.max_steps,
         "supervisor_window_start": config.supervisor.window_start,
@@ -277,7 +379,7 @@ def cmd_stop_all_runs(*, stop_autoresearch: bool, as_json: bool) -> int:
         print(json.dumps(payload, ensure_ascii=True, indent=2))
         return 0
 
-    console.print_json(json.dumps(payload, ensure_ascii=True))
+    _print_json_payload(payload)
     return 0
 
 
@@ -321,7 +423,7 @@ def cmd_purge_cloud_profiles(*, execute: bool, preview: int, as_json: bool) -> i
         if as_json:
             print(json.dumps(payload, ensure_ascii=True, indent=2))
             return 0
-        console.print_json(json.dumps(payload, ensure_ascii=True))
+        _print_json_payload(payload)
         return 0
 
     deleted: list[dict[str, Any]] = []
@@ -345,7 +447,7 @@ def cmd_purge_cloud_profiles(*, execute: bool, preview: int, as_json: bool) -> i
     if as_json:
         print(json.dumps(payload, ensure_ascii=True, indent=2))
         return 0 if not failures else 1
-    console.print_json(json.dumps(payload, ensure_ascii=True))
+    _print_json_payload(payload)
     return 0 if not failures else 1
 
 
@@ -439,7 +541,9 @@ def cmd_test_providers(
             "provider_type": profile.provider_type,
             "model": profile.model,
             "api_base": profile.api_base,
+            "command": profile.command,
             "has_api_key": bool(profile.api_key),
+            "uses_managed_auth": profile.provider_type.strip().lower() == "codex",
             "scenarios": [],
             "ok": True,
         }
@@ -474,6 +578,11 @@ def cmd_test_providers(
 
 def _short_text(value: str, limit: int = 220) -> str:
     compact = " ".join(value.split())
+    compact = compact.translate(DISPLAY_CHAR_REPLACEMENTS)
+    try:
+        compact.encode(DISPLAY_ENCODING)
+    except UnicodeEncodeError:
+        compact = compact.encode(DISPLAY_ENCODING, errors="replace").decode(DISPLAY_ENCODING)
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3] + "..."
@@ -739,13 +848,16 @@ def _render_run_header(event: dict[str, object]) -> None:
     if isinstance(attempts_path, str) and attempts_path.strip():
         grid.add_row("Ledger", _display_path(attempts_path))
     grid.add_row("Run Plot", _display_path(str(event.get("run_progress_plot"))))
-    console.print(
-        Panel(
-            grid,
-            title="[bold green]Autoresearch Run[/bold green]",
-            border_style="green",
-            box=box.ROUNDED,
-        )
+    _safe_render(
+        lambda: console.print(
+            Panel(
+                grid,
+                title="[bold green]Autoresearch Run[/bold green]",
+                border_style="green",
+                box=box.ROUNDED,
+            )
+        ),
+        lambda: _render_run_header_plain(event),
     )
 
 
@@ -805,7 +917,10 @@ def _render_step(step_payload: dict[str, Any]) -> None:
                 result_table.add_row(Text(label, style=style), Text(_summarize_result(result), style=style))
         body.append(result_table)
 
-    console.print(Group(*body))
+    _safe_render(
+        lambda: console.print(Group(*body)),
+        lambda: _render_step_plain(step_payload),
+    )
 
 
 def _render_run_footer(result: dict[str, object]) -> None:
@@ -831,13 +946,16 @@ def _render_run_footer(result: dict[str, object]) -> None:
     summary = result.get("summary")
     if isinstance(summary, str) and summary.strip():
         grid.add_row("Summary", _short_text(summary, 420))
-    console.print(
-        Panel(
-            grid,
-            title="[bold green]Run Complete[/bold green]",
-            border_style="green",
-            box=box.ROUNDED,
-        )
+    _safe_render(
+        lambda: console.print(
+            Panel(
+                grid,
+                title="[bold green]Run Complete[/bold green]",
+                border_style="green",
+                box=box.ROUNDED,
+            )
+        ),
+        lambda: _render_run_footer_plain(result),
     )
 
 

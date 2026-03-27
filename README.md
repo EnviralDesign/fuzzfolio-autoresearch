@@ -158,9 +158,11 @@ Profiles can reference those shared keys with `api_key_ref`:
 ```
 
 You can still set `providers.<profile>.api_key` directly in `.agentsecrets` if you want profile-specific overrides. `api_key_ref` is just the cleaner shared-key path.
+The `codex` provider is different: it does not read an API key from `.agentsecrets`. Instead it talks to the local `codex app-server`, which uses the active managed auth in `~/.codex/auth.json` (for example from `codex login` / ChatGPT sign-in).
 
 The current provider types are:
 
+- `codex`
 - `openai`
 - `xai`
 - `groq`
@@ -174,6 +176,36 @@ The current provider types are:
 - `transport = "chat_completions"`
 
 That is the preferred path when you want Groq-hosted OSS models without going through OpenRouter routing.
+
+`codex` is a first-class local managed-auth provider. It defaults to:
+
+- `command = "codex"`
+- `transport = "app_server"`
+- `timeout_seconds = 180`
+
+Example:
+
+```json
+{
+  "providers": {
+    "codex-mini": {
+      "type": "codex",
+      "command": "codex",
+      "model": "gpt-5.4-mini"
+    }
+  }
+}
+```
+
+Before using it, make sure the local Codex app is already signed in:
+
+```powershell
+codex login
+uv run autoresearch test-providers --profile codex-mini
+uv run autoresearch run --explorer-profile codex-mini
+```
+
+This path keeps ChatGPT/Codex OAuth under Codex itself rather than copying bearer tokens or API keys into `autoresearch`.
 
 Profiles may also choose a transport explicitly when needed:
 

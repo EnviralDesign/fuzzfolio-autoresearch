@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import subprocess
 import json
+import shutil
+import threading
 import time
+from collections import deque
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -60,6 +64,14 @@ JSON_VALIDATE_FAILED_MARKERS = (
     "json_validate_failed",
     "failed to generate json",
 )
+CODEX_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "response_json": {"type": "string"},
+    },
+    "required": ["response_json"],
+    "additionalProperties": False,
+}
 
 
 def _escape_invalid_json_backslashes(text: str) -> str:
@@ -358,6 +370,271 @@ class JsonCompletionProvider(Protocol):
         ...
 
 
+class _CodexAppServerSession:
+    def __init__(self, config: ProviderProfileConfig):
+        self.config = config
+        self.process: subprocess.Popen[str] | None = None
+        self._request_id = 0
+        self._stderr_lines: deque[str] = deque(maxlen=40)
+        self._stderr_thread: threading.Thread | None = None
+        self._start()
+
+    def _command(self) -> list[str]:
+        command = (self.config.command or "codex").strip() or "codex"
+        resolved = shutil.which(command) or command
+        return [resolved, "app-server", "--listen", "stdio://", "--session-source", "cli"]
+
+    def _start(self) -> None:
+        try:
+            self.process = subprocess.Popen(
+                self._command(),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            raise ProviderError(
+                "Could not start Codex app-server. Install Codex or set providers.<profile>.command "
+                "to the local Codex executable."
+            ) from exc
+        if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None:
+            self.close()
+            raise ProviderError("Codex app-server did not expose the expected stdio pipes.")
+        self._stderr_thread = threading.Thread(target=self._capture_stderr, daemon=True)
+        self._stderr_thread.start()
+        try:
+            self._request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "fuzzfolio_autoresearch",
+                        "title": "Fuzzfolio Autoresearch",
+                        "version": "0.1.0",
+                    }
+                },
+            )
+            self._notify("initialized", {})
+            account_result = self._request("account/read", {"refreshToken": True})
+        except Exception:
+            self.close()
+            raise
+        if not isinstance(account_result, dict):
+            self.close()
+            raise ProviderError("Codex app-server returned an invalid account/read response.")
+        if account_result.get("requiresOpenaiAuth") and not account_result.get("account"):
+            self.close()
+            raise ProviderError(
+                "Codex app-server requires OpenAI auth but no local account is active. "
+                "Run `codex login` first."
+            )
+
+    def _capture_stderr(self) -> None:
+        if self.process is None or self.process.stderr is None:
+            return
+        for line in self.process.stderr:
+            stripped = line.rstrip()
+            if stripped:
+                self._stderr_lines.append(stripped)
+
+    def _stderr_preview(self) -> str:
+        if not self._stderr_lines:
+            return ""
+        return " | stderr=" + " || ".join(self._stderr_lines)
+
+    def _send(self, payload: dict[str, Any]) -> None:
+        if self.process is None or self.process.stdin is None:
+            raise ProviderError("Codex app-server is not running.")
+        self.process.stdin.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        self.process.stdin.flush()
+
+    def _read_message(self) -> dict[str, Any]:
+        if self.process is None or self.process.stdout is None:
+            raise ProviderError("Codex app-server is not running.")
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                code = self.process.poll()
+                raise ProviderError(
+                    "Codex app-server closed unexpectedly"
+                    + (f" with exit code {code}" if code is not None else "")
+                    + self._stderr_preview()
+                )
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                return payload
+
+    def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self._request_id += 1
+        request_id = self._request_id
+        self._send({"method": method, "id": request_id, "params": params})
+        while True:
+            payload = self._read_message()
+            if payload.get("id") != request_id:
+                self._handle_unsolicited_message(payload)
+                continue
+            error = payload.get("error")
+            if isinstance(error, dict):
+                message = error.get("message") or "unknown Codex app-server error"
+                raise ProviderError(f"Codex app-server {method} failed: {message}{self._stderr_preview()}")
+            result = payload.get("result")
+            if not isinstance(result, dict):
+                raise ProviderError(
+                    f"Codex app-server {method} returned an invalid result payload.{self._stderr_preview()}"
+                )
+            return result
+
+    def _notify(self, method: str, params: dict[str, Any]) -> None:
+        self._send({"method": method, "params": params})
+
+    def _handle_unsolicited_message(self, payload: dict[str, Any]) -> None:
+        method = payload.get("method")
+        request_id = payload.get("id")
+        if isinstance(method, str) and request_id is not None:
+            self._send(
+                {
+                    "id": request_id,
+                    "error": {
+                        "code": -32601,
+                        "message": (
+                            "Autoresearch Codex provider does not support interactive server requests. "
+                            "This turn must complete without approvals or tool callbacks."
+                        ),
+                    },
+                }
+            )
+
+    def start_turn(self, prompt: str) -> str:
+        thread = self._request(
+            "thread/start",
+            {
+                "approvalPolicy": "never",
+                "sandbox": "read-only",
+                "personality": "none",
+            },
+        ).get("thread")
+        if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
+            raise ProviderError("Codex app-server did not return a usable thread id.")
+        thread_id = thread["id"]
+        turn_result = self._request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt}],
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "readOnly"},
+                "model": self.config.model,
+                "summary": "concise",
+                "personality": "none",
+                "outputSchema": CODEX_OUTPUT_SCHEMA,
+            },
+        )
+        turn = turn_result.get("turn")
+        if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
+            raise ProviderError("Codex app-server did not return a usable turn id.")
+        return turn["id"]
+
+    def collect_turn_text(self, turn_id: str) -> str:
+        deltas: list[str] = []
+        final_text: str | None = None
+        while True:
+            payload = self._read_message()
+            if payload.get("id") is not None:
+                self._handle_unsolicited_message(payload)
+                continue
+            method = payload.get("method")
+            params = payload.get("params")
+            if not isinstance(method, str) or not isinstance(params, dict):
+                continue
+            if method == "item/agentMessage/delta":
+                if params.get("itemId") and isinstance(params.get("delta"), str):
+                    deltas.append(str(params["delta"]))
+                continue
+            if method == "item/completed":
+                item = params.get("item")
+                if isinstance(item, dict) and item.get("type") == "agentMessage":
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        final_text = text
+                continue
+            if method != "turn/completed":
+                continue
+            turn = params.get("turn")
+            if not isinstance(turn, dict) or turn.get("id") != turn_id:
+                continue
+            status = str(turn.get("status") or "")
+            if status != "completed":
+                error_payload = turn.get("error")
+                detail = ""
+                if isinstance(error_payload, dict):
+                    detail = str(error_payload.get("message") or "")
+                raise ProviderError(
+                    f"Codex app-server turn failed with status {status!r}"
+                    + (f": {detail}" if detail else "")
+                    + self._stderr_preview()
+                )
+            combined = (final_text or "".join(deltas)).strip()
+            if not combined:
+                raise ProviderError(
+                    "Codex app-server turn completed without assistant text." + self._stderr_preview()
+                )
+            return combined
+
+    def close(self) -> None:
+        if self.process is None:
+            return
+        try:
+            self.process.terminate()
+            self.process.wait(timeout=5)
+        except Exception:
+            try:
+                self.process.kill()
+            except Exception:
+                pass
+        finally:
+            self.process = None
+
+
+class CodexAppServerProvider:
+    def __init__(self, config: ProviderProfileConfig):
+        self.config = config
+
+    def _prompt_from_messages(self, messages: list[ChatMessage]) -> str:
+        sections = [
+            "You are not allowed to use native tools, shell commands, file edits, MCP tools, or approvals.",
+            "Answer directly as plain assistant text.",
+            "Your final assistant message is schema-constrained.",
+            "Set response_json to the exact raw JSON object string the caller expects.",
+            "Do not wrap it in Markdown. Escape Windows paths correctly inside JSON strings.",
+            "",
+            "Conversation transcript:",
+        ]
+        for message in messages:
+            sections.append(f"{message.role.upper()}:\n{message.content}")
+        return "\n\n".join(sections)
+
+    def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
+        session = _CodexAppServerSession(self.config)
+        try:
+            turn_id = session.start_turn(self._prompt_from_messages(messages))
+            outer_payload = _parse_provider_json_object(session.collect_turn_text(turn_id))
+            response_json = outer_payload.get("response_json")
+            if isinstance(response_json, str) and response_json.strip():
+                return _parse_provider_json_object(response_json)
+            return outer_payload
+        finally:
+            session.close()
+
+
 class ChatCompletionsJsonProvider:
     def __init__(self, config: ProviderProfileConfig):
         self.config = config
@@ -417,6 +694,22 @@ class ChatCompletionsJsonProvider:
                 ),
             ),
         ]
+
+    def _max_completion_tokens_cap(self) -> int | None:
+        return None
+
+    def _completion_budgets(self) -> list[int]:
+        base_budget = max(1, int(self.config.max_tokens))
+        fallback_budget = max(base_budget * 2, 4800)
+        cap = self._max_completion_tokens_cap()
+        if cap is not None:
+            base_budget = min(base_budget, cap)
+            fallback_budget = min(fallback_budget, cap)
+        budgets: list[int] = []
+        for budget in (base_budget, fallback_budget):
+            if budget not in budgets:
+                budgets.append(budget)
+        return budgets
 
     def _extract_content(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices") or []
@@ -506,7 +799,7 @@ class ChatCompletionsJsonProvider:
                 f"No API key configured for provider profile using model {self.config.model!r}. "
                 f"Put it in .agentsecrets under providers.<profile>.api_key or set {env_hint}."
             )
-        budgets = [self.config.max_tokens, max(self.config.max_tokens * 2, 4800)]
+        budgets = self._completion_budgets()
         last_error: ProviderError | None = None
         for index, budget in enumerate(budgets):
             malformed_attempts = 0
@@ -518,6 +811,16 @@ class ChatCompletionsJsonProvider:
                 except ProviderError as exc:
                     last_error = exc
                     if _is_json_validate_failed_error(exc):
+                        failed_generation = _extract_failed_generation_text(exc)
+                        if failed_generation:
+                            repaired = self._repair_invalid_json(
+                                request_messages,
+                                failed_generation,
+                                max(budget, budgets[-1]),
+                            )
+                            if repaired is not None:
+                                return repaired
+                    if _is_tool_use_failed_error(exc):
                         failed_generation = _extract_failed_generation_text(exc)
                         if failed_generation:
                             repaired = self._repair_invalid_json(
@@ -611,6 +914,12 @@ class XAIChatProvider(ChatCompletionsJsonProvider):
 
 
 class GroqProvider(ChatCompletionsJsonProvider):
+    def _max_completion_tokens_cap(self) -> int | None:
+        model = (self.config.model or "").strip().lower()
+        if model in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
+            return 8192
+        return None
+
     def _build_body(
         self,
         messages: list[ChatMessage],
@@ -663,6 +972,34 @@ class ResponsesJsonProvider:
 
     def _completion_budget_fields(self, max_completion_tokens: int) -> dict[str, Any]:
         return {"max_output_tokens": max_completion_tokens}
+
+    def _messages_for_tool_retry(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        return [
+            *messages,
+            ChatMessage(
+                role="system",
+                content=(
+                    "Do not call any native tools, function calls, provider tools, MCP tools, "
+                    "or built-in tools. Return plain assistant text containing only the required JSON object."
+                ),
+            ),
+        ]
+
+    def _max_completion_tokens_cap(self) -> int | None:
+        return None
+
+    def _completion_budgets(self) -> list[int]:
+        base_budget = max(1, int(self.config.max_tokens))
+        fallback_budget = max(base_budget * 2, 4800)
+        cap = self._max_completion_tokens_cap()
+        if cap is not None:
+            base_budget = min(base_budget, cap)
+            fallback_budget = min(fallback_budget, cap)
+        budgets: list[int] = []
+        for budget in (base_budget, fallback_budget):
+            if budget not in budgets:
+                budgets.append(budget)
+        return budgets
 
     def _extract_content(self, payload: dict[str, Any]) -> str:
         output_text = payload.get("output_text")
@@ -732,12 +1069,44 @@ class ResponsesJsonProvider:
                 f"No API key configured for provider profile using model {self.config.model!r}. "
                 f"Put it in .agentsecrets under providers.<profile>.api_key or set {env_hint}."
             )
-        budgets = [self.config.max_tokens, max(self.config.max_tokens * 2, 4800)]
+        budgets = self._completion_budgets()
         last_error: ProviderError | None = None
         for index, budget in enumerate(budgets):
             malformed_attempts = 0
+            tool_use_attempts = 0
+            request_messages = messages
             while True:
-                payload = self._request_json(messages, budget)
+                try:
+                    payload = self._request_json(request_messages, budget)
+                except ProviderError as exc:
+                    last_error = exc
+                    if _is_json_validate_failed_error(exc):
+                        failed_generation = _extract_failed_generation_text(exc)
+                        if failed_generation:
+                            repaired = self._repair_invalid_json(
+                                request_messages,
+                                failed_generation,
+                                max(budget, budgets[-1]),
+                            )
+                            if repaired is not None:
+                                return repaired
+                    if _is_tool_use_failed_error(exc):
+                        failed_generation = _extract_failed_generation_text(exc)
+                        if failed_generation:
+                            repaired = self._repair_invalid_json(
+                                request_messages,
+                                failed_generation,
+                                max(budget, budgets[-1]),
+                            )
+                            if repaired is not None:
+                                return repaired
+                    if _is_tool_use_failed_error(exc) and tool_use_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
+                        self._refresh_session()
+                        request_messages = self._messages_for_tool_retry(messages)
+                        time.sleep(_malformed_success_delay_seconds(tool_use_attempts))
+                        tool_use_attempts += 1
+                        continue
+                    raise
                 raw_text: str | None = None
                 finish_reason = payload.get("status")
                 try:
@@ -792,6 +1161,8 @@ class XAIResponsesProvider(ResponsesJsonProvider):
 def create_provider(config: ProviderProfileConfig) -> JsonCompletionProvider:
     normalized = (config.provider_type or "openai").strip().lower()
     transport = (config.transport or "chat_completions").strip().lower()
+    if normalized == "codex":
+        return CodexAppServerProvider(config)
     if normalized == "xai":
         if transport == "responses":
             return XAIResponsesProvider(config)

@@ -15,6 +15,7 @@ SECRETS_FILE_NAME = ".agentsecrets"
 class ProviderProfileConfig:
     provider_type: str = "openai"
     api_base: str | None = None
+    command: str | None = None
     model: str = "gpt-5.4-mini"
     api_key: str | None = None
     api_key_ref: str | None = None
@@ -154,9 +155,18 @@ def _env_or_value(*keys: str, fallback: str | None = None) -> str | None:
 
 def _provider_defaults(provider_type: str) -> dict[str, Any]:
     normalized = (provider_type or "openai").strip().lower()
+    if normalized == "codex":
+        return {
+            "api_base": None,
+            "command": "codex",
+            "api_key_env": None,
+            "timeout_seconds": 180,
+            "transport": "app_server",
+        }
     if normalized == "xai":
         return {
             "api_base": "https://api.x.ai/v1",
+            "command": None,
             "api_key_env": "XAI_API_KEY",
             "timeout_seconds": 180,
             "transport": "chat_completions",
@@ -164,6 +174,7 @@ def _provider_defaults(provider_type: str) -> dict[str, Any]:
     if normalized == "groq":
         return {
             "api_base": "https://api.groq.com/openai/v1",
+            "command": None,
             "api_key_env": "GROQ_API_KEY",
             "timeout_seconds": 120,
             "transport": "chat_completions",
@@ -171,6 +182,7 @@ def _provider_defaults(provider_type: str) -> dict[str, Any]:
     if normalized == "openrouter":
         return {
             "api_base": "https://openrouter.ai/api/v1",
+            "command": None,
             "api_key_env": "OPENROUTER_API_KEY",
             "timeout_seconds": 120,
             "transport": "chat_completions",
@@ -178,12 +190,14 @@ def _provider_defaults(provider_type: str) -> dict[str, Any]:
     if normalized == "openai_compatible":
         return {
             "api_base": None,
+            "command": None,
             "api_key_env": "AUTORESEARCH_PROVIDER_API_KEY",
             "timeout_seconds": 120,
             "transport": "chat_completions",
         }
     return {
         "api_base": "https://api.openai.com/v1",
+        "command": None,
         "api_key_env": "OPENAI_API_KEY",
         "timeout_seconds": 120,
         "transport": "chat_completions",
@@ -220,12 +234,19 @@ def _load_provider_profiles(
                 candidate = api_keys_map.get(api_key_ref)
                 if candidate:
                     referenced_api_key = str(candidate)
-            api_key_env = str(profile_cfg.get("api_key_env") or defaults["api_key_env"])
+            api_key_env_value = profile_cfg.get("api_key_env")
+            if api_key_env_value is None:
+                api_key_env_value = defaults["api_key_env"]
+            api_key_env = str(api_key_env_value).strip() if api_key_env_value else None
             profiles[profile_name] = ProviderProfileConfig(
                 provider_type=provider_type,
                 api_base=_env_or_value(
                     f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_BASE_URL",
                     fallback=profile_cfg.get("api_base") or defaults["api_base"],
+                ),
+                command=_env_or_value(
+                    f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_COMMAND",
+                    fallback=profile_cfg.get("command") or defaults.get("command"),
                 ),
                 model=_env_or_value(
                     f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_MODEL",
@@ -308,9 +329,14 @@ def _load_provider_profiles(
         "openai-mini": ProviderProfileConfig(
             provider_type=provider_type,
             api_base=shared_api_base,
+            command=defaults.get("command"),
             model=explorer_model,
             api_key=shared_api_key,
-            api_key_env=str(defaults["api_key_env"]),
+            api_key_env=(
+                str(defaults["api_key_env"]).strip()
+                if defaults.get("api_key_env")
+                else None
+            ),
             temperature=shared_temperature,
             max_tokens=shared_max_tokens,
             timeout_seconds=shared_timeout,
@@ -322,9 +348,14 @@ def _load_provider_profiles(
         "openai-supervisor": ProviderProfileConfig(
             provider_type=provider_type,
             api_base=shared_api_base,
+            command=defaults.get("command"),
             model=supervisor_model,
             api_key=shared_api_key,
-            api_key_env=str(defaults["api_key_env"]),
+            api_key_env=(
+                str(defaults["api_key_env"]).strip()
+                if defaults.get("api_key_env")
+                else None
+            ),
             temperature=shared_temperature,
             max_tokens=shared_max_tokens,
             timeout_seconds=shared_timeout,
