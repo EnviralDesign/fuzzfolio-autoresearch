@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +83,15 @@ class SupervisorConfig:
 
 
 @dataclass
+class AdvisorConfig:
+    enabled: bool = False
+    every_n_steps: int = 5
+    profiles: list[str] = field(default_factory=list)
+    max_recent_steps: int = 4
+    max_recent_attempts: int = 6
+
+
+@dataclass
 class AppConfig:
     repo_root: Path
     config_path: Path
@@ -92,6 +101,7 @@ class AppConfig:
     fuzzfolio: FuzzfolioConfig
     research: ResearchConfig
     supervisor: SupervisorConfig
+    advisor: AdvisorConfig
 
     @property
     def provider(self) -> ProviderProfileConfig:
@@ -134,6 +144,14 @@ class AppConfig:
     @property
     def model_leaderboard_json_path(self) -> Path:
         return self.derived_root / "leaderboard-model-averages.json"
+
+    @property
+    def tradeoff_leaderboard_plot_path(self) -> Path:
+        return self.derived_root / "leaderboard-score-vs-trades.png"
+
+    @property
+    def tradeoff_leaderboard_json_path(self) -> Path:
+        return self.derived_root / "leaderboard-score-vs-trades.json"
 
     @property
     def program_path(self) -> Path:
@@ -399,6 +417,7 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     fuzzfolio_secrets = raw_secrets.get("fuzzfolio", {})
     research_cfg = raw_config.get("research", {})
     supervisor_cfg = raw_config.get("supervisor", {})
+    advisor_cfg = raw_config.get("advisor", {})
     llm, providers = _load_provider_profiles(raw_config, raw_secrets)
 
     fuzzfolio = FuzzfolioConfig(
@@ -549,6 +568,34 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             )
         ),
     )
+    advisor_profiles = [
+        str(item).strip()
+        for item in advisor_cfg.get("profiles", [])
+        if str(item).strip()
+    ] if isinstance(advisor_cfg.get("profiles", []), list) else []
+    unknown_advisor_profiles = [item for item in advisor_profiles if item not in providers]
+    if unknown_advisor_profiles:
+        raise KeyError(
+            "Configured advisor profile(s) are not defined in providers: "
+            + ", ".join(sorted(unknown_advisor_profiles))
+        )
+    advisor = AdvisorConfig(
+        enabled=bool(advisor_cfg.get("enabled", AdvisorConfig.enabled)),
+        every_n_steps=int(advisor_cfg.get("every_n_steps", AdvisorConfig.every_n_steps)),
+        profiles=advisor_profiles,
+        max_recent_steps=int(
+            advisor_cfg.get(
+                "max_recent_steps",
+                AdvisorConfig.max_recent_steps,
+            )
+        ),
+        max_recent_attempts=int(
+            advisor_cfg.get(
+                "max_recent_attempts",
+                AdvisorConfig.max_recent_attempts,
+            )
+        ),
+    )
 
     return AppConfig(
         repo_root=root,
@@ -559,4 +606,5 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
         fuzzfolio=fuzzfolio,
         research=research,
         supervisor=supervisor,
+        advisor=advisor,
     )

@@ -23,6 +23,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from autoresearch.config import load_config
     from autoresearch.controller import ResearchController, RunPolicy
+    from autoresearch.dashboard import serve_dashboard
     from autoresearch.fuzzfolio import FuzzfolioCli
     from autoresearch.ledger import (
         append_attempt,
@@ -40,12 +41,14 @@ if __package__ in {None, ""}:
         render_leaderboard_artifacts,
         render_model_leaderboard_artifacts,
         render_progress_artifacts,
+        render_tradeoff_leaderboard_artifacts,
     )
     from autoresearch.provider import ChatMessage, ProviderError, create_provider
     from autoresearch.scoring import build_attempt_score, load_sensitivity_snapshot
 else:
     from .config import load_config
     from .controller import ResearchController, RunPolicy
+    from .dashboard import serve_dashboard
     from .fuzzfolio import FuzzfolioCli
     from .ledger import (
         append_attempt,
@@ -63,6 +66,7 @@ else:
         render_leaderboard_artifacts,
         render_model_leaderboard_artifacts,
         render_progress_artifacts,
+        render_tradeoff_leaderboard_artifacts,
     )
     from .provider import ChatMessage, ProviderError, create_provider
     from .scoring import build_attempt_score, load_sensitivity_snapshot
@@ -149,6 +153,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--max-steps", type=int, default=None)
     run.add_argument("--explorer-profile", default=None, help="Override the configured explorer provider profile for this run.")
     run.add_argument("--supervisor-profile", default=None, help="Override the configured supervisor provider profile for this run.")
+    run.add_argument("--advisor-profile", action="append", default=None, help="Override advisor provider profiles for this run. Can be repeated.")
+    run.add_argument("--advisor-every", type=int, default=None, help="Inject advisor guidance every N steps.")
+    run.add_argument("--no-advisor", action="store_true", help="Disable periodic advisor guidance for this run.")
     run.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
     run.add_argument("--plain-progress", action="store_true", help="Use plain line-oriented progress output instead of Rich panels.")
 
@@ -159,6 +166,9 @@ def build_parser() -> argparse.ArgumentParser:
     supervise.add_argument("--timezone", default=None, help="IANA timezone for the operating window, e.g. America/Chicago.")
     supervise.add_argument("--explorer-profile", default=None, help="Override the configured explorer provider profile for this run.")
     supervise.add_argument("--supervisor-profile", default=None, help="Override the configured supervisor provider profile for this run.")
+    supervise.add_argument("--advisor-profile", action="append", default=None, help="Override advisor provider profiles for this supervise session. Can be repeated.")
+    supervise.add_argument("--advisor-every", type=int, default=None, help="Inject advisor guidance every N steps.")
+    supervise.add_argument("--no-advisor", action="store_true", help="Disable periodic advisor guidance for this supervise session.")
     supervise.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
     supervise.add_argument("--plain-progress", action="store_true", help="Use plain line-oriented progress output instead of Rich panels.")
 
@@ -167,6 +177,15 @@ def build_parser() -> argparse.ArgumentParser:
     plot.add_argument("--all-runs", action="store_true", help="Render a derived aggregate plot across all runs.")
     leaderboard = subparsers.add_parser("leaderboard", help="Generate a derived best-per-run leaderboard image and JSON.")
     leaderboard.add_argument("--limit", type=int, default=15, help="Maximum number of runs to include.")
+    dashboard = subparsers.add_parser("dashboard", help="Serve a local SPA for run, leaderboard, and backtest drilldown.")
+    dashboard.add_argument("--host", default="127.0.0.1", help="Bind host. Default: 127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=47832, help="Bind port. Default: 47832")
+    dashboard.add_argument("--limit", type=int, default=25, help="Leaderboard limit used during refresh. Default: 25")
+    dashboard.add_argument(
+        "--no-refresh-on-start",
+        action="store_true",
+        help="Serve immediately using current derived artifacts instead of rebuilding them on startup.",
+    )
     profile_drop_pngs = subparsers.add_parser(
         "sync-profile-drop-pngs",
         help="Rebuild run-local profile-drop PNGs for each run's best scored attempt.",
@@ -389,6 +408,11 @@ def cmd_doctor() -> int:
         "supervisor_timezone": config.supervisor.timezone,
         "supervisor_soft_wrap_minutes": config.supervisor.soft_wrap_minutes,
         "supervisor_auto_restart_terminal_sessions": config.supervisor.auto_restart_terminal_sessions,
+        "advisor_enabled": config.advisor.enabled,
+        "advisor_every_n_steps": config.advisor.every_n_steps,
+        "advisor_profiles": config.advisor.profiles,
+        "advisor_max_recent_steps": config.advisor.max_recent_steps,
+        "advisor_max_recent_attempts": config.advisor.max_recent_attempts,
         "auth_ok": auth.returncode == 0,
         "seed_ok": seed.returncode == 0,
     }
@@ -826,21 +850,48 @@ def _load_runtime_config(
     *,
     explorer_profile: str | None = None,
     supervisor_profile: str | None = None,
+    advisor_profiles: list[str] | None = None,
+    advisor_every: int | None = None,
+    no_advisor: bool = False,
 ):
     config = load_config()
     effective_explorer = explorer_profile or config.llm.explorer_profile
     effective_supervisor = supervisor_profile or config.llm.supervisor_profile
+    effective_advisors = list(config.advisor.profiles)
+    if advisor_profiles is not None:
+        effective_advisors = []
+        seen: set[str] = set()
+        for item in advisor_profiles:
+            token = str(item or "").strip()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            effective_advisors.append(token)
 
     missing: list[str] = []
     if effective_explorer not in config.providers:
         missing.append(f"explorer profile {effective_explorer!r}")
     if effective_supervisor not in config.providers:
         missing.append(f"supervisor profile {effective_supervisor!r}")
+    for advisor_profile in effective_advisors:
+        if advisor_profile not in config.providers:
+            missing.append(f"advisor profile {advisor_profile!r}")
     if missing:
         raise SystemExit(f"Unknown provider profile override(s): {', '.join(missing)}")
 
     config.llm.explorer_profile = effective_explorer
     config.llm.supervisor_profile = effective_supervisor
+    config.advisor.profiles = effective_advisors
+    if advisor_every is not None:
+        config.advisor.every_n_steps = int(advisor_every)
+        if advisor_every > 0:
+            config.advisor.enabled = True
+    if advisor_profiles is not None:
+        config.advisor.enabled = bool(effective_advisors)
+    if no_advisor:
+        config.advisor.enabled = False
+    if config.advisor.enabled and not config.advisor.profiles:
+        raise SystemExit("Advisor guidance is enabled but no advisor profiles are configured.")
     return config
 
 
@@ -984,6 +1035,22 @@ def _summarize_result(result: dict[str, object]) -> str:
         if isinstance(next_moves, list) and next_moves:
             parts.append("next: " + _short_text(str(next_moves[0]), 160))
         return " | ".join(parts)
+    if tool == "advisor_guidance":
+        advisors = result.get("advisors")
+        profiles = []
+        if isinstance(advisors, list):
+            for item in advisors[:3]:
+                if isinstance(item, dict):
+                    label = str(item.get("label") or "").strip()
+                    if label:
+                        profiles.append(label)
+        parts = ["advisor_guidance"]
+        if profiles:
+            parts.append("profiles=" + ", ".join(profiles))
+        summary = str(result.get("message", "")).strip()
+        if summary:
+            parts.append(_short_text(summary, 200))
+        return " | ".join(parts)
     if tool == "step_guard":
         return f"step_guard | {_short_text(str(result.get('message', '')), 220)}"
     if tool == "response_guard":
@@ -997,6 +1064,8 @@ def _result_style(result: dict[str, object]) -> str:
     tool = str(result.get("tool", "unknown"))
     if tool == "yield_guard":
         return "yellow"
+    if tool == "advisor_guidance":
+        return "magenta"
     if tool in {"step_guard", "response_guard"}:
         return "bold yellow"
     if result.get("error"):
@@ -1176,6 +1245,9 @@ def cmd_run(
     *,
     explorer_profile: str | None,
     supervisor_profile: str | None,
+    advisor_profiles: list[str] | None,
+    advisor_every: int | None,
+    no_advisor: bool,
     as_json: bool,
     plain_progress: bool,
 ) -> int:
@@ -1183,6 +1255,9 @@ def cmd_run(
     config = _load_runtime_config(
         explorer_profile=explorer_profile,
         supervisor_profile=supervisor_profile,
+        advisor_profiles=advisor_profiles,
+        advisor_every=advisor_every,
+        no_advisor=no_advisor,
     )
     _set_display_context(repo_root=config.repo_root, run_dir=None)
     controller = ResearchController(config)
@@ -1206,6 +1281,9 @@ def cmd_supervise(
     timezone_name: str | None,
     explorer_profile: str | None,
     supervisor_profile: str | None,
+    advisor_profiles: list[str] | None,
+    advisor_every: int | None,
+    no_advisor: bool,
     as_json: bool,
     plain_progress: bool,
 ) -> int:
@@ -1213,6 +1291,9 @@ def cmd_supervise(
     config = _load_runtime_config(
         explorer_profile=explorer_profile,
         supervisor_profile=supervisor_profile,
+        advisor_profiles=advisor_profiles,
+        advisor_every=advisor_every,
+        no_advisor=no_advisor,
     )
     _set_display_context(repo_root=config.repo_root, run_dir=None)
     session_max_steps, policy = _resolve_supervise_policy(
@@ -1409,6 +1490,13 @@ def cmd_leaderboard(*, limit: int) -> int:
         run_metadata_by_run_id=run_metadata_by_run_id,
         lower_is_better=config.research.plot_lower_is_better,
     )
+    tradeoff_ranked = render_tradeoff_leaderboard_artifacts(
+        attempts,
+        config.tradeoff_leaderboard_plot_path,
+        config.tradeoff_leaderboard_json_path,
+        run_metadata_by_run_id=run_metadata_by_run_id,
+        lower_is_better=config.research.plot_lower_is_better,
+    )
     print(
         json.dumps(
             {
@@ -1418,10 +1506,25 @@ def cmd_leaderboard(*, limit: int) -> int:
                 "models_ranked": len(model_ranked),
                 "model_leaderboard_plot": str(config.model_leaderboard_plot_path),
                 "model_leaderboard_json": str(config.model_leaderboard_json_path),
+                "tradeoff_runs_ranked": len(tradeoff_ranked),
+                "tradeoff_leaderboard_plot": str(config.tradeoff_leaderboard_plot_path),
+                "tradeoff_leaderboard_json": str(config.tradeoff_leaderboard_json_path),
             },
             ensure_ascii=True,
             indent=2,
         )
+    )
+    return 0
+
+
+def cmd_dashboard(*, host: str, port: int, limit: int, refresh_on_start: bool) -> int:
+    config = load_config()
+    serve_dashboard(
+        config,
+        host=host,
+        port=port,
+        limit=limit,
+        refresh_on_start=refresh_on_start,
     )
     return 0
 
@@ -1529,6 +1632,147 @@ def _coerce_profile_instruments(profile_path: Path) -> list[str]:
     return normalized
 
 
+def _coerce_profile_timeframe(profile_path: Path) -> str:
+    payload = _load_json_if_exists(profile_path)
+    indicators = _nested_get(payload, ["profile", "indicators"])
+    if not isinstance(indicators, list):
+        return ""
+    seen: list[str] = []
+    for indicator in indicators:
+        if not isinstance(indicator, dict):
+            continue
+        token = str(_nested_get(indicator, ["config", "timeframe"]) or "").strip().upper()
+        if not token or token in seen:
+            continue
+        seen.append(token)
+    return seen[0] if seen else ""
+
+
+def _normalize_tokens(values: list[Any]) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        token = str(raw or "").strip().upper()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        normalized.append(token)
+    return normalized
+
+
+def _attempt_request_payload(attempt: dict[str, Any]) -> dict[str, Any]:
+    artifact_dir = Path(str(attempt.get("artifact_dir", ""))).resolve()
+    request_payload = _nested_get(_load_json_if_exists(artifact_dir / "deep-replay-job.json"), ["request"]) or {}
+    return request_payload if isinstance(request_payload, dict) else {}
+
+
+def _candidate_sweep_stems(candidate_name: str) -> list[str]:
+    token = candidate_name.strip().lower()
+    if not token:
+        return []
+    stems = [token]
+    for marker in ["_new_eval", "_eval"]:
+        index = token.find(marker)
+        if index > 0:
+            stems.append(token[:index])
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for stem in stems:
+        if stem and stem not in seen:
+            seen.add(stem)
+            ordered.append(stem)
+    return ordered
+
+
+def _find_sweep_definition(run_dir: Path, attempt: dict[str, Any]) -> dict[str, Any]:
+    candidate_name = str(attempt.get("candidate_name") or "")
+    stems = _candidate_sweep_stems(candidate_name)
+    search_roots = [run_dir / "profiles", run_dir / "profiles" / "sweeps"]
+    candidates: list[tuple[int, Path, dict[str, Any]]] = []
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.json")):
+            payload = _load_json_if_exists(path)
+            if not payload:
+                continue
+            base_profile_id = str(payload.get("base_profile_id") or "").strip()
+            if not base_profile_id:
+                continue
+            lowered_name = path.stem.lower()
+            score = 0
+            for index, stem in enumerate(stems):
+                if lowered_name == stem:
+                    score = max(score, 100 - index)
+                elif lowered_name.startswith(stem):
+                    score = max(score, 80 - index)
+            if score <= 0 and "sweep" in lowered_name:
+                score = 1
+            if score > 0:
+                candidates.append((score, path, payload))
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda item: (-item[0], len(str(item[1]))))
+    return candidates[0][2]
+
+
+def _find_attempt_for_profile_ref(attempts: list[dict[str, Any]], profile_ref: str) -> dict[str, Any] | None:
+    profile_ref = profile_ref.strip()
+    if not profile_ref:
+        return None
+    for attempt in attempts:
+        if str(attempt.get("profile_ref") or "").strip() == profile_ref:
+            return attempt
+        request_payload = _attempt_request_payload(attempt)
+        if str(request_payload.get("profile_id") or "").strip() == profile_ref:
+            return attempt
+    return None
+
+
+def _recover_package_inputs_from_sweep(
+    run_dir: Path,
+    attempt: dict[str, Any],
+    attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    sweep_payload = _find_sweep_definition(run_dir, attempt)
+    if not sweep_payload:
+        return {}
+    base_profile_id = str(sweep_payload.get("base_profile_id") or "").strip()
+    if not base_profile_id:
+        return {}
+    base_attempt = _find_attempt_for_profile_ref(attempts, base_profile_id)
+    if base_attempt is None:
+        return {}
+
+    base_profile_path_raw = str(base_attempt.get("profile_path") or "").strip()
+    base_profile_path = Path(base_profile_path_raw).resolve() if base_profile_path_raw else None
+    base_request_payload = _attempt_request_payload(base_attempt)
+
+    instruments = _normalize_tokens(list(sweep_payload.get("instruments") or []))
+    if not instruments and base_profile_path is not None and base_profile_path.exists():
+        instruments = _coerce_profile_instruments(base_profile_path)
+
+    timeframe = str(
+        base_request_payload.get("timeframe")
+        or _nested_get(base_attempt, ["best_summary", "timeframe"])
+        or (_coerce_profile_timeframe(base_profile_path) if base_profile_path is not None and base_profile_path.exists() else "")
+        or ""
+    ).strip().upper()
+
+    if not timeframe or not instruments:
+        return {}
+
+    return {
+        "artifact_dir": Path(str(attempt.get("artifact_dir", ""))).resolve(),
+        "profile_path": base_profile_path,
+        "profile_ref": base_profile_id,
+        "timeframe": timeframe,
+        "instruments": instruments,
+        "lookback_months": _derive_lookback_months(base_request_payload, _load_json_if_exists(Path(str(base_attempt.get("artifact_dir", ""))).resolve() / "sensitivity-response.json")),
+        "recovered_from_sweep": True,
+    }
+
+
 def _derive_lookback_months(request_payload: dict[str, Any], sensitivity_payload: dict[str, Any]) -> int:
     raw_months = request_payload.get("lookback_months")
     if isinstance(raw_months, int) and raw_months > 0:
@@ -1549,14 +1793,17 @@ def _derive_lookback_months(request_payload: dict[str, Any], sensitivity_payload
     return max(1, int(ceil(numeric)))
 
 
-def _build_package_inputs(attempt: dict[str, Any]) -> dict[str, Any]:
+def _build_package_inputs(
+    attempt: dict[str, Any],
+    *,
+    run_dir: Path | None = None,
+    attempts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     artifact_dir = Path(str(attempt.get("artifact_dir", ""))).resolve()
     profile_path_raw = str(attempt.get("profile_path", "")).strip()
     profile_path = Path(profile_path_raw).resolve() if profile_path_raw else None
 
-    request_payload = _nested_get(_load_json_if_exists(artifact_dir / "deep-replay-job.json"), ["request"]) or {}
-    if not isinstance(request_payload, dict):
-        request_payload = {}
+    request_payload = _attempt_request_payload(attempt)
     sensitivity_payload = _load_json_if_exists(artifact_dir / "sensitivity-response.json")
 
     timeframe = str(
@@ -1564,23 +1811,30 @@ def _build_package_inputs(attempt: dict[str, Any]) -> dict[str, Any]:
         or _nested_get(sensitivity_payload, ["data", "aggregate", "timeframe"])
         or _nested_get(sensitivity_payload, ["data", "timeframe"])
         or _nested_get(attempt, ["best_summary", "timeframe"])
+        or (_coerce_profile_timeframe(profile_path) if profile_path is not None and profile_path.exists() else "")
         or ""
     ).strip().upper()
-    if not timeframe:
-        raise RuntimeError(f"Could not resolve timeframe for attempt {attempt.get('attempt_id')}")
 
     instruments_raw = request_payload.get("instruments")
-    instruments: list[str] = []
-    if isinstance(instruments_raw, list):
-        seen: set[str] = set()
-        for raw in instruments_raw:
-            token = str(raw or "").strip().upper()
-            if not token or token in seen:
-                continue
-            seen.add(token)
-            instruments.append(token)
+    instruments = _normalize_tokens(instruments_raw if isinstance(instruments_raw, list) else [])
     if not instruments and profile_path is not None and profile_path.exists():
         instruments = _coerce_profile_instruments(profile_path)
+
+    if (not timeframe or not instruments or not (profile_path is not None and profile_path.exists())) and run_dir is not None and attempts is not None:
+        recovered = _recover_package_inputs_from_sweep(run_dir, attempt, attempts)
+        if recovered:
+            merged = {
+                "artifact_dir": artifact_dir,
+                "profile_path": profile_path,
+                "timeframe": timeframe,
+                "instruments": instruments,
+                "lookback_months": _derive_lookback_months(request_payload, sensitivity_payload),
+            }
+            merged.update({key: value for key, value in recovered.items() if value})
+            return merged
+
+    if not timeframe:
+        raise RuntimeError(f"Could not resolve timeframe for attempt {attempt.get('attempt_id')}")
     if not instruments:
         raise RuntimeError(f"Could not resolve instruments for attempt {attempt.get('attempt_id')}")
 
@@ -1695,9 +1949,9 @@ def cmd_sync_profile_drop_pngs(
                 f"{best_attempt.get('attempt_id')} "
                 f"score={float(best_attempt.get('composite_score')):.3f}"
             )
-            package_inputs = _build_package_inputs(best_attempt)
+            package_inputs = _build_package_inputs(best_attempt, run_dir=run_dir, attempts=attempts)
             profile_path = package_inputs.get("profile_path")
-            profile_ref = str(best_attempt.get("profile_ref") or "").strip()
+            profile_ref = str(package_inputs.get("profile_ref") or best_attempt.get("profile_ref") or "").strip()
             recreated_profile = False
 
             if profile_ref:
@@ -1725,6 +1979,8 @@ def cmd_sync_profile_drop_pngs(
                 f"instruments={','.join(package_inputs['instruments'])} "
                 f"lookback={lookback_months}mo"
             )
+            if package_inputs.get("recovered_from_sweep"):
+                emit("  recovered package inputs from sweep base profile")
             package_args = [
                 "package",
                 "--profile-ref",
@@ -1982,6 +2238,9 @@ def main() -> int:
             max_steps=args.max_steps,
             explorer_profile=args.explorer_profile,
             supervisor_profile=args.supervisor_profile,
+            advisor_profiles=args.advisor_profile,
+            advisor_every=args.advisor_every,
+            no_advisor=bool(args.no_advisor),
             as_json=bool(args.json),
             plain_progress=bool(args.plain_progress),
         )
@@ -1993,6 +2252,9 @@ def main() -> int:
             timezone_name=args.timezone,
             explorer_profile=args.explorer_profile,
             supervisor_profile=args.supervisor_profile,
+            advisor_profiles=args.advisor_profile,
+            advisor_every=args.advisor_every,
+            no_advisor=bool(args.no_advisor),
             as_json=bool(args.json),
             plain_progress=bool(args.plain_progress),
         )
@@ -2000,6 +2262,13 @@ def main() -> int:
         return cmd_plot(run_id=args.run_id, all_runs=bool(args.all_runs))
     if args.command == "leaderboard":
         return cmd_leaderboard(limit=args.limit)
+    if args.command == "dashboard":
+        return cmd_dashboard(
+            host=str(args.host),
+            port=int(args.port),
+            limit=int(args.limit),
+            refresh_on_start=not bool(args.no_refresh_on_start),
+        )
     if args.command == "sync-profile-drop-pngs":
         return cmd_sync_profile_drop_pngs(
             run_ids=args.run_id,

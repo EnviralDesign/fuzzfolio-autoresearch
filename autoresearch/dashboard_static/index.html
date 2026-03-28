@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Autoresearch Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Autoresearch Dashboard</p>
+          <h1>Runs, models, and profile backtests in one local view.</h1>
+          <p class="lede">
+            Derived charts stay available, but the main view is now drillable: best runs,
+            every attempt in a run, and the realized equity and drawdown path for a selected profile.
+          </p>
+        </div>
+        <div class="hero-actions">
+          <button id="refreshButton" class="primary-button" type="button">Refresh From Source</button>
+          <div class="status-card">
+            <span class="status-label">Generated</span>
+            <strong id="generatedAt">Waiting…</strong>
+            <span id="refreshStatus" class="muted">Idle</span>
+          </div>
+        </div>
+      </header>
+
+      <main class="main-grid">
+        <section class="panel span-12">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Overview</p>
+              <h2>Current bench shape</h2>
+            </div>
+          </div>
+          <div id="overviewCards" class="metric-grid"></div>
+        </section>
+
+        <section class="panel span-12">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Derived Views</p>
+              <h2>Existing chart renders</h2>
+            </div>
+          </div>
+          <div id="derivedGallery" class="gallery-grid"></div>
+        </section>
+
+        <section class="panel span-7">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Tradeoff Map</p>
+              <h2>Score vs trades per month</h2>
+            </div>
+            <span class="panel-note">Click a point to jump to the run.</span>
+          </div>
+          <div id="tradeoffChart" class="chart-frame"></div>
+        </section>
+
+        <section class="panel span-5">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Drawdown Lens</p>
+              <h2>Score vs max drawdown</h2>
+            </div>
+          </div>
+          <div id="drawdownChart" class="chart-frame"></div>
+        </section>
+
+        <section class="panel span-6">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Model Consistency</p>
+              <h2>Who converts runs into quality most reliably?</h2>
+            </div>
+          </div>
+          <div id="modelTable"></div>
+        </section>
+
+        <section class="panel span-6">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Run List</p>
+              <h2>All runs, newest first</h2>
+            </div>
+          </div>
+          <div id="runsTable"></div>
+        </section>
+
+        <section class="panel span-12">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Run Drilldown</p>
+              <h2 id="runDetailTitle">Select a run</h2>
+            </div>
+            <span id="runDetailMeta" class="panel-note"></span>
+          </div>
+          <div id="runDetail" class="empty-state">
+            Pick a run from the table or a point from the charts.
+          </div>
+        </section>
+
+        <section class="panel span-12">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Attempt Detail</p>
+              <h2 id="attemptDetailTitle">Select an attempt</h2>
+            </div>
+            <span id="attemptDetailMeta" class="panel-note"></span>
+          </div>
+          <div id="attemptDetail" class="empty-state">
+            Once a run is selected, pick an attempt to inspect its backtest path and profile payload.
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>

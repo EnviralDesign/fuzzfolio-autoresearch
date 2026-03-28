@@ -93,6 +93,16 @@ uv run autoresearch run --max-steps 20 --explorer-profile openai-mini --supervis
 uv run autoresearch supervise --explorer-profile grok-fast --supervisor-profile grok-420-multi-agent-0309
 ```
 
+Periodic advisor guidance can also be configured globally or overridden per invocation:
+
+```powershell
+uv run autoresearch run --max-steps 20 --advisor-every 5 --advisor-profile openai-54 --advisor-profile grok-420-multi-agent-0309 --advisor-profile gemini-31-pro
+uv run autoresearch supervise --advisor-every 5 --advisor-profile openai-54 --advisor-profile grok-420-multi-agent-0309 --advisor-profile gemini-31-pro
+uv run autoresearch run --no-advisor
+```
+
+Advisor responses are anonymized in the run trace as `advisor1`, `advisor2`, and so on. The explorer sees only compact external guidance, not the underlying model names.
+
 The default live trace uses `rich` for colored panels and step/result tables so it is easier to watch during longer managed runs.
 The default provider completion budget is intentionally a bit roomy because the agent sometimes needs to emit a full portable profile JSON in one action.
 The controller also uses threshold-triggered context compaction modeled after `codex-rs`: once the live prompt estimate crosses the configured token threshold, it writes a checkpoint summary and rebuilds the active history from fresh run state plus a short recent tail.
@@ -115,6 +125,14 @@ Provider selection now lives in two places:
 - `llm.explorer_profile`
 - `llm.supervisor_profile`
 
+Optional periodic guidance lives under:
+
+- `advisor.enabled`
+- `advisor.every_n_steps`
+- `advisor.profiles`
+- `advisor.max_recent_steps`
+- `advisor.max_recent_attempts`
+
 Each named profile is defined under `providers`.
 
 Example:
@@ -124,6 +142,13 @@ Example:
   "llm": {
     "explorer_profile": "openai-mini",
     "supervisor_profile": "xai-grok"
+  },
+  "advisor": {
+    "enabled": true,
+    "every_n_steps": 5,
+    "profiles": ["openai-54", "grok-420-multi-agent-0309", "gemini-31-pro"],
+    "max_recent_steps": 4,
+    "max_recent_attempts": 6
   },
   "providers": {
     "openai-mini": {
@@ -139,6 +164,8 @@ Example:
   }
 }
 ```
+
+When enabled, the controller periodically synthesizes a compact run-state packet from the ledger, controller log, frontier snapshot, recent scored attempts, and recent execution issues. It then queries the configured advisor profiles and injects their short guidance back into the explorer loop as anonymous `advisor1`/`advisor2`/`advisor3` feedback.
 
 That profile-level compaction override is useful when one model has a much larger context window, a very different token cost, or a different quality/latency tradeoff than another.
 Provider profiles can also tune generic rate-limit behavior with:
@@ -379,9 +406,12 @@ These write derived artifacts under:
 - `runs/derived/leaderboard.json`
 - `runs/derived/leaderboard-model-averages.png`
 - `runs/derived/leaderboard-model-averages.json`
+- `runs/derived/leaderboard-score-vs-trades.png`
+- `runs/derived/leaderboard-score-vs-trades.json`
 
 The leaderboard is best-per-run, sorted by `quality_score`.
 The model-average leaderboard groups those best-per-run outcomes by explorer model and reports the mean score per model.
+The score-vs-trades leaderboard maps each run's best candidate as a point, with resolved trades on the x-axis and quality score on the y-axis, and highlights the Pareto frontier.
 
 Useful commands:
 
@@ -393,9 +423,29 @@ uv run autoresearch supervise --no-window
 uv run autoresearch plot --all-runs
 uv run autoresearch leaderboard
 uv run autoresearch sync-profile-drop-pngs
+uv run autoresearch dashboard
 uv run autoresearch rescore-attempts
 uv run autoresearch reset-runs
 ```
+
+The local dashboard command serves a simple SPA over the existing run artifacts:
+
+```powershell
+uv run autoresearch dashboard
+```
+
+Default URL:
+
+- `http://127.0.0.1:47832`
+
+What it gives you:
+
+- overview cards for run count, attempts, best score, profile-drop coverage, and curve coverage
+- the existing derived leaderboard images with a refresh button that rebuilds them from source
+- interactive score-vs-trade-rate and score-vs-drawdown views
+- a run list and model consistency table
+- per-run attempt drilldown
+- lightweight backtest inspection from `best-cell-path-detail.json`, including equity and drawdown curves
 
 `sync-profile-drop-pngs` walks each run, finds its best scored attempt, ensures the backing profile exists in cloud storage, rebuilds a fresh profile-drop bundle through the existing FuzzFolio package flow, renders a new PNG, and leaves only:
 

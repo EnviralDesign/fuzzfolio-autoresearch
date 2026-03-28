@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import shutil
 from pathlib import Path
 from statistics import median
@@ -285,6 +286,74 @@ def _model_group_label(run_metadata: dict[str, Any] | None) -> str | None:
     return None
 
 
+def _attempt_trade_count(attempt: dict[str, Any]) -> int | None:
+    best_summary = attempt.get("best_summary")
+    if not isinstance(best_summary, dict):
+        return None
+    candidates = [
+        best_summary.get("best_cell_path_metrics"),
+        best_summary.get("best_cell"),
+    ]
+    for payload in candidates:
+        if not isinstance(payload, dict):
+            continue
+        raw = payload.get("trade_count")
+        if raw is None:
+            raw = payload.get("resolved_trades")
+        try:
+            trade_count = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if trade_count >= 0:
+            return trade_count
+    return None
+
+
+def _attempt_effective_window_months(attempt: dict[str, Any]) -> float | None:
+    best_summary = attempt.get("best_summary")
+    if not isinstance(best_summary, dict):
+        return None
+    current: Any = best_summary.get("quality_score_payload")
+    if isinstance(current, dict):
+        inputs = current.get("inputs")
+        if isinstance(inputs, dict):
+            try:
+                value = float(inputs.get("effective_window_months"))
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value > 0:
+                return value
+    market_window = best_summary.get("market_data_window")
+    if isinstance(market_window, dict):
+        try:
+            value = float(market_window.get("effective_window_months"))
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _attempt_trades_per_month(attempt: dict[str, Any]) -> float | None:
+    best_summary = attempt.get("best_summary")
+    if isinstance(best_summary, dict):
+        quality_score_payload = best_summary.get("quality_score_payload")
+        if isinstance(quality_score_payload, dict):
+            inputs = quality_score_payload.get("inputs")
+            if isinstance(inputs, dict):
+                try:
+                    value = float(inputs.get("trades_per_month"))
+                except (TypeError, ValueError):
+                    value = None
+                if value is not None and value >= 0:
+                    return value
+    trade_count = _attempt_trade_count(attempt)
+    effective_window_months = _attempt_effective_window_months(attempt)
+    if trade_count is None or effective_window_months is None or effective_window_months <= 0:
+        return None
+    return float(trade_count) / float(effective_window_months)
+
+
 def _best_scored_attempts_by_run(
     attempts: list[dict[str, Any]],
     *,
@@ -308,6 +377,118 @@ def _best_scored_attempts_by_run(
             best_by_run[run_id] = attempt
 
     return list(best_by_run.values())
+
+
+def _compute_tradeoff_frontier(
+    attempts: list[dict[str, Any]],
+    *,
+    lower_is_better: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    ordered = sorted(
+        attempts,
+        key=lambda attempt: (
+            float(attempt.get("trades_per_month", 0.0)),
+            float(attempt.get("composite_score")),
+        ),
+        reverse=False,
+    )
+    frontier: list[dict[str, Any]] = []
+    non_frontier: list[dict[str, Any]] = []
+    best_seen_score: float | None = None
+    for attempt in ordered:
+        score = float(attempt.get("composite_score"))
+        if best_seen_score is None:
+            frontier.append(attempt)
+            best_seen_score = score
+            continue
+        improved = score < best_seen_score if lower_is_better else score > best_seen_score
+        if improved:
+            frontier.append(attempt)
+            best_seen_score = score
+        else:
+            non_frontier.append(attempt)
+    return frontier, non_frontier
+
+
+def _compute_tradeoff_envelope(
+    attempts: list[dict[str, Any]],
+    *,
+    lower_is_better: bool = False,
+) -> list[dict[str, Any]]:
+    if not attempts:
+        return []
+
+    distinct_trade_rates = sorted(
+        {
+            float(attempt.get("trades_per_month", 0.0))
+            for attempt in attempts
+            if float(attempt.get("trades_per_month", 0.0)) > 0
+        }
+    )
+    if not distinct_trade_rates:
+        return []
+
+    def pick_best(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        return sorted(
+            candidates,
+            key=lambda attempt: float(attempt.get("composite_score")),
+            reverse=not lower_is_better,
+        )[0]
+
+    selected: list[dict[str, Any]] = []
+    if len(distinct_trade_rates) <= 12:
+        for trade_rate in distinct_trade_rates:
+            bucket = [
+                attempt
+                for attempt in attempts
+                if float(attempt.get("trades_per_month", 0.0)) == trade_rate
+            ]
+            if bucket:
+                selected.append(pick_best(bucket))
+    else:
+        min_trade = min(distinct_trade_rates)
+        max_trade = max(distinct_trade_rates)
+        use_log_bins = max_trade >= max(8.0, min_trade * 6.0)
+        bucket_count = min(12, max(6, int(len(attempts) ** 0.5) + 2))
+        edges: list[float] = []
+        if use_log_bins:
+            log_min = float(math.log10(min_trade))
+            log_max = float(math.log10(max_trade))
+            step = (log_max - log_min) / bucket_count if bucket_count > 0 else 1.0
+            edges = [10 ** (log_min + step * index) for index in range(bucket_count + 1)]
+        else:
+            span = max_trade - min_trade
+            step = span / bucket_count if bucket_count > 0 else 1.0
+            edges = [min_trade + step * index for index in range(bucket_count + 1)]
+
+        for index in range(len(edges) - 1):
+            left = edges[index]
+            right = edges[index + 1]
+            if index == len(edges) - 2:
+                bucket = [
+                    attempt
+                    for attempt in attempts
+                    if left <= float(attempt.get("trades_per_month", 0.0)) <= right
+                ]
+            else:
+                bucket = [
+                    attempt
+                    for attempt in attempts
+                    if left <= float(attempt.get("trades_per_month", 0.0)) < right
+                ]
+            if bucket:
+                selected.append(pick_best(bucket))
+
+    envelope: list[dict[str, Any]] = []
+    seen_attempt_ids: set[str] = set()
+    for attempt in sorted(selected, key=lambda row: float(row.get("trades_per_month", 0.0))):
+        attempt_id = str(attempt.get("attempt_id", "")).strip()
+        if attempt_id and attempt_id in seen_attempt_ids:
+            continue
+        if attempt_id:
+            seen_attempt_ids.add(attempt_id)
+        envelope.append(attempt)
+    return envelope
 
 
 def render_leaderboard_artifacts(
@@ -451,3 +632,155 @@ def render_model_leaderboard_artifacts(
     plt.savefig(png_output_path, dpi=160)
     plt.close()
     return summary_rows
+
+
+def render_tradeoff_leaderboard_artifacts(
+    attempts: list[dict[str, Any]],
+    png_output_path: Path,
+    json_output_path: Path,
+    *,
+    run_metadata_by_run_id: dict[str, dict[str, Any]] | None = None,
+    lower_is_better: bool = False,
+) -> list[dict[str, Any]]:
+    enriched_rows: list[dict[str, Any]] = []
+    min_display_score = None if lower_is_better else 15.0
+    for attempt in _best_scored_attempts_by_run(attempts, lower_is_better=lower_is_better):
+        trade_count = _attempt_trade_count(attempt)
+        trades_per_month = _attempt_trades_per_month(attempt)
+        effective_window_months = _attempt_effective_window_months(attempt)
+        score = attempt.get("composite_score")
+        if trade_count is None or trades_per_month is None or score is None:
+            continue
+        score_value = float(score)
+        if min_display_score is not None and score_value < min_display_score:
+            continue
+        run_id = str(attempt.get("run_id", "")).strip()
+        run_metadata = (run_metadata_by_run_id or {}).get(run_id, {})
+        enriched = dict(attempt)
+        enriched["run_metadata"] = run_metadata
+        enriched["leaderboard_label"] = _leaderboard_label(attempt, run_metadata)
+        enriched["trade_count"] = trade_count
+        enriched["trades_per_month"] = trades_per_month
+        enriched["effective_window_months"] = effective_window_months
+        enriched_rows.append(enriched)
+
+    frontier, non_frontier = _compute_tradeoff_frontier(
+        enriched_rows,
+        lower_is_better=lower_is_better,
+    )
+    envelope = _compute_tradeoff_envelope(
+        enriched_rows,
+        lower_is_better=lower_is_better,
+    )
+    frontier_run_ids = {
+        str(attempt.get("run_id", "")).strip()
+        for attempt in frontier
+        if str(attempt.get("run_id", "")).strip()
+    }
+    envelope_attempt_ids = {
+        str(attempt.get("attempt_id", "")).strip()
+        for attempt in envelope
+        if str(attempt.get("attempt_id", "")).strip()
+    }
+
+    serializable_rows: list[dict[str, Any]] = []
+    for attempt in sorted(
+        enriched_rows,
+        key=lambda row: (
+            float(row.get("trades_per_month", 0.0)),
+            float(row.get("composite_score")),
+        ),
+    ):
+        serialized = dict(attempt)
+        serialized["is_frontier"] = str(attempt.get("run_id", "")).strip() in frontier_run_ids
+        serialized["is_trade_envelope"] = str(attempt.get("attempt_id", "")).strip() in envelope_attempt_ids
+        serializable_rows.append(serialized)
+
+    json_output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_output_path.write_text(json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    png_output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(14, 9))
+    if not serializable_rows:
+        plt.title("Autoresearch Score vs Trade Rate: No Scored Runs With Trade Counts Yet")
+        plt.xlabel("Average Resolved Trades / Month")
+        plt.ylabel("Quality Score")
+        plt.tight_layout()
+        plt.savefig(png_output_path, dpi=160)
+        plt.close()
+        return serializable_rows
+
+    x_all = [float(attempt["trades_per_month"]) for attempt in serializable_rows]
+    y_all = [float(attempt["composite_score"]) for attempt in serializable_rows]
+    plt.scatter(
+        x_all,
+        y_all,
+        c="#8ecae6",
+        edgecolors="#4d88a8",
+        s=54,
+        alpha=0.75,
+        label="Best run candidate",
+    )
+
+    if envelope:
+        envelope_sorted = sorted(envelope, key=lambda attempt: float(attempt.get("trades_per_month", 0.0)))
+        x_front = [float(attempt["trades_per_month"]) for attempt in envelope_sorted]
+        y_front = [float(attempt["composite_score"]) for attempt in envelope_sorted]
+        plt.plot(x_front, y_front, color="#2a9d8f", linewidth=2.1, alpha=0.9, label="Upper envelope")
+        plt.scatter(
+            x_front,
+            y_front,
+            c="#2ecc71",
+            edgecolors="#1f6f54",
+            s=86,
+            zorder=3,
+            label="Envelope point",
+        )
+        for attempt in envelope_sorted:
+            label = str(attempt.get("leaderboard_label") or "run")
+            if len(label) > 40:
+                label = label[:37] + "..."
+            plt.annotate(
+                label,
+                (float(attempt["trades_per_month"]), float(attempt["composite_score"])),
+                textcoords="offset points",
+                xytext=(8, 6),
+                fontsize=8,
+                color="#1f6f54",
+            )
+
+    if frontier:
+        frontier_sorted = sorted(frontier, key=lambda attempt: float(attempt.get("trades_per_month", 0.0)))
+        plt.scatter(
+            [float(attempt["trades_per_month"]) for attempt in frontier_sorted],
+            [float(attempt["composite_score"]) for attempt in frontier_sorted],
+            facecolors="none",
+            edgecolors="#146356",
+            s=106,
+            linewidths=1.1,
+            zorder=4,
+            label="Pareto point",
+        )
+
+    x_min = min(x_all)
+    x_max = max(x_all)
+    y_min = min(y_all)
+    y_max = max(y_all)
+    x_padding = max(0.15, (x_max - x_min) * 0.08) if x_max != x_min else 0.15
+    plt.xlim(max(0.0, x_min - x_padding), x_max + x_padding)
+    y_padding = max(0.5, (y_max - y_min) * 0.08) if y_max != y_min else 0.5
+    if lower_is_better:
+        plt.ylim(y_max + y_padding, y_min - y_padding)
+    else:
+        plt.ylim(y_min - y_padding, y_max + y_padding)
+
+    direction = "lower is better" if lower_is_better else "higher is better"
+    plt.xlabel("Average Resolved Trades / Month")
+    plt.ylabel(f"Quality Score ({direction})")
+    plt.title("Autoresearch Tradeoff Map: Best Score vs Trade Rate")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(png_output_path, dpi=160)
+    plt.close()
+    return serializable_rows

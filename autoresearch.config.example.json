@@ -109,5 +109,15 @@
     "stop_mode": "after_step",
     "soft_wrap_minutes": 30,
     "auto_restart_terminal_sessions": false
+  },
+  "advisor": {
+    "enabled": false,
+    "every_n_steps": 5,
+    "profiles": [
+      "openai-mini",
+      "xai-grok"
+    ],
+    "max_recent_steps": 4,
+    "max_recent_attempts": 6
   }
 }

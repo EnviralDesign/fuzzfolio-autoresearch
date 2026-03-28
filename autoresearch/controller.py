@@ -17,6 +17,7 @@ from .ledger import (
     append_attempt,
     attempt_exists,
     attempts_path_for_run_dir,
+    load_run_metadata,
     load_attempts,
     load_run_attempts,
     make_attempt_record,
@@ -136,6 +137,29 @@ Rules:
 - During exploration phase, do not encourage finish or summary-writing.
 """
 
+ADVISOR_PROMPT = """You are an expert strategy advisor for an autonomous Fuzzfolio research run.
+
+You are not executing tools. You are giving short, high-signal guidance to the explorer model that is actively operating the loop.
+
+Return JSON only in this exact shape:
+{
+  "message": "2-4 sentences of direct guidance",
+  "next_moves": ["concrete move 1", "concrete move 2", "concrete move 3"],
+  "risks": ["risk 1", "risk 2"]
+}
+
+Rules:
+- Keep it compact and specific.
+- Do not suggest finish or wrap-up unless the packet says wrap-up is active.
+- Do not suggest invalid CLI syntax or invalid instruments.
+- Prefer guidance that changes branch quality, not just branch count.
+- Treat sweeps as first-class.
+- Think in months and years of evidence, not bars.
+- Use quality_score as the primary target metric, while using PSR, DSR, drawdown, robustness, trade rate, and coverage as reasons.
+- Do not recommend broad indicator-family swaps unless the packet explicitly allows structural pivots.
+- Assume the explorer can choose whether to follow your guidance; optimize for clarity, not control.
+"""
+
 SUMMARY_PREFIX = """Another language model started to solve this problem and produced a summary of its thinking process.
 Use the summary below to continue the same autonomous Fuzzfolio research run without repeating old work.
 """
@@ -190,6 +214,11 @@ class ResearchController:
         self.config = app_config
         self.provider = create_provider(app_config.provider)
         self.supervisor_provider = create_provider(app_config.supervisor_provider)
+        self.advisor_providers = [
+            (f"advisor{index}", profile_name, create_provider(app_config.providers[profile_name]))
+            for index, profile_name in enumerate(app_config.advisor.profiles, start=1)
+            if profile_name in app_config.providers
+        ]
         self.cli = FuzzfolioCli(app_config.fuzzfolio)
         self.profile_sources: dict[str, Path] = {}
         self.last_created_profile_ref: str | None = None
@@ -1351,6 +1380,20 @@ class ResearchController:
                 "tool": tool,
                 "result": result.get("result"),
             }
+        if tool == "advisor_guidance":
+            advisors = result.get("advisors")
+            labels = []
+            if isinstance(advisors, list):
+                for item in advisors[:4]:
+                    if isinstance(item, dict):
+                        label = str(item.get("label") or "").strip()
+                        if label:
+                            labels.append(label)
+            return {
+                "tool": tool,
+                "message": result.get("message"),
+                "advisors": labels,
+            }
         if tool in {"yield_guard", "finish"}:
             return result
         return result
@@ -1813,15 +1856,16 @@ class ResearchController:
         self,
         tool_context: ToolContext,
         current_step_payload: dict[str, Any] | None = None,
+        limit: int | None = None,
     ) -> str:
-        limit = max(1, self.config.research.supervisor_recent_steps)
-        payloads = self._load_recent_step_payloads(tool_context, limit)
+        effective_limit = max(1, limit or self.config.research.supervisor_recent_steps)
+        payloads = self._load_recent_step_payloads(tool_context, effective_limit)
         if current_step_payload is not None:
             payloads.append(current_step_payload)
         if not payloads:
             return "No recent step history is available."
         lines: list[str] = []
-        for payload in payloads[-limit:]:
+        for payload in payloads[-effective_limit:]:
             step = payload.get("step")
             reasoning = _short = " ".join(str(payload.get("reasoning", "")).split())
             if len(_short) > 180:
@@ -1839,6 +1883,359 @@ class ResearchController:
                         summary = self._history_result_summary(result)
                         lines.append(f"  result: {json.dumps(summary, ensure_ascii=True)[:240]}")
         return "\n".join(lines)
+
+    def _attempt_trade_count(self, attempt: dict[str, Any]) -> int | None:
+        best_summary = attempt.get("best_summary")
+        if not isinstance(best_summary, dict):
+            return None
+        best_cell = best_summary.get("best_cell")
+        if isinstance(best_cell, dict):
+            try:
+                value = int(best_cell.get("resolved_trades"))
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value >= 0:
+                return value
+        path_metrics = best_summary.get("best_cell_path_metrics")
+        if isinstance(path_metrics, dict):
+            try:
+                value = int(path_metrics.get("trade_count"))
+            except (TypeError, ValueError):
+                value = None
+            if value is not None and value >= 0:
+                return value
+        return None
+
+    def _attempt_trades_per_month(self, attempt: dict[str, Any]) -> float | None:
+        best_summary = attempt.get("best_summary")
+        if isinstance(best_summary, dict):
+            quality_score_payload = best_summary.get("quality_score_payload")
+            if isinstance(quality_score_payload, dict):
+                inputs = quality_score_payload.get("inputs")
+                if isinstance(inputs, dict):
+                    try:
+                        value = float(inputs.get("trades_per_month"))
+                    except (TypeError, ValueError):
+                        value = None
+                    if value is not None and value >= 0:
+                        return value
+                    try:
+                        trade_count = float(inputs.get("resolved_trades"))
+                        months = float(inputs.get("effective_window_months"))
+                    except (TypeError, ValueError):
+                        trade_count = None
+                        months = None
+                    if trade_count is not None and months is not None and months > 0:
+                        return trade_count / months
+        return None
+
+    def _attempt_max_drawdown_r(self, attempt: dict[str, Any]) -> float | None:
+        best_summary = attempt.get("best_summary")
+        if not isinstance(best_summary, dict):
+            return None
+        path_metrics = best_summary.get("best_cell_path_metrics")
+        if not isinstance(path_metrics, dict):
+            return None
+        try:
+            value = float(path_metrics.get("max_drawdown_r"))
+        except (TypeError, ValueError):
+            return None
+        return value
+
+    def _attempt_positive_cell_ratio(self, attempt: dict[str, Any]) -> float | None:
+        best_summary = attempt.get("best_summary")
+        if not isinstance(best_summary, dict):
+            return None
+        matrix_summary = best_summary.get("matrix_summary")
+        if not isinstance(matrix_summary, dict):
+            return None
+        try:
+            value = float(matrix_summary.get("positive_cell_ratio"))
+        except (TypeError, ValueError):
+            return None
+        return value
+
+    def _recent_scored_attempts_text(self, tool_context: ToolContext, limit: int) -> str:
+        attempts = [
+            attempt for attempt in self._run_attempts(tool_context.run_id)
+            if attempt.get("composite_score") is not None
+        ]
+        if not attempts:
+            return "No scored attempts yet."
+        lines: list[str] = []
+        for attempt in attempts[-max(1, limit):]:
+            trade_count = self._attempt_trade_count(attempt)
+            trades_per_month = self._attempt_trades_per_month(attempt)
+            positive_cell_ratio = self._attempt_positive_cell_ratio(attempt)
+            parts = [
+                f"seq={attempt.get('sequence')}",
+                f"candidate={attempt.get('candidate_name')}",
+                f"score={self._format_score(attempt.get('composite_score'))}",
+                f"basis={attempt.get('score_basis', 'n/a')}",
+            ]
+            if trade_count is not None:
+                parts.append(f"trades={trade_count}")
+            if trades_per_month is not None:
+                parts.append(f"trades_per_month={self._format_score(trades_per_month)}")
+            if positive_cell_ratio is not None:
+                parts.append(f"positive_cell_ratio={self._format_score(positive_cell_ratio)}")
+            lines.append("- " + " ".join(parts))
+        return "\n".join(lines)
+
+    def _execution_issue_lines(
+        self,
+        tool_context: ToolContext,
+        current_step_payload: dict[str, Any] | None,
+        limit: int,
+    ) -> list[str]:
+        payloads = self._load_recent_step_payloads(tool_context, max(1, limit))
+        if current_step_payload is not None:
+            payloads.append(current_step_payload)
+        issues: list[str] = []
+        for payload in payloads[-max(1, limit):]:
+            step = payload.get("step")
+            results = payload.get("results")
+            if not isinstance(results, list):
+                continue
+            for result in results:
+                if not isinstance(result, dict):
+                    continue
+                tool = str(result.get("tool", "unknown"))
+                if result.get("error"):
+                    issues.append(f"- step={step} {tool}: {str(result.get('error'))[:220]}")
+                elif tool in {"response_guard", "step_guard", "yield_guard"}:
+                    message = str(result.get("message") or result.get("error") or "").strip()
+                    if message:
+                        issues.append(f"- step={step} {tool}: {message[:220]}")
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for issue in issues:
+            if issue in seen:
+                continue
+            seen.add(issue)
+            deduped.append(issue)
+        return deduped[:6]
+
+    def _synthesized_run_diagnosis(
+        self,
+        tool_context: ToolContext,
+        current_step_payload: dict[str, Any] | None,
+    ) -> str:
+        attempts = self._run_attempts(tool_context.run_id)
+        scored = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+        unscored = [attempt for attempt in attempts if attempt.get("composite_score") is None]
+        leader = self._best_attempt(attempts)
+        lines: list[str] = []
+        lines.append(f"- total_attempts={len(attempts)} scored={len(scored)} unscored={len(unscored)}")
+        if leader is not None:
+            leader_trade_rate = self._attempt_trades_per_month(leader)
+            leader_drawdown = self._attempt_max_drawdown_r(leader)
+            leader_parts = [
+                f"current_leader_seq={leader.get('sequence')}",
+                f"score={self._format_score(leader.get('composite_score'))}",
+                f"candidate={leader.get('candidate_name')}",
+            ]
+            if leader_trade_rate is not None:
+                leader_parts.append(f"trades_per_month={self._format_score(leader_trade_rate)}")
+            if leader_drawdown is not None:
+                leader_parts.append(f"max_drawdown_r={self._format_score(leader_drawdown)}")
+            lines.append("- " + " ".join(leader_parts))
+
+        if len(scored) >= 2 and leader is not None:
+            high_trade_scored = [
+                attempt for attempt in scored
+                if attempt is not leader and self._attempt_trades_per_month(attempt) is not None
+            ]
+            if high_trade_scored:
+                highest_trade = max(
+                    high_trade_scored,
+                    key=lambda attempt: float(self._attempt_trades_per_month(attempt) or 0.0),
+                )
+                highest_trade_rate = self._attempt_trades_per_month(highest_trade)
+                leader_trade_rate = self._attempt_trades_per_month(leader)
+                if (
+                    highest_trade_rate is not None
+                    and leader_trade_rate is not None
+                    and highest_trade_rate > max(leader_trade_rate * 2.0, leader_trade_rate + 20.0)
+                    and self._score_better(
+                        float(leader.get("composite_score")),
+                        float(highest_trade.get("composite_score")),
+                    )
+                ):
+                    lines.append(
+                        "- high-trade branches have not beaten the current selective leader; "
+                        f"highest recent trade-rate loser was {highest_trade.get('candidate_name')} at "
+                        f"{self._format_score(highest_trade_rate)} trades/month with score "
+                        f"{self._format_score(highest_trade.get('composite_score'))}"
+                    )
+
+        recent_tail = attempts[-6:]
+        recent_unscored = sum(1 for attempt in recent_tail if attempt.get("composite_score") is None)
+        if recent_unscored:
+            lines.append(f"- recent_unscored_in_last_6={recent_unscored}")
+
+        issues = self._execution_issue_lines(tool_context, current_step_payload, 4)
+        if issues:
+            lines.append("- recent execution issues are present; prefer recovery over fresh broadening")
+
+        return "\n".join(lines)
+
+    def _advisor_packet_text(
+        self,
+        tool_context: ToolContext,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+        current_step_payload: dict[str, Any] | None,
+    ) -> str:
+        phase_info = self._run_phase_info(step, step_limit, policy)
+        horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
+        score_target = self._score_target_snapshot(tool_context)
+        run_metadata = load_run_metadata(tool_context.run_dir)
+        leader = self._best_attempt(self._run_attempts(tool_context.run_id))
+        leader_lines = "No scored leader yet."
+        if leader is not None:
+            leader_lines = "\n".join(
+                [
+                    f"- seq={leader.get('sequence')}",
+                    f"- candidate={leader.get('candidate_name')}",
+                    f"- quality_score={self._format_score(leader.get('composite_score'))}",
+                    f"- score_basis={leader.get('score_basis', 'n/a')}",
+                    f"- psr={self._format_score((leader.get('metrics') or {}).get('psr')) if isinstance(leader.get('metrics'), dict) else 'n/a'}",
+                    f"- trades_per_month={self._format_score(self._attempt_trades_per_month(leader))}",
+                    f"- resolved_trades={self._attempt_trade_count(leader) if self._attempt_trade_count(leader) is not None else 'n/a'}",
+                    f"- max_drawdown_r={self._format_score(self._attempt_max_drawdown_r(leader))}",
+                    f"- positive_cell_ratio={self._format_score(self._attempt_positive_cell_ratio(leader))}",
+                    f"- artifact={leader.get('artifact_dir')}",
+                ]
+            )
+        issues = self._execution_issue_lines(
+            tool_context,
+            current_step_payload,
+            self.config.advisor.max_recent_steps,
+        )
+        issue_text = "\n".join(issues) if issues else "No recent execution issues."
+        checkpoint_path = self._checkpoint_path(tool_context)
+        checkpoint_summary = (
+            checkpoint_path.read_text(encoding="utf-8")
+            if checkpoint_path.exists()
+            else "No checkpoint summary exists yet."
+        )
+        return (
+            "Run advisory packet\n\n"
+            f"Run id: {tool_context.run_id}\n"
+            f"Mode: {policy.mode_name}\n"
+            f"Step: {step}/{step_limit}\n"
+            f"Phase: {phase_info['name']}\n"
+            f"Explorer profile: {run_metadata.get('explorer_profile') or self.config.llm.explorer_profile}\n"
+            f"Explorer model: {run_metadata.get('explorer_model') or self.config.provider.model}\n"
+            f"Supervisor profile: {run_metadata.get('supervisor_profile') or self.config.llm.supervisor_profile}\n"
+            f"Supervisor model: {run_metadata.get('supervisor_model') or self.config.supervisor_provider.model}\n"
+            f"Quality-score preset: {run_metadata.get('quality_score_preset') or self.config.research.quality_score_preset}\n\n"
+            f"Controller horizon target:\n{horizon_policy['summary']}\n\n"
+            f"Controller score target:\n{score_target['summary']}\n\n"
+            "Advisory goal:\n"
+            "Give the explorer short, concrete guidance that improves the next few steps. "
+            "Do not try to end the run. Help it avoid drift, stale paths, and low-value retries.\n\n"
+            f"Current best run-local leader:\n{leader_lines}\n\n"
+            f"Recent scored attempts:\n{self._recent_scored_attempts_text(tool_context, self.config.advisor.max_recent_attempts)}\n\n"
+            f"Frontier snapshot:\n{self._frontier_snapshot_text(tool_context)}\n\n"
+            f"Recent execution issues:\n{issue_text}\n\n"
+            f"Synthesized run diagnosis:\n{self._synthesized_run_diagnosis(tool_context, current_step_payload)}\n\n"
+            f"Checkpoint summary:\n{checkpoint_summary[:2000]}\n\n"
+            f"Recent step window:\n{self._recent_step_window_text(tool_context, current_step_payload, limit=self.config.advisor.max_recent_steps)}\n\n"
+            "Decision request:\n"
+            "Help the explorer choose the highest-value next branch over the next 2-3 steps.\n"
+        )
+
+    def _advisor_feedback_message(self, advisor_result: dict[str, Any]) -> str:
+        advisors = advisor_result.get("advisors")
+        if not isinstance(advisors, list) or not advisors:
+            return ""
+        lines = [
+            "External advisor guidance. Treat this as advisory input, not a command. "
+            "Use it if it improves the next bounded actions."
+        ]
+        for advisor in advisors:
+            if not isinstance(advisor, dict):
+                continue
+            profile = str(advisor.get("label") or "advisor").strip()
+            message = str(advisor.get("message") or "").strip()
+            next_moves = advisor.get("next_moves")
+            risks = advisor.get("risks")
+            lines.append(f"{profile}: {message}")
+            if isinstance(next_moves, list):
+                for move in next_moves[:3]:
+                    lines.append(f"- next: {str(move).strip()}")
+            if isinstance(risks, list):
+                for risk in risks[:2]:
+                    lines.append(f"- risk: {str(risk).strip()}")
+        return "\n".join(lines)
+
+    def _periodic_advisor_guidance(
+        self,
+        tool_context: ToolContext,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+        current_step_payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not self.config.advisor.enabled:
+            return None
+        if step >= step_limit:
+            return None
+        cadence = max(1, int(self.config.advisor.every_n_steps))
+        if step % cadence != 0:
+            return None
+        if not self.advisor_providers:
+            return None
+
+        packet = self._advisor_packet_text(
+            tool_context,
+            step,
+            step_limit,
+            policy,
+            current_step_payload,
+        )
+        advisors: list[dict[str, Any]] = []
+        for advisor_label, profile_name, provider in self.advisor_providers:
+            try:
+                payload = provider.complete_json(
+                    [
+                        ChatMessage(role="system", content=ADVISOR_PROMPT),
+                        ChatMessage(role="user", content=packet),
+                    ]
+                )
+            except ProviderError:
+                continue
+            message = str(payload.get("message") or "").strip()
+            next_moves = payload.get("next_moves")
+            risks = payload.get("risks")
+            if not message:
+                continue
+            advisors.append(
+                {
+                    "label": advisor_label,
+                    "message": message,
+                    "next_moves": (
+                        [str(item).strip() for item in next_moves[:3]]
+                        if isinstance(next_moves, list)
+                        else []
+                    ),
+                    "risks": (
+                        [str(item).strip() for item in risks[:2]]
+                        if isinstance(risks, list)
+                        else []
+                    ),
+                }
+            )
+        if not advisors:
+            return None
+        return {
+            "tool": "advisor_guidance",
+            "message": f"Injected {len(advisors)} advisor note(s).",
+            "advisors": advisors,
+        }
 
     def _supervisor_guidance(
         self,
@@ -2179,6 +2576,7 @@ class ResearchController:
 
             finished = False
             finish_summary = ""
+            advisor_result: dict[str, Any] | None = None
             for action in actions:
                 try:
                     result = self._execute_action(
@@ -2238,6 +2636,17 @@ class ResearchController:
                         step_payload["results"].append(guard_payload)
                     break
 
+            if not finished:
+                advisor_result = self._periodic_advisor_guidance(
+                    tool_context,
+                    step,
+                    step_limit,
+                    policy,
+                    step_payload,
+                )
+                if advisor_result is not None:
+                    step_payload["results"].append(advisor_result)
+
             self._append_step_log(tool_context, step_payload)
             if progress_callback:
                 progress_callback(
@@ -2273,12 +2682,22 @@ class ResearchController:
                                 self._history_result_summary(result)
                                 for result in step_payload["results"]
                                 if isinstance(result, dict)
+                                and str(result.get("tool", "")) != "advisor_guidance"
                             ],
                             ensure_ascii=True,
                         )
                     ),
                 )
             )
+            if advisor_result is not None:
+                advisor_message = self._advisor_feedback_message(advisor_result)
+                if advisor_message.strip():
+                    messages.append(
+                        ChatMessage(
+                            role="user",
+                            content=advisor_message,
+                        )
+                    )
 
             if finished:
                 return {
