@@ -73,6 +73,7 @@ Rules:
 - Do not use `--bar-limit` as a research lever unless the user explicitly asks. Treat bar counts as implementation detail, not strategy.
 - `__BASKET__` may appear inside saved analysis summaries as an aggregate label. It is not a valid CLI instrument argument. Use exact catalog symbols from the catalog.
 - In early phase, diversify across multiple distinct instruments or small instrument groups before narrowing hard onto one pair unless the evidence is already unusually strong.
+- Basket pruning is allowed when per-instrument evidence shows a specific symbol is a clear empirical drag on an otherwise promising basket. Do not assume basket expansion is justified from per-instrument results alone.
 - `finish` is terminal for the whole run. Never use it to mean "continue" or "step complete".
 - Only call `finish` when you intend to stop the run now and can provide a concise non-empty final summary.
 - This is an iterative research session, not a one-shot evaluation. Keep exploring unless you have reached the step limit or the controller explicitly allows finish.
@@ -158,6 +159,7 @@ Rules:
 - Think in months and years of evidence, not bars.
 - Use quality_score as the primary target metric, while using PSR, DSR, drawdown, robustness, trade rate, and coverage as reasons.
 - Do not recommend broad indicator-family swaps unless the packet explicitly allows structural pivots.
+- It is valid to recommend pruning a specific instrument from a basket when per-instrument evidence shows it is a clear drag. Do not recommend adding instruments based on per-instrument results alone.
 - Assume the explorer can choose whether to follow your guidance; optimize for clarity, not control.
 """
 
@@ -1192,6 +1194,8 @@ class ResearchController:
             "- `__BASKET__` may appear in saved summaries as an aggregate label. Never pass it as --instrument.\n"
             "- Invalid instrument aliases now fail fast with close-match suggestions.\n"
             "- In early phase, do not spend the whole run anchored to one pair. Explore across multiple distinct instruments or small instrument groups before narrowing hard.\n"
+            "- If basket analysis shows one instrument is a clear empirical drag, pruning that weak link is a valid follow-up branch.\n"
+            "- Do not widen a basket just because extra instruments look acceptable. Correlation-aware expansion is out of scope for now.\n"
             "- A normal managed run should explore multiple candidates. Do not stop after the first strong score; branch and test at least a few follow-up ideas.\n"
             "- Do not finish the run as soon as the minimum threshold is reached if there is still room in the step budget for a couple more meaningful contrasts.\n"
             "- If a sensitivity run already auto-logged the attempt, avoid redundant log_attempt unless you are recovering from a missing ledger entry.\n"
