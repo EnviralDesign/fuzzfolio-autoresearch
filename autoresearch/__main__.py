@@ -91,6 +91,41 @@ DISPLAY_CHAR_REPLACEMENTS = str.maketrans(
 )
 
 
+class _SafeTextStream:
+    def __init__(self, stream: Any):
+        self._stream = stream
+
+    def write(self, data: str) -> int:
+        try:
+            return self._stream.write(data)
+        except OSError:
+            return 0
+
+    def flush(self) -> None:
+        try:
+            self._stream.flush()
+        except OSError:
+            return
+
+    def writelines(self, lines: Any) -> None:
+        for line in lines:
+            self.write(line)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
+def _install_safe_std_streams() -> None:
+    for attr_name in ("stdout", "stderr", "__stdout__", "__stderr__"):
+        stream = getattr(sys, attr_name, None)
+        if stream is None or isinstance(stream, _SafeTextStream):
+            continue
+        setattr(sys, attr_name, _SafeTextStream(stream))
+
+
+_install_safe_std_streams()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fuzzfolio autoresearch runtime.")
     subparsers = parser.add_subparsers(dest="command", required=True)
