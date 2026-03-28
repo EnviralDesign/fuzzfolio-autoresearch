@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time as pytime
 from datetime import datetime, time, timedelta
 from math import ceil
 from pathlib import Path
@@ -119,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
     supervise = subparsers.add_parser("supervise", help="Run the supervised controller with config-backed policy defaults.")
     supervise.add_argument("--max-steps", type=int, default=None, help="Per-session step cap before supervise starts a fresh isolated session.")
     supervise.add_argument("--window", default=None, help="Operating window in HH:MM-HH:MM format.")
+    supervise.add_argument("--no-window", action="store_true", help="Disable supervise windowing and run sessions around the clock.")
     supervise.add_argument("--timezone", default=None, help="IANA timezone for the operating window, e.g. America/Chicago.")
     supervise.add_argument("--explorer-profile", default=None, help="Override the configured explorer provider profile for this run.")
     supervise.add_argument("--supervisor-profile", default=None, help="Override the configured supervisor provider profile for this run.")
@@ -346,10 +348,12 @@ def cmd_doctor() -> int:
         "supervisor_uses_managed_auth": config.supervisor_provider.provider_type.strip().lower() == "codex",
         "supervisor_compact_trigger_tokens": config.compact_trigger_tokens_for(config.llm.supervisor_profile),
         "supervisor_max_steps": config.supervisor.max_steps,
+        "supervisor_window_enabled": config.supervisor.window_enabled,
         "supervisor_window_start": config.supervisor.window_start,
         "supervisor_window_end": config.supervisor.window_end,
         "supervisor_timezone": config.supervisor.timezone,
         "supervisor_soft_wrap_minutes": config.supervisor.soft_wrap_minutes,
+        "supervisor_auto_restart_terminal_sessions": config.supervisor.auto_restart_terminal_sessions,
         "auth_ok": auth.returncode == 0,
         "seed_ok": seed.returncode == 0,
     }
@@ -810,13 +814,15 @@ def _resolve_supervise_policy(
     *,
     max_steps: int | None,
     window: str | None,
+    no_window: bool,
     timezone_name: str | None,
 ) -> tuple[int, RunPolicy]:
     cfg = config.supervisor
     window_start, window_end = _parse_window(window)
     effective_max_steps = max_steps or cfg.max_steps or config.research.max_steps
-    effective_window_start = window_start if window_start is not None else cfg.window_start
-    effective_window_end = window_end if window_end is not None else cfg.window_end
+    window_enabled = bool(cfg.window_enabled) and not no_window
+    effective_window_start = None if not window_enabled else (window_start if window_start is not None else cfg.window_start)
+    effective_window_end = None if not window_enabled else (window_end if window_end is not None else cfg.window_end)
     effective_timezone = timezone_name or cfg.timezone
     return effective_max_steps, RunPolicy(
         allow_finish=False,
@@ -1161,6 +1167,7 @@ def cmd_supervise(
     max_steps: int | None,
     *,
     window: str | None,
+    no_window: bool,
     timezone_name: str | None,
     explorer_profile: str | None,
     supervisor_profile: str | None,
@@ -1177,8 +1184,10 @@ def cmd_supervise(
         config,
         max_steps=max_steps,
         window=window,
+        no_window=no_window,
         timezone_name=timezone_name,
     )
+    auto_restart_terminal = bool(config.supervisor.auto_restart_terminal_sessions)
     session_results: list[dict[str, Any]] = []
     stop_reason = "window_closed"
     while True:
@@ -1205,11 +1214,22 @@ def cmd_supervise(
                 payload["max_steps"] = session_max_steps
             _emit_run_progress(payload)
 
-        result = controller.run(
-            max_steps=session_max_steps,
-            progress_callback=None if as_json else emit_progress,
-            policy=policy,
-        )
+        try:
+            result = controller.run(
+                max_steps=session_max_steps,
+                progress_callback=None if as_json else emit_progress,
+                policy=policy,
+            )
+        except Exception as exc:
+            result = {
+                "status": "session_error",
+                "run_id": None,
+                "run_dir": None,
+                "attempts_path": None,
+                "run_progress_plot": None,
+                "summary": str(exc),
+                "error": str(exc),
+            }
         result["session_index"] = session_index
         session_results.append(result)
         if not as_json and result.get("status") == "step_limit_reached":
@@ -1219,9 +1239,34 @@ def cmd_supervise(
                 "Supervise will start a fresh isolated session if time remains in the outer window."
             )
             _render_run_footer(rollover_footer)
-        if result.get("status") != "step_limit_reached":
-            stop_reason = str(result.get("status") or "supervise_stopped")
-            break
+        elif not as_json and result.get("status") == "session_error":
+            error_footer = dict(result)
+            if auto_restart_terminal:
+                error_footer["summary"] = (
+                    "This supervised session failed, but terminal-session auto-restart is enabled. "
+                    "Supervise will start a fresh isolated session if time remains in the outer window."
+                )
+            _render_run_footer(error_footer)
+        elif (
+            not as_json
+            and auto_restart_terminal
+            and result.get("status") not in {"window_closed", "step_limit_reached"}
+        ):
+            restart_footer = dict(result)
+            restart_footer["summary"] = (
+                "This supervised session ended normally, but terminal-session auto-restart is enabled. "
+                "Supervise will start a fresh isolated session if time remains in the outer window."
+            )
+            _render_run_footer(restart_footer)
+
+        status = str(result.get("status") or "supervise_stopped")
+        if status == "step_limit_reached":
+            continue
+        if auto_restart_terminal and status not in {"window_closed"}:
+            pytime.sleep(2.0)
+            continue
+        stop_reason = status
+        break
 
     last_result = session_results[-1] if session_results else {}
     if stop_reason == "soft_wrap_reached":
@@ -1582,15 +1627,21 @@ def cmd_sync_profile_drop_pngs(
     else:
         run_dirs = all_run_dirs
 
+    def emit(message: str) -> None:
+        if not as_json:
+            _write_plain_line(message)
+
     results: list[dict[str, Any]] = []
     rendered = 0
     skipped = 0
     failed = 0
 
-    for run_dir in run_dirs:
+    total_runs = len(run_dirs)
+    for index, run_dir in enumerate(run_dirs, start=1):
         temp_root = run_dir / ".profile-drop-sync"
         result: dict[str, Any] = {"run_id": run_dir.name}
         try:
+            emit(f"sync {index}/{total_runs} {run_dir.name}")
             attempts = load_run_attempts(run_dir)
             best_attempt = _best_attempt_for_run(
                 attempts,
@@ -1600,15 +1651,22 @@ def cmd_sync_profile_drop_pngs(
                 skipped += 1
                 result["status"] = "skipped"
                 result["reason"] = "No scored attempts exist for this run."
+                emit("  skipped: no scored attempts")
                 results.append(result)
                 continue
 
+            emit(
+                "  best attempt: "
+                f"{best_attempt.get('attempt_id')} "
+                f"score={float(best_attempt.get('composite_score')):.3f}"
+            )
             package_inputs = _build_package_inputs(best_attempt)
             profile_path = package_inputs.get("profile_path")
             profile_ref = str(best_attempt.get("profile_ref") or "").strip()
             recreated_profile = False
 
             if profile_ref:
+                emit(f"  checking cloud profile: {profile_ref}")
                 if not _cloud_profile_exists(cli, profile_ref):
                     profile_ref = ""
             if not profile_ref:
@@ -1616,6 +1674,7 @@ def cmd_sync_profile_drop_pngs(
                     raise RuntimeError(
                         f"Best attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
                     )
+                emit("  cloud profile missing, recreating from local profile")
                 profile_ref = _create_cloud_profile(cli, profile_path)
                 _update_attempt_profile_ref(run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref)
                 recreated_profile = True
@@ -1625,6 +1684,12 @@ def cmd_sync_profile_drop_pngs(
             package_output_root = temp_root / "package-root"
             package_output_root.mkdir(parents=True, exist_ok=True)
 
+            emit(
+                "  packaging: "
+                f"timeframe={package_inputs['timeframe']} "
+                f"instruments={','.join(package_inputs['instruments'])} "
+                f"lookback={lookback_months}mo"
+            )
             package_args = [
                 "package",
                 "--profile-ref",
@@ -1649,6 +1714,7 @@ def cmd_sync_profile_drop_pngs(
 
             bundle_dir = _discover_bundle_dir(package_output_root)
             png_path = run_dir / "profile-drop.png"
+            emit("  rendering profile-drop.png")
             renderer_argv = [str(renderer_executable)]
             if workspace_root is not None:
                 renderer_argv.extend(["--workspace-root", str(workspace_root)])
@@ -1666,6 +1732,10 @@ def cmd_sync_profile_drop_pngs(
                 shutil.rmtree(temp_root)
 
             rendered += 1
+            emit(
+                "  done"
+                + (" (recreated cloud profile)" if recreated_profile else "")
+            )
             result.update(
                 {
                     "status": "rendered",
@@ -1681,6 +1751,7 @@ def cmd_sync_profile_drop_pngs(
             failed += 1
             result["status"] = "failed"
             result["error"] = str(exc)
+            emit(f"  failed: {exc}")
             if temp_root.exists():
                 result["temp_root"] = str(temp_root)
         results.append(result)
@@ -1883,6 +1954,7 @@ def main() -> int:
         return cmd_supervise(
             max_steps=args.max_steps,
             window=args.window,
+            no_window=bool(args.no_window),
             timezone_name=args.timezone,
             explorer_profile=args.explorer_profile,
             supervisor_profile=args.supervisor_profile,

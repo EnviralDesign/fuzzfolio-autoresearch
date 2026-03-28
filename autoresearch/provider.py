@@ -966,6 +966,98 @@ class OpenAICompatibleProvider(ChatCompletionsJsonProvider):
     pass
 
 
+class LMStudioProvider(OpenAICompatibleProvider):
+    def _build_headers(self) -> dict[str, str]:
+        headers = {"Content-Type": "application/json"}
+        if self.config.api_key:
+            headers["Authorization"] = f"Bearer {self.config.api_key}"
+        return headers
+
+    def _response_format(self) -> dict[str, Any] | None:
+        # LM Studio's OpenAI-compatible server rejects json_object here.
+        # Keep the prompt contract authoritative and repair invalid JSON if needed.
+        return None
+
+    def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
+        budgets = self._completion_budgets()
+        last_error: ProviderError | None = None
+        for index, budget in enumerate(budgets):
+            malformed_attempts = 0
+            tool_use_attempts = 0
+            request_messages = messages
+            while True:
+                try:
+                    payload = self._request_json(request_messages, budget)
+                except ProviderError as exc:
+                    last_error = exc
+                    if _is_json_validate_failed_error(exc):
+                        failed_generation = _extract_failed_generation_text(exc)
+                        if failed_generation:
+                            repaired = self._repair_invalid_json(
+                                request_messages,
+                                failed_generation,
+                                max(budget, budgets[-1]),
+                            )
+                            if repaired is not None:
+                                return repaired
+                        if malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
+                            self._refresh_session()
+                            request_messages = self._messages_for_json_retry(messages)
+                            time.sleep(_malformed_success_delay_seconds(malformed_attempts))
+                            malformed_attempts += 1
+                            continue
+                    if _is_tool_use_failed_error(exc):
+                        failed_generation = _extract_failed_generation_text(exc)
+                        if failed_generation:
+                            salvaged = _salvage_native_tool_failed_generation(
+                                failed_generation
+                            )
+                            if salvaged is not None:
+                                return salvaged
+                        if tool_use_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
+                            self._refresh_session()
+                            request_messages = self._messages_for_tool_retry(messages)
+                            time.sleep(_malformed_success_delay_seconds(tool_use_attempts))
+                            tool_use_attempts += 1
+                            continue
+                    if _is_malformed_success_error(exc):
+                        if malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
+                            self._refresh_session()
+                            request_messages = self._messages_for_json_retry(messages)
+                            time.sleep(_malformed_success_delay_seconds(malformed_attempts))
+                            malformed_attempts += 1
+                            continue
+                    break
+                try:
+                    raw_text = self._extract_content(payload)
+                except ProviderError as exc:
+                    last_error = exc
+                    if malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
+                        self._refresh_session()
+                        request_messages = self._messages_for_json_retry(messages)
+                        time.sleep(_malformed_success_delay_seconds(malformed_attempts))
+                        malformed_attempts += 1
+                        continue
+                    break
+                try:
+                    return self._parse_json_object(raw_text)
+                except ProviderError as exc:
+                    last_error = exc
+                    repaired = self._repair_invalid_json(
+                        request_messages,
+                        raw_text,
+                        max(budget, budgets[-1]),
+                    )
+                    if repaired is not None:
+                        return repaired
+                    break
+            if index < len(budgets) - 1:
+                continue
+        raise last_error or ProviderError(
+            "Provider request failed without a specific error."
+        )
+
+
 class OpenRouterProvider(ChatCompletionsJsonProvider):
     def _completion_budget_fields(self, max_completion_tokens: int) -> dict[str, Any]:
         return {"max_tokens": max_completion_tokens}
@@ -1264,6 +1356,8 @@ def create_provider(config: ProviderProfileConfig) -> JsonCompletionProvider:
         return ResponsesJsonProvider(config)
     if normalized == "openrouter":
         return OpenRouterProvider(config)
+    if normalized == "lmstudio":
+        return LMStudioProvider(config)
     if normalized == "openai_compatible":
         return OpenAICompatibleProvider(config)
     if normalized == "openai":

@@ -58,6 +58,9 @@ Keep both untracked. `.agentsecrets` is the place for per-profile provider keys 
 ```powershell
 uv run autoresearch doctor
 uv run autoresearch test-providers
+
+Supported provider types include `openai`, `xai`, `groq`, `openrouter`, `codex`, `openai_compatible`, and `lmstudio`.
+LM Studio's OpenAI-compatible local server defaults to `http://localhost:1234/v1`, and authentication is off by default unless you enable "Require Authentication" in LM Studio's server settings.
 uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
 uv run autoresearch stop-all-runs
@@ -386,6 +389,7 @@ Useful commands:
 uv run autoresearch test-providers
 uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
+uv run autoresearch supervise --no-window
 uv run autoresearch plot --all-runs
 uv run autoresearch leaderboard
 uv run autoresearch sync-profile-drop-pngs
@@ -402,6 +406,10 @@ It defaults to a fixed `12` month replay window for every rebuilt card. Override
 ```powershell
 uv run autoresearch sync-profile-drop-pngs --lookback-months 36
 ```
+
+`supervise` already starts a fresh isolated session when the prior session stops with `step_limit_reached` and time remains in the outer supervise window. Set `"window_enabled": false` under `supervisor`, or pass `--no-window`, to let supervise run around the clock.
+
+If you also set `"auto_restart_terminal_sessions": true` under `supervisor`, supervise will start a fresh isolated session after terminal session endings such as `finished` or `session_error`, not just after `step_limit_reached`.
 
 ## Scoring
 

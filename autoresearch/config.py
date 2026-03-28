@@ -73,11 +73,13 @@ class ResearchConfig:
 @dataclass
 class SupervisorConfig:
     max_steps: int | None = None
+    window_enabled: bool = True
     window_start: str | None = None
     window_end: str | None = None
     timezone: str = "America/Chicago"
     stop_mode: str = "after_step"
     soft_wrap_minutes: int = 30
+    auto_restart_terminal_sessions: bool = False
 
 
 @dataclass
@@ -194,6 +196,14 @@ def _provider_defaults(provider_type: str) -> dict[str, Any]:
             "api_base": "https://openrouter.ai/api/v1",
             "command": None,
             "api_key_env": "OPENROUTER_API_KEY",
+            "timeout_seconds": 120,
+            "transport": "chat_completions",
+        }
+    if normalized == "lmstudio":
+        return {
+            "api_base": "http://localhost:1234/v1",
+            "command": None,
+            "api_key_env": None,
             "timeout_seconds": 120,
             "transport": "chat_completions",
         }
@@ -519,6 +529,9 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             if supervisor_cfg.get("max_steps") is not None
             else None
         ),
+        window_enabled=bool(
+            supervisor_cfg.get("window_enabled", SupervisorConfig.window_enabled)
+        ),
         window_start=supervisor_cfg.get("window_start"),
         window_end=supervisor_cfg.get("window_end"),
         timezone=supervisor_cfg.get("timezone", SupervisorConfig.timezone),
@@ -527,6 +540,12 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             supervisor_cfg.get(
                 "soft_wrap_minutes",
                 SupervisorConfig.soft_wrap_minutes,
+            )
+        ),
+        auto_restart_terminal_sessions=bool(
+            supervisor_cfg.get(
+                "auto_restart_terminal_sessions",
+                SupervisorConfig.auto_restart_terminal_sessions,
             )
         ),
     )

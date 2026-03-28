@@ -63,6 +63,14 @@
       "temperature": 0.2,
       "max_tokens": 3200,
       "timeout_seconds": 180
+    },
+    "lmstudio-sample": {
+      "type": "lmstudio",
+      "api_base": "http://localhost:1234/v1",
+      "model": "qwen/qwen3.5-9b",
+      "temperature": 0.2,
+      "max_tokens": 8192,
+      "timeout_seconds": 180
     }
   },
   "fuzzfolio": {
@@ -94,10 +102,12 @@
   },
   "supervisor": {
     "max_steps": 200,
+    "window_enabled": true,
     "window_start": "23:00",
     "window_end": "05:00",
     "timezone": "America/Chicago",
     "stop_mode": "after_step",
-    "soft_wrap_minutes": 30
+    "soft_wrap_minutes": 30,
+    "auto_restart_terminal_sessions": false
   }
 }
