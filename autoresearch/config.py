@@ -126,6 +126,14 @@ class AppConfig:
         return self.derived_root / "leaderboard.json"
 
     @property
+    def model_leaderboard_plot_path(self) -> Path:
+        return self.derived_root / "leaderboard-model-averages.png"
+
+    @property
+    def model_leaderboard_json_path(self) -> Path:
+        return self.derived_root / "leaderboard-model-averages.json"
+
+    @property
     def program_path(self) -> Path:
         return self.repo_root / "program.md"
 

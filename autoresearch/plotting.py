@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import shutil
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 import matplotlib.pyplot as plt
@@ -273,14 +274,21 @@ def _leaderboard_label(attempt: dict[str, Any], run_metadata: dict[str, Any] | N
     return label
 
 
-def render_leaderboard_artifacts(
+def _model_group_label(run_metadata: dict[str, Any] | None) -> str | None:
+    payload = run_metadata or {}
+    explorer_model = str(payload.get("explorer_model") or "").strip()
+    explorer_profile = str(payload.get("explorer_profile") or "").strip()
+    if explorer_model:
+        return explorer_model
+    if explorer_profile:
+        return explorer_profile
+    return None
+
+
+def _best_scored_attempts_by_run(
     attempts: list[dict[str, Any]],
-    png_output_path: Path,
-    json_output_path: Path,
     *,
-    run_metadata_by_run_id: dict[str, dict[str, Any]] | None = None,
     lower_is_better: bool = False,
-    limit: int = 15,
 ) -> list[dict[str, Any]]:
     scored = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
     best_by_run: dict[str, dict[str, Any]] = {}
@@ -299,8 +307,21 @@ def render_leaderboard_artifacts(
         if improved:
             best_by_run[run_id] = attempt
 
+    return list(best_by_run.values())
+
+
+def render_leaderboard_artifacts(
+    attempts: list[dict[str, Any]],
+    png_output_path: Path,
+    json_output_path: Path,
+    *,
+    run_metadata_by_run_id: dict[str, dict[str, Any]] | None = None,
+    lower_is_better: bool = False,
+    limit: int = 15,
+) -> list[dict[str, Any]]:
+    best_by_run = _best_scored_attempts_by_run(attempts, lower_is_better=lower_is_better)
     ranked = sorted(
-        best_by_run.values(),
+        best_by_run,
         key=lambda attempt: float(attempt.get("composite_score")),
         reverse=not lower_is_better,
     )[:limit]
@@ -348,3 +369,85 @@ def render_leaderboard_artifacts(
     plt.savefig(png_output_path, dpi=160)
     plt.close()
     return enriched_ranked
+
+
+def render_model_leaderboard_artifacts(
+    attempts: list[dict[str, Any]],
+    png_output_path: Path,
+    json_output_path: Path,
+    *,
+    run_metadata_by_run_id: dict[str, dict[str, Any]] | None = None,
+    lower_is_better: bool = False,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for attempt in _best_scored_attempts_by_run(attempts, lower_is_better=lower_is_better):
+        run_id = str(attempt.get("run_id", "")).strip()
+        label = _model_group_label((run_metadata_by_run_id or {}).get(run_id))
+        if not label:
+            label = "unknown"
+        grouped.setdefault(label, []).append(attempt)
+
+    summary_rows: list[dict[str, Any]] = []
+    for label, model_attempts in grouped.items():
+        scores = [float(attempt.get("composite_score")) for attempt in model_attempts]
+        run_ids = sorted(
+            {
+                str(attempt.get("run_id", "")).strip()
+                for attempt in model_attempts
+                if str(attempt.get("run_id", "")).strip()
+            }
+        )
+        summary_rows.append(
+            {
+                "model_label": label,
+                "run_count": len(run_ids),
+                "average_score": sum(scores) / len(scores),
+                "median_score": median(scores),
+                "best_score": min(scores) if lower_is_better else max(scores),
+                "worst_score": max(scores) if lower_is_better else min(scores),
+                "run_ids": run_ids,
+            }
+        )
+
+    summary_rows.sort(
+        key=lambda row: float(row["average_score"]),
+        reverse=not lower_is_better,
+    )
+
+    json_output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_output_path.write_text(json.dumps(summary_rows, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    png_output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(14, max(5, min(12, len(summary_rows) * 0.65 + 2))))
+    if not summary_rows:
+        plt.title("Autoresearch Model Averages: No Scored Runs Yet")
+        plt.xlabel("Average Quality Score")
+        plt.tight_layout()
+        plt.savefig(png_output_path, dpi=160)
+        plt.close()
+        return summary_rows
+
+    positions = list(range(len(summary_rows)))
+    scores = [float(row["average_score"]) for row in summary_rows]
+    labels = [f'{row["model_label"]} (n={row["run_count"]})' for row in summary_rows]
+    colors = ["#ffb703"] + ["#90e0ef"] * max(0, len(summary_rows) - 1)
+
+    plt.barh(positions, scores, color=colors)
+    plt.yticks(positions, labels, fontsize=9)
+    plt.gca().invert_yaxis()
+    plt.xlabel("Average Best-Per-Run Quality Score")
+    plt.title("Autoresearch Model Averages: Mean Best Candidate Per Run")
+
+    for index, row in enumerate(summary_rows):
+        plt.text(
+            float(row["average_score"]),
+            index,
+            f'  {float(row["average_score"]):.3f} avg | {float(row["median_score"]):.3f} med',
+            va="center",
+            fontsize=8,
+        )
+
+    plt.tight_layout()
+    plt.savefig(png_output_path, dpi=160)
+    plt.close()
+    return summary_rows

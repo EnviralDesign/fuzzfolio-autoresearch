@@ -201,13 +201,60 @@ def _is_json_validate_failed_error(error: ProviderError) -> bool:
 
 
 def _extract_failed_generation_text(error: ProviderError) -> str | None:
-    marker = "failed_generation="
     text = str(error)
+    json_start = text.find("{")
+    if json_start >= 0:
+        try:
+            payload = json.loads(text[json_start:])
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            error_payload = payload.get("error")
+            if isinstance(error_payload, dict):
+                failed_generation = error_payload.get("failed_generation")
+                if isinstance(failed_generation, str) and failed_generation.strip():
+                    return failed_generation.strip()
+    marker = "failed_generation="
     index = text.find(marker)
     if index < 0:
         return None
     failed_generation = text[index + len(marker):].strip()
-    return failed_generation or None
+    if not failed_generation:
+        return None
+    if failed_generation[0] in {'"', "'"}:
+        try:
+            decoded = json.loads(failed_generation)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, str) and decoded.strip():
+            return decoded.strip()
+    return failed_generation
+
+
+def _salvage_failed_generation_action(text: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    name = payload.get("name")
+    arguments = payload.get("arguments")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    if not isinstance(arguments, dict):
+        return None
+    allowed_tools = {"run_cli", "write_file", "read_file", "list_dir", "log_attempt", "finish"}
+    tool_name = name.strip()
+    if tool_name not in allowed_tools:
+        return None
+    action = {"tool": tool_name}
+    for key, value in arguments.items():
+        action[key] = value
+    return {
+        "reasoning": "",
+        "actions": [action],
+    }
 
 
 def _malformed_success_delay_seconds(attempt_index: int) -> int:
@@ -695,6 +742,18 @@ class ChatCompletionsJsonProvider:
             ),
         ]
 
+    def _messages_for_json_retry(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        return [
+            *messages,
+            ChatMessage(
+                role="system",
+                content=(
+                    "Return plain assistant text containing exactly one valid JSON object that matches the required schema. "
+                    "Do not emit empty output. Do not emit markdown, bullets, prose outside JSON, or native tool calls."
+                ),
+            ),
+        ]
+
     def _max_completion_tokens_cap(self) -> int | None:
         return None
 
@@ -820,9 +879,18 @@ class ChatCompletionsJsonProvider:
                             )
                             if repaired is not None:
                                 return repaired
+                        if malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
+                            self._refresh_session()
+                            request_messages = self._messages_for_json_retry(messages)
+                            time.sleep(_malformed_success_delay_seconds(malformed_attempts))
+                            malformed_attempts += 1
+                            continue
                     if _is_tool_use_failed_error(exc):
                         failed_generation = _extract_failed_generation_text(exc)
                         if failed_generation:
+                            salvaged = _salvage_failed_generation_action(failed_generation)
+                            if salvaged is not None:
+                                return salvaged
                             repaired = self._repair_invalid_json(
                                 request_messages,
                                 failed_generation,
@@ -985,6 +1053,18 @@ class ResponsesJsonProvider:
             ),
         ]
 
+    def _messages_for_json_retry(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        return [
+            *messages,
+            ChatMessage(
+                role="system",
+                content=(
+                    "Return plain assistant text containing exactly one valid JSON object that matches the required schema. "
+                    "Do not emit empty output. Do not emit markdown, bullets, prose outside JSON, or native tool calls."
+                ),
+            ),
+        ]
+
     def _max_completion_tokens_cap(self) -> int | None:
         return None
 
@@ -1090,9 +1170,18 @@ class ResponsesJsonProvider:
                             )
                             if repaired is not None:
                                 return repaired
+                        if malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
+                            self._refresh_session()
+                            request_messages = self._messages_for_json_retry(messages)
+                            time.sleep(_malformed_success_delay_seconds(malformed_attempts))
+                            malformed_attempts += 1
+                            continue
                     if _is_tool_use_failed_error(exc):
                         failed_generation = _extract_failed_generation_text(exc)
                         if failed_generation:
+                            salvaged = _salvage_failed_generation_action(failed_generation)
+                            if salvaged is not None:
+                                return salvaged
                             repaired = self._repair_invalid_json(
                                 request_messages,
                                 failed_generation,

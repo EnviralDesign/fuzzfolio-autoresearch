@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from datetime import datetime, time, timedelta
+from math import ceil
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -34,7 +35,11 @@ if __package__ in {None, ""}:
         make_attempt_record,
         write_attempts,
     )
-    from autoresearch.plotting import render_leaderboard_artifacts, render_progress_artifacts
+    from autoresearch.plotting import (
+        render_leaderboard_artifacts,
+        render_model_leaderboard_artifacts,
+        render_progress_artifacts,
+    )
     from autoresearch.provider import ChatMessage, ProviderError, create_provider
     from autoresearch.scoring import build_attempt_score, load_sensitivity_snapshot
 else:
@@ -53,7 +58,11 @@ else:
         make_attempt_record,
         write_attempts,
     )
-    from .plotting import render_leaderboard_artifacts, render_progress_artifacts
+    from .plotting import (
+        render_leaderboard_artifacts,
+        render_model_leaderboard_artifacts,
+        render_progress_artifacts,
+    )
     from .provider import ChatMessage, ProviderError, create_provider
     from .scoring import build_attempt_score, load_sensitivity_snapshot
 
@@ -121,6 +130,28 @@ def build_parser() -> argparse.ArgumentParser:
     plot.add_argument("--all-runs", action="store_true", help="Render a derived aggregate plot across all runs.")
     leaderboard = subparsers.add_parser("leaderboard", help="Generate a derived best-per-run leaderboard image and JSON.")
     leaderboard.add_argument("--limit", type=int, default=15, help="Maximum number of runs to include.")
+    profile_drop_pngs = subparsers.add_parser(
+        "sync-profile-drop-pngs",
+        help="Rebuild run-local profile-drop PNGs for each run's best scored attempt.",
+    )
+    profile_drop_pngs.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only process the named run id. Can be repeated.",
+    )
+    profile_drop_pngs.add_argument(
+        "--keep-temp",
+        action="store_true",
+        help="Keep temporary package bundles under each run directory instead of deleting them after a successful render.",
+    )
+    profile_drop_pngs.add_argument(
+        "--lookback-months",
+        type=int,
+        default=12,
+        help="Fixed deep-replay lookback window in months for rebuilt profile-drop cards. Default: 12.",
+    )
+    profile_drop_pngs.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     subparsers.add_parser("reset-runs", help="Delete all run artifacts and recreate a clean empty runs state.")
     prune_runs = subparsers.add_parser(
         "prune-runs",
@@ -1291,18 +1322,378 @@ def cmd_leaderboard(*, limit: int) -> int:
         lower_is_better=config.research.plot_lower_is_better,
         limit=limit,
     )
+    model_ranked = render_model_leaderboard_artifacts(
+        attempts,
+        config.model_leaderboard_plot_path,
+        config.model_leaderboard_json_path,
+        run_metadata_by_run_id=run_metadata_by_run_id,
+        lower_is_better=config.research.plot_lower_is_better,
+    )
     print(
         json.dumps(
             {
                 "runs_ranked": len(ranked),
                 "leaderboard_plot": str(config.leaderboard_plot_path),
                 "leaderboard_json": str(config.leaderboard_json_path),
+                "models_ranked": len(model_ranked),
+                "model_leaderboard_plot": str(config.model_leaderboard_plot_path),
+                "model_leaderboard_json": str(config.model_leaderboard_json_path),
             },
             ensure_ascii=True,
             indent=2,
         )
     )
     return 0
+
+
+def _trading_dashboard_roots(config) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    raw_candidates = [
+        config.fuzzfolio.workspace_root,
+        config.repo_root.parent / "Trading-Dashboard",
+    ]
+    for candidate in raw_candidates:
+        if candidate is None:
+            continue
+        resolved = candidate.resolve()
+        key = str(resolved).lower()
+        if key in seen or not resolved.exists():
+            continue
+        seen.add(key)
+        candidates.append(resolved)
+    return candidates
+
+
+def _resolve_drop_renderer_executable(config) -> tuple[Path, Path | None]:
+    env_override = os.environ.get("AUTORESEARCH_DROP_RENDERER")
+    if env_override:
+        path = Path(env_override).expanduser()
+        if path.exists():
+            return path.resolve(), next(iter(_trading_dashboard_roots(config)), None)
+    resolved = shutil.which("fuzzfolio-drop-renderer")
+    if resolved:
+        return Path(resolved).resolve(), next(iter(_trading_dashboard_roots(config)), None)
+
+    exe_name = "fuzzfolio-drop-renderer.exe" if os.name == "nt" else "fuzzfolio-drop-renderer"
+    for workspace_root in _trading_dashboard_roots(config):
+        candidate = workspace_root / "harness" / "fuzzfolio_drop_renderer" / "cli" / "target" / "release" / exe_name
+        if candidate.exists():
+            return candidate.resolve(), workspace_root
+    raise FileNotFoundError(
+        "Could not resolve fuzzfolio-drop-renderer. Set AUTORESEARCH_DROP_RENDERER or build the renderer under Trading-Dashboard."
+    )
+
+
+def _run_external(argv: list[str], *, cwd: Path) -> None:
+    proc = subprocess.run(
+        argv,
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        encoding="utf-8",
+    )
+    if proc.returncode == 0:
+        return
+    stdout = proc.stdout.strip()
+    stderr = proc.stderr.strip()
+    raise RuntimeError(
+        f"Command failed: {' '.join(argv)}\n"
+        f"cwd: {cwd}\n"
+        f"exit: {proc.returncode}\n"
+        f"stdout:\n{stdout[:1600]}\n\nstderr:\n{stderr[:1600]}"
+    )
+
+
+def _best_attempt_for_run(attempts: list[dict[str, Any]], *, lower_is_better: bool = False) -> dict[str, Any] | None:
+    scored = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+    if not scored:
+        return None
+    return sorted(
+        scored,
+        key=lambda attempt: float(attempt.get("composite_score")),
+        reverse=not lower_is_better,
+    )[0]
+
+
+def _nested_get(payload: dict[str, Any], path: list[str]) -> Any:
+    current: Any = payload
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _load_json_if_exists(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _coerce_profile_instruments(profile_path: Path) -> list[str]:
+    payload = _load_json_if_exists(profile_path)
+    instruments = _nested_get(payload, ["profile", "instruments"])
+    if not isinstance(instruments, list):
+        return []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in instruments:
+        token = str(raw or "").strip().upper()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        normalized.append(token)
+    return normalized
+
+
+def _derive_lookback_months(request_payload: dict[str, Any], sensitivity_payload: dict[str, Any]) -> int:
+    raw_months = request_payload.get("lookback_months")
+    if isinstance(raw_months, int) and raw_months > 0:
+        return raw_months
+    effective_months = _nested_get(
+        sensitivity_payload,
+        ["data", "aggregate", "market_data_window", "effective_window_months"],
+    )
+    if effective_months is None:
+        effective_months = _nested_get(
+            sensitivity_payload,
+            ["data", "market_data_window", "effective_window_months"],
+        )
+    try:
+        numeric = float(effective_months)
+    except (TypeError, ValueError):
+        numeric = 3.0
+    return max(1, int(ceil(numeric)))
+
+
+def _build_package_inputs(attempt: dict[str, Any]) -> dict[str, Any]:
+    artifact_dir = Path(str(attempt.get("artifact_dir", ""))).resolve()
+    profile_path_raw = str(attempt.get("profile_path", "")).strip()
+    profile_path = Path(profile_path_raw).resolve() if profile_path_raw else None
+
+    request_payload = _nested_get(_load_json_if_exists(artifact_dir / "deep-replay-job.json"), ["request"]) or {}
+    if not isinstance(request_payload, dict):
+        request_payload = {}
+    sensitivity_payload = _load_json_if_exists(artifact_dir / "sensitivity-response.json")
+
+    timeframe = str(
+        request_payload.get("timeframe")
+        or _nested_get(sensitivity_payload, ["data", "aggregate", "timeframe"])
+        or _nested_get(sensitivity_payload, ["data", "timeframe"])
+        or _nested_get(attempt, ["best_summary", "timeframe"])
+        or ""
+    ).strip().upper()
+    if not timeframe:
+        raise RuntimeError(f"Could not resolve timeframe for attempt {attempt.get('attempt_id')}")
+
+    instruments_raw = request_payload.get("instruments")
+    instruments: list[str] = []
+    if isinstance(instruments_raw, list):
+        seen: set[str] = set()
+        for raw in instruments_raw:
+            token = str(raw or "").strip().upper()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            instruments.append(token)
+    if not instruments and profile_path is not None and profile_path.exists():
+        instruments = _coerce_profile_instruments(profile_path)
+    if not instruments:
+        raise RuntimeError(f"Could not resolve instruments for attempt {attempt.get('attempt_id')}")
+
+    return {
+        "artifact_dir": artifact_dir,
+        "profile_path": profile_path,
+        "timeframe": timeframe,
+        "instruments": instruments,
+        "lookback_months": _derive_lookback_months(request_payload, sensitivity_payload),
+    }
+
+
+def _profile_export_missing(text: str) -> bool:
+    lowered = text.lower()
+    return "not found" in lowered or "404" in lowered or "no document" in lowered
+
+
+def _cloud_profile_exists(cli: FuzzfolioCli, profile_ref: str) -> bool:
+    result = cli.run(["export-profile", "--profile-ref", profile_ref], check=False)
+    if result.returncode == 0:
+        return True
+    combined = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+    if _profile_export_missing(combined):
+        return False
+    raise CliError(FuzzfolioCli.format_result(result))
+
+
+def _create_cloud_profile(cli: FuzzfolioCli, profile_path: Path) -> str:
+    result = cli.run(["profiles", "create", "--file", str(profile_path), "--pretty"])
+    payload = result.parsed_json if isinstance(result.parsed_json, dict) else None
+    profile_id = str(_nested_get(payload or {}, ["data", "id"]) or "").strip()
+    if not profile_id:
+        raise CliError(f"profiles create did not return a profile id for {profile_path}")
+    return profile_id
+
+
+def _update_attempt_profile_ref(run_dir: Path, attempt_id: str, profile_ref: str) -> None:
+    attempts_path = attempts_path_for_run_dir(run_dir)
+    attempts = load_attempts(attempts_path)
+    changed = False
+    for attempt in attempts:
+        if str(attempt.get("attempt_id") or "") != attempt_id:
+            continue
+        if str(attempt.get("profile_ref") or "").strip() == profile_ref:
+            return
+        attempt["profile_ref"] = profile_ref
+        changed = True
+    if changed:
+        write_attempts(attempts_path, attempts)
+
+
+def _discover_bundle_dir(package_output_root: Path) -> Path:
+    bundle_dirs = [path for path in package_output_root.iterdir() if path.is_dir()]
+    if not bundle_dirs:
+        raise RuntimeError(f"Package command did not create a bundle under {package_output_root}")
+    return sorted(bundle_dirs, key=lambda path: path.stat().st_mtime, reverse=True)[0]
+
+
+def cmd_sync_profile_drop_pngs(
+    *,
+    run_ids: list[str] | None,
+    keep_temp: bool,
+    lookback_months: int,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    cli = FuzzfolioCli(config.fuzzfolio)
+    cli.ensure_login()
+    renderer_executable, workspace_root = _resolve_drop_renderer_executable(config)
+    working_dir = workspace_root or config.repo_root
+
+    all_run_dirs = list_run_dirs(config.runs_root)
+    if run_ids:
+        wanted = {token.strip() for token in run_ids if str(token).strip()}
+        run_dirs = [run_dir for run_dir in all_run_dirs if run_dir.name in wanted]
+        missing = sorted(wanted - {run_dir.name for run_dir in run_dirs})
+        if missing:
+            raise SystemExit(f"Run directories do not exist: {', '.join(missing)}")
+    else:
+        run_dirs = all_run_dirs
+
+    results: list[dict[str, Any]] = []
+    rendered = 0
+    skipped = 0
+    failed = 0
+
+    for run_dir in run_dirs:
+        temp_root = run_dir / ".profile-drop-sync"
+        result: dict[str, Any] = {"run_id": run_dir.name}
+        try:
+            attempts = load_run_attempts(run_dir)
+            best_attempt = _best_attempt_for_run(
+                attempts,
+                lower_is_better=config.research.plot_lower_is_better,
+            )
+            if best_attempt is None:
+                skipped += 1
+                result["status"] = "skipped"
+                result["reason"] = "No scored attempts exist for this run."
+                results.append(result)
+                continue
+
+            package_inputs = _build_package_inputs(best_attempt)
+            profile_path = package_inputs.get("profile_path")
+            profile_ref = str(best_attempt.get("profile_ref") or "").strip()
+            recreated_profile = False
+
+            if profile_ref:
+                if not _cloud_profile_exists(cli, profile_ref):
+                    profile_ref = ""
+            if not profile_ref:
+                if not isinstance(profile_path, Path) or not profile_path.exists():
+                    raise RuntimeError(
+                        f"Best attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
+                    )
+                profile_ref = _create_cloud_profile(cli, profile_path)
+                _update_attempt_profile_ref(run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref)
+                recreated_profile = True
+
+            if temp_root.exists():
+                shutil.rmtree(temp_root)
+            package_output_root = temp_root / "package-root"
+            package_output_root.mkdir(parents=True, exist_ok=True)
+
+            package_args = [
+                "package",
+                "--profile-ref",
+                profile_ref,
+                "--timeframe",
+                str(package_inputs["timeframe"]),
+                "--lookback-months",
+                str(lookback_months),
+                "--output-root",
+                str(package_output_root),
+                "--label",
+                run_dir.name,
+                "--skip-catalogs",
+                "--skip-render-capture",
+                "--allow-timeframe-mismatch",
+                "--quality-score-preset",
+                str(config.research.quality_score_preset),
+            ]
+            for instrument in package_inputs["instruments"]:
+                package_args.extend(["--instrument", str(instrument)])
+            cli.run(package_args, cwd=working_dir)
+
+            bundle_dir = _discover_bundle_dir(package_output_root)
+            png_path = run_dir / "profile-drop.png"
+            renderer_argv = [str(renderer_executable)]
+            if workspace_root is not None:
+                renderer_argv.extend(["--workspace-root", str(workspace_root)])
+            renderer_argv.extend(
+                [
+                    "render",
+                    "--bundle",
+                    str(bundle_dir),
+                    "--out",
+                    str(png_path),
+                ]
+            )
+            _run_external(renderer_argv, cwd=working_dir)
+            if not keep_temp:
+                shutil.rmtree(temp_root)
+
+            rendered += 1
+            result.update(
+                {
+                    "status": "rendered",
+                    "png_path": str(png_path),
+                    "profile_ref": profile_ref,
+                    "recreated_profile": recreated_profile,
+                    "lookback_months": lookback_months,
+                    "attempt_id": best_attempt.get("attempt_id"),
+                    "candidate_name": best_attempt.get("candidate_name"),
+                }
+            )
+        except Exception as exc:
+            failed += 1
+            result["status"] = "failed"
+            result["error"] = str(exc)
+            if temp_root.exists():
+                result["temp_root"] = str(temp_root)
+        results.append(result)
+
+    payload = {
+        "runs_considered": len(run_dirs),
+        "rendered": rendered,
+        "skipped": skipped,
+        "failed": failed,
+        "results": results,
+    }
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0 if failed == 0 else 1
 
 
 def cmd_reset_runs() -> int:
@@ -1502,6 +1893,13 @@ def main() -> int:
         return cmd_plot(run_id=args.run_id, all_runs=bool(args.all_runs))
     if args.command == "leaderboard":
         return cmd_leaderboard(limit=args.limit)
+    if args.command == "sync-profile-drop-pngs":
+        return cmd_sync_profile_drop_pngs(
+            run_ids=args.run_id,
+            keep_temp=bool(args.keep_temp),
+            lookback_months=int(args.lookback_months),
+            as_json=bool(args.json),
+        )
     if args.command == "reset-runs":
         return cmd_reset_runs()
     if args.command == "prune-runs":

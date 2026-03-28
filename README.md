@@ -374,8 +374,11 @@ These write derived artifacts under:
 - `runs/derived/progress-all-runs.png`
 - `runs/derived/leaderboard.png`
 - `runs/derived/leaderboard.json`
+- `runs/derived/leaderboard-model-averages.png`
+- `runs/derived/leaderboard-model-averages.json`
 
 The leaderboard is best-per-run, sorted by `quality_score`.
+The model-average leaderboard groups those best-per-run outcomes by explorer model and reports the mean score per model.
 
 Useful commands:
 
@@ -385,8 +388,19 @@ uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
 uv run autoresearch plot --all-runs
 uv run autoresearch leaderboard
+uv run autoresearch sync-profile-drop-pngs
 uv run autoresearch rescore-attempts
 uv run autoresearch reset-runs
+```
+
+`sync-profile-drop-pngs` walks each run, finds its best scored attempt, ensures the backing profile exists in cloud storage, rebuilds a fresh profile-drop bundle through the existing FuzzFolio package flow, renders a new PNG, and leaves only:
+
+- `runs/<run-id>/profile-drop.png`
+
+It defaults to a fixed `12` month replay window for every rebuilt card. Override with:
+
+```powershell
+uv run autoresearch sync-profile-drop-pngs --lookback-months 36
 ```
 
 ## Scoring

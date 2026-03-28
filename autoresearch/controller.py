@@ -1434,6 +1434,47 @@ class ResearchController:
                 errors.append(f"Action {index}: finish is not allowed now. {message}")
         return errors
 
+    def _validate_repeated_actions(
+        self,
+        tool_context: ToolContext,
+        actions: Any,
+    ) -> list[str]:
+        if not isinstance(actions, list) or not actions:
+            return []
+        current_summaries = [
+            self._history_action_summary(action)
+            for action in actions
+            if isinstance(action, dict)
+        ]
+        if not current_summaries or len(current_summaries) != len(actions):
+            return []
+        recent_payloads = self._load_recent_step_payloads(tool_context, 3)
+        if len(recent_payloads) < 3:
+            return []
+
+        for payload in recent_payloads:
+            prior_actions = payload.get("actions")
+            if not isinstance(prior_actions, list) or len(prior_actions) != len(actions):
+                return []
+            prior_summaries = [
+                self._history_action_summary(action)
+                for action in prior_actions
+                if isinstance(action, dict)
+            ]
+            if prior_summaries != current_summaries:
+                return []
+            prior_results = payload.get("results")
+            if not isinstance(prior_results, list):
+                return []
+            if any(isinstance(result, dict) and result.get("error") for result in prior_results):
+                return []
+
+        summarized = " | ".join(current_summaries)
+        return [
+            "Response repeats the same action plan from the last 3 steps without new evidence. "
+            f"Choose a different branch or advance the workflow instead of repeating: {summarized[:400]}"
+        ]
+
     def _repair_invalid_response(
         self,
         messages: list[ChatMessage],
@@ -2050,6 +2091,12 @@ class ResearchController:
                     policy,
                 )
             )
+            validation_errors.extend(
+                self._validate_repeated_actions(
+                    tool_context,
+                    actions,
+                )
+            )
             if validation_errors:
                 repaired = self._repair_invalid_response(messages, reasoning, actions if isinstance(actions, list) else [], validation_errors)
                 if repaired is not None:
@@ -2064,6 +2111,12 @@ class ResearchController:
                             step,
                             step_limit,
                             policy,
+                        )
+                    )
+                    validation_errors.extend(
+                        self._validate_repeated_actions(
+                            tool_context,
+                            actions,
                         )
                     )
             if validation_errors:
