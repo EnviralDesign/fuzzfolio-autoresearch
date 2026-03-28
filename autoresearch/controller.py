@@ -71,7 +71,8 @@ Rules:
 - The controller owns default horizon policy and may inject phase-appropriate `--lookback-months` into sensitivity runs when you omit it.
 - The controller also owns the active quality-score preset and injects it into deep-replay-backed evaluations and scaffolded sweeps. Do not try to vary or omit it yourself.
 - Do not use `--bar-limit` as a research lever unless the user explicitly asks. Treat bar counts as implementation detail, not strategy.
-- `__BASKET__` may appear inside saved analysis summaries as an aggregate label. It is not a valid CLI instrument argument. Use exact catalog symbols like EURUSD.
+- `__BASKET__` may appear inside saved analysis summaries as an aggregate label. It is not a valid CLI instrument argument. Use exact catalog symbols from the catalog.
+- In early phase, diversify across multiple distinct instruments or small instrument groups before narrowing hard onto one pair unless the evidence is already unusually strong.
 - `finish` is terminal for the whole run. Never use it to mean "continue" or "step complete".
 - Only call `finish` when you intend to stop the run now and can provide a concise non-empty final summary.
 - This is an iterative research session, not a one-shot evaluation. Keep exploring unless you have reached the step limit or the controller explicitly allows finish.
@@ -736,7 +737,7 @@ class ResearchController:
         summaries = {
             "early": (
                 f"Early phase: branch broadly, reject weak ideas cheaply, and prioritize fresh contrasts until step {wrap_up_start}. "
-                "Use permissive screening first, and include at least one bounded sweep around a promising family before locking into manual tweaks only."
+                "Use permissive screening first, include at least one bounded sweep around a promising family before locking into manual tweaks only, and test multiple distinct instruments or small instrument groups before narrowing hard."
             ),
             "mid": (
                 f"Mid phase: narrow onto the strongest families, deepen evidence, and prefer systematic follow-up over random wandering before wrap-up at step {wrap_up_start}. "
@@ -1190,6 +1191,7 @@ class ResearchController:
             "- If command syntax drifts, use run_cli [\"help\"] or run_cli [\"help\", \"profiles\"] instead of guessing.\n"
             "- `__BASKET__` may appear in saved summaries as an aggregate label. Never pass it as --instrument.\n"
             "- Invalid instrument aliases now fail fast with close-match suggestions.\n"
+            "- In early phase, do not spend the whole run anchored to one pair. Explore across multiple distinct instruments or small instrument groups before narrowing hard.\n"
             "- A normal managed run should explore multiple candidates. Do not stop after the first strong score; branch and test at least a few follow-up ideas.\n"
             "- Do not finish the run as soon as the minimum threshold is reached if there is still room in the step budget for a couple more meaningful contrasts.\n"
             "- If a sensitivity run already auto-logged the attempt, avoid redundant log_attempt unless you are recovering from a missing ledger entry.\n"

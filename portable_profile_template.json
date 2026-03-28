@@ -5,7 +5,7 @@
     "name": "Seeded Run Candidate",
     "description": "Replace this with a seed-guided hypothesis for the current run.",
     "instruments": [
-      "EURUSD"
+      "EXAMPLE_SYMBOL"
     ],
     "indicators": [
       {
