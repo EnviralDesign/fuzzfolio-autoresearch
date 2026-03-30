@@ -69,6 +69,18 @@ class ResearchConfig:
     coverage_min_mid_months: int = 11
     coverage_min_wrap_up_months: int = 34
     validation_max_concurrency: int = 4
+    retention_strong_candidate_threshold: float = 55.0
+    retention_max_same_family_mutations_before_check: int = 2
+    retention_fail_delta: float = -12.0
+    retention_fail_ratio: float = 0.82
+    retention_pass_delta: float = -6.0
+    retention_check_months_sparse: int = 12
+    retention_check_months_normal: int = 9
+    timeframe_intent_enforcement: str = "warn_and_require_resolution"
+    timeframe_adjustment_repeat_block: bool = True
+    same_family_exploit_cap: int = 3
+    sweep_oversized_warning: int = 64
+    sweep_oversized_hard_block: int = 256
 
 
 @dataclass
@@ -192,7 +204,9 @@ def find_repo_root(start: Path | None = None) -> Path:
     for path in [current, *current.parents]:
         if (path / ".git").exists() and (path / "program.md").exists():
             return path
-    raise FileNotFoundError("Could not locate repo root containing .git and program.md.")
+    raise FileNotFoundError(
+        "Could not locate repo root containing .git and program.md."
+    )
 
 
 def load_json_file(path: Path) -> dict[str, Any]:
@@ -301,7 +315,11 @@ def _load_provider_profiles(
                 else {}
             )
             api_key_ref = (
-                str(secret_cfg.get("api_key_ref") or profile_cfg.get("api_key_ref") or "").strip()
+                str(
+                    secret_cfg.get("api_key_ref")
+                    or profile_cfg.get("api_key_ref")
+                    or ""
+                ).strip()
                 or None
             )
             referenced_api_key = None
@@ -331,13 +349,21 @@ def _load_provider_profiles(
                 api_key=_env_or_value(
                     f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_API_KEY",
                     api_key_env,
-                    fallback=secret_cfg.get("api_key") or profile_cfg.get("api_key") or referenced_api_key,
+                    fallback=secret_cfg.get("api_key")
+                    or profile_cfg.get("api_key")
+                    or referenced_api_key,
                 ),
                 api_key_ref=api_key_ref,
                 api_key_env=api_key_env,
-                temperature=float(profile_cfg.get("temperature", ProviderProfileConfig.temperature)),
-                max_tokens=int(profile_cfg.get("max_tokens", ProviderProfileConfig.max_tokens)),
-                timeout_seconds=int(profile_cfg.get("timeout_seconds", defaults["timeout_seconds"])),
+                temperature=float(
+                    profile_cfg.get("temperature", ProviderProfileConfig.temperature)
+                ),
+                max_tokens=int(
+                    profile_cfg.get("max_tokens", ProviderProfileConfig.max_tokens)
+                ),
+                timeout_seconds=int(
+                    profile_cfg.get("timeout_seconds", defaults["timeout_seconds"])
+                ),
                 transport=str(profile_cfg.get("transport") or defaults["transport"]),
                 compact_trigger_tokens=(
                     int(profile_cfg["compact_trigger_tokens"])
@@ -345,7 +371,10 @@ def _load_provider_profiles(
                     else None
                 ),
                 rate_limit_backoff_seconds=(
-                    [int(item) for item in profile_cfg.get("rate_limit_backoff_seconds", [])]
+                    [
+                        int(item)
+                        for item in profile_cfg.get("rate_limit_backoff_seconds", [])
+                    ]
                     if profile_cfg.get("rate_limit_backoff_seconds") is not None
                     else None
                 ),
@@ -360,15 +389,22 @@ def _load_provider_profiles(
             "AUTORESEARCH_EXPLORER_PROFILE",
             fallback=llm_cfg.get("explorer_profile"),
         ) or next(iter(profiles.keys()), LlmConfig.explorer_profile)
-        supervisor_profile = _env_or_value(
-            "AUTORESEARCH_SUPERVISOR_PROFILE",
-            fallback=llm_cfg.get("supervisor_profile"),
-        ) or explorer_profile
+        supervisor_profile = (
+            _env_or_value(
+                "AUTORESEARCH_SUPERVISOR_PROFILE",
+                fallback=llm_cfg.get("supervisor_profile"),
+            )
+            or explorer_profile
+        )
 
         if explorer_profile not in profiles:
-            raise KeyError(f"Configured explorer_profile {explorer_profile!r} is not defined in providers.")
+            raise KeyError(
+                f"Configured explorer_profile {explorer_profile!r} is not defined in providers."
+            )
         if supervisor_profile not in profiles:
-            raise KeyError(f"Configured supervisor_profile {supervisor_profile!r} is not defined in providers.")
+            raise KeyError(
+                f"Configured supervisor_profile {supervisor_profile!r} is not defined in providers."
+            )
 
         return LlmConfig(
             explorer_profile=explorer_profile,
@@ -382,23 +418,36 @@ def _load_provider_profiles(
     shared_api_key = _env_or_value(
         "AUTORESEARCH_PROVIDER_API_KEY",
         defaults["api_key_env"],
-        fallback=legacy_provider_secrets.get("api_key") or legacy_provider_cfg.get("api_key"),
+        fallback=legacy_provider_secrets.get("api_key")
+        or legacy_provider_cfg.get("api_key"),
     )
     shared_api_base = _env_or_value(
         "AUTORESEARCH_PROVIDER_BASE_URL",
         fallback=legacy_provider_cfg.get("api_base") or defaults["api_base"],
     )
-    shared_temperature = float(legacy_provider_cfg.get("temperature", ProviderProfileConfig.temperature))
-    shared_max_tokens = int(legacy_provider_cfg.get("max_tokens", ProviderProfileConfig.max_tokens))
-    shared_timeout = int(legacy_provider_cfg.get("timeout_seconds", defaults["timeout_seconds"]))
-    explorer_model = _env_or_value(
-        "AUTORESEARCH_PROVIDER_MODEL",
-        fallback=legacy_provider_cfg.get("model"),
-    ) or ProviderProfileConfig.model
-    supervisor_model = _env_or_value(
-        "AUTORESEARCH_SUPERVISOR_MODEL",
-        fallback=legacy_provider_cfg.get("supervisor_model"),
-    ) or "gpt-5.4"
+    shared_temperature = float(
+        legacy_provider_cfg.get("temperature", ProviderProfileConfig.temperature)
+    )
+    shared_max_tokens = int(
+        legacy_provider_cfg.get("max_tokens", ProviderProfileConfig.max_tokens)
+    )
+    shared_timeout = int(
+        legacy_provider_cfg.get("timeout_seconds", defaults["timeout_seconds"])
+    )
+    explorer_model = (
+        _env_or_value(
+            "AUTORESEARCH_PROVIDER_MODEL",
+            fallback=legacy_provider_cfg.get("model"),
+        )
+        or ProviderProfileConfig.model
+    )
+    supervisor_model = (
+        _env_or_value(
+            "AUTORESEARCH_SUPERVISOR_MODEL",
+            fallback=legacy_provider_cfg.get("supervisor_model"),
+        )
+        or "gpt-5.4"
+    )
 
     profiles = {
         "openai-mini": ProviderProfileConfig(
@@ -458,7 +507,9 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     llm, providers = _load_provider_profiles(raw_config, raw_secrets)
 
     fuzzfolio = FuzzfolioConfig(
-        cli_command=_env_or_value("AUTORESEARCH_FUZZFOLIO_CLI", fallback=fuzzfolio_cfg.get("cli_command"))
+        cli_command=_env_or_value(
+            "AUTORESEARCH_FUZZFOLIO_CLI", fallback=fuzzfolio_cfg.get("cli_command")
+        )
         or FuzzfolioConfig.cli_command,
         base_url=_env_or_value(
             "PROFILE_DROP_BASE_URL",
@@ -482,22 +533,41 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             if fuzzfolio_cfg.get("workspace_root")
             else None
         ),
-        email=_env_or_value("AUTORESEARCH_FUZZFOLIO_EMAIL", fallback=fuzzfolio_secrets.get("email")),
-        password=_env_or_value("AUTORESEARCH_FUZZFOLIO_PASSWORD", fallback=fuzzfolio_secrets.get("password")),
+        email=_env_or_value(
+            "AUTORESEARCH_FUZZFOLIO_EMAIL", fallback=fuzzfolio_secrets.get("email")
+        ),
+        password=_env_or_value(
+            "AUTORESEARCH_FUZZFOLIO_PASSWORD",
+            fallback=fuzzfolio_secrets.get("password"),
+        ),
     )
 
     research = ResearchConfig(
         max_steps=int(research_cfg.get("max_steps", ResearchConfig.max_steps)),
-        recent_attempts_window=int(research_cfg.get("recent_attempts_window", ResearchConfig.recent_attempts_window)),
+        recent_attempts_window=int(
+            research_cfg.get(
+                "recent_attempts_window", ResearchConfig.recent_attempts_window
+            )
+        ),
         label_prefix=research_cfg.get("label_prefix", ResearchConfig.label_prefix),
-        auto_seed_prompt=bool(research_cfg.get("auto_seed_prompt", ResearchConfig.auto_seed_prompt)),
+        auto_seed_prompt=bool(
+            research_cfg.get("auto_seed_prompt", ResearchConfig.auto_seed_prompt)
+        ),
         quality_score_preset=str(
-            research_cfg.get("quality_score_preset", ResearchConfig.quality_score_preset)
+            research_cfg.get(
+                "quality_score_preset", ResearchConfig.quality_score_preset
+            )
         ).strip()
         or ResearchConfig.quality_score_preset,
-        plot_lower_is_better=bool(research_cfg.get("plot_lower_is_better", ResearchConfig.plot_lower_is_better)),
+        plot_lower_is_better=bool(
+            research_cfg.get(
+                "plot_lower_is_better", ResearchConfig.plot_lower_is_better
+            )
+        ),
         compact_trigger_tokens=int(
-            research_cfg.get("compact_trigger_tokens", ResearchConfig.compact_trigger_tokens)
+            research_cfg.get(
+                "compact_trigger_tokens", ResearchConfig.compact_trigger_tokens
+            )
         ),
         compact_keep_recent_messages=int(
             research_cfg.get(
@@ -564,7 +634,9 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                 "coverage_reference_timeframe",
                 ResearchConfig.coverage_reference_timeframe,
             )
-        ).strip().upper()
+        )
+        .strip()
+        .upper()
         or ResearchConfig.coverage_reference_timeframe,
         coverage_min_mid_months=int(
             research_cfg.get(
@@ -586,6 +658,78 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                     ResearchConfig.validation_max_concurrency,
                 )
             ),
+        ),
+        retention_strong_candidate_threshold=float(
+            research_cfg.get(
+                "retention_strong_candidate_threshold",
+                ResearchConfig.retention_strong_candidate_threshold,
+            )
+        ),
+        retention_max_same_family_mutations_before_check=int(
+            research_cfg.get(
+                "retention_max_same_family_mutations_before_check",
+                ResearchConfig.retention_max_same_family_mutations_before_check,
+            )
+        ),
+        retention_fail_delta=float(
+            research_cfg.get(
+                "retention_fail_delta",
+                ResearchConfig.retention_fail_delta,
+            )
+        ),
+        retention_fail_ratio=float(
+            research_cfg.get(
+                "retention_fail_ratio",
+                ResearchConfig.retention_fail_ratio,
+            )
+        ),
+        retention_pass_delta=float(
+            research_cfg.get(
+                "retention_pass_delta",
+                ResearchConfig.retention_pass_delta,
+            )
+        ),
+        retention_check_months_sparse=int(
+            research_cfg.get(
+                "retention_check_months_sparse",
+                ResearchConfig.retention_check_months_sparse,
+            )
+        ),
+        retention_check_months_normal=int(
+            research_cfg.get(
+                "retention_check_months_normal",
+                ResearchConfig.retention_check_months_normal,
+            )
+        ),
+        timeframe_intent_enforcement=str(
+            research_cfg.get(
+                "timeframe_intent_enforcement",
+                ResearchConfig.timeframe_intent_enforcement,
+            )
+        ).strip(),
+        timeframe_adjustment_repeat_block=bool(
+            research_cfg.get(
+                "timeframe_adjustment_repeat_block",
+                ResearchConfig.timeframe_adjustment_repeat_block,
+            )
+        ),
+        same_family_exploit_cap=int(
+            research_cfg.get(
+                "same_family_exploit_cap",
+                ResearchConfig.same_family_exploit_cap,
+            )
+        ),
+        sweep_oversized_warning=int(
+            research_cfg.get(
+                "sweep_oversized_warning",
+                ResearchConfig.sweep_oversized_warning,
+            )
+        ),
+        sweep_oversized_hard_block=int(
+            research_cfg.get(
+                "sweep_oversized_hard_block",
+                ResearchConfig.sweep_oversized_hard_block,
+            )
         ),
     )
     supervisor = SupervisorConfig(
@@ -614,12 +758,18 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             )
         ),
     )
-    advisor_profiles = [
-        str(item).strip()
-        for item in advisor_cfg.get("profiles", [])
-        if str(item).strip()
-    ] if isinstance(advisor_cfg.get("profiles", []), list) else []
-    unknown_advisor_profiles = [item for item in advisor_profiles if item not in providers]
+    advisor_profiles = (
+        [
+            str(item).strip()
+            for item in advisor_cfg.get("profiles", [])
+            if str(item).strip()
+        ]
+        if isinstance(advisor_cfg.get("profiles", []), list)
+        else []
+    )
+    unknown_advisor_profiles = [
+        item for item in advisor_profiles if item not in providers
+    ]
     if unknown_advisor_profiles:
         raise KeyError(
             "Configured advisor profile(s) are not defined in providers: "
@@ -627,7 +777,9 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
         )
     advisor = AdvisorConfig(
         enabled=bool(advisor_cfg.get("enabled", AdvisorConfig.enabled)),
-        every_n_steps=int(advisor_cfg.get("every_n_steps", AdvisorConfig.every_n_steps)),
+        every_n_steps=int(
+            advisor_cfg.get("every_n_steps", AdvisorConfig.every_n_steps)
+        ),
         profiles=advisor_profiles,
         max_recent_steps=int(
             advisor_cfg.get(

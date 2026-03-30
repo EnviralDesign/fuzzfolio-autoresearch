@@ -58,8 +58,7 @@ Rules:
 - Prefer `profiles clone-local` to normalize/copy an existing local profile into a fresh run-owned portable document before branching.
 - Prefer `profiles patch` for bounded edits to local profile files instead of rewriting whole JSON documents when only a few fields need to change.
 - Prefer `profiles validate --file <ABS_FILE>` as a cheap preflight after materially editing a profile file.
-- Use sweeps as a normal research tool, not a rare last resort.
-- Prefer `sweep scaffold`, `sweep patch`, and `sweep validate` when you need a sweep definition instead of hand-writing raw sweep JSON.
+- Use sweeps as a normal research tool, not a rare last resort. Prefer `sweep run` for the common scaffold+submit+wait workflow. Use `sweep scaffold`, `sweep patch`, `sweep validate` only when you need to inspect or edit the definition between steps.
 - Only update profile refs that were created during this run.
 - In profile JSON, `indicator.meta.id` must be an exact id from the sticky indicator catalog. Seed phrases and concept labels are not valid ids.
 - After `profiles create`, use the returned profile id for later `--profile-ref` calls. A local `*.created.json` file is not itself a profile ref.
@@ -89,6 +88,29 @@ Rules:
 - If a file body is too large to fit comfortably, emit fewer actions in that step. Do not omit `content`.
 - Do not call `profiles create` or `profiles update` for a profile JSON path unless that file already exists on disk or you wrote it earlier in the same step.
 - If `profiles create` fails, recover by fixing the profile JSON first. Do not continue to `sensitivity-basket` in the same step.
+
+Retention and pacing rules (controller-enforced):
+- The controller tracks each indicator family separately using instance IDs. Indicators sharing the same `meta.instanceId` values are the same family.
+- After a family earns a strong score (quality_score >= 55) and the controller has spent several same-family exploit steps on it, the controller will require a longer-horizon validation before allowing more same-family tweaks.
+- If a longer-horizon eval degrades materially vs the baseline strong score (delta <= -12 or ratio < 0.82), the controller will block further same-family exploit and require a structural contrast: a different indicator family, instrument cluster, timeframe architecture, or directional regime.
+- After a family passes a longer-horizon retention check (delta >= -6 and score still strong), local tuning on that family is unlocked again.
+- Indicators with few resolved trades (< 30) or low trades-per-month (< 2) are treated as sparse/selective and face stricter retention requirements.
+- Same-family exploit actions include: notificationThreshold tweaks, lookbackBars tweaks, range-width tweaks, weight tweaks, and adjacent sweeps on the same core family.
+
+Timeframe mismatch rules (controller-enforced):
+- If a CLI output shows "Auto-adjusted timeframe from X to Y", that does NOT count as a valid higher-timeframe experiment. The run actually ran at Y, not X.
+- The controller tracks these mismatches. If you repeatedly request the same higher timeframe with an unchanged profile that was already auto-adjusted, the controller will block that action.
+- To properly test a higher timeframe: patch the indicator timeframe(s) in the profile to match your intended timeframe first, or reformulate the experiment as the effective lower timeframe and acknowledge that in your reasoning.
+
+Behavior digest fields (available in run state prompt after each eval):
+- edge_shape: persistent = strong across all horizons; episodic = strong sometimes; one_burst = early spike only; late_breakdown = degrades at longer horizons; flat_weak = weak everywhere
+- support_shape: well_supported = many trades across many cells; selective_but_credible = fewer trades but credible; sparse_risky = too few signals to be sure; too_sparse = essentially uninterpretable
+- drawdown_shape: smooth = consistent; clustered = blows up in specific regimes; late_blowup = holds early but fails later; high_chop = noisy across all horizons
+- retention_risk: low = likely holds at longer horizons; moderate = uncertain; high = likely degrades when extended
+- failure_mode_hint: recent_only = short-horizon artifact; trend_regime_dependent = works in trends not ranges; range_regime_dependent = the opposite; weak_support = too few signals to trust
+- next_move_hint: validate_longer = run a longer-horizon check; contrast_family = try a different indicator family; prune_family = abandon this family; test_same_logic_new_instrument = same idea different market; local_tune_allowed = nearby tweaks still worthwhile; stop_threshold_tuning = plateau reached, stop tweaking thresholds
+
+Use the behavior digest to guide your next branch decision, not just the scalar score.
 """
 
 _RUNTIME_TRACE_STDERR_MODE = "verbose"
@@ -114,6 +136,7 @@ def _should_emit_runtime_trace_line(*, status: str, level: str | None) -> bool:
         return True
     warning_statuses = {"blocked", "denied", "action_failed", "error", "failed"}
     return normalized_status in warning_statuses
+
 
 SUPERVISED_EXTRA_RULES = """
 - You are running in supervised mode. The supervisor, not you, decides when the session stops.
@@ -208,8 +231,6 @@ Hard requirements:
 """
 
 
-
-
 @dataclass
 class ToolContext:
     run_id: str
@@ -245,7 +266,11 @@ class ResearchController:
         self.provider = create_provider(app_config.provider)
         self.supervisor_provider = create_provider(app_config.supervisor_provider)
         self.advisor_providers = [
-            (f"advisor{index}", profile_name, create_provider(app_config.providers[profile_name]))
+            (
+                f"advisor{index}",
+                profile_name,
+                create_provider(app_config.providers[profile_name]),
+            )
             for index, profile_name in enumerate(app_config.advisor.profiles, start=1)
             if profile_name in app_config.providers
         ]
@@ -253,33 +278,398 @@ class ResearchController:
         self.profile_sources: dict[str, Path] = {}
         self.last_created_profile_ref: str | None = None
         self.finish_denials = 0
-        self.profile_template_path = self.config.repo_root / "portable_profile_template.json"
+        self.profile_template_path = (
+            self.config.repo_root / "portable_profile_template.json"
+        )
         self._cli_help_catalog_cache: dict[str, Any] | None = None
+        self._family_mutation_counts: dict[str, int] = {}
+        self._family_last_score: dict[str, float] = {}
+        self._family_baseline_score: dict[str, float] = {}
+        self._family_last_horizon_months: dict[str, int] = {}
+        self._family_retention_state: dict[str, dict[str, Any]] = {}
+        self._consecutive_same_family_exploit: int = 0
+        self._last_family_id: str | None = None
+        self._timeframe_mismatches: list[dict[str, Any]] = []
+        self._same_family_exploit_history: list[str] = []
+
+    def _reset_run_state(self) -> None:
+        self._family_mutation_counts = {}
+        self._family_last_score = {}
+        self._family_baseline_score = {}
+        self._family_last_horizon_months = {}
+        self._family_retention_state = {}
+        self._consecutive_same_family_exploit = 0
+        self._last_family_id = None
+        self._timeframe_mismatches = []
+        self._same_family_exploit_history = []
+
+    def _derive_family_id_from_profile(self, profile_path: Path | None) -> str | None:
+        if profile_path is None or not profile_path.exists():
+            return None
+        try:
+            payload = json.loads(profile_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        profile = (
+            payload.get("profile")
+            if isinstance(payload.get("profile"), dict)
+            else payload
+        )
+        indicators = profile.get("indicators") if isinstance(profile, dict) else None
+        if not isinstance(indicators, list) or not indicators:
+            return None
+        instance_ids = []
+        for ind in indicators:
+            if not isinstance(ind, dict):
+                continue
+            meta = ind.get("meta") if isinstance(ind.get("meta"), dict) else {}
+            inst_id = str(meta.get("instanceId") or "").strip()
+            if inst_id:
+                instance_ids.append(inst_id)
+        if not instance_ids:
+            return None
+        return "|".join(sorted(instance_ids))
+
+    def _derive_support_quality(self, attempt: dict[str, Any]) -> str:
+        trade_count = self._attempt_trade_count(attempt)
+        trades_per_month = self._attempt_trades_per_month(attempt)
+        positive_ratio = self._attempt_positive_cell_ratio(attempt)
+        if trade_count is None:
+            return "sparse"
+        if trade_count < 30:
+            return "sparse"
+        if trades_per_month is not None and trades_per_month < 2:
+            return "selective"
+        if positive_ratio is not None and positive_ratio < 0.3:
+            return "selective"
+        return "broad"
+
+    def _is_same_family_exploit_action(self, action: dict[str, Any]) -> bool:
+        tool = str(action.get("tool", "")).strip()
+        if tool != "run_cli":
+            return False
+        args = action.get("args")
+        if not isinstance(args, list):
+            command = str(action.get("command", "")).lower()
+            args = command.split()
+        args_lower = [str(a).lower() for a in args]
+        args_str = " ".join(args_lower)
+        exploit_patterns = [
+            "notificationthreshold",
+            "lookbackbars",
+            ".weight",
+            "patch",
+        ]
+        sweep_subcommands = {"scaffold", "patch", "submit"}
+        if args_lower and args_lower[0] == "sweep" and len(args_lower) >= 2:
+            subcommand = args_lower[1]
+            if subcommand in sweep_subcommands:
+                return True
+        for pattern in exploit_patterns:
+            if pattern in args_str:
+                return True
+        return False
+
+    def _check_retention_gating(
+        self,
+        tool_context: ToolContext,
+        candidate_family_id: str,
+        current_score: float,
+        horizon_months: int | None = None,
+    ) -> dict[str, Any]:
+        cfg = self.config.research
+        threshold = cfg.retention_strong_candidate_threshold
+        max_mutations = cfg.retention_max_same_family_mutations_before_check
+        current_mutations = self._family_mutation_counts.get(candidate_family_id, 0)
+        last_score = self._family_last_score.get(candidate_family_id)
+        baseline_score = self._family_baseline_score.get(candidate_family_id)
+        last_horizon = self._family_last_horizon_months.get(candidate_family_id)
+        retention_state = self._family_retention_state.get(candidate_family_id, {})
+        is_strong = current_score >= threshold
+        support_quality = retention_state.get("support_quality", "normal")
+        needs_retention_check = False
+        gated_message = None
+        horizon_increased = (
+            horizon_months is not None
+            and last_horizon is not None
+            and horizon_months > last_horizon
+        )
+        if is_strong and current_mutations >= max_mutations:
+            if not retention_state.get("retention_check_passed"):
+                retention_done = retention_state.get("retention_check_done")
+                if not retention_done:
+                    needs_retention_check = True
+                    if support_quality == "sparse":
+                        suggested_months = cfg.retention_check_months_sparse
+                    else:
+                        suggested_months = cfg.retention_check_months_normal
+                    gated_message = (
+                        f"Family {candidate_family_id[:16]}... is a strong candidate (score={current_score:.1f}) "
+                        f"but requires a retention check at {suggested_months}m before further same-family exploit. "
+                        f"Current same-family mutations={current_mutations} (max allowed={max_mutations}). "
+                        f"Suggested next move: run a longer-horizon validation or pivot to a structural contrast branch."
+                    )
+        if (
+            horizon_increased
+            and baseline_score is not None
+            and current_score < baseline_score
+        ):
+            delta = current_score - baseline_score
+            ratio = current_score / baseline_score if baseline_score != 0 else 0
+            if delta <= cfg.retention_fail_delta or ratio < cfg.retention_fail_ratio:
+                self._family_retention_state[candidate_family_id] = {
+                    "retention_check_done": True,
+                    "retention_check_passed": False,
+                    "last_delta": delta,
+                    "last_ratio": ratio,
+                    "support_quality": support_quality,
+                    "baseline_score": baseline_score,
+                    "retention_horizon": horizon_months,
+                }
+                return {
+                    "family_id": candidate_family_id,
+                    "retention_failed": True,
+                    "delta": delta,
+                    "ratio": ratio,
+                    "baseline_score": baseline_score,
+                    "current_horizon": horizon_months,
+                    "message": (
+                        f"Retention check FAILED for family {candidate_family_id[:16]}... "
+                        f"(delta={delta:.1f}, ratio={ratio:.2f}) at {horizon_months}m horizon vs {baseline_score:.1f} baseline. "
+                        f"Next step must be a structural contrast, not another same-family tweak. "
+                        f"Disallowed: notificationThreshold tweak, lookbackBars tweak, range-width tweak, same-family sweep. "
+                        f"Allowed: different indicator family, different instrument cluster, different timeframe architecture, different directional logic."
+                    ),
+                }
+        if last_score is not None:
+            delta = current_score - last_score
+            if delta >= cfg.retention_pass_delta and current_score >= threshold:
+                self._family_retention_state[candidate_family_id] = {
+                    "retention_check_done": True,
+                    "retention_check_passed": True,
+                    "last_delta": delta,
+                    "support_quality": support_quality,
+                }
+        self._family_last_score[candidate_family_id] = current_score
+        if horizon_months is not None:
+            self._family_last_horizon_months[candidate_family_id] = horizon_months
+        if is_strong and baseline_score is None:
+            self._family_baseline_score[candidate_family_id] = current_score
+        return {
+            "family_id": candidate_family_id,
+            "retention_failed": False,
+            "needs_retention_check": needs_retention_check,
+            "gated_message": gated_message,
+        }
+
+    def _update_family_exploit_state(
+        self,
+        family_id: str | None,
+        is_exploit: bool,
+        support_quality: str | None = None,
+    ) -> None:
+        if family_id is None:
+            return
+        if is_exploit:
+            if self._last_family_id == family_id:
+                self._consecutive_same_family_exploit += 1
+            else:
+                self._consecutive_same_family_exploit = 1
+            self._same_family_exploit_history.append(family_id)
+        else:
+            self._consecutive_same_family_exploit = 0
+        self._last_family_id = family_id
+        if family_id not in self._family_mutation_counts:
+            self._family_mutation_counts[family_id] = 0
+            support = "normal"
+            if self._family_retention_state.get(family_id):
+                support = self._family_retention_state[family_id].get(
+                    "support_quality", "normal"
+                )
+            elif support_quality:
+                support = support_quality
+            self._family_retention_state[family_id] = {"support_quality": support}
+        if is_exploit:
+            self._family_mutation_counts[family_id] = (
+                self._family_mutation_counts.get(family_id, 0) + 1
+            )
+
+    def _get_same_family_exploit_status(self) -> dict[str, Any]:
+        cap = self.config.research.same_family_exploit_cap
+        return {
+            "consecutive_exploit_steps": self._consecutive_same_family_exploit,
+            "exploit_cap": cap,
+            "at_cap": self._consecutive_same_family_exploit >= cap,
+            "message": (
+                f"Consecutive same-family exploit steps: {self._consecutive_same_family_exploit}/{cap}. "
+                f"After {cap} consecutive same-family exploit steps, the next step must be a structural contrast "
+                f"(different indicator family, instrument cluster, timeframe architecture, or directional logic) "
+                f"unless retention has recently passed."
+            )
+            if self._consecutive_same_family_exploit >= cap
+            else None,
+        }
+
+    def _detect_timeframe_mismatch(
+        self, cli_result: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        result_payload = cli_result.get("result")
+        if not isinstance(result_payload, dict):
+            return None
+        stdout = result_payload.get("stdout", "")
+        stderr = result_payload.get("stderr", "")
+        combined_output = stdout + "\n" + stderr
+        if "Auto-adjusted timeframe from" not in combined_output:
+            return None
+        match = re.search(
+            r"Auto-adjusted timeframe from\s+(\S+)\s+to\s+(\S+)", combined_output
+        )
+        if not match:
+            return None
+        requested_timeframe = match.group(1)
+        effective_timeframe = match.group(2)
+        entry = {
+            "requested": requested_timeframe,
+            "effective": effective_timeframe,
+            "mismatch": requested_timeframe != effective_timeframe,
+        }
+        self._timeframe_mismatches.append(entry)
+        return entry
+
+    def _get_timeframe_mismatch_status(self) -> dict[str, Any]:
+        if not self._timeframe_mismatches:
+            return {"has_mismatch": False}
+        latest = self._timeframe_mismatches[-1]
+        repeat_block = self.config.research.timeframe_adjustment_repeat_block
+        recent_count = sum(
+            1
+            for m in self._timeframe_mismatches[-5:]
+            if m.get("requested") == latest.get("requested")
+        )
+        return {
+            "has_mismatch": True,
+            "latest": latest,
+            "total_mismatches": len(self._timeframe_mismatches),
+            "recent_same_count": recent_count,
+            "repeat_blocked": repeat_block and recent_count >= 2,
+            "message": (
+                f"Timeframe auto-adjustment detected: requested {latest.get('requested')} "
+                f"but CLI ran {latest.get('effective')}. "
+                f"This does NOT count as a valid higher-timeframe experiment. "
+                f"Next action must resolve the mismatch: patch active indicator timeframe(s) "
+                f"to the intended timeframe, reformulate as {latest.get('effective')} test, "
+                f"or abandon that timeframe hypothesis. "
+                f"Do NOT request the same higher-timeframe eval with the same unchanged profile."
+            ),
+        }
+
+    def _generate_behavior_digest(self, attempt: dict[str, Any]) -> dict[str, Any]:
+        score = attempt.get("composite_score")
+        trade_count = self._attempt_trade_count(attempt)
+        trades_per_month = self._attempt_trades_per_month(attempt)
+        positive_ratio = self._attempt_positive_cell_ratio(attempt)
+        max_drawdown = self._attempt_max_drawdown_r(attempt)
+        best_summary = attempt.get("best_summary")
+        edge_shape = "flat_weak"
+        support_shape = "well_supported"
+        drawdown_shape = "smooth"
+        retention_risk = "low"
+        failure_mode_hint = "none"
+        next_move_hint = "local_tune_allowed"
+        if score is None:
+            edge_shape = "flat_weak"
+            support_shape = "too_sparse"
+            retention_risk = "high"
+            failure_mode_hint = "weak_support"
+            next_move_hint = "prune_family"
+        elif trade_count is not None and trade_count < 20:
+            support_shape = "too_sparse"
+            retention_risk = "high"
+            failure_mode_hint = "weak_support"
+            next_move_hint = "contrast_family"
+        elif trades_per_month is not None and trades_per_month < 3:
+            support_shape = "sparse_risky"
+            retention_risk = "moderate"
+        if positive_ratio is not None:
+            if positive_ratio > 0.7:
+                edge_shape = "persistent"
+                support_shape = "well_supported"
+            elif positive_ratio > 0.4:
+                edge_shape = "episodic"
+                support_shape = "selective_but_credible"
+            else:
+                edge_shape = "one_burst"
+                support_shape = "sparse_risky"
+                retention_risk = "high"
+                failure_mode_hint = "recent_only"
+        if max_drawdown is not None:
+            if max_drawdown > 10:
+                drawdown_shape = "late_blowup"
+                retention_risk = "high"
+                failure_mode_hint = "trend_regime_dependent"
+            elif max_drawdown > 5:
+                drawdown_shape = "clustered"
+        best_summary = attempt.get("best_summary")
+        if isinstance(best_summary, dict):
+            matrix_summary = best_summary.get("matrix_summary")
+            if isinstance(matrix_summary, dict):
+                cell_count = matrix_summary.get("cell_count", 0)
+                if cell_count > 100:
+                    edge_shape = "late_breakdown"
+                    failure_mode_hint = "range_regime_dependent"
+        if score is not None and score < 40:
+            next_move_hint = "stop_threshold_tuning"
+        elif retention_risk == "high":
+            next_move_hint = "contrast_family"
+        return {
+            "edge_shape": edge_shape,
+            "support_shape": support_shape,
+            "drawdown_shape": drawdown_shape,
+            "retention_risk": retention_risk,
+            "failure_mode_hint": failure_mode_hint,
+            "next_move_hint": next_move_hint,
+        }
+
+    def _format_behavior_digest_text(self, digest: dict[str, Any]) -> str:
+        lines = ["Behavior digest:"]
+        for key, value in digest.items():
+            lines.append(f"- {key}: {value}")
+        return "\n".join(lines)
 
     def _system_protocol_text(self, policy: RunPolicy) -> str:
         if policy.allow_finish:
             return SYSTEM_PROTOCOL
         return SYSTEM_PROTOCOL + "\n" + SUPERVISED_EXTRA_RULES
 
-    def _normalize_model_response(self, payload: dict[str, Any] | list[Any]) -> dict[str, Any]:
+    def _normalize_model_response(
+        self, payload: dict[str, Any] | list[Any]
+    ) -> dict[str, Any]:
         if isinstance(payload, dict):
             reasoning = payload.get("reasoning")
             action_keys = ("actions", "planned_actions", "tool_calls", "steps")
             for key in action_keys:
                 candidate_actions = payload.get(key)
-                if isinstance(candidate_actions, list) and all(isinstance(item, dict) for item in candidate_actions):
+                if isinstance(candidate_actions, list) and all(
+                    isinstance(item, dict) for item in candidate_actions
+                ):
                     return {
-                        "reasoning": str(reasoning).strip() if isinstance(reasoning, str) else "",
+                        "reasoning": str(reasoning).strip()
+                        if isinstance(reasoning, str)
+                        else "",
                         "actions": candidate_actions,
                     }
             if payload.get("tool"):
                 action = dict(payload)
                 action.pop("reasoning", None)
                 return {
-                    "reasoning": str(reasoning).strip() if isinstance(reasoning, str) else "",
+                    "reasoning": str(reasoning).strip()
+                    if isinstance(reasoning, str)
+                    else "",
                     "actions": [action],
                 }
-        if isinstance(payload, list) and all(isinstance(item, dict) for item in payload):
+        if isinstance(payload, list) and all(
+            isinstance(item, dict) for item in payload
+        ):
             return {"reasoning": "", "actions": payload}
         raise RuntimeError(f"Model returned invalid actions payload: {payload}")
 
@@ -353,14 +743,18 @@ class ResearchController:
             if first in executable_names:
                 normalized = normalized[1:]
             if not normalized:
-                raise ValueError("run_cli args list only contained the CLI executable name.")
+                raise ValueError(
+                    "run_cli args list only contained the CLI executable name."
+                )
             return self._canonicalize_cli_args(normalized)
         if isinstance(args, str) and args.strip():
             command_text = args.strip()
         else:
             command = action.get("command")
             if not isinstance(command, str) or not command.strip():
-                raise ValueError("run_cli requires a non-empty args list or command string.")
+                raise ValueError(
+                    "run_cli requires a non-empty args list or command string."
+                )
             command_text = command.strip()
         parts = shlex.split(command_text, posix=False)
         if not parts:
@@ -369,7 +763,9 @@ class ResearchController:
         if first in executable_names:
             parts = parts[1:]
         if not parts:
-            raise ValueError("run_cli command string only contained the CLI executable name.")
+            raise ValueError(
+                "run_cli command string only contained the CLI executable name."
+            )
         return self._canonicalize_cli_args(parts)
 
     def _canonicalize_cli_args(self, args: list[str]) -> list[str]:
@@ -436,7 +832,9 @@ class ResearchController:
         except Exception:
             path.write_text("{}", encoding="utf-8")
             return path
-        path.write_text(json.dumps(catalog, ensure_ascii=True, indent=2), encoding="utf-8")
+        path.write_text(
+            json.dumps(catalog, ensure_ascii=True, indent=2), encoding="utf-8"
+        )
         return path
 
     def _format_cli_guard_error(
@@ -486,7 +884,9 @@ class ResearchController:
         except Exception:
             return None
         top_level = catalog.get("top_level", {}) if isinstance(catalog, dict) else {}
-        subcommands = catalog.get("subcommands", {}) if isinstance(catalog, dict) else {}
+        subcommands = (
+            catalog.get("subcommands", {}) if isinstance(catalog, dict) else {}
+        )
         if first not in top_level:
             valid = sorted(str(item) for item in top_level.keys())
             closest = get_close_matches(first, valid, n=3, cutoff=0.45)
@@ -567,7 +967,9 @@ class ResearchController:
         if args[0] in {"sensitivity", "sensitivity-basket"}:
             effective = self._strip_cli_flag(list(args), "--bar-limit")
             if "--timeframe" not in effective:
-                inferred_timeframe = self._infer_timeframe_for_sensitivity_args(effective)
+                inferred_timeframe = self._infer_timeframe_for_sensitivity_args(
+                    effective
+                )
                 if inferred_timeframe:
                     effective.extend(["--timeframe", inferred_timeframe])
             if "--lookback-months" not in effective:
@@ -614,7 +1016,11 @@ class ResearchController:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
-        profile = payload.get("profile") if isinstance(payload.get("profile"), dict) else payload
+        profile = (
+            payload.get("profile")
+            if isinstance(payload.get("profile"), dict)
+            else payload
+        )
         indicators = profile.get("indicators") if isinstance(profile, dict) else None
         if not isinstance(indicators, list):
             return None
@@ -631,7 +1037,11 @@ class ResearchController:
         for indicator in indicators:
             if not isinstance(indicator, dict):
                 continue
-            config = indicator.get("config") if isinstance(indicator.get("config"), dict) else {}
+            config = (
+                indicator.get("config")
+                if isinstance(indicator.get("config"), dict)
+                else {}
+            )
             if config.get("isActive") is False:
                 continue
             timeframe = str(config.get("timeframe") or "").strip().upper()
@@ -645,7 +1055,9 @@ class ResearchController:
         return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
     def create_run_context(self) -> ToolContext:
-        run_id = f"{self._timestamp()}-{self.config.research.label_prefix}-{uuid4().hex[:6]}"
+        run_id = (
+            f"{self._timestamp()}-{self.config.research.label_prefix}-{uuid4().hex[:6]}"
+        )
         run_dir = self.config.runs_root / run_id
         attempts_path = attempts_path_for_run_dir(run_dir)
         run_metadata = {
@@ -670,9 +1082,13 @@ class ResearchController:
         seed_prompt_path = run_dir / "seed-prompt.json"
         if self.config.research.auto_seed_prompt:
             self.cli.seed_prompt(seed_prompt_path)
-        seed_indicator_ids = self._seed_indicator_ids(seed_prompt_path if seed_prompt_path.exists() else None)
+        seed_indicator_ids = self._seed_indicator_ids(
+            seed_prompt_path if seed_prompt_path.exists() else None
+        )
         indicator_catalog_summary = self._indicator_catalog_summary(seed_indicator_ids)
-        seed_indicator_parameter_hints = self._seed_indicator_parameter_hints(seed_indicator_ids)
+        seed_indicator_parameter_hints = self._seed_indicator_parameter_hints(
+            seed_indicator_ids
+        )
         instrument_catalog_summary = self._instrument_catalog_summary()
         return ToolContext(
             run_id=run_id,
@@ -695,7 +1111,10 @@ class ResearchController:
         return self.config.program_path.read_text(encoding="utf-8")
 
     def _seed_text(self, tool_context: ToolContext) -> str:
-        if not tool_context.seed_prompt_path or not tool_context.seed_prompt_path.exists():
+        if (
+            not tool_context.seed_prompt_path
+            or not tool_context.seed_prompt_path.exists()
+        ):
             return "No seed prompt file exists for this run."
         return tool_context.seed_prompt_path.read_text(encoding="utf-8")
 
@@ -726,7 +1145,11 @@ class ResearchController:
         )
 
     def _scored_attempts(self, attempts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+        return [
+            attempt
+            for attempt in attempts
+            if attempt.get("composite_score") is not None
+        ]
 
     def _score_better(self, left: float, right: float) -> bool:
         if self.config.research.plot_lower_is_better:
@@ -737,12 +1160,16 @@ class ResearchController:
         scored = self._scored_attempts(attempts)
         if not scored:
             return None
-        return min(
-            scored,
-            key=lambda attempt: float(attempt.get("composite_score")),
-        ) if self.config.research.plot_lower_is_better else max(
-            scored,
-            key=lambda attempt: float(attempt.get("composite_score")),
+        return (
+            min(
+                scored,
+                key=lambda attempt: float(attempt.get("composite_score")),
+            )
+            if self.config.research.plot_lower_is_better
+            else max(
+                scored,
+                key=lambda attempt: float(attempt.get("composite_score")),
+            )
         )
 
     def _format_score(self, value: Any) -> str:
@@ -755,7 +1182,9 @@ class ResearchController:
             text = text.rstrip("0").rstrip(".")
         return text
 
-    def _run_phase_info(self, step: int, step_limit: int, policy: RunPolicy) -> dict[str, Any]:
+    def _run_phase_info(
+        self, step: int, step_limit: int, policy: RunPolicy
+    ) -> dict[str, Any]:
         wrap_up_steps = max(1, min(step_limit, self.config.research.run_wrap_up_steps))
         wrap_up_start = max(1, step_limit - wrap_up_steps + 1)
         if step >= wrap_up_start:
@@ -774,7 +1203,9 @@ class ResearchController:
         else:
             progress = (step - 1) / max(1, exploration_steps - 1)
             early_cutoff = min(max(self.config.research.phase_early_ratio, 0.05), 0.9)
-            late_cutoff = min(max(self.config.research.phase_late_ratio, early_cutoff + 0.05), 0.98)
+            late_cutoff = min(
+                max(self.config.research.phase_late_ratio, early_cutoff + 0.05), 0.98
+            )
             if progress < early_cutoff:
                 phase_name = "early"
             elif progress < late_cutoff:
@@ -817,27 +1248,25 @@ class ResearchController:
             "wrap_up": self.config.research.horizon_wrap_up_months,
             "managed": self.config.research.horizon_mid_months,
         }
-        months = int(phase_months.get(phase_name, self.config.research.horizon_mid_months))
+        months = int(
+            phase_months.get(phase_name, self.config.research.horizon_mid_months)
+        )
         if phase_name == "early":
             rationale = "cheap early screening: test broad branches over a shorter horizon before spending more compute"
-            guidance = (
-                f"Target about {months} months of evidence. Favor cheap branch-heavy screening and reject weak ideas quickly."
-            )
+            guidance = f"Target about {months} months of evidence. Favor cheap branch-heavy screening and reject weak ideas quickly."
         elif phase_name == "mid":
-            rationale = "deepen evidence on the strongest branches before full pressure testing"
-            guidance = (
-                f"Target about {months} months of evidence. Narrow onto top branches and start validating that the edge persists."
+            rationale = (
+                "deepen evidence on the strongest branches before full pressure testing"
             )
+            guidance = f"Target about {months} months of evidence. Narrow onto top branches and start validating that the edge persists."
         elif phase_name == "late":
-            rationale = "pressure-test one or two survivors over longer history before wrap-up"
-            guidance = (
-                f"Target about {months} months of evidence. Prefer robustness, portability, and structured follow-up over novelty."
+            rationale = (
+                "pressure-test one or two survivors over longer history before wrap-up"
             )
+            guidance = f"Target about {months} months of evidence. Prefer robustness, portability, and structured follow-up over novelty."
         else:
             rationale = "final validation should use the longest horizon in the session"
-            guidance = (
-                f"Target about {months} months of evidence. Use the last steps to validate the likely winner over the longest believable horizon."
-            )
+            guidance = f"Target about {months} months of evidence. Use the last steps to validate the likely winner over the longest believable horizon."
         return {
             "phase": phase_name,
             "lookback_months": months,
@@ -854,7 +1283,8 @@ class ResearchController:
 
         current_score = (
             float(run_best.get("composite_score"))
-            if isinstance(run_best, dict) and run_best.get("composite_score") is not None
+            if isinstance(run_best, dict)
+            and run_best.get("composite_score") is not None
             else None
         )
 
@@ -862,13 +1292,23 @@ class ResearchController:
         rationale: str
         if current_score is not None:
             delta = max(3.0, abs(current_score) * 0.05)
-            target_score = current_score - delta if self.config.research.plot_lower_is_better else current_score + delta
-            rationale = "push past the current run leader with one believable improvement"
+            target_score = (
+                current_score - delta
+                if self.config.research.plot_lower_is_better
+                else current_score + delta
+            )
+            rationale = (
+                "push past the current run leader with one believable improvement"
+            )
         else:
-            rationale = "log the first credible scored candidate before chasing higher targets"
+            rationale = (
+                "log the first credible scored candidate before chasing higher targets"
+            )
 
         if target_score is None:
-            summary = "Next target: log the first credible scored candidate for this run."
+            summary = (
+                "Next target: log the first credible scored candidate for this run."
+            )
         elif self.config.research.plot_lower_is_better:
             summary = (
                 f"Next target: get quality_score <= {self._format_score(target_score)}. "
@@ -883,7 +1323,9 @@ class ResearchController:
         return {
             "target_score": target_score,
             "current_run_best_score": current_score,
-            "current_run_best_candidate": run_best.get("candidate_name") if isinstance(run_best, dict) else None,
+            "current_run_best_candidate": run_best.get("candidate_name")
+            if isinstance(run_best, dict)
+            else None,
             "global_best_score": None,
             "global_best_candidate": None,
             "summary": summary,
@@ -892,7 +1334,11 @@ class ResearchController:
 
     def _frontier_snapshot_text(self, tool_context: ToolContext) -> str:
         attempts = load_run_attempts(tool_context.run_dir)
-        valid = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+        valid = [
+            attempt
+            for attempt in attempts
+            if attempt.get("composite_score") is not None
+        ]
         if not valid:
             return "No scored frontier points exist yet in this run."
 
@@ -905,11 +1351,27 @@ class ResearchController:
 
         lines: list[str] = []
         current_best = frontier[-1]
-        best_summary = current_best.get("best_summary") if isinstance(current_best.get("best_summary"), dict) else {}
-        current_metrics = current_best.get("metrics") if isinstance(current_best.get("metrics"), dict) else {}
-        best_cell = best_summary.get("best_cell") if isinstance(best_summary.get("best_cell"), dict) else {}
+        best_summary = (
+            current_best.get("best_summary")
+            if isinstance(current_best.get("best_summary"), dict)
+            else {}
+        )
+        current_metrics = (
+            current_best.get("metrics")
+            if isinstance(current_best.get("metrics"), dict)
+            else {}
+        )
+        best_cell = (
+            best_summary.get("best_cell")
+            if isinstance(best_summary.get("best_cell"), dict)
+            else {}
+        )
         positive_ratio = None
-        matrix_summary = best_summary.get("matrix_summary") if isinstance(best_summary.get("matrix_summary"), dict) else {}
+        matrix_summary = (
+            best_summary.get("matrix_summary")
+            if isinstance(best_summary.get("matrix_summary"), dict)
+            else {}
+        )
         if matrix_summary:
             positive_ratio = matrix_summary.get("positive_cell_ratio")
 
@@ -924,9 +1386,21 @@ class ResearchController:
 
         lines.append("Recent frontier points:")
         for attempt in frontier[-10:]:
-            summary = attempt.get("best_summary") if isinstance(attempt.get("best_summary"), dict) else {}
-            metrics = attempt.get("metrics") if isinstance(attempt.get("metrics"), dict) else {}
-            cell = summary.get("best_cell") if isinstance(summary.get("best_cell"), dict) else {}
+            summary = (
+                attempt.get("best_summary")
+                if isinstance(attempt.get("best_summary"), dict)
+                else {}
+            )
+            metrics = (
+                attempt.get("metrics")
+                if isinstance(attempt.get("metrics"), dict)
+                else {}
+            )
+            cell = (
+                summary.get("best_cell")
+                if isinstance(summary.get("best_cell"), dict)
+                else {}
+            )
             lines.append(
                 f"- seq={attempt.get('sequence')} score={attempt.get('composite_score')} "
                 f"basis={attempt.get('score_basis', 'n/a')} dsr={metrics.get('dsr', 'n/a')} "
@@ -938,12 +1412,18 @@ class ResearchController:
         if len(frontier) < 5:
             scored = sorted(
                 valid,
-                key=lambda attempt: float(attempt.get("composite_score", float("-inf"))),
+                key=lambda attempt: float(
+                    attempt.get("composite_score", float("-inf"))
+                ),
                 reverse=not self.config.research.plot_lower_is_better,
             )
             lines.append("Top scored attempts fallback:")
             for attempt in scored[:5]:
-                metrics = attempt.get("metrics") if isinstance(attempt.get("metrics"), dict) else {}
+                metrics = (
+                    attempt.get("metrics")
+                    if isinstance(attempt.get("metrics"), dict)
+                    else {}
+                )
                 lines.append(
                     f"- seq={attempt.get('sequence')} score={attempt.get('composite_score')} "
                     f"basis={attempt.get('score_basis', 'n/a')} dsr={metrics.get('dsr', 'n/a')} "
@@ -976,7 +1456,9 @@ class ResearchController:
         data = result.parsed_json.get("data")
         if not isinstance(data, dict):
             return "Indicator catalog snapshot unavailable."
-        timeframes = data.get("timeframes") if isinstance(data.get("timeframes"), list) else []
+        timeframes = (
+            data.get("timeframes") if isinstance(data.get("timeframes"), list) else []
+        )
         tf_values = [
             str(item.get("value"))
             for item in timeframes
@@ -1009,12 +1491,20 @@ class ResearchController:
         for item in indicators:
             if not isinstance(item, dict):
                 continue
-            indicator_id = str(item.get("id") or item.get("meta", {}).get("id") or "").strip()
+            indicator_id = str(
+                item.get("id") or item.get("meta", {}).get("id") or ""
+            ).strip()
             if not indicator_id:
                 continue
             meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-            defaults = item.get("configDefaults") if isinstance(item.get("configDefaults"), dict) else {}
-            talib_meta = meta.get("talibMeta") if isinstance(meta.get("talibMeta"), list) else []
+            defaults = (
+                item.get("configDefaults")
+                if isinstance(item.get("configDefaults"), dict)
+                else {}
+            )
+            talib_meta = (
+                meta.get("talibMeta") if isinstance(meta.get("talibMeta"), list) else []
+            )
             talib_parts: list[str] = []
             for param in talib_meta[:8]:
                 if not isinstance(param, dict):
@@ -1027,7 +1517,11 @@ class ResearchController:
                     talib_parts.append(name)
                 else:
                     talib_parts.append(f"{name}={default}")
-            ranges = defaults.get("ranges") if isinstance(defaults.get("ranges"), dict) else {}
+            ranges = (
+                defaults.get("ranges")
+                if isinstance(defaults.get("ranges"), dict)
+                else {}
+            )
             buy_range = ranges.get("buy")
             sell_range = ranges.get("sell")
             range_text = ""
@@ -1055,8 +1549,16 @@ class ResearchController:
         if not isinstance(data, dict):
             return "Instrument catalog snapshot unavailable."
         symbols = data.get("symbols") if isinstance(data.get("symbols"), list) else []
-        asset_classes = data.get("asset_classes") if isinstance(data.get("asset_classes"), list) else []
-        fx_jpy = [str(symbol) for symbol in symbols if isinstance(symbol, str) and symbol.endswith("JPY")]
+        asset_classes = (
+            data.get("asset_classes")
+            if isinstance(data.get("asset_classes"), list)
+            else []
+        )
+        fx_jpy = [
+            str(symbol)
+            for symbol in symbols
+            if isinstance(symbol, str) and symbol.endswith("JPY")
+        ]
         coverage_lines: list[str] = []
         coverage_result = self.cli.run(
             [
@@ -1067,7 +1569,9 @@ class ResearchController:
             ],
             check=False,
         )
-        if coverage_result.returncode == 0 and isinstance(coverage_result.parsed_json, dict):
+        if coverage_result.returncode == 0 and isinstance(
+            coverage_result.parsed_json, dict
+        ):
             coverage_data = coverage_result.parsed_json.get("data")
             if isinstance(coverage_data, dict):
                 eligible_mid: list[str] = []
@@ -1078,9 +1582,13 @@ class ResearchController:
                     months = payload.get("effective_window_months")
                     if not isinstance(months, (int, float)):
                         continue
-                    if float(months) >= float(self.config.research.coverage_min_mid_months):
+                    if float(months) >= float(
+                        self.config.research.coverage_min_mid_months
+                    ):
                         eligible_mid.append(symbol)
-                    if float(months) >= float(self.config.research.coverage_min_wrap_up_months):
+                    if float(months) >= float(
+                        self.config.research.coverage_min_wrap_up_months
+                    ):
                         eligible_wrap.append(symbol)
                 if eligible_mid or eligible_wrap:
                     coverage_lines.append(
@@ -1147,7 +1655,9 @@ class ResearchController:
 
     def _run_owned_profiles_summary(self, tool_context: ToolContext) -> str:
         lines: list[str] = []
-        for created_file in sorted(tool_context.profiles_dir.glob("*.created.json"))[:24]:
+        for created_file in sorted(tool_context.profiles_dir.glob("*.created.json"))[
+            :24
+        ]:
             try:
                 payload = json.loads(created_file.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
@@ -1156,7 +1666,9 @@ class ResearchController:
                 continue
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
             profile_ref = str(data.get("id", "")).strip()
-            profile = data.get("profile") if isinstance(data.get("profile"), dict) else {}
+            profile = (
+                data.get("profile") if isinstance(data.get("profile"), dict) else {}
+            )
             name = str(profile.get("name", created_file.stem)).strip()
             if profile_ref:
                 lines.append(f"- {profile_ref}: {name}")
@@ -1196,25 +1708,28 @@ class ResearchController:
         effective_step = step or 1
         effective_step_limit = step_limit or self.config.research.max_steps
         phase_info = self._run_phase_info(effective_step, effective_step_limit, policy)
-        horizon_policy = self._horizon_policy_snapshot(effective_step, effective_step_limit, policy)
+        horizon_policy = self._horizon_policy_snapshot(
+            effective_step, effective_step_limit, policy
+        )
         score_target = self._score_target_snapshot(tool_context)
         soft_wrap_note = self._soft_wrap_note(policy)
         cli_guide = (
             "Important CLI command shapes:\n"
-            '- profiles clone-local --file <ABS_FILE> --out <ABS_FILE>\n'
+            "- profiles clone-local --file <ABS_FILE> --out <ABS_FILE>\n"
             '- profiles patch --file <ABS_FILE> --set profile.name="..." --set profile.indicators[0].config.timeframe="H1" --out <ABS_FILE>\n'
-            '- profiles scaffold --indicator <ID> --indicator <ID> --instrument <SYMBOL> --out <ABS_FILE>\n'
-            '- profiles scaffold --indicator <ID> --indicator <ID> --instrument <SYMBOL> --instrument <SYMBOL> --out <ABS_FILE>\n'
-            '- profiles validate --file <ABS_FILE> --pretty\n'
-            '- profiles create --file <ABS_FILE> --out <ABS_FILE>\n'
-            '- profiles update --profile-ref <REF> --file <ABS_FILE> --out <ABS_FILE>\n'
-            '- sweep scaffold --profile-ref <REF> --instrument <SYMBOL> --axis profile.notificationThreshold=70,75,80 --axis indicator[0].config.lookbackBars=1,2,3 --out <ABS_FILE>\n'
+            "- profiles scaffold --indicator <ID> --indicator <ID> --instrument <SYMBOL> --out <ABS_FILE>\n"
+            "- profiles scaffold --indicator <ID> --indicator <ID> --instrument <SYMBOL> --instrument <SYMBOL> --out <ABS_FILE>\n"
+            "- profiles validate --file <ABS_FILE> --pretty\n"
+            "- profiles create --file <ABS_FILE> --out <ABS_FILE>\n"
+            "- profiles update --profile-ref <REF> --file <ABS_FILE> --out <ABS_FILE>\n"
+            "- sweep scaffold --profile-ref <REF> --instrument <SYMBOL> --axis profile.notificationThreshold=70,75,80 --axis indicator[0].config.lookbackBars=1,2,3 --out <ABS_FILE>\n"
             '- sweep patch --definition <ABS_FILE> --set fitness_metric="quality_score" --out <ABS_FILE>\n'
-            '- sweep validate --definition <ABS_FILE> --pretty\n'
-            '- sweep submit --definition <ABS_FILE_OR_INLINE_JSON> --out <ABS_FILE> --pretty\n'
-            '- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --lookback-months <MONTHS> --output-dir <ABS_DIR>\n'
-            '- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --instrument <INSTRUMENT> --lookback-months <MONTHS> --output-dir <ABS_DIR>\n'
-            '- compare-sensitivity --input <ABS_DIR> --pretty\n'
+            "- sweep validate --definition <ABS_FILE> --pretty\n"
+            "- sweep submit --definition <ABS_FILE_OR_INLINE_JSON> --out <ABS_FILE> --pretty\n"
+            "- sweep run --profile-ref <REF> --instrument <SYMBOL> --axis profile.notificationThreshold=70,75,80 --axis indicator[0].config.lookbackBars=1,2,3\n"
+            "- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --lookback-months <MONTHS> --output-dir <ABS_DIR>\n"
+            "- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --instrument <INSTRUMENT> --lookback-months <MONTHS> --output-dir <ABS_DIR>\n"
+            "- compare-sensitivity --input <ABS_DIR> --pretty\n"
             "Notes:\n"
             "- profiles scaffold generates a valid portable profile from live indicator templates and is preferred for fresh candidate bootstrapping.\n"
             "- profiles clone-local normalizes/copies an existing local profile into a fresh portable document for safe local branching.\n"
@@ -1225,6 +1740,8 @@ class ResearchController:
             "- sweep scaffold builds a valid sweep definition around an existing saved profile using simple axis expressions. Prefer it over hand-writing sweep JSON.\n"
             "- sweep patch applies deterministic edits to a local sweep definition file.\n"
             "- sweep validate performs a local structural preflight before sweep submit.\n"
+            "- sweep run combines scaffold+submit+wait into a single action: use it as the default when you want to run a sweep and get results in one step. Only use scaffold/validate/submit separately when you need to inspect or edit the definition between steps.\n"
+            "- IMPORTANT: sweep run does NOT take --timeframe or --out. It uses the timeframe embedded in the profile. It does accept optional --output-dir to write results to a file. Do NOT mix sensitivity-basket flags into a sweep run command.\n"
             "- Only exact indicator ids from the sticky indicator catalog are valid in indicator.meta.id.\n"
             "- The seed prompt is backed by the live indicator catalog, but seed concepts are still ideas, not ids.\n"
             "- Use the seed-to-valid-id hints when the seed uses semantic phrases instead of exact ids.\n"
@@ -1237,7 +1754,7 @@ class ResearchController:
             "- sensitivity-basket may auto-adjust the timeframe down to the profile's lowest active indicator timeframe.\n"
             "- Saved sensitivity responses now include requested_timeframe and effective_timeframe fields.\n"
             "- Raw bar-count mechanics are implementation detail. Prefer effective_window_days and effective_window_months when judging whether a requested horizon was really satisfied.\n"
-            "- If command syntax drifts, use run_cli [\"help\"] or run_cli [\"help\", \"profiles\"] instead of guessing.\n"
+            '- If command syntax drifts, use run_cli ["help"] or run_cli ["help", "profiles"] instead of guessing.\n'
             "- Multi-instrument commands repeat --instrument once per symbol. Never comma-join symbols into a single token.\n"
             "- `__BASKET__` may appear in saved summaries as an aggregate label. Never pass it as --instrument.\n"
             "- Invalid instrument aliases now fail fast with close-match suggestions.\n"
@@ -1294,8 +1811,82 @@ class ResearchController:
             f"Run-owned profiles so far:\n{self._run_owned_profiles_summary(tool_context)}\n\n"
             f"Sticky frontier snapshot:\n{self._frontier_snapshot_text(tool_context)}\n\n"
             f"Checkpoint summary:\n{checkpoint}\n\n"
-            f"Recent attempts:\n{self._recent_attempts_summary(tool_context)}\n"
+            f"Recent attempts:\n{self._recent_attempts_summary(tool_context)}\n\n"
+            f"{self._retention_and_exploit_status_text(tool_context)}\n\n"
+            f"{self._timeframe_mismatch_status_text()}\n\n"
+            f"{self._recent_behavior_digest_text(tool_context)}\n"
             f"\nCLI guide:\n{cli_guide}\n"
+        )
+
+    def _retention_and_exploit_status_text(self, tool_context: ToolContext) -> str:
+        exploit_status = self._get_same_family_exploit_status()
+        lines = ["Retention and exploit pacing status:"]
+        exploit_msg = exploit_status.get("message")
+        if exploit_msg:
+            lines.append(f"- exploit_cap: {exploit_msg}")
+        else:
+            lines.append(
+                f"- exploit steps: {exploit_status.get('consecutive_exploit_steps', 0)}/{exploit_status.get('exploit_cap', 3)} (no cap triggered)"
+            )
+        family_states = []
+        for family_id, state in self._family_retention_state.items():
+            passed = state.get("retention_check_passed")
+            done = state.get("retention_check_done")
+            support = state.get("support_quality", "unknown")
+            mutations = self._family_mutation_counts.get(family_id, 0)
+            short_family = family_id[:16] + "..." if len(family_id) > 16 else family_id
+            if done:
+                if passed:
+                    family_states.append(
+                        f"{short_family}: retention PASSED (support={support}, mutations={mutations})"
+                    )
+                else:
+                    family_states.append(
+                        f"{short_family}: retention FAILED (support={support})"
+                    )
+            else:
+                family_states.append(
+                    f"{short_family}: pending retention check (support={support}, mutations={mutations})"
+                )
+        if family_states:
+            lines.append("- Family retention states:")
+            for state in family_states[:5]:
+                lines.append(f"  - {state}")
+        return "\n".join(lines)
+
+    def _timeframe_mismatch_status_text(self) -> str:
+        status = self._get_timeframe_mismatch_status()
+        if not status.get("has_mismatch"):
+            return "Timeframe intent status: No auto-adjustments detected."
+        lines = ["Timeframe intent status:"]
+        latest = status.get("latest", {})
+        lines.append(
+            f"- Latest mismatch: requested={latest.get('requested')} effective={latest.get('effective')}"
+        )
+        lines.append(f"- Total mismatches: {status.get('total_mismatches', 0)}")
+        msg = status.get("message")
+        if msg:
+            lines.append(f"- Warning: {msg}")
+        if status.get("repeat_blocked"):
+            lines.append(
+                "- BLOCKED: Repeated requests for same mismatched timeframe are blocked."
+            )
+        return "\n".join(lines)
+
+    def _recent_behavior_digest_text(self, tool_context: ToolContext) -> str:
+        attempts = self._run_attempts(tool_context.run_id)
+        if not attempts:
+            return "Behavior digest: No evaluated attempts yet."
+        recent_attempts = [a for a in attempts if a.get("composite_score") is not None]
+        if not recent_attempts:
+            return "Behavior digest: No scored attempts yet."
+        last_attempt = recent_attempts[-1]
+        digest = self._generate_behavior_digest(last_attempt)
+        candidate_name = last_attempt.get("candidate_name", "unknown")
+        score = last_attempt.get("composite_score", "n/a")
+        return (
+            f"Most recent behavior digest (seq={last_attempt.get('sequence')}, candidate={candidate_name}, score={score}):\n"
+            + self._format_behavior_digest_text(digest)
         )
 
     def _serialize_tool_result(self, result: Any) -> str:
@@ -1337,8 +1928,14 @@ class ResearchController:
             if isinstance(command, str):
                 return f"run_cli {command[:400]}"
         if tool in {"read_file", "list_dir", "log_attempt", "finish"}:
-            return json.dumps({key: value for key, value in action.items() if key != "content"}, ensure_ascii=True)
-        return json.dumps({key: value for key, value in action.items() if key != "content"}, ensure_ascii=True)
+            return json.dumps(
+                {key: value for key, value in action.items() if key != "content"},
+                ensure_ascii=True,
+            )
+        return json.dumps(
+            {key: value for key, value in action.items() if key != "content"},
+            ensure_ascii=True,
+        )
 
     def _history_result_summary(self, result: dict[str, Any]) -> dict[str, Any]:
         tool = str(result.get("tool", "unknown"))
@@ -1348,7 +1945,9 @@ class ResearchController:
                 "error": str(result.get("error"))[:500],
             }
         if tool == "run_cli":
-            payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+            payload = (
+                result.get("result") if isinstance(result.get("result"), dict) else {}
+            )
             summarized: dict[str, Any] = {
                 "tool": tool,
                 "ok": bool(result.get("ok")),
@@ -1375,7 +1974,9 @@ class ResearchController:
                         "effective_timeframe",
                         "status",
                     ]
-                    summarized["parsed_json_keys"] = [key for key in preview_keys if key in parsed][:8]
+                    summarized["parsed_json_keys"] = [
+                        key for key in preview_keys if key in parsed
+                    ][:8]
                     if len(cli_args) >= 1:
                         if "compare-sensitivity" in cli_args:
                             best = parsed.get("best")
@@ -1390,23 +1991,43 @@ class ResearchController:
                                     "timeframe": best.get("timeframe"),
                                 }
                                 if isinstance(best_cell, dict):
-                                    compare_summary["resolved_trades"] = best_cell.get("resolved_trades")
-                                    compare_summary["avg_net_r_per_closed_trade"] = best_cell.get("avg_net_r_per_closed_trade")
+                                    compare_summary["resolved_trades"] = best_cell.get(
+                                        "resolved_trades"
+                                    )
+                                    compare_summary["avg_net_r_per_closed_trade"] = (
+                                        best_cell.get("avg_net_r_per_closed_trade")
+                                    )
                                 if isinstance(best_path, dict):
                                     compare_summary["psr"] = best_path.get("psr")
                                     compare_summary["dsr"] = best.get("dsr")
-                                    compare_summary["k_ratio"] = best_path.get("k_ratio")
-                                    compare_summary["sharpe_r"] = best_path.get("sharpe_r")
-                                    compare_summary["max_drawdown_r"] = best_path.get("max_drawdown_r")
+                                    compare_summary["k_ratio"] = best_path.get(
+                                        "k_ratio"
+                                    )
+                                    compare_summary["sharpe_r"] = best_path.get(
+                                        "sharpe_r"
+                                    )
+                                    compare_summary["max_drawdown_r"] = best_path.get(
+                                        "max_drawdown_r"
+                                    )
                                 if isinstance(market_window, dict):
-                                    compare_summary["effective_window_months"] = market_window.get("effective_window_months")
-                                    compare_summary["window_truncated"] = market_window.get("window_truncated")
+                                    compare_summary["effective_window_months"] = (
+                                        market_window.get("effective_window_months")
+                                    )
+                                    compare_summary["window_truncated"] = (
+                                        market_window.get("window_truncated")
+                                    )
                                 if isinstance(matrix_summary, dict):
-                                    compare_summary["positive_cell_ratio"] = matrix_summary.get("positive_cell_ratio")
+                                    compare_summary["positive_cell_ratio"] = (
+                                        matrix_summary.get("positive_cell_ratio")
+                                    )
                                 summarized["compare_summary"] = compare_summary
                 if isinstance(stdout, str) and "Auto-adjusted timeframe from" in stdout:
                     summarized["timeframe_auto_adjusted"] = True
-                if isinstance(stderr, str) and stderr.strip() and not bool(result.get("ok")):
+                if (
+                    isinstance(stderr, str)
+                    and stderr.strip()
+                    and not bool(result.get("ok"))
+                ):
                     summarized["stderr"] = stderr[:500]
             return summarized
         if tool == "read_file":
@@ -1458,7 +2079,14 @@ class ResearchController:
         tool = str(action.get("tool", "")).strip()
         if not tool:
             return "Action is missing tool."
-        if tool not in {"run_cli", "write_file", "read_file", "list_dir", "log_attempt", "finish"}:
+        if tool not in {
+            "run_cli",
+            "write_file",
+            "read_file",
+            "list_dir",
+            "log_attempt",
+            "finish",
+        }:
             return f"Unknown tool: {tool}"
         if tool == "write_file":
             path = action.get("path")
@@ -1551,7 +2179,9 @@ class ResearchController:
 
         for payload in recent_payloads:
             prior_actions = payload.get("actions")
-            if not isinstance(prior_actions, list) or len(prior_actions) != len(actions):
+            if not isinstance(prior_actions, list) or len(prior_actions) != len(
+                actions
+            ):
                 return []
             prior_summaries = [
                 self._history_action_summary(action)
@@ -1563,7 +2193,10 @@ class ResearchController:
             prior_results = payload.get("results")
             if not isinstance(prior_results, list):
                 return []
-            if any(isinstance(result, dict) and result.get("error") for result in prior_results):
+            if any(
+                isinstance(result, dict) and result.get("error")
+                for result in prior_results
+            ):
                 return []
 
         summarized = " | ".join(current_summaries)
@@ -1571,6 +2204,42 @@ class ResearchController:
             "Response repeats the same action plan from the last 3 steps without new evidence. "
             f"Choose a different branch or advance the workflow instead of repeating: {summarized[:400]}"
         ]
+
+    def _validate_timeframe_mismatch_block(
+        self,
+        actions: Any,
+    ) -> list[str]:
+        if not isinstance(actions, list):
+            return []
+        if not self.config.research.timeframe_adjustment_repeat_block:
+            return []
+        status = self._get_timeframe_mismatch_status()
+        if not status.get("repeat_blocked"):
+            return []
+        if not status.get("has_mismatch"):
+            return []
+        latest_requested = status.get("latest", {}).get("requested")
+        if latest_requested is None:
+            return []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            tool = str(action.get("tool", "")).strip()
+            if tool != "run_cli":
+                continue
+            args = action.get("args")
+            if isinstance(args, list):
+                args_str = " ".join(str(a).lower() for a in args)
+            else:
+                args_str = str(action.get("command", "")).lower()
+            if latest_requested.lower() in args_str:
+                return [
+                    f"Timeframe mismatch repeat BLOCKED: the previous step requested {latest_requested} "
+                    f"but the CLI auto-adjusted to {status.get('latest', {}).get('effective')}. "
+                    f"Repeatedly requesting {latest_requested} with the same unchanged profile is not a valid experiment. "
+                    f"Resolve the mismatch first: patch indicator timeframe(s) to match, reformulate as {status.get('latest', {}).get('effective')} test, or abandon the higher-timeframe hypothesis."
+                ]
+        return []
 
     def _repair_invalid_response(
         self,
@@ -1601,8 +2270,7 @@ class ResearchController:
                 role="user",
                 content=(
                     f"{RESPONSE_REPAIR_PROMPT}\n\n"
-                    "Problems:\n"
-                    + "\n".join(f"- {error}" for error in errors)
+                    "Problems:\n" + "\n".join(f"- {error}" for error in errors)
                 ),
             ),
         ]
@@ -1652,7 +2320,9 @@ class ResearchController:
             phase="response_repair",
             status="ok",
             message="Response repair succeeded.",
-            action_count=len(repaired_actions) if isinstance(repaired_actions, list) else None,
+            action_count=len(repaired_actions)
+            if isinstance(repaired_actions, list)
+            else None,
         )
         return normalized
 
@@ -1725,7 +2395,9 @@ class ResearchController:
             phase="payload_shape_repair",
             status="ok",
             message="Payload-shape repair succeeded.",
-            action_count=len(repaired_actions) if isinstance(repaired_actions, list) else None,
+            action_count=len(repaired_actions)
+            if isinstance(repaired_actions, list)
+            else None,
         )
         return normalized
 
@@ -1738,7 +2410,11 @@ class ResearchController:
         return None
 
     def _resolve_profile_ref_arg(self, value: str) -> str:
-        if value.startswith("<") and value.endswith(">") and self.last_created_profile_ref:
+        if (
+            value.startswith("<")
+            and value.endswith(">")
+            and self.last_created_profile_ref
+        ):
             return self.last_created_profile_ref
         candidate = Path(value)
         if not candidate.exists() or not candidate.is_file():
@@ -1769,7 +2445,10 @@ class ResearchController:
         if attempt_exists(tool_context.attempts_path, artifact_dir):
             attempts = load_attempts(tool_context.attempts_path)
             existing = next(
-                attempt for attempt in attempts if str(attempt.get("artifact_dir", "")).lower() == str(artifact_dir).lower()
+                attempt
+                for attempt in attempts
+                if str(attempt.get("artifact_dir", "")).lower()
+                == str(artifact_dir).lower()
             )
             return {"status": "existing", "attempt": existing}
 
@@ -1790,7 +2469,9 @@ class ResearchController:
             candidate_name=artifact_dir.name,
             profile_ref=profile_ref,
             profile_path=self.profile_sources.get(profile_ref) if profile_ref else None,
-            sensitivity_snapshot_path=sensitivity_snapshot_path if sensitivity_snapshot_path.exists() else None,
+            sensitivity_snapshot_path=sensitivity_snapshot_path
+            if sensitivity_snapshot_path.exists()
+            else None,
             note=note,
         )
         append_attempt(tool_context.attempts_path, record)
@@ -1834,7 +2515,10 @@ class ResearchController:
         args: list[str],
     ) -> dict[str, Any] | None:
         primary = str(args[0]).lower()
-        if primary not in {"sensitivity", "sensitivity-basket"} or "--output-dir" not in args:
+        if (
+            primary not in {"sensitivity", "sensitivity-basket"}
+            or "--output-dir" not in args
+        ):
             return None
         output_index = args.index("--output-dir") + 1
         if output_index >= len(args):
@@ -1845,7 +2529,9 @@ class ResearchController:
             profile_index = args.index("--profile-ref") + 1
             if profile_index < len(args):
                 profile_ref = str(args[profile_index])
-        return self._record_attempt_from_artifact(tool_context, artifact_dir, profile_ref=profile_ref)
+        return self._record_attempt_from_artifact(
+            tool_context, artifact_dir, profile_ref=profile_ref
+        )
 
     def _execute_action(
         self,
@@ -1877,7 +2563,13 @@ class ResearchController:
                     "source_profile_file": None,
                     "result": {
                         "argv": [*self.cli.build_base_argv(), *args],
-                        "cwd": str(Path(action["cwd"]).resolve()) if action.get("cwd") else str((self.config.fuzzfolio.workspace_root or Path.cwd()).resolve()),
+                        "cwd": str(Path(action["cwd"]).resolve())
+                        if action.get("cwd")
+                        else str(
+                            (
+                                self.config.fuzzfolio.workspace_root or Path.cwd()
+                            ).resolve()
+                        ),
                         "returncode": 2,
                         "stdout": "",
                         "stderr": guard_error,
@@ -1887,17 +2579,27 @@ class ResearchController:
             if "--profile-ref" in args:
                 profile_index = args.index("--profile-ref") + 1
                 if profile_index < len(args):
-                    args[profile_index] = self._resolve_profile_ref_arg(str(args[profile_index]))
+                    args[profile_index] = self._resolve_profile_ref_arg(
+                        str(args[profile_index])
+                    )
             result = self.cli.run(
                 [str(item) for item in args],
                 cwd=Path(action["cwd"]) if action.get("cwd") else None,
                 check=False,
             )
 
+            serialized_result = json.loads(self._serialize_tool_result(result))
+            timeframe_mismatch = self._detect_timeframe_mismatch(serialized_result)
+
             profile_ref: str | None = None
             file_arg: Path | None = None
-            if result.returncode == 0 and args[:2] in (["profiles", "create"], ["profiles", "update"]):
-                payload = result.parsed_json if isinstance(result.parsed_json, dict) else {}
+            if result.returncode == 0 and args[:2] in (
+                ["profiles", "create"],
+                ["profiles", "update"],
+            ):
+                payload = (
+                    result.parsed_json if isinstance(result.parsed_json, dict) else {}
+                )
                 profile_ref = self._extract_profile_ref(payload)
                 if "--file" in args:
                     file_index = args.index("--file") + 1
@@ -1908,14 +2610,84 @@ class ResearchController:
                         self.last_created_profile_ref = profile_ref
                     self.profile_sources[profile_ref] = file_arg
 
-            auto_log = self._maybe_auto_log_attempt(tool_context, args) if result.returncode == 0 else None
+            auto_log = (
+                self._maybe_auto_log_attempt(tool_context, args)
+                if result.returncode == 0
+                else None
+            )
+            if auto_log is not None and auto_log.get("status") == "logged":
+                artifact_dir_str = auto_log.get("artifact_dir", "")
+                if artifact_dir_str:
+                    artifact_path = Path(artifact_dir_str)
+                    score = auto_log.get("composite_score")
+                    profile_ref_for_family = auto_log.get("profile_ref")
+                    profile_path_for_family = (
+                        self.profile_sources.get(profile_ref_for_family)
+                        if profile_ref_for_family
+                        else None
+                    )
+                    family_id = self._derive_family_id_from_profile(
+                        profile_path_for_family
+                    )
+                    is_exploit = self._is_same_family_exploit_action(action)
+                    resolved_trades = auto_log.get("resolved_trades")
+                    trades_per_month = auto_log.get("trades_per_month")
+                    positive_ratio = auto_log.get("positive_cell_ratio")
+                    support_quality = "broad"
+                    trade_count_val = (
+                        resolved_trades if isinstance(resolved_trades, int) else None
+                    )
+                    tpm_val = (
+                        trades_per_month
+                        if isinstance(trades_per_month, (int, float))
+                        else None
+                    )
+                    pos_val = (
+                        positive_ratio
+                        if isinstance(positive_ratio, (int, float))
+                        else None
+                    )
+                    if trade_count_val is not None and trade_count_val < 30:
+                        support_quality = "sparse"
+                    elif tpm_val is not None and tpm_val < 2:
+                        support_quality = "selective"
+                    elif pos_val is not None and pos_val < 0.3:
+                        support_quality = "selective"
+                    if family_id:
+                        self._update_family_exploit_state(
+                            family_id, is_exploit, support_quality
+                        )
+                        if score is not None:
+                            horizon_months = (
+                                int(auto_log.get("effective_window_months"))
+                                if auto_log.get("effective_window_months") is not None
+                                else None
+                            )
+                            retention_result = self._check_retention_gating(
+                                tool_context, family_id, float(score), horizon_months
+                            )
+                            if retention_result.get("retention_failed"):
+                                retention_result["auto_log"] = auto_log
+                                return {
+                                    "tool": "run_cli",
+                                    "ok": result.returncode == 0,
+                                    "created_profile_ref": profile_ref,
+                                    "source_profile_file": str(file_arg)
+                                    if file_arg
+                                    else None,
+                                    "result": serialized_result,
+                                    "auto_log": auto_log,
+                                    "timeframe_mismatch": timeframe_mismatch,
+                                    "retention_gate": retention_result,
+                                }
             return {
                 "tool": "run_cli",
                 "ok": result.returncode == 0,
                 "created_profile_ref": profile_ref,
                 "source_profile_file": str(file_arg) if file_arg else None,
-                "result": json.loads(self._serialize_tool_result(result)),
+                "result": serialized_result,
                 "auto_log": auto_log,
+                "timeframe_mismatch": timeframe_mismatch,
             }
 
         if tool == "write_file":
@@ -1925,17 +2697,29 @@ class ResearchController:
                 raise ValueError("write_file requires string content.")
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-            return {"tool": "write_file", "path": str(path), "bytes": len(content.encode("utf-8"))}
+            return {
+                "tool": "write_file",
+                "path": str(path),
+                "bytes": len(content.encode("utf-8")),
+            }
 
         if tool == "read_file":
             path = Path(str(action.get("path", ""))).resolve()
             if not path.exists():
-                raise FileNotFoundError(f"read_file failed: path does not exist: {path}")
+                raise FileNotFoundError(
+                    f"read_file failed: path does not exist: {path}"
+                )
             if path.is_dir():
-                raise IsADirectoryError(f"read_file failed: path is a directory, not a file: {path}. Use list_dir instead.")
+                raise IsADirectoryError(
+                    f"read_file failed: path is a directory, not a file: {path}. Use list_dir instead."
+                )
             max_chars = int(action.get("max_chars", 6000))
             content = path.read_text(encoding="utf-8")
-            return {"tool": "read_file", "path": str(path), "content": content[:max_chars]}
+            return {
+                "tool": "read_file",
+                "path": str(path),
+                "content": content[:max_chars],
+            }
 
         if tool == "list_dir":
             path = Path(str(action.get("path", ""))).resolve()
@@ -1968,7 +2752,9 @@ class ResearchController:
 
         raise ValueError(f"Unknown tool: {tool}")
 
-    def _append_step_log(self, tool_context: ToolContext, payload: dict[str, Any]) -> None:
+    def _append_step_log(
+        self, tool_context: ToolContext, payload: dict[str, Any]
+    ) -> None:
         path = self._step_log_path(tool_context)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
@@ -2027,7 +2813,9 @@ class ResearchController:
                 text = text[:217] + "..."
             parts.append(f"{key}={text}")
         line = " ".join(parts)
-        if not _should_emit_runtime_trace_line(status=status, level=str(fields.get("level") or "")):
+        if not _should_emit_runtime_trace_line(
+            status=status, level=str(fields.get("level") or "")
+        ):
             return
         print(line, file=sys.stderr, flush=True)
 
@@ -2050,7 +2838,9 @@ class ResearchController:
             model=getattr(provider_config, "model", None),
         )
 
-    def _load_recent_step_payloads(self, tool_context: ToolContext, limit: int) -> list[dict[str, Any]]:
+    def _load_recent_step_payloads(
+        self, tool_context: ToolContext, limit: int
+    ) -> list[dict[str, Any]]:
         path = self._step_log_path(tool_context)
         if not path.exists() or limit <= 0:
             return []
@@ -2083,18 +2873,22 @@ class ResearchController:
             reasoning = _short = " ".join(str(payload.get("reasoning", "")).split())
             if len(_short) > 180:
                 _short = _short[:177] + "..."
-            lines.append(f"Step {step}: { _short or 'n/a' }")
+            lines.append(f"Step {step}: {_short or 'n/a'}")
             actions = payload.get("actions")
             if isinstance(actions, list):
                 for action in actions[:3]:
                     if isinstance(action, dict):
-                        lines.append(f"  action: {self._history_action_summary(action)}")
+                        lines.append(
+                            f"  action: {self._history_action_summary(action)}"
+                        )
             results = payload.get("results")
             if isinstance(results, list):
                 for result in results[:4]:
                     if isinstance(result, dict):
                         summary = self._history_result_summary(result)
-                        lines.append(f"  result: {json.dumps(summary, ensure_ascii=True)[:240]}")
+                        lines.append(
+                            f"  result: {json.dumps(summary, ensure_ascii=True)[:240]}"
+                        )
         return "\n".join(lines)
 
     def _attempt_trade_count(self, attempt: dict[str, Any]) -> int | None:
@@ -2168,15 +2962,18 @@ class ResearchController:
             return None
         return value
 
-    def _recent_scored_attempts_text(self, tool_context: ToolContext, limit: int) -> str:
+    def _recent_scored_attempts_text(
+        self, tool_context: ToolContext, limit: int
+    ) -> str:
         attempts = [
-            attempt for attempt in self._run_attempts(tool_context.run_id)
+            attempt
+            for attempt in self._run_attempts(tool_context.run_id)
             if attempt.get("composite_score") is not None
         ]
         if not attempts:
             return "No scored attempts yet."
         lines: list[str] = []
-        for attempt in attempts[-max(1, limit):]:
+        for attempt in attempts[-max(1, limit) :]:
             trade_count = self._attempt_trade_count(attempt)
             trades_per_month = self._attempt_trades_per_month(attempt)
             positive_cell_ratio = self._attempt_positive_cell_ratio(attempt)
@@ -2191,7 +2988,9 @@ class ResearchController:
             if trades_per_month is not None:
                 parts.append(f"trades_per_month={self._format_score(trades_per_month)}")
             if positive_cell_ratio is not None:
-                parts.append(f"positive_cell_ratio={self._format_score(positive_cell_ratio)}")
+                parts.append(
+                    f"positive_cell_ratio={self._format_score(positive_cell_ratio)}"
+                )
             lines.append("- " + " ".join(parts))
         return "\n".join(lines)
 
@@ -2205,7 +3004,7 @@ class ResearchController:
         if current_step_payload is not None:
             payloads.append(current_step_payload)
         issues: list[str] = []
-        for payload in payloads[-max(1, limit):]:
+        for payload in payloads[-max(1, limit) :]:
             step = payload.get("step")
             results = payload.get("results")
             if not isinstance(results, list):
@@ -2215,9 +3014,13 @@ class ResearchController:
                     continue
                 tool = str(result.get("tool", "unknown"))
                 if result.get("error"):
-                    issues.append(f"- step={step} {tool}: {str(result.get('error'))[:220]}")
+                    issues.append(
+                        f"- step={step} {tool}: {str(result.get('error'))[:220]}"
+                    )
                 elif tool in {"response_guard", "step_guard", "yield_guard"}:
-                    message = str(result.get("message") or result.get("error") or "").strip()
+                    message = str(
+                        result.get("message") or result.get("error") or ""
+                    ).strip()
                     if message:
                         issues.append(f"- step={step} {tool}: {message[:220]}")
         deduped: list[str] = []
@@ -2235,11 +3038,19 @@ class ResearchController:
         current_step_payload: dict[str, Any] | None,
     ) -> str:
         attempts = self._run_attempts(tool_context.run_id)
-        scored = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
-        unscored = [attempt for attempt in attempts if attempt.get("composite_score") is None]
+        scored = [
+            attempt
+            for attempt in attempts
+            if attempt.get("composite_score") is not None
+        ]
+        unscored = [
+            attempt for attempt in attempts if attempt.get("composite_score") is None
+        ]
         leader = self._best_attempt(attempts)
         lines: list[str] = []
-        lines.append(f"- total_attempts={len(attempts)} scored={len(scored)} unscored={len(unscored)}")
+        lines.append(
+            f"- total_attempts={len(attempts)} scored={len(scored)} unscored={len(unscored)}"
+        )
         if leader is not None:
             leader_trade_rate = self._attempt_trades_per_month(leader)
             leader_drawdown = self._attempt_max_drawdown_r(leader)
@@ -2249,27 +3060,36 @@ class ResearchController:
                 f"candidate={leader.get('candidate_name')}",
             ]
             if leader_trade_rate is not None:
-                leader_parts.append(f"trades_per_month={self._format_score(leader_trade_rate)}")
+                leader_parts.append(
+                    f"trades_per_month={self._format_score(leader_trade_rate)}"
+                )
             if leader_drawdown is not None:
-                leader_parts.append(f"max_drawdown_r={self._format_score(leader_drawdown)}")
+                leader_parts.append(
+                    f"max_drawdown_r={self._format_score(leader_drawdown)}"
+                )
             lines.append("- " + " ".join(leader_parts))
 
         if len(scored) >= 2 and leader is not None:
             high_trade_scored = [
-                attempt for attempt in scored
-                if attempt is not leader and self._attempt_trades_per_month(attempt) is not None
+                attempt
+                for attempt in scored
+                if attempt is not leader
+                and self._attempt_trades_per_month(attempt) is not None
             ]
             if high_trade_scored:
                 highest_trade = max(
                     high_trade_scored,
-                    key=lambda attempt: float(self._attempt_trades_per_month(attempt) or 0.0),
+                    key=lambda attempt: float(
+                        self._attempt_trades_per_month(attempt) or 0.0
+                    ),
                 )
                 highest_trade_rate = self._attempt_trades_per_month(highest_trade)
                 leader_trade_rate = self._attempt_trades_per_month(leader)
                 if (
                     highest_trade_rate is not None
                     and leader_trade_rate is not None
-                    and highest_trade_rate > max(leader_trade_rate * 2.0, leader_trade_rate + 20.0)
+                    and highest_trade_rate
+                    > max(leader_trade_rate * 2.0, leader_trade_rate + 20.0)
                     and self._score_better(
                         float(leader.get("composite_score")),
                         float(highest_trade.get("composite_score")),
@@ -2283,13 +3103,17 @@ class ResearchController:
                     )
 
         recent_tail = attempts[-6:]
-        recent_unscored = sum(1 for attempt in recent_tail if attempt.get("composite_score") is None)
+        recent_unscored = sum(
+            1 for attempt in recent_tail if attempt.get("composite_score") is None
+        )
         if recent_unscored:
             lines.append(f"- recent_unscored_in_last_6={recent_unscored}")
 
         issues = self._execution_issue_lines(tool_context, current_step_payload, 4)
         if issues:
-            lines.append("- recent execution issues are present; prefer recovery over fresh broadening")
+            lines.append(
+                "- recent execution issues are present; prefer recovery over fresh broadening"
+            )
 
         return "\n".join(lines)
 
@@ -2583,11 +3407,17 @@ class ResearchController:
         )
         return {
             "message": message.strip(),
-            "questions": [str(item).strip() for item in questions[:3]] if isinstance(questions, list) else [],
-            "next_moves": [str(item).strip() for item in next_moves[:3]] if isinstance(next_moves, list) else [],
+            "questions": [str(item).strip() for item in questions[:3]]
+            if isinstance(questions, list)
+            else [],
+            "next_moves": [str(item).strip() for item in next_moves[:3]]
+            if isinstance(next_moves, list)
+            else [],
         }
 
-    def _checkpoint_messages(self, history_messages: list[ChatMessage]) -> list[ChatMessage]:
+    def _checkpoint_messages(
+        self, history_messages: list[ChatMessage]
+    ) -> list[ChatMessage]:
         serialized_history = [
             {"role": message.role, "content": message.content}
             for message in history_messages
@@ -2630,7 +3460,9 @@ class ResearchController:
                 phase="compaction",
                 provider=self.provider,
             ):
-                payload = self.provider.complete_json(self._checkpoint_messages(history_messages))
+                payload = self.provider.complete_json(
+                    self._checkpoint_messages(history_messages)
+                )
         except ProviderError as exc:
             self._trace_runtime(
                 tool_context,
@@ -2655,7 +3487,9 @@ class ResearchController:
             return messages
 
         checkpoint_text = f"{SUMMARY_PREFIX}\n{summary.strip()}"
-        self._checkpoint_path(tool_context).write_text(checkpoint_text, encoding="utf-8")
+        self._checkpoint_path(tool_context).write_text(
+            checkpoint_text, encoding="utf-8"
+        )
         self._trace_runtime(
             tool_context,
             step=step,
@@ -2668,7 +3502,12 @@ class ResearchController:
         recent_tail = history_messages[-keep:] if keep else []
         return [
             ChatMessage(role="system", content=self._system_protocol_text(policy)),
-            ChatMessage(role="user", content=self._run_state_prompt(tool_context, policy, step=step, step_limit=step_limit)),
+            ChatMessage(
+                role="user",
+                content=self._run_state_prompt(
+                    tool_context, policy, step=step, step_limit=step_limit
+                ),
+            ),
             *recent_tail,
         ]
 
@@ -2680,12 +3519,16 @@ class ResearchController:
         step: int,
         step_limit: int,
     ) -> list[ChatMessage]:
-        trigger = self.config.compact_trigger_tokens_for(self.config.llm.explorer_profile)
+        trigger = self.config.compact_trigger_tokens_for(
+            self.config.llm.explorer_profile
+        )
         if trigger <= 0:
             return messages
         if self._approx_message_tokens(messages) < trigger:
             return messages
-        return self._compact_message_history(messages, tool_context, policy, step, step_limit)
+        return self._compact_message_history(
+            messages, tool_context, policy, step, step_limit
+        )
 
     def _allow_finish(
         self,
@@ -2696,16 +3539,28 @@ class ResearchController:
         policy: RunPolicy,
     ) -> tuple[bool, str]:
         if not policy.allow_finish:
-            return False, "Finish is disabled in supervised mode. Keep working until the supervisor stops prompting you."
+            return (
+                False,
+                "Finish is disabled in supervised mode. Keep working until the supervisor stops prompting you.",
+            )
         if not summary.strip():
-            return False, "Do not use finish as a continue marker. Finish is terminal and requires a non-empty summary."
+            return (
+                False,
+                "Do not use finish as a continue marker. Finish is terminal and requires a non-empty summary.",
+            )
         attempts = self._run_attempts(tool_context.run_id)
-        min_attempts_before_finish = min(self.config.research.finish_min_attempts, step_limit)
+        min_attempts_before_finish = min(
+            self.config.research.finish_min_attempts, step_limit
+        )
         phase_info = self._run_phase_info(step, step_limit, policy)
         score_target = self._score_target_snapshot(tool_context)
         if phase_info["name"] != "wrap_up":
             wrap_up_start = phase_info.get("wrap_up_start")
-            wrap_up_text = f"Wrap-up begins at step {wrap_up_start}." if wrap_up_start else "Stay in exploration mode."
+            wrap_up_text = (
+                f"Wrap-up begins at step {wrap_up_start}."
+                if wrap_up_start
+                else "Stay in exploration mode."
+            )
             return (
                 False,
                 (
@@ -2736,6 +3591,7 @@ class ResearchController:
         self.profile_sources = {}
         self.last_created_profile_ref = None
         self.finish_denials = 0
+        self._reset_run_state()
         self.cli.ensure_login()
         tool_context = self.create_run_context()
         self._refresh_progress_artifacts(tool_context)
@@ -2751,7 +3607,9 @@ class ResearchController:
         effective_step_limit = max_steps or self.config.research.max_steps
         if progress_callback:
             initial_phase = self._run_phase_info(1, effective_step_limit, policy)
-            initial_horizon = self._horizon_policy_snapshot(1, effective_step_limit, policy)
+            initial_horizon = self._horizon_policy_snapshot(
+                1, effective_step_limit, policy
+            )
             initial_target = self._score_target_snapshot(tool_context)
             progress_callback(
                 {
@@ -2780,7 +3638,12 @@ class ResearchController:
             return result
         messages: list[ChatMessage] = [
             ChatMessage(role="system", content=self._system_protocol_text(policy)),
-            ChatMessage(role="user", content=self._run_state_prompt(tool_context, policy, step=1, step_limit=effective_step_limit)),
+            ChatMessage(
+                role="user",
+                content=self._run_state_prompt(
+                    tool_context, policy, step=1, step_limit=effective_step_limit
+                ),
+            ),
         ]
 
         step_limit = effective_step_limit
@@ -2795,7 +3658,9 @@ class ResearchController:
             )
             messages[1] = ChatMessage(
                 role="user",
-                content=self._run_state_prompt(tool_context, policy, step=step, step_limit=step_limit),
+                content=self._run_state_prompt(
+                    tool_context, policy, step=step, step_limit=step_limit
+                ),
             )
             if step > 1 and not self._within_operating_window(policy):
                 result = {
@@ -2808,7 +3673,9 @@ class ResearchController:
                 if progress_callback:
                     progress_callback({"event": "window_closed", "result": result})
                 return result
-            messages = self._maybe_compact_messages(messages, tool_context, policy, step, step_limit)
+            messages = self._maybe_compact_messages(
+                messages, tool_context, policy, step, step_limit
+            )
             try:
                 self._trace_runtime(
                     tool_context,
@@ -2899,6 +3766,7 @@ class ResearchController:
                     actions,
                 )
             )
+            validation_errors.extend(self._validate_timeframe_mismatch_block(actions))
             if validation_errors:
                 repaired = self._repair_invalid_response(
                     tool_context,
@@ -2928,6 +3796,9 @@ class ResearchController:
                             actions,
                         )
                     )
+                    validation_errors.extend(
+                        self._validate_timeframe_mismatch_block(actions)
+                    )
             if validation_errors:
                 self._trace_runtime(
                     tool_context,
@@ -2944,7 +3815,9 @@ class ResearchController:
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "phase": self._run_phase_info(step, step_limit, policy)["name"],
                     "horizon_target": horizon_policy["summary"],
-                    "score_target": self._score_target_snapshot(tool_context)["summary"],
+                    "score_target": self._score_target_snapshot(tool_context)[
+                        "summary"
+                    ],
                     "reasoning": reasoning,
                     "actions": actions if isinstance(actions, list) else [],
                     "results": [
@@ -3007,7 +3880,11 @@ class ResearchController:
                 action_count=len(actions) if isinstance(actions, list) else None,
             )
             for action in actions:
-                action_summary = self._history_action_summary(action) if isinstance(action, dict) else str(action)
+                action_summary = (
+                    self._history_action_summary(action)
+                    if isinstance(action, dict)
+                    else str(action)
+                )
                 self._trace_runtime(
                     tool_context,
                     step=step,
@@ -3034,8 +3911,12 @@ class ResearchController:
                     tool_context,
                     step=step,
                     phase="action_execution",
-                    status="action_done" if not result.get("error") else "action_failed",
-                    message="Action completed." if not result.get("error") else "Action failed.",
+                    status="action_done"
+                    if not result.get("error")
+                    else "action_failed",
+                    message="Action completed."
+                    if not result.get("error")
+                    else "Action failed.",
                     action=action_summary,
                     tool=result.get("tool"),
                     ok=result.get("ok"),
@@ -3065,7 +3946,9 @@ class ResearchController:
                     break
                 if result.get("tool") == "finish":
                     proposed_summary = str(result.get("summary", ""))
-                    allow, message = self._allow_finish(tool_context, step, step_limit, proposed_summary, policy)
+                    allow, message = self._allow_finish(
+                        tool_context, step, step_limit, proposed_summary, policy
+                    )
                     if allow:
                         self._trace_runtime(
                             tool_context,
@@ -3104,9 +3987,13 @@ class ResearchController:
                             "score_target": step_payload.get("score_target"),
                         }
                         if supervisor:
-                            guard_payload["supervisor_message"] = supervisor.get("message")
+                            guard_payload["supervisor_message"] = supervisor.get(
+                                "message"
+                            )
                             guard_payload["questions"] = supervisor.get("questions", [])
-                            guard_payload["next_moves"] = supervisor.get("next_moves", [])
+                            guard_payload["next_moves"] = supervisor.get(
+                                "next_moves", []
+                            )
                         step_payload["results"].append(guard_payload)
                     break
 
@@ -3125,7 +4012,9 @@ class ResearchController:
                         phase="advisor",
                         status="injected",
                         message="Advisor guidance injected into conversation.",
-                        advisor_count=len(advisor_result.get("advisors", [])) if isinstance(advisor_result, dict) else None,
+                        advisor_count=len(advisor_result.get("advisors", []))
+                        if isinstance(advisor_result, dict)
+                        else None,
                     )
                     step_payload["results"].append(advisor_result)
 
