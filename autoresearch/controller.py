@@ -91,6 +91,30 @@ Rules:
 - If `profiles create` fails, recover by fixing the profile JSON first. Do not continue to `sensitivity-basket` in the same step.
 """
 
+_RUNTIME_TRACE_STDERR_MODE = "verbose"
+
+
+def set_runtime_trace_stderr_mode(mode: str) -> None:
+    global _RUNTIME_TRACE_STDERR_MODE
+    normalized = str(mode or "").strip().lower()
+    if normalized not in {"verbose", "warnings_only", "off"}:
+        normalized = "verbose"
+    _RUNTIME_TRACE_STDERR_MODE = normalized
+
+
+def _should_emit_runtime_trace_line(*, status: str, level: str | None) -> bool:
+    mode = _RUNTIME_TRACE_STDERR_MODE
+    if mode == "verbose":
+        return True
+    if mode == "off":
+        return False
+    normalized_level = str(level or "").strip().lower()
+    normalized_status = str(status or "").strip().lower()
+    if normalized_level in {"warning", "error"}:
+        return True
+    warning_statuses = {"blocked", "denied", "action_failed", "error", "failed"}
+    return normalized_status in warning_statuses
+
 SUPERVISED_EXTRA_RULES = """
 - You are running in supervised mode. The supervisor, not you, decides when the session stops.
 - Do not use `finish` in supervised mode. Keep working until the controller stops prompting you.
@@ -2003,6 +2027,8 @@ class ResearchController:
                 text = text[:217] + "..."
             parts.append(f"{key}={text}")
         line = " ".join(parts)
+        if not _should_emit_runtime_trace_line(status=status, level=str(fields.get("level") or "")):
+            return
         print(line, file=sys.stderr, flush=True)
 
     def _provider_scope(

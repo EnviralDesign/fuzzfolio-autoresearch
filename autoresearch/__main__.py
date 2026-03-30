@@ -25,7 +25,7 @@ from rich.text import Text
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from autoresearch.config import load_config
-    from autoresearch.controller import ResearchController, RunPolicy
+    from autoresearch.controller import ResearchController, RunPolicy, set_runtime_trace_stderr_mode
     from autoresearch.dashboard import serve_dashboard
     from autoresearch.fuzzfolio import CliError, FuzzfolioCli
     from autoresearch.ledger import (
@@ -54,11 +54,11 @@ if __package__ in {None, ""}:
         render_validation_delta_artifacts,
         render_validation_scatter_artifacts,
     )
-    from autoresearch.provider import ChatMessage, ProviderError, create_provider
+    from autoresearch.provider import ChatMessage, ProviderError, create_provider, set_provider_trace_stderr_mode
     from autoresearch.scoring import build_attempt_score, load_sensitivity_snapshot
 else:
     from .config import load_config
-    from .controller import ResearchController, RunPolicy
+    from .controller import ResearchController, RunPolicy, set_runtime_trace_stderr_mode
     from .dashboard import serve_dashboard
     from .fuzzfolio import CliError, FuzzfolioCli
     from .ledger import (
@@ -87,13 +87,14 @@ else:
         render_validation_delta_artifacts,
         render_validation_scatter_artifacts,
     )
-    from .provider import ChatMessage, ProviderError, create_provider
+    from .provider import ChatMessage, ProviderError, create_provider, set_provider_trace_stderr_mode
     from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 
 console = Console(safe_box=True)
 DISPLAY_CONTEXT: dict[str, Path | None] = {"repo_root": None, "run_dir": None}
 PLAIN_PROGRESS_MODE = False
+PLAIN_PROGRESS_STATE: dict[str, Any] = {"best_score": None, "last_score": None, "run_id": None}
 DISPLAY_ENCODING = getattr(getattr(console, "file", None), "encoding", None) or "utf-8"
 DISPLAY_CHAR_REPLACEMENTS = str.maketrans(
     {
@@ -347,11 +348,20 @@ def _set_plain_progress_mode(enabled: bool) -> None:
     PLAIN_PROGRESS_MODE = bool(enabled)
 
 
+def _set_trace_console_mode(*, plain_progress: bool, as_json: bool) -> None:
+    if plain_progress and not as_json:
+        set_runtime_trace_stderr_mode("warnings_only")
+        set_provider_trace_stderr_mode("warnings_only")
+        return
+    set_runtime_trace_stderr_mode("verbose")
+    set_provider_trace_stderr_mode("verbose")
+
+
 def _plain_separator(label: str | None = None) -> str:
-    width = 78
+    width = 110
     if not label:
         return "-" * width
-    compact = _short_text(label, 28)
+    compact = _short_text(label, 96)
     decorated = f"---- {compact} "
     return decorated + ("-" * max(0, width - len(decorated)))
 
@@ -368,6 +378,9 @@ def _safe_render(console_renderer: Any, plain_renderer: Any) -> None:
 
 
 def _render_run_header_plain(event: dict[str, object]) -> None:
+    PLAIN_PROGRESS_STATE["best_score"] = None
+    PLAIN_PROGRESS_STATE["last_score"] = None
+    PLAIN_PROGRESS_STATE["run_id"] = event.get("run_id")
     _write_plain_line(_plain_separator("Autoresearch Run"))
     _write_plain_line(
         f"Run {event.get('run_id')} | mode={event.get('mode') or 'run'} | steps={event.get('max_steps')} | dir={_display_path(str(event.get('run_dir')))}"
@@ -380,19 +393,167 @@ def _render_run_header_plain(event: dict[str, object]) -> None:
         _write_plain_line(f"Target: {score_target}")
 
 
+def _coerce_score(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text or text.lower() in {"none", "nan", "n/a"}:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _extract_result_score(result: dict[str, object]) -> float | None:
+    auto_log = result.get("auto_log")
+    if isinstance(auto_log, dict):
+        status = str(auto_log.get("status") or "").strip().lower()
+        if status == "logged":
+            score = _coerce_score(auto_log.get("composite_score"))
+            if score is not None:
+                return score
+        if status == "existing":
+            attempt = auto_log.get("attempt")
+            if isinstance(attempt, dict):
+                score = _coerce_score(attempt.get("composite_score"))
+                if score is not None:
+                    return score
+    payload = result.get("result")
+    if isinstance(payload, dict):
+        score = _coerce_score(payload.get("composite_score"))
+        if score is not None:
+            return score
+    return None
+
+
+def _warning_count(step_payload: dict[str, Any]) -> int:
+    count = 0
+    results = step_payload.get("results")
+    if not isinstance(results, list):
+        return count
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        tool = str(result.get("tool", ""))
+        if result.get("error"):
+            count += 1
+            continue
+        if tool == "run_cli" and not bool(result.get("ok", True)):
+            count += 1
+            continue
+        if tool in {"yield_guard", "step_guard", "response_guard"}:
+            count += 1
+    return count
+
+
+def _step_focus_text(step_payload: dict[str, Any]) -> str:
+    reasoning = " ".join(str(step_payload.get("reasoning", "")).split()).strip()
+    if reasoning:
+        sentence = reasoning.split(". ", 1)[0].strip()
+        if sentence:
+            if not sentence.endswith(".") and len(sentence) < len(reasoning):
+                sentence += "."
+            return _short_text(sentence, 180)
+        return _short_text(reasoning, 180)
+    actions = step_payload.get("actions")
+    if isinstance(actions, list) and actions:
+        first = actions[0]
+        if isinstance(first, dict):
+            return _short_text(_summarize_action(first), 180)
+    return ""
+
+
+def _step_header_label(step_payload: dict[str, Any]) -> str:
+    results = step_payload.get("results")
+    if isinstance(results, list):
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            score = _extract_result_score(result)
+            if score is None:
+                continue
+            PLAIN_PROGRESS_STATE["last_score"] = score
+            best_score = _coerce_score(PLAIN_PROGRESS_STATE.get("best_score"))
+            if best_score is None or score > best_score:
+                PLAIN_PROGRESS_STATE["best_score"] = score
+    best_score = _coerce_score(PLAIN_PROGRESS_STATE.get("best_score"))
+    last_score = _coerce_score(PLAIN_PROGRESS_STATE.get("last_score"))
+    action_count = len(step_payload.get("actions", [])) if isinstance(step_payload.get("actions"), list) else 0
+    warning_count = _warning_count(step_payload)
+    parts = [f"Step {step_payload.get('step')}"]
+    parts.append(f"best={best_score:.4f}" if best_score is not None else "best=n/a")
+    if last_score is not None:
+        parts.append(f"last={last_score:.4f}")
+    parts.append(f"actions={action_count}")
+    if warning_count:
+        parts.append(f"warnings={warning_count}")
+    return " | ".join(parts)
+
+
+def _plain_result_details(result: dict[str, object]) -> list[str]:
+    details: list[str] = []
+    tool = str(result.get("tool", ""))
+    error = result.get("error")
+    if error:
+        details.append(f"error: {str(error)}")
+    payload = result.get("result")
+    if isinstance(payload, dict):
+        stderr = payload.get("stderr")
+        if isinstance(stderr, str) and stderr.strip():
+            for line in stderr.splitlines():
+                text = line.strip()
+                if text:
+                    details.append(f"stderr: {text}")
+        if (error or (tool == "run_cli" and not bool(result.get('ok', True)))) and isinstance(payload.get("stdout"), str):
+            stdout = str(payload.get("stdout")).strip()
+            if stdout:
+                for line in stdout.splitlines():
+                    text = line.strip()
+                    if text:
+                        details.append(f"stdout: {text}")
+    if tool == "yield_guard":
+        message = str(result.get("supervisor_message") or result.get("message") or "").strip()
+        if message:
+            details.append(f"warning: {message}")
+        questions = result.get("questions")
+        if isinstance(questions, list):
+            for item in questions:
+                text = str(item).strip()
+                if text:
+                    details.append(f"question: {text}")
+        next_moves = result.get("next_moves")
+        if isinstance(next_moves, list):
+            for item in next_moves:
+                text = str(item).strip()
+                if text:
+                    details.append(f"next: {text}")
+    if tool in {"step_guard", "response_guard"}:
+        message = str(result.get("message") or result.get("error") or "").strip()
+        if message:
+            details.append(f"warning: {message}")
+    return details
+
+
 def _render_step_plain(step_payload: dict[str, Any]) -> None:
-    _write_plain_line(_plain_separator(f"Step {step_payload.get('step')}"))
-    _write_plain_line(f"Step {step_payload.get('step')}: {_short_text(str(step_payload.get('reasoning', '')), 420)}")
+    _write_plain_line(_plain_separator(_step_header_label(step_payload)))
+    focus = _step_focus_text(step_payload)
+    if focus:
+        _write_plain_line(f"focus: {focus}")
     actions = step_payload.get("actions")
     if isinstance(actions, list):
         for action in actions:
             if isinstance(action, dict):
-                _write_plain_line(f"  plan: {_summarize_action(action)}")
+                _write_plain_line(f"plan: {_summarize_action(action)}")
     results = step_payload.get("results")
     if isinstance(results, list):
         for result in results:
             if isinstance(result, dict):
-                _write_plain_line(f"  result: {_summarize_result(result)}")
+                _write_plain_line(f"result: {_summarize_result(result)}")
+                for detail in _plain_result_details(result):
+                    _write_plain_line(detail)
 
 
 def _render_run_footer_plain(result: dict[str, object]) -> None:
@@ -1296,6 +1457,7 @@ def cmd_run(
     plain_progress: bool,
 ) -> int:
     _set_plain_progress_mode(plain_progress and not as_json)
+    _set_trace_console_mode(plain_progress=plain_progress, as_json=as_json)
     config = _load_runtime_config(
         explorer_profile=explorer_profile,
         supervisor_profile=supervisor_profile,
@@ -1332,6 +1494,7 @@ def cmd_supervise(
     plain_progress: bool,
 ) -> int:
     _set_plain_progress_mode(plain_progress and not as_json)
+    _set_trace_console_mode(plain_progress=plain_progress, as_json=as_json)
     config = _load_runtime_config(
         explorer_profile=explorer_profile,
         supervisor_profile=supervisor_profile,

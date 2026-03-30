@@ -38,6 +38,37 @@ class ProviderTraceContext:
     model: str | None = None
 
 
+_PROVIDER_TRACE_STDERR_MODE = "verbose"
+
+
+def set_provider_trace_stderr_mode(mode: str) -> None:
+    global _PROVIDER_TRACE_STDERR_MODE
+    normalized = str(mode or "").strip().lower()
+    if normalized not in {"verbose", "warnings_only", "off"}:
+        normalized = "verbose"
+    _PROVIDER_TRACE_STDERR_MODE = normalized
+
+
+def _should_emit_provider_trace_event(event: str) -> bool:
+    mode = _PROVIDER_TRACE_STDERR_MODE
+    if mode == "verbose":
+        return True
+    if mode == "off":
+        return False
+    lowered = str(event or "").strip().lower()
+    if not lowered:
+        return False
+    warning_markers = (
+        "exception",
+        "retry",
+        "failure",
+        "failed",
+        "rate_limit",
+        "quota",
+    )
+    return any(marker in lowered for marker in warning_markers)
+
+
 JSON_REPAIR_PROMPT = """Your previous assistant response was invalid or incomplete JSON.
 
 Return one complete corrected JSON object only.
@@ -120,6 +151,8 @@ def provider_trace_scope(
 
 
 def _trace_provider_event(event: str, **fields: Any) -> None:
+    if not _should_emit_provider_trace_event(event):
+        return
     context = _PROVIDER_TRACE_CONTEXT.get()
     parts = [f"provider_trace event={event}"]
     if context is not None:
