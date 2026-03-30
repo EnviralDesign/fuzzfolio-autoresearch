@@ -71,6 +71,15 @@
       "temperature": 0.2,
       "max_tokens": 8192,
       "timeout_seconds": 180
+    },
+    "minimax-27-sample": {
+      "type": "minimax",
+      "api_base": "https://api.minimax.io/v1",
+      "api_key_ref": "minimax_main",
+      "model": "MiniMax-M2.7",
+      "temperature": 0.2,
+      "max_tokens": 8192,
+      "timeout_seconds": 180
     }
   },
   "fuzzfolio": {

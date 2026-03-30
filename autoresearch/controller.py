@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import re
 import shlex
 from difflib import get_close_matches
@@ -24,7 +25,7 @@ from .ledger import (
     write_run_metadata,
 )
 from .plotting import compute_frontier, render_progress_artifacts
-from .provider import ChatMessage, ProviderError, create_provider
+from .provider import ChatMessage, ProviderError, create_provider, provider_trace_scope
 from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 
@@ -181,6 +182,8 @@ Hard requirements:
 - Do not omit required fields.
 - Return raw JSON only.
 """
+
+
 
 
 @dataclass
@@ -1547,6 +1550,8 @@ class ResearchController:
 
     def _repair_invalid_response(
         self,
+        tool_context: ToolContext,
+        step: int,
         messages: list[ChatMessage],
         reasoning: str,
         actions: list[Any],
@@ -1577,19 +1582,60 @@ class ResearchController:
                 ),
             ),
         ]
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="response_repair",
+            status="start",
+            message="Repairing invalid controller response.",
+            error_count=len(errors),
+        )
         try:
-            repaired = self.provider.complete_json(repair_messages)
+            with self._provider_scope(
+                tool_context=tool_context,
+                step=step,
+                label="response_repair",
+                phase="response_repair",
+                provider=self.provider,
+            ):
+                repaired = self.provider.complete_json(repair_messages)
             normalized = self._normalize_model_response(repaired)
-        except (ProviderError, RuntimeError, TypeError, ValueError):
+        except (ProviderError, RuntimeError, TypeError, ValueError) as exc:
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="response_repair",
+                status="failed",
+                message="Response repair failed.",
+                error=exc,
+            )
             return None
         repaired_actions = normalized.get("actions")
         repaired_errors = self._validate_actions(repaired_actions)
         if repaired_errors:
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="response_repair",
+                status="rejected",
+                message="Repaired response still failed validation.",
+                error_count=len(repaired_errors),
+            )
             return None
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="response_repair",
+            status="ok",
+            message="Response repair succeeded.",
+            action_count=len(repaired_actions) if isinstance(repaired_actions, list) else None,
+        )
         return normalized
 
     def _repair_invalid_payload_shape(
         self,
+        tool_context: ToolContext,
+        step: int,
         messages: list[ChatMessage],
         payload: Any,
         error: str,
@@ -1609,15 +1655,54 @@ class ResearchController:
                 ),
             ),
         ]
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="payload_shape_repair",
+            status="start",
+            message="Repairing invalid top-level payload shape.",
+            error=error,
+        )
         try:
-            repaired = self.provider.complete_json(repair_messages)
+            with self._provider_scope(
+                tool_context=tool_context,
+                step=step,
+                label="payload_shape_repair",
+                phase="payload_shape_repair",
+                provider=self.provider,
+            ):
+                repaired = self.provider.complete_json(repair_messages)
             normalized = self._normalize_model_response(repaired)
-        except (ProviderError, RuntimeError):
+        except (ProviderError, RuntimeError) as exc:
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="payload_shape_repair",
+                status="failed",
+                message="Payload-shape repair failed.",
+                error=exc,
+            )
             return None
         repaired_actions = normalized.get("actions")
         repaired_errors = self._validate_actions(repaired_actions)
         if repaired_errors:
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="payload_shape_repair",
+                status="rejected",
+                message="Payload-shape repair still failed validation.",
+                error_count=len(repaired_errors),
+            )
             return None
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="payload_shape_repair",
+            status="ok",
+            message="Payload-shape repair succeeded.",
+            action_count=len(repaired_actions) if isinstance(repaired_actions, list) else None,
+        )
         return normalized
 
     def _extract_profile_ref(self, payload: dict[str, Any]) -> str | None:
@@ -1863,6 +1948,81 @@ class ResearchController:
         path = self._step_log_path(tool_context)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+    def _runtime_state_path(self, tool_context: ToolContext) -> Path:
+        return tool_context.run_dir / "runtime-state.json"
+
+    def _runtime_trace_path(self, tool_context: ToolContext) -> Path:
+        return tool_context.run_dir / "runtime-trace.jsonl"
+
+    def _trace_runtime(
+        self,
+        tool_context: ToolContext,
+        *,
+        step: int | None,
+        phase: str,
+        status: str,
+        message: str,
+        level: str = "info",
+        **fields: Any,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "run_id": tool_context.run_id,
+            "step": step,
+            "phase": phase,
+            "status": status,
+            "message": message,
+        }
+        for key, value in fields.items():
+            if value is not None:
+                payload[key] = value
+        trace_path = self._runtime_trace_path(tool_context)
+        with trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+        self._runtime_state_path(tool_context).write_text(
+            json.dumps(payload, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
+        parts = [
+            "run_trace",
+            f"run_id={tool_context.run_id}",
+            f"phase={phase}",
+            f"status={status}",
+        ]
+        if step is not None:
+            parts.append(f"step={step}")
+        parts.append(f"message={message}")
+        for key, value in fields.items():
+            if value is None:
+                continue
+            text = str(value).replace("\n", " ").strip()
+            if not text:
+                continue
+            if len(text) > 220:
+                text = text[:217] + "..."
+            parts.append(f"{key}={text}")
+        line = " ".join(parts)
+        print(line, file=sys.stderr, flush=True)
+
+    def _provider_scope(
+        self,
+        *,
+        tool_context: ToolContext,
+        step: int,
+        label: str,
+        phase: str,
+        provider: Any,
+    ):
+        provider_config = getattr(provider, "config", None)
+        return provider_trace_scope(
+            label=label,
+            run_id=tool_context.run_id,
+            step=step,
+            phase=phase,
+            provider_type=getattr(provider_config, "provider_type", None),
+            model=getattr(provider_config, "model", None),
+        )
 
     def _load_recent_step_payloads(self, tool_context: ToolContext, limit: int) -> list[dict[str, Any]]:
         path = self._step_log_path(tool_context)
@@ -2226,20 +2386,63 @@ class ResearchController:
         )
         advisors: list[dict[str, Any]] = []
         for advisor_label, profile_name, provider in self.advisor_providers:
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="advisor",
+                status="start",
+                message="Requesting periodic advisor guidance.",
+                advisor=advisor_label,
+                profile=profile_name,
+            )
             try:
-                payload = provider.complete_json(
-                    [
-                        ChatMessage(role="system", content=ADVISOR_PROMPT),
-                        ChatMessage(role="user", content=packet),
-                    ]
+                with self._provider_scope(
+                    tool_context=tool_context,
+                    step=step,
+                    label=f"advisor:{advisor_label}",
+                    phase="advisor",
+                    provider=provider,
+                ):
+                    payload = provider.complete_json(
+                        [
+                            ChatMessage(role="system", content=ADVISOR_PROMPT),
+                            ChatMessage(role="user", content=packet),
+                        ]
+                    )
+            except ProviderError as exc:
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="advisor",
+                    status="failed",
+                    message="Advisor request failed.",
+                    advisor=advisor_label,
+                    error=exc,
+                    level="warning",
                 )
-            except ProviderError:
                 continue
             message = str(payload.get("message") or "").strip()
             next_moves = payload.get("next_moves")
             risks = payload.get("risks")
             if not message:
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="advisor",
+                    status="empty",
+                    message="Advisor returned no usable message.",
+                    advisor=advisor_label,
+                    level="warning",
+                )
                 continue
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="advisor",
+                status="ok",
+                message="Advisor guidance received.",
+                advisor=advisor_label,
+            )
             advisors.append(
                 {
                     "label": advisor_label,
@@ -2300,20 +2503,58 @@ class ResearchController:
             f"Recent run attempts:\n{chr(10).join(attempt_lines) if attempt_lines else 'No attempts yet.'}\n\n"
             f"Recent step window:\n{self._recent_step_window_text(tool_context, current_step_payload)}\n"
         )
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="supervisor",
+            status="start",
+            message="Requesting supervisor guidance after finish denial.",
+        )
         try:
-            payload = self.supervisor_provider.complete_json(
-                [
-                    ChatMessage(role="system", content=SUPERVISOR_PROMPT),
-                    ChatMessage(role="user", content=prompt),
-                ]
+            with self._provider_scope(
+                tool_context=tool_context,
+                step=step,
+                label="supervisor",
+                phase="supervisor",
+                provider=self.supervisor_provider,
+            ):
+                payload = self.supervisor_provider.complete_json(
+                    [
+                        ChatMessage(role="system", content=SUPERVISOR_PROMPT),
+                        ChatMessage(role="user", content=prompt),
+                    ]
+                )
+        except ProviderError as exc:
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="supervisor",
+                status="failed",
+                message="Supervisor request failed.",
+                error=exc,
+                level="warning",
             )
-        except ProviderError:
             return None
         message = payload.get("message")
         questions = payload.get("questions")
         next_moves = payload.get("next_moves")
         if not isinstance(message, str) or not message.strip():
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="supervisor",
+                status="empty",
+                message="Supervisor returned no usable message.",
+                level="warning",
+            )
             return None
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="supervisor",
+            status="ok",
+            message="Supervisor guidance received.",
+        )
         return {
             "message": message.strip(),
             "questions": [str(item).strip() for item in questions[:3]] if isinstance(questions, list) else [],
@@ -2347,16 +2588,55 @@ class ResearchController:
         history_messages = messages[2:]
         if not history_messages:
             return messages
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="compaction",
+            status="start",
+            message="Compacting message history.",
+            history_messages=len(history_messages),
+        )
         try:
-            payload = self.provider.complete_json(self._checkpoint_messages(history_messages))
-        except ProviderError:
+            with self._provider_scope(
+                tool_context=tool_context,
+                step=step,
+                label="compaction",
+                phase="compaction",
+                provider=self.provider,
+            ):
+                payload = self.provider.complete_json(self._checkpoint_messages(history_messages))
+        except ProviderError as exc:
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="compaction",
+                status="failed",
+                message="Compaction request failed; keeping full message history.",
+                error=exc,
+                level="warning",
+            )
             return messages
         summary = payload.get("checkpoint_summary")
         if not isinstance(summary, str) or not summary.strip():
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="compaction",
+                status="empty",
+                message="Compaction returned no summary; keeping full message history.",
+                level="warning",
+            )
             return messages
 
         checkpoint_text = f"{SUMMARY_PREFIX}\n{summary.strip()}"
         self._checkpoint_path(tool_context).write_text(checkpoint_text, encoding="utf-8")
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="compaction",
+            status="ok",
+            message="Compaction succeeded.",
+        )
 
         keep = max(0, self.config.research.compact_keep_recent_messages)
         recent_tail = history_messages[-keep:] if keep else []
@@ -2433,6 +2713,15 @@ class ResearchController:
         self.cli.ensure_login()
         tool_context = self.create_run_context()
         self._refresh_progress_artifacts(tool_context)
+        self._trace_runtime(
+            tool_context,
+            step=0,
+            phase="run",
+            status="started",
+            message="Research run started.",
+            explorer_profile=self.config.llm.explorer_profile,
+            supervisor_profile=self.config.llm.supervisor_profile,
+        )
         effective_step_limit = max_steps or self.config.research.max_steps
         if progress_callback:
             initial_phase = self._run_phase_info(1, effective_step_limit, policy)
@@ -2471,6 +2760,13 @@ class ResearchController:
         step_limit = effective_step_limit
         for step in range(1, step_limit + 1):
             self.last_created_profile_ref = None
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="step",
+                status="start",
+                message="Starting controller step.",
+            )
             messages[1] = ChatMessage(
                 role="user",
                 content=self._run_state_prompt(tool_context, policy, step=step, step_limit=step_limit),
@@ -2488,19 +2784,75 @@ class ResearchController:
                 return result
             messages = self._maybe_compact_messages(messages, tool_context, policy, step, step_limit)
             try:
-                raw_response = self.provider.complete_json(messages)
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="explorer_provider",
+                    status="waiting",
+                    message="Waiting for explorer provider response.",
+                    message_count=len(messages),
+                )
+                with self._provider_scope(
+                    tool_context=tool_context,
+                    step=step,
+                    label="explorer",
+                    phase="explorer_provider",
+                    provider=self.provider,
+                ):
+                    raw_response = self.provider.complete_json(messages)
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="explorer_provider",
+                    status="ok",
+                    message="Explorer provider response received.",
+                )
                 try:
+                    self._trace_runtime(
+                        tool_context,
+                        step=step,
+                        phase="explorer_normalize",
+                        status="start",
+                        message="Normalizing explorer payload.",
+                    )
                     response = self._normalize_model_response(raw_response)
+                    self._trace_runtime(
+                        tool_context,
+                        step=step,
+                        phase="explorer_normalize",
+                        status="ok",
+                        message="Explorer payload normalized.",
+                    )
                 except RuntimeError as exc:
                     repaired_shape = self._repair_invalid_payload_shape(
+                        tool_context,
+                        step,
                         messages,
                         raw_response,
                         str(exc),
                     )
                     if repaired_shape is None:
+                        self._trace_runtime(
+                            tool_context,
+                            step=step,
+                            phase="explorer_normalize",
+                            status="failed",
+                            message="Explorer payload normalization failed and shape repair did not recover it.",
+                            error=exc,
+                            level="error",
+                        )
                         raise
                     response = repaired_shape
             except (ProviderError, CliError) as exc:
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="explorer_provider",
+                    status="failed",
+                    message="Explorer provider call failed.",
+                    error=exc,
+                    level="error",
+                )
                 raise RuntimeError(str(exc)) from exc
 
             actions = response.get("actions")
@@ -2522,7 +2874,14 @@ class ResearchController:
                 )
             )
             if validation_errors:
-                repaired = self._repair_invalid_response(messages, reasoning, actions if isinstance(actions, list) else [], validation_errors)
+                repaired = self._repair_invalid_response(
+                    tool_context,
+                    step,
+                    messages,
+                    reasoning,
+                    actions if isinstance(actions, list) else [],
+                    validation_errors,
+                )
                 if repaired is not None:
                     response = repaired
                     actions = response.get("actions")
@@ -2544,6 +2903,15 @@ class ResearchController:
                         )
                     )
             if validation_errors:
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="response_guard",
+                    status="blocked",
+                    message="Controller rejected model response after validation.",
+                    error_count=len(validation_errors),
+                    level="warning",
+                )
                 horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
                 step_payload = {
                     "step": step,
@@ -2604,7 +2972,24 @@ class ResearchController:
             finished = False
             finish_summary = ""
             advisor_result: dict[str, Any] | None = None
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="action_execution",
+                status="start",
+                message="Executing planned actions.",
+                action_count=len(actions) if isinstance(actions, list) else None,
+            )
             for action in actions:
+                action_summary = self._history_action_summary(action) if isinstance(action, dict) else str(action)
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="action_execution",
+                    status="action_start",
+                    message="Starting action.",
+                    action=action_summary,
+                )
                 try:
                     result = self._execute_action(
                         tool_context,
@@ -2619,11 +3004,32 @@ class ResearchController:
                         "ok": False,
                         "error": str(exc),
                     }
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="action_execution",
+                    status="action_done" if not result.get("error") else "action_failed",
+                    message="Action completed." if not result.get("error") else "Action failed.",
+                    action=action_summary,
+                    tool=result.get("tool"),
+                    ok=result.get("ok"),
+                    error=result.get("error"),
+                    level="warning" if result.get("error") else "info",
+                )
                 step_payload["results"].append(result)
                 hard_failure = bool(result.get("error"))
                 if result.get("tool") == "run_cli" and not bool(result.get("ok", True)):
                     hard_failure = True
                 if hard_failure:
+                    self._trace_runtime(
+                        tool_context,
+                        step=step,
+                        phase="step_guard",
+                        status="blocked",
+                        message="Stopped executing remaining actions after first failed action.",
+                        action=action_summary,
+                        level="warning",
+                    )
                     step_payload["results"].append(
                         {
                             "tool": "step_guard",
@@ -2635,9 +3041,24 @@ class ResearchController:
                     proposed_summary = str(result.get("summary", ""))
                     allow, message = self._allow_finish(tool_context, step, step_limit, proposed_summary, policy)
                     if allow:
+                        self._trace_runtime(
+                            tool_context,
+                            step=step,
+                            phase="finish",
+                            status="accepted",
+                            message="Finish accepted for run.",
+                        )
                         finished = True
                         finish_summary = proposed_summary
                     else:
+                        self._trace_runtime(
+                            tool_context,
+                            step=step,
+                            phase="finish",
+                            status="denied",
+                            message="Finish denied; requesting supervisor guidance.",
+                            level="warning",
+                        )
                         self.finish_denials += 1
                         supervisor = self._supervisor_guidance(
                             tool_context,
@@ -2672,9 +3093,25 @@ class ResearchController:
                     step_payload,
                 )
                 if advisor_result is not None:
+                    self._trace_runtime(
+                        tool_context,
+                        step=step,
+                        phase="advisor",
+                        status="injected",
+                        message="Advisor guidance injected into conversation.",
+                        advisor_count=len(advisor_result.get("advisors", [])) if isinstance(advisor_result, dict) else None,
+                    )
                     step_payload["results"].append(advisor_result)
 
             self._append_step_log(tool_context, step_payload)
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="step",
+                status="completed",
+                message="Controller step completed.",
+                result_count=len(step_payload["results"]),
+            )
             if progress_callback:
                 progress_callback(
                     {
@@ -2727,6 +3164,13 @@ class ResearchController:
                     )
 
             if finished:
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="run",
+                    status="finished",
+                    message="Research run finished normally.",
+                )
                 return {
                     "status": "finished",
                     "run_id": tool_context.run_id,
@@ -2736,6 +3180,14 @@ class ResearchController:
                     "summary": finish_summary,
                 }
 
+        self._trace_runtime(
+            tool_context,
+            step=step_limit,
+            phase="run",
+            status="step_limit_reached",
+            message="Research run hit the step limit.",
+            level="warning",
+        )
         return {
             "status": "step_limit_reached",
             "run_id": tool_context.run_id,

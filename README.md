@@ -61,8 +61,9 @@ Keep both untracked. `.agentsecrets` is the place for per-profile provider keys 
 uv run autoresearch doctor
 uv run autoresearch test-providers
 
-Supported provider types include `openai`, `xai`, `groq`, `openrouter`, `codex`, `openai_compatible`, and `lmstudio`.
+Supported provider types include `openai`, `xai`, `groq`, `openrouter`, `codex`, `openai_compatible`, `lmstudio`, and `minimax`.
 LM Studio's OpenAI-compatible local server defaults to `http://localhost:1234/v1`, and authentication is off by default unless you enable "Require Authentication" in LM Studio's server settings.
+MiniMax defaults to `https://api.minimax.io/v1` with `MINIMAX_API_KEY`; the standard coding/token-plan model name is `MiniMax-M2.7`.
 uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
 uv run autoresearch stop-all-runs
@@ -211,6 +212,7 @@ The current provider types are:
 - `xai`
 - `groq`
 - `openrouter`
+- `minimax`
 - `openai_compatible`
 
 `groq` is a first-class direct provider that defaults to:
@@ -220,6 +222,28 @@ The current provider types are:
 - `transport = "chat_completions"`
 
 That is the preferred path when you want Groq-hosted OSS models without going through OpenRouter routing.
+
+`minimax` is a first-class direct provider that defaults to:
+
+- `api_base = "https://api.minimax.io/v1"`
+- `api_key_env = "MINIMAX_API_KEY"`
+- `transport = "chat_completions"`
+
+Example:
+
+```json
+{
+  "providers": {
+    "minimax-27": {
+      "type": "minimax",
+      "api_key_ref": "minimax_main",
+      "model": "MiniMax-M2.7"
+    }
+  }
+}
+```
+
+If your MiniMax token plan exposes the higher-throughput variant, you can swap the model name to `MiniMax-M2.7-highspeed` without changing the provider type.
 
 `codex` is a first-class local managed-auth provider. It defaults to:
 

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import contextvars
 import subprocess
 import json
 import shutil
+import sys
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -23,6 +26,16 @@ class ProviderError(RuntimeError):
 class ChatMessage:
     role: str
     content: str
+
+
+@dataclass
+class ProviderTraceContext:
+    label: str
+    run_id: str | None = None
+    step: int | None = None
+    phase: str | None = None
+    provider_type: str | None = None
+    model: str | None = None
 
 
 JSON_REPAIR_PROMPT = """Your previous assistant response was invalid or incomplete JSON.
@@ -72,6 +85,65 @@ CODEX_OUTPUT_SCHEMA: dict[str, Any] = {
     "required": ["response_json"],
     "additionalProperties": False,
 }
+
+
+_PROVIDER_TRACE_CONTEXT: contextvars.ContextVar[ProviderTraceContext | None] = contextvars.ContextVar(
+    "provider_trace_context",
+    default=None,
+)
+
+
+@contextmanager
+def provider_trace_scope(
+    *,
+    label: str,
+    run_id: str | None = None,
+    step: int | None = None,
+    phase: str | None = None,
+    provider_type: str | None = None,
+    model: str | None = None,
+):
+    token = _PROVIDER_TRACE_CONTEXT.set(
+        ProviderTraceContext(
+            label=label,
+            run_id=run_id,
+            step=step,
+            phase=phase,
+            provider_type=provider_type,
+            model=model,
+        )
+    )
+    try:
+        yield
+    finally:
+        _PROVIDER_TRACE_CONTEXT.reset(token)
+
+
+def _trace_provider_event(event: str, **fields: Any) -> None:
+    context = _PROVIDER_TRACE_CONTEXT.get()
+    parts = [f"provider_trace event={event}"]
+    if context is not None:
+        parts.append(f"label={context.label}")
+        if context.run_id:
+            parts.append(f"run_id={context.run_id}")
+        if context.step is not None:
+            parts.append(f"step={context.step}")
+        if context.phase:
+            parts.append(f"phase={context.phase}")
+        if context.provider_type:
+            parts.append(f"provider_type={context.provider_type}")
+        if context.model:
+            parts.append(f"model={context.model}")
+    for key, value in fields.items():
+        if value is None:
+            continue
+        text = str(value).replace("\n", " ").strip()
+        if not text:
+            continue
+        if len(text) > 240:
+            text = text[:237] + "..."
+        parts.append(f"{key}={text}")
+    print(" ".join(parts), file=sys.stderr, flush=True)
 
 
 def _escape_invalid_json_backslashes(text: str) -> str:
@@ -329,7 +401,15 @@ def _post_json_with_retry(
 ) -> dict[str, Any]:
     rate_limit_retries = 0
     transient_retries = 0
+    request_attempt = 0
     while True:
+        request_attempt += 1
+        _trace_provider_event(
+            "http_request_start",
+            attempt=request_attempt,
+            timeout_seconds=timeout_seconds,
+            url=url,
+        )
         try:
             response = session.post(
                 url,
@@ -339,11 +419,24 @@ def _post_json_with_retry(
             )
         except requests.RequestException as exc:
             transient_retries += 1
+            _trace_provider_event(
+                "http_request_exception",
+                attempt=request_attempt,
+                transient_retries=transient_retries,
+                error=exc,
+            )
             if transient_retries > DEFAULT_TRANSIENT_MAX_RETRIES:
                 raise ProviderError(
                     f"Provider request failed after {transient_retries} transient retries: {exc}"
                 ) from exc
-            time.sleep(_transient_delay_seconds(config, transient_retries - 1, None))
+            delay_seconds = _transient_delay_seconds(config, transient_retries - 1, None)
+            _trace_provider_event(
+                "http_request_retry_scheduled",
+                attempt=request_attempt,
+                retry_kind="transient",
+                delay_seconds=delay_seconds,
+            )
+            time.sleep(delay_seconds)
             continue
 
         classification = _classify_retryable_response(response)
@@ -351,23 +444,59 @@ def _post_json_with_retry(
             retry_kind, retry_after = classification
             if retry_kind == "rate_limit":
                 rate_limit_retries += 1
+                _trace_provider_event(
+                    "http_response_retryable",
+                    attempt=request_attempt,
+                    retry_kind=retry_kind,
+                    status_code=response.status_code,
+                    rate_limit_retries=rate_limit_retries,
+                    retry_after=retry_after,
+                )
                 if rate_limit_retries > _configured_rate_limit_max_retries(config):
                     raise ProviderError(
                         f"Provider remained rate-limited after {rate_limit_retries} retries: "
                         f"{response.status_code} {response.text[:800]}"
                     )
-                time.sleep(_rate_limit_delay_seconds(config, rate_limit_retries - 1, retry_after))
+                delay_seconds = _rate_limit_delay_seconds(config, rate_limit_retries - 1, retry_after)
+                _trace_provider_event(
+                    "http_request_retry_scheduled",
+                    attempt=request_attempt,
+                    retry_kind=retry_kind,
+                    delay_seconds=delay_seconds,
+                )
+                time.sleep(delay_seconds)
                 continue
             transient_retries += 1
+            _trace_provider_event(
+                "http_response_retryable",
+                attempt=request_attempt,
+                retry_kind=retry_kind,
+                status_code=response.status_code,
+                transient_retries=transient_retries,
+                retry_after=retry_after,
+            )
             if transient_retries > DEFAULT_TRANSIENT_MAX_RETRIES:
                 raise ProviderError(
                     f"Provider request kept failing transiently after {transient_retries} retries: "
                     f"{response.status_code} {response.text[:800]}"
                 )
-            time.sleep(_transient_delay_seconds(config, transient_retries - 1, retry_after))
+            delay_seconds = _transient_delay_seconds(config, transient_retries - 1, retry_after)
+            _trace_provider_event(
+                "http_request_retry_scheduled",
+                attempt=request_attempt,
+                retry_kind=retry_kind,
+                delay_seconds=delay_seconds,
+            )
+            time.sleep(delay_seconds)
             continue
 
         if response.status_code >= 400:
+            _trace_provider_event(
+                "http_response_error",
+                attempt=request_attempt,
+                status_code=response.status_code,
+                body_preview=response.text[:240] if response.text else "",
+            )
             if response.status_code == 400:
                 try:
                     error_payload = response.json().get("error")
@@ -394,21 +523,54 @@ def _post_json_with_retry(
             retry_kind, retry_after = payload_classification
             if retry_kind == "rate_limit":
                 rate_limit_retries += 1
+                _trace_provider_event(
+                    "http_payload_retryable",
+                    attempt=request_attempt,
+                    retry_kind=retry_kind,
+                    rate_limit_retries=rate_limit_retries,
+                    retry_after=retry_after,
+                )
                 if rate_limit_retries > _configured_rate_limit_max_retries(config):
                     raise ProviderError(
                         f"Provider remained rate-limited after {rate_limit_retries} retries: "
                         f"{json.dumps(payload, ensure_ascii=True)[:800]}"
                     )
-                time.sleep(_rate_limit_delay_seconds(config, rate_limit_retries - 1, retry_after))
+                delay_seconds = _rate_limit_delay_seconds(config, rate_limit_retries - 1, retry_after)
+                _trace_provider_event(
+                    "http_request_retry_scheduled",
+                    attempt=request_attempt,
+                    retry_kind=retry_kind,
+                    delay_seconds=delay_seconds,
+                )
+                time.sleep(delay_seconds)
                 continue
             transient_retries += 1
+            _trace_provider_event(
+                "http_payload_retryable",
+                attempt=request_attempt,
+                retry_kind=retry_kind,
+                transient_retries=transient_retries,
+                retry_after=retry_after,
+            )
             if transient_retries > DEFAULT_TRANSIENT_MAX_RETRIES:
                 raise ProviderError(
                     f"Provider kept returning transient upstream error payloads after {transient_retries} retries: "
                     f"{json.dumps(payload, ensure_ascii=True)[:800]}"
                 )
-            time.sleep(_transient_delay_seconds(config, transient_retries - 1, retry_after))
+            delay_seconds = _transient_delay_seconds(config, transient_retries - 1, retry_after)
+            _trace_provider_event(
+                "http_request_retry_scheduled",
+                attempt=request_attempt,
+                retry_kind=retry_kind,
+                delay_seconds=delay_seconds,
+            )
+            time.sleep(delay_seconds)
             continue
+        _trace_provider_event(
+            "http_request_success",
+            attempt=request_attempt,
+            status_code=response.status_code,
+        )
         return payload
 
 
@@ -670,13 +832,20 @@ class CodexAppServerProvider:
         return "\n\n".join(sections)
 
     def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
+        _trace_provider_event(
+            "complete_json_start",
+            message_count=len(messages),
+        )
         session = _CodexAppServerSession(self.config)
         try:
             turn_id = session.start_turn(self._prompt_from_messages(messages))
             outer_payload = _parse_provider_json_object(session.collect_turn_text(turn_id))
             response_json = outer_payload.get("response_json")
             if isinstance(response_json, str) and response_json.strip():
-                return _parse_provider_json_object(response_json)
+                parsed = _parse_provider_json_object(response_json)
+                _trace_provider_event("complete_json_success", message_count=len(messages))
+                return parsed
+            _trace_provider_event("complete_json_success", message_count=len(messages))
             return outer_payload
         finally:
             session.close()
@@ -840,6 +1009,11 @@ class ChatCompletionsJsonProvider:
         raw_text: str,
         max_completion_tokens: int,
     ) -> dict[str, Any] | None:
+        _trace_provider_event(
+            "json_repair_start",
+            max_completion_tokens=max_completion_tokens,
+            raw_preview=raw_text[:240],
+        )
         repair_messages = [
             *messages,
             ChatMessage(role="assistant", content=raw_text),
@@ -847,8 +1021,11 @@ class ChatCompletionsJsonProvider:
         ]
         try:
             payload = self._request_json(repair_messages, max_completion_tokens)
-            return self._parse_json_object(self._extract_content(payload))
-        except ProviderError:
+            repaired = self._parse_json_object(self._extract_content(payload))
+            _trace_provider_event("json_repair_success")
+            return repaired
+        except ProviderError as exc:
+            _trace_provider_event("json_repair_failed", error=exc)
             return None
 
     def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
@@ -858,6 +1035,11 @@ class ChatCompletionsJsonProvider:
                 f"No API key configured for provider profile using model {self.config.model!r}. "
                 f"Put it in .agentsecrets under providers.<profile>.api_key or set {env_hint}."
             )
+        _trace_provider_event(
+            "complete_json_start",
+            message_count=len(messages),
+            budgets=",".join(str(item) for item in self._completion_budgets()),
+        )
         budgets = self._completion_budgets()
         last_error: ProviderError | None = None
         for index, budget in enumerate(budgets):
@@ -878,6 +1060,7 @@ class ChatCompletionsJsonProvider:
                                 max(budget, budgets[-1]),
                             )
                             if repaired is not None:
+                                _trace_provider_event("complete_json_success", path="json_validate_repair")
                                 return repaired
                         if malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
                             self._refresh_session()
@@ -897,6 +1080,7 @@ class ChatCompletionsJsonProvider:
                                 max(budget, budgets[-1]),
                             )
                             if repaired is not None:
+                                _trace_provider_event("complete_json_success", path="tool_use_repair")
                                 return repaired
                     if _is_tool_use_failed_error(exc) and tool_use_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
                         self._refresh_session()
@@ -912,7 +1096,9 @@ class ChatCompletionsJsonProvider:
                     finish_reason = choices[0].get("finish_reason")
                 try:
                     raw_text = self._extract_content(payload)
-                    return self._parse_json_object(raw_text)
+                    parsed = self._parse_json_object(raw_text)
+                    _trace_provider_event("complete_json_success", path="direct")
+                    return parsed
                 except ProviderError as exc:
                     last_error = exc
                     error_text = str(exc).lower()
@@ -935,6 +1121,7 @@ class ChatCompletionsJsonProvider:
                                 max(budget, budgets[-1]),
                             )
                             if repaired is not None:
+                                _trace_provider_event("complete_json_success", path="invalid_json_repair")
                                 return repaired
                         time.sleep(_malformed_success_delay_seconds(malformed_attempts))
                         malformed_attempts += 1
@@ -953,8 +1140,10 @@ class ChatCompletionsJsonProvider:
                     if raw_text:
                         repaired = self._repair_invalid_json(messages, raw_text, max(budget, budgets[-1]))
                         if repaired is not None:
+                            _trace_provider_event("complete_json_success", path="final_repair")
                             return repaired
                     raise
+        _trace_provider_event("complete_json_failure", error=last_error or "unknown")
         raise last_error or ProviderError("Provider request failed without a specific error.")
 
 
@@ -979,6 +1168,11 @@ class LMStudioProvider(OpenAICompatibleProvider):
         return None
 
     def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
+        _trace_provider_event(
+            "complete_json_start",
+            message_count=len(messages),
+            budgets=",".join(str(item) for item in self._completion_budgets()),
+        )
         budgets = self._completion_budgets()
         last_error: ProviderError | None = None
         for index, budget in enumerate(budgets):
@@ -999,6 +1193,7 @@ class LMStudioProvider(OpenAICompatibleProvider):
                                 max(budget, budgets[-1]),
                             )
                             if repaired is not None:
+                                _trace_provider_event("complete_json_success", path="json_validate_repair")
                                 return repaired
                         if malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
                             self._refresh_session()
@@ -1049,13 +1244,26 @@ class LMStudioProvider(OpenAICompatibleProvider):
                         max(budget, budgets[-1]),
                     )
                     if repaired is not None:
+                        _trace_provider_event("complete_json_success", path="invalid_json_repair")
                         return repaired
                     break
             if index < len(budgets) - 1:
                 continue
+        _trace_provider_event("complete_json_failure", error=last_error or "unknown")
         raise last_error or ProviderError(
             "Provider request failed without a specific error."
         )
+
+
+class MiniMaxProvider(OpenAICompatibleProvider):
+    def _completion_budget_fields(self, max_completion_tokens: int) -> dict[str, Any]:
+        return {"max_tokens": max_completion_tokens}
+
+    def _response_format(self) -> dict[str, Any] | None:
+        # MiniMax documents OpenAI compatibility, but this runtime only needs
+        # plain JSON text. Keep the prompt contract authoritative and repair
+        # malformed JSON locally instead of assuming strict response_format support.
+        return None
 
 
 class OpenRouterProvider(ChatCompletionsJsonProvider):
@@ -1223,6 +1431,11 @@ class ResponsesJsonProvider:
         raw_text: str,
         max_completion_tokens: int,
     ) -> dict[str, Any] | None:
+        _trace_provider_event(
+            "json_repair_start",
+            max_completion_tokens=max_completion_tokens,
+            raw_preview=raw_text[:240],
+        )
         repair_messages = [
             *messages,
             ChatMessage(role="assistant", content=raw_text),
@@ -1230,8 +1443,11 @@ class ResponsesJsonProvider:
         ]
         try:
             payload = self._request_json(repair_messages, max_completion_tokens)
-            return self._parse_json_object(self._extract_content(payload))
-        except ProviderError:
+            repaired = self._parse_json_object(self._extract_content(payload))
+            _trace_provider_event("json_repair_success")
+            return repaired
+        except ProviderError as exc:
+            _trace_provider_event("json_repair_failed", error=exc)
             return None
 
     def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
@@ -1241,6 +1457,11 @@ class ResponsesJsonProvider:
                 f"No API key configured for provider profile using model {self.config.model!r}. "
                 f"Put it in .agentsecrets under providers.<profile>.api_key or set {env_hint}."
             )
+        _trace_provider_event(
+            "complete_json_start",
+            message_count=len(messages),
+            budgets=",".join(str(item) for item in self._completion_budgets()),
+        )
         budgets = self._completion_budgets()
         last_error: ProviderError | None = None
         for index, budget in enumerate(budgets):
@@ -1261,6 +1482,7 @@ class ResponsesJsonProvider:
                                 max(budget, budgets[-1]),
                             )
                             if repaired is not None:
+                                _trace_provider_event("complete_json_success", path="json_validate_repair")
                                 return repaired
                         if malformed_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
                             self._refresh_session()
@@ -1280,6 +1502,7 @@ class ResponsesJsonProvider:
                                 max(budget, budgets[-1]),
                             )
                             if repaired is not None:
+                                _trace_provider_event("complete_json_success", path="tool_use_repair")
                                 return repaired
                     if _is_tool_use_failed_error(exc) and tool_use_attempts < DEFAULT_MALFORMED_SUCCESS_RETRIES:
                         self._refresh_session()
@@ -1292,7 +1515,9 @@ class ResponsesJsonProvider:
                 finish_reason = payload.get("status")
                 try:
                     raw_text = self._extract_content(payload)
-                    return self._parse_json_object(raw_text)
+                    parsed = self._parse_json_object(raw_text)
+                    _trace_provider_event("complete_json_success", path="direct")
+                    return parsed
                 except ProviderError as exc:
                     last_error = exc
                     invalid_json = raw_text is not None and _is_invalid_json_error(exc)
@@ -1314,6 +1539,7 @@ class ResponsesJsonProvider:
                                 max(budget, budgets[-1]),
                             )
                             if repaired is not None:
+                                _trace_provider_event("complete_json_success", path="invalid_json_repair")
                                 return repaired
                         time.sleep(_malformed_success_delay_seconds(malformed_attempts))
                         malformed_attempts += 1
@@ -1326,8 +1552,10 @@ class ResponsesJsonProvider:
                     if raw_text:
                         repaired = self._repair_invalid_json(messages, raw_text, max(budget, budgets[-1]))
                         if repaired is not None:
+                            _trace_provider_event("complete_json_success", path="final_repair")
                             return repaired
                     raise
+        _trace_provider_event("complete_json_failure", error=last_error or "unknown")
         raise last_error or ProviderError("Provider request failed without a specific error.")
 
 
@@ -1344,6 +1572,8 @@ def create_provider(config: ProviderProfileConfig) -> JsonCompletionProvider:
     transport = (config.transport or "chat_completions").strip().lower()
     if normalized == "codex":
         return CodexAppServerProvider(config)
+    if normalized == "minimax":
+        return MiniMaxProvider(config)
     if normalized == "xai":
         if transport == "responses":
             return XAIResponsesProvider(config)

@@ -254,6 +254,14 @@ def _provider_defaults(provider_type: str) -> dict[str, Any]:
             "timeout_seconds": 120,
             "transport": "chat_completions",
         }
+    if normalized == "minimax":
+        return {
+            "api_base": "https://api.minimax.io/v1",
+            "command": None,
+            "api_key_env": "MINIMAX_API_KEY",
+            "timeout_seconds": 180,
+            "transport": "chat_completions",
+        }
     if normalized == "openai_compatible":
         return {
             "api_base": None,
