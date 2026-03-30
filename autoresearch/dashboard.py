@@ -664,17 +664,21 @@ def serve_dashboard(
     local_url = f"http://127.0.0.1:{port}"
     print("Autoresearch dashboard starting...", flush=True)
     print(f"  bind: {host}:{port}", flush=True)
-    print(f"  local url: {local_url}", flush=True)
-    if host not in {"127.0.0.1", "localhost"}:
-        print(f"  bound url: {public_url}", flush=True)
     print(f"  leaderboard limit: {limit}", flush=True)
     print(f"  refresh on start: {'yes' if refresh_on_start else 'no'}", flush=True)
     print(f"  force rebuild: {'yes' if force_rebuild else 'no'}", flush=True)
     print(f"  runs root: {config.runs_root}", flush=True)
     if refresh_on_start:
+        print(f"  local url (pending): {local_url}", flush=True)
+        if host not in {"127.0.0.1", "localhost"}:
+            print(f"  bound url (pending): {public_url}", flush=True)
+        print("  server is not reachable until the startup refresh completes", flush=True)
         print("  building dashboard payload from source artifacts...", flush=True)
         state.rebuild()
     else:
+        print(f"  local url: {local_url}", flush=True)
+        if host not in {"127.0.0.1", "localhost"}:
+            print(f"  bound url: {public_url}", flush=True)
         print("  loading dashboard payload from existing derived artifacts...", flush=True)
         state.payload = build_dashboard_payload(config, limit=limit)
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
