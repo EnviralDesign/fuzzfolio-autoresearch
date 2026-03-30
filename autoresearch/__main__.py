@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from rich import box
 from rich.console import Console, Group
 from rich.panel import Panel
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 from rich.table import Table
 from rich.text import Text
 
@@ -24,7 +25,7 @@ if __package__ in {None, ""}:
     from autoresearch.config import load_config
     from autoresearch.controller import ResearchController, RunPolicy
     from autoresearch.dashboard import serve_dashboard
-    from autoresearch.fuzzfolio import FuzzfolioCli
+    from autoresearch.fuzzfolio import CliError, FuzzfolioCli
     from autoresearch.ledger import (
         append_attempt,
         attempts_path_for_run_dir,
@@ -38,10 +39,18 @@ if __package__ in {None, ""}:
         write_attempts,
     )
     from autoresearch.plotting import (
+        _attempt_effective_window_months,
+        _attempt_trade_count,
+        _attempt_trades_per_month,
+        _best_scored_attempts_by_run,
         render_leaderboard_artifacts,
         render_model_leaderboard_artifacts,
         render_progress_artifacts,
+        render_similarity_heatmap_artifacts,
+        render_similarity_scatter_artifacts,
         render_tradeoff_leaderboard_artifacts,
+        render_validation_delta_artifacts,
+        render_validation_scatter_artifacts,
     )
     from autoresearch.provider import ChatMessage, ProviderError, create_provider
     from autoresearch.scoring import build_attempt_score, load_sensitivity_snapshot
@@ -49,7 +58,7 @@ else:
     from .config import load_config
     from .controller import ResearchController, RunPolicy
     from .dashboard import serve_dashboard
-    from .fuzzfolio import FuzzfolioCli
+    from .fuzzfolio import CliError, FuzzfolioCli
     from .ledger import (
         append_attempt,
         attempts_path_for_run_dir,
@@ -63,10 +72,18 @@ else:
         write_attempts,
     )
     from .plotting import (
+        _attempt_effective_window_months,
+        _attempt_trade_count,
+        _attempt_trades_per_month,
+        _best_scored_attempts_by_run,
         render_leaderboard_artifacts,
         render_model_leaderboard_artifacts,
         render_progress_artifacts,
+        render_similarity_heatmap_artifacts,
+        render_similarity_scatter_artifacts,
         render_tradeoff_leaderboard_artifacts,
+        render_validation_delta_artifacts,
+        render_validation_scatter_artifacts,
     )
     from .provider import ChatMessage, ProviderError, create_provider
     from .scoring import build_attempt_score, load_sensitivity_snapshot
@@ -176,11 +193,31 @@ def build_parser() -> argparse.ArgumentParser:
     plot.add_argument("--run-id", default=None, help="Specific run id to render. Defaults to latest discovered run.")
     plot.add_argument("--all-runs", action="store_true", help="Render a derived aggregate plot across all runs.")
     leaderboard = subparsers.add_parser("leaderboard", help="Generate a derived best-per-run leaderboard image and JSON.")
-    leaderboard.add_argument("--limit", type=int, default=15, help="Maximum number of runs to include.")
+    leaderboard.add_argument(
+        "--limit",
+        type=int,
+        default=15,
+        help="Maximum number of runs to show in the classic bar leaderboard. Validation and similarity analyze the full best-per-run set.",
+    )
+    leaderboard.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Ignore cached validation artifacts and rebuild all derived validation/similarity inputs.",
+    )
     dashboard = subparsers.add_parser("dashboard", help="Serve a local SPA for run, leaderboard, and backtest drilldown.")
     dashboard.add_argument("--host", default="127.0.0.1", help="Bind host. Default: 127.0.0.1")
     dashboard.add_argument("--port", type=int, default=47832, help="Bind port. Default: 47832")
-    dashboard.add_argument("--limit", type=int, default=25, help="Leaderboard limit used during refresh. Default: 25")
+    dashboard.add_argument(
+        "--limit",
+        type=int,
+        default=25,
+        help="Classic bar leaderboard display limit used during refresh. Validation and similarity still analyze the full best-per-run set. Default: 25",
+    )
+    dashboard.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Ignore cached validation artifacts when refreshing derived dashboard data.",
+    )
     dashboard.add_argument(
         "--no-refresh-on-start",
         action="store_true",
@@ -206,6 +243,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=12,
         help="Fixed deep-replay lookback window in months for rebuilt profile-drop cards. Default: 12.",
+    )
+    profile_drop_pngs.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Ignore existing profile-drop PNG/manifests and rerender every requested horizon.",
     )
     profile_drop_pngs.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     subparsers.add_parser("reset-runs", help="Delete all run artifacts and recreate a clean empty runs state.")
@@ -572,7 +614,7 @@ def cmd_purge_cloud_profiles(*, execute: bool, preview: int, as_json: bool) -> i
         try:
             cli.run(["profiles", "delete", "--profile-ref", profile_id, "--pretty"])
             deleted.append({"id": profile_id, "name": str((item.get("profile") or {}).get("name") or "")})
-        except Exception as exc:
+        except (CliError, OSError, ValueError, json.JSONDecodeError) as exc:
             failures.append({"id": profile_id, "error": str(exc)})
 
     payload["deleted_count"] = len(deleted)
@@ -1468,13 +1510,21 @@ def cmd_plot(*, run_id: str | None, all_runs: bool) -> int:
     return 0
 
 
-def cmd_leaderboard(*, limit: int) -> int:
+def cmd_leaderboard(*, limit: int, force_rebuild: bool) -> int:
     config = load_config()
+    def emit(message: str) -> None:
+        _write_plain_line(message)
+
+    emit("leaderboard: loading run attempts")
     attempts = load_all_run_attempts(config.runs_root)
+    cli = FuzzfolioCli(config.fuzzfolio)
+    cli.ensure_login()
+    emit(f"leaderboard: loaded {len(attempts)} attempts")
     run_metadata_by_run_id = {
         run_dir.name: load_run_metadata(run_dir)
         for run_dir in sorted(path for path in config.runs_root.iterdir() if path.is_dir() and path.name != "derived")
     } if config.runs_root.exists() else {}
+    emit("leaderboard: rendering best-per-run leaderboard")
     ranked = render_leaderboard_artifacts(
         attempts,
         config.leaderboard_plot_path,
@@ -1483,6 +1533,15 @@ def cmd_leaderboard(*, limit: int) -> int:
         lower_is_better=config.research.plot_lower_is_better,
         limit=limit,
     )
+    analysis_ranked = sorted(
+        _best_scored_attempts_by_run(
+            attempts,
+            lower_is_better=config.research.plot_lower_is_better,
+        ),
+        key=lambda attempt: float(attempt.get("composite_score")),
+        reverse=not config.research.plot_lower_is_better,
+    )
+    emit("leaderboard: rendering model averages")
     model_ranked = render_model_leaderboard_artifacts(
         attempts,
         config.model_leaderboard_plot_path,
@@ -1490,6 +1549,7 @@ def cmd_leaderboard(*, limit: int) -> int:
         run_metadata_by_run_id=run_metadata_by_run_id,
         lower_is_better=config.research.plot_lower_is_better,
     )
+    emit("leaderboard: rendering tradeoff map")
     tradeoff_ranked = render_tradeoff_leaderboard_artifacts(
         attempts,
         config.tradeoff_leaderboard_plot_path,
@@ -1497,10 +1557,51 @@ def cmd_leaderboard(*, limit: int) -> int:
         run_metadata_by_run_id=run_metadata_by_run_id,
         lower_is_better=config.research.plot_lower_is_better,
     )
+    emit(f"leaderboard: validating {len(analysis_ranked)} best-per-run leaders at 12mo and 36mo")
+    validation_rows = _build_validation_rows(
+        config=config,
+        cli=cli,
+        ranked_attempts=analysis_ranked,
+        run_metadata_by_run_id=run_metadata_by_run_id,
+        force_rebuild=force_rebuild,
+        emit=emit,
+    )
+    skipped_validation_rows = max(0, len(analysis_ranked) - len(validation_rows))
+    if skipped_validation_rows:
+        emit(f"leaderboard: skipped {skipped_validation_rows} validation candidate(s) after recoverable errors")
+    emit("leaderboard: rendering validation scatter")
+    validation_ranked = render_validation_scatter_artifacts(
+        validation_rows,
+        config.validation_scatter_plot_path,
+        config.validation_leaderboard_json_path,
+        lower_is_better=config.research.plot_lower_is_better,
+    )
+    emit("leaderboard: rendering validation delta")
+    render_validation_delta_artifacts(
+        validation_rows,
+        config.validation_delta_plot_path,
+        lower_is_better=config.research.plot_lower_is_better,
+    )
+    emit("leaderboard: computing 36mo similarity payload")
+    similarity_payload = _build_similarity_payload(validation_rows)
+    emit("leaderboard: rendering similarity heatmap")
+    similarity_rendered = render_similarity_heatmap_artifacts(
+        similarity_payload,
+        config.similarity_heatmap_plot_path,
+        config.similarity_leaderboard_json_path,
+    )
+    emit("leaderboard: rendering score-vs-sameness map")
+    similarity_leaders = render_similarity_scatter_artifacts(
+        similarity_payload,
+        config.similarity_scatter_plot_path,
+        lower_is_better=config.research.plot_lower_is_better,
+    )
+    emit("leaderboard: done")
     print(
         json.dumps(
             {
                 "runs_ranked": len(ranked),
+                "analysis_runs_ranked": len(analysis_ranked),
                 "leaderboard_plot": str(config.leaderboard_plot_path),
                 "leaderboard_json": str(config.leaderboard_json_path),
                 "models_ranked": len(model_ranked),
@@ -1509,6 +1610,16 @@ def cmd_leaderboard(*, limit: int) -> int:
                 "tradeoff_runs_ranked": len(tradeoff_ranked),
                 "tradeoff_leaderboard_plot": str(config.tradeoff_leaderboard_plot_path),
                 "tradeoff_leaderboard_json": str(config.tradeoff_leaderboard_json_path),
+                "validation_rows": len(validation_ranked),
+                "validation_skipped": skipped_validation_rows,
+                "validation_leaderboard_json": str(config.validation_leaderboard_json_path),
+                "validation_scatter_plot": str(config.validation_scatter_plot_path),
+                "validation_delta_plot": str(config.validation_delta_plot_path),
+                "similarity_leaders": len(similarity_leaders),
+                "similarity_pairs": len(similarity_rendered.get("pairs") or []),
+                "similarity_leaderboard_json": str(config.similarity_leaderboard_json_path),
+                "similarity_heatmap_plot": str(config.similarity_heatmap_plot_path),
+                "similarity_scatter_plot": str(config.similarity_scatter_plot_path),
             },
             ensure_ascii=True,
             indent=2,
@@ -1517,7 +1628,7 @@ def cmd_leaderboard(*, limit: int) -> int:
     return 0
 
 
-def cmd_dashboard(*, host: str, port: int, limit: int, refresh_on_start: bool) -> int:
+def cmd_dashboard(*, host: str, port: int, limit: int, refresh_on_start: bool, force_rebuild: bool) -> int:
     config = load_config()
     serve_dashboard(
         config,
@@ -1525,6 +1636,7 @@ def cmd_dashboard(*, host: str, port: int, limit: int, refresh_on_start: bool) -
         port=port,
         limit=limit,
         refresh_on_start=refresh_on_start,
+        force_rebuild=force_rebuild,
     )
     return 0
 
@@ -1614,6 +1726,35 @@ def _load_json_if_exists(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     return payload if isinstance(payload, dict) else {}
+
+
+def _attempt_max_drawdown_r(attempt: dict[str, Any]) -> float | None:
+    best_summary = attempt.get("best_summary")
+    if not isinstance(best_summary, dict):
+        return None
+    candidates = [
+        best_summary.get("best_cell_path_metrics"),
+        best_summary.get("quality_score_payload"),
+    ]
+    for payload in candidates:
+        if not isinstance(payload, dict):
+            continue
+        for path in (
+            ["max_drawdown_r"],
+            ["inputs", "max_drawdown_r"],
+        ):
+            current: Any = payload
+            for key in path:
+                if not isinstance(current, dict):
+                    current = None
+                    break
+                current = current.get(key)
+            try:
+                if current is not None:
+                    return float(current)
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 def _coerce_profile_instruments(profile_path: Path) -> list[str]:
@@ -1893,11 +2034,421 @@ def _discover_bundle_dir(package_output_root: Path) -> Path:
     return sorted(bundle_dirs, key=lambda path: path.stat().st_mtime, reverse=True)[0]
 
 
+def _write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def _validation_cache_dir(config, run_id: str, lookback_months: int) -> Path:
+    return config.validation_cache_root / run_id / f"{int(lookback_months)}mo"
+
+
+def _validation_manifest_path(config, run_id: str, lookback_months: int) -> Path:
+    return _validation_cache_dir(config, run_id, lookback_months) / "manifest.json"
+
+
+def _profile_drop_manifest_path(run_dir: Path, lookback_months: int) -> Path:
+    return run_dir / f"profile-drop-{int(lookback_months)}mo.manifest.json"
+
+
+def _load_validation_score(artifact_dir: Path) -> dict[str, Any]:
+    sensitivity_payload = _load_json_if_exists(artifact_dir / "sensitivity-response.json")
+    aggregate = _nested_get(sensitivity_payload, ["data", "aggregate"])
+    if not isinstance(aggregate, dict):
+        aggregate = _nested_get(sensitivity_payload, ["data"])
+    compare_payload = {"best": aggregate or {}}
+    score = build_attempt_score(compare_payload, sensitivity_payload if sensitivity_payload else None)
+    synthetic_attempt = {
+        "best_summary": score.best_summary,
+        "composite_score": score.composite_score,
+    }
+    return {
+        "score": score.composite_score,
+        "score_basis": score.score_basis,
+        "metrics": score.metrics,
+        "best_summary": score.best_summary,
+        "trade_count": _attempt_trade_count(synthetic_attempt),
+        "trades_per_month": _attempt_trades_per_month(synthetic_attempt),
+        "effective_window_months": _attempt_effective_window_months(synthetic_attempt),
+        "max_drawdown_r": _attempt_max_drawdown_r(synthetic_attempt),
+    }
+
+
+def _load_validation_curve_series(artifact_dir: Path) -> dict[str, float]:
+    payload = _load_json_if_exists(artifact_dir / "best-cell-path-detail.json")
+    points = _nested_get(payload, ["curve", "points"])
+    if not isinstance(points, list):
+        return {}
+    series: dict[str, float] = {}
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        date_key = str(point.get("date") or "").strip()
+        if not date_key:
+            continue
+        try:
+            realized_r = float(point.get("realized_r"))
+        except (TypeError, ValueError):
+            continue
+        series[date_key] = realized_r
+    return series
+
+
+def _load_validation_request(artifact_dir: Path) -> dict[str, Any]:
+    payload = _load_json_if_exists(artifact_dir / "deep-replay-job.json")
+    request_payload = payload.get("request") if isinstance(payload, dict) else None
+    return request_payload if isinstance(request_payload, dict) else {}
+
+
+def _pearson_correlation(left: list[float], right: list[float]) -> float | None:
+    if len(left) != len(right) or len(left) < 3:
+        return None
+    left_mean = sum(left) / len(left)
+    right_mean = sum(right) / len(right)
+    left_var = sum((value - left_mean) ** 2 for value in left)
+    right_var = sum((value - right_mean) ** 2 for value in right)
+    if left_var <= 0.0 or right_var <= 0.0:
+        return None
+    covariance = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right))
+    return covariance / (left_var ** 0.5 * right_var ** 0.5)
+
+
+def _build_similarity_payload(validation_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    prepared: list[dict[str, Any]] = []
+    for row in validation_rows:
+        artifact_dir_raw = str(row.get("artifact_dir_36m") or "").strip()
+        if not artifact_dir_raw:
+            continue
+        artifact_dir = Path(artifact_dir_raw)
+        curve_series = _load_validation_curve_series(artifact_dir)
+        if not curve_series:
+            continue
+        request_payload = _load_validation_request(artifact_dir)
+        instruments = _normalize_tokens(list(request_payload.get("instruments") or []))
+        timeframe = str(request_payload.get("timeframe") or "").strip() or None
+        active_dates = {date for date, value in curve_series.items() if abs(float(value)) > 1e-9}
+        prepared.append(
+            {
+                **row,
+                "curve_series": curve_series,
+                "instruments_36m": instruments,
+                "timeframe_36m": timeframe,
+                "active_dates": active_dates,
+            }
+        )
+
+    if not prepared:
+        return {"leaders": [], "pairs": [], "matrix_labels": [], "matrix_values": []}
+
+    prepared.sort(key=lambda item: float(item.get("score_36m", float("-inf"))), reverse=True)
+    pair_records: list[dict[str, Any]] = []
+
+    for left_index, left in enumerate(prepared):
+        left_dates = set(left["curve_series"].keys())
+        left_values_map = left["curve_series"]
+        left_instruments = set(str(item) for item in left.get("instruments_36m") or [])
+        for right_index in range(left_index + 1, len(prepared)):
+            right = prepared[right_index]
+            right_dates = set(right["curve_series"].keys())
+            common_dates = sorted(left_dates & right_dates)
+            if len(common_dates) < 30:
+                continue
+            left_values = [float(left_values_map[date]) for date in common_dates]
+            right_values = [float(right["curve_series"][date]) for date in common_dates]
+            corr = _pearson_correlation(left_values, right_values)
+            positive_corr = max(0.0, float(corr)) if corr is not None else 0.0
+            right_instruments = set(str(item) for item in right.get("instruments_36m") or [])
+            union_instruments = left_instruments | right_instruments
+            instrument_overlap = (
+                len(left_instruments & right_instruments) / len(union_instruments)
+                if union_instruments
+                else 0.0
+            )
+            active_left = set(left.get("active_dates") or set())
+            active_right = set(right.get("active_dates") or set())
+            active_union = active_left | active_right
+            shared_active_ratio = (
+                len(active_left & active_right) / len(active_union)
+                if active_union
+                else 0.0
+            )
+            similarity_score = max(
+                0.0,
+                min(1.0, positive_corr * 0.75 + shared_active_ratio * 0.25),
+            )
+            pair_records.append(
+                {
+                    "left_run_id": left["run_id"],
+                    "left_attempt_id": left["attempt_id"],
+                    "left_label": left.get("leaderboard_label") or left["run_id"],
+                    "right_run_id": right["run_id"],
+                    "right_attempt_id": right["attempt_id"],
+                    "right_label": right.get("leaderboard_label") or right["run_id"],
+                    "left_score_36m": left.get("score_36m"),
+                    "right_score_36m": right.get("score_36m"),
+                    "correlation": corr,
+                    "positive_correlation": positive_corr,
+                    "shared_active_ratio": shared_active_ratio,
+                    "instrument_overlap_ratio": instrument_overlap,
+                    "same_timeframe": str(left.get("timeframe_36m") or "") == str(right.get("timeframe_36m") or ""),
+                    "overlap_days": len(common_dates),
+                    "similarity_score": similarity_score,
+                }
+            )
+
+    adjacency: dict[str, list[dict[str, Any]]] = {str(item["run_id"]): [] for item in prepared}
+    for pair in pair_records:
+        adjacency[pair["left_run_id"]].append(pair)
+        adjacency[pair["right_run_id"]].append(pair)
+
+    leaders: list[dict[str, Any]] = []
+    for row in prepared:
+        related = adjacency.get(str(row["run_id"]), [])
+        max_pair = max(related, key=lambda item: float(item.get("similarity_score", 0.0)), default=None)
+        avg_sameness = (
+            sum(float(item.get("similarity_score", 0.0)) for item in related) / len(related)
+            if related
+            else 0.0
+        )
+        closest_match_run_id = None
+        closest_match_label = None
+        if max_pair:
+            if max_pair["left_run_id"] == row["run_id"]:
+                closest_match_run_id = max_pair["right_run_id"]
+                closest_match_label = max_pair["right_label"]
+            else:
+                closest_match_run_id = max_pair["left_run_id"]
+                closest_match_label = max_pair["left_label"]
+        leaders.append(
+            {
+                "run_id": row["run_id"],
+                "attempt_id": row["attempt_id"],
+                "candidate_name": row.get("candidate_name"),
+                "leaderboard_label": row.get("leaderboard_label"),
+                "score_36m": row.get("score_36m"),
+                "score_12m": row.get("score_12m"),
+                "score_delta": row.get("score_delta"),
+                "trades_per_month_36m": row.get("trades_per_month_36m"),
+                "trade_count_36m": row.get("trade_count_36m"),
+                "instrument_count_36m": len(row.get("instruments_36m") or []),
+                "instruments_36m": list(row.get("instruments_36m") or []),
+                "timeframe_36m": row.get("timeframe_36m"),
+                "avg_sameness": avg_sameness,
+                "max_sameness": float(max_pair.get("similarity_score", 0.0)) if max_pair else 0.0,
+                "closest_match_run_id": closest_match_run_id,
+                "closest_match_label": closest_match_label,
+            }
+        )
+
+    matrix_labels = [
+        str(item.get("leaderboard_label") or item.get("run_id") or "run")
+        for item in prepared
+    ]
+    pair_lookup: dict[tuple[str, str], float] = {}
+    for pair in pair_records:
+        key = tuple(sorted([str(pair["left_run_id"]), str(pair["right_run_id"])]))
+        pair_lookup[key] = float(pair.get("similarity_score", 0.0))
+
+    matrix_values: list[list[float]] = []
+    for left in prepared:
+        row_values: list[float] = []
+        for right in prepared:
+            if left["run_id"] == right["run_id"]:
+                row_values.append(1.0)
+                continue
+            key = tuple(sorted([str(left["run_id"]), str(right["run_id"])]))
+            row_values.append(float(pair_lookup.get(key, 0.0)))
+        matrix_values.append(row_values)
+
+    pair_records.sort(key=lambda item: float(item.get("similarity_score", 0.0)), reverse=True)
+    return {
+        "leaders": leaders,
+        "pairs": pair_records,
+        "matrix_labels": matrix_labels,
+        "matrix_values": matrix_values,
+    }
+
+
+def _ensure_validation_artifacts(
+    *,
+    config,
+    cli: FuzzfolioCli,
+    run_dir: Path,
+    attempts: list[dict[str, Any]],
+    best_attempt: dict[str, Any],
+    lookback_months: int,
+    force_rebuild: bool = False,
+    emit: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    package_inputs = _build_package_inputs(best_attempt, run_dir=run_dir, attempts=attempts)
+    profile_path = package_inputs.get("profile_path")
+    profile_ref = str(package_inputs.get("profile_ref") or best_attempt.get("profile_ref") or "").strip()
+    recreated_profile = False
+
+    if profile_ref and not _cloud_profile_exists(cli, profile_ref):
+        profile_ref = ""
+    if not profile_ref:
+        if not isinstance(profile_path, Path) or not profile_path.exists():
+            raise RuntimeError(
+                f"Best attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
+            )
+        profile_ref = _create_cloud_profile(cli, profile_path)
+        _update_attempt_profile_ref(run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref)
+        recreated_profile = True
+
+    cache_dir = _validation_cache_dir(config, run_dir.name, lookback_months)
+    manifest_path = _validation_manifest_path(config, run_dir.name, lookback_months)
+    manifest_payload = {
+        "run_id": run_dir.name,
+        "attempt_id": str(best_attempt.get("attempt_id") or ""),
+        "candidate_name": str(best_attempt.get("candidate_name") or ""),
+        "profile_ref": profile_ref,
+        "timeframe": str(package_inputs["timeframe"]),
+        "instruments": list(package_inputs["instruments"]),
+        "lookback_months": int(lookback_months),
+        "quality_score_preset": str(config.research.quality_score_preset),
+    }
+    sensitivity_path = cache_dir / "sensitivity-response.json"
+    if (not force_rebuild) and sensitivity_path.exists() and manifest_path.exists():
+        existing_manifest = _load_json_if_exists(manifest_path)
+        if existing_manifest == manifest_payload:
+            payload = _load_validation_score(cache_dir)
+            payload["artifact_dir"] = str(cache_dir)
+            payload["profile_ref"] = profile_ref
+            payload["recreated_profile"] = recreated_profile
+            payload["cache_hit"] = True
+            return payload
+
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    if emit:
+        emit(
+            f"  validating {lookback_months}mo: "
+            f"timeframe={package_inputs['timeframe']} instruments={','.join(package_inputs['instruments'])}"
+        )
+
+    args = [
+        "sensitivity-basket",
+        "--profile-ref",
+        profile_ref,
+        "--timeframe",
+        str(package_inputs["timeframe"]),
+        "--lookback-months",
+        str(int(lookback_months)),
+        "--output-dir",
+        str(cache_dir),
+        "--allow-timeframe-mismatch",
+        "--quality-score-preset",
+        str(config.research.quality_score_preset),
+    ]
+    for instrument in package_inputs["instruments"]:
+        args.extend(["--instrument", str(instrument)])
+    cli.run(args, timeout_seconds=420)
+    _write_json_file(manifest_path, manifest_payload)
+
+    payload = _load_validation_score(cache_dir)
+    payload["artifact_dir"] = str(cache_dir)
+    payload["profile_ref"] = profile_ref
+    payload["recreated_profile"] = recreated_profile
+    payload["cache_hit"] = False
+    return payload
+
+
+def _build_validation_rows(
+    *,
+    config,
+    cli: FuzzfolioCli,
+    ranked_attempts: list[dict[str, Any]],
+    run_metadata_by_run_id: dict[str, dict[str, Any]],
+    force_rebuild: bool = False,
+    emit: Callable[[str], None] | None = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for attempt in ranked_attempts:
+        run_id = str(attempt.get("run_id") or "").strip()
+        if not run_id:
+            continue
+        run_dir = config.runs_root / run_id
+        attempts = load_run_attempts(run_dir)
+        if not attempts:
+            continue
+        best_attempt = _best_attempt_for_run(attempts, lower_is_better=config.research.plot_lower_is_better)
+        if best_attempt is None or str(best_attempt.get("attempt_id") or "") != str(attempt.get("attempt_id") or ""):
+            best_attempt = attempt
+        if emit:
+            emit(f"validate {run_id} {best_attempt.get('attempt_id')}")
+        row = {
+            "run_id": run_id,
+            "attempt_id": str(best_attempt.get("attempt_id") or ""),
+            "candidate_name": best_attempt.get("candidate_name"),
+            "leaderboard_label": attempt.get("leaderboard_label"),
+            "explorer_model": (run_metadata_by_run_id.get(run_id) or {}).get("explorer_model"),
+            "explorer_profile": (run_metadata_by_run_id.get(run_id) or {}).get("explorer_profile"),
+        }
+        try:
+            validation_12 = _ensure_validation_artifacts(
+                config=config,
+                cli=cli,
+                run_dir=run_dir,
+                attempts=attempts,
+                best_attempt=best_attempt,
+                lookback_months=12,
+                force_rebuild=force_rebuild,
+                emit=emit,
+            )
+            validation_36 = _ensure_validation_artifacts(
+                config=config,
+                cli=cli,
+                run_dir=run_dir,
+                attempts=attempts,
+                best_attempt=best_attempt,
+                lookback_months=36,
+                force_rebuild=force_rebuild,
+                emit=emit,
+            )
+        except Exception as exc:
+            if emit:
+                detail = str(exc).splitlines()[0].strip() if str(exc).strip() else exc.__class__.__name__
+                emit(f"validate skip {run_id} {best_attempt.get('attempt_id')}: {detail}")
+            continue
+        row.update(
+            {
+                "score_12m": validation_12.get("score"),
+                "score_basis_12m": validation_12.get("score_basis"),
+                "trades_per_month_12m": validation_12.get("trades_per_month"),
+                "trade_count_12m": validation_12.get("trade_count"),
+                "effective_window_months_12m": validation_12.get("effective_window_months"),
+                "max_drawdown_r_12m": validation_12.get("max_drawdown_r"),
+                "artifact_dir_12m": validation_12.get("artifact_dir"),
+                "score_36m": validation_36.get("score"),
+                "score_basis_36m": validation_36.get("score_basis"),
+                "trades_per_month_36m": validation_36.get("trades_per_month"),
+                "trade_count_36m": validation_36.get("trade_count"),
+                "effective_window_months_36m": validation_36.get("effective_window_months"),
+                "max_drawdown_r_36m": validation_36.get("max_drawdown_r"),
+                "artifact_dir_36m": validation_36.get("artifact_dir"),
+            }
+        )
+        try:
+            score_12 = float(row["score_12m"])
+            score_36 = float(row["score_36m"])
+        except (TypeError, ValueError):
+            pass
+        else:
+            row["score_delta"] = score_36 - score_12
+            row["score_retention_ratio"] = (score_36 / score_12) if score_12 not in {0.0, -0.0} else None
+        rows.append(row)
+    return rows
+
+
 def cmd_sync_profile_drop_pngs(
     *,
     run_ids: list[str] | None,
     keep_temp: bool,
     lookback_months: int,
+    force_rebuild: bool,
     as_json: bool,
 ) -> int:
     config = load_config()
@@ -1916,136 +2467,208 @@ def cmd_sync_profile_drop_pngs(
     else:
         run_dirs = all_run_dirs
 
-    def emit(message: str) -> None:
-        if not as_json:
-            _write_plain_line(message)
-
     results: list[dict[str, Any]] = []
     rendered = 0
     skipped = 0
     failed = 0
 
     total_runs = len(run_dirs)
-    for index, run_dir in enumerate(run_dirs, start=1):
-        temp_root = run_dir / ".profile-drop-sync"
-        result: dict[str, Any] = {"run_id": run_dir.name}
-        try:
-            emit(f"sync {index}/{total_runs} {run_dir.name}")
-            attempts = load_run_attempts(run_dir)
-            best_attempt = _best_attempt_for_run(
-                attempts,
-                lower_is_better=config.research.plot_lower_is_better,
-            )
-            if best_attempt is None:
-                skipped += 1
-                result["status"] = "skipped"
-                result["reason"] = "No scored attempts exist for this run."
-                emit("  skipped: no scored attempts")
-                results.append(result)
-                continue
+    use_progress = (not as_json) and (not PLAIN_PROGRESS_MODE) and bool(getattr(console, "is_terminal", False))
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=32),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+        disable=not use_progress,
+    )
 
-            emit(
-                "  best attempt: "
-                f"{best_attempt.get('attempt_id')} "
-                f"score={float(best_attempt.get('composite_score')):.3f}"
-            )
-            package_inputs = _build_package_inputs(best_attempt, run_dir=run_dir, attempts=attempts)
-            profile_path = package_inputs.get("profile_path")
-            profile_ref = str(package_inputs.get("profile_ref") or best_attempt.get("profile_ref") or "").strip()
-            recreated_profile = False
+    def emit(message: str) -> None:
+        if as_json:
+            return
+        if use_progress:
+            progress.console.print(message)
+            return
+        _write_plain_line(message)
 
-            if profile_ref:
-                emit(f"  checking cloud profile: {profile_ref}")
-                if not _cloud_profile_exists(cli, profile_ref):
-                    profile_ref = ""
-            if not profile_ref:
-                if not isinstance(profile_path, Path) or not profile_path.exists():
-                    raise RuntimeError(
-                        f"Best attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
+    with progress:
+        task_id = progress.add_task("sync profile drops", total=total_runs or 1)
+        for index, run_dir in enumerate(run_dirs, start=1):
+            progress.update(
+                task_id,
+                description=(
+                    f"sync {index}/{total_runs} "
+                    f"[green]ok={rendered}[/green] "
+                    f"[yellow]skip={skipped}[/yellow] "
+                    f"[red]fail={failed}[/red] "
+                    f"{run_dir.name}"
+                ),
+            )
+            temp_root = run_dir / ".profile-drop-sync"
+            result: dict[str, Any] = {"run_id": run_dir.name}
+            try:
+                emit(
+                    f"sync {index}/{total_runs} {run_dir.name}"
+                )
+                attempts = load_run_attempts(run_dir)
+                best_attempt = _best_attempt_for_run(
+                    attempts,
+                    lower_is_better=config.research.plot_lower_is_better,
+                )
+                if best_attempt is None:
+                    skipped += 1
+                    result["status"] = "skipped"
+                    result["reason"] = "No scored attempts exist for this run."
+                    emit("  skipped: no scored attempts")
+                    results.append(result)
+                    progress.advance(task_id, 1)
+                    continue
+
+                emit(
+                    "  best attempt: "
+                    f"{best_attempt.get('attempt_id')} "
+                    f"score={float(best_attempt.get('composite_score')):.3f}"
+                )
+                package_inputs = _build_package_inputs(best_attempt, run_dir=run_dir, attempts=attempts)
+                profile_path = package_inputs.get("profile_path")
+                profile_ref = str(package_inputs.get("profile_ref") or best_attempt.get("profile_ref") or "").strip()
+                recreated_profile = False
+
+                if profile_ref:
+                    emit(f"  checking cloud profile: {profile_ref}")
+                    if not _cloud_profile_exists(cli, profile_ref):
+                        profile_ref = ""
+                if not profile_ref:
+                    if not isinstance(profile_path, Path) or not profile_path.exists():
+                        raise RuntimeError(
+                            f"Best attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
+                        )
+                    emit("  cloud profile missing, recreating from local profile")
+                    profile_ref = _create_cloud_profile(cli, profile_path)
+                    _update_attempt_profile_ref(run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref)
+                    recreated_profile = True
+
+                if temp_root.exists():
+                    shutil.rmtree(temp_root)
+                rendered_pngs: list[str] = []
+                skipped_horizons: list[int] = []
+                requested_horizons = sorted({12, int(lookback_months), 36})
+                for horizon_months in requested_horizons:
+                    horizon_manifest_payload = {
+                        "version": 1,
+                        "run_id": run_dir.name,
+                        "attempt_id": str(best_attempt.get("attempt_id") or ""),
+                        "candidate_name": str(best_attempt.get("candidate_name") or ""),
+                        "profile_ref": profile_ref,
+                        "timeframe": str(package_inputs["timeframe"]),
+                        "instruments": list(package_inputs["instruments"]),
+                        "lookback_months": int(horizon_months),
+                        "quality_score_preset": str(config.research.quality_score_preset),
+                    }
+                    horizon_manifest_path = _profile_drop_manifest_path(run_dir, horizon_months)
+                    png_path = run_dir / f"profile-drop-{horizon_months}mo.png"
+                    if (
+                        not force_rebuild
+                        and png_path.exists()
+                        and horizon_manifest_path.exists()
+                        and _load_json_if_exists(horizon_manifest_path) == horizon_manifest_payload
+                    ):
+                        emit(f"  skipping {png_path.name}: up to date")
+                        rendered_pngs.append(str(png_path))
+                        skipped_horizons.append(horizon_months)
+                        continue
+                    package_output_root = temp_root / f"package-root-{horizon_months}mo"
+                    package_output_root.mkdir(parents=True, exist_ok=True)
+                    emit(
+                        "  packaging: "
+                        f"timeframe={package_inputs['timeframe']} "
+                        f"instruments={','.join(package_inputs['instruments'])} "
+                        f"lookback={horizon_months}mo"
                     )
-                emit("  cloud profile missing, recreating from local profile")
-                profile_ref = _create_cloud_profile(cli, profile_path)
-                _update_attempt_profile_ref(run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref)
-                recreated_profile = True
+                    if package_inputs.get("recovered_from_sweep"):
+                        emit("  recovered package inputs from sweep base profile")
+                    package_args = [
+                        "package",
+                        "--profile-ref",
+                        profile_ref,
+                        "--timeframe",
+                        str(package_inputs["timeframe"]),
+                        "--lookback-months",
+                        str(horizon_months),
+                        "--output-root",
+                        str(package_output_root),
+                        "--label",
+                        f"{run_dir.name}-{horizon_months}mo",
+                        "--skip-catalogs",
+                        "--skip-render-capture",
+                        "--allow-timeframe-mismatch",
+                        "--quality-score-preset",
+                        str(config.research.quality_score_preset),
+                    ]
+                    for instrument in package_inputs["instruments"]:
+                        package_args.extend(["--instrument", str(instrument)])
+                    cli.run(package_args, cwd=working_dir)
 
-            if temp_root.exists():
-                shutil.rmtree(temp_root)
-            package_output_root = temp_root / "package-root"
-            package_output_root.mkdir(parents=True, exist_ok=True)
+                    bundle_dir = _discover_bundle_dir(package_output_root)
+                    png_path = run_dir / f"profile-drop-{horizon_months}mo.png"
+                    emit(f"  rendering {png_path.name}")
+                    renderer_argv = [str(renderer_executable)]
+                    if workspace_root is not None:
+                        renderer_argv.extend(["--workspace-root", str(workspace_root)])
+                    renderer_argv.extend(
+                        [
+                            "render",
+                            "--bundle",
+                            str(bundle_dir),
+                            "--out",
+                            str(png_path),
+                        ]
+                    )
+                    _run_external(renderer_argv, cwd=working_dir)
+                    _write_json_file(horizon_manifest_path, horizon_manifest_payload)
+                    rendered_pngs.append(str(png_path))
 
-            emit(
-                "  packaging: "
-                f"timeframe={package_inputs['timeframe']} "
-                f"instruments={','.join(package_inputs['instruments'])} "
-                f"lookback={lookback_months}mo"
-            )
-            if package_inputs.get("recovered_from_sweep"):
-                emit("  recovered package inputs from sweep base profile")
-            package_args = [
-                "package",
-                "--profile-ref",
-                profile_ref,
-                "--timeframe",
-                str(package_inputs["timeframe"]),
-                "--lookback-months",
-                str(lookback_months),
-                "--output-root",
-                str(package_output_root),
-                "--label",
-                run_dir.name,
-                "--skip-catalogs",
-                "--skip-render-capture",
-                "--allow-timeframe-mismatch",
-                "--quality-score-preset",
-                str(config.research.quality_score_preset),
-            ]
-            for instrument in package_inputs["instruments"]:
-                package_args.extend(["--instrument", str(instrument)])
-            cli.run(package_args, cwd=working_dir)
+                if not keep_temp:
+                    if temp_root.exists():
+                        shutil.rmtree(temp_root)
 
-            bundle_dir = _discover_bundle_dir(package_output_root)
-            png_path = run_dir / "profile-drop.png"
-            emit("  rendering profile-drop.png")
-            renderer_argv = [str(renderer_executable)]
-            if workspace_root is not None:
-                renderer_argv.extend(["--workspace-root", str(workspace_root)])
-            renderer_argv.extend(
-                [
-                    "render",
-                    "--bundle",
-                    str(bundle_dir),
-                    "--out",
-                    str(png_path),
-                ]
-            )
-            _run_external(renderer_argv, cwd=working_dir)
-            if not keep_temp:
-                shutil.rmtree(temp_root)
-
-            rendered += 1
-            emit(
-                "  done"
-                + (" (recreated cloud profile)" if recreated_profile else "")
-            )
-            result.update(
-                {
-                    "status": "rendered",
-                    "png_path": str(png_path),
-                    "profile_ref": profile_ref,
-                    "recreated_profile": recreated_profile,
-                    "lookback_months": lookback_months,
-                    "attempt_id": best_attempt.get("attempt_id"),
-                    "candidate_name": best_attempt.get("candidate_name"),
-                }
-            )
-        except Exception as exc:
-            failed += 1
-            result["status"] = "failed"
-            result["error"] = str(exc)
-            emit(f"  failed: {exc}")
-            if temp_root.exists():
-                result["temp_root"] = str(temp_root)
-        results.append(result)
+                rendered_horizons = [months for months in requested_horizons if months not in skipped_horizons]
+                if rendered_horizons or recreated_profile:
+                    rendered += 1
+                    emit(
+                        "  done"
+                        + (" (recreated cloud profile)" if recreated_profile else "")
+                    )
+                    status = "rendered"
+                else:
+                    skipped += 1
+                    emit("  skipped: all requested horizons already up to date")
+                    status = "skipped"
+                result.update(
+                    {
+                        "status": status,
+                        "png_paths": rendered_pngs,
+                        "profile_ref": profile_ref,
+                        "recreated_profile": recreated_profile,
+                        "lookback_months": lookback_months,
+                        "rendered_horizons": rendered_horizons,
+                        "skipped_horizons": skipped_horizons,
+                        "attempt_id": best_attempt.get("attempt_id"),
+                        "candidate_name": best_attempt.get("candidate_name"),
+                    }
+                )
+            except Exception as exc:
+                failed += 1
+                result["status"] = "failed"
+                result["error"] = str(exc)
+                emit(f"  failed: {exc}")
+                if temp_root.exists():
+                    result["temp_root"] = str(temp_root)
+            results.append(result)
+            progress.advance(task_id, 1)
 
     payload = {
         "runs_considered": len(run_dirs),
@@ -2261,19 +2884,21 @@ def main() -> int:
     if args.command == "plot":
         return cmd_plot(run_id=args.run_id, all_runs=bool(args.all_runs))
     if args.command == "leaderboard":
-        return cmd_leaderboard(limit=args.limit)
+        return cmd_leaderboard(limit=args.limit, force_rebuild=bool(args.force_rebuild))
     if args.command == "dashboard":
         return cmd_dashboard(
             host=str(args.host),
             port=int(args.port),
             limit=int(args.limit),
             refresh_on_start=not bool(args.no_refresh_on_start),
+            force_rebuild=bool(args.force_rebuild),
         )
     if args.command == "sync-profile-drop-pngs":
         return cmd_sync_profile_drop_pngs(
             run_ids=args.run_id,
             keep_temp=bool(args.keep_temp),
             lookback_months=int(args.lookback_months),
+            force_rebuild=bool(args.force_rebuild),
             as_json=bool(args.json),
         )
     if args.command == "reset-runs":

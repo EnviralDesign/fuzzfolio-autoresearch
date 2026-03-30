@@ -763,7 +763,7 @@ def render_tradeoff_leaderboard_artifacts(
         )
 
     x_min = min(x_all)
-    x_max = max(x_all)
+    x_max = min(200.0, max(x_all))
     y_min = min(y_all)
     y_max = max(y_all)
     x_padding = max(0.15, (x_max - x_min) * 0.08) if x_max != x_min else 0.15
@@ -784,3 +784,328 @@ def render_tradeoff_leaderboard_artifacts(
     plt.savefig(png_output_path, dpi=160)
     plt.close()
     return serializable_rows
+
+
+def render_validation_scatter_artifacts(
+    rows: list[dict[str, Any]],
+    png_output_path: Path,
+    json_output_path: Path,
+    *,
+    lower_is_better: bool = False,
+) -> list[dict[str, Any]]:
+    serializable_rows = [
+        dict(row)
+        for row in rows
+        if row.get("score_12m") is not None and row.get("score_36m") is not None
+    ]
+    serializable_rows.sort(
+        key=lambda row: float(row.get("score_36m", float("-inf"))),
+        reverse=not lower_is_better,
+    )
+
+    json_output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_output_path.write_text(json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    png_output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(13, 9))
+    if not serializable_rows:
+        plt.title("Autoresearch Validation Map: No Validation Rows Yet")
+        plt.xlabel("36m Quality Score")
+        plt.ylabel("12m Quality Score")
+        plt.tight_layout()
+        plt.savefig(png_output_path, dpi=160)
+        plt.close()
+        return serializable_rows
+
+    x_all = [float(row["score_36m"]) for row in serializable_rows]
+    y_all = [float(row["score_12m"]) for row in serializable_rows]
+    sizes = []
+    for row in serializable_rows:
+        trade_rate = row.get("trades_per_month_36m")
+        try:
+            numeric = float(trade_rate)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        sizes.append(max(44.0, min(130.0, 42.0 + numeric * 1.2)))
+
+    plt.scatter(
+        x_all,
+        y_all,
+        s=sizes,
+        c="#8ecae6",
+        edgecolors="#376481",
+        alpha=0.78,
+    )
+
+    diagonal_min = min(min(x_all), min(y_all))
+    diagonal_max = max(max(x_all), max(y_all))
+    plt.plot(
+        [diagonal_min, diagonal_max],
+        [diagonal_min, diagonal_max],
+        color="#60d6c3",
+        linewidth=1.8,
+        linestyle="--",
+        alpha=0.9,
+        label="12m = 36m",
+    )
+
+    annotation_rows = serializable_rows if len(serializable_rows) <= 30 else serializable_rows[:20]
+    for row in annotation_rows:
+        label = str(row.get("leaderboard_label") or row.get("run_id") or "run")
+        if len(label) > 34:
+            label = label[:31] + "..."
+        plt.annotate(
+            label,
+            (float(row["score_36m"]), float(row["score_12m"])),
+            textcoords="offset points",
+            xytext=(8, 6),
+            fontsize=8,
+            color="#cfe7ff",
+        )
+
+    x_min = min(x_all)
+    x_max = max(x_all)
+    y_min = min(y_all)
+    y_max = max(y_all)
+    x_padding = max(0.5, (x_max - x_min) * 0.08) if x_max != x_min else 0.5
+    y_padding = max(0.5, (y_max - y_min) * 0.08) if y_max != y_min else 0.5
+    if lower_is_better:
+        plt.xlim(x_max + x_padding, x_min - x_padding)
+        plt.ylim(y_max + y_padding, y_min - y_padding)
+    else:
+        plt.xlim(x_min - x_padding, x_max + x_padding)
+        plt.ylim(y_min - y_padding, y_max + y_padding)
+
+    plt.xlabel("36m Quality Score")
+    plt.ylabel("12m Quality Score")
+    plt.title("Autoresearch Validation Map: Short-Horizon Winner vs 3-Year Scrutiny")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(png_output_path, dpi=160)
+    plt.close()
+    return serializable_rows
+
+
+def render_validation_delta_artifacts(
+    rows: list[dict[str, Any]],
+    png_output_path: Path,
+    *,
+    lower_is_better: bool = False,
+) -> list[dict[str, Any]]:
+    serializable_rows = [
+        dict(row)
+        for row in rows
+        if row.get("score_12m") is not None and row.get("score_36m") is not None
+    ]
+    for row in serializable_rows:
+        score_12 = float(row["score_12m"])
+        score_36 = float(row["score_36m"])
+        row["score_delta"] = score_36 - score_12
+        row["score_retention_ratio"] = (score_36 / score_12) if score_12 not in {0.0, -0.0} else None
+
+    serializable_rows.sort(
+        key=lambda row: float(row.get("score_delta", float("-inf"))),
+        reverse=not lower_is_better,
+    )
+
+    png_output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(15, max(6, min(14, len(serializable_rows) * 0.65 + 2))))
+    if not serializable_rows:
+        plt.title("Autoresearch Validation Delta: No Validation Rows Yet")
+        plt.xlabel("36m - 12m Quality Score")
+        plt.tight_layout()
+        plt.savefig(png_output_path, dpi=160)
+        plt.close()
+        return serializable_rows
+
+    labels = []
+    deltas = []
+    colors = []
+    for row in serializable_rows:
+        label = str(row.get("leaderboard_label") or row.get("run_id") or "run")
+        if len(label) > 42:
+            label = label[:39] + "..."
+        labels.append(label)
+        delta = float(row["score_delta"])
+        deltas.append(delta)
+        colors.append("#60d6c3" if delta >= 0 else "#ff9a76")
+
+    positions = list(range(len(serializable_rows)))
+    plt.barh(positions, deltas, color=colors, alpha=0.9)
+    plt.yticks(positions, labels, fontsize=8)
+    plt.gca().invert_yaxis()
+    plt.axvline(0.0, color="#d8e4ff", linewidth=1.0, alpha=0.7)
+    plt.xlabel("36m - 12m Quality Score")
+    plt.title("Autoresearch Validation Delta: How Much the Leaders Survive 3-Year Scrutiny")
+
+    for index, row in enumerate(serializable_rows):
+        delta = float(row["score_delta"])
+        score_12 = float(row["score_12m"])
+        score_36 = float(row["score_36m"])
+        plt.text(
+            delta,
+            index,
+            f"  {delta:+.2f} | 12m {score_12:.2f} -> 36m {score_36:.2f}",
+            va="center",
+            fontsize=8,
+        )
+
+    plt.tight_layout()
+    plt.savefig(png_output_path, dpi=160)
+    plt.close()
+    return serializable_rows
+
+
+def render_similarity_heatmap_artifacts(
+    payload: dict[str, Any],
+    png_output_path: Path,
+    json_output_path: Path,
+) -> dict[str, Any]:
+    serializable_payload = {
+        "leaders": list(payload.get("leaders") or []),
+        "pairs": list(payload.get("pairs") or []),
+        "matrix_labels": list(payload.get("matrix_labels") or []),
+        "matrix_values": list(payload.get("matrix_values") or []),
+    }
+    json_output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_output_path.write_text(
+        json.dumps(serializable_payload, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+
+    png_output_path.parent.mkdir(parents=True, exist_ok=True)
+    matrix_values = serializable_payload["matrix_values"]
+    matrix_labels = serializable_payload["matrix_labels"]
+    axis_size = min(30.0, max(7.0, len(matrix_labels) * 0.45))
+    plt.figure(figsize=(axis_size, axis_size))
+    if not matrix_values or not matrix_labels:
+        plt.title("Autoresearch Similarity Heatmap: No Validated Curves Yet")
+        plt.tight_layout()
+        plt.savefig(png_output_path, dpi=160)
+        plt.close()
+        return serializable_payload
+
+    image = plt.imshow(matrix_values, cmap="viridis", vmin=0.0, vmax=1.0)
+    plt.colorbar(image, fraction=0.046, pad=0.04, label="Sameness score")
+    ticks = list(range(len(matrix_labels)))
+    font_size = max(4, min(8, int(round(10 - (len(matrix_labels) / 18)))))
+    truncated = [
+        label if len(label) <= 22 else label[:19] + "..."
+        for label in matrix_labels
+    ]
+    plt.xticks(ticks, truncated, rotation=55, ha="right", fontsize=font_size)
+    plt.yticks(ticks, truncated, fontsize=font_size)
+    plt.title("Autoresearch Similarity Heatmap: 36m Realized-Return Sameness")
+    plt.xlabel("Validated run leader")
+    plt.ylabel("Validated run leader")
+
+    if len(matrix_labels) <= 32:
+        for row_index, row in enumerate(matrix_values):
+            for col_index, value in enumerate(row):
+                text_color = "#f5fbff" if float(value) < 0.62 else "#08111d"
+                plt.text(
+                    col_index,
+                    row_index,
+                    f"{float(value):.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=max(5, font_size - 1),
+                    color=text_color,
+                )
+
+    plt.tight_layout()
+    plt.savefig(png_output_path, dpi=160)
+    plt.close()
+    return serializable_payload
+
+
+def render_similarity_scatter_artifacts(
+    payload: dict[str, Any],
+    png_output_path: Path,
+    *,
+    lower_is_better: bool = False,
+) -> list[dict[str, Any]]:
+    leaders = [dict(row) for row in (payload.get("leaders") or [])]
+    leaders = [row for row in leaders if row.get("score_36m") is not None]
+    leaders.sort(
+        key=lambda row: float(row.get("score_36m", float("-inf"))),
+        reverse=not lower_is_better,
+    )
+
+    png_output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(13, 9))
+    if not leaders:
+        plt.title("Autoresearch Diversity Map: No Similarity Rows Yet")
+        plt.xlabel("Closest-match sameness")
+        plt.ylabel("36m Quality Score")
+        plt.tight_layout()
+        plt.savefig(png_output_path, dpi=160)
+        plt.close()
+        return leaders
+
+    x_all = [float(row.get("max_sameness", 0.0) or 0.0) for row in leaders]
+    y_all = [float(row["score_36m"]) for row in leaders]
+    sizes = []
+    for row in leaders:
+        trade_rate = row.get("trades_per_month_36m")
+        try:
+            numeric = float(trade_rate)
+        except (TypeError, ValueError):
+            numeric = 0.0
+        sizes.append(max(48.0, min(136.0, 44.0 + numeric * 1.5)))
+
+    plt.scatter(
+        x_all,
+        y_all,
+        s=sizes,
+        c="#ffba6d",
+        edgecolors="#85501f",
+        alpha=0.82,
+    )
+
+    median_sameness = median(x_all) if x_all else 0.0
+    plt.axvline(
+        median_sameness,
+        color="#60d6c3",
+        linewidth=1.6,
+        linestyle="--",
+        alpha=0.8,
+        label=f"Median sameness {median_sameness:.2f}",
+    )
+
+    annotation_rows = leaders if len(leaders) <= 30 else leaders[:20]
+    for row in annotation_rows:
+        label = str(row.get("leaderboard_label") or row.get("run_id") or "run")
+        if len(label) > 34:
+            label = label[:31] + "..."
+        plt.annotate(
+            label,
+            (float(row.get("max_sameness", 0.0) or 0.0), float(row["score_36m"])),
+            textcoords="offset points",
+            xytext=(8, 6),
+            fontsize=8,
+            color="#f5d9b7",
+        )
+
+    x_min = min(x_all)
+    x_max = max(x_all)
+    y_min = min(y_all)
+    y_max = max(y_all)
+    x_padding = max(0.03, (x_max - x_min) * 0.1) if x_max != x_min else 0.03
+    y_padding = max(0.5, (y_max - y_min) * 0.08) if y_max != y_min else 0.5
+    plt.xlim(max(0.0, x_min - x_padding), min(1.0, x_max + x_padding))
+    if lower_is_better:
+        plt.ylim(y_max + y_padding, y_min - y_padding)
+    else:
+        plt.ylim(y_min - y_padding, y_max + y_padding)
+
+    plt.xlabel("Closest-match sameness (0 = distinct, 1 = highly similar)")
+    plt.ylabel("36m Quality Score")
+    plt.title("Autoresearch Diversity Map: Long-Horizon Score vs Closest-Match Sameness")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(png_output_path, dpi=160)
+    plt.close()
+    return leaders

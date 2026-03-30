@@ -434,6 +434,24 @@ class ResearchController:
         first = str(args[0]).strip()
         if not first:
             return "No CLI command tokens were provided."
+        instrument_index = 0
+        while instrument_index < len(args):
+            token = str(args[instrument_index]).strip()
+            if token == "--instrument":
+                value_index = instrument_index + 1
+                if value_index < len(args):
+                    raw_value = str(args[value_index]).strip()
+                    if "," in raw_value:
+                        rendered = " ".join(str(item) for item in args)
+                        return (
+                            "Invalid multi-instrument syntax. Do not comma-join symbols after "
+                            "`--instrument`. Repeat the flag once per symbol, for example: "
+                            "`--instrument EURUSD --instrument CADJPY --instrument AUDCHF`. "
+                            f"Offending command: `{rendered}`"
+                        )
+                instrument_index += 2
+                continue
+            instrument_index += 1
         if first.startswith("-"):
             return None
         try:
@@ -1159,6 +1177,7 @@ class ResearchController:
             '- profiles clone-local --file <ABS_FILE> --out <ABS_FILE>\n'
             '- profiles patch --file <ABS_FILE> --set profile.name="..." --set profile.indicators[0].config.timeframe="H1" --out <ABS_FILE>\n'
             '- profiles scaffold --indicator <ID> --indicator <ID> --instrument <SYMBOL> --out <ABS_FILE>\n'
+            '- profiles scaffold --indicator <ID> --indicator <ID> --instrument <SYMBOL> --instrument <SYMBOL> --out <ABS_FILE>\n'
             '- profiles validate --file <ABS_FILE> --pretty\n'
             '- profiles create --file <ABS_FILE> --out <ABS_FILE>\n'
             '- profiles update --profile-ref <REF> --file <ABS_FILE> --out <ABS_FILE>\n'
@@ -1167,6 +1186,7 @@ class ResearchController:
             '- sweep validate --definition <ABS_FILE> --pretty\n'
             '- sweep submit --definition <ABS_FILE_OR_INLINE_JSON> --out <ABS_FILE> --pretty\n'
             '- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --lookback-months <MONTHS> --output-dir <ABS_DIR>\n'
+            '- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --instrument <INSTRUMENT> --lookback-months <MONTHS> --output-dir <ABS_DIR>\n'
             '- compare-sensitivity --input <ABS_DIR> --pretty\n'
             "Notes:\n"
             "- profiles scaffold generates a valid portable profile from live indicator templates and is preferred for fresh candidate bootstrapping.\n"
@@ -1191,6 +1211,7 @@ class ResearchController:
             "- Saved sensitivity responses now include requested_timeframe and effective_timeframe fields.\n"
             "- Raw bar-count mechanics are implementation detail. Prefer effective_window_days and effective_window_months when judging whether a requested horizon was really satisfied.\n"
             "- If command syntax drifts, use run_cli [\"help\"] or run_cli [\"help\", \"profiles\"] instead of guessing.\n"
+            "- Multi-instrument commands repeat --instrument once per symbol. Never comma-join symbols into a single token.\n"
             "- `__BASKET__` may appear in saved summaries as an aggregate label. Never pass it as --instrument.\n"
             "- Invalid instrument aliases now fail fast with close-match suggestions.\n"
             "- In early phase, do not spend the whole run anchored to one pair. Explore across multiple distinct instruments or small instrument groups before narrowing hard.\n"

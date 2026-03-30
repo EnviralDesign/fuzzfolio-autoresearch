@@ -31,6 +31,8 @@ The new runtime lives in `autoresearch/` and exposes:
 - `autoresearch record-attempt <artifact_dir>`
 - `autoresearch plot`
 - `autoresearch leaderboard`
+- `autoresearch dashboard`
+- `autoresearch sync-profile-drop-pngs`
 - `autoresearch reset-runs`
 
 ## Local config
@@ -96,8 +98,8 @@ uv run autoresearch supervise --explorer-profile grok-fast --supervisor-profile 
 Periodic advisor guidance can also be configured globally or overridden per invocation:
 
 ```powershell
-uv run autoresearch run --max-steps 20 --advisor-every 5 --advisor-profile openai-54 --advisor-profile grok-420-multi-agent-0309 --advisor-profile gemini-31-pro
-uv run autoresearch supervise --advisor-every 5 --advisor-profile openai-54 --advisor-profile grok-420-multi-agent-0309 --advisor-profile gemini-31-pro
+uv run autoresearch run --max-steps 20 --advisor-every 20 --advisor-profile grok-420-multi-agent-0309
+uv run autoresearch supervise --advisor-every 20 --advisor-profile grok-420-multi-agent-0309
 uv run autoresearch run --no-advisor
 ```
 
@@ -145,8 +147,8 @@ Example:
   },
   "advisor": {
     "enabled": true,
-    "every_n_steps": 5,
-    "profiles": ["openai-54", "grok-420-multi-agent-0309", "gemini-31-pro"],
+    "every_n_steps": 20,
+    "profiles": ["grok-420-multi-agent-0309"],
     "max_recent_steps": 4,
     "max_recent_attempts": 6
   },
@@ -166,6 +168,7 @@ Example:
 ```
 
 When enabled, the controller periodically synthesizes a compact run-state packet from the ledger, controller log, frontier snapshot, recent scored attempts, and recent execution issues. It then queries the configured advisor profiles and injects their short guidance back into the explorer loop as anonymous `advisor1`/`advisor2`/`advisor3` feedback.
+Even when you use a single advisor profile, the explorer still sees anonymous labels such as `advisor1` rather than the underlying model name.
 
 That profile-level compaction override is useful when one model has a much larger context window, a very different token cost, or a different quality/latency tradeoff than another.
 Provider profiles can also tune generic rate-limit behavior with:
@@ -408,10 +411,28 @@ These write derived artifacts under:
 - `runs/derived/leaderboard-model-averages.json`
 - `runs/derived/leaderboard-score-vs-trades.png`
 - `runs/derived/leaderboard-score-vs-trades.json`
+- `runs/derived/leaderboard-validation.json`
+- `runs/derived/leaderboard-validation-12m-vs-36m.png`
+- `runs/derived/leaderboard-validation-delta.png`
 
 The leaderboard is best-per-run, sorted by `quality_score`.
 The model-average leaderboard groups those best-per-run outcomes by explorer model and reports the mean score per model.
-The score-vs-trades leaderboard maps each run's best candidate as a point, with resolved trades on the x-axis and quality score on the y-axis, and highlights the Pareto frontier.
+The score-vs-trades leaderboard maps each run's best candidate as a point, with trades per month on the x-axis and quality score on the y-axis. It filters out very low-scoring noise, clamps the visible x-axis to `200` trades/month, and overlays the upper-envelope frontier so the top-left to top-middle tradeoff is easier to read.
+The validation scatter plots each run leader's `36m` score on the x-axis against its `12m` score on the y-axis so recent-only winners separate from candidates that survive scrutiny.
+The validation delta chart ranks those same leaders by `36m - 12m` score, which makes score decay obvious at a glance.
+
+Useful validation workflow:
+
+```powershell
+uv run autoresearch leaderboard
+```
+
+That single command now regenerates the classic leaderboards plus the two validation views above.
+By default it heals missing or stale validation artifacts and reuses matching cached manifests. If you want to invalidate the validation/similarity cache on purpose, use:
+
+```powershell
+uv run autoresearch leaderboard --force-rebuild
+```
 
 Useful commands:
 
@@ -438,24 +459,45 @@ Default URL:
 
 - `http://127.0.0.1:47832`
 
+If you want the dashboard refresh path to ignore cached validation artifacts and rebuild them from scratch on startup, use:
+
+```powershell
+uv run autoresearch dashboard --force-rebuild
+```
+
 What it gives you:
 
 - overview cards for run count, attempts, best score, profile-drop coverage, and curve coverage
 - the existing derived leaderboard images with a refresh button that rebuilds them from source
 - interactive score-vs-trade-rate and score-vs-drawdown views
+- interactive `12m vs 36m` validation scatter and scrutiny-delta views
 - a run list and model consistency table
 - per-run attempt drilldown
 - lightweight backtest inspection from `best-cell-path-detail.json`, including equity and drawdown curves
+- per-attempt profile-drop previews that prefer `12mo` and `36mo` renders when present
 
-`sync-profile-drop-pngs` walks each run, finds its best scored attempt, ensures the backing profile exists in cloud storage, rebuilds a fresh profile-drop bundle through the existing FuzzFolio package flow, renders a new PNG, and leaves only:
+`sync-profile-drop-pngs` walks each run, finds its best scored attempt, ensures the backing profile exists in cloud storage, rebuilds a fresh profile-drop bundle through the existing FuzzFolio package flow, and renders side-by-side horizon cards:
 
-- `runs/<run-id>/profile-drop.png`
+- `runs/<run-id>/profile-drop-12mo.png`
+- `runs/<run-id>/profile-drop-36mo.png`
 
 It defaults to a fixed `12` month replay window for every rebuilt card. Override with:
 
 ```powershell
 uv run autoresearch sync-profile-drop-pngs --lookback-months 36
 ```
+
+Examples:
+
+```powershell
+uv run autoresearch sync-profile-drop-pngs
+uv run autoresearch sync-profile-drop-pngs --run-id 20260327T212626114512Z-agentic-0245ff
+uv run autoresearch sync-profile-drop-pngs --lookback-months 24
+uv run autoresearch sync-profile-drop-pngs --force-rebuild
+```
+
+When `--lookback-months` is neither `12` nor `36`, the command still always renders the standard `12mo` and `36mo` cards and will additionally render the requested custom horizon.
+By default it heals missing or stale profile-drop renders using per-horizon manifests and skips runs that are already up to date. Use `--force-rebuild` when you intentionally want to rerender everything.
 
 `supervise` already starts a fresh isolated session when the prior session stops with `step_limit_reached` and time remains in the outer supervise window. Set `"window_enabled": false` under `supervisor`, or pass `--no-window`, to let supervise run around the clock.
 

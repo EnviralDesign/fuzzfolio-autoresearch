@@ -79,6 +79,10 @@ function renderGallery(images) {
     ["Best-per-run leaderboard", images.leaderboardPlotUrl, "The current champion from each run."],
     ["Model averages", images.modelLeaderboardPlotUrl, "Average best-per-run score by explorer model."],
     ["Score vs trade rate", images.tradeoffPlotUrl, "Existing derived tradeoff render from the leaderboard pass."],
+    ["12m vs 36m validation", images.validationScatterPlotUrl, "How the recent winners hold up under 3-year scrutiny."],
+    ["Scrutiny delta", images.validationDeltaPlotUrl, "36m minus 12m score for the currently validated leaders."],
+    ["Similarity heatmap", images.similarityHeatmapPlotUrl, "Pairwise 36m sameness across the validated leaders."],
+    ["Score vs sameness", images.similarityScatterPlotUrl, "High-scoring leaders that are not obvious clones stand out on the left."],
   ].filter((row) => row[1]);
   gallery.innerHTML = rows
     .map(
@@ -129,10 +133,10 @@ function renderScatterChart(container, points, options) {
   const innerHeight = height - margin.top - margin.bottom;
   const xValues = points.map((point) => Number(point.x));
   const yValues = points.map((point) => Number(point.y));
-  const xMin = Math.min(...xValues);
-  const xMax = Math.max(...xValues);
-  const yMin = Math.min(...yValues);
-  const yMax = Math.max(...yValues);
+  const xMin = options.xDomain ? Number(options.xDomain[0]) : Math.min(...xValues);
+  const xMax = options.xDomain ? Number(options.xDomain[1]) : Math.max(...xValues);
+  const yMin = options.yDomain ? Number(options.yDomain[0]) : Math.min(...yValues);
+  const yMax = options.yDomain ? Number(options.yDomain[1]) : Math.max(...yValues);
   const xPad = xMax === xMin ? 1 : (xMax - xMin) * 0.08;
   const yPad = yMax === yMin ? 1 : (yMax - yMin) * 0.08;
   const xScale = (value) =>
@@ -232,6 +236,48 @@ function renderSimpleTable(containerId, columns, rows) {
   });
 }
 
+function renderHorizontalBarChart(container, rows, options) {
+  if (!rows.length) {
+    container.innerHTML = `<div class="empty-state">No bars yet.</div>`;
+    return;
+  }
+  const width = Math.max(container.clientWidth || 640, 320);
+  const rowHeight = 28;
+  const height = Math.max(240, rows.length * rowHeight + 72);
+  const margin = { top: 22, right: 24, bottom: 34, left: 220 };
+  const innerWidth = width - margin.left - margin.right;
+  const innerHeight = height - margin.top - margin.bottom;
+  const values = rows.map((row) => Number(row.value));
+  const minValue = Math.min(0, ...values);
+  const maxValue = Math.max(0, ...values);
+  const padding = maxValue === minValue ? 1 : (maxValue - minValue) * 0.08;
+  const domainMin = minValue - padding;
+  const domainMax = maxValue + padding;
+  const xScale = (value) =>
+    margin.left + ((value - domainMin) / (domainMax - domainMin)) * innerWidth;
+  const zeroX = xScale(0);
+  const svgParts = [
+    `<svg class="chart-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(options.title)}">`,
+    `<rect x="0" y="0" width="${width}" height="${height}" rx="18" fill="rgba(7,12,22,0.45)"></rect>`,
+    `<line x1="${zeroX}" y1="${margin.top}" x2="${zeroX}" y2="${margin.top + innerHeight}" stroke="rgba(216,228,255,0.65)" stroke-width="1.2" />`,
+  ];
+  rows.forEach((row, index) => {
+    const y = margin.top + index * rowHeight + 2;
+    const barHeight = rowHeight - 8;
+    const valueX = xScale(Number(row.value));
+    const x = Math.min(zeroX, valueX);
+    const barWidth = Math.abs(valueX - zeroX);
+    svgParts.push(`<text x="${margin.left - 10}" y="${y + barHeight * 0.78}" fill="#c7d8ef" text-anchor="end" font-size="11">${escapeHtml(row.label)}</text>`);
+    svgParts.push(`<rect x="${x}" y="${y}" width="${barWidth}" height="${barHeight}" rx="8" fill="${escapeHtml(row.color || "#60d6c3")}" opacity="0.88"></rect>`);
+    svgParts.push(`<text x="${valueX + (Number(row.value) >= 0 ? 8 : -8)}" y="${y + barHeight * 0.78}" fill="#ebf3ff" text-anchor="${Number(row.value) >= 0 ? "start" : "end"}" font-size="11">${escapeHtml(options.valueFormat(Number(row.value), row))}</text>`);
+  });
+  svgParts.push(
+    `<text x="${margin.left + innerWidth / 2}" y="${height - 8}" fill="#99abc4" text-anchor="middle" font-size="12">${escapeHtml(options.xLabel)}</text>`,
+  );
+  svgParts.push(`</svg>`);
+  container.innerHTML = svgParts.join("");
+}
+
 function renderModelTable(payload) {
   renderSimpleTable(
     "modelTable",
@@ -271,7 +317,10 @@ function renderRunsTable(payload) {
 }
 
 function renderTradeoffChart(payload) {
-  const points = (payload.tradeoff || []).map((row) => ({
+  const visibleRows = (payload.tradeoff || []).filter(
+    (row) => Number(row.composite_score) >= 15 && Number(row.trades_per_month) <= 200,
+  );
+  const points = visibleRows.map((row) => ({
     x: row.trades_per_month,
     y: row.composite_score,
     emphasis: row.is_trade_envelope,
@@ -279,7 +328,7 @@ function renderTradeoffChart(payload) {
     tooltip: `<strong>${escapeHtml(row.run_id)}</strong><br>${escapeHtml(row.candidate_name)}<br>score ${formatNumber(row.composite_score, 2)}<br>${formatNumber(row.trades_per_month, 1)} trades/mo`,
     onClick: () => setHashForRun(row.run_id, row.attempt_id),
   }));
-  const envelope = (payload.tradeoff || [])
+  const envelope = visibleRows
     .filter((row) => row.is_trade_envelope)
     .map((row) => ({ x: row.trades_per_month, y: row.composite_score }))
     .sort((left, right) => left.x - right.x);
@@ -290,6 +339,7 @@ function renderTradeoffChart(payload) {
     xTickFormat: (value) => formatNumber(value, value < 10 ? 1 : 0),
     yTickFormat: (value) => formatNumber(value, 0),
     polyline: envelope,
+    xDomain: [0, 200],
   });
 }
 
@@ -309,6 +359,97 @@ function renderDrawdownChart(payload) {
     xTickFormat: (value) => formatNumber(value, 0),
     yTickFormat: (value) => formatNumber(value, 0),
   });
+}
+
+function renderValidationScatterChart(payload) {
+  const points = (payload.validation || []).map((row) => ({
+    x: row.score_36m,
+    y: row.score_12m,
+    emphasis: Number(row.trades_per_month_36m || 0) >= 20,
+    outline: false,
+    tooltip: `<strong>${escapeHtml(row.run_id)}</strong><br>${escapeHtml(row.candidate_name || "candidate")}<br>12m ${formatNumber(row.score_12m, 2)}<br>36m ${formatNumber(row.score_36m, 2)}<br>${formatNumber(row.trades_per_month_36m, 1)} trades/mo on 36m`,
+    onClick: () => setHashForRun(row.run_id, row.attempt_id),
+  }));
+  const diagonal = points.length
+    ? (() => {
+        const values = points.flatMap((point) => [Number(point.x), Number(point.y)]);
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        return [{ x: min, y: min }, { x: max, y: max }];
+      })()
+    : [];
+  renderScatterChart(document.getElementById("validationScatterChart"), points, {
+    title: "12m vs 36m validation",
+    xLabel: "36m quality score",
+    yLabel: "12m quality score",
+    xTickFormat: (value) => formatNumber(value, 0),
+    yTickFormat: (value) => formatNumber(value, 0),
+    polyline: diagonal,
+  });
+}
+
+function renderValidationDeltaChart(payload) {
+  const rows = (payload.validation || [])
+    .map((row) => ({
+      label: row.leaderboard_label || row.run_id,
+      value: Number(row.score_delta),
+      runId: row.run_id,
+      attemptId: row.attempt_id,
+      score12m: row.score_12m,
+      score36m: row.score_36m,
+      color: Number(row.score_delta) >= 0 ? "#60d6c3" : "#ff9a76",
+    }))
+    .sort((left, right) => right.value - left.value);
+  renderHorizontalBarChart(document.getElementById("validationDeltaChart"), rows, {
+    title: "36m minus 12m score",
+    xLabel: "36m - 12m quality score",
+    valueFormat: (value, row) => `${value >= 0 ? "+" : ""}${formatNumber(value, 2)} (${formatNumber(row.score12m, 1)} → ${formatNumber(row.score36m, 1)})`,
+  });
+}
+
+function renderSimilarityScatterChart(payload) {
+  const points = (payload.similarity || []).map((row) => ({
+    x: Number(row.max_sameness || 0),
+    y: Number(row.score_36m),
+    emphasis: Number(row.trades_per_month_36m || 0) >= 20,
+    outline: false,
+    tooltip:
+      `<strong>${escapeHtml(row.run_id)}</strong><br>` +
+      `${escapeHtml(row.candidate_name || "candidate")}<br>` +
+      `36m ${formatNumber(row.score_36m, 2)}<br>` +
+      `closest-match sameness ${formatNumber(row.max_sameness, 2)}<br>` +
+      `${formatNumber(row.trades_per_month_36m, 1)} trades/mo<br>` +
+      `${escapeHtml(row.closest_match_label || "no close match found")}`,
+    onClick: () => setHashForRun(row.run_id, row.attempt_id),
+  }));
+  renderScatterChart(document.getElementById("similarityScatterChart"), points, {
+    title: "Score vs closest-match sameness",
+    xLabel: "Closest-match sameness",
+    yLabel: "36m quality score",
+    xTickFormat: (value) => formatNumber(value, 2),
+    yTickFormat: (value) => formatNumber(value, 0),
+    xDomain: [0, 1],
+  });
+}
+
+function renderSimilarityPairsTable(payload) {
+  renderSimpleTable(
+    "similarityPairsTable",
+    [
+      {
+        label: "Pair",
+        render: (row) =>
+          `<strong>${escapeHtml(row.left_run_id)}</strong><div class="muted">${escapeHtml(row.right_run_id)}</div>`,
+      },
+      { label: "Sameness", render: (row) => formatNumber(row.similarity_score, 2) },
+      { label: "Corr", render: (row) => formatNumber(row.positive_correlation, 2) },
+      { label: "Overlap", render: (row) => `${Math.round(Number(row.shared_active_ratio || 0) * 100)}%` },
+    ],
+    (payload.similarityPairs || []).map((row) => ({
+      ...row,
+      onClick: () => setHashForRun(row.left_run_id, row.left_attempt_id),
+    })),
+  );
 }
 
 function parseHash() {
@@ -443,7 +584,12 @@ function renderAttemptDetail(detail) {
         <div id="drawdownCurveChart" class="chart-frame"></div>
       </section>
       <section class="span-4">
-        ${detail.profileDropPngUrl ? `<div class="image-frame"><img alt="Profile drop" src="${escapeHtml(detail.profileDropPngUrl)}&t=${Date.now()}" /></div>` : `<div class="empty-state">No profile-drop.png rendered for this run yet.</div>`}
+        <div class="payload-grid">
+          ${detail.profileDrop12PngUrl ? `<div class="image-frame"><img alt="Profile drop 12mo" src="${escapeHtml(detail.profileDrop12PngUrl)}&t=${Date.now()}" /></div>` : ""}
+          ${detail.profileDrop36PngUrl ? `<div class="image-frame"><img alt="Profile drop 36mo" src="${escapeHtml(detail.profileDrop36PngUrl)}&t=${Date.now()}" /></div>` : ""}
+          ${!detail.profileDrop12PngUrl && !detail.profileDrop36PngUrl && detail.profileDropPngUrl ? `<div class="image-frame"><img alt="Profile drop" src="${escapeHtml(detail.profileDropPngUrl)}&t=${Date.now()}" /></div>` : ""}
+          ${!detail.profileDrop12PngUrl && !detail.profileDrop36PngUrl && !detail.profileDropPngUrl ? `<div class="empty-state">No profile-drop PNG rendered for this run yet.</div>` : ""}
+        </div>
       </section>
       <section class="span-12 payload-grid">
         <details open>
@@ -570,6 +716,10 @@ async function loadOverview(refresh = false) {
     renderRunsTable(payload);
     renderTradeoffChart(payload);
     renderDrawdownChart(payload);
+    renderValidationScatterChart(payload);
+    renderValidationDeltaChart(payload);
+    renderSimilarityScatterChart(payload);
+    renderSimilarityPairsTable(payload);
     setStatus(refresh ? "Refresh complete." : "Ready.");
     await renderRunDetailFromHash();
   } catch (error) {
@@ -593,6 +743,10 @@ function wireEvents() {
     if (state.overview) {
       renderTradeoffChart(state.overview);
       renderDrawdownChart(state.overview);
+      renderValidationScatterChart(state.overview);
+      renderValidationDeltaChart(state.overview);
+      renderSimilarityScatterChart(state.overview);
+      renderSimilarityPairsTable(state.overview);
       renderRunDetailFromHash();
     }
   });

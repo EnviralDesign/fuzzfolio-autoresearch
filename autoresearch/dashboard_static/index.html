@@ -72,6 +72,49 @@
         <section class="panel span-6">
           <div class="panel-header">
             <div>
+              <p class="eyebrow">Validation Map</p>
+              <h2>12m vs 36m score</h2>
+            </div>
+            <span class="panel-note">Top-right and near the diagonal is what survives scrutiny.</span>
+          </div>
+          <div id="validationScatterChart" class="chart-frame"></div>
+        </section>
+
+        <section class="panel span-6">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Scrutiny Delta</p>
+              <h2>36m minus 12m score</h2>
+            </div>
+            <span class="panel-note">Closer to zero is more stable. Positive is rare and notable.</span>
+          </div>
+          <div id="validationDeltaChart" class="chart-frame"></div>
+        </section>
+
+        <section class="panel span-7">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Diversity Map</p>
+              <h2>36m score vs closest-match sameness</h2>
+            </div>
+            <span class="panel-note">Top-left is the sweet spot: strong and not obviously a clone.</span>
+          </div>
+          <div id="similarityScatterChart" class="chart-frame"></div>
+        </section>
+
+        <section class="panel span-5">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Closest Matches</p>
+              <h2>Most similar validated pairs</h2>
+            </div>
+          </div>
+          <div id="similarityPairsTable"></div>
+        </section>
+
+        <section class="panel span-6">
+          <div class="panel-header">
+            <div>
               <p class="eyebrow">Model Consistency</p>
               <h2>Who converts runs into quality most reliably?</h2>
             </div>

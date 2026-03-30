@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import subprocess
+import sys
 import threading
+from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -40,6 +43,45 @@ def _load_optional_json(path: Path) -> Any | None:
         return None
 
 
+def _run_streaming_subprocess(argv: list[str], *, cwd: str, prefix: str) -> tuple[int, str, str]:
+    process = subprocess.Popen(
+        argv,
+        cwd=cwd,
+        text=True,
+        encoding="utf-8",
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+    )
+    stdout_tail: deque[str] = deque(maxlen=60)
+    stderr_tail: deque[str] = deque(maxlen=60)
+
+    def pump(stream: Any, sink: Any, tail: deque[str], label: str) -> None:
+        if stream is None:
+            return
+        for raw_line in stream:
+            line = raw_line.rstrip("\n")
+            tail.append(line)
+            print(f"{prefix}{label}{line}", file=sink, flush=True)
+
+    stdout_thread = threading.Thread(
+        target=pump,
+        args=(process.stdout, sys.stdout, stdout_tail, ""),
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=pump,
+        args=(process.stderr, sys.stderr, stderr_tail, "stderr: "),
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    return_code = process.wait()
+    stdout_thread.join(timeout=2)
+    stderr_thread.join(timeout=2)
+    return return_code, "\n".join(stdout_tail), "\n".join(stderr_tail)
+
+
 def _metric_value(payload: dict[str, Any], *path: str) -> float | None:
     current: Any = payload
     for key in path:
@@ -62,9 +104,11 @@ def _run_metadata_by_id(config: AppConfig) -> dict[str, dict[str, Any]]:
     return {run_dir.name: load_run_metadata(run_dir) for run_dir in list_run_dirs(config.runs_root)}
 
 
-def refresh_dashboard_sources(config: AppConfig, *, limit: int) -> dict[str, str]:
+def refresh_dashboard_sources(config: AppConfig, *, limit: int, force_rebuild: bool) -> dict[str, str]:
+    print("dashboard refresh: loading run attempts", flush=True)
     attempts = load_all_run_attempts(config.runs_root)
     run_metadata_by_run_id = _run_metadata_by_id(config)
+    print("dashboard refresh: rendering aggregate progress", flush=True)
     render_progress_artifacts(
         attempts,
         config.aggregate_plot_path,
@@ -92,11 +136,31 @@ def refresh_dashboard_sources(config: AppConfig, *, limit: int) -> dict[str, str
         run_metadata_by_run_id=run_metadata_by_run_id,
         lower_is_better=config.research.plot_lower_is_better,
     )
+    print("dashboard refresh: running leaderboard pipeline", flush=True)
+    if force_rebuild:
+        print("dashboard refresh: force rebuild enabled", flush=True)
+    leaderboard_argv = [sys.executable, "-m", "autoresearch", "leaderboard", "--limit", str(limit)]
+    if force_rebuild:
+        leaderboard_argv.append("--force-rebuild")
+    return_code, stdout_tail, stderr_tail = _run_streaming_subprocess(
+        leaderboard_argv,
+        cwd=str(config.repo_root),
+        prefix="  leaderboard | ",
+    )
+    if return_code != 0:
+        raise RuntimeError(
+            f"leaderboard refresh failed\nstdout:\n{stdout_tail[:1600]}\n\nstderr:\n{stderr_tail[:1600]}"
+        )
+    print("dashboard refresh: done", flush=True)
     return {
         "aggregate_plot": str(config.aggregate_plot_path),
         "leaderboard_plot": str(config.leaderboard_plot_path),
         "model_plot": str(config.model_leaderboard_plot_path),
         "tradeoff_plot": str(config.tradeoff_leaderboard_plot_path),
+        "validation_scatter_plot": str(config.validation_scatter_plot_path),
+        "validation_delta_plot": str(config.validation_delta_plot_path),
+        "similarity_heatmap_plot": str(config.similarity_heatmap_plot_path),
+        "similarity_scatter_plot": str(config.similarity_scatter_plot_path),
     }
 
 
@@ -316,7 +380,8 @@ def _run_summary(config: AppConfig, run_dir: Path) -> dict[str, Any]:
         "latestLogTimestamp": latest_timestamp,
         "advisorGuidanceCount": advisor_count,
         "progressPngUrl": _file_url(config, run_dir / "progress.png"),
-        "profileDropPngUrl": _file_url(config, run_dir / "profile-drop.png") if (run_dir / "profile-drop.png").exists() else None,
+        "profileDrop12PngUrl": _file_url(config, run_dir / "profile-drop-12mo.png") if (run_dir / "profile-drop-12mo.png").exists() else None,
+        "profileDrop36PngUrl": _file_url(config, run_dir / "profile-drop-36mo.png") if (run_dir / "profile-drop-36mo.png").exists() else None,
         "bestAttempt": _attempt_summary(config, best_attempt) if best_attempt else None,
     }
 
@@ -375,6 +440,10 @@ def build_dashboard_payload(config: AppConfig, *, limit: int) -> dict[str, Any]:
     leaderboard_rows = _load_optional_json(config.leaderboard_json_path) or []
     model_rows = _load_optional_json(config.model_leaderboard_json_path) or []
     tradeoff_rows = _load_optional_json(config.tradeoff_leaderboard_json_path) or []
+    validation_rows = _load_optional_json(config.validation_leaderboard_json_path) or []
+    similarity_payload = _load_optional_json(config.similarity_leaderboard_json_path) or {}
+    similarity_leaders = list((similarity_payload or {}).get("leaders") or [])
+    similarity_pairs = list((similarity_payload or {}).get("pairs") or [])
     run_summaries = [_run_summary(config, run_dir) for run_dir in reversed(run_dirs)]
 
     best_scores = [
@@ -396,6 +465,8 @@ def build_dashboard_payload(config: AppConfig, *, limit: int) -> dict[str, Any]:
         "leaderboardCount": len(leaderboard_rows),
         "modelBucketCount": len(model_rows),
         "tradeoffPointCount": len(tradeoff_rows),
+        "validationPointCount": len(validation_rows),
+        "similarityLeaderCount": len(similarity_leaders),
     }
 
     return {
@@ -405,11 +476,18 @@ def build_dashboard_payload(config: AppConfig, *, limit: int) -> dict[str, Any]:
             "leaderboardPlotUrl": _file_url(config, config.leaderboard_plot_path) if config.leaderboard_plot_path.exists() else None,
             "modelLeaderboardPlotUrl": _file_url(config, config.model_leaderboard_plot_path) if config.model_leaderboard_plot_path.exists() else None,
             "tradeoffPlotUrl": _file_url(config, config.tradeoff_leaderboard_plot_path) if config.tradeoff_leaderboard_plot_path.exists() else None,
+            "validationScatterPlotUrl": _file_url(config, config.validation_scatter_plot_path) if config.validation_scatter_plot_path.exists() else None,
+            "validationDeltaPlotUrl": _file_url(config, config.validation_delta_plot_path) if config.validation_delta_plot_path.exists() else None,
+            "similarityHeatmapPlotUrl": _file_url(config, config.similarity_heatmap_plot_path) if config.similarity_heatmap_plot_path.exists() else None,
+            "similarityScatterPlotUrl": _file_url(config, config.similarity_scatter_plot_path) if config.similarity_scatter_plot_path.exists() else None,
         },
         "leaderboard": leaderboard_rows,
         "modelAverages": model_rows,
         "modelConsistency": _model_consistency_rows(leaderboard_rows),
         "tradeoff": tradeoff_rows,
+        "validation": validation_rows,
+        "similarity": similarity_leaders,
+        "similarityPairs": similarity_pairs,
         "scoreVsDrawdown": _drawdown_rows(leaderboard_rows),
         "runs": run_summaries,
         "limit": limit,
@@ -455,20 +533,22 @@ def build_attempt_detail(config: AppConfig, run_id: str, attempt_id: str) -> dic
             "sensitivity": sensitivity_payload,
             "deepReplayJob": deep_replay_job,
             "profile": profile_payload,
-            "profileDropPngUrl": _file_url(config, run_dir / "profile-drop.png") if (run_dir / "profile-drop.png").exists() else None,
+            "profileDrop12PngUrl": _file_url(config, run_dir / "profile-drop-12mo.png") if (run_dir / "profile-drop-12mo.png").exists() else None,
+            "profileDrop36PngUrl": _file_url(config, run_dir / "profile-drop-36mo.png") if (run_dir / "profile-drop-36mo.png").exists() else None,
         }
     return None
 
 
 class DashboardState:
-    def __init__(self, config: AppConfig, *, limit: int):
+    def __init__(self, config: AppConfig, *, limit: int, force_rebuild: bool):
         self.config = config
         self.limit = limit
+        self.force_rebuild = force_rebuild
         self._lock = threading.Lock()
         self.payload: dict[str, Any] = {}
 
     def rebuild(self) -> dict[str, Any]:
-        refresh_dashboard_sources(self.config, limit=self.limit)
+        refresh_dashboard_sources(self.config, limit=self.limit, force_rebuild=self.force_rebuild)
         payload = build_dashboard_payload(self.config, limit=self.limit)
         with self._lock:
             self.payload = payload
@@ -577,14 +657,29 @@ def serve_dashboard(
     port: int,
     limit: int,
     refresh_on_start: bool = True,
+    force_rebuild: bool = False,
 ) -> None:
-    state = DashboardState(config, limit=limit)
+    state = DashboardState(config, limit=limit, force_rebuild=force_rebuild)
+    public_url = f"http://{host}:{port}"
+    local_url = f"http://127.0.0.1:{port}"
+    print("Autoresearch dashboard starting...", flush=True)
+    print(f"  bind: {host}:{port}", flush=True)
+    print(f"  local url: {local_url}", flush=True)
+    if host not in {"127.0.0.1", "localhost"}:
+        print(f"  bound url: {public_url}", flush=True)
+    print(f"  leaderboard limit: {limit}", flush=True)
+    print(f"  refresh on start: {'yes' if refresh_on_start else 'no'}", flush=True)
+    print(f"  force rebuild: {'yes' if force_rebuild else 'no'}", flush=True)
+    print(f"  runs root: {config.runs_root}", flush=True)
     if refresh_on_start:
+        print("  building dashboard payload from source artifacts...", flush=True)
         state.rebuild()
     else:
+        print("  loading dashboard payload from existing derived artifacts...", flush=True)
         state.payload = build_dashboard_payload(config, limit=limit)
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
-    print(f"Autoresearch dashboard listening on http://{host}:{port}")
+    print("Autoresearch dashboard ready.", flush=True)
+    print(f"  open: {local_url}", flush=True)
     try:
         httpd.serve_forever()
     finally:

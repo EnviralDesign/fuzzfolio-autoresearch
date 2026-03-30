@@ -54,16 +54,26 @@ class FuzzfolioCli:
         *,
         cwd: Path | None = None,
         check: bool = True,
+        timeout_seconds: float | None = None,
     ) -> CommandResult:
         argv = [*self.build_base_argv(), *args]
         working_dir = cwd or self.config.workspace_root or Path.cwd()
-        proc = subprocess.run(
-            argv,
-            cwd=str(working_dir),
-            text=True,
-            capture_output=True,
-            encoding="utf-8",
-        )
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=str(working_dir),
+                text=True,
+                capture_output=True,
+                encoding="utf-8",
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CliError(
+                f"Command timed out after {timeout_seconds:.0f}s: {' '.join(argv)}\n"
+                f"cwd: {working_dir}\n"
+                f"stdout:\n{(exc.stdout or '').strip()[:1600]}\n\n"
+                f"stderr:\n{(exc.stderr or '').strip()[:1600]}"
+            ) from exc
         parsed_json = None
         stdout = proc.stdout.strip()
         if stdout.startswith("{") or stdout.startswith("["):

@@ -154,6 +154,34 @@ class AppConfig:
         return self.derived_root / "leaderboard-score-vs-trades.json"
 
     @property
+    def validation_leaderboard_json_path(self) -> Path:
+        return self.derived_root / "leaderboard-validation.json"
+
+    @property
+    def validation_scatter_plot_path(self) -> Path:
+        return self.derived_root / "leaderboard-validation-12m-vs-36m.png"
+
+    @property
+    def validation_delta_plot_path(self) -> Path:
+        return self.derived_root / "leaderboard-validation-delta.png"
+
+    @property
+    def similarity_leaderboard_json_path(self) -> Path:
+        return self.derived_root / "leaderboard-similarity.json"
+
+    @property
+    def similarity_heatmap_plot_path(self) -> Path:
+        return self.derived_root / "leaderboard-similarity-heatmap.png"
+
+    @property
+    def similarity_scatter_plot_path(self) -> Path:
+        return self.derived_root / "leaderboard-score-vs-sameness.png"
+
+    @property
+    def validation_cache_root(self) -> Path:
+        return self.derived_root / "validation-cache"
+
+    @property
     def program_path(self) -> Path:
         return self.repo_root / "program.md"
 
