@@ -68,6 +68,7 @@ class ResearchConfig:
     coverage_reference_timeframe: str = "M15"
     coverage_min_mid_months: int = 11
     coverage_min_wrap_up_months: int = 34
+    validation_max_concurrency: int = 4
 
 
 @dataclass
@@ -568,6 +569,15 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                 "coverage_min_wrap_up_months",
                 ResearchConfig.coverage_min_wrap_up_months,
             )
+        ),
+        validation_max_concurrency=max(
+            1,
+            int(
+                research_cfg.get(
+                    "validation_max_concurrency",
+                    ResearchConfig.validation_max_concurrency,
+                )
+            ),
         ),
     )
     supervisor = SupervisorConfig(

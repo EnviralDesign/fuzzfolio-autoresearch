@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import shutil
 import subprocess
 import sys
+import threading
 import time as pytime
 from datetime import datetime, time, timedelta
 from math import ceil
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from rich import box
@@ -2365,8 +2367,8 @@ def _build_validation_rows(
     force_rebuild: bool = False,
     emit: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for attempt in ranked_attempts:
+    prepared_attempts: list[tuple[int, str, Path, list[dict[str, Any]], dict[str, Any], dict[str, Any]]] = []
+    for index, attempt in enumerate(ranked_attempts):
         run_id = str(attempt.get("run_id") or "").strip()
         if not run_id:
             continue
@@ -2377,8 +2379,26 @@ def _build_validation_rows(
         best_attempt = _best_attempt_for_run(attempts, lower_is_better=config.research.plot_lower_is_better)
         if best_attempt is None or str(best_attempt.get("attempt_id") or "") != str(attempt.get("attempt_id") or ""):
             best_attempt = attempt
-        if emit:
-            emit(f"validate {run_id} {best_attempt.get('attempt_id')}")
+        prepared_attempts.append((index, run_id, run_dir, attempts, best_attempt, attempt))
+
+    if not prepared_attempts:
+        return []
+
+    emit_lock = threading.Lock()
+    max_workers = min(max(1, int(config.research.validation_max_concurrency)), len(prepared_attempts))
+
+    def emit_serial(message: str) -> None:
+        if emit is None:
+            return
+        with emit_lock:
+            emit(message)
+
+    def build_row(
+        item: tuple[int, str, Path, list[dict[str, Any]], dict[str, Any], dict[str, Any]]
+    ) -> tuple[int, dict[str, Any] | None]:
+        index, run_id, run_dir, attempts, best_attempt, attempt = item
+        cli_for_task = FuzzfolioCli(cli.config)
+        emit_serial(f"validate {run_id} {best_attempt.get('attempt_id')}")
         row = {
             "run_id": run_id,
             "attempt_id": str(best_attempt.get("attempt_id") or ""),
@@ -2390,29 +2410,29 @@ def _build_validation_rows(
         try:
             validation_12 = _ensure_validation_artifacts(
                 config=config,
-                cli=cli,
+                cli=cli_for_task,
                 run_dir=run_dir,
                 attempts=attempts,
                 best_attempt=best_attempt,
                 lookback_months=12,
                 force_rebuild=force_rebuild,
-                emit=emit,
+                emit=emit_serial,
             )
             validation_36 = _ensure_validation_artifacts(
                 config=config,
-                cli=cli,
+                cli=cli_for_task,
                 run_dir=run_dir,
                 attempts=attempts,
                 best_attempt=best_attempt,
                 lookback_months=36,
                 force_rebuild=force_rebuild,
-                emit=emit,
+                emit=emit_serial,
             )
         except Exception as exc:
-            if emit:
+            if emit is not None:
                 detail = str(exc).splitlines()[0].strip() if str(exc).strip() else exc.__class__.__name__
-                emit(f"validate skip {run_id} {best_attempt.get('attempt_id')}: {detail}")
-            continue
+                emit_serial(f"validate skip {run_id} {best_attempt.get('attempt_id')}: {detail}")
+            return index, None
         row.update(
             {
                 "score_12m": validation_12.get("score"),
@@ -2439,8 +2459,17 @@ def _build_validation_rows(
         else:
             row["score_delta"] = score_36 - score_12
             row["score_retention_ratio"] = (score_36 / score_12) if score_12 not in {0.0, -0.0} else None
-        rows.append(row)
-    return rows
+        return index, row
+
+    rows_by_index: dict[int, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(build_row, item) for item in prepared_attempts]
+        for future in as_completed(futures):
+            index, row = future.result()
+            if row is not None:
+                rows_by_index[index] = row
+
+    return [rows_by_index[index] for index, *_ in prepared_attempts if index in rows_by_index]
 
 
 def cmd_sync_profile_drop_pngs(
