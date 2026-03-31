@@ -18,15 +18,31 @@ from zoneinfo import ZoneInfo
 from rich import box
 from rich.console import Console, Group
 from rich.panel import Panel
-from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from autoresearch.config import load_config
-    from autoresearch.controller import ResearchController, RunPolicy, set_runtime_trace_stderr_mode
-    from autoresearch.dashboard import serve_dashboard
+    from autoresearch.controller import (
+        ResearchController,
+        RunPolicy,
+        set_runtime_trace_stderr_mode,
+    )
+    from autoresearch.dashboard import (
+        serve_dashboard,
+        _has_full_backtest,
+        _run_full_backtest_for_attempt,
+    )
     from autoresearch.fuzzfolio import CliError, FuzzfolioCli
     from autoresearch.ledger import (
         append_attempt,
@@ -54,7 +70,12 @@ if __package__ in {None, ""}:
         render_validation_delta_artifacts,
         render_validation_scatter_artifacts,
     )
-    from autoresearch.provider import ChatMessage, ProviderError, create_provider, set_provider_trace_stderr_mode
+    from autoresearch.provider import (
+        ChatMessage,
+        ProviderError,
+        create_provider,
+        set_provider_trace_stderr_mode,
+    )
     from autoresearch.scoring import build_attempt_score, load_sensitivity_snapshot
 else:
     from .config import load_config
@@ -87,14 +108,23 @@ else:
         render_validation_delta_artifacts,
         render_validation_scatter_artifacts,
     )
-    from .provider import ChatMessage, ProviderError, create_provider, set_provider_trace_stderr_mode
+    from .provider import (
+        ChatMessage,
+        ProviderError,
+        create_provider,
+        set_provider_trace_stderr_mode,
+    )
     from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 
 console = Console(safe_box=True)
 DISPLAY_CONTEXT: dict[str, Path | None] = {"repo_root": None, "run_dir": None}
 PLAIN_PROGRESS_MODE = False
-PLAIN_PROGRESS_STATE: dict[str, Any] = {"best_score": None, "last_score": None, "run_id": None}
+PLAIN_PROGRESS_STATE: dict[str, Any] = {
+    "best_score": None,
+    "last_score": None,
+    "run_id": None,
+}
 DISPLAY_ENCODING = getattr(getattr(console, "file", None), "encoding", None) or "utf-8"
 DISPLAY_CHAR_REPLACEMENTS = str.maketrans(
     {
@@ -154,8 +184,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Fuzzfolio autoresearch runtime.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    doctor = subparsers.add_parser("doctor", help="Verify config, CLI, auth, and seed prompt.")
-    doctor.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    doctor = subparsers.add_parser(
+        "doctor", help="Verify config, CLI, auth, and seed prompt."
+    )
+    doctor.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
 
     provider_test = subparsers.add_parser(
         "test-providers",
@@ -167,35 +201,128 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Only test the named provider profile. Can be repeated.",
     )
-    provider_test.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    provider_test.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
 
     run = subparsers.add_parser("run", help="Run the autonomous research controller.")
     run.add_argument("--max-steps", type=int, default=None)
-    run.add_argument("--explorer-profile", default=None, help="Override the configured explorer provider profile for this run.")
-    run.add_argument("--supervisor-profile", default=None, help="Override the configured supervisor provider profile for this run.")
-    run.add_argument("--advisor-profile", action="append", default=None, help="Override advisor provider profiles for this run. Can be repeated.")
-    run.add_argument("--advisor-every", type=int, default=None, help="Inject advisor guidance every N steps.")
-    run.add_argument("--no-advisor", action="store_true", help="Disable periodic advisor guidance for this run.")
-    run.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
-    run.add_argument("--plain-progress", action="store_true", help="Use plain line-oriented progress output instead of Rich panels.")
+    run.add_argument(
+        "--explorer-profile",
+        default=None,
+        help="Override the configured explorer provider profile for this run.",
+    )
+    run.add_argument(
+        "--supervisor-profile",
+        default=None,
+        help="Override the configured supervisor provider profile for this run.",
+    )
+    run.add_argument(
+        "--advisor-profile",
+        action="append",
+        default=None,
+        help="Override advisor provider profiles for this run. Can be repeated.",
+    )
+    run.add_argument(
+        "--advisor-every",
+        type=int,
+        default=None,
+        help="Inject advisor guidance every N steps.",
+    )
+    run.add_argument(
+        "--no-advisor",
+        action="store_true",
+        help="Disable periodic advisor guidance for this run.",
+    )
+    run.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON instead of live console progress.",
+    )
+    run.add_argument(
+        "--plain-progress",
+        action="store_true",
+        help="Use plain line-oriented progress output instead of Rich panels.",
+    )
 
-    supervise = subparsers.add_parser("supervise", help="Run the supervised controller with config-backed policy defaults.")
-    supervise.add_argument("--max-steps", type=int, default=None, help="Per-session step cap before supervise starts a fresh isolated session.")
-    supervise.add_argument("--window", default=None, help="Operating window in HH:MM-HH:MM format.")
-    supervise.add_argument("--no-window", action="store_true", help="Disable supervise windowing and run sessions around the clock.")
-    supervise.add_argument("--timezone", default=None, help="IANA timezone for the operating window, e.g. America/Chicago.")
-    supervise.add_argument("--explorer-profile", default=None, help="Override the configured explorer provider profile for this run.")
-    supervise.add_argument("--supervisor-profile", default=None, help="Override the configured supervisor provider profile for this run.")
-    supervise.add_argument("--advisor-profile", action="append", default=None, help="Override advisor provider profiles for this supervise session. Can be repeated.")
-    supervise.add_argument("--advisor-every", type=int, default=None, help="Inject advisor guidance every N steps.")
-    supervise.add_argument("--no-advisor", action="store_true", help="Disable periodic advisor guidance for this supervise session.")
-    supervise.add_argument("--json", action="store_true", help="Print machine-readable JSON instead of live console progress.")
-    supervise.add_argument("--plain-progress", action="store_true", help="Use plain line-oriented progress output instead of Rich panels.")
+    supervise = subparsers.add_parser(
+        "supervise",
+        help="Run the supervised controller with config-backed policy defaults.",
+    )
+    supervise.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Per-session step cap before supervise starts a fresh isolated session.",
+    )
+    supervise.add_argument(
+        "--window", default=None, help="Operating window in HH:MM-HH:MM format."
+    )
+    supervise.add_argument(
+        "--no-window",
+        action="store_true",
+        help="Disable supervise windowing and run sessions around the clock.",
+    )
+    supervise.add_argument(
+        "--timezone",
+        default=None,
+        help="IANA timezone for the operating window, e.g. America/Chicago.",
+    )
+    supervise.add_argument(
+        "--explorer-profile",
+        default=None,
+        help="Override the configured explorer provider profile for this run.",
+    )
+    supervise.add_argument(
+        "--supervisor-profile",
+        default=None,
+        help="Override the configured supervisor provider profile for this run.",
+    )
+    supervise.add_argument(
+        "--advisor-profile",
+        action="append",
+        default=None,
+        help="Override advisor provider profiles for this supervise session. Can be repeated.",
+    )
+    supervise.add_argument(
+        "--advisor-every",
+        type=int,
+        default=None,
+        help="Inject advisor guidance every N steps.",
+    )
+    supervise.add_argument(
+        "--no-advisor",
+        action="store_true",
+        help="Disable periodic advisor guidance for this supervise session.",
+    )
+    supervise.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON instead of live console progress.",
+    )
+    supervise.add_argument(
+        "--plain-progress",
+        action="store_true",
+        help="Use plain line-oriented progress output instead of Rich panels.",
+    )
 
-    plot = subparsers.add_parser("plot", help="Generate a run-local or all-runs derived progress plot.")
-    plot.add_argument("--run-id", default=None, help="Specific run id to render. Defaults to latest discovered run.")
-    plot.add_argument("--all-runs", action="store_true", help="Render a derived aggregate plot across all runs.")
-    leaderboard = subparsers.add_parser("leaderboard", help="Generate a derived best-per-run leaderboard image and JSON.")
+    plot = subparsers.add_parser(
+        "plot", help="Generate a run-local or all-runs derived progress plot."
+    )
+    plot.add_argument(
+        "--run-id",
+        default=None,
+        help="Specific run id to render. Defaults to latest discovered run.",
+    )
+    plot.add_argument(
+        "--all-runs",
+        action="store_true",
+        help="Render a derived aggregate plot across all runs.",
+    )
+    leaderboard = subparsers.add_parser(
+        "leaderboard",
+        help="Generate a derived best-per-run leaderboard image and JSON.",
+    )
     leaderboard.add_argument(
         "--limit",
         type=int,
@@ -207,9 +334,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore cached validation artifacts and rebuild all derived validation/similarity inputs.",
     )
-    dashboard = subparsers.add_parser("dashboard", help="Serve a local SPA for run, leaderboard, and backtest drilldown.")
-    dashboard.add_argument("--host", default="127.0.0.1", help="Bind host. Default: 127.0.0.1")
-    dashboard.add_argument("--port", type=int, default=47832, help="Bind port. Default: 47832")
+    dashboard = subparsers.add_parser(
+        "dashboard",
+        help="Serve a local SPA for run, leaderboard, and backtest drilldown.",
+    )
+    dashboard.add_argument(
+        "--host", default="127.0.0.1", help="Bind host. Default: 127.0.0.1"
+    )
+    dashboard.add_argument(
+        "--port", type=int, default=47832, help="Bind port. Default: 47832"
+    )
     dashboard.add_argument(
         "--limit",
         type=int,
@@ -252,8 +386,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Ignore existing profile-drop PNG/manifests and rerender every requested horizon.",
     )
-    profile_drop_pngs.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
-    subparsers.add_parser("reset-runs", help="Delete all run artifacts and recreate a clean empty runs state.")
+    profile_drop_pngs.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+    subparsers.add_parser(
+        "reset-runs",
+        help="Delete all run artifacts and recreate a clean empty runs state.",
+    )
     prune_runs = subparsers.add_parser(
         "prune-runs",
         help="Delete low-signal run directories, such as smoke tests or early dead runs.",
@@ -275,7 +414,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=20,
         help="How many matched runs to include in the preview output.",
     )
-    prune_runs.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    prune_runs.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
     stop_all = subparsers.add_parser(
         "stop-all-runs",
         help="Clear local queued Fuzzfolio research work and optionally stop local autoresearch processes.",
@@ -285,7 +426,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Also stop local autoresearch run/supervise Python processes.",
     )
-    stop_all.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    stop_all.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
     purge_profiles = subparsers.add_parser(
         "purge-cloud-profiles",
         help="Delete saved scoring profiles from the currently configured Fuzzfolio account.",
@@ -301,12 +444,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=10,
         help="How many profiles to include in the preview output.",
     )
-    purge_profiles.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    purge_profiles.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
 
-    score = subparsers.add_parser("score", help="Score one sensitivity artifact directory.")
+    calc_backtests = subparsers.add_parser(
+        "calculate-full-backtests",
+        help="Calculate 3yr backtest curves for all attempts that don't have them yet.",
+    )
+    calc_backtests.add_argument(
+        "--run-ids",
+        nargs="*",
+        default=None,
+        help="Specific run IDs to process. Defaults to all runs.",
+    )
+    calc_backtests.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Recalculate even if full-backtest file already exists.",
+    )
+    calc_backtests.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    score = subparsers.add_parser(
+        "score", help="Score one sensitivity artifact directory."
+    )
     score.add_argument("artifact_dir", type=Path)
 
-    record = subparsers.add_parser("record-attempt", help="Score and append one artifact directory to the attempts ledger.")
+    record = subparsers.add_parser(
+        "record-attempt",
+        help="Score and append one artifact directory to the attempts ledger.",
+    )
     record.add_argument("artifact_dir", type=Path)
     record.add_argument("--candidate-name", default=None)
     record.add_argument("--run-id", default="manual")
@@ -481,7 +650,11 @@ def _step_header_label(step_payload: dict[str, Any]) -> str:
                 PLAIN_PROGRESS_STATE["best_score"] = score
     best_score = _coerce_score(PLAIN_PROGRESS_STATE.get("best_score"))
     last_score = _coerce_score(PLAIN_PROGRESS_STATE.get("last_score"))
-    action_count = len(step_payload.get("actions", [])) if isinstance(step_payload.get("actions"), list) else 0
+    action_count = (
+        len(step_payload.get("actions", []))
+        if isinstance(step_payload.get("actions"), list)
+        else 0
+    )
     warning_count = _warning_count(step_payload)
     parts = [f"Step {step_payload.get('step')}"]
     parts.append(f"best={best_score:.4f}" if best_score is not None else "best=n/a")
@@ -507,7 +680,9 @@ def _plain_result_details(result: dict[str, object]) -> list[str]:
                 text = line.strip()
                 if text:
                     details.append(f"stderr: {text}")
-        if (error or (tool == "run_cli" and not bool(result.get('ok', True)))) and isinstance(payload.get("stdout"), str):
+        if (
+            error or (tool == "run_cli" and not bool(result.get("ok", True)))
+        ) and isinstance(payload.get("stdout"), str):
             stdout = str(payload.get("stdout")).strip()
             if stdout:
                 for line in stdout.splitlines():
@@ -515,7 +690,9 @@ def _plain_result_details(result: dict[str, object]) -> list[str]:
                     if text:
                         details.append(f"stdout: {text}")
     if tool == "yield_guard":
-        message = str(result.get("supervisor_message") or result.get("message") or "").strip()
+        message = str(
+            result.get("supervisor_message") or result.get("message") or ""
+        ).strip()
         if message:
             details.append(f"warning: {message}")
         questions = result.get("questions")
@@ -596,16 +773,22 @@ def cmd_doctor() -> int:
         "explorer_api_base": config.provider.api_base,
         "explorer_command": config.provider.command,
         "explorer_has_api_key": bool(config.provider.api_key),
-        "explorer_uses_managed_auth": config.provider.provider_type.strip().lower() == "codex",
-        "explorer_compact_trigger_tokens": config.compact_trigger_tokens_for(config.llm.explorer_profile),
+        "explorer_uses_managed_auth": config.provider.provider_type.strip().lower()
+        == "codex",
+        "explorer_compact_trigger_tokens": config.compact_trigger_tokens_for(
+            config.llm.explorer_profile
+        ),
         "supervisor_profile": config.llm.supervisor_profile,
         "supervisor_provider_type": config.supervisor_provider.provider_type,
         "supervisor_model": config.supervisor_provider.model,
         "supervisor_api_base": config.supervisor_provider.api_base,
         "supervisor_command": config.supervisor_provider.command,
         "supervisor_has_api_key": bool(config.supervisor_provider.api_key),
-        "supervisor_uses_managed_auth": config.supervisor_provider.provider_type.strip().lower() == "codex",
-        "supervisor_compact_trigger_tokens": config.compact_trigger_tokens_for(config.llm.supervisor_profile),
+        "supervisor_uses_managed_auth": config.supervisor_provider.provider_type.strip().lower()
+        == "codex",
+        "supervisor_compact_trigger_tokens": config.compact_trigger_tokens_for(
+            config.llm.supervisor_profile
+        ),
         "supervisor_max_steps": config.supervisor.max_steps,
         "supervisor_window_enabled": config.supervisor.window_enabled,
         "supervisor_window_start": config.supervisor.window_start,
@@ -678,13 +861,27 @@ def _fuzzfolio_harness_dir(repo_root: Path) -> Path | None:
 def _drain_local_fuzzfolio_queues(repo_root: Path) -> dict[str, Any]:
     harness_dir = _fuzzfolio_harness_dir(repo_root)
     if harness_dir is None:
-        return {"ok": False, "warning": "Trading-Dashboard harness directory was not found."}
+        return {
+            "ok": False,
+            "warning": "Trading-Dashboard harness directory was not found.",
+        }
 
     queue_keys = ["QUEUE:sweep_jobs", "QUEUE:deep_replay_jobs", "QUEUE:sim_jobs"]
     deleted: list[dict[str, Any]] = []
     for key in queue_keys:
         completed = subprocess.run(
-            ["uv", "run", "cli.py", "--env", ".env.redis", "redis", "kv", "del", "--key", key],
+            [
+                "uv",
+                "run",
+                "cli.py",
+                "--env",
+                ".env.redis",
+                "redis",
+                "kv",
+                "del",
+                "--key",
+                key,
+            ],
             cwd=harness_dir,
             check=True,
             capture_output=True,
@@ -725,7 +922,9 @@ def cmd_stop_all_runs(*, stop_autoresearch: bool, as_json: bool) -> int:
     return 0
 
 
-def _extract_cloud_profiles(payload: dict[str, Any] | list[Any] | None) -> list[dict[str, Any]]:
+def _extract_cloud_profiles(
+    payload: dict[str, Any] | list[Any] | None,
+) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         data = payload.get("data")
         if isinstance(data, list):
@@ -742,7 +941,9 @@ def _profile_preview_row(item: dict[str, Any]) -> dict[str, Any]:
         "name": str(profile.get("name") or ""),
         "created_at": item.get("$createdAt"),
         "updated_at": item.get("$updatedAt"),
-        "is_active": bool(profile.get("isActive")) if isinstance(profile.get("isActive"), bool) else None,
+        "is_active": bool(profile.get("isActive"))
+        if isinstance(profile.get("isActive"), bool)
+        else None,
     }
 
 
@@ -761,7 +962,9 @@ def cmd_purge_cloud_profiles(*, execute: bool, preview: int, as_json: bool) -> i
     }
 
     if not execute:
-        payload["message"] = "Dry run only. Re-run with --yes to delete these saved cloud profiles."
+        payload["message"] = (
+            "Dry run only. Re-run with --yes to delete these saved cloud profiles."
+        )
         if as_json:
             print(json.dumps(payload, ensure_ascii=True, indent=2))
             return 0
@@ -776,7 +979,12 @@ def cmd_purge_cloud_profiles(*, execute: bool, preview: int, as_json: bool) -> i
             continue
         try:
             cli.run(["profiles", "delete", "--profile-ref", profile_id, "--pretty"])
-            deleted.append({"id": profile_id, "name": str((item.get("profile") or {}).get("name") or "")})
+            deleted.append(
+                {
+                    "id": profile_id,
+                    "name": str((item.get("profile") or {}).get("name") or ""),
+                }
+            )
         except (CliError, OSError, ValueError, json.JSONDecodeError) as exc:
             failures.append({"id": profile_id, "error": str(exc)})
 
@@ -869,7 +1077,9 @@ def cmd_prune_runs(
     return 0 if not blocked else 1
 
 
-def _provider_test_scenarios() -> list[tuple[str, list[ChatMessage], Callable[[dict[str, Any]], str | None]]]:
+def _provider_test_scenarios() -> list[
+    tuple[str, list[ChatMessage], Callable[[dict[str, Any]], str | None]]
+]:
     def validate_minimal(payload: dict[str, Any]) -> str | None:
         if payload.get("probe") != "json_minimal":
             return "expected probe=json_minimal"
@@ -904,7 +1114,7 @@ def _provider_test_scenarios() -> list[tuple[str, list[ChatMessage], Callable[[d
                 ChatMessage(
                     role="user",
                     content=(
-                        'Return exactly this JSON object and nothing else: '
+                        "Return exactly this JSON object and nothing else: "
                         '{"probe":"json_minimal","status":"ok","value":7}'
                     ),
                 ),
@@ -921,7 +1131,7 @@ def _provider_test_scenarios() -> list[tuple[str, list[ChatMessage], Callable[[d
                 ChatMessage(
                     role="user",
                     content=(
-                        'Return a JSON object with exactly these top-level fields: '
+                        "Return a JSON object with exactly these top-level fields: "
                         '{"mode":"runtime_shape","reasoning":"one short sentence","actions":[]}. '
                         "Keep reasoning non-empty and actions as an empty array."
                     ),
@@ -1000,13 +1210,17 @@ def _short_text(value: str, limit: int = 220) -> str:
     try:
         compact.encode(DISPLAY_ENCODING)
     except UnicodeEncodeError:
-        compact = compact.encode(DISPLAY_ENCODING, errors="replace").decode(DISPLAY_ENCODING)
+        compact = compact.encode(DISPLAY_ENCODING, errors="replace").decode(
+            DISPLAY_ENCODING
+        )
     if len(compact) <= limit:
         return compact
     return compact[: limit - 3] + "..."
 
 
-def _set_display_context(*, repo_root: Path | None = None, run_dir: Path | None = None) -> None:
+def _set_display_context(
+    *, repo_root: Path | None = None, run_dir: Path | None = None
+) -> None:
     if repo_root is not None:
         DISPLAY_CONTEXT["repo_root"] = repo_root
     if run_dir is not None:
@@ -1096,7 +1310,9 @@ def _load_runtime_config(
     if no_advisor:
         config.advisor.enabled = False
     if config.advisor.enabled and not config.advisor.profiles:
-        raise SystemExit("Advisor guidance is enabled but no advisor profiles are configured.")
+        raise SystemExit(
+            "Advisor guidance is enabled but no advisor profiles are configured."
+        )
     return config
 
 
@@ -1112,8 +1328,16 @@ def _resolve_supervise_policy(
     window_start, window_end = _parse_window(window)
     effective_max_steps = max_steps or cfg.max_steps or config.research.max_steps
     window_enabled = bool(cfg.window_enabled) and not no_window
-    effective_window_start = None if not window_enabled else (window_start if window_start is not None else cfg.window_start)
-    effective_window_end = None if not window_enabled else (window_end if window_end is not None else cfg.window_end)
+    effective_window_start = (
+        None
+        if not window_enabled
+        else (window_start if window_start is not None else cfg.window_start)
+    )
+    effective_window_end = (
+        None
+        if not window_enabled
+        else (window_end if window_end is not None else cfg.window_end)
+    )
     effective_timezone = timezone_name or cfg.timezone
     return effective_max_steps, RunPolicy(
         allow_finish=False,
@@ -1160,7 +1384,9 @@ def _summarize_action(action: dict[str, object]) -> str:
     if tool == "run_cli":
         args = action.get("args")
         if isinstance(args, list) and args:
-            return f"run_cli {' '.join(_display_value(str(item)) for item in args[:14])}"
+            return (
+                f"run_cli {' '.join(_display_value(str(item)) for item in args[:14])}"
+            )
         command = action.get("command")
         if isinstance(command, str) and command.strip():
             return f"run_cli {_short_text(command, 100)}"
@@ -1200,7 +1426,9 @@ def _summarize_result(result: dict[str, object]) -> str:
             elif auto_log.get("status") == "existing":
                 attempt = auto_log.get("attempt")
                 if isinstance(attempt, dict):
-                    parts.append(f"attempt=existing score={attempt.get('composite_score')}")
+                    parts.append(
+                        f"attempt=existing score={attempt.get('composite_score')}"
+                    )
         payload = result.get("result")
         if isinstance(payload, dict):
             stdout = payload.get("stdout")
@@ -1217,7 +1445,9 @@ def _summarize_result(result: dict[str, object]) -> str:
         path = str(result.get("path", ""))
         return f"read_file ok | {_display_path(path)}"
     if tool == "list_dir":
-        count = len(result.get("items", [])) if isinstance(result.get("items"), list) else 0
+        count = (
+            len(result.get("items", [])) if isinstance(result.get("items"), list) else 0
+        )
         return f"list_dir ok | items={count}"
     if tool == "log_attempt":
         payload = result.get("result")
@@ -1225,7 +1455,9 @@ def _summarize_result(result: dict[str, object]) -> str:
             if payload.get("status") == "existing":
                 attempt = payload.get("attempt")
                 if isinstance(attempt, dict):
-                    return f"log_attempt existing | score={attempt.get('composite_score')}"
+                    return (
+                        f"log_attempt existing | score={attempt.get('composite_score')}"
+                    )
             return f"log_attempt {payload.get('status')} | score={payload.get('composite_score')}"
     if tool == "yield_guard":
         base = str(result.get("supervisor_message") or result.get("message", ""))
@@ -1235,7 +1467,10 @@ def _summarize_result(result: dict[str, object]) -> str:
             parts.append("target: " + _short_text(score_target, 140))
         questions = result.get("questions")
         if isinstance(questions, list) and questions:
-            parts.append("q: " + " / ".join(_short_text(str(item), 120) for item in questions[:2]))
+            parts.append(
+                "q: "
+                + " / ".join(_short_text(str(item), 120) for item in questions[:2])
+            )
         next_moves = result.get("next_moves")
         if isinstance(next_moves, list) and next_moves:
             parts.append("next: " + _short_text(str(next_moves[0]), 160))
@@ -1379,7 +1614,10 @@ def _render_step(step_payload: dict[str, Any]) -> None:
                     label = "guard"
                 elif str(result.get("tool", "")) == "finish":
                     label = "finish"
-                result_table.add_row(Text(label, style=style), Text(_summarize_result(result), style=style))
+                result_table.add_row(
+                    Text(label, style=style),
+                    Text(_summarize_result(result), style=style),
+                )
         body.append(result_table)
 
     _safe_render(
@@ -1519,7 +1757,10 @@ def cmd_supervise(
             stop_reason = "window_closed"
             break
         if session_results and policy.soft_wrap_minutes > 0:
-            if minutes_remaining is not None and minutes_remaining <= policy.soft_wrap_minutes:
+            if (
+                minutes_remaining is not None
+                and minutes_remaining <= policy.soft_wrap_minutes
+            ):
                 stop_reason = "soft_wrap_reached"
                 break
         session_index = len(session_results) + 1
@@ -1677,6 +1918,7 @@ def cmd_plot(*, run_id: str | None, all_runs: bool) -> int:
 
 def cmd_leaderboard(*, limit: int, force_rebuild: bool) -> int:
     config = load_config()
+
     def emit(message: str) -> None:
         _write_plain_line(message)
 
@@ -1685,10 +1927,18 @@ def cmd_leaderboard(*, limit: int, force_rebuild: bool) -> int:
     cli = FuzzfolioCli(config.fuzzfolio)
     cli.ensure_login()
     emit(f"leaderboard: loaded {len(attempts)} attempts")
-    run_metadata_by_run_id = {
-        run_dir.name: load_run_metadata(run_dir)
-        for run_dir in sorted(path for path in config.runs_root.iterdir() if path.is_dir() and path.name != "derived")
-    } if config.runs_root.exists() else {}
+    run_metadata_by_run_id = (
+        {
+            run_dir.name: load_run_metadata(run_dir)
+            for run_dir in sorted(
+                path
+                for path in config.runs_root.iterdir()
+                if path.is_dir() and path.name != "derived"
+            )
+        }
+        if config.runs_root.exists()
+        else {}
+    )
     emit("leaderboard: rendering best-per-run leaderboard")
     ranked = render_leaderboard_artifacts(
         attempts,
@@ -1722,7 +1972,9 @@ def cmd_leaderboard(*, limit: int, force_rebuild: bool) -> int:
         run_metadata_by_run_id=run_metadata_by_run_id,
         lower_is_better=config.research.plot_lower_is_better,
     )
-    emit(f"leaderboard: validating {len(analysis_ranked)} best-per-run leaders at 12mo and 36mo")
+    emit(
+        f"leaderboard: validating {len(analysis_ranked)} best-per-run leaders at 12mo and 36mo"
+    )
     validation_rows = _build_validation_rows(
         config=config,
         cli=cli,
@@ -1733,7 +1985,9 @@ def cmd_leaderboard(*, limit: int, force_rebuild: bool) -> int:
     )
     skipped_validation_rows = max(0, len(analysis_ranked) - len(validation_rows))
     if skipped_validation_rows:
-        emit(f"leaderboard: skipped {skipped_validation_rows} validation candidate(s) after recoverable errors")
+        emit(
+            f"leaderboard: skipped {skipped_validation_rows} validation candidate(s) after recoverable errors"
+        )
     emit("leaderboard: rendering validation scatter")
     validation_ranked = render_validation_scatter_artifacts(
         validation_rows,
@@ -1777,12 +2031,16 @@ def cmd_leaderboard(*, limit: int, force_rebuild: bool) -> int:
                 "tradeoff_leaderboard_json": str(config.tradeoff_leaderboard_json_path),
                 "validation_rows": len(validation_ranked),
                 "validation_skipped": skipped_validation_rows,
-                "validation_leaderboard_json": str(config.validation_leaderboard_json_path),
+                "validation_leaderboard_json": str(
+                    config.validation_leaderboard_json_path
+                ),
                 "validation_scatter_plot": str(config.validation_scatter_plot_path),
                 "validation_delta_plot": str(config.validation_delta_plot_path),
                 "similarity_leaders": len(similarity_leaders),
                 "similarity_pairs": len(similarity_rendered.get("pairs") or []),
-                "similarity_leaderboard_json": str(config.similarity_leaderboard_json_path),
+                "similarity_leaderboard_json": str(
+                    config.similarity_leaderboard_json_path
+                ),
                 "similarity_heatmap_plot": str(config.similarity_heatmap_plot_path),
                 "similarity_scatter_plot": str(config.similarity_scatter_plot_path),
             },
@@ -1793,7 +2051,9 @@ def cmd_leaderboard(*, limit: int, force_rebuild: bool) -> int:
     return 0
 
 
-def cmd_dashboard(*, host: str, port: int, limit: int, refresh_on_start: bool, force_rebuild: bool) -> int:
+def cmd_dashboard(
+    *, host: str, port: int, limit: int, refresh_on_start: bool, force_rebuild: bool
+) -> int:
     config = load_config()
     serve_dashboard(
         config,
@@ -1833,11 +2093,23 @@ def _resolve_drop_renderer_executable(config) -> tuple[Path, Path | None]:
             return path.resolve(), next(iter(_trading_dashboard_roots(config)), None)
     resolved = shutil.which("fuzzfolio-drop-renderer")
     if resolved:
-        return Path(resolved).resolve(), next(iter(_trading_dashboard_roots(config)), None)
+        return Path(resolved).resolve(), next(
+            iter(_trading_dashboard_roots(config)), None
+        )
 
-    exe_name = "fuzzfolio-drop-renderer.exe" if os.name == "nt" else "fuzzfolio-drop-renderer"
+    exe_name = (
+        "fuzzfolio-drop-renderer.exe" if os.name == "nt" else "fuzzfolio-drop-renderer"
+    )
     for workspace_root in _trading_dashboard_roots(config):
-        candidate = workspace_root / "harness" / "fuzzfolio_drop_renderer" / "cli" / "target" / "release" / exe_name
+        candidate = (
+            workspace_root
+            / "harness"
+            / "fuzzfolio_drop_renderer"
+            / "cli"
+            / "target"
+            / "release"
+            / exe_name
+        )
         if candidate.exists():
             return candidate.resolve(), workspace_root
     raise FileNotFoundError(
@@ -1865,8 +2137,12 @@ def _run_external(argv: list[str], *, cwd: Path) -> None:
     )
 
 
-def _best_attempt_for_run(attempts: list[dict[str, Any]], *, lower_is_better: bool = False) -> dict[str, Any] | None:
-    scored = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+def _best_attempt_for_run(
+    attempts: list[dict[str, Any]], *, lower_is_better: bool = False
+) -> dict[str, Any] | None:
+    scored = [
+        attempt for attempt in attempts if attempt.get("composite_score") is not None
+    ]
     if not scored:
         return None
     return sorted(
@@ -1947,7 +2223,9 @@ def _coerce_profile_timeframe(profile_path: Path) -> str:
     for indicator in indicators:
         if not isinstance(indicator, dict):
             continue
-        token = str(_nested_get(indicator, ["config", "timeframe"]) or "").strip().upper()
+        token = (
+            str(_nested_get(indicator, ["config", "timeframe"]) or "").strip().upper()
+        )
         if not token or token in seen:
             continue
         seen.append(token)
@@ -1968,7 +2246,12 @@ def _normalize_tokens(values: list[Any]) -> list[str]:
 
 def _attempt_request_payload(attempt: dict[str, Any]) -> dict[str, Any]:
     artifact_dir = Path(str(attempt.get("artifact_dir", ""))).resolve()
-    request_payload = _nested_get(_load_json_if_exists(artifact_dir / "deep-replay-job.json"), ["request"]) or {}
+    request_payload = (
+        _nested_get(
+            _load_json_if_exists(artifact_dir / "deep-replay-job.json"), ["request"]
+        )
+        or {}
+    )
     return request_payload if isinstance(request_payload, dict) else {}
 
 
@@ -2022,7 +2305,9 @@ def _find_sweep_definition(run_dir: Path, attempt: dict[str, Any]) -> dict[str, 
     return candidates[0][2]
 
 
-def _find_attempt_for_profile_ref(attempts: list[dict[str, Any]], profile_ref: str) -> dict[str, Any] | None:
+def _find_attempt_for_profile_ref(
+    attempts: list[dict[str, Any]], profile_ref: str
+) -> dict[str, Any] | None:
     profile_ref = profile_ref.strip()
     if not profile_ref:
         return None
@@ -2051,19 +2336,29 @@ def _recover_package_inputs_from_sweep(
         return {}
 
     base_profile_path_raw = str(base_attempt.get("profile_path") or "").strip()
-    base_profile_path = Path(base_profile_path_raw).resolve() if base_profile_path_raw else None
+    base_profile_path = (
+        Path(base_profile_path_raw).resolve() if base_profile_path_raw else None
+    )
     base_request_payload = _attempt_request_payload(base_attempt)
 
     instruments = _normalize_tokens(list(sweep_payload.get("instruments") or []))
     if not instruments and base_profile_path is not None and base_profile_path.exists():
         instruments = _coerce_profile_instruments(base_profile_path)
 
-    timeframe = str(
-        base_request_payload.get("timeframe")
-        or _nested_get(base_attempt, ["best_summary", "timeframe"])
-        or (_coerce_profile_timeframe(base_profile_path) if base_profile_path is not None and base_profile_path.exists() else "")
-        or ""
-    ).strip().upper()
+    timeframe = (
+        str(
+            base_request_payload.get("timeframe")
+            or _nested_get(base_attempt, ["best_summary", "timeframe"])
+            or (
+                _coerce_profile_timeframe(base_profile_path)
+                if base_profile_path is not None and base_profile_path.exists()
+                else ""
+            )
+            or ""
+        )
+        .strip()
+        .upper()
+    )
 
     if not timeframe or not instruments:
         return {}
@@ -2074,12 +2369,20 @@ def _recover_package_inputs_from_sweep(
         "profile_ref": base_profile_id,
         "timeframe": timeframe,
         "instruments": instruments,
-        "lookback_months": _derive_lookback_months(base_request_payload, _load_json_if_exists(Path(str(base_attempt.get("artifact_dir", ""))).resolve() / "sensitivity-response.json")),
+        "lookback_months": _derive_lookback_months(
+            base_request_payload,
+            _load_json_if_exists(
+                Path(str(base_attempt.get("artifact_dir", ""))).resolve()
+                / "sensitivity-response.json"
+            ),
+        ),
         "recovered_from_sweep": True,
     }
 
 
-def _derive_lookback_months(request_payload: dict[str, Any], sensitivity_payload: dict[str, Any]) -> int:
+def _derive_lookback_months(
+    request_payload: dict[str, Any], sensitivity_payload: dict[str, Any]
+) -> int:
     raw_months = request_payload.get("lookback_months")
     if isinstance(raw_months, int) and raw_months > 0:
         return raw_months
@@ -2110,23 +2413,43 @@ def _build_package_inputs(
     profile_path = Path(profile_path_raw).resolve() if profile_path_raw else None
 
     request_payload = _attempt_request_payload(attempt)
-    sensitivity_payload = _load_json_if_exists(artifact_dir / "sensitivity-response.json")
+    sensitivity_payload = _load_json_if_exists(
+        artifact_dir / "sensitivity-response.json"
+    )
 
-    timeframe = str(
-        request_payload.get("timeframe")
-        or _nested_get(sensitivity_payload, ["data", "aggregate", "timeframe"])
-        or _nested_get(sensitivity_payload, ["data", "timeframe"])
-        or _nested_get(attempt, ["best_summary", "timeframe"])
-        or (_coerce_profile_timeframe(profile_path) if profile_path is not None and profile_path.exists() else "")
-        or ""
-    ).strip().upper()
+    timeframe = (
+        str(
+            request_payload.get("timeframe")
+            or _nested_get(sensitivity_payload, ["data", "aggregate", "timeframe"])
+            or _nested_get(sensitivity_payload, ["data", "timeframe"])
+            or _nested_get(attempt, ["best_summary", "timeframe"])
+            or (
+                _coerce_profile_timeframe(profile_path)
+                if profile_path is not None and profile_path.exists()
+                else ""
+            )
+            or ""
+        )
+        .strip()
+        .upper()
+    )
 
     instruments_raw = request_payload.get("instruments")
-    instruments = _normalize_tokens(instruments_raw if isinstance(instruments_raw, list) else [])
+    instruments = _normalize_tokens(
+        instruments_raw if isinstance(instruments_raw, list) else []
+    )
     if not instruments and profile_path is not None and profile_path.exists():
         instruments = _coerce_profile_instruments(profile_path)
 
-    if (not timeframe or not instruments or not (profile_path is not None and profile_path.exists())) and run_dir is not None and attempts is not None:
+    if (
+        (
+            not timeframe
+            or not instruments
+            or not (profile_path is not None and profile_path.exists())
+        )
+        and run_dir is not None
+        and attempts is not None
+    ):
         recovered = _recover_package_inputs_from_sweep(run_dir, attempt, attempts)
         if recovered:
             merged = {
@@ -2134,22 +2457,30 @@ def _build_package_inputs(
                 "profile_path": profile_path,
                 "timeframe": timeframe,
                 "instruments": instruments,
-                "lookback_months": _derive_lookback_months(request_payload, sensitivity_payload),
+                "lookback_months": _derive_lookback_months(
+                    request_payload, sensitivity_payload
+                ),
             }
             merged.update({key: value for key, value in recovered.items() if value})
             return merged
 
     if not timeframe:
-        raise RuntimeError(f"Could not resolve timeframe for attempt {attempt.get('attempt_id')}")
+        raise RuntimeError(
+            f"Could not resolve timeframe for attempt {attempt.get('attempt_id')}"
+        )
     if not instruments:
-        raise RuntimeError(f"Could not resolve instruments for attempt {attempt.get('attempt_id')}")
+        raise RuntimeError(
+            f"Could not resolve instruments for attempt {attempt.get('attempt_id')}"
+        )
 
     return {
         "artifact_dir": artifact_dir,
         "profile_path": profile_path,
         "timeframe": timeframe,
         "instruments": instruments,
-        "lookback_months": _derive_lookback_months(request_payload, sensitivity_payload),
+        "lookback_months": _derive_lookback_months(
+            request_payload, sensitivity_payload
+        ),
     }
 
 
@@ -2162,7 +2493,9 @@ def _cloud_profile_exists(cli: FuzzfolioCli, profile_ref: str) -> bool:
     result = cli.run(["export-profile", "--profile-ref", profile_ref], check=False)
     if result.returncode == 0:
         return True
-    combined = "\n".join(part for part in [result.stdout, result.stderr] if part).strip()
+    combined = "\n".join(
+        part for part in [result.stdout, result.stderr] if part
+    ).strip()
     if _profile_export_missing(combined):
         return False
     raise CliError(FuzzfolioCli.format_result(result))
@@ -2173,11 +2506,15 @@ def _create_cloud_profile(cli: FuzzfolioCli, profile_path: Path) -> str:
     payload = result.parsed_json if isinstance(result.parsed_json, dict) else None
     profile_id = str(_nested_get(payload or {}, ["data", "id"]) or "").strip()
     if not profile_id:
-        raise CliError(f"profiles create did not return a profile id for {profile_path}")
+        raise CliError(
+            f"profiles create did not return a profile id for {profile_path}"
+        )
     return profile_id
 
 
-def _update_attempt_profile_ref(run_dir: Path, attempt_id: str, profile_ref: str) -> None:
+def _update_attempt_profile_ref(
+    run_dir: Path, attempt_id: str, profile_ref: str
+) -> None:
     attempts_path = attempts_path_for_run_dir(run_dir)
     attempts = load_attempts(attempts_path)
     changed = False
@@ -2195,7 +2532,9 @@ def _update_attempt_profile_ref(run_dir: Path, attempt_id: str, profile_ref: str
 def _discover_bundle_dir(package_output_root: Path) -> Path:
     bundle_dirs = [path for path in package_output_root.iterdir() if path.is_dir()]
     if not bundle_dirs:
-        raise RuntimeError(f"Package command did not create a bundle under {package_output_root}")
+        raise RuntimeError(
+            f"Package command did not create a bundle under {package_output_root}"
+        )
     return sorted(bundle_dirs, key=lambda path: path.stat().st_mtime, reverse=True)[0]
 
 
@@ -2217,12 +2556,16 @@ def _profile_drop_manifest_path(run_dir: Path, lookback_months: int) -> Path:
 
 
 def _load_validation_score(artifact_dir: Path) -> dict[str, Any]:
-    sensitivity_payload = _load_json_if_exists(artifact_dir / "sensitivity-response.json")
+    sensitivity_payload = _load_json_if_exists(
+        artifact_dir / "sensitivity-response.json"
+    )
     aggregate = _nested_get(sensitivity_payload, ["data", "aggregate"])
     if not isinstance(aggregate, dict):
         aggregate = _nested_get(sensitivity_payload, ["data"])
     compare_payload = {"best": aggregate or {}}
-    score = build_attempt_score(compare_payload, sensitivity_payload if sensitivity_payload else None)
+    score = build_attempt_score(
+        compare_payload, sensitivity_payload if sensitivity_payload else None
+    )
     synthetic_attempt = {
         "best_summary": score.best_summary,
         "composite_score": score.composite_score,
@@ -2275,7 +2618,7 @@ def _pearson_correlation(left: list[float], right: list[float]) -> float | None:
     if left_var <= 0.0 or right_var <= 0.0:
         return None
     covariance = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right))
-    return covariance / (left_var ** 0.5 * right_var ** 0.5)
+    return covariance / (left_var**0.5 * right_var**0.5)
 
 
 def _build_similarity_payload(validation_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2291,7 +2634,9 @@ def _build_similarity_payload(validation_rows: list[dict[str, Any]]) -> dict[str
         request_payload = _load_validation_request(artifact_dir)
         instruments = _normalize_tokens(list(request_payload.get("instruments") or []))
         timeframe = str(request_payload.get("timeframe") or "").strip() or None
-        active_dates = {date for date, value in curve_series.items() if abs(float(value)) > 1e-9}
+        active_dates = {
+            date for date, value in curve_series.items() if abs(float(value)) > 1e-9
+        }
         prepared.append(
             {
                 **row,
@@ -2305,7 +2650,9 @@ def _build_similarity_payload(validation_rows: list[dict[str, Any]]) -> dict[str
     if not prepared:
         return {"leaders": [], "pairs": [], "matrix_labels": [], "matrix_values": []}
 
-    prepared.sort(key=lambda item: float(item.get("score_36m", float("-inf"))), reverse=True)
+    prepared.sort(
+        key=lambda item: float(item.get("score_36m", float("-inf"))), reverse=True
+    )
     pair_records: list[dict[str, Any]] = []
 
     for left_index, left in enumerate(prepared):
@@ -2322,7 +2669,9 @@ def _build_similarity_payload(validation_rows: list[dict[str, Any]]) -> dict[str
             right_values = [float(right["curve_series"][date]) for date in common_dates]
             corr = _pearson_correlation(left_values, right_values)
             positive_corr = max(0.0, float(corr)) if corr is not None else 0.0
-            right_instruments = set(str(item) for item in right.get("instruments_36m") or [])
+            right_instruments = set(
+                str(item) for item in right.get("instruments_36m") or []
+            )
             union_instruments = left_instruments | right_instruments
             instrument_overlap = (
                 len(left_instruments & right_instruments) / len(union_instruments)
@@ -2355,13 +2704,16 @@ def _build_similarity_payload(validation_rows: list[dict[str, Any]]) -> dict[str
                     "positive_correlation": positive_corr,
                     "shared_active_ratio": shared_active_ratio,
                     "instrument_overlap_ratio": instrument_overlap,
-                    "same_timeframe": str(left.get("timeframe_36m") or "") == str(right.get("timeframe_36m") or ""),
+                    "same_timeframe": str(left.get("timeframe_36m") or "")
+                    == str(right.get("timeframe_36m") or ""),
                     "overlap_days": len(common_dates),
                     "similarity_score": similarity_score,
                 }
             )
 
-    adjacency: dict[str, list[dict[str, Any]]] = {str(item["run_id"]): [] for item in prepared}
+    adjacency: dict[str, list[dict[str, Any]]] = {
+        str(item["run_id"]): [] for item in prepared
+    }
     for pair in pair_records:
         adjacency[pair["left_run_id"]].append(pair)
         adjacency[pair["right_run_id"]].append(pair)
@@ -2369,9 +2721,14 @@ def _build_similarity_payload(validation_rows: list[dict[str, Any]]) -> dict[str
     leaders: list[dict[str, Any]] = []
     for row in prepared:
         related = adjacency.get(str(row["run_id"]), [])
-        max_pair = max(related, key=lambda item: float(item.get("similarity_score", 0.0)), default=None)
+        max_pair = max(
+            related,
+            key=lambda item: float(item.get("similarity_score", 0.0)),
+            default=None,
+        )
         avg_sameness = (
-            sum(float(item.get("similarity_score", 0.0)) for item in related) / len(related)
+            sum(float(item.get("similarity_score", 0.0)) for item in related)
+            / len(related)
             if related
             else 0.0
         )
@@ -2399,7 +2756,9 @@ def _build_similarity_payload(validation_rows: list[dict[str, Any]]) -> dict[str
                 "instruments_36m": list(row.get("instruments_36m") or []),
                 "timeframe_36m": row.get("timeframe_36m"),
                 "avg_sameness": avg_sameness,
-                "max_sameness": float(max_pair.get("similarity_score", 0.0)) if max_pair else 0.0,
+                "max_sameness": float(max_pair.get("similarity_score", 0.0))
+                if max_pair
+                else 0.0,
                 "closest_match_run_id": closest_match_run_id,
                 "closest_match_label": closest_match_label,
             }
@@ -2425,7 +2784,9 @@ def _build_similarity_payload(validation_rows: list[dict[str, Any]]) -> dict[str
             row_values.append(float(pair_lookup.get(key, 0.0)))
         matrix_values.append(row_values)
 
-    pair_records.sort(key=lambda item: float(item.get("similarity_score", 0.0)), reverse=True)
+    pair_records.sort(
+        key=lambda item: float(item.get("similarity_score", 0.0)), reverse=True
+    )
     return {
         "leaders": leaders,
         "pairs": pair_records,
@@ -2445,9 +2806,13 @@ def _ensure_validation_artifacts(
     force_rebuild: bool = False,
     emit: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    package_inputs = _build_package_inputs(best_attempt, run_dir=run_dir, attempts=attempts)
+    package_inputs = _build_package_inputs(
+        best_attempt, run_dir=run_dir, attempts=attempts
+    )
     profile_path = package_inputs.get("profile_path")
-    profile_ref = str(package_inputs.get("profile_ref") or best_attempt.get("profile_ref") or "").strip()
+    profile_ref = str(
+        package_inputs.get("profile_ref") or best_attempt.get("profile_ref") or ""
+    ).strip()
     recreated_profile = False
 
     if profile_ref and not _cloud_profile_exists(cli, profile_ref):
@@ -2458,7 +2823,9 @@ def _ensure_validation_artifacts(
                 f"Best attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
             )
         profile_ref = _create_cloud_profile(cli, profile_path)
-        _update_attempt_profile_ref(run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref)
+        _update_attempt_profile_ref(
+            run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref
+        )
         recreated_profile = True
 
     cache_dir = _validation_cache_dir(config, run_dir.name, lookback_months)
@@ -2530,7 +2897,9 @@ def _build_validation_rows(
     force_rebuild: bool = False,
     emit: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
-    prepared_attempts: list[tuple[int, str, Path, list[dict[str, Any]], dict[str, Any], dict[str, Any]]] = []
+    prepared_attempts: list[
+        tuple[int, str, Path, list[dict[str, Any]], dict[str, Any], dict[str, Any]]
+    ] = []
     for index, attempt in enumerate(ranked_attempts):
         run_id = str(attempt.get("run_id") or "").strip()
         if not run_id:
@@ -2539,16 +2908,24 @@ def _build_validation_rows(
         attempts = load_run_attempts(run_dir)
         if not attempts:
             continue
-        best_attempt = _best_attempt_for_run(attempts, lower_is_better=config.research.plot_lower_is_better)
-        if best_attempt is None or str(best_attempt.get("attempt_id") or "") != str(attempt.get("attempt_id") or ""):
+        best_attempt = _best_attempt_for_run(
+            attempts, lower_is_better=config.research.plot_lower_is_better
+        )
+        if best_attempt is None or str(best_attempt.get("attempt_id") or "") != str(
+            attempt.get("attempt_id") or ""
+        ):
             best_attempt = attempt
-        prepared_attempts.append((index, run_id, run_dir, attempts, best_attempt, attempt))
+        prepared_attempts.append(
+            (index, run_id, run_dir, attempts, best_attempt, attempt)
+        )
 
     if not prepared_attempts:
         return []
 
     emit_lock = threading.Lock()
-    max_workers = min(max(1, int(config.research.validation_max_concurrency)), len(prepared_attempts))
+    max_workers = min(
+        max(1, int(config.research.validation_max_concurrency)), len(prepared_attempts)
+    )
 
     def emit_serial(message: str) -> None:
         if emit is None:
@@ -2557,7 +2934,9 @@ def _build_validation_rows(
             emit(message)
 
     def build_row(
-        item: tuple[int, str, Path, list[dict[str, Any]], dict[str, Any], dict[str, Any]]
+        item: tuple[
+            int, str, Path, list[dict[str, Any]], dict[str, Any], dict[str, Any]
+        ],
     ) -> tuple[int, dict[str, Any] | None]:
         index, run_id, run_dir, attempts, best_attempt, attempt = item
         cli_for_task = FuzzfolioCli(cli.config)
@@ -2567,8 +2946,12 @@ def _build_validation_rows(
             "attempt_id": str(best_attempt.get("attempt_id") or ""),
             "candidate_name": best_attempt.get("candidate_name"),
             "leaderboard_label": attempt.get("leaderboard_label"),
-            "explorer_model": (run_metadata_by_run_id.get(run_id) or {}).get("explorer_model"),
-            "explorer_profile": (run_metadata_by_run_id.get(run_id) or {}).get("explorer_profile"),
+            "explorer_model": (run_metadata_by_run_id.get(run_id) or {}).get(
+                "explorer_model"
+            ),
+            "explorer_profile": (run_metadata_by_run_id.get(run_id) or {}).get(
+                "explorer_profile"
+            ),
         }
         try:
             validation_12 = _ensure_validation_artifacts(
@@ -2593,8 +2976,14 @@ def _build_validation_rows(
             )
         except Exception as exc:
             if emit is not None:
-                detail = str(exc).splitlines()[0].strip() if str(exc).strip() else exc.__class__.__name__
-                emit_serial(f"validate skip {run_id} {best_attempt.get('attempt_id')}: {detail}")
+                detail = (
+                    str(exc).splitlines()[0].strip()
+                    if str(exc).strip()
+                    else exc.__class__.__name__
+                )
+                emit_serial(
+                    f"validate skip {run_id} {best_attempt.get('attempt_id')}: {detail}"
+                )
             return index, None
         row.update(
             {
@@ -2602,14 +2991,18 @@ def _build_validation_rows(
                 "score_basis_12m": validation_12.get("score_basis"),
                 "trades_per_month_12m": validation_12.get("trades_per_month"),
                 "trade_count_12m": validation_12.get("trade_count"),
-                "effective_window_months_12m": validation_12.get("effective_window_months"),
+                "effective_window_months_12m": validation_12.get(
+                    "effective_window_months"
+                ),
                 "max_drawdown_r_12m": validation_12.get("max_drawdown_r"),
                 "artifact_dir_12m": validation_12.get("artifact_dir"),
                 "score_36m": validation_36.get("score"),
                 "score_basis_36m": validation_36.get("score_basis"),
                 "trades_per_month_36m": validation_36.get("trades_per_month"),
                 "trade_count_36m": validation_36.get("trade_count"),
-                "effective_window_months_36m": validation_36.get("effective_window_months"),
+                "effective_window_months_36m": validation_36.get(
+                    "effective_window_months"
+                ),
                 "max_drawdown_r_36m": validation_36.get("max_drawdown_r"),
                 "artifact_dir_36m": validation_36.get("artifact_dir"),
             }
@@ -2621,7 +3014,9 @@ def _build_validation_rows(
             pass
         else:
             row["score_delta"] = score_36 - score_12
-            row["score_retention_ratio"] = (score_36 / score_12) if score_12 not in {0.0, -0.0} else None
+            row["score_retention_ratio"] = (
+                (score_36 / score_12) if score_12 not in {0.0, -0.0} else None
+            )
         return index, row
 
     rows_by_index: dict[int, dict[str, Any]] = {}
@@ -2632,7 +3027,11 @@ def _build_validation_rows(
             if row is not None:
                 rows_by_index[index] = row
 
-    return [rows_by_index[index] for index, *_ in prepared_attempts if index in rows_by_index]
+    return [
+        rows_by_index[index]
+        for index, *_ in prepared_attempts
+        if index in rows_by_index
+    ]
 
 
 def cmd_sync_profile_drop_pngs(
@@ -2665,7 +3064,11 @@ def cmd_sync_profile_drop_pngs(
     failed = 0
 
     total_runs = len(run_dirs)
-    use_progress = (not as_json) and (not PLAIN_PROGRESS_MODE) and bool(getattr(console, "is_terminal", False))
+    use_progress = (
+        (not as_json)
+        and (not PLAIN_PROGRESS_MODE)
+        and bool(getattr(console, "is_terminal", False))
+    )
     progress = Progress(
         SpinnerColumn(),
         TextColumn("[bold cyan]{task.description}"),
@@ -2702,9 +3105,7 @@ def cmd_sync_profile_drop_pngs(
             temp_root = run_dir / ".profile-drop-sync"
             result: dict[str, Any] = {"run_id": run_dir.name}
             try:
-                emit(
-                    f"sync {index}/{total_runs} {run_dir.name}"
-                )
+                emit(f"sync {index}/{total_runs} {run_dir.name}")
                 attempts = load_run_attempts(run_dir)
                 best_attempt = _best_attempt_for_run(
                     attempts,
@@ -2724,9 +3125,15 @@ def cmd_sync_profile_drop_pngs(
                     f"{best_attempt.get('attempt_id')} "
                     f"score={float(best_attempt.get('composite_score')):.3f}"
                 )
-                package_inputs = _build_package_inputs(best_attempt, run_dir=run_dir, attempts=attempts)
+                package_inputs = _build_package_inputs(
+                    best_attempt, run_dir=run_dir, attempts=attempts
+                )
                 profile_path = package_inputs.get("profile_path")
-                profile_ref = str(package_inputs.get("profile_ref") or best_attempt.get("profile_ref") or "").strip()
+                profile_ref = str(
+                    package_inputs.get("profile_ref")
+                    or best_attempt.get("profile_ref")
+                    or ""
+                ).strip()
                 recreated_profile = False
 
                 if profile_ref:
@@ -2740,7 +3147,9 @@ def cmd_sync_profile_drop_pngs(
                         )
                     emit("  cloud profile missing, recreating from local profile")
                     profile_ref = _create_cloud_profile(cli, profile_path)
-                    _update_attempt_profile_ref(run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref)
+                    _update_attempt_profile_ref(
+                        run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref
+                    )
                     recreated_profile = True
 
                 if temp_root.exists():
@@ -2758,15 +3167,20 @@ def cmd_sync_profile_drop_pngs(
                         "timeframe": str(package_inputs["timeframe"]),
                         "instruments": list(package_inputs["instruments"]),
                         "lookback_months": int(horizon_months),
-                        "quality_score_preset": str(config.research.quality_score_preset),
+                        "quality_score_preset": str(
+                            config.research.quality_score_preset
+                        ),
                     }
-                    horizon_manifest_path = _profile_drop_manifest_path(run_dir, horizon_months)
+                    horizon_manifest_path = _profile_drop_manifest_path(
+                        run_dir, horizon_months
+                    )
                     png_path = run_dir / f"profile-drop-{horizon_months}mo.png"
                     if (
                         not force_rebuild
                         and png_path.exists()
                         and horizon_manifest_path.exists()
-                        and _load_json_if_exists(horizon_manifest_path) == horizon_manifest_payload
+                        and _load_json_if_exists(horizon_manifest_path)
+                        == horizon_manifest_payload
                     ):
                         emit(f"  skipping {png_path.name}: up to date")
                         rendered_pngs.append(str(png_path))
@@ -2827,7 +3241,11 @@ def cmd_sync_profile_drop_pngs(
                     if temp_root.exists():
                         shutil.rmtree(temp_root)
 
-                rendered_horizons = [months for months in requested_horizons if months not in skipped_horizons]
+                rendered_horizons = [
+                    months
+                    for months in requested_horizons
+                    if months not in skipped_horizons
+                ]
                 if rendered_horizons or recreated_profile:
                     rendered += 1
                     emit(
@@ -2866,6 +3284,127 @@ def cmd_sync_profile_drop_pngs(
         "runs_considered": len(run_dirs),
         "rendered": rendered,
         "skipped": skipped,
+        "failed": failed,
+        "results": results,
+    }
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0 if failed == 0 else 1
+
+
+def cmd_calculate_full_backtests(
+    *,
+    run_ids: list[str] | None,
+    force_rebuild: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    cli = FuzzfolioCli(config.fuzzfolio)
+
+    all_run_dirs = list_run_dirs(config.runs_root)
+    if run_ids:
+        wanted = {token.strip() for token in run_ids if str(token).strip()}
+        run_dirs = [run_dir for run_dir in all_run_dirs if run_dir.name in wanted]
+        missing = sorted(wanted - {run_dir.name for run_dir in run_dirs})
+        if missing:
+            raise SystemExit(f"Run directories do not exist: {', '.join(missing)}")
+    else:
+        run_dirs = all_run_dirs
+
+    all_attempts: list[tuple[Path, dict[str, Any]]] = []
+    for run_dir in run_dirs:
+        for attempt in load_run_attempts(run_dir):
+            all_attempts.append((run_dir, attempt))
+
+    if not all_attempts:
+        print(
+            json.dumps(
+                {"status": "no_attempts", "considered": 0}, ensure_ascii=True, indent=2
+            )
+        )
+        return 0
+
+    def needs_calculation(run_dir: Path, attempt: dict[str, Any]) -> bool:
+        artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+        if not artifact_dir.exists():
+            return False
+        if force_rebuild:
+            return True
+        curve_path = artifact_dir / "full-backtest-36mo-curve.json"
+        return not curve_path.exists()
+
+    to_calculate = [(rd, a) for rd, a in all_attempts if needs_calculation(rd, a)]
+    total = len(to_calculate)
+    skipped = len(all_attempts) - total
+
+    results: list[dict[str, Any]] = []
+    calculated = 0
+    failed = 0
+
+    use_progress = (
+        (not as_json)
+        and (not PLAIN_PROGRESS_MODE)
+        and bool(getattr(console, "is_terminal", False))
+    )
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=32),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+        disable=not use_progress,
+    )
+
+    def emit(message: str) -> None:
+        if as_json:
+            return
+        if use_progress:
+            progress.console.print(message)
+            return
+        _write_plain_line(message)
+
+    with progress:
+        task_id = progress.add_task("calculate full backtests", total=total or 1)
+        for index, (run_dir, attempt) in enumerate(to_calculate):
+            attempt_id = str(attempt.get("attempt_id") or "")
+            run_id = run_dir.name
+            progress.update(
+                task_id,
+                description=(
+                    f"{index + 1}/{total} "
+                    f"[green]ok={calculated}[/green] "
+                    f"[yellow]skip={skipped}[/yellow] "
+                    f"[red]fail={failed}[/red] "
+                    f"{run_id}"
+                ),
+            )
+            emit(f"calculate {index + 1}/{total} {run_id} {attempt_id}")
+            result_entry: dict[str, Any] = {
+                "run_id": run_id,
+                "attempt_id": attempt_id,
+                "status": "pending",
+            }
+            try:
+                paths = _run_full_backtest_for_attempt(config, attempt)
+                result_entry["status"] = "calculated"
+                result_entry["curve_path"] = paths.get("curve_path")
+                calculated += 1
+                emit(f"  done: {paths.get('curve_path')}")
+            except Exception as exc:
+                failed += 1
+                result_entry["status"] = "failed"
+                result_entry["error"] = str(exc)
+                emit(f"  failed: {exc}")
+            results.append(result_entry)
+            progress.advance(task_id, 1)
+
+    payload = {
+        "runs_considered": len(run_dirs),
+        "total_attempts": len(all_attempts),
+        "skipped": skipped,
+        "calculated": calculated,
         "failed": failed,
         "results": results,
     }
@@ -2941,7 +3480,11 @@ def cmd_record_attempt(
     progress_plot_path = run_dir / "progress.png"
     compare_payload = cli.score_artifact(artifact_dir.resolve())
     snapshot_path = artifact_dir.resolve() / "sensitivity-response.json"
-    snapshot = load_sensitivity_snapshot(artifact_dir.resolve()) if snapshot_path.exists() else None
+    snapshot = (
+        load_sensitivity_snapshot(artifact_dir.resolve())
+        if snapshot_path.exists()
+        else None
+    )
     score = build_attempt_score(compare_payload, snapshot)
     record = make_attempt_record(
         config,
@@ -2990,10 +3533,20 @@ def cmd_rescore_attempts() -> int:
     run_count = 0
 
     if not config.runs_root.exists():
-        print(json.dumps({"runs_updated": 0, "updated": 0, "skipped": 0, "attempts": 0}, ensure_ascii=True, indent=2))
+        print(
+            json.dumps(
+                {"runs_updated": 0, "updated": 0, "skipped": 0, "attempts": 0},
+                ensure_ascii=True,
+                indent=2,
+            )
+        )
         return 0
 
-    for run_dir in sorted(path for path in config.runs_root.iterdir() if path.is_dir() and path.name != "derived"):
+    for run_dir in sorted(
+        path
+        for path in config.runs_root.iterdir()
+        if path.is_dir() and path.name != "derived"
+    ):
         attempts_path = attempts_path_for_run_dir(run_dir)
         attempts = load_attempts(attempts_path)
         if not attempts:
@@ -3090,6 +3643,12 @@ def main() -> int:
             run_ids=args.run_id,
             keep_temp=bool(args.keep_temp),
             lookback_months=int(args.lookback_months),
+            force_rebuild=bool(args.force_rebuild),
+            as_json=bool(args.json),
+        )
+    if args.command == "calculate-full-backtests":
+        return cmd_calculate_full_backtests(
+            run_ids=args.run_ids,
             force_rebuild=bool(args.force_rebuild),
             as_json=bool(args.json),
         )

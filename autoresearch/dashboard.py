@@ -2,19 +2,28 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import shutil
 import subprocess
 import sys
 import threading
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from statistics import median
+from tempfile import TemporaryDirectory
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import AppConfig
-from .ledger import list_run_dirs, load_all_run_attempts, load_run_attempts, load_run_metadata
+from .fuzzfolio import FuzzfolioCli
+from .ledger import (
+    list_run_dirs,
+    load_all_run_attempts,
+    load_run_attempts,
+    load_run_metadata,
+)
 from .plotting import (
     _attempt_effective_window_months,
     _attempt_trade_count,
@@ -43,7 +52,9 @@ def _load_optional_json(path: Path) -> Any | None:
         return None
 
 
-def _run_streaming_subprocess(argv: list[str], *, cwd: str, prefix: str) -> tuple[int, str, str]:
+def _run_streaming_subprocess(
+    argv: list[str], *, cwd: str, prefix: str
+) -> tuple[int, str, str]:
     process = subprocess.Popen(
         argv,
         cwd=cwd,
@@ -101,10 +112,15 @@ def _best_summary(attempt: dict[str, Any]) -> dict[str, Any]:
 
 
 def _run_metadata_by_id(config: AppConfig) -> dict[str, dict[str, Any]]:
-    return {run_dir.name: load_run_metadata(run_dir) for run_dir in list_run_dirs(config.runs_root)}
+    return {
+        run_dir.name: load_run_metadata(run_dir)
+        for run_dir in list_run_dirs(config.runs_root)
+    }
 
 
-def refresh_dashboard_sources(config: AppConfig, *, limit: int, force_rebuild: bool) -> dict[str, str]:
+def refresh_dashboard_sources(
+    config: AppConfig, *, limit: int, force_rebuild: bool
+) -> dict[str, str]:
     print("dashboard refresh: loading run attempts", flush=True)
     attempts = load_all_run_attempts(config.runs_root)
     run_metadata_by_run_id = _run_metadata_by_id(config)
@@ -139,7 +155,14 @@ def refresh_dashboard_sources(config: AppConfig, *, limit: int, force_rebuild: b
     print("dashboard refresh: running leaderboard pipeline", flush=True)
     if force_rebuild:
         print("dashboard refresh: force rebuild enabled", flush=True)
-    leaderboard_argv = [sys.executable, "-m", "autoresearch", "leaderboard", "--limit", str(limit)]
+    leaderboard_argv = [
+        sys.executable,
+        "-m",
+        "autoresearch",
+        "leaderboard",
+        "--limit",
+        str(limit),
+    ]
     if force_rebuild:
         leaderboard_argv.append("--force-rebuild")
     return_code, stdout_tail, stderr_tail = _run_streaming_subprocess(
@@ -168,7 +191,9 @@ def _repo_relative(config: AppConfig, path: Path | None) -> str | None:
     if path is None:
         return None
     try:
-        return str(path.resolve().relative_to(config.repo_root.resolve())).replace("\\", "/")
+        return str(path.resolve().relative_to(config.repo_root.resolve())).replace(
+            "\\", "/"
+        )
     except Exception:
         return None
 
@@ -187,10 +212,14 @@ def _attempt_max_drawdown_r(attempt: dict[str, Any]) -> float | None:
         best_summary.get("quality_score_payload"),
     ]
     for payload in candidates:
-        value = _metric_value(payload if isinstance(payload, dict) else {}, "max_drawdown_r")
+        value = _metric_value(
+            payload if isinstance(payload, dict) else {}, "max_drawdown_r"
+        )
         if value is not None:
             return value
-        value = _metric_value(payload if isinstance(payload, dict) else {}, "inputs", "max_drawdown_r")
+        value = _metric_value(
+            payload if isinstance(payload, dict) else {}, "inputs", "max_drawdown_r"
+        )
         if value is not None:
             return value
     return None
@@ -201,12 +230,16 @@ def _attempt_positive_cell_ratio(attempt: dict[str, Any]) -> float | None:
     value = _metric_value(best_summary, "matrix_summary", "positive_cell_ratio")
     if value is not None:
         return value
-    return _metric_value(best_summary, "quality_score_payload", "inputs", "positive_cell_ratio")
+    return _metric_value(
+        best_summary, "quality_score_payload", "inputs", "positive_cell_ratio"
+    )
 
 
 def _attempt_expectancy_r(attempt: dict[str, Any]) -> float | None:
     best_summary = _best_summary(attempt)
-    value = _metric_value(best_summary, "quality_score_payload", "inputs", "expectancy_r")
+    value = _metric_value(
+        best_summary, "quality_score_payload", "inputs", "expectancy_r"
+    )
     if value is not None:
         return value
     return _metric_value(best_summary, "best_cell", "avg_net_r_per_closed_trade")
@@ -231,7 +264,11 @@ def _attempt_instrument(attempt: dict[str, Any]) -> str | None:
     response_path = _best_summary(attempt).get("response_path")
     if isinstance(response_path, str):
         sensitivity = _load_optional_json(Path(response_path))
-        aggregate = ((sensitivity or {}).get("data") or {}).get("aggregate") if isinstance(sensitivity, dict) else None
+        aggregate = (
+            ((sensitivity or {}).get("data") or {}).get("aggregate")
+            if isinstance(sensitivity, dict)
+            else None
+        )
         if isinstance(aggregate, dict):
             instrument = aggregate.get("instrument")
             if instrument:
@@ -245,8 +282,14 @@ def _attempt_timeframe(attempt: dict[str, Any]) -> str | None:
         return str(value)
     response_path = _best_summary(attempt).get("response_path")
     if isinstance(response_path, str):
-        deep_replay_job = _load_optional_json(Path(response_path).with_name("deep-replay-job.json"))
-        request_payload = deep_replay_job.get("request") if isinstance(deep_replay_job, dict) else None
+        deep_replay_job = _load_optional_json(
+            Path(response_path).with_name("deep-replay-job.json")
+        )
+        request_payload = (
+            deep_replay_job.get("request")
+            if isinstance(deep_replay_job, dict)
+            else None
+        )
         if isinstance(request_payload, dict) and request_payload.get("timeframe"):
             return str(request_payload.get("timeframe"))
     return None
@@ -269,11 +312,162 @@ def _deep_replay_job_path_for_attempt(attempt: dict[str, Any]) -> Path | None:
 
 
 def _sensitivity_path_for_attempt(attempt: dict[str, Any]) -> Path | None:
-    raw = attempt.get("sensitivity_snapshot_path") or _best_summary(attempt).get("response_path")
+    raw = attempt.get("sensitivity_snapshot_path") or _best_summary(attempt).get(
+        "response_path"
+    )
     if not isinstance(raw, str) or not raw.strip():
         return None
     path = Path(raw)
     return path if path.exists() else None
+
+
+FULL_BACKTEST_CURVE_FILENAME = "full-backtest-36mo-curve.json"
+FULL_BACKTEST_RESULT_FILENAME = "full-backtest-36mo-result.json"
+
+
+def _full_backtest_curve_path(attempt: dict[str, Any]) -> Path | None:
+    artifact_dir = attempt.get("artifact_dir")
+    if not isinstance(artifact_dir, str) or not artifact_dir.strip():
+        return None
+    path = Path(artifact_dir) / FULL_BACKTEST_CURVE_FILENAME
+    return path if path.exists() else None
+
+
+def _full_backtest_result_path(attempt: dict[str, Any]) -> Path | None:
+    artifact_dir = attempt.get("artifact_dir")
+    if not isinstance(artifact_dir, str) or not artifact_dir.strip():
+        return None
+    path = Path(artifact_dir) / FULL_BACKTEST_RESULT_FILENAME
+    return path if path.exists() else None
+
+
+def _has_full_backtest(attempt: dict[str, Any]) -> bool:
+    return (
+        _full_backtest_curve_path(attempt) is not None
+        and _full_backtest_result_path(attempt) is not None
+    )
+
+
+def _attempt_deep_replay_job(attempt: dict[str, Any]) -> dict[str, Any] | None:
+    path = _deep_replay_job_path_for_attempt(attempt)
+    if path is None:
+        return None
+    payload = _load_optional_json(path)
+    return payload if isinstance(payload, dict) else None
+
+
+def _attempt_profile_path(attempt: dict[str, Any]) -> Path | None:
+    profile_path_raw = str(attempt.get("profile_path") or "").strip()
+    if not profile_path_raw:
+        return None
+    path = Path(profile_path_raw)
+    return path if path.exists() else None
+
+
+def _run_full_backtest_for_attempt(
+    config: AppConfig, attempt: dict[str, Any]
+) -> dict[str, Any]:
+    artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+    if not artifact_dir.exists():
+        raise RuntimeError(f"Artifact directory does not exist: {artifact_dir}")
+
+    attempt_id = str(attempt.get("attempt_id") or "")
+    print(f"[calculate-backtest] starting for attempt={attempt_id}", flush=True)
+
+    profile_ref = str(attempt.get("profile_ref") or "").strip()
+    profile_path = _attempt_profile_path(attempt)
+
+    deep_replay_job = _attempt_deep_replay_job(attempt)
+    request_payload = (
+        deep_replay_job.get("request") if isinstance(deep_replay_job, dict) else None
+    )
+
+    if isinstance(request_payload, dict):
+        timeframe = str(request_payload.get("timeframe") or "").strip()
+        instruments = request_payload.get("instruments")
+    else:
+        timeframe = ""
+        instruments = None
+
+    if isinstance(instruments, list):
+        instruments = [str(i) for i in instruments if i]
+    else:
+        instruments = []
+
+    if not profile_ref and profile_path is not None and profile_path.exists():
+        cli_for_upload = FuzzfolioCli(config.fuzzfolio)
+        try:
+            print(
+                f"[calculate-backtest] uploading local profile to cloud...", flush=True
+            )
+            profile_ref = cli_for_upload.create_cloud_profile(profile_path)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to upload profile to cloud: {exc}") from exc
+
+    if not profile_ref:
+        raise RuntimeError(
+            "Attempt has neither profile_ref nor valid local profile_path"
+        )
+
+    with TemporaryDirectory(prefix="full_backtest_") as temp_dir:
+        temp_path = Path(temp_dir)
+        sensitivity_output_dir = temp_path / "sensitivity-output"
+        sensitivity_output_dir.mkdir(parents=True, exist_ok=True)
+
+        args = [
+            "sensitivity-basket",
+            "--profile-ref",
+            profile_ref,
+            "--timeframe",
+            timeframe or "M5",
+            "--lookback-months",
+            "36",
+            "--output-dir",
+            str(sensitivity_output_dir),
+            "--allow-timeframe-mismatch",
+        ]
+        for instrument in instruments:
+            args.extend(["--instrument", instrument])
+
+        print(
+            f"[calculate-backtest] running sensitivity-basket: {' '.join(args)}",
+            flush=True,
+        )
+        cli = FuzzfolioCli(config.fuzzfolio)
+        result = cli.run(args, timeout_seconds=420)
+        print(
+            f"[calculate-backtest] sensitivity-basket returned {result.returncode}",
+            flush=True,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"sensitivity-basket failed (exit {result.returncode}):\n"
+                f"stdout: {result.stdout[:800]}\n"
+                f"stderr: {result.stderr[:800]}"
+            )
+
+        curve_src = sensitivity_output_dir / "best-cell-path-detail.json"
+        result_src = sensitivity_output_dir / "sensitivity-response.json"
+
+        if not curve_src.exists():
+            raise RuntimeError(
+                f"sensitivity-basket did not produce best-cell-path-detail.json. "
+                f"Files in output dir: {list(sensitivity_output_dir.iterdir())}"
+            )
+
+        dest_curve = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
+        dest_result = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
+
+        shutil.copy2(curve_src, dest_curve)
+        if result_src.exists():
+            shutil.copy2(result_src, dest_result)
+
+        print(f"[calculate-backtest] done, wrote {dest_curve}", flush=True)
+        return {
+            "curve_path": str(dest_curve),
+            "result_path": str(dest_result) if result_src.exists() else None,
+        }
 
 
 def _count_advisor_injections(run_dir: Path) -> tuple[int, int | None, str | None]:
@@ -300,7 +494,10 @@ def _count_advisor_injections(run_dir: Path) -> tuple[int, int | None, str | Non
             if timestamp:
                 latest_timestamp = str(timestamp)
             for result in payload.get("results", []):
-                if isinstance(result, dict) and result.get("tool") == "advisor_guidance":
+                if (
+                    isinstance(result, dict)
+                    and result.get("tool") == "advisor_guidance"
+                ):
                     advisor_count += 1
     return advisor_count, latest_step, latest_timestamp
 
@@ -308,8 +505,12 @@ def _count_advisor_injections(run_dir: Path) -> tuple[int, int | None, str | Non
 def _attempt_summary(config: AppConfig, attempt: dict[str, Any]) -> dict[str, Any]:
     best_summary = _best_summary(attempt)
     curve_path = _curve_path_for_attempt(attempt)
-    profile_path = Path(str(attempt.get("profile_path"))) if attempt.get("profile_path") else None
-    artifact_dir = Path(str(attempt.get("artifact_dir"))) if attempt.get("artifact_dir") else None
+    profile_path = (
+        Path(str(attempt.get("profile_path"))) if attempt.get("profile_path") else None
+    )
+    artifact_dir = (
+        Path(str(attempt.get("artifact_dir"))) if attempt.get("artifact_dir") else None
+    )
     sensitivity_path = _sensitivity_path_for_attempt(attempt)
     deep_replay_job_path = _deep_replay_job_path_for_attempt(attempt)
     return {
@@ -336,17 +537,27 @@ def _attempt_summary(config: AppConfig, attempt: dict[str, Any]) -> dict[str, An
         "profilePath": str(profile_path) if profile_path else None,
         "profilePathUrl": _file_url(config, profile_path) if profile_path else None,
         "sensitivityPath": str(sensitivity_path) if sensitivity_path else None,
-        "sensitivityPathUrl": _file_url(config, sensitivity_path) if sensitivity_path else None,
+        "sensitivityPathUrl": _file_url(config, sensitivity_path)
+        if sensitivity_path
+        else None,
         "curvePath": str(curve_path) if curve_path else None,
         "curvePathUrl": _file_url(config, curve_path) if curve_path else None,
-        "deepReplayJobPath": str(deep_replay_job_path) if deep_replay_job_path else None,
-        "deepReplayJobPathUrl": _file_url(config, deep_replay_job_path) if deep_replay_job_path else None,
+        "deepReplayJobPath": str(deep_replay_job_path)
+        if deep_replay_job_path
+        else None,
+        "deepReplayJobPathUrl": _file_url(config, deep_replay_job_path)
+        if deep_replay_job_path
+        else None,
         "bestSummary": best_summary,
     }
 
 
-def _best_attempt_for_run(attempts: list[dict[str, Any]], *, lower_is_better: bool) -> dict[str, Any] | None:
-    scored = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+def _best_attempt_for_run(
+    attempts: list[dict[str, Any]], *, lower_is_better: bool
+) -> dict[str, Any] | None:
+    scored = [
+        attempt for attempt in attempts if attempt.get("composite_score") is not None
+    ]
     if not scored:
         return None
     return sorted(
@@ -360,10 +571,18 @@ def _run_summary(config: AppConfig, run_dir: Path) -> dict[str, Any]:
     metadata = load_run_metadata(run_dir)
     attempts = load_run_attempts(run_dir)
     advisor_count, latest_step, latest_timestamp = _count_advisor_injections(run_dir)
-    best_attempt = _best_attempt_for_run(attempts, lower_is_better=config.research.plot_lower_is_better)
-    scored_count = sum(1 for attempt in attempts if attempt.get("composite_score") is not None)
-    curve_count = sum(1 for attempt in attempts if _curve_path_for_attempt(attempt) is not None)
-    latest_attempt_at = max((str(attempt.get("created_at") or "") for attempt in attempts), default=None)
+    best_attempt = _best_attempt_for_run(
+        attempts, lower_is_better=config.research.plot_lower_is_better
+    )
+    scored_count = sum(
+        1 for attempt in attempts if attempt.get("composite_score") is not None
+    )
+    curve_count = sum(
+        1 for attempt in attempts if _curve_path_for_attempt(attempt) is not None
+    )
+    latest_attempt_at = max(
+        (str(attempt.get("created_at") or "") for attempt in attempts), default=None
+    )
     return {
         "runId": run_dir.name,
         "createdAt": metadata.get("created_at"),
@@ -380,22 +599,36 @@ def _run_summary(config: AppConfig, run_dir: Path) -> dict[str, Any]:
         "latestLogTimestamp": latest_timestamp,
         "advisorGuidanceCount": advisor_count,
         "progressPngUrl": _file_url(config, run_dir / "progress.png"),
-        "profileDrop12PngUrl": _file_url(config, run_dir / "profile-drop-12mo.png") if (run_dir / "profile-drop-12mo.png").exists() else None,
-        "profileDrop36PngUrl": _file_url(config, run_dir / "profile-drop-36mo.png") if (run_dir / "profile-drop-36mo.png").exists() else None,
+        "profileDrop12PngUrl": _file_url(config, run_dir / "profile-drop-12mo.png")
+        if (run_dir / "profile-drop-12mo.png").exists()
+        else None,
+        "profileDrop36PngUrl": _file_url(config, run_dir / "profile-drop-36mo.png")
+        if (run_dir / "profile-drop-36mo.png").exists()
+        else None,
         "bestAttempt": _attempt_summary(config, best_attempt) if best_attempt else None,
     }
 
 
-def _model_consistency_rows(leaderboard_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _model_consistency_rows(
+    leaderboard_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in leaderboard_rows:
         metadata = row.get("run_metadata") or {}
-        label = str(metadata.get("explorer_model") or metadata.get("explorer_profile") or "unknown")
+        label = str(
+            metadata.get("explorer_model")
+            or metadata.get("explorer_profile")
+            or "unknown"
+        )
         grouped.setdefault(label, []).append(row)
 
     rows: list[dict[str, Any]] = []
     for label, items in grouped.items():
-        scores = [float(item.get("composite_score")) for item in items if item.get("composite_score") is not None]
+        scores = [
+            float(item.get("composite_score"))
+            for item in items
+            if item.get("composite_score") is not None
+        ]
         if not scores:
             continue
         rows.append(
@@ -405,8 +638,10 @@ def _model_consistency_rows(leaderboard_rows: list[dict[str, Any]]) -> list[dict
                 "averageScore": sum(scores) / len(scores),
                 "medianScore": median(scores),
                 "bestScore": max(scores),
-                "score70PlusRate": sum(1 for score in scores if score >= 70.0) / len(scores),
-                "score80PlusRate": sum(1 for score in scores if score >= 80.0) / len(scores),
+                "score70PlusRate": sum(1 for score in scores if score >= 70.0)
+                / len(scores),
+                "score80PlusRate": sum(1 for score in scores if score >= 80.0)
+                / len(scores),
             }
         )
     rows.sort(key=lambda row: row["averageScore"], reverse=True)
@@ -441,7 +676,9 @@ def build_dashboard_payload(config: AppConfig, *, limit: int) -> dict[str, Any]:
     model_rows = _load_optional_json(config.model_leaderboard_json_path) or []
     tradeoff_rows = _load_optional_json(config.tradeoff_leaderboard_json_path) or []
     validation_rows = _load_optional_json(config.validation_leaderboard_json_path) or []
-    similarity_payload = _load_optional_json(config.similarity_leaderboard_json_path) or {}
+    similarity_payload = (
+        _load_optional_json(config.similarity_leaderboard_json_path) or {}
+    )
     similarity_leaders = list((similarity_payload or {}).get("leaders") or [])
     similarity_pairs = list((similarity_payload or {}).get("pairs") or [])
     run_summaries = [_run_summary(config, run_dir) for run_dir in reversed(run_dirs)]
@@ -449,7 +686,8 @@ def build_dashboard_payload(config: AppConfig, *, limit: int) -> dict[str, Any]:
     best_scores = [
         float(row["bestAttempt"]["score"])
         for row in run_summaries
-        if isinstance(row.get("bestAttempt"), dict) and row["bestAttempt"].get("score") is not None
+        if isinstance(row.get("bestAttempt"), dict)
+        and row["bestAttempt"].get("score") is not None
     ]
     overview = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -460,8 +698,12 @@ def build_dashboard_payload(config: AppConfig, *, limit: int) -> dict[str, Any]:
         "scoredRunCount": len(best_scores),
         "bestScore": max(best_scores) if best_scores else None,
         "medianBestScore": median(best_scores) if best_scores else None,
-        "profileDropCount": sum(1 for row in run_summaries if row.get("profileDropPngUrl")),
-        "curveCoverageCount": sum(1 for row in run_summaries if (row.get("curveAttemptCount") or 0) > 0),
+        "profileDropCount": sum(
+            1 for row in run_summaries if row.get("profileDropPngUrl")
+        ),
+        "curveCoverageCount": sum(
+            1 for row in run_summaries if (row.get("curveAttemptCount") or 0) > 0
+        ),
         "leaderboardCount": len(leaderboard_rows),
         "modelBucketCount": len(model_rows),
         "tradeoffPointCount": len(tradeoff_rows),
@@ -472,14 +714,40 @@ def build_dashboard_payload(config: AppConfig, *, limit: int) -> dict[str, Any]:
     return {
         "overview": overview,
         "images": {
-            "aggregatePlotUrl": _file_url(config, config.aggregate_plot_path) if config.aggregate_plot_path.exists() else None,
-            "leaderboardPlotUrl": _file_url(config, config.leaderboard_plot_path) if config.leaderboard_plot_path.exists() else None,
-            "modelLeaderboardPlotUrl": _file_url(config, config.model_leaderboard_plot_path) if config.model_leaderboard_plot_path.exists() else None,
-            "tradeoffPlotUrl": _file_url(config, config.tradeoff_leaderboard_plot_path) if config.tradeoff_leaderboard_plot_path.exists() else None,
-            "validationScatterPlotUrl": _file_url(config, config.validation_scatter_plot_path) if config.validation_scatter_plot_path.exists() else None,
-            "validationDeltaPlotUrl": _file_url(config, config.validation_delta_plot_path) if config.validation_delta_plot_path.exists() else None,
-            "similarityHeatmapPlotUrl": _file_url(config, config.similarity_heatmap_plot_path) if config.similarity_heatmap_plot_path.exists() else None,
-            "similarityScatterPlotUrl": _file_url(config, config.similarity_scatter_plot_path) if config.similarity_scatter_plot_path.exists() else None,
+            "aggregatePlotUrl": _file_url(config, config.aggregate_plot_path)
+            if config.aggregate_plot_path.exists()
+            else None,
+            "leaderboardPlotUrl": _file_url(config, config.leaderboard_plot_path)
+            if config.leaderboard_plot_path.exists()
+            else None,
+            "modelLeaderboardPlotUrl": _file_url(
+                config, config.model_leaderboard_plot_path
+            )
+            if config.model_leaderboard_plot_path.exists()
+            else None,
+            "tradeoffPlotUrl": _file_url(config, config.tradeoff_leaderboard_plot_path)
+            if config.tradeoff_leaderboard_plot_path.exists()
+            else None,
+            "validationScatterPlotUrl": _file_url(
+                config, config.validation_scatter_plot_path
+            )
+            if config.validation_scatter_plot_path.exists()
+            else None,
+            "validationDeltaPlotUrl": _file_url(
+                config, config.validation_delta_plot_path
+            )
+            if config.validation_delta_plot_path.exists()
+            else None,
+            "similarityHeatmapPlotUrl": _file_url(
+                config, config.similarity_heatmap_plot_path
+            )
+            if config.similarity_heatmap_plot_path.exists()
+            else None,
+            "similarityScatterPlotUrl": _file_url(
+                config, config.similarity_scatter_plot_path
+            )
+            if config.similarity_scatter_plot_path.exists()
+            else None,
         },
         "leaderboard": leaderboard_rows,
         "modelAverages": model_rows,
@@ -514,7 +782,9 @@ def build_run_detail(config: AppConfig, run_id: str) -> dict[str, Any] | None:
     }
 
 
-def build_attempt_detail(config: AppConfig, run_id: str, attempt_id: str) -> dict[str, Any] | None:
+def build_attempt_detail(
+    config: AppConfig, run_id: str, attempt_id: str
+) -> dict[str, Any] | None:
     run_dir = config.runs_root / run_id
     if not run_dir.exists() or not run_dir.is_dir():
         return None
@@ -522,10 +792,26 @@ def build_attempt_detail(config: AppConfig, run_id: str, attempt_id: str) -> dic
         if str(attempt.get("attempt_id")) != attempt_id:
             continue
         summary = _attempt_summary(config, attempt)
-        curve_payload = _load_optional_json(_curve_path_for_attempt(attempt) or Path("__missing__"))
-        sensitivity_payload = _load_optional_json(_sensitivity_path_for_attempt(attempt) or Path("__missing__"))
-        deep_replay_job = _load_optional_json(_deep_replay_job_path_for_attempt(attempt) or Path("__missing__"))
-        profile_payload = _load_optional_json(Path(str(attempt.get("profile_path")))) if attempt.get("profile_path") else None
+        curve_payload = _load_optional_json(
+            _curve_path_for_attempt(attempt) or Path("__missing__")
+        )
+        sensitivity_payload = _load_optional_json(
+            _sensitivity_path_for_attempt(attempt) or Path("__missing__")
+        )
+        deep_replay_job = _load_optional_json(
+            _deep_replay_job_path_for_attempt(attempt) or Path("__missing__")
+        )
+        profile_payload = (
+            _load_optional_json(Path(str(attempt.get("profile_path"))))
+            if attempt.get("profile_path")
+            else None
+        )
+        full_backtest_result = _load_optional_json(
+            _full_backtest_result_path(attempt) or Path("__missing__")
+        )
+        full_backtest_curve = _load_optional_json(
+            _full_backtest_curve_path(attempt) or Path("__missing__")
+        )
         return {
             "runId": run_id,
             "attempt": summary,
@@ -533,8 +819,15 @@ def build_attempt_detail(config: AppConfig, run_id: str, attempt_id: str) -> dic
             "sensitivity": sensitivity_payload,
             "deepReplayJob": deep_replay_job,
             "profile": profile_payload,
-            "profileDrop12PngUrl": _file_url(config, run_dir / "profile-drop-12mo.png") if (run_dir / "profile-drop-12mo.png").exists() else None,
-            "profileDrop36PngUrl": _file_url(config, run_dir / "profile-drop-36mo.png") if (run_dir / "profile-drop-36mo.png").exists() else None,
+            "profileDrop12PngUrl": _file_url(config, run_dir / "profile-drop-12mo.png")
+            if (run_dir / "profile-drop-12mo.png").exists()
+            else None,
+            "profileDrop36PngUrl": _file_url(config, run_dir / "profile-drop-36mo.png")
+            if (run_dir / "profile-drop-36mo.png").exists()
+            else None,
+            "fullBacktestResult": full_backtest_result,
+            "fullBacktestCurve": full_backtest_curve,
+            "hasFullBacktest": _has_full_backtest(attempt),
         }
     return None
 
@@ -548,7 +841,9 @@ class DashboardState:
         self.payload: dict[str, Any] = {}
 
     def rebuild(self) -> dict[str, Any]:
-        refresh_dashboard_sources(self.config, limit=self.limit, force_rebuild=self.force_rebuild)
+        refresh_dashboard_sources(
+            self.config, limit=self.limit, force_rebuild=self.force_rebuild
+        )
         payload = build_dashboard_payload(self.config, limit=self.limit)
         with self._lock:
             self.payload = payload
@@ -565,7 +860,10 @@ def _json_bytes(payload: Any) -> bytes:
 
 def _serve_file(repo_root: Path, raw_relative: str) -> tuple[bytes, str] | None:
     candidate = (repo_root / raw_relative).resolve()
-    if repo_root.resolve() not in candidate.parents and candidate != repo_root.resolve():
+    if (
+        repo_root.resolve() not in candidate.parents
+        and candidate != repo_root.resolve()
+    ):
         return None
     if not candidate.exists() or not candidate.is_file():
         return None
@@ -597,11 +895,17 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path in {"/", "/index.html"}:
-                return self._send_static(STATIC_ROOT / "index.html", "text/html; charset=utf-8")
+                return self._send_static(
+                    STATIC_ROOT / "index.html", "text/html; charset=utf-8"
+                )
             if parsed.path == "/app.js":
-                return self._send_static(STATIC_ROOT / "app.js", "application/javascript; charset=utf-8")
+                return self._send_static(
+                    STATIC_ROOT / "app.js", "application/javascript; charset=utf-8"
+                )
             if parsed.path == "/styles.css":
-                return self._send_static(STATIC_ROOT / "styles.css", "text/css; charset=utf-8")
+                return self._send_static(
+                    STATIC_ROOT / "styles.css", "text/css; charset=utf-8"
+                )
             if parsed.path == "/api/overview":
                 return self._send_json(state.snapshot())
             if parsed.path == "/api/refresh":
@@ -617,7 +921,9 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
                 if len(parts) == 5 and parts[3] == "attempts":
                     detail = build_attempt_detail(state.config, parts[2], parts[4])
                     if detail is None:
-                        return self._send_json({"error": "attempt_not_found"}, status=404)
+                        return self._send_json(
+                            {"error": "attempt_not_found"}, status=404
+                        )
                     return self._send_json(detail)
             if parsed.path == "/files":
                 query = parse_qs(parsed.query)
@@ -630,18 +936,56 @@ def make_handler(state: DashboardState) -> type[BaseHTTPRequestHandler]:
                 body, content_type = result
                 return self._send(200, body, content_type)
             if parsed.path.startswith("/assets/"):
-                asset_path = (STATIC_ROOT / parsed.path.removeprefix("/assets/")).resolve()
-                if STATIC_ROOT.resolve() not in asset_path.parents or not asset_path.exists():
+                asset_path = (
+                    STATIC_ROOT / parsed.path.removeprefix("/assets/")
+                ).resolve()
+                if (
+                    STATIC_ROOT.resolve() not in asset_path.parents
+                    or not asset_path.exists()
+                ):
                     return self._send_json({"error": "asset_not_found"}, status=404)
                 mime_type, _ = mimetypes.guess_type(str(asset_path))
-                return self._send(200, asset_path.read_bytes(), mime_type or "application/octet-stream")
-            return self._send_static(STATIC_ROOT / "index.html", "text/html; charset=utf-8")
+                return self._send(
+                    200,
+                    asset_path.read_bytes(),
+                    mime_type or "application/octet-stream",
+                )
+            return self._send_static(
+                STATIC_ROOT / "index.html", "text/html; charset=utf-8"
+            )
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path == "/api/refresh":
                 payload = state.rebuild()
                 return self._send_json(payload)
+            if parsed.path.startswith("/api/runs/") and "/attempts/" in parsed.path:
+                parts = [unquote(part) for part in parsed.path.split("/") if part]
+                if (
+                    len(parts) == 6
+                    and parts[1] == "runs"
+                    and parts[3] == "attempts"
+                    and parts[5] == "calculate-backtest"
+                ):
+                    run_id = parts[2]
+                    attempt_id = parts[4]
+                    for attempt in load_run_attempts(state.config.runs_root / run_id):
+                        if str(attempt.get("attempt_id")) != attempt_id:
+                            continue
+                        try:
+                            paths = _run_full_backtest_for_attempt(
+                                state.config, attempt
+                            )
+                            detail = build_attempt_detail(
+                                state.config, run_id, attempt_id
+                            )
+                            return self._send_json(detail)
+                        except Exception as exc:
+                            return self._send_json(
+                                {"error": f"backtest_calculation_failed: {exc}"},
+                                status=500,
+                            )
+                    return self._send_json({"error": "attempt_not_found"}, status=404)
             return self._send_json({"error": "not_found"}, status=404)
 
         def log_message(self, format: str, *args: object) -> None:
@@ -672,14 +1016,18 @@ def serve_dashboard(
         print(f"  local url (pending): {local_url}", flush=True)
         if host not in {"127.0.0.1", "localhost"}:
             print(f"  bound url (pending): {public_url}", flush=True)
-        print("  server is not reachable until the startup refresh completes", flush=True)
+        print(
+            "  server is not reachable until the startup refresh completes", flush=True
+        )
         print("  building dashboard payload from source artifacts...", flush=True)
         state.rebuild()
     else:
         print(f"  local url: {local_url}", flush=True)
         if host not in {"127.0.0.1", "localhost"}:
             print(f"  bound url: {public_url}", flush=True)
-        print("  loading dashboard payload from existing derived artifacts...", flush=True)
+        print(
+            "  loading dashboard payload from existing derived artifacts...", flush=True
+        )
         state.payload = build_dashboard_payload(config, limit=limit)
     httpd = ThreadingHTTPServer((host, port), make_handler(state))
     print("Autoresearch dashboard ready.", flush=True)

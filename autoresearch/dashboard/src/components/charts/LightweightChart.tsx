@@ -1,25 +1,29 @@
 import { useEffect, useRef, memo } from "react";
-import { createChart, ColorType, LineSeries, type IChartApi } from "lightweight-charts";
+import { createChart, ColorType, LineSeries, type IChartApi, type Time } from "lightweight-charts";
+import type { CurvePoint } from "../../lib/types";
 
 interface LightweightChartProps {
   className?: string;
   height?: number;
+  equityData?: CurvePoint[];
+  hasFullBacktest?: boolean;
+  onCalculate?: () => void;
+  isCalculating?: boolean;
 }
 
-/**
- * Placeholder Lightweight Chart component.
- * Shows a styled empty chart shell ready for equity curve / backtest data.
- * Will be wired to real CurvePoint[] data in a future iteration.
- */
-export const LightweightChartPlaceholder = memo(function LightweightChartPlaceholder({
+export const LightweightChart = memo(function LightweightChart({
   className,
   height = 320,
+  equityData,
+  hasFullBacktest = false,
+  onCalculate,
+  isCalculating,
 }: LightweightChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
 
   useEffect(() => {
-    if (!containerRef.current) return;
+    if (!containerRef.current || !hasFullBacktest) return;
 
     const chart = createChart(containerRef.current, {
       layout: {
@@ -49,22 +53,36 @@ export const LightweightChartPlaceholder = memo(function LightweightChartPlaceho
 
     chartRef.current = chart;
 
-    const lineSeries = chart.addSeries(LineSeries, {
+    const equitySeries = chart.addSeries(LineSeries, {
       color: "#60d6c3",
       lineWidth: 2,
       priceFormat: { type: "custom", formatter: (v: number) => v.toFixed(1) + "R" },
     });
 
-    // Generate some subtle placeholder data to show the chart is alive
-    const now = Math.floor(Date.now() / 1000);
-    const day = 86400;
-    const placeholderData = Array.from({ length: 60 }, (_, i) => ({
-      time: (now - (60 - i) * day) as unknown as never,
-      value: 10 + Math.sin(i * 0.15) * 3 + i * 0.4 + Math.random() * 1.5,
-    }));
-    lineSeries.setData(placeholderData);
+    const drawdownSeries = chart.addSeries(LineSeries, {
+      color: "#f97070",
+      lineWidth: 1,
+      priceFormat: { type: "custom", formatter: (v: number) => v.toFixed(1) + "R" },
+    });
 
-    chart.timeScale().fitContent();
+      if (equityData) {
+      const equityPoints = equityData.map((p) => ({
+        time: p.time as unknown as never,
+        value: p.equity_r,
+      }));
+      const drawdownPoints = equityData.map((p) => ({
+        time: p.time as unknown as never,
+        value: p.equity_r - p.drawdown_r,
+      }));
+      equitySeries.setData(equityPoints);
+      drawdownSeries.setData(drawdownPoints);
+
+      const from = equityPoints[0].time as Time;
+      const to = equityPoints[equityPoints.length - 1].time as Time;
+      chart.timeScale().setVisibleRange({ from, to });
+    } else {
+      chart.timeScale().fitContent();
+    }
 
     const handleResize = () => {
       if (containerRef.current) {
@@ -78,7 +96,30 @@ export const LightweightChartPlaceholder = memo(function LightweightChartPlaceho
       chart.remove();
       chartRef.current = null;
     };
-  }, [height]);
+  }, [height, equityData, hasFullBacktest]);
+
+  if (!hasFullBacktest) {
+    return (
+      <div className={className}>
+        <div
+          className="rounded-lg border border-border/50 bg-card/30 flex items-center justify-center"
+          style={{ height }}
+        >
+          <div className="flex flex-col items-center gap-2">
+            {onCalculate && (
+              <button
+                onClick={onCalculate}
+                disabled={isCalculating}
+                className="px-3 py-1.5 text-xs rounded-md bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 transition-colors disabled:opacity-50"
+              >
+                {isCalculating ? "Calculating 3yr backtest..." : "Calculate Full 3yr Backtest"}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={className}>
@@ -86,9 +127,18 @@ export const LightweightChartPlaceholder = memo(function LightweightChartPlaceho
         ref={containerRef}
         className="rounded-lg overflow-hidden border border-border/50"
       />
-      <p className="text-[10px] text-muted-foreground mt-1.5 opacity-60 text-center">
-        Equity curve placeholder — will show real backtest data when wired up
-      </p>
+      <div className="flex items-center gap-4 mt-1.5 justify-center">
+        <div className="flex items-center gap-1.5">
+          <div className="w-3 h-0.5 rounded-full bg-[#60d6c3]" />
+          <span className="text-[10px] text-muted-foreground">Equity (R)</span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <div className="w-3 h-0.5 rounded-full bg-[#f97070]" />
+          <span className="text-[10px] text-muted-foreground">Drawdown floor (R)</span>
+        </div>
+      </div>
     </div>
   );
 });
+
+export const LightweightChartPlaceholder = LightweightChart;

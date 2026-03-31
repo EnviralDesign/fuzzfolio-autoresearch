@@ -32,3 +32,14 @@ export function fetchAttemptDetail(runId: string, attemptId: string): Promise<At
     `/api/runs/${encodeURIComponent(runId)}/attempts/${encodeURIComponent(attemptId)}`
   );
 }
+
+/** Calculate full 3yr backtest for an attempt and return updated detail */
+export function calculateBacktest(
+  runId: string,
+  attemptId: string
+): Promise<AttemptDetail> {
+  return fetchJson<AttemptDetail>(
+    `/api/runs/${encodeURIComponent(runId)}/attempts/${encodeURIComponent(attemptId)}/calculate-backtest`,
+    { method: "POST" }
+  );
+}

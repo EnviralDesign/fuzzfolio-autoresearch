@@ -1,5 +1,5 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { fetchOverview, triggerRefresh, fetchRunDetail, fetchAttemptDetail } from "@/lib/api";
+import { fetchOverview, triggerRefresh, fetchRunDetail, fetchAttemptDetail, calculateBacktest } from "@/lib/api";
 
 /** Dashboard overview — polls every 30s */
 export function useDashboard() {
@@ -39,5 +39,17 @@ export function useAttemptDetail(runId: string | undefined, attemptId: string | 
     queryFn: () => fetchAttemptDetail(runId!, attemptId!),
     enabled: !!runId && !!attemptId,
     staleTime: 60_000,
+  });
+}
+
+/** Calculate full 3yr backtest for an attempt */
+export function useCalculateBacktest() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ runId, attemptId }: { runId: string; attemptId: string }) =>
+      calculateBacktest(runId, attemptId),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["attempt", data.runId, data.attempt?.attemptId], data);
+    },
   });
 }

@@ -266,4 +266,37 @@ export interface AttemptDetail {
   profile: unknown;
   profileDrop12PngUrl: string | null;
   profileDrop36PngUrl: string | null;
+  fullBacktestResult: FullBacktestResult | null;
+  fullBacktestCurve: FullBacktestCurve | null;
+  hasFullBacktest: boolean;
+}
+
+export interface FullBacktestResult {
+  data?: {
+    aggregate?: {
+      quality_score?: {
+        score: number;
+        components: Record<string, number>;
+        inputs?: {
+          trades_per_month?: number;
+          expectancy_r?: number;
+          profit_factor?: number;
+          max_drawdown_r?: number;
+          effective_window_months?: number;
+        };
+      };
+      best_cell_path_metrics?: Record<string, number>;
+      best_cell?: {
+        avg_net_r_per_closed_trade?: number;
+        profit_factor?: number;
+      };
+      market_data_window?: { effective_window_months: number };
+    };
+  };
+}
+
+export interface FullBacktestCurve {
+  curve?: {
+    points: CurvePoint[];
+  };
 }

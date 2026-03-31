@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import matplotlib
+
+matplotlib.use("Agg")
+
 import csv
 import math
 import shutil
@@ -11,6 +15,7 @@ import matplotlib.pyplot as plt
 import json
 
 from .ledger import load_run_metadata
+
 
 def compute_frontier(
     attempts: list[dict[str, Any]],
@@ -26,7 +31,9 @@ def compute_frontier(
             non_frontier.append(attempt)
             continue
         score = float(score)
-        improved = best_score is None or (score < best_score if lower_is_better else score > best_score)
+        improved = best_score is None or (
+            score < best_score if lower_is_better else score > best_score
+        )
         if improved:
             frontier.append(attempt)
             best_score = score
@@ -51,7 +58,11 @@ def _metadata_model_summary(run_metadata: dict[str, Any] | None) -> str | None:
         parts.append(f"Explorer: {explorer}")
     if supervisor_model or supervisor_profile:
         supervisor = supervisor_model or supervisor_profile
-        if supervisor_profile and supervisor_model and supervisor_profile != supervisor_model:
+        if (
+            supervisor_profile
+            and supervisor_model
+            and supervisor_profile != supervisor_model
+        ):
             supervisor = f"{supervisor_profile} / {supervisor_model}"
         parts.append(f"Supervisor: {supervisor}")
     if quality_score_preset:
@@ -67,7 +78,9 @@ def render_progress_plot(
     lower_is_better: bool = False,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    valid = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+    valid = [
+        attempt for attempt in attempts if attempt.get("composite_score") is not None
+    ]
     total_logged = len(attempts)
     model_summary = _metadata_model_summary(run_metadata)
 
@@ -98,7 +111,15 @@ def render_progress_plot(
     if discarded:
         plt.scatter(x_disc, y_disc, c="#c7c7c7", s=14, alpha=0.5, label="Non-frontier")
     plt.plot(x_front, y_front, color="#57c785", linewidth=2.0, label="Running best")
-    plt.scatter(x_front, y_front, c="#2ecc71", edgecolors="#2d6a4f", s=46, zorder=3, label="Frontier")
+    plt.scatter(
+        x_front,
+        y_front,
+        c="#2ecc71",
+        edgecolors="#2d6a4f",
+        s=46,
+        zorder=3,
+        label="Frontier",
+    )
 
     for attempt in frontier:
         label = _attempt_plot_label(attempt)
@@ -141,11 +162,15 @@ def _attempt_plot_label(attempt: dict[str, Any]) -> str:
     profile_label = _profile_file_label(attempt)
     if profile_label:
         return prefix + profile_label
-    candidate_name = str(attempt.get("candidate_name", "candidate")).strip() or "candidate"
+    candidate_name = (
+        str(attempt.get("candidate_name", "candidate")).strip() or "candidate"
+    )
     return prefix + candidate_name
 
 
-def _progress_index_rows(attempts: list[dict[str, Any]], run_metadata: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def _progress_index_rows(
+    attempts: list[dict[str, Any]], run_metadata: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for attempt in attempts:
         rows.append(
@@ -154,17 +179,29 @@ def _progress_index_rows(attempts: list[dict[str, Any]], run_metadata: dict[str,
                 "attempt_id": attempt.get("attempt_id"),
                 "plot_label": _attempt_plot_label(attempt),
                 "candidate_name": attempt.get("candidate_name"),
-                "profile_file": Path(str(attempt["profile_path"])).name if attempt.get("profile_path") else None,
+                "profile_file": Path(str(attempt["profile_path"])).name
+                if attempt.get("profile_path")
+                else None,
                 "profile_path": attempt.get("profile_path"),
                 "profile_ref": attempt.get("profile_ref"),
                 "composite_score": attempt.get("composite_score"),
                 "score_basis": attempt.get("score_basis"),
                 "artifact_dir": attempt.get("artifact_dir"),
-                "explorer_profile": run_metadata.get("explorer_profile") if isinstance(run_metadata, dict) else None,
-                "explorer_model": run_metadata.get("explorer_model") if isinstance(run_metadata, dict) else None,
-                "supervisor_profile": run_metadata.get("supervisor_profile") if isinstance(run_metadata, dict) else None,
-                "supervisor_model": run_metadata.get("supervisor_model") if isinstance(run_metadata, dict) else None,
-                "quality_score_preset": run_metadata.get("quality_score_preset") if isinstance(run_metadata, dict) else None,
+                "explorer_profile": run_metadata.get("explorer_profile")
+                if isinstance(run_metadata, dict)
+                else None,
+                "explorer_model": run_metadata.get("explorer_model")
+                if isinstance(run_metadata, dict)
+                else None,
+                "supervisor_profile": run_metadata.get("supervisor_profile")
+                if isinstance(run_metadata, dict)
+                else None,
+                "supervisor_model": run_metadata.get("supervisor_model")
+                if isinstance(run_metadata, dict)
+                else None,
+                "quality_score_preset": run_metadata.get("quality_score_preset")
+                if isinstance(run_metadata, dict)
+                else None,
             }
         )
     return rows
@@ -178,7 +215,9 @@ def write_progress_index(
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rows = _progress_index_rows(attempts, run_metadata)
-    output_path.write_text(json.dumps(rows, ensure_ascii=True, indent=2), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(rows, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
 
     csv_path = output_path.with_suffix(".csv")
     fieldnames = [
@@ -214,7 +253,11 @@ def render_progress_artifacts(
     mirror_attempts: list[dict[str, Any]] | None = None,
     mirror_run_metadata_path: Path | None = None,
 ) -> None:
-    run_metadata = load_run_metadata(run_metadata_path.parent) if run_metadata_path and run_metadata_path.exists() else None
+    run_metadata = (
+        load_run_metadata(run_metadata_path.parent)
+        if run_metadata_path and run_metadata_path.exists()
+        else None
+    )
     render_progress_plot(
         attempts,
         primary_output_path,
@@ -231,8 +274,12 @@ def render_progress_artifacts(
     mirror_output_path.parent.mkdir(parents=True, exist_ok=True)
     if mirror_attempts is None:
         shutil.copy2(primary_output_path, mirror_output_path)
-        source_index = primary_output_path.with_name(f"{primary_output_path.stem}-index.json")
-        target_index = mirror_output_path.with_name(f"{mirror_output_path.stem}-index.json")
+        source_index = primary_output_path.with_name(
+            f"{primary_output_path.stem}-index.json"
+        )
+        target_index = mirror_output_path.with_name(
+            f"{mirror_output_path.stem}-index.json"
+        )
         if source_index.exists():
             shutil.copy2(source_index, target_index)
             source_csv = source_index.with_suffix(".csv")
@@ -261,9 +308,13 @@ def render_progress_artifacts(
     )
 
 
-def _leaderboard_label(attempt: dict[str, Any], run_metadata: dict[str, Any] | None) -> str:
+def _leaderboard_label(
+    attempt: dict[str, Any], run_metadata: dict[str, Any] | None
+) -> str:
     run_id = str(attempt.get("run_id", "run")).strip() or "run"
-    candidate_name = str(attempt.get("candidate_name", "candidate")).strip() or "candidate"
+    candidate_name = (
+        str(attempt.get("candidate_name", "candidate")).strip() or "candidate"
+    )
     explorer_model = str((run_metadata or {}).get("explorer_model") or "").strip()
     explorer_profile = str((run_metadata or {}).get("explorer_profile") or "").strip()
     model_label = explorer_model or explorer_profile
@@ -349,7 +400,11 @@ def _attempt_trades_per_month(attempt: dict[str, Any]) -> float | None:
                     return value
     trade_count = _attempt_trade_count(attempt)
     effective_window_months = _attempt_effective_window_months(attempt)
-    if trade_count is None or effective_window_months is None or effective_window_months <= 0:
+    if (
+        trade_count is None
+        or effective_window_months is None
+        or effective_window_months <= 0
+    ):
         return None
     return float(trade_count) / float(effective_window_months)
 
@@ -359,7 +414,9 @@ def _best_scored_attempts_by_run(
     *,
     lower_is_better: bool = False,
 ) -> list[dict[str, Any]]:
-    scored = [attempt for attempt in attempts if attempt.get("composite_score") is not None]
+    scored = [
+        attempt for attempt in attempts if attempt.get("composite_score") is not None
+    ]
     best_by_run: dict[str, dict[str, Any]] = {}
 
     for attempt in scored:
@@ -401,7 +458,9 @@ def _compute_tradeoff_frontier(
             frontier.append(attempt)
             best_seen_score = score
             continue
-        improved = score < best_seen_score if lower_is_better else score > best_seen_score
+        improved = (
+            score < best_seen_score if lower_is_better else score > best_seen_score
+        )
         if improved:
             frontier.append(attempt)
             best_seen_score = score
@@ -455,7 +514,9 @@ def _compute_tradeoff_envelope(
             log_min = float(math.log10(min_trade))
             log_max = float(math.log10(max_trade))
             step = (log_max - log_min) / bucket_count if bucket_count > 0 else 1.0
-            edges = [10 ** (log_min + step * index) for index in range(bucket_count + 1)]
+            edges = [
+                10 ** (log_min + step * index) for index in range(bucket_count + 1)
+            ]
         else:
             span = max_trade - min_trade
             step = span / bucket_count if bucket_count > 0 else 1.0
@@ -481,7 +542,9 @@ def _compute_tradeoff_envelope(
 
     envelope: list[dict[str, Any]] = []
     seen_attempt_ids: set[str] = set()
-    for attempt in sorted(selected, key=lambda row: float(row.get("trades_per_month", 0.0))):
+    for attempt in sorted(
+        selected, key=lambda row: float(row.get("trades_per_month", 0.0))
+    ):
         attempt_id = str(attempt.get("attempt_id", "")).strip()
         if attempt_id and attempt_id in seen_attempt_ids:
             continue
@@ -500,7 +563,9 @@ def render_leaderboard_artifacts(
     lower_is_better: bool = False,
     limit: int = 15,
 ) -> list[dict[str, Any]]:
-    best_by_run = _best_scored_attempts_by_run(attempts, lower_is_better=lower_is_better)
+    best_by_run = _best_scored_attempts_by_run(
+        attempts, lower_is_better=lower_is_better
+    )
     ranked = sorted(
         best_by_run,
         key=lambda attempt: float(attempt.get("composite_score")),
@@ -517,7 +582,9 @@ def render_leaderboard_artifacts(
         enriched_ranked.append(enriched)
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
-    json_output_path.write_text(json.dumps(enriched_ranked, ensure_ascii=True, indent=2), encoding="utf-8")
+    json_output_path.write_text(
+        json.dumps(enriched_ranked, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(16, max(6, min(14, len(enriched_ranked) * 0.65 + 2))))
@@ -541,7 +608,9 @@ def render_leaderboard_artifacts(
     plt.yticks(positions, labels, fontsize=8)
     plt.gca().invert_yaxis()
     plt.xlabel("Quality Score")
-    plt.title(f"Autoresearch Leaderboard: Best Candidate Per Run ({len(enriched_ranked)} runs)")
+    plt.title(
+        f"Autoresearch Leaderboard: Best Candidate Per Run ({len(enriched_ranked)} runs)"
+    )
 
     for index, score in enumerate(scores):
         plt.text(score, index, f" {score:.3f}", va="center", fontsize=8)
@@ -561,7 +630,9 @@ def render_model_leaderboard_artifacts(
     lower_is_better: bool = False,
 ) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
-    for attempt in _best_scored_attempts_by_run(attempts, lower_is_better=lower_is_better):
+    for attempt in _best_scored_attempts_by_run(
+        attempts, lower_is_better=lower_is_better
+    ):
         run_id = str(attempt.get("run_id", "")).strip()
         label = _model_group_label((run_metadata_by_run_id or {}).get(run_id))
         if not label:
@@ -596,7 +667,9 @@ def render_model_leaderboard_artifacts(
     )
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
-    json_output_path.write_text(json.dumps(summary_rows, ensure_ascii=True, indent=2), encoding="utf-8")
+    json_output_path.write_text(
+        json.dumps(summary_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(14, max(5, min(12, len(summary_rows) * 0.65 + 2))))
@@ -610,7 +683,7 @@ def render_model_leaderboard_artifacts(
 
     positions = list(range(len(summary_rows)))
     scores = [float(row["average_score"]) for row in summary_rows]
-    labels = [f'{row["model_label"]} (n={row["run_count"]})' for row in summary_rows]
+    labels = [f"{row['model_label']} (n={row['run_count']})" for row in summary_rows]
     colors = ["#ffb703"] + ["#90e0ef"] * max(0, len(summary_rows) - 1)
 
     plt.barh(positions, scores, color=colors)
@@ -623,7 +696,7 @@ def render_model_leaderboard_artifacts(
         plt.text(
             float(row["average_score"]),
             index,
-            f'  {float(row["average_score"]):.3f} avg | {float(row["median_score"]):.3f} med',
+            f"  {float(row['average_score']):.3f} avg | {float(row['median_score']):.3f} med",
             va="center",
             fontsize=8,
         )
@@ -644,7 +717,9 @@ def render_tradeoff_leaderboard_artifacts(
 ) -> list[dict[str, Any]]:
     enriched_rows: list[dict[str, Any]] = []
     min_display_score = None if lower_is_better else 15.0
-    for attempt in _best_scored_attempts_by_run(attempts, lower_is_better=lower_is_better):
+    for attempt in _best_scored_attempts_by_run(
+        attempts, lower_is_better=lower_is_better
+    ):
         trade_count = _attempt_trade_count(attempt)
         trades_per_month = _attempt_trades_per_month(attempt)
         effective_window_months = _attempt_effective_window_months(attempt)
@@ -692,17 +767,25 @@ def render_tradeoff_leaderboard_artifacts(
         ),
     ):
         serialized = dict(attempt)
-        serialized["is_frontier"] = str(attempt.get("run_id", "")).strip() in frontier_run_ids
-        serialized["is_trade_envelope"] = str(attempt.get("attempt_id", "")).strip() in envelope_attempt_ids
+        serialized["is_frontier"] = (
+            str(attempt.get("run_id", "")).strip() in frontier_run_ids
+        )
+        serialized["is_trade_envelope"] = (
+            str(attempt.get("attempt_id", "")).strip() in envelope_attempt_ids
+        )
         serializable_rows.append(serialized)
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
-    json_output_path.write_text(json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8")
+    json_output_path.write_text(
+        json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(14, 9))
     if not serializable_rows:
-        plt.title("Autoresearch Score vs Trade Rate: No Scored Runs With Trade Counts Yet")
+        plt.title(
+            "Autoresearch Score vs Trade Rate: No Scored Runs With Trade Counts Yet"
+        )
         plt.xlabel("Average Resolved Trades / Month")
         plt.ylabel("Quality Score")
         plt.tight_layout()
@@ -723,10 +806,19 @@ def render_tradeoff_leaderboard_artifacts(
     )
 
     if envelope:
-        envelope_sorted = sorted(envelope, key=lambda attempt: float(attempt.get("trades_per_month", 0.0)))
+        envelope_sorted = sorted(
+            envelope, key=lambda attempt: float(attempt.get("trades_per_month", 0.0))
+        )
         x_front = [float(attempt["trades_per_month"]) for attempt in envelope_sorted]
         y_front = [float(attempt["composite_score"]) for attempt in envelope_sorted]
-        plt.plot(x_front, y_front, color="#2a9d8f", linewidth=2.1, alpha=0.9, label="Upper envelope")
+        plt.plot(
+            x_front,
+            y_front,
+            color="#2a9d8f",
+            linewidth=2.1,
+            alpha=0.9,
+            label="Upper envelope",
+        )
         plt.scatter(
             x_front,
             y_front,
@@ -750,7 +842,9 @@ def render_tradeoff_leaderboard_artifacts(
             )
 
     if frontier:
-        frontier_sorted = sorted(frontier, key=lambda attempt: float(attempt.get("trades_per_month", 0.0)))
+        frontier_sorted = sorted(
+            frontier, key=lambda attempt: float(attempt.get("trades_per_month", 0.0))
+        )
         plt.scatter(
             [float(attempt["trades_per_month"]) for attempt in frontier_sorted],
             [float(attempt["composite_score"]) for attempt in frontier_sorted],
@@ -804,7 +898,9 @@ def render_validation_scatter_artifacts(
     )
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
-    json_output_path.write_text(json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8")
+    json_output_path.write_text(
+        json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(13, 9))
@@ -849,7 +945,9 @@ def render_validation_scatter_artifacts(
         label="12m = 36m",
     )
 
-    annotation_rows = serializable_rows if len(serializable_rows) <= 30 else serializable_rows[:20]
+    annotation_rows = (
+        serializable_rows if len(serializable_rows) <= 30 else serializable_rows[:20]
+    )
     for row in annotation_rows:
         label = str(row.get("leaderboard_label") or row.get("run_id") or "run")
         if len(label) > 34:
@@ -902,7 +1000,9 @@ def render_validation_delta_artifacts(
         score_12 = float(row["score_12m"])
         score_36 = float(row["score_36m"])
         row["score_delta"] = score_36 - score_12
-        row["score_retention_ratio"] = (score_36 / score_12) if score_12 not in {0.0, -0.0} else None
+        row["score_retention_ratio"] = (
+            (score_36 / score_12) if score_12 not in {0.0, -0.0} else None
+        )
 
     serializable_rows.sort(
         key=lambda row: float(row.get("score_delta", float("-inf"))),
@@ -937,7 +1037,9 @@ def render_validation_delta_artifacts(
     plt.gca().invert_yaxis()
     plt.axvline(0.0, color="#d8e4ff", linewidth=1.0, alpha=0.7)
     plt.xlabel("36m - 12m Quality Score")
-    plt.title("Autoresearch Validation Delta: How Much the Leaders Survive 3-Year Scrutiny")
+    plt.title(
+        "Autoresearch Validation Delta: How Much the Leaders Survive 3-Year Scrutiny"
+    )
 
     for index, row in enumerate(serializable_rows):
         delta = float(row["score_delta"])
@@ -991,8 +1093,7 @@ def render_similarity_heatmap_artifacts(
     ticks = list(range(len(matrix_labels)))
     font_size = max(4, min(8, int(round(10 - (len(matrix_labels) / 18)))))
     truncated = [
-        label if len(label) <= 22 else label[:19] + "..."
-        for label in matrix_labels
+        label if len(label) <= 22 else label[:19] + "..." for label in matrix_labels
     ]
     plt.xticks(ticks, truncated, rotation=55, ha="right", fontsize=font_size)
     plt.yticks(ticks, truncated, fontsize=font_size)
@@ -1102,7 +1203,9 @@ def render_similarity_scatter_artifacts(
 
     plt.xlabel("Closest-match sameness (0 = distinct, 1 = highly similar)")
     plt.ylabel("36m Quality Score")
-    plt.title("Autoresearch Diversity Map: Long-Horizon Score vs Closest-Match Sameness")
+    plt.title(
+        "Autoresearch Diversity Map: Long-Horizon Score vs Closest-Match Sameness"
+    )
     plt.grid(True, alpha=0.25)
     plt.legend()
     plt.tight_layout()

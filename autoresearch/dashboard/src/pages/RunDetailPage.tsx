@@ -1,5 +1,5 @@
 import { useParams, useNavigate } from "react-router-dom";
-import { useRunDetail, useAttemptDetail } from "@/hooks/use-dashboard";
+import { useRunDetail, useAttemptDetail, useCalculateBacktest } from "@/hooks/use-dashboard";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { MetricCard } from "@/components/ui/MetricCard";
 import { Panel, PanelHeader } from "@/components/ui/Panel";
@@ -8,7 +8,7 @@ import { ScoreBadge } from "@/components/ui/ScoreBadge";
 import { QualityRadar } from "@/components/charts/QualityRadar";
 import { LightweightChartPlaceholder } from "@/components/charts/LightweightChart";
 import { formatNumber, formatInt, formatTime, shortRunId } from "@/lib/utils";
-import type { AttemptSummary } from "@/lib/types";
+import type { AttemptSummary, QualityScoreComponents } from "@/lib/types";
 import {
   ResponsiveContainer,
   Scatter,
@@ -33,6 +33,7 @@ export function RunDetailPage() {
   const effectiveAttemptId =
     selectedAttemptId || data?.run.bestAttempt?.attemptId;
   const attemptDetail = useAttemptDetail(runId, effectiveAttemptId);
+  const calculateBacktest = useCalculateBacktest();
 
   if (isLoading) {
     return (
@@ -116,7 +117,17 @@ export function RunDetailPage() {
   // Attempt detail view
   const ad = attemptDetail.data;
   const adAttempt = ad?.attempt;
-  const components = adAttempt?.bestSummary?.quality_score_payload?.components;
+
+  // Full backtest metrics — fall back to realized ledger when full backtest not available
+  const fbr = ad?.fullBacktestResult?.data?.aggregate;
+  const fbScore = fbr?.quality_score?.score ?? adAttempt?.score;
+  const fbTradesPerMonth = fbr?.quality_score?.inputs?.trades_per_month ?? adAttempt?.tradesPerMonth;
+  const fbTradeCount = fbr?.best_cell_path_metrics?.trade_count ?? adAttempt?.tradeCount;
+  const fbMaxDrawdownR = fbr?.best_cell_path_metrics?.max_drawdown_r ?? adAttempt?.maxDrawdownR;
+  const fbEffectiveWindowMonths = fbr?.market_data_window?.effective_window_months ?? adAttempt?.effectiveWindowMonths;
+  const fbExpectancyR = fbr?.best_cell?.avg_net_r_per_closed_trade ?? adAttempt?.expectancyR;
+  const fbProfitFactor = fbr?.best_cell?.profit_factor ?? adAttempt?.profitFactor;
+  const fbComponents = fbr?.quality_score?.components ?? adAttempt?.bestSummary?.quality_score_payload?.components;
 
   return (
     <div className="p-6 space-y-6">
@@ -221,8 +232,8 @@ export function RunDetailPage() {
             eyebrow="Quality Breakdown"
             title={adAttempt?.candidateName || "Select an attempt"}
           />
-          {components ? (
-            <QualityRadar components={components} score={adAttempt?.score ?? undefined} />
+          {fbComponents ? (
+            <QualityRadar components={fbComponents as QualityScoreComponents} score={fbScore ?? undefined} />
           ) : (
             <div className="h-52 flex items-center justify-center text-muted-foreground text-sm">
               {attemptDetail.isLoading ? "Loading…" : "No quality components"}
@@ -252,15 +263,15 @@ export function RunDetailPage() {
           <PanelHeader
             eyebrow="Attempt Detail"
             title={adAttempt.candidateName || effectiveAttemptId || ""}
-            note={`${formatTime(adAttempt.createdAt)} · ${formatNumber(adAttempt.score, 2)} score · ${formatNumber(adAttempt.tradesPerMonth, 1)} trades/mo`}
+            note={`${formatTime(adAttempt.createdAt)} · ${formatNumber(fbScore, 2)} score · ${formatNumber(fbTradesPerMonth, 1)} trades/mo`}
           />
 
           {/* Key metrics row */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-            <MetricCard label="Score" value={formatNumber(adAttempt.score, 2)} secondary={adAttempt.scoreBasis || "quality score"} />
-            <MetricCard label="Trades/mo" value={formatNumber(adAttempt.tradesPerMonth, 1)} secondary={`${formatInt(adAttempt.tradeCount)} resolved`} />
-            <MetricCard label="Max DD" value={`${formatNumber(adAttempt.maxDrawdownR, 1)}R`} secondary={`${formatNumber(adAttempt.effectiveWindowMonths, 1)} mo window`} />
-            <MetricCard label="Expectancy" value={`${formatNumber(adAttempt.expectancyR, 3)}R`} secondary={`PF ${formatNumber(adAttempt.profitFactor, 2)}`} />
+            <MetricCard label="Score" value={formatNumber(fbScore, 2)} secondary={adAttempt.scoreBasis || "quality score"} />
+            <MetricCard label="Trades/mo" value={formatNumber(fbTradesPerMonth, 1)} secondary={`${formatInt(fbTradeCount)} resolved`} />
+            <MetricCard label="Max DD" value={`${formatNumber(fbMaxDrawdownR, 1)}R`} secondary={`${formatNumber(fbEffectiveWindowMonths, 1)} mo window`} />
+            <MetricCard label="Expectancy" value={`${formatNumber(fbExpectancyR, 3)}R`} secondary={`PF ${formatNumber(fbProfitFactor, 2)}`} />
           </div>
 
           {/* Tags */}
@@ -282,13 +293,26 @@ export function RunDetailPage() {
             )}
           </div>
 
-          {/* Lightweight Charts placeholder */}
-          <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-            <div className="xl:col-span-2">
-              <LightweightChartPlaceholder height={320} />
-            </div>
-            <div className="space-y-3">
-              {/* Profile drop images */}
+          {/* Equity curve chart */}
+          <LightweightChartPlaceholder
+            height={320}
+            equityData={ad?.fullBacktestCurve?.curve?.points}
+            hasFullBacktest={ad?.hasFullBacktest}
+            onCalculate={
+              !ad?.hasFullBacktest && !attemptDetail.isLoading
+                ? () =>
+                    calculateBacktest.mutate({
+                      runId: runId!,
+                      attemptId: effectiveAttemptId!,
+                    })
+                : undefined
+            }
+            isCalculating={calculateBacktest.isPending}
+          />
+
+          {/* Profile drop images */}
+          {(ad?.profileDrop12PngUrl || ad?.profileDrop36PngUrl) && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {ad?.profileDrop12PngUrl && (
                 <div className="rounded-lg overflow-hidden border border-border/50">
                   <img
@@ -307,13 +331,8 @@ export function RunDetailPage() {
                   />
                 </div>
               )}
-              {!ad?.profileDrop12PngUrl && !ad?.profileDrop36PngUrl && (
-                <div className="text-xs text-muted-foreground py-4 text-center">
-                  No profile drop images
-                </div>
-              )}
             </div>
-          </div>
+          )}
 
           {/* Collapsible JSON payloads */}
           <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4">
