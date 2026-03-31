@@ -81,6 +81,21 @@ class ResearchConfig:
     same_family_exploit_cap: int = 3
     sweep_oversized_warning: int = 64
     sweep_oversized_hard_block: int = 256
+    validated_leader_min_horizon_months: int = 12
+    bankruptcy_fail_count: int = 2
+    bankruptcy_cooldown_steps: int = 4
+    reseed_min_remaining_steps: int = 6
+    reseed_max_recent_failures_window: int = 6
+    collapse_recovery_max_steps: int = 5
+    max_bankrupt_families_before_force_breadth: int = 2
+    provisional_leader_decay_ratio: float = 0.62
+    horizon_failure_counts_as_retention_fail: bool = True
+    validated_portability_check_required: bool = False
+    validated_cross_instrument_min_score_ratio: float = 0.0
+    late_phase_new_family_budget: float = 0.25
+    wrap_up_requires_validated_leader: bool = False
+    effective_coverage_min_ratio: float = 0.88
+    retention_digest_high_risk_fail_weight: float = 1.5
 
 
 @dataclass
@@ -729,6 +744,113 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             research_cfg.get(
                 "sweep_oversized_hard_block",
                 ResearchConfig.sweep_oversized_hard_block,
+            )
+        ),
+        validated_leader_min_horizon_months=int(
+            research_cfg.get(
+                "validated_leader_min_horizon_months",
+                ResearchConfig.validated_leader_min_horizon_months,
+            )
+        ),
+        bankruptcy_fail_count=max(
+            1,
+            int(
+                research_cfg.get(
+                    "bankruptcy_fail_count", ResearchConfig.bankruptcy_fail_count
+                )
+            ),
+        ),
+        bankruptcy_cooldown_steps=max(
+            0,
+            int(
+                research_cfg.get(
+                    "bankruptcy_cooldown_steps",
+                    ResearchConfig.bankruptcy_cooldown_steps,
+                )
+            ),
+        ),
+        reseed_min_remaining_steps=max(
+            0,
+            int(
+                research_cfg.get(
+                    "reseed_min_remaining_steps",
+                    ResearchConfig.reseed_min_remaining_steps,
+                )
+            ),
+        ),
+        reseed_max_recent_failures_window=max(
+            1,
+            int(
+                research_cfg.get(
+                    "reseed_max_recent_failures_window",
+                    ResearchConfig.reseed_max_recent_failures_window,
+                )
+            ),
+        ),
+        collapse_recovery_max_steps=max(
+            0,
+            int(
+                research_cfg.get(
+                    "collapse_recovery_max_steps",
+                    ResearchConfig.collapse_recovery_max_steps,
+                )
+            ),
+        ),
+        max_bankrupt_families_before_force_breadth=max(
+            1,
+            int(
+                research_cfg.get(
+                    "max_bankrupt_families_before_force_breadth",
+                    ResearchConfig.max_bankrupt_families_before_force_breadth,
+                )
+            ),
+        ),
+        provisional_leader_decay_ratio=float(
+            research_cfg.get(
+                "provisional_leader_decay_ratio",
+                ResearchConfig.provisional_leader_decay_ratio,
+            )
+        ),
+        horizon_failure_counts_as_retention_fail=bool(
+            research_cfg.get(
+                "horizon_failure_counts_as_retention_fail",
+                ResearchConfig.horizon_failure_counts_as_retention_fail,
+            )
+        ),
+        validated_portability_check_required=bool(
+            research_cfg.get(
+                "validated_portability_check_required",
+                ResearchConfig.validated_portability_check_required,
+            )
+        ),
+        validated_cross_instrument_min_score_ratio=float(
+            research_cfg.get(
+                "validated_cross_instrument_min_score_ratio",
+                ResearchConfig.validated_cross_instrument_min_score_ratio,
+            )
+        ),
+        late_phase_new_family_budget=float(
+            research_cfg.get(
+                "late_phase_new_family_budget",
+                ResearchConfig.late_phase_new_family_budget,
+            )
+        ),
+        wrap_up_requires_validated_leader=bool(
+            research_cfg.get(
+                "wrap_up_requires_validated_leader",
+                ResearchConfig.wrap_up_requires_validated_leader,
+            )
+        ),
+        effective_coverage_min_ratio=float(
+            research_cfg.get(
+                "effective_coverage_min_ratio",
+                ResearchConfig.effective_coverage_min_ratio,
+            )
+        ),
+        retention_digest_high_risk_fail_weight=float(
+            research_cfg.get(
+                "retention_digest_high_risk_fail_weight",
+                ResearchConfig.retention_digest_high_risk_fail_weight,
             )
         ),
     )

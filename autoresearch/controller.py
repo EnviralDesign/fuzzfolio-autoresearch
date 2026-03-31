@@ -5,13 +5,14 @@ import sys
 import re
 import shlex
 from difflib import get_close_matches
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from . import branch_lifecycle as bl
 from .config import AppConfig
 from .fuzzfolio import CliError, CommandResult, FuzzfolioCli
 from .ledger import (
@@ -291,6 +292,11 @@ class ResearchController:
         self._last_family_id: str | None = None
         self._timeframe_mismatches: list[dict[str, Any]] = []
         self._same_family_exploit_history: list[str] = []
+        self._family_branches: dict[str, bl.FamilyBranchState] = {}
+        self._branch_overlay = bl.BranchRunOverlay()
+        self._current_controller_step: int = 0
+        self._current_step_limit: int = 0
+        self._current_run_policy: RunPolicy | None = None
 
     def _reset_run_state(self) -> None:
         self._family_mutation_counts = {}
@@ -302,6 +308,525 @@ class ResearchController:
         self._last_family_id = None
         self._timeframe_mismatches = []
         self._same_family_exploit_history = []
+        self._family_branches = {}
+        self._branch_overlay = bl.BranchRunOverlay()
+        self._current_controller_step = 0
+        self._current_step_limit = 0
+        self._current_run_policy = None
+
+    def _parse_lookback_months_from_cli_args(self, args: list[str]) -> int | None:
+        if "--lookback-months" not in args:
+            return None
+        idx = args.index("--lookback-months") + 1
+        if idx >= len(args):
+            return None
+        try:
+            return int(str(args[idx]).strip())
+        except (TypeError, ValueError):
+            return None
+
+    def _family_id_for_profile_ref(self, profile_ref: str | None) -> str | None:
+        if not profile_ref:
+            return None
+        path = self.profile_sources.get(str(profile_ref).strip())
+        return self._derive_family_id_from_profile(path)
+
+    def _family_id_from_cli_args(self, args: list[str]) -> str | None:
+        if "--profile-ref" not in args:
+            return None
+        idx = args.index("--profile-ref") + 1
+        if idx >= len(args):
+            return None
+        return self._family_id_for_profile_ref(str(args[idx]).strip())
+
+    def _resolve_cli_family_id(self, args: list[str]) -> str | None:
+        fid = self._family_id_from_cli_args(args)
+        if fid:
+            return fid
+        if (
+            len(args) >= 2
+            and str(args[0]).lower() == "profiles"
+            and str(args[1]).lower() == "patch"
+            and "--file" in args
+        ):
+            fi = args.index("--file") + 1
+            if fi < len(args):
+                return self._derive_family_id_from_profile(
+                    Path(str(args[fi])).resolve()
+                )
+        return None
+
+    def _cli_action_hits_family_exploit_surface(
+        self, args: list[str], family_id: str | None
+    ) -> bool:
+        if not family_id:
+            return False
+        head = [str(a).lower() for a in args[:3]]
+        if not head:
+            return False
+        if head[0] in {"sensitivity", "sensitivity-basket"}:
+            return True
+        if head[0] == "sweep":
+            return True
+        if len(head) >= 2 and head[:2] == ["profiles", "patch"]:
+            return True
+        return False
+
+    def _mark_family_collapsed(
+        self,
+        tool_context: ToolContext,
+        family_id: str,
+        reason: str,
+        step: int,
+        step_limit: int,
+    ) -> None:
+        cfg = self.config.research
+        branch = bl.ensure_family_branch(self._family_branches, family_id)
+        if branch.exploit_dead:
+            return
+        branch.lifecycle_state = bl.LIFECYCLE_COLLAPSED
+        branch.retention_status = bl.RETENTION_FAILED
+        branch.bankrupt = True
+        branch.exploit_dead = True
+        branch.collapse_reason = reason
+        branch.structural_contrast_required = True
+        branch.cooldown_until_step = step + int(cfg.bankruptcy_cooldown_steps)
+        self._branch_overlay.recent_retention_failures.append(step)
+        keep = max(20, cfg.reseed_max_recent_failures_window * 4)
+        self._branch_overlay.recent_retention_failures = self._branch_overlay.recent_retention_failures[
+            -keep:
+        ]
+        self._maybe_activate_reseed(tool_context, step, step_limit)
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="branch_lifecycle",
+            status="collapsed",
+            message=f"Family {family_id[:20]}... collapsed: {reason}",
+            family_id_prefix=family_id[:16],
+        )
+
+    def _maybe_activate_reseed(
+        self, tool_context: ToolContext, step: int, step_limit: int
+    ) -> None:
+        cfg = self.config.research
+        remaining = step_limit - step
+        if remaining < cfg.reseed_min_remaining_steps:
+            return
+        if self._branch_overlay.validated_leader_family_id:
+            return
+        window = max(1, cfg.reseed_max_recent_failures_window)
+        recent_fails = [s for s in self._branch_overlay.recent_retention_failures if step - s <= window]
+        if not recent_fails:
+            return
+        dead = sum(1 for b in self._family_branches.values() if b.exploit_dead)
+        if dead < 1 and not any(
+            b.structural_contrast_required for b in self._family_branches.values()
+        ):
+            return
+        if not self._branch_overlay.reseed_active:
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="branch_lifecycle",
+                status="reseed",
+                message="Reseed / collapse-recovery window activated.",
+            )
+        self._branch_overlay.reseed_active = True
+        if self._branch_overlay.reseed_started_step is None:
+            self._branch_overlay.reseed_started_step = step
+        self._branch_overlay.collapse_recovery_remaining = max(
+            self._branch_overlay.collapse_recovery_remaining,
+            cfg.collapse_recovery_max_steps,
+        )
+
+    def _branch_step_maintenance(
+        self, step: int, step_limit: int, policy: RunPolicy
+    ) -> None:
+        for branch in self._family_branches.values():
+            if branch.bankrupt and branch.cooldown_until_step <= step:
+                branch.bankrupt = False
+                if branch.exploit_dead:
+                    branch.lifecycle_state = bl.LIFECYCLE_RESEED_ELIGIBLE
+                else:
+                    branch.lifecycle_state = bl.LIFECYCLE_SCOUT
+        if (
+            self._branch_overlay.reseed_active
+            and self._branch_overlay.collapse_recovery_remaining > 0
+        ):
+            self._branch_overlay.collapse_recovery_remaining -= 1
+            if self._branch_overlay.collapse_recovery_remaining <= 0:
+                self._branch_overlay.reseed_active = False
+        self._sync_branch_budget_mode(step, step_limit, policy)
+
+    def _sync_branch_budget_mode(
+        self, step: int, step_limit: int, policy: RunPolicy
+    ) -> None:
+        phase_info = self._run_phase_info(step, step_limit, policy)
+        phase_name = str(phase_info.get("name") or "")
+        self._recompute_branch_leaders()
+        self._branch_overlay.explored_family_count = len(self._family_branches)
+        dead_cnt = sum(1 for b in self._family_branches.values() if b.exploit_dead)
+        if dead_cnt >= self.config.research.max_bankrupt_families_before_force_breadth:
+            self._branch_overlay.budget_mode = bl.BUDGET_SCOUTING
+            return
+        if phase_name == "wrap_up":
+            self._branch_overlay.budget_mode = bl.BUDGET_WRAP_UP
+            return
+        if (
+            self._branch_overlay.reseed_active
+            and self._branch_overlay.collapse_recovery_remaining > 0
+        ):
+            self._branch_overlay.budget_mode = bl.BUDGET_COLLAPSE_RECOVERY
+            return
+        if self._branch_overlay.validated_leader_family_id:
+            self._branch_overlay.budget_mode = (
+                bl.BUDGET_VALIDATION
+                if phase_name in {"mid", "late"}
+                else bl.BUDGET_EXPLOIT
+            )
+            return
+        if phase_name == "early" or not self._branch_overlay.provisional_leader_family_id:
+            self._branch_overlay.budget_mode = bl.BUDGET_SCOUTING
+            return
+        self._branch_overlay.budget_mode = (
+            bl.BUDGET_VALIDATION if phase_name in {"mid", "late"} else bl.BUDGET_EXPLOIT
+        )
+
+    def _recompute_branch_leaders(self) -> None:
+        threshold = self.config.research.retention_strong_candidate_threshold
+        best_prov: tuple[float, str | None] = (float("-inf"), None)
+        best_val: tuple[float, str | None] = (float("-inf"), None)
+        for fid, st in self._family_branches.items():
+            if st.exploit_dead or st.bankrupt or bl.cooldown_active(st, self._current_controller_step):
+                continue
+            sc = st.best_score
+            if sc is None or sc < threshold:
+                continue
+            if (
+                st.promotion_level == bl.PROMOTION_VALIDATED
+                and st.retention_status == bl.RETENTION_PASSED
+            ):
+                if sc > best_val[0]:
+                    best_val = (sc, fid)
+            else:
+                if sc > best_prov[0]:
+                    best_prov = (sc, fid)
+        self._branch_overlay.validated_leader_family_id = best_val[1]
+        self._branch_overlay.provisional_leader_family_id = best_prov[1]
+
+    def _refresh_branch_lifecycle_after_eval(
+        self,
+        tool_context: ToolContext,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+        *,
+        family_id: str | None,
+        profile_ref: str | None,
+        attempt_id: str | None,
+        score: float,
+        requested_horizon_months: int | None,
+        effective_window_months: float | None,
+        retention_result: dict[str, Any] | None,
+        behavior_digest: dict[str, Any] | None,
+        had_timeframe_mismatch: bool,
+) -> None:
+        if not family_id:
+            return
+        cfg = self.config.research
+        branch = bl.ensure_family_branch(self._family_branches, family_id)
+        digest = behavior_digest or {}
+        support_shape = str(digest.get("support_shape") or "")
+        retention_risk = str(digest.get("retention_risk") or "low")
+        next_move_hint = str(digest.get("next_move_hint") or "")
+
+        if branch.first_seen_attempt_id is None and attempt_id:
+            branch.first_seen_attempt_id = attempt_id
+        branch.latest_attempt_id = attempt_id
+        branch.latest_score = score
+        branch.latest_horizon_months = requested_horizon_months
+        branch.latest_effective_window_months = effective_window_months
+        if profile_ref:
+            branch.last_profile_ref = str(profile_ref).strip()
+
+        if branch.best_score is None or score > branch.best_score:
+            branch.best_score = score
+            branch.best_attempt_id = attempt_id
+            branch.best_horizon_months = requested_horizon_months
+            branch.best_effective_window_months = effective_window_months
+
+        if support_shape == "too_sparse" and branch.lifecycle_state != bl.LIFECYCLE_COLLAPSED:
+            branch.lifecycle_state = bl.LIFECYCLE_RETENTION_WARNING
+
+        if retention_risk == "high" and next_move_hint in {
+            "contrast_family",
+            "prune_family",
+        }:
+            branch.structural_contrast_required = True
+        if next_move_hint == "stop_threshold_tuning":
+            branch.structural_contrast_required = True
+
+        coverage_ok = True
+        if requested_horizon_months is not None and effective_window_months is not None:
+            try:
+                req = float(requested_horizon_months)
+                eff = float(effective_window_months)
+                floor = req * float(cfg.effective_coverage_min_ratio)
+                coverage_ok = eff + 1e-6 >= floor
+            except (TypeError, ValueError):
+                coverage_ok = False
+        elif (
+            cfg.horizon_failure_counts_as_retention_fail
+            and requested_horizon_months is not None
+            and effective_window_months is None
+        ):
+            coverage_ok = False
+
+        if not coverage_ok and cfg.horizon_failure_counts_as_retention_fail:
+            w = (
+                cfg.retention_digest_high_risk_fail_weight
+                if retention_risk == "high"
+                else 1.0
+            )
+            branch.retention_fail_count += max(1, int(round(w)))
+            branch.coverage_inadequate_count += 1
+
+        if had_timeframe_mismatch:
+            branch.timeframe_mismatch_hits += 1
+            if branch.timeframe_mismatch_hits >= 3:
+                self._mark_family_collapsed(
+                    tool_context,
+                    family_id,
+                    "repeated_timeframe_intent_mismatch",
+                    step,
+                    step_limit,
+                )
+
+        min_horizon = cfg.validated_leader_min_horizon_months
+        if (
+            requested_horizon_months is not None
+            and requested_horizon_months < min_horizon
+        ):
+            peak = branch.provisional_peak_score
+            if peak is None or score > peak:
+                branch.provisional_peak_score = score
+                branch.provisional_peak_horizon_months = requested_horizon_months
+
+        if (
+            score is not None
+            and requested_horizon_months is not None
+            and requested_horizon_months >= min_horizon
+            and branch.provisional_peak_score is not None
+            and score
+            < branch.provisional_peak_score * float(cfg.provisional_leader_decay_ratio)
+        ):
+            branch.long_rung_low_score_streak += 1
+        else:
+            branch.long_rung_low_score_streak = 0
+
+        if branch.long_rung_low_score_streak >= 2:
+            self._mark_family_collapsed(
+                tool_context,
+                family_id,
+                "repeated_long_horizon_scores_far_below_provisional_peak",
+                step,
+                step_limit,
+            )
+
+        rr = retention_result or {}
+        if rr.get("retention_failed"):
+            self._mark_family_collapsed(
+                tool_context,
+                family_id,
+                "retention_threshold_failed",
+                step,
+                step_limit,
+            )
+
+        rs = self._family_retention_state.get(family_id, {})
+        if not branch.exploit_dead and rs.get("retention_check_passed"):
+            branch.retention_status = bl.RETENTION_PASSED
+            if (
+                requested_horizon_months is not None
+                and requested_horizon_months >= min_horizon
+                and coverage_ok
+            ):
+                branch.promotion_level = bl.PROMOTION_VALIDATED
+                branch.lifecycle_state = bl.LIFECYCLE_VALIDATED_LEADER
+            else:
+                branch.promotion_level = bl.PROMOTION_PROVISIONAL
+                if branch.lifecycle_state not in {
+                    bl.LIFECYCLE_COLLAPSED,
+                    bl.LIFECYCLE_VALIDATED_LEADER,
+                }:
+                    branch.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_LEADER
+
+        if rr.get("needs_retention_check") and not branch.exploit_dead:
+            branch.retention_status = bl.RETENTION_PENDING
+
+        if (
+            not branch.exploit_dead
+            and branch.retention_fail_count >= cfg.bankruptcy_fail_count
+        ):
+            self._mark_family_collapsed(
+                tool_context,
+                family_id,
+                "retention_fail_count_budget_exceeded",
+                step,
+                step_limit,
+            )
+
+        if (
+            not branch.exploit_dead
+            and score >= cfg.retention_strong_candidate_threshold
+            and branch.promotion_level == bl.PROMOTION_SCOUT
+            and branch.lifecycle_state != bl.LIFECYCLE_COLLAPSED
+        ):
+            branch.promotion_level = bl.PROMOTION_PROVISIONAL
+            branch.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_CONTENDER
+
+        self._sync_branch_budget_mode(step, step_limit, policy)
+        self._persist_branch_runtime_state(tool_context, step)
+
+    def _persist_branch_runtime_state(self, tool_context: ToolContext, step: int) -> None:
+        snapshot = self._build_branch_runtime_snapshot(tool_context, step)
+        path = self._runtime_state_path(tool_context)
+        prior: dict[str, Any] = {}
+        if path.exists():
+            try:
+                prior = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                prior = {}
+        if not isinstance(prior, dict):
+            prior = {}
+        prior["controller"] = snapshot
+        prior["controller_updated_at"] = datetime.now(timezone.utc).isoformat()
+        path.write_text(json.dumps(prior, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    def _build_branch_runtime_snapshot(
+        self, tool_context: ToolContext, step: int
+    ) -> dict[str, Any]:
+        overlay = self._branch_overlay
+        collapsed = [
+            fid
+            for fid, st in self._family_branches.items()
+            if st.lifecycle_state == bl.LIFECYCLE_COLLAPSED or st.exploit_dead
+        ]
+        cooldown = [
+            {
+                "family_id": fid[:24] + ("..." if len(fid) > 24 else ""),
+                "until_step": st.cooldown_until_step,
+            }
+            for fid, st in self._family_branches.items()
+            if st.bankrupt and st.cooldown_until_step > step
+        ]
+        return {
+            "step": step,
+            "run_id": tool_context.run_id,
+            "provisional_leader_family_prefix": (
+                (overlay.provisional_leader_family_id or "")[:20] + "..."
+                if overlay.provisional_leader_family_id
+                else None
+            ),
+            "validated_leader_family_prefix": (
+                (overlay.validated_leader_family_id or "")[:20] + "..."
+                if overlay.validated_leader_family_id
+                else None
+            ),
+            "budget_mode": overlay.budget_mode,
+            "reseed_active": overlay.reseed_active,
+            "reseed_started_step": overlay.reseed_started_step,
+            "collapse_recovery_remaining": overlay.collapse_recovery_remaining,
+            "explored_family_count": overlay.explored_family_count,
+            "collapsed_families_count": len(collapsed),
+            "collapsed_family_prefixes": [c[:16] + "..." for c in collapsed[:12]],
+            "families_on_cooldown": cooldown,
+            "families": {
+                k[:24] + ("..." if len(k) > 24 else ""): v.to_dict()
+                for k, v in list(self._family_branches.items())[:40]
+            },
+        }
+
+    def _branch_lifecycle_run_packet_text(
+        self, tool_context: ToolContext, step: int, step_limit: int
+    ) -> str:
+        ov = self._branch_overlay
+        lines = [
+            "Branch lifecycle (controller-owned):",
+            f"- budget_mode: {ov.budget_mode}",
+            f"- reseed_active: {ov.reseed_active} (collapse_recovery_steps_left={ov.collapse_recovery_remaining})",
+            f"- provisional_leader_family: {(ov.provisional_leader_family_id or 'none')[:28]}{'...' if ov.provisional_leader_family_id and len(ov.provisional_leader_family_id) > 28 else ''}",
+            f"- validated_leader_family: {(ov.validated_leader_family_id or 'none')[:28]}{'...' if ov.validated_leader_family_id and len(ov.validated_leader_family_id) > 28 else ''}",
+            f"- explored_distinct_families: {ov.explored_family_count}",
+        ]
+        dead = [fid for fid, st in self._family_branches.items() if st.exploit_dead]
+        if dead:
+            lines.append(
+                "- exploit_dead_families (same profile_ref sensitivity/sweeps blocked): "
+                + ", ".join(d[:12] + "..." for d in dead[:6])
+            )
+        contrast = any(
+            st.structural_contrast_required for st in self._family_branches.values()
+        )
+        if contrast or ov.budget_mode == bl.BUDGET_COLLAPSE_RECOVERY:
+            lines.append(
+                "- STRUCTURAL CONTRAST PRIORITY: pivot indicator family, instrument cluster, "
+                "timeframe architecture, or directional logic before more same-family tuning."
+            )
+        if ov.budget_mode == bl.BUDGET_WRAP_UP:
+            lines.append(
+                "- Wrap-up budget: favor validating or pressure-testing validated survivors; "
+                "avoid broad new search unless config allows and no validated leader exists."
+            )
+        return "\n".join(lines)
+
+    def _validate_branch_lifecycle_actions(
+        self,
+        tool_context: ToolContext,
+        actions: Any,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> list[str]:
+        if not isinstance(actions, list):
+            return []
+        errors: list[str] = []
+        overlay = self._branch_overlay
+        for index, action in enumerate(actions, start=1):
+            if not isinstance(action, dict):
+                continue
+            if str(action.get("tool", "")).strip() != "run_cli":
+                continue
+            try:
+                args = [str(item) for item in self._normalize_cli_args(action)]
+            except Exception:
+                continue
+            family_id = self._resolve_cli_family_id(args)
+            if not family_id:
+                continue
+            branch = self._family_branches.get(family_id)
+            is_exploit = self._is_same_family_exploit_action(action)
+            if branch and branch.exploit_dead and self._cli_action_hits_family_exploit_surface(
+                args, family_id
+            ):
+                errors.append(
+                    f"Action {index}: branch lifecycle BLOCK — family {family_id[:16]}... is exploit_dead "
+                    "(retention collapse). Do not run sensitivity, sweep, or profiles patch on this profile; "
+                    "use a structural contrast (new scaffold/clone path) or different instruments."
+                )
+                continue
+            if overlay.budget_mode == bl.BUDGET_COLLAPSE_RECOVERY and is_exploit:
+                errors.append(
+                    f"Action {index}: collapse_recovery budget — same-family exploit blocked; "
+                    f"prefer structural contrast or validation on a different family."
+                )
+            if branch and branch.structural_contrast_required and is_exploit:
+                errors.append(
+                    f"Action {index}: structural contrast required for family {family_id[:16]}... "
+                    "— blocked same-family exploit until contrast pivot progresses."
+                )
+        return errors
 
     def _derive_family_id_from_profile(self, profile_path: Path | None) -> str | None:
         if profile_path is None or not profile_path.exists():
@@ -1813,6 +2338,7 @@ class ResearchController:
             f"Checkpoint summary:\n{checkpoint}\n\n"
             f"Recent attempts:\n{self._recent_attempts_summary(tool_context)}\n\n"
             f"{self._retention_and_exploit_status_text(tool_context)}\n\n"
+            f"{self._branch_lifecycle_run_packet_text(tool_context, effective_step, effective_step_limit)}\n\n"
             f"{self._timeframe_mismatch_status_text()}\n\n"
             f"{self._recent_behavior_digest_text(tool_context)}\n"
             f"\nCLI guide:\n{cli_guide}\n"
@@ -2304,6 +2830,24 @@ class ResearchController:
             return None
         repaired_actions = normalized.get("actions")
         repaired_errors = self._validate_actions(repaired_actions)
+        pol = self._current_run_policy or RunPolicy()
+        lim = self._current_step_limit or self.config.research.max_steps
+        repaired_errors.extend(
+            self._validate_finish_timing(
+                tool_context, repaired_actions, step, lim, pol
+            )
+        )
+        repaired_errors.extend(
+            self._validate_repeated_actions(tool_context, repaired_actions)
+        )
+        repaired_errors.extend(
+            self._validate_timeframe_mismatch_block(repaired_actions)
+        )
+        repaired_errors.extend(
+            self._validate_branch_lifecycle_actions(
+                tool_context, repaired_actions, step, lim, pol
+            )
+        )
         if repaired_errors:
             self._trace_runtime(
                 tool_context,
@@ -2379,6 +2923,24 @@ class ResearchController:
             return None
         repaired_actions = normalized.get("actions")
         repaired_errors = self._validate_actions(repaired_actions)
+        pol = self._current_run_policy or RunPolicy()
+        lim = self._current_step_limit or self.config.research.max_steps
+        repaired_errors.extend(
+            self._validate_finish_timing(
+                tool_context, repaired_actions, step, lim, pol
+            )
+        )
+        repaired_errors.extend(
+            self._validate_repeated_actions(tool_context, repaired_actions)
+        )
+        repaired_errors.extend(
+            self._validate_timeframe_mismatch_block(repaired_actions)
+        )
+        repaired_errors.extend(
+            self._validate_branch_lifecycle_actions(
+                tool_context, repaired_actions, step, lim, pol
+            )
+        )
         if repaired_errors:
             self._trace_runtime(
                 tool_context,
@@ -2490,6 +3052,50 @@ class ResearchController:
         auto_log_reason = None
         if record.composite_score is None:
             auto_log_reason = "quality_score was null in the evaluation artifacts"
+        if (
+            record.composite_score is not None
+            and self._current_run_policy is not None
+            and self._current_step_limit > 0
+        ):
+            profile_path = (
+                Path(record.profile_path)
+                if record.profile_path
+                else None
+            )
+            family_id = self._derive_family_id_from_profile(profile_path)
+            if family_id:
+                attempt_dict = asdict(record)
+                digest = self._generate_behavior_digest(attempt_dict)
+                eff_float: float | None = None
+                if effective_window_months is not None:
+                    try:
+                        eff_float = float(effective_window_months)
+                    except (TypeError, ValueError):
+                        eff_float = None
+                horizon_int = (
+                    int(eff_float) if eff_float is not None else None
+                )
+                retention_snapshot = self._check_retention_gating(
+                    tool_context,
+                    family_id,
+                    float(record.composite_score),
+                    horizon_int,
+                )
+                self._refresh_branch_lifecycle_after_eval(
+                    tool_context,
+                    self._current_controller_step,
+                    self._current_step_limit,
+                    self._current_run_policy,
+                    family_id=family_id,
+                    profile_ref=record.profile_ref,
+                    attempt_id=record.attempt_id,
+                    score=float(record.composite_score),
+                    requested_horizon_months=horizon_int,
+                    effective_window_months=eff_float,
+                    retention_result=retention_snapshot,
+                    behavior_digest=digest,
+                    had_timeframe_mismatch=False,
+                )
         return {
             "status": "logged",
             "attempt_id": record.attempt_id,
@@ -2658,13 +3264,61 @@ class ResearchController:
                             family_id, is_exploit, support_quality
                         )
                         if score is not None:
+                            eff_raw = auto_log.get("effective_window_months")
                             horizon_months = (
-                                int(auto_log.get("effective_window_months"))
-                                if auto_log.get("effective_window_months") is not None
+                                int(eff_raw)
+                                if eff_raw is not None
+                                and str(eff_raw).strip() not in {"", "none"}
                                 else None
+                            )
+                            requested_horizon_months = self._parse_lookback_months_from_cli_args(
+                                args
                             )
                             retention_result = self._check_retention_gating(
                                 tool_context, family_id, float(score), horizon_months
+                            )
+                            attempts_list = self._run_attempts(tool_context.run_id)
+                            attempt_dict = (
+                                attempts_list[-1] if attempts_list else None
+                            )
+                            digest = (
+                                self._generate_behavior_digest(attempt_dict)
+                                if isinstance(attempt_dict, dict)
+                                else {}
+                            )
+                            had_mismatch = timeframe_mismatch is not None
+                            eff_float: float | None = None
+                            if isinstance(eff_raw, (int, float)):
+                                eff_float = float(eff_raw)
+                            elif eff_raw is not None:
+                                try:
+                                    eff_float = float(str(eff_raw).strip())
+                                except (TypeError, ValueError):
+                                    eff_float = None
+                            self._refresh_branch_lifecycle_after_eval(
+                                tool_context,
+                                step,
+                                step_limit,
+                                policy,
+                                family_id=family_id,
+                                profile_ref=str(profile_ref_for_family).strip()
+                                if profile_ref_for_family
+                                else None,
+                                attempt_id=(
+                                    str(auto_log.get("attempt_id"))
+                                    if auto_log.get("attempt_id")
+                                    else None
+                                ),
+                                score=float(score),
+                                requested_horizon_months=(
+                                    requested_horizon_months
+                                    if requested_horizon_months is not None
+                                    else horizon_months
+                                ),
+                                effective_window_months=eff_float,
+                                retention_result=retention_result,
+                                behavior_digest=digest,
+                                had_timeframe_mismatch=had_mismatch,
                             )
                             if retention_result.get("retention_failed"):
                                 retention_result["auto_log"] = auto_log
@@ -2790,8 +3444,20 @@ class ResearchController:
         trace_path = self._runtime_trace_path(tool_context)
         with trace_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
-        self._runtime_state_path(tool_context).write_text(
-            json.dumps(payload, ensure_ascii=True, indent=2),
+        state_path = self._runtime_state_path(tool_context)
+        merged: dict[str, Any] = {"last_trace": payload}
+        if state_path.exists():
+            try:
+                cur = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(cur, dict):
+                    if isinstance(cur.get("controller"), dict):
+                        merged["controller"] = cur["controller"]
+                    if isinstance(cur.get("controller_updated_at"), str):
+                        merged["controller_updated_at"] = cur["controller_updated_at"]
+            except (OSError, json.JSONDecodeError):
+                pass
+        state_path.write_text(
+            json.dumps(merged, ensure_ascii=True, indent=2),
             encoding="utf-8",
         )
         parts = [
@@ -3569,6 +4235,17 @@ class ResearchController:
                 ),
             )
         if len(attempts) >= min_attempts_before_finish:
+            if (
+                self.config.research.wrap_up_requires_validated_leader
+                and not self._branch_overlay.validated_leader_family_id
+            ):
+                return (
+                    False,
+                    (
+                        "Finish withheld: a validated leader (long-horizon retention passed) is required before stop. "
+                        f"Continue with structural contrast or longer-horizon validation. {score_target['summary']}"
+                    ),
+                )
             return True, ""
         if step >= step_limit:
             return True, ""
@@ -3647,8 +4324,14 @@ class ResearchController:
         ]
 
         step_limit = effective_step_limit
+        self._current_step_limit = step_limit
+        self._current_run_policy = policy
         for step in range(1, step_limit + 1):
             self.last_created_profile_ref = None
+            self._current_controller_step = step
+            self._current_step_limit = step_limit
+            self._current_run_policy = policy
+            self._branch_step_maintenance(step, step_limit, policy)
             self._trace_runtime(
                 tool_context,
                 step=step,
@@ -3767,6 +4450,15 @@ class ResearchController:
                 )
             )
             validation_errors.extend(self._validate_timeframe_mismatch_block(actions))
+            validation_errors.extend(
+                self._validate_branch_lifecycle_actions(
+                    tool_context,
+                    actions,
+                    step,
+                    step_limit,
+                    policy,
+                )
+            )
             if validation_errors:
                 repaired = self._repair_invalid_response(
                     tool_context,
@@ -3798,6 +4490,15 @@ class ResearchController:
                     )
                     validation_errors.extend(
                         self._validate_timeframe_mismatch_block(actions)
+                    )
+                    validation_errors.extend(
+                        self._validate_branch_lifecycle_actions(
+                            tool_context,
+                            actions,
+                            step,
+                            step_limit,
+                            policy,
+                        )
                     )
             if validation_errors:
                 self._trace_runtime(
