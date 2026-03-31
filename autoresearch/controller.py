@@ -6,7 +6,7 @@ import sys
 import re
 import shlex
 from difflib import get_close_matches
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -324,6 +324,148 @@ class ResearchController:
             return int(str(args[idx]).strip())
         except (TypeError, ValueError):
             return None
+
+    def _requested_horizon_from_artifact_dir(self, artifact_dir: Path) -> int | None:
+        """Resolve requested lookback months from CLI echoes in sensitivity-response.json."""
+        snap = load_sensitivity_snapshot(artifact_dir.resolve())
+        if not isinstance(snap, dict):
+            return None
+        candidates: list[Any] = []
+        for path in (
+            ("data", "request", "lookback_months"),
+            ("data", "request", "lookbackMonths"),
+            ("request", "lookback_months"),
+            ("lookback_months"),
+        ):
+            cur: Any = snap
+            for key in path[:-1]:
+                if not isinstance(cur, dict):
+                    cur = None
+                    break
+                cur = cur.get(key)
+            if isinstance(cur, dict):
+                v = cur.get(path[-1])
+                candidates.append(v)
+        cur = snap.get("data") if isinstance(snap.get("data"), dict) else None
+        if isinstance(cur, dict):
+            candidates.append(cur.get("lookback_months"))
+        for raw in candidates:
+            if isinstance(raw, int) and raw > 0:
+                return raw
+            if isinstance(raw, float) and raw > 0:
+                return int(raw)
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    n = int(float(raw.strip()))
+                    if n > 0:
+                        return n
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _finalize_attempt_branch_state(
+        self,
+        tool_context: ToolContext,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+        *,
+        auto_log: dict[str, Any],
+        cli_args: list[str] | None,
+        source_action: dict[str, Any],
+        timeframe_mismatch: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """After a new scored attempt: exploit counters, retention gating (requested horizon), branch lifecycle."""
+        artifact_dir_str = str(auto_log.get("artifact_dir") or "").strip()
+        if not artifact_dir_str:
+            return {}
+        score = auto_log.get("composite_score")
+        if score is None:
+            return {}
+        profile_ref_for_family = auto_log.get("profile_ref")
+        profile_path_for_family = (
+            self.profile_sources.get(profile_ref_for_family)
+            if profile_ref_for_family
+            else None
+        )
+        family_id = self._derive_family_id_from_profile(profile_path_for_family)
+        if not family_id:
+            return {}
+
+        is_exploit = self._is_same_family_exploit_action(source_action)
+        resolved_trades = auto_log.get("resolved_trades")
+        trades_per_month = auto_log.get("trades_per_month")
+        positive_ratio = auto_log.get("positive_cell_ratio")
+        support_quality = "broad"
+        trade_count_val = resolved_trades if isinstance(resolved_trades, int) else None
+        tpm_val = (
+            trades_per_month
+            if isinstance(trades_per_month, (int, float))
+            else None
+        )
+        pos_val = positive_ratio if isinstance(positive_ratio, (int, float)) else None
+        if trade_count_val is not None and trade_count_val < 30:
+            support_quality = "sparse"
+        elif tpm_val is not None and tpm_val < 2:
+            support_quality = "selective"
+        elif pos_val is not None and pos_val < 0.3:
+            support_quality = "selective"
+
+        self._update_family_exploit_state(family_id, is_exploit, support_quality)
+
+        artifact_path = Path(artifact_dir_str).resolve()
+        requested_horizon: int | None = None
+        if cli_args is not None:
+            requested_horizon = self._parse_lookback_months_from_cli_args(cli_args)
+        if requested_horizon is None:
+            requested_horizon = self._requested_horizon_from_artifact_dir(artifact_path)
+
+        eff_raw = auto_log.get("effective_window_months")
+        eff_float: float | None = None
+        if isinstance(eff_raw, (int, float)):
+            eff_float = float(eff_raw)
+        elif eff_raw is not None and str(eff_raw).strip() not in {"", "none"}:
+            try:
+                eff_float = float(str(eff_raw).strip())
+            except (TypeError, ValueError):
+                eff_float = None
+
+        retention_result = self._check_retention_gating(
+            tool_context,
+            family_id,
+            float(score),
+            requested_horizon,
+        )
+        attempts_list = self._run_attempts(tool_context.run_id)
+        attempt_dict = attempts_list[-1] if attempts_list else None
+        digest = (
+            self._generate_behavior_digest(attempt_dict)
+            if isinstance(attempt_dict, dict)
+            else {}
+        )
+        had_mismatch = timeframe_mismatch is not None
+        self._refresh_branch_lifecycle_after_eval(
+            tool_context,
+            step,
+            step_limit,
+            policy,
+            family_id=family_id,
+            profile_ref=str(profile_ref_for_family).strip()
+            if profile_ref_for_family
+            else None,
+            attempt_id=(
+                str(auto_log.get("attempt_id"))
+                if auto_log.get("attempt_id")
+                else None
+            ),
+            score=float(score),
+            requested_horizon_months=requested_horizon,
+            effective_window_months=eff_float,
+            retention_result=retention_result,
+            behavior_digest=digest,
+            had_timeframe_mismatch=had_mismatch,
+        )
+        return retention_result if isinstance(retention_result, dict) else {}
 
     def _family_id_for_profile_ref(self, profile_ref: str | None) -> str | None:
         if not profile_ref:
@@ -1033,11 +1175,19 @@ class ResearchController:
         support_quality = retention_state.get("support_quality", "normal")
         needs_retention_check = False
         gated_message = None
-        horizon_increased = (
-            horizon_months is not None
-            and last_horizon is not None
-            and horizon_months > last_horizon
-        )
+        min_h = int(cfg.validated_leader_min_horizon_months)
+        horizon_increased = False
+        if horizon_months is not None:
+            try:
+                hm = int(horizon_months)
+            except (TypeError, ValueError):
+                hm = 0
+            if last_horizon is None:
+                horizon_increased = bool(
+                    baseline_score is not None and hm >= min_h
+                )
+            else:
+                horizon_increased = hm > int(last_horizon)
         if is_strong and current_mutations >= max_mutations:
             if not retention_state.get("retention_check_passed"):
                 retention_done = retention_state.get("retention_check_done")
@@ -3234,50 +3384,6 @@ class ResearchController:
         auto_log_reason = None
         if record.composite_score is None:
             auto_log_reason = "quality_score was null in the evaluation artifacts"
-        if (
-            record.composite_score is not None
-            and self._current_run_policy is not None
-            and self._current_step_limit > 0
-        ):
-            profile_path = (
-                Path(record.profile_path)
-                if record.profile_path
-                else None
-            )
-            family_id = self._derive_family_id_from_profile(profile_path)
-            if family_id:
-                attempt_dict = asdict(record)
-                digest = self._generate_behavior_digest(attempt_dict)
-                eff_float: float | None = None
-                if effective_window_months is not None:
-                    try:
-                        eff_float = float(effective_window_months)
-                    except (TypeError, ValueError):
-                        eff_float = None
-                horizon_int = (
-                    int(eff_float) if eff_float is not None else None
-                )
-                retention_snapshot = self._check_retention_gating(
-                    tool_context,
-                    family_id,
-                    float(record.composite_score),
-                    horizon_int,
-                )
-                self._refresh_branch_lifecycle_after_eval(
-                    tool_context,
-                    self._current_controller_step,
-                    self._current_step_limit,
-                    self._current_run_policy,
-                    family_id=family_id,
-                    profile_ref=record.profile_ref,
-                    attempt_id=record.attempt_id,
-                    score=float(record.composite_score),
-                    requested_horizon_months=horizon_int,
-                    effective_window_months=eff_float,
-                    retention_result=retention_snapshot,
-                    behavior_digest=digest,
-                    had_timeframe_mismatch=False,
-                )
         return {
             "status": "logged",
             "attempt_id": record.attempt_id,
@@ -3285,6 +3391,7 @@ class ResearchController:
             "primary_score": record.primary_score,
             "score_basis": record.score_basis,
             "metrics": record.metrics,
+            "profile_ref": record.profile_ref,
             "signal_count": signal_count,
             "resolved_trades": resolved_trades,
             "effective_window_months": effective_window_months,
@@ -3397,115 +3504,36 @@ class ResearchController:
             artifact_dir_str = auto_log.get("artifact_dir", "")
             if artifact_dir_str:
                 score = auto_log.get("composite_score")
-                profile_ref_for_family = auto_log.get("profile_ref")
-                profile_path_for_family = (
-                    self.profile_sources.get(profile_ref_for_family)
-                    if profile_ref_for_family
-                    else None
-                )
-                family_id = self._derive_family_id_from_profile(
-                    profile_path_for_family
-                )
-                is_exploit = self._is_same_family_exploit_action(source_action)
-                resolved_trades = auto_log.get("resolved_trades")
-                trades_per_month = auto_log.get("trades_per_month")
-                positive_ratio = auto_log.get("positive_cell_ratio")
-                support_quality = "broad"
-                trade_count_val = (
-                    resolved_trades if isinstance(resolved_trades, int) else None
-                )
-                tpm_val = (
-                    trades_per_month
-                    if isinstance(trades_per_month, (int, float))
-                    else None
-                )
-                pos_val = (
-                    positive_ratio if isinstance(positive_ratio, (int, float)) else None
-                )
-                if trade_count_val is not None and trade_count_val < 30:
-                    support_quality = "sparse"
-                elif tpm_val is not None and tpm_val < 2:
-                    support_quality = "selective"
-                elif pos_val is not None and pos_val < 0.3:
-                    support_quality = "selective"
-                if family_id:
-                    self._update_family_exploit_state(
-                        family_id, is_exploit, support_quality
+                if score is not None:
+                    retention_result = self._finalize_attempt_branch_state(
+                        tool_context,
+                        step,
+                        step_limit,
+                        policy,
+                        auto_log=auto_log,
+                        cli_args=args,
+                        source_action=source_action,
+                        timeframe_mismatch=timeframe_mismatch,
                     )
-                    if score is not None:
-                        eff_raw = auto_log.get("effective_window_months")
-                        horizon_months = (
-                            int(eff_raw)
-                            if eff_raw is not None
-                            and str(eff_raw).strip() not in {"", "none"}
-                            else None
-                        )
-                        requested_horizon_months = self._parse_lookback_months_from_cli_args(
-                            args
-                        )
-                        retention_result = self._check_retention_gating(
-                            tool_context, family_id, float(score), horizon_months
-                        )
-                        attempts_list = self._run_attempts(tool_context.run_id)
-                        attempt_dict = attempts_list[-1] if attempts_list else None
-                        digest = (
-                            self._generate_behavior_digest(attempt_dict)
-                            if isinstance(attempt_dict, dict)
-                            else {}
-                        )
-                        had_mismatch = timeframe_mismatch is not None
-                        eff_float: float | None = None
-                        if isinstance(eff_raw, (int, float)):
-                            eff_float = float(eff_raw)
-                        elif eff_raw is not None:
-                            try:
-                                eff_float = float(str(eff_raw).strip())
-                            except (TypeError, ValueError):
-                                eff_float = None
-                        self._refresh_branch_lifecycle_after_eval(
-                            tool_context,
-                            step,
-                            step_limit,
-                            policy,
-                            family_id=family_id,
-                            profile_ref=str(profile_ref_for_family).strip()
-                            if profile_ref_for_family
-                            else None,
-                            attempt_id=(
-                                str(auto_log.get("attempt_id"))
-                                if auto_log.get("attempt_id")
-                                else None
-                            ),
-                            score=float(score),
-                            requested_horizon_months=(
-                                requested_horizon_months
-                                if requested_horizon_months is not None
-                                else horizon_months
-                            ),
-                            effective_window_months=eff_float,
-                            retention_result=retention_result,
-                            behavior_digest=digest,
-                            had_timeframe_mismatch=had_mismatch,
-                        )
-                        if retention_result.get("retention_failed"):
-                            retention_result["auto_log"] = auto_log
-                            base = {
-                                "tool": result_tool,
-                                "ok": result.returncode == 0,
-                                "created_profile_ref": profile_ref,
-                                "source_profile_file": str(file_arg) if file_arg else None,
-                                "result": serialized_result,
-                                "auto_log": auto_log,
-                                "timeframe_mismatch": timeframe_mismatch,
-                                "retention_gate": retention_result,
-                                "warnings": [],
-                                "errors": [],
-                                "artifacts": {},
-                                "state_updates": {},
-                                "next_recommended_action": None,
-                                "status": "failed",
-                            }
-                            return self._finalize_typed_cli_surface(base)
+                    if retention_result.get("retention_failed"):
+                        retention_result["auto_log"] = auto_log
+                        base = {
+                            "tool": result_tool,
+                            "ok": result.returncode == 0,
+                            "created_profile_ref": profile_ref,
+                            "source_profile_file": str(file_arg) if file_arg else None,
+                            "result": serialized_result,
+                            "auto_log": auto_log,
+                            "timeframe_mismatch": timeframe_mismatch,
+                            "retention_gate": retention_result,
+                            "warnings": [],
+                            "errors": [],
+                            "artifacts": {},
+                            "state_updates": {},
+                            "next_recommended_action": None,
+                            "status": "failed",
+                        }
+                        return self._finalize_typed_cli_surface(base)
 
         stderr_msg = ""
         if isinstance(serialized_result, dict):
@@ -4417,12 +4445,27 @@ class ResearchController:
             artifact_dir = Path(str(action.get("artifact_dir", ""))).resolve()
             profile_ref = action.get("profile_ref")
             note = action.get("note")
-            return {
-                "tool": "log_attempt",
-                "result": self._record_attempt_from_artifact(
-                    tool_context, artifact_dir, profile_ref=profile_ref, note=note
-                ),
-            }
+            log_result = self._record_attempt_from_artifact(
+                tool_context, artifact_dir, profile_ref=profile_ref, note=note
+            )
+            if (
+                isinstance(log_result, dict)
+                and log_result.get("status") == "logged"
+                and log_result.get("composite_score") is not None
+            ):
+                if not log_result.get("profile_ref") and isinstance(profile_ref, str):
+                    log_result = {**log_result, "profile_ref": profile_ref.strip()}
+                self._finalize_attempt_branch_state(
+                    tool_context,
+                    step,
+                    step_limit,
+                    policy,
+                    auto_log=log_result,
+                    cli_args=None,
+                    source_action=action,
+                    timeframe_mismatch=None,
+                )
+            return {"tool": "log_attempt", "result": log_result}
 
         if tool == "finish":
             return {"tool": "finish", "summary": action.get("summary", "")}
