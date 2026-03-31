@@ -16,6 +16,7 @@ from typing import Any, Protocol
 import requests
 
 from .config import ProviderProfileConfig
+from .typed_tools import ALL_CONTROLLER_TOOLS
 
 
 class ProviderError(RuntimeError):
@@ -349,7 +350,7 @@ def _salvage_failed_generation_action(text: str) -> dict[str, Any] | None:
         return None
     if not isinstance(arguments, dict):
         return None
-    allowed_tools = {"run_cli", "write_file", "read_file", "list_dir", "log_attempt", "finish"}
+    allowed_tools = set(ALL_CONTROLLER_TOOLS)
     tool_name = name.strip()
     if tool_name not in allowed_tools:
         return None

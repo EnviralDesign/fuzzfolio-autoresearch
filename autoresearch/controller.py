@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import re
 import shlex
@@ -13,6 +14,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from . import branch_lifecycle as bl
+from . import typed_tools as tt
 from .config import AppConfig
 from .fuzzfolio import CliError, CommandResult, FuzzfolioCli
 from .ledger import (
@@ -32,86 +34,76 @@ from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 SYSTEM_PROTOCOL = """You are operating an autonomous Fuzzfolio research loop.
 
+Your native vocabulary is typed research tools—not raw shell. Default to typed tools for all normal work.
+
 Return JSON only in this exact top-level shape:
 {
   "reasoning": "one short paragraph",
   "actions": [
     {
-      "tool": "run_cli" | "write_file" | "read_file" | "list_dir" | "log_attempt" | "finish",
+      "tool": "prepare_profile" | "mutate_profile" | "validate_profile" | "register_profile" | "evaluate_candidate" | "run_parameter_sweep" | "inspect_artifact" | "compare_artifacts" | "run_cli" | "write_file" | "read_file" | "list_dir" | "log_attempt" | "finish",
       "... tool specific fields ..."
     }
   ]
 }
 
-Rules:
-- Use absolute Windows paths.
-- Prefer fuzzfolio-agent-cli for workflow actions.
-- Keep actions bounded. Use at most 3 actions per response.
-- Every evaluated candidate should end up in the attempts ledger. You may rely on automatic logging after sensitivity runs, or call log_attempt explicitly.
-- Do not emit Markdown. Return raw JSON only.
-- Do not return a raw scoring-profile document as the top-level response. If you want to create or edit a profile, do it through actions such as `write_file`, `profiles scaffold`, or `profiles patch`.
-- The controller already handled auth bootstrap and created the run seed file before this conversation started. Do not spend steps repeating auth or seed unless a prior tool result shows a failure that requires recovery.
-- Auth is already verified at run start. Do not call `auth whoami` unless you are recovering from an auth-related tool failure.
-- Use only real CLI commands and subcommands. Do not invent near-miss names.
-- Existing saved profiles from outside this run are off-limits as candidate seeds. Do not call profiles list/get/export to mine old profiles unless the user explicitly asks.
-- Start from the current run's seed hand and write fresh portable profile JSON files under the current run's profiles directory.
-- Prefer `profiles scaffold` to generate a valid starter profile from seeded indicator ids instead of hand-writing the whole schema from scratch.
-- Prefer `profiles clone-local` to normalize/copy an existing local profile into a fresh run-owned portable document before branching.
-- Prefer `profiles patch` for bounded edits to local profile files instead of rewriting whole JSON documents when only a few fields need to change.
-- Prefer `profiles validate --file <ABS_FILE>` as a cheap preflight after materially editing a profile file.
-- Use sweeps as a normal research tool, not a rare last resort. Prefer `sweep run` for the common scaffold+submit+wait workflow. Use `sweep scaffold`, `sweep patch`, `sweep validate` only when you need to inspect or edit the definition between steps.
-- Only update profile refs that were created during this run.
-- In profile JSON, `indicator.meta.id` must be an exact id from the sticky indicator catalog. Seed phrases and concept labels are not valid ids.
-- After `profiles create`, use the returned profile id for later `--profile-ref` calls. A local `*.created.json` file is not itself a profile ref.
-- After `profiles create`, the tool result will surface `created_profile_ref` directly. Use that exact value for the next evaluation step.
-- Runtime placeholders like `<created_profile_ref>` may appear in tool arguments. Reuse them exactly when provided; the controller will substitute the real value.
-- After `sensitivity-basket`, the expected artifact files are `sensitivity-response.json`, `deep-replay-job.json`, and sometimes `best-cell-path-detail.json`. Do not look for `summary.json`.
-- `sensitivity` and `sensitivity-basket` now expose `requested_timeframe` and `effective_timeframe` in JSON output when you inspect stdout or saved responses.
-- Saved analysis artifacts may also expose `effective_window_start`, `effective_window_end`, `effective_window_days`, and `effective_window_months`. Use those to judge whether a requested horizon was actually satisfied.
-- Think in weeks, months, and years of evidence, not in raw bars.
-- The controller owns default horizon policy and may inject phase-appropriate `--lookback-months` into sensitivity runs when you omit it.
-- The controller also owns the active quality-score preset and injects it into deep-replay-backed evaluations and scaffolded sweeps. Do not try to vary or omit it yourself.
-- Do not use `--bar-limit` as a research lever unless the user explicitly asks. Treat bar counts as implementation detail, not strategy.
-- `__BASKET__` may appear inside saved analysis summaries as an aggregate label. It is not a valid CLI instrument argument. Use exact catalog symbols from the catalog.
-- In early phase, diversify across multiple distinct instruments or small instrument groups before narrowing hard onto one pair unless the evidence is already unusually strong.
-- Basket pruning is allowed when per-instrument evidence shows a specific symbol is a clear empirical drag on an otherwise promising basket. Do not assume basket expansion is justified from per-instrument results alone.
-- `finish` is terminal for the whole run. Never use it to mean "continue" or "step complete".
-- Only call `finish` when you intend to stop the run now and can provide a concise non-empty final summary.
-- This is an iterative research session, not a one-shot evaluation. Keep exploring unless you have reached the step limit or the controller explicitly allows finish.
-- A strong result should usually trigger a contrasting follow-up candidate, not immediate finish.
-- Even after the minimum exploration threshold is satisfied, prefer using most of the remaining step budget if there are still obvious contrasting branches to test.
-- For run_cli, prefer this shape:
-  { "tool": "run_cli", "args": ["auth", "whoami", "--pretty"] }
-- A legacy string command may also work, but args arrays are preferred.
-- For write_file, always include both:
-  { "tool": "write_file", "path": "C:\\abs\\file.json", "content": "{...full file text...}" }
-- Never emit write_file without a full non-empty string `content` field.
-- If a file body is too large to fit comfortably, emit fewer actions in that step. Do not omit `content`.
-- Do not call `profiles create` or `profiles update` for a profile JSON path unless that file already exists on disk or you wrote it earlier in the same step.
-- If `profiles create` fails, recover by fixing the profile JSON first. Do not continue to `sensitivity-basket` in the same step.
+Tool choice hierarchy (follow this order):
+1) Typed tools: prepare_profile, mutate_profile, validate_profile, register_profile, evaluate_candidate, run_parameter_sweep.
+2) inspect_artifact / compare_artifacts to interpret results or compare candidates (instead of opening many files).
+3) read_file / list_dir only when structured tool output is insufficient.
+4) run_cli last resort: recovery after a typed-tool failure, CLI help, or an operation with no typed equivalent.
 
-Retention and pacing rules (controller-enforced):
-- The controller tracks each indicator family separately using instance IDs. Indicators sharing the same `meta.instanceId` values are the same family.
-- After a family earns a strong score (quality_score >= 55) and the controller has spent several same-family exploit steps on it, the controller will require a longer-horizon validation before allowing more same-family tweaks.
-- If a longer-horizon eval degrades materially vs the baseline strong score (delta <= -12 or ratio < 0.82), the controller will block further same-family exploit and require a structural contrast: a different indicator family, instrument cluster, timeframe architecture, or directional regime.
-- After a family passes a longer-horizon retention check (delta >= -6 and score still strong), local tuning on that family is unlocked again.
-- Indicators with few resolved trades (< 30) or low trades-per-month (< 2) are treated as sparse/selective and face stricter retention requirements.
-- Same-family exploit actions include: notificationThreshold tweaks, lookbackBars tweaks, range-width tweaks, weight tweaks, and adjacent sweeps on the same core family.
+Trust structured results first:
+- Typed tools and run_cli return envelopes with fields like ok, status, warnings, errors, score, artifact_dir, auto_log, created_profile_ref, profile_ref, retention_gate (when applicable), and next_recommended_action.
+- Use those before reflexively reading artifacts on disk.
 
-Timeframe mismatch rules (controller-enforced):
-- If a CLI output shows "Auto-adjusted timeframe from X to Y", that does NOT count as a valid higher-timeframe experiment. The run actually ran at Y, not X.
-- The controller tracks these mismatches. If you repeatedly request the same higher timeframe with an unchanged profile that was already auto-adjusted, the controller will block that action.
-- To properly test a higher timeframe: patch the indicator timeframe(s) in the profile to match your intended timeframe first, or reformulate the experiment as the effective lower timeframe and acknowledge that in your reasoning.
+Controller-owned (you observe and adapt; you do not replace these policies in your head):
+- Phase horizons and default lookback injection, quality-score preset, retention and branch lifecycle, finish gating, tool validation, timeframe-mismatch blocking, and exploit caps. The run state packet spells out current phase, horizon target, lifecycle, and mismatch status.
 
-Behavior digest fields (available in run state prompt after each eval):
-- edge_shape: persistent = strong across all horizons; episodic = strong sometimes; one_burst = early spike only; late_breakdown = degrades at longer horizons; flat_weak = weak everywhere
-- support_shape: well_supported = many trades across many cells; selective_but_credible = fewer trades but credible; sparse_risky = too few signals to be sure; too_sparse = essentially uninterpretable
-- drawdown_shape: smooth = consistent; clustered = blows up in specific regimes; late_blowup = holds early but fails later; high_chop = noisy across all horizons
-- retention_risk: low = likely holds at longer horizons; moderate = uncertain; high = likely degrades when extended
-- failure_mode_hint: recent_only = short-horizon artifact; trend_regime_dependent = works in trends not ranges; range_regime_dependent = the opposite; weak_support = too few signals to trust
-- next_move_hint: validate_longer = run a longer-horizon check; contrast_family = try a different indicator family; prune_family = abandon this family; test_same_logic_new_instrument = same idea different market; local_tune_allowed = nearby tweaks still worthwhile; stop_threshold_tuning = plateau reached, stop tweaking thresholds
+General rules:
+- Use absolute Windows paths. At most 3 actions per response. Raw JSON only; no Markdown as the top-level response.
+- Do not return a raw scoring-profile document at the top level. Build profiles through prepare_profile / mutate_profile / validate_profile / register_profile (or write_file only if unavoidable).
+- Auth and run seed are already handled at start. Do not repeat unless a tool result shows auth failure (recovery: run_cli only).
+- Off-run saved profiles are not candidate seeds unless the user explicitly asks. Work from this run's seed hand and run-owned files under the run directory.
+- indicator.meta.id must be exact catalog ids from the run context. Seed phrases are not ids.
+- Only use profile refs created during this run (or paths the controller can map). Placeholders like <created_profile_ref> are substituted by the controller when provided.
+- Sweeps are normal: use run_parameter_sweep, not ad-hoc repeated manual edits only.
+- Think in months/years of effective evidence, not raw bars. Effective window fields in results matter more than bar counts.
+- `__BASKET__` may appear in summaries; never pass it as an instrument. Use exact catalog symbols; repeat --instrument per symbol in typed fields as multiple entries in the instruments array (evaluate_candidate), not comma-joined tokens.
+- Early phase: diversify instruments/groups before over-focusing one pair. Prune a basket member when it is clearly a drag; do not widen baskets solely from per-instrument screens.
+- finish ends the entire run; never use it to mean "step done". Only call finish when stopping now with a concise non-empty summary and the controller allows it. Keep exploring through contrasts while step budget remains.
 
-Use the behavior digest to guide your next branch decision, not just the scalar score.
+Normal workflows (all typed):
+- New candidate: prepare_profile -> validate_profile -> register_profile -> evaluate_candidate.
+- Tune locally: mutate_profile -> validate_profile -> evaluate_candidate (reuse the same profile_ref after register).
+- Sweep: run_parameter_sweep -> inspect_artifact -> compare_artifacts -> next evaluate_candidate or mutate as needed.
+- After evaluate_candidate, use inspect_artifact with view "summary" (or compare_artifacts) before read_file on JSON blobs.
+
+Representative examples (adjust paths/ids to the run):
+{"tool":"prepare_profile","mode":"scaffold_from_seed","indicator_ids":["ID_A","ID_B"],"instruments":["EURUSD"],"candidate_name":"cand1","destination_path":"C:\\\\runs\\\\...\\\\profiles\\\\cand1.json"}
+{"tool":"validate_profile","profile_path":"C:\\\\runs\\\\...\\\\profiles\\\\cand1.json"}
+{"tool":"register_profile","profile_path":"C:\\\\runs\\\\...\\\\profiles\\\\cand1.json","operation":"create"}
+{"tool":"evaluate_candidate","profile_ref":"<from prior result>","instruments":["EURUSD","GBPUSD"],"timeframe_policy":"profile_default","evaluation_mode":"screen","candidate_name":"cand1"}
+{"tool":"mutate_profile","profile_path":"C:\\\\runs\\\\...\\\\profiles\\\\cand1.json","mutations":[{"path":"profile.name","value":"cand1b"}],"destination_path":"C:\\\\runs\\\\...\\\\profiles\\\\cand1b.json"}
+{"tool":"run_parameter_sweep","profile_ref":"<ref>","axes":["profile.notificationThreshold=70,75,80"],"instruments":["EURUSD"],"candidate_name_prefix":"sw1"}
+{"tool":"inspect_artifact","attempt_id":"<from ledger>","view":"summary"}
+{"tool":"compare_artifacts","attempt_ids":["id1","id2"]}
+
+run_cli (fallback only):
+- Example: {"tool":"run_cli","args":["help"]} or {"tool":"run_cli","args":["help","profiles"]} when you need authoritative CLI help. Use argv style; do not invent command families (e.g. no top-level "patch").
+
+write_file: only when necessary; must include full non-empty "content". If too large, split across steps.
+
+log_attempt: explicit ledger recovery; auto-log usually fills in after successful evaluations.
+
+Retention and pacing (controller-enforced summary—details in run packet):
+- Families keyed by meta.instanceId; strong scores trigger longer-horizon checks and exploit caps; material degradation forces structural contrast; sparse/selective profiles face stricter checks.
+
+Timeframe mismatch (controller-enforced):
+- Auto-adjusted timeframes are not valid tests of the higher timeframe you asked for; follow run packet warnings. Fix via mutate_profile on indicator timeframes or align intent with effective timeframe.
+
+Behavior digest (after evals in run state):
+- edge_shape, support_shape, drawdown_shape, retention_risk, failure_mode_hint, next_move_hint — use with score, not instead of it.
 """
 
 _RUNTIME_TRACE_STDERR_MODE = "verbose"
@@ -175,13 +167,12 @@ Return JSON only in this exact shape:
 Rules:
 - Keep it compact.
 - Work only within the current run, its seed hand, and run-owned artifacts.
-- Do not suggest invalid CLI syntax or invalid instruments like __BASKET__.
+- Speak in research operations, not shell: prefer prepare_profile / mutate_profile / validate_profile / register_profile / evaluate_candidate / run_parameter_sweep / inspect_artifact / compare_artifacts. Do not suggest invalid instruments like __BASKET__ or invented tool names.
 - Prefer hypothesis pivots, contrast branches, and meaningful parameter or timeframe shifts over repetitive retries.
-- Treat sweeps as first-class. If the explorer is doing repeated manual branch edits without any sweep support, push it toward a bounded sweep around the current promising family.
-- Horizon policy belongs to you and the controller, not the explorer. Push the run to think in months and years, not bars.
-- Quality-score preset choice also belongs to the controller. Assume evaluations are using the current preset consistently and do not ask the explorer to vary it.
-- If an analysis window came back truncated, focus on the missing effective months/days, not the raw bar machinery.
-- Early phase should screen cheaply, mid phase should deepen evidence, and late phase should pressure-test survivors over longer horizons.
+- Treat sweeps as first-class: if the explorer only does tiny manual edits, push toward run_parameter_sweep around the promising family.
+- Default horizons, lookback injection, and quality-score preset are controller-owned. Coach the explorer toward phased depth and longer effective evidence windows (months/years), not toward tweaking CLI flags the controller already manages.
+- If an analysis window came back truncated, focus on missing effective months/days from tool results, not bar counts.
+- Early phase: cheap screening; mid: deepen; late: pressure-test survivors on longer horizons—mirror the packet, do not override it.
 - If the explorer is drifting, say so plainly.
 - If the controller provides a score target, use it as a believable next stretch goal instead of vague encouragement.
 - The controller's score target refers to `quality_score`, the aggregate source-of-truth metric. Do not describe it as PSR. You may mention PSR, DSR, drawdown, robustness, or other inputs separately as reasons why quality_score moved.
@@ -202,10 +193,10 @@ Return JSON only in this exact shape:
 Rules:
 - Keep it compact and specific.
 - Do not suggest finish or wrap-up unless the packet says wrap-up is active.
-- Do not suggest invalid CLI syntax or invalid instruments.
+- Prefer typed research moves in your wording (evaluate_candidate, mutate_profile, run_parameter_sweep, inspect_artifact, compare_artifacts). Do not teach raw CLI unless the explorer is stuck in recovery. Never suggest invalid instruments.
 - Prefer guidance that changes branch quality, not just branch count.
-- Treat sweeps as first-class.
-- Think in months and years of evidence, not bars.
+- Treat sweeps as first-class: encourage bounded run_parameter_sweep when manual tweaking dominates.
+- Think in months and years of effective evidence, not bars.
 - Use quality_score as the primary target metric, while using PSR, DSR, drawdown, robustness, trade rate, and coverage as reasons.
 - Do not recommend broad indicator-family swaps unless the packet explicitly allows structural pivots.
 - It is valid to recommend pruning a specific instrument from a basket when per-instrument evidence shows it is a clear drag. Do not recommend adding instruments based on per-instrument results alone.
@@ -225,6 +216,7 @@ Return a corrected full replacement response in the exact required top-level sha
 }
 
 Hard requirements:
+- Preserve the same intent. If you were using typed tools (prepare_profile, mutate_profile, validate_profile, register_profile, evaluate_candidate, run_parameter_sweep, inspect_artifact, compare_artifacts), keep them—do not rewrite into run_cli unless the original plan was already run_cli or recovery truly requires it.
 - Every write_file action must include a full non-empty string `content` field.
 - If you cannot fit all planned work, reduce the number of actions.
 - Do not omit required fields.
@@ -297,6 +289,7 @@ class ResearchController:
         self._current_controller_step: int = 0
         self._current_step_limit: int = 0
         self._current_run_policy: RunPolicy | None = None
+        self._tool_usage_counts: dict[str, int] = {}
 
     def _reset_run_state(self) -> None:
         self._family_mutation_counts = {}
@@ -313,6 +306,11 @@ class ResearchController:
         self._current_controller_step = 0
         self._current_step_limit = 0
         self._current_run_policy = None
+        self._tool_usage_counts = {}
+
+    def _bump_tool_usage(self, tool: str) -> None:
+        key = str(tool).strip() or "unknown"
+        self._tool_usage_counts[key] = int(self._tool_usage_counts.get(key, 0)) + 1
 
     def _parse_lookback_months_from_cli_args(self, args: list[str]) -> int | None:
         if "--lookback-months" not in args:
@@ -354,6 +352,48 @@ class ResearchController:
                 return self._derive_family_id_from_profile(
                     Path(str(args[fi])).resolve()
                 )
+        return None
+
+    def _profile_ref_for_local_file(self, path: Path) -> str | None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return None
+        for ref, src in self.profile_sources.items():
+            try:
+                if src.resolve() == resolved:
+                    return str(ref).strip()
+            except OSError:
+                continue
+        return None
+
+    def _synthetic_cli_args_for_branch_validation(
+        self, action: dict[str, Any]
+    ) -> list[str] | None:
+        tool = str(action.get("tool", "")).strip()
+        if tool == "run_cli":
+            try:
+                return [str(item) for item in self._normalize_cli_args(action)]
+            except Exception:
+                return None
+        if tool == "evaluate_candidate":
+            ref = action.get("profile_ref")
+            path = action.get("profile_path")
+            if isinstance(ref, str) and ref.strip():
+                return ["sensitivity-basket", "--profile-ref", ref.strip()]
+            if isinstance(path, str) and path.strip():
+                return ["sensitivity-basket", "--profile-ref", path.strip()]
+            return None
+        if tool == "run_parameter_sweep":
+            ref = action.get("profile_ref")
+            if isinstance(ref, str) and ref.strip():
+                return ["sweep", "run", "--profile-ref", ref.strip()]
+            return None
+        if tool == "mutate_profile":
+            pp = action.get("profile_path")
+            if isinstance(pp, str) and pp.strip():
+                return ["profiles", "patch", "--file", pp.strip()]
+            return None
         return None
 
     def _cli_action_hits_family_exploit_surface(
@@ -746,6 +786,7 @@ class ResearchController:
                 k[:24] + ("..." if len(k) > 24 else ""): v.to_dict()
                 for k, v in list(self._family_branches.items())[:40]
             },
+            "tool_usage_counts": dict(sorted(self._tool_usage_counts.items())),
         }
 
     def _branch_lifecycle_run_packet_text(
@@ -796,11 +837,8 @@ class ResearchController:
         for index, action in enumerate(actions, start=1):
             if not isinstance(action, dict):
                 continue
-            if str(action.get("tool", "")).strip() != "run_cli":
-                continue
-            try:
-                args = [str(item) for item in self._normalize_cli_args(action)]
-            except Exception:
+            args = self._synthetic_cli_args_for_branch_validation(action)
+            if not args:
                 continue
             family_id = self._resolve_cli_family_id(args)
             if not family_id:
@@ -871,6 +909,12 @@ class ResearchController:
 
     def _is_same_family_exploit_action(self, action: dict[str, Any]) -> bool:
         tool = str(action.get("tool", "")).strip()
+        if tool == "evaluate_candidate":
+            return True
+        if tool == "run_parameter_sweep":
+            return True
+        if tool == "mutate_profile":
+            return True
         if tool != "run_cli":
             return False
         args = action.get("args")
@@ -2157,11 +2201,10 @@ class ResearchController:
 
     def _artifact_layout_text(self) -> str:
         return (
-            "Sensitivity artifact layout:\n"
-            "- sensitivity-response.json\n"
-            "- deep-replay-job.json\n"
-            "- best-cell-path-detail.json (when available)\n"
-            "Use compare-sensitivity for compact scoring. Do not expect summary.json."
+            "Sensitivity artifact layout (on disk after evaluations):\n"
+            "- sensitivity-response.json, deep-replay-job.json, best-cell-path-detail.json when available\n"
+            "Prefer inspect_artifact / compare_artifacts for summaries and scores. Do not expect summary.json.\n"
+            "Drop to read_file only when those tools lack the detail you need."
         )
 
     def _seed_to_catalog_hints_text(self, seed_indicator_ids: list[str]) -> str:
@@ -2169,7 +2212,7 @@ class ResearchController:
             return (
                 "Seed indicator guidance:\n"
                 "- No seeded indicator ids were available for this run.\n"
-                "- If the seed hand lacks explicit ids, inspect the seed file first before drafting profiles."
+                "- If the seed hand lacks explicit ids, read the seed file only if needed, then use prepare_profile with catalog ids from context."
             )
         return (
             "Seed indicator guidance:\n"
@@ -2238,67 +2281,34 @@ class ResearchController:
         )
         score_target = self._score_target_snapshot(tool_context)
         soft_wrap_note = self._soft_wrap_note(policy)
-        cli_guide = (
-            "Important CLI command shapes:\n"
-            "- profiles clone-local --file <ABS_FILE> --out <ABS_FILE>\n"
-            '- profiles patch --file <ABS_FILE> --set profile.name="..." --set profile.indicators[0].config.timeframe="H1" --out <ABS_FILE>\n'
-            "- profiles scaffold --indicator <ID> --indicator <ID> --instrument <SYMBOL> --out <ABS_FILE>\n"
-            "- profiles scaffold --indicator <ID> --indicator <ID> --instrument <SYMBOL> --instrument <SYMBOL> --out <ABS_FILE>\n"
-            "- profiles validate --file <ABS_FILE> --pretty\n"
-            "- profiles create --file <ABS_FILE> --out <ABS_FILE>\n"
-            "- profiles update --profile-ref <REF> --file <ABS_FILE> --out <ABS_FILE>\n"
-            "- sweep scaffold --profile-ref <REF> --instrument <SYMBOL> --axis profile.notificationThreshold=70,75,80 --axis indicator[0].config.lookbackBars=1,2,3 --out <ABS_FILE>\n"
-            '- sweep patch --definition <ABS_FILE> --set fitness_metric="quality_score" --out <ABS_FILE>\n'
-            "- sweep validate --definition <ABS_FILE> --pretty\n"
-            "- sweep submit --definition <ABS_FILE_OR_INLINE_JSON> --out <ABS_FILE> --pretty\n"
-            "- sweep run --profile-ref <REF> --instrument <SYMBOL> --axis profile.notificationThreshold=70,75,80 --axis indicator[0].config.lookbackBars=1,2,3\n"
-            "- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --lookback-months <MONTHS> --output-dir <ABS_DIR>\n"
-            "- sensitivity-basket --profile-ref <REF> --timeframe <TF> --instrument <INSTRUMENT> --instrument <INSTRUMENT> --lookback-months <MONTHS> --output-dir <ABS_DIR>\n"
-            "- compare-sensitivity --input <ABS_DIR> --pretty\n"
-            "Notes:\n"
-            "- profiles scaffold generates a valid portable profile from live indicator templates and is preferred for fresh candidate bootstrapping.\n"
-            "- profiles clone-local normalizes/copies an existing local profile into a fresh portable document for safe local branching.\n"
-            "- profiles patch applies deterministic path=value edits to a local profile file and is preferred for small branch mutations.\n"
-            "- profiles validate performs a local schema/instrument preflight and is preferred before create when you materially edited a profile.\n"
-            "- profiles create/update require --file. They do not accept branch/indicator/timeframe flags.\n"
-            "- Create fresh run-owned profile JSON from scaffold output, clone-local output, or the portable template, then call profiles create.\n"
-            "- sweep scaffold builds a valid sweep definition around an existing saved profile using simple axis expressions. Prefer it over hand-writing sweep JSON.\n"
-            "- sweep patch applies deterministic edits to a local sweep definition file.\n"
-            "- sweep validate performs a local structural preflight before sweep submit.\n"
-            "- sweep run combines scaffold+submit+wait into a single action: use it as the default when you want to run a sweep and get results in one step. Only use scaffold/validate/submit separately when you need to inspect or edit the definition between steps.\n"
-            "- IMPORTANT: sweep run does NOT take --timeframe or --out. It uses the timeframe embedded in the profile. It does accept optional --output-dir to write results to a file. Do NOT mix sensitivity-basket flags into a sweep run command.\n"
-            "- Only exact indicator ids from the sticky indicator catalog are valid in indicator.meta.id.\n"
-            "- The seed prompt is backed by the live indicator catalog, but seed concepts are still ideas, not ids.\n"
-            "- Use the seed-to-valid-id hints when the seed uses semantic phrases instead of exact ids.\n"
-            "- After profiles create, use the returned data.id as the profile ref for later commands.\n"
-            "- The controller also returns created_profile_ref explicitly in the tool result. Prefer that field.\n"
-            "- sensitivity and sensitivity-basket accept --pretty when printing JSON to stdout.\n"
-            "- sensitivity-basket writes a directory when using --output-dir.\n"
-            "- If you omit --lookback-months on sensitivity commands, the controller will inject the phase-appropriate horizon automatically.\n"
-            "- Do not use --bar-limit as a research lever. The controller strips it unless the user explicitly asks.\n"
-            "- sensitivity-basket may auto-adjust the timeframe down to the profile's lowest active indicator timeframe.\n"
-            "- Saved sensitivity responses now include requested_timeframe and effective_timeframe fields.\n"
-            "- Raw bar-count mechanics are implementation detail. Prefer effective_window_days and effective_window_months when judging whether a requested horizon was really satisfied.\n"
-            '- If command syntax drifts, use run_cli ["help"] or run_cli ["help", "profiles"] instead of guessing.\n'
-            "- Multi-instrument commands repeat --instrument once per symbol. Never comma-join symbols into a single token.\n"
-            "- `__BASKET__` may appear in saved summaries as an aggregate label. Never pass it as --instrument.\n"
-            "- Invalid instrument aliases now fail fast with close-match suggestions.\n"
-            "- In early phase, do not spend the whole run anchored to one pair. Explore across multiple distinct instruments or small instrument groups before narrowing hard.\n"
-            "- If basket analysis shows one instrument is a clear empirical drag, pruning that weak link is a valid follow-up branch.\n"
-            "- Do not widen a basket just because extra instruments look acceptable. Correlation-aware expansion is out of scope for now.\n"
-            "- A normal managed run should explore multiple candidates. Do not stop after the first strong score; branch and test at least a few follow-up ideas.\n"
-            "- Do not finish the run as soon as the minimum threshold is reached if there is still room in the step budget for a couple more meaningful contrasts.\n"
-            "- If a sensitivity run already auto-logged the attempt, avoid redundant log_attempt unless you are recovering from a missing ledger entry.\n"
-            "- Use compare-sensitivity when comparing artifact directories or inspecting score details, not as a mandatory step after every successful sensitivity run.\n"
-            "- Sweeps are a required part of healthy search, especially in early and mid phases. Do not spend the whole run on manual one-off edits only.\n"
-            "- Post-eval files are sensitivity-response.json, deep-replay-job.json, and best-cell-path-detail.json when available.\n"
-            "- Do not try to read summary.json after sensitivity-basket.\n"
-            "- Do not use old saved profiles as candidate seeds for this run.\n"
-            "- If you need a new profile, write the profile JSON first, then create it, then evaluate it.\n"
-            "- If a profile create fails, do not evaluate that profile ref in the same step.\n"
-            "- Reuse successful profile JSON patterns and valid TA-Lib parameter names from prior successful create results when branching.\n"
-            "- MA_CROSSOVER uses fastperiod, slowperiod, and optional matype. It does not use signalperiod.\n"
-            "- Horizon strategy is phase-driven: early = cheap screening, mid = deeper confirmation, late/wrap-up = long-horizon pressure test.\n"
+        tool_reference = (
+            "Typed tool reference (default path — prefer these over run_cli):\n"
+            "- prepare_profile: mode scaffold_from_seed | clone_local | from_template; indicator_ids, instruments, source_profile_path, destination_path, candidate_name as needed.\n"
+            "- mutate_profile: profile_path; mutations [{path, value}][]; optional destination_path.\n"
+            "- validate_profile: profile_path.\n"
+            "- register_profile: profile_path; operation create|update; profile_ref required for update.\n"
+            "- evaluate_candidate: profile_ref or profile_path; instruments[]; timeframe_policy profile_default|explicit; optional timeframe, requested_horizon_months, evaluation_mode, candidate_name.\n"
+            "- run_parameter_sweep: profile_ref; axes[] strings; optional instruments[], output_dir, candidate_name_prefix.\n"
+            "- inspect_artifact: artifact_dir or attempt_id; view summary|files|curve_meta|request_meta.\n"
+            "- compare_artifacts: attempt_ids[] or artifact_dirs[].\n"
+            "Workflows:\n"
+            "- New candidate: prepare_profile -> validate_profile -> register_profile -> evaluate_candidate.\n"
+            "- Iterate: mutate_profile -> validate_profile -> evaluate_candidate.\n"
+            "- Sweep: run_parameter_sweep -> inspect_artifact / compare_artifacts.\n"
+            "- Read tool envelopes (ok, score, artifact_dir, auto_log, effective windows, warnings) before read_file/list_dir.\n"
+            "Controller-managed (do not fight it in tool choice):\n"
+            "- Injected lookback when omitted on evals; quality-score preset; bar-limit policy; phase horizon targets (see packet above).\n"
+            "Catalog discipline:\n"
+            "- Exact indicator meta ids; exact instrument symbols; instruments[] uses one array entry per symbol (no comma-joined tokens); never __BASKET__ as an instrument.\n"
+            "Search discipline:\n"
+            "- Explore multiple candidates; sweeps are normal (run_parameter_sweep); diversify early, prune weak basket members, do not finish early while budget remains.\n"
+            "Artifacts:\n"
+            "- sensitivity-response.json / deep-replay-job.json / best-cell-path-detail.json — prefer inspect_artifact and compare_artifacts over manual compare-sensitivity; no summary.json.\n"
+            "run_cli fallback:\n"
+            "- Help or recovery only, e.g. [\"help\"] or [\"help\",\"profiles\"]. Use typed tools for profiles, evals, and sweeps when available.\n"
+            "Extra:\n"
+            "- MA_CROSSOVER uses fastperiod, slowperiod, matype—not signalperiod.\n"
+            "- If register_profile fails, fix the profile before evaluate_candidate in a later step.\n"
         )
         return (
             f"Repo root: {self.config.repo_root}\n"
@@ -2341,7 +2351,7 @@ class ResearchController:
             f"{self._branch_lifecycle_run_packet_text(tool_context, effective_step, effective_step_limit)}\n\n"
             f"{self._timeframe_mismatch_status_text()}\n\n"
             f"{self._recent_behavior_digest_text(tool_context)}\n"
-            f"\nCLI guide:\n{cli_guide}\n"
+            f"\nTool reference:\n{tool_reference}\n"
         )
 
     def _retention_and_exploit_status_text(self, tool_context: ToolContext) -> str:
@@ -2470,7 +2480,7 @@ class ResearchController:
                 "tool": tool,
                 "error": str(result.get("error"))[:500],
             }
-        if tool == "run_cli":
+        if tool == "run_cli" or tool in tt.TYPED_TOOLS_CLI_WRAPPER:
             payload = (
                 result.get("result") if isinstance(result.get("result"), dict) else {}
             )
@@ -2555,7 +2565,26 @@ class ResearchController:
                     and not bool(result.get("ok"))
                 ):
                     summarized["stderr"] = stderr[:500]
+            if tool == "evaluate_candidate":
+                if result.get("score") is not None:
+                    summarized["typed_score"] = result.get("score")
+                if result.get("artifact_dir"):
+                    summarized["artifact_dir"] = result.get("artifact_dir")
             return summarized
+        if tool == "inspect_artifact":
+            return {
+                "tool": tool,
+                "ok": bool(result.get("ok", True)),
+                "artifact_dir": result.get("artifact_dir"),
+                "view": result.get("view"),
+            }
+        if tool == "compare_artifacts":
+            return {
+                "tool": tool,
+                "ok": bool(result.get("ok", True)),
+                "ranked_preview": result.get("ranked_comparison"),
+                "dominant_deltas": result.get("dominant_deltas"),
+            }
         if tool == "read_file":
             content = str(result.get("content", ""))
             return {
@@ -2605,14 +2634,7 @@ class ResearchController:
         tool = str(action.get("tool", "")).strip()
         if not tool:
             return "Action is missing tool."
-        if tool not in {
-            "run_cli",
-            "write_file",
-            "read_file",
-            "list_dir",
-            "log_attempt",
-            "finish",
-        }:
+        if tool not in tt.ALL_CONTROLLER_TOOLS:
             return f"Unknown tool: {tool}"
         if tool == "write_file":
             path = action.get("path")
@@ -2637,10 +2659,82 @@ class ResearchController:
             if summary is not None and not isinstance(summary, str):
                 return "finish summary must be a string."
             return None
-        try:
-            self._normalize_cli_args(action)
-        except Exception as exc:
-            return str(exc)
+        if tool == "prepare_profile":
+            mode = str(action.get("mode") or "").strip()
+            if mode not in {"scaffold_from_seed", "clone_local", "from_template"}:
+                return "prepare_profile requires mode scaffold_from_seed, clone_local, or from_template."
+            if mode == "scaffold_from_seed":
+                ids = action.get("indicator_ids")
+                if not isinstance(ids, list) or not ids:
+                    return "prepare_profile scaffold_from_seed requires indicator_ids array."
+            if mode == "clone_local":
+                src = action.get("source_profile_path")
+                if not isinstance(src, str) or not src.strip():
+                    return "prepare_profile clone_local requires source_profile_path."
+            return None
+        if tool == "mutate_profile":
+            pp = action.get("profile_path")
+            if not isinstance(pp, str) or not pp.strip():
+                return "mutate_profile requires profile_path."
+            mutations = action.get("mutations")
+            if not isinstance(mutations, list) or not mutations:
+                return "mutate_profile requires mutations array."
+            return None
+        if tool == "validate_profile":
+            pp = action.get("profile_path")
+            if not isinstance(pp, str) or not pp.strip():
+                return "validate_profile requires profile_path."
+            return None
+        if tool == "register_profile":
+            pp = action.get("profile_path")
+            if not isinstance(pp, str) or not pp.strip():
+                return "register_profile requires profile_path."
+            op = str(action.get("operation") or "create").strip().lower()
+            if op == "update":
+                ref = action.get("profile_ref")
+                if not isinstance(ref, str) or not ref.strip():
+                    return "register_profile update requires profile_ref."
+            return None
+        if tool == "evaluate_candidate":
+            inst = action.get("instruments")
+            if not isinstance(inst, list) or not inst:
+                return "evaluate_candidate requires instruments array."
+            has_ref = isinstance(action.get("profile_ref"), str) and bool(
+                str(action.get("profile_ref")).strip()
+            )
+            has_path = isinstance(action.get("profile_path"), str) and bool(
+                str(action.get("profile_path")).strip()
+            )
+            if not has_ref and not has_path:
+                return "evaluate_candidate requires profile_ref or profile_path."
+            return None
+        if tool == "run_parameter_sweep":
+            ref = action.get("profile_ref")
+            if not isinstance(ref, str) or not ref.strip():
+                return "run_parameter_sweep requires profile_ref."
+            axes = action.get("axes")
+            if not isinstance(axes, list) or not axes:
+                return "run_parameter_sweep requires axes array."
+            return None
+        if tool == "inspect_artifact":
+            ad = action.get("artifact_dir")
+            aid = action.get("attempt_id")
+            if (not isinstance(ad, str) or not ad.strip()) and (
+                not isinstance(aid, str) or not aid.strip()
+            ):
+                return "inspect_artifact requires artifact_dir or attempt_id."
+            return None
+        if tool == "compare_artifacts":
+            ids = action.get("attempt_ids") or action.get("artifact_dirs")
+            if not isinstance(ids, list) or not ids:
+                return "compare_artifacts requires attempt_ids or artifact_dirs array."
+            return None
+        if tool == "run_cli":
+            try:
+                self._normalize_cli_args(action)
+            except Exception as exc:
+                return str(exc)
+            return None
         return None
 
     def _validate_actions(self, actions: Any) -> list[str]:
@@ -2751,20 +2845,33 @@ class ResearchController:
             if not isinstance(action, dict):
                 continue
             tool = str(action.get("tool", "")).strip()
-            if tool != "run_cli":
-                continue
-            args = action.get("args")
-            if isinstance(args, list):
-                args_str = " ".join(str(a).lower() for a in args)
-            else:
-                args_str = str(action.get("command", "")).lower()
-            if latest_requested.lower() in args_str:
-                return [
-                    f"Timeframe mismatch repeat BLOCKED: the previous step requested {latest_requested} "
-                    f"but the CLI auto-adjusted to {status.get('latest', {}).get('effective')}. "
-                    f"Repeatedly requesting {latest_requested} with the same unchanged profile is not a valid experiment. "
-                    f"Resolve the mismatch first: patch indicator timeframe(s) to match, reformulate as {status.get('latest', {}).get('effective')} test, or abandon the higher-timeframe hypothesis."
-                ]
+            if tool == "run_cli":
+                args = action.get("args")
+                if isinstance(args, list):
+                    args_str = " ".join(str(a).lower() for a in args)
+                else:
+                    args_str = str(action.get("command", "")).lower()
+                if latest_requested.lower() in args_str:
+                    return [
+                        f"Timeframe mismatch repeat BLOCKED: the previous step requested {latest_requested} "
+                        f"but the CLI auto-adjusted to {status.get('latest', {}).get('effective')}. "
+                        f"Repeatedly requesting {latest_requested} with the same unchanged profile is not a valid experiment. "
+                        f"Resolve the mismatch first: patch indicator timeframe(s) to match, reformulate as {status.get('latest', {}).get('effective')} test, or abandon the higher-timeframe hypothesis."
+                    ]
+            elif tool == "evaluate_candidate":
+                pol = str(action.get("timeframe_policy") or "").strip().lower()
+                if pol != "explicit":
+                    continue
+                tf = action.get("timeframe")
+                if isinstance(tf, str) and tf.strip():
+                    candidate = tf.strip().lower()
+                    if latest_requested.lower() in candidate or candidate in latest_requested.lower():
+                        return [
+                            f"Timeframe mismatch repeat BLOCKED: the previous step requested {latest_requested} "
+                            f"but the CLI auto-adjusted to {status.get('latest', {}).get('effective')}. "
+                            f"Repeatedly requesting {latest_requested} with the same unchanged profile is not a valid experiment. "
+                            f"Resolve the mismatch first: patch indicator timeframe(s) to match, reformulate as {status.get('latest', {}).get('effective')} test, or abandon the higher-timeframe hypothesis."
+                        ]
         return []
 
     def _repair_invalid_response(
@@ -3139,6 +3246,990 @@ class ResearchController:
             tool_context, artifact_dir, profile_ref=profile_ref
         )
 
+    def _execute_cli_invocation(
+        self,
+        tool_context: ToolContext,
+        *,
+        args: list[str],
+        cwd: Path | None,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+        source_action: dict[str, Any],
+        result_tool: str = "run_cli",
+    ) -> dict[str, Any]:
+        guard_error = self._guard_cli_args(args)
+        working_dir = cwd or self.config.fuzzfolio.workspace_root or Path.cwd()
+        if guard_error:
+            return {
+                "tool": result_tool,
+                "ok": False,
+                "created_profile_ref": None,
+                "source_profile_file": None,
+                "result": {
+                    "argv": [*self.cli.build_base_argv(), *args],
+                    "cwd": str(working_dir.resolve()),
+                    "returncode": 2,
+                    "stdout": "",
+                    "stderr": guard_error,
+                },
+                "auto_log": None,
+                "warnings": [],
+                "errors": [guard_error],
+                "artifacts": {},
+                "state_updates": {},
+                "next_recommended_action": None,
+                "status": "failed",
+            }
+        if "--profile-ref" in args:
+            profile_index = args.index("--profile-ref") + 1
+            if profile_index < len(args):
+                args[profile_index] = self._resolve_profile_ref_arg(
+                    str(args[profile_index])
+                )
+        result = self.cli.run(
+            [str(item) for item in args],
+            cwd=cwd,
+            check=False,
+        )
+
+        serialized_result = json.loads(self._serialize_tool_result(result))
+        timeframe_mismatch = self._detect_timeframe_mismatch(serialized_result)
+
+        profile_ref: str | None = None
+        file_arg: Path | None = None
+        if result.returncode == 0 and args[:2] in (
+            ["profiles", "create"],
+            ["profiles", "update"],
+        ):
+            payload = result.parsed_json if isinstance(result.parsed_json, dict) else {}
+            profile_ref = self._extract_profile_ref(payload)
+            if "--file" in args:
+                file_index = args.index("--file") + 1
+                if file_index < len(args):
+                    file_arg = Path(str(args[file_index])).resolve()
+            if profile_ref and file_arg:
+                if args[:2] == ["profiles", "create"]:
+                    self.last_created_profile_ref = profile_ref
+                self.profile_sources[profile_ref] = file_arg
+
+        auto_log = (
+            self._maybe_auto_log_attempt(tool_context, args)
+            if result.returncode == 0
+            else None
+        )
+        if auto_log is not None and auto_log.get("status") == "logged":
+            artifact_dir_str = auto_log.get("artifact_dir", "")
+            if artifact_dir_str:
+                score = auto_log.get("composite_score")
+                profile_ref_for_family = auto_log.get("profile_ref")
+                profile_path_for_family = (
+                    self.profile_sources.get(profile_ref_for_family)
+                    if profile_ref_for_family
+                    else None
+                )
+                family_id = self._derive_family_id_from_profile(
+                    profile_path_for_family
+                )
+                is_exploit = self._is_same_family_exploit_action(source_action)
+                resolved_trades = auto_log.get("resolved_trades")
+                trades_per_month = auto_log.get("trades_per_month")
+                positive_ratio = auto_log.get("positive_cell_ratio")
+                support_quality = "broad"
+                trade_count_val = (
+                    resolved_trades if isinstance(resolved_trades, int) else None
+                )
+                tpm_val = (
+                    trades_per_month
+                    if isinstance(trades_per_month, (int, float))
+                    else None
+                )
+                pos_val = (
+                    positive_ratio if isinstance(positive_ratio, (int, float)) else None
+                )
+                if trade_count_val is not None and trade_count_val < 30:
+                    support_quality = "sparse"
+                elif tpm_val is not None and tpm_val < 2:
+                    support_quality = "selective"
+                elif pos_val is not None and pos_val < 0.3:
+                    support_quality = "selective"
+                if family_id:
+                    self._update_family_exploit_state(
+                        family_id, is_exploit, support_quality
+                    )
+                    if score is not None:
+                        eff_raw = auto_log.get("effective_window_months")
+                        horizon_months = (
+                            int(eff_raw)
+                            if eff_raw is not None
+                            and str(eff_raw).strip() not in {"", "none"}
+                            else None
+                        )
+                        requested_horizon_months = self._parse_lookback_months_from_cli_args(
+                            args
+                        )
+                        retention_result = self._check_retention_gating(
+                            tool_context, family_id, float(score), horizon_months
+                        )
+                        attempts_list = self._run_attempts(tool_context.run_id)
+                        attempt_dict = attempts_list[-1] if attempts_list else None
+                        digest = (
+                            self._generate_behavior_digest(attempt_dict)
+                            if isinstance(attempt_dict, dict)
+                            else {}
+                        )
+                        had_mismatch = timeframe_mismatch is not None
+                        eff_float: float | None = None
+                        if isinstance(eff_raw, (int, float)):
+                            eff_float = float(eff_raw)
+                        elif eff_raw is not None:
+                            try:
+                                eff_float = float(str(eff_raw).strip())
+                            except (TypeError, ValueError):
+                                eff_float = None
+                        self._refresh_branch_lifecycle_after_eval(
+                            tool_context,
+                            step,
+                            step_limit,
+                            policy,
+                            family_id=family_id,
+                            profile_ref=str(profile_ref_for_family).strip()
+                            if profile_ref_for_family
+                            else None,
+                            attempt_id=(
+                                str(auto_log.get("attempt_id"))
+                                if auto_log.get("attempt_id")
+                                else None
+                            ),
+                            score=float(score),
+                            requested_horizon_months=(
+                                requested_horizon_months
+                                if requested_horizon_months is not None
+                                else horizon_months
+                            ),
+                            effective_window_months=eff_float,
+                            retention_result=retention_result,
+                            behavior_digest=digest,
+                            had_timeframe_mismatch=had_mismatch,
+                        )
+                        if retention_result.get("retention_failed"):
+                            retention_result["auto_log"] = auto_log
+                            base = {
+                                "tool": result_tool,
+                                "ok": result.returncode == 0,
+                                "created_profile_ref": profile_ref,
+                                "source_profile_file": str(file_arg) if file_arg else None,
+                                "result": serialized_result,
+                                "auto_log": auto_log,
+                                "timeframe_mismatch": timeframe_mismatch,
+                                "retention_gate": retention_result,
+                                "warnings": [],
+                                "errors": [],
+                                "artifacts": {},
+                                "state_updates": {},
+                                "next_recommended_action": None,
+                                "status": "failed",
+                            }
+                            return self._finalize_typed_cli_surface(base)
+
+        stderr_msg = ""
+        if isinstance(serialized_result, dict):
+            stderr_val = serialized_result.get("stderr")
+            if isinstance(stderr_val, str) and stderr_val.strip():
+                stderr_msg = stderr_val.strip()
+        warn_list: list[str] = []
+        if isinstance(timeframe_mismatch, dict) and timeframe_mismatch:
+            msg = timeframe_mismatch.get("message")
+            warn_list.append(str(msg or "timeframe_mismatch"))
+        err_list: list[str] = []
+        if result.returncode != 0 and stderr_msg:
+            err_list.append(stderr_msg[:1200])
+        next_hint = None
+        if args and str(args[0]).lower() in {"sensitivity", "sensitivity-basket"}:
+            next_hint = "inspect_artifact" if result.returncode == 0 else None
+        base = {
+            "tool": result_tool,
+            "ok": result.returncode == 0,
+            "created_profile_ref": profile_ref,
+            "source_profile_file": str(file_arg) if file_arg else None,
+            "result": serialized_result,
+            "auto_log": auto_log,
+            "timeframe_mismatch": timeframe_mismatch,
+            "warnings": warn_list,
+            "errors": err_list,
+            "artifacts": {},
+            "state_updates": {},
+            "next_recommended_action": next_hint,
+            "status": "ok" if result.returncode == 0 else "failed",
+        }
+        return self._finalize_typed_cli_surface(base)
+
+    def _finalize_typed_cli_surface(self, payload: dict[str, Any]) -> dict[str, Any]:
+        payload.setdefault("warnings", [])
+        payload.setdefault("errors", [])
+        payload.setdefault("artifacts", {})
+        payload.setdefault("state_updates", {})
+        if "status" not in payload:
+            payload["status"] = "ok" if payload.get("ok") else "failed"
+        return payload
+
+    def _sanitize_label(self, raw: str, *, max_len: int = 72) -> str:
+        text = re.sub(r"[^\w\-]+", "_", (raw or "item").strip()) or "item"
+        return text[:max_len]
+
+    def _typed_prepare_profile(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> dict[str, Any]:
+        mode = str(action.get("mode") or "").strip()
+        profiles_dir = tool_context.profiles_dir
+        name = self._sanitize_label(str(action.get("candidate_name") or "candidate"))
+        warnings: list[str] = []
+        if mode == "from_template":
+            dest_raw = action.get("destination_path")
+            dest = (
+                Path(str(dest_raw).strip()).resolve()
+                if isinstance(dest_raw, str) and dest_raw.strip()
+                else (profiles_dir / f"{name}_{self._timestamp()}.json").resolve()
+            )
+            tpl = tool_context.profile_template_path
+            if not tpl.exists():
+                return tt.normalized_tool_envelope(
+                    "prepare_profile",
+                    ok=False,
+                    errors=[f"Template profile missing: {tpl}"],
+                    profile_path=str(dest),
+                    profile_name=name,
+                    indicator_ids=action.get("indicator_ids"),
+                    next_recommended_action="run_cli",
+                )
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(tpl, dest)
+            return tt.normalized_tool_envelope(
+                "prepare_profile",
+                ok=True,
+                profile_path=str(dest),
+                profile_name=name,
+                indicator_ids=action.get("indicator_ids"),
+                timeframe_summary=str(action.get("timeframe") or ""),
+                warnings=warnings,
+                next_recommended_action="validate_profile",
+                artifacts={"profile_path": str(dest)},
+            )
+        if mode == "clone_local":
+            src_raw = action.get("source_profile_path")
+            if not isinstance(src_raw, str) or not src_raw.strip():
+                return tt.normalized_tool_envelope(
+                    "prepare_profile",
+                    ok=False,
+                    errors=["prepare_profile clone_local requires source_profile_path."],
+                    next_recommended_action=None,
+                )
+            src = Path(src_raw.strip()).resolve()
+            dest_raw = action.get("destination_path")
+            dest = (
+                Path(str(dest_raw).strip()).resolve()
+                if isinstance(dest_raw, str) and dest_raw.strip()
+                else (profiles_dir / f"{name}_{self._timestamp()}.json").resolve()
+            )
+            args = [
+                "profiles",
+                "clone-local",
+                "--file",
+                str(src),
+                "--out",
+                str(dest),
+                "--pretty",
+            ]
+            base = self._execute_cli_invocation(
+                tool_context,
+                args=args,
+                cwd=None,
+                step=step,
+                step_limit=step_limit,
+                policy=policy,
+                source_action=action,
+                result_tool="prepare_profile",
+            )
+            base["profile_path"] = str(dest)
+            base["profile_name"] = name
+            base["indicator_ids"] = action.get("indicator_ids")
+            if base.get("ok"):
+                base["next_recommended_action"] = "validate_profile"
+            else:
+                base["next_recommended_action"] = "inspect source_profile_path and retry"
+            artifacts = dict(base.get("artifacts") or {})
+            artifacts["profile_path"] = str(dest)
+            base["artifacts"] = artifacts
+            return self._finalize_typed_cli_surface(base)
+        if mode == "scaffold_from_seed":
+            ids = action.get("indicator_ids")
+            if not isinstance(ids, list) or not all(
+                isinstance(item, (str, int)) for item in ids
+            ):
+                return tt.normalized_tool_envelope(
+                    "prepare_profile",
+                    ok=False,
+                    errors=["prepare_profile scaffold_from_seed requires indicator_ids array."],
+                    next_recommended_action=None,
+                )
+            dest_raw = action.get("destination_path")
+            dest = (
+                Path(str(dest_raw).strip()).resolve()
+                if isinstance(dest_raw, str) and dest_raw.strip()
+                else (profiles_dir / f"{name}_{self._timestamp()}.json").resolve()
+            )
+            args = ["profiles", "scaffold"]
+            for ind in ids:
+                args.extend(["--indicator", str(ind)])
+            instruments = action.get("instruments")
+            if isinstance(instruments, list):
+                for sym in instruments:
+                    args.extend(["--instrument", str(sym)])
+            args.extend(["--out", str(dest), "--pretty"])
+            base = self._execute_cli_invocation(
+                tool_context,
+                args=args,
+                cwd=None,
+                step=step,
+                step_limit=step_limit,
+                policy=policy,
+                source_action=action,
+                result_tool="prepare_profile",
+            )
+            base["profile_path"] = str(dest)
+            base["profile_name"] = name
+            base["indicator_ids"] = ids
+            if base.get("ok"):
+                base["next_recommended_action"] = "validate_profile"
+            artifacts = dict(base.get("artifacts") or {})
+            artifacts["profile_path"] = str(dest)
+            base["artifacts"] = artifacts
+            return self._finalize_typed_cli_surface(base)
+        return tt.normalized_tool_envelope(
+            "prepare_profile",
+            ok=False,
+            errors=[f"Unknown prepare_profile mode: {mode or '(empty)'}"],
+            next_recommended_action=None,
+        )
+
+    def _typed_mutate_profile(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> dict[str, Any]:
+        path_raw = action.get("profile_path")
+        if not isinstance(path_raw, str) or not path_raw.strip():
+            return tt.normalized_tool_envelope(
+                "mutate_profile",
+                ok=False,
+                errors=["mutate_profile requires profile_path."],
+                next_recommended_action=None,
+            )
+        profile_path = Path(path_raw.strip()).resolve()
+        mutations = action.get("mutations")
+        if not isinstance(mutations, list) or not mutations:
+            return tt.normalized_tool_envelope(
+                "mutate_profile",
+                ok=False,
+                errors=["mutate_profile requires non-empty mutations array."],
+                next_recommended_action=None,
+            )
+        applied: list[dict[str, Any]] = []
+        args: list[str] = ["profiles", "patch", "--file", str(profile_path)]
+        for mut in mutations:
+            if not isinstance(mut, dict):
+                continue
+            path = mut.get("path")
+            if not isinstance(path, str) or not path.strip():
+                continue
+            value = mut.get("value")
+            if isinstance(value, str):
+                rendered = value
+            else:
+                rendered = json.dumps(value, ensure_ascii=True)
+            args.extend(["--set", f"{path.strip()}={rendered}"])
+            applied.append({"path": path.strip(), "value": value})
+        if len(args) <= 3:
+            return tt.normalized_tool_envelope(
+                "mutate_profile",
+                ok=False,
+                errors=["No valid mutations were provided."],
+                next_recommended_action=None,
+            )
+        out_raw = action.get("destination_path")
+        out_path = (
+            Path(str(out_raw).strip()).resolve()
+            if isinstance(out_raw, str) and out_raw.strip()
+            else profile_path
+        )
+        args.extend(["--out", str(out_path), "--pretty"])
+        base = self._execute_cli_invocation(
+            tool_context,
+            args=args,
+            cwd=None,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+            source_action=action,
+            result_tool="mutate_profile",
+        )
+        base["profile_path"] = str(out_path)
+        base["applied_mutations"] = applied
+        base["mutation_summary"] = f"{len(applied)} patch operation(s)"
+        if base.get("ok"):
+            base["next_recommended_action"] = "validate_profile"
+        arts = dict(base.get("artifacts") or {})
+        arts["profile_path"] = str(out_path)
+        base["artifacts"] = arts
+        return self._finalize_typed_cli_surface(base)
+
+    def _typed_validate_profile(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> dict[str, Any]:
+        path_raw = action.get("profile_path")
+        if not isinstance(path_raw, str) or not path_raw.strip():
+            return tt.normalized_tool_envelope(
+                "validate_profile",
+                ok=False,
+                errors=["validate_profile requires profile_path."],
+                next_recommended_action=None,
+            )
+        path = Path(path_raw.strip()).resolve()
+        args = ["profiles", "validate", "--file", str(path), "--pretty"]
+        base = self._execute_cli_invocation(
+            tool_context,
+            args=args,
+            cwd=None,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+            source_action=action,
+            result_tool="validate_profile",
+        )
+        base["profile_path"] = str(path)
+        parsed = {}
+        res = base.get("result")
+        if isinstance(res, dict):
+            pj = res.get("parsed_json")
+            if isinstance(pj, dict):
+                parsed = pj
+        base["validation_ok"] = bool(base.get("ok"))
+        base["normalized_timeframe_summary"] = str(
+            parsed.get("timeframe_summary")
+            or parsed.get("timeframes")
+            or ""
+        )
+        base["normalized_instrument_summary"] = str(
+            parsed.get("instrument_summary") or parsed.get("instruments") or ""
+        )
+        if base.get("ok"):
+            base["next_recommended_action"] = "register_profile"
+        return self._finalize_typed_cli_surface(base)
+
+    def _typed_register_profile(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> dict[str, Any]:
+        path_raw = action.get("profile_path")
+        if not isinstance(path_raw, str) or not path_raw.strip():
+            return tt.normalized_tool_envelope(
+                "register_profile",
+                ok=False,
+                errors=["register_profile requires profile_path."],
+                next_recommended_action=None,
+            )
+        path = Path(path_raw.strip()).resolve()
+        operation = str(action.get("operation") or "create").strip().lower()
+        out_raw = action.get("metadata_out_path")
+        if isinstance(out_raw, str) and out_raw.strip():
+            out_path = Path(out_raw.strip()).resolve()
+        else:
+            out_path = path.parent / f"{path.stem}.created.json"
+        if operation == "update":
+            ref = action.get("profile_ref")
+            if not isinstance(ref, str) or not ref.strip():
+                return tt.normalized_tool_envelope(
+                    "register_profile",
+                    ok=False,
+                    errors=["register_profile update requires profile_ref."],
+                    next_recommended_action=None,
+                )
+            ref = self._substitute_runtime_placeholders(ref.strip())
+            args = [
+                "profiles",
+                "update",
+                "--profile-ref",
+                ref,
+                "--file",
+                str(path),
+                "--out",
+                str(out_path),
+                "--pretty",
+            ]
+        else:
+            args = [
+                "profiles",
+                "create",
+                "--file",
+                str(path),
+                "--out",
+                str(out_path),
+                "--pretty",
+            ]
+        base = self._execute_cli_invocation(
+            tool_context,
+            args=args,
+            cwd=None,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+            source_action=action,
+            result_tool="register_profile",
+        )
+        profile_ref = base.get("created_profile_ref")
+        payload = base.get("result")
+        if isinstance(payload, dict):
+            pj = payload.get("parsed_json")
+            if profile_ref is None and isinstance(pj, dict):
+                profile_ref = self._extract_profile_ref(pj)
+        base["profile_ref"] = profile_ref
+        base["profile_path"] = str(path)
+        base["created"] = operation != "update"
+        base["updated"] = operation == "update"
+        if base.get("ok"):
+            base["next_recommended_action"] = "evaluate_candidate"
+        return self._finalize_typed_cli_surface(base)
+
+    def _typed_evaluate_candidate(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> dict[str, Any]:
+        instruments = action.get("instruments")
+        if not isinstance(instruments, list) or not instruments:
+            return tt.normalized_tool_envelope(
+                "evaluate_candidate",
+                ok=False,
+                errors=["evaluate_candidate requires instruments array."],
+                next_recommended_action=None,
+            )
+        raw_ref = action.get("profile_ref")
+        raw_path = action.get("profile_path")
+        ref: str | None = None
+        if isinstance(raw_ref, str) and raw_ref.strip():
+            ref = self._substitute_runtime_placeholders(raw_ref.strip())
+        elif isinstance(raw_path, str) and raw_path.strip():
+            p = Path(self._substitute_runtime_placeholders(raw_path.strip())).resolve()
+            ref = self._profile_ref_for_local_file(p)
+        if not ref:
+            return tt.normalized_tool_envelope(
+                "evaluate_candidate",
+                ok=False,
+                errors=[
+                    "evaluate_candidate needs profile_ref (cloud id) or profile_path for a file already registered in this run."
+                ],
+                next_recommended_action="register_profile",
+            )
+        label = self._sanitize_label(
+            str(
+                action.get("candidate_name")
+                or action.get("output_name")
+                or "candidate"
+            )
+        )
+        out_dir = (
+            tool_context.evals_dir / f"eval_{label}_{self._timestamp()}"
+        ).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        args: list[str] = [
+            "sensitivity-basket",
+            "--profile-ref",
+            ref,
+            "--output-dir",
+            str(out_dir),
+        ]
+        for ins in instruments:
+            args.extend(["--instrument", str(ins)])
+        pol = str(action.get("timeframe_policy") or "profile_default").strip().lower()
+        if pol == "explicit":
+            tf = action.get("timeframe")
+            if isinstance(tf, str) and tf.strip():
+                args.extend(["--timeframe", tf.strip()])
+        rh = action.get("requested_horizon_months")
+        if rh is not None:
+            try:
+                args.extend(["--lookback-months", str(int(rh))])
+            except (TypeError, ValueError):
+                pass
+        args.append("--pretty")
+        args = self._apply_horizon_policy_to_cli_args(
+            args,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+        )
+        base = self._execute_cli_invocation(
+            tool_context,
+            args=args,
+            cwd=None,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+            source_action=action,
+            result_tool="evaluate_candidate",
+        )
+        auto = base.get("auto_log")
+        mode = str(action.get("evaluation_mode") or "screen").strip().lower()
+        score_basis = None
+        score_val = None
+        attempted = False
+        tpm = None
+        pos_ratio = None
+        trades = None
+        eff_months = None
+        req_tf = None
+        eff_tf = None
+        if isinstance(auto, dict):
+            attempted = str(auto.get("status") or "") == "logged"
+            score_basis = auto.get("score_basis")
+            score_val = auto.get("composite_score")
+            tpm = auto.get("trades_per_month")
+            pos_ratio = auto.get("positive_cell_ratio")
+            trades = auto.get("resolved_trades")
+            eff_months = auto.get("effective_window_months")
+        cli_res = base.get("result")
+        if isinstance(cli_res, dict) and isinstance(cli_res.get("parsed_json"), dict):
+            pj = cli_res["parsed_json"]
+            req_tf = pj.get("requested_timeframe")
+            eff_tf = pj.get("effective_timeframe")
+        base["attempt_logged"] = attempted
+        base["attempt_id"] = auto.get("attempt_id") if isinstance(auto, dict) else None
+        base["artifact_dir"] = str(out_dir)
+        base["profile_ref"] = ref
+        base["requested_timeframe"] = req_tf
+        base["effective_timeframe"] = eff_tf
+        base["requested_horizon_months"] = self._parse_lookback_months_from_cli_args(
+            args
+        )
+        base["effective_window_months"] = eff_months
+        base["score"] = score_val
+        base["score_basis"] = score_basis
+        base["resolved_trades"] = trades
+        base["trades_per_month"] = tpm
+        base["positive_cell_ratio"] = pos_ratio
+        base["retention_relevant_flags"] = {
+            "evaluation_mode": mode,
+            "timeframe_policy": pol,
+        }
+        base["timeframe_auto_adjusted"] = bool(base.get("timeframe_mismatch"))
+        if mode == "validate":
+            base["next_recommended_action"] = (
+                "compare_artifacts" if base.get("ok") else "inspect_artifact"
+            )
+        elif base.get("ok"):
+            base["next_recommended_action"] = "inspect_artifact"
+        arts = dict(base.get("artifacts") or {})
+        arts["artifact_dir"] = str(out_dir)
+        base["artifacts"] = arts
+        return self._finalize_typed_cli_surface(base)
+
+    def _typed_run_parameter_sweep(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> dict[str, Any]:
+        raw_ref = action.get("profile_ref")
+        if not isinstance(raw_ref, str) or not raw_ref.strip():
+            return tt.normalized_tool_envelope(
+                "run_parameter_sweep",
+                ok=False,
+                errors=["run_parameter_sweep requires profile_ref."],
+                next_recommended_action=None,
+            )
+        ref = self._substitute_runtime_placeholders(raw_ref.strip())
+        axes = action.get("axes")
+        if not isinstance(axes, list) or not axes:
+            return tt.normalized_tool_envelope(
+                "run_parameter_sweep",
+                ok=False,
+                errors=["run_parameter_sweep requires axes array of sweep axis strings."],
+                next_recommended_action=None,
+            )
+        prefix = self._sanitize_label(
+            str(action.get("candidate_name_prefix") or "sweep")
+        )
+        out_raw = action.get("output_dir")
+        if isinstance(out_raw, str) and out_raw.strip():
+            out_dir = Path(out_raw.strip()).resolve()
+        else:
+            out_dir = (
+                tool_context.evals_dir / f"sweep_{prefix}_{self._timestamp()}"
+            ).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        args: list[str] = [
+            "sweep",
+            "run",
+            "--profile-ref",
+            ref,
+            "--output-dir",
+            str(out_dir),
+        ]
+        instruments = action.get("instruments")
+        if isinstance(instruments, list):
+            for ins in instruments:
+                args.extend(["--instrument", str(ins)])
+        for ax in axes:
+            args.extend(["--axis", str(ax)])
+        args.append("--pretty")
+        base = self._execute_cli_invocation(
+            tool_context,
+            args=args,
+            cwd=None,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+            source_action=action,
+            result_tool="run_parameter_sweep",
+        )
+        ranked = None
+        best = None
+        sweep_id = None
+        completed = bool(base.get("ok"))
+        cli_res = base.get("result")
+        if isinstance(cli_res, dict) and isinstance(cli_res.get("parsed_json"), dict):
+            pj = cli_res["parsed_json"]
+            ranked = pj.get("ranked") or pj.get("results")
+            best = pj.get("best")
+            sweep_id = pj.get("sweep_id") or pj.get("id")
+        base["sweep_id"] = sweep_id
+        base["completed"] = completed
+        base["ranked_results"] = ranked
+        base["best_variant"] = best
+        if isinstance(best, dict):
+            base["best_score"] = best.get("quality_score")
+        base["artifact_dir"] = str(out_dir)
+        if base.get("ok"):
+            base["next_recommended_action"] = "inspect_artifact"
+        arts = dict(base.get("artifacts") or {})
+        arts["artifact_dir"] = str(out_dir)
+        base["artifacts"] = arts
+        return self._finalize_typed_cli_surface(base)
+
+    def _resolve_artifact_path(
+        self, tool_context: ToolContext, action: dict[str, Any]
+    ) -> Path | None:
+        ad = action.get("artifact_dir")
+        if isinstance(ad, str) and ad.strip():
+            return Path(ad.strip()).resolve()
+        aid = action.get("attempt_id")
+        if isinstance(aid, str) and aid.strip():
+            needle = aid.strip()
+            for att in load_run_attempts(tool_context.run_dir):
+                if str(att.get("attempt_id") or "") != needle:
+                    continue
+                ar = att.get("artifact_dir")
+                if isinstance(ar, str) and ar.strip():
+                    return Path(ar.strip()).resolve()
+        return None
+
+    def _typed_inspect_artifact(
+        self, tool_context: ToolContext, action: dict[str, Any]
+    ) -> dict[str, Any]:
+        path = self._resolve_artifact_path(tool_context, action)
+        if path is None or not path.exists():
+            return tt.normalized_tool_envelope(
+                "inspect_artifact",
+                ok=False,
+                errors=["inspect_artifact needs artifact_dir or a known attempt_id."],
+                next_recommended_action="evaluate_candidate",
+            )
+        view = str(action.get("view") or "summary").strip().lower()
+        snapshot = load_sensitivity_snapshot(path)
+        files = sorted(str(p) for p in path.iterdir()) if path.is_dir() else []
+        snap_keys: list[str] = []
+        if isinstance(snapshot, dict):
+            snap_keys = [str(k) for k in list(snapshot.keys())[:40]]
+        payload: dict[str, Any] = {
+            "tool": "inspect_artifact",
+            "ok": True,
+            "status": "ok",
+            "artifact_dir": str(path),
+            "view": view,
+            "warnings": [],
+            "errors": [],
+            "artifacts": {"artifact_dir": str(path)},
+            "state_updates": {},
+            "next_recommended_action": "compare_artifacts",
+            "files": files[:80],
+            "sensitivity_snapshot_keys": snap_keys,
+        }
+        if view == "files":
+            return payload
+        if view == "curve_meta":
+            detail = path / "best-cell-path-detail.json"
+            if detail.exists():
+                try:
+                    payload["curve_meta"] = json.loads(
+                        detail.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    payload["curve_meta"] = None
+            else:
+                payload["curve_meta"] = None
+            return payload
+        if view == "request_meta":
+            resp = path / "sensitivity-response.json"
+            if resp.exists():
+                try:
+                    payload["request_meta"] = json.loads(
+                        resp.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError):
+                    payload["request_meta"] = None
+            return payload
+        try:
+            compare = self.cli.score_artifact(path)
+        except (CliError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            payload["ok"] = False
+            payload["status"] = "failed"
+            payload["errors"] = [str(exc)[:800]]
+            payload["next_recommended_action"] = None
+            return payload
+        payload["compare_summary"] = compare
+        best = compare.get("best")
+        mw_hint = None
+        if isinstance(best, dict):
+            mdw = best.get("market_data_window")
+            if isinstance(mdw, dict):
+                mw_hint = mdw.get("effective_window_months")
+        payload["effective_window_months_hint"] = mw_hint
+        return payload
+
+    def _typed_compare_artifacts(
+        self, tool_context: ToolContext, action: dict[str, Any]
+    ) -> dict[str, Any]:
+        entries = action.get("attempt_ids") or action.get("artifact_dirs")
+        if not isinstance(entries, list) or not entries:
+            return tt.normalized_tool_envelope(
+                "compare_artifacts",
+                ok=False,
+                errors=["compare_artifacts requires attempt_ids or artifact_dirs array."],
+                next_recommended_action=None,
+            )
+        resolved: list[tuple[str, Path]] = []
+        for item in entries:
+            if not isinstance(item, str) or not item.strip():
+                continue
+            token = item.strip()
+            p = Path(token)
+            if p.exists() and p.is_dir():
+                resolved.append((token, p.resolve()))
+                continue
+            r = self._resolve_artifact_path(
+                tool_context, {"attempt_id": token, "artifact_dir": ""}
+            )
+            if r and r.exists():
+                resolved.append((token, r))
+        if not resolved:
+            return tt.normalized_tool_envelope(
+                "compare_artifacts",
+                ok=False,
+                errors=["Could not resolve any artifact directories from inputs."],
+                next_recommended_action=None,
+            )
+        scored: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for label, p in resolved:
+            try:
+                payload = self.cli.score_artifact(p)
+                score = None
+                best = payload.get("best")
+                if isinstance(best, dict):
+                    score = best.get("quality_score")
+                scored.append(
+                    {
+                        "label": label,
+                        "artifact_dir": str(p),
+                        "quality_score": score,
+                        "best": best,
+                    }
+                )
+            except (CliError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                errors.append(f"{label}: {exc}")
+        if not scored:
+            return tt.normalized_tool_envelope(
+                "compare_artifacts",
+                ok=False,
+                errors=errors or ["compare failed"],
+                next_recommended_action=None,
+            )
+        lower_better = bool(self.config.research.plot_lower_is_better)
+
+        def _rank_key(row: dict[str, Any]) -> float:
+            v = row.get("quality_score")
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return float("inf") if lower_better else float("-inf")
+            return f
+
+        ranked = sorted(
+            scored,
+            key=_rank_key,
+            reverse=not lower_better,
+        )
+        leader = ranked[0]
+        trailer = ranked[-1] if len(ranked) > 1 else None
+        deltas: list[str] = []
+        if trailer and leader.get("quality_score") is not None:
+            try:
+                deltas.append(
+                    f"score_delta={float(leader['quality_score']) - float(trailer.get('quality_score')):.4f}"
+                )
+            except (TypeError, ValueError):
+                pass
+        retention_note = "Compare effective_window_months and trades_per_month in each best cell before trusting longer horizons."
+        return tt.normalized_tool_envelope(
+            "compare_artifacts",
+            ok=True,
+            ranked_comparison=ranked,
+            dominant_deltas=deltas,
+            retention_notes=[retention_note],
+            suggested_next_move="evaluate_candidate on leader unless retention already satisfied",
+            errors=errors,
+            artifacts={"compared": [r["artifact_dir"] for r in ranked]},
+            next_recommended_action="evaluate_candidate",
+        )
+
     def _execute_action(
         self,
         tool_context: ToolContext,
@@ -3149,6 +4240,7 @@ class ResearchController:
         policy: RunPolicy,
     ) -> dict[str, Any]:
         tool = action.get("tool")
+        self._bump_tool_usage(str(tool or ""))
         if tool == "run_cli":
             args = [
                 self._substitute_runtime_placeholders(str(item))
@@ -3160,189 +4252,45 @@ class ResearchController:
                 step_limit=step_limit,
                 policy=policy,
             )
-            guard_error = self._guard_cli_args(args)
-            if guard_error:
-                return {
-                    "tool": "run_cli",
-                    "ok": False,
-                    "created_profile_ref": None,
-                    "source_profile_file": None,
-                    "result": {
-                        "argv": [*self.cli.build_base_argv(), *args],
-                        "cwd": str(Path(action["cwd"]).resolve())
-                        if action.get("cwd")
-                        else str(
-                            (
-                                self.config.fuzzfolio.workspace_root or Path.cwd()
-                            ).resolve()
-                        ),
-                        "returncode": 2,
-                        "stdout": "",
-                        "stderr": guard_error,
-                    },
-                    "auto_log": None,
-                }
-            if "--profile-ref" in args:
-                profile_index = args.index("--profile-ref") + 1
-                if profile_index < len(args):
-                    args[profile_index] = self._resolve_profile_ref_arg(
-                        str(args[profile_index])
-                    )
-            result = self.cli.run(
-                [str(item) for item in args],
+            return self._execute_cli_invocation(
+                tool_context,
+                args=args,
                 cwd=Path(action["cwd"]) if action.get("cwd") else None,
-                check=False,
+                step=step,
+                step_limit=step_limit,
+                policy=policy,
+                source_action=action,
+                result_tool="run_cli",
             )
 
-            serialized_result = json.loads(self._serialize_tool_result(result))
-            timeframe_mismatch = self._detect_timeframe_mismatch(serialized_result)
-
-            profile_ref: str | None = None
-            file_arg: Path | None = None
-            if result.returncode == 0 and args[:2] in (
-                ["profiles", "create"],
-                ["profiles", "update"],
-            ):
-                payload = (
-                    result.parsed_json if isinstance(result.parsed_json, dict) else {}
-                )
-                profile_ref = self._extract_profile_ref(payload)
-                if "--file" in args:
-                    file_index = args.index("--file") + 1
-                    if file_index < len(args):
-                        file_arg = Path(str(args[file_index])).resolve()
-                if profile_ref and file_arg:
-                    if args[:2] == ["profiles", "create"]:
-                        self.last_created_profile_ref = profile_ref
-                    self.profile_sources[profile_ref] = file_arg
-
-            auto_log = (
-                self._maybe_auto_log_attempt(tool_context, args)
-                if result.returncode == 0
-                else None
+        if tool == "prepare_profile":
+            return self._typed_prepare_profile(
+                tool_context, action, step=step, step_limit=step_limit, policy=policy
             )
-            if auto_log is not None and auto_log.get("status") == "logged":
-                artifact_dir_str = auto_log.get("artifact_dir", "")
-                if artifact_dir_str:
-                    artifact_path = Path(artifact_dir_str)
-                    score = auto_log.get("composite_score")
-                    profile_ref_for_family = auto_log.get("profile_ref")
-                    profile_path_for_family = (
-                        self.profile_sources.get(profile_ref_for_family)
-                        if profile_ref_for_family
-                        else None
-                    )
-                    family_id = self._derive_family_id_from_profile(
-                        profile_path_for_family
-                    )
-                    is_exploit = self._is_same_family_exploit_action(action)
-                    resolved_trades = auto_log.get("resolved_trades")
-                    trades_per_month = auto_log.get("trades_per_month")
-                    positive_ratio = auto_log.get("positive_cell_ratio")
-                    support_quality = "broad"
-                    trade_count_val = (
-                        resolved_trades if isinstance(resolved_trades, int) else None
-                    )
-                    tpm_val = (
-                        trades_per_month
-                        if isinstance(trades_per_month, (int, float))
-                        else None
-                    )
-                    pos_val = (
-                        positive_ratio
-                        if isinstance(positive_ratio, (int, float))
-                        else None
-                    )
-                    if trade_count_val is not None and trade_count_val < 30:
-                        support_quality = "sparse"
-                    elif tpm_val is not None and tpm_val < 2:
-                        support_quality = "selective"
-                    elif pos_val is not None and pos_val < 0.3:
-                        support_quality = "selective"
-                    if family_id:
-                        self._update_family_exploit_state(
-                            family_id, is_exploit, support_quality
-                        )
-                        if score is not None:
-                            eff_raw = auto_log.get("effective_window_months")
-                            horizon_months = (
-                                int(eff_raw)
-                                if eff_raw is not None
-                                and str(eff_raw).strip() not in {"", "none"}
-                                else None
-                            )
-                            requested_horizon_months = self._parse_lookback_months_from_cli_args(
-                                args
-                            )
-                            retention_result = self._check_retention_gating(
-                                tool_context, family_id, float(score), horizon_months
-                            )
-                            attempts_list = self._run_attempts(tool_context.run_id)
-                            attempt_dict = (
-                                attempts_list[-1] if attempts_list else None
-                            )
-                            digest = (
-                                self._generate_behavior_digest(attempt_dict)
-                                if isinstance(attempt_dict, dict)
-                                else {}
-                            )
-                            had_mismatch = timeframe_mismatch is not None
-                            eff_float: float | None = None
-                            if isinstance(eff_raw, (int, float)):
-                                eff_float = float(eff_raw)
-                            elif eff_raw is not None:
-                                try:
-                                    eff_float = float(str(eff_raw).strip())
-                                except (TypeError, ValueError):
-                                    eff_float = None
-                            self._refresh_branch_lifecycle_after_eval(
-                                tool_context,
-                                step,
-                                step_limit,
-                                policy,
-                                family_id=family_id,
-                                profile_ref=str(profile_ref_for_family).strip()
-                                if profile_ref_for_family
-                                else None,
-                                attempt_id=(
-                                    str(auto_log.get("attempt_id"))
-                                    if auto_log.get("attempt_id")
-                                    else None
-                                ),
-                                score=float(score),
-                                requested_horizon_months=(
-                                    requested_horizon_months
-                                    if requested_horizon_months is not None
-                                    else horizon_months
-                                ),
-                                effective_window_months=eff_float,
-                                retention_result=retention_result,
-                                behavior_digest=digest,
-                                had_timeframe_mismatch=had_mismatch,
-                            )
-                            if retention_result.get("retention_failed"):
-                                retention_result["auto_log"] = auto_log
-                                return {
-                                    "tool": "run_cli",
-                                    "ok": result.returncode == 0,
-                                    "created_profile_ref": profile_ref,
-                                    "source_profile_file": str(file_arg)
-                                    if file_arg
-                                    else None,
-                                    "result": serialized_result,
-                                    "auto_log": auto_log,
-                                    "timeframe_mismatch": timeframe_mismatch,
-                                    "retention_gate": retention_result,
-                                }
-            return {
-                "tool": "run_cli",
-                "ok": result.returncode == 0,
-                "created_profile_ref": profile_ref,
-                "source_profile_file": str(file_arg) if file_arg else None,
-                "result": serialized_result,
-                "auto_log": auto_log,
-                "timeframe_mismatch": timeframe_mismatch,
-            }
+        if tool == "mutate_profile":
+            return self._typed_mutate_profile(
+                tool_context, action, step=step, step_limit=step_limit, policy=policy
+            )
+        if tool == "validate_profile":
+            return self._typed_validate_profile(
+                tool_context, action, step=step, step_limit=step_limit, policy=policy
+            )
+        if tool == "register_profile":
+            return self._typed_register_profile(
+                tool_context, action, step=step, step_limit=step_limit, policy=policy
+            )
+        if tool == "evaluate_candidate":
+            return self._typed_evaluate_candidate(
+                tool_context, action, step=step, step_limit=step_limit, policy=policy
+            )
+        if tool == "run_parameter_sweep":
+            return self._typed_run_parameter_sweep(
+                tool_context, action, step=step, step_limit=step_limit, policy=policy
+            )
+        if tool == "inspect_artifact":
+            return self._typed_inspect_artifact(tool_context, action)
+        if tool == "compare_artifacts":
+            return self._typed_compare_artifacts(tool_context, action)
 
         if tool == "write_file":
             path = Path(str(action.get("path", ""))).resolve()
@@ -3857,7 +4805,8 @@ class ResearchController:
             return ""
         lines = [
             "External advisor guidance. Treat this as advisory input, not a command. "
-            "Use it if it improves the next bounded actions."
+            "Use it if it improves the next bounded actions. "
+            "When acting on it, prefer typed tools over run_cli unless recovery demands raw CLI."
         ]
         for advisor in advisors:
             if not isinstance(advisor, dict):
@@ -4626,7 +5575,8 @@ class ResearchController:
                 )
                 step_payload["results"].append(result)
                 hard_failure = bool(result.get("error"))
-                if result.get("tool") == "run_cli" and not bool(result.get("ok", True)):
+                res_tool = str(result.get("tool") or "")
+                if res_tool in tt.CLI_OK_TOOLS and not bool(result.get("ok", True)):
                     hard_failure = True
                 if hard_failure:
                     self._trace_runtime(

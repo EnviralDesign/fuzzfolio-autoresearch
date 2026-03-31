@@ -77,6 +77,7 @@ if __package__ in {None, ""}:
         set_provider_trace_stderr_mode,
     )
     from autoresearch.scoring import build_attempt_score, load_sensitivity_snapshot
+    from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
     from .controller import ResearchController, RunPolicy, set_runtime_trace_stderr_mode
@@ -115,6 +116,7 @@ else:
         set_provider_trace_stderr_mode,
     )
     from .scoring import build_attempt_score, load_sensitivity_snapshot
+    from .typed_tools import CLI_OK_TOOLS
 
 
 console = Console(safe_box=True)
@@ -595,6 +597,9 @@ def _extract_result_score(result: dict[str, object]) -> float | None:
         score = _coerce_score(payload.get("composite_score"))
         if score is not None:
             return score
+    score = _coerce_score(result.get("score"))
+    if score is not None:
+        return score
     return None
 
 
@@ -610,7 +615,7 @@ def _warning_count(step_payload: dict[str, Any]) -> int:
         if result.get("error"):
             count += 1
             continue
-        if tool == "run_cli" and not bool(result.get("ok", True)):
+        if tool in CLI_OK_TOOLS and not bool(result.get("ok", True)):
             count += 1
             continue
         if tool in {"yield_guard", "step_guard", "response_guard"}:
@@ -681,7 +686,7 @@ def _plain_result_details(result: dict[str, object]) -> list[str]:
                 if text:
                     details.append(f"stderr: {text}")
         if (
-            error or (tool == "run_cli" and not bool(result.get("ok", True)))
+            error or (tool in CLI_OK_TOOLS and not bool(result.get("ok", True)))
         ) and isinstance(payload.get("stdout"), str):
             stdout = str(payload.get("stdout")).strip()
             if stdout:
@@ -1410,10 +1415,10 @@ def _summarize_result(result: dict[str, object]) -> str:
     tool = str(result.get("tool", "unknown"))
     if result.get("error"):
         return f"{tool} failed | {_short_text(str(result.get('error')), 220)}"
-    if tool == "run_cli":
+    if tool == "run_cli" or tool in CLI_OK_TOOLS:
         ok = bool(result.get("ok"))
         status = "ok" if ok else "failed"
-        parts = [f"run_cli {status}"]
+        parts = [f"{tool} {status}"]
         created_profile_ref = result.get("created_profile_ref")
         if created_profile_ref:
             parts.append(f"profile={created_profile_ref}")
@@ -1429,6 +1434,8 @@ def _summarize_result(result: dict[str, object]) -> str:
                     parts.append(
                         f"attempt=existing score={attempt.get('composite_score')}"
                     )
+        if tool == "evaluate_candidate" and result.get("score") is not None:
+            parts.append(f"typed_score={result.get('score')}")
         payload = result.get("result")
         if isinstance(payload, dict):
             stdout = payload.get("stdout")
@@ -1510,7 +1517,7 @@ def _result_style(result: dict[str, object]) -> str:
         return "bold yellow"
     if result.get("error"):
         return "bold red"
-    if tool == "run_cli":
+    if tool in CLI_OK_TOOLS:
         return "green" if bool(result.get("ok")) else "bold red"
     return "cyan"
 
@@ -1519,7 +1526,7 @@ def _action_style(action: dict[str, object]) -> str:
     tool = str(action.get("tool", "unknown"))
     if tool == "finish":
         return "magenta"
-    if tool == "run_cli":
+    if tool in CLI_OK_TOOLS:
         return "cyan"
     return "white"
 

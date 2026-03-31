@@ -8,7 +8,7 @@ Use the available tools to keep exploring the scoring-profile search space, eval
 
 ## Core Rules
 
-1. Use `fuzzfolio-agent-cli` as the main workflow surface.
+1. Use the harness typed tools (`prepare_profile`, `mutate_profile`, `validate_profile`, `register_profile`, `evaluate_candidate`, `run_parameter_sweep`, `inspect_artifact`, `compare_artifacts`) as the default workflow surface. Use raw `run_cli` only for recovery, CLI help, or gaps without a typed equivalent.
 2. Start fresh from the current run's seed hand. Do not branch inward from old saved profiles that existed before this run.
 3. Only evolve scoring profiles that were created inside the current run directory.
 4. Prefer deterministic tool actions over free-form speculation.
@@ -19,7 +19,7 @@ Use the available tools to keep exploring the scoring-profile search space, eval
    - non-frontier attempts become faint gray dots
 8. Do not stop early just because you feel like you have a decent candidate.
 9. If you think you are done, verify that you have actually logged meaningful attempts and met the run goal.
-10. Sweeps are a normal part of healthy search. Do not spend the whole run on one-off manual edits only.
+10. Sweeps are a normal part of healthy search (`run_parameter_sweep`). Do not spend the whole run on one-off manual edits only.
 
 ## Workflow
 
@@ -28,14 +28,13 @@ Use the available tools to keep exploring the scoring-profile search space, eval
 3. If the hand is clearly redundant or poor, reshuffle at most once and record that choice in the run notes.
 4. After a reshuffle, fully commit to the new hand. Do not half-follow two different hands.
 5. In the early phase, be permissive: branch broadly, screen cheaply, and accept rough-looking ideas as long as they teach you something.
-6. Author a new portable profile JSON under the current run directory using only the seed-guided idea space for this run.
-7. Create the profile through the CLI.
-8. Evaluate candidates with `sensitivity` or `sensitivity-basket`.
-9. Use deterministic sweep helpers to probe promising families, especially in early and mid phases, before overcommitting to hand-tuned one-off variants.
-10. Update only the profiles created during this run when branching or refining.
-11. As evidence accumulates, become more restrictive: fewer families, tighter hypotheses, longer horizons, and stronger robustness demands.
-12. Log evaluated attempts so the ledger and plot stay current.
-13. Continue until the controller or the user explicitly stops the run.
+6. Author or scaffold run-local profiles using typed tools (`prepare_profile`, then `validate_profile` and `register_profile` as needed) within the seed-guided idea space.
+7. Evaluate with `evaluate_candidate`; interpret results with `inspect_artifact` / `compare_artifacts` before reading raw files.
+8. Probe promising families with `run_parameter_sweep` in early and mid phases before overcommitting to hand-tuned one-off variants.
+9. Update only the profiles created during this run when branching or refining.
+10. As evidence accumulates, become more restrictive: fewer families, tighter hypotheses, longer horizons, and stronger robustness demands—within controller phase and horizon policy shown in the run packet.
+11. Log evaluated attempts so the ledger and plot stay current.
+12. Continue until the controller or the user explicitly stops the run.
 
 ## Research Heuristics
 
@@ -77,6 +76,6 @@ When rejecting or moving away from a branch, prefer a short explicit failure lab
 
 - Keep paths absolute.
 - Keep scratch artifacts under the current run directory.
-- Use the CLI's saved auth profile when available; fall back to `.agentsecrets` only when login is required.
+- Auth is handled at run start; use `run_cli` recovery only if a tool result indicates an auth problem.
 - Treat CLI probabilistic metrics as authoritative. Prefer `dsr` when available, otherwise `psr`, with `rank_score` as a fallback/secondary view.
 - Existing saved profiles can be inspected only if the user explicitly asks. They are not the candidate pool for autonomous runs.
