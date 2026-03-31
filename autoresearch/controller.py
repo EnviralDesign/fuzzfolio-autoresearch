@@ -290,6 +290,7 @@ class ResearchController:
         self._current_step_limit: int = 0
         self._current_run_policy: RunPolicy | None = None
         self._tool_usage_counts: dict[str, int] = {}
+        self._validation_stale_without_validated: int = 0
 
     def _reset_run_state(self) -> None:
         self._family_mutation_counts = {}
@@ -307,6 +308,7 @@ class ResearchController:
         self._current_step_limit = 0
         self._current_run_policy = None
         self._tool_usage_counts = {}
+        self._validation_stale_without_validated = 0
 
     def _bump_tool_usage(self, tool: str) -> None:
         key = str(tool).strip() or "unknown"
@@ -457,20 +459,31 @@ class ResearchController:
             return
         window = max(1, cfg.reseed_max_recent_failures_window)
         recent_fails = [s for s in self._branch_overlay.recent_retention_failures if step - s <= window]
-        if not recent_fails:
-            return
         dead = sum(1 for b in self._family_branches.values() if b.exploit_dead)
-        if dead < 1 and not any(
-            b.structural_contrast_required for b in self._family_branches.values()
-        ):
+        contrast = any(b.structural_contrast_required for b in self._family_branches.values())
+        stale_validation = (
+            cfg.reseed_after_stale_validation_steps > 0
+            and self._validation_stale_without_validated
+            >= cfg.reseed_after_stale_validation_steps
+        )
+        ok_failure_path = bool(recent_fails) and (dead >= 1 or contrast)
+        if not ok_failure_path and not stale_validation:
             return
         if not self._branch_overlay.reseed_active:
+            if stale_validation and not ok_failure_path:
+                msg = (
+                    "Reseed / collapse-recovery window activated "
+                    f"(stale validation: {self._validation_stale_without_validated} steps "
+                    f"with provisional leader but no validated leader)."
+                )
+            else:
+                msg = "Reseed / collapse-recovery window activated."
             self._trace_runtime(
                 tool_context,
                 step=step,
                 phase="branch_lifecycle",
                 status="reseed",
-                message="Reseed / collapse-recovery window activated.",
+                message=msg,
             )
         self._branch_overlay.reseed_active = True
         if self._branch_overlay.reseed_started_step is None:
@@ -498,6 +511,15 @@ class ResearchController:
             if self._branch_overlay.collapse_recovery_remaining <= 0:
                 self._branch_overlay.reseed_active = False
         self._sync_branch_budget_mode(step, step_limit, policy)
+        if (
+            not self._branch_overlay.validated_leader_family_id
+            and self._branch_overlay.provisional_leader_family_id
+            and self._branch_overlay.budget_mode == bl.BUDGET_VALIDATION
+            and not self._branch_overlay.reseed_active
+        ):
+            self._validation_stale_without_validated += 1
+        else:
+            self._validation_stale_without_validated = 0
 
     def _sync_branch_budget_mode(
         self, step: int, step_limit: int, policy: RunPolicy
@@ -599,12 +621,22 @@ class ResearchController:
         if support_shape == "too_sparse" and branch.lifecycle_state != bl.LIFECYCLE_COLLAPSED:
             branch.lifecycle_state = bl.LIFECYCLE_RETENTION_WARNING
 
-        if retention_risk == "high" and next_move_hint in {
-            "contrast_family",
-            "prune_family",
-        }:
+        strong_branch = (
+            branch.best_score is not None
+            and branch.best_score >= cfg.retention_strong_candidate_threshold
+        )
+        if (
+            not branch.exploit_dead
+            and retention_risk == "high"
+            and next_move_hint in {"contrast_family", "prune_family"}
+            and not strong_branch
+        ):
             branch.structural_contrast_required = True
-        if next_move_hint == "stop_threshold_tuning":
+        if (
+            not branch.exploit_dead
+            and next_move_hint == "stop_threshold_tuning"
+            and not strong_branch
+        ):
             branch.structural_contrast_required = True
 
         coverage_ok = True
@@ -694,6 +726,7 @@ class ResearchController:
             ):
                 branch.promotion_level = bl.PROMOTION_VALIDATED
                 branch.lifecycle_state = bl.LIFECYCLE_VALIDATED_LEADER
+                branch.structural_contrast_required = False
             else:
                 branch.promotion_level = bl.PROMOTION_PROVISIONAL
                 if branch.lifecycle_state not in {
@@ -787,6 +820,8 @@ class ResearchController:
                 for k, v in list(self._family_branches.items())[:40]
             },
             "tool_usage_counts": dict(sorted(self._tool_usage_counts.items())),
+            "validation_stale_without_validated": self._validation_stale_without_validated,
+            "reseed_stale_validation_threshold": self.config.research.reseed_after_stale_validation_steps,
         }
 
     def _branch_lifecycle_run_packet_text(
@@ -801,6 +836,13 @@ class ResearchController:
             f"- validated_leader_family: {(ov.validated_leader_family_id or 'none')[:28]}{'...' if ov.validated_leader_family_id and len(ov.validated_leader_family_id) > 28 else ''}",
             f"- explored_distinct_families: {ov.explored_family_count}",
         ]
+        thr = self.config.research.reseed_after_stale_validation_steps
+        if thr > 0 and self._validation_stale_without_validated > 0:
+            lines.append(
+                f"- validation_stale_without_validated: "
+                f"{self._validation_stale_without_validated}/{thr} controller steps "
+                f"(reopens exploration / collapse_recovery when threshold hit without a validated leader)"
+            )
         dead = [fid for fid, st in self._family_branches.items() if st.exploit_dead]
         if dead:
             lines.append(
@@ -907,10 +949,29 @@ class ResearchController:
             return "selective"
         return "broad"
 
+    def _evaluate_candidate_is_retention_style(self, action: dict[str, Any]) -> bool:
+        mode = str(action.get("evaluation_mode") or "screen").strip().lower()
+        if mode in {
+            "validate",
+            "validation",
+            "portability",
+            "portability_check",
+            "pressure_test",
+            "pressure",
+        }:
+            return True
+        rh = action.get("requested_horizon_months")
+        if rh is None:
+            return False
+        try:
+            return int(rh) >= int(self.config.research.validated_leader_min_horizon_months)
+        except (TypeError, ValueError):
+            return False
+
     def _is_same_family_exploit_action(self, action: dict[str, Any]) -> bool:
         tool = str(action.get("tool", "")).strip()
         if tool == "evaluate_candidate":
-            return True
+            return not self._evaluate_candidate_is_retention_style(action)
         if tool == "run_parameter_sweep":
             return True
         if tool == "mutate_profile":
@@ -922,6 +983,20 @@ class ResearchController:
             command = str(action.get("command", "")).lower()
             args = command.split()
         args_lower = [str(a).lower() for a in args]
+        if (
+            args_lower
+            and args_lower[0] in {"sensitivity", "sensitivity-basket"}
+            and "--lookback-months" in args_lower
+        ):
+            idx = args_lower.index("--lookback-months") + 1
+            if idx < len(args_lower):
+                try:
+                    if int(args_lower[idx]) >= int(
+                        self.config.research.validated_leader_min_horizon_months
+                    ):
+                        return False
+                except (TypeError, ValueError):
+                    pass
         args_str = " ".join(args_lower)
         exploit_patterns = [
             "notificationthreshold",
@@ -5281,6 +5356,8 @@ class ResearchController:
             self._current_step_limit = step_limit
             self._current_run_policy = policy
             self._branch_step_maintenance(step, step_limit, policy)
+            self._maybe_activate_reseed(tool_context, step, step_limit)
+            self._sync_branch_budget_mode(step, step_limit, policy)
             self._trace_runtime(
                 tool_context,
                 step=step,
@@ -5670,6 +5747,7 @@ class ResearchController:
                     step_payload["results"].append(advisor_result)
 
             self._append_step_log(tool_context, step_payload)
+            self._persist_branch_runtime_state(tool_context, step)
             self._trace_runtime(
                 tool_context,
                 step=step,
@@ -5754,6 +5832,7 @@ class ResearchController:
             message="Research run hit the step limit.",
             level="warning",
         )
+        self._persist_branch_runtime_state(tool_context, step_limit)
         return {
             "status": "step_limit_reached",
             "run_id": tool_context.run_id,
