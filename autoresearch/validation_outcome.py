@@ -21,7 +21,15 @@ EVIDENCE_FAILED_HARDENED_UNRESOLVED = "failed_after_unresolved_budget"
 EVIDENCE_UNRESOLVED_MISSING_DATA = "unresolved_missing_or_incomplete_data"
 EVIDENCE_UNRESOLVED_RETRYABLE = "unresolved_retry_allowed"
 EVIDENCE_UNRESOLVED_PENDING = "unresolved_pending_retention"
+EVIDENCE_UNRESOLVED_TIMEFRAME_MISMATCH = "unresolved_timeframe_intent_mismatch"
 EVIDENCE_PASSED = "passed_clear_validation"
+
+# Controller-facing promotability (not synonymous with validation tri-state)
+PROMOTABILITY_BLOCKED = "blocked"
+PROMOTABILITY_VALIDATED_READY = "validated_ready"
+PROMOTABILITY_PROVISIONAL_BEST_AVAILABLE = "provisional_best_available"
+PROMOTABILITY_RETRY_RECOMMENDED = "retry_recommended"
+PROMOTABILITY_UNKNOWN = "unknown"
 
 
 @dataclass
@@ -42,6 +50,10 @@ class ValidationOutcome:
     should_collapse: bool = False
     should_retry_resolution: bool = False
     evidence_tier: str | None = None
+    promotability_status: str = PROMOTABILITY_UNKNOWN
+    validation_confidence: str = "low"
+    effective_window_source: str | None = None
+    timeframe_mismatch: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -88,9 +100,36 @@ def build_validation_outcome(
     branch_retention_passed: bool | None,
     is_retention_horizon_check: bool,
     hardened_unresolved: bool,
+    weak_provisional_evidence: bool = False,
+    effective_window_source: str | None = None,
+    timeframe_mismatch: bool = False,
 ) -> ValidationOutcome:
     """Assemble one canonical evidence object after an eval + lifecycle refresh."""
     rr = retention_result or {}
+    if timeframe_mismatch:
+        d_raw, r_raw = rr.get("delta"), rr.get("ratio")
+        return ValidationOutcome(
+            family_id=family_id,
+            attempt_id=attempt_id,
+            requested_horizon_months=requested_horizon_months,
+            effective_window_months=effective_window_months,
+            requested_timeframe=requested_timeframe,
+            effective_timeframe=effective_timeframe,
+            outcome=VALIDATION_UNRESOLVED,
+            reason="requested_effective_timeframe_mismatch",
+            delta_vs_baseline=float(d_raw) if d_raw is not None else None,
+            ratio_vs_baseline=float(r_raw) if r_raw is not None else None,
+            coverage_status=coverage_status,
+            is_retention_check=is_retention_horizon_check,
+            should_promote=False,
+            should_collapse=False,
+            should_retry_resolution=True,
+            evidence_tier=EVIDENCE_UNRESOLVED_TIMEFRAME_MISMATCH,
+            promotability_status=PROMOTABILITY_BLOCKED,
+            validation_confidence="low",
+            effective_window_source=effective_window_source,
+            timeframe_mismatch=True,
+        )
     failed = bool(rr.get("retention_failed"))
     outcome = VALIDATION_UNRESOLVED
     reason: str | None = None
@@ -121,6 +160,27 @@ def build_validation_outcome(
     should_collapse = failed
     should_retry_resolution = outcome == VALIDATION_UNRESOLVED and not hardened_unresolved
     should_promote = outcome == VALIDATION_PASSED and is_retention_horizon_check and coverage_ok
+
+    promotability_status = PROMOTABILITY_UNKNOWN
+    validation_confidence = "low"
+    if failed or should_collapse:
+        promotability_status = PROMOTABILITY_BLOCKED
+        validation_confidence = "low"
+    elif should_promote:
+        promotability_status = PROMOTABILITY_VALIDATED_READY
+        validation_confidence = "high"
+    elif weak_provisional_evidence:
+        promotability_status = PROMOTABILITY_PROVISIONAL_BEST_AVAILABLE
+        validation_confidence = "low" if outcome == VALIDATION_UNRESOLVED else "medium"
+    elif outcome == VALIDATION_FAILED:
+        promotability_status = PROMOTABILITY_BLOCKED
+        validation_confidence = "low"
+    elif outcome == VALIDATION_UNRESOLVED:
+        promotability_status = PROMOTABILITY_RETRY_RECOMMENDED
+        validation_confidence = "medium"
+    elif outcome == VALIDATION_PASSED:
+        promotability_status = PROMOTABILITY_PROVISIONAL_BEST_AVAILABLE
+        validation_confidence = "medium"
 
     evidence_tier: str | None = None
     if outcome == VALIDATION_PASSED:
@@ -154,4 +214,8 @@ def build_validation_outcome(
         should_collapse=should_collapse,
         should_retry_resolution=should_retry_resolution,
         evidence_tier=evidence_tier,
+        promotability_status=promotability_status,
+        validation_confidence=validation_confidence,
+        effective_window_source=effective_window_source,
+        timeframe_mismatch=False,
     )

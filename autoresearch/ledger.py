@@ -40,6 +40,7 @@ class AttemptRecord:
     resolved_trades: int | None = None
     trades_per_month: float | None = None
     positive_cell_ratio: float | None = None
+    effective_window_source: str | None = None
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -155,6 +156,7 @@ def make_attempt_record(
     resolved_trades: int | None = None,
     trades_per_month: float | None = None,
     positive_cell_ratio: float | None = None,
+    effective_window_source: str | None = None,
 ) -> AttemptRecord:
     existing = load_attempts(attempts_path)
     sequence = len(existing) + 1
@@ -185,4 +187,5 @@ def make_attempt_record(
         resolved_trades=resolved_trades,
         trades_per_month=trades_per_month,
         positive_cell_ratio=positive_cell_ratio,
+        effective_window_source=effective_window_source,
     )

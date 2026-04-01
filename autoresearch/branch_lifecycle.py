@@ -50,6 +50,8 @@ class FamilyBranchState:
     retention_check_done: bool = False
     retention_check_passed: bool | None = None
     retention_baseline_score: float | None = None
+    # First-seen score per family for debugging; does not gate retention_pass alone.
+    retention_observational_baseline_score: float | None = None
     retention_last_delta: float | None = None
     retention_last_ratio: float | None = None
     retention_support_quality: str = "normal"
@@ -77,6 +79,10 @@ class FamilyBranchState:
     provisional_peak_horizon_months: int | None = None
 
     last_validation_evidence: dict[str, Any] | None = None
+    # Coarse controller hints: validated_ready | provisional_best_available | retry_recommended | blocked | unknown
+    promotability_status: str = "unknown"
+    # high | medium | low — how much confidence to place in coverage/retention evidence
+    validation_confidence: str = "low"
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -109,6 +115,8 @@ class BranchRunOverlay:
     validated_leader_family_id: str | None = None
     shadow_leader_family_id: str | None = None
     shadow_leader_reason: str | None = None
+    """Promotability tag copied from the current provisional leader family, if any."""
+    provisional_leader_promotability: str | None = None
     """Latest scored attempt's canonical validation evidence (for step packet / tooling)."""
     last_scored_validation_digest: dict[str, Any] | None = None
     budget_mode: str = BUDGET_SCOUTING

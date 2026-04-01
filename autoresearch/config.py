@@ -70,6 +70,15 @@ class ResearchConfig:
     coverage_min_wrap_up_months: int = 34
     validation_max_concurrency: int = 4
     retention_strong_candidate_threshold: float = 55.0
+    # Minimum best_score for validated-leader overlay; use 0 to disable the floor.
+    validated_leader_min_score: float = 45.0
+    # Provisional/shadow leader selection uses this score floor (not the strong-candidate bar).
+    provisional_leader_min_score: float = 0.0
+    # Retention baseline (for long-horizon vs baseline checks) is only established once score reaches this.
+    # When None, uses retention_strong_candidate_threshold.
+    retention_baseline_establish_min_score: float | None = None
+    # Deprecated for retention_check_passed: pass now requires strong-candidate score; kept for config compat.
+    retention_pass_min_score: float = 0.0
     retention_max_same_family_mutations_before_check: int = 2
     retention_fail_delta: float = -12.0
     retention_fail_ratio: float = 0.82
@@ -681,6 +690,29 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             research_cfg.get(
                 "retention_strong_candidate_threshold",
                 ResearchConfig.retention_strong_candidate_threshold,
+            )
+        ),
+        validated_leader_min_score=(
+            float(research_cfg["validated_leader_min_score"])
+            if research_cfg.get("validated_leader_min_score") is not None
+            else ResearchConfig.validated_leader_min_score
+        ),
+        retention_baseline_establish_min_score=(
+            float(research_cfg["retention_baseline_establish_min_score"])
+            if research_cfg.get("retention_baseline_establish_min_score")
+            is not None
+            else ResearchConfig.retention_baseline_establish_min_score
+        ),
+        provisional_leader_min_score=float(
+            research_cfg.get(
+                "provisional_leader_min_score",
+                ResearchConfig.provisional_leader_min_score,
+            )
+        ),
+        retention_pass_min_score=float(
+            research_cfg.get(
+                "retention_pass_min_score",
+                ResearchConfig.retention_pass_min_score,
             )
         ),
         retention_max_same_family_mutations_before_check=int(

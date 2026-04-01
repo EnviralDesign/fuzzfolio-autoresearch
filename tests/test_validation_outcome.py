@@ -67,6 +67,54 @@ def test_failed_hardened_tier() -> None:
     assert out.evidence_tier == vo.EVIDENCE_FAILED_HARDENED_UNRESOLVED
 
 
+def test_timeframe_mismatch_explicit_evidence() -> None:
+    out = vo.build_validation_outcome(
+        family_id="fam",
+        attempt_id="a1",
+        requested_horizon_months=24,
+        effective_window_months=20.0,
+        requested_timeframe="H4",
+        effective_timeframe="H1",
+        coverage_status=vo.COVERAGE_OK,
+        coverage_ok=True,
+        retention_result={"retention_failed": False},
+        branch_retention_status="passed",
+        branch_retention_passed=True,
+        is_retention_horizon_check=True,
+        hardened_unresolved=False,
+        timeframe_mismatch=True,
+    )
+    assert out.outcome == vo.VALIDATION_UNRESOLVED
+    assert out.reason == "requested_effective_timeframe_mismatch"
+    assert out.timeframe_mismatch is True
+    assert out.should_promote is False
+    assert out.evidence_tier == vo.EVIDENCE_UNRESOLVED_TIMEFRAME_MISMATCH
+    assert out.promotability_status == vo.PROMOTABILITY_BLOCKED
+
+
+def test_weak_provisional_sets_promotability() -> None:
+    out = vo.build_validation_outcome(
+        family_id="fam",
+        attempt_id="a1",
+        requested_horizon_months=12,
+        effective_window_months=None,
+        requested_timeframe="H1",
+        effective_timeframe="H1",
+        coverage_status=vo.COVERAGE_UNRESOLVED,
+        coverage_ok=False,
+        retention_result={"retention_failed": False},
+        branch_retention_status="pending",
+        branch_retention_passed=False,
+        is_retention_horizon_check=True,
+        hardened_unresolved=False,
+        weak_provisional_evidence=True,
+        effective_window_source=None,
+    )
+    assert out.outcome == vo.VALIDATION_UNRESOLVED
+    assert out.promotability_status == vo.PROMOTABILITY_PROVISIONAL_BEST_AVAILABLE
+    assert out.validation_confidence == "low"
+
+
 def test_classify_coverage() -> None:
     s, ok = vo.classify_coverage(
         requested_horizon_months=12,
