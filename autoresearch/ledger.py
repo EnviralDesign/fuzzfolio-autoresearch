@@ -30,6 +30,16 @@ class AttemptRecord:
     best_summary: dict[str, Any]
     sensitivity_snapshot_path: str | None
     note: str | None = None
+    requested_horizon_months: int | None = None
+    effective_window_months: float | None = None
+    requested_timeframe: str | None = None
+    effective_timeframe: str | None = None
+    validation_outcome: str | None = None
+    coverage_status: str | None = None
+    job_status: str | None = None
+    resolved_trades: int | None = None
+    trades_per_month: float | None = None
+    positive_cell_ratio: float | None = None
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -135,6 +145,16 @@ def make_attempt_record(
     profile_path: Path | None = None,
     sensitivity_snapshot_path: Path | None = None,
     note: str | None = None,
+    requested_horizon_months: int | None = None,
+    effective_window_months: float | None = None,
+    requested_timeframe: str | None = None,
+    effective_timeframe: str | None = None,
+    validation_outcome: str | None = None,
+    coverage_status: str | None = None,
+    job_status: str | None = None,
+    resolved_trades: int | None = None,
+    trades_per_month: float | None = None,
+    positive_cell_ratio: float | None = None,
 ) -> AttemptRecord:
     existing = load_attempts(attempts_path)
     sequence = len(existing) + 1
@@ -155,4 +175,14 @@ def make_attempt_record(
         best_summary=score.best_summary,
         sensitivity_snapshot_path=str(sensitivity_snapshot_path.resolve()) if sensitivity_snapshot_path else None,
         note=note,
+        requested_horizon_months=requested_horizon_months,
+        effective_window_months=effective_window_months,
+        requested_timeframe=requested_timeframe,
+        effective_timeframe=effective_timeframe,
+        validation_outcome=validation_outcome,
+        coverage_status=coverage_status,
+        job_status=job_status,
+        resolved_trades=resolved_trades,
+        trades_per_month=trades_per_month,
+        positive_cell_ratio=positive_cell_ratio,
     )

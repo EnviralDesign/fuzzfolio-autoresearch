@@ -87,6 +87,8 @@ class ResearchConfig:
     reseed_min_remaining_steps: int = 6
     reseed_max_recent_failures_window: int = 6
     reseed_after_stale_validation_steps: int = 10
+    reseed_min_scored_attempts: int = 4
+    unresolved_coverage_harden_after: int = 3
     collapse_recovery_max_steps: int = 5
     max_bankrupt_families_before_force_breadth: int = 2
     provisional_leader_decay_ratio: float = 0.62
@@ -794,6 +796,24 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                 research_cfg.get(
                     "reseed_after_stale_validation_steps",
                     ResearchConfig.reseed_after_stale_validation_steps,
+                )
+            ),
+        ),
+        reseed_min_scored_attempts=max(
+            0,
+            int(
+                research_cfg.get(
+                    "reseed_min_scored_attempts",
+                    ResearchConfig.reseed_min_scored_attempts,
+                )
+            ),
+        ),
+        unresolved_coverage_harden_after=max(
+            1,
+            int(
+                research_cfg.get(
+                    "unresolved_coverage_harden_after",
+                    ResearchConfig.unresolved_coverage_harden_after,
                 )
             ),
         ),

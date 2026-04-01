@@ -1669,8 +1669,47 @@ def _render_run_footer(result: dict[str, object]) -> None:
     )
 
 
+def _render_context_compaction_plain(event: dict[str, object]) -> None:
+    step = event.get("step")
+    before = event.get("approx_tokens_before")
+    after = event.get("approx_tokens_after")
+    if step is not None:
+        label = f"compaction step {step}: ~{before} tok before, ~{after} tok after"
+    else:
+        label = f"compaction: ~{before} tok before, ~{after} tok after"
+    _write_plain_line(_plain_separator(label))
+
+
+def _render_context_compaction_rich(event: dict[str, object]) -> None:
+    step = event.get("step")
+    before = event.get("approx_tokens_before")
+    after = event.get("approx_tokens_after")
+    trig = event.get("compact_trigger_tokens")
+    lines = [f"Approx prompt tokens: ~{before} → ~{after}"]
+    if trig is not None:
+        lines.append(f"Compaction trigger: {trig}")
+    console.print(
+        Panel(
+            Text("\n".join(lines), style="white"),
+            title=f"[bold magenta]Context compaction[/bold magenta] (step {step})",
+            border_style="magenta",
+            box=box.ROUNDED,
+        )
+    )
+
+
+def _render_context_compaction(event: dict[str, object]) -> None:
+    _safe_render(
+        lambda: _render_context_compaction_rich(event),
+        lambda: _render_context_compaction_plain(event),
+    )
+
+
 def _emit_run_progress(event: dict[str, object]) -> None:
     kind = event.get("event")
+    if kind == "context_compaction":
+        _render_context_compaction(event)
+        return
     if kind == "run_started":
         run_dir = event.get("run_dir")
         if isinstance(run_dir, str):

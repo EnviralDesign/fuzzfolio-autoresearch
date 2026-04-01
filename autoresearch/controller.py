@@ -13,8 +13,11 @@ from typing import Any, Callable
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from . import artifact_resolution as ar
 from . import branch_lifecycle as bl
+from . import profile_identity as pi
 from . import typed_tools as tt
+from . import validation_outcome as vo
 from .config import AppConfig
 from .fuzzfolio import CliError, CommandResult, FuzzfolioCli
 from .ledger import (
@@ -29,7 +32,15 @@ from .ledger import (
 )
 from .plotting import compute_frontier, render_progress_artifacts
 from .provider import ChatMessage, ProviderError, create_provider, provider_trace_scope
-from .scoring import build_attempt_score, load_sensitivity_snapshot
+from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapshot
+
+_HARD_COLLAPSE_REASONS = frozenset(
+    {
+        "retention_threshold_failed",
+        "repeated_long_horizon_scores_far_below_provisional_peak",
+        "repeated_timeframe_intent_mismatch",
+    }
+)
 
 
 SYSTEM_PROTOCOL = """You are operating an autonomous Fuzzfolio research loop.
@@ -276,10 +287,9 @@ class ResearchController:
         )
         self._cli_help_catalog_cache: dict[str, Any] | None = None
         self._family_mutation_counts: dict[str, int] = {}
-        self._family_last_score: dict[str, float] = {}
-        self._family_baseline_score: dict[str, float] = {}
-        self._family_last_horizon_months: dict[str, int] = {}
-        self._family_retention_state: dict[str, dict[str, Any]] = {}
+        self._profile_path_validate_cache: dict[str, tuple[str, float]] = {}
+        self._profile_fingerprint_validate_ok: dict[str, bool] = {}
+        self._profile_fingerprint_to_ref: dict[str, str] = {}
         self._consecutive_same_family_exploit: int = 0
         self._last_family_id: str | None = None
         self._timeframe_mismatches: list[dict[str, Any]] = []
@@ -294,10 +304,9 @@ class ResearchController:
 
     def _reset_run_state(self) -> None:
         self._family_mutation_counts = {}
-        self._family_last_score = {}
-        self._family_baseline_score = {}
-        self._family_last_horizon_months = {}
-        self._family_retention_state = {}
+        self._profile_path_validate_cache = {}
+        self._profile_fingerprint_validate_ok = {}
+        self._profile_fingerprint_to_ref = {}
         self._consecutive_same_family_exploit = 0
         self._last_family_id = None
         self._timeframe_mismatches = []
@@ -325,6 +334,29 @@ class ResearchController:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _positive_int_or_none(val: Any) -> int | None:
+        if isinstance(val, bool):
+            return None
+        if isinstance(val, int) and val > 0:
+            return val
+        if isinstance(val, float) and val > 0:
+            return int(val)
+        if isinstance(val, str) and val.strip():
+            try:
+                n = int(float(val.strip()))
+                return n if n > 0 else None
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _requested_horizon_from_source_action(
+        self, source_action: dict[str, Any]
+    ) -> int | None:
+        if str(source_action.get("tool") or "").strip() != "evaluate_candidate":
+            return None
+        return self._positive_int_or_none(source_action.get("requested_horizon_months"))
+
     def _requested_horizon_from_artifact_dir(self, artifact_dir: Path) -> int | None:
         """Resolve requested lookback months from CLI echoes in sensitivity-response.json."""
         snap = load_sensitivity_snapshot(artifact_dir.resolve())
@@ -334,8 +366,12 @@ class ResearchController:
         for path in (
             ("data", "request", "lookback_months"),
             ("data", "request", "lookbackMonths"),
+            ("data", "request", "lookback"),
             ("request", "lookback_months"),
+            ("meta", "lookback_months"),
+            ("meta", "lookbackMonths"),
             ("lookback_months"),
+            ("lookbackMonths",),
         ):
             cur: Any = snap
             for key in path[:-1]:
@@ -362,6 +398,131 @@ class ResearchController:
                 except (TypeError, ValueError):
                     continue
         return None
+
+    def _timeframes_from_sensitivity_snapshot(
+        self, snap: dict[str, Any] | None
+    ) -> tuple[str | None, str | None]:
+        """Extract requested and effective timeframe strings without dropping either."""
+        if not isinstance(snap, dict):
+            return None, None
+        req_tf: str | None = None
+        eff_tf: str | None = None
+        data = snap.get("data") if isinstance(snap.get("data"), dict) else None
+        if isinstance(data, dict):
+            req = data.get("request")
+            if isinstance(req, dict):
+                for key in ("timeframe", "time_frame", "primary_timeframe"):
+                    v = req.get(key)
+                    if isinstance(v, str) and v.strip():
+                        req_tf = v.strip()
+                        break
+            for key in ("effective_timeframe", "effectiveTimeframe"):
+                v = data.get(key)
+                if isinstance(v, str) and v.strip():
+                    eff_tf = v.strip()
+                    break
+            mw = data.get("market_data_window")
+            if isinstance(mw, dict):
+                if req_tf is None:
+                    mreq = mw.get("requested_timeframe")
+                    if isinstance(mreq, str) and mreq.strip():
+                        req_tf = mreq.strip()
+                if eff_tf is None:
+                    meff = mw.get("effective_timeframe")
+                    if isinstance(meff, str) and meff.strip():
+                        eff_tf = meff.strip()
+        if req_tf is None:
+            for key in ("requested_timeframe", "requestedTimeframe"):
+                v = snap.get(key)
+                if isinstance(v, str) and v.strip():
+                    req_tf = v.strip()
+                    break
+        if eff_tf is None:
+            for key in ("effective_timeframe", "effectiveTimeframe"):
+                v = snap.get(key)
+                if isinstance(v, str) and v.strip():
+                    eff_tf = v.strip()
+                    break
+        return req_tf, eff_tf
+
+    def _normalized_attempt_record_evidence(
+        self,
+        artifact_dir: Path,
+        sensitivity_snapshot: dict[str, Any] | None,
+        score: AttemptScore,
+    ) -> dict[str, Any]:
+        req_h = self._requested_horizon_from_artifact_dir(artifact_dir)
+        req_tf, snap_eff_tf = self._timeframes_from_sensitivity_snapshot(
+            sensitivity_snapshot
+        )
+        eff_w: float | None = None
+        resolved_trades: int | None = None
+        trades_per_month: float | None = None
+        positive_cell_ratio: float | None = None
+        eff_tf: str | None = snap_eff_tf
+        best = score.best_summary if isinstance(score.best_summary, dict) else {}
+        bc = best.get("best_cell") if isinstance(best.get("best_cell"), dict) else {}
+        if bc:
+            rt = bc.get("resolved_trades")
+            if isinstance(rt, int):
+                resolved_trades = rt
+            elif isinstance(rt, float):
+                resolved_trades = int(rt)
+        mw = best.get("market_data_window")
+        if isinstance(mw, dict):
+            ew = mw.get("effective_window_months")
+            if isinstance(ew, (int, float)):
+                eff_w = float(ew)
+            elif ew is not None and str(ew).strip() not in {"", "none"}:
+                try:
+                    eff_w = float(str(ew).strip())
+                except (TypeError, ValueError):
+                    eff_w = None
+            mreq = mw.get("requested_timeframe")
+            meff = mw.get("effective_timeframe")
+            if isinstance(mreq, str) and mreq.strip():
+                req_tf = mreq.strip()
+            if isinstance(meff, str) and meff.strip():
+                eff_tf = meff.strip()
+        if isinstance(score.metrics, dict):
+            tpm = score.metrics.get("trades_per_month")
+            if isinstance(tpm, (int, float)):
+                trades_per_month = float(tpm)
+            pcr = score.metrics.get("positive_cell_ratio")
+            if isinstance(pcr, (int, float)):
+                positive_cell_ratio = float(pcr)
+        cov_status, _ = vo.classify_coverage(
+            requested_horizon_months=req_h,
+            effective_window_months=eff_w,
+            effective_coverage_min_ratio=self.config.research.effective_coverage_min_ratio,
+        )
+        val_out: str | None = None
+        if cov_status == vo.COVERAGE_UNRESOLVED:
+            val_out = vo.VALIDATION_UNRESOLVED
+        elif cov_status == vo.COVERAGE_INADEQUATE:
+            val_out = vo.VALIDATION_FAILED
+        job_status: str | None = None
+        if (artifact_dir / "deep-replay-job.json").exists():
+            job_status = "deep_replay_job_present"
+        return {
+            "requested_horizon_months": req_h,
+            "effective_window_months": eff_w,
+            "requested_timeframe": req_tf,
+            "effective_timeframe": eff_tf,
+            "validation_outcome": val_out,
+            "coverage_status": cov_status,
+            "job_status": job_status,
+            "resolved_trades": resolved_trades,
+            "trades_per_month": trades_per_month,
+            "positive_cell_ratio": positive_cell_ratio,
+        }
+
+    def _scored_attempt_count(self, tool_context: ToolContext) -> int:
+        return sum(
+            1
+            for row in self._run_attempts(tool_context.run_id)
+            if row.get("composite_score") is not None
+        )
 
     def _finalize_attempt_branch_state(
         self,
@@ -414,9 +575,26 @@ class ResearchController:
         self._update_family_exploit_state(family_id, is_exploit, support_quality)
 
         artifact_path = Path(artifact_dir_str).resolve()
-        requested_horizon: int | None = None
-        if cli_args is not None:
+        attempt_id_log = (
+            str(auto_log.get("attempt_id")).strip()
+            if auto_log.get("attempt_id")
+            else None
+        )
+        ledger_row = (
+            self._attempt_row_for_id(tool_context, attempt_id_log)
+            if attempt_id_log
+            else None
+        )
+
+        requested_horizon: int | None = self._requested_horizon_from_source_action(
+            source_action
+        )
+        if requested_horizon is None and cli_args is not None:
             requested_horizon = self._parse_lookback_months_from_cli_args(cli_args)
+        if requested_horizon is None and isinstance(ledger_row, dict):
+            requested_horizon = self._positive_int_or_none(
+                ledger_row.get("requested_horizon_months")
+            )
         if requested_horizon is None:
             requested_horizon = self._requested_horizon_from_artifact_dir(artifact_path)
 
@@ -429,6 +607,15 @@ class ResearchController:
                 eff_float = float(str(eff_raw).strip())
             except (TypeError, ValueError):
                 eff_float = None
+        if eff_float is None and isinstance(ledger_row, dict):
+            lew = ledger_row.get("effective_window_months")
+            if isinstance(lew, (int, float)):
+                eff_float = float(lew)
+            elif lew is not None and str(lew).strip() not in {"", "none"}:
+                try:
+                    eff_float = float(str(lew).strip())
+                except (TypeError, ValueError):
+                    eff_float = None
 
         retention_result = self._check_retention_gating(
             tool_context,
@@ -436,14 +623,43 @@ class ResearchController:
             float(score),
             requested_horizon,
         )
-        attempts_list = self._run_attempts(tool_context.run_id)
-        attempt_dict = attempts_list[-1] if attempts_list else None
+        attempt_dict = ledger_row
+        if attempt_dict is None:
+            attempts_list = self._run_attempts(tool_context.run_id)
+            attempt_dict = attempts_list[-1] if attempts_list else None
         digest = (
             self._generate_behavior_digest(attempt_dict)
             if isinstance(attempt_dict, dict)
             else {}
         )
         had_mismatch = timeframe_mismatch is not None
+        req_tf_a = None
+        eff_tf_a = None
+        if isinstance(ledger_row, dict):
+            rt = ledger_row.get("requested_timeframe")
+            et = ledger_row.get("effective_timeframe")
+            if isinstance(rt, str) and rt.strip():
+                req_tf_a = rt.strip()
+            if isinstance(et, str) and et.strip():
+                eff_tf_a = et.strip()
+        if req_tf_a is None or eff_tf_a is None:
+            snap_tf = load_sensitivity_snapshot(artifact_path)
+            s_req, s_eff = self._timeframes_from_sensitivity_snapshot(
+                snap_tf if isinstance(snap_tf, dict) else None
+            )
+            if req_tf_a is None:
+                req_tf_a = s_req
+            if eff_tf_a is None:
+                eff_tf_a = s_eff
+        if req_tf_a is None and isinstance(attempt_dict, dict):
+            rt = attempt_dict.get("requested_timeframe")
+            if isinstance(rt, str) and rt.strip():
+                req_tf_a = rt.strip()
+        if eff_tf_a is None and isinstance(attempt_dict, dict):
+            et = attempt_dict.get("effective_timeframe")
+            if isinstance(et, str) and et.strip():
+                eff_tf_a = et.strip()
+
         self._refresh_branch_lifecycle_after_eval(
             tool_context,
             step,
@@ -464,6 +680,8 @@ class ResearchController:
             retention_result=retention_result,
             behavior_digest=digest,
             had_timeframe_mismatch=had_mismatch,
+            requested_timeframe=req_tf_a,
+            effective_timeframe=eff_tf_a,
         )
         return retention_result if isinstance(retention_result, dict) else {}
 
@@ -523,11 +741,17 @@ class ResearchController:
         if tool == "evaluate_candidate":
             ref = action.get("profile_ref")
             path = action.get("profile_path")
+            args = []
             if isinstance(ref, str) and ref.strip():
-                return ["sensitivity-basket", "--profile-ref", ref.strip()]
-            if isinstance(path, str) and path.strip():
-                return ["sensitivity-basket", "--profile-ref", path.strip()]
-            return None
+                args = ["sensitivity-basket", "--profile-ref", ref.strip()]
+            elif isinstance(path, str) and path.strip():
+                args = ["sensitivity-basket", "--profile-ref", path.strip()]
+            else:
+                return None
+            rh = self._positive_int_or_none(action.get("requested_horizon_months"))
+            if rh is not None:
+                args.extend(["--lookback-months", str(rh)])
+            return args
         if tool == "run_parameter_sweep":
             ref = action.get("profile_ref")
             if isinstance(ref, str) and ref.strip():
@@ -571,9 +795,11 @@ class ResearchController:
         branch.lifecycle_state = bl.LIFECYCLE_COLLAPSED
         branch.retention_status = bl.RETENTION_FAILED
         branch.bankrupt = True
+        branch.hard_dead = reason in _HARD_COLLAPSE_REASONS
         branch.exploit_dead = True
         branch.collapse_reason = reason
         branch.structural_contrast_required = True
+        branch.needs_structural_contrast = True
         branch.cooldown_until_step = step + int(cfg.bankruptcy_cooldown_steps)
         self._branch_overlay.recent_retention_failures.append(step)
         keep = max(20, cfg.reseed_max_recent_failures_window * 4)
@@ -611,6 +837,10 @@ class ResearchController:
         ok_failure_path = bool(recent_fails) and (dead >= 1 or contrast)
         if not ok_failure_path and not stale_validation:
             return
+        scored = self._scored_attempt_count(tool_context)
+        min_scored = int(cfg.reseed_min_scored_attempts)
+        if min_scored > 0 and scored < min_scored:
+            return
         if not self._branch_overlay.reseed_active:
             if stale_validation and not ok_failure_path:
                 msg = (
@@ -641,10 +871,16 @@ class ResearchController:
         for branch in self._family_branches.values():
             if branch.bankrupt and branch.cooldown_until_step <= step:
                 branch.bankrupt = False
-                if branch.exploit_dead:
-                    branch.lifecycle_state = bl.LIFECYCLE_RESEED_ELIGIBLE
+                if branch.hard_dead:
+                    if branch.exploit_dead:
+                        branch.lifecycle_state = bl.LIFECYCLE_RESEED_ELIGIBLE
                 else:
-                    branch.lifecycle_state = bl.LIFECYCLE_SCOUT
+                    branch.exploit_dead = False
+                    if branch.lifecycle_state in {
+                        bl.LIFECYCLE_COLLAPSED,
+                        bl.LIFECYCLE_RESEED_ELIGIBLE,
+                    }:
+                        branch.lifecycle_state = bl.LIFECYCLE_SCOUT
         if (
             self._branch_overlay.reseed_active
             and self._branch_overlay.collapse_recovery_remaining > 0
@@ -701,6 +937,8 @@ class ResearchController:
         threshold = self.config.research.retention_strong_candidate_threshold
         best_prov: tuple[float, str | None] = (float("-inf"), None)
         best_val: tuple[float, str | None] = (float("-inf"), None)
+        best_shadow: tuple[float, str | None] = (float("-inf"), None)
+        shadow_reason: str | None = None
         for fid, st in self._family_branches.items():
             if st.exploit_dead or st.bankrupt or bl.cooldown_active(st, self._current_controller_step):
                 continue
@@ -718,6 +956,26 @@ class ResearchController:
                     best_prov = (sc, fid)
         self._branch_overlay.validated_leader_family_id = best_val[1]
         self._branch_overlay.provisional_leader_family_id = best_prov[1]
+        for fid, st in self._family_branches.items():
+            sc = st.best_score
+            if sc is None or sc < threshold:
+                continue
+            if fid == best_val[1] or fid == best_prov[1]:
+                continue
+            if st.last_validation_outcome == vo.VALIDATION_UNRESOLVED:
+                if sc > best_shadow[0]:
+                    best_shadow = (sc, fid)
+                    shadow_reason = "unresolved_validation"
+            elif st.exploit_dead and not st.hard_dead:
+                if sc > best_shadow[0]:
+                    best_shadow = (sc, fid)
+                    shadow_reason = "soft_exploit_dead"
+        if best_shadow[1]:
+            self._branch_overlay.shadow_leader_family_id = best_shadow[1]
+            self._branch_overlay.shadow_leader_reason = shadow_reason
+        else:
+            self._branch_overlay.shadow_leader_family_id = None
+            self._branch_overlay.shadow_leader_reason = None
 
     def _refresh_branch_lifecycle_after_eval(
         self,
@@ -735,15 +993,15 @@ class ResearchController:
         retention_result: dict[str, Any] | None,
         behavior_digest: dict[str, Any] | None,
         had_timeframe_mismatch: bool,
-) -> None:
+        requested_timeframe: str | None = None,
+        effective_timeframe: str | None = None,
+    ) -> None:
         if not family_id:
             return
         cfg = self.config.research
         branch = bl.ensure_family_branch(self._family_branches, family_id)
         digest = behavior_digest or {}
         support_shape = str(digest.get("support_shape") or "")
-        retention_risk = str(digest.get("retention_risk") or "low")
-        next_move_hint = str(digest.get("next_move_hint") or "")
 
         if branch.first_seen_attempt_id is None and attempt_id:
             branch.first_seen_attempt_id = attempt_id
@@ -757,54 +1015,49 @@ class ResearchController:
         if branch.best_score is None or score > branch.best_score:
             branch.best_score = score
             branch.best_attempt_id = attempt_id
-            branch.best_horizon_months = requested_horizon_months
-            branch.best_effective_window_months = effective_window_months
+            if requested_horizon_months is not None:
+                branch.best_horizon_months = requested_horizon_months
+            if effective_window_months is not None:
+                branch.best_effective_window_months = effective_window_months
+        elif branch.best_score is not None and abs(float(score) - float(branch.best_score)) < 1e-9:
+            if branch.best_horizon_months is None and requested_horizon_months is not None:
+                branch.best_horizon_months = requested_horizon_months
+            if (
+                branch.best_effective_window_months is None
+                and effective_window_months is not None
+            ):
+                branch.best_effective_window_months = effective_window_months
 
         if support_shape == "too_sparse" and branch.lifecycle_state != bl.LIFECYCLE_COLLAPSED:
             branch.lifecycle_state = bl.LIFECYCLE_RETENTION_WARNING
 
-        strong_branch = (
-            branch.best_score is not None
-            and branch.best_score >= cfg.retention_strong_candidate_threshold
+        coverage_status, coverage_ok = vo.classify_coverage(
+            requested_horizon_months=requested_horizon_months,
+            effective_window_months=effective_window_months,
+            effective_coverage_min_ratio=cfg.effective_coverage_min_ratio,
         )
-        if (
-            not branch.exploit_dead
-            and retention_risk == "high"
-            and next_move_hint in {"contrast_family", "prune_family"}
-            and not strong_branch
-        ):
-            branch.structural_contrast_required = True
-        if (
-            not branch.exploit_dead
-            and next_move_hint == "stop_threshold_tuning"
-            and not strong_branch
-        ):
-            branch.structural_contrast_required = True
-
-        coverage_ok = True
-        if requested_horizon_months is not None and effective_window_months is not None:
-            try:
-                req = float(requested_horizon_months)
-                eff = float(effective_window_months)
-                floor = req * float(cfg.effective_coverage_min_ratio)
-                coverage_ok = eff + 1e-6 >= floor
-            except (TypeError, ValueError):
-                coverage_ok = False
-        elif (
-            cfg.horizon_failure_counts_as_retention_fail
-            and requested_horizon_months is not None
-            and effective_window_months is None
-        ):
-            coverage_ok = False
-
-        if not coverage_ok and cfg.horizon_failure_counts_as_retention_fail:
-            w = (
-                cfg.retention_digest_high_risk_fail_weight
-                if retention_risk == "high"
-                else 1.0
-            )
-            branch.retention_fail_count += max(1, int(round(w)))
-            branch.coverage_inadequate_count += 1
+        branch.last_coverage_status = coverage_status
+        hardened_unresolved = False
+        if coverage_status == vo.COVERAGE_UNRESOLVED:
+            if (
+                requested_horizon_months is not None
+                and cfg.horizon_failure_counts_as_retention_fail
+            ):
+                branch.unresolved_coverage_count += 1
+                if branch.unresolved_coverage_count >= cfg.unresolved_coverage_harden_after:
+                    branch.retention_fail_count += 1
+                    branch.unresolved_coverage_count = 0
+                    branch.coverage_inadequate_count += 1
+                    hardened_unresolved = True
+            else:
+                branch.unresolved_coverage_count = 0
+        elif coverage_status == vo.COVERAGE_INADEQUATE:
+            branch.unresolved_coverage_count = 0
+            if cfg.horizon_failure_counts_as_retention_fail:
+                branch.retention_fail_count += 1
+                branch.coverage_inadequate_count += 1
+        else:
+            branch.unresolved_coverage_count = 0
 
         if had_timeframe_mismatch:
             branch.timeframe_mismatch_hits += 1
@@ -834,6 +1087,7 @@ class ResearchController:
             and branch.provisional_peak_score is not None
             and score
             < branch.provisional_peak_score * float(cfg.provisional_leader_decay_ratio)
+            and coverage_status != vo.COVERAGE_UNRESOLVED
         ):
             branch.long_rung_low_score_streak += 1
         else:
@@ -858,27 +1112,70 @@ class ResearchController:
                 step_limit,
             )
 
-        rs = self._family_retention_state.get(family_id, {})
-        if not branch.exploit_dead and rs.get("retention_check_passed"):
-            branch.retention_status = bl.RETENTION_PASSED
-            if (
-                requested_horizon_months is not None
-                and requested_horizon_months >= min_horizon
-                and coverage_ok
-            ):
-                branch.promotion_level = bl.PROMOTION_VALIDATED
-                branch.lifecycle_state = bl.LIFECYCLE_VALIDATED_LEADER
-                branch.structural_contrast_required = False
+        if not branch.exploit_dead and branch.retention_check_passed is True:
+            if coverage_status == vo.COVERAGE_UNRESOLVED and not hardened_unresolved:
+                branch.retention_status = bl.RETENTION_PENDING
+            elif coverage_status == vo.COVERAGE_INADEQUATE or hardened_unresolved:
+                branch.retention_status = bl.RETENTION_FAILED
             else:
-                branch.promotion_level = bl.PROMOTION_PROVISIONAL
-                if branch.lifecycle_state not in {
-                    bl.LIFECYCLE_COLLAPSED,
-                    bl.LIFECYCLE_VALIDATED_LEADER,
-                }:
-                    branch.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_LEADER
+                branch.retention_status = bl.RETENTION_PASSED
+                if (
+                    requested_horizon_months is not None
+                    and requested_horizon_months >= min_horizon
+                    and coverage_ok
+                ):
+                    branch.promotion_level = bl.PROMOTION_VALIDATED
+                    branch.lifecycle_state = bl.LIFECYCLE_VALIDATED_LEADER
+                    branch.structural_contrast_required = False
+                    branch.needs_structural_contrast = False
+                else:
+                    branch.promotion_level = bl.PROMOTION_PROVISIONAL
+                    if branch.lifecycle_state not in {
+                        bl.LIFECYCLE_COLLAPSED,
+                        bl.LIFECYCLE_VALIDATED_LEADER,
+                    }:
+                        branch.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_LEADER
 
         if rr.get("needs_retention_check") and not branch.exploit_dead:
             branch.retention_status = bl.RETENTION_PENDING
+
+        if not branch.exploit_dead:
+            if coverage_status == vo.COVERAGE_UNRESOLVED and not hardened_unresolved:
+                branch.last_validation_outcome = vo.VALIDATION_UNRESOLVED
+            elif coverage_status == vo.COVERAGE_INADEQUATE or hardened_unresolved:
+                branch.last_validation_outcome = vo.VALIDATION_FAILED
+            elif branch.retention_status == bl.RETENTION_PASSED and coverage_ok:
+                branch.last_validation_outcome = vo.VALIDATION_PASSED
+            elif branch.retention_status == bl.RETENTION_PENDING:
+                branch.last_validation_outcome = vo.VALIDATION_UNRESOLVED
+            elif branch.retention_status == bl.RETENTION_FAILED:
+                branch.last_validation_outcome = vo.VALIDATION_FAILED
+
+        branch.unresolved_validation_active = (
+            coverage_status == vo.COVERAGE_UNRESOLVED and not hardened_unresolved
+        )
+        branch.needs_structural_contrast = branch.structural_contrast_required
+
+        evidence = vo.build_validation_outcome(
+            family_id=family_id,
+            attempt_id=attempt_id,
+            requested_horizon_months=requested_horizon_months,
+            effective_window_months=effective_window_months,
+            requested_timeframe=requested_timeframe,
+            effective_timeframe=effective_timeframe,
+            coverage_status=coverage_status,
+            coverage_ok=coverage_ok,
+            retention_result=rr,
+            branch_retention_status=branch.retention_status,
+            branch_retention_passed=branch.retention_check_passed,
+            is_retention_horizon_check=(
+                requested_horizon_months is not None
+                and requested_horizon_months >= min_horizon
+            ),
+            hardened_unresolved=hardened_unresolved,
+        )
+        evd = evidence.to_dict()
+        branch.last_validation_evidence = evd
 
         if (
             not branch.exploit_dead
@@ -900,6 +1197,19 @@ class ResearchController:
         ):
             branch.promotion_level = bl.PROMOTION_PROVISIONAL
             branch.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_CONTENDER
+
+        self._branch_overlay.last_scored_validation_digest = {
+            "family_id": family_id,
+            "attempt_id": attempt_id,
+            "validation_evidence": evd,
+            "lifecycle_state": branch.lifecycle_state,
+            "promotion_level": branch.promotion_level,
+            "retention_status": branch.retention_status,
+            "coverage_status": branch.last_coverage_status,
+            "last_validation_outcome": branch.last_validation_outcome,
+            "exploit_dead": branch.exploit_dead,
+            "collapse_reason": branch.collapse_reason,
+        }
 
         self._sync_branch_budget_mode(step, step_limit, policy)
         self._persist_branch_runtime_state(tool_context, step)
@@ -923,11 +1233,18 @@ class ResearchController:
         self, tool_context: ToolContext, step: int
     ) -> dict[str, Any]:
         overlay = self._branch_overlay
-        collapsed = [
+        lifecycle_collapsed_ids = [
             fid
             for fid, st in self._family_branches.items()
-            if st.lifecycle_state == bl.LIFECYCLE_COLLAPSED or st.exploit_dead
+            if st.lifecycle_state == bl.LIFECYCLE_COLLAPSED
         ]
+        exploit_dead_ids = [
+            fid for fid, st in self._family_branches.items() if st.exploit_dead
+        ]
+        suppressed_ids = sorted(
+            set(lifecycle_collapsed_ids) | set(exploit_dead_ids),
+            key=lambda x: x,
+        )
         cooldown = [
             {
                 "family_id": fid[:24] + ("..." if len(fid) > 24 else ""),
@@ -949,13 +1266,30 @@ class ResearchController:
                 if overlay.validated_leader_family_id
                 else None
             ),
+            "shadow_leader_family_prefix": (
+                (overlay.shadow_leader_family_id or "")[:20] + "..."
+                if overlay.shadow_leader_family_id
+                else None
+            ),
+            "shadow_leader_reason": overlay.shadow_leader_reason,
             "budget_mode": overlay.budget_mode,
             "reseed_active": overlay.reseed_active,
             "reseed_started_step": overlay.reseed_started_step,
             "collapse_recovery_remaining": overlay.collapse_recovery_remaining,
             "explored_family_count": overlay.explored_family_count,
-            "collapsed_families_count": len(collapsed),
-            "collapsed_family_prefixes": [c[:16] + "..." for c in collapsed[:12]],
+            "collapsed_families_count": len(lifecycle_collapsed_ids),
+            "collapsed_family_prefixes": [
+                c[:16] + "..." for c in lifecycle_collapsed_ids[:12]
+            ],
+            "exploit_dead_families_count": len(exploit_dead_ids),
+            "exploit_dead_family_prefixes": [
+                c[:16] + "..." for c in exploit_dead_ids[:12]
+            ],
+            "policy_suppressed_families_count": len(suppressed_ids),
+            "policy_suppressed_family_prefixes": [
+                c[:16] + "..." for c in suppressed_ids[:12]
+            ],
+            "last_scored_validation_digest": overlay.last_scored_validation_digest,
             "families_on_cooldown": cooldown,
             "families": {
                 k[:24] + ("..." if len(k) > 24 else ""): v.to_dict()
@@ -976,6 +1310,8 @@ class ResearchController:
             f"- reseed_active: {ov.reseed_active} (collapse_recovery_steps_left={ov.collapse_recovery_remaining})",
             f"- provisional_leader_family: {(ov.provisional_leader_family_id or 'none')[:28]}{'...' if ov.provisional_leader_family_id and len(ov.provisional_leader_family_id) > 28 else ''}",
             f"- validated_leader_family: {(ov.validated_leader_family_id or 'none')[:28]}{'...' if ov.validated_leader_family_id and len(ov.validated_leader_family_id) > 28 else ''}",
+            f"- shadow_leader_family: {(ov.shadow_leader_family_id or 'none')[:28]}{'...' if ov.shadow_leader_family_id and len(ov.shadow_leader_family_id) > 28 else ''}"
+            + (f" ({ov.shadow_leader_reason})" if ov.shadow_leader_reason else ""),
             f"- explored_distinct_families: {ov.explored_family_count}",
         ]
         thr = self.config.research.reseed_after_stale_validation_steps
@@ -1003,6 +1339,19 @@ class ResearchController:
             lines.append(
                 "- Wrap-up budget: favor validating or pressure-testing validated survivors; "
                 "avoid broad new search unless config allows and no validated leader exists."
+            )
+        digest = ov.last_scored_validation_digest
+        if isinstance(digest, dict) and digest.get("validation_evidence"):
+            ev = digest.get("validation_evidence")
+            tier = ev.get("evidence_tier") if isinstance(ev, dict) else None
+            lines.append(
+                "- last_scored_validation: "
+                f"family={str(digest.get('family_id') or '')[:32]}"
+                f" attempt={digest.get('attempt_id')}"
+                f" lifecycle={digest.get('lifecycle_state')}"
+                f" retention={digest.get('retention_status')}"
+                f" outcome={ev.get('outcome') if isinstance(ev, dict) else '?'}"
+                + (f" tier={tier}" if tier else "")
             )
         return "\n".join(lines)
 
@@ -1164,15 +1513,15 @@ class ResearchController:
         horizon_months: int | None = None,
     ) -> dict[str, Any]:
         cfg = self.config.research
+        branch = bl.ensure_family_branch(self._family_branches, candidate_family_id)
         threshold = cfg.retention_strong_candidate_threshold
         max_mutations = cfg.retention_max_same_family_mutations_before_check
         current_mutations = self._family_mutation_counts.get(candidate_family_id, 0)
-        last_score = self._family_last_score.get(candidate_family_id)
-        baseline_score = self._family_baseline_score.get(candidate_family_id)
-        last_horizon = self._family_last_horizon_months.get(candidate_family_id)
-        retention_state = self._family_retention_state.get(candidate_family_id, {})
+        last_score = branch.retention_last_eval_score
+        baseline_score = branch.retention_baseline_score
+        last_horizon = branch.retention_last_horizon
         is_strong = current_score >= threshold
-        support_quality = retention_state.get("support_quality", "normal")
+        support_quality = branch.retention_support_quality or "normal"
         needs_retention_check = False
         gated_message = None
         min_h = int(cfg.validated_leader_min_horizon_months)
@@ -1189,9 +1538,8 @@ class ResearchController:
             else:
                 horizon_increased = hm > int(last_horizon)
         if is_strong and current_mutations >= max_mutations:
-            if not retention_state.get("retention_check_passed"):
-                retention_done = retention_state.get("retention_check_done")
-                if not retention_done:
+            if branch.retention_check_passed is not True:
+                if not branch.retention_check_done:
                     needs_retention_check = True
                     if support_quality == "sparse":
                         suggested_months = cfg.retention_check_months_sparse
@@ -1211,15 +1559,11 @@ class ResearchController:
             delta = current_score - baseline_score
             ratio = current_score / baseline_score if baseline_score != 0 else 0
             if delta <= cfg.retention_fail_delta or ratio < cfg.retention_fail_ratio:
-                self._family_retention_state[candidate_family_id] = {
-                    "retention_check_done": True,
-                    "retention_check_passed": False,
-                    "last_delta": delta,
-                    "last_ratio": ratio,
-                    "support_quality": support_quality,
-                    "baseline_score": baseline_score,
-                    "retention_horizon": horizon_months,
-                }
+                branch.retention_check_done = True
+                branch.retention_check_passed = False
+                branch.retention_last_delta = delta
+                branch.retention_last_ratio = ratio
+                branch.retention_last_horizon = horizon_months
                 return {
                     "family_id": candidate_family_id,
                     "retention_failed": True,
@@ -1238,17 +1582,14 @@ class ResearchController:
         if last_score is not None:
             delta = current_score - last_score
             if delta >= cfg.retention_pass_delta and current_score >= threshold:
-                self._family_retention_state[candidate_family_id] = {
-                    "retention_check_done": True,
-                    "retention_check_passed": True,
-                    "last_delta": delta,
-                    "support_quality": support_quality,
-                }
-        self._family_last_score[candidate_family_id] = current_score
+                branch.retention_check_done = True
+                branch.retention_check_passed = True
+                branch.retention_last_delta = delta
+        branch.retention_last_eval_score = current_score
         if horizon_months is not None:
-            self._family_last_horizon_months[candidate_family_id] = horizon_months
+            branch.retention_last_horizon = horizon_months
         if is_strong and baseline_score is None:
-            self._family_baseline_score[candidate_family_id] = current_score
+            branch.retention_baseline_score = current_score
         return {
             "family_id": candidate_family_id,
             "retention_failed": False,
@@ -1275,14 +1616,13 @@ class ResearchController:
         self._last_family_id = family_id
         if family_id not in self._family_mutation_counts:
             self._family_mutation_counts[family_id] = 0
-            support = "normal"
-            if self._family_retention_state.get(family_id):
-                support = self._family_retention_state[family_id].get(
-                    "support_quality", "normal"
-                )
-            elif support_quality:
-                support = support_quality
-            self._family_retention_state[family_id] = {"support_quality": support}
+            fb = bl.ensure_family_branch(self._family_branches, family_id)
+            sq = support_quality or fb.retention_support_quality or "normal"
+            fb.retention_support_quality = sq
+        elif support_quality:
+            bl.ensure_family_branch(
+                self._family_branches, family_id
+            ).retention_support_quality = support_quality
         if is_exploit:
             self._family_mutation_counts[family_id] = (
                 self._family_mutation_counts.get(family_id, 0) + 1
@@ -2590,14 +2930,18 @@ class ResearchController:
                 f"- exploit steps: {exploit_status.get('consecutive_exploit_steps', 0)}/{exploit_status.get('exploit_cap', 3)} (no cap triggered)"
             )
         family_states = []
-        for family_id, state in self._family_retention_state.items():
-            passed = state.get("retention_check_passed")
-            done = state.get("retention_check_done")
-            support = state.get("support_quality", "unknown")
+        for family_id, br in self._family_branches.items():
+            if self._family_mutation_counts.get(family_id, 0) == 0 and not (
+                br.retention_check_done or br.retention_check_passed
+            ):
+                continue
+            passed = br.retention_check_passed
+            done = br.retention_check_done
+            support = br.retention_support_quality or "unknown"
             mutations = self._family_mutation_counts.get(family_id, 0)
             short_family = family_id[:16] + "..." if len(family_id) > 16 else family_id
             if done:
-                if passed:
+                if passed is True:
                     family_states.append(
                         f"{short_family}: retention PASSED (support={support}, mutations={mutations})"
                     )
@@ -3354,6 +3698,11 @@ class ResearchController:
             else None
         )
         score = build_attempt_score(compare_payload, sensitivity_snapshot)
+        ev = self._normalized_attempt_record_evidence(
+            artifact_dir,
+            sensitivity_snapshot if isinstance(sensitivity_snapshot, dict) else None,
+            score,
+        )
         record = make_attempt_record(
             self.config,
             tool_context.attempts_path,
@@ -3367,6 +3716,7 @@ class ResearchController:
             if sensitivity_snapshot_path.exists()
             else None,
             note=note,
+            **ev,
         )
         append_attempt(tool_context.attempts_path, record)
         self._render_run_progress(tool_context)
@@ -3384,6 +3734,9 @@ class ResearchController:
         auto_log_reason = None
         if record.composite_score is None:
             auto_log_reason = "quality_score was null in the evaluation artifacts"
+        eff_from_ev = record.effective_window_months
+        if eff_from_ev is None and effective_window_months is not None:
+            eff_from_ev = effective_window_months
         return {
             "status": "logged",
             "attempt_id": record.attempt_id,
@@ -3393,8 +3746,18 @@ class ResearchController:
             "metrics": record.metrics,
             "profile_ref": record.profile_ref,
             "signal_count": signal_count,
-            "resolved_trades": resolved_trades,
-            "effective_window_months": effective_window_months,
+            "resolved_trades": resolved_trades
+            if resolved_trades is not None
+            else record.resolved_trades,
+            "trades_per_month": record.trades_per_month,
+            "positive_cell_ratio": record.positive_cell_ratio,
+            "effective_window_months": eff_from_ev,
+            "requested_horizon_months": record.requested_horizon_months,
+            "requested_timeframe": record.requested_timeframe,
+            "effective_timeframe": record.effective_timeframe,
+            "coverage_status": record.coverage_status,
+            "validation_outcome": record.validation_outcome,
+            "job_status": record.job_status,
             "reason": auto_log_reason,
             "artifact_dir": record.artifact_dir,
             "run_progress_plot": str(tool_context.progress_plot_path),
@@ -3924,6 +4287,156 @@ class ResearchController:
             base["next_recommended_action"] = "evaluate_candidate"
         return self._finalize_typed_cli_surface(base)
 
+    def _transactional_prepare_profile_ref_for_eval(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> dict[str, Any]:
+        """Resolve profile_ref: existing ref, run-mapped path, content-hash dedupe, or validate+register."""
+        warnings: list[str] = []
+        meta: dict[str, Any] = {
+            "profile_content_fingerprint": None,
+            "reused_profile_ref_via_hash": False,
+            "reused_profile_ref_via_run_map": False,
+            "skipped_validate_cached": False,
+        }
+        raw_ref = action.get("profile_ref")
+        raw_path = action.get("profile_path")
+        if isinstance(raw_ref, str) and raw_ref.strip():
+            ref = self._substitute_runtime_placeholders(raw_ref.strip())
+            return {
+                "ok": True,
+                "ref": ref,
+                "warnings": warnings,
+                "errors": [],
+                "meta": meta,
+            }
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            return {
+                "ok": False,
+                "ref": None,
+                "warnings": [],
+                "errors": ["profile_path required when profile_ref is absent."],
+                "meta": meta,
+            }
+        path = Path(self._substitute_runtime_placeholders(raw_path.strip())).resolve()
+        if not path.is_file():
+            return {
+                "ok": False,
+                "ref": None,
+                "warnings": [],
+                "errors": [f"profile_path not found: {path}"],
+                "meta": meta,
+            }
+        mapped = self._profile_ref_for_local_file(path)
+        if mapped:
+            meta["reused_profile_ref_via_run_map"] = True
+            warnings.append("Using profile_ref already mapped to this path in the current run.")
+            return {
+                "ok": True,
+                "ref": mapped,
+                "warnings": warnings,
+                "errors": [],
+                "meta": meta,
+            }
+        fp, ferr = pi.compute_profile_fingerprint(path)
+        if not fp:
+            return {
+                "ok": False,
+                "ref": None,
+                "warnings": [],
+                "errors": [ferr or "could not fingerprint profile JSON"],
+                "meta": meta,
+            }
+        meta["profile_content_fingerprint"] = fp
+        cached_ref = self._profile_fingerprint_to_ref.get(fp)
+        if cached_ref:
+            meta["reused_profile_ref_via_hash"] = True
+            warnings.append(
+                "Reused profile_ref from content-hash cache (same normalized JSON as a prior registration)."
+            )
+            return {
+                "ok": True,
+                "ref": cached_ref,
+                "warnings": warnings,
+                "errors": [],
+                "meta": meta,
+            }
+        try:
+            mtime = path.stat().st_mtime
+        except OSError as exc:
+            return {
+                "ok": False,
+                "ref": None,
+                "warnings": [],
+                "errors": [str(exc)],
+                "meta": meta,
+            }
+        need_validate = True
+        pv = self._profile_path_validate_cache.get(str(path))
+        if (
+            pv is not None
+            and pv == (fp, mtime)
+            and self._profile_fingerprint_validate_ok.get(fp)
+        ):
+            need_validate = False
+            meta["skipped_validate_cached"] = True
+        if need_validate:
+            v = self._typed_validate_profile(
+                tool_context,
+                {"profile_path": str(path)},
+                step=step,
+                step_limit=step_limit,
+                policy=policy,
+            )
+            if not v.get("ok"):
+                return {
+                    "ok": False,
+                    "ref": None,
+                    "warnings": warnings,
+                    "errors": list(v.get("errors") or ["validate_profile failed"]),
+                    "meta": meta,
+                }
+            self._profile_path_validate_cache[str(path)] = (fp, mtime)
+            self._profile_fingerprint_validate_ok[fp] = True
+        reg = self._typed_register_profile(
+            tool_context,
+            {"profile_path": str(path), "operation": "create"},
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+        )
+        if not reg.get("ok"):
+            return {
+                "ok": False,
+                "ref": None,
+                "warnings": warnings,
+                "errors": list(reg.get("errors") or ["register_profile failed"]),
+                "meta": meta,
+            }
+        ref = reg.get("profile_ref") or reg.get("created_profile_ref")
+        if not isinstance(ref, str) or not ref.strip():
+            return {
+                "ok": False,
+                "ref": None,
+                "warnings": warnings,
+                "errors": ["register_profile did not yield profile_ref"],
+                "meta": meta,
+            }
+        ref = ref.strip()
+        self._profile_fingerprint_to_ref[fp] = ref
+        return {
+            "ok": True,
+            "ref": ref,
+            "warnings": warnings,
+            "errors": [],
+            "meta": meta,
+        }
+
     def _typed_evaluate_candidate(
         self,
         tool_context: ToolContext,
@@ -3941,23 +4454,24 @@ class ResearchController:
                 errors=["evaluate_candidate requires instruments array."],
                 next_recommended_action=None,
             )
-        raw_ref = action.get("profile_ref")
-        raw_path = action.get("profile_path")
-        ref: str | None = None
-        if isinstance(raw_ref, str) and raw_ref.strip():
-            ref = self._substitute_runtime_placeholders(raw_ref.strip())
-        elif isinstance(raw_path, str) and raw_path.strip():
-            p = Path(self._substitute_runtime_placeholders(raw_path.strip())).resolve()
-            ref = self._profile_ref_for_local_file(p)
-        if not ref:
+        prep = self._transactional_prepare_profile_ref_for_eval(
+            tool_context,
+            action,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+        )
+        if not prep["ok"]:
             return tt.normalized_tool_envelope(
                 "evaluate_candidate",
                 ok=False,
-                errors=[
-                    "evaluate_candidate needs profile_ref (cloud id) or profile_path for a file already registered in this run."
-                ],
-                next_recommended_action="register_profile",
+                errors=list(prep["errors"]),
+                warnings=list(prep.get("warnings") or []),
+                next_recommended_action="validate_profile",
             )
+        ref = str(prep["ref"])
+        txn_warnings = list(prep.get("warnings") or [])
+        profile_txn = prep.get("meta") or {}
         label = self._sanitize_label(
             str(
                 action.get("candidate_name")
@@ -4059,6 +4573,36 @@ class ResearchController:
         arts = dict(base.get("artifacts") or {})
         arts["artifact_dir"] = str(out_dir)
         base["artifacts"] = arts
+        su = dict(base.get("state_updates") or {})
+        su["evaluate_profile_transaction"] = profile_txn
+        base["state_updates"] = su
+        tw = list(base.get("warnings") or [])
+        tw.extend(txn_warnings)
+        base["warnings"] = tw
+        if isinstance(auto, dict) and str(auto.get("status") or "") == "logged":
+            base["requested_timeframe"] = base.get("requested_timeframe") or auto.get(
+                "requested_timeframe"
+            )
+            base["effective_timeframe"] = base.get("effective_timeframe") or auto.get(
+                "effective_timeframe"
+            )
+            if base.get("effective_window_months") is None:
+                base["effective_window_months"] = auto.get("effective_window_months")
+            if base.get("requested_horizon_months") is None:
+                base["requested_horizon_months"] = auto.get("requested_horizon_months")
+            fid = self._family_id_for_profile_ref(ref)
+            if fid:
+                br = self._family_branches.get(fid)
+                if br and br.last_validation_evidence:
+                    base["validation_evidence"] = br.last_validation_evidence
+                    base["branch_lifecycle_after_eval"] = {
+                        "family_id": fid,
+                        "lifecycle_state": br.lifecycle_state,
+                        "promotion_level": br.promotion_level,
+                        "retention_status": br.retention_status,
+                        "latest_horizon_months": br.latest_horizon_months,
+                        "latest_effective_window_months": br.latest_effective_window_months,
+                    }
         return self._finalize_typed_cli_surface(base)
 
     def _typed_run_parameter_sweep(
@@ -4164,9 +4708,26 @@ class ResearchController:
                     return Path(ar.strip()).resolve()
         return None
 
+    def _attempt_row_for_id(
+        self, tool_context: ToolContext, attempt_id: str
+    ) -> dict[str, Any] | None:
+        needle = attempt_id.strip()
+        for att in load_run_attempts(tool_context.run_dir):
+            if str(att.get("attempt_id") or "") == needle:
+                return att if isinstance(att, dict) else None
+        return None
+
     def _typed_inspect_artifact(
         self, tool_context: ToolContext, action: dict[str, Any]
     ) -> dict[str, Any]:
+        aid_raw = action.get("attempt_id")
+        aid = aid_raw.strip() if isinstance(aid_raw, str) else None
+        ledger_dir: str | None = None
+        attempt_row: dict[str, Any] | None = None
+        if aid:
+            attempt_row = self._attempt_row_for_id(tool_context, aid)
+            if attempt_row and isinstance(attempt_row.get("artifact_dir"), str):
+                ledger_dir = str(attempt_row["artifact_dir"]).strip() or None
         path = self._resolve_artifact_path(tool_context, action)
         if path is None or not path.exists():
             return tt.normalized_tool_envelope(
@@ -4175,12 +4736,40 @@ class ResearchController:
                 errors=["inspect_artifact needs artifact_dir or a known attempt_id."],
                 next_recommended_action="evaluate_candidate",
             )
+        explicit_ad = action.get("artifact_dir")
+        if (
+            isinstance(explicit_ad, str)
+            and explicit_ad.strip()
+            and ledger_dir
+            and path.resolve() != Path(ledger_dir).resolve()
+        ):
+            return tt.normalized_tool_envelope(
+                "inspect_artifact",
+                ok=False,
+                errors=[
+                    "artifact_dir does not match the path recorded for this attempt_id in the ledger."
+                ],
+                next_recommended_action=None,
+                artifact_resolution={
+                    "resolution": ar.RESOLUTION_ATTEMPT_MISMATCH,
+                    "artifact_dir": str(path),
+                    "attempt_id": aid,
+                    "ledger_artifact_dir": ledger_dir,
+                },
+            )
         view = str(action.get("view") or "summary").strip().lower()
         snapshot = load_sensitivity_snapshot(path)
         files = sorted(str(p) for p in path.iterdir()) if path.is_dir() else []
         snap_keys: list[str] = []
         if isinstance(snapshot, dict):
             snap_keys = [str(k) for k in list(snapshot.keys())[:40]]
+        scorer = self.cli.score_artifact if view == "summary" else None
+        resolution = ar.artifact_resolution_status(
+            path,
+            expected_attempt_id=aid,
+            ledger_artifact_dir=ledger_dir,
+            score_artifact=scorer,
+        )
         payload: dict[str, Any] = {
             "tool": "inspect_artifact",
             "ok": True,
@@ -4194,6 +4783,26 @@ class ResearchController:
             "next_recommended_action": "compare_artifacts",
             "files": files[:80],
             "sensitivity_snapshot_keys": snap_keys,
+            "artifact_resolution": resolution,
+            "attempt_ledger_hint": (
+                {
+                    "attempt_id": attempt_row.get("attempt_id"),
+                    "composite_score": attempt_row.get("composite_score"),
+                    "requested_horizon_months": attempt_row.get(
+                        "requested_horizon_months"
+                    ),
+                    "effective_window_months": attempt_row.get(
+                        "effective_window_months"
+                    ),
+                    "requested_timeframe": attempt_row.get("requested_timeframe"),
+                    "effective_timeframe": attempt_row.get("effective_timeframe"),
+                    "validation_outcome": attempt_row.get("validation_outcome"),
+                    "coverage_status": attempt_row.get("coverage_status"),
+                    "job_status": attempt_row.get("job_status"),
+                }
+                if isinstance(attempt_row, dict)
+                else None
+            ),
         }
         if view == "files":
             return payload
@@ -5173,10 +5782,14 @@ class ResearchController:
         policy: RunPolicy,
         step: int,
         step_limit: int,
+        *,
+        compact_trigger_tokens: int,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[ChatMessage]:
         history_messages = messages[2:]
         if not history_messages:
             return messages
+        approx_prompt_tokens_before = self._approx_message_tokens(messages)
         self._trace_runtime(
             tool_context,
             step=step,
@@ -5184,6 +5797,8 @@ class ResearchController:
             status="start",
             message="Compacting message history.",
             history_messages=len(history_messages),
+            approx_prompt_tokens_before=approx_prompt_tokens_before,
+            compact_trigger_tokens=compact_trigger_tokens,
         )
         try:
             with self._provider_scope(
@@ -5223,17 +5838,10 @@ class ResearchController:
         self._checkpoint_path(tool_context).write_text(
             checkpoint_text, encoding="utf-8"
         )
-        self._trace_runtime(
-            tool_context,
-            step=step,
-            phase="compaction",
-            status="ok",
-            message="Compaction succeeded.",
-        )
 
         keep = max(0, self.config.research.compact_keep_recent_messages)
         recent_tail = history_messages[-keep:] if keep else []
-        return [
+        compacted_messages = [
             ChatMessage(role="system", content=self._system_protocol_text(policy)),
             ChatMessage(
                 role="user",
@@ -5243,6 +5851,32 @@ class ResearchController:
             ),
             *recent_tail,
         ]
+        approx_prompt_tokens_after = self._approx_message_tokens(compacted_messages)
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="compaction",
+            status="ok",
+            message="Compaction succeeded.",
+            approx_prompt_tokens_before=approx_prompt_tokens_before,
+            approx_prompt_tokens_after=approx_prompt_tokens_after,
+            compact_trigger_tokens=compact_trigger_tokens,
+            history_messages=len(history_messages),
+            compacted_message_count=len(compacted_messages),
+        )
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "context_compaction",
+                    "run_id": tool_context.run_id,
+                    "run_dir": str(tool_context.run_dir),
+                    "step": step,
+                    "approx_tokens_before": approx_prompt_tokens_before,
+                    "approx_tokens_after": approx_prompt_tokens_after,
+                    "compact_trigger_tokens": compact_trigger_tokens,
+                }
+            )
+        return compacted_messages
 
     def _maybe_compact_messages(
         self,
@@ -5251,6 +5885,8 @@ class ResearchController:
         policy: RunPolicy,
         step: int,
         step_limit: int,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> list[ChatMessage]:
         trigger = self.config.compact_trigger_tokens_for(
             self.config.llm.explorer_profile
@@ -5260,7 +5896,13 @@ class ResearchController:
         if self._approx_message_tokens(messages) < trigger:
             return messages
         return self._compact_message_history(
-            messages, tool_context, policy, step, step_limit
+            messages,
+            tool_context,
+            policy,
+            step,
+            step_limit,
+            compact_trigger_tokens=trigger,
+            progress_callback=progress_callback,
         )
 
     def _allow_finish(
@@ -5426,7 +6068,12 @@ class ResearchController:
                     progress_callback({"event": "window_closed", "result": result})
                 return result
             messages = self._maybe_compact_messages(
-                messages, tool_context, policy, step, step_limit
+                messages,
+                tool_context,
+                policy,
+                step,
+                step_limit,
+                progress_callback=progress_callback,
             )
             try:
                 self._trace_runtime(
