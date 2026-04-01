@@ -1,7 +1,6 @@
 {
   "llm": {
-    "explorer_profile": "openai-mini",
-    "supervisor_profile": "xai-grok"
+    "explorer_profile": "openai-mini"
   },
   "providers": {
     "openai-mini": {
@@ -96,7 +95,7 @@
     "plot_lower_is_better": false,
     "compact_trigger_tokens": 12000,
     "compact_keep_recent_messages": 4,
-    "supervisor_recent_steps": 6,
+    "recent_step_window_steps": 6,
     "finish_min_attempts": 4,
     "run_wrap_up_steps": 3,
     "phase_early_ratio": 0.35,
@@ -109,7 +108,7 @@
     "coverage_min_mid_months": 11,
     "coverage_min_wrap_up_months": 34
   },
-  "supervisor": {
+  "supervise": {
     "max_steps": 200,
     "window_enabled": true,
     "window_start": "23:00",
@@ -119,14 +118,11 @@
     "soft_wrap_minutes": 30,
     "auto_restart_terminal_sessions": false
   },
-  "advisor": {
-    "enabled": false,
-    "every_n_steps": 5,
+  "manager": {
+    "enabled": true,
     "profiles": [
-      "openai-mini",
-      "xai-grok"
+      "openai-mini"
     ],
-    "max_recent_steps": 4,
-    "max_recent_attempts": 6
+    "max_candidate_families_in_packet": 8
   }
 }

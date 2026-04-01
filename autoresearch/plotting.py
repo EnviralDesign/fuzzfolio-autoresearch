@@ -47,8 +47,6 @@ def _metadata_model_summary(run_metadata: dict[str, Any] | None) -> str | None:
         return None
     explorer_profile = str(run_metadata.get("explorer_profile") or "").strip()
     explorer_model = str(run_metadata.get("explorer_model") or "").strip()
-    supervisor_profile = str(run_metadata.get("supervisor_profile") or "").strip()
-    supervisor_model = str(run_metadata.get("supervisor_model") or "").strip()
     quality_score_preset = str(run_metadata.get("quality_score_preset") or "").strip()
     parts: list[str] = []
     if explorer_model or explorer_profile:
@@ -56,15 +54,6 @@ def _metadata_model_summary(run_metadata: dict[str, Any] | None) -> str | None:
         if explorer_profile and explorer_model and explorer_profile != explorer_model:
             explorer = f"{explorer_profile} / {explorer_model}"
         parts.append(f"Explorer: {explorer}")
-    if supervisor_model or supervisor_profile:
-        supervisor = supervisor_model or supervisor_profile
-        if (
-            supervisor_profile
-            and supervisor_model
-            and supervisor_profile != supervisor_model
-        ):
-            supervisor = f"{supervisor_profile} / {supervisor_model}"
-        parts.append(f"Supervisor: {supervisor}")
     if quality_score_preset:
         parts.append(f"Preset: {quality_score_preset}")
     return " | ".join(parts) if parts else None
@@ -193,12 +182,6 @@ def _progress_index_rows(
                 "explorer_model": run_metadata.get("explorer_model")
                 if isinstance(run_metadata, dict)
                 else None,
-                "supervisor_profile": run_metadata.get("supervisor_profile")
-                if isinstance(run_metadata, dict)
-                else None,
-                "supervisor_model": run_metadata.get("supervisor_model")
-                if isinstance(run_metadata, dict)
-                else None,
                 "quality_score_preset": run_metadata.get("quality_score_preset")
                 if isinstance(run_metadata, dict)
                 else None,
@@ -233,8 +216,6 @@ def write_progress_index(
         "artifact_dir",
         "explorer_profile",
         "explorer_model",
-        "supervisor_profile",
-        "supervisor_model",
         "quality_score_preset",
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as handle:

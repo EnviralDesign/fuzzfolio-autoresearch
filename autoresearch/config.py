@@ -32,7 +32,6 @@ class ProviderProfileConfig:
 @dataclass
 class LlmConfig:
     explorer_profile: str = "openai-mini"
-    supervisor_profile: str = "openai-supervisor"
 
 
 @dataclass
@@ -56,7 +55,7 @@ class ResearchConfig:
     plot_lower_is_better: bool = False
     compact_trigger_tokens: int = 12000
     compact_keep_recent_messages: int = 4
-    supervisor_recent_steps: int = 6
+    recent_step_window_steps: int = 6
     finish_min_attempts: int = 4
     run_wrap_up_steps: int = 3
     phase_early_ratio: float = 0.35
@@ -77,8 +76,6 @@ class ResearchConfig:
     # Retention baseline (for long-horizon vs baseline checks) is only established once score reaches this.
     # When None, uses retention_strong_candidate_threshold.
     retention_baseline_establish_min_score: float | None = None
-    # Deprecated for retention_check_passed: pass now requires strong-candidate score; kept for config compat.
-    retention_pass_min_score: float = 0.0
     retention_max_same_family_mutations_before_check: int = 2
     retention_fail_delta: float = -12.0
     retention_fail_ratio: float = 0.82
@@ -91,7 +88,6 @@ class ResearchConfig:
     sweep_oversized_warning: int = 64
     sweep_oversized_hard_block: int = 256
     validated_leader_min_horizon_months: int = 12
-    bankruptcy_fail_count: int = 2
     bankruptcy_cooldown_steps: int = 4
     reseed_min_remaining_steps: int = 6
     reseed_max_recent_failures_window: int = 6
@@ -100,10 +96,8 @@ class ResearchConfig:
     unresolved_coverage_harden_after: int = 3
     collapse_recovery_max_steps: int = 5
     max_bankrupt_families_before_force_breadth: int = 2
-    provisional_leader_decay_ratio: float = 0.62
     horizon_failure_counts_as_retention_fail: bool = True
     validated_portability_check_required: bool = False
-    validated_cross_instrument_min_score_ratio: float = 0.0
     late_phase_new_family_budget: float = 0.25
     wrap_up_requires_validated_leader: bool = False
     effective_coverage_min_ratio: float = 0.88
@@ -111,7 +105,7 @@ class ResearchConfig:
 
 
 @dataclass
-class SupervisorConfig:
+class SuperviseConfig:
     max_steps: int | None = None
     window_enabled: bool = True
     window_start: str | None = None
@@ -121,14 +115,17 @@ class SupervisorConfig:
     soft_wrap_minutes: int = 30
     auto_restart_terminal_sessions: bool = False
 
-
 @dataclass
-class AdvisorConfig:
+class ManagerConfig:
+    """Event-driven branch adjudicator (LLM). Does not execute research tools.
+
+    When enabled with at least one profile, heuristic leader recomputation is not
+    used; overlay leaders come from manager actions (and existing state).
+    """
+
     enabled: bool = False
-    every_n_steps: int = 5
     profiles: list[str] = field(default_factory=list)
-    max_recent_steps: int = 4
-    max_recent_attempts: int = 6
+    max_candidate_families_in_packet: int = 8
 
 
 @dataclass
@@ -140,16 +137,12 @@ class AppConfig:
     providers: dict[str, ProviderProfileConfig]
     fuzzfolio: FuzzfolioConfig
     research: ResearchConfig
-    supervisor: SupervisorConfig
-    advisor: AdvisorConfig
+    supervise: SuperviseConfig
+    manager: ManagerConfig
 
     @property
     def provider(self) -> ProviderProfileConfig:
         return self.providers[self.llm.explorer_profile]
-
-    @property
-    def supervisor_provider(self) -> ProviderProfileConfig:
-        return self.providers[self.llm.supervisor_profile]
 
     def compact_trigger_tokens_for(self, profile_name: str) -> int:
         profile = self.providers[profile_name]
@@ -416,27 +409,11 @@ def _load_provider_profiles(
             "AUTORESEARCH_EXPLORER_PROFILE",
             fallback=llm_cfg.get("explorer_profile"),
         ) or next(iter(profiles.keys()), LlmConfig.explorer_profile)
-        supervisor_profile = (
-            _env_or_value(
-                "AUTORESEARCH_SUPERVISOR_PROFILE",
-                fallback=llm_cfg.get("supervisor_profile"),
-            )
-            or explorer_profile
-        )
-
         if explorer_profile not in profiles:
             raise KeyError(
                 f"Configured explorer_profile {explorer_profile!r} is not defined in providers."
             )
-        if supervisor_profile not in profiles:
-            raise KeyError(
-                f"Configured supervisor_profile {supervisor_profile!r} is not defined in providers."
-            )
-
-        return LlmConfig(
-            explorer_profile=explorer_profile,
-            supervisor_profile=supervisor_profile,
-        ), profiles
+        return LlmConfig(explorer_profile=explorer_profile), profiles
 
     legacy_provider_cfg = raw_config.get("provider", {})
     legacy_provider_secrets = raw_secrets.get("provider", {})
@@ -468,39 +445,12 @@ def _load_provider_profiles(
         )
         or ProviderProfileConfig.model
     )
-    supervisor_model = (
-        _env_or_value(
-            "AUTORESEARCH_SUPERVISOR_MODEL",
-            fallback=legacy_provider_cfg.get("supervisor_model"),
-        )
-        or "gpt-5.4"
-    )
-
     profiles = {
         "openai-mini": ProviderProfileConfig(
             provider_type=provider_type,
             api_base=shared_api_base,
             command=defaults.get("command"),
             model=explorer_model,
-            api_key=shared_api_key,
-            api_key_env=(
-                str(defaults["api_key_env"]).strip()
-                if defaults.get("api_key_env")
-                else None
-            ),
-            temperature=shared_temperature,
-            max_tokens=shared_max_tokens,
-            timeout_seconds=shared_timeout,
-            transport=str(defaults["transport"]),
-            compact_trigger_tokens=None,
-            rate_limit_backoff_seconds=None,
-            rate_limit_max_retries=None,
-        ),
-        "openai-supervisor": ProviderProfileConfig(
-            provider_type=provider_type,
-            api_base=shared_api_base,
-            command=defaults.get("command"),
-            model=supervisor_model,
             api_key=shared_api_key,
             api_key_env=(
                 str(defaults["api_key_env"]).strip()
@@ -529,8 +479,8 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     fuzzfolio_cfg = raw_config.get("fuzzfolio", {})
     fuzzfolio_secrets = raw_secrets.get("fuzzfolio", {})
     research_cfg = raw_config.get("research", {})
-    supervisor_cfg = raw_config.get("supervisor", {})
-    advisor_cfg = raw_config.get("advisor", {})
+    supervise_cfg = raw_config.get("supervise", raw_config.get("supervisor", {}))
+    manager_cfg = raw_config.get("manager", {})
     llm, providers = _load_provider_profiles(raw_config, raw_secrets)
 
     fuzzfolio = FuzzfolioConfig(
@@ -602,10 +552,13 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                 ResearchConfig.compact_keep_recent_messages,
             )
         ),
-        supervisor_recent_steps=int(
+        recent_step_window_steps=int(
             research_cfg.get(
-                "supervisor_recent_steps",
-                ResearchConfig.supervisor_recent_steps,
+                "recent_step_window_steps",
+                research_cfg.get(
+                    "supervisor_recent_steps",
+                    ResearchConfig.recent_step_window_steps,
+                ),
             )
         ),
         finish_min_attempts=int(
@@ -709,12 +662,6 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                 ResearchConfig.provisional_leader_min_score,
             )
         ),
-        retention_pass_min_score=float(
-            research_cfg.get(
-                "retention_pass_min_score",
-                ResearchConfig.retention_pass_min_score,
-            )
-        ),
         retention_max_same_family_mutations_before_check=int(
             research_cfg.get(
                 "retention_max_same_family_mutations_before_check",
@@ -786,14 +733,6 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                 "validated_leader_min_horizon_months",
                 ResearchConfig.validated_leader_min_horizon_months,
             )
-        ),
-        bankruptcy_fail_count=max(
-            1,
-            int(
-                research_cfg.get(
-                    "bankruptcy_fail_count", ResearchConfig.bankruptcy_fail_count
-                )
-            ),
         ),
         bankruptcy_cooldown_steps=max(
             0,
@@ -867,12 +806,6 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                 )
             ),
         ),
-        provisional_leader_decay_ratio=float(
-            research_cfg.get(
-                "provisional_leader_decay_ratio",
-                ResearchConfig.provisional_leader_decay_ratio,
-            )
-        ),
         horizon_failure_counts_as_retention_fail=bool(
             research_cfg.get(
                 "horizon_failure_counts_as_retention_fail",
@@ -883,12 +816,6 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             research_cfg.get(
                 "validated_portability_check_required",
                 ResearchConfig.validated_portability_check_required,
-            )
-        ),
-        validated_cross_instrument_min_score_ratio=float(
-            research_cfg.get(
-                "validated_cross_instrument_min_score_ratio",
-                ResearchConfig.validated_cross_instrument_min_score_ratio,
             )
         ),
         late_phase_new_family_budget=float(
@@ -916,66 +843,61 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             )
         ),
     )
-    supervisor = SupervisorConfig(
+    supervise = SuperviseConfig(
         max_steps=(
-            int(supervisor_cfg["max_steps"])
-            if supervisor_cfg.get("max_steps") is not None
+            int(supervise_cfg["max_steps"])
+            if supervise_cfg.get("max_steps") is not None
             else None
         ),
         window_enabled=bool(
-            supervisor_cfg.get("window_enabled", SupervisorConfig.window_enabled)
+            supervise_cfg.get("window_enabled", SuperviseConfig.window_enabled)
         ),
-        window_start=supervisor_cfg.get("window_start"),
-        window_end=supervisor_cfg.get("window_end"),
-        timezone=supervisor_cfg.get("timezone", SupervisorConfig.timezone),
-        stop_mode=supervisor_cfg.get("stop_mode", SupervisorConfig.stop_mode),
+        window_start=supervise_cfg.get("window_start"),
+        window_end=supervise_cfg.get("window_end"),
+        timezone=supervise_cfg.get("timezone", SuperviseConfig.timezone),
+        stop_mode=supervise_cfg.get("stop_mode", SuperviseConfig.stop_mode),
         soft_wrap_minutes=int(
-            supervisor_cfg.get(
+            supervise_cfg.get(
                 "soft_wrap_minutes",
-                SupervisorConfig.soft_wrap_minutes,
+                SuperviseConfig.soft_wrap_minutes,
             )
         ),
         auto_restart_terminal_sessions=bool(
-            supervisor_cfg.get(
+            supervise_cfg.get(
                 "auto_restart_terminal_sessions",
-                SupervisorConfig.auto_restart_terminal_sessions,
+                SuperviseConfig.auto_restart_terminal_sessions,
             )
         ),
     )
-    advisor_profiles = (
+
+    manager_profiles = (
         [
             str(item).strip()
-            for item in advisor_cfg.get("profiles", [])
+            for item in manager_cfg.get("profiles", [])
             if str(item).strip()
         ]
-        if isinstance(advisor_cfg.get("profiles", []), list)
+        if isinstance(manager_cfg.get("profiles", []), list)
         else []
     )
-    unknown_advisor_profiles = [
-        item for item in advisor_profiles if item not in providers
+    unknown_manager_profiles = [
+        item for item in manager_profiles if item not in providers
     ]
-    if unknown_advisor_profiles:
+    if unknown_manager_profiles:
         raise KeyError(
-            "Configured advisor profile(s) are not defined in providers: "
-            + ", ".join(sorted(unknown_advisor_profiles))
+            "Configured manager profile(s) are not defined in providers: "
+            + ", ".join(sorted(unknown_manager_profiles))
         )
-    advisor = AdvisorConfig(
-        enabled=bool(advisor_cfg.get("enabled", AdvisorConfig.enabled)),
-        every_n_steps=int(
-            advisor_cfg.get("every_n_steps", AdvisorConfig.every_n_steps)
-        ),
-        profiles=advisor_profiles,
-        max_recent_steps=int(
-            advisor_cfg.get(
-                "max_recent_steps",
-                AdvisorConfig.max_recent_steps,
-            )
-        ),
-        max_recent_attempts=int(
-            advisor_cfg.get(
-                "max_recent_attempts",
-                AdvisorConfig.max_recent_attempts,
-            )
+    manager = ManagerConfig(
+        enabled=bool(manager_cfg.get("enabled", ManagerConfig.enabled)),
+        profiles=manager_profiles,
+        max_candidate_families_in_packet=max(
+            2,
+            int(
+                manager_cfg.get(
+                    "max_candidate_families_in_packet",
+                    ManagerConfig.max_candidate_families_in_packet,
+                )
+            ),
         ),
     )
 
@@ -987,6 +909,6 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
         providers=providers,
         fuzzfolio=fuzzfolio,
         research=research,
-        supervisor=supervisor,
-        advisor=advisor,
+        supervise=supervise,
+        manager=manager,
     )

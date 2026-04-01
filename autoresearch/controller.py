@@ -15,11 +15,17 @@ from zoneinfo import ZoneInfo
 
 from . import artifact_resolution as ar
 from . import branch_lifecycle as bl
+from . import branch_mechanics as bmech
+from . import manager_actions as mgr_actions
+from . import manager_hooks as mgr_hooks
+from . import manager_packet as mgr_packet
 from . import profile_identity as pi
 from . import typed_tools as tt
 from . import validation_outcome as vo
 from .config import AppConfig
 from .fuzzfolio import CliError, CommandResult, FuzzfolioCli
+from .manager_models import ManagerHookEvent
+from .manager_state import ManagerRuntimeState
 from .ledger import (
     append_attempt,
     attempt_exists,
@@ -33,15 +39,6 @@ from .ledger import (
 from .plotting import compute_frontier, render_progress_artifacts
 from .provider import ChatMessage, ProviderError, create_provider, provider_trace_scope
 from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapshot
-
-_HARD_COLLAPSE_REASONS = frozenset(
-    {
-        "retention_threshold_failed",
-        "repeated_long_horizon_scores_far_below_provisional_peak",
-        "repeated_timeframe_intent_mismatch",
-    }
-)
-
 
 SYSTEM_PROTOCOL = """You are operating an autonomous Fuzzfolio research loop.
 
@@ -68,8 +65,9 @@ Trust structured results first:
 - Typed tools and run_cli return envelopes with fields like ok, status, warnings, errors, score, artifact_dir, auto_log, created_profile_ref, profile_ref, retention_gate (when applicable), and next_recommended_action.
 - Use those before reflexively reading artifacts on disk.
 
-Controller-owned (you observe and adapt; you do not replace these policies in your head):
-- Phase horizons and default lookback injection, quality-score preset, retention and branch lifecycle, finish gating, tool validation, timeframe-mismatch blocking, and exploit caps. The run state packet spells out current phase, horizon target, lifecycle, and mismatch status.
+Controller-owned (you observe and adapt; you do not replace these mechanics in your head):
+- Phase horizons and default lookback injection, quality-score preset, finish gating, tool validation, timeframe-mismatch blocking, exploit caps, and ledger bookkeeping. Branch overlay leaders and reseed/suppression policy come from the event-driven manager (see runtime-state manager snapshot); budget mode and validation evidence update mechanically after each eval. The run state packet spells out current phase, horizon target, lifecycle, and mismatch status.
+- Authority precedence: current branch lifecycle, manager guidance, budget mode, and validation evidence outrank raw frontier score when they conflict. Treat the raw frontier as supporting evidence, not leadership authority.
 
 General rules:
 - Use absolute Windows paths. At most 3 actions per response. Raw JSON only; no Markdown as the top-level response.
@@ -82,6 +80,7 @@ General rules:
 - Think in months/years of effective evidence, not raw bars. Effective window fields in results matter more than bar counts.
 - `__BASKET__` may appear in summaries; never pass it as an instrument. Use exact catalog symbols; repeat --instrument per symbol in typed fields as multiple entries in the instruments array (evaluate_candidate), not comma-joined tokens.
 - Early phase: diversify instruments/groups before over-focusing one pair. Prune a basket member when it is clearly a drag; do not widen baskets solely from per-instrument screens.
+- If the run packet names a provisional leader, validated leader, structural-contrast priority, or validation-resolution priority, plan around that first. Do not abandon controller/manager priorities just because another candidate has a higher raw score.
 - finish ends the entire run; never use it to mean "step done". Only call finish when stopping now with a concise non-empty summary and the controller allows it. Keep exploring through contrasts while step budget remains.
 
 Normal workflows (all typed):
@@ -143,7 +142,7 @@ def _should_emit_runtime_trace_line(*, status: str, level: str | None) -> bool:
 
 
 SUPERVISED_EXTRA_RULES = """
-- You are running in supervised mode. The supervisor, not you, decides when the session stops.
+- You are running in supervised mode. The controller/session policy, not you, decides when the session stops.
 - Do not use `finish` in supervised mode. Keep working until the controller stops prompting you.
 - When you have a good candidate, keep exploring nearby and contrasting branches instead of trying to end the run.
 """
@@ -161,57 +160,6 @@ Return JSON with this shape only:
 {
   "checkpoint_summary": "concise multi-line summary"
 }
-"""
-
-SUPERVISOR_PROMPT = """You are the supervisor for an autonomous Fuzzfolio research run.
-
-Your job is to redirect the explorer away from low-value wandering when it tries to stop early or gets stuck.
-Be sharp, adventurous, concrete, and Socratic. Push for better branch quality, not just more steps.
-
-Return JSON only in this exact shape:
-{
-  "message": "2-4 sentences of direct coaching",
-  "questions": ["short question 1", "short question 2"],
-  "next_moves": ["concrete move 1", "concrete move 2", "concrete move 3"]
-}
-
-Rules:
-- Keep it compact.
-- Work only within the current run, its seed hand, and run-owned artifacts.
-- Speak in research operations, not shell: prefer prepare_profile / mutate_profile / validate_profile / register_profile / evaluate_candidate / run_parameter_sweep / inspect_artifact / compare_artifacts. Do not suggest invalid instruments like __BASKET__ or invented tool names.
-- Prefer hypothesis pivots, contrast branches, and meaningful parameter or timeframe shifts over repetitive retries.
-- Treat sweeps as first-class: if the explorer only does tiny manual edits, push toward run_parameter_sweep around the promising family.
-- Default horizons, lookback injection, and quality-score preset are controller-owned. Coach the explorer toward phased depth and longer effective evidence windows (months/years), not toward tweaking CLI flags the controller already manages.
-- If an analysis window came back truncated, focus on missing effective months/days from tool results, not bar counts.
-- Early phase: cheap screening; mid: deepen; late: pressure-test survivors on longer horizons—mirror the packet, do not override it.
-- If the explorer is drifting, say so plainly.
-- If the controller provides a score target, use it as a believable next stretch goal instead of vague encouragement.
-- The controller's score target refers to `quality_score`, the aggregate source-of-truth metric. Do not describe it as PSR. You may mention PSR, DSR, drawdown, robustness, or other inputs separately as reasons why quality_score moved.
-- During exploration phase, do not encourage finish or summary-writing.
-"""
-
-ADVISOR_PROMPT = """You are an expert strategy advisor for an autonomous Fuzzfolio research run.
-
-You are not executing tools. You are giving short, high-signal guidance to the explorer model that is actively operating the loop.
-
-Return JSON only in this exact shape:
-{
-  "message": "2-4 sentences of direct guidance",
-  "next_moves": ["concrete move 1", "concrete move 2", "concrete move 3"],
-  "risks": ["risk 1", "risk 2"]
-}
-
-Rules:
-- Keep it compact and specific.
-- Do not suggest finish or wrap-up unless the packet says wrap-up is active.
-- Prefer typed research moves in your wording (evaluate_candidate, mutate_profile, run_parameter_sweep, inspect_artifact, compare_artifacts). Do not teach raw CLI unless the explorer is stuck in recovery. Never suggest invalid instruments.
-- Prefer guidance that changes branch quality, not just branch count.
-- Treat sweeps as first-class: encourage bounded run_parameter_sweep when manual tweaking dominates.
-- Think in months and years of effective evidence, not bars.
-- Use quality_score as the primary target metric, while using PSR, DSR, drawdown, robustness, trade rate, and coverage as reasons.
-- Do not recommend broad indicator-family swaps unless the packet explicitly allows structural pivots.
-- It is valid to recommend pruning a specific instrument from a basket when per-instrument evidence shows it is a clear drag. Do not recommend adding instruments based on per-instrument results alone.
-- Assume the explorer can choose whether to follow your guidance; optimize for clarity, not control.
 """
 
 SUMMARY_PREFIX = """Another language model started to solve this problem and produced a summary of its thinking process.
@@ -268,16 +216,17 @@ class ResearchController:
     def __init__(self, app_config: AppConfig):
         self.config = app_config
         self.provider = create_provider(app_config.provider)
-        self.supervisor_provider = create_provider(app_config.supervisor_provider)
-        self.advisor_providers = [
+        self.manager_providers = [
             (
-                f"advisor{index}",
+                f"manager{index}",
                 profile_name,
                 create_provider(app_config.providers[profile_name]),
             )
-            for index, profile_name in enumerate(app_config.advisor.profiles, start=1)
+            for index, profile_name in enumerate(app_config.manager.profiles, start=1)
             if profile_name in app_config.providers
         ]
+        self._manager_runtime = ManagerRuntimeState()
+        self._frontier_prior_best: float | None = None
         self.cli = FuzzfolioCli(app_config.fuzzfolio)
         self.profile_sources: dict[str, Path] = {}
         self.last_created_profile_ref: str | None = None
@@ -301,6 +250,7 @@ class ResearchController:
         self._current_run_policy: RunPolicy | None = None
         self._tool_usage_counts: dict[str, int] = {}
         self._validation_stale_without_validated: int = 0
+        self._pending_manager_events: list[dict[str, Any]] = []
 
     def _reset_run_state(self) -> None:
         self._family_mutation_counts = {}
@@ -318,10 +268,42 @@ class ResearchController:
         self._current_run_policy = None
         self._tool_usage_counts = {}
         self._validation_stale_without_validated = 0
+        self._pending_manager_events = []
+        self._manager_runtime = ManagerRuntimeState()
+        self._frontier_prior_best = None
 
     def _bump_tool_usage(self, tool: str) -> None:
         key = str(tool).strip() or "unknown"
         self._tool_usage_counts[key] = int(self._tool_usage_counts.get(key, 0)) + 1
+
+    def _record_pending_manager_event(
+        self,
+        *,
+        hook: ManagerHookEvent,
+        status: str,
+        action_count: int = 0,
+        rationale: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        event: dict[str, Any] = {
+            "hook": hook.value,
+            "status": str(status or "").strip() or "unknown",
+            "action_count": max(0, int(action_count)),
+        }
+        rationale_text = str(rationale or "").strip()
+        if rationale_text:
+            event["rationale"] = rationale_text[:500]
+        error_text = str(error or "").strip()
+        if error_text:
+            event["error"] = error_text[:300]
+        self._pending_manager_events.append(event)
+
+    def _flush_pending_manager_events(self) -> list[dict[str, Any]]:
+        if not self._pending_manager_events:
+            return []
+        events = list(self._pending_manager_events)
+        self._pending_manager_events = []
+        return events
 
     def _parse_lookback_months_from_cli_args(self, args: list[str]) -> int | None:
         if "--lookback-months" not in args:
@@ -866,93 +848,12 @@ class ResearchController:
             return True
         return False
 
-    def _mark_family_collapsed(
+    def _branch_step_maintenance(
         self,
         tool_context: ToolContext,
-        family_id: str,
-        reason: str,
         step: int,
         step_limit: int,
-    ) -> None:
-        cfg = self.config.research
-        branch = bl.ensure_family_branch(self._family_branches, family_id)
-        if branch.exploit_dead:
-            return
-        branch.lifecycle_state = bl.LIFECYCLE_COLLAPSED
-        branch.retention_status = bl.RETENTION_FAILED
-        branch.bankrupt = True
-        branch.hard_dead = reason in _HARD_COLLAPSE_REASONS
-        branch.exploit_dead = True
-        branch.collapse_reason = reason
-        branch.structural_contrast_required = True
-        branch.needs_structural_contrast = True
-        branch.cooldown_until_step = step + int(cfg.bankruptcy_cooldown_steps)
-        self._branch_overlay.recent_retention_failures.append(step)
-        keep = max(20, cfg.reseed_max_recent_failures_window * 4)
-        self._branch_overlay.recent_retention_failures = self._branch_overlay.recent_retention_failures[
-            -keep:
-        ]
-        self._maybe_activate_reseed(tool_context, step, step_limit)
-        self._trace_runtime(
-            tool_context,
-            step=step,
-            phase="branch_lifecycle",
-            status="collapsed",
-            message=f"Family {family_id[:20]}... collapsed: {reason}",
-            family_id_prefix=family_id[:16],
-        )
-
-    def _maybe_activate_reseed(
-        self, tool_context: ToolContext, step: int, step_limit: int
-    ) -> None:
-        cfg = self.config.research
-        remaining = step_limit - step
-        if remaining < cfg.reseed_min_remaining_steps:
-            return
-        if self._branch_overlay.validated_leader_family_id:
-            return
-        window = max(1, cfg.reseed_max_recent_failures_window)
-        recent_fails = [s for s in self._branch_overlay.recent_retention_failures if step - s <= window]
-        dead = sum(1 for b in self._family_branches.values() if b.exploit_dead)
-        contrast = any(b.structural_contrast_required for b in self._family_branches.values())
-        stale_validation = (
-            cfg.reseed_after_stale_validation_steps > 0
-            and self._validation_stale_without_validated
-            >= cfg.reseed_after_stale_validation_steps
-        )
-        ok_failure_path = bool(recent_fails) and (dead >= 1 or contrast)
-        if not ok_failure_path and not stale_validation:
-            return
-        scored = self._scored_attempt_count(tool_context)
-        min_scored = int(cfg.reseed_min_scored_attempts)
-        if min_scored > 0 and scored < min_scored:
-            return
-        if not self._branch_overlay.reseed_active:
-            if stale_validation and not ok_failure_path:
-                msg = (
-                    "Reseed / collapse-recovery window activated "
-                    f"(stale validation: {self._validation_stale_without_validated} steps "
-                    f"with provisional leader but no validated leader)."
-                )
-            else:
-                msg = "Reseed / collapse-recovery window activated."
-            self._trace_runtime(
-                tool_context,
-                step=step,
-                phase="branch_lifecycle",
-                status="reseed",
-                message=msg,
-            )
-        self._branch_overlay.reseed_active = True
-        if self._branch_overlay.reseed_started_step is None:
-            self._branch_overlay.reseed_started_step = step
-        self._branch_overlay.collapse_recovery_remaining = max(
-            self._branch_overlay.collapse_recovery_remaining,
-            cfg.collapse_recovery_max_steps,
-        )
-
-    def _branch_step_maintenance(
-        self, step: int, step_limit: int, policy: RunPolicy
+        policy: RunPolicy,
     ) -> None:
         for branch in self._family_branches.values():
             if branch.bankrupt and branch.cooldown_until_step <= step:
@@ -984,148 +885,159 @@ class ResearchController:
             self._validation_stale_without_validated += 1
         else:
             self._validation_stale_without_validated = 0
+        thr = self.config.research.reseed_after_stale_validation_steps
+        if (
+            self.config.manager.enabled
+            and self.manager_providers
+            and thr > 0
+            and self._validation_stale_without_validated == thr
+        ):
+            self._manager_invoke_for_hook(
+                ManagerHookEvent.on_stale_validation_without_validated,
+                tool_context,
+                step,
+                step_limit,
+                policy,
+                extra_issues=["stale_validation_threshold_reached"],
+            )
+            self._sync_branch_budget_mode(step, step_limit, policy)
+            self._persist_branch_runtime_state(tool_context, step)
 
     def _sync_branch_budget_mode(
-        self, step: int, step_limit: int, policy: RunPolicy
+        self,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
     ) -> None:
-        phase_info = self._run_phase_info(step, step_limit, policy)
-        phase_name = str(phase_info.get("name") or "")
-        self._recompute_branch_leaders()
-        self._branch_overlay.explored_family_count = len(self._family_branches)
-        if phase_name == "wrap_up":
-            self._branch_overlay.budget_mode = bl.BUDGET_WRAP_UP
-            return
-        if (
-            self._branch_overlay.reseed_active
-            and self._branch_overlay.collapse_recovery_remaining > 0
-        ):
-            self._branch_overlay.budget_mode = bl.BUDGET_COLLAPSE_RECOVERY
-            return
-        # Validated survivor should drive budget mode even when many branches are exploit-dead.
-        if self._branch_overlay.validated_leader_family_id:
-            self._branch_overlay.budget_mode = (
-                bl.BUDGET_VALIDATION
-                if phase_name in {"mid", "late"}
-                else bl.BUDGET_EXPLOIT
-            )
-            return
-        dead_cnt = sum(1 for b in self._family_branches.values() if b.exploit_dead)
-        if dead_cnt >= self.config.research.max_bankrupt_families_before_force_breadth:
-            self._branch_overlay.budget_mode = bl.BUDGET_SCOUTING
-            return
-        if phase_name == "early" or not self._branch_overlay.provisional_leader_family_id:
-            self._branch_overlay.budget_mode = bl.BUDGET_SCOUTING
-            return
-        self._branch_overlay.budget_mode = (
-            bl.BUDGET_VALIDATION if phase_name in {"mid", "late"} else bl.BUDGET_EXPLOIT
+        bmech.sync_branch_budget_mode(self, step, step_limit, policy)
+
+    def _manager_invoke_for_hook(
+        self,
+        hook: ManagerHookEvent,
+        tool_context: ToolContext,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+        *,
+        extra_issues: list[str] | None = None,
+    ) -> bool:
+        """Return True when manager returned actions and all applied successfully."""
+        if not self.config.manager.enabled or not self.manager_providers:
+            return False
+        packet = mgr_packet.build_manager_packet(
+            self,
+            tool_context,
+            hook,
+            step,
+            step_limit,
+            policy,
+            extra_issues=extra_issues,
         )
-
-    def _recompute_branch_leaders(self) -> None:
-        prov_floor = float(self.config.research.provisional_leader_min_score)
-        val_floor = float(self.config.research.validated_leader_min_score)
-        best_prov: tuple[float, str | None] = (float("-inf"), None)
-        best_val: tuple[float, str | None] = (float("-inf"), None)
-        best_shadow: tuple[float, str | None] = (float("-inf"), None)
-        shadow_reason: str | None = None
-        for fid, st in self._family_branches.items():
-            if st.exploit_dead or st.bankrupt or bl.cooldown_active(st, self._current_controller_step):
-                continue
-            sc = st.best_score
-            if sc is None or sc < prov_floor:
-                continue
-            meets_validated_overlay_floor = val_floor <= 0 or sc >= val_floor
-            if (
-                st.promotion_level == bl.PROMOTION_VALIDATED
-                and st.retention_status == bl.RETENTION_PASSED
-                and meets_validated_overlay_floor
-            ):
-                if sc > best_val[0]:
-                    best_val = (sc, fid)
-            else:
-                if sc > best_prov[0]:
-                    best_prov = (sc, fid)
-        self._branch_overlay.validated_leader_family_id = best_val[1]
-        self._branch_overlay.provisional_leader_family_id = best_prov[1]
-        val_id = best_val[1]
-        prov_id = best_prov[1]
-        for fid, st in self._family_branches.items():
-            if st.exploit_dead or st.bankrupt or bl.cooldown_active(st, self._current_controller_step):
-                continue
-            sc = st.best_score
-            if sc is None or sc < prov_floor:
-                continue
-            if fid == val_id or fid == prov_id:
-                continue
-            if st.last_validation_outcome == vo.VALIDATION_UNRESOLVED:
-                if sc > best_shadow[0]:
-                    best_shadow = (sc, fid)
-                    shadow_reason = "unresolved_validation"
-            elif st.exploit_dead and not st.hard_dead:
-                if sc > best_shadow[0]:
-                    best_shadow = (sc, fid)
-                    shadow_reason = "soft_exploit_dead"
-        if prov_id and (
-            prov_id in self._family_branches
-            and self._family_branches[prov_id].last_validation_outcome
-            == vo.VALIDATION_UNRESOLVED
-            and best_shadow[1] is None
-        ):
-            runner: tuple[float, str | None] = (float("-inf"), None)
-            for fid, st in self._family_branches.items():
-                if (
-                    st.exploit_dead
-                    or st.bankrupt
-                    or bl.cooldown_active(st, self._current_controller_step)
+        user_msg = mgr_packet.manager_user_message(packet)
+        last_err: str | None = None
+        for mgr_label, _profile_name, provider in self.manager_providers:
+            try:
+                with self._provider_scope(
+                    tool_context=tool_context,
+                    step=step,
+                    label=f"manager:{mgr_label}",
+                    phase="manager",
+                    provider=provider,
                 ):
-                    continue
-                if st.last_validation_outcome != vo.VALIDATION_UNRESOLVED:
-                    continue
-                sc = st.best_score
-                if sc is None or sc < prov_floor or fid == prov_id or fid == val_id:
-                    continue
-                if sc > runner[0]:
-                    runner = (sc, fid)
-            if runner[1]:
-                best_shadow = runner
-                shadow_reason = "unresolved_runner_up_while_leader_unresolved"
-        if best_shadow[1]:
-            self._branch_overlay.shadow_leader_family_id = best_shadow[1]
-            self._branch_overlay.shadow_leader_reason = shadow_reason
-        else:
-            self._branch_overlay.shadow_leader_family_id = None
-            self._branch_overlay.shadow_leader_reason = None
-        self._apply_overlay_provisional_leadership()
-        if prov_id and prov_id in self._family_branches:
-            self._branch_overlay.provisional_leader_promotability = (
-                self._family_branches[prov_id].promotability_status
+                    last_raw = provider.complete_json(
+                        [
+                            ChatMessage(
+                                role="system",
+                                content=mgr_packet.MANAGER_SYSTEM_PROMPT,
+                            ),
+                            ChatMessage(role="user", content=user_msg),
+                        ]
+                    )
+            except ProviderError as exc:
+                last_err = str(exc)
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="manager",
+                    status="failed",
+                    message="Manager request failed.",
+                    error=exc,
+                    level="warning",
+                )
+                continue
+            if not isinstance(last_raw, dict):
+                last_err = "non_object_response"
+                continue
+            decision = mgr_actions.parse_manager_decision(last_raw)
+            if decision is None:
+                last_err = "parse_failed"
+                continue
+            if not decision.actions:
+                self._manager_runtime.record_invocation(
+                    hook=hook,
+                    step=step,
+                    rationale=decision.rationale,
+                    actions_applied=[],
+                    raw_ok=True,
+                    error=None,
+                    invocation_incomplete=False,
+                )
+                self._record_pending_manager_event(
+                    hook=hook,
+                    status="no_change",
+                    rationale=decision.rationale,
+                )
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase="manager",
+                    status="no_change",
+                    message=f"Manager hook {hook.value} returned no state change.",
+                )
+                return True
+            applied = mgr_actions.apply_manager_decision(
+                self, tool_context, decision, step, step_limit, policy
             )
-        else:
-            self._branch_overlay.provisional_leader_promotability = None
-
-    def _apply_overlay_provisional_leadership(self) -> None:
-        """Point run-best provisional overlay id at PROVISIONAL_LEADER lifecycle when viable."""
-        leader = self._branch_overlay.provisional_leader_family_id
-        validated = self._branch_overlay.validated_leader_family_id
-        for fid, st in self._family_branches.items():
-            if (
-                st.lifecycle_state == bl.LIFECYCLE_PROVISIONAL_LEADER
-                and fid != leader
-                and fid != validated
-                and st.promotion_level != bl.PROMOTION_VALIDATED
-            ):
-                st.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_CONTENDER
-        if not leader:
-            return
-        br = self._family_branches.get(leader)
-        if not br or br.exploit_dead or br.lifecycle_state == bl.LIFECYCLE_COLLAPSED:
-            return
-        if br.promotion_level == bl.PROMOTION_SCOUT:
-            br.promotion_level = bl.PROMOTION_PROVISIONAL
-        if br.lifecycle_state not in (
-            bl.LIFECYCLE_VALIDATED_LEADER,
-            bl.LIFECYCLE_COLLAPSED,
-        ):
-            br.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_LEADER
+            ok = all(x.get("ok", True) for x in applied)
+            self._manager_runtime.record_invocation(
+                hook=hook,
+                step=step,
+                rationale=decision.rationale,
+                actions_applied=applied,
+                raw_ok=ok,
+                error=None if ok else "action_failed",
+                invocation_incomplete=not ok,
+            )
+            self._record_pending_manager_event(
+                hook=hook,
+                status="ok" if ok else "partial",
+                action_count=len(applied),
+                rationale=decision.rationale,
+                error=None if ok else "action_failed",
+            )
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase="manager",
+                status="ok" if ok else "partial",
+                message=f"Manager hook {hook.value} — {len(applied)} action(s).",
+            )
+            return bool(ok)
+        self._manager_runtime.record_invocation(
+            hook=hook,
+            step=step,
+            rationale=None,
+            actions_applied=[],
+            raw_ok=False,
+            error=last_err or "no_provider",
+            invocation_incomplete=True,
+        )
+        self._record_pending_manager_event(
+            hook=hook,
+            status="failed",
+            error=last_err or "no_provider",
+        )
+        return False
 
     def _refresh_branch_lifecycle_after_eval(
         self,
@@ -1149,237 +1061,78 @@ class ResearchController:
     ) -> None:
         if not family_id:
             return
-        cfg = self.config.research
-        branch = bl.ensure_family_branch(self._family_branches, family_id)
-        digest = behavior_digest or {}
-        support_shape = str(digest.get("support_shape") or "")
-
-        if branch.first_seen_attempt_id is None and attempt_id:
-            branch.first_seen_attempt_id = attempt_id
-        branch.latest_attempt_id = attempt_id
-        branch.latest_score = score
-        branch.latest_horizon_months = requested_horizon_months
-        branch.latest_effective_window_months = effective_window_months
-        if profile_ref:
-            branch.last_profile_ref = str(profile_ref).strip()
-
-        if branch.best_score is None or score > branch.best_score:
-            branch.best_score = score
-            branch.best_attempt_id = attempt_id
-            if requested_horizon_months is not None:
-                branch.best_horizon_months = requested_horizon_months
-            if effective_window_months is not None:
-                branch.best_effective_window_months = effective_window_months
-        elif branch.best_score is not None and abs(float(score) - float(branch.best_score)) < 1e-9:
-            if branch.best_horizon_months is None and requested_horizon_months is not None:
-                branch.best_horizon_months = requested_horizon_months
-            if (
-                branch.best_effective_window_months is None
-                and effective_window_months is not None
-            ):
-                branch.best_effective_window_months = effective_window_months
-
-        if support_shape == "too_sparse" and branch.lifecycle_state != bl.LIFECYCLE_COLLAPSED:
-            branch.lifecycle_state = bl.LIFECYCLE_RETENTION_WARNING
-
-        coverage_status, coverage_ok = vo.classify_coverage(
-            requested_horizon_months=requested_horizon_months,
-            effective_window_months=effective_window_months,
-            effective_coverage_min_ratio=cfg.effective_coverage_min_ratio,
-        )
-        branch.last_coverage_status = coverage_status
-        hardened_unresolved = False
-        if coverage_status == vo.COVERAGE_UNRESOLVED:
-            if (
-                requested_horizon_months is not None
-                and cfg.horizon_failure_counts_as_retention_fail
-            ):
-                branch.unresolved_coverage_count += 1
-                if branch.unresolved_coverage_count >= cfg.unresolved_coverage_harden_after:
-                    branch.retention_fail_count += 1
-                    branch.unresolved_coverage_count = 0
-                    branch.coverage_inadequate_count += 1
-                    hardened_unresolved = True
-            else:
-                branch.unresolved_coverage_count = 0
-        elif coverage_status == vo.COVERAGE_INADEQUATE:
-            branch.unresolved_coverage_count = 0
-            if cfg.horizon_failure_counts_as_retention_fail:
-                branch.retention_fail_count += 1
-                branch.coverage_inadequate_count += 1
-        else:
-            branch.unresolved_coverage_count = 0
-
-        if had_timeframe_mismatch:
-            branch.timeframe_mismatch_hits += 1
-            if branch.timeframe_mismatch_hits >= 3:
-                self._mark_family_collapsed(
-                    tool_context,
-                    family_id,
-                    "repeated_timeframe_intent_mismatch",
-                    step,
-                    step_limit,
-                )
-
-        min_horizon = cfg.validated_leader_min_horizon_months
-        if (
-            requested_horizon_months is not None
-            and requested_horizon_months < min_horizon
-        ):
-            peak = branch.provisional_peak_score
-            if peak is None or score > peak:
-                branch.provisional_peak_score = score
-                branch.provisional_peak_horizon_months = requested_horizon_months
-
-        if (
-            score is not None
-            and requested_horizon_months is not None
-            and requested_horizon_months >= min_horizon
-            and branch.provisional_peak_score is not None
-            and score
-            < branch.provisional_peak_score * float(cfg.provisional_leader_decay_ratio)
-            and coverage_status != vo.COVERAGE_UNRESOLVED
-        ):
-            branch.long_rung_low_score_streak += 1
-        else:
-            branch.long_rung_low_score_streak = 0
-
-        if branch.long_rung_low_score_streak >= 2:
-            self._mark_family_collapsed(
-                tool_context,
-                family_id,
-                "repeated_long_horizon_scores_far_below_provisional_peak",
-                step,
-                step_limit,
+        try:
+            sc = float(score)
+            frontier_improved = self._frontier_prior_best is None or self._score_better(
+                sc, float(self._frontier_prior_best)
             )
-
-        rr = retention_result or {}
-        if rr.get("retention_failed"):
-            self._mark_family_collapsed(
-                tool_context,
-                family_id,
-                "retention_threshold_failed",
-                step,
-                step_limit,
-            )
-
-        strict_pass = branch.retention_check_passed is True
-        weak_retention_pass = (
-            not branch.exploit_dead
-            and not strict_pass
-            and not rr.get("retention_failed")
-            and coverage_status != vo.COVERAGE_INADEQUATE
-            and not hardened_unresolved
-            and not had_timeframe_mismatch
-            and self._timeframes_compatible_for_provisional(
-                requested_timeframe, effective_timeframe
-            )
-        )
-        if had_timeframe_mismatch and not branch.exploit_dead:
-            branch.retention_status = bl.RETENTION_PENDING
-        elif not branch.exploit_dead and (strict_pass or weak_retention_pass):
-            if coverage_status == vo.COVERAGE_UNRESOLVED and not hardened_unresolved:
-                branch.retention_status = bl.RETENTION_PENDING
-            elif coverage_status == vo.COVERAGE_INADEQUATE or hardened_unresolved:
-                branch.retention_status = bl.RETENTION_FAILED
-            else:
-                branch.retention_status = bl.RETENTION_PASSED
-                can_validate = (
-                    strict_pass
-                    and not had_timeframe_mismatch
-                    and requested_horizon_months is not None
-                    and requested_horizon_months >= min_horizon
-                    and coverage_ok
-                )
-                if can_validate:
-                    branch.promotion_level = bl.PROMOTION_VALIDATED
-                    branch.lifecycle_state = bl.LIFECYCLE_VALIDATED_LEADER
-                    branch.structural_contrast_required = False
-                    branch.needs_structural_contrast = False
-                else:
-                    branch.promotion_level = bl.PROMOTION_PROVISIONAL
-                    if branch.lifecycle_state not in {
-                        bl.LIFECYCLE_COLLAPSED,
-                        bl.LIFECYCLE_VALIDATED_LEADER,
-                    }:
-                        branch.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_LEADER
-
-        if rr.get("needs_retention_check") and not branch.exploit_dead:
-            branch.retention_status = bl.RETENTION_PENDING
-
-        branch.unresolved_validation_active = (
-            coverage_status == vo.COVERAGE_UNRESOLVED and not hardened_unresolved
-        )
-        branch.needs_structural_contrast = branch.structural_contrast_required
-
-        evidence = vo.build_validation_outcome(
+        except (TypeError, ValueError):
+            frontier_improved = False
+        mgr_on = bool(self.config.manager.enabled and self.manager_providers)
+        bmech.refresh_family_after_scored_eval(
+            self,
+            tool_context,
+            step,
+            step_limit,
             family_id=family_id,
+            profile_ref=profile_ref,
             attempt_id=attempt_id,
+            score=score,
             requested_horizon_months=requested_horizon_months,
             effective_window_months=effective_window_months,
+            retention_result=retention_result,
+            behavior_digest=behavior_digest,
+            had_timeframe_mismatch=had_timeframe_mismatch,
             requested_timeframe=requested_timeframe,
             effective_timeframe=effective_timeframe,
-            coverage_status=coverage_status,
-            coverage_ok=coverage_ok,
-            retention_result=rr,
-            branch_retention_status=branch.retention_status,
-            branch_retention_passed=branch.retention_check_passed,
-            is_retention_horizon_check=(
-                requested_horizon_months is not None
-                and requested_horizon_months >= min_horizon
-            ),
-            hardened_unresolved=hardened_unresolved,
-            weak_provisional_evidence=weak_retention_pass,
             effective_window_source=effective_window_source,
-            timeframe_mismatch=had_timeframe_mismatch,
         )
-        evd = evidence.to_dict()
-        branch.last_validation_evidence = evd
-        branch.last_validation_outcome = evidence.outcome
-        branch.promotability_status = evidence.promotability_status
-        branch.validation_confidence = evidence.validation_confidence
-
-        if (
-            not branch.exploit_dead
-            and branch.retention_fail_count >= cfg.bankruptcy_fail_count
-        ):
-            self._mark_family_collapsed(
+        if mgr_on:
+            extra: list[str] = []
+            if had_timeframe_mismatch:
+                extra.append("timeframe_mismatch")
+            rr = retention_result or {}
+            if rr.get("retention_failed"):
+                extra.append("explicit_retention_fail")
+            digest_snap = self._branch_overlay.last_scored_validation_digest
+            unresolved_validation = False
+            if isinstance(digest_snap, dict):
+                ve = digest_snap.get("validation_evidence")
+                if isinstance(ve, dict) and ve.get("outcome") == vo.VALIDATION_UNRESOLVED:
+                    unresolved_validation = True
+                    extra.append("unresolved_validation")
+            if frontier_improved:
+                extra.append("candidate_frontier_change")
+            hook = mgr_hooks.select_post_eval_hook(
+                had_timeframe_mismatch=had_timeframe_mismatch,
+                explicit_retention_fail=bool(rr.get("retention_failed")),
+                unresolved_validation=unresolved_validation,
+                frontier_improved=frontier_improved,
+            )
+            self._manager_invoke_for_hook(
+                hook,
                 tool_context,
-                family_id,
-                "retention_fail_count_budget_exceeded",
                 step,
                 step_limit,
+                policy,
+                extra_issues=extra,
             )
-
-        if (
-            not branch.exploit_dead
-            and (
-                score >= cfg.retention_strong_candidate_threshold
-                or score >= float(cfg.provisional_leader_min_score)
-            )
-            and branch.promotion_level == bl.PROMOTION_SCOUT
-            and branch.lifecycle_state != bl.LIFECYCLE_COLLAPSED
-        ):
-            branch.promotion_level = bl.PROMOTION_PROVISIONAL
-            branch.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_CONTENDER
-
-        self._branch_overlay.last_scored_validation_digest = {
-            "family_id": family_id,
-            "attempt_id": attempt_id,
-            "validation_evidence": evd,
-            "lifecycle_state": branch.lifecycle_state,
-            "promotion_level": branch.promotion_level,
-            "retention_status": branch.retention_status,
-            "coverage_status": branch.last_coverage_status,
-            "last_validation_outcome": branch.last_validation_outcome,
-            "promotability_status": branch.promotability_status,
-            "validation_confidence": branch.validation_confidence,
-            "exploit_dead": branch.exploit_dead,
-            "collapse_reason": branch.collapse_reason,
-        }
-
         self._sync_branch_budget_mode(step, step_limit, policy)
         self._persist_branch_runtime_state(tool_context, step)
+        self._maybe_update_frontier_prior_best(tool_context)
+
+    def _maybe_update_frontier_prior_best(self, tool_context: ToolContext) -> None:
+        br = self._best_attempt(self._run_attempts(tool_context.run_id))
+        if not br or br.get("composite_score") is None:
+            return
+        try:
+            gb = float(br["composite_score"])
+        except (TypeError, ValueError):
+            return
+        if self._frontier_prior_best is None or self._score_better(
+            gb, float(self._frontier_prior_best)
+        ):
+            self._frontier_prior_best = gb
 
     def _persist_branch_runtime_state(self, tool_context: ToolContext, step: int) -> None:
         snapshot = self._build_branch_runtime_snapshot(tool_context, step)
@@ -1394,6 +1147,7 @@ class ResearchController:
             prior = {}
         prior["controller"] = snapshot
         prior["controller_updated_at"] = datetime.now(timezone.utc).isoformat()
+        prior["manager"] = self._manager_runtime.to_snapshot_dict()
         path.write_text(json.dumps(prior, ensure_ascii=True, indent=2), encoding="utf-8")
 
     def _build_branch_runtime_snapshot(
@@ -1466,6 +1220,7 @@ class ResearchController:
             "tool_usage_counts": dict(sorted(self._tool_usage_counts.items())),
             "validation_stale_without_validated": self._validation_stale_without_validated,
             "reseed_stale_validation_threshold": self.config.research.reseed_after_stale_validation_steps,
+            "frontier_prior_best": self._frontier_prior_best,
         }
 
     def _branch_lifecycle_run_packet_text(
@@ -1473,12 +1228,12 @@ class ResearchController:
     ) -> str:
         ov = self._branch_overlay
         lines = [
-            "Branch lifecycle (controller-owned):",
+            "Branch lifecycle (authoritative controller/manager state; this outranks raw frontier score when they conflict):",
             f"- budget_mode: {ov.budget_mode}",
             f"- reseed_active: {ov.reseed_active} (collapse_recovery_steps_left={ov.collapse_recovery_remaining})",
-            f"- provisional_leader_family: {(ov.provisional_leader_family_id or 'none')[:28]}{'...' if ov.provisional_leader_family_id and len(ov.provisional_leader_family_id) > 28 else ''}",
-            f"- validated_leader_family: {(ov.validated_leader_family_id or 'none')[:28]}{'...' if ov.validated_leader_family_id and len(ov.validated_leader_family_id) > 28 else ''}",
-            f"- shadow_leader_family: {(ov.shadow_leader_family_id or 'none')[:28]}{'...' if ov.shadow_leader_family_id and len(ov.shadow_leader_family_id) > 28 else ''}"
+            f"- provisional_leader_family: {self._short_family_id(ov.provisional_leader_family_id)}",
+            f"- validated_leader_family: {self._short_family_id(ov.validated_leader_family_id)}",
+            f"- shadow_leader_family: {self._short_family_id(ov.shadow_leader_family_id)}"
             + (f" ({ov.shadow_leader_reason})" if ov.shadow_leader_reason else ""),
             f"- provisional_leader_promotability: {ov.provisional_leader_promotability or 'n/a'}",
             f"- explored_distinct_families: {ov.explored_family_count}",
@@ -2379,10 +2134,9 @@ class ResearchController:
             "explorer_profile": self.config.llm.explorer_profile,
             "explorer_provider_type": self.config.provider.provider_type,
             "explorer_model": self.config.provider.model,
-            "supervisor_profile": self.config.llm.supervisor_profile,
-            "supervisor_provider_type": self.config.supervisor_provider.provider_type,
-            "supervisor_model": self.config.supervisor_provider.model,
             "quality_score_preset": self.config.research.quality_score_preset,
+            "manager_enabled": self.config.manager.enabled,
+            "manager_profiles": list(self.config.manager.profiles),
         }
         profiles_dir = run_dir / "profiles"
         evals_dir = run_dir / "evals"
@@ -2422,6 +2176,14 @@ class ResearchController:
 
     def _program_text(self) -> str:
         return self.config.program_path.read_text(encoding="utf-8")
+
+    def _short_family_id(self, family_id: str | None, *, limit: int = 28) -> str:
+        text = str(family_id or "").strip()
+        if not text:
+            return "none"
+        if len(text) <= limit:
+            return text
+        return text[:limit] + "..."
 
     def _seed_text(self, tool_context: ToolContext) -> str:
         if (
@@ -3000,6 +2762,165 @@ class ResearchController:
             lines.append(f"- {path}{suffix}")
         return "\n".join(lines)
 
+    def _manager_guidance_text(self, step: int) -> str:
+        runtime = self._manager_runtime
+        lines = ["Recent manager branch guidance (authoritative for branch-control state):"]
+        if not runtime.last_hook:
+            lines.append("- No manager intervention has fired yet in this run.")
+            lines.append(
+                "- Until a manager hook fires, follow the controller priority and branch lifecycle packet."
+            )
+            return "\n".join(lines)
+        lines.append(
+            f"- latest_hook: {runtime.last_hook} at step {runtime.last_hook_step}"
+        )
+        if runtime.last_rationale:
+            lines.append(f"- latest_rationale: {runtime.last_rationale}")
+        if runtime.last_actions_applied:
+            action_kinds = [
+                str(item.get("kind") or "unknown")
+                for item in runtime.last_actions_applied
+                if isinstance(item, dict)
+            ]
+            if action_kinds:
+                lines.append("- latest_actions: " + ", ".join(action_kinds[:8]))
+        if runtime.manager_notes:
+            lines.append(f"- latest_note: {runtime.manager_notes[-1]}")
+        if runtime.last_hook_step is not None and step > runtime.last_hook_step:
+            lines.append(
+                f"- recency: this guidance is {step - runtime.last_hook_step} step(s) old; follow it unless new evidence clearly changes branch state."
+            )
+        if runtime.invocation_incomplete:
+            lines.append(
+                f"- manager_status: incomplete ({runtime.last_error or 'unknown_error'})"
+            )
+        return "\n".join(lines)
+
+    def _current_research_priority_text(
+        self,
+        tool_context: ToolContext,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> str:
+        ov = self._branch_overlay
+        attempts = self._run_attempts(tool_context.run_id)
+        raw_best = self._best_attempt(attempts)
+        raw_best_score = None
+        raw_best_candidate = None
+        raw_best_family = None
+        if isinstance(raw_best, dict):
+            raw_best_candidate = str(raw_best.get("candidate_name") or "").strip() or None
+            try:
+                raw_best_score = (
+                    float(raw_best.get("composite_score"))
+                    if raw_best.get("composite_score") is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                raw_best_score = None
+            raw_best_family = self._family_id_for_profile_ref(
+                str(raw_best.get("profile_ref") or "").strip() or None
+            )
+        validation_digest = (
+            ov.last_scored_validation_digest
+            if isinstance(ov.last_scored_validation_digest, dict)
+            else {}
+        )
+        validation_evidence = (
+            validation_digest.get("validation_evidence")
+            if isinstance(validation_digest.get("validation_evidence"), dict)
+            else {}
+        )
+        unresolved_validation = (
+            validation_evidence.get("outcome") == vo.VALIDATION_UNRESOLVED
+        )
+        contrast_required = any(
+            branch.structural_contrast_required for branch in self._family_branches.values()
+        )
+        authoritative_family = (
+            ov.validated_leader_family_id or ov.provisional_leader_family_id or None
+        )
+        lines = [
+            "Current controller priority (authoritative; follow this over raw frontier score when they conflict):"
+        ]
+        if ov.validated_leader_family_id:
+            lines.append(
+                f"- Primary objective: protect and pressure-test the validated leader {self._short_family_id(ov.validated_leader_family_id)}."
+            )
+            lines.append(
+                "- Preferred next moves: validate or inspect the validated leader path, compare close contrasts, and avoid broad frontier chasing unless the branch packet explicitly reopens search."
+            )
+        elif ov.provisional_leader_family_id and unresolved_validation:
+            lines.append(
+                f"- Primary objective: resolve provisional leader validation for {self._short_family_id(ov.provisional_leader_family_id)} before chasing raw frontier winners."
+            )
+            stale_text = ""
+            threshold = self.config.research.reseed_after_stale_validation_steps
+            if threshold > 0 and self._validation_stale_without_validated > 0:
+                stale_text = (
+                    f" Validation has been stale for {self._validation_stale_without_validated}/{threshold} controller steps."
+                )
+            lines.append(
+                "- Preferred next moves: inspect the latest provisional-leader artifact, run disciplined longer-horizon validation or close contrast, and improve promotability evidence."
+                + stale_text
+            )
+        elif ov.provisional_leader_family_id:
+            lines.append(
+                f"- Primary objective: either promote or replace the provisional leader {self._short_family_id(ov.provisional_leader_family_id)} using direct validation evidence."
+            )
+            lines.append(
+                "- Preferred next moves: validation-centric follow-up or a disciplined nearby contrast that clarifies whether this family deserves leadership."
+            )
+        elif ov.budget_mode == bl.BUDGET_COLLAPSE_RECOVERY or contrast_required:
+            lines.append(
+                "- Primary objective: structural contrast. Do not keep exploiting blocked or exhausted families."
+            )
+            lines.append(
+                "- Preferred next moves: prepare a fresh scaffold/clone on a different family, instrument cluster, timeframe architecture, or directional logic."
+            )
+        elif ov.budget_mode == bl.BUDGET_WRAP_UP:
+            lines.append(
+                "- Primary objective: convert remaining budget into decisive validation evidence, not broad exploration."
+            )
+            lines.append(
+                "- Preferred next moves: validate survivors, inspect artifacts, compare contenders, and only open new branches if no leader path can be resolved."
+            )
+        else:
+            lines.append(
+                "- Primary objective: establish the next credible leader through diverse scored evidence."
+            )
+            lines.append(
+                "- Preferred next moves: prepare/validate/register/evaluate candidates across distinct families or instrument clusters."
+            )
+        if authoritative_family and raw_best_family and authoritative_family != raw_best_family:
+            raw_best_bits = [self._short_family_id(raw_best_family)]
+            if raw_best_candidate:
+                raw_best_bits.append(raw_best_candidate)
+            if raw_best_score is not None:
+                raw_best_bits.append(f"score={self._format_score(raw_best_score)}")
+            lines.append(
+                "- Conflict note: raw frontier best ("
+                + ", ".join(raw_best_bits)
+                + ") does not override current branch authority "
+                + self._short_family_id(authoritative_family)
+                + "."
+            )
+        if (
+            ov.budget_mode == bl.BUDGET_VALIDATION
+            and ov.provisional_leader_family_id
+            and not ov.validated_leader_family_id
+        ):
+            lines.append(
+                "- Planning rule: treat validation resolution as the default path; do not pivot to unrelated broad search without a concrete reason from the branch packet."
+            )
+        phase_name = str(self._run_phase_info(step, step_limit, policy).get("name") or "")
+        if phase_name == "wrap_up":
+            lines.append(
+                "- Phase note: wrap_up is active, so extra exploration needs strong justification."
+            )
+        return "\n".join(lines)
+
     def _step_log_path(self, tool_context: ToolContext) -> Path:
         return tool_context.run_dir / "controller-log.jsonl"
 
@@ -3071,6 +2992,11 @@ class ResearchController:
             f"Score target rationale: {score_target['rationale']}\n"
             f"Operating window: {policy.window_start or 'none'} -> {policy.window_end or 'none'} ({policy.timezone_name})\n"
             f"{soft_wrap_note + chr(10) if soft_wrap_note else ''}"
+            f"{self._current_research_priority_text(tool_context, effective_step, effective_step_limit, policy)}\n\n"
+            f"{self._manager_guidance_text(effective_step)}\n\n"
+            f"{self._branch_lifecycle_run_packet_text(tool_context, effective_step, effective_step_limit)}\n\n"
+            f"{self._retention_and_exploit_status_text(tool_context)}\n\n"
+            f"{self._timeframe_mismatch_status_text()}\n\n"
             f"Profiles dir: {tool_context.profiles_dir}\n"
             f"Evals dir: {tool_context.evals_dir}\n"
             f"Notes dir: {tool_context.notes_dir}\n"
@@ -3088,12 +3014,9 @@ class ResearchController:
             f"{self._artifact_layout_text()}\n\n"
             f"Profile JSON files currently on disk:\n{self._profile_files_summary(tool_context)}\n\n"
             f"Run-owned profiles so far:\n{self._run_owned_profiles_summary(tool_context)}\n\n"
-            f"Sticky frontier snapshot:\n{self._frontier_snapshot_text(tool_context)}\n\n"
             f"Checkpoint summary:\n{checkpoint}\n\n"
             f"Recent attempts:\n{self._recent_attempts_summary(tool_context)}\n\n"
-            f"{self._retention_and_exploit_status_text(tool_context)}\n\n"
-            f"{self._branch_lifecycle_run_packet_text(tool_context, effective_step, effective_step_limit)}\n\n"
-            f"{self._timeframe_mismatch_status_text()}\n\n"
+            f"Raw frontier snapshot (informational only; not leadership authority):\n{self._frontier_snapshot_text(tool_context)}\n\n"
             f"{self._recent_behavior_digest_text(tool_context)}\n"
             f"\nTool reference:\n{tool_reference}\n"
         )
@@ -3357,20 +3280,6 @@ class ResearchController:
             return {
                 "tool": tool,
                 "result": result.get("result"),
-            }
-        if tool == "advisor_guidance":
-            advisors = result.get("advisors")
-            labels = []
-            if isinstance(advisors, list):
-                for item in advisors[:4]:
-                    if isinstance(item, dict):
-                        label = str(item.get("label") or "").strip()
-                        if label:
-                            labels.append(label)
-            return {
-                "tool": tool,
-                "message": result.get("message"),
-                "advisors": labels,
             }
         if tool in {"yield_guard", "finish"}:
             return result
@@ -5388,7 +5297,7 @@ class ResearchController:
         current_step_payload: dict[str, Any] | None = None,
         limit: int | None = None,
     ) -> str:
-        effective_limit = max(1, limit or self.config.research.supervisor_recent_steps)
+        effective_limit = max(1, limit or self.config.research.recent_step_window_steps)
         payloads = self._load_recent_step_payloads(tool_context, effective_limit)
         if current_step_payload is not None:
             payloads.append(current_step_payload)
@@ -5644,305 +5553,6 @@ class ResearchController:
 
         return "\n".join(lines)
 
-    def _advisor_packet_text(
-        self,
-        tool_context: ToolContext,
-        step: int,
-        step_limit: int,
-        policy: RunPolicy,
-        current_step_payload: dict[str, Any] | None,
-    ) -> str:
-        phase_info = self._run_phase_info(step, step_limit, policy)
-        horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
-        score_target = self._score_target_snapshot(tool_context)
-        run_metadata = load_run_metadata(tool_context.run_dir)
-        leader = self._best_attempt(self._run_attempts(tool_context.run_id))
-        leader_lines = "No scored leader yet."
-        if leader is not None:
-            leader_lines = "\n".join(
-                [
-                    f"- seq={leader.get('sequence')}",
-                    f"- candidate={leader.get('candidate_name')}",
-                    f"- quality_score={self._format_score(leader.get('composite_score'))}",
-                    f"- score_basis={leader.get('score_basis', 'n/a')}",
-                    f"- psr={self._format_score((leader.get('metrics') or {}).get('psr')) if isinstance(leader.get('metrics'), dict) else 'n/a'}",
-                    f"- trades_per_month={self._format_score(self._attempt_trades_per_month(leader))}",
-                    f"- resolved_trades={self._attempt_trade_count(leader) if self._attempt_trade_count(leader) is not None else 'n/a'}",
-                    f"- max_drawdown_r={self._format_score(self._attempt_max_drawdown_r(leader))}",
-                    f"- positive_cell_ratio={self._format_score(self._attempt_positive_cell_ratio(leader))}",
-                    f"- artifact={leader.get('artifact_dir')}",
-                ]
-            )
-        issues = self._execution_issue_lines(
-            tool_context,
-            current_step_payload,
-            self.config.advisor.max_recent_steps,
-        )
-        issue_text = "\n".join(issues) if issues else "No recent execution issues."
-        checkpoint_path = self._checkpoint_path(tool_context)
-        checkpoint_summary = (
-            checkpoint_path.read_text(encoding="utf-8")
-            if checkpoint_path.exists()
-            else "No checkpoint summary exists yet."
-        )
-        return (
-            "Run advisory packet\n\n"
-            f"Run id: {tool_context.run_id}\n"
-            f"Mode: {policy.mode_name}\n"
-            f"Step: {step}/{step_limit}\n"
-            f"Phase: {phase_info['name']}\n"
-            f"Explorer profile: {run_metadata.get('explorer_profile') or self.config.llm.explorer_profile}\n"
-            f"Explorer model: {run_metadata.get('explorer_model') or self.config.provider.model}\n"
-            f"Supervisor profile: {run_metadata.get('supervisor_profile') or self.config.llm.supervisor_profile}\n"
-            f"Supervisor model: {run_metadata.get('supervisor_model') or self.config.supervisor_provider.model}\n"
-            f"Quality-score preset: {run_metadata.get('quality_score_preset') or self.config.research.quality_score_preset}\n\n"
-            f"Controller horizon target:\n{horizon_policy['summary']}\n\n"
-            f"Controller score target:\n{score_target['summary']}\n\n"
-            "Advisory goal:\n"
-            "Give the explorer short, concrete guidance that improves the next few steps. "
-            "Do not try to end the run. Help it avoid drift, stale paths, and low-value retries.\n\n"
-            f"Current best run-local leader:\n{leader_lines}\n\n"
-            f"Recent scored attempts:\n{self._recent_scored_attempts_text(tool_context, self.config.advisor.max_recent_attempts)}\n\n"
-            f"Frontier snapshot:\n{self._frontier_snapshot_text(tool_context)}\n\n"
-            f"Recent execution issues:\n{issue_text}\n\n"
-            f"Synthesized run diagnosis:\n{self._synthesized_run_diagnosis(tool_context, current_step_payload)}\n\n"
-            f"Checkpoint summary:\n{checkpoint_summary[:2000]}\n\n"
-            f"Recent step window:\n{self._recent_step_window_text(tool_context, current_step_payload, limit=self.config.advisor.max_recent_steps)}\n\n"
-            "Decision request:\n"
-            "Help the explorer choose the highest-value next branch over the next 2-3 steps.\n"
-        )
-
-    def _advisor_feedback_message(self, advisor_result: dict[str, Any]) -> str:
-        advisors = advisor_result.get("advisors")
-        if not isinstance(advisors, list) or not advisors:
-            return ""
-        lines = [
-            "External advisor guidance. Treat this as advisory input, not a command. "
-            "Use it if it improves the next bounded actions. "
-            "When acting on it, prefer typed tools over run_cli unless recovery demands raw CLI."
-        ]
-        for advisor in advisors:
-            if not isinstance(advisor, dict):
-                continue
-            profile = str(advisor.get("label") or "advisor").strip()
-            message = str(advisor.get("message") or "").strip()
-            next_moves = advisor.get("next_moves")
-            risks = advisor.get("risks")
-            lines.append(f"{profile}: {message}")
-            if isinstance(next_moves, list):
-                for move in next_moves[:3]:
-                    lines.append(f"- next: {str(move).strip()}")
-            if isinstance(risks, list):
-                for risk in risks[:2]:
-                    lines.append(f"- risk: {str(risk).strip()}")
-        return "\n".join(lines)
-
-    def _periodic_advisor_guidance(
-        self,
-        tool_context: ToolContext,
-        step: int,
-        step_limit: int,
-        policy: RunPolicy,
-        current_step_payload: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        if not self.config.advisor.enabled:
-            return None
-        if step >= step_limit:
-            return None
-        cadence = max(1, int(self.config.advisor.every_n_steps))
-        if step % cadence != 0:
-            return None
-        if not self.advisor_providers:
-            return None
-
-        packet = self._advisor_packet_text(
-            tool_context,
-            step,
-            step_limit,
-            policy,
-            current_step_payload,
-        )
-        advisors: list[dict[str, Any]] = []
-        for advisor_label, profile_name, provider in self.advisor_providers:
-            self._trace_runtime(
-                tool_context,
-                step=step,
-                phase="advisor",
-                status="start",
-                message="Requesting periodic advisor guidance.",
-                advisor=advisor_label,
-                profile=profile_name,
-            )
-            try:
-                with self._provider_scope(
-                    tool_context=tool_context,
-                    step=step,
-                    label=f"advisor:{advisor_label}",
-                    phase="advisor",
-                    provider=provider,
-                ):
-                    payload = provider.complete_json(
-                        [
-                            ChatMessage(role="system", content=ADVISOR_PROMPT),
-                            ChatMessage(role="user", content=packet),
-                        ]
-                    )
-            except ProviderError as exc:
-                self._trace_runtime(
-                    tool_context,
-                    step=step,
-                    phase="advisor",
-                    status="failed",
-                    message="Advisor request failed.",
-                    advisor=advisor_label,
-                    error=exc,
-                    level="warning",
-                )
-                continue
-            message = str(payload.get("message") or "").strip()
-            next_moves = payload.get("next_moves")
-            risks = payload.get("risks")
-            if not message:
-                self._trace_runtime(
-                    tool_context,
-                    step=step,
-                    phase="advisor",
-                    status="empty",
-                    message="Advisor returned no usable message.",
-                    advisor=advisor_label,
-                    level="warning",
-                )
-                continue
-            self._trace_runtime(
-                tool_context,
-                step=step,
-                phase="advisor",
-                status="ok",
-                message="Advisor guidance received.",
-                advisor=advisor_label,
-            )
-            advisors.append(
-                {
-                    "label": advisor_label,
-                    "message": message,
-                    "next_moves": (
-                        [str(item).strip() for item in next_moves[:3]]
-                        if isinstance(next_moves, list)
-                        else []
-                    ),
-                    "risks": (
-                        [str(item).strip() for item in risks[:2]]
-                        if isinstance(risks, list)
-                        else []
-                    ),
-                }
-            )
-        if not advisors:
-            return None
-        return {
-            "tool": "advisor_guidance",
-            "message": f"Injected {len(advisors)} advisor note(s).",
-            "advisors": advisors,
-        }
-
-    def _supervisor_guidance(
-        self,
-        tool_context: ToolContext,
-        step: int,
-        step_limit: int,
-        policy: RunPolicy,
-        finish_summary: str,
-        denial_message: str,
-        current_step_payload: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        attempts = self._run_attempts(tool_context.run_id)
-        attempt_lines: list[str] = []
-        for attempt in attempts[-6:]:
-            attempt_lines.append(
-                f"- seq={attempt.get('sequence')} candidate={attempt.get('candidate_name')} "
-                f"score={attempt.get('composite_score')} basis={attempt.get('score_basis')}"
-            )
-        phase_info = self._run_phase_info(step, step_limit, policy)
-        horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
-        score_target = self._score_target_snapshot(tool_context)
-        prompt = (
-            f"Step: {step}/{step_limit}\n"
-            f"Run phase: {phase_info['name']}\n"
-            f"Phase guidance: {phase_info['summary']}\n"
-            f"Horizon target: {horizon_policy['summary']}\n"
-            f"Horizon guidance: {horizon_policy['guidance']}\n"
-            f"Horizon rationale: {horizon_policy['rationale']}\n"
-            f"Finish denial count: {self.finish_denials + 1}\n"
-            f"Denied finish summary: {finish_summary or 'n/a'}\n"
-            f"Controller denial: {denial_message}\n\n"
-            f"Score target:\n{score_target['summary']}\n"
-            f"Target rationale: {score_target['rationale']}\n\n"
-            f"Frontier snapshot:\n{self._frontier_snapshot_text(tool_context)}\n\n"
-            f"Recent run attempts:\n{chr(10).join(attempt_lines) if attempt_lines else 'No attempts yet.'}\n\n"
-            f"Recent step window:\n{self._recent_step_window_text(tool_context, current_step_payload)}\n"
-        )
-        self._trace_runtime(
-            tool_context,
-            step=step,
-            phase="supervisor",
-            status="start",
-            message="Requesting supervisor guidance after finish denial.",
-        )
-        try:
-            with self._provider_scope(
-                tool_context=tool_context,
-                step=step,
-                label="supervisor",
-                phase="supervisor",
-                provider=self.supervisor_provider,
-            ):
-                payload = self.supervisor_provider.complete_json(
-                    [
-                        ChatMessage(role="system", content=SUPERVISOR_PROMPT),
-                        ChatMessage(role="user", content=prompt),
-                    ]
-                )
-        except ProviderError as exc:
-            self._trace_runtime(
-                tool_context,
-                step=step,
-                phase="supervisor",
-                status="failed",
-                message="Supervisor request failed.",
-                error=exc,
-                level="warning",
-            )
-            return None
-        message = payload.get("message")
-        questions = payload.get("questions")
-        next_moves = payload.get("next_moves")
-        if not isinstance(message, str) or not message.strip():
-            self._trace_runtime(
-                tool_context,
-                step=step,
-                phase="supervisor",
-                status="empty",
-                message="Supervisor returned no usable message.",
-                level="warning",
-            )
-            return None
-        self._trace_runtime(
-            tool_context,
-            step=step,
-            phase="supervisor",
-            status="ok",
-            message="Supervisor guidance received.",
-        )
-        return {
-            "message": message.strip(),
-            "questions": [str(item).strip() for item in questions[:3]]
-            if isinstance(questions, list)
-            else [],
-            "next_moves": [str(item).strip() for item in next_moves[:3]]
-            if isinstance(next_moves, list)
-            else [],
-        }
-
     def _checkpoint_messages(
         self, history_messages: list[ChatMessage]
     ) -> list[ChatMessage]:
@@ -6102,7 +5712,7 @@ class ResearchController:
         if not policy.allow_finish:
             return (
                 False,
-                "Finish is disabled in supervised mode. Keep working until the supervisor stops prompting you.",
+                "Finish is disabled in supervised mode. Keep working until the controller stops the session.",
             )
         if not summary.strip():
             return (
@@ -6174,7 +5784,6 @@ class ResearchController:
             status="started",
             message="Research run started.",
             explorer_profile=self.config.llm.explorer_profile,
-            supervisor_profile=self.config.llm.supervisor_profile,
         )
         effective_step_limit = max_steps or self.config.research.max_steps
         if progress_callback:
@@ -6226,9 +5835,25 @@ class ResearchController:
             self._current_controller_step = step
             self._current_step_limit = step_limit
             self._current_run_policy = policy
-            self._branch_step_maintenance(step, step_limit, policy)
-            self._maybe_activate_reseed(tool_context, step, step_limit)
+            self._pending_manager_events = []
+            self._branch_step_maintenance(tool_context, step, step_limit, policy)
             self._sync_branch_budget_mode(step, step_limit, policy)
+            phase_now = self._run_phase_info(step, step_limit, policy)
+            if (
+                str(phase_now.get("name")) == "wrap_up"
+                and self.config.manager.enabled
+                and self.manager_providers
+            ):
+                self._manager_invoke_for_hook(
+                    ManagerHookEvent.before_wrap_up_decision,
+                    tool_context,
+                    step,
+                    step_limit,
+                    policy,
+                    extra_issues=["wrap_up_phase"],
+                )
+                self._sync_branch_budget_mode(step, step_limit, policy)
+                self._persist_branch_runtime_state(tool_context, step)
             self._trace_runtime(
                 tool_context,
                 step=step,
@@ -6423,6 +6048,7 @@ class ResearchController:
                     ],
                     "reasoning": reasoning,
                     "actions": actions if isinstance(actions, list) else [],
+                    "manager_events": [],
                     "results": [
                         {
                             "tool": "response_guard",
@@ -6431,6 +6057,7 @@ class ResearchController:
                         }
                     ],
                 }
+                step_payload["manager_events"].extend(self._flush_pending_manager_events())
                 self._append_step_log(tool_context, step_payload)
                 if progress_callback:
                     progress_callback(
@@ -6468,12 +6095,12 @@ class ResearchController:
                 "score_target": self._score_target_snapshot(tool_context)["summary"],
                 "reasoning": reasoning,
                 "actions": actions,
+                "manager_events": [],
                 "results": [],
             }
 
             finished = False
             finish_summary = ""
-            advisor_result: dict[str, Any] | None = None
             self._trace_runtime(
                 tool_context,
                 step=step,
@@ -6569,19 +6196,10 @@ class ResearchController:
                             step=step,
                             phase="finish",
                             status="denied",
-                            message="Finish denied; requesting supervisor guidance.",
+                            message="Finish denied.",
                             level="warning",
                         )
                         self.finish_denials += 1
-                        supervisor = self._supervisor_guidance(
-                            tool_context,
-                            step,
-                            step_limit,
-                            policy,
-                            proposed_summary,
-                            message,
-                            step_payload,
-                        )
                         guard_payload: dict[str, Any] = {
                             "tool": "yield_guard",
                             "message": message,
@@ -6590,38 +6208,10 @@ class ResearchController:
                             "horizon_target": step_payload.get("horizon_target"),
                             "score_target": step_payload.get("score_target"),
                         }
-                        if supervisor:
-                            guard_payload["supervisor_message"] = supervisor.get(
-                                "message"
-                            )
-                            guard_payload["questions"] = supervisor.get("questions", [])
-                            guard_payload["next_moves"] = supervisor.get(
-                                "next_moves", []
-                            )
                         step_payload["results"].append(guard_payload)
                     break
 
-            if not finished:
-                advisor_result = self._periodic_advisor_guidance(
-                    tool_context,
-                    step,
-                    step_limit,
-                    policy,
-                    step_payload,
-                )
-                if advisor_result is not None:
-                    self._trace_runtime(
-                        tool_context,
-                        step=step,
-                        phase="advisor",
-                        status="injected",
-                        message="Advisor guidance injected into conversation.",
-                        advisor_count=len(advisor_result.get("advisors", []))
-                        if isinstance(advisor_result, dict)
-                        else None,
-                    )
-                    step_payload["results"].append(advisor_result)
-
+            step_payload["manager_events"].extend(self._flush_pending_manager_events())
             self._append_step_log(tool_context, step_payload)
             self._persist_branch_runtime_state(tool_context, step)
             self._trace_runtime(
@@ -6666,22 +6256,12 @@ class ResearchController:
                                 self._history_result_summary(result)
                                 for result in step_payload["results"]
                                 if isinstance(result, dict)
-                                and str(result.get("tool", "")) != "advisor_guidance"
                             ],
                             ensure_ascii=True,
                         )
                     ),
                 )
             )
-            if advisor_result is not None:
-                advisor_message = self._advisor_feedback_message(advisor_result)
-                if advisor_message.strip():
-                    messages.append(
-                        ChatMessage(
-                            role="user",
-                            content=advisor_message,
-                        )
-                    )
 
             if finished:
                 self._trace_runtime(

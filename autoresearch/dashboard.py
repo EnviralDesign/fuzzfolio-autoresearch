@@ -470,11 +470,10 @@ def _run_full_backtest_for_attempt(
         }
 
 
-def _count_advisor_injections(run_dir: Path) -> tuple[int, int | None, str | None]:
+def _latest_run_log_state(run_dir: Path) -> tuple[int | None, str | None]:
     log_path = run_dir / "controller-log.jsonl"
     if not log_path.exists():
-        return 0, None, None
-    advisor_count = 0
+        return None, None
     latest_step: int | None = None
     latest_timestamp: str | None = None
     with log_path.open("r", encoding="utf-8") as handle:
@@ -493,13 +492,7 @@ def _count_advisor_injections(run_dir: Path) -> tuple[int, int | None, str | Non
             timestamp = payload.get("timestamp")
             if timestamp:
                 latest_timestamp = str(timestamp)
-            for result in payload.get("results", []):
-                if (
-                    isinstance(result, dict)
-                    and result.get("tool") == "advisor_guidance"
-                ):
-                    advisor_count += 1
-    return advisor_count, latest_step, latest_timestamp
+    return latest_step, latest_timestamp
 
 
 def _attempt_summary(config: AppConfig, attempt: dict[str, Any]) -> dict[str, Any]:
@@ -570,7 +563,7 @@ def _best_attempt_for_run(
 def _run_summary(config: AppConfig, run_dir: Path) -> dict[str, Any]:
     metadata = load_run_metadata(run_dir)
     attempts = load_run_attempts(run_dir)
-    advisor_count, latest_step, latest_timestamp = _count_advisor_injections(run_dir)
+    latest_step, latest_timestamp = _latest_run_log_state(run_dir)
     best_attempt = _best_attempt_for_run(
         attempts, lower_is_better=config.research.plot_lower_is_better
     )
@@ -588,8 +581,6 @@ def _run_summary(config: AppConfig, run_dir: Path) -> dict[str, Any]:
         "createdAt": metadata.get("created_at"),
         "explorerProfile": metadata.get("explorer_profile"),
         "explorerModel": metadata.get("explorer_model"),
-        "supervisorProfile": metadata.get("supervisor_profile"),
-        "supervisorModel": metadata.get("supervisor_model"),
         "qualityScorePreset": metadata.get("quality_score_preset"),
         "attemptCount": len(attempts),
         "scoredAttemptCount": scored_count,
@@ -597,7 +588,6 @@ def _run_summary(config: AppConfig, run_dir: Path) -> dict[str, Any]:
         "latestAttemptAt": latest_attempt_at,
         "latestStep": latest_step,
         "latestLogTimestamp": latest_timestamp,
-        "advisorGuidanceCount": advisor_count,
         "progressPngUrl": _file_url(config, run_dir / "progress.png"),
         "profileDrop12PngUrl": _file_url(config, run_dir / "profile-drop-12mo.png")
         if (run_dir / "profile-drop-12mo.png").exists()

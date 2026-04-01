@@ -92,31 +92,21 @@ uv run autoresearch supervise --plain-progress
 You can also override the configured provider profiles per invocation:
 
 ```powershell
-uv run autoresearch run --max-steps 20 --explorer-profile openai-mini --supervisor-profile xai-grok
-uv run autoresearch supervise --explorer-profile grok-fast --supervisor-profile grok-420-multi-agent-0309
+uv run autoresearch run --max-steps 20 --explorer-profile openai-mini
+uv run autoresearch supervise --explorer-profile grok-fast
 ```
-
-Periodic advisor guidance can also be configured globally or overridden per invocation:
-
-```powershell
-uv run autoresearch run --max-steps 20 --advisor-every 20 --advisor-profile grok-420-multi-agent-0309
-uv run autoresearch supervise --advisor-every 20 --advisor-profile grok-420-multi-agent-0309
-uv run autoresearch run --no-advisor
-```
-
-Advisor responses are anonymized in the run trace as `advisor1`, `advisor2`, and so on. The explorer sees only compact external guidance, not the underlying model names.
 
 The default live trace uses `rich` for colored panels and step/result tables so it is easier to watch during longer managed runs.
 The default provider completion budget is intentionally a bit roomy because the agent sometimes needs to emit a full portable profile JSON in one action.
 The controller also uses threshold-triggered context compaction modeled after `codex-rs`: once the live prompt estimate crosses the configured token threshold, it writes a checkpoint summary and rebuilds the active history from fresh run state plus a short recent tail.
 Compaction thresholds can now also be set per provider profile with `providers.<name>.compact_trigger_tokens`. If omitted, the runtime falls back to the global `research.compact_trigger_tokens`.
-The runtime now uses named LLM provider profiles instead of one global provider block. By default in the example config, the main explorer loop uses the `openai-mini` profile (`gpt-5.4-mini`) while the supervisor guidance path uses the `xai-grok` profile (`grok-4.20-reasoning`).
+The runtime now uses named LLM provider profiles instead of one global provider block. By default in the example config, the main explorer loop uses the `openai-mini` profile (`gpt-5.4-mini`).
 In plain `run` mode, the controller now uses an explicit phase policy: most of the run is exploration with finish disabled, and only the last few steps become wrap-up. The prompt also carries a rolling next-score target so the explorer has a concrete stretch goal instead of repeatedly trying to stop.
 The controller now also owns horizon policy by phase: early runs screen over shorter month-based windows, mid runs deepen evidence around one year, and late/wrap-up phases push survivors toward 2-3 year pressure tests. The worker is guided to think in weeks/months/years, not bars.
 The controller also owns the active quality-score preset. By default it injects the `profile-drop` preset into deep-replay-backed evaluations and scaffolded sweeps so the agent does not need to remember or reason about preset selection mid-run.
 The controller now treats sweeps as first-class search behavior instead of an optional side path. Early and mid phases explicitly encourage `sweep scaffold`, `sweep patch`, `sweep validate`, and then `sweep submit` around promising families before the run settles into manual profile tweaking only.
 Instrument context is also coverage-aware now. The runtime asks the CLI for market coverage at a reference timeframe and surfaces buffered shortlist hints such as roughly `11` months for mid-phase work and `34` months for long-horizon wrap-up, so the agent naturally favors symbols that can actually satisfy the requested evidence horizon.
-New runs also persist `run-metadata.json` with the active explorer/supervisor profile and model names. Progress plots, progress indexes, and the derived leaderboard use that file when present so you can tell which models produced which runs.
+New runs also persist `run-metadata.json` with the active explorer profile and model name. Progress plots, progress indexes, and the derived leaderboard use that file when present so you can tell which model produced which run.
 The controller now also writes `cli-help-catalog.json` per run from the real `fuzzfolio-agent-cli --help` surface. It uses that catalog as a shallow front-door guard for invalid command families and subcommands, and the agent can explicitly recover with `run_cli ["help"]` or `run_cli ["help", "<family>"]`.
 
 If you want to change that preset later, set `research.quality_score_preset` in `autoresearch.config.json`.
@@ -126,15 +116,14 @@ If you want to change that preset later, set `research.quality_score_preset` in 
 Provider selection now lives in two places:
 
 - `llm.explorer_profile`
-- `llm.supervisor_profile`
 
-Optional periodic guidance lives under:
+Optional **event-driven branch manager** (adjudication only; no research tools) lives under:
 
-- `advisor.enabled`
-- `advisor.every_n_steps`
-- `advisor.profiles`
-- `advisor.max_recent_steps`
-- `advisor.max_recent_attempts`
+- `manager.enabled`
+- `manager.profiles` (named `providers` entries)
+- `manager.max_candidate_families_in_packet`
+
+**Leader IDs** (provisional / validated) in the overlay are set only via **manager actions** or prior run state — there is no score-based leader recomputation in the controller. After each scored eval the controller updates validation evidence and budget mode mechanically; reseed windows and suppression are driven by the manager (or prior overlay state). Runtime state and `runtime-state.json` include a `manager` section with the last hook, rationale tail, applied actions, and an `invocation_incomplete` flag when the manager errored, returned invalid output, or an action failed to apply.
 
 Each named profile is defined under `providers`.
 
@@ -143,15 +132,7 @@ Example:
 ```json
 {
   "llm": {
-    "explorer_profile": "openai-mini",
-    "supervisor_profile": "xai-grok"
-  },
-  "advisor": {
-    "enabled": true,
-    "every_n_steps": 20,
-    "profiles": ["grok-420-multi-agent-0309"],
-    "max_recent_steps": 4,
-    "max_recent_attempts": 6
+    "explorer_profile": "openai-mini"
   },
   "providers": {
     "openai-mini": {
@@ -167,9 +148,6 @@ Example:
   }
 }
 ```
-
-When enabled, the controller periodically synthesizes a compact run-state packet from the ledger, controller log, frontier snapshot, recent scored attempts, and recent execution issues. It then queries the configured advisor profiles and injects their short guidance back into the explorer loop as anonymous `advisor1`/`advisor2`/`advisor3` feedback.
-Even when you use a single advisor profile, the explorer still sees anonymous labels such as `advisor1` rather than the underlying model name.
 
 That profile-level compaction override is useful when one model has a much larger context window, a very different token cost, or a different quality/latency tradeoff than another.
 Provider profiles can also tune generic rate-limit behavior with:
@@ -310,7 +288,7 @@ These are useful both for permissive early screening and for later hardening aro
 
 - It reads defaults from `autoresearch.config.json` if you do not pass flags.
 - CLI flags override config values when you do pass them.
-- The supervisor, not the agent, owns termination in this mode.
+- The controller/session policy, not the agent, owns termination in this mode.
 - `max_steps` is a per-session cap in this mode, not a whole-night cap.
 - When a supervised session hits its step cap, supervise starts a brand-new isolated session if the outer time window is still open.
 - New supervised sessions do not carry over prior conversation state; each one starts boxed-in and fresh with its own run directory.
@@ -359,7 +337,7 @@ Config-backed example:
 
 ```json
 {
-  "supervisor": {
+  "supervise": {
     "max_steps": 200,
     "window_start": "23:00",
     "window_end": "05:00",
@@ -523,9 +501,9 @@ uv run autoresearch sync-profile-drop-pngs --force-rebuild
 When `--lookback-months` is neither `12` nor `36`, the command still always renders the standard `12mo` and `36mo` cards and will additionally render the requested custom horizon.
 By default it heals missing or stale profile-drop renders using per-horizon manifests and skips runs that are already up to date. Use `--force-rebuild` when you intentionally want to rerender everything.
 
-`supervise` already starts a fresh isolated session when the prior session stops with `step_limit_reached` and time remains in the outer supervise window. Set `"window_enabled": false` under `supervisor`, or pass `--no-window`, to let supervise run around the clock.
+`supervise` already starts a fresh isolated session when the prior session stops with `step_limit_reached` and time remains in the outer supervise window. Set `"window_enabled": false` under `supervise`, or pass `--no-window`, to let supervise run around the clock.
 
-If you also set `"auto_restart_terminal_sessions": true` under `supervisor`, supervise will start a fresh isolated session after terminal session endings such as `finished` or `session_error`, not just after `step_limit_reached`.
+If you also set `"auto_restart_terminal_sessions": true` under `supervise`, supervise will start a fresh isolated session after terminal session endings such as `finished` or `session_error`, not just after `step_limit_reached`.
 
 ## Scoring
 
@@ -548,7 +526,7 @@ Saved sensitivity artifacts now expose both requested and effective window infor
 - `effective_window_days`
 - `effective_window_months`
 
-That means the worker and supervisor can reason about evidence horizon in months and days instead of bars. If a requested 24-month test only delivered 2.8 effective months, the run can now see that directly without digging through raw bar mechanics.
+That means the worker and controller can reason about evidence horizon in months and days instead of bars. If a requested 24-month test only delivered 2.8 effective months, the run can now see that directly without digging through raw bar mechanics.
 
 ## Long-running behavior
 

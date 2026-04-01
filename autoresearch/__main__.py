@@ -215,28 +215,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the configured explorer provider profile for this run.",
     )
     run.add_argument(
-        "--supervisor-profile",
-        default=None,
-        help="Override the configured supervisor provider profile for this run.",
-    )
-    run.add_argument(
-        "--advisor-profile",
-        action="append",
-        default=None,
-        help="Override advisor provider profiles for this run. Can be repeated.",
-    )
-    run.add_argument(
-        "--advisor-every",
-        type=int,
-        default=None,
-        help="Inject advisor guidance every N steps.",
-    )
-    run.add_argument(
-        "--no-advisor",
-        action="store_true",
-        help="Disable periodic advisor guidance for this run.",
-    )
-    run.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON instead of live console progress.",
@@ -274,28 +252,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--explorer-profile",
         default=None,
         help="Override the configured explorer provider profile for this run.",
-    )
-    supervise.add_argument(
-        "--supervisor-profile",
-        default=None,
-        help="Override the configured supervisor provider profile for this run.",
-    )
-    supervise.add_argument(
-        "--advisor-profile",
-        action="append",
-        default=None,
-        help="Override advisor provider profiles for this supervise session. Can be repeated.",
-    )
-    supervise.add_argument(
-        "--advisor-every",
-        type=int,
-        default=None,
-        help="Inject advisor guidance every N steps.",
-    )
-    supervise.add_argument(
-        "--no-advisor",
-        action="store_true",
-        help="Disable periodic advisor guidance for this supervise session.",
     )
     supervise.add_argument(
         "--json",
@@ -528,13 +484,14 @@ def _set_trace_console_mode(*, plain_progress: bool, as_json: bool) -> None:
     set_provider_trace_stderr_mode("verbose")
 
 
-def _plain_separator(label: str | None = None) -> str:
+def _plain_separator(label: str | None = None, *, fill: str = "-") -> str:
     width = 110
+    fill_char = str(fill or "-")[:1] or "-"
     if not label:
-        return "-" * width
+        return fill_char * width
     compact = _short_text(label, 96)
-    decorated = f"---- {compact} "
-    return decorated + ("-" * max(0, width - len(decorated)))
+    decorated = f"{fill_char * 4} {compact} "
+    return decorated + (fill_char * max(0, width - len(decorated)))
 
 
 def _safe_render(console_renderer: Any, plain_renderer: Any) -> None:
@@ -695,9 +652,7 @@ def _plain_result_details(result: dict[str, object]) -> list[str]:
                     if text:
                         details.append(f"stdout: {text}")
     if tool == "yield_guard":
-        message = str(
-            result.get("supervisor_message") or result.get("message") or ""
-        ).strip()
+        message = str(result.get("message") or "").strip()
         if message:
             details.append(f"warning: {message}")
         questions = result.get("questions")
@@ -719,6 +674,27 @@ def _plain_result_details(result: dict[str, object]) -> list[str]:
     return details
 
 
+def _summarize_manager_event(event: dict[str, object]) -> str:
+    hook = str(event.get("hook") or "unknown")
+    status = str(event.get("status") or "unknown")
+    parts = [f"{hook} | status={status}"]
+    action_count = event.get("action_count")
+    if isinstance(action_count, int):
+        parts.append(f"actions={action_count}")
+    error = str(event.get("error") or "").strip()
+    if error:
+        parts.append(f"error={_short_text(error, 120)}")
+    return " | ".join(parts)
+
+
+def _plain_manager_event_details(event: dict[str, object]) -> list[str]:
+    details: list[str] = []
+    rationale = str(event.get("rationale") or "").strip()
+    if rationale:
+        details.append(f"rationale: {_short_text(rationale, 300)}")
+    return details
+
+
 def _render_step_plain(step_payload: dict[str, Any]) -> None:
     _write_plain_line(_plain_separator(_step_header_label(step_payload)))
     focus = _step_focus_text(step_payload)
@@ -729,6 +705,13 @@ def _render_step_plain(step_payload: dict[str, Any]) -> None:
         for action in actions:
             if isinstance(action, dict):
                 _write_plain_line(f"plan: {_summarize_action(action)}")
+    manager_events = step_payload.get("manager_events")
+    if isinstance(manager_events, list):
+        for event in manager_events:
+            if isinstance(event, dict):
+                _write_plain_line(f"manager: {_summarize_manager_event(event)}")
+                for detail in _plain_manager_event_details(event):
+                    _write_plain_line(detail)
     results = step_payload.get("results")
     if isinstance(results, list):
         for result in results:
@@ -783,29 +766,16 @@ def cmd_doctor() -> int:
         "explorer_compact_trigger_tokens": config.compact_trigger_tokens_for(
             config.llm.explorer_profile
         ),
-        "supervisor_profile": config.llm.supervisor_profile,
-        "supervisor_provider_type": config.supervisor_provider.provider_type,
-        "supervisor_model": config.supervisor_provider.model,
-        "supervisor_api_base": config.supervisor_provider.api_base,
-        "supervisor_command": config.supervisor_provider.command,
-        "supervisor_has_api_key": bool(config.supervisor_provider.api_key),
-        "supervisor_uses_managed_auth": config.supervisor_provider.provider_type.strip().lower()
-        == "codex",
-        "supervisor_compact_trigger_tokens": config.compact_trigger_tokens_for(
-            config.llm.supervisor_profile
-        ),
-        "supervisor_max_steps": config.supervisor.max_steps,
-        "supervisor_window_enabled": config.supervisor.window_enabled,
-        "supervisor_window_start": config.supervisor.window_start,
-        "supervisor_window_end": config.supervisor.window_end,
-        "supervisor_timezone": config.supervisor.timezone,
-        "supervisor_soft_wrap_minutes": config.supervisor.soft_wrap_minutes,
-        "supervisor_auto_restart_terminal_sessions": config.supervisor.auto_restart_terminal_sessions,
-        "advisor_enabled": config.advisor.enabled,
-        "advisor_every_n_steps": config.advisor.every_n_steps,
-        "advisor_profiles": config.advisor.profiles,
-        "advisor_max_recent_steps": config.advisor.max_recent_steps,
-        "advisor_max_recent_attempts": config.advisor.max_recent_attempts,
+        "supervise_max_steps": config.supervise.max_steps,
+        "supervise_window_enabled": config.supervise.window_enabled,
+        "supervise_window_start": config.supervise.window_start,
+        "supervise_window_end": config.supervise.window_end,
+        "supervise_timezone": config.supervise.timezone,
+        "supervise_soft_wrap_minutes": config.supervise.soft_wrap_minutes,
+        "supervise_auto_restart_terminal_sessions": config.supervise.auto_restart_terminal_sessions,
+        "manager_enabled": config.manager.enabled,
+        "manager_profiles": config.manager.profiles,
+        "manager_max_candidate_families_in_packet": config.manager.max_candidate_families_in_packet,
         "auth_ok": auth.returncode == 0,
         "seed_ok": seed.returncode == 0,
     }
@@ -1273,51 +1243,17 @@ def _parse_window(window_text: str | None) -> tuple[str | None, str | None]:
 def _load_runtime_config(
     *,
     explorer_profile: str | None = None,
-    supervisor_profile: str | None = None,
-    advisor_profiles: list[str] | None = None,
-    advisor_every: int | None = None,
-    no_advisor: bool = False,
 ):
     config = load_config()
     effective_explorer = explorer_profile or config.llm.explorer_profile
-    effective_supervisor = supervisor_profile or config.llm.supervisor_profile
-    effective_advisors = list(config.advisor.profiles)
-    if advisor_profiles is not None:
-        effective_advisors = []
-        seen: set[str] = set()
-        for item in advisor_profiles:
-            token = str(item or "").strip()
-            if not token or token in seen:
-                continue
-            seen.add(token)
-            effective_advisors.append(token)
 
     missing: list[str] = []
     if effective_explorer not in config.providers:
         missing.append(f"explorer profile {effective_explorer!r}")
-    if effective_supervisor not in config.providers:
-        missing.append(f"supervisor profile {effective_supervisor!r}")
-    for advisor_profile in effective_advisors:
-        if advisor_profile not in config.providers:
-            missing.append(f"advisor profile {advisor_profile!r}")
     if missing:
         raise SystemExit(f"Unknown provider profile override(s): {', '.join(missing)}")
 
     config.llm.explorer_profile = effective_explorer
-    config.llm.supervisor_profile = effective_supervisor
-    config.advisor.profiles = effective_advisors
-    if advisor_every is not None:
-        config.advisor.every_n_steps = int(advisor_every)
-        if advisor_every > 0:
-            config.advisor.enabled = True
-    if advisor_profiles is not None:
-        config.advisor.enabled = bool(effective_advisors)
-    if no_advisor:
-        config.advisor.enabled = False
-    if config.advisor.enabled and not config.advisor.profiles:
-        raise SystemExit(
-            "Advisor guidance is enabled but no advisor profiles are configured."
-        )
     return config
 
 
@@ -1329,7 +1265,7 @@ def _resolve_supervise_policy(
     no_window: bool,
     timezone_name: str | None,
 ) -> tuple[int, RunPolicy]:
-    cfg = config.supervisor
+    cfg = config.supervise
     window_start, window_end = _parse_window(window)
     effective_max_steps = max_steps or cfg.max_steps or config.research.max_steps
     window_enabled = bool(cfg.window_enabled) and not no_window
@@ -1467,7 +1403,7 @@ def _summarize_result(result: dict[str, object]) -> str:
                     )
             return f"log_attempt {payload.get('status')} | score={payload.get('composite_score')}"
     if tool == "yield_guard":
-        base = str(result.get("supervisor_message") or result.get("message", ""))
+        base = str(result.get("message", ""))
         parts = [f"yield_guard | {_short_text(base, 300)}"]
         score_target = result.get("score_target")
         if isinstance(score_target, str) and score_target.strip():
@@ -1482,22 +1418,6 @@ def _summarize_result(result: dict[str, object]) -> str:
         if isinstance(next_moves, list) and next_moves:
             parts.append("next: " + _short_text(str(next_moves[0]), 160))
         return " | ".join(parts)
-    if tool == "advisor_guidance":
-        advisors = result.get("advisors")
-        profiles = []
-        if isinstance(advisors, list):
-            for item in advisors[:3]:
-                if isinstance(item, dict):
-                    label = str(item.get("label") or "").strip()
-                    if label:
-                        profiles.append(label)
-        parts = ["advisor_guidance"]
-        if profiles:
-            parts.append("profiles=" + ", ".join(profiles))
-        summary = str(result.get("message", "")).strip()
-        if summary:
-            parts.append(_short_text(summary, 200))
-        return " | ".join(parts)
     if tool == "step_guard":
         return f"step_guard | {_short_text(str(result.get('message', '')), 220)}"
     if tool == "response_guard":
@@ -1511,8 +1431,6 @@ def _result_style(result: dict[str, object]) -> str:
     tool = str(result.get("tool", "unknown"))
     if tool == "yield_guard":
         return "yellow"
-    if tool == "advisor_guidance":
-        return "magenta"
     if tool in {"step_guard", "response_guard"}:
         return "bold yellow"
     if result.get("error"):
@@ -1520,6 +1438,19 @@ def _result_style(result: dict[str, object]) -> str:
     if tool in CLI_OK_TOOLS:
         return "green" if bool(result.get("ok")) else "bold red"
     return "cyan"
+
+
+def _manager_event_style(event: dict[str, object]) -> str:
+    status = str(event.get("status") or "").strip().lower()
+    if status == "ok":
+        return "green"
+    if status == "no_change":
+        return "cyan"
+    if status == "partial":
+        return "bold yellow"
+    if status == "failed":
+        return "bold red"
+    return "white"
 
 
 def _action_style(action: dict[str, object]) -> str:
@@ -1606,6 +1537,29 @@ def _render_step(step_payload: dict[str, Any]) -> None:
                 )
         body.append(action_table)
 
+    manager_events = step_payload.get("manager_events")
+    if isinstance(manager_events, list) and manager_events:
+        manager_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+        manager_table.add_column("Manager", style="bold magenta", width=10)
+        manager_table.add_column("Detail", style="white")
+        for event in manager_events:
+            if isinstance(event, dict):
+                style = _manager_event_style(event)
+                manager_table.add_row(
+                    Text("manager", style=style),
+                    Text(_summarize_manager_event(event), style=style),
+                )
+                rationale = str(event.get("rationale") or "").strip()
+                if rationale:
+                    manager_table.add_row(
+                        Text("", style=style),
+                        Text(
+                            "rationale: " + _short_text(rationale, 320),
+                            style=style,
+                        ),
+                    )
+        body.append(manager_table)
+
     results = step_payload.get("results")
     if isinstance(results, list) and results:
         result_table = Table(box=box.SIMPLE_HEAVY, expand=True)
@@ -1677,7 +1631,7 @@ def _render_context_compaction_plain(event: dict[str, object]) -> None:
         label = f"compaction step {step}: ~{before} tok before, ~{after} tok after"
     else:
         label = f"compaction: ~{before} tok before, ~{after} tok after"
-    _write_plain_line(_plain_separator(label))
+    _write_plain_line(_plain_separator(label, fill="="))
 
 
 def _render_context_compaction_rich(event: dict[str, object]) -> None:
@@ -1733,10 +1687,6 @@ def cmd_run(
     max_steps: int | None,
     *,
     explorer_profile: str | None,
-    supervisor_profile: str | None,
-    advisor_profiles: list[str] | None,
-    advisor_every: int | None,
-    no_advisor: bool,
     as_json: bool,
     plain_progress: bool,
 ) -> int:
@@ -1744,10 +1694,6 @@ def cmd_run(
     _set_trace_console_mode(plain_progress=plain_progress, as_json=as_json)
     config = _load_runtime_config(
         explorer_profile=explorer_profile,
-        supervisor_profile=supervisor_profile,
-        advisor_profiles=advisor_profiles,
-        advisor_every=advisor_every,
-        no_advisor=no_advisor,
     )
     _set_display_context(repo_root=config.repo_root, run_dir=None)
     controller = ResearchController(config)
@@ -1770,10 +1716,6 @@ def cmd_supervise(
     no_window: bool,
     timezone_name: str | None,
     explorer_profile: str | None,
-    supervisor_profile: str | None,
-    advisor_profiles: list[str] | None,
-    advisor_every: int | None,
-    no_advisor: bool,
     as_json: bool,
     plain_progress: bool,
 ) -> int:
@@ -1781,10 +1723,6 @@ def cmd_supervise(
     _set_trace_console_mode(plain_progress=plain_progress, as_json=as_json)
     config = _load_runtime_config(
         explorer_profile=explorer_profile,
-        supervisor_profile=supervisor_profile,
-        advisor_profiles=advisor_profiles,
-        advisor_every=advisor_every,
-        no_advisor=no_advisor,
     )
     _set_display_context(repo_root=config.repo_root, run_dir=None)
     session_max_steps, policy = _resolve_supervise_policy(
@@ -1794,7 +1732,7 @@ def cmd_supervise(
         no_window=no_window,
         timezone_name=timezone_name,
     )
-    auto_restart_terminal = bool(config.supervisor.auto_restart_terminal_sessions)
+    auto_restart_terminal = bool(config.supervise.auto_restart_terminal_sessions)
     session_results: list[dict[str, Any]] = []
     stop_reason = "window_closed"
     while True:
@@ -3651,10 +3589,6 @@ def main() -> int:
         return cmd_run(
             max_steps=args.max_steps,
             explorer_profile=args.explorer_profile,
-            supervisor_profile=args.supervisor_profile,
-            advisor_profiles=args.advisor_profile,
-            advisor_every=args.advisor_every,
-            no_advisor=bool(args.no_advisor),
             as_json=bool(args.json),
             plain_progress=bool(args.plain_progress),
         )
@@ -3665,10 +3599,6 @@ def main() -> int:
             no_window=bool(args.no_window),
             timezone_name=args.timezone,
             explorer_profile=args.explorer_profile,
-            supervisor_profile=args.supervisor_profile,
-            advisor_profiles=args.advisor_profile,
-            advisor_every=args.advisor_every,
-            no_advisor=bool(args.no_advisor),
             as_json=bool(args.json),
             plain_progress=bool(args.plain_progress),
         )
