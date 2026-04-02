@@ -51,6 +51,8 @@ Rules:
 - Never declare the run finished.
 - Treat validation evidence and phase as primary context; avoid contradicting explicit failed retention without good cause.
 - Raw frontier score is supporting evidence, not sole authority. Budget mode, validation evidence, and current leaders should usually dominate.
+- If extra.gut_check_pending is present, reinforce the immediate longer-horizon pressure test instead of encouraging more broad frontier chasing.
+- If extra.wrap_up_focus is present during wrap_up without a validated leader, reinforce that single-family continuation path instead of diffusing across multiple unresolved branches.
 - Provisional/validated leaders are not assigned by the controller. After each scored eval you usually want set_provisional_leader (and set_validated_leader when evidence supports it) so the run has steering; use suppress_family for clear policy breaks (e.g. digest shows retention_failed, repeated timeframe mismatch, or hopeless coverage), with a reason string.
 """
 
@@ -70,6 +72,10 @@ def build_manager_packet(
     overlay = ctrl._branch_overlay
     attempts = ctrl._run_attempts(tool_context.run_id)
     best = ctrl._best_attempt(attempts)
+    admissible = ctrl._admissible_frontier_snapshot(attempts)
+    admissible_best = admissible.get("best") if isinstance(admissible, dict) else None
+    gut_check = ctrl._current_gut_check_state(attempts, phase_name=phase)
+    wrap_up_focus = ctrl._current_wrap_up_focus_state(attempts)
     frontier_best: float | None = None
     if isinstance(best, dict):
         raw = best.get("composite_score")
@@ -130,6 +136,14 @@ def build_manager_packet(
         last_validation_digest=dig if isinstance(dig, dict) else None,
         candidate_families=candidate_families,
         recent_issues=sorted(set(issues)),
+        extra={
+            "admissible_frontier_best": admissible_best,
+            "admissible_frontier_summary": admissible.get("summary")
+            if isinstance(admissible, dict)
+            else None,
+            "gut_check_pending": gut_check,
+            "wrap_up_focus": wrap_up_focus,
+        },
     )
 
 

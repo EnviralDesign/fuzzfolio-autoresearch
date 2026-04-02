@@ -183,6 +183,277 @@ Hard requirements:
 """
 
 
+def _read_json_if_exists(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists() or not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _profile_root(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    nested = payload.get("profile")
+    if isinstance(nested, dict):
+        return nested
+    indicators = payload.get("indicators")
+    if isinstance(indicators, list):
+        return payload
+    return None
+
+
+def _summary_join(
+    values: list[str],
+    *,
+    separator: str,
+    max_visible: int,
+) -> str:
+    clean = [str(value).strip() for value in values if str(value).strip()]
+    if not clean:
+        return ""
+    if len(clean) <= max_visible:
+        return separator.join(clean)
+    visible = separator.join(clean[:max_visible])
+    return f"{visible}{separator}{len(clean) - max_visible} more"
+
+
+def _normalize_timeframe_value(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip().strip("\"'").strip()
+    if not text:
+        return None
+    return text.upper()
+
+
+def _timeframe_mismatch_message(requested_timeframe: str, effective_timeframe: str) -> str:
+    return (
+        f"Timeframe auto-adjustment detected: requested {requested_timeframe} "
+        f"but CLI ran {effective_timeframe}. "
+        f"This does NOT count as a valid higher-timeframe experiment. "
+        f"Next action must resolve the mismatch: patch active indicator timeframe(s) "
+        f"to the intended timeframe, reformulate as {effective_timeframe} test, "
+        f"or abandon that timeframe hypothesis. "
+        f"Do NOT request the same higher-timeframe eval with the same unchanged profile."
+    )
+
+
+def _build_timeframe_mismatch_entry(
+    requested_timeframe: Any,
+    effective_timeframe: Any,
+    *,
+    source: str,
+) -> dict[str, Any] | None:
+    requested = _normalize_timeframe_value(requested_timeframe)
+    effective = _normalize_timeframe_value(effective_timeframe)
+    if not requested or not effective or requested == effective:
+        return None
+    return {
+        "requested": requested,
+        "effective": effective,
+        "mismatch": True,
+        "source": source,
+        "message": _timeframe_mismatch_message(requested, effective),
+    }
+
+
+def _extract_timeframe_mismatch_from_output(output: str) -> dict[str, Any] | None:
+    if "Auto-adjusted timeframe from" not in output:
+        return None
+    match = re.search(
+        r"Auto-adjusted timeframe from\s+'?([^'\s]+)'?\s+to\s+'?([^'\s]+)'?",
+        output,
+    )
+    if not match:
+        return None
+    return _build_timeframe_mismatch_entry(
+        match.group(1),
+        match.group(2),
+        source="cli_output",
+    )
+
+
+def _candidate_summary_from_profile_payload(
+    payload: dict[str, Any] | None,
+    *,
+    profile_path: Path | None = None,
+    profile_ref: str | None = None,
+    draft_name: str | None = None,
+) -> dict[str, Any] | None:
+    profile = _profile_root(payload)
+    if not isinstance(profile, dict):
+        return None
+    indicators = profile.get("indicators")
+    if not isinstance(indicators, list) or not indicators:
+        return None
+    indicator_ids: list[str] = []
+    instance_ids: list[str] = []
+    timeframes: list[str] = []
+    for indicator in indicators:
+        if not isinstance(indicator, dict):
+            continue
+        meta = indicator.get("meta") if isinstance(indicator.get("meta"), dict) else {}
+        config = (
+            indicator.get("config") if isinstance(indicator.get("config"), dict) else {}
+        )
+        indicator_id = str(meta.get("id") or "").strip()
+        if indicator_id:
+            indicator_ids.append(indicator_id)
+        instance_id = str(meta.get("instanceId") or "").strip()
+        if instance_id:
+            instance_ids.append(instance_id)
+        timeframe = str(config.get("timeframe") or "").strip()
+        if timeframe:
+            timeframes.append(timeframe)
+    instruments_raw = profile.get("instruments")
+    instruments = (
+        [str(item).strip() for item in instruments_raw if str(item).strip()]
+        if isinstance(instruments_raw, list)
+        else []
+    )
+    family_id = "|".join(sorted(instance_ids)) if instance_ids else None
+    fingerprint: str | None = None
+    if profile_path is not None:
+        fp, _err = pi.compute_profile_fingerprint(profile_path)
+        fingerprint = fp
+    if fingerprint is None:
+        source_payload = payload if isinstance(payload, dict) else {"profile": profile}
+        fingerprint = pi.fingerprint_for_json_object(source_payload)
+    summary: dict[str, Any] = {
+        "draft_name": str(draft_name or profile.get("name") or "").strip() or None,
+        "profile_name": str(profile.get("name") or "").strip() or None,
+        "candidate_fingerprint": fingerprint,
+        "family_id": family_id,
+        "indicator_ids": indicator_ids,
+        "indicator_instance_ids": instance_ids,
+        "timeframe_summary": _summary_join(
+            timeframes, separator=" + ", max_visible=4
+        ),
+        "instrument_summary": _summary_join(
+            instruments, separator=", ", max_visible=4
+        ),
+        "instrument_count": len(instruments),
+        "indicator_count": len(indicator_ids),
+        "profile_path": str(profile_path) if profile_path is not None else None,
+        "profile_ref": str(profile_ref).strip() if profile_ref else None,
+    }
+    return {
+        key: value
+        for key, value in summary.items()
+        if value is not None and value != ""
+    }
+
+
+def _normalized_profile_material_changes(
+    source_payload: dict[str, Any] | None,
+    normalized_profile: dict[str, Any] | None,
+) -> bool | None:
+    source_root = _profile_root(source_payload)
+    normalized_root = (
+        normalized_profile if isinstance(normalized_profile, dict) else None
+    )
+    if not isinstance(source_root, dict) or not isinstance(normalized_root, dict):
+        return None
+    return (
+        pi.fingerprint_for_json_object(source_root)
+        != pi.fingerprint_for_json_object(normalized_root)
+    )
+
+
+def _extract_effective_window_from_sweep_fitness(
+    fitness: dict[str, Any],
+) -> float | None:
+    candidates: list[Any] = [
+        fitness.get("effective_window_months"),
+        (
+            fitness.get("quality_score_payload") or {}
+        ).get("inputs", {}).get("effective_window_months")
+        if isinstance(fitness.get("quality_score_payload"), dict)
+        else None,
+    ]
+    for value in candidates:
+        try:
+            if value is not None:
+                return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _summarize_sweep_results_payload(
+    payload: dict[str, Any] | None,
+    *,
+    artifact_dir: Path,
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict):
+        return None
+    ranked = data.get("ranked_permutations")
+    if not isinstance(ranked, list):
+        ranked = data.get("ranked") if isinstance(data.get("ranked"), list) else []
+    top = ranked[0] if ranked and isinstance(ranked[0], dict) else None
+    fitness = (
+        top.get("fitness")
+        if isinstance(top, dict) and isinstance(top.get("fitness"), dict)
+        else {}
+    )
+    parameter_importance = (
+        data.get("parameter_importance")
+        if isinstance(data.get("parameter_importance"), list)
+        else []
+    )
+    flat_importance = bool(parameter_importance) and all(
+        (
+            abs(float(item.get("importance_pct") or 0.0)) < 1e-9
+            and abs(float(item.get("raw_spread") or 0.0)) < 1e-9
+        )
+        for item in parameter_importance
+        if isinstance(item, dict)
+    )
+    top_parameters = (
+        top.get("parameters")
+        if isinstance(top, dict) and isinstance(top.get("parameters"), dict)
+        else {}
+    )
+    recommended = (
+        "Sweep found no meaningful parameter gradient; treat this as a plateau and move on."
+        if flat_importance and parameter_importance
+        else "Sweep isolated a leading permutation worth comparing against the current branch leader."
+    )
+    summary: dict[str, Any] = {
+        "artifact_dir": str(artifact_dir),
+        "fitness_metric": data.get("fitness_metric"),
+        "mode": data.get("mode"),
+        "elapsed_seconds": data.get("elapsed_seconds"),
+        "ranked_permutation_count": len(ranked),
+        "top_rank": top.get("rank") if isinstance(top, dict) else None,
+        "top_score": (
+            top.get("fitness_value")
+            if isinstance(top, dict) and top.get("fitness_value") is not None
+            else fitness.get("quality_score")
+        ),
+        "top_parameters": top_parameters,
+        "top_effective_window_months": _extract_effective_window_from_sweep_fitness(
+            fitness
+        ),
+        "top_resolved_trades": fitness.get("resolved_trade_count_max")
+        or fitness.get("best_cell_resolved_trades"),
+        "parameter_importance_flat": flat_importance,
+        "parameter_importance": parameter_importance[:8],
+        "recommended_interpretation": recommended,
+    }
+    return {
+        key: value
+        for key, value in summary.items()
+        if value is not None and value != ""
+    }
+
+
 @dataclass
 class ToolContext:
     run_id: str
@@ -551,6 +822,20 @@ class ResearchController:
             pcr = score.metrics.get("positive_cell_ratio")
             if isinstance(pcr, (int, float)):
                 positive_cell_ratio = float(pcr)
+        support_attempt = {
+            "best_summary": best if isinstance(best, dict) else {},
+            "effective_window_months": eff_w,
+        }
+        (
+            resolved_trades,
+            trades_per_month,
+            positive_cell_ratio,
+        ) = self._resolve_support_metrics(
+            support_attempt,
+            resolved_trades=resolved_trades,
+            trades_per_month=trades_per_month,
+            positive_ratio=positive_cell_ratio,
+        )
         cov_status, _ = vo.classify_coverage(
             requested_horizon_months=req_h,
             effective_window_months=eff_w,
@@ -615,26 +900,6 @@ class ResearchController:
             return {}
 
         is_exploit = self._is_same_family_exploit_action(source_action)
-        resolved_trades = auto_log.get("resolved_trades")
-        trades_per_month = auto_log.get("trades_per_month")
-        positive_ratio = auto_log.get("positive_cell_ratio")
-        support_quality = "broad"
-        trade_count_val = resolved_trades if isinstance(resolved_trades, int) else None
-        tpm_val = (
-            trades_per_month
-            if isinstance(trades_per_month, (int, float))
-            else None
-        )
-        pos_val = positive_ratio if isinstance(positive_ratio, (int, float)) else None
-        if trade_count_val is not None and trade_count_val < 30:
-            support_quality = "sparse"
-        elif tpm_val is not None and tpm_val < 2:
-            support_quality = "selective"
-        elif pos_val is not None and pos_val < 0.3:
-            support_quality = "selective"
-
-        self._update_family_exploit_state(family_id, is_exploit, support_quality)
-
         artifact_path = Path(artifact_dir_str).resolve()
         attempt_id_log = (
             str(auto_log.get("attempt_id")).strip()
@@ -645,6 +910,17 @@ class ResearchController:
             self._attempt_row_for_id(tool_context, attempt_id_log)
             if attempt_id_log
             else None
+        )
+        attempt_dict = ledger_row
+        if attempt_dict is None:
+            attempts_list = self._run_attempts(tool_context.run_id)
+            attempt_dict = attempts_list[-1] if attempts_list else None
+
+        resolved_trades, trades_per_month, positive_ratio = self._resolve_support_metrics(
+            attempt_dict,
+            resolved_trades=auto_log.get("resolved_trades"),
+            trades_per_month=auto_log.get("trades_per_month"),
+            positive_ratio=auto_log.get("positive_cell_ratio"),
         )
 
         requested_horizon: int | None = self._requested_horizon_from_source_action(
@@ -678,22 +954,24 @@ class ResearchController:
                 except (TypeError, ValueError):
                     eff_float = None
 
+        support_quality = self._cadence_support_quality(
+            trades_per_month=trades_per_month,
+            positive_ratio=positive_ratio,
+            effective_window_months=eff_float,
+        )
+        self._update_family_exploit_state(family_id, is_exploit, support_quality)
+
         retention_result = self._check_retention_gating(
             tool_context,
             family_id,
             float(score),
             requested_horizon,
         )
-        attempt_dict = ledger_row
-        if attempt_dict is None:
-            attempts_list = self._run_attempts(tool_context.run_id)
-            attempt_dict = attempts_list[-1] if attempts_list else None
         digest = (
             self._generate_behavior_digest(attempt_dict)
             if isinstance(attempt_dict, dict)
             else {}
         )
-        had_mismatch = timeframe_mismatch is not None
         req_tf_a = None
         eff_tf_a = None
         if isinstance(ledger_row, dict):
@@ -720,6 +998,14 @@ class ResearchController:
             et = attempt_dict.get("effective_timeframe")
             if isinstance(et, str) and et.strip():
                 eff_tf_a = et.strip()
+        had_mismatch = timeframe_mismatch is not None
+        if not had_mismatch:
+            timeframe_mismatch = self._record_structured_timeframe_mismatch(
+                req_tf_a,
+                eff_tf_a,
+                source="attempt_record",
+            )
+            had_mismatch = timeframe_mismatch is not None
 
         ew_src = auto_log.get("effective_window_source")
         effective_window_source = (
@@ -833,9 +1119,11 @@ class ResearchController:
         return None
 
     def _cli_action_hits_family_exploit_surface(
-        self, args: list[str], family_id: str | None
+        self, args: list[str] | None, family_id: str | None
     ) -> bool:
         if not family_id:
+            return False
+        if not isinstance(args, list):
             return False
         head = [str(a).lower() for a in args[:3]]
         if not head:
@@ -1154,6 +1442,9 @@ class ResearchController:
         self, tool_context: ToolContext, step: int
     ) -> dict[str, Any]:
         overlay = self._branch_overlay
+        wrap_up_focus = self._current_wrap_up_focus_state(
+            self._run_attempts(tool_context.run_id)
+        )
         lifecycle_collapsed_ids = [
             fid
             for fid, st in self._family_branches.items()
@@ -1212,6 +1503,7 @@ class ResearchController:
                 c[:16] + "..." for c in suppressed_ids[:12]
             ],
             "last_scored_validation_digest": overlay.last_scored_validation_digest,
+            "wrap_up_focus": wrap_up_focus,
             "families_on_cooldown": cooldown,
             "families": {
                 k[:24] + ("..." if len(k) > 24 else ""): v.to_dict()
@@ -1295,11 +1587,17 @@ class ResearchController:
             if not isinstance(action, dict):
                 continue
             args = self._synthetic_cli_args_for_branch_validation(action)
+            action_families = self._action_family_ids_for_branch_validation(
+                tool_context, action, synthetic_args=args
+            )
             if not args:
-                continue
-            family_id = self._resolve_cli_family_id(args)
-            if not family_id:
-                continue
+                family_id = next(iter(action_families), None) if action_families else None
+            else:
+                family_id = self._resolve_cli_family_id(args)
+                if family_id:
+                    action_families.add(family_id)
+            if not family_id and action_families:
+                family_id = next(iter(action_families))
             branch = self._family_branches.get(family_id)
             is_exploit = self._is_same_family_exploit_action(action)
             if branch and branch.exploit_dead and self._cli_action_hits_family_exploit_surface(
@@ -1321,7 +1619,134 @@ class ResearchController:
                     f"Action {index}: structural contrast required for family {family_id[:16]}... "
                     "— blocked same-family exploit until contrast pivot progresses."
                 )
+            if overlay.budget_mode == bl.BUDGET_WRAP_UP and not overlay.validated_leader_family_id:
+                wrap_up_focus = self._current_wrap_up_focus_state(
+                    self._run_attempts(tool_context.run_id)
+                )
+                focus_family = (
+                    str(wrap_up_focus.get("family_id") or "").strip()
+                    if isinstance(wrap_up_focus, dict)
+                    else ""
+                )
+                if focus_family:
+                    if action_families and any(
+                        fam and fam != focus_family for fam in action_families
+                    ):
+                        errors.append(
+                            f"Action {index}: wrap_up focus is {focus_family[:16]}... "
+                            "— block unrelated family work until the focus path is resolved or invalidated."
+                        )
+                        continue
+                    if not self._is_decisive_wrap_up_focus_action(
+                        tool_context,
+                        action,
+                        focus_family=focus_family,
+                        step=step,
+                        step_limit=step_limit,
+                        action_families=action_families,
+                    ):
+                        errors.append(
+                            f"Action {index}: wrap_up focus is {focus_family[:16]}... "
+                            "— only decisive focus-path actions are allowed here. "
+                            "Use evaluate_candidate on the focus family, or inspect/compare that focus path only when a follow-up step remains."
+                        )
         return errors
+
+    def _attempt_row_for_artifact_dir(
+        self, tool_context: ToolContext, artifact_dir: str | Path
+    ) -> dict[str, Any] | None:
+        needle = str(artifact_dir).strip()
+        if not needle:
+            return None
+        try:
+            needle_path = str(Path(needle).resolve())
+        except (OSError, RuntimeError, TypeError, ValueError):
+            needle_path = needle
+        for att in load_run_attempts(tool_context.run_dir):
+            if not isinstance(att, dict):
+                continue
+            artifact = str(att.get("artifact_dir") or "").strip()
+            if not artifact:
+                continue
+            try:
+                artifact_path = str(Path(artifact).resolve())
+            except (OSError, RuntimeError, TypeError, ValueError):
+                artifact_path = artifact
+            if artifact_path == needle_path:
+                return att
+        return None
+
+    def _action_family_ids_for_branch_validation(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        *,
+        synthetic_args: list[str] | None = None,
+    ) -> set[str]:
+        families: set[str] = set()
+        args = synthetic_args
+        if args:
+            family_id = self._resolve_cli_family_id(args)
+            if family_id:
+                families.add(family_id)
+        tool = str(action.get("tool", "")).strip()
+        if tool == "inspect_artifact":
+            attempt_id = action.get("attempt_id")
+            if isinstance(attempt_id, str) and attempt_id.strip():
+                attempt = self._attempt_row_for_id(tool_context, attempt_id.strip())
+                if isinstance(attempt, dict):
+                    family_id = self._family_id_for_profile_ref(
+                        str(attempt.get("profile_ref") or "").strip()
+                    )
+                    if family_id:
+                        families.add(family_id)
+            artifact_dir = action.get("artifact_dir")
+            if isinstance(artifact_dir, str) and artifact_dir.strip():
+                attempt = self._attempt_row_for_artifact_dir(tool_context, artifact_dir)
+                if isinstance(attempt, dict):
+                    family_id = self._family_id_for_profile_ref(
+                        str(attempt.get("profile_ref") or "").strip()
+                    )
+                    if family_id:
+                        families.add(family_id)
+        if tool == "compare_artifacts":
+            entries = action.get("attempt_ids") or action.get("artifact_dirs")
+            if isinstance(entries, list):
+                for entry in entries:
+                    if not isinstance(entry, str) or not entry.strip():
+                        continue
+                    token = entry.strip()
+                    attempt = self._attempt_row_for_id(tool_context, token)
+                    if not isinstance(attempt, dict):
+                        attempt = self._attempt_row_for_artifact_dir(tool_context, token)
+                    if isinstance(attempt, dict):
+                        family_id = self._family_id_for_profile_ref(
+                            str(attempt.get("profile_ref") or "").strip()
+                        )
+                        if family_id:
+                            families.add(family_id)
+        return families
+
+    def _is_decisive_wrap_up_focus_action(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        *,
+        focus_family: str,
+        step: int,
+        step_limit: int,
+        action_families: set[str] | None = None,
+    ) -> bool:
+        tool = str(action.get("tool", "")).strip()
+        families = {fam for fam in (action_families or set()) if fam}
+        steps_remaining_after = max(step_limit - step, 0)
+        if tool == "evaluate_candidate":
+            return families == {focus_family}
+        if tool == "inspect_artifact":
+            return families == {focus_family} and steps_remaining_after >= 1
+        if tool == "compare_artifacts":
+            return families == {focus_family} and steps_remaining_after >= 1
+        return False
 
     def _derive_family_id_from_profile(self, profile_path: Path | None) -> str | None:
         if profile_path is None or not profile_path.exists():
@@ -1351,16 +1776,62 @@ class ResearchController:
         return "|".join(sorted(instance_ids))
 
     def _derive_support_quality(self, attempt: dict[str, Any]) -> str:
-        trade_count = self._attempt_trade_count(attempt)
         trades_per_month = self._attempt_trades_per_month(attempt)
         positive_ratio = self._attempt_positive_cell_ratio(attempt)
-        if trade_count is None:
+        effective_window_months = self._attempt_effective_window_months(attempt)
+        return self._cadence_support_quality(
+            trades_per_month=trades_per_month,
+            positive_ratio=positive_ratio,
+            effective_window_months=effective_window_months,
+        )
+
+    def _resolve_support_metrics(
+        self,
+        attempt: dict[str, Any] | None,
+        *,
+        resolved_trades: Any = None,
+        trades_per_month: Any = None,
+        positive_ratio: Any = None,
+    ) -> tuple[Any, Any, Any]:
+        if not isinstance(attempt, dict):
+            return resolved_trades, trades_per_month, positive_ratio
+        if resolved_trades is None:
+            resolved_trades = self._attempt_trade_count(attempt)
+        if trades_per_month is None:
+            trades_per_month = self._attempt_trades_per_month(attempt)
+        if positive_ratio is None:
+            positive_ratio = self._attempt_positive_cell_ratio(attempt)
+        return resolved_trades, trades_per_month, positive_ratio
+
+    def _cadence_support_quality(
+        self,
+        *,
+        trades_per_month: Any,
+        positive_ratio: Any,
+        effective_window_months: Any,
+    ) -> str:
+        tpm = (
+            float(trades_per_month)
+            if isinstance(trades_per_month, (int, float))
+            else None
+        )
+        pos = (
+            float(positive_ratio) if isinstance(positive_ratio, (int, float)) else None
+        )
+        eff = self._coerce_float_months(effective_window_months)
+        if tpm is None:
+            if eff is not None and eff < 2.0:
+                return "selective"
+            if pos is not None and pos < 0.3:
+                return "selective"
             return "sparse"
-        if trade_count < 30:
+        if tpm < 1.5:
             return "sparse"
-        if trades_per_month is not None and trades_per_month < 2:
+        if tpm < 3.0:
             return "selective"
-        if positive_ratio is not None and positive_ratio < 0.3:
+        if eff is not None and eff < 3.0 and tpm < 5.0:
+            return "selective"
+        if pos is not None and pos < 0.3:
             return "selective"
         return "broad"
 
@@ -1587,22 +2058,56 @@ class ResearchController:
         stdout = result_payload.get("stdout", "")
         stderr = result_payload.get("stderr", "")
         combined_output = stdout + "\n" + stderr
-        if "Auto-adjusted timeframe from" not in combined_output:
+        entry = _extract_timeframe_mismatch_from_output(combined_output)
+        if entry is None:
             return None
-        match = re.search(
-            r"Auto-adjusted timeframe from\s+(\S+)\s+to\s+(\S+)", combined_output
-        )
-        if not match:
-            return None
-        requested_timeframe = match.group(1)
-        effective_timeframe = match.group(2)
-        entry = {
-            "requested": requested_timeframe,
-            "effective": effective_timeframe,
-            "mismatch": requested_timeframe != effective_timeframe,
-        }
         self._timeframe_mismatches.append(entry)
         return entry
+
+    def _record_structured_timeframe_mismatch(
+        self,
+        requested_timeframe: Any,
+        effective_timeframe: Any,
+        *,
+        source: str,
+    ) -> dict[str, Any] | None:
+        entry = _build_timeframe_mismatch_entry(
+            requested_timeframe,
+            effective_timeframe,
+            source=source,
+        )
+        if entry is None:
+            return None
+        self._timeframe_mismatches.append(entry)
+        return entry
+
+    def _resolve_timeframe_mismatch(
+        self,
+        cli_result: dict[str, Any],
+        *,
+        auto_log: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        result_payload = cli_result.get("result")
+        if isinstance(result_payload, dict):
+            parsed_json = result_payload.get("parsed_json")
+            if isinstance(parsed_json, dict):
+                req_tf, eff_tf = self._timeframes_from_sensitivity_snapshot(parsed_json)
+                entry = self._record_structured_timeframe_mismatch(
+                    req_tf,
+                    eff_tf,
+                    source="parsed_json",
+                )
+                if entry is not None:
+                    return entry
+        if isinstance(auto_log, dict):
+            entry = self._record_structured_timeframe_mismatch(
+                auto_log.get("requested_timeframe"),
+                auto_log.get("effective_timeframe"),
+                source="auto_log",
+            )
+            if entry is not None:
+                return entry
+        return self._detect_timeframe_mismatch(cli_result)
 
     def _get_timeframe_mismatch_status(self) -> dict[str, Any]:
         if not self._timeframe_mismatches:
@@ -1620,21 +2125,13 @@ class ResearchController:
             "total_mismatches": len(self._timeframe_mismatches),
             "recent_same_count": recent_count,
             "repeat_blocked": repeat_block and recent_count >= 2,
-            "message": (
-                f"Timeframe auto-adjustment detected: requested {latest.get('requested')} "
-                f"but CLI ran {latest.get('effective')}. "
-                f"This does NOT count as a valid higher-timeframe experiment. "
-                f"Next action must resolve the mismatch: patch active indicator timeframe(s) "
-                f"to the intended timeframe, reformulate as {latest.get('effective')} test, "
-                f"or abandon that timeframe hypothesis. "
-                f"Do NOT request the same higher-timeframe eval with the same unchanged profile."
-            ),
+            "message": str(latest.get("message") or ""),
         }
 
     def _generate_behavior_digest(self, attempt: dict[str, Any]) -> dict[str, Any]:
         score = attempt.get("composite_score")
-        trade_count = self._attempt_trade_count(attempt)
         trades_per_month = self._attempt_trades_per_month(attempt)
+        effective_window_months = self._attempt_effective_window_months(attempt)
         positive_ratio = self._attempt_positive_cell_ratio(attempt)
         max_drawdown = self._attempt_max_drawdown_r(attempt)
         best_summary = attempt.get("best_summary")
@@ -1650,7 +2147,7 @@ class ResearchController:
             retention_risk = "high"
             failure_mode_hint = "weak_support"
             next_move_hint = "prune_family"
-        elif trade_count is not None and trade_count < 20:
+        elif trades_per_month is not None and trades_per_month < 1.5:
             support_shape = "too_sparse"
             retention_risk = "high"
             failure_mode_hint = "weak_support"
@@ -1677,6 +2174,27 @@ class ResearchController:
                 failure_mode_hint = "trend_regime_dependent"
             elif max_drawdown > 5:
                 drawdown_shape = "clustered"
+        strong_floor = max(
+            float(self.config.research.retention_strong_candidate_threshold),
+            float(self.config.research.validated_leader_min_score),
+        )
+        if (
+            score is not None
+            and effective_window_months is not None
+            and effective_window_months
+            < float(self.config.research.validated_leader_min_horizon_months)
+            and (
+                score <= strong_floor
+                if self.config.research.plot_lower_is_better
+                else score >= strong_floor
+            )
+        ):
+            if support_shape == "well_supported":
+                support_shape = "selective_but_credible"
+            if retention_risk == "low":
+                retention_risk = "moderate"
+            failure_mode_hint = "short_window_spike"
+            next_move_hint = "pressure_test_horizon"
         best_summary = attempt.get("best_summary")
         if isinstance(best_summary, dict):
             matrix_summary = best_summary.get("matrix_summary")
@@ -2247,6 +2765,429 @@ class ResearchController:
             )
         )
 
+    def _best_attempt_for_family(
+        self, attempts: list[dict[str, Any]], family_id: str
+    ) -> dict[str, Any] | None:
+        family_attempts = [
+            attempt
+            for attempt in self._scored_attempts(attempts)
+            if self._family_id_for_profile_ref(
+                str(attempt.get("profile_ref") or "").strip() or None
+            )
+            == family_id
+        ]
+        if not family_attempts:
+            return None
+        return (
+            min(
+                family_attempts,
+                key=lambda attempt: float(attempt.get("composite_score")),
+            )
+            if self.config.research.plot_lower_is_better
+            else max(
+                family_attempts,
+                key=lambda attempt: float(attempt.get("composite_score")),
+            )
+        )
+
+    def _attempt_effective_window_months(
+        self, attempt: dict[str, Any]
+    ) -> float | None:
+        best_summary = attempt.get("best_summary")
+        if isinstance(best_summary, dict):
+            market_window = best_summary.get("market_data_window")
+            if isinstance(market_window, dict):
+                value = self._coerce_float_months(
+                    market_window.get("effective_window_months")
+                )
+                if value is not None and value >= 0:
+                    return value
+            quality_score_payload = best_summary.get("quality_score_payload")
+            if isinstance(quality_score_payload, dict):
+                inputs = quality_score_payload.get("inputs")
+                if isinstance(inputs, dict):
+                    value = self._coerce_float_months(
+                        inputs.get("effective_window_months")
+                    )
+                    if value is not None and value >= 0:
+                        return value
+        value = self._coerce_float_months(attempt.get("effective_window_months"))
+        if value is not None and value >= 0:
+            return value
+        return None
+
+    def _attempt_has_timeframe_mismatch(self, attempt: dict[str, Any]) -> bool:
+        req = str(attempt.get("requested_timeframe") or "").strip()
+        eff = str(attempt.get("effective_timeframe") or "").strip()
+        if req and eff and req != eff:
+            return True
+        return bool(attempt.get("timeframe_mismatch"))
+
+    def _attempt_admissibility_snapshot(
+        self, attempt: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        raw_score = attempt.get("composite_score")
+        if raw_score is None:
+            return None
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            return None
+        effective_window_months = self._attempt_effective_window_months(attempt)
+        trades_per_month = self._attempt_trades_per_month(attempt)
+        support_quality = self._derive_support_quality(attempt)
+        validation_outcome = str(attempt.get("validation_outcome") or "").strip() or None
+        mismatch = self._attempt_has_timeframe_mismatch(attempt)
+        profile_ref = str(attempt.get("profile_ref") or "").strip() or None
+        family_id = self._family_id_for_profile_ref(profile_ref)
+        branch = self._family_branches.get(family_id) if family_id else None
+        promotability_status = (
+            branch.promotability_status
+            if branch and isinstance(branch.promotability_status, str)
+            else None
+        )
+
+        validated_min = max(
+            1.0, float(self.config.research.validated_leader_min_horizon_months)
+        )
+        if effective_window_months is None:
+            window_factor = 0.55
+        else:
+            ratio = effective_window_months / validated_min
+            if ratio < 0.25:
+                window_factor = 0.30
+            elif ratio < 0.50:
+                window_factor = 0.45
+            elif ratio < 0.75:
+                window_factor = 0.65
+            elif ratio < 1.00:
+                window_factor = 0.82
+            elif effective_window_months >= float(
+                self.config.research.horizon_wrap_up_months
+            ):
+                window_factor = 1.12
+            elif effective_window_months >= float(
+                self.config.research.horizon_late_months
+            ):
+                window_factor = 1.08
+            else:
+                window_factor = 1.0
+
+        if trades_per_month is None:
+            cadence_factor = 0.85
+        elif trades_per_month < 1.5:
+            cadence_factor = 0.55
+        elif trades_per_month < 3.0:
+            cadence_factor = 0.75
+        elif trades_per_month < 6.0:
+            cadence_factor = 0.90
+        else:
+            cadence_factor = 1.0
+
+        if mismatch:
+            validation_factor = 0.55
+        elif validation_outcome == vo.VALIDATION_FAILED:
+            validation_factor = 0.72
+        elif validation_outcome == vo.VALIDATION_UNRESOLVED:
+            validation_factor = 0.86
+        elif validation_outcome == vo.VALIDATION_PASSED:
+            validation_factor = 1.05
+        else:
+            validation_factor = 1.0
+
+        if promotability_status == vo.PROMOTABILITY_VALIDATED_READY:
+            promotability_factor = 1.08
+        elif promotability_status == vo.PROMOTABILITY_BLOCKED:
+            promotability_factor = 0.72
+        elif promotability_status == vo.PROMOTABILITY_RETRY_RECOMMENDED:
+            promotability_factor = 0.92
+        else:
+            promotability_factor = 1.0
+
+        multiplier = (
+            window_factor
+            * cadence_factor
+            * validation_factor
+            * promotability_factor
+        )
+        steering_score = (
+            score / max(multiplier, 1e-6)
+            if self.config.research.plot_lower_is_better
+            else score * multiplier
+        )
+        penalties: list[str] = []
+        if effective_window_months is not None and effective_window_months < validated_min:
+            penalties.append(
+                f"short_window={self._format_score(effective_window_months)}m"
+            )
+        if trades_per_month is not None and trades_per_month < 3.0:
+            penalties.append(f"cadence={self._format_score(trades_per_month)}/mo")
+        if mismatch:
+            penalties.append("timeframe_mismatch")
+        if validation_outcome == vo.VALIDATION_UNRESOLVED:
+            penalties.append("validation_unresolved")
+        elif validation_outcome == vo.VALIDATION_FAILED:
+            penalties.append("validation_failed")
+        if promotability_status == vo.PROMOTABILITY_BLOCKED:
+            penalties.append("blocked")
+        return {
+            "attempt": attempt,
+            "family_id": family_id,
+            "profile_ref": profile_ref,
+            "candidate_name": str(attempt.get("candidate_name") or "").strip() or None,
+            "raw_score": score,
+            "steering_score": steering_score,
+            "admissibility_multiplier": multiplier,
+            "effective_window_months": effective_window_months,
+            "trades_per_month": trades_per_month,
+            "support_quality": support_quality,
+            "validation_outcome": validation_outcome,
+            "timeframe_mismatch": mismatch,
+            "promotability_status": promotability_status,
+            "penalties": penalties,
+        }
+
+    def _admissible_frontier_snapshot(
+        self, attempts: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        ranked = [
+            snap
+            for snap in (
+                self._attempt_admissibility_snapshot(attempt)
+                for attempt in self._scored_attempts(attempts)
+            )
+            if isinstance(snap, dict)
+        ]
+        if not ranked:
+            return {
+                "best": None,
+                "summary": "No admissible frontier points exist yet.",
+            }
+        best = (
+            min(ranked, key=lambda snap: float(snap["steering_score"]))
+            if self.config.research.plot_lower_is_better
+            else max(ranked, key=lambda snap: float(snap["steering_score"]))
+        )
+        penalty_text = ", ".join(best["penalties"]) if best["penalties"] else "clean"
+        summary = (
+            "Best admissible steering frontier: "
+            f"candidate={best.get('candidate_name') or 'n/a'} "
+            f"family={self._short_family_id(best.get('family_id'))} "
+            f"raw_score={self._format_score(best.get('raw_score'))} "
+            f"steering_score={self._format_score(best.get('steering_score'))} "
+            f"window={self._format_score(best.get('effective_window_months'))}m "
+            f"cadence={self._format_score(best.get('trades_per_month'))}/mo "
+            f"status={best.get('validation_outcome') or 'n/a'} "
+            f"notes={penalty_text}"
+        )
+        return {
+            "best": best,
+            "summary": summary,
+            "ranked_count": len(ranked),
+        }
+
+    def _current_wrap_up_focus_state(
+        self, attempts: list[dict[str, Any]]
+    ) -> dict[str, Any] | None:
+        overlay = self._branch_overlay
+        focus_family = overlay.validated_leader_family_id
+        if not focus_family:
+            provisional = overlay.provisional_leader_family_id
+            provisional_branch = (
+                self._family_branches.get(provisional) if provisional else None
+            )
+            if (
+                provisional
+                and provisional_branch
+                and not provisional_branch.exploit_dead
+                and provisional_branch.lifecycle_state != bl.LIFECYCLE_COLLAPSED
+            ):
+                focus_family = provisional
+        ranked: list[dict[str, Any]] = []
+        for snap in (
+            self._attempt_admissibility_snapshot(attempt)
+            for attempt in self._scored_attempts(attempts)
+        ):
+            if not isinstance(snap, dict):
+                continue
+            family_id = str(snap.get("family_id") or "").strip()
+            if not family_id:
+                continue
+            branch = self._family_branches.get(family_id)
+            if not branch or branch.exploit_dead or branch.lifecycle_state == bl.LIFECYCLE_COLLAPSED:
+                continue
+            snap["branch"] = branch
+            ranked.append(snap)
+        if not ranked:
+            return None
+        if not focus_family:
+            promotability_rank = {
+                vo.PROMOTABILITY_VALIDATED_READY: 4,
+                vo.PROMOTABILITY_PROVISIONAL_BEST_AVAILABLE: 3,
+                vo.PROMOTABILITY_RETRY_RECOMMENDED: 2,
+                "unknown": 1,
+                vo.PROMOTABILITY_BLOCKED: 0,
+            }
+            retention_rank = {
+                bl.RETENTION_PASSED: 3,
+                bl.RETENTION_PENDING: 2,
+                bl.RETENTION_UNTESTED: 1,
+                bl.RETENTION_FAILED: 0,
+            }
+            ranked.sort(
+                key=lambda snap: (
+                    promotability_rank.get(
+                        str(snap["branch"].promotability_status or "unknown"), 1
+                    ),
+                    retention_rank.get(str(snap["branch"].retention_status or ""), 0),
+                    1
+                    if snap["branch"].lifecycle_state == bl.LIFECYCLE_PROVISIONAL_LEADER
+                    else 0,
+                    float(snap["steering_score"]),
+                ),
+                reverse=not self.config.research.plot_lower_is_better,
+            )
+            if self.config.research.plot_lower_is_better:
+                ranked.sort(
+                    key=lambda snap: (
+                        -promotability_rank.get(
+                            str(snap["branch"].promotability_status or "unknown"), 1
+                        ),
+                        -retention_rank.get(str(snap["branch"].retention_status or ""), 0),
+                        -(
+                            1
+                            if snap["branch"].lifecycle_state
+                            == bl.LIFECYCLE_PROVISIONAL_LEADER
+                            else 0
+                        ),
+                        float(snap["steering_score"]),
+                    )
+                )
+            focus_family = str(ranked[0].get("family_id") or "").strip() or None
+        if not focus_family:
+            return None
+        branch = self._family_branches.get(focus_family)
+        if not branch:
+            return None
+        family_attempts = [
+            snap for snap in ranked if str(snap.get("family_id") or "").strip() == focus_family
+        ]
+        if not family_attempts:
+            return None
+        best_snap = (
+            min(family_attempts, key=lambda snap: float(snap["steering_score"]))
+            if self.config.research.plot_lower_is_better
+            else max(family_attempts, key=lambda snap: float(snap["steering_score"]))
+        )
+        return {
+            "family_id": focus_family,
+            "candidate_name": best_snap.get("candidate_name"),
+            "profile_ref": best_snap.get("profile_ref") or branch.last_profile_ref,
+            "latest_attempt_id": branch.latest_attempt_id,
+            "lifecycle_state": branch.lifecycle_state,
+            "promotability_status": branch.promotability_status,
+            "retention_status": branch.retention_status,
+            "raw_score": best_snap.get("raw_score"),
+            "steering_score": best_snap.get("steering_score"),
+            "effective_window_months": best_snap.get("effective_window_months"),
+            "trades_per_month": best_snap.get("trades_per_month"),
+            "reason": (
+                "validated_leader"
+                if overlay.validated_leader_family_id == focus_family
+                else "provisional_leader"
+                if overlay.provisional_leader_family_id == focus_family
+                else "best_retryable_provisional"
+            ),
+        }
+
+    def _current_gut_check_state(
+        self,
+        attempts: list[dict[str, Any]],
+        *,
+        phase_name: str,
+    ) -> dict[str, Any] | None:
+        overlay = self._branch_overlay
+        admissible = self._admissible_frontier_snapshot(attempts).get("best")
+        focus_family = (
+            overlay.validated_leader_family_id
+            or overlay.provisional_leader_family_id
+            or (admissible.get("family_id") if isinstance(admissible, dict) else None)
+        )
+        if not focus_family:
+            return None
+        focus_attempt = self._best_attempt_for_family(attempts, focus_family)
+        if not isinstance(focus_attempt, dict):
+            return None
+        try:
+            raw_score = float(focus_attempt.get("composite_score"))
+        except (TypeError, ValueError):
+            return None
+        strong_floor = max(
+            float(self.config.research.retention_strong_candidate_threshold),
+            float(self.config.research.validated_leader_min_score),
+        )
+        if self.config.research.plot_lower_is_better:
+            is_strong = raw_score <= strong_floor
+        else:
+            is_strong = raw_score >= strong_floor
+        if not is_strong:
+            return None
+        clean_horizons: list[int] = []
+        for attempt in attempts:
+            if self._family_id_for_profile_ref(
+                str(attempt.get("profile_ref") or "").strip() or None
+            ) != focus_family:
+                continue
+            if self._attempt_has_timeframe_mismatch(attempt):
+                continue
+            try:
+                horizon = int(attempt.get("requested_horizon_months"))
+            except (TypeError, ValueError):
+                continue
+            if horizon > 0:
+                clean_horizons.append(horizon)
+        max_clean_horizon = max(clean_horizons) if clean_horizons else 0
+        ladder: list[int] = []
+        for horizon in (
+            int(self.config.research.validated_leader_min_horizon_months),
+            int(self.config.research.horizon_late_months),
+            int(self.config.research.horizon_wrap_up_months),
+        ):
+            if horizon not in ladder:
+                ladder.append(horizon)
+        target_horizon: int | None = None
+        for horizon in ladder:
+            if max_clean_horizon < horizon:
+                if horizon == int(self.config.research.validated_leader_min_horizon_months):
+                    target_horizon = horizon
+                    break
+                if horizon == int(self.config.research.horizon_late_months) and phase_name in {
+                    "mid",
+                    "late",
+                    "wrap_up",
+                }:
+                    target_horizon = horizon
+                    break
+                if horizon == int(self.config.research.horizon_wrap_up_months) and phase_name == "wrap_up":
+                    target_horizon = horizon
+                    break
+        if target_horizon is None:
+            return None
+        return {
+            "family_id": focus_family,
+            "candidate_name": str(focus_attempt.get("candidate_name") or "").strip()
+            or None,
+            "profile_ref": str(focus_attempt.get("profile_ref") or "").strip() or None,
+            "raw_score": raw_score,
+            "effective_window_months": self._attempt_effective_window_months(
+                focus_attempt
+            ),
+            "trades_per_month": self._attempt_trades_per_month(focus_attempt),
+            "target_horizon_months": target_horizon,
+            "max_clean_horizon_months": max_clean_horizon,
+            "phase_name": phase_name,
+        }
+
     def _format_score(self, value: Any) -> str:
         try:
             number = float(value)
@@ -2354,9 +3295,18 @@ class ResearchController:
         }
 
     def _score_target_snapshot(self, tool_context: ToolContext) -> dict[str, Any]:
-        run_best = self._best_attempt(self._run_attempts(tool_context.run_id))
+        attempts = self._run_attempts(tool_context.run_id)
+        run_best = self._best_attempt(attempts)
+        admissible = self._admissible_frontier_snapshot(attempts)
+        steering_best = admissible.get("best") if isinstance(admissible, dict) else None
 
         current_score = (
+            float(steering_best.get("steering_score"))
+            if isinstance(steering_best, dict)
+            and steering_best.get("steering_score") is not None
+            else None
+        )
+        raw_best_score = (
             float(run_best.get("composite_score"))
             if isinstance(run_best, dict)
             and run_best.get("composite_score") is not None
@@ -2373,7 +3323,7 @@ class ResearchController:
                 else current_score + delta
             )
             rationale = (
-                "push past the current run leader with one believable improvement"
+                "push past the current admissible leader with one believable improvement"
             )
         else:
             rationale = (
@@ -2386,21 +3336,30 @@ class ResearchController:
             )
         elif self.config.research.plot_lower_is_better:
             summary = (
-                f"Next target: get quality_score <= {self._format_score(target_score)}. "
-                f"Current run best={self._format_score(current_score)}."
+                f"Next target: get admissible quality_score <= {self._format_score(target_score)}. "
+                f"Current admissible best={self._format_score(current_score)}."
             )
         else:
             summary = (
-                f"Next target: get quality_score >= {self._format_score(target_score)}. "
-                f"Current run best={self._format_score(current_score)}."
+                f"Next target: get admissible quality_score >= {self._format_score(target_score)}. "
+                f"Current admissible best={self._format_score(current_score)}."
+            )
+        if current_score is not None and raw_best_score is not None:
+            summary += (
+                f" Raw run best={self._format_score(raw_best_score)} remains informational only."
             )
 
         return {
             "target_score": target_score,
             "current_run_best_score": current_score,
-            "current_run_best_candidate": run_best.get("candidate_name")
+            "current_run_best_candidate": steering_best.get("candidate_name")
+            if isinstance(steering_best, dict)
+            else None,
+            "raw_run_best_score": raw_best_score,
+            "raw_run_best_candidate": run_best.get("candidate_name")
             if isinstance(run_best, dict)
             else None,
+            "admissible_frontier": steering_best,
             "global_best_score": None,
             "global_best_candidate": None,
             "summary": summary,
@@ -2441,6 +3400,8 @@ class ResearchController:
             if isinstance(best_summary.get("best_cell"), dict)
             else {}
         )
+        effective_window_months = self._attempt_effective_window_months(current_best)
+        trades_per_month = self._attempt_trades_per_month(current_best)
         positive_ratio = None
         matrix_summary = (
             best_summary.get("matrix_summary")
@@ -2456,6 +3417,8 @@ class ResearchController:
             f"candidate={current_best.get('candidate_name')} profile_ref={current_best.get('profile_ref') or 'n/a'} "
             f"basis={current_best.get('score_basis', 'n/a')} dsr={current_metrics.get('dsr', 'n/a')} "
             f"psr={current_metrics.get('psr', 'n/a')} resolved_trades={best_cell.get('resolved_trades', 'n/a')} "
+            f"effective_window_months={self._format_score(effective_window_months)} "
+            f"trades_per_month={self._format_score(trades_per_month)} "
             f"positive_cell_ratio={positive_ratio if positive_ratio is not None else 'n/a'}"
         )
 
@@ -2476,11 +3439,15 @@ class ResearchController:
                 if isinstance(summary.get("best_cell"), dict)
                 else {}
             )
+            eff_months = self._attempt_effective_window_months(attempt)
+            tpm = self._attempt_trades_per_month(attempt)
             lines.append(
                 f"- seq={attempt.get('sequence')} score={attempt.get('composite_score')} "
                 f"basis={attempt.get('score_basis', 'n/a')} dsr={metrics.get('dsr', 'n/a')} "
                 f"psr={metrics.get('psr', 'n/a')} candidate={attempt.get('candidate_name')} "
                 f"trades={cell.get('resolved_trades', 'n/a')} "
+                f"effective_window_months={self._format_score(eff_months)} "
+                f"trades_per_month={self._format_score(tpm)} "
                 f"artifact={attempt.get('artifact_dir')}"
             )
 
@@ -2796,6 +3763,191 @@ class ResearchController:
             )
         return "\n".join(lines)
 
+    def _latest_successful_step_result(
+        self,
+        tool_context: ToolContext,
+        *,
+        tool_names: set[str],
+        limit: int = 12,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        payloads = self._load_recent_step_payloads(tool_context, max(1, limit))
+        for payload in reversed(payloads):
+            results = payload.get("results")
+            if not isinstance(results, list):
+                continue
+            for result in reversed(results):
+                if not isinstance(result, dict):
+                    continue
+                tool = str(result.get("tool") or "").strip()
+                if tool not in tool_names:
+                    continue
+                if result.get("ok") is False or result.get("error"):
+                    continue
+                return result, payload
+        return None, None
+
+    @staticmethod
+    def _summarize_candidate_handle(result: dict[str, Any]) -> str | None:
+        candidate = (
+            result.get("candidate_summary")
+            if isinstance(result.get("candidate_summary"), dict)
+            else {}
+        )
+        parts: list[str] = []
+        family_id = str(candidate.get("family_id") or "").strip()
+        if family_id:
+            parts.append(f"family={family_id}")
+        profile_ref = str(
+            result.get("profile_ref")
+            or result.get("created_profile_ref")
+            or candidate.get("profile_ref")
+            or ""
+        ).strip()
+        if profile_ref:
+            parts.append(f"profile_ref={profile_ref}")
+        profile_path = str(
+            result.get("profile_path") or candidate.get("profile_path") or ""
+        ).strip()
+        if profile_path:
+            parts.append(f"profile_path={profile_path}")
+        next_action = str(result.get("next_recommended_action") or "").strip()
+        if next_action:
+            parts.append(f"next={next_action}")
+        if not parts:
+            return None
+        return ", ".join(parts[:5])
+
+    @staticmethod
+    def _summarize_eval_handle(result: dict[str, Any]) -> str | None:
+        parts: list[str] = []
+        attempt_id = str(result.get("attempt_id") or "").strip()
+        if attempt_id:
+            parts.append(f"attempt_id={attempt_id}")
+        profile_ref = str(result.get("profile_ref") or "").strip()
+        if profile_ref:
+            parts.append(f"profile_ref={profile_ref}")
+        score = result.get("score")
+        if score is not None:
+            parts.append(f"score={score}")
+        artifact_dir = str(result.get("artifact_dir") or "").strip()
+        if artifact_dir:
+            parts.append(f"artifact_dir={artifact_dir}")
+        next_action = str(result.get("next_recommended_action") or "").strip()
+        if next_action:
+            parts.append(f"next={next_action}")
+        if not parts:
+            return None
+        return ", ".join(parts[:5])
+
+    @staticmethod
+    def _summarize_sweep_handle(result: dict[str, Any]) -> str | None:
+        parts: list[str] = []
+        inspect_ref = str(result.get("inspect_ref") or "").strip()
+        if inspect_ref:
+            parts.append(f"inspect_ref={inspect_ref}")
+        artifact_dir = str(result.get("artifact_dir") or "").strip()
+        if artifact_dir:
+            parts.append(f"artifact_dir={artifact_dir}")
+        preset = str(result.get("quality_score_preset") or "").strip()
+        if preset:
+            parts.append(f"score_preset={preset}")
+        next_action = str(result.get("next_recommended_action") or "").strip()
+        if next_action:
+            parts.append(f"next={next_action}")
+        if not parts:
+            return None
+        return ", ".join(parts[:5])
+
+    def _working_memory_text(self, tool_context: ToolContext) -> str:
+        lines = ["Pinned working memory (operational handles; prefer these over guessing ids):"]
+        ov = self._branch_overlay
+        wrap_up_focus = self._current_wrap_up_focus_state(
+            self._run_attempts(tool_context.run_id)
+        )
+        if ov.validated_leader_family_id:
+            branch = self._family_branches.get(ov.validated_leader_family_id)
+            parts = [
+                f"family={ov.validated_leader_family_id}",
+            ]
+            if branch:
+                if branch.last_profile_ref:
+                    parts.append(f"profile_ref={branch.last_profile_ref}")
+                if branch.latest_attempt_id:
+                    parts.append(f"latest_attempt_id={branch.latest_attempt_id}")
+                if branch.best_score is not None:
+                    parts.append(f"best_score={self._format_score(branch.best_score)}")
+            lines.append("- validated_leader: " + ", ".join(parts[:5]))
+        elif ov.provisional_leader_family_id:
+            branch = self._family_branches.get(ov.provisional_leader_family_id)
+            parts = [
+                f"family={ov.provisional_leader_family_id}",
+            ]
+            if branch:
+                if branch.last_profile_ref:
+                    parts.append(f"profile_ref={branch.last_profile_ref}")
+                if branch.latest_attempt_id:
+                    parts.append(f"latest_attempt_id={branch.latest_attempt_id}")
+                if branch.latest_score is not None:
+                    parts.append(f"latest_score={self._format_score(branch.latest_score)}")
+            lines.append("- provisional_leader: " + ", ".join(parts[:5]))
+        latest_candidate_result, _ = self._latest_successful_step_result(
+            tool_context,
+            tool_names={
+                "register_profile",
+                "validate_profile",
+                "mutate_profile",
+                "prepare_profile",
+            },
+        )
+        candidate_summary = (
+            self._summarize_candidate_handle(latest_candidate_result)
+            if isinstance(latest_candidate_result, dict)
+            else None
+        )
+        if candidate_summary:
+            lines.append("- current_candidate: " + candidate_summary)
+        latest_eval_result, _ = self._latest_successful_step_result(
+            tool_context,
+            tool_names={"evaluate_candidate"},
+        )
+        eval_summary = (
+            self._summarize_eval_handle(latest_eval_result)
+            if isinstance(latest_eval_result, dict)
+            else None
+        )
+        if eval_summary:
+            lines.append("- latest_eval: " + eval_summary)
+        latest_sweep_result, _ = self._latest_successful_step_result(
+            tool_context,
+            tool_names={"run_parameter_sweep"},
+        )
+        sweep_summary = (
+            self._summarize_sweep_handle(latest_sweep_result)
+            if isinstance(latest_sweep_result, dict)
+            else None
+        )
+        if sweep_summary:
+            lines.append("- latest_sweep: " + sweep_summary)
+            lines.append(
+                "- sweep_rule: sweep outputs are not attempt_ids; inspect via artifact_dir or inspect_ref."
+            )
+        if isinstance(wrap_up_focus, dict):
+            parts = [f"family={wrap_up_focus.get('family_id')}"]
+            if wrap_up_focus.get("profile_ref"):
+                parts.append(f"profile_ref={wrap_up_focus.get('profile_ref')}")
+            if wrap_up_focus.get("latest_attempt_id"):
+                parts.append(f"latest_attempt_id={wrap_up_focus.get('latest_attempt_id')}")
+            if wrap_up_focus.get("promotability_status"):
+                parts.append(
+                    f"promotability={wrap_up_focus.get('promotability_status')}"
+                )
+            lines.append("- wrap_up_focus: " + ", ".join(parts[:5]))
+        if self.last_created_profile_ref:
+            lines.append(f"- last_created_profile_ref: {self.last_created_profile_ref}")
+        if len(lines) == 1:
+            lines.append("- No live handles are pinned yet; use typed tool results from this step.")
+        return "\n".join(lines)
+
     def _current_research_priority_text(
         self,
         tool_context: ToolContext,
@@ -2806,6 +3958,8 @@ class ResearchController:
         ov = self._branch_overlay
         attempts = self._run_attempts(tool_context.run_id)
         raw_best = self._best_attempt(attempts)
+        admissible = self._admissible_frontier_snapshot(attempts)
+        admissible_best = admissible.get("best") if isinstance(admissible, dict) else None
         raw_best_score = None
         raw_best_candidate = None
         raw_best_family = None
@@ -2841,9 +3995,33 @@ class ResearchController:
         authoritative_family = (
             ov.validated_leader_family_id or ov.provisional_leader_family_id or None
         )
+        phase_name = str(self._run_phase_info(step, step_limit, policy).get("name") or "")
+        gut_check = self._current_gut_check_state(attempts, phase_name=phase_name)
+        wrap_up_focus = self._current_wrap_up_focus_state(attempts)
         lines = [
             "Current controller priority (authoritative; follow this over raw frontier score when they conflict):"
         ]
+        if isinstance(admissible_best, dict):
+            lines.append(
+                "- Admissible frontier anchor: "
+                f"{admissible_best.get('candidate_name') or 'n/a'} "
+                f"family={self._short_family_id(admissible_best.get('family_id'))} "
+                f"raw_score={self._format_score(admissible_best.get('raw_score'))} "
+                f"steering_score={self._format_score(admissible_best.get('steering_score'))} "
+                f"window={self._format_score(admissible_best.get('effective_window_months'))}m "
+                f"cadence={self._format_score(admissible_best.get('trades_per_month'))}/mo."
+            )
+        if isinstance(gut_check, dict):
+            lines.append(
+                "- Immediate pressure test pending: "
+                f"{self._short_family_id(gut_check.get('family_id'))} "
+                f"must be re-evaluated at {gut_check.get('target_horizon_months')}m "
+                "before further frontier chasing. "
+                f"Current clean horizon={gut_check.get('max_clean_horizon_months')}m, "
+                f"score={self._format_score(gut_check.get('raw_score'))}, "
+                f"effective_window={self._format_score(gut_check.get('effective_window_months'))}m, "
+                f"cadence={self._format_score(gut_check.get('trades_per_month'))}/mo."
+            )
         if ov.validated_leader_family_id:
             lines.append(
                 f"- Primary objective: protect and pressure-test the validated leader {self._short_family_id(ov.validated_leader_family_id)}."
@@ -2880,12 +4058,22 @@ class ResearchController:
                 "- Preferred next moves: prepare a fresh scaffold/clone on a different family, instrument cluster, timeframe architecture, or directional logic."
             )
         elif ov.budget_mode == bl.BUDGET_WRAP_UP:
-            lines.append(
-                "- Primary objective: convert remaining budget into decisive validation evidence, not broad exploration."
-            )
-            lines.append(
-                "- Preferred next moves: validate survivors, inspect artifacts, compare contenders, and only open new branches if no leader path can be resolved."
-            )
+            if isinstance(wrap_up_focus, dict):
+                lines.append(
+                    "- Primary objective: convert remaining budget into decisive evidence on wrap-up focus "
+                    + self._short_family_id(wrap_up_focus.get("family_id"))
+                    + ", not broad exploration."
+                )
+                lines.append(
+                    "- Preferred next moves: validate, inspect, or compare the wrap-up focus path directly; avoid unrelated family tuning unless that focus is clearly dead."
+                )
+            else:
+                lines.append(
+                    "- Primary objective: convert remaining budget into decisive validation evidence, not broad exploration."
+                )
+                lines.append(
+                    "- Preferred next moves: validate survivors, inspect artifacts, compare contenders, and only open new branches if no leader path can be resolved."
+                )
         else:
             lines.append(
                 "- Primary objective: establish the next credible leader through diverse scored evidence."
@@ -2906,6 +4094,14 @@ class ResearchController:
                 + self._short_family_id(authoritative_family)
                 + "."
             )
+        elif isinstance(admissible_best, dict):
+            admissible_family = str(admissible_best.get("family_id") or "").strip() or None
+            if admissible_family and raw_best_family and admissible_family != raw_best_family:
+                lines.append(
+                    "- Conflict note: raw frontier best "
+                    + self._short_family_id(raw_best_family)
+                    + " is not the current admissible leader. Follow admissibility and branch state over raw spikes."
+                )
         if (
             ov.budget_mode == bl.BUDGET_VALIDATION
             and ov.provisional_leader_family_id
@@ -2914,7 +4110,6 @@ class ResearchController:
             lines.append(
                 "- Planning rule: treat validation resolution as the default path; do not pivot to unrelated broad search without a concrete reason from the branch packet."
             )
-        phase_name = str(self._run_phase_info(step, step_limit, policy).get("name") or "")
         if phase_name == "wrap_up":
             lines.append(
                 "- Phase note: wrap_up is active, so extra exploration needs strong justification."
@@ -2994,6 +4189,7 @@ class ResearchController:
             f"{soft_wrap_note + chr(10) if soft_wrap_note else ''}"
             f"{self._current_research_priority_text(tool_context, effective_step, effective_step_limit, policy)}\n\n"
             f"{self._manager_guidance_text(effective_step)}\n\n"
+            f"{self._working_memory_text(tool_context)}\n\n"
             f"{self._branch_lifecycle_run_packet_text(tool_context, effective_step, effective_step_limit)}\n\n"
             f"{self._retention_and_exploit_status_text(tool_context)}\n\n"
             f"{self._timeframe_mismatch_status_text()}\n\n"
@@ -3006,13 +4202,14 @@ class ResearchController:
             f"Program:\n{self._program_text()}\n\n"
             f"Current seed hand:\n{self._seed_text(tool_context)}\n\n"
             f"Portable profile template path: {tool_context.profile_template_path}\n"
-            f"Portable profile template:\n{self._profile_template_text(tool_context)}\n\n"
+            "Portable profile template note:\n"
+            "- The controller can scaffold from the portable template through prepare_profile.\n"
+            "- Do not hand-author a full profile from this template unless typed tools are unavailable.\n\n"
             f"Sticky indicator context:\n{tool_context.indicator_catalog_summary or 'Unavailable'}\n\n"
             f"Seeded indicator parameter hints:\n{tool_context.seed_indicator_parameter_hints or 'Unavailable'}\n\n"
             f"Sticky instrument context:\n{tool_context.instrument_catalog_summary or 'Unavailable'}\n\n"
             f"{self._seed_to_catalog_hints_text(self._seed_indicator_ids(tool_context.seed_prompt_path))}\n\n"
             f"{self._artifact_layout_text()}\n\n"
-            f"Profile JSON files currently on disk:\n{self._profile_files_summary(tool_context)}\n\n"
             f"Run-owned profiles so far:\n{self._run_owned_profiles_summary(tool_context)}\n\n"
             f"Checkpoint summary:\n{checkpoint}\n\n"
             f"Recent attempts:\n{self._recent_attempts_summary(tool_context)}\n\n"
@@ -3163,6 +4360,26 @@ class ResearchController:
                 summarized["created_profile_ref"] = result.get("created_profile_ref")
             if result.get("auto_log") is not None:
                 summarized["auto_log"] = result.get("auto_log")
+            if isinstance(result.get("candidate_summary"), dict):
+                summarized["candidate"] = result.get("candidate_summary")
+            if result.get("controller_hint"):
+                summarized["controller_hint"] = str(result.get("controller_hint"))[:220]
+            if result.get("artifact_kind"):
+                summarized["artifact_kind"] = result.get("artifact_kind")
+            if result.get("inspect_ref"):
+                summarized["inspect_ref"] = str(result.get("inspect_ref"))[:120]
+            if result.get("quality_score_preset"):
+                summarized["quality_score_preset"] = str(
+                    result.get("quality_score_preset")
+                )[:80]
+            if result.get("ready_for_registration") is not None:
+                summarized["ready_for_registration"] = bool(
+                    result.get("ready_for_registration")
+                )
+            if result.get("ready_to_evaluate") is not None:
+                summarized["ready_to_evaluate"] = bool(result.get("ready_to_evaluate"))
+            if result.get("material_changes") is not None:
+                summarized["material_changes"] = bool(result.get("material_changes"))
             if isinstance(payload, dict):
                 argv = payload.get("argv")
                 cli_args = argv if isinstance(argv, list) else []
@@ -3228,8 +4445,10 @@ class ResearchController:
                                         matrix_summary.get("positive_cell_ratio")
                                     )
                                 summarized["compare_summary"] = compare_summary
-                if isinstance(stdout, str) and "Auto-adjusted timeframe from" in stdout:
+                if bool(result.get("timeframe_auto_adjusted")):
                     summarized["timeframe_auto_adjusted"] = True
+                if isinstance(result.get("timeframe_mismatch"), dict):
+                    summarized["timeframe_mismatch"] = result.get("timeframe_mismatch")
                 if (
                     isinstance(stderr, str)
                     and stderr.strip()
@@ -3243,12 +4462,25 @@ class ResearchController:
                     summarized["artifact_dir"] = result.get("artifact_dir")
             return summarized
         if tool == "inspect_artifact":
-            return {
+            summarized = {
                 "tool": tool,
                 "ok": bool(result.get("ok", True)),
                 "artifact_dir": result.get("artifact_dir"),
                 "view": result.get("view"),
             }
+            if result.get("artifact_kind"):
+                summarized["artifact_kind"] = result.get("artifact_kind")
+            if isinstance(result.get("sweep_summary"), dict):
+                summarized["sweep_summary"] = result.get("sweep_summary")
+            if isinstance(result.get("compare_summary"), dict):
+                summarized["compare_summary"] = result.get("compare_summary")
+            if result.get("effective_window_months_hint") is not None:
+                summarized["effective_window_months_hint"] = result.get(
+                    "effective_window_months_hint"
+                )
+            if result.get("controller_hint"):
+                summarized["controller_hint"] = str(result.get("controller_hint"))[:220]
+            return summarized
         if tool == "compare_artifacts":
             return {
                 "tool": tool,
@@ -3826,6 +5058,18 @@ class ResearchController:
         eff_from_ev = record.effective_window_months
         if eff_from_ev is None and effective_window_months is not None:
             eff_from_ev = effective_window_months
+        derived_attempt = {
+            "best_summary": record.best_summary if isinstance(record.best_summary, dict) else {},
+            "effective_window_months": eff_from_ev,
+        }
+        resolved_trades, derived_trades_per_month, derived_positive_cell_ratio = (
+            self._resolve_support_metrics(
+                derived_attempt,
+                resolved_trades=resolved_trades if resolved_trades is not None else record.resolved_trades,
+                trades_per_month=record.trades_per_month,
+                positive_ratio=record.positive_cell_ratio,
+            )
+        )
         return {
             "status": "logged",
             "attempt_id": record.attempt_id,
@@ -3838,8 +5082,8 @@ class ResearchController:
             "resolved_trades": resolved_trades
             if resolved_trades is not None
             else record.resolved_trades,
-            "trades_per_month": record.trades_per_month,
-            "positive_cell_ratio": record.positive_cell_ratio,
+            "trades_per_month": derived_trades_per_month,
+            "positive_cell_ratio": derived_positive_cell_ratio,
             "effective_window_months": eff_from_ev,
             "effective_window_source": record.effective_window_source,
             "requested_horizon_months": record.requested_horizon_months,
@@ -3929,7 +5173,6 @@ class ResearchController:
         )
 
         serialized_result = json.loads(self._serialize_tool_result(result))
-        timeframe_mismatch = self._detect_timeframe_mismatch(serialized_result)
 
         profile_ref: str | None = None
         file_arg: Path | None = None
@@ -3952,6 +5195,10 @@ class ResearchController:
             self._maybe_auto_log_attempt(tool_context, args)
             if result.returncode == 0
             else None
+        )
+        timeframe_mismatch = self._resolve_timeframe_mismatch(
+            serialized_result,
+            auto_log=auto_log if isinstance(auto_log, dict) else None,
         )
         if auto_log is not None and auto_log.get("status") == "logged":
             artifact_dir_str = auto_log.get("artifact_dir", "")
@@ -4066,6 +5313,11 @@ class ResearchController:
                 )
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(tpl, dest)
+            candidate_summary = _candidate_summary_from_profile_payload(
+                _read_json_if_exists(dest),
+                profile_path=dest,
+                draft_name=name,
+            )
             return tt.normalized_tool_envelope(
                 "prepare_profile",
                 ok=True,
@@ -4073,6 +5325,8 @@ class ResearchController:
                 profile_name=name,
                 indicator_ids=action.get("indicator_ids"),
                 timeframe_summary=str(action.get("timeframe") or ""),
+                candidate_summary=candidate_summary,
+                controller_hint="Profile scaffold is ready. Use candidate_summary directly and validate next instead of rereading the profile file.",
                 warnings=warnings,
                 next_recommended_action="validate_profile",
                 artifacts={"profile_path": str(dest)},
@@ -4115,6 +5369,13 @@ class ResearchController:
             base["profile_path"] = str(dest)
             base["profile_name"] = name
             base["indicator_ids"] = action.get("indicator_ids")
+            base["candidate_summary"] = _candidate_summary_from_profile_payload(
+                _read_json_if_exists(dest),
+                profile_path=dest,
+                draft_name=name,
+            )
+            if base.get("candidate_summary"):
+                base["controller_hint"] = "Local clone is ready. Validate this candidate next instead of inspecting the cloned file."
             if base.get("ok"):
                 base["next_recommended_action"] = "validate_profile"
             else:
@@ -4161,6 +5422,13 @@ class ResearchController:
             base["profile_path"] = str(dest)
             base["profile_name"] = name
             base["indicator_ids"] = ids
+            base["candidate_summary"] = _candidate_summary_from_profile_payload(
+                _read_json_if_exists(dest),
+                profile_path=dest,
+                draft_name=name,
+            )
+            if base.get("candidate_summary"):
+                base["controller_hint"] = "Candidate scaffold is ready. Validate next; do not reread the profile file unless the tool reported an error."
             if base.get("ok"):
                 base["next_recommended_action"] = "validate_profile"
             artifacts = dict(base.get("artifacts") or {})
@@ -4279,21 +5547,53 @@ class ResearchController:
             result_tool="validate_profile",
         )
         base["profile_path"] = str(path)
+        source_payload = _read_json_if_exists(path)
         parsed = {}
         res = base.get("result")
         if isinstance(res, dict):
             pj = res.get("parsed_json")
             if isinstance(pj, dict):
                 parsed = pj
+        parsed_data = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+        normalized_profile = (
+            parsed_data.get("normalized_profile")
+            if isinstance(parsed_data, dict)
+            and isinstance(parsed_data.get("normalized_profile"), dict)
+            else None
+        )
+        candidate_summary = _candidate_summary_from_profile_payload(
+            {"profile": normalized_profile}
+            if isinstance(normalized_profile, dict)
+            else source_payload,
+            profile_path=path if path.exists() else None,
+        )
         base["validation_ok"] = bool(base.get("ok"))
+        base["candidate_summary"] = candidate_summary
         base["normalized_timeframe_summary"] = str(
-            parsed.get("timeframe_summary")
+            (candidate_summary or {}).get("timeframe_summary")
+            or parsed_data.get("timeframe_summary")
+            or parsed_data.get("timeframes")
+            or parsed.get("timeframe_summary")
             or parsed.get("timeframes")
             or ""
         )
         base["normalized_instrument_summary"] = str(
-            parsed.get("instrument_summary") or parsed.get("instruments") or ""
+            (candidate_summary or {}).get("instrument_summary")
+            or parsed_data.get("instrument_summary")
+            or parsed_data.get("instruments")
+            or parsed.get("instrument_summary")
+            or parsed.get("instruments")
+            or ""
         )
+        base["material_changes"] = _normalized_profile_material_changes(
+            source_payload,
+            normalized_profile,
+        )
+        base["ready_for_registration"] = bool(base.get("ok"))
+        if base.get("ok"):
+            base["controller_hint"] = (
+                "Validation passed. Register next using this candidate summary; only revisit the file if you need to debug a warning."
+            )
         if base.get("ok"):
             base["next_recommended_action"] = "register_profile"
         return self._finalize_typed_cli_surface(base)
@@ -4373,8 +5673,21 @@ class ResearchController:
         base["profile_path"] = str(path)
         base["created"] = operation != "update"
         base["updated"] = operation == "update"
+        base["candidate_summary"] = _candidate_summary_from_profile_payload(
+            _read_json_if_exists(path),
+            profile_path=path if path.exists() else None,
+            profile_ref=str(profile_ref).strip() if isinstance(profile_ref, str) else None,
+        )
+        base["ready_to_evaluate"] = bool(base.get("ok") and profile_ref)
+        if base.get("ok"):
+            base["controller_hint"] = (
+                "Registration produced a canonical profile_ref. Use that ref directly in evaluate_candidate; do not reread the profile file unless debugging."
+            )
         if base.get("ok"):
             base["next_recommended_action"] = "evaluate_candidate"
+        artifacts = dict(base.get("artifacts") or {})
+        artifacts["metadata_out_path"] = str(out_path)
+        base["artifacts"] = artifacts
         return self._finalize_typed_cli_surface(base)
 
     def _transactional_prepare_profile_ref_for_eval(
@@ -4779,6 +6092,12 @@ class ResearchController:
         if isinstance(best, dict):
             base["best_score"] = best.get("quality_score")
         base["artifact_dir"] = str(out_dir)
+        base["artifact_kind"] = "parameter_sweep"
+        base["inspect_ref"] = out_dir.name
+        base["quality_score_preset"] = self.config.research.quality_score_preset
+        base["controller_hint"] = (
+            "Inspect this sweep using artifact_dir or inspect_ref. Sweep outputs are not attempt_ids."
+        )
         if base.get("ok"):
             base["next_recommended_action"] = "inspect_artifact"
         arts = dict(base.get("artifacts") or {})
@@ -4923,6 +6242,27 @@ class ResearchController:
                 except (OSError, json.JSONDecodeError):
                     payload["request_meta"] = None
             return payload
+        sweep_results_path = path / "sweep-results.json"
+        if view == "summary" and sweep_results_path.exists():
+            sweep_payload = _read_json_if_exists(sweep_results_path)
+            sweep_summary = _summarize_sweep_results_payload(
+                sweep_payload,
+                artifact_dir=path,
+            )
+            if sweep_summary is not None:
+                payload["artifact_kind"] = "parameter_sweep"
+                payload["sweep_summary"] = sweep_summary
+                payload["artifact_resolution"] = {
+                    "artifact_dir": str(path),
+                    "resolution": "parameter_sweep_results",
+                    "reason": "sweep-results.json present",
+                    "has_sweep_results": True,
+                }
+                payload["next_recommended_action"] = "compare_artifacts"
+                payload["controller_hint"] = (
+                    "Sweep summary already identifies the top permutation. Compare or evaluate from this summary before opening raw sweep JSON."
+                )
+                return payload
         try:
             compare = self.cli.score_artifact(path)
         except (CliError, OSError, RuntimeError, TypeError, ValueError) as exc:
@@ -4931,6 +6271,7 @@ class ResearchController:
             payload["errors"] = [str(exc)[:800]]
             payload["next_recommended_action"] = None
             return payload
+        payload["artifact_kind"] = "sensitivity_eval"
         payload["compare_summary"] = compare
         best = compare.get("best")
         mw_hint = None
@@ -4939,6 +6280,9 @@ class ResearchController:
             if isinstance(mdw, dict):
                 mw_hint = mdw.get("effective_window_months")
         payload["effective_window_months_hint"] = mw_hint
+        payload["controller_hint"] = (
+            "Use compare_summary and attempt_ledger_hint before reading raw artifact files."
+        )
         return payload
 
     def _typed_compare_artifacts(
@@ -5224,6 +6568,8 @@ class ResearchController:
                         merged["controller"] = cur["controller"]
                     if isinstance(cur.get("controller_updated_at"), str):
                         merged["controller_updated_at"] = cur["controller_updated_at"]
+                    if isinstance(cur.get("manager"), dict):
+                        merged["manager"] = cur["manager"]
             except (OSError, json.JSONDecodeError):
                 pass
         state_path.write_text(

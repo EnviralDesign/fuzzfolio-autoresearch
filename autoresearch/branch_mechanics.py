@@ -112,18 +112,46 @@ def apply_overlay_provisional_leadership(ctrl: Any) -> None:
             br.lifecycle_state = bl.LIFECYCLE_VALIDATED_LEADER
             br.structural_contrast_required = False
             br.needs_structural_contrast = False
-    if not leader:
+    if leader:
+        br = ctrl._family_branches.get(leader)
+        if br and not br.exploit_dead and br.lifecycle_state != bl.LIFECYCLE_COLLAPSED:
+            if br.promotion_level == bl.PROMOTION_SCOUT:
+                br.promotion_level = bl.PROMOTION_PROVISIONAL
+            if br.lifecycle_state not in (
+                bl.LIFECYCLE_VALIDATED_LEADER,
+                bl.LIFECYCLE_COLLAPSED,
+            ):
+                br.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_LEADER
+    sync_last_scored_validation_digest(ctrl)
+
+
+def sync_last_scored_validation_digest(ctrl: Any) -> None:
+    """Keep the last scored validation digest aligned with current family truth."""
+    overlay = ctrl._branch_overlay
+    digest = overlay.last_scored_validation_digest
+    if not isinstance(digest, dict):
         return
-    br = ctrl._family_branches.get(leader)
-    if not br or br.exploit_dead or br.lifecycle_state == bl.LIFECYCLE_COLLAPSED:
+    family_id = str(digest.get("family_id") or "").strip()
+    if not family_id:
         return
-    if br.promotion_level == bl.PROMOTION_SCOUT:
-        br.promotion_level = bl.PROMOTION_PROVISIONAL
-    if br.lifecycle_state not in (
-        bl.LIFECYCLE_VALIDATED_LEADER,
-        bl.LIFECYCLE_COLLAPSED,
-    ):
-        br.lifecycle_state = bl.LIFECYCLE_PROVISIONAL_LEADER
+    branch = ctrl._family_branches.get(family_id)
+    if not branch:
+        return
+    validation_evidence = (
+        branch.last_validation_evidence
+        if isinstance(branch.last_validation_evidence, dict)
+        else digest.get("validation_evidence")
+    )
+    digest["validation_evidence"] = validation_evidence
+    digest["lifecycle_state"] = branch.lifecycle_state
+    digest["promotion_level"] = branch.promotion_level
+    digest["retention_status"] = branch.retention_status
+    digest["coverage_status"] = branch.last_coverage_status
+    digest["last_validation_outcome"] = branch.last_validation_outcome
+    digest["promotability_status"] = branch.promotability_status
+    digest["validation_confidence"] = branch.validation_confidence
+    digest["exploit_dead"] = branch.exploit_dead
+    digest["collapse_reason"] = branch.collapse_reason
 
 
 def sync_branch_budget_mode(

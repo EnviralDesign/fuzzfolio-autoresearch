@@ -148,6 +148,53 @@ def test_suppressing_leader_clears_overlay_refs() -> None:
     assert ctrl._family_branches["fam-a"].lifecycle_state == bl.LIFECYCLE_COLLAPSED
 
 
+def test_suppressing_family_resyncs_last_scored_digest() -> None:
+    ctrl = DummyCtrl()
+    branch = ctrl._family_branches["fam-a"]
+    branch.lifecycle_state = bl.LIFECYCLE_VALIDATED_LEADER
+    branch.promotion_level = bl.PROMOTION_VALIDATED
+    branch.retention_status = bl.RETENTION_PASSED
+    branch.last_validation_outcome = vo.VALIDATION_PASSED
+    branch.promotability_status = vo.PROMOTABILITY_VALIDATED_READY
+    branch.validation_confidence = "high"
+    branch.last_validation_evidence = {"outcome": vo.VALIDATION_PASSED}
+    ctrl._branch_overlay.validated_leader_family_id = "fam-a"
+    ctrl._branch_overlay.last_scored_validation_digest = {
+        "family_id": "fam-a",
+        "attempt_id": "attempt-a",
+        "validation_evidence": {"outcome": vo.VALIDATION_PASSED},
+        "lifecycle_state": bl.LIFECYCLE_VALIDATED_LEADER,
+        "promotion_level": bl.PROMOTION_VALIDATED,
+        "retention_status": bl.RETENTION_PASSED,
+        "coverage_status": "adequate",
+        "last_validation_outcome": vo.VALIDATION_PASSED,
+        "promotability_status": vo.PROMOTABILITY_VALIDATED_READY,
+        "validation_confidence": "high",
+        "exploit_dead": False,
+        "collapse_reason": None,
+    }
+    decision = ManagerDecision(
+        rationale="q",
+        actions=[
+            ManagerAction(
+                kind=ManagerActionKind.suppress_family,
+                payload={"family_id": "fam-a", "reason": "manager_suppress"},
+            )
+        ],
+    )
+
+    ma.apply_manager_decision(
+        ctrl, None, decision, step=1, step_limit=10, policy=DummyPolicy()
+    )
+
+    digest = ctrl._branch_overlay.last_scored_validation_digest
+    assert digest is not None
+    assert digest["lifecycle_state"] == bl.LIFECYCLE_COLLAPSED
+    assert digest["retention_status"] == bl.RETENTION_FAILED
+    assert digest["exploit_dead"] is True
+    assert digest["collapse_reason"] == "manager_suppress"
+
+
 def test_select_post_eval_hook_prefers_specific_events() -> None:
     assert (
         mh.select_post_eval_hook(
