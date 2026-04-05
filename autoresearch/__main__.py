@@ -88,6 +88,11 @@ if __package__ in {None, ""}:
         render_validation_delta_artifacts,
         render_validation_scatter_artifacts,
     )
+    from autoresearch.portfolio import (
+        build_sleeve_selection,
+        load_portfolio_spec,
+        merge_portfolio_sleeves,
+    )
     from autoresearch.provider import (
         ChatMessage,
         ProviderError,
@@ -145,6 +150,11 @@ else:
         render_tradeoff_leaderboard_artifacts,
         render_validation_delta_artifacts,
         render_validation_scatter_artifacts,
+    )
+    from .portfolio import (
+        build_sleeve_selection,
+        load_portfolio_spec,
+        merge_portfolio_sleeves,
     )
     from .provider import (
         ChatMessage,
@@ -807,11 +817,72 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-candidate timeout for packaging/rendering profile-drop PNGs. Default: 1800",
     )
     shortlist_report.add_argument(
+        "--profile-drop-workers",
+        type=int,
+        default=4,
+        help="Concurrent workers for shortlisted profile-drop packaging/rendering. Default: 4",
+    )
+    shortlist_report.add_argument(
         "--force-rebuild-profile-drops",
         action="store_true",
         help="Re-render shortlisted profile-drop PNGs even if the derived shortlist copies already exist.",
     )
     shortlist_report.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    portfolio_report = subparsers.add_parser(
+        "build-portfolio",
+        help="Build a config-driven multi-sleeve portfolio report, charts, and optional profile-drop PNGs.",
+    )
+    portfolio_report.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only consider attempts from the named run id. Can be repeated.",
+    )
+    portfolio_report.add_argument(
+        "--attempt-id",
+        action="append",
+        default=None,
+        help="Only consider the named attempt id. Can be repeated.",
+    )
+    portfolio_report.add_argument(
+        "--portfolio-config",
+        default=None,
+        help="Path to a JSON portfolio config. Defaults to repo-root portfolio.config.json, falling back to built-in defaults if missing.",
+    )
+    portfolio_report.add_argument(
+        "--catch-up-full-backtests",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the portfolio config and catch up missing 36mo full-backtests before building the portfolio.",
+    )
+    portfolio_report.add_argument(
+        "--catch-up-force-rebuild",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the portfolio config and force full-backtest rebuilds during the optional catch-up phase.",
+    )
+    portfolio_report.add_argument(
+        "--catch-up-require-scrutiny-36",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the portfolio config and only catch up attempts that already have 36mo scrutiny.",
+    )
+    portfolio_report.add_argument(
+        "--generate-profile-drops",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the portfolio config and enable or disable final portfolio profile-drop PNG generation.",
+    )
+    portfolio_report.add_argument(
+        "--profile-drop-workers",
+        type=int,
+        default=None,
+        help="Override the portfolio config worker count for profile-drop packaging/rendering.",
+    )
+    portfolio_report.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
@@ -4588,6 +4659,201 @@ def _render_profile_drop_for_attempt(
     }
 
 
+def _render_profile_drop_rows(
+    *,
+    config,
+    rows: list[dict[str, Any]],
+    output_root: Path,
+    lookback_months: int,
+    timeout_seconds: int,
+    force_rebuild: bool,
+    profile_drop_workers: int,
+    as_json: bool,
+    progress_label: str,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+
+    cli = FuzzfolioCli(config.fuzzfolio)
+    cli.ensure_login()
+    renderer_executable, workspace_root = _resolve_drop_renderer_executable(config)
+    working_dir = workspace_root or config.repo_root
+
+    expected_drop_dirs = {
+        _slug_token(
+            f"{row.get('selection_rank') or row.get('portfolio_rank') or ''}-{row.get('attempt_id') or row.get('candidate_name') or 'candidate'}"
+        )
+        for row in rows
+    }
+    output_root.mkdir(parents=True, exist_ok=True)
+    for child in output_root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name not in expected_drop_dirs:
+            shutil.rmtree(child)
+
+    matched_items = _matched_attempt_items(
+        config,
+        attempt_ids=[
+            str(row.get("attempt_id") or "").strip()
+            for row in rows
+            if str(row.get("attempt_id") or "").strip()
+        ],
+        require_scored=False,
+    )
+    item_by_attempt_id = {
+        str(attempt.get("attempt_id") or ""): (run_dir, attempts, attempt)
+        for run_dir, attempts, attempt in matched_items
+    }
+
+    ordered_results: list[dict[str, Any]] = []
+    work_items: list[tuple[int, dict[str, Any], Path, list[dict[str, Any]], dict[str, Any]]] = []
+    for index, row in enumerate(rows):
+        attempt_id = str(row.get("attempt_id") or "").strip()
+        matched = item_by_attempt_id.get(attempt_id)
+        if matched is None:
+            ordered_results.append(
+                {
+                    "_row_index": index,
+                    "attempt_id": row.get("attempt_id"),
+                    "run_id": row.get("run_id"),
+                    "candidate_name": row.get("candidate_name"),
+                    "status": "failed",
+                    "error": f"Attempt ledger record missing for attempt {attempt_id}",
+                }
+            )
+            continue
+        run_dir, attempts, attempt = matched
+        work_items.append((index, row, run_dir, attempts, attempt))
+
+    use_progress = (
+        (not as_json)
+        and (not PLAIN_PROGRESS_MODE)
+        and bool(getattr(console, "is_terminal", False))
+    )
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=32),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+        disable=not use_progress,
+    )
+
+    cached_count = 0
+    rendered_count = 0
+    failed_count = sum(1 for row in ordered_results if row.get("status") == "failed")
+
+    def _progress_description() -> str:
+        return (
+            f"{progress_label} "
+            f"[green]rendered={rendered_count}[/green] "
+            f"[cyan]cached={cached_count}[/cyan] "
+            f"[red]failed={failed_count}[/red]"
+        )
+
+    def render_one(
+        row: dict[str, Any],
+        run_dir: Path,
+        attempts: list[dict[str, Any]],
+        attempt: dict[str, Any],
+    ) -> dict[str, Any]:
+        worker_cli = FuzzfolioCli(config.fuzzfolio)
+        result = _render_profile_drop_for_attempt(
+            config=config,
+            cli=worker_cli,
+            renderer_executable=renderer_executable,
+            working_dir=working_dir,
+            run_dir=run_dir,
+            attempts=attempts,
+            attempt=attempt,
+            output_root=output_root,
+            lookback_months=int(lookback_months),
+            force_rebuild=force_rebuild,
+            timeout_seconds=int(timeout_seconds),
+            emit=None,
+        )
+        return {
+            "attempt_id": row.get("attempt_id"),
+            "run_id": row.get("run_id"),
+            "candidate_name": row.get("candidate_name"),
+            **result,
+        }
+
+    worker_count = max(1, int(profile_drop_workers))
+    with progress:
+        task_id = progress.add_task(
+            _progress_description(),
+            total=max(1, len(work_items)),
+        )
+        if worker_count == 1:
+            for index, row, run_dir, attempts, attempt in work_items:
+                try:
+                    result = render_one(row, run_dir, attempts, attempt)
+                except Exception as exc:
+                    result = {
+                        "attempt_id": row.get("attempt_id"),
+                        "run_id": row.get("run_id"),
+                        "candidate_name": row.get("candidate_name"),
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                status = str(result.get("status") or "")
+                if status == "cached":
+                    cached_count += 1
+                elif status == "failed":
+                    failed_count += 1
+                else:
+                    rendered_count += 1
+                ordered_results.append({"_row_index": index, **result})
+                progress.advance(task_id, 1)
+                progress.update(task_id, description=_progress_description())
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_map = {
+                    executor.submit(render_one, row, run_dir, attempts, attempt): (index, row)
+                    for index, row, run_dir, attempts, attempt in work_items
+                }
+                for future in as_completed(future_map):
+                    index, row = future_map[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        result = {
+                            "attempt_id": row.get("attempt_id"),
+                            "run_id": row.get("run_id"),
+                            "candidate_name": row.get("candidate_name"),
+                            "status": "failed",
+                            "error": str(exc),
+                        }
+                    status = str(result.get("status") or "")
+                    if status == "cached":
+                        cached_count += 1
+                    elif status == "failed":
+                        failed_count += 1
+                    else:
+                        rendered_count += 1
+                    ordered_results.append({"_row_index": index, **result})
+                    progress.advance(task_id, 1)
+                    progress.update(task_id, description=_progress_description())
+
+    ordered_results.sort(key=lambda row: int(row.get("_row_index") or 0))
+    for row in ordered_results:
+        row.pop("_row_index", None)
+    return ordered_results
+
+
+def _portfolio_chart_paths(report_root: Path) -> tuple[Path, Path]:
+    charts_root = report_root / "charts"
+    profile_drop_root = report_root / "profile-drops"
+    charts_root.mkdir(parents=True, exist_ok=True)
+    profile_drop_root.mkdir(parents=True, exist_ok=True)
+    return charts_root, profile_drop_root
+
+
 def cmd_build_shortlist_report(
     *,
     run_ids: list[str] | None,
@@ -4610,6 +4876,7 @@ def cmd_build_shortlist_report(
     profile_drop_lookback_months: int,
     chart_trades_x_max: float,
     profile_drop_timeout_seconds: int,
+    profile_drop_workers: int,
     force_rebuild_profile_drops: bool,
     as_json: bool,
 ) -> int:
@@ -4703,11 +4970,8 @@ def cmd_build_shortlist_report(
     shortlist_similarity_payload = build_candidate_similarity_payload(shortlist_rows)
 
     report_root = config.derived_root / "shortlist-report"
-    charts_root = report_root / "charts"
-    profile_drop_root = report_root / "profile-drops"
     report_root.mkdir(parents=True, exist_ok=True)
-    charts_root.mkdir(parents=True, exist_ok=True)
-    profile_drop_root.mkdir(parents=True, exist_ok=True)
+    charts_root, profile_drop_root = _portfolio_chart_paths(report_root)
 
     trades_x_cap = None if float(chart_trades_x_max) < 0.0 else float(chart_trades_x_max)
     render_attempt_tradeoff_scatter_artifacts(
@@ -4764,75 +5028,17 @@ def cmd_build_shortlist_report(
 
     profile_drop_results: list[dict[str, Any]] = []
     if generate_profile_drops and shortlist_rows:
-        cli = FuzzfolioCli(config.fuzzfolio)
-        cli.ensure_login()
-        renderer_executable, workspace_root = _resolve_drop_renderer_executable(config)
-        working_dir = workspace_root or config.repo_root
-        expected_drop_dirs = {
-            _slug_token(
-                f"{row.get('selection_rank') or ''}-{row.get('attempt_id') or row.get('candidate_name') or 'candidate'}"
-            )
-            for row in shortlist_rows
-        }
-        for child in profile_drop_root.iterdir():
-            if not child.is_dir():
-                continue
-            if child.name not in expected_drop_dirs:
-                shutil.rmtree(child)
-        for row in shortlist_rows:
-            run_dir = config.runs_root / str(row.get("run_id") or "")
-            attempts = load_run_attempts(run_dir)
-            matched_attempt = next(
-                (
-                    attempt
-                    for attempt in attempts
-                    if str(attempt.get("attempt_id") or "")
-                    == str(row.get("attempt_id") or "")
-                ),
-                None,
-            )
-            if matched_attempt is None:
-                profile_drop_results.append(
-                    {
-                        "attempt_id": row.get("attempt_id"),
-                        "status": "failed",
-                        "error": f"Attempt ledger record missing for run {run_dir.name}",
-                    }
-                )
-                continue
-            try:
-                result = _render_profile_drop_for_attempt(
-                    config=config,
-                    cli=cli,
-                    renderer_executable=renderer_executable,
-                    working_dir=working_dir,
-                    run_dir=run_dir,
-                    attempts=attempts,
-                    attempt=matched_attempt,
-                    output_root=profile_drop_root,
-                    lookback_months=int(profile_drop_lookback_months),
-                    force_rebuild=force_rebuild_profile_drops,
-                    timeout_seconds=int(profile_drop_timeout_seconds),
-                    emit=(None if as_json else _write_plain_line),
-                )
-                profile_drop_results.append(
-                    {
-                        "attempt_id": row.get("attempt_id"),
-                        "run_id": row.get("run_id"),
-                        "candidate_name": row.get("candidate_name"),
-                        **result,
-                    }
-                )
-            except Exception as exc:
-                profile_drop_results.append(
-                    {
-                        "attempt_id": row.get("attempt_id"),
-                        "run_id": row.get("run_id"),
-                        "candidate_name": row.get("candidate_name"),
-                        "status": "failed",
-                        "error": str(exc),
-                    }
-                )
+        profile_drop_results = _render_profile_drop_rows(
+            config=config,
+            rows=shortlist_rows,
+            output_root=profile_drop_root,
+            lookback_months=int(profile_drop_lookback_months),
+            timeout_seconds=int(profile_drop_timeout_seconds),
+            force_rebuild=force_rebuild_profile_drops,
+            profile_drop_workers=int(profile_drop_workers),
+            as_json=as_json,
+            progress_label="shortlist profile drops",
+        )
 
     shortlist_payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
@@ -4854,6 +5060,7 @@ def cmd_build_shortlist_report(
             "max_sameness_to_board": max_sameness_to_board,
             "require_full_backtest_36": require_full_backtest_36,
             "profile_drop_lookback_months": profile_drop_lookback_months,
+            "profile_drop_workers": int(profile_drop_workers),
             "chart_trades_x_max": trades_x_cap,
         },
         "candidate_count": len(candidate_rows),
@@ -4904,6 +5111,253 @@ def cmd_build_shortlist_report(
                 ),
                 "charts": shortlist_payload["charts"],
                 "selected": shortlist_rows,
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_build_portfolio(
+    *,
+    run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    portfolio_config: str | None,
+    catch_up_full_backtests: bool | None,
+    catch_up_force_rebuild: bool | None,
+    catch_up_require_scrutiny_36: bool | None,
+    generate_profile_drops: bool | None,
+    profile_drop_workers: int | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    spec_path = (
+        Path(portfolio_config).resolve()
+        if portfolio_config
+        else (config.repo_root / "portfolio.config.json")
+    )
+    portfolio_spec, used_defaults = load_portfolio_spec(spec_path)
+
+    if catch_up_full_backtests is not None:
+        portfolio_spec["catch_up_full_backtests"] = bool(catch_up_full_backtests)
+    if catch_up_force_rebuild is not None:
+        portfolio_spec["catch_up_force_rebuild"] = bool(catch_up_force_rebuild)
+    if catch_up_require_scrutiny_36 is not None:
+        portfolio_spec["catch_up_require_scrutiny_36"] = bool(catch_up_require_scrutiny_36)
+    if generate_profile_drops is not None:
+        portfolio_spec["generate_profile_drops"] = bool(generate_profile_drops)
+    if profile_drop_workers is not None:
+        portfolio_spec["profile_drop_workers"] = max(1, int(profile_drop_workers))
+
+    catch_up_summary: dict[str, Any] | None = None
+    if bool(portfolio_spec.get("catch_up_full_backtests")):
+        exit_code = cmd_calculate_full_backtests(
+            run_ids=run_ids,
+            attempt_ids=attempt_ids,
+            limit=None,
+            max_workers=None,
+            use_dev_sim_worker_count=True,
+            require_scrutiny_36=bool(portfolio_spec.get("catch_up_require_scrutiny_36")),
+            force_rebuild=bool(portfolio_spec.get("catch_up_force_rebuild")),
+            as_json=True,
+        )
+        catch_up_summary = {
+            "attempt_catalog_summary": load_json_if_exists(config.attempt_catalog_summary_path),
+            "full_backtest_failures": load_json_if_exists(
+                config.full_backtest_failures_json_path
+            ),
+        }
+        if exit_code != 0:
+            raise SystemExit("Full-backtest catch-up failed during build-portfolio.")
+
+    run_dirs = _matching_run_dirs(config, run_ids)
+    full_catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    wanted_attempt_ids = {
+        token.strip() for token in (attempt_ids or []) if str(token).strip()
+    }
+    rows = list(full_catalog_rows)
+    if wanted_attempt_ids:
+        rows = [
+            row for row in rows if str(row.get("attempt_id") or "") in wanted_attempt_ids
+        ]
+    rows.sort(key=_full_backtest_priority_key)
+
+    sleeve_results = [
+        build_sleeve_selection(rows, sleeve_spec)
+        for sleeve_spec in list(portfolio_spec.get("sleeves") or [])
+    ]
+    merged = merge_portfolio_sleeves(sleeve_results)
+    portfolio_rows = list(merged.get("selected_rows") or [])
+    portfolio_candidate_rows = list(merged.get("candidate_rows") or [])
+    portfolio_similarity_payload = build_candidate_similarity_payload(portfolio_rows)
+    candidate_similarity_payload = build_candidate_similarity_payload(portfolio_candidate_rows)
+
+    portfolio_name = str(portfolio_spec.get("portfolio_name") or "default-portfolio").strip()
+    report_root = config.derived_root / "portfolio-report" / _slug_token(portfolio_name)
+    report_root.mkdir(parents=True, exist_ok=True)
+    charts_root, profile_drop_root = _portfolio_chart_paths(report_root)
+
+    trades_x_cap = (
+        None
+        if float(portfolio_spec.get("chart_trades_x_max", 300.0)) < 0.0
+        else float(portfolio_spec.get("chart_trades_x_max", 300.0))
+    )
+    render_attempt_tradeoff_scatter_artifacts(
+        portfolio_candidate_rows,
+        charts_root / "portfolio-candidate-score-vs-trades-36mo.png",
+        charts_root / "portfolio-candidate-score-vs-trades-36mo.json",
+        require_full_backtest_36=True,
+        x_axis_max=trades_x_cap,
+        title_prefix="Portfolio Candidate Union",
+    )
+    render_attempt_tradeoff_scatter_artifacts(
+        portfolio_rows,
+        charts_root / "portfolio-score-vs-trades-36mo.png",
+        charts_root / "portfolio-score-vs-trades-36mo.json",
+        require_full_backtest_36=True,
+        x_axis_max=trades_x_cap,
+        title_prefix="Portfolio",
+    )
+    render_attempt_tradeoff_overlay_artifacts(
+        portfolio_candidate_rows,
+        portfolio_rows,
+        charts_root / "portfolio-overlay-score-vs-trades-36mo.png",
+        charts_root / "portfolio-overlay-score-vs-trades-36mo.json",
+        x_axis_max=trades_x_cap,
+        title_prefix="Portfolio Overlay",
+    )
+    render_attempt_drawdown_scatter_artifacts(
+        portfolio_candidate_rows,
+        charts_root / "portfolio-candidate-score-vs-drawdown-36mo.png",
+        charts_root / "portfolio-candidate-score-vs-drawdown-36mo.json",
+        require_full_backtest_36=True,
+        title_prefix="Portfolio Candidate Union",
+    )
+    render_attempt_drawdown_scatter_artifacts(
+        portfolio_rows,
+        charts_root / "portfolio-score-vs-drawdown-36mo.png",
+        charts_root / "portfolio-score-vs-drawdown-36mo.json",
+        require_full_backtest_36=True,
+        title_prefix="Portfolio",
+    )
+    render_similarity_scatter_artifacts(
+        candidate_similarity_payload,
+        charts_root / "portfolio-candidate-score-vs-sameness-36mo.png",
+    )
+    render_similarity_scatter_artifacts(
+        portfolio_similarity_payload,
+        charts_root / "portfolio-score-vs-sameness-36mo.png",
+    )
+    render_similarity_heatmap_artifacts(
+        portfolio_similarity_payload,
+        charts_root / "portfolio-similarity-heatmap.png",
+        charts_root / "portfolio-similarity-heatmap.json",
+    )
+
+    profile_drop_results: list[dict[str, Any]] = []
+    if bool(portfolio_spec.get("generate_profile_drops")) and portfolio_rows:
+        profile_drop_results = _render_profile_drop_rows(
+            config=config,
+            rows=portfolio_rows,
+            output_root=profile_drop_root,
+            lookback_months=int(portfolio_spec.get("profile_drop_lookback_months", 36)),
+            timeout_seconds=int(portfolio_spec.get("profile_drop_timeout_seconds", 1800)),
+            force_rebuild=False,
+            profile_drop_workers=int(portfolio_spec.get("profile_drop_workers", 4)),
+            as_json=as_json,
+            progress_label="portfolio profile drops",
+        )
+
+    sleeves_payload: list[dict[str, Any]] = []
+    for sleeve in sleeve_results:
+        board = sleeve.get("board") or {}
+        sleeves_payload.append(
+            {
+                "name": sleeve.get("name"),
+                "spec": sleeve.get("spec") or {},
+                "candidate_count": len(sleeve.get("candidate_rows") or []),
+                "selected_count": len(sleeve.get("selected_rows") or []),
+                "alternate_count": len(board.get("alternates") or []),
+                "filter_rejections": sleeve.get("filter_rejections") or {},
+                "selected_trade_rate_summary": _trade_rate_summary(
+                    list(sleeve.get("selected_rows") or [])
+                ),
+                "candidate_trade_rate_summary": _trade_rate_summary(
+                    list(sleeve.get("candidate_rows") or [])
+                ),
+                "selected": list(sleeve.get("selected_rows") or []),
+                "alternates": list(board.get("alternates") or []),
+            }
+        )
+
+    payload = {
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "portfolio_name": portfolio_name,
+        "portfolio_config_path": str(spec_path),
+        "portfolio_config_defaulted": used_defaults,
+        "portfolio_spec": portfolio_spec,
+        "catch_up_summary": catch_up_summary,
+        "run_ids": run_ids,
+        "attempt_ids": attempt_ids,
+        "candidate_union_count": len(portfolio_candidate_rows),
+        "selected_union_count": len(portfolio_rows),
+        "selected_overlap_count": int(merged.get("selected_overlap_count") or 0),
+        "candidate_trade_rate_summary": _trade_rate_summary(portfolio_candidate_rows),
+        "selected_trade_rate_summary": _trade_rate_summary(portfolio_rows),
+        "sleeves": sleeves_payload,
+        "selected": portfolio_rows,
+        "profile_drops": profile_drop_results,
+        "charts": {
+            "portfolio_candidate_score_vs_trades": str(
+                charts_root / "portfolio-candidate-score-vs-trades-36mo.png"
+            ),
+            "portfolio_score_vs_trades": str(
+                charts_root / "portfolio-score-vs-trades-36mo.png"
+            ),
+            "portfolio_overlay_score_vs_trades": str(
+                charts_root / "portfolio-overlay-score-vs-trades-36mo.png"
+            ),
+            "portfolio_candidate_score_vs_drawdown": str(
+                charts_root / "portfolio-candidate-score-vs-drawdown-36mo.png"
+            ),
+            "portfolio_score_vs_drawdown": str(
+                charts_root / "portfolio-score-vs-drawdown-36mo.png"
+            ),
+            "portfolio_candidate_score_vs_sameness": str(
+                charts_root / "portfolio-candidate-score-vs-sameness-36mo.png"
+            ),
+            "portfolio_score_vs_sameness": str(
+                charts_root / "portfolio-score-vs-sameness-36mo.png"
+            ),
+            "portfolio_similarity_heatmap": str(
+                charts_root / "portfolio-similarity-heatmap.png"
+            ),
+        },
+    }
+    write_json(report_root / "portfolio-report.json", payload)
+    write_csv(
+        report_root / "portfolio-report.csv",
+        [{"section": "selected", **row} for row in portfolio_rows],
+    )
+    print(
+        json.dumps(
+            {
+                "report_root": str(report_root),
+                "portfolio_json": str(report_root / "portfolio-report.json"),
+                "portfolio_csv": str(report_root / "portfolio-report.csv"),
+                "portfolio_name": portfolio_name,
+                "candidate_union_count": len(portfolio_candidate_rows),
+                "selected_union_count": len(portfolio_rows),
+                "selected_overlap_count": int(merged.get("selected_overlap_count") or 0),
+                "profile_drop_rendered": sum(
+                    1 for row in profile_drop_results if row.get("status") in {"rendered", "cached"}
+                ),
+                "profile_drop_failed": sum(
+                    1 for row in profile_drop_results if row.get("status") == "failed"
+                ),
+                "charts": payload["charts"],
+                "selected": portfolio_rows,
             },
             ensure_ascii=True,
             indent=2,
@@ -5588,7 +6042,20 @@ def main() -> int:
             profile_drop_lookback_months=int(args.profile_drop_lookback_months),
             chart_trades_x_max=float(args.chart_trades_x_max),
             profile_drop_timeout_seconds=int(args.profile_drop_timeout_seconds),
+            profile_drop_workers=int(args.profile_drop_workers),
             force_rebuild_profile_drops=bool(args.force_rebuild_profile_drops),
+            as_json=bool(args.json),
+        )
+    if args.command == "build-portfolio":
+        return cmd_build_portfolio(
+            run_ids=args.run_id,
+            attempt_ids=args.attempt_id,
+            portfolio_config=args.portfolio_config,
+            catch_up_full_backtests=args.catch_up_full_backtests,
+            catch_up_force_rebuild=args.catch_up_force_rebuild,
+            catch_up_require_scrutiny_36=args.catch_up_require_scrutiny_36,
+            generate_profile_drops=args.generate_profile_drops,
+            profile_drop_workers=args.profile_drop_workers,
             as_json=bool(args.json),
         )
     if args.command == "reset-runs":

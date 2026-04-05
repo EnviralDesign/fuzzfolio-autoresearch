@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "portfolio_name": "default-portfolio",
+  "catch_up_full_backtests": false,
+  "catch_up_force_rebuild": false,
+  "catch_up_require_scrutiny_36": false,
+  "generate_profile_drops": true,
+  "profile_drop_lookback_months": 36,
+  "profile_drop_timeout_seconds": 1800,
+  "profile_drop_workers": 4,
+  "chart_trades_x_max": 300.0,
+  "sleeves": [
+    {
+      "name": "quality",
+      "candidate_limit": -1,
+      "shortlist_size": 12,
+      "min_score_36": 40.0,
+      "min_retention_ratio": 0.0,
+      "min_trades_per_month": 0.0,
+      "max_drawdown_r": -1.0,
+      "drawdown_penalty": 0.65,
+      "trade_rate_bonus_weight": 0.0,
+      "trade_rate_bonus_target": 8.0,
+      "novelty_penalty": 18.0,
+      "max_per_run": 1,
+      "max_per_strategy_key": 1,
+      "max_sameness_to_board": 0.78,
+      "require_full_backtest_36": true
+    },
+    {
+      "name": "cadence",
+      "candidate_limit": -1,
+      "shortlist_size": 12,
+      "min_score_36": 40.0,
+      "min_retention_ratio": 0.0,
+      "min_trades_per_month": 0.0,
+      "max_drawdown_r": -1.0,
+      "drawdown_penalty": 0.65,
+      "trade_rate_bonus_weight": 8.0,
+      "trade_rate_bonus_target": 4.0,
+      "novelty_penalty": 18.0,
+      "max_per_run": 1,
+      "max_per_strategy_key": 1,
+      "max_sameness_to_board": 0.78,
+      "require_full_backtest_36": true
+    }
+  ]
+}
