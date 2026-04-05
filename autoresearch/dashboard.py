@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import AppConfig
-from .fuzzfolio import FuzzfolioCli
+from .fuzzfolio import CliError, FuzzfolioCli
 from .ledger import (
     list_run_dirs,
     load_all_run_attempts,
@@ -323,6 +323,7 @@ def _sensitivity_path_for_attempt(attempt: dict[str, Any]) -> Path | None:
 
 FULL_BACKTEST_CURVE_FILENAME = "full-backtest-36mo-curve.json"
 FULL_BACKTEST_RESULT_FILENAME = "full-backtest-36mo-result.json"
+FULL_BACKTEST_TIMEOUT_SECONDS = 1800
 
 
 def _full_backtest_curve_path(attempt: dict[str, Any]) -> Path | None:
@@ -339,6 +340,37 @@ def _full_backtest_result_path(attempt: dict[str, Any]) -> Path | None:
         return None
     path = Path(artifact_dir) / FULL_BACKTEST_RESULT_FILENAME
     return path if path.exists() else None
+
+
+def _copy_full_backtest_outputs(
+    artifact_dir: Path,
+    sensitivity_output_dir: Path,
+    *,
+    recovery_mode: str | None = None,
+) -> dict[str, Any]:
+    curve_src = sensitivity_output_dir / "best-cell-path-detail.json"
+    result_src = sensitivity_output_dir / "sensitivity-response.json"
+    if not curve_src.exists():
+        raise RuntimeError(
+            f"sensitivity-basket did not produce best-cell-path-detail.json. "
+            f"Files in output dir: {list(sensitivity_output_dir.iterdir())}"
+        )
+
+    dest_curve = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
+    dest_result = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
+    shutil.copy2(curve_src, dest_curve)
+    result_path: str | None = None
+    if result_src.exists():
+        shutil.copy2(result_src, dest_result)
+        result_path = str(dest_result)
+    print(f"[calculate-backtest] done, wrote {dest_curve}", flush=True)
+    payload = {
+        "curve_path": str(dest_curve),
+        "result_path": result_path,
+    }
+    if recovery_mode:
+        payload["recovery_mode"] = recovery_mode
+    return payload
 
 
 def _has_full_backtest(attempt: dict[str, Any]) -> bool:
@@ -434,40 +466,38 @@ def _run_full_backtest_for_attempt(
             flush=True,
         )
         cli = FuzzfolioCli(config.fuzzfolio)
-        result = cli.run(args, timeout_seconds=420)
-        print(
-            f"[calculate-backtest] sensitivity-basket returned {result.returncode}",
-            flush=True,
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"sensitivity-basket failed (exit {result.returncode}):\n"
-                f"stdout: {result.stdout[:800]}\n"
-                f"stderr: {result.stderr[:800]}"
+        try:
+            result = cli.run(
+                args,
+                check=False,
+                timeout_seconds=FULL_BACKTEST_TIMEOUT_SECONDS,
             )
-
-        curve_src = sensitivity_output_dir / "best-cell-path-detail.json"
-        result_src = sensitivity_output_dir / "sensitivity-response.json"
-
-        if not curve_src.exists():
-            raise RuntimeError(
-                f"sensitivity-basket did not produce best-cell-path-detail.json. "
-                f"Files in output dir: {list(sensitivity_output_dir.iterdir())}"
+            print(
+                f"[calculate-backtest] sensitivity-basket returned {result.returncode}",
+                flush=True,
             )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"sensitivity-basket failed (exit {result.returncode}):\n"
+                    f"stdout: {result.stdout[:800]}\n"
+                    f"stderr: {result.stderr[:800]}"
+                )
+        except CliError as exc:
+            message = str(exc)
+            curve_src = sensitivity_output_dir / "best-cell-path-detail.json"
+            if "Command timed out" in message and curve_src.exists():
+                print(
+                    "[calculate-backtest] sensitivity-basket timed out after writing outputs; salvaging artifacts",
+                    flush=True,
+                )
+                return _copy_full_backtest_outputs(
+                    artifact_dir,
+                    sensitivity_output_dir,
+                    recovery_mode="timeout_salvaged",
+                )
+            raise RuntimeError(message) from exc
 
-        dest_curve = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
-        dest_result = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
-
-        shutil.copy2(curve_src, dest_curve)
-        if result_src.exists():
-            shutil.copy2(result_src, dest_result)
-
-        print(f"[calculate-backtest] done, wrote {dest_curve}", flush=True)
-        return {
-            "curve_path": str(dest_curve),
-            "result_path": str(dest_result) if result_src.exists() else None,
-        }
+        return _copy_full_backtest_outputs(artifact_dir, sensitivity_output_dir)
 
 
 def _latest_run_log_state(run_dir: Path) -> tuple[int | None, str | None]:

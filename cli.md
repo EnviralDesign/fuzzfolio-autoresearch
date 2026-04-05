@@ -249,6 +249,8 @@ Calculate 3-year backtest curves for all attempts that do not have them yet.
 ```powershell
 uv run autoresearch calculate-full-backtests
 uv run autoresearch calculate-full-backtests --run-ids 20260324T181958Z-agentic 20260325T101010Z-agentic
+uv run autoresearch calculate-full-backtests --attempt-id 20260327T205658482523Z-agentic-aebf78-attempt-00045 --limit 1
+uv run autoresearch calculate-full-backtests --require-scrutiny-36
 uv run autoresearch calculate-full-backtests --force-rebuild
 uv run autoresearch calculate-full-backtests --json
 ```
@@ -256,8 +258,111 @@ uv run autoresearch calculate-full-backtests --json
 | Argument | Type | Default | Description |
 |---|---|---|---|
 | `--run-ids` | string (repeatable) | all runs | Specific run IDs to process. Defaults to all runs. |
+| `--attempt-id` | string (repeatable) | null | Only process the named attempt id. |
+| `--limit` | int | null | Optional cap on how many matched attempts to process after score sorting. |
+| `--max-workers` | int | detected dev Sim Worker count | Maximum concurrent full-backtest jobs. |
+| `--no-use-dev-sim-worker-count` | flag | false | Disable dev sim-worker auto sizing and fall back to `validation_max_concurrency` unless `--max-workers` is set. |
+| `--require-scrutiny-36` | flag | false | Only materialize full backtests for attempts that already have `36mo` scrutiny. |
 | `--force-rebuild` | flag | false | Recalculate even if the full-backtest file already exists. |
 | `--json` | flag | false | Print machine-readable JSON. |
+
+Behavior notes:
+
+- The command now uses a queued worker loop with Rich progress for the heavy path.
+- It first tries to materialize `full-backtest-36mo-*` from an existing attempt-local `36mo` scrutiny cache or matching legacy run-validation cache.
+- Only candidates that cannot be seeded fall through to the dev backend for a real `sensitivity-basket` run.
+
+---
+
+## build-attempt-catalog
+
+Build a corpus-wide attempt catalog and cache-coverage audit.
+
+```powershell
+uv run autoresearch build-attempt-catalog
+uv run autoresearch build-attempt-catalog --run-id manual-mtf-pullback-regime-20260329
+uv run autoresearch build-attempt-catalog --json
+```
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--run-id` | string (repeatable) | all runs | Only catalog the named run id. Can be repeated. |
+| `--json` | flag | false | Print machine-readable JSON. |
+
+Outputs under `runs/derived/`:
+
+- `attempt-catalog.json`
+- `attempt-catalog.csv`
+- `attempt-catalog-summary.json`
+
+---
+
+## hydrate-scrutiny-cache
+
+Heal or rebuild attempt-local scrutiny caches for selected attempts.
+
+```powershell
+uv run autoresearch hydrate-scrutiny-cache --limit 10
+uv run autoresearch hydrate-scrutiny-cache --run-id manual-mtf-pullback-regime-20260329 --lookback-months 36
+uv run autoresearch hydrate-scrutiny-cache --attempt-id <ATTEMPT_ID> --force-rebuild
+```
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--run-id` | string (repeatable) | all runs | Only process attempts from the named run id. |
+| `--attempt-id` | string (repeatable) | null | Only process the named attempt id. |
+| `--lookback-months` | int (repeatable) | `12, 36` | Scrutiny horizons to build. |
+| `--limit` | int | all matched attempts | Optional cap after score sorting. |
+| `--force-rebuild` | flag | false | Ignore existing attempt-local scrutiny artifacts and rebuild them. |
+| `--json` | flag | false | Print machine-readable JSON. |
+
+The command prefers portable attempt-local caches and will seed them from:
+
+- existing attempt-local `scrutiny-cache/<horizon>`
+- existing `full-backtest-36mo-*` files for `36mo`
+- legacy `runs/derived/validation-cache/<run-id>/<horizon>` artifacts when they match the attempt
+
+---
+
+## build-promotion-board
+
+Build a `36mo` promotion-oriented board that balances score against sameness.
+
+```powershell
+uv run autoresearch build-promotion-board
+uv run autoresearch build-promotion-board --candidate-limit 200 --board-size 12
+uv run autoresearch build-promotion-board --hydrate-missing --force-rebuild
+uv run autoresearch build-promotion-board --require-full-backtest-36 --max-per-run 1 --max-per-strategy-key 1
+```
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--run-id` | string (repeatable) | all runs | Only consider attempts from the named run id. |
+| `--attempt-id` | string (repeatable) | null | Only consider the named attempt id. |
+| `--candidate-limit` | int | 250 | Maximum candidate pool after score sorting. |
+| `--board-size` | int | 12 | How many promotion candidates to select. |
+| `--min-score-36` | float | 40.0 | Minimum `36mo` score required for inclusion. |
+| `--min-retention-ratio` | float | 0.0 | Minimum `36m / 12m` retention ratio when `12mo` scrutiny exists. |
+| `--min-trades-per-month` | float | 0.0 | Minimum `36mo` cadence required. |
+| `--novelty-penalty` | float | 18.0 | Penalty applied to max sameness during greedy selection. |
+| `--max-per-run` | int | 2 | Maximum selected candidates per run. Use `-1` to disable. |
+| `--max-per-strategy-key` | int | 2 | Maximum selected candidates per normalized `timeframe + instrument-set`. Use `-1` to disable. |
+| `--max-sameness-to-board` | float | 0.85 | Hard exclusion ceiling for max sameness to the current board. |
+| `--require-full-backtest-36` | flag | false | Restrict the board to attempts with attempt-local `full-backtest-36mo-*` artifacts. |
+| `--hydrate-missing` | flag | false | Heal missing long-horizon scrutiny for the candidate pool before ranking. |
+| `--force-rebuild` | flag | false | Rebuild hydrated scrutiny artifacts instead of reusing caches. |
+| `--json` | flag | false | Print machine-readable JSON. |
+
+Outputs under `runs/derived/`:
+
+- `promotion-board.json`
+- `promotion-board.csv`
+
+The JSON payload also includes:
+
+- `filter_rejections`
+- `selected_by_run`
+- `selected_by_strategy_key`
 
 ---
 

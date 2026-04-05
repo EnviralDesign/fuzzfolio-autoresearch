@@ -1,302 +1,178 @@
-/* Types matching the Python backend API payloads */
-
-export interface Overview {
-  generatedAt: string;
-  repoRoot: string;
-  runsRoot: string;
-  runCount: number;
-  attemptCount: number;
-  scoredRunCount: number;
-  bestScore: number | null;
-  medianBestScore: number | null;
-  profileDropCount: number;
-  curveCoverageCount: number;
-  leaderboardCount: number;
-  modelBucketCount: number;
-  tradeoffPointCount: number;
-  validationPointCount: number;
-  similarityLeaderCount: number;
-}
-
-export interface Images {
-  aggregatePlotUrl: string | null;
-  leaderboardPlotUrl: string | null;
-  modelLeaderboardPlotUrl: string | null;
-  tradeoffPlotUrl: string | null;
-  validationScatterPlotUrl: string | null;
-  validationDeltaPlotUrl: string | null;
-  similarityHeatmapPlotUrl: string | null;
-  similarityScatterPlotUrl: string | null;
-}
-
-export interface QualityScoreComponents {
-  belief: number;
-  cadence: number;
-  edge_rate: number;
-  path_quality: number;
-  return_quality: number;
-  robustness: number;
-}
-
-export interface QualityScorePayload {
-  belief_basis: string;
-  components: QualityScoreComponents;
-  gates: Record<string, boolean>;
-  inputs: Record<string, number>;
-  preset: string;
-  score: number;
-  version: string;
-}
-
-export interface BestSummary {
-  quality_score?: number;
-  quality_score_payload?: QualityScorePayload;
-  best_cell?: {
-    avg_net_r_per_closed_trade: number;
-    profit_factor: number;
-    resolved_trades: number;
-    reward_multiple: number;
-    stop_loss_percent: number;
-    take_profit_percent: number;
-  };
-  best_cell_path_metrics?: {
-    equity_curve_r_squared: number;
-    final_equity_r: number;
-    k_ratio: number;
-    max_drawdown_r: number;
-    peak_equity_r: number;
-    psr: number;
-    sharpe_r: number;
-    time_under_water_ratio: number;
-    trade_count: number;
-    ulcer_index_r: number;
-  };
-  behavior_summary?: {
-    signal_selectivity: string;
-    bars_per_signal: number;
-    direction_flip_rate: number;
-    signal_coverage_ratio: number;
-  };
-  matrix_summary?: {
-    positive_cell_ratio: number;
-    positive_cell_count: number;
-    best_cell_positive_neighbor_count: number;
-    largest_positive_cluster_size: number;
-  };
-  instrument?: string;
-  timeframe?: string;
-  mode?: string;
-  signal_count?: number;
+export type AttemptCatalogRow = {
+  run_id: string;
+  attempt_id: string;
+  created_at?: string | null;
+  candidate_name?: string | null;
+  composite_score?: number | null;
+  score_36m?: number | null;
+  score_12m?: number | null;
+  trades_per_month_36m?: number | null;
+  trade_count_36m?: number | null;
+  max_drawdown_r_36m?: number | null;
+  strategy_key_36m?: string | null;
+  timeframe_36m?: string | null;
+  instruments_36m?: string[] | null;
+  full_backtest_validation_status_36m?: string | null;
+  has_full_backtest_36m?: boolean;
+  artifact_dir?: string | null;
+  artifact_dir_url?: string | null;
+  profile_path?: string | null;
+  profile_path_url?: string | null;
+  full_backtest_result_path_36m?: string | null;
+  full_backtest_result_path_36m_url?: string | null;
+  full_backtest_curve_path_36m?: string | null;
+  full_backtest_curve_path_36m_url?: string | null;
+  selection_rank?: number | null;
+  selection_utility?: number | null;
+  score_component?: number | null;
+  drawdown_penalty_component?: number | null;
+  max_sameness_to_selected?: number | null;
+  max_sameness_to_board?: number | null;
+  closest_selected_attempt_id?: string | null;
   [key: string]: unknown;
-}
+};
 
-export interface AttemptSummary {
-  attemptId: string;
-  sequence: number;
-  createdAt: string;
-  candidateName: string;
-  score: number | null;
-  scoreBasis: string;
-  metrics: Record<string, number | null>;
-  tradeCount: number | null;
-  tradesPerMonth: number | null;
-  effectiveWindowMonths: number | null;
-  maxDrawdownR: number | null;
-  positiveCellRatio: number | null;
-  expectancyR: number | null;
-  profitFactor: number | null;
-  signalSelectivity: string | null;
-  instrument: string | null;
-  timeframe: string | null;
-  profileRef: string | null;
-  artifactDir: string | null;
-  artifactDirUrl: string | null;
-  profilePath: string | null;
-  profilePathUrl: string | null;
-  sensitivityPath: string | null;
-  sensitivityPathUrl: string | null;
-  curvePath: string | null;
-  curvePathUrl: string | null;
-  deepReplayJobPath: string | null;
-  deepReplayJobPathUrl: string | null;
-  bestSummary: BestSummary;
-}
+export type ChartAsset = {
+  path: string;
+  url: string | null;
+  exists: boolean;
+};
 
-export interface RunSummary {
-  runId: string;
-  createdAt: string;
-  explorerProfile: string;
-  explorerModel: string;
-  supervisorProfile: string;
-  supervisorModel: string;
-  qualityScorePreset: string;
-  attemptCount: number;
-  scoredAttemptCount: number;
-  curveAttemptCount: number;
-  latestAttemptAt: string | null;
-  latestStep: number | null;
-  latestLogTimestamp: string | null;
-  advisorGuidanceCount: number;
-  progressPngUrl: string | null;
-  profileDrop12PngUrl: string | null;
-  profileDrop36PngUrl: string | null;
-  bestAttempt: AttemptSummary | null;
-}
+export type CorpusSummary = {
+  run_count?: number;
+  attempt_count?: number;
+  scored_attempt_count?: number;
+  unique_base_strategy_count?: number;
+  unique_strategy_count_36m?: number;
+  unique_full_backtest_strategy_count_36m?: number;
+  attempts_with_scrutiny_36m?: number;
+  attempts_with_full_backtest_36m?: number;
+  attempts_with_valid_full_backtest_36m?: number;
+  attempts_with_invalid_full_backtest_36m?: number;
+  attempts_with_base_sensitivity?: number;
+  scrutiny_36m_coverage_ratio?: number;
+  full_backtest_36m_coverage_ratio?: number;
+  valid_full_backtest_36m_coverage_ratio?: number;
+  full_backtest_36m_vs_scrutiny_coverage_ratio?: number;
+  median_score_36m?: number;
+  score_36m_ge_40?: number;
+  score_36m_ge_60?: number;
+  score_36m_ge_70?: number;
+  full_backtest_36m_ge_40?: number;
+  full_backtest_36m_ge_60?: number;
+  full_backtest_36m_ge_70?: number;
+  [key: string]: unknown;
+};
 
-export interface LeaderboardRow {
+export type FullBacktestAudit = {
+  summary?: CorpusSummary;
+  status?: string;
+  provisional_reasons?: string[];
+  invalid_examples?: AttemptCatalogRow[];
+  pending_scrutiny_examples?: AttemptCatalogRow[];
+};
+
+export type FilterRejections = Record<string, number>;
+
+export type ShortlistProfileDrop = {
   attempt_id: string;
-  sequence: number;
-  created_at: string;
   run_id: string;
-  candidate_name: string;
-  composite_score: number;
-  score_basis: string;
-  metrics: Record<string, number | null>;
-  best_summary: BestSummary;
-  run_metadata?: {
-    explorer_model?: string;
-    explorer_profile?: string;
-    supervisor_model?: string;
-  };
-  leaderboard_label: string;
-}
+  candidate_name?: string | null;
+  status?: string;
+  png_path?: string | null;
+  png_url?: string | null;
+  manifest_path?: string | null;
+  manifest_url?: string | null;
+  profile_ref?: string | null;
+  recreated_profile?: boolean;
+};
 
-export interface TradeoffRow {
+export type ShortlistReport = {
+  generated_at?: string;
+  filters?: Record<string, unknown>;
+  candidate_count?: number;
+  selected_count?: number;
+  alternate_count?: number;
+  filter_rejections?: FilterRejections;
+  selected_by_run?: Record<string, number>;
+  selected_by_strategy_key?: Record<string, number>;
+  selected?: AttemptCatalogRow[];
+  alternates?: AttemptCatalogRow[];
+  top_similarity_pairs?: Record<string, unknown>[];
+  charts?: Record<string, ChartAsset>;
+  profile_drops?: ShortlistProfileDrop[];
+};
+
+export type PromotionBoard = {
+  generated_at?: string;
+  status?: string;
+  provisional_reasons?: string[];
+  filters?: Record<string, unknown>;
+  coverage?: Record<string, unknown>;
+  filter_rejections?: FilterRejections;
+  candidate_count?: number;
+  similarity_pair_count?: number;
+  selected?: AttemptCatalogRow[];
+  alternates?: AttemptCatalogRow[];
+  top_similarity_pairs?: Record<string, unknown>[];
+};
+
+export type RunSummary = {
   run_id: string;
-  attempt_id: string;
-  candidate_name: string;
-  composite_score: number;
-  trades_per_month: number;
-  is_trade_envelope?: boolean;
-  is_frontier?: boolean;
-}
+  created_at?: string | null;
+  latest_created_at?: string | null;
+  explorer_model?: string | null;
+  explorer_profile?: string | null;
+  supervisor_model?: string | null;
+  supervisor_profile?: string | null;
+  quality_score_preset?: string | null;
+  attempt_count: number;
+  scored_attempt_count: number;
+  full_backtest_36m_count: number;
+  score_36m_count: number;
+  best_attempt?: AttemptCatalogRow | null;
+  progress_png_url?: string | null;
+};
 
-export interface ValidationRow {
-  run_id: string;
-  attempt_id: string;
-  candidate_name: string;
-  leaderboard_label: string | null;
-  explorer_model: string | null;
-  score_12m: number;
-  score_36m: number;
-  score_delta: number;
-  score_retention_ratio: number;
-  trades_per_month_12m: number;
-  trades_per_month_36m: number;
-  trade_count_12m: number;
-  trade_count_36m: number;
-  max_drawdown_r_12m: number;
-  max_drawdown_r_36m: number;
-}
+export type CadenceBand = {
+  band: string;
+  count: number;
+  mean_score_36m: number | null;
+  max_score_36m: number | null;
+  mean_drawdown_r_36m: number | null;
+};
 
-export interface SimilarityLeader {
-  run_id: string;
-  attempt_id: string;
-  candidate_name: string;
-  score_36m: number;
-  max_sameness: number;
-  closest_match_label: string;
-  trades_per_month_36m: number;
-}
-
-export interface SimilarityPair {
-  left_run_id: string;
-  left_attempt_id: string;
-  right_run_id: string;
-  right_attempt_id: string;
-  similarity_score: number;
-  positive_correlation: number;
-  shared_active_ratio: number;
-}
-
-export interface ModelConsistencyRow {
-  modelLabel: string;
-  runCount: number;
-  averageScore: number;
-  medianScore: number;
-  bestScore: number;
-  score70PlusRate: number;
-  score80PlusRate: number;
-}
-
-export interface DrawdownRow {
-  runId: string;
-  attemptId: string;
-  label: string;
-  score: number;
-  maxDrawdownR: number;
-  tradesPerMonth: number | null;
-  tradeCount: number | null;
-}
-
-export interface DashboardPayload {
-  overview: Overview;
-  images: Images;
-  leaderboard: LeaderboardRow[];
-  modelAverages: unknown[];
-  modelConsistency: ModelConsistencyRow[];
-  tradeoff: TradeoffRow[];
-  validation: ValidationRow[];
-  similarity: SimilarityLeader[];
-  similarityPairs: SimilarityPair[];
-  scoreVsDrawdown: DrawdownRow[];
+export type ViewerState = {
+  generated_at: string;
+  corpus_summary: CorpusSummary;
+  audit: FullBacktestAudit;
+  shortlist: ShortlistReport;
+  promotion: PromotionBoard;
   runs: RunSummary[];
-  limit: number;
-}
+  charts: Record<string, ChartAsset>;
+  cadence_bands_all_scored: CadenceBand[];
+  cadence_bands_score_ge_40: CadenceBand[];
+};
 
-export interface RunDetail {
-  run: RunSummary;
-  attempts: AttemptSummary[];
-}
+export type CatalogResponse = {
+  generated_at: string;
+  attempt_count: number;
+  rows: AttemptCatalogRow[];
+};
 
-export interface CurvePoint {
-  time: number;
-  equity_r: number;
-  drawdown_r: number;
-  date: string;
-  closed_trade_count: number;
-}
+export type RunsResponse = {
+  generated_at: string;
+  run_count: number;
+  runs: RunSummary[];
+};
 
-export interface AttemptDetail {
-  runId: string;
-  attempt: AttemptSummary;
-  curve: { curve: { points: CurvePoint[] } } | null;
-  sensitivity: unknown;
-  deepReplayJob: unknown;
-  profile: unknown;
-  profileDrop12PngUrl: string | null;
-  profileDrop36PngUrl: string | null;
-  fullBacktestResult: FullBacktestResult | null;
-  fullBacktestCurve: FullBacktestCurve | null;
-  hasFullBacktest: boolean;
-}
+export type RunDetail = {
+  run: RunSummary | null;
+  attempts: AttemptCatalogRow[];
+};
 
-export interface FullBacktestResult {
-  data?: {
-    aggregate?: {
-      quality_score?: {
-        score: number;
-        components: Record<string, number>;
-        inputs?: {
-          trades_per_month?: number;
-          expectancy_r?: number;
-          profit_factor?: number;
-          max_drawdown_r?: number;
-          effective_window_months?: number;
-        };
-      };
-      best_cell_path_metrics?: Record<string, number>;
-      best_cell?: {
-        avg_net_r_per_closed_trade?: number;
-        profit_factor?: number;
-      };
-      market_data_window?: { effective_window_months: number };
-    };
-  };
-}
-
-export interface FullBacktestCurve {
-  curve?: {
-    points: CurvePoint[];
-  };
-}
+export type AttemptDetail = {
+  attempt: AttemptCatalogRow;
+  full_backtest_result: Record<string, unknown> | null;
+  full_backtest_curve: Record<string, unknown> | null;
+};

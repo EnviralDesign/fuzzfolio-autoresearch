@@ -215,6 +215,42 @@ class AppConfig:
         return self.derived_root / "validation-cache"
 
     @property
+    def attempt_catalog_json_path(self) -> Path:
+        return self.derived_root / "attempt-catalog.json"
+
+    @property
+    def attempt_catalog_csv_path(self) -> Path:
+        return self.derived_root / "attempt-catalog.csv"
+
+    @property
+    def attempt_catalog_summary_path(self) -> Path:
+        return self.derived_root / "attempt-catalog-summary.json"
+
+    @property
+    def promotion_board_json_path(self) -> Path:
+        return self.derived_root / "promotion-board.json"
+
+    @property
+    def promotion_board_csv_path(self) -> Path:
+        return self.derived_root / "promotion-board.csv"
+
+    @property
+    def full_backtest_audit_json_path(self) -> Path:
+        return self.derived_root / "full-backtest-audit.json"
+
+    @property
+    def full_backtest_failures_json_path(self) -> Path:
+        return self.derived_root / "full-backtest-failures.json"
+
+    @property
+    def corpus_tradeoff_plot_path(self) -> Path:
+        return self.derived_root / "corpus-score-vs-trades-36mo.png"
+
+    @property
+    def corpus_tradeoff_json_path(self) -> Path:
+        return self.derived_root / "corpus-score-vs-trades-36mo.json"
+
+    @property
     def program_path(self) -> Path:
         return self.repo_root / "program.md"
 

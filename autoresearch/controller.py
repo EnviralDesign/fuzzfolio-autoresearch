@@ -1442,9 +1442,9 @@ class ResearchController:
         self, tool_context: ToolContext, step: int
     ) -> dict[str, Any]:
         overlay = self._branch_overlay
-        wrap_up_focus = self._current_wrap_up_focus_state(
-            self._run_attempts(tool_context.run_id)
-        )
+        attempts = self._run_attempts(tool_context.run_id)
+        wrap_up_focus = self._current_wrap_up_focus_state(attempts)
+        run_outcome = self._run_outcome_snapshot(attempts)
         lifecycle_collapsed_ids = [
             fid
             for fid, st in self._family_branches.items()
@@ -1504,6 +1504,7 @@ class ResearchController:
             ],
             "last_scored_validation_digest": overlay.last_scored_validation_digest,
             "wrap_up_focus": wrap_up_focus,
+            "run_outcome": run_outcome,
             "families_on_cooldown": cooldown,
             "families": {
                 k[:24] + ("..." if len(k) > 24 else ""): v.to_dict()
@@ -3074,15 +3075,32 @@ class ResearchController:
         ]
         if not family_attempts:
             return None
-        best_snap = (
-            min(family_attempts, key=lambda snap: float(snap["steering_score"]))
-            if self.config.research.plot_lower_is_better
-            else max(family_attempts, key=lambda snap: float(snap["steering_score"]))
+        highest_horizon = max(
+            (
+                int(snap.get("attempt", {}).get("requested_horizon_months") or 0)
+                for snap in family_attempts
+            ),
+            default=0,
         )
+        if highest_horizon > 0:
+            family_attempts = [
+                snap
+                for snap in family_attempts
+                if int(snap.get("attempt", {}).get("requested_horizon_months") or 0)
+                == highest_horizon
+            ] or family_attempts
+        best_snap = self._select_best_attempt_snapshot(family_attempts)
+        if not isinstance(best_snap, dict):
+            return None
         return {
             "family_id": focus_family,
             "candidate_name": best_snap.get("candidate_name"),
             "profile_ref": best_snap.get("profile_ref") or branch.last_profile_ref,
+            "selected_attempt_id": (
+                str(best_snap.get("attempt", {}).get("attempt_id") or "").strip()
+                or branch.best_attempt_id
+                or branch.latest_attempt_id
+            ),
             "latest_attempt_id": branch.latest_attempt_id,
             "lifecycle_state": branch.lifecycle_state,
             "promotability_status": branch.promotability_status,
@@ -3091,6 +3109,15 @@ class ResearchController:
             "steering_score": best_snap.get("steering_score"),
             "effective_window_months": best_snap.get("effective_window_months"),
             "trades_per_month": best_snap.get("trades_per_month"),
+            "requested_horizon_months": best_snap.get("attempt", {}).get(
+                "requested_horizon_months"
+            ),
+            "requested_timeframe": best_snap.get("attempt", {}).get(
+                "requested_timeframe"
+            ),
+            "effective_timeframe": best_snap.get("attempt", {}).get(
+                "effective_timeframe"
+            ),
             "reason": (
                 "validated_leader"
                 if overlay.validated_leader_family_id == focus_family
@@ -3098,6 +3125,201 @@ class ResearchController:
                 if overlay.provisional_leader_family_id == focus_family
                 else "best_retryable_provisional"
             ),
+        }
+
+    def _select_best_attempt_snapshot(
+        self,
+        snapshots: list[dict[str, Any]],
+        *,
+        prefer_highest_horizon: bool = False,
+    ) -> dict[str, Any] | None:
+        ranked = [snap for snap in snapshots if isinstance(snap, dict)]
+        if not ranked:
+            return None
+        if prefer_highest_horizon:
+            highest_horizon = max(
+                (
+                    int(snap.get("attempt", {}).get("requested_horizon_months") or 0)
+                    for snap in ranked
+                ),
+                default=0,
+            )
+            if highest_horizon > 0:
+                ranked = [
+                    snap
+                    for snap in ranked
+                    if int(snap.get("attempt", {}).get("requested_horizon_months") or 0)
+                    == highest_horizon
+                ] or ranked
+        return (
+            min(
+                ranked,
+                key=lambda snap: (
+                    float(snap.get("steering_score") or 0.0),
+                    float(snap.get("raw_score") or 0.0),
+                ),
+            )
+            if self.config.research.plot_lower_is_better
+            else max(
+                ranked,
+                key=lambda snap: (
+                    float(snap.get("steering_score") or 0.0),
+                    float(snap.get("raw_score") or 0.0),
+                ),
+            )
+        )
+
+    def _outcome_entry_for_snapshot(
+        self,
+        snap: dict[str, Any] | None,
+        *,
+        branch: bl.FamilyBranchState | None = None,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        if not isinstance(snap, dict):
+            return None
+        branch = branch or snap.get("branch")
+        attempt = snap.get("attempt") if isinstance(snap.get("attempt"), dict) else {}
+        family_id = str(snap.get("family_id") or "").strip() or None
+        return {
+            "family_id": family_id,
+            "candidate_name": snap.get("candidate_name"),
+            "profile_ref": snap.get("profile_ref"),
+            "attempt_id": str(attempt.get("attempt_id") or "").strip() or None,
+            "raw_score": snap.get("raw_score"),
+            "steering_score": snap.get("steering_score"),
+            "effective_window_months": snap.get("effective_window_months"),
+            "trades_per_month": snap.get("trades_per_month"),
+            "requested_horizon_months": attempt.get("requested_horizon_months"),
+            "requested_timeframe": attempt.get("requested_timeframe"),
+            "effective_timeframe": attempt.get("effective_timeframe"),
+            "validation_outcome": snap.get("validation_outcome"),
+            "promotability_status": (
+                branch.promotability_status if branch else snap.get("promotability_status")
+            ),
+            "retention_status": branch.retention_status if branch else None,
+            "lifecycle_state": branch.lifecycle_state if branch else None,
+            "promotion_level": branch.promotion_level if branch else None,
+            "currently_live": bool(
+                branch
+                and not branch.exploit_dead
+                and branch.lifecycle_state != bl.LIFECYCLE_COLLAPSED
+            ),
+            "currently_collapsed": bool(
+                branch and branch.lifecycle_state == bl.LIFECYCLE_COLLAPSED
+            ),
+            "reason": reason,
+        }
+
+    def _run_outcome_snapshot(
+        self, attempts: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        overlay = self._branch_overlay
+        ranked: list[dict[str, Any]] = []
+        for snap in (
+            self._attempt_admissibility_snapshot(attempt)
+            for attempt in self._scored_attempts(attempts)
+        ):
+            if not isinstance(snap, dict):
+                continue
+            family_id = str(snap.get("family_id") or "").strip()
+            if not family_id:
+                continue
+            branch = self._family_branches.get(family_id)
+            if branch:
+                snap["branch"] = branch
+            ranked.append(snap)
+
+        wrap_up_focus = self._current_wrap_up_focus_state(attempts)
+        selected_focus_attempt_id = (
+            str(wrap_up_focus.get("selected_attempt_id") or "").strip()
+            if isinstance(wrap_up_focus, dict)
+            else ""
+        )
+        best_live_focus: dict[str, Any] | None = None
+        if selected_focus_attempt_id:
+            focus_snap = next(
+                (
+                    snap
+                    for snap in ranked
+                    if str(snap.get("attempt", {}).get("attempt_id") or "").strip()
+                    == selected_focus_attempt_id
+                ),
+                None,
+            )
+            best_live_focus = self._outcome_entry_for_snapshot(
+                focus_snap,
+                reason="best_live_focus",
+            )
+
+        validated_snaps = [
+            snap
+            for snap in ranked
+            if isinstance(snap.get("branch"), bl.FamilyBranchState)
+            and snap["branch"].promotion_level == bl.PROMOTION_VALIDATED
+        ]
+        best_historical_validated = self._outcome_entry_for_snapshot(
+            self._select_best_attempt_snapshot(
+                validated_snaps,
+                prefer_highest_horizon=True,
+            ),
+            reason="best_historical_validated",
+        )
+
+        retryable_snaps = [
+            snap
+            for snap in ranked
+            if isinstance(snap.get("branch"), bl.FamilyBranchState)
+            and not snap["branch"].exploit_dead
+            and snap["branch"].lifecycle_state != bl.LIFECYCLE_COLLAPSED
+            and str(snap["branch"].promotability_status or "")
+            in {
+                vo.PROMOTABILITY_PROVISIONAL_BEST_AVAILABLE,
+                vo.PROMOTABILITY_RETRY_RECOMMENDED,
+            }
+        ]
+        best_historical_retryable = self._outcome_entry_for_snapshot(
+            self._select_best_attempt_snapshot(
+                retryable_snaps,
+                prefer_highest_horizon=True,
+            ),
+            reason="best_historical_retryable",
+        )
+
+        official_winner: dict[str, Any] | None = None
+        official_winner_type = "none"
+        rationale: str
+        if overlay.validated_leader_family_id and best_live_focus:
+            official_winner = dict(best_live_focus)
+            official_winner["reason"] = "official_validated_winner"
+            official_winner_type = "validated_leader"
+            rationale = (
+                "A validated leader remains authoritative at the end of the run, so it is "
+                "the official winner."
+            )
+        elif best_historical_validated:
+            rationale = (
+                "No official winner: the run previously produced validated evidence, but the "
+                "validated family did not remain authoritative through the end state."
+            )
+        elif best_live_focus:
+            rationale = (
+                "No official winner: the run ended with only a provisional live focus and no "
+                "validated leader."
+            )
+        else:
+            rationale = (
+                "No official winner: the run ended without a validated leader or a live "
+                "focus candidate."
+            )
+
+        return {
+            "official_winner_type": official_winner_type,
+            "official_winner": official_winner,
+            "best_live_focus": best_live_focus,
+            "best_historical_validated": best_historical_validated,
+            "best_historical_retryable": best_historical_retryable,
+            "rationale": rationale,
         }
 
     def _current_gut_check_state(
@@ -3858,6 +4080,46 @@ class ResearchController:
             return None
         return ", ".join(parts[:5])
 
+    def _run_outcome_text(self, tool_context: ToolContext) -> str:
+        outcome = self._run_outcome_snapshot(self._run_attempts(tool_context.run_id))
+        lines = ["Run outcome state (controller-owned; separates live focus from historical bests):"]
+        official_type = str(outcome.get("official_winner_type") or "none")
+        lines.append(f"- official_winner_type: {official_type}")
+        official = outcome.get("official_winner")
+        if isinstance(official, dict):
+            lines.append(
+                "- official_winner: "
+                f"attempt={official.get('attempt_id') or 'n/a'} "
+                f"family={self._short_family_id(official.get('family_id'))} "
+                f"score={self._format_score(official.get('raw_score'))} "
+                f"window={self._format_score(official.get('effective_window_months'))}m "
+                f"cadence={self._format_score(official.get('trades_per_month'))}/mo"
+            )
+        else:
+            lines.append("- official_winner: none yet")
+        for key in (
+            "best_live_focus",
+            "best_historical_validated",
+            "best_historical_retryable",
+        ):
+            item = outcome.get(key)
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- {key}: "
+                f"attempt={item.get('attempt_id') or 'n/a'} "
+                f"family={self._short_family_id(item.get('family_id'))} "
+                f"score={self._format_score(item.get('raw_score'))} "
+                f"window={self._format_score(item.get('effective_window_months'))}m "
+                f"status={item.get('lifecycle_state') or 'n/a'} "
+                f"retention={item.get('retention_status') or 'n/a'} "
+                f"live={item.get('currently_live')}"
+            )
+        rationale = str(outcome.get("rationale") or "").strip()
+        if rationale:
+            lines.append(f"- rationale: {rationale}")
+        return "\n".join(lines)
+
     def _working_memory_text(self, tool_context: ToolContext) -> str:
         lines = ["Pinned working memory (operational handles; prefer these over guessing ids):"]
         ov = self._branch_overlay
@@ -3935,6 +4197,10 @@ class ResearchController:
             parts = [f"family={wrap_up_focus.get('family_id')}"]
             if wrap_up_focus.get("profile_ref"):
                 parts.append(f"profile_ref={wrap_up_focus.get('profile_ref')}")
+            if wrap_up_focus.get("selected_attempt_id"):
+                parts.append(
+                    f"selected_attempt_id={wrap_up_focus.get('selected_attempt_id')}"
+                )
             if wrap_up_focus.get("latest_attempt_id"):
                 parts.append(f"latest_attempt_id={wrap_up_focus.get('latest_attempt_id')}")
             if wrap_up_focus.get("promotability_status"):
@@ -4189,6 +4455,7 @@ class ResearchController:
             f"{soft_wrap_note + chr(10) if soft_wrap_note else ''}"
             f"{self._current_research_priority_text(tool_context, effective_step, effective_step_limit, policy)}\n\n"
             f"{self._manager_guidance_text(effective_step)}\n\n"
+            f"{self._run_outcome_text(tool_context)}\n\n"
             f"{self._working_memory_text(tool_context)}\n\n"
             f"{self._branch_lifecycle_run_packet_text(tool_context, effective_step, effective_step_limit)}\n\n"
             f"{self._retention_and_exploit_status_text(tool_context)}\n\n"
@@ -4998,6 +5265,7 @@ class ResearchController:
         *,
         profile_ref: str | None = None,
         note: str | None = None,
+        requested_horizon_months: int | None = None,
     ) -> dict[str, Any]:
         artifact_dir = artifact_dir.resolve()
         if attempt_exists(tool_context.attempts_path, artifact_dir):
@@ -5024,6 +5292,8 @@ class ResearchController:
             score,
             compare_payload if isinstance(compare_payload, dict) else None,
         )
+        if requested_horizon_months is not None:
+            ev["requested_horizon_months"] = requested_horizon_months
         record = make_attempt_record(
             self.config,
             tool_context.attempts_path,
@@ -5121,8 +5391,12 @@ class ResearchController:
             profile_index = args.index("--profile-ref") + 1
             if profile_index < len(args):
                 profile_ref = str(args[profile_index])
+        requested_horizon_months = self._parse_lookback_months_from_cli_args(args)
         return self._record_attempt_from_artifact(
-            tool_context, artifact_dir, profile_ref=profile_ref
+            tool_context,
+            artifact_dir,
+            profile_ref=profile_ref,
+            requested_horizon_months=requested_horizon_months,
         )
 
     def _execute_cli_invocation(
@@ -6533,6 +6807,26 @@ class ResearchController:
     def _runtime_trace_path(self, tool_context: ToolContext) -> Path:
         return tool_context.run_dir / "runtime-trace.jsonl"
 
+    def _json_safe_value(self, value: Any) -> Any:
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, BaseException):
+            return f"{type(value).__name__}: {value}"
+        if isinstance(value, dict):
+            sanitized: dict[str, Any] = {}
+            for key, item in value.items():
+                sanitized[str(key)] = self._json_safe_value(item)
+            return sanitized
+        if isinstance(value, (list, tuple, set)):
+            return [self._json_safe_value(item) for item in value]
+        try:
+            json.dumps(value, ensure_ascii=True)
+            return value
+        except (TypeError, ValueError):
+            return str(value)
+
     def _trace_runtime(
         self,
         tool_context: ToolContext,
@@ -6554,7 +6848,7 @@ class ResearchController:
         }
         for key, value in fields.items():
             if value is not None:
-                payload[key] = value
+                payload[key] = self._json_safe_value(value)
         trace_path = self._runtime_trace_path(tool_context)
         with trace_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")

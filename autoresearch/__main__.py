@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time as pytime
+import urllib.error
+import urllib.request
 from datetime import datetime, time, timedelta
 from math import ceil
 from pathlib import Path
@@ -33,16 +36,28 @@ from rich.text import Text
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from autoresearch.config import load_config
+    from autoresearch.corpus_tools import (
+        build_full_backtest_audit,
+        catalog_summary,
+        build_similarity_payload as build_candidate_similarity_payload,
+        extract_attempt_catalog_row,
+        full_backtest_provisional_reasons,
+        legacy_validation_cache_dir,
+        load_json_if_exists,
+        normalize_tokens,
+        resolve_attempt_scrutiny_source,
+        scrutiny_cache_dir_for_artifact_dir,
+        select_promotion_board,
+        write_csv,
+        write_json,
+    )
     from autoresearch.controller import (
         ResearchController,
         RunPolicy,
         set_runtime_trace_stderr_mode,
     )
-    from autoresearch.dashboard import (
-        serve_dashboard,
-        _has_full_backtest,
-        _run_full_backtest_for_attempt,
-    )
+    from autoresearch.dashboard import _has_full_backtest, _run_full_backtest_for_attempt
+    from autoresearch.dashboard_viewer import serve_dashboard
     from autoresearch.fuzzfolio import CliError, FuzzfolioCli
     from autoresearch.ledger import (
         append_attempt,
@@ -63,7 +78,10 @@ if __package__ in {None, ""}:
         _best_scored_attempts_by_run,
         render_leaderboard_artifacts,
         render_model_leaderboard_artifacts,
+        render_attempt_tradeoff_overlay_artifacts,
+        render_attempt_drawdown_scatter_artifacts,
         render_progress_artifacts,
+        render_attempt_tradeoff_scatter_artifacts,
         render_similarity_heatmap_artifacts,
         render_similarity_scatter_artifacts,
         render_tradeoff_leaderboard_artifacts,
@@ -80,8 +98,24 @@ if __package__ in {None, ""}:
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
+    from .corpus_tools import (
+        build_full_backtest_audit,
+        catalog_summary,
+        build_similarity_payload as build_candidate_similarity_payload,
+        extract_attempt_catalog_row,
+        full_backtest_provisional_reasons,
+        legacy_validation_cache_dir,
+        load_json_if_exists,
+        normalize_tokens,
+        resolve_attempt_scrutiny_source,
+        scrutiny_cache_dir_for_artifact_dir,
+        select_promotion_board,
+        write_csv,
+        write_json,
+    )
     from .controller import ResearchController, RunPolicy, set_runtime_trace_stderr_mode
-    from .dashboard import serve_dashboard
+    from .dashboard import _has_full_backtest, _run_full_backtest_for_attempt
+    from .dashboard_viewer import serve_dashboard
     from .fuzzfolio import CliError, FuzzfolioCli
     from .ledger import (
         append_attempt,
@@ -102,7 +136,10 @@ else:
         _best_scored_attempts_by_run,
         render_leaderboard_artifacts,
         render_model_leaderboard_artifacts,
+        render_attempt_tradeoff_overlay_artifacts,
+        render_attempt_drawdown_scatter_artifacts,
         render_progress_artifacts,
+        render_attempt_tradeoff_scatter_artifacts,
         render_similarity_heatmap_artifacts,
         render_similarity_scatter_artifacts,
         render_tradeoff_leaderboard_artifacts,
@@ -294,7 +331,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dashboard = subparsers.add_parser(
         "dashboard",
-        help="Serve a local SPA for run, leaderboard, and backtest drilldown.",
+        help="Serve the read-only dashboard viewer from already-computed derived artifacts.",
     )
     dashboard.add_argument(
         "--host", default="127.0.0.1", help="Bind host. Default: 127.0.0.1"
@@ -306,17 +343,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         default=25,
-        help="Classic bar leaderboard display limit used during refresh. Validation and similarity still analyze the full best-per-run set. Default: 25",
+        help="Legacy no-op kept for compatibility. The dashboard no longer rebuilds or limits data on startup.",
     )
     dashboard.add_argument(
         "--force-rebuild",
         action="store_true",
-        help="Ignore cached validation artifacts when refreshing derived dashboard data.",
+        help="Legacy no-op kept for compatibility. The dashboard no longer triggers rebuilds.",
     )
     dashboard.add_argument(
         "--no-refresh-on-start",
         action="store_true",
-        help="Serve immediately using current derived artifacts instead of rebuilding them on startup.",
+        help="Legacy no-op kept for compatibility. The dashboard is always read-only and serves current derived artifacts.",
     )
     profile_drop_pngs = subparsers.add_parser(
         "sync-profile-drop-pngs",
@@ -417,11 +454,364 @@ def build_parser() -> argparse.ArgumentParser:
         help="Specific run IDs to process. Defaults to all runs.",
     )
     calc_backtests.add_argument(
+        "--attempt-id",
+        action="append",
+        default=None,
+        help="Only process the named attempt id. Can be repeated.",
+    )
+    calc_backtests.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional cap on how many matched attempts to process after score sorting.",
+    )
+    calc_backtests.add_argument(
+        "--max-workers",
+        type=int,
+        default=None,
+        help="Maximum concurrent full-backtest jobs. Defaults to the detected running dev Sim Worker count, falling back to validation_max_concurrency.",
+    )
+    calc_backtests.add_argument(
+        "--no-use-dev-sim-worker-count",
+        action="store_true",
+        help="Disable dev sim-worker auto sizing and fall back to validation_max_concurrency unless --max-workers is set.",
+    )
+    calc_backtests.add_argument(
+        "--require-scrutiny-36",
+        action="store_true",
+        help="Only backtest attempts that already have 36mo scrutiny artifacts.",
+    )
+    calc_backtests.add_argument(
         "--force-rebuild",
         action="store_true",
         help="Recalculate even if full-backtest file already exists.",
     )
     calc_backtests.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    attempt_catalog = subparsers.add_parser(
+        "build-attempt-catalog",
+        help="Build a corpus-wide attempt catalog with scrutiny/cache coverage audit.",
+    )
+    attempt_catalog.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only catalog the named run id. Can be repeated.",
+    )
+    attempt_catalog.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    full_backtest_audit = subparsers.add_parser(
+        "audit-full-backtests",
+        help="Audit current 36mo full-backtest coverage and artifact trust without generating new cache.",
+    )
+    full_backtest_audit.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only audit the named run id. Can be repeated.",
+    )
+    full_backtest_audit.add_argument(
+        "--attempt-id",
+        action="append",
+        default=None,
+        help="Only audit the named attempt id. Can be repeated.",
+    )
+    full_backtest_audit.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    corpus_tradeoff = subparsers.add_parser(
+        "plot-corpus-score-vs-trades",
+        help="Render an attempt-level 36mo score vs trades/month scatter plot to runs/derived.",
+    )
+    corpus_tradeoff.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only include the named run id. Can be repeated.",
+    )
+    corpus_tradeoff.add_argument(
+        "--attempt-id",
+        action="append",
+        default=None,
+        help="Only include the named attempt id. Can be repeated.",
+    )
+    corpus_tradeoff.add_argument(
+        "--require-full-backtest-36",
+        action="store_true",
+        help="Only plot attempts with valid local 36mo full-backtest artifacts.",
+    )
+    corpus_tradeoff.add_argument(
+        "--x-axis-max",
+        type=float,
+        default=300.0,
+        help="Cap the trades/month axis at this value. Use a negative number to disable. Default: 300",
+    )
+    corpus_tradeoff.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    scrutiny_cache = subparsers.add_parser(
+        "hydrate-scrutiny-cache",
+        help="Heal or rebuild attempt-local 12mo/36mo scrutiny caches.",
+    )
+    scrutiny_cache.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only process attempts from the named run id. Can be repeated.",
+    )
+    scrutiny_cache.add_argument(
+        "--attempt-id",
+        action="append",
+        default=None,
+        help="Only process the named attempt id. Can be repeated.",
+    )
+    scrutiny_cache.add_argument(
+        "--lookback-months",
+        action="append",
+        type=int,
+        default=None,
+        help="Scrutiny horizon in months. Can be repeated. Defaults to 12 and 36.",
+    )
+    scrutiny_cache.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional cap on how many matched attempts to process after sorting by score.",
+    )
+    scrutiny_cache.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Ignore existing attempt-local scrutiny artifacts and rebuild them.",
+    )
+    scrutiny_cache.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    promotion_board = subparsers.add_parser(
+        "build-promotion-board",
+        help="Build a similarity-aware long-horizon promotion board from attempt-level scrutiny.",
+    )
+    promotion_board.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only consider attempts from the named run id. Can be repeated.",
+    )
+    promotion_board.add_argument(
+        "--attempt-id",
+        action="append",
+        default=None,
+        help="Only consider the named attempt id. Can be repeated.",
+    )
+    promotion_board.add_argument(
+        "--candidate-limit",
+        type=int,
+        default=250,
+        help="Maximum number of candidate attempts to consider after score sorting. Default: 250",
+    )
+    promotion_board.add_argument(
+        "--board-size",
+        type=int,
+        default=12,
+        help="How many promotion candidates to select. Default: 12",
+    )
+    promotion_board.add_argument(
+        "--min-score-36",
+        type=float,
+        default=40.0,
+        help="Minimum 36mo score required for inclusion. Default: 40.0",
+    )
+    promotion_board.add_argument(
+        "--min-retention-ratio",
+        type=float,
+        default=0.0,
+        help="Minimum 36m/12m score retention ratio when 12mo scrutiny exists. Default: 0.0",
+    )
+    promotion_board.add_argument(
+        "--min-trades-per-month",
+        type=float,
+        default=0.0,
+        help="Minimum 36mo trade cadence. Default: 0.0",
+    )
+    promotion_board.add_argument(
+        "--novelty-penalty",
+        type=float,
+        default=18.0,
+        help="Penalty applied to max sameness during greedy board selection. Default: 18.0",
+    )
+    promotion_board.add_argument(
+        "--max-per-run",
+        type=int,
+        default=2,
+        help="Maximum selected candidates per run. Use -1 to disable. Default: 2",
+    )
+    promotion_board.add_argument(
+        "--max-per-strategy-key",
+        type=int,
+        default=2,
+        help="Maximum selected candidates per normalized 36mo timeframe+instrument set. Use -1 to disable. Default: 2",
+    )
+    promotion_board.add_argument(
+        "--max-sameness-to-board",
+        type=float,
+        default=0.85,
+        help="Stop selecting candidates once their max sameness to the current board exceeds this ceiling. Default: 0.85",
+    )
+    promotion_board.add_argument(
+        "--require-full-backtest-36",
+        action="store_true",
+        help="Only consider attempts with attempt-local 36mo full-backtest artifacts.",
+    )
+    promotion_board.add_argument(
+        "--hydrate-missing",
+        action="store_true",
+        help="Heal missing 36mo scrutiny for the candidate pool before ranking.",
+    )
+    promotion_board.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Rebuild scrutiny for hydrated candidates instead of reusing caches.",
+    )
+    promotion_board.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    shortlist_report = subparsers.add_parser(
+        "build-shortlist-report",
+        help="Build a diversified 36mo shortlist, render charts, and generate official profile-drop PNGs for the selected candidates.",
+    )
+    shortlist_report.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only consider attempts from the named run id. Can be repeated.",
+    )
+    shortlist_report.add_argument(
+        "--attempt-id",
+        action="append",
+        default=None,
+        help="Only consider the named attempt id. Can be repeated.",
+    )
+    shortlist_report.add_argument(
+        "--candidate-limit",
+        type=int,
+        default=-1,
+        help="Optional cap on ranked candidates before similarity/selection. Use -1 for all qualified candidates. Default: -1",
+    )
+    shortlist_report.add_argument(
+        "--shortlist-size",
+        type=int,
+        default=12,
+        help="How many candidates to put on the shortlist. Default: 12",
+    )
+    shortlist_report.add_argument(
+        "--min-score-36",
+        type=float,
+        default=40.0,
+        help="Minimum 36mo score required for shortlist consideration. Default: 40.0",
+    )
+    shortlist_report.add_argument(
+        "--min-retention-ratio",
+        type=float,
+        default=0.0,
+        help="Minimum 36m/12m score retention ratio when 12mo scrutiny exists. Default: 0.0",
+    )
+    shortlist_report.add_argument(
+        "--min-trades-per-month",
+        type=float,
+        default=0.0,
+        help="Minimum 36mo trade cadence. Default: 0.0",
+    )
+    shortlist_report.add_argument(
+        "--max-drawdown-r",
+        type=float,
+        default=-1.0,
+        help="Maximum allowed 36mo drawdown in R. Use -1 to disable. Default: -1",
+    )
+    shortlist_report.add_argument(
+        "--drawdown-penalty",
+        type=float,
+        default=0.65,
+        help="Penalty applied per R of 36mo max drawdown during shortlist selection. Default: 0.65",
+    )
+    shortlist_report.add_argument(
+        "--trade-rate-bonus-weight",
+        type=float,
+        default=0.0,
+        help="Optional positive utility bonus for higher 36mo trade cadence. Default: 0.0",
+    )
+    shortlist_report.add_argument(
+        "--trade-rate-bonus-target",
+        type=float,
+        default=8.0,
+        help="Trade cadence level where the bonus saturates when trade-rate bonus is enabled. Default: 8.0",
+    )
+    shortlist_report.add_argument(
+        "--novelty-penalty",
+        type=float,
+        default=18.0,
+        help="Penalty applied to max sameness during shortlist selection. Default: 18.0",
+    )
+    shortlist_report.add_argument(
+        "--max-per-run",
+        type=int,
+        default=1,
+        help="Maximum shortlisted candidates per run. Use -1 to disable. Default: 1",
+    )
+    shortlist_report.add_argument(
+        "--max-per-strategy-key",
+        type=int,
+        default=1,
+        help="Maximum shortlisted candidates per normalized 36mo timeframe+instrument set. Use -1 to disable. Default: 1",
+    )
+    shortlist_report.add_argument(
+        "--max-sameness-to-board",
+        type=float,
+        default=0.78,
+        help="Stop selecting once a candidate's max sameness to the board exceeds this ceiling. Default: 0.78",
+    )
+    shortlist_report.add_argument(
+        "--require-full-backtest-36",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Require valid local 36mo full-backtest artifacts for shortlist candidates. Default: true",
+    )
+    shortlist_report.add_argument(
+        "--generate-profile-drops",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render official profile-drop PNGs for shortlisted candidates. Default: true",
+    )
+    shortlist_report.add_argument(
+        "--profile-drop-lookback-months",
+        type=int,
+        default=36,
+        help="Lookback used for shortlisted profile-drop PNG generation. Default: 36",
+    )
+    shortlist_report.add_argument(
+        "--chart-trades-x-max",
+        type=float,
+        default=300.0,
+        help="Default cap for trades/month charts. Use a negative number to disable. Default: 300",
+    )
+    shortlist_report.add_argument(
+        "--profile-drop-timeout-seconds",
+        type=int,
+        default=1800,
+        help="Per-candidate timeout for packaging/rendering profile-drop PNGs. Default: 1800",
+    )
+    shortlist_report.add_argument(
+        "--force-rebuild-profile-drops",
+        action="store_true",
+        help="Re-render shortlisted profile-drop PNGs even if the derived shortlist copies already exist.",
+    )
+    shortlist_report.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
@@ -2101,14 +2491,25 @@ def _resolve_drop_renderer_executable(config) -> tuple[Path, Path | None]:
     )
 
 
-def _run_external(argv: list[str], *, cwd: Path) -> None:
-    proc = subprocess.run(
-        argv,
-        cwd=str(cwd),
-        text=True,
-        capture_output=True,
-        encoding="utf-8",
-    )
+def _run_external(
+    argv: list[str], *, cwd: Path, timeout_seconds: float | None = None
+) -> None:
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Command timed out after {timeout_seconds:.0f}s: {' '.join(argv)}\n"
+            f"cwd: {cwd}\n"
+            f"stdout:\n{(exc.stdout or '').strip()[:1600]}\n\n"
+            f"stderr:\n{(exc.stderr or '').strip()[:1600]}"
+        ) from exc
     if proc.returncode == 0:
         return
     stdout = proc.stdout.strip()
@@ -2136,6 +2537,317 @@ def _best_attempt_for_run(
     )[0]
 
 
+def _matching_run_dirs(
+    config, run_ids: list[str] | None = None
+) -> list[Path]:
+    all_run_dirs = list_run_dirs(config.runs_root)
+    if not run_ids:
+        return all_run_dirs
+    wanted = {token.strip() for token in run_ids if str(token).strip()}
+    run_dirs = [run_dir for run_dir in all_run_dirs if run_dir.name in wanted]
+    missing = sorted(wanted - {run_dir.name for run_dir in run_dirs})
+    if missing:
+        raise SystemExit(f"Run directories do not exist: {', '.join(missing)}")
+    return run_dirs
+
+
+def _catalog_rows_for_run_dirs(config, run_dirs: list[Path]) -> list[dict[str, Any]]:
+    run_metadata_by_run_id = {
+        run_dir.name: load_run_metadata(run_dir) for run_dir in run_dirs
+    }
+    rows: list[dict[str, Any]] = []
+    for run_dir in run_dirs:
+        run_metadata = run_metadata_by_run_id.get(run_dir.name) or {}
+        for attempt in load_run_attempts(run_dir):
+            rows.append(
+                extract_attempt_catalog_row(
+                    attempt,
+                    run_metadata,
+                    validation_cache_root=config.validation_cache_root,
+                )
+            )
+    rows.sort(
+        key=lambda row: (
+            row.get("composite_score") is None,
+            -(float(row["composite_score"]) if row.get("composite_score") is not None else float("-inf")),
+            str(row.get("attempt_id") or ""),
+        )
+    )
+    return rows
+
+
+def _refresh_global_derived_corpus_state(config) -> dict[str, Any]:
+    run_dirs = _matching_run_dirs(config, None)
+    rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    summary = catalog_summary(rows)
+    audit_payload = build_full_backtest_audit(rows)
+    write_json(config.attempt_catalog_json_path, rows)
+    write_csv(config.attempt_catalog_csv_path, rows)
+    write_json(config.attempt_catalog_summary_path, summary)
+    write_json(config.full_backtest_audit_json_path, audit_payload)
+    return {
+        "run_count": len(run_dirs),
+        "attempt_count": len(rows),
+        "attempt_catalog_json": str(config.attempt_catalog_json_path),
+        "attempt_catalog_csv": str(config.attempt_catalog_csv_path),
+        "attempt_catalog_summary_json": str(config.attempt_catalog_summary_path),
+        "full_backtest_audit_json": str(config.full_backtest_audit_json_path),
+        "summary": summary,
+        "audit": audit_payload,
+    }
+
+
+def _matched_attempt_items(
+    config,
+    *,
+    run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
+    require_scored: bool = True,
+) -> list[tuple[Path, list[dict[str, Any]], dict[str, Any]]]:
+    wanted_attempt_ids = {
+        token.strip() for token in (attempt_ids or []) if str(token).strip()
+    }
+    items: list[tuple[Path, list[dict[str, Any]], dict[str, Any]]] = []
+    for run_dir in _matching_run_dirs(config, run_ids):
+        attempts = load_run_attempts(run_dir)
+        if not attempts:
+            continue
+        for attempt in attempts:
+            attempt_id = str(attempt.get("attempt_id") or "").strip()
+            if wanted_attempt_ids and attempt_id not in wanted_attempt_ids:
+                continue
+            if require_scored and not wanted_attempt_ids and attempt.get("composite_score") is None:
+                continue
+            items.append((run_dir, attempts, attempt))
+    if wanted_attempt_ids:
+        matched_attempt_ids = {
+            str(attempt.get("attempt_id") or "").strip() for _, _, attempt in items
+        }
+        missing = sorted(wanted_attempt_ids - matched_attempt_ids)
+        if missing:
+            raise SystemExit(f"Attempt ids do not exist: {', '.join(missing)}")
+    items.sort(
+        key=lambda item: (
+            item[2].get("composite_score") is None,
+            -(
+                float(item[2]["composite_score"])
+                if item[2].get("composite_score") is not None
+                else float("-inf")
+            ),
+            str(item[2].get("attempt_id") or ""),
+        )
+    )
+    return items
+
+
+def _full_backtest_priority_key(row: dict[str, Any] | None) -> tuple[bool, float, float, str]:
+    row = row or {}
+    score_36 = row.get("score_36m")
+    composite_score = row.get("composite_score")
+    primary = (
+        float(score_36)
+        if score_36 is not None
+        else (
+            float(composite_score)
+            if composite_score is not None
+            else float("-inf")
+        )
+    )
+    secondary = (
+        float(composite_score)
+        if composite_score is not None
+        else float("-inf")
+    )
+    return (
+        primary == float("-inf"),
+        -primary,
+        -secondary,
+        str(row.get("attempt_id") or ""),
+    )
+
+
+def _detect_dev_sim_worker_count(*, timeout_seconds: float = 2.0) -> int | None:
+    try:
+        with urllib.request.urlopen(
+            "http://127.0.0.1:47821/processes", timeout=timeout_seconds
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        OSError,
+        TimeoutError,
+        urllib.error.URLError,
+        urllib.error.HTTPError,
+        json.JSONDecodeError,
+    ):
+        return None
+    if not isinstance(payload, list):
+        return None
+    count = 0
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        name = str(item.get("name") or "").strip().lower()
+        command = str(item.get("command") or "").strip().lower()
+        if status != "running":
+            continue
+        if name.startswith("sim worker") or command.endswith("sim-worker"):
+            count += 1
+    return count if count > 0 else None
+
+
+def _run_full_backtest_with_retry(
+    config,
+    attempt: dict[str, Any],
+) -> dict[str, Any]:
+    artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+    if artifact_dir.exists():
+        source_payload = resolve_attempt_scrutiny_source(
+            attempt,
+            36,
+            validation_cache_root=config.validation_cache_root,
+        )
+        source_name = str(source_payload.get("source") or "")
+        result_path_raw = str(source_payload.get("result_path") or "").strip()
+        curve_path_raw = str(source_payload.get("curve_path") or "").strip()
+        if (
+            source_payload.get("available")
+            and source_name in {"attempt_scrutiny_cache", "legacy_run_validation_cache"}
+            and result_path_raw
+            and curve_path_raw
+        ):
+            source_result_path = Path(result_path_raw)
+            source_curve_path = Path(curve_path_raw)
+            if source_result_path.exists() and source_curve_path.exists():
+                dest_curve = artifact_dir / "full-backtest-36mo-curve.json"
+                dest_result = artifact_dir / "full-backtest-36mo-result.json"
+                shutil.copy2(source_curve_path, dest_curve)
+                shutil.copy2(source_result_path, dest_result)
+                return {
+                    "curve_path": str(dest_curve),
+                    "result_path": str(dest_result),
+                    "seed_source": source_name,
+                }
+    try:
+        return _run_full_backtest_for_attempt(config, attempt)
+    except Exception as exc:
+        message = str(exc)
+        profile_path_raw = str(attempt.get("profile_path") or "").strip()
+        profile_path = Path(profile_path_raw) if profile_path_raw else None
+        should_retry_with_local_profile = (
+            (
+                "Selected-cell detail has not been computed yet" in message
+                or "Profile not found" in message
+            )
+            and profile_path is not None
+            and profile_path.exists()
+        )
+        if not should_retry_with_local_profile:
+            raise
+    retry_attempt = dict(attempt)
+    retry_attempt["profile_ref"] = ""
+    result = _run_full_backtest_for_attempt(config, retry_attempt)
+    result["retry_mode"] = "local_profile_reupload"
+    return result
+
+
+def _classify_full_backtest_failure(error_message: str) -> str:
+    message = str(error_message or "").lower()
+    if "profile not found" in message:
+        return "profile_not_found"
+    if "selected-cell detail has not been computed yet" in message:
+        return "selected_cell_detail_pending"
+    if "command timed out" in message:
+        return "timeout"
+    if "artifact directory does not exist" in message:
+        return "missing_artifact_dir"
+    if "missing a valid cloud profile ref and local profile file" in message:
+        return "missing_profile_material"
+    if "sensitivity-basket failed" in message:
+        return "sensitivity_basket_failed"
+    return "other"
+
+
+def _build_full_backtest_failure_summary(
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    failed_rows = [row for row in results if str(row.get("status") or "") == "failed"]
+    by_reason: dict[str, int] = {}
+    examples: dict[str, list[dict[str, Any]]] = {}
+    for row in failed_rows:
+        reason = _classify_full_backtest_failure(str(row.get("error") or ""))
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+        bucket = examples.setdefault(reason, [])
+        if len(bucket) >= 20:
+            continue
+        bucket.append(
+            {
+                "run_id": row.get("run_id"),
+                "attempt_id": row.get("attempt_id"),
+                "candidate_name": row.get("candidate_name"),
+                "duration_seconds": row.get("duration_seconds"),
+                "error": row.get("error"),
+            }
+        )
+    recovery_summary = {
+        "seeded_materialized": sum(
+            1 for row in results if str(row.get("status") or "") == "seeded"
+        ),
+        "local_profile_reupload": sum(
+            1
+            for row in results
+            if str(row.get("retry_mode") or "") == "local_profile_reupload"
+        ),
+        "timeout_salvaged": sum(
+            1 for row in results if str(row.get("recovery_mode") or "") == "timeout_salvaged"
+        ),
+    }
+    return {
+        "failed_count": len(failed_rows),
+        "failure_reasons": by_reason,
+        "failure_examples": examples,
+        "recovery_summary": recovery_summary,
+    }
+
+
+def _trade_rate_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    values = sorted(
+        float(value)
+        for value in (_safe_float_value(row.get("trades_per_month_36m")) for row in rows)
+        if value is not None
+    )
+    if not values:
+        return {
+            "count": 0,
+            "min": None,
+            "median": None,
+            "mean": None,
+            "max": None,
+            "under_1_per_month": 0,
+            "at_least_1_per_month": 0,
+            "at_least_2_per_month": 0,
+            "at_least_4_per_month": 0,
+        }
+    count = len(values)
+    midpoint = count // 2
+    median = (
+        values[midpoint]
+        if count % 2 == 1
+        else (values[midpoint - 1] + values[midpoint]) / 2.0
+    )
+    return {
+        "count": count,
+        "min": values[0],
+        "median": median,
+        "mean": sum(values) / count,
+        "max": values[-1],
+        "under_1_per_month": sum(1 for value in values if value < 1.0),
+        "at_least_1_per_month": sum(1 for value in values if value >= 1.0),
+        "at_least_2_per_month": sum(1 for value in values if value >= 2.0),
+        "at_least_4_per_month": sum(1 for value in values if value >= 4.0),
+    }
+
+
 def _nested_get(payload: dict[str, Any], path: list[str]) -> Any:
     current: Any = payload
     for key in path:
@@ -2143,6 +2855,15 @@ def _nested_get(payload: dict[str, Any], path: list[str]) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def _safe_float_value(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _load_json_if_exists(path: Path) -> dict[str, Any]:
@@ -2539,6 +3260,45 @@ def _profile_drop_manifest_path(run_dir: Path, lookback_months: int) -> Path:
     return run_dir / f"profile-drop-{int(lookback_months)}mo.manifest.json"
 
 
+def _slug_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9]+", "-", str(value or "").strip()).strip("-").lower()
+    return token or "item"
+
+
+def _attempt_scrutiny_cache_dir(
+    attempt: dict[str, Any], lookback_months: int
+) -> Path:
+    artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+    return scrutiny_cache_dir_for_artifact_dir(artifact_dir, lookback_months)
+
+
+def _attempt_scrutiny_manifest_path(
+    attempt: dict[str, Any], lookback_months: int
+) -> Path:
+    return _attempt_scrutiny_cache_dir(attempt, lookback_months) / "manifest.json"
+
+
+def _scrutiny_manifest_payload(
+    config,
+    *,
+    run_dir: Path,
+    attempt: dict[str, Any],
+    profile_ref: str,
+    package_inputs: dict[str, Any],
+    lookback_months: int,
+) -> dict[str, Any]:
+    return {
+        "run_id": run_dir.name,
+        "attempt_id": str(attempt.get("attempt_id") or ""),
+        "candidate_name": str(attempt.get("candidate_name") or ""),
+        "profile_ref": profile_ref,
+        "timeframe": str(package_inputs["timeframe"]),
+        "instruments": list(package_inputs["instruments"]),
+        "lookback_months": int(lookback_months),
+        "quality_score_preset": str(config.research.quality_score_preset),
+    }
+
+
 def _load_validation_score(artifact_dir: Path) -> dict[str, Any]:
     sensitivity_payload = _load_json_if_exists(
         artifact_dir / "sensitivity-response.json"
@@ -2564,6 +3324,61 @@ def _load_validation_score(artifact_dir: Path) -> dict[str, Any]:
         "effective_window_months": _attempt_effective_window_months(synthetic_attempt),
         "max_drawdown_r": _attempt_max_drawdown_r(synthetic_attempt),
     }
+
+
+def _try_seed_attempt_scrutiny_cache(
+    config,
+    *,
+    run_dir: Path,
+    attempt: dict[str, Any],
+    cache_dir: Path,
+    manifest_payload: dict[str, Any],
+) -> str | None:
+    lookback_months = int(manifest_payload["lookback_months"])
+    artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+
+    legacy_dir = legacy_validation_cache_dir(
+        config.validation_cache_root, run_dir.name, lookback_months
+    )
+    legacy_manifest_path = legacy_dir / "manifest.json"
+    if (
+        legacy_manifest_path.exists()
+        and (legacy_dir / "sensitivity-response.json").exists()
+        and (legacy_dir / "best-cell-path-detail.json").exists()
+    ):
+        legacy_manifest = load_json_if_exists(legacy_manifest_path)
+        if (
+            isinstance(legacy_manifest, dict)
+            and str(legacy_manifest.get("attempt_id") or "")
+            == str(manifest_payload.get("attempt_id") or "")
+            and int(legacy_manifest.get("lookback_months") or 0) == lookback_months
+            and str(legacy_manifest.get("timeframe") or "").strip().upper()
+            == str(manifest_payload.get("timeframe") or "").strip().upper()
+            and normalize_tokens(list(legacy_manifest.get("instruments") or []))
+            == normalize_tokens(list(manifest_payload.get("instruments") or []))
+        ):
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            shutil.copytree(legacy_dir, cache_dir)
+            _write_json_file(cache_dir / "manifest.json", manifest_payload)
+            return "legacy_run_validation_cache"
+
+    if lookback_months == 36:
+        full_result_path = artifact_dir / "full-backtest-36mo-result.json"
+        full_curve_path = artifact_dir / "full-backtest-36mo-curve.json"
+        if full_result_path.exists() and full_curve_path.exists():
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(full_result_path, cache_dir / "sensitivity-response.json")
+            shutil.copy2(full_curve_path, cache_dir / "best-cell-path-detail.json")
+            job_path = artifact_dir / "deep-replay-job.json"
+            if job_path.exists():
+                shutil.copy2(job_path, cache_dir / "deep-replay-job.json")
+            _write_json_file(cache_dir / "manifest.json", manifest_payload)
+            return "full_backtest"
+
+    return None
 
 
 def _load_validation_curve_series(artifact_dir: Path) -> dict[str, float]:
@@ -2779,23 +3594,21 @@ def _build_similarity_payload(validation_rows: list[dict[str, Any]]) -> dict[str
     }
 
 
-def _ensure_validation_artifacts(
+def _ensure_attempt_scrutiny_artifacts(
     *,
     config,
     cli: FuzzfolioCli,
     run_dir: Path,
     attempts: list[dict[str, Any]],
-    best_attempt: dict[str, Any],
+    attempt: dict[str, Any],
     lookback_months: int,
     force_rebuild: bool = False,
     emit: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    package_inputs = _build_package_inputs(
-        best_attempt, run_dir=run_dir, attempts=attempts
-    )
+    package_inputs = _build_package_inputs(attempt, run_dir=run_dir, attempts=attempts)
     profile_path = package_inputs.get("profile_path")
     profile_ref = str(
-        package_inputs.get("profile_ref") or best_attempt.get("profile_ref") or ""
+        package_inputs.get("profile_ref") or attempt.get("profile_ref") or ""
     ).strip()
     recreated_profile = False
 
@@ -2804,26 +3617,24 @@ def _ensure_validation_artifacts(
     if not profile_ref:
         if not isinstance(profile_path, Path) or not profile_path.exists():
             raise RuntimeError(
-                f"Best attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
+                f"Attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
             )
         profile_ref = _create_cloud_profile(cli, profile_path)
         _update_attempt_profile_ref(
-            run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref
+            run_dir, str(attempt.get("attempt_id") or ""), profile_ref
         )
         recreated_profile = True
 
-    cache_dir = _validation_cache_dir(config, run_dir.name, lookback_months)
-    manifest_path = _validation_manifest_path(config, run_dir.name, lookback_months)
-    manifest_payload = {
-        "run_id": run_dir.name,
-        "attempt_id": str(best_attempt.get("attempt_id") or ""),
-        "candidate_name": str(best_attempt.get("candidate_name") or ""),
-        "profile_ref": profile_ref,
-        "timeframe": str(package_inputs["timeframe"]),
-        "instruments": list(package_inputs["instruments"]),
-        "lookback_months": int(lookback_months),
-        "quality_score_preset": str(config.research.quality_score_preset),
-    }
+    cache_dir = _attempt_scrutiny_cache_dir(attempt, lookback_months)
+    manifest_path = _attempt_scrutiny_manifest_path(attempt, lookback_months)
+    manifest_payload = _scrutiny_manifest_payload(
+        config,
+        run_dir=run_dir,
+        attempt=attempt,
+        profile_ref=profile_ref,
+        package_inputs=package_inputs,
+        lookback_months=lookback_months,
+    )
     sensitivity_path = cache_dir / "sensitivity-response.json"
     if (not force_rebuild) and sensitivity_path.exists() and manifest_path.exists():
         existing_manifest = _load_json_if_exists(manifest_path)
@@ -2833,6 +3644,25 @@ def _ensure_validation_artifacts(
             payload["profile_ref"] = profile_ref
             payload["recreated_profile"] = recreated_profile
             payload["cache_hit"] = True
+            payload["seed_source"] = None
+            return payload
+
+    seed_source = None
+    if not force_rebuild:
+        seed_source = _try_seed_attempt_scrutiny_cache(
+            config,
+            run_dir=run_dir,
+            attempt=attempt,
+            cache_dir=cache_dir,
+            manifest_payload=manifest_payload,
+        )
+        if seed_source is not None:
+            payload = _load_validation_score(cache_dir)
+            payload["artifact_dir"] = str(cache_dir)
+            payload["profile_ref"] = profile_ref
+            payload["recreated_profile"] = recreated_profile
+            payload["cache_hit"] = True
+            payload["seed_source"] = seed_source
             return payload
 
     if cache_dir.exists():
@@ -2841,7 +3671,7 @@ def _ensure_validation_artifacts(
 
     if emit:
         emit(
-            f"  validating {lookback_months}mo: "
+            f"  scrutiny {lookback_months}mo: "
             f"timeframe={package_inputs['timeframe']} instruments={','.join(package_inputs['instruments'])}"
         )
 
@@ -2869,7 +3699,31 @@ def _ensure_validation_artifacts(
     payload["profile_ref"] = profile_ref
     payload["recreated_profile"] = recreated_profile
     payload["cache_hit"] = False
+    payload["seed_source"] = seed_source
     return payload
+
+
+def _ensure_validation_artifacts(
+    *,
+    config,
+    cli: FuzzfolioCli,
+    run_dir: Path,
+    attempts: list[dict[str, Any]],
+    best_attempt: dict[str, Any],
+    lookback_months: int,
+    force_rebuild: bool = False,
+    emit: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    return _ensure_attempt_scrutiny_artifacts(
+        config=config,
+        cli=cli,
+        run_dir=run_dir,
+        attempts=attempts,
+        attempt=best_attempt,
+        lookback_months=lookback_months,
+        force_rebuild=force_rebuild,
+        emit=emit,
+    )
 
 
 def _build_validation_rows(
@@ -3278,28 +4132,27 @@ def cmd_sync_profile_drop_pngs(
 def cmd_calculate_full_backtests(
     *,
     run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    limit: int | None,
+    max_workers: int | None,
+    use_dev_sim_worker_count: bool,
+    require_scrutiny_36: bool,
     force_rebuild: bool,
     as_json: bool,
 ) -> int:
     config = load_config()
-    cli = FuzzfolioCli(config.fuzzfolio)
-
-    all_run_dirs = list_run_dirs(config.runs_root)
-    if run_ids:
-        wanted = {token.strip() for token in run_ids if str(token).strip()}
-        run_dirs = [run_dir for run_dir in all_run_dirs if run_dir.name in wanted]
-        missing = sorted(wanted - {run_dir.name for run_dir in run_dirs})
-        if missing:
-            raise SystemExit(f"Run directories do not exist: {', '.join(missing)}")
-    else:
-        run_dirs = all_run_dirs
-
-    all_attempts: list[tuple[Path, dict[str, Any]]] = []
-    for run_dir in run_dirs:
-        for attempt in load_run_attempts(run_dir):
-            all_attempts.append((run_dir, attempt))
-
-    if not all_attempts:
+    run_dirs = _matching_run_dirs(config, run_ids)
+    catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    catalog_by_attempt_id = {
+        str(row.get("attempt_id") or ""): row for row in catalog_rows
+    }
+    matched_items = _matched_attempt_items(
+        config,
+        run_ids=run_ids,
+        attempt_ids=attempt_ids,
+        require_scored=False,
+    )
+    if not matched_items:
         print(
             json.dumps(
                 {"status": "no_attempts", "considered": 0}, ensure_ascii=True, indent=2
@@ -3307,7 +4160,7 @@ def cmd_calculate_full_backtests(
         )
         return 0
 
-    def needs_calculation(run_dir: Path, attempt: dict[str, Any]) -> bool:
+    def needs_calculation(attempt: dict[str, Any]) -> bool:
         artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
         if not artifact_dir.exists():
             return False
@@ -3316,13 +4169,50 @@ def cmd_calculate_full_backtests(
         curve_path = artifact_dir / "full-backtest-36mo-curve.json"
         return not curve_path.exists()
 
-    to_calculate = [(rd, a) for rd, a in all_attempts if needs_calculation(rd, a)]
+    filter_rejections = {
+        "already_has_full_backtest": 0,
+        "missing_scrutiny_36m": 0,
+    }
+    eligible_items: list[tuple[Path, dict[str, Any], dict[str, Any]]] = []
+    for run_dir, _attempts, attempt in matched_items:
+        row = catalog_by_attempt_id.get(str(attempt.get("attempt_id") or "")) or {}
+        if not needs_calculation(attempt):
+            filter_rejections["already_has_full_backtest"] += 1
+            continue
+        if require_scrutiny_36 and not bool(row.get("has_scrutiny_36m")):
+            filter_rejections["missing_scrutiny_36m"] += 1
+            continue
+        eligible_items.append((run_dir, attempt, row))
+
+    eligible_items.sort(key=lambda item: _full_backtest_priority_key(item[2]))
+    to_calculate = list(eligible_items)
+    if limit is not None and int(limit) >= 0:
+        to_calculate = to_calculate[: int(limit)]
     total = len(to_calculate)
-    skipped = len(all_attempts) - total
+    skipped = len(matched_items) - total
+
+    worker_source = "config.validation_max_concurrency"
+    detected_sim_workers = None
+    resolved_max_workers = int(max_workers) if max_workers is not None else None
+    if use_dev_sim_worker_count:
+        detected_sim_workers = _detect_dev_sim_worker_count()
+        if detected_sim_workers is not None:
+            worker_source = "dev_sim_workers"
+            if resolved_max_workers is None:
+                resolved_max_workers = detected_sim_workers
+        else:
+            worker_source = "config.validation_max_concurrency_fallback"
+    if resolved_max_workers is None:
+        resolved_max_workers = int(config.research.validation_max_concurrency)
+    resolved_max_workers = max(1, int(resolved_max_workers))
+    if total > 0:
+        resolved_max_workers = min(resolved_max_workers, total)
 
     results: list[dict[str, Any]] = []
     calculated = 0
+    seeded_materialized = 0
     failed = 0
+    derived_refresh = None
 
     use_progress = (
         (not as_json)
@@ -3351,49 +4241,1046 @@ def cmd_calculate_full_backtests(
 
     with progress:
         task_id = progress.add_task("calculate full backtests", total=total or 1)
-        for index, (run_dir, attempt) in enumerate(to_calculate):
-            attempt_id = str(attempt.get("attempt_id") or "")
-            run_id = run_dir.name
+        if total == 0:
             progress.update(
                 task_id,
                 description=(
-                    f"{index + 1}/{total} "
-                    f"[green]ok={calculated}[/green] "
-                    f"[yellow]skip={skipped}[/yellow] "
-                    f"[red]fail={failed}[/red] "
-                    f"{run_id}"
+                    f"0/0 [green]ok={calculated}[/green] "
+                    f"[yellow]skip={skipped}[/yellow] [red]fail={failed}[/red]"
                 ),
             )
-            emit(f"calculate {index + 1}/{total} {run_id} {attempt_id}")
-            result_entry: dict[str, Any] = {
-                "run_id": run_id,
-                "attempt_id": attempt_id,
-                "status": "pending",
-            }
-            try:
-                paths = _run_full_backtest_for_attempt(config, attempt)
-                result_entry["status"] = "calculated"
-                result_entry["curve_path"] = paths.get("curve_path")
-                calculated += 1
-                emit(f"  done: {paths.get('curve_path')}")
-            except Exception as exc:
-                failed += 1
-                result_entry["status"] = "failed"
-                result_entry["error"] = str(exc)
-                emit(f"  failed: {exc}")
-            results.append(result_entry)
-            progress.advance(task_id, 1)
+        else:
+            pending_items = list(to_calculate)
+            in_flight: dict[Any, tuple[Path, dict[str, Any], dict[str, Any], float]] = {}
+
+            def refresh_progress(active_run_id: str | None = None) -> None:
+                queued_count = len(pending_items)
+                running_count = len(in_flight)
+                detail = f" {active_run_id}" if active_run_id else ""
+                progress.update(
+                    task_id,
+                    description=(
+                        f"{calculated + failed}/{total} "
+                        f"[green]ok={calculated}[/green] "
+                        f"[yellow]seeded={seeded_materialized}[/yellow] "
+                        f"[cyan]run={running_count}[/cyan] "
+                        f"[magenta]queue={queued_count}[/magenta] "
+                        f"[bright_yellow]skip={skipped}[/bright_yellow] "
+                        f"[red]fail={failed}[/red]{detail}"
+                    ),
+                )
+
+            with ThreadPoolExecutor(max_workers=resolved_max_workers) as executor:
+                while pending_items or in_flight:
+                    while pending_items and len(in_flight) < resolved_max_workers:
+                        run_dir, attempt, row = pending_items.pop(0)
+                        attempt_id = str(attempt.get("attempt_id") or "")
+                        emit(
+                            f"queue {calculated + failed + len(in_flight) + 1}/{total} "
+                            f"{run_dir.name} {attempt_id}"
+                        )
+                        future = executor.submit(
+                            _run_full_backtest_with_retry, config, attempt
+                        )
+                        in_flight[future] = (run_dir, attempt, row, pytime.time())
+                        refresh_progress(run_dir.name)
+                    done, _ = wait(
+                        set(in_flight.keys()),
+                        return_when=FIRST_COMPLETED,
+                    )
+                    for future in done:
+                        run_dir, attempt, row, started_at = in_flight.pop(future)
+                        attempt_id = str(attempt.get("attempt_id") or "")
+                        result_entry: dict[str, Any] = {
+                            "run_id": run_dir.name,
+                            "attempt_id": attempt_id,
+                            "candidate_name": row.get("candidate_name"),
+                            "score_36m": row.get("score_36m"),
+                            "composite_score": row.get("composite_score"),
+                            "status": "pending",
+                            "duration_seconds": round(pytime.time() - started_at, 3),
+                        }
+                        try:
+                            paths = future.result()
+                            seed_source = paths.get("seed_source")
+                            retry_mode = paths.get("retry_mode")
+                            recovery_mode = paths.get("recovery_mode")
+                            result_entry["status"] = (
+                                "seeded" if seed_source else "calculated"
+                            )
+                            result_entry["curve_path"] = paths.get("curve_path")
+                            result_entry["result_path"] = paths.get("result_path")
+                            result_entry["seed_source"] = seed_source
+                            if retry_mode:
+                                result_entry["retry_mode"] = retry_mode
+                            if recovery_mode:
+                                result_entry["recovery_mode"] = recovery_mode
+                            calculated += 1
+                            if seed_source:
+                                seeded_materialized += 1
+                            emit(
+                                f"  done: {run_dir.name} {attempt_id} "
+                                f"({result_entry['duration_seconds']}s)"
+                                + (
+                                    f" seed={seed_source}"
+                                    if seed_source
+                                    else ""
+                                )
+                                + (
+                                    f" retry={retry_mode}"
+                                    if retry_mode
+                                    else ""
+                                )
+                                + (
+                                    f" recovery={recovery_mode}"
+                                    if recovery_mode
+                                    else ""
+                                )
+                            )
+                        except Exception as exc:
+                            failed += 1
+                            result_entry["status"] = "failed"
+                            result_entry["error"] = str(exc)
+                            emit(
+                                f"  failed: {run_dir.name} {attempt_id} "
+                                f"({result_entry['duration_seconds']}s) {exc}"
+                            )
+                        results.append(result_entry)
+                        progress.advance(task_id, 1)
+                        refresh_progress(run_dir.name)
+
+    derived_refresh = _refresh_global_derived_corpus_state(config)
+    failure_summary = _build_full_backtest_failure_summary(results)
+    write_json(config.full_backtest_failures_json_path, failure_summary)
 
     payload = {
-        "runs_considered": len(run_dirs),
-        "total_attempts": len(all_attempts),
+        "runs_considered": len({run_dir.name for run_dir, *_ in matched_items}),
+        "matched_attempts": len(matched_items),
+        "eligible_attempts": len(eligible_items),
         "skipped": skipped,
+        "filter_rejections": filter_rejections,
+        "filters": {
+            "run_ids": run_ids,
+            "attempt_ids": attempt_ids,
+            "limit": limit,
+            "require_scrutiny_36": require_scrutiny_36,
+            "force_rebuild": force_rebuild,
+        },
+        "max_workers_used": resolved_max_workers,
+        "max_workers_source": worker_source,
+        "detected_dev_sim_workers": detected_sim_workers,
         "calculated": calculated,
+        "seeded_materialized": seeded_materialized,
         "failed": failed,
+        "failure_summary": failure_summary,
+        "failure_summary_json": str(config.full_backtest_failures_json_path),
+        "derived_refresh": derived_refresh,
         "results": results,
     }
     print(json.dumps(payload, ensure_ascii=True, indent=2))
     return 0 if failed == 0 else 1
+
+
+def cmd_build_attempt_catalog(*, run_ids: list[str] | None, as_json: bool) -> int:
+    config = load_config()
+    run_dirs = _matching_run_dirs(config, run_ids)
+    rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    summary = catalog_summary(rows)
+    write_json(config.attempt_catalog_json_path, rows)
+    write_csv(config.attempt_catalog_csv_path, rows)
+    write_json(config.attempt_catalog_summary_path, summary)
+    payload = {
+        "run_count": len(run_dirs),
+        "attempt_catalog_json": str(config.attempt_catalog_json_path),
+        "attempt_catalog_csv": str(config.attempt_catalog_csv_path),
+        "attempt_catalog_summary_json": str(config.attempt_catalog_summary_path),
+        "summary": summary,
+    }
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0
+
+
+def cmd_audit_full_backtests(
+    *,
+    run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    run_dirs = _matching_run_dirs(config, run_ids)
+    rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    wanted_attempt_ids = {
+        token.strip() for token in (attempt_ids or []) if str(token).strip()
+    }
+    if wanted_attempt_ids:
+        rows = [
+            row for row in rows if str(row.get("attempt_id") or "") in wanted_attempt_ids
+        ]
+    audit_payload = build_full_backtest_audit(rows)
+    output_path = (
+        config.full_backtest_audit_json_path
+        if not run_ids and not wanted_attempt_ids
+        else None
+    )
+    if output_path is not None:
+        write_json(output_path, audit_payload)
+    payload = {
+        "full_backtest_audit_json": str(output_path) if output_path is not None else None,
+        "run_count": len(run_dirs),
+        "attempt_count": len(rows),
+        **audit_payload,
+    }
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0
+
+
+def cmd_plot_corpus_score_vs_trades(
+    *,
+    run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    require_full_backtest_36: bool,
+    x_axis_max: float | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    run_dirs = _matching_run_dirs(config, run_ids)
+    rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    wanted_attempt_ids = {
+        token.strip() for token in (attempt_ids or []) if str(token).strip()
+    }
+    if wanted_attempt_ids:
+        rows = [
+            row for row in rows if str(row.get("attempt_id") or "") in wanted_attempt_ids
+        ]
+    plotted_rows = render_attempt_tradeoff_scatter_artifacts(
+        rows,
+        config.corpus_tradeoff_plot_path,
+        config.corpus_tradeoff_json_path,
+        require_full_backtest_36=require_full_backtest_36,
+        x_axis_max=(
+            None if x_axis_max is not None and float(x_axis_max) < 0.0 else x_axis_max
+        ),
+    )
+    payload = {
+        "plot_path": str(config.corpus_tradeoff_plot_path),
+        "json_path": str(config.corpus_tradeoff_json_path),
+        "run_count": len(run_dirs),
+        "candidate_rows_plotted": len(plotted_rows),
+        "valid_full_backtest_rows_plotted": sum(
+            1 for row in plotted_rows if bool(row.get("is_valid_full_backtest_36m"))
+        ),
+        "require_full_backtest_36": require_full_backtest_36,
+    }
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0
+
+
+def _render_profile_drop_for_attempt(
+    *,
+    config,
+    cli: FuzzfolioCli,
+    renderer_executable: Path,
+    working_dir: Path,
+    run_dir: Path,
+    attempts: list[dict[str, Any]],
+    attempt: dict[str, Any],
+    output_root: Path,
+    lookback_months: int,
+    force_rebuild: bool,
+    timeout_seconds: int,
+    emit: Callable[[str], None] | None,
+) -> dict[str, Any]:
+    package_inputs = _build_package_inputs(attempt, run_dir=run_dir, attempts=attempts)
+    profile_path = package_inputs.get("profile_path")
+    profile_ref = str(
+        package_inputs.get("profile_ref") or attempt.get("profile_ref") or ""
+    ).strip()
+    recreated_profile = False
+
+    if profile_ref and not _cloud_profile_exists(cli, profile_ref):
+        profile_ref = ""
+    if not profile_ref:
+        if not isinstance(profile_path, Path) or not profile_path.exists():
+            raise RuntimeError(
+                f"Attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
+            )
+        profile_ref = _create_cloud_profile(cli, profile_path)
+        _update_attempt_profile_ref(
+            run_dir, str(attempt.get("attempt_id") or ""), profile_ref
+        )
+        recreated_profile = True
+
+    attempt_token = _slug_token(
+        f"{attempt.get('selection_rank') or ''}-{attempt.get('attempt_id') or attempt.get('candidate_name') or 'candidate'}"
+    )
+    attempt_root = output_root / attempt_token
+    package_output_root = attempt_root / "bundle"
+    png_path = attempt_root / f"profile-drop-{int(lookback_months)}mo.png"
+    manifest_path = attempt_root / f"profile-drop-{int(lookback_months)}mo.manifest.json"
+    manifest_payload = {
+        "version": 1,
+        "run_id": run_dir.name,
+        "attempt_id": str(attempt.get("attempt_id") or ""),
+        "candidate_name": str(attempt.get("candidate_name") or ""),
+        "profile_ref": profile_ref,
+        "timeframe": str(package_inputs["timeframe"]),
+        "instruments": list(package_inputs["instruments"]),
+        "lookback_months": int(lookback_months),
+        "quality_score_preset": str(config.research.quality_score_preset),
+    }
+    if (
+        (not force_rebuild)
+        and png_path.exists()
+        and manifest_path.exists()
+        and _load_json_if_exists(manifest_path) == manifest_payload
+    ):
+        return {
+            "status": "cached",
+            "png_path": str(png_path),
+            "manifest_path": str(manifest_path),
+            "profile_ref": profile_ref,
+            "recreated_profile": recreated_profile,
+        }
+
+    if attempt_root.exists():
+        shutil.rmtree(attempt_root)
+    package_output_root.mkdir(parents=True, exist_ok=True)
+    if emit:
+        emit(
+            f"  package {attempt.get('attempt_id')} timeframe={package_inputs['timeframe']} "
+            f"instruments={','.join(package_inputs['instruments'])} lookback={lookback_months}mo"
+        )
+    package_args = [
+        "package",
+        "--profile-ref",
+        profile_ref,
+        "--timeframe",
+        str(package_inputs["timeframe"]),
+        "--lookback-months",
+        str(int(lookback_months)),
+        "--output-root",
+        str(package_output_root),
+        "--label",
+        f"shortlist-{attempt_token}",
+        "--skip-catalogs",
+        "--skip-render-capture",
+        "--allow-timeframe-mismatch",
+        "--quality-score-preset",
+        str(config.research.quality_score_preset),
+    ]
+    for instrument in package_inputs["instruments"]:
+        package_args.extend(["--instrument", str(instrument)])
+    cli.run(package_args, cwd=working_dir, timeout_seconds=float(timeout_seconds))
+
+    bundle_dir = _discover_bundle_dir(package_output_root)
+    renderer_argv = [str(renderer_executable)]
+    if config.fuzzfolio.workspace_root is not None:
+        renderer_argv.extend(["--workspace-root", str(config.fuzzfolio.workspace_root)])
+    renderer_argv.extend(["render", "--bundle", str(bundle_dir), "--out", str(png_path)])
+    _run_external(renderer_argv, cwd=working_dir, timeout_seconds=float(timeout_seconds))
+    _write_json_file(manifest_path, manifest_payload)
+    return {
+        "status": "rendered",
+        "png_path": str(png_path),
+        "manifest_path": str(manifest_path),
+        "profile_ref": profile_ref,
+        "recreated_profile": recreated_profile,
+    }
+
+
+def cmd_build_shortlist_report(
+    *,
+    run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    candidate_limit: int,
+    shortlist_size: int,
+    min_score_36: float,
+    min_retention_ratio: float,
+    min_trades_per_month: float,
+    max_drawdown_r: float,
+    drawdown_penalty: float,
+    trade_rate_bonus_weight: float,
+    trade_rate_bonus_target: float,
+    novelty_penalty: float,
+    max_per_run: int,
+    max_per_strategy_key: int,
+    max_sameness_to_board: float,
+    require_full_backtest_36: bool,
+    generate_profile_drops: bool,
+    profile_drop_lookback_months: int,
+    chart_trades_x_max: float,
+    profile_drop_timeout_seconds: int,
+    force_rebuild_profile_drops: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    run_dirs = _matching_run_dirs(config, run_ids)
+    full_catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    wanted_attempt_ids = {
+        token.strip() for token in (attempt_ids or []) if str(token).strip()
+    }
+    rows = list(full_catalog_rows)
+    if wanted_attempt_ids:
+        rows = [
+            row for row in rows if str(row.get("attempt_id") or "") in wanted_attempt_ids
+        ]
+    rows.sort(key=_full_backtest_priority_key)
+    if candidate_limit >= 0:
+        rows = rows[:candidate_limit]
+
+    filter_rejections = {
+        "missing_score_36m": 0,
+        "score_below_min_score_36": 0,
+        "missing_trades_per_month_36m": 0,
+        "trades_below_min_trades_per_month": 0,
+        "missing_retention_ratio_36m_vs_12m": 0,
+        "retention_below_min_retention_ratio": 0,
+        "missing_drawdown_36m": 0,
+        "drawdown_above_max_drawdown_r": 0,
+        "missing_full_backtest_36m": 0,
+        "invalid_full_backtest_36m": 0,
+    }
+    candidate_rows: list[dict[str, Any]] = []
+    max_drawdown_cap = None if float(max_drawdown_r) < 0.0 else float(max_drawdown_r)
+    for row in rows:
+        score_36 = _safe_float_value(row.get("score_36m"))
+        if score_36 is None:
+            filter_rejections["missing_score_36m"] += 1
+            continue
+        if score_36 < float(min_score_36):
+            filter_rejections["score_below_min_score_36"] += 1
+            continue
+        trades_per_month_36 = _safe_float_value(row.get("trades_per_month_36m"))
+        if float(min_trades_per_month) > 0.0:
+            if trades_per_month_36 is None:
+                filter_rejections["missing_trades_per_month_36m"] += 1
+                continue
+            if trades_per_month_36 < float(min_trades_per_month):
+                filter_rejections["trades_below_min_trades_per_month"] += 1
+                continue
+        retention_ratio = _safe_float_value(row.get("score_retention_ratio_36m_vs_12m"))
+        if float(min_retention_ratio) > 0.0:
+            if retention_ratio is None:
+                filter_rejections["missing_retention_ratio_36m_vs_12m"] += 1
+                continue
+            if retention_ratio < float(min_retention_ratio):
+                filter_rejections["retention_below_min_retention_ratio"] += 1
+                continue
+        drawdown_36 = _safe_float_value(row.get("max_drawdown_r_36m"))
+        if max_drawdown_cap is not None:
+            if drawdown_36 is None:
+                filter_rejections["missing_drawdown_36m"] += 1
+                continue
+            if drawdown_36 > max_drawdown_cap:
+                filter_rejections["drawdown_above_max_drawdown_r"] += 1
+                continue
+        if require_full_backtest_36 and not bool(row.get("has_full_backtest_36m")):
+            filter_rejections["missing_full_backtest_36m"] += 1
+            continue
+        if (
+            require_full_backtest_36
+            and str(row.get("full_backtest_validation_status_36m") or "") != "valid"
+        ):
+            filter_rejections["invalid_full_backtest_36m"] += 1
+            continue
+        candidate_rows.append(row)
+
+    similarity_payload = build_candidate_similarity_payload(candidate_rows)
+    shortlist_board = select_promotion_board(
+        candidate_rows,
+        similarity_payload,
+        board_size=shortlist_size,
+        novelty_penalty=novelty_penalty,
+        drawdown_penalty=drawdown_penalty,
+        trade_rate_bonus_weight=trade_rate_bonus_weight,
+        trade_rate_bonus_target=trade_rate_bonus_target,
+        max_drawdown_r=max_drawdown_cap,
+        max_sameness_to_board=max_sameness_to_board,
+        max_per_run=(None if max_per_run < 0 else max_per_run),
+        max_per_strategy_key=(None if max_per_strategy_key < 0 else max_per_strategy_key),
+    )
+    shortlist_rows = list(shortlist_board.get("selected") or [])
+    shortlist_similarity_payload = build_candidate_similarity_payload(shortlist_rows)
+
+    report_root = config.derived_root / "shortlist-report"
+    charts_root = report_root / "charts"
+    profile_drop_root = report_root / "profile-drops"
+    report_root.mkdir(parents=True, exist_ok=True)
+    charts_root.mkdir(parents=True, exist_ok=True)
+    profile_drop_root.mkdir(parents=True, exist_ok=True)
+
+    trades_x_cap = None if float(chart_trades_x_max) < 0.0 else float(chart_trades_x_max)
+    render_attempt_tradeoff_scatter_artifacts(
+        candidate_rows,
+        charts_root / "corpus-score-vs-trades-36mo.png",
+        charts_root / "corpus-score-vs-trades-36mo.json",
+        require_full_backtest_36=require_full_backtest_36,
+        x_axis_max=trades_x_cap,
+        title_prefix="Corpus",
+    )
+    render_attempt_tradeoff_scatter_artifacts(
+        shortlist_rows,
+        charts_root / "shortlist-score-vs-trades-36mo.png",
+        charts_root / "shortlist-score-vs-trades-36mo.json",
+        require_full_backtest_36=require_full_backtest_36,
+        x_axis_max=trades_x_cap,
+        title_prefix="Shortlist",
+    )
+    render_attempt_tradeoff_overlay_artifacts(
+        candidate_rows,
+        shortlist_rows,
+        charts_root / "shortlist-overlay-score-vs-trades-36mo.png",
+        charts_root / "shortlist-overlay-score-vs-trades-36mo.json",
+        x_axis_max=trades_x_cap,
+        title_prefix="Shortlist Overlay",
+    )
+    render_attempt_drawdown_scatter_artifacts(
+        candidate_rows,
+        charts_root / "corpus-score-vs-drawdown-36mo.png",
+        charts_root / "corpus-score-vs-drawdown-36mo.json",
+        require_full_backtest_36=require_full_backtest_36,
+        title_prefix="Corpus",
+    )
+    render_attempt_drawdown_scatter_artifacts(
+        shortlist_rows,
+        charts_root / "shortlist-score-vs-drawdown-36mo.png",
+        charts_root / "shortlist-score-vs-drawdown-36mo.json",
+        require_full_backtest_36=require_full_backtest_36,
+        title_prefix="Shortlist",
+    )
+    render_similarity_scatter_artifacts(
+        similarity_payload,
+        charts_root / "corpus-score-vs-sameness-36mo.png",
+    )
+    render_similarity_heatmap_artifacts(
+        shortlist_similarity_payload,
+        charts_root / "shortlist-similarity-heatmap.png",
+        charts_root / "shortlist-similarity-heatmap.json",
+    )
+    render_similarity_scatter_artifacts(
+        shortlist_similarity_payload,
+        charts_root / "shortlist-score-vs-sameness-36mo.png",
+    )
+
+    profile_drop_results: list[dict[str, Any]] = []
+    if generate_profile_drops and shortlist_rows:
+        cli = FuzzfolioCli(config.fuzzfolio)
+        cli.ensure_login()
+        renderer_executable, workspace_root = _resolve_drop_renderer_executable(config)
+        working_dir = workspace_root or config.repo_root
+        expected_drop_dirs = {
+            _slug_token(
+                f"{row.get('selection_rank') or ''}-{row.get('attempt_id') or row.get('candidate_name') or 'candidate'}"
+            )
+            for row in shortlist_rows
+        }
+        for child in profile_drop_root.iterdir():
+            if not child.is_dir():
+                continue
+            if child.name not in expected_drop_dirs:
+                shutil.rmtree(child)
+        for row in shortlist_rows:
+            run_dir = config.runs_root / str(row.get("run_id") or "")
+            attempts = load_run_attempts(run_dir)
+            matched_attempt = next(
+                (
+                    attempt
+                    for attempt in attempts
+                    if str(attempt.get("attempt_id") or "")
+                    == str(row.get("attempt_id") or "")
+                ),
+                None,
+            )
+            if matched_attempt is None:
+                profile_drop_results.append(
+                    {
+                        "attempt_id": row.get("attempt_id"),
+                        "status": "failed",
+                        "error": f"Attempt ledger record missing for run {run_dir.name}",
+                    }
+                )
+                continue
+            try:
+                result = _render_profile_drop_for_attempt(
+                    config=config,
+                    cli=cli,
+                    renderer_executable=renderer_executable,
+                    working_dir=working_dir,
+                    run_dir=run_dir,
+                    attempts=attempts,
+                    attempt=matched_attempt,
+                    output_root=profile_drop_root,
+                    lookback_months=int(profile_drop_lookback_months),
+                    force_rebuild=force_rebuild_profile_drops,
+                    timeout_seconds=int(profile_drop_timeout_seconds),
+                    emit=(None if as_json else _write_plain_line),
+                )
+                profile_drop_results.append(
+                    {
+                        "attempt_id": row.get("attempt_id"),
+                        "run_id": row.get("run_id"),
+                        "candidate_name": row.get("candidate_name"),
+                        **result,
+                    }
+                )
+            except Exception as exc:
+                profile_drop_results.append(
+                    {
+                        "attempt_id": row.get("attempt_id"),
+                        "run_id": row.get("run_id"),
+                        "candidate_name": row.get("candidate_name"),
+                        "status": "failed",
+                        "error": str(exc),
+                    }
+                )
+
+    shortlist_payload = {
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "filters": {
+            "run_ids": run_ids,
+            "attempt_ids": attempt_ids,
+            "candidate_limit": candidate_limit,
+            "shortlist_size": shortlist_size,
+            "min_score_36": min_score_36,
+            "min_retention_ratio": min_retention_ratio,
+            "min_trades_per_month": min_trades_per_month,
+            "max_drawdown_r": max_drawdown_cap,
+            "drawdown_penalty": drawdown_penalty,
+            "trade_rate_bonus_weight": trade_rate_bonus_weight,
+            "trade_rate_bonus_target": trade_rate_bonus_target,
+            "novelty_penalty": novelty_penalty,
+            "max_per_run": max_per_run,
+            "max_per_strategy_key": max_per_strategy_key,
+            "max_sameness_to_board": max_sameness_to_board,
+            "require_full_backtest_36": require_full_backtest_36,
+            "profile_drop_lookback_months": profile_drop_lookback_months,
+            "chart_trades_x_max": trades_x_cap,
+        },
+        "candidate_count": len(candidate_rows),
+        "selected_count": len(shortlist_rows),
+        "alternate_count": len(shortlist_board.get("alternates") or []),
+        "candidate_trade_rate_summary": _trade_rate_summary(candidate_rows),
+        "selected_trade_rate_summary": _trade_rate_summary(shortlist_rows),
+        "filter_rejections": filter_rejections,
+        "selected_by_run": shortlist_board.get("selected_by_run") or {},
+        "selected_by_strategy_key": shortlist_board.get("selected_by_strategy_key") or {},
+        "selected": shortlist_rows,
+        "alternates": shortlist_board.get("alternates") or [],
+        "top_similarity_pairs": list((similarity_payload.get("pairs") or [])[:400]),
+        "charts": {
+            "corpus_score_vs_trades": str(charts_root / "corpus-score-vs-trades-36mo.png"),
+            "shortlist_score_vs_trades": str(charts_root / "shortlist-score-vs-trades-36mo.png"),
+            "shortlist_overlay_score_vs_trades": str(
+                charts_root / "shortlist-overlay-score-vs-trades-36mo.png"
+            ),
+            "corpus_score_vs_drawdown": str(charts_root / "corpus-score-vs-drawdown-36mo.png"),
+            "shortlist_score_vs_drawdown": str(charts_root / "shortlist-score-vs-drawdown-36mo.png"),
+            "corpus_score_vs_sameness": str(charts_root / "corpus-score-vs-sameness-36mo.png"),
+            "shortlist_score_vs_sameness": str(charts_root / "shortlist-score-vs-sameness-36mo.png"),
+            "shortlist_similarity_heatmap": str(charts_root / "shortlist-similarity-heatmap.png"),
+        },
+        "profile_drops": profile_drop_results,
+    }
+    write_json(report_root / "shortlist-report.json", shortlist_payload)
+    write_csv(
+        report_root / "shortlist-report.csv",
+        [{"section": "selected", **row} for row in shortlist_rows]
+        + [{"section": "alternate", **row} for row in (shortlist_board.get("alternates") or [])],
+    )
+    print(
+        json.dumps(
+            {
+                "report_root": str(report_root),
+                "shortlist_json": str(report_root / "shortlist-report.json"),
+                "shortlist_csv": str(report_root / "shortlist-report.csv"),
+                "candidate_count": len(candidate_rows),
+                "selected_count": len(shortlist_rows),
+                "alternate_count": len(shortlist_board.get("alternates") or []),
+                "profile_drop_rendered": sum(
+                    1 for row in profile_drop_results if row.get("status") in {"rendered", "cached"}
+                ),
+                "profile_drop_failed": sum(
+                    1 for row in profile_drop_results if row.get("status") == "failed"
+                ),
+                "charts": shortlist_payload["charts"],
+                "selected": shortlist_rows,
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_hydrate_scrutiny_cache(
+    *,
+    run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    lookback_months: list[int] | None,
+    limit: int | None,
+    force_rebuild: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    cli = FuzzfolioCli(config.fuzzfolio)
+    cli.ensure_login()
+    horizons = sorted({int(value) for value in (lookback_months or [12, 36]) if int(value) > 0})
+    items = _matched_attempt_items(
+        config,
+        run_ids=run_ids,
+        attempt_ids=attempt_ids,
+        require_scored=True,
+    )
+    if limit is not None and limit >= 0:
+        items = items[:limit]
+
+    total = len(items)
+    results: list[dict[str, Any]] = []
+    rebuilt = 0
+    cache_hits = 0
+    seeded = 0
+    failed = 0
+    derived_refresh = None
+
+    use_progress = (
+        (not as_json)
+        and (not PLAIN_PROGRESS_MODE)
+        and bool(getattr(console, "is_terminal", False))
+    )
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=32),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+        disable=not use_progress,
+    )
+
+    def emit(message: str) -> None:
+        if as_json:
+            return
+        if use_progress:
+            progress.console.print(message)
+            return
+        _write_plain_line(message)
+
+    with progress:
+        task_id = progress.add_task("hydrate scrutiny cache", total=total or 1)
+        for index, (run_dir, attempts, attempt) in enumerate(items, start=1):
+            progress.update(
+                task_id,
+                description=(
+                    f"{index}/{total} "
+                    f"[green]rebuilt={rebuilt}[/green] "
+                    f"[cyan]hits={cache_hits}[/cyan] "
+                    f"[yellow]seeded={seeded}[/yellow] "
+                    f"[red]fail={failed}[/red] "
+                    f"{run_dir.name}"
+                ),
+            )
+            emit(f"scrutiny {index}/{total} {run_dir.name} {attempt.get('attempt_id')}")
+            attempt_result: dict[str, Any] = {
+                "run_id": run_dir.name,
+                "attempt_id": str(attempt.get("attempt_id") or ""),
+                "candidate_name": attempt.get("candidate_name"),
+                "horizons": [],
+            }
+            try:
+                for horizon in horizons:
+                    payload = _ensure_attempt_scrutiny_artifacts(
+                        config=config,
+                        cli=cli,
+                        run_dir=run_dir,
+                        attempts=attempts,
+                        attempt=attempt,
+                        lookback_months=horizon,
+                        force_rebuild=force_rebuild,
+                        emit=emit,
+                    )
+                    cache_hit = bool(payload.get("cache_hit"))
+                    seed_source = payload.get("seed_source")
+                    if cache_hit:
+                        cache_hits += 1
+                    else:
+                        rebuilt += 1
+                    if seed_source:
+                        seeded += 1
+                    attempt_result["horizons"].append(
+                        {
+                            "lookback_months": horizon,
+                            "artifact_dir": payload.get("artifact_dir"),
+                            "score": payload.get("score"),
+                            "score_basis": payload.get("score_basis"),
+                            "cache_hit": cache_hit,
+                            "seed_source": seed_source,
+                        }
+                    )
+                attempt_result["status"] = "ok"
+            except Exception as exc:
+                failed += 1
+                attempt_result["status"] = "failed"
+                attempt_result["error"] = str(exc)
+                emit(f"  failed: {exc}")
+            results.append(attempt_result)
+            progress.advance(task_id, 1)
+
+    derived_refresh = _refresh_global_derived_corpus_state(config)
+
+    payload = {
+        "attempts_considered": len(items),
+        "horizons": horizons,
+        "rebuilt": rebuilt,
+        "cache_hits": cache_hits,
+        "seeded": seeded,
+        "failed": failed,
+        "derived_refresh": derived_refresh,
+        "results": results,
+    }
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 0 if failed == 0 else 1
+
+
+def cmd_build_promotion_board(
+    *,
+    run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    candidate_limit: int,
+    board_size: int,
+    min_score_36: float,
+    min_retention_ratio: float,
+    min_trades_per_month: float,
+    novelty_penalty: float,
+    max_per_run: int,
+    max_per_strategy_key: int,
+    max_sameness_to_board: float,
+    require_full_backtest_36: bool,
+    hydrate_missing: bool,
+    force_rebuild: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    run_dirs = _matching_run_dirs(config, run_ids)
+    full_catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    initial_rows = list(full_catalog_rows)
+    wanted_attempt_ids = {
+        token.strip() for token in (attempt_ids or []) if str(token).strip()
+    }
+
+    def promotion_sort_key(row: dict[str, Any]) -> tuple[bool, float, float, str]:
+        score_36 = row.get("score_36m")
+        composite_score = row.get("composite_score")
+        primary = (
+            float(score_36)
+            if score_36 is not None
+            else (
+                float(composite_score)
+                if composite_score is not None
+                else float("-inf")
+            )
+        )
+        secondary = (
+            float(composite_score)
+            if composite_score is not None
+            else float("-inf")
+        )
+        return (
+            primary == float("-inf"),
+            -primary,
+            -secondary,
+            str(row.get("attempt_id") or ""),
+        )
+
+    if wanted_attempt_ids:
+        initial_rows = [
+            row
+            for row in initial_rows
+            if str(row.get("attempt_id") or "") in wanted_attempt_ids
+        ]
+    initial_rows.sort(key=promotion_sort_key)
+    if candidate_limit >= 0:
+        initial_rows = initial_rows[:candidate_limit]
+
+    if hydrate_missing and initial_rows:
+        cli = FuzzfolioCli(config.fuzzfolio)
+        cli.ensure_login()
+        hydrate_attempt_ids = [str(row.get("attempt_id") or "") for row in initial_rows]
+        horizons = [36]
+        if min_retention_ratio > 0.0:
+            horizons = [12, 36]
+        hydrate_items = _matched_attempt_items(
+            config,
+            run_ids=run_ids,
+            attempt_ids=hydrate_attempt_ids,
+            require_scored=True,
+        )
+        for run_dir, attempts, attempt in hydrate_items:
+            for horizon in horizons:
+                _ensure_attempt_scrutiny_artifacts(
+                    config=config,
+                    cli=cli,
+                    run_dir=run_dir,
+                    attempts=attempts,
+                    attempt=attempt,
+                    lookback_months=horizon,
+                    force_rebuild=force_rebuild,
+                    emit=None,
+                )
+
+    full_catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    rows = list(full_catalog_rows)
+    if wanted_attempt_ids:
+        rows = [
+            row for row in rows if str(row.get("attempt_id") or "") in wanted_attempt_ids
+        ]
+    rows.sort(key=promotion_sort_key)
+    if candidate_limit >= 0:
+        rows = rows[:candidate_limit]
+
+    filtered_rows = []
+    filter_rejections = {
+        "missing_score_36m": 0,
+        "score_below_min_score_36": 0,
+        "missing_trades_per_month_36m": 0,
+        "trades_below_min_trades_per_month": 0,
+        "missing_retention_ratio_36m_vs_12m": 0,
+        "retention_below_min_retention_ratio": 0,
+        "missing_full_backtest_36m": 0,
+        "invalid_full_backtest_36m": 0,
+    }
+    for row in rows:
+        score_36 = row.get("score_36m")
+        trades_per_month_36 = row.get("trades_per_month_36m")
+        retention_ratio = row.get("score_retention_ratio_36m_vs_12m")
+        if score_36 is None:
+            filter_rejections["missing_score_36m"] += 1
+            continue
+        if float(score_36) < float(min_score_36):
+            filter_rejections["score_below_min_score_36"] += 1
+            continue
+        if min_trades_per_month > 0.0:
+            if trades_per_month_36 is None:
+                filter_rejections["missing_trades_per_month_36m"] += 1
+                continue
+            if float(trades_per_month_36) < float(min_trades_per_month):
+                filter_rejections["trades_below_min_trades_per_month"] += 1
+                continue
+        if min_retention_ratio > 0.0:
+            if retention_ratio is None:
+                filter_rejections["missing_retention_ratio_36m_vs_12m"] += 1
+                continue
+            if float(retention_ratio) < float(min_retention_ratio):
+                filter_rejections["retention_below_min_retention_ratio"] += 1
+                continue
+        if require_full_backtest_36 and not bool(row.get("has_full_backtest_36m")):
+            filter_rejections["missing_full_backtest_36m"] += 1
+            continue
+        if (
+            require_full_backtest_36
+            and str(row.get("full_backtest_validation_status_36m") or "") != "valid"
+        ):
+            filter_rejections["invalid_full_backtest_36m"] += 1
+            continue
+        filtered_rows.append(row)
+
+    similarity_payload = build_candidate_similarity_payload(filtered_rows)
+    board = select_promotion_board(
+        filtered_rows,
+        similarity_payload,
+        board_size=board_size,
+        novelty_penalty=novelty_penalty,
+        max_sameness_to_board=max_sameness_to_board,
+        max_per_run=(None if max_per_run < 0 else max_per_run),
+        max_per_strategy_key=(
+            None if max_per_strategy_key < 0 else max_per_strategy_key
+        ),
+    )
+    full_catalog_summary = catalog_summary(full_catalog_rows)
+    provisional_reasons = full_backtest_provisional_reasons(
+        full_catalog_summary,
+        require_full_backtest_36=require_full_backtest_36,
+        selected_rows=list(board.get("selected") or []),
+    )
+    payload = {
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "status": "provisional" if provisional_reasons else "ready_for_review",
+        "provisional_reasons": provisional_reasons,
+        "filters": {
+            "run_ids": run_ids,
+            "attempt_ids": attempt_ids,
+            "candidate_limit": candidate_limit,
+            "board_size": board_size,
+            "min_score_36": min_score_36,
+            "min_retention_ratio": min_retention_ratio,
+            "min_trades_per_month": min_trades_per_month,
+            "novelty_penalty": novelty_penalty,
+            "max_per_run": max_per_run,
+            "max_per_strategy_key": max_per_strategy_key,
+            "max_sameness_to_board": max_sameness_to_board,
+            "require_full_backtest_36": require_full_backtest_36,
+            "hydrate_missing": hydrate_missing,
+            "force_rebuild": force_rebuild,
+        },
+        "coverage": {
+            "attempt_count": full_catalog_summary.get("attempt_count"),
+            "attempts_with_scrutiny_36m": full_catalog_summary.get(
+                "attempts_with_scrutiny_36m"
+            ),
+            "attempts_with_full_backtest_36m": full_catalog_summary.get(
+                "attempts_with_full_backtest_36m"
+            ),
+            "attempts_with_valid_full_backtest_36m": full_catalog_summary.get(
+                "attempts_with_valid_full_backtest_36m"
+            ),
+            "attempts_with_invalid_full_backtest_36m": full_catalog_summary.get(
+                "attempts_with_invalid_full_backtest_36m"
+            ),
+            "full_backtest_36m_vs_scrutiny_coverage_ratio": full_catalog_summary.get(
+                "full_backtest_36m_vs_scrutiny_coverage_ratio"
+            ),
+            "valid_full_backtest_36m_vs_scrutiny_coverage_ratio": full_catalog_summary.get(
+                "valid_full_backtest_36m_vs_scrutiny_coverage_ratio"
+            ),
+        },
+        "filter_rejections": filter_rejections,
+        "candidate_count": len(filtered_rows),
+        "similarity_pair_count": len(similarity_payload.get("pairs") or []),
+        "selected_by_run": board.get("selected_by_run") or {},
+        "selected_by_strategy_key": board.get("selected_by_strategy_key") or {},
+        "selected": board.get("selected") or [],
+        "alternates": board.get("alternates") or [],
+        "top_similarity_pairs": list((similarity_payload.get("pairs") or [])[:200]),
+    }
+    derived_refresh = _refresh_global_derived_corpus_state(config)
+
+    write_json(config.promotion_board_json_path, payload)
+    csv_rows = [
+        {"section": "selected", **row} for row in (payload["selected"])
+    ] + [{"section": "alternate", **row} for row in (payload["alternates"])]
+    write_csv(config.promotion_board_csv_path, csv_rows)
+    print(
+        json.dumps(
+            {
+                "promotion_board_json": str(config.promotion_board_json_path),
+                "promotion_board_csv": str(config.promotion_board_csv_path),
+                "status": payload["status"],
+                "derived_refresh": derived_refresh,
+                "provisional_reasons": payload["provisional_reasons"],
+                "candidate_count": payload["candidate_count"],
+                "selected_count": len(payload["selected"]),
+                "alternate_count": len(payload["alternates"]),
+                "similarity_pair_count": payload["similarity_pair_count"],
+                "selected_by_run": payload["selected_by_run"],
+                "selected_by_strategy_key": payload["selected_by_strategy_key"],
+                "selected": payload["selected"],
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+    )
+    return 0
 
 
 def cmd_reset_runs() -> int:
@@ -3625,7 +5512,83 @@ def main() -> int:
     if args.command == "calculate-full-backtests":
         return cmd_calculate_full_backtests(
             run_ids=args.run_ids,
+            attempt_ids=args.attempt_id,
+            limit=args.limit,
+            max_workers=args.max_workers,
+            use_dev_sim_worker_count=not bool(args.no_use_dev_sim_worker_count),
+            require_scrutiny_36=bool(args.require_scrutiny_36),
             force_rebuild=bool(args.force_rebuild),
+            as_json=bool(args.json),
+        )
+    if args.command == "build-attempt-catalog":
+        return cmd_build_attempt_catalog(
+            run_ids=args.run_id,
+            as_json=bool(args.json),
+        )
+    if args.command == "audit-full-backtests":
+        return cmd_audit_full_backtests(
+            run_ids=args.run_id,
+            attempt_ids=args.attempt_id,
+            as_json=bool(args.json),
+        )
+    if args.command == "plot-corpus-score-vs-trades":
+        return cmd_plot_corpus_score_vs_trades(
+            run_ids=args.run_id,
+            attempt_ids=args.attempt_id,
+            require_full_backtest_36=bool(args.require_full_backtest_36),
+            x_axis_max=float(args.x_axis_max),
+            as_json=bool(args.json),
+        )
+    if args.command == "hydrate-scrutiny-cache":
+        return cmd_hydrate_scrutiny_cache(
+            run_ids=args.run_id,
+            attempt_ids=args.attempt_id,
+            lookback_months=args.lookback_months,
+            limit=args.limit,
+            force_rebuild=bool(args.force_rebuild),
+            as_json=bool(args.json),
+        )
+    if args.command == "build-promotion-board":
+        return cmd_build_promotion_board(
+            run_ids=args.run_id,
+            attempt_ids=args.attempt_id,
+            candidate_limit=int(args.candidate_limit),
+            board_size=int(args.board_size),
+            min_score_36=float(args.min_score_36),
+            min_retention_ratio=float(args.min_retention_ratio),
+            min_trades_per_month=float(args.min_trades_per_month),
+            novelty_penalty=float(args.novelty_penalty),
+            max_per_run=int(args.max_per_run),
+            max_per_strategy_key=int(args.max_per_strategy_key),
+            max_sameness_to_board=float(args.max_sameness_to_board),
+            require_full_backtest_36=bool(args.require_full_backtest_36),
+            hydrate_missing=bool(args.hydrate_missing),
+            force_rebuild=bool(args.force_rebuild),
+            as_json=bool(args.json),
+        )
+    if args.command == "build-shortlist-report":
+        return cmd_build_shortlist_report(
+            run_ids=args.run_id,
+            attempt_ids=args.attempt_id,
+            candidate_limit=int(args.candidate_limit),
+            shortlist_size=int(args.shortlist_size),
+            min_score_36=float(args.min_score_36),
+            min_retention_ratio=float(args.min_retention_ratio),
+            min_trades_per_month=float(args.min_trades_per_month),
+            max_drawdown_r=float(args.max_drawdown_r),
+            drawdown_penalty=float(args.drawdown_penalty),
+            trade_rate_bonus_weight=float(args.trade_rate_bonus_weight),
+            trade_rate_bonus_target=float(args.trade_rate_bonus_target),
+            novelty_penalty=float(args.novelty_penalty),
+            max_per_run=int(args.max_per_run),
+            max_per_strategy_key=int(args.max_per_strategy_key),
+            max_sameness_to_board=float(args.max_sameness_to_board),
+            require_full_backtest_36=bool(args.require_full_backtest_36),
+            generate_profile_drops=bool(args.generate_profile_drops),
+            profile_drop_lookback_months=int(args.profile_drop_lookback_months),
+            chart_trades_x_max=float(args.chart_trades_x_max),
+            profile_drop_timeout_seconds=int(args.profile_drop_timeout_seconds),
+            force_rebuild_profile_drops=bool(args.force_rebuild_profile_drops),
             as_json=bool(args.json),
         )
     if args.command == "reset-runs":

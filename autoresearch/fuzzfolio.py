@@ -147,3 +147,16 @@ class FuzzfolioCli:
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
         return stdout or stderr
+
+    def create_cloud_profile(self, profile_path: Path) -> str:
+        result = self.run(
+            ["profiles", "create", "--file", str(profile_path), "--pretty"]
+        )
+        payload = result.parsed_json if isinstance(result.parsed_json, dict) else None
+        data = payload.get("data") if isinstance(payload, dict) else None
+        profile_id = str((data or {}).get("id") or "").strip()
+        if not profile_id:
+            raise CliError(
+                f"profiles create did not return a profile id for {profile_path}"
+            )
+        return profile_id

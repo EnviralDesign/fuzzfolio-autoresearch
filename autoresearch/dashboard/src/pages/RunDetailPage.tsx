@@ -1,362 +1,87 @@
-import { useParams, useNavigate } from "react-router-dom";
-import { useRunDetail, useAttemptDetail, useCalculateBacktest } from "@/hooks/use-dashboard";
-import { PageHeader } from "@/components/ui/PageHeader";
-import { MetricCard } from "@/components/ui/MetricCard";
-import { Panel, PanelHeader } from "@/components/ui/Panel";
-import { DataTable } from "@/components/ui/DataTable";
-import { ScoreBadge } from "@/components/ui/ScoreBadge";
-import { QualityRadar } from "@/components/charts/QualityRadar";
-import { LightweightChartPlaceholder } from "@/components/charts/LightweightChart";
-import { formatNumber, formatInt, formatTime, shortRunId } from "@/lib/utils";
-import type { AttemptSummary, QualityScoreComponents } from "@/lib/types";
-import {
-  ResponsiveContainer,
-  Scatter,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Line,
-  ComposedChart,
-  Cell,
-} from "recharts";
-import { useState } from "react";
-import { ArrowLeft } from "lucide-react";
+import { useParams } from "react-router-dom";
+
+import { AttemptTable } from "@/components/attempt-table";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { useRunDetail } from "@/hooks/use-viewer-data";
+import { compactRunId, formatDateTime, formatInt, formatNumber } from "@/lib/utils";
 
 export function RunDetailPage() {
-  const { runId } = useParams<{ runId: string }>();
-  const navigate = useNavigate();
+  const { runId } = useParams();
   const { data, isLoading, error } = useRunDetail(runId);
-  const [selectedAttemptId, setSelectedAttemptId] = useState<string | null>(null);
-
-  // Attempt detail - defaults to best attempt
-  const effectiveAttemptId =
-    selectedAttemptId || data?.run.bestAttempt?.attemptId;
-  const attemptDetail = useAttemptDetail(runId, effectiveAttemptId);
-  const calculateBacktest = useCalculateBacktest();
 
   if (isLoading) {
+    return <div className="py-20 text-sm text-muted-foreground">Loading run detail…</div>;
+  }
+
+  if (!data?.run) {
     return (
-      <div className="p-6">
-        <PageHeader title="Loading run…" eyebrow="Run Detail" />
-        <div className="space-y-4">
-          {Array.from({ length: 3 }).map((_, i) => (
-            <div key={i} className="h-24 rounded-xl border border-border bg-card/30 animate-pulse" />
-          ))}
-        </div>
+      <div className="py-20 text-sm text-destructive">
+        {error instanceof Error ? error.message : "Run detail failed to load."}
       </div>
     );
   }
 
-  if (error || !data) {
-    return (
-      <div className="p-6">
-        <PageHeader title="Run not found" eyebrow="Error" />
-        <p className="text-muted-foreground">
-          {error instanceof Error ? error.message : "Could not load run detail."}
-        </p>
-      </div>
-    );
-  }
-
-  const { run, attempts } = data;
-
-  // Timeline data for the score trace chart
-  const timelineData = attempts
-    .filter((a) => a.score !== null && a.score !== undefined)
-    .sort((a, b) => a.sequence - b.sequence)
-    .map((a) => ({
-      sequence: a.sequence,
-      score: a.score!,
-      candidateName: a.candidateName,
-      attemptId: a.attemptId,
-      isBest: a.attemptId === run.bestAttempt?.attemptId,
-    }));
-
-  const attemptColumns = [
-    {
-      key: "candidate",
-      label: "Candidate",
-      render: (row: AttemptSummary) => (
-        <div className="min-w-0">
-          <div className="text-sm font-medium truncate max-w-40">{row.candidateName || "candidate"}</div>
-          <div className="text-xs text-muted-foreground">#{row.sequence}</div>
-        </div>
-      ),
-    },
-    {
-      key: "score",
-      label: "Score",
-      render: (row: AttemptSummary) => <ScoreBadge score={row.score} />,
-    },
-    {
-      key: "trades",
-      label: "Trades/mo",
-      render: (row: AttemptSummary) => formatNumber(row.tradesPerMonth, 1),
-    },
-    {
-      key: "dd",
-      label: "DD",
-      render: (row: AttemptSummary) =>
-        row.maxDrawdownR != null ? `${formatNumber(row.maxDrawdownR, 1)}R` : "—",
-    },
-    {
-      key: "pf",
-      label: "PF",
-      render: (row: AttemptSummary) => formatNumber(row.profitFactor, 2),
-    },
-    {
-      key: "instrument",
-      label: "Instrument",
-      render: (row: AttemptSummary) => (
-        <span className="text-xs text-muted-foreground">{row.instrument || "—"}</span>
-      ),
-    },
-  ];
-
-  // Attempt detail view
-  const ad = attemptDetail.data;
-  const adAttempt = ad?.attempt;
-
-  // Full backtest metrics — fall back to realized ledger when full backtest not available
-  const fbr = ad?.fullBacktestResult?.data?.aggregate;
-  const fbScore = fbr?.quality_score?.score ?? adAttempt?.score;
-  const fbTradesPerMonth = fbr?.quality_score?.inputs?.trades_per_month ?? adAttempt?.tradesPerMonth;
-  const fbTradeCount = fbr?.best_cell_path_metrics?.trade_count ?? adAttempt?.tradeCount;
-  const fbMaxDrawdownR = fbr?.best_cell_path_metrics?.max_drawdown_r ?? adAttempt?.maxDrawdownR;
-  const fbEffectiveWindowMonths = fbr?.market_data_window?.effective_window_months ?? adAttempt?.effectiveWindowMonths;
-  const fbExpectancyR = fbr?.best_cell?.avg_net_r_per_closed_trade ?? adAttempt?.expectancyR;
-  const fbProfitFactor = fbr?.best_cell?.profit_factor ?? adAttempt?.profitFactor;
-  const fbComponents = fbr?.quality_score?.components ?? adAttempt?.bestSummary?.quality_score_payload?.components;
+  const run = data.run;
 
   return (
-    <div className="p-6 space-y-6">
-      {/* Header */}
-      <div className="flex items-center gap-3">
-        <button
-          onClick={() => navigate("/runs")}
-          className="p-1.5 rounded-lg border border-border hover:bg-surface-hover transition-colors"
-        >
-          <ArrowLeft className="w-4 h-4" />
-        </button>
-        <PageHeader
-          title={shortRunId(run.runId)}
-          eyebrow="Run Detail"
-          description={`${run.explorerModel || run.explorerProfile || "unknown"} · ${formatTime(run.createdAt)} · ${formatInt(run.attemptCount)} attempts`}
-        />
-      </div>
-
-      {/* KPI row */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <MetricCard
-          label="Leader"
-          value={formatNumber(run.bestAttempt?.score, 2)}
-          secondary={run.bestAttempt?.candidateName || "none"}
-        />
-        <MetricCard
-          label="Advisors"
-          value={formatInt(run.advisorGuidanceCount)}
-          secondary={`step ${formatInt(run.latestStep)}`}
-        />
-        <MetricCard
-          label="Curves"
-          value={formatInt(run.curveAttemptCount)}
-          secondary="attempts with path detail"
-        />
-        <MetricCard
-          label="Scored"
-          value={`${formatInt(run.scoredAttemptCount)} / ${formatInt(run.attemptCount)}`}
-          secondary="attempts scored"
-        />
-      </div>
-
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-        {/* Score timeline */}
-        <Panel className="xl:col-span-2">
-          <PanelHeader
-            eyebrow="Score Trace"
-            title="Quality score over attempts"
-          />
-          {timelineData.length > 0 ? (
-            <ResponsiveContainer width="100%" height={260}>
-              <ComposedChart data={timelineData} margin={{ top: 10, right: 20, bottom: 10, left: 10 }}>
-                <CartesianGrid strokeDasharray="3 3" stroke="rgba(147, 190, 255, 0.08)" />
-                <XAxis
-                  dataKey="sequence"
-                  tick={{ fill: "#99abc4", fontSize: 11 }}
-                  axisLine={{ stroke: "rgba(147, 190, 255, 0.12)" }}
-                />
-                <YAxis
-                  tick={{ fill: "#99abc4", fontSize: 11 }}
-                  axisLine={{ stroke: "rgba(147, 190, 255, 0.12)" }}
-                />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: "rgba(7, 12, 22, 0.95)",
-                    border: "1px solid rgba(147, 190, 255, 0.2)",
-                    borderRadius: "8px",
-                    fontSize: "12px",
-                    color: "#ebf3ff",
-                  }}
-                />
-                <Line
-                  type="monotone"
-                  dataKey="score"
-                  stroke="#60d6c3"
-                  strokeWidth={2}
-                  dot={false}
-                />
-                <Scatter dataKey="score">
-                  {timelineData.map((entry, i) => (
-                    <Cell
-                      key={i}
-                      fill={entry.isBest ? "#ffba6d" : "#60d6c3"}
-                      r={entry.isBest ? 6 : 3}
-                      cursor="pointer"
-                      onClick={() => setSelectedAttemptId(entry.attemptId)}
-                    />
-                  ))}
-                </Scatter>
-              </ComposedChart>
-            </ResponsiveContainer>
-          ) : (
-            <div className="h-60 flex items-center justify-center text-muted-foreground text-sm">
-              No scored attempts yet
+    <div className="space-y-8">
+      <section className="grid gap-6 xl:grid-cols-[1.2fr_1fr]">
+        <Card className="border-border/60 bg-card/85 shadow-2xl shadow-black/25">
+          <CardHeader className="gap-4">
+            <div className="flex flex-wrap items-center gap-3">
+              <Badge variant="secondary">Run detail</Badge>
+              <Badge variant="outline">{compactRunId(run.run_id)}</Badge>
             </div>
-          )}
-        </Panel>
-
-        {/* Quality radar for selected attempt */}
-        <Panel>
-          <PanelHeader
-            eyebrow="Quality Breakdown"
-            title={adAttempt?.candidateName || "Select an attempt"}
-          />
-          {fbComponents ? (
-            <QualityRadar components={fbComponents as QualityScoreComponents} score={fbScore ?? undefined} />
-          ) : (
-            <div className="h-52 flex items-center justify-center text-muted-foreground text-sm">
-              {attemptDetail.isLoading ? "Loading…" : "No quality components"}
+            <div className="space-y-3">
+              <CardTitle className="text-4xl leading-tight tracking-tight">
+                {run.explorer_model || run.explorer_profile || "Unknown explorer"}
+              </CardTitle>
+              <CardDescription className="max-w-3xl text-base leading-7">
+                A provenance view for one run. Useful for understanding how many attempts it produced and what its best 36-month survivor looked like.
+              </CardDescription>
             </div>
-          )}
-        </Panel>
-      </div>
+          </CardHeader>
+          <CardContent className="grid gap-4 md:grid-cols-3">
+            <RunFact label="Attempts" value={formatInt(run.attempt_count)} />
+            <RunFact label="36mo scores" value={formatInt(run.score_36m_count)} />
+            <RunFact label="Best 36mo" value={formatNumber(run.best_attempt?.score_36m ?? null, 2)} />
+          </CardContent>
+        </Card>
 
-      {/* Attempts table */}
-      <Panel>
-        <PanelHeader
-          eyebrow="Attempts"
-          title="All attempts in this run"
-          note="Best scores float to the top. Click to inspect."
-        />
-        <DataTable
-          columns={attemptColumns}
-          data={attempts}
-          maxHeight="400px"
-          onRowClick={(row) => setSelectedAttemptId(row.attemptId)}
-        />
-      </Panel>
+        <Card className="border-border/60 bg-card/85 shadow-2xl shadow-black/25">
+          <CardHeader>
+            <CardTitle className="text-2xl tracking-tight">Metadata</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3 text-sm leading-7 text-muted-foreground">
+            <div>Created: {formatDateTime(run.created_at)}</div>
+            <div>Latest attempt: {formatDateTime(run.latest_created_at)}</div>
+            <div>Quality preset: {String(run.quality_score_preset || "—")}</div>
+            <div>Supervisor: {String(run.supervisor_model || run.supervisor_profile || "—")}</div>
+          </CardContent>
+        </Card>
+      </section>
 
-      {/* Attempt detail section */}
-      {adAttempt && (
-        <Panel>
-          <PanelHeader
-            eyebrow="Attempt Detail"
-            title={adAttempt.candidateName || effectiveAttemptId || ""}
-            note={`${formatTime(adAttempt.createdAt)} · ${formatNumber(fbScore, 2)} score · ${formatNumber(fbTradesPerMonth, 1)} trades/mo`}
-          />
+      <Card className="border-border/60 bg-card/85 shadow-2xl shadow-black/25">
+        <CardHeader>
+          <CardTitle className="text-2xl tracking-tight">Attempts in run</CardTitle>
+          <CardDescription>
+            Sorted by 36-month score when present, otherwise by composite score.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <AttemptTable rows={data.attempts} caption="Attempts loaded from the current attempt catalog." />
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
 
-          {/* Key metrics row */}
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
-            <MetricCard label="Score" value={formatNumber(fbScore, 2)} secondary={adAttempt.scoreBasis || "quality score"} />
-            <MetricCard label="Trades/mo" value={formatNumber(fbTradesPerMonth, 1)} secondary={`${formatInt(fbTradeCount)} resolved`} />
-            <MetricCard label="Max DD" value={`${formatNumber(fbMaxDrawdownR, 1)}R`} secondary={`${formatNumber(fbEffectiveWindowMonths, 1)} mo window`} />
-            <MetricCard label="Expectancy" value={`${formatNumber(fbExpectancyR, 3)}R`} secondary={`PF ${formatNumber(fbProfitFactor, 2)}`} />
-          </div>
-
-          {/* Tags */}
-          <div className="flex flex-wrap gap-2 mb-4">
-            {adAttempt.instrument && (
-              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-primary/10 border border-primary/20 text-primary">
-                {adAttempt.instrument}
-              </span>
-            )}
-            {adAttempt.timeframe && (
-              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-card border border-border text-foreground">
-                {adAttempt.timeframe}
-              </span>
-            )}
-            {adAttempt.signalSelectivity && (
-              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-card border border-border text-foreground">
-                {adAttempt.signalSelectivity}
-              </span>
-            )}
-          </div>
-
-          {/* Equity curve chart */}
-          <LightweightChartPlaceholder
-            height={320}
-            equityData={ad?.fullBacktestCurve?.curve?.points}
-            hasFullBacktest={ad?.hasFullBacktest}
-            onCalculate={
-              !ad?.hasFullBacktest && !attemptDetail.isLoading
-                ? () =>
-                    calculateBacktest.mutate({
-                      runId: runId!,
-                      attemptId: effectiveAttemptId!,
-                    })
-                : undefined
-            }
-            isCalculating={calculateBacktest.isPending}
-          />
-
-          {/* Profile drop images */}
-          {(ad?.profileDrop12PngUrl || ad?.profileDrop36PngUrl) && (
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {ad?.profileDrop12PngUrl && (
-                <div className="rounded-lg overflow-hidden border border-border/50">
-                  <img
-                    alt="Profile drop 12mo"
-                    src={`${ad.profileDrop12PngUrl}&t=${Date.now()}`}
-                    className="w-full"
-                  />
-                </div>
-              )}
-              {ad?.profileDrop36PngUrl && (
-                <div className="rounded-lg overflow-hidden border border-border/50">
-                  <img
-                    alt="Profile drop 36mo"
-                    src={`${ad.profileDrop36PngUrl}&t=${Date.now()}`}
-                    className="w-full"
-                  />
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Collapsible JSON payloads */}
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4">
-            <details className="rounded-lg border border-border bg-surface p-3">
-              <summary className="cursor-pointer text-sm font-medium">Profile payload</summary>
-              <pre className="mt-2 text-xs text-muted-foreground overflow-auto max-h-64 font-mono">
-                {JSON.stringify(ad?.profile || {}, null, 2)}
-              </pre>
-            </details>
-            <details className="rounded-lg border border-border bg-surface p-3">
-              <summary className="cursor-pointer text-sm font-medium">Deep replay request</summary>
-              <pre className="mt-2 text-xs text-muted-foreground overflow-auto max-h-64 font-mono">
-                {JSON.stringify(ad?.deepReplayJob || {}, null, 2)}
-              </pre>
-            </details>
-            <details className="rounded-lg border border-border bg-surface p-3">
-              <summary className="cursor-pointer text-sm font-medium">Best summary</summary>
-              <pre className="mt-2 text-xs text-muted-foreground overflow-auto max-h-64 font-mono">
-                {JSON.stringify(adAttempt.bestSummary || {}, null, 2)}
-              </pre>
-            </details>
-          </div>
-        </Panel>
-      )}
+function RunFact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-3xl border border-border/60 bg-background/40 p-4">
+      <div className="text-[0.72rem] uppercase tracking-[0.18em] text-muted-foreground">{label}</div>
+      <div className="mt-3 text-3xl font-semibold tracking-tight">{value}</div>
     </div>
   );
 }

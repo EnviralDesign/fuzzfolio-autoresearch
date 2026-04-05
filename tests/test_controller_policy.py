@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from autoresearch import branch_lifecycle as bl
 from autoresearch import manager_packet as mp
 from autoresearch import validation_outcome as vo
+import autoresearch.controller as ctrlmod
 from autoresearch.controller import ResearchController
 from autoresearch.manager_models import ManagerHookEvent
 from autoresearch.scoring import AttemptScore
@@ -386,6 +388,217 @@ def test_current_wrap_up_focus_prefers_retryable_provisional_line() -> None:
     assert focus["reason"] == "provisional_leader"
 
 
+def test_current_wrap_up_focus_prefers_best_steering_sibling_not_raw_spike() -> None:
+    controller = _make_controller({"ref-a": "fam-a"})
+    controller._family_branches = {
+        "fam-a": bl.FamilyBranchState(
+            family_id="fam-a",
+            lifecycle_state=bl.LIFECYCLE_PROVISIONAL_LEADER,
+            promotability_status=vo.PROMOTABILITY_RETRY_RECOMMENDED,
+            retention_status=bl.RETENTION_PASSED,
+            best_attempt_id="attempt-best",
+            latest_attempt_id="attempt-latest",
+            last_profile_ref="ref-a",
+        )
+    }
+    controller._branch_overlay = bl.BranchRunOverlay(
+        provisional_leader_family_id="fam-a",
+        budget_mode=bl.BUDGET_WRAP_UP,
+    )
+    attempts = [
+        {
+            **_make_attempt(
+                sequence=1,
+                name="best-focus",
+                profile_ref="ref-a",
+                score=50.274,
+                horizon_months=24,
+                effective_window_months=22.67,
+                trades_per_month=1.191001,
+                resolved_trades=27,
+                positive_cell_ratio=0.7344,
+            ),
+            "attempt_id": "attempt-best",
+        },
+        {
+            **_make_attempt(
+                sequence=2,
+                name="latest-weaker",
+                profile_ref="ref-a",
+                score=41.5354,
+                horizon_months=24,
+                effective_window_months=23.53,
+                trades_per_month=6.544836,
+                resolved_trades=154,
+                positive_cell_ratio=0.375,
+            ),
+            "attempt_id": "attempt-latest",
+        },
+    ]
+
+    focus = controller._current_wrap_up_focus_state(attempts)
+
+    assert focus is not None
+    assert focus["family_id"] == "fam-a"
+    assert focus["candidate_name"] == "latest-weaker"
+    assert focus["selected_attempt_id"] == "attempt-latest"
+    assert focus["latest_attempt_id"] == "attempt-latest"
+    assert focus["requested_horizon_months"] == 24
+    assert focus["requested_timeframe"] == "M15"
+    assert focus["effective_timeframe"] == "M15"
+
+
+def test_select_best_attempt_snapshot_prefers_steering_score_within_retryable_set() -> None:
+    controller = _make_controller({"ref-a": "fam-a"})
+    snapshots = [
+        controller._attempt_admissibility_snapshot(
+            {
+                **_make_attempt(
+                    sequence=1,
+                    name="raw-spike",
+                    profile_ref="ref-a",
+                    score=50.274,
+                    horizon_months=24,
+                    effective_window_months=22.67,
+                    trades_per_month=1.191001,
+                    resolved_trades=27,
+                    positive_cell_ratio=0.7344,
+                ),
+                "attempt_id": "attempt-best",
+            }
+        ),
+        controller._attempt_admissibility_snapshot(
+            {
+                **_make_attempt(
+                    sequence=2,
+                    name="durable-sibling",
+                    profile_ref="ref-a",
+                    score=41.5354,
+                    horizon_months=24,
+                    effective_window_months=23.53,
+                    trades_per_month=6.544836,
+                    resolved_trades=154,
+                    positive_cell_ratio=0.375,
+                ),
+                "attempt_id": "attempt-latest",
+            }
+        ),
+    ]
+
+    best = controller._select_best_attempt_snapshot(
+        [snap for snap in snapshots if isinstance(snap, dict)],
+        prefer_highest_horizon=True,
+    )
+
+    assert best is not None
+    assert best["candidate_name"] == "durable-sibling"
+
+
+def test_run_outcome_snapshot_separates_live_focus_from_historical_validated() -> None:
+    controller = _make_controller({"ref-a": "fam-a", "ref-b": "fam-b"})
+    controller._family_branches = {
+        "fam-a": bl.FamilyBranchState(
+            family_id="fam-a",
+            lifecycle_state=bl.LIFECYCLE_COLLAPSED,
+            promotion_level=bl.PROMOTION_VALIDATED,
+            promotability_status=vo.PROMOTABILITY_BLOCKED,
+            retention_status=bl.RETENTION_FAILED,
+            exploit_dead=True,
+            best_attempt_id="attempt-validated",
+            latest_attempt_id="attempt-validated",
+        ),
+        "fam-b": bl.FamilyBranchState(
+            family_id="fam-b",
+            lifecycle_state=bl.LIFECYCLE_PROVISIONAL_LEADER,
+            promotion_level=bl.PROMOTION_PROVISIONAL,
+            promotability_status=vo.PROMOTABILITY_RETRY_RECOMMENDED,
+            retention_status=bl.RETENTION_PASSED,
+            best_attempt_id="attempt-live",
+            latest_attempt_id="attempt-live",
+            last_profile_ref="ref-b",
+        ),
+    }
+    controller._branch_overlay.provisional_leader_family_id = "fam-b"
+    attempts = [
+        {
+            **_make_attempt(
+                sequence=1,
+                name="historic-validated",
+                profile_ref="ref-a",
+                score=61.0,
+                horizon_months=24,
+                effective_window_months=23.0,
+                trades_per_month=4.0,
+                resolved_trades=92,
+                validation_outcome=vo.VALIDATION_PASSED,
+            ),
+            "attempt_id": "attempt-validated",
+        },
+        {
+            **_make_attempt(
+                sequence=2,
+                name="live-focus",
+                profile_ref="ref-b",
+                score=14.0,
+                horizon_months=36,
+                effective_window_months=35.0,
+                trades_per_month=7.0,
+                resolved_trades=240,
+            ),
+            "attempt_id": "attempt-live",
+        },
+    ]
+
+    outcome = controller._run_outcome_snapshot(attempts)
+
+    assert outcome["official_winner_type"] == "none"
+    assert outcome["official_winner"] is None
+    assert outcome["best_live_focus"]["attempt_id"] == "attempt-live"
+    assert outcome["best_historical_validated"]["attempt_id"] == "attempt-validated"
+    assert outcome["best_historical_validated"]["currently_live"] is False
+    assert "No official winner" in outcome["rationale"]
+
+
+def test_build_branch_runtime_snapshot_includes_run_outcome() -> None:
+    controller = _make_controller({"ref-a": "fam-a"})
+    controller._tool_usage_counts = {}
+    controller._run_attempts = lambda _run_id: [
+        {
+            **_make_attempt(
+                sequence=1,
+                name="live-focus",
+                profile_ref="ref-a",
+                score=18.0,
+                horizon_months=24,
+                effective_window_months=23.0,
+                trades_per_month=5.0,
+                resolved_trades=120,
+            ),
+            "attempt_id": "attempt-live",
+        }
+    ]
+    controller._family_branches = {
+        "fam-a": bl.FamilyBranchState(
+            family_id="fam-a",
+            lifecycle_state=bl.LIFECYCLE_PROVISIONAL_LEADER,
+            promotion_level=bl.PROMOTION_PROVISIONAL,
+            promotability_status=vo.PROMOTABILITY_RETRY_RECOMMENDED,
+            retention_status=bl.RETENTION_PASSED,
+            best_attempt_id="attempt-live",
+            latest_attempt_id="attempt-live",
+            last_profile_ref="ref-a",
+        )
+    }
+    controller._branch_overlay.provisional_leader_family_id = "fam-a"
+    tool_context = SimpleNamespace(run_id="run-a")
+
+    snapshot = controller._build_branch_runtime_snapshot(tool_context, step=42)
+
+    assert snapshot["run_outcome"]["official_winner_type"] == "none"
+    assert snapshot["run_outcome"]["best_live_focus"]["attempt_id"] == "attempt-live"
+    assert snapshot["wrap_up_focus"]["selected_attempt_id"] == "attempt-live"
+
+
 def test_wrap_up_validation_blocks_unrelated_family_tuning() -> None:
     controller = _make_controller({"ref-a": "fam-a", "ref-b": "fam-b"})
     controller._family_branches = {
@@ -647,3 +860,146 @@ def test_trace_runtime_preserves_manager_snapshot(tmp_path) -> None:
 
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     assert payload["manager"]["last_hook"] == "on_unresolved_validation"
+
+
+def test_trace_runtime_serializes_exception_fields(tmp_path) -> None:
+    controller = object.__new__(ResearchController)
+    tool_context = SimpleNamespace(run_dir=tmp_path, run_id="run-a")
+
+    controller._trace_runtime(
+        tool_context,
+        step=79,
+        phase="response_repair",
+        status="failed",
+        message="Response repair failed.",
+        error=RuntimeError("Model returned invalid actions payload"),
+        details={"nested": ValueError("bad field")},
+    )
+
+    trace_path = tmp_path / "runtime-trace.jsonl"
+    row = json.loads(trace_path.read_text(encoding="utf-8").strip())
+    assert row["error"] == "RuntimeError: Model returned invalid actions payload"
+    assert row["details"]["nested"] == "ValueError: bad field"
+
+
+def test_maybe_auto_log_attempt_forwards_requested_horizon() -> None:
+    controller = _make_controller()
+    captured: dict[str, object] = {}
+
+    def fake_record_attempt(tool_context, artifact_dir, **kwargs):
+        captured["artifact_dir"] = artifact_dir
+        captured.update(kwargs)
+        return {"status": "logged"}
+
+    controller._record_attempt_from_artifact = fake_record_attempt
+
+    result = controller._maybe_auto_log_attempt(
+        SimpleNamespace(attempts_path=Path("attempts.jsonl"), run_id="run-a"),
+        [
+            "sensitivity-basket",
+            "--profile-ref",
+            "ref-a",
+            "--output-dir",
+            "C:\\runs\\eval-a",
+            "--lookback-months",
+            "24",
+        ],
+    )
+
+    assert result == {"status": "logged"}
+    assert captured["profile_ref"] == "ref-a"
+    assert captured["requested_horizon_months"] == 24
+
+
+def test_record_attempt_from_artifact_persists_explicit_requested_horizon(
+    tmp_path, monkeypatch
+) -> None:
+    controller = _make_controller()
+    controller._render_run_progress = lambda _tool_context: None
+    controller.profile_sources = {}
+    controller.cli = SimpleNamespace(score_artifact=lambda _artifact_dir: {"best": {}})
+
+    run_dir = tmp_path / "run"
+    artifact_dir = run_dir / "evals" / "eval_case"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "sensitivity-response.json").write_text("{}", encoding="utf-8")
+    tool_context = SimpleNamespace(
+        attempts_path=run_dir / "attempts.jsonl",
+        run_id="run-a",
+        progress_plot_path=run_dir / "progress.png",
+    )
+
+    monkeypatch.setattr(ctrlmod, "attempt_exists", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(ctrlmod, "load_sensitivity_snapshot", lambda _artifact_dir: {})
+    monkeypatch.setattr(
+        ctrlmod,
+        "build_attempt_score",
+        lambda *_args, **_kwargs: AttemptScore(
+            primary_score=12.3,
+            composite_score=12.3,
+            score_basis="v1:psr",
+            metrics={"quality_score": 12.3},
+            best_summary={},
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_normalized_attempt_record_evidence",
+        lambda *_args, **_kwargs: {
+            "requested_horizon_months": None,
+            "effective_window_months": 11.5,
+            "effective_window_source": "test",
+            "requested_timeframe": "M5",
+            "effective_timeframe": "M5",
+            "validation_outcome": None,
+            "coverage_status": "ok",
+            "job_status": None,
+            "resolved_trades": 50,
+            "trades_per_month": 4.0,
+            "positive_cell_ratio": 0.5,
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def fake_make_attempt_record(*args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            attempt_id="run-a-attempt-00001",
+            sequence=1,
+            created_at="2026-04-02T00:00:00+00:00",
+            run_id="run-a",
+            candidate_name="eval_case",
+            artifact_dir=str(artifact_dir),
+            profile_ref="ref-a",
+            profile_path=None,
+            primary_score=12.3,
+            composite_score=12.3,
+            score_basis="v1:psr",
+            metrics={"quality_score": 12.3},
+            best_summary={},
+            sensitivity_snapshot_path=None,
+            requested_horizon_months=kwargs.get("requested_horizon_months"),
+            effective_window_months=11.5,
+            requested_timeframe="M5",
+            effective_timeframe="M5",
+            validation_outcome=None,
+            coverage_status="ok",
+            job_status=None,
+            resolved_trades=50,
+            trades_per_month=4.0,
+            positive_cell_ratio=0.5,
+            effective_window_source="test",
+        )
+
+    monkeypatch.setattr(ctrlmod, "make_attempt_record", fake_make_attempt_record)
+    monkeypatch.setattr(ctrlmod, "append_attempt", lambda *_args, **_kwargs: None)
+
+    controller._record_attempt_from_artifact(
+        tool_context,
+        artifact_dir,
+        profile_ref="ref-a",
+        requested_horizon_months=24,
+    )
+
+    assert captured["requested_horizon_months"] == 24

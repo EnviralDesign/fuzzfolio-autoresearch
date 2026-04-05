@@ -861,6 +861,365 @@ def render_tradeoff_leaderboard_artifacts(
     return serializable_rows
 
 
+def render_attempt_tradeoff_scatter_artifacts(
+    rows: list[dict[str, Any]],
+    png_output_path: Path,
+    json_output_path: Path,
+    *,
+    require_full_backtest_36: bool = False,
+    x_axis_max: float | None = 300.0,
+    title_prefix: str = "Corpus",
+) -> list[dict[str, Any]]:
+    serializable_rows: list[dict[str, Any]] = []
+    for row in rows:
+        score_36 = row.get("score_36m")
+        trades_per_month_36 = row.get("trades_per_month_36m")
+        if score_36 is None or trades_per_month_36 is None:
+            continue
+        if require_full_backtest_36 and not bool(row.get("has_full_backtest_36m")):
+            continue
+        serialized = dict(row)
+        serialized["is_valid_full_backtest_36m"] = (
+            str(row.get("full_backtest_validation_status_36m") or "") == "valid"
+        )
+        serializable_rows.append(serialized)
+
+    serializable_rows.sort(
+        key=lambda row: (
+            float(row.get("score_36m", float("-inf"))),
+            float(row.get("trades_per_month_36m", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    json_output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_output_path.write_text(
+        json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
+
+    png_output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(14, 9))
+    if not serializable_rows:
+        title = f"{title_prefix} 36mo Score vs Trade Rate: No Attempt Rows Yet"
+        if require_full_backtest_36:
+            title = f"{title_prefix} 36mo Score vs Trade Rate: No Valid Full-Backtest Rows Yet"
+        plt.title(title)
+        plt.xlabel("Resolved Trades / Month (36mo)")
+        plt.ylabel("36mo Quality Score")
+        plt.tight_layout()
+        plt.savefig(png_output_path, dpi=160)
+        plt.close()
+        return serializable_rows
+
+    valid_full = [
+        row for row in serializable_rows if bool(row.get("is_valid_full_backtest_36m"))
+    ]
+    scrutiny_only = [
+        row for row in serializable_rows if not bool(row.get("is_valid_full_backtest_36m"))
+    ]
+
+    if scrutiny_only:
+        plt.scatter(
+            [float(row["trades_per_month_36m"]) for row in scrutiny_only],
+            [float(row["score_36m"]) for row in scrutiny_only],
+            c="#b8c4d0",
+            edgecolors="#8a97a3",
+            s=34,
+            alpha=0.5,
+            label="Scrutiny only",
+        )
+    if valid_full:
+        plt.scatter(
+            [float(row["trades_per_month_36m"]) for row in valid_full],
+            [float(row["score_36m"]) for row in valid_full],
+            c="#2a9d8f",
+            edgecolors="#1f6f54",
+            s=56,
+            alpha=0.82,
+            label="Valid full backtest",
+        )
+
+    top_rows = serializable_rows[: min(12, len(serializable_rows))]
+    for row in top_rows:
+        label = str(row.get("candidate_name") or row.get("attempt_id") or "attempt")
+        if len(label) > 36:
+            label = label[:33] + "..."
+        plt.annotate(
+            label,
+            (float(row["trades_per_month_36m"]), float(row["score_36m"])),
+            textcoords="offset points",
+            xytext=(7, 5),
+            fontsize=8,
+            color="#1f2933",
+        )
+
+    x_all = [float(row["trades_per_month_36m"]) for row in serializable_rows]
+    y_all = [float(row["score_36m"]) for row in serializable_rows]
+    x_min = min(x_all)
+    x_max = max(x_all)
+    y_min = min(y_all)
+    y_max = max(y_all)
+    if x_axis_max is not None:
+        x_all = [value for value in x_all if value <= float(x_axis_max)]
+        x_max = min(x_max, float(x_axis_max))
+    x_padding = max(0.15, (x_max - x_min) * 0.08) if x_max != x_min else 0.15
+    y_padding = max(0.5, (y_max - y_min) * 0.08) if y_max != y_min else 0.5
+    plt.xlim(max(0.0, x_min - x_padding), x_max + x_padding)
+    plt.ylim(y_min - y_padding, y_max + y_padding)
+
+    valid_count = len(valid_full)
+    total_count = len(serializable_rows)
+    title = f"{title_prefix} 36mo Score vs Trade Rate: {total_count} attempts"
+    subtitle = f"{valid_count} valid full-backtest rows"
+    if require_full_backtest_36:
+        subtitle = f"full-backtest only | {valid_count} rows"
+    plt.title(f"{title}\n{subtitle}")
+    plt.xlabel("Resolved Trades / Month (36mo)")
+    plt.ylabel("36mo Quality Score")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(png_output_path, dpi=160)
+    plt.close()
+    return serializable_rows
+
+
+def render_attempt_tradeoff_overlay_artifacts(
+    candidate_rows: list[dict[str, Any]],
+    selected_rows: list[dict[str, Any]],
+    png_output_path: Path,
+    json_output_path: Path,
+    *,
+    x_axis_max: float | None = 300.0,
+    title_prefix: str = "Shortlist Overlay",
+) -> list[dict[str, Any]]:
+    selected_attempt_ids = {
+        str(row.get("attempt_id") or "").strip()
+        for row in selected_rows
+        if str(row.get("attempt_id") or "").strip()
+    }
+    serializable_rows: list[dict[str, Any]] = []
+    for row in candidate_rows:
+        score_36 = row.get("score_36m")
+        trades_per_month_36 = row.get("trades_per_month_36m")
+        if score_36 is None or trades_per_month_36 is None:
+            continue
+        attempt_id = str(row.get("attempt_id") or "").strip()
+        serialized = dict(row)
+        serialized["is_selected"] = attempt_id in selected_attempt_ids
+        serializable_rows.append(serialized)
+
+    serializable_rows.sort(
+        key=lambda row: (
+            bool(row.get("is_selected")),
+            float(row.get("score_36m", float("-inf"))),
+            float(row.get("trades_per_month_36m", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    json_output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_output_path.write_text(
+        json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
+
+    png_output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(14, 9))
+    if not serializable_rows:
+        plt.title(f"{title_prefix}: No Attempt Rows Yet")
+        plt.xlabel("Resolved Trades / Month (36mo)")
+        plt.ylabel("36mo Quality Score")
+        plt.tight_layout()
+        plt.savefig(png_output_path, dpi=160)
+        plt.close()
+        return serializable_rows
+
+    background_rows = [row for row in serializable_rows if not bool(row.get("is_selected"))]
+    highlighted_rows = [row for row in serializable_rows if bool(row.get("is_selected"))]
+
+    if background_rows:
+        plt.scatter(
+            [float(row["trades_per_month_36m"]) for row in background_rows],
+            [float(row["score_36m"]) for row in background_rows],
+            c="#bcc4cf",
+            edgecolors="#97a1ad",
+            s=28,
+            alpha=0.45,
+            label="Qualified, not shortlisted",
+        )
+    if highlighted_rows:
+        plt.scatter(
+            [float(row["trades_per_month_36m"]) for row in highlighted_rows],
+            [float(row["score_36m"]) for row in highlighted_rows],
+            c="#2ecc71",
+            edgecolors="#1f6f54",
+            s=76,
+            alpha=0.92,
+            label="Shortlisted",
+            zorder=4,
+        )
+
+    for row in highlighted_rows[: min(16, len(highlighted_rows))]:
+        label = str(row.get("candidate_name") or row.get("attempt_id") or "attempt")
+        if len(label) > 36:
+            label = label[:33] + "..."
+        plt.annotate(
+            label,
+            (float(row["trades_per_month_36m"]), float(row["score_36m"])),
+            textcoords="offset points",
+            xytext=(7, 5),
+            fontsize=8,
+            color="#1f2933",
+        )
+
+    x_all = [float(row["trades_per_month_36m"]) for row in serializable_rows]
+    y_all = [float(row["score_36m"]) for row in serializable_rows]
+    x_min = min(x_all)
+    x_max = max(x_all)
+    y_min = min(y_all)
+    y_max = max(y_all)
+    if x_axis_max is not None:
+        x_max = min(x_max, float(x_axis_max))
+    x_padding = max(0.15, (x_max - x_min) * 0.08) if x_max != x_min else 0.15
+    y_padding = max(0.5, (y_max - y_min) * 0.08) if y_max != y_min else 0.5
+    plt.xlim(max(0.0, x_min - x_padding), x_max + x_padding)
+    plt.ylim(y_min - y_padding, y_max + y_padding)
+
+    plt.title(
+        f"{title_prefix}: {len(highlighted_rows)} shortlisted vs {len(serializable_rows)} qualified candidates"
+    )
+    plt.xlabel("Resolved Trades / Month (36mo)")
+    plt.ylabel("36mo Quality Score")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(png_output_path, dpi=160)
+    plt.close()
+    return serializable_rows
+
+
+def render_attempt_drawdown_scatter_artifacts(
+    rows: list[dict[str, Any]],
+    png_output_path: Path,
+    json_output_path: Path,
+    *,
+    require_full_backtest_36: bool = False,
+    x_axis_max: float | None = None,
+    title_prefix: str = "Corpus",
+) -> list[dict[str, Any]]:
+    serializable_rows: list[dict[str, Any]] = []
+    for row in rows:
+        score_36 = row.get("score_36m")
+        drawdown_36 = row.get("max_drawdown_r_36m")
+        if score_36 is None or drawdown_36 is None:
+            continue
+        if require_full_backtest_36 and not bool(row.get("has_full_backtest_36m")):
+            continue
+        serialized = dict(row)
+        serialized["is_valid_full_backtest_36m"] = (
+            str(row.get("full_backtest_validation_status_36m") or "") == "valid"
+        )
+        serializable_rows.append(serialized)
+
+    serializable_rows.sort(
+        key=lambda row: (
+            float(row.get("score_36m", float("-inf"))),
+            -float(row.get("max_drawdown_r_36m", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    json_output_path.parent.mkdir(parents=True, exist_ok=True)
+    json_output_path.write_text(
+        json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
+
+    png_output_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(14, 9))
+    if not serializable_rows:
+        title = f"{title_prefix} 36mo Score vs Drawdown: No Attempt Rows Yet"
+        if require_full_backtest_36:
+            title = f"{title_prefix} 36mo Score vs Drawdown: No Valid Full-Backtest Rows Yet"
+        plt.title(title)
+        plt.xlabel("Max Drawdown R (lower is better)")
+        plt.ylabel("36mo Quality Score")
+        plt.tight_layout()
+        plt.savefig(png_output_path, dpi=160)
+        plt.close()
+        return serializable_rows
+
+    valid_full = [
+        row for row in serializable_rows if bool(row.get("is_valid_full_backtest_36m"))
+    ]
+    scrutiny_only = [
+        row for row in serializable_rows if not bool(row.get("is_valid_full_backtest_36m"))
+    ]
+
+    if scrutiny_only:
+        plt.scatter(
+            [float(row["max_drawdown_r_36m"]) for row in scrutiny_only],
+            [float(row["score_36m"]) for row in scrutiny_only],
+            c="#d8b4a0",
+            edgecolors="#9b6b5a",
+            s=34,
+            alpha=0.5,
+            label="Scrutiny only",
+        )
+    if valid_full:
+        plt.scatter(
+            [float(row["max_drawdown_r_36m"]) for row in valid_full],
+            [float(row["score_36m"]) for row in valid_full],
+            c="#e76f51",
+            edgecolors="#8a3d2d",
+            s=56,
+            alpha=0.82,
+            label="Valid full backtest",
+        )
+
+    top_rows = serializable_rows[: min(12, len(serializable_rows))]
+    for row in top_rows:
+        label = str(row.get("candidate_name") or row.get("attempt_id") or "attempt")
+        if len(label) > 36:
+            label = label[:33] + "..."
+        plt.annotate(
+            label,
+            (float(row["max_drawdown_r_36m"]), float(row["score_36m"])),
+            textcoords="offset points",
+            xytext=(7, 5),
+            fontsize=8,
+            color="#1f2933",
+        )
+
+    x_all = [float(row["max_drawdown_r_36m"]) for row in serializable_rows]
+    y_all = [float(row["score_36m"]) for row in serializable_rows]
+    x_min = min(x_all)
+    x_max = max(x_all)
+    y_min = min(y_all)
+    y_max = max(y_all)
+    if x_axis_max is not None:
+        x_max = min(x_max, float(x_axis_max))
+    x_padding = max(0.15, (x_max - x_min) * 0.08) if x_max != x_min else 0.15
+    y_padding = max(0.5, (y_max - y_min) * 0.08) if y_max != y_min else 0.5
+    plt.xlim(max(0.0, x_min - x_padding), x_max + x_padding)
+    plt.ylim(y_min - y_padding, y_max + y_padding)
+
+    valid_count = len(valid_full)
+    total_count = len(serializable_rows)
+    title = f"{title_prefix} 36mo Score vs Drawdown: {total_count} attempts"
+    subtitle = f"{valid_count} valid full-backtest rows"
+    if require_full_backtest_36:
+        subtitle = f"full-backtest only | {valid_count} rows"
+    plt.title(f"{title}\n{subtitle}")
+    plt.xlabel("Max Drawdown R (lower is better)")
+    plt.ylabel("36mo Quality Score")
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(png_output_path, dpi=160)
+    plt.close()
+    return serializable_rows
+
+
 def render_validation_scatter_artifacts(
     rows: list[dict[str, Any]],
     png_output_path: Path,
