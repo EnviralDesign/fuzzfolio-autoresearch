@@ -324,6 +324,91 @@ The command prefers portable attempt-local caches and will seed them from:
 
 ---
 
+## build-shortlist-report
+
+Build a diversified `36mo` shortlist, render charts, and optionally generate official profile-drop PNGs for the selected candidates.
+
+```powershell
+uv run autoresearch build-shortlist-report
+uv run autoresearch build-shortlist-report --shortlist-size 24 --no-generate-profile-drops
+uv run autoresearch build-shortlist-report --trade-rate-bonus-weight 8 --trade-rate-bonus-target 4
+uv run autoresearch build-shortlist-report --profile-drop-workers 8
+```
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--run-id` | string (repeatable) | all runs | Only consider attempts from the named run id. |
+| `--attempt-id` | string (repeatable) | null | Only consider the named attempt id. |
+| `--candidate-limit` | int | -1 | Optional cap on ranked candidates before similarity/selection. |
+| `--shortlist-size` | int | 12 | How many candidates to put on the shortlist. |
+| `--min-score-36` | float | 40.0 | Minimum `36mo` score required for shortlist consideration. |
+| `--min-retention-ratio` | float | 0.0 | Minimum `36m / 12m` score retention ratio when `12mo` scrutiny exists. |
+| `--min-trades-per-month` | float | 0.0 | Minimum `36mo` trade cadence. |
+| `--max-drawdown-r` | float | -1.0 | Maximum allowed `36mo` drawdown in R. Use `-1` to disable. |
+| `--drawdown-penalty` | float | 0.65 | Penalty applied per R of `36mo` max drawdown during shortlist selection. |
+| `--trade-rate-bonus-weight` | float | 0.0 | Optional positive utility bonus for higher `36mo` trade cadence. |
+| `--trade-rate-bonus-target` | float | 8.0 | Cadence level where the bonus saturates. |
+| `--novelty-penalty` | float | 18.0 | Penalty applied to max sameness during shortlist selection. |
+| `--max-per-run` | int | 1 | Maximum shortlisted candidates per run. Use `-1` to disable. |
+| `--max-per-strategy-key` | int | 1 | Maximum shortlisted candidates per normalized `timeframe + instrument-set`. Use `-1` to disable. |
+| `--max-sameness-to-board` | float | 0.78 | Stop selecting once max sameness to the current board exceeds this ceiling. |
+| `--require-full-backtest-36` | bool | true | Require valid local `36mo` full-backtest artifacts for shortlist candidates. |
+| `--generate-profile-drops` | bool | true | Render official profile-drop PNGs for shortlisted candidates. |
+| `--profile-drop-lookback-months` | int | 36 | Lookback used for shortlisted profile-drop PNG generation. |
+| `--chart-trades-x-max` | float | 300.0 | Default cap for trades/month charts. Use a negative number to disable. |
+| `--profile-drop-timeout-seconds` | int | 1800 | Per-candidate timeout for profile-drop packaging/rendering. |
+| `--profile-drop-workers` | int | 4 | Concurrent workers for shortlisted profile-drop packaging/rendering. |
+| `--force-rebuild-profile-drops` | flag | false | Re-render shortlisted profile-drop PNGs even if derived copies already exist. |
+| `--json` | flag | false | Print machine-readable JSON. |
+
+Outputs under `runs/derived/shortlist-report/`:
+
+- `shortlist-report.json`
+- `shortlist-report.csv`
+- `charts/*`
+- `profile-drops/*`
+
+---
+
+## build-portfolio
+
+Build a config-driven multi-sleeve portfolio report, charts, and optional profile-drop PNGs.
+
+```powershell
+uv run autoresearch build-portfolio
+uv run autoresearch build-portfolio --portfolio-config .\portfolio.config.json
+uv run autoresearch build-portfolio --catch-up-full-backtests
+uv run autoresearch build-portfolio --profile-drop-workers 8
+uv run autoresearch build-portfolio --no-generate-profile-drops
+```
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--run-id` | string (repeatable) | all runs | Only consider attempts from the named run id. |
+| `--attempt-id` | string (repeatable) | null | Only consider the named attempt id. |
+| `--portfolio-config` | path | `portfolio.config.json` | JSON portfolio config path. Falls back to built-in defaults if the file is missing. |
+| `--catch-up-full-backtests` | bool | config/default | Catch up missing `36mo` full-backtests before building the portfolio. |
+| `--catch-up-force-rebuild` | bool | config/default | Force full-backtest rebuilds during the optional catch-up phase. |
+| `--catch-up-require-scrutiny-36` | bool | config/default | Only catch up attempts that already have `36mo` scrutiny. |
+| `--generate-profile-drops` | bool | config/default | Enable or disable final portfolio profile-drop PNG generation. |
+| `--profile-drop-workers` | int | config/default | Override worker count for portfolio profile-drop packaging/rendering. |
+| `--json` | flag | false | Print machine-readable JSON. |
+
+Outputs under `runs/derived/portfolio-report/<portfolio-name>/`:
+
+- `portfolio-report.json`
+- `portfolio-report.csv`
+- `charts/*`
+- `profile-drops/*`
+
+Default config source:
+
+- `portfolio.config.json` at the repo root if present
+- otherwise the built-in default two-sleeve portfolio
+- see `portfolio.config.example.json` for a starting point
+
+---
+
 ## build-promotion-board
 
 Build a `36mo` promotion-oriented board that balances score against sameness.

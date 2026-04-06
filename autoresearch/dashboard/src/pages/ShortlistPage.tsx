@@ -8,7 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useViewerState } from "@/hooks/use-viewer-data";
-import { formatInt } from "@/lib/utils";
+import { formatInt, formatNumber } from "@/lib/utils";
 
 export function ShortlistPage() {
   const { data, isLoading, error } = useViewerState();
@@ -29,6 +29,12 @@ export function ShortlistPage() {
   const selected = shortlist.selected || [];
   const alternates = shortlist.alternates || [];
   const profileDrops = shortlist.profile_drops || [];
+  const basket = shortlist.selected_basket_summary;
+  const isPortfolio = shortlist.source_type === "portfolio";
+  const primaryLabel = isPortfolio ? "Portfolio" : "Shortlist";
+  const candidateLabel = isPortfolio ? "union qualified" : "qualified";
+  const overlapCount =
+    typeof shortlist.selected_overlap_count === "number" ? shortlist.selected_overlap_count : null;
 
   return (
     <div className="space-y-8">
@@ -36,35 +42,53 @@ export function ShortlistPage() {
         <Card className="border-border/60 bg-card/85 shadow-2xl shadow-black/25">
           <CardHeader className="gap-4">
             <div className="flex flex-wrap items-center gap-3">
-              <Badge variant="secondary">Shortlist</Badge>
-              <Badge variant="outline">{formatInt(shortlist.candidate_count)} qualified</Badge>
+              <Badge variant="secondary">{primaryLabel}</Badge>
+              <Badge variant="outline">{formatInt(shortlist.candidate_count)} {candidateLabel}</Badge>
               <Badge>{formatInt(shortlist.selected_count)} selected</Badge>
+              {isPortfolio && overlapCount !== null ? (
+                <Badge variant="outline">{formatInt(overlapCount)} overlap</Badge>
+              ) : null}
             </div>
             <div className="space-y-3">
               <CardTitle className="text-4xl leading-tight tracking-tight">
-                This is the first intentionally diverse cut, not just the highest points on one axis.
+                {isPortfolio
+                  ? "This is the multi-sleeve portfolio union, not a single-axis ranking."
+                  : "This is the first intentionally diverse cut, not just the highest points on one axis."}
               </CardTitle>
               <CardDescription className="max-w-3xl text-base leading-7">
-                The shortlist starts from the full 36-month qualified pool, then applies caps and novelty
-                pressure so the board does not collapse into a pile of near-identical winners.
+                {isPortfolio
+                  ? "The dashboard now treats the latest portfolio build as the primary shortlist. It unions multiple sleeves, then shows the final selected basket and where it sits inside the qualified corpus."
+                  : "The shortlist starts from the full 36-month qualified pool, then applies caps and novelty pressure so the board does not collapse into a pile of near-identical winners."}
               </CardDescription>
             </div>
           </CardHeader>
           <CardContent className="grid gap-4 md:grid-cols-3">
             <KeyFact
               icon={<Filter className="h-4 w-4" />}
-              label="Score floor"
-              value={String(shortlist.filters?.min_score_36 ?? "—")}
+              label={isPortfolio ? "Sleeves" : "Score floor"}
+              value={
+                isPortfolio
+                  ? String((shortlist.sleeves || []).length || "—")
+                  : String(shortlist.filters?.min_score_36 ?? "—")
+              }
             />
             <KeyFact
               icon={<ScanHeart className="h-4 w-4" />}
-              label="Sameness cap"
-              value={String(shortlist.filters?.max_sameness_to_board ?? "—")}
+              label={isPortfolio ? "Overlap" : "Sameness cap"}
+              value={
+                isPortfolio
+                  ? String(overlapCount ?? "—")
+                  : String(shortlist.filters?.max_sameness_to_board ?? "—")
+              }
             />
             <KeyFact
               icon={<GalleryHorizontal className="h-4 w-4" />}
-              label="Per strategy cap"
-              value={String(shortlist.filters?.max_per_strategy_key ?? "—")}
+              label={isPortfolio ? "Portfolio name" : "Per strategy cap"}
+              value={
+                isPortfolio
+                  ? String(shortlist.portfolio_name ?? "—")
+                  : String(shortlist.filters?.max_per_strategy_key ?? "—")
+              }
             />
           </CardContent>
         </Card>
@@ -73,8 +97,9 @@ export function ShortlistPage() {
           <CardHeader>
             <CardTitle className="text-2xl tracking-tight">What to look for</CardTitle>
             <CardDescription className="text-sm leading-7">
-              Green points should sit near the upper envelope of the corpus while still spreading across
-              different run lineages and strategy keys.
+              {isPortfolio
+                ? "Green points should show where the unioned sleeves actually landed after overlap and diversity pressure."
+                : "Green points should sit near the upper envelope of the corpus while still spreading across different run lineages and strategy keys."}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4 text-sm leading-7 text-muted-foreground">
@@ -92,8 +117,8 @@ export function ShortlistPage() {
 
       <section className="grid gap-6 xl:grid-cols-2">
         <ChartPanel
-          title="Shortlist overlay on the corpus distribution"
-          description="Gray is the qualified corpus. Green is the chosen set. This is the quickest way to see where selection pressure actually lands."
+          title={isPortfolio ? "Portfolio overlay on the corpus distribution" : "Shortlist overlay on the corpus distribution"}
+          description={isPortfolio ? "Gray is the union-qualified pool. Green is the final portfolio set." : "Gray is the qualified corpus. Green is the chosen set. This is the quickest way to see where selection pressure actually lands."}
           chart={data.charts.shortlist_overlay_score_vs_trades}
         />
         <ChartPanel
@@ -101,6 +126,66 @@ export function ShortlistPage() {
           description="The chosen set should not light this up like a solid block. This is where accidental sameness becomes obvious."
           chart={data.charts.shortlist_similarity_heatmap}
         />
+      </section>
+
+      <section>
+        <Card className="border-border/60 bg-card/85 shadow-2xl shadow-black/25">
+          <CardHeader>
+            <CardTitle className="text-2xl tracking-tight">Basket view of the shortlist</CardTitle>
+            <CardDescription>
+              {isPortfolio
+                ? "These are basket-level rollups for the current portfolio union, using local 36-month full-backtest curves and metadata already in the corpus."
+                : "These are portfolio-level rollups for the currently selected names, using the local 36-month full-backtest curves and metadata already in the corpus."}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+            <KeyFact
+              icon={<GalleryHorizontal className="h-4 w-4" />}
+              label="Strategies"
+              value={formatInt(basket?.strategy_count)}
+            />
+            <KeyFact
+              icon={<Filter className="h-4 w-4" />}
+              label="Total trades / month"
+              value={formatNumber(basket?.trades_per_month?.sum, 2)}
+            />
+            <KeyFact
+              icon={<Filter className="h-4 w-4" />}
+              label="Avg trades / month"
+              value={formatNumber(basket?.trades_per_month?.mean, 2)}
+            />
+            <KeyFact
+              icon={<ScanHeart className="h-4 w-4" />}
+              label="Total R / month"
+              value={formatNumber(basket?.realized_r_per_month_36m?.sum, 2)}
+            />
+            <KeyFact
+              icon={<ScanHeart className="h-4 w-4" />}
+              label="Avg R / month"
+              value={formatNumber(basket?.realized_r_per_month_36m?.mean, 2)}
+            />
+            <KeyFact
+              icon={<ScanHeart className="h-4 w-4" />}
+              label="Avg max DD (R)"
+              value={formatNumber(basket?.max_drawdown_r_36m?.mean, 2)}
+            />
+            <KeyFact
+              icon={<ScanHeart className="h-4 w-4" />}
+              label="Avg max DD / month"
+              value={formatNumber(basket?.max_drawdown_r_per_month_36m?.mean, 3)}
+            />
+            <KeyFact
+              icon={<GalleryHorizontal className="h-4 w-4" />}
+              label="Avg 36m score"
+              value={formatNumber(basket?.score_36m?.mean, 2)}
+            />
+            <KeyFact
+              icon={<GalleryHorizontal className="h-4 w-4" />}
+              label="Total 36m R"
+              value={formatNumber(basket?.realized_r_total_36m?.sum, 2)}
+            />
+          </CardContent>
+        </Card>
       </section>
 
       <section>
@@ -114,14 +199,20 @@ export function ShortlistPage() {
               <CardHeader>
                 <CardTitle className="text-2xl tracking-tight">Selected attempts</CardTitle>
                 <CardDescription>
-                  Utility is score minus novelty pressure minus drawdown penalty.
+                  {isPortfolio
+                    ? "These are the currently selected names from the latest multi-sleeve portfolio build."
+                    : "Utility is score minus novelty pressure minus drawdown penalty."}
                 </CardDescription>
               </CardHeader>
               <CardContent>
                 <AttemptTable
                   rows={selected}
                   showSelectionFields
-                  caption="These are the current chosen attempts from the shortlist builder."
+                  caption={
+                    isPortfolio
+                      ? "These are the current chosen attempts from the portfolio builder."
+                      : "These are the current chosen attempts from the shortlist builder."
+                  }
                 />
               </CardContent>
             </Card>

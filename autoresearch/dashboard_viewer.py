@@ -34,6 +34,18 @@ def _load_optional_json(path: Path) -> Any | None:
         return None
 
 
+def _latest_portfolio_report_path(config: AppConfig) -> Path | None:
+    root = config.derived_root / "portfolio-report"
+    if not root.exists():
+        return None
+    candidates = sorted(
+        root.glob("*/portfolio-report.json"),
+        key=lambda path: path.stat().st_mtime_ns if path.exists() else 0,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
 def _file_signature(path: Path) -> tuple[str, bool, int | None, int | None]:
     try:
         stat = path.stat()
@@ -268,6 +280,19 @@ def _cadence_band_rows(rows: list[dict[str, Any]], *, min_score: float | None = 
 def _normalize_shortlist_payload(config: AppConfig, payload: dict[str, Any] | None) -> dict[str, Any]:
     report = dict(payload or {})
     report_root = config.derived_root / SHORTLIST_REPORT_ROOTNAME
+    filters = dict(report.get("filters") or {})
+    scope = dict(report.get("scope") or {})
+    is_filtered = bool(filters.get("run_ids") or filters.get("attempt_ids"))
+    report["scope"] = {
+        "is_canonical": bool(scope.get("is_canonical", True)),
+        "is_filtered": bool(scope.get("is_filtered", is_filtered)),
+        "report_root": str(scope.get("report_root") or report_root),
+    }
+    if report["scope"]["is_filtered"]:
+        report["warning"] = (
+            "The current shortlist artifact was built from a filtered run/attempt slice, "
+            "not the full corpus."
+        )
     charts = dict(report.get("charts") or {})
     overlay_png = report_root / "charts" / "shortlist-overlay-score-vs-trades-36mo.png"
     overlay_json = report_root / "charts" / "shortlist-overlay-score-vs-trades-36mo.json"
@@ -306,6 +331,120 @@ def _normalize_shortlist_payload(config: AppConfig, payload: dict[str, Any] | No
     return report
 
 
+def _merge_attempt_unions(
+    rows: list[dict[str, Any]] | None,
+    *,
+    label_field: str,
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for row in list(rows or []):
+        attempt_id = str(row.get("attempt_id") or "").strip()
+        if not attempt_id:
+            continue
+        if attempt_id not in merged:
+            merged[attempt_id] = dict(row)
+            continue
+        prior = merged[attempt_id]
+        labels = list(prior.get(label_field) or [])
+        for label in list(row.get(label_field) or []):
+            if label not in labels:
+                labels.append(label)
+        if labels:
+            prior[label_field] = labels
+            prior[f"{label_field}_count"] = len(labels)
+    merged_rows = list(merged.values())
+    merged_rows.sort(key=_score_sort_key)
+    return merged_rows
+
+
+def _normalize_portfolio_as_shortlist(
+    config: AppConfig, payload: dict[str, Any] | None, report_path: Path
+) -> dict[str, Any]:
+    report = dict(payload or {})
+    portfolio_spec = dict(report.get("portfolio_spec") or {})
+    selected_rows = list(report.get("selected") or [])
+    alternates = _merge_attempt_unions(
+        [
+            dict(item)
+            for sleeve in list(report.get("sleeves") or [])
+            for item in list((sleeve or {}).get("alternates") or [])
+        ],
+        label_field="selected_by_sleeves",
+    )
+    charts = dict(report.get("charts") or {})
+    mapped_charts: dict[str, str] = {}
+    chart_key_map = {
+        "portfolio_candidate_score_vs_drawdown": "corpus_score_vs_drawdown",
+        "portfolio_candidate_score_vs_sameness": "corpus_score_vs_sameness",
+        "portfolio_score_vs_trades": "shortlist_score_vs_trades",
+        "portfolio_score_vs_drawdown": "shortlist_score_vs_drawdown",
+        "portfolio_score_vs_sameness": "shortlist_score_vs_sameness",
+        "portfolio_similarity_heatmap": "shortlist_similarity_heatmap",
+        "portfolio_overlay_score_vs_trades": "shortlist_overlay_score_vs_trades",
+    }
+    for source_key, target_key in chart_key_map.items():
+        if charts.get(source_key):
+            mapped_charts[target_key] = str(charts[source_key])
+    normalized = {
+        "generated_at": report.get("generated_at"),
+        "source_type": "portfolio",
+        "source_label": "Portfolio",
+        "portfolio_name": report.get("portfolio_name"),
+        "filters": {
+            "sleeve_count": len(list(report.get("sleeves") or [])),
+            "selected_overlap_count": int(report.get("selected_overlap_count") or 0),
+            "profile_drop_workers": portfolio_spec.get("profile_drop_workers"),
+            "chart_trades_x_max": portfolio_spec.get("chart_trades_x_max"),
+        },
+        "candidate_count": int(report.get("candidate_union_count") or 0),
+        "selected_count": int(report.get("selected_union_count") or len(selected_rows)),
+        "alternate_count": len(alternates),
+        "selected_basket_summary": report.get("selected_basket_summary") or {},
+        "selected": selected_rows,
+        "alternates": alternates,
+        "profile_drops": list(report.get("profile_drops") or []),
+        "charts": mapped_charts,
+        "scope": {
+            "is_canonical": True,
+            "is_filtered": bool(report.get("run_ids") or report.get("attempt_ids")),
+            "report_root": str(report_path.parent),
+        },
+        "warning": None,
+        "selected_trade_rate_summary": report.get("selected_trade_rate_summary") or {},
+        "candidate_trade_rate_summary": report.get("candidate_trade_rate_summary") or {},
+        "selected_overlap_count": int(report.get("selected_overlap_count") or 0),
+        "sleeves": list(report.get("sleeves") or []),
+    }
+    normalized["selected"] = [
+        _normalize_path_fields(config, row) for row in list(normalized.get("selected") or [])
+    ]
+    normalized["alternates"] = [
+        _normalize_path_fields(config, row) for row in list(normalized.get("alternates") or [])
+    ]
+    normalized["profile_drops"] = [
+        {
+            **dict(item),
+            "png_url": (
+                _file_url(config, Path(str(item.get("png_path"))))
+                if item.get("png_path") and Path(str(item.get("png_path"))).exists()
+                else None
+            ),
+            "manifest_url": (
+                _file_url(config, Path(str(item.get("manifest_path"))))
+                if item.get("manifest_path") and Path(str(item.get("manifest_path"))).exists()
+                else None
+            ),
+        }
+        for item in list(normalized.get("profile_drops") or [])
+    ]
+    normalized["charts"] = {
+        key: _normalize_chart_entry(config, str(value))
+        for key, value in mapped_charts.items()
+        if value
+    }
+    return normalized
+
+
 def _normalize_promotion_payload(config: AppConfig, payload: dict[str, Any] | None) -> dict[str, Any]:
     report = dict(payload or {})
     report["selected"] = [
@@ -321,10 +460,18 @@ def _normalize_promotion_payload(config: AppConfig, payload: dict[str, Any] | No
 def _build_viewer_payload(config: AppConfig, catalog_rows: list[dict[str, Any]]) -> dict[str, Any]:
     summary = _load_optional_json(config.attempt_catalog_summary_path) or {}
     audit = _load_optional_json(config.full_backtest_audit_json_path) or {}
-    shortlist = _normalize_shortlist_payload(
-        config,
-        _load_optional_json(config.derived_root / SHORTLIST_REPORT_ROOTNAME / "shortlist-report.json"),
-    )
+    latest_portfolio_path = _latest_portfolio_report_path(config)
+    if latest_portfolio_path:
+        shortlist = _normalize_portfolio_as_shortlist(
+            config,
+            _load_optional_json(latest_portfolio_path),
+            latest_portfolio_path,
+        )
+    else:
+        shortlist = _normalize_shortlist_payload(
+            config,
+            _load_optional_json(config.derived_root / SHORTLIST_REPORT_ROOTNAME / "shortlist-report.json"),
+        )
     promotion = _normalize_promotion_payload(
         config,
         _load_optional_json(config.promotion_board_json_path),
@@ -388,6 +535,7 @@ class ViewerState:
             return list(self._catalog_rows)
 
     def snapshot(self) -> dict[str, Any]:
+        latest_portfolio_path = _latest_portfolio_report_path(self.config)
         signature = (
             _file_signature(self.config.attempt_catalog_summary_path),
             _file_signature(self.config.full_backtest_audit_json_path),
@@ -396,6 +544,7 @@ class ViewerState:
             _file_signature(
                 self.config.derived_root / SHORTLIST_REPORT_ROOTNAME / "shortlist-report.json"
             ),
+            _file_signature(latest_portfolio_path) if latest_portfolio_path else ("", False, None, None),
             _file_signature(self.config.corpus_tradeoff_plot_path),
         )
         with self._lock:

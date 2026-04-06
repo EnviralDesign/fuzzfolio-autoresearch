@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from contextlib import redirect_stdout
+import io
 import json
 import os
 import re
@@ -2622,20 +2624,39 @@ def _matching_run_dirs(
     return run_dirs
 
 
-def _catalog_rows_for_run_dirs(config, run_dirs: list[Path]) -> list[dict[str, Any]]:
+def _catalog_rows_for_run_dirs(
+    config,
+    run_dirs: list[Path],
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> list[dict[str, Any]]:
     run_metadata_by_run_id = {
         run_dir.name: load_run_metadata(run_dir) for run_dir in run_dirs
     }
+    total_runs = len(run_dirs)
+    if progress_callback is not None:
+        progress_callback({"stage": "start", "total_runs": total_runs})
     rows: list[dict[str, Any]] = []
-    for run_dir in run_dirs:
+    for index, run_dir in enumerate(run_dirs, start=1):
         run_metadata = run_metadata_by_run_id.get(run_dir.name) or {}
-        for attempt in load_run_attempts(run_dir):
+        attempts = load_run_attempts(run_dir)
+        for attempt in attempts:
             rows.append(
                 extract_attempt_catalog_row(
                     attempt,
                     run_metadata,
                     validation_cache_root=config.validation_cache_root,
                 )
+            )
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "progress",
+                    "completed_runs": index,
+                    "total_runs": total_runs,
+                    "run_id": run_dir.name,
+                    "attempt_count": len(attempts),
+                    "row_count": len(rows),
+                }
             )
     rows.sort(
         key=lambda row: (
@@ -2916,6 +2937,86 @@ def _trade_rate_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "at_least_1_per_month": sum(1 for value in values if value >= 1.0),
         "at_least_2_per_month": sum(1 for value in values if value >= 2.0),
         "at_least_4_per_month": sum(1 for value in values if value >= 4.0),
+    }
+
+
+def _curve_terminal_realized_r(curve_path: Path | None) -> float | None:
+    if curve_path is None or not curve_path.exists():
+        return None
+    payload = _load_json_if_exists(curve_path)
+    points = _nested_get(payload, ["curve", "points"])
+    if not isinstance(points, list):
+        return None
+    last_value: float | None = None
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        value = _safe_float_value(point.get("realized_r"))
+        if value is None:
+            continue
+        last_value = value
+    return last_value
+
+
+def _summary_from_values(values: list[float]) -> dict[str, Any]:
+    if not values:
+        return {"count": 0, "min": None, "mean": None, "median": None, "max": None, "sum": None}
+    ordered = sorted(values)
+    count = len(ordered)
+    midpoint = count // 2
+    median = (
+        ordered[midpoint]
+        if count % 2 == 1
+        else (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+    )
+    return {
+        "count": count,
+        "min": ordered[0],
+        "mean": sum(ordered) / count,
+        "median": median,
+        "max": ordered[-1],
+        "sum": sum(ordered),
+    }
+
+
+def _build_selection_basket_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    realized_r_per_month_values: list[float] = []
+    realized_r_total_values: list[float] = []
+    drawdown_values: list[float] = []
+    drawdown_per_month_values: list[float] = []
+    trades_per_month_values: list[float] = []
+    score_values: list[float] = []
+
+    for row in rows:
+        trades_per_month = _safe_float_value(row.get("trades_per_month_36m"))
+        if trades_per_month is not None:
+            trades_per_month_values.append(trades_per_month)
+        score_36 = _safe_float_value(row.get("score_36m"))
+        if score_36 is not None:
+            score_values.append(score_36)
+        drawdown_r = _safe_float_value(row.get("max_drawdown_r_36m"))
+        if drawdown_r is not None:
+            drawdown_values.append(drawdown_r)
+
+        effective_window = _safe_float_value(row.get("effective_window_months_36m"))
+        curve_path_raw = row.get("full_backtest_curve_path_36m") or row.get("scrutiny_curve_path_36m")
+        curve_path = Path(str(curve_path_raw)).resolve() if curve_path_raw else None
+        realized_r_total = _curve_terminal_realized_r(curve_path)
+        if realized_r_total is not None:
+            realized_r_total_values.append(realized_r_total)
+            if effective_window and effective_window > 0:
+                realized_r_per_month_values.append(realized_r_total / effective_window)
+        if drawdown_r is not None and effective_window and effective_window > 0:
+            drawdown_per_month_values.append(drawdown_r / effective_window)
+
+    return {
+        "strategy_count": len(rows),
+        "trades_per_month": _summary_from_values(trades_per_month_values),
+        "score_36m": _summary_from_values(score_values),
+        "realized_r_total_36m": _summary_from_values(realized_r_total_values),
+        "realized_r_per_month_36m": _summary_from_values(realized_r_per_month_values),
+        "max_drawdown_r_36m": _summary_from_values(drawdown_values),
+        "max_drawdown_r_per_month_36m": _summary_from_values(drawdown_per_month_values),
     }
 
 
@@ -4659,6 +4760,19 @@ def _render_profile_drop_for_attempt(
     }
 
 
+def _should_retry_profile_drop_error(message: str) -> bool:
+    normalized = str(message or "").lower()
+    retry_tokens = [
+        "http request failed",
+        "connection was forcibly closed",
+        "connection error",
+        "sendrequest",
+        "timed out",
+        "timeout",
+    ]
+    return any(token in normalized for token in retry_tokens)
+
+
 def _render_profile_drop_rows(
     *,
     config,
@@ -4761,27 +4875,38 @@ def _render_profile_drop_rows(
         attempts: list[dict[str, Any]],
         attempt: dict[str, Any],
     ) -> dict[str, Any]:
-        worker_cli = FuzzfolioCli(config.fuzzfolio)
-        result = _render_profile_drop_for_attempt(
-            config=config,
-            cli=worker_cli,
-            renderer_executable=renderer_executable,
-            working_dir=working_dir,
-            run_dir=run_dir,
-            attempts=attempts,
-            attempt=attempt,
-            output_root=output_root,
-            lookback_months=int(lookback_months),
-            force_rebuild=force_rebuild,
-            timeout_seconds=int(timeout_seconds),
-            emit=None,
-        )
-        return {
-            "attempt_id": row.get("attempt_id"),
-            "run_id": row.get("run_id"),
-            "candidate_name": row.get("candidate_name"),
-            **result,
-        }
+        attempts_remaining = 3
+        last_error: Exception | None = None
+        while attempts_remaining > 0:
+            try:
+                worker_cli = FuzzfolioCli(config.fuzzfolio)
+                result = _render_profile_drop_for_attempt(
+                    config=config,
+                    cli=worker_cli,
+                    renderer_executable=renderer_executable,
+                    working_dir=working_dir,
+                    run_dir=run_dir,
+                    attempts=attempts,
+                    attempt=attempt,
+                    output_root=output_root,
+                    lookback_months=int(lookback_months),
+                    force_rebuild=force_rebuild,
+                    timeout_seconds=int(timeout_seconds),
+                    emit=None,
+                )
+                return {
+                    "attempt_id": row.get("attempt_id"),
+                    "run_id": row.get("run_id"),
+                    "candidate_name": row.get("candidate_name"),
+                    **result,
+                }
+            except Exception as exc:
+                last_error = exc
+                attempts_remaining -= 1
+                if attempts_remaining <= 0 or not _should_retry_profile_drop_error(str(exc)):
+                    break
+                pytime.sleep(2.0)
+        raise RuntimeError(str(last_error) if last_error is not None else "Unknown render error")
 
     worker_count = max(1, int(profile_drop_workers))
     with progress:
@@ -4854,6 +4979,103 @@ def _portfolio_chart_paths(report_root: Path) -> tuple[Path, Path]:
     return charts_root, profile_drop_root
 
 
+def _sanitize_report_token(value: str, *, fallback: str = "slice") -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value or "").strip()).strip("-._")
+    return token[:80] if token else fallback
+
+
+def _shortlist_report_root(
+    config: AppConfig,
+    *,
+    run_ids: Sequence[str] | None,
+    attempt_ids: Sequence[str] | None,
+) -> tuple[Path, bool]:
+    filtered_run_ids = [str(value).strip() for value in (run_ids or []) if str(value).strip()]
+    filtered_attempt_ids = [
+        str(value).strip() for value in (attempt_ids or []) if str(value).strip()
+    ]
+    if not filtered_run_ids and not filtered_attempt_ids:
+        return config.derived_root / "shortlist-report", True
+    label_parts: list[str] = []
+    if filtered_run_ids:
+        if len(filtered_run_ids) == 1:
+            label_parts.append(f"run-{_sanitize_report_token(filtered_run_ids[0], fallback='run')}")
+        else:
+            label_parts.append(f"runs-{len(filtered_run_ids)}")
+    if filtered_attempt_ids:
+        if len(filtered_attempt_ids) == 1:
+            label_parts.append(
+                f"attempt-{_sanitize_report_token(filtered_attempt_ids[0], fallback='attempt')}"
+            )
+        else:
+            label_parts.append(f"attempts-{len(filtered_attempt_ids)}")
+    timestamp = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
+    label = "-".join(label_parts) if label_parts else "filtered"
+    return config.derived_root / "shortlist-report-slices" / f"{timestamp}-{label}", False
+
+
+def _phase_emit(message: str, *, as_json: bool) -> None:
+    if as_json:
+        return
+    _write_plain_line(message)
+
+
+def _catalog_phase_callback(label: str, *, as_json: bool) -> Callable[[dict[str, Any]], None]:
+    def callback(event: dict[str, Any]) -> None:
+        if as_json:
+            return
+        stage = str(event.get("stage") or "")
+        if stage == "start":
+            total_runs = int(event.get("total_runs") or 0)
+            _write_plain_line(f"[{label}] loading corpus rows from {total_runs} run directories")
+            return
+        if stage == "progress":
+            completed = int(event.get("completed_runs") or 0)
+            total_runs = int(event.get("total_runs") or 0)
+            run_id = str(event.get("run_id") or "")
+            row_count = int(event.get("row_count") or 0)
+            if completed == 1 or completed == total_runs or completed % 10 == 0:
+                _write_plain_line(
+                    f"[{label}] catalog {completed}/{total_runs} runs, {row_count} rows loaded, latest={run_id}"
+                )
+
+    return callback
+
+
+def _similarity_phase_callback(
+    label: str, *, as_json: bool
+) -> Callable[[dict[str, Any]], None]:
+    def callback(event: dict[str, Any]) -> None:
+        if as_json:
+            return
+        stage = str(event.get("stage") or "")
+        if stage == "prepare_start":
+            total = int(event.get("total") or 0)
+            _write_plain_line(f"[{label}] loading {total} curve payloads for similarity")
+            return
+        if stage == "prepare_progress":
+            completed = int(event.get("completed") or 0)
+            total = int(event.get("total") or 0)
+            prepared = int(event.get("prepared_count") or 0)
+            _write_plain_line(
+                f"[{label}] similarity curves {completed}/{total} scanned, {prepared} usable"
+            )
+            return
+        if stage == "pairs_start":
+            total = int(event.get("total") or 0)
+            prepared = int(event.get("prepared_count") or 0)
+            _write_plain_line(
+                f"[{label}] computing similarity pairs for {prepared} candidates ({total} pair checks)"
+            )
+            return
+        if stage == "pairs_progress":
+            completed = int(event.get("completed") or 0)
+            total = int(event.get("total") or 0)
+            _write_plain_line(f"[{label}] similarity pairs {completed}/{total}")
+
+    return callback
+
+
 def cmd_build_shortlist_report(
     *,
     run_ids: list[str] | None,
@@ -4882,7 +5104,11 @@ def cmd_build_shortlist_report(
 ) -> int:
     config = load_config()
     run_dirs = _matching_run_dirs(config, run_ids)
-    full_catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    full_catalog_rows = _catalog_rows_for_run_dirs(
+        config,
+        run_dirs,
+        progress_callback=_catalog_phase_callback("shortlist", as_json=as_json),
+    )
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
     }
@@ -4952,7 +5178,14 @@ def cmd_build_shortlist_report(
             continue
         candidate_rows.append(row)
 
-    similarity_payload = build_candidate_similarity_payload(candidate_rows)
+    _phase_emit(
+        f"[shortlist] {len(candidate_rows)} qualified candidates after filtering",
+        as_json=as_json,
+    )
+    similarity_payload = build_candidate_similarity_payload(
+        candidate_rows,
+        progress_callback=_similarity_phase_callback("shortlist", as_json=as_json),
+    )
     shortlist_board = select_promotion_board(
         candidate_rows,
         similarity_payload,
@@ -4967,9 +5200,22 @@ def cmd_build_shortlist_report(
         max_per_strategy_key=(None if max_per_strategy_key < 0 else max_per_strategy_key),
     )
     shortlist_rows = list(shortlist_board.get("selected") or [])
-    shortlist_similarity_payload = build_candidate_similarity_payload(shortlist_rows)
+    _phase_emit(
+        f"[shortlist] selected {len(shortlist_rows)} candidates, building shortlist-only similarity payload",
+        as_json=as_json,
+    )
+    shortlist_similarity_payload = build_candidate_similarity_payload(
+        shortlist_rows,
+        progress_callback=_similarity_phase_callback(
+            "shortlist-selected", as_json=as_json
+        ),
+    )
 
-    report_root = config.derived_root / "shortlist-report"
+    report_root, is_canonical_report = _shortlist_report_root(
+        config,
+        run_ids=run_ids,
+        attempt_ids=attempt_ids,
+    )
     report_root.mkdir(parents=True, exist_ok=True)
     charts_root, profile_drop_root = _portfolio_chart_paths(report_root)
 
@@ -5042,6 +5288,11 @@ def cmd_build_shortlist_report(
 
     shortlist_payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
+        "scope": {
+            "is_canonical": is_canonical_report,
+            "is_filtered": bool(run_ids or attempt_ids),
+            "report_root": str(report_root),
+        },
         "filters": {
             "run_ids": run_ids,
             "attempt_ids": attempt_ids,
@@ -5068,6 +5319,7 @@ def cmd_build_shortlist_report(
         "alternate_count": len(shortlist_board.get("alternates") or []),
         "candidate_trade_rate_summary": _trade_rate_summary(candidate_rows),
         "selected_trade_rate_summary": _trade_rate_summary(shortlist_rows),
+        "selected_basket_summary": _build_selection_basket_summary(shortlist_rows),
         "filter_rejections": filter_rejections,
         "selected_by_run": shortlist_board.get("selected_by_run") or {},
         "selected_by_strategy_key": shortlist_board.get("selected_by_strategy_key") or {},
@@ -5098,6 +5350,7 @@ def cmd_build_shortlist_report(
         json.dumps(
             {
                 "report_root": str(report_root),
+                "is_canonical_report": is_canonical_report,
                 "shortlist_json": str(report_root / "shortlist-report.json"),
                 "shortlist_csv": str(report_root / "shortlist-report.csv"),
                 "candidate_count": len(candidate_rows),
@@ -5152,16 +5405,31 @@ def cmd_build_portfolio(
 
     catch_up_summary: dict[str, Any] | None = None
     if bool(portfolio_spec.get("catch_up_full_backtests")):
-        exit_code = cmd_calculate_full_backtests(
-            run_ids=run_ids,
-            attempt_ids=attempt_ids,
-            limit=None,
-            max_workers=None,
-            use_dev_sim_worker_count=True,
-            require_scrutiny_36=bool(portfolio_spec.get("catch_up_require_scrutiny_36")),
-            force_rebuild=bool(portfolio_spec.get("catch_up_force_rebuild")),
-            as_json=True,
-        )
+        if as_json:
+            with io.StringIO() as capture, redirect_stdout(capture):
+                exit_code = cmd_calculate_full_backtests(
+                    run_ids=run_ids,
+                    attempt_ids=attempt_ids,
+                    limit=None,
+                    max_workers=None,
+                    use_dev_sim_worker_count=True,
+                    require_scrutiny_36=bool(
+                        portfolio_spec.get("catch_up_require_scrutiny_36")
+                    ),
+                    force_rebuild=bool(portfolio_spec.get("catch_up_force_rebuild")),
+                    as_json=True,
+                )
+        else:
+            exit_code = cmd_calculate_full_backtests(
+                run_ids=run_ids,
+                attempt_ids=attempt_ids,
+                limit=None,
+                max_workers=None,
+                use_dev_sim_worker_count=True,
+                require_scrutiny_36=bool(portfolio_spec.get("catch_up_require_scrutiny_36")),
+                force_rebuild=bool(portfolio_spec.get("catch_up_force_rebuild")),
+                as_json=False,
+            )
         catch_up_summary = {
             "attempt_catalog_summary": load_json_if_exists(config.attempt_catalog_summary_path),
             "full_backtest_failures": load_json_if_exists(
@@ -5172,7 +5440,11 @@ def cmd_build_portfolio(
             raise SystemExit("Full-backtest catch-up failed during build-portfolio.")
 
     run_dirs = _matching_run_dirs(config, run_ids)
-    full_catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    full_catalog_rows = _catalog_rows_for_run_dirs(
+        config,
+        run_dirs,
+        progress_callback=_catalog_phase_callback("portfolio", as_json=as_json),
+    )
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
     }
@@ -5183,15 +5455,39 @@ def cmd_build_portfolio(
         ]
     rows.sort(key=_full_backtest_priority_key)
 
-    sleeve_results = [
-        build_sleeve_selection(rows, sleeve_spec)
-        for sleeve_spec in list(portfolio_spec.get("sleeves") or [])
-    ]
+    sleeve_results = []
+    for sleeve_spec in list(portfolio_spec.get("sleeves") or []):
+        sleeve_name = str(sleeve_spec.get("name") or "sleeve").strip()
+        _phase_emit(f"[portfolio] building sleeve '{sleeve_name}'", as_json=as_json)
+        sleeve_result = build_sleeve_selection(
+            rows,
+            sleeve_spec,
+            similarity_progress_callback=_similarity_phase_callback(
+                f"portfolio:{sleeve_name}", as_json=as_json
+            ),
+        )
+        _phase_emit(
+            f"[portfolio] sleeve '{sleeve_name}' selected {len(sleeve_result.get('selected_rows') or [])} from {len(sleeve_result.get('candidate_rows') or [])} qualified",
+            as_json=as_json,
+        )
+        sleeve_results.append(sleeve_result)
     merged = merge_portfolio_sleeves(sleeve_results)
     portfolio_rows = list(merged.get("selected_rows") or [])
     portfolio_candidate_rows = list(merged.get("candidate_rows") or [])
-    portfolio_similarity_payload = build_candidate_similarity_payload(portfolio_rows)
-    candidate_similarity_payload = build_candidate_similarity_payload(portfolio_candidate_rows)
+    _phase_emit(
+        f"[portfolio] merged {len(portfolio_rows)} final selections from {len(portfolio_candidate_rows)} union candidates",
+        as_json=as_json,
+    )
+    portfolio_similarity_payload = build_candidate_similarity_payload(
+        portfolio_rows,
+        progress_callback=_similarity_phase_callback("portfolio-final", as_json=as_json),
+    )
+    candidate_similarity_payload = build_candidate_similarity_payload(
+        portfolio_candidate_rows,
+        progress_callback=_similarity_phase_callback(
+            "portfolio-union", as_json=as_json
+        ),
+    )
 
     portfolio_name = str(portfolio_spec.get("portfolio_name") or "default-portfolio").strip()
     report_root = config.derived_root / "portfolio-report" / _slug_token(portfolio_name)
@@ -5305,6 +5601,7 @@ def cmd_build_portfolio(
         "selected_overlap_count": int(merged.get("selected_overlap_count") or 0),
         "candidate_trade_rate_summary": _trade_rate_summary(portfolio_candidate_rows),
         "selected_trade_rate_summary": _trade_rate_summary(portfolio_rows),
+        "selected_basket_summary": _build_selection_basket_summary(portfolio_rows),
         "sleeves": sleeves_payload,
         "selected": portfolio_rows,
         "profile_drops": profile_drop_results,

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .corpus_tools import (
     build_similarity_payload as build_candidate_similarity_payload,
@@ -44,6 +44,7 @@ DEFAULT_PORTFOLIO_SPEC: dict[str, Any] = {
         {
             **DEFAULT_SLEEVE_SPEC,
             "name": "quality",
+            "shortlist_size": 24,
             "trade_rate_bonus_weight": 0.0,
             "trade_rate_bonus_target": 8.0,
         },
@@ -173,6 +174,7 @@ def filter_selection_candidate_rows(
 def build_sleeve_selection(
     rows: list[dict[str, Any]],
     sleeve_spec: dict[str, Any],
+    similarity_progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     candidate_rows, filter_rejections, max_drawdown_cap = filter_selection_candidate_rows(
         rows,
@@ -183,7 +185,9 @@ def build_sleeve_selection(
         max_drawdown_r=float(sleeve_spec.get("max_drawdown_r", -1.0)),
         require_full_backtest_36=bool(sleeve_spec.get("require_full_backtest_36", True)),
     )
-    similarity_payload = build_candidate_similarity_payload(candidate_rows)
+    similarity_payload = build_candidate_similarity_payload(
+        candidate_rows, progress_callback=similarity_progress_callback
+    )
     board = select_promotion_board(
         candidate_rows,
         similarity_payload,
@@ -277,4 +281,3 @@ def merge_portfolio_sleeves(sleeve_results: list[dict[str, Any]]) -> dict[str, A
         "selected_union_count": len(selected_rows),
         "candidate_union_count": len(candidate_rows),
     }
-

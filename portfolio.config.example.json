@@ -13,7 +13,7 @@
     {
       "name": "quality",
       "candidate_limit": -1,
-      "shortlist_size": 12,
+      "shortlist_size": 24,
       "min_score_36": 40.0,
       "min_retention_ratio": 0.0,
       "min_trades_per_month": 0.0,

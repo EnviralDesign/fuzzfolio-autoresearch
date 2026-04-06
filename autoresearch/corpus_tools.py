@@ -4,7 +4,7 @@ import csv
 import json
 from math import log1p
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .scoring import build_attempt_score
 
@@ -951,14 +951,42 @@ def pearson_correlation(left: list[float], right: list[float]) -> float | None:
     return covariance / (left_var**0.5 * right_var**0.5)
 
 
-def build_similarity_payload(candidate_rows: list[dict[str, Any]]) -> dict[str, Any]:
+def build_similarity_payload(
+    candidate_rows: list[dict[str, Any]],
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     prepared: list[dict[str, Any]] = []
-    for row in candidate_rows:
+    candidate_total = len(candidate_rows)
+    if progress_callback is not None:
+        progress_callback({"stage": "prepare_start", "total": candidate_total})
+    for index, row in enumerate(candidate_rows, start=1):
         curve_path_raw = str(row.get("scrutiny_curve_path_36m") or "").strip()
         if not curve_path_raw:
+            if progress_callback is not None and (
+                index == candidate_total or index == 1 or index % 50 == 0
+            ):
+                progress_callback(
+                    {
+                        "stage": "prepare_progress",
+                        "completed": index,
+                        "total": candidate_total,
+                        "prepared_count": len(prepared),
+                    }
+                )
             continue
         curve_series = load_curve_series(Path(curve_path_raw))
         if not curve_series:
+            if progress_callback is not None and (
+                index == candidate_total or index == 1 or index % 50 == 0
+            ):
+                progress_callback(
+                    {
+                        "stage": "prepare_progress",
+                        "completed": index,
+                        "total": candidate_total,
+                        "prepared_count": len(prepared),
+                    }
+                )
             continue
         prepared.append(
             {
@@ -984,24 +1012,61 @@ def build_similarity_payload(candidate_rows: list[dict[str, Any]]) -> dict[str, 
                 "max_drawdown_norm": _safe_float(row.get("max_drawdown_r_36m")),
             }
         )
+        if progress_callback is not None and (
+            index == candidate_total or index == 1 or index % 50 == 0
+        ):
+            progress_callback(
+                {
+                    "stage": "prepare_progress",
+                    "completed": index,
+                    "total": candidate_total,
+                    "prepared_count": len(prepared),
+                }
+            )
 
     if not prepared:
+        if progress_callback is not None:
+            progress_callback({"stage": "pairs_start", "total": 0, "prepared_count": 0})
         return {"leaders": [], "pairs": [], "matrix_labels": [], "matrix_values": []}
 
     prepared.sort(
         key=lambda item: float(item.get("score_36m") or float("-inf")), reverse=True
     )
     pair_records: list[dict[str, Any]] = []
+    pair_total = (len(prepared) * (len(prepared) - 1)) // 2
+    processed_pairs = 0
+    if progress_callback is not None:
+        progress_callback(
+            {
+                "stage": "pairs_start",
+                "total": pair_total,
+                "prepared_count": len(prepared),
+            }
+        )
 
     for left_index, left in enumerate(prepared):
         left_dates = set(left["curve_series"].keys())
         left_values_map = left["curve_series"]
         left_instruments = set(left["instruments_norm"])
         for right_index in range(left_index + 1, len(prepared)):
+            processed_pairs += 1
             right = prepared[right_index]
             right_dates = set(right["curve_series"].keys())
             common_dates = sorted(left_dates & right_dates)
             if len(common_dates) < 30:
+                if progress_callback is not None and (
+                    processed_pairs == pair_total
+                    or processed_pairs == 1
+                    or processed_pairs % 5000 == 0
+                ):
+                    progress_callback(
+                        {
+                            "stage": "pairs_progress",
+                            "completed": processed_pairs,
+                            "total": pair_total,
+                            "prepared_count": len(prepared),
+                        }
+                    )
                 continue
             left_values = [float(left_values_map[date]) for date in common_dates]
             right_values = [float(right["curve_series"][date]) for date in common_dates]
@@ -1086,6 +1151,19 @@ def build_similarity_payload(candidate_rows: list[dict[str, Any]]) -> dict[str, 
                     "similarity_score": similarity_score,
                 }
             )
+            if progress_callback is not None and (
+                processed_pairs == pair_total
+                or processed_pairs == 1
+                or processed_pairs % 5000 == 0
+            ):
+                progress_callback(
+                    {
+                        "stage": "pairs_progress",
+                        "completed": processed_pairs,
+                        "total": pair_total,
+                        "prepared_count": len(prepared),
+                    }
+                )
 
     adjacency: dict[str, list[dict[str, Any]]] = {
         str(item["attempt_id"]): [] for item in prepared

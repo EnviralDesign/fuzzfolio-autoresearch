@@ -58,6 +58,7 @@ uv run autoresearch calculate-full-backtests
 uv run autoresearch build-attempt-catalog
 uv run autoresearch audit-full-backtests
 uv run autoresearch build-shortlist-report
+uv run autoresearch build-portfolio
 uv run autoresearch build-promotion-board
 uv run autoresearch plot-corpus-score-vs-trades
 uv run autoresearch dashboard
@@ -199,6 +200,7 @@ uv run autoresearch build-shortlist-report --shortlist-size 24 --no-generate-pro
 uv run autoresearch build-shortlist-report --min-trades-per-month 1
 uv run autoresearch build-shortlist-report --trade-rate-bonus-weight 8 --trade-rate-bonus-target 4
 uv run autoresearch build-shortlist-report --trade-rate-bonus-weight 15 --trade-rate-bonus-target 2
+uv run autoresearch build-shortlist-report --shortlist-size 24 --profile-drop-workers 8
 uv run autoresearch build-shortlist-report --max-sameness-to-board 0.72
 uv run autoresearch build-shortlist-report --chart-trades-x-max 500
 ```
@@ -218,6 +220,8 @@ Important flags:
   - better than a hard floor when you want more active names without forcing junk in
 - `--trade-rate-bonus-target`
   - cadence level where the bonus saturates
+- `--profile-drop-workers`
+  - parallel worker count for official shortlist profile-drop packaging and rendering
 - `--drawdown-penalty`
   - subtracts utility for deeper drawdowns
 - `--novelty-penalty`
@@ -245,7 +249,51 @@ Useful chart files:
 - [corpus-score-vs-drawdown-36mo.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts/corpus-score-vs-drawdown-36mo.png)
 - [shortlist-similarity-heatmap.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts/shortlist-similarity-heatmap.png)
 
-### 6. Build a stricter promotion board
+### 6. Build a multi-sleeve portfolio
+
+Use this when one shortlist is not enough and you want separate sleeves, such as:
+
+- a quality sleeve that keeps rare high-score names even at low cadence
+- a cadence sleeve that intentionally leans toward more active names
+- a final union report with charts and optional official profile-drop PNGs
+
+Start from the repo-root example config:
+
+```powershell
+Copy-Item portfolio.config.example.json portfolio.config.json
+```
+
+Main command:
+
+```powershell
+uv run autoresearch build-portfolio
+```
+
+Useful variants:
+
+```powershell
+uv run autoresearch build-portfolio --profile-drop-workers 8
+uv run autoresearch build-portfolio --no-generate-profile-drops
+uv run autoresearch build-portfolio --catch-up-full-backtests
+uv run autoresearch build-portfolio --catch-up-full-backtests --catch-up-require-scrutiny-36
+uv run autoresearch build-portfolio --portfolio-config .\portfolio.config.json
+```
+
+Important notes:
+
+- `build-portfolio` wraps multiple shortlist-style sleeves from config
+- sleeves are unioned, not collapsed into one weighted sum
+- profile-drop PNG generation runs in parallel here too
+- optional catch-up can backfill missing `36mo` full-backtests before portfolio selection
+
+Outputs:
+
+- `runs/derived/portfolio-report/<portfolio-name>/portfolio-report.json`
+- `runs/derived/portfolio-report/<portfolio-name>/portfolio-report.csv`
+- `runs/derived/portfolio-report/<portfolio-name>/charts/*`
+- `runs/derived/portfolio-report/<portfolio-name>/profile-drops/*`
+
+### 7. Build a stricter promotion board
 
 Use this when you want a smaller, cleaner promotion gate rather than a richer shortlist/report package.
 
@@ -283,7 +331,7 @@ Outputs:
 - [promotion-board.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/promotion-board.json)
 - [promotion-board.csv](/C:/repos/fuzzfolio-autoresearch/runs/derived/promotion-board.csv)
 
-### 7. Generate the corpus trade-rate chart
+### 8. Generate the corpus trade-rate chart
 
 This renders the attempt-level `36mo` score vs trades/month scatter.
 
@@ -306,7 +354,7 @@ Outputs:
 
 Default x-axis cap is `300 trades/month`.
 
-### 8. Open the dashboard viewer
+### 9. Open the dashboard viewer
 
 The dashboard is now read-only. It does not rebuild or refresh corpus data.
 
@@ -352,6 +400,7 @@ Main derived outputs live under [runs/derived](/C:/repos/fuzzfolio-autoresearch/
 - [full-backtest-failures.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/full-backtest-failures.json)
 - [promotion-board.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/promotion-board.json)
 - [shortlist-report/shortlist-report.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/shortlist-report.json)
+- [portfolio-report/default-portfolio/portfolio-report.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/portfolio-report/default-portfolio/portfolio-report.json)
 - [corpus-score-vs-trades-36mo.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/corpus-score-vs-trades-36mo.png)
 
 ## Recommended Defaults
@@ -362,6 +411,7 @@ If you just want the practical sequence:
 uv run autoresearch calculate-full-backtests
 uv run autoresearch audit-full-backtests
 uv run autoresearch build-shortlist-report --shortlist-size 24
+uv run autoresearch build-portfolio
 uv run autoresearch build-promotion-board --board-size 12 --require-full-backtest-36 --max-per-run 1 --max-per-strategy-key 1
 uv run autoresearch dashboard
 ```
@@ -372,6 +422,7 @@ If you want to iterate on shortlist shape quickly:
 uv run autoresearch build-shortlist-report --shortlist-size 24 --no-generate-profile-drops
 uv run autoresearch build-shortlist-report --shortlist-size 24 --trade-rate-bonus-weight 8 --trade-rate-bonus-target 4 --no-generate-profile-drops
 uv run autoresearch build-shortlist-report --shortlist-size 24 --min-trades-per-month 1 --no-generate-profile-drops
+uv run autoresearch build-portfolio --no-generate-profile-drops
 ```
 
 ## Notes

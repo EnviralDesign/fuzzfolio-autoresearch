@@ -87,12 +87,36 @@ export type ShortlistProfileDrop = {
   recreated_profile?: boolean;
 };
 
+export type NumericSummary = {
+  count: number;
+  min: number | null;
+  mean: number | null;
+  median: number | null;
+  max: number | null;
+  sum: number | null;
+};
+
+export type BasketSummary = {
+  strategy_count: number;
+  trades_per_month?: NumericSummary;
+  score_36m?: NumericSummary;
+  realized_r_total_36m?: NumericSummary;
+  realized_r_per_month_36m?: NumericSummary;
+  max_drawdown_r_36m?: NumericSummary;
+  max_drawdown_r_per_month_36m?: NumericSummary;
+};
+
 export type ShortlistReport = {
   generated_at?: string;
+  source_type?: string;
+  source_label?: string;
+  portfolio_name?: string;
   filters?: Record<string, unknown>;
   candidate_count?: number;
   selected_count?: number;
   alternate_count?: number;
+  selected_overlap_count?: number;
+  selected_basket_summary?: BasketSummary;
   filter_rejections?: FilterRejections;
   selected_by_run?: Record<string, number>;
   selected_by_strategy_key?: Record<string, number>;
@@ -101,6 +125,13 @@ export type ShortlistReport = {
   top_similarity_pairs?: Record<string, unknown>[];
   charts?: Record<string, ChartAsset>;
   profile_drops?: ShortlistProfileDrop[];
+  sleeves?: Record<string, unknown>[];
+  scope?: {
+    is_canonical?: boolean;
+    is_filtered?: boolean;
+    report_root?: string;
+  };
+  warning?: string | null;
 };
 
 export type PromotionBoard = {
