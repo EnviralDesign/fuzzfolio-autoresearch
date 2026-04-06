@@ -142,7 +142,7 @@ uv run autoresearch dashboard --no-refresh-on-start
 
 | Argument | Type | Default | Description |
 |---|---|---|---|
-| `--host` | string | `127.0.0.1` | Bind host. |
+| `--host` | string | `0.0.0.0` | Bind host. |
 | `--port` | int | 47832 | Bind port. |
 | `--limit` | int | 25 | Classic bar leaderboard display limit during refresh. Validation and similarity still analyze the full best-per-run set. |
 | `--force-rebuild` | flag | false | Ignore cached validation artifacts when refreshing derived dashboard data. |

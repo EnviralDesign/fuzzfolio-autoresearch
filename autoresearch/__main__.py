@@ -346,7 +346,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Serve the read-only dashboard viewer from already-computed derived artifacts.",
     )
     dashboard.add_argument(
-        "--host", default="127.0.0.1", help="Bind host. Default: 127.0.0.1"
+        "--host", default="0.0.0.0", help="Bind host. Default: 0.0.0.0"
     )
     dashboard.add_argument(
         "--port", type=int, default=47832, help="Bind port. Default: 47832"
