@@ -9,6 +9,7 @@ def test_load_portfolio_spec_defaults_when_file_missing(tmp_path: Path) -> None:
 
     assert defaulted is True
     assert spec["portfolio_name"] == "default-portfolio"
+    assert spec["full_backtest_job_timeout_seconds"] == 2400
     assert [sleeve["name"] for sleeve in spec["sleeves"]] == ["quality", "cadence"]
 
 
@@ -114,3 +115,68 @@ def test_build_selection_basket_summary_uses_curve_terminal_values(tmp_path: Pat
     assert summary["realized_r_total_36m"]["sum"] == 9.0
     assert summary["realized_r_per_month_36m"]["mean"] == 3.0
     assert summary["max_drawdown_r_per_month_36m"]["mean"] == 2.0
+
+
+def test_profile_drop_attempt_token_prefers_row_identity() -> None:
+    token = ar_main._profile_drop_attempt_token(
+        {
+            "selection_rank": 1,
+            "attempt_id": "RUN-attempt-00051",
+            "candidate_name": "winner",
+        },
+        {
+            "attempt_id": "RUN-attempt-00046",
+            "candidate_name": "stale",
+        },
+    )
+
+    assert token == "1-run-attempt-00051"
+
+
+def test_nuke_deep_cache_artifacts_removes_rebuildable_outputs_only(
+    tmp_path: Path,
+) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    artifact_dir = runs_root / "run-a" / "evals" / "candidate-a"
+    scrutiny_dir = artifact_dir / "scrutiny-cache" / "36mo"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    scrutiny_dir.mkdir(parents=True, exist_ok=True)
+    derived_root.mkdir(parents=True, exist_ok=True)
+
+    full_curve = artifact_dir / "full-backtest-36mo-curve.json"
+    full_result = artifact_dir / "full-backtest-36mo-result.json"
+    profile_drop_png = runs_root / "run-a" / "profile-drop-36mo.png"
+    profile_drop_manifest = runs_root / "run-a" / "profile-drop-36mo.manifest.json"
+    source_snapshot = artifact_dir / "sensitivity-response.json"
+    derived_payload = derived_root / "portfolio-report.json"
+
+    full_curve.write_text("{}", encoding="utf-8")
+    full_result.write_text("{}", encoding="utf-8")
+    (scrutiny_dir / "manifest.json").write_text("{}", encoding="utf-8")
+    profile_drop_png.write_text("png", encoding="utf-8")
+    profile_drop_manifest.write_text("{}", encoding="utf-8")
+    source_snapshot.write_text('{"keep": true}', encoding="utf-8")
+    derived_payload.write_text("{}", encoding="utf-8")
+
+    summary = ar_main._nuke_deep_cache_artifacts(
+        runs_root=runs_root,
+        derived_root=derived_root,
+        summary_timestamp="20260406T170000",
+    )
+
+    assert summary["deleted_full_backtest_curve_files"] == 1
+    assert summary["deleted_full_backtest_result_files"] == 1
+    assert summary["deleted_scrutiny_cache_dirs"] == 1
+    assert summary["deleted_run_profile_drop_pngs"] == 1
+    assert summary["deleted_run_profile_drop_manifests"] == 1
+    assert summary["derived_entries_before_reset"] == 1
+    assert full_curve.exists() is False
+    assert full_result.exists() is False
+    assert scrutiny_dir.parent.exists() is False
+    assert profile_drop_png.exists() is False
+    assert profile_drop_manifest.exists() is False
+    assert source_snapshot.exists() is True
+    assert derived_root.exists() is True
+    assert (derived_root / "portfolio-report.json").exists() is False
+    assert (derived_root / "deep-cache-reset-20260406T170000.json").exists() is True

@@ -888,6 +888,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
+    nuke_deep_caches = subparsers.add_parser(
+        "nuke-deep-caches",
+        help="Delete rebuildable deep/backtest/scrutiny/profile-drop/derived cache artifacts. Rebuild afterward with build-portfolio.",
+    )
+    nuke_deep_caches.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
     score = subparsers.add_parser(
         "score", help="Score one sensitivity artifact directory."
     )
@@ -3443,6 +3451,27 @@ def _slug_token(value: str) -> str:
     return token or "item"
 
 
+def _profile_drop_attempt_token(
+    row: dict[str, Any] | None,
+    attempt: dict[str, Any] | None = None,
+) -> str:
+    row = row or {}
+    attempt = attempt or {}
+    rank = (
+        row.get("selection_rank")
+        or row.get("portfolio_rank")
+        or attempt.get("selection_rank")
+        or attempt.get("portfolio_rank")
+        or ""
+    )
+    attempt_id = str(row.get("attempt_id") or attempt.get("attempt_id") or "").strip()
+    candidate_name = str(
+        row.get("candidate_name") or attempt.get("candidate_name") or "candidate"
+    ).strip()
+    identity = attempt_id or candidate_name or "candidate"
+    return _slug_token(f"{rank}-{identity}")
+
+
 def _attempt_scrutiny_cache_dir(
     attempt: dict[str, Any], lookback_months: int
 ) -> Path:
@@ -4666,6 +4695,7 @@ def _render_profile_drop_for_attempt(
     working_dir: Path,
     run_dir: Path,
     attempts: list[dict[str, Any]],
+    row: dict[str, Any],
     attempt: dict[str, Any],
     output_root: Path,
     lookback_months: int,
@@ -4693,9 +4723,7 @@ def _render_profile_drop_for_attempt(
         )
         recreated_profile = True
 
-    attempt_token = _slug_token(
-        f"{attempt.get('selection_rank') or ''}-{attempt.get('attempt_id') or attempt.get('candidate_name') or 'candidate'}"
-    )
+    attempt_token = _profile_drop_attempt_token(row, attempt)
     attempt_root = output_root / attempt_token
     package_output_root = attempt_root / "bundle"
     png_path = attempt_root / f"profile-drop-{int(lookback_months)}mo.png"
@@ -4703,8 +4731,10 @@ def _render_profile_drop_for_attempt(
     manifest_payload = {
         "version": 1,
         "run_id": run_dir.name,
-        "attempt_id": str(attempt.get("attempt_id") or ""),
-        "candidate_name": str(attempt.get("candidate_name") or ""),
+        "attempt_id": str(row.get("attempt_id") or attempt.get("attempt_id") or ""),
+        "candidate_name": str(
+            row.get("candidate_name") or attempt.get("candidate_name") or ""
+        ),
         "profile_ref": profile_ref,
         "timeframe": str(package_inputs["timeframe"]),
         "instruments": list(package_inputs["instruments"]),
@@ -4762,6 +4792,14 @@ def _render_profile_drop_for_attempt(
     renderer_argv.extend(["render", "--bundle", str(bundle_dir), "--out", str(png_path)])
     _run_external(renderer_argv, cwd=working_dir, timeout_seconds=float(timeout_seconds))
     _write_json_file(manifest_path, manifest_payload)
+    if not png_path.exists():
+        raise RuntimeError(
+            f"Profile-drop render reported success but PNG is missing: {png_path}"
+        )
+    if not manifest_path.exists():
+        raise RuntimeError(
+            f"Profile-drop render reported success but manifest is missing: {manifest_path}"
+        )
     return {
         "status": "rendered",
         "png_path": str(png_path),
@@ -4805,9 +4843,7 @@ def _render_profile_drop_rows(
     working_dir = workspace_root or config.repo_root
 
     expected_drop_dirs = {
-        _slug_token(
-            f"{row.get('selection_rank') or row.get('portfolio_rank') or ''}-{row.get('attempt_id') or row.get('candidate_name') or 'candidate'}"
-        )
+        _profile_drop_attempt_token(row)
         for row in rows
     }
     output_root.mkdir(parents=True, exist_ok=True)
@@ -4898,6 +4934,7 @@ def _render_profile_drop_rows(
                     working_dir=working_dir,
                     run_dir=run_dir,
                     attempts=attempts,
+                    row=row,
                     attempt=attempt,
                     output_root=output_root,
                     lookback_months=int(lookback_months),
@@ -4979,6 +5016,23 @@ def _render_profile_drop_rows(
     ordered_results.sort(key=lambda row: int(row.get("_row_index") or 0))
     for row in ordered_results:
         row.pop("_row_index", None)
+        status = str(row.get("status") or "")
+        if status not in {"rendered", "cached"}:
+            continue
+        png_path = Path(str(row.get("png_path") or "")) if row.get("png_path") else None
+        manifest_path = (
+            Path(str(row.get("manifest_path") or "")) if row.get("manifest_path") else None
+        )
+        missing_parts: list[str] = []
+        if png_path is None or not png_path.exists():
+            missing_parts.append("png")
+        if manifest_path is None or not manifest_path.exists():
+            missing_parts.append("manifest")
+        if missing_parts:
+            row["status"] = "failed"
+            row["error"] = (
+                "Profile-drop artifacts missing after render: " + ", ".join(missing_parts)
+            )
     return ordered_results
 
 
@@ -5283,20 +5337,6 @@ def cmd_build_shortlist_report(
         charts_root / "shortlist-score-vs-sameness-36mo.png",
     )
 
-    profile_drop_results: list[dict[str, Any]] = []
-    if generate_profile_drops and shortlist_rows:
-        profile_drop_results = _render_profile_drop_rows(
-            config=config,
-            rows=shortlist_rows,
-            output_root=profile_drop_root,
-            lookback_months=int(profile_drop_lookback_months),
-            timeout_seconds=int(profile_drop_timeout_seconds),
-            force_rebuild=force_rebuild_profile_drops,
-            profile_drop_workers=int(profile_drop_workers),
-            as_json=as_json,
-            progress_label="shortlist profile drops",
-        )
-
     shortlist_payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
         "scope": {
@@ -5349,7 +5389,10 @@ def cmd_build_shortlist_report(
             "shortlist_score_vs_sameness": str(charts_root / "shortlist-score-vs-sameness-36mo.png"),
             "shortlist_similarity_heatmap": str(charts_root / "shortlist-similarity-heatmap.png"),
         },
-        "profile_drops": profile_drop_results,
+        "profile_drop_phase": "pending"
+        if generate_profile_drops and shortlist_rows
+        else "skipped",
+        "profile_drops": [],
     }
     write_json(report_root / "shortlist-report.json", shortlist_payload)
     write_csv(
@@ -5357,6 +5400,23 @@ def cmd_build_shortlist_report(
         [{"section": "selected", **row} for row in shortlist_rows]
         + [{"section": "alternate", **row} for row in (shortlist_board.get("alternates") or [])],
     )
+    profile_drop_results: list[dict[str, Any]] = []
+    if generate_profile_drops and shortlist_rows:
+        profile_drop_results = _render_profile_drop_rows(
+            config=config,
+            rows=shortlist_rows,
+            output_root=profile_drop_root,
+            lookback_months=int(profile_drop_lookback_months),
+            timeout_seconds=int(profile_drop_timeout_seconds),
+            force_rebuild=force_rebuild_profile_drops,
+            profile_drop_workers=int(profile_drop_workers),
+            as_json=as_json,
+            progress_label="shortlist profile drops",
+        )
+        shortlist_payload["generated_at"] = datetime.now().astimezone().isoformat()
+        shortlist_payload["profile_drop_phase"] = "complete"
+        shortlist_payload["profile_drops"] = profile_drop_results
+        write_json(report_root / "shortlist-report.json", shortlist_payload)
     print(
         json.dumps(
             {
@@ -5573,20 +5633,6 @@ def cmd_build_portfolio(
         charts_root / "portfolio-similarity-heatmap.json",
     )
 
-    profile_drop_results: list[dict[str, Any]] = []
-    if bool(portfolio_spec.get("generate_profile_drops")) and portfolio_rows:
-        profile_drop_results = _render_profile_drop_rows(
-            config=config,
-            rows=portfolio_rows,
-            output_root=profile_drop_root,
-            lookback_months=int(portfolio_spec.get("profile_drop_lookback_months", 36)),
-            timeout_seconds=int(portfolio_spec.get("profile_drop_timeout_seconds", 1800)),
-            force_rebuild=False,
-            profile_drop_workers=int(portfolio_spec.get("profile_drop_workers", 4)),
-            as_json=as_json,
-            progress_label="portfolio profile drops",
-        )
-
     sleeves_payload: list[dict[str, Any]] = []
     for sleeve in sleeve_results:
         board = sleeve.get("board") or {}
@@ -5626,7 +5672,6 @@ def cmd_build_portfolio(
         "selected_basket_summary": _build_selection_basket_summary(portfolio_rows),
         "sleeves": sleeves_payload,
         "selected": portfolio_rows,
-        "profile_drops": profile_drop_results,
         "charts": {
             "portfolio_candidate_score_vs_trades": str(
                 charts_root / "portfolio-candidate-score-vs-trades-36mo.png"
@@ -5653,12 +5698,33 @@ def cmd_build_portfolio(
                 charts_root / "portfolio-similarity-heatmap.png"
             ),
         },
+        "profile_drop_phase": "pending"
+        if bool(portfolio_spec.get("generate_profile_drops")) and portfolio_rows
+        else "skipped",
+        "profile_drops": [],
     }
     write_json(report_root / "portfolio-report.json", payload)
     write_csv(
         report_root / "portfolio-report.csv",
         [{"section": "selected", **row} for row in portfolio_rows],
     )
+    profile_drop_results: list[dict[str, Any]] = []
+    if bool(portfolio_spec.get("generate_profile_drops")) and portfolio_rows:
+        profile_drop_results = _render_profile_drop_rows(
+            config=config,
+            rows=portfolio_rows,
+            output_root=profile_drop_root,
+            lookback_months=int(portfolio_spec.get("profile_drop_lookback_months", 36)),
+            timeout_seconds=int(portfolio_spec.get("profile_drop_timeout_seconds", 1800)),
+            force_rebuild=False,
+            profile_drop_workers=int(portfolio_spec.get("profile_drop_workers", 4)),
+            as_json=as_json,
+            progress_label="portfolio profile drops",
+        )
+        payload["generated_at"] = datetime.now().astimezone().isoformat()
+        payload["profile_drop_phase"] = "complete"
+        payload["profile_drops"] = profile_drop_results
+        write_json(report_root / "portfolio-report.json", payload)
     print(
         json.dumps(
             {
@@ -6086,6 +6152,121 @@ def cmd_reset_runs() -> int:
     return 0
 
 
+def _nuke_deep_cache_artifacts(
+    *,
+    runs_root: Path,
+    derived_root: Path,
+    summary_timestamp: str | None = None,
+) -> dict[str, Any]:
+    runs_root.mkdir(parents=True, exist_ok=True)
+    blocked: list[dict[str, str]] = []
+
+    def _delete_file(path: Path) -> bool:
+        try:
+            path.unlink()
+            return True
+        except OSError as exc:
+            blocked.append({"path": str(path), "error": str(exc)})
+            return False
+
+    def _delete_tree(path: Path) -> bool:
+        try:
+            shutil.rmtree(path)
+            return True
+        except OSError as exc:
+            blocked.append({"path": str(path), "error": str(exc)})
+            return False
+
+    full_backtest_curve_files = list(runs_root.glob("**/full-backtest-36mo-curve.json"))
+    full_backtest_result_files = list(
+        runs_root.glob("**/full-backtest-36mo-result.json")
+    )
+    scrutiny_cache_dirs = [
+        path for path in runs_root.glob("**/scrutiny-cache") if path.is_dir()
+    ]
+    run_profile_drop_pngs = [
+        path
+        for path in runs_root.glob("**/profile-drop-*.png")
+        if derived_root not in path.parents
+    ]
+    run_profile_drop_manifests = [
+        path
+        for path in runs_root.glob("**/profile-drop-*.manifest.json")
+        if derived_root not in path.parents
+    ]
+
+    deleted_curve_files = sum(1 for path in full_backtest_curve_files if _delete_file(path))
+    deleted_result_files = sum(
+        1 for path in full_backtest_result_files if _delete_file(path)
+    )
+    deleted_scrutiny_cache_dirs = sum(
+        1 for path in scrutiny_cache_dirs if _delete_tree(path)
+    )
+    deleted_run_profile_drop_pngs = sum(
+        1 for path in run_profile_drop_pngs if _delete_file(path)
+    )
+    deleted_run_profile_drop_manifests = sum(
+        1 for path in run_profile_drop_manifests if _delete_file(path)
+    )
+
+    derived_entries_before_reset = 0
+    deleted_derived_root = False
+    if derived_root.exists():
+        derived_entries_before_reset = len(list(derived_root.iterdir()))
+        deleted_derived_root = _delete_tree(derived_root)
+    derived_root.mkdir(parents=True, exist_ok=True)
+
+    timestamp_token = summary_timestamp or datetime.now(
+        ZoneInfo("America/Chicago")
+    ).strftime("%Y%m%dT%H%M%S")
+    summary_path = derived_root / f"deep-cache-reset-{timestamp_token}.json"
+    summary = {
+        "runs_root": str(runs_root),
+        "derived_root": str(derived_root),
+        "summary_path": str(summary_path),
+        "deleted_full_backtest_curve_files": deleted_curve_files,
+        "deleted_full_backtest_result_files": deleted_result_files,
+        "deleted_scrutiny_cache_dirs": deleted_scrutiny_cache_dirs,
+        "deleted_run_profile_drop_pngs": deleted_run_profile_drop_pngs,
+        "deleted_run_profile_drop_manifests": deleted_run_profile_drop_manifests,
+        "derived_entries_before_reset": derived_entries_before_reset,
+        "deleted_derived_root": deleted_derived_root,
+        "blocked_entries": blocked,
+    }
+    write_json(summary_path, summary)
+    return summary
+
+
+def cmd_nuke_deep_caches(*, as_json: bool) -> int:
+    config = load_config()
+    summary = _nuke_deep_cache_artifacts(
+        runs_root=config.runs_root,
+        derived_root=config.derived_root,
+    )
+    if as_json:
+        print(json.dumps(summary, ensure_ascii=True, indent=2))
+        return 0
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Full-backtest curves deleted: {summary['deleted_full_backtest_curve_files']}",
+                    f"Full-backtest results deleted: {summary['deleted_full_backtest_result_files']}",
+                    f"Scrutiny-cache dirs deleted: {summary['deleted_scrutiny_cache_dirs']}",
+                    f"Run profile-drop PNGs deleted: {summary['deleted_run_profile_drop_pngs']}",
+                    f"Run profile-drop manifests deleted: {summary['deleted_run_profile_drop_manifests']}",
+                    f"Derived entries reset: {summary['derived_entries_before_reset']}",
+                    f"Summary: {summary['summary_path']}",
+                    "Next: uv run autoresearch build-portfolio",
+                ]
+            ),
+            title="Deep Cache Reset",
+            border_style="yellow",
+        )
+    )
+    return 0
+
+
 def cmd_score(artifact_dir: Path) -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
@@ -6378,6 +6559,8 @@ def main() -> int:
             profile_drop_workers=args.profile_drop_workers,
             as_json=bool(args.json),
         )
+    if args.command == "nuke-deep-caches":
+        return cmd_nuke_deep_caches(as_json=bool(args.json))
     if args.command == "reset-runs":
         return cmd_reset_runs()
     if args.command == "prune-runs":

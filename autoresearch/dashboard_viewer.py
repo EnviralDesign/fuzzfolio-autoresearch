@@ -321,6 +321,17 @@ def _normalize_shortlist_payload(config: AppConfig, payload: dict[str, Any] | No
         )
         profile_drops.append(normalized)
     report["profile_drops"] = profile_drops
+    missing_drop_count = sum(
+        1
+        for item in profile_drops
+        if str(item.get("status") or "") in {"rendered", "cached"}
+        and not item.get("png_url")
+    )
+    if missing_drop_count > 0:
+        report["warning"] = (
+            f"{missing_drop_count} rendered profile-drop records are missing their PNG or manifest on disk. "
+            "This usually means a prior shortlist build was interrupted after writing some assets but before fully refreshing the report."
+        )
     report["selected"] = [
         _normalize_path_fields(config, row) for row in list(report.get("selected") or [])
     ]
@@ -437,6 +448,17 @@ def _normalize_portfolio_as_shortlist(
         }
         for item in list(normalized.get("profile_drops") or [])
     ]
+    missing_drop_count = sum(
+        1
+        for item in list(normalized.get("profile_drops") or [])
+        if str(item.get("status") or "") in {"rendered", "cached"}
+        and not item.get("png_url")
+    )
+    if missing_drop_count > 0:
+        normalized["warning"] = (
+            f"{missing_drop_count} rendered portfolio profile-drop records are missing their PNG or manifest on disk. "
+            "This usually means a later portfolio build updated drop folders without finishing the final report refresh."
+        )
     normalized["charts"] = {
         key: _normalize_chart_entry(config, str(value))
         for key, value in mapped_charts.items()

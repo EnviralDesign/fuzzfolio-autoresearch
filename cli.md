@@ -173,6 +173,37 @@ uv run autoresearch sync-profile-drop-pngs --json
 
 ---
 
+## nuke-deep-caches
+
+Delete rebuildable deep-cache artifacts so the next `build-portfolio` starts cold from source.
+
+```powershell
+uv run autoresearch nuke-deep-caches
+uv run autoresearch nuke-deep-caches --json
+```
+
+No filtering arguments. The command removes:
+
+- attempt-local `full-backtest-36mo-curve.json`
+- attempt-local `full-backtest-36mo-result.json`
+- attempt-local `scrutiny-cache/`
+- run-local `profile-drop-*.png` and `profile-drop-*.manifest.json`
+- everything under `runs/derived/`
+
+It preserves the original attempt/source artifacts such as `sensitivity-response.json`, ledgers, and run metadata.
+
+Typical follow-up:
+
+```powershell
+uv run autoresearch build-portfolio
+```
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--json` | flag | false | Print machine-readable reset summary. |
+
+---
+
 ## reset-runs
 
 Delete all run artifacts and recreate a clean empty runs state.

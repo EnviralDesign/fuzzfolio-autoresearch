@@ -59,6 +59,7 @@ uv run autoresearch build-attempt-catalog
 uv run autoresearch audit-full-backtests
 uv run autoresearch build-shortlist-report
 uv run autoresearch build-portfolio
+uv run autoresearch nuke-deep-caches
 uv run autoresearch build-promotion-board
 uv run autoresearch plot-corpus-score-vs-trades
 uv run autoresearch dashboard
@@ -66,7 +67,29 @@ uv run autoresearch dashboard
 
 ## Common Workflows
 
-### 1. Resume corpus backfill
+### 1. Cold-reset all rebuildable deep caches
+
+Use this when deep-replay semantics changed and you want the next portfolio build to regenerate backtests, scrutiny, charts, and profile drops from source.
+
+```powershell
+uv run autoresearch nuke-deep-caches
+uv run autoresearch build-portfolio
+```
+
+What it deletes:
+
+- attempt-local `full-backtest-36mo-*`
+- attempt-local `scrutiny-cache/`
+- run-local `profile-drop-*.png` and manifests
+- everything under `runs/derived/`
+
+What it does not delete:
+
+- original run folders
+- attempt ledgers
+- base sensitivity/source artifacts like `sensitivity-response.json`
+
+### 2. Resume corpus backfill
 
 This is the main heavy command. It fills missing attempt-local `36mo` full backtests, uses the detected dev sim-worker count by default, and is resumable when you do not pass `--force-rebuild`.
 
@@ -107,7 +130,7 @@ Artifacts and summaries written:
 - [runs/derived/full-backtest-failures.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/full-backtest-failures.json)
 - refreshed catalog and audit files under `runs/derived`
 
-### 2. Rebuild scrutiny caches
+### 3. Rebuild scrutiny caches
 
 This heals or rebuilds portable attempt-local scrutiny caches. Use it when `12mo` or `36mo` scrutiny is missing or stale.
 
@@ -132,7 +155,7 @@ Important flags:
 - `--force-rebuild`
   - ignore current scrutiny caches and rebuild them
 
-### 3. Rebuild the corpus catalog
+### 4. Rebuild the corpus catalog
 
 This indexes the whole corpus and summarizes what evidence exists per attempt.
 

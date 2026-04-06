@@ -33,6 +33,7 @@ export function ShortlistPage() {
   const isPortfolio = shortlist.source_type === "portfolio";
   const primaryLabel = isPortfolio ? "Portfolio" : "Shortlist";
   const candidateLabel = isPortfolio ? "union qualified" : "qualified";
+  const warning = shortlist.warning;
   const overlapCount =
     typeof shortlist.selected_overlap_count === "number" ? shortlist.selected_overlap_count : null;
 
@@ -127,6 +128,15 @@ export function ShortlistPage() {
           chart={data.charts.shortlist_similarity_heatmap}
         />
       </section>
+
+      {warning ? (
+        <Card className="border-amber-500/30 bg-amber-500/10 shadow-2xl shadow-black/20">
+          <CardHeader>
+            <CardTitle className="text-xl tracking-tight text-amber-200">Artifact warning</CardTitle>
+            <CardDescription className="text-amber-100/85">{warning}</CardDescription>
+          </CardHeader>
+        </Card>
+      ) : null}
 
       <section>
         <Card className="border-border/60 bg-card/85 shadow-2xl shadow-black/25">
