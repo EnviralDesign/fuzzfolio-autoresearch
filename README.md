@@ -269,6 +269,14 @@ Main command:
 uv run autoresearch build-portfolio
 ```
 
+Important config keys in `portfolio.config.json`:
+
+- `catch_up_full_backtests`
+- `catch_up_force_rebuild`
+- `catch_up_require_scrutiny_36`
+- `full_backtest_job_timeout_seconds`
+- `profile_drop_workers`
+
 Useful variants:
 
 ```powershell

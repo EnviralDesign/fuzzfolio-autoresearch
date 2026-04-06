@@ -2791,6 +2791,8 @@ def _detect_dev_sim_worker_count(*, timeout_seconds: float = 2.0) -> int | None:
 def _run_full_backtest_with_retry(
     config,
     attempt: dict[str, Any],
+    *,
+    job_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
     if artifact_dir.exists():
@@ -2821,7 +2823,9 @@ def _run_full_backtest_with_retry(
                     "seed_source": source_name,
                 }
     try:
-        return _run_full_backtest_for_attempt(config, attempt)
+        return _run_full_backtest_for_attempt(
+            config, attempt, job_timeout_seconds=job_timeout_seconds
+        )
     except Exception as exc:
         message = str(exc)
         profile_path_raw = str(attempt.get("profile_path") or "").strip()
@@ -2838,7 +2842,9 @@ def _run_full_backtest_with_retry(
             raise
     retry_attempt = dict(attempt)
     retry_attempt["profile_ref"] = ""
-    result = _run_full_backtest_for_attempt(config, retry_attempt)
+    result = _run_full_backtest_for_attempt(
+        config, retry_attempt, job_timeout_seconds=job_timeout_seconds
+    )
     result["retry_mode"] = "local_profile_reupload"
     return result
 
@@ -4310,6 +4316,7 @@ def cmd_calculate_full_backtests(
     use_dev_sim_worker_count: bool,
     require_scrutiny_36: bool,
     force_rebuild: bool,
+    job_timeout_seconds: int | None,
     as_json: bool,
 ) -> int:
     config = load_config()
@@ -4452,7 +4459,10 @@ def cmd_calculate_full_backtests(
                             f"{run_dir.name} {attempt_id}"
                         )
                         future = executor.submit(
-                            _run_full_backtest_with_retry, config, attempt
+                            _run_full_backtest_with_retry,
+                            config,
+                            attempt,
+                            job_timeout_seconds=job_timeout_seconds,
                         )
                         in_flight[future] = (run_dir, attempt, row, pytime.time())
                         refresh_progress(run_dir.name)
@@ -4537,6 +4547,7 @@ def cmd_calculate_full_backtests(
             "limit": limit,
             "require_scrutiny_36": require_scrutiny_36,
             "force_rebuild": force_rebuild,
+            "job_timeout_seconds": job_timeout_seconds,
         },
         "max_workers_used": resolved_max_workers,
         "max_workers_source": worker_source,
@@ -5417,6 +5428,12 @@ def cmd_build_portfolio(
                         portfolio_spec.get("catch_up_require_scrutiny_36")
                     ),
                     force_rebuild=bool(portfolio_spec.get("catch_up_force_rebuild")),
+                    job_timeout_seconds=(
+                        int(portfolio_spec.get("full_backtest_job_timeout_seconds"))
+                        if portfolio_spec.get("full_backtest_job_timeout_seconds")
+                        is not None
+                        else None
+                    ),
                     as_json=True,
                 )
         else:
@@ -5428,6 +5445,11 @@ def cmd_build_portfolio(
                 use_dev_sim_worker_count=True,
                 require_scrutiny_36=bool(portfolio_spec.get("catch_up_require_scrutiny_36")),
                 force_rebuild=bool(portfolio_spec.get("catch_up_force_rebuild")),
+                job_timeout_seconds=(
+                    int(portfolio_spec.get("full_backtest_job_timeout_seconds"))
+                    if portfolio_spec.get("full_backtest_job_timeout_seconds") is not None
+                    else None
+                ),
                 as_json=False,
             )
         catch_up_summary = {
@@ -6269,6 +6291,7 @@ def main() -> int:
             use_dev_sim_worker_count=not bool(args.no_use_dev_sim_worker_count),
             require_scrutiny_36=bool(args.require_scrutiny_36),
             force_rebuild=bool(args.force_rebuild),
+            job_timeout_seconds=None,
             as_json=bool(args.json),
         )
     if args.command == "build-attempt-catalog":

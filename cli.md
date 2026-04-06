@@ -406,6 +406,7 @@ Default config source:
 - `portfolio.config.json` at the repo root if present
 - otherwise the built-in default two-sleeve portfolio
 - see `portfolio.config.example.json` for a starting point
+- `full_backtest_job_timeout_seconds` in the config controls the deep-replay wait timeout used by catch-up full-backtests
 
 ---
 

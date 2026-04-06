@@ -397,7 +397,10 @@ def _attempt_profile_path(attempt: dict[str, Any]) -> Path | None:
 
 
 def _run_full_backtest_for_attempt(
-    config: AppConfig, attempt: dict[str, Any]
+    config: AppConfig,
+    attempt: dict[str, Any],
+    *,
+    job_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
     if not artifact_dir.exists():
@@ -447,6 +450,11 @@ def _run_full_backtest_for_attempt(
         sensitivity_output_dir.mkdir(parents=True, exist_ok=True)
 
         args = [
+            *(
+                ["--job-timeout-seconds", str(int(job_timeout_seconds))]
+                if job_timeout_seconds is not None and int(job_timeout_seconds) > 0
+                else []
+            ),
             "sensitivity-basket",
             "--profile-ref",
             profile_ref,

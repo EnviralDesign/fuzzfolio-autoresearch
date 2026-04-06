@@ -35,6 +35,7 @@ DEFAULT_PORTFOLIO_SPEC: dict[str, Any] = {
     "catch_up_full_backtests": False,
     "catch_up_force_rebuild": False,
     "catch_up_require_scrutiny_36": False,
+    "full_backtest_job_timeout_seconds": 2400,
     "generate_profile_drops": True,
     "profile_drop_lookback_months": 36,
     "profile_drop_timeout_seconds": 1800,
