@@ -11,6 +11,7 @@ type AttemptTableProps = {
   rows: AttemptCatalogRow[];
   showSelectionFields?: boolean;
   caption?: string;
+  onAttemptClick?: (attempt: AttemptCatalogRow) => void;
 };
 
 const baseColumns: ColumnDef<AttemptCatalogRow, unknown>[] = [
@@ -89,6 +90,7 @@ export function AttemptTable({
   rows,
   showSelectionFields = false,
   caption,
+  onAttemptClick,
 }: AttemptTableProps) {
   const columns = showSelectionFields
     ? [...baseColumns, ...selectionColumns]
@@ -100,6 +102,7 @@ export function AttemptTable({
       data={rows}
       caption={caption}
       emptyMessage="No rows match the current view."
+      onRowClick={onAttemptClick}
     />
   );
 }

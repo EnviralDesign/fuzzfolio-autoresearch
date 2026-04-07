@@ -23,6 +23,7 @@ type DataTableProps<TData> = {
   data: TData[];
   caption?: string;
   emptyMessage?: string;
+  onRowClick?: (row: TData) => void;
 };
 
 export function DataTable<TData>({
@@ -30,6 +31,7 @@ export function DataTable<TData>({
   data,
   caption,
   emptyMessage = "No rows match the current view.",
+  onRowClick,
 }: DataTableProps<TData>) {
   const [sorting, setSorting] = useState<SortingState>([]);
 
@@ -93,7 +95,8 @@ export function DataTable<TData>({
             table.getRowModel().rows.map((row) => (
               <TableRow
                 key={row.id}
-                className="border-border/50"
+                className={`border-border/50${onRowClick ? " cursor-pointer" : ""}`}
+                onClick={() => onRowClick?.(row.original)}
               >
                 {row.getVisibleCells().map((cell) => (
                   <TableCell key={cell.id}>
