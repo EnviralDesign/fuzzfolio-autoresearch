@@ -1,19 +1,73 @@
 import { AlertTriangle, BookMarked, CircleGauge, LibraryBig, ScanSearch } from "lucide-react";
 
 import { ChartPanel } from "@/components/chart-panel";
+import { DataTable } from "@/components/data-table";
 import { MetricTile } from "@/components/metric-tile";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { useViewerState } from "@/hooks/use-viewer-data";
 import { formatInt, formatPercent } from "@/lib/utils";
+import type { ColumnDef } from "@tanstack/react-table";
+
+type CadenceBandRow = {
+  band: string;
+  count: number;
+  mean_score_36m: number | null;
+  max_score_36m: number | null;
+  mean_drawdown_r_36m: number | null;
+};
+
+const cadenceBandColumns: ColumnDef<CadenceBandRow, unknown>[] = [
+  {
+    accessorKey: "band",
+    header: "Band",
+    cell: ({ row }) => row.original.band,
+    enableSorting: true,
+  },
+  {
+    accessorKey: "count",
+    header: "Count",
+    cell: ({ row }) => formatInt(row.original.count),
+    enableSorting: true,
+  },
+  {
+    accessorKey: "mean_score_36m",
+    header: "Mean score",
+    cell: ({ row }) =>
+      row.original.mean_score_36m != null
+        ? row.original.mean_score_36m.toFixed(2)
+        : "—",
+    enableSorting: true,
+  },
+  {
+    accessorKey: "max_score_36m",
+    header: "Best score",
+    cell: ({ row }) =>
+      row.original.max_score_36m != null
+        ? row.original.max_score_36m.toFixed(2)
+        : "—",
+    enableSorting: true,
+  },
+  {
+    accessorKey: "mean_drawdown_r_36m",
+    header: "Mean drawdown",
+    cell: ({ row }) =>
+      row.original.mean_drawdown_r_36m != null
+        ? `${row.original.mean_drawdown_r_36m.toFixed(2)}R`
+        : "—",
+    enableSorting: true,
+  },
+];
+
+function CadenceBandTable({ rows }: { rows: CadenceBandRow[] }) {
+  return (
+    <DataTable
+      columns={cadenceBandColumns}
+      data={rows}
+      emptyMessage="No cadence band data available."
+    />
+  );
+}
 
 export function CorpusPage() {
   const { data, isLoading, error } = useViewerState();
@@ -181,45 +235,6 @@ export function CorpusPage() {
           </CardContent>
         </Card>
       </section>
-    </div>
-  );
-}
-
-type CadenceBandRow = {
-  band: string;
-  count: number;
-  mean_score_36m: number | null;
-  max_score_36m: number | null;
-  mean_drawdown_r_36m: number | null;
-};
-
-function CadenceBandTable({ rows }: { rows: CadenceBandRow[] }) {
-  return (
-    <div className="overflow-hidden rounded-3xl border border-border/60 bg-background/45">
-      <Table>
-        <TableHeader>
-          <TableRow className="border-border/60">
-            <TableHead>Band</TableHead>
-            <TableHead>Count</TableHead>
-            <TableHead>Mean score</TableHead>
-            <TableHead>Best score</TableHead>
-            <TableHead>Mean drawdown</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {rows.map((row) => (
-            <TableRow key={row.band} className="border-border/50">
-              <TableCell>{row.band}</TableCell>
-              <TableCell>{formatInt(row.count)}</TableCell>
-              <TableCell>{row.mean_score_36m != null ? row.mean_score_36m.toFixed(2) : "—"}</TableCell>
-              <TableCell>{row.max_score_36m != null ? row.max_score_36m.toFixed(2) : "—"}</TableCell>
-              <TableCell>
-                {row.mean_drawdown_r_36m != null ? `${row.mean_drawdown_r_36m.toFixed(2)}R` : "—"}
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
     </div>
   );
 }

@@ -4,16 +4,57 @@ import { GitBranch, ShieldCheck, ShieldX } from "lucide-react";
 import { AttemptTable } from "@/components/attempt-table";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
+import { DataTable } from "@/components/data-table";
 import { useViewerState } from "@/hooks/use-viewer-data";
 import { compactRunId, formatInt, formatNumber } from "@/lib/utils";
+import type { ColumnDef } from "@tanstack/react-table";
+
+type SimilarityPair = Record<string, unknown>;
+
+const similarityColumns: ColumnDef<SimilarityPair, unknown>[] = [
+  {
+    accessorKey: "left_candidate_name",
+    header: "Left",
+    cell: ({ row }) =>
+      String(row.original.left_candidate_name || compactRunId(String(row.original.left_run_id || ""))),
+    enableSorting: true,
+  },
+  {
+    accessorKey: "right_candidate_name",
+    header: "Right",
+    cell: ({ row }) =>
+      String(row.original.right_candidate_name || compactRunId(String(row.original.right_run_id || ""))),
+    enableSorting: true,
+  },
+  {
+    accessorKey: "similarity_score",
+    header: "Similarity",
+    cell: ({ row }) => formatNumber(Number(row.original.similarity_score ?? 0), 3),
+    enableSorting: true,
+  },
+  {
+    accessorKey: "positive_correlation",
+    header: "Correlation",
+    cell: ({ row }) => formatNumber(Number(row.original.positive_correlation ?? 0), 3),
+    enableSorting: true,
+  },
+  {
+    accessorKey: "shared_active_ratio",
+    header: "Shared active",
+    cell: ({ row }) => formatNumber(Number(row.original.shared_active_ratio ?? 0), 3),
+    enableSorting: true,
+  },
+];
+
+function SimilarityPairsTable({ pairs }: { pairs: SimilarityPair[] }) {
+  return (
+    <DataTable
+      columns={similarityColumns}
+      data={pairs}
+      emptyMessage="No similarity pairs to display."
+    />
+  );
+}
 
 export function PromotionPage() {
   const { data, isLoading, error } = useViewerState();
@@ -134,34 +175,7 @@ export function PromotionPage() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="overflow-hidden rounded-3xl border border-border/60 bg-background/45">
-            <Table>
-              <TableHeader>
-                <TableRow className="border-border/60">
-                  <TableHead>Left</TableHead>
-                  <TableHead>Right</TableHead>
-                  <TableHead>Similarity</TableHead>
-                  <TableHead>Correlation</TableHead>
-                  <TableHead>Shared active</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {topPairs.map((pair, index) => (
-                  <TableRow key={`${pair.left_attempt_id}-${pair.right_attempt_id}-${index}`} className="border-border/50">
-                    <TableCell className="text-sm text-muted-foreground">
-                      {String(pair.left_candidate_name || compactRunId(String(pair.left_run_id || "")))}
-                    </TableCell>
-                    <TableCell className="text-sm text-muted-foreground">
-                      {String(pair.right_candidate_name || compactRunId(String(pair.right_run_id || "")))}
-                    </TableCell>
-                    <TableCell>{formatNumber(Number(pair.similarity_score ?? 0), 3)}</TableCell>
-                    <TableCell>{formatNumber(Number(pair.positive_correlation ?? 0), 3)}</TableCell>
-                    <TableCell>{formatNumber(Number(pair.shared_active_ratio ?? 0), 3)}</TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+          <SimilarityPairsTable pairs={topPairs} />
         </CardContent>
       </Card>
     </div>
