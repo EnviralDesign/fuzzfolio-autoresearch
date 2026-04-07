@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import { Filter, GalleryHorizontal, ScanHeart } from "lucide-react";
 
 import { AttemptTable } from "@/components/attempt-table";
+import { BasketCurvePanel } from "@/components/basket-curve-panel";
 import { ChartPanel } from "@/components/chart-panel";
 import { ProfileDropGrid } from "@/components/profile-drop-grid";
 import { Badge } from "@/components/ui/badge";
@@ -139,63 +140,74 @@ export function ShortlistPage() {
       ) : null}
 
       <section>
-        <Card className="border-border/60 bg-card/85 shadow-2xl shadow-black/25">
-          <CardHeader>
-            <CardTitle className="text-2xl tracking-tight">Basket view of the shortlist</CardTitle>
-            <CardDescription>
-              {isPortfolio
-                ? "These are basket-level rollups for the current portfolio union, using local 36-month full-backtest curves and metadata already in the corpus."
-                : "These are portfolio-level rollups for the currently selected names, using the local 36-month full-backtest curves and metadata already in the corpus."}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            <KeyFact
-              icon={<GalleryHorizontal className="h-4 w-4" />}
-              label="Strategies"
-              value={formatInt(basket?.strategy_count)}
-            />
-            <KeyFact
-              icon={<Filter className="h-4 w-4" />}
-              label="Total trades / month"
-              value={formatNumber(basket?.trades_per_month?.sum, 2)}
-            />
-            <KeyFact
-              icon={<Filter className="h-4 w-4" />}
-              label="Avg trades / month"
-              value={formatNumber(basket?.trades_per_month?.mean, 2)}
-            />
-            <KeyFact
-              icon={<ScanHeart className="h-4 w-4" />}
-              label="Total R / month"
-              value={formatNumber(basket?.realized_r_per_month_36m?.sum, 2)}
-            />
-            <KeyFact
-              icon={<ScanHeart className="h-4 w-4" />}
-              label="Avg R / month"
-              value={formatNumber(basket?.realized_r_per_month_36m?.mean, 2)}
-            />
-            <KeyFact
-              icon={<ScanHeart className="h-4 w-4" />}
-              label="Avg max DD (R)"
-              value={formatNumber(basket?.max_drawdown_r_36m?.mean, 2)}
-            />
-            <KeyFact
-              icon={<ScanHeart className="h-4 w-4" />}
-              label="Avg max DD / month"
-              value={formatNumber(basket?.max_drawdown_r_per_month_36m?.mean, 3)}
-            />
-            <KeyFact
-              icon={<GalleryHorizontal className="h-4 w-4" />}
-              label="Avg 36m score"
-              value={formatNumber(basket?.score_36m?.mean, 2)}
-            />
-            <KeyFact
-              icon={<GalleryHorizontal className="h-4 w-4" />}
-              label="Total 36m R"
-              value={formatNumber(basket?.realized_r_total_36m?.sum, 2)}
-            />
-          </CardContent>
-        </Card>
+        <div className="space-y-6">
+          <BasketCurvePanel
+            title="Basket curve of the shortlist"
+            description={
+              isPortfolio
+                ? "This is the aggregate mark-to-market basket path across the selected portfolio names, using their local 36-month full-backtest curves."
+                : "This is the aggregate mark-to-market basket path across the selected shortlist names, using their local 36-month full-backtest curves."
+            }
+            curve={shortlist.selected_basket_curve_36m}
+          />
+          <Card className="border-border/60 bg-card/85 shadow-2xl shadow-black/25">
+            <CardHeader>
+              <CardTitle className="text-2xl tracking-tight">Basket view of the shortlist</CardTitle>
+              <CardDescription>
+                {isPortfolio
+                  ? "These are basket-level rollups for the current portfolio union, using local 36-month full-backtest curves and metadata already in the corpus."
+                  : "These are portfolio-level rollups for the currently selected names, using the local 36-month full-backtest curves and metadata already in the corpus."}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              <KeyFact
+                icon={<GalleryHorizontal className="h-4 w-4" />}
+                label="Strategies"
+                value={formatInt(basket?.strategy_count)}
+              />
+              <KeyFact
+                icon={<Filter className="h-4 w-4" />}
+                label="Total trades / month"
+                value={formatNumber(basket?.trades_per_month?.sum, 2)}
+              />
+              <KeyFact
+                icon={<Filter className="h-4 w-4" />}
+                label="Avg trades / month"
+                value={formatNumber(basket?.trades_per_month?.mean, 2)}
+              />
+              <KeyFact
+                icon={<ScanHeart className="h-4 w-4" />}
+                label="Total R / month"
+                value={formatNumber(basket?.realized_r_per_month_36m?.sum, 2)}
+              />
+              <KeyFact
+                icon={<ScanHeart className="h-4 w-4" />}
+                label="Avg R / month"
+                value={formatNumber(basket?.realized_r_per_month_36m?.mean, 2)}
+              />
+              <KeyFact
+                icon={<ScanHeart className="h-4 w-4" />}
+                label="Avg max DD (R)"
+                value={formatNumber(basket?.max_drawdown_r_36m?.mean, 2)}
+              />
+              <KeyFact
+                icon={<ScanHeart className="h-4 w-4" />}
+                label="Avg max DD / month"
+                value={formatNumber(basket?.max_drawdown_r_per_month_36m?.mean, 3)}
+              />
+              <KeyFact
+                icon={<GalleryHorizontal className="h-4 w-4" />}
+                label="Avg 36m score"
+                value={formatNumber(basket?.score_36m?.mean, 2)}
+              />
+              <KeyFact
+                icon={<GalleryHorizontal className="h-4 w-4" />}
+                label="Total 36m R"
+                value={formatNumber(basket?.realized_r_total_36m?.sum, 2)}
+              />
+            </CardContent>
+          </Card>
+        </div>
       </section>
 
       <section>

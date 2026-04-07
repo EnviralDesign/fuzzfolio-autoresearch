@@ -106,6 +106,27 @@ export type BasketSummary = {
   max_drawdown_r_per_month_36m?: NumericSummary;
 };
 
+export type BasketCurvePoint = {
+  time: number;
+  date: string;
+  equity_r: number;
+  drawdown_r: number;
+  realized_r: number;
+  closed_trade_count: number;
+};
+
+export type BasketCurve = {
+  strategy_count: number;
+  point_count: number;
+  points: BasketCurvePoint[];
+  max_equity_r?: number | null;
+  max_drawdown_r?: number | null;
+  final_equity_r?: number | null;
+  final_drawdown_r?: number | null;
+  final_realized_r?: number | null;
+  final_closed_trade_count?: number | null;
+};
+
 export type ShortlistReport = {
   generated_at?: string;
   source_type?: string;
@@ -117,6 +138,7 @@ export type ShortlistReport = {
   alternate_count?: number;
   selected_overlap_count?: number;
   selected_basket_summary?: BasketSummary;
+  selected_basket_curve_36m?: BasketCurve;
   filter_rejections?: FilterRejections;
   selected_by_run?: Record<string, number>;
   selected_by_strategy_key?: Record<string, number>;

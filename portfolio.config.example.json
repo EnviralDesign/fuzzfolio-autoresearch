@@ -6,6 +6,7 @@
   "catch_up_require_scrutiny_36": false,
   "full_backtest_job_timeout_seconds": 2400,
   "generate_profile_drops": true,
+  "export_bundle": true,
   "profile_drop_lookback_months": 36,
   "profile_drop_timeout_seconds": 1800,
   "profile_drop_workers": 4,

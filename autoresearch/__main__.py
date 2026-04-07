@@ -50,6 +50,7 @@ if __package__ in {None, ""}:
         resolve_attempt_scrutiny_source,
         scrutiny_cache_dir_for_artifact_dir,
         select_promotion_board,
+        subset_similarity_payload,
         write_csv,
         write_json,
     )
@@ -92,6 +93,7 @@ if __package__ in {None, ""}:
     )
     from autoresearch.portfolio import (
         build_sleeve_selection,
+        filter_selection_candidate_rows,
         load_portfolio_spec,
         merge_portfolio_sleeves,
     )
@@ -117,6 +119,7 @@ else:
         resolve_attempt_scrutiny_source,
         scrutiny_cache_dir_for_artifact_dir,
         select_promotion_board,
+        subset_similarity_payload,
         write_csv,
         write_json,
     )
@@ -155,6 +158,7 @@ else:
     )
     from .portfolio import (
         build_sleeve_selection,
+        filter_selection_candidate_rows,
         load_portfolio_spec,
         merge_portfolio_sleeves,
     )
@@ -879,12 +883,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the portfolio config and enable or disable final portfolio profile-drop PNG generation.",
     )
     portfolio_report.add_argument(
+        "--export-bundle",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the portfolio config and export a dated portfolio bundle with selected profiles and rendered drops.",
+    )
+    portfolio_report.add_argument(
         "--profile-drop-workers",
         type=int,
         default=None,
         help="Override the portfolio config worker count for profile-drop packaging/rendering.",
     )
     portfolio_report.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    export_portfolio_bundle = subparsers.add_parser(
+        "export-portfolio-bundle",
+        help="Export the latest portfolio selection into a dated derived bundle with profile JSONs and rendered drops.",
+    )
+    export_portfolio_bundle.add_argument(
+        "--portfolio-report",
+        default=None,
+        help="Path to a portfolio-report.json. Defaults to the latest derived portfolio report.",
+    )
+    export_portfolio_bundle.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
@@ -3034,6 +3057,142 @@ def _build_selection_basket_summary(rows: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
+def _coerce_curve_points(curve_path: Path | None) -> list[dict[str, Any]]:
+    if curve_path is None or not curve_path.exists():
+        return []
+    payload = _load_json_if_exists(curve_path)
+    points = _nested_get(payload, ["curve", "points"])
+    if not isinstance(points, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for point in points:
+        if not isinstance(point, dict):
+            continue
+        timestamp_value = point.get("time")
+        date_value = point.get("date")
+        timestamp: int | None = None
+        try:
+            if timestamp_value is not None:
+                timestamp = int(timestamp_value)
+        except (TypeError, ValueError):
+            timestamp = None
+        if timestamp is None and date_value:
+            try:
+                timestamp = int(datetime.fromisoformat(str(date_value)).timestamp())
+            except ValueError:
+                timestamp = None
+        if timestamp is None:
+            continue
+        normalized.append(
+            {
+                "time": timestamp,
+                "date": str(date_value or ""),
+                "equity_r": _safe_float_value(point.get("equity_r")) or 0.0,
+                "drawdown_r": _safe_float_value(point.get("drawdown_r")) or 0.0,
+                "realized_r": _safe_float_value(
+                    point.get("cumulative_realized_r")
+                )
+                if _safe_float_value(point.get("cumulative_realized_r")) is not None
+                else (_safe_float_value(point.get("realized_r")) or 0.0),
+                "closed_trade_count": int(
+                    _safe_float_value(point.get("closed_trade_count")) or 0
+                ),
+            }
+        )
+    normalized.sort(key=lambda item: (int(item.get("time") or 0), str(item.get("date") or "")))
+    return normalized
+
+
+def _build_selection_basket_curve(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    curve_series: list[list[dict[str, Any]]] = []
+    strategy_count = 0
+    for row in rows:
+        curve_path_raw = row.get("full_backtest_curve_path_36m") or row.get(
+            "scrutiny_curve_path_36m"
+        )
+        curve_path = Path(str(curve_path_raw)).resolve() if curve_path_raw else None
+        points = _coerce_curve_points(curve_path)
+        if not points:
+            continue
+        curve_series.append(points)
+        strategy_count += 1
+
+    if not curve_series:
+        return {
+            "strategy_count": 0,
+            "point_count": 0,
+            "points": [],
+            "max_equity_r": None,
+            "max_drawdown_r": None,
+            "final_equity_r": None,
+            "final_drawdown_r": None,
+            "final_realized_r": None,
+            "final_closed_trade_count": None,
+        }
+
+    all_timestamps = sorted({int(point["time"]) for series in curve_series for point in series})
+    per_series_indexes = [0 for _ in curve_series]
+    per_series_states = [
+        {
+            "equity_r": 0.0,
+            "drawdown_r": 0.0,
+            "realized_r": 0.0,
+            "closed_trade_count": 0,
+        }
+        for _ in curve_series
+    ]
+    basket_points: list[dict[str, Any]] = []
+    max_equity_r: float | None = None
+    max_drawdown_r: float | None = None
+    for timestamp in all_timestamps:
+        for index, series in enumerate(curve_series):
+            series_index = per_series_indexes[index]
+            while series_index < len(series) and int(series[series_index]["time"]) <= timestamp:
+                point = series[series_index]
+                per_series_states[index] = {
+                    "equity_r": float(point.get("equity_r") or 0.0),
+                    "drawdown_r": float(point.get("drawdown_r") or 0.0),
+                    "realized_r": float(point.get("realized_r") or 0.0),
+                    "closed_trade_count": int(point.get("closed_trade_count") or 0),
+                }
+                series_index += 1
+            per_series_indexes[index] = series_index
+        equity_r = sum(float(state["equity_r"]) for state in per_series_states)
+        drawdown_r = sum(float(state["drawdown_r"]) for state in per_series_states)
+        realized_r = sum(float(state["realized_r"]) for state in per_series_states)
+        closed_trade_count = sum(
+            int(state["closed_trade_count"]) for state in per_series_states
+        )
+        point_date = datetime.fromtimestamp(timestamp).date().isoformat()
+        basket_points.append(
+            {
+                "time": timestamp,
+                "date": point_date,
+                "equity_r": round(equity_r, 6),
+                "drawdown_r": round(drawdown_r, 6),
+                "realized_r": round(realized_r, 6),
+                "closed_trade_count": closed_trade_count,
+            }
+        )
+        max_equity_r = equity_r if max_equity_r is None else max(max_equity_r, equity_r)
+        max_drawdown_r = (
+            drawdown_r if max_drawdown_r is None else max(max_drawdown_r, drawdown_r)
+        )
+
+    final_point = basket_points[-1]
+    return {
+        "strategy_count": strategy_count,
+        "point_count": len(basket_points),
+        "points": basket_points,
+        "max_equity_r": round(max_equity_r, 6) if max_equity_r is not None else None,
+        "max_drawdown_r": round(max_drawdown_r, 6) if max_drawdown_r is not None else None,
+        "final_equity_r": final_point["equity_r"],
+        "final_drawdown_r": final_point["drawdown_r"],
+        "final_realized_r": final_point["realized_r"],
+        "final_closed_trade_count": final_point["closed_trade_count"],
+    }
+
+
 def _nested_get(payload: dict[str, Any], path: list[str]) -> Any:
     current: Any = payload
     for key in path:
@@ -3432,6 +3591,168 @@ def _discover_bundle_dir(package_output_root: Path) -> Path:
 def _write_json_file(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def _normalize_profile_description(text: str | None) -> str:
+    return " ".join(str(text or "").strip().lower().split())
+
+
+def _is_generic_profile_description(text: str | None) -> bool:
+    normalized = _normalize_profile_description(text)
+    if not normalized:
+        return True
+    generic_tokens = {
+        "portable scoring profile scaffolded from live indicator templates.",
+        "portable scoring profile scaffolded from live indicator templates",
+    }
+    return normalized in generic_tokens
+
+
+def _extract_profile_document_profile(payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("profile"), dict):
+        return payload.get("profile")
+    profile_document = payload.get("profile_document")
+    if isinstance(profile_document, dict) and isinstance(profile_document.get("profile"), dict):
+        return profile_document.get("profile")
+    return None
+
+
+def _summarize_phrase(items: list[str], *, limit: int = 4) -> str:
+    cleaned = [str(item).strip() for item in items if str(item).strip()]
+    if not cleaned:
+        return ""
+    if len(cleaned) == 1:
+        return cleaned[0]
+    if len(cleaned) == 2:
+        return f"{cleaned[0]} and {cleaned[1]}"
+    if len(cleaned) <= limit:
+        return ", ".join(cleaned[:-1]) + f", and {cleaned[-1]}"
+    visible = cleaned[:limit]
+    remaining = len(cleaned) - limit
+    return ", ".join(visible[:-1]) + f", {visible[-1]}, and {remaining} more"
+
+
+def _build_profile_drop_description(
+    profile_payload: dict[str, Any] | None,
+    *,
+    package_inputs: dict[str, Any],
+    row: dict[str, Any],
+    attempt: dict[str, Any],
+) -> str:
+    profile = _extract_profile_document_profile(profile_payload) or {}
+    direction_mode = str(
+        profile.get("directionMode")
+        or row.get("direction_mode")
+        or attempt.get("direction_mode")
+        or "both"
+    ).strip().lower()
+    direction_label = {
+        "both": "Both-direction",
+        "long": "Long-only",
+        "short": "Short-only",
+    }.get(direction_mode, "Multi-direction")
+
+    instruments = [
+        str(item).strip().upper()
+        for item in list(package_inputs.get("instruments") or [])
+        if str(item).strip()
+    ]
+    if len(instruments) == 1:
+        instrument_phrase = f"{instruments[0]} profile"
+    else:
+        instrument_phrase = f"basket profile across {_summarize_phrase(instruments, limit=3)}"
+
+    primary_timeframe = str(package_inputs.get("timeframe") or "").strip().upper() or "mixed"
+
+    indicators = [
+        indicator
+        for indicator in list(profile.get("indicators") or [])
+        if isinstance(indicator, dict)
+    ]
+    active_indicators = [
+        indicator
+        for indicator in indicators
+        if bool((indicator.get("config") or {}).get("isActive", True))
+    ]
+    indicator_source = active_indicators or indicators
+
+    indicator_labels: list[str] = []
+    indicator_timeframes: list[str] = []
+    trend_count = 0
+    mean_reversion_count = 0
+    neutral_count = 0
+    for indicator in indicator_source:
+        config = indicator.get("config") or {}
+        meta = indicator.get("meta") or {}
+        label = str(config.get("label") or meta.get("id") or "indicator").strip()
+        timeframe = str(config.get("timeframe") or "").strip().upper()
+        if label and label not in indicator_labels:
+            indicator_labels.append(label)
+        if timeframe and timeframe not in indicator_timeframes:
+            indicator_timeframes.append(timeframe)
+        trend_flag = config.get("isTrendFollowing")
+        if trend_flag is True:
+            trend_count += 1
+        elif trend_flag is False:
+            mean_reversion_count += 1
+        else:
+            neutral_count += 1
+
+    label_phrase = _summarize_phrase(indicator_labels, limit=4) or "a custom indicator stack"
+    sentence_one = (
+        f"{direction_label} {instrument_phrase} on {primary_timeframe} using {label_phrase}."
+    )
+
+    detail_parts: list[str] = []
+    if indicator_timeframes:
+        detail_parts.append(
+            f"Active signals span {_summarize_phrase(indicator_timeframes, limit=4)} timeframes"
+        )
+    mix_parts: list[str] = []
+    if trend_count:
+        mix_parts.append(f"{trend_count} trend-following")
+    if mean_reversion_count:
+        mix_parts.append(f"{mean_reversion_count} mean-reversion")
+    if neutral_count:
+        mix_parts.append(f"{neutral_count} neutral")
+    if mix_parts:
+        mix_phrase = _summarize_phrase(mix_parts, limit=4)
+        detail_parts.append(f"mixing {mix_phrase} indicator{'s' if len(mix_parts) != 1 else ''}")
+
+    if detail_parts:
+        return sentence_one + " " + "; ".join(detail_parts) + "."
+    return sentence_one
+
+
+def _apply_profile_drop_description_fallback(
+    bundle_dir: Path,
+    *,
+    package_inputs: dict[str, Any],
+    row: dict[str, Any],
+    attempt: dict[str, Any],
+) -> str | None:
+    profile_document_path = bundle_dir / "profile-document.json"
+    payload = _load_json_if_exists(profile_document_path)
+    if not isinstance(payload, dict):
+        return None
+    profile = _extract_profile_document_profile(payload)
+    if not isinstance(profile, dict):
+        return None
+    if not _is_generic_profile_description(profile.get("description")):
+        return None
+    description = _build_profile_drop_description(
+        payload,
+        package_inputs=package_inputs,
+        row=row,
+        attempt=attempt,
+    )
+    if not description:
+        return None
+    profile["description"] = description
+    _write_json_file(profile_document_path, payload)
+    return description
 
 
 def _validation_cache_dir(config, run_id: str, lookback_months: int) -> Path:
@@ -4786,6 +5107,14 @@ def _render_profile_drop_for_attempt(
     cli.run(package_args, cwd=working_dir, timeout_seconds=float(timeout_seconds))
 
     bundle_dir = _discover_bundle_dir(package_output_root)
+    description_override = _apply_profile_drop_description_fallback(
+        bundle_dir,
+        package_inputs=package_inputs,
+        row=row,
+        attempt=attempt,
+    )
+    if emit and description_override:
+        emit(f"  profile summary fallback applied for {attempt.get('attempt_id')}")
     renderer_argv = [str(renderer_executable)]
     if config.fuzzfolio.workspace_root is not None:
         renderer_argv.extend(["--workspace-root", str(config.fuzzfolio.workspace_root)])
@@ -5269,11 +5598,9 @@ def cmd_build_shortlist_report(
         f"[shortlist] selected {len(shortlist_rows)} candidates, building shortlist-only similarity payload",
         as_json=as_json,
     )
-    shortlist_similarity_payload = build_candidate_similarity_payload(
+    shortlist_similarity_payload = subset_similarity_payload(
+        similarity_payload,
         shortlist_rows,
-        progress_callback=_similarity_phase_callback(
-            "shortlist-selected", as_json=as_json
-        ),
     )
 
     report_root, is_canonical_report = _shortlist_report_root(
@@ -5371,6 +5698,7 @@ def cmd_build_shortlist_report(
         "candidate_trade_rate_summary": _trade_rate_summary(candidate_rows),
         "selected_trade_rate_summary": _trade_rate_summary(shortlist_rows),
         "selected_basket_summary": _build_selection_basket_summary(shortlist_rows),
+        "selected_basket_curve_36m": _build_selection_basket_curve(shortlist_rows),
         "filter_rejections": filter_rejections,
         "selected_by_run": shortlist_board.get("selected_by_run") or {},
         "selected_by_strategy_key": shortlist_board.get("selected_by_strategy_key") or {},
@@ -5452,6 +5780,7 @@ def cmd_build_portfolio(
     catch_up_force_rebuild: bool | None,
     catch_up_require_scrutiny_36: bool | None,
     generate_profile_drops: bool | None,
+    export_bundle: bool | None,
     profile_drop_workers: int | None,
     as_json: bool,
 ) -> int:
@@ -5471,6 +5800,8 @@ def cmd_build_portfolio(
         portfolio_spec["catch_up_require_scrutiny_36"] = bool(catch_up_require_scrutiny_36)
     if generate_profile_drops is not None:
         portfolio_spec["generate_profile_drops"] = bool(generate_profile_drops)
+    if export_bundle is not None:
+        portfolio_spec["export_bundle"] = bool(export_bundle)
     if profile_drop_workers is not None:
         portfolio_spec["profile_drop_workers"] = max(1, int(profile_drop_workers))
 
@@ -5537,22 +5868,103 @@ def cmd_build_portfolio(
         ]
     rows.sort(key=_full_backtest_priority_key)
 
-    sleeve_results = []
-    for sleeve_spec in list(portfolio_spec.get("sleeves") or []):
+    raw_sleeve_specs = list(portfolio_spec.get("sleeves") or [])
+    sleeve_filters: list[dict[str, Any]] = []
+    for sleeve_spec in raw_sleeve_specs:
         sleeve_name = str(sleeve_spec.get("name") or "sleeve").strip()
-        _phase_emit(f"[portfolio] building sleeve '{sleeve_name}'", as_json=as_json)
-        sleeve_result = build_sleeve_selection(
+        candidate_rows, filter_rejections, max_drawdown_cap = filter_selection_candidate_rows(
             rows,
-            sleeve_spec,
-            similarity_progress_callback=_similarity_phase_callback(
-                f"portfolio:{sleeve_name}", as_json=as_json
+            candidate_limit=int(sleeve_spec.get("candidate_limit", -1)),
+            min_score_36=float(sleeve_spec.get("min_score_36", 40.0)),
+            min_retention_ratio=float(sleeve_spec.get("min_retention_ratio", 0.0)),
+            min_trades_per_month=float(sleeve_spec.get("min_trades_per_month", 0.0)),
+            max_drawdown_r=float(sleeve_spec.get("max_drawdown_r", -1.0)),
+            require_full_backtest_36=bool(sleeve_spec.get("require_full_backtest_36", True)),
+        )
+        sleeve_filters.append(
+            {
+                "name": sleeve_name,
+                "spec": dict(sleeve_spec),
+                "candidate_rows": candidate_rows,
+                "filter_rejections": filter_rejections,
+                "max_drawdown_cap": max_drawdown_cap,
+            }
+        )
+
+    union_candidate_rows = merge_portfolio_sleeves(
+        [
+            {
+                "name": item["name"],
+                "candidate_rows": item["candidate_rows"],
+                "selected_rows": [],
+            }
+            for item in sleeve_filters
+        ]
+    ).get("candidate_rows") or []
+
+    candidate_similarity_payload = build_candidate_similarity_payload(
+        list(union_candidate_rows),
+        progress_callback=_similarity_phase_callback(
+            "portfolio-union", as_json=as_json
+        ),
+    )
+
+    sleeve_results = []
+    for sleeve in sleeve_filters:
+        sleeve_name = str(sleeve.get("name") or "sleeve").strip()
+        _phase_emit(f"[portfolio] building sleeve '{sleeve_name}'", as_json=as_json)
+        sleeve_similarity_payload = subset_similarity_payload(
+            candidate_similarity_payload,
+            list(sleeve.get("candidate_rows") or []),
+        )
+        board = select_promotion_board(
+            list(sleeve.get("candidate_rows") or []),
+            sleeve_similarity_payload,
+            board_size=int(sleeve["spec"].get("shortlist_size", 12)),
+            novelty_penalty=float(sleeve["spec"].get("novelty_penalty", 18.0)),
+            drawdown_penalty=float(sleeve["spec"].get("drawdown_penalty", 0.65)),
+            trade_rate_bonus_weight=float(
+                sleeve["spec"].get("trade_rate_bonus_weight", 0.0)
+            ),
+            trade_rate_bonus_target=float(
+                sleeve["spec"].get("trade_rate_bonus_target", 8.0)
+            ),
+            max_drawdown_r=sleeve.get("max_drawdown_cap"),
+            max_sameness_to_board=(
+                None
+                if float(sleeve["spec"].get("max_sameness_to_board", 0.78)) < 0.0
+                else float(sleeve["spec"].get("max_sameness_to_board", 0.78))
+            ),
+            max_per_run=(
+                None
+                if int(sleeve["spec"].get("max_per_run", 1)) < 0
+                else int(sleeve["spec"]["max_per_run"])
+            ),
+            max_per_strategy_key=(
+                None
+                if int(sleeve["spec"].get("max_per_strategy_key", 1)) < 0
+                else int(sleeve["spec"]["max_per_strategy_key"])
             ),
         )
+        selected_rows = [dict(row) for row in (board.get("selected") or [])]
+        for rank, row in enumerate(selected_rows, start=1):
+            row["sleeve_name"] = sleeve_name
+            row["sleeve_selection_rank"] = rank
+        sleeve_result = {
+            "name": sleeve_name,
+            "spec": dict(sleeve["spec"]),
+            "candidate_rows": list(sleeve.get("candidate_rows") or []),
+            "filter_rejections": sleeve.get("filter_rejections") or {},
+            "similarity_payload": sleeve_similarity_payload,
+            "board": board,
+            "selected_rows": selected_rows,
+        }
         _phase_emit(
-            f"[portfolio] sleeve '{sleeve_name}' selected {len(sleeve_result.get('selected_rows') or [])} from {len(sleeve_result.get('candidate_rows') or [])} qualified",
+            f"[portfolio] sleeve '{sleeve_name}' selected {len(selected_rows)} from {len(sleeve_result.get('candidate_rows') or [])} qualified",
             as_json=as_json,
         )
         sleeve_results.append(sleeve_result)
+
     merged = merge_portfolio_sleeves(sleeve_results)
     portfolio_rows = list(merged.get("selected_rows") or [])
     portfolio_candidate_rows = list(merged.get("candidate_rows") or [])
@@ -5560,15 +5972,9 @@ def cmd_build_portfolio(
         f"[portfolio] merged {len(portfolio_rows)} final selections from {len(portfolio_candidate_rows)} union candidates",
         as_json=as_json,
     )
-    portfolio_similarity_payload = build_candidate_similarity_payload(
+    portfolio_similarity_payload = subset_similarity_payload(
+        candidate_similarity_payload,
         portfolio_rows,
-        progress_callback=_similarity_phase_callback("portfolio-final", as_json=as_json),
-    )
-    candidate_similarity_payload = build_candidate_similarity_payload(
-        portfolio_candidate_rows,
-        progress_callback=_similarity_phase_callback(
-            "portfolio-union", as_json=as_json
-        ),
     )
 
     portfolio_name = str(portfolio_spec.get("portfolio_name") or "default-portfolio").strip()
@@ -5664,12 +6070,14 @@ def cmd_build_portfolio(
         "catch_up_summary": catch_up_summary,
         "run_ids": run_ids,
         "attempt_ids": attempt_ids,
+        "export_bundle": None,
         "candidate_union_count": len(portfolio_candidate_rows),
         "selected_union_count": len(portfolio_rows),
         "selected_overlap_count": int(merged.get("selected_overlap_count") or 0),
         "candidate_trade_rate_summary": _trade_rate_summary(portfolio_candidate_rows),
         "selected_trade_rate_summary": _trade_rate_summary(portfolio_rows),
         "selected_basket_summary": _build_selection_basket_summary(portfolio_rows),
+        "selected_basket_curve_36m": _build_selection_basket_curve(portfolio_rows),
         "sleeves": sleeves_payload,
         "selected": portfolio_rows,
         "charts": {
@@ -5725,6 +6133,16 @@ def cmd_build_portfolio(
         payload["profile_drop_phase"] = "complete"
         payload["profile_drops"] = profile_drop_results
         write_json(report_root / "portfolio-report.json", payload)
+    export_bundle_summary = None
+    if bool(portfolio_spec.get("export_bundle")):
+        export_bundle_summary = _export_portfolio_bundle(
+            config=config,
+            payload=payload,
+            report_root=report_root,
+            report_path=report_root / "portfolio-report.json",
+        )
+        payload["export_bundle"] = export_bundle_summary
+        write_json(report_root / "portfolio-report.json", payload)
     print(
         json.dumps(
             {
@@ -5741,6 +6159,7 @@ def cmd_build_portfolio(
                 "profile_drop_failed": sum(
                     1 for row in profile_drop_results if row.get("status") == "failed"
                 ),
+                "export_bundle": export_bundle_summary,
                 "charts": payload["charts"],
                 "selected": portfolio_rows,
             },
@@ -6216,9 +6635,9 @@ def _nuke_deep_cache_artifacts(
         deleted_derived_root = _delete_tree(derived_root)
     derived_root.mkdir(parents=True, exist_ok=True)
 
-    timestamp_token = summary_timestamp or datetime.now(
-        ZoneInfo("America/Chicago")
-    ).strftime("%Y%m%dT%H%M%S")
+    timestamp_token = summary_timestamp or datetime.now().astimezone().strftime(
+        "%Y%m%dT%H%M%S"
+    )
     summary_path = derived_root / f"deep-cache-reset-{timestamp_token}.json"
     summary = {
         "runs_root": str(runs_root),
@@ -6262,6 +6681,168 @@ def cmd_nuke_deep_caches(*, as_json: bool) -> int:
             ),
             title="Deep Cache Reset",
             border_style="yellow",
+        )
+    )
+    return 0
+
+
+def _latest_portfolio_report_path(config) -> Path | None:
+    root = config.derived_root / "portfolio-report"
+    if not root.exists():
+        return None
+    candidates = sorted(
+        root.glob("*/portfolio-report.json"),
+        key=lambda path: path.stat().st_mtime_ns if path.exists() else 0,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def _portfolio_bundle_root(config, portfolio_name: str) -> Path:
+    return config.derived_root / "portfolio-exports" / _slug_token(portfolio_name)
+
+
+def _copy_if_exists(source: Path | None, destination: Path) -> bool:
+    if source is None or not source.exists():
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, destination)
+    return True
+
+
+def _human_bundle_item_token(
+    candidate_name: str,
+    attempt_id: str,
+    used_tokens: set[str],
+) -> str:
+    base_token = _sanitize_report_token(candidate_name, fallback=attempt_id or "attempt")
+    token = base_token
+    suffix = 2
+    while token in used_tokens:
+        token = f"{base_token}-{suffix}"
+        suffix += 1
+    used_tokens.add(token)
+    return token
+
+
+def _export_portfolio_bundle(
+    *,
+    config,
+    payload: dict[str, Any],
+    report_root: Path,
+    report_path: Path,
+) -> dict[str, Any]:
+    portfolio_name = str(payload.get("portfolio_name") or "default-portfolio").strip()
+    export_root = _portfolio_bundle_root(config, portfolio_name)
+    export_root.mkdir(parents=True, exist_ok=True)
+    timestamp_token = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
+    bundle_root = export_root / timestamp_token
+    bundle_root.mkdir(parents=True, exist_ok=True)
+
+    selected_rows = list(payload.get("selected") or [])
+    profile_drop_lookup = {
+        str(item.get("attempt_id") or "").strip(): dict(item)
+        for item in list(payload.get("profile_drops") or [])
+        if str(item.get("attempt_id") or "").strip()
+    }
+
+    exported_profiles = 0
+    missing_profiles: list[str] = []
+    exported_drop_pngs = 0
+    missing_drop_attempts: list[str] = []
+    manifest_rows: list[dict[str, Any]] = []
+    used_item_tokens: set[str] = set()
+
+    for rank, row in enumerate(selected_rows, start=1):
+        attempt_id = str(row.get("attempt_id") or "").strip()
+        candidate_name = str(row.get("candidate_name") or "").strip()
+        item_token = _human_bundle_item_token(
+            candidate_name=candidate_name,
+            attempt_id=attempt_id,
+            used_tokens=used_item_tokens,
+        )
+        item_root = bundle_root / item_token
+        item_root.mkdir(parents=True, exist_ok=True)
+        profile_path_raw = str(row.get("profile_path") or "").strip()
+        profile_path = Path(profile_path_raw).resolve() if profile_path_raw else None
+        profile_export_path = item_root / f"{item_token}.json"
+        has_profile = _copy_if_exists(profile_path, profile_export_path)
+        if has_profile:
+            exported_profiles += 1
+        else:
+            missing_profiles.append(attempt_id)
+
+        drop_item = profile_drop_lookup.get(attempt_id) or {}
+        png_path_raw = str(drop_item.get("png_path") or "").strip()
+        png_path = Path(png_path_raw).resolve() if png_path_raw else None
+        png_export_path = item_root / f"{item_token}.png"
+        has_drop_png = False
+        if _copy_if_exists(png_path, png_export_path):
+            exported_drop_pngs += 1
+            has_drop_png = True
+        if not has_drop_png:
+            missing_drop_attempts.append(attempt_id)
+
+        manifest_rows.append(
+            {
+                "selection_rank": rank,
+                "attempt_id": attempt_id,
+                "run_id": str(row.get("run_id") or ""),
+                "candidate_name": candidate_name,
+                "profile_ref": str(drop_item.get("profile_ref") or row.get("profile_ref") or ""),
+                "export_dir": str(item_root),
+                "profile_export_path": str(profile_export_path) if has_profile else None,
+                "drop_png_export_path": str(png_export_path) if has_drop_png else None,
+            }
+        )
+
+    summary = {
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "portfolio_name": portfolio_name,
+        "bundle_root": str(bundle_root),
+        "report_path": str(report_path),
+        "selected_count": len(selected_rows),
+        "exported_profiles": exported_profiles,
+        "missing_profiles": missing_profiles,
+        "exported_drop_pngs": exported_drop_pngs,
+        "missing_drop_attempts": missing_drop_attempts,
+        "selected_rows": manifest_rows,
+    }
+    return summary
+
+
+def cmd_export_portfolio_bundle(*, portfolio_report: str | None, as_json: bool) -> int:
+    config = load_config()
+    report_path = (
+        Path(portfolio_report).resolve() if portfolio_report else _latest_portfolio_report_path(config)
+    )
+    if report_path is None or not report_path.exists():
+        raise SystemExit("No portfolio-report.json found to export.")
+    payload = load_json_if_exists(report_path)
+    if not isinstance(payload, dict) or not payload:
+        raise SystemExit(f"Portfolio report is missing or invalid: {report_path}")
+    summary = _export_portfolio_bundle(
+        config=config,
+        payload=payload,
+        report_root=report_path.parent,
+        report_path=report_path,
+    )
+    if as_json:
+        print(json.dumps(summary, ensure_ascii=True, indent=2))
+        return 0
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Portfolio: {summary['portfolio_name']}",
+                    f"Bundle: {summary['bundle_root']}",
+                    f"Selected: {summary['selected_count']}",
+                    f"Profiles exported: {summary['exported_profiles']}",
+                    f"Drop PNGs exported: {summary['exported_drop_pngs']}",
+                ]
+            ),
+            title="Portfolio Bundle Export",
+            border_style="green",
         )
     )
     return 0
@@ -6556,7 +7137,13 @@ def main() -> int:
             catch_up_force_rebuild=args.catch_up_force_rebuild,
             catch_up_require_scrutiny_36=args.catch_up_require_scrutiny_36,
             generate_profile_drops=args.generate_profile_drops,
+            export_bundle=args.export_bundle,
             profile_drop_workers=args.profile_drop_workers,
+            as_json=bool(args.json),
+        )
+    if args.command == "export-portfolio-bundle":
+        return cmd_export_portfolio_bundle(
+            portfolio_report=args.portfolio_report,
             as_json=bool(args.json),
         )
     if args.command == "nuke-deep-caches":

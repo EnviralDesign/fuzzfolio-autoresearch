@@ -60,6 +60,7 @@ uv run autoresearch audit-full-backtests
 uv run autoresearch build-shortlist-report
 uv run autoresearch build-portfolio
 uv run autoresearch nuke-deep-caches
+uv run autoresearch export-portfolio-bundle
 uv run autoresearch build-promotion-board
 uv run autoresearch plot-corpus-score-vs-trades
 uv run autoresearch dashboard
@@ -299,12 +300,14 @@ Important config keys in `portfolio.config.json`:
 - `catch_up_require_scrutiny_36`
 - `full_backtest_job_timeout_seconds`
 - `profile_drop_workers`
+- `export_bundle`
 
 Useful variants:
 
 ```powershell
 uv run autoresearch build-portfolio --profile-drop-workers 8
 uv run autoresearch build-portfolio --no-generate-profile-drops
+uv run autoresearch build-portfolio --no-export-bundle
 uv run autoresearch build-portfolio --catch-up-full-backtests
 uv run autoresearch build-portfolio --catch-up-full-backtests --catch-up-require-scrutiny-36
 uv run autoresearch build-portfolio --portfolio-config .\portfolio.config.json
@@ -316,6 +319,7 @@ Important notes:
 - sleeves are unioned, not collapsed into one weighted sum
 - profile-drop PNG generation runs in parallel here too
 - optional catch-up can backfill missing `36mo` full-backtests before portfolio selection
+- by default it also exports a dated import bundle under `runs/derived/portfolio-exports/`
 
 Outputs:
 
@@ -323,6 +327,7 @@ Outputs:
 - `runs/derived/portfolio-report/<portfolio-name>/portfolio-report.csv`
 - `runs/derived/portfolio-report/<portfolio-name>/charts/*`
 - `runs/derived/portfolio-report/<portfolio-name>/profile-drops/*`
+- `runs/derived/portfolio-exports/<portfolio-name>/<timestamp>/*`
 
 ### 7. Build a stricter promotion board
 

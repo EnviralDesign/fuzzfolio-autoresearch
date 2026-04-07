@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 from autoresearch import __main__ as ar_main
 from autoresearch import portfolio as pf
@@ -180,3 +181,172 @@ def test_nuke_deep_cache_artifacts_removes_rebuildable_outputs_only(
     assert derived_root.exists() is True
     assert (derived_root / "portfolio-report.json").exists() is False
     assert (derived_root / "deep-cache-reset-20260406T170000.json").exists() is True
+
+
+def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    derived_root.mkdir(parents=True, exist_ok=True)
+    report_root = derived_root / "portfolio-report" / "default-portfolio"
+    report_root.mkdir(parents=True, exist_ok=True)
+
+    profile_path = runs_root / "run-a" / "evals" / "candidate-a" / "profile.json"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text('{"name":"alpha"}', encoding="utf-8")
+
+    source_drop_root = report_root / "profile-drops" / "1-attempt-a-alpha"
+    source_drop_root.mkdir(parents=True, exist_ok=True)
+    source_drop_png = source_drop_root / "profile-drop-36mo.png"
+    source_drop_manifest = source_drop_root / "profile-drop-36mo.manifest.json"
+    source_drop_png.write_text("png", encoding="utf-8")
+    source_drop_manifest.write_text("{}", encoding="utf-8")
+
+    report_path = report_root / "portfolio-report.json"
+    report_path.write_text("{}", encoding="utf-8")
+
+    payload = {
+        "portfolio_name": "default-portfolio",
+        "selected": [
+            {
+                "attempt_id": "attempt-a",
+                "run_id": "run-a",
+                "candidate_name": "alpha",
+                "profile_path": str(profile_path),
+                "profile_ref": "abc123",
+            }
+        ],
+        "profile_drops": [
+            {
+                "attempt_id": "attempt-a",
+                "profile_ref": "abc123",
+                "png_path": str(source_drop_png),
+                "manifest_path": str(source_drop_manifest),
+            }
+        ],
+    }
+
+    config = SimpleNamespace(derived_root=derived_root)
+    summary = ar_main._export_portfolio_bundle(
+        config=config,
+        payload=payload,
+        report_root=report_root,
+        report_path=report_path,
+    )
+
+    bundle_root = Path(summary["bundle_root"])
+    item_root = bundle_root / "alpha"
+
+    assert item_root.exists() is True
+    assert (item_root / "alpha.json").exists() is True
+    assert (item_root / "alpha.png").exists() is True
+    assert (item_root / "profile-drop-36mo.manifest.json").exists() is False
+    assert (bundle_root / "portfolio-report.json").exists() is False
+    assert (bundle_root / "portfolio-report.csv").exists() is False
+    assert (bundle_root / "selected-attempts.csv").exists() is False
+    assert (bundle_root / "bundle-manifest.json").exists() is False
+    assert summary["exported_profiles"] == 1
+    assert summary["exported_drop_pngs"] == 1
+
+
+def test_human_bundle_item_token_avoids_collisions() -> None:
+    used: set[str] = set()
+
+    first = ar_main._human_bundle_item_token("alpha", "attempt-a", used)
+    second = ar_main._human_bundle_item_token("alpha", "attempt-b", used)
+
+    assert first == "alpha"
+    assert second == "alpha-2"
+
+
+def test_profile_drop_description_fallback_detects_generic_text() -> None:
+    assert (
+        ar_main._is_generic_profile_description(
+            "Portable scoring profile scaffolded from live indicator templates."
+        )
+        is True
+    )
+    assert ar_main._is_generic_profile_description("") is True
+    assert ar_main._is_generic_profile_description("Custom mean reversion profile.") is False
+
+
+def test_build_profile_drop_description_uses_profile_structure() -> None:
+    payload = {
+        "profile": {
+            "description": "Portable scoring profile scaffolded from live indicator templates.",
+            "directionMode": "both",
+            "indicators": [
+                {
+                    "config": {
+                        "isActive": True,
+                        "isTrendFollowing": True,
+                        "label": "RSI",
+                        "timeframe": "M5",
+                    },
+                    "meta": {"id": "RSI"},
+                },
+                {
+                    "config": {
+                        "isActive": True,
+                        "isTrendFollowing": False,
+                        "label": "WILLR",
+                        "timeframe": "H1",
+                    },
+                    "meta": {"id": "WILLR"},
+                },
+            ],
+        }
+    }
+
+    description = ar_main._build_profile_drop_description(
+        payload,
+        package_inputs={"instruments": ["EURUSD", "GBPUSD"], "timeframe": "M5"},
+        row={},
+        attempt={},
+    )
+
+    assert "Both-direction basket profile across EURUSD and GBPUSD on M5" in description
+    assert "RSI and WILLR" in description
+    assert "M5 and H1 timeframes" in description
+    assert "1 trend-following and 1 mean-reversion" in description
+
+
+def test_apply_profile_drop_description_fallback_rewrites_bundle_profile(tmp_path: Path) -> None:
+    bundle_dir = tmp_path / "bundle"
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    profile_document_path = bundle_dir / "profile-document.json"
+    profile_document_path.write_text(
+        """
+        {
+          "format": "fuzzfolio.scoring-profile",
+          "formatVersion": 1,
+          "profile": {
+            "description": "Portable scoring profile scaffolded from live indicator templates.",
+            "directionMode": "both",
+            "indicators": [
+              {
+                "config": {
+                  "isActive": true,
+                  "isTrendFollowing": true,
+                  "label": "ADX",
+                  "timeframe": "M15"
+                },
+                "meta": {"id": "ADX"}
+              }
+            ]
+          }
+        }
+        """.strip(),
+        encoding="utf-8",
+    )
+
+    applied = ar_main._apply_profile_drop_description_fallback(
+        bundle_dir,
+        package_inputs={"instruments": ["EURUSD"], "timeframe": "M15"},
+        row={},
+        attempt={},
+    )
+    updated = ar_main.load_json_if_exists(profile_document_path)
+
+    assert applied is not None
+    assert "EURUSD profile on M15 using ADX" in applied
+    assert updated["profile"]["description"] == applied

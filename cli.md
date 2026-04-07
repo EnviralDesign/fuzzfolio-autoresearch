@@ -411,6 +411,7 @@ uv run autoresearch build-portfolio --portfolio-config .\portfolio.config.json
 uv run autoresearch build-portfolio --catch-up-full-backtests
 uv run autoresearch build-portfolio --profile-drop-workers 8
 uv run autoresearch build-portfolio --no-generate-profile-drops
+uv run autoresearch build-portfolio --no-export-bundle
 ```
 
 | Argument | Type | Default | Description |
@@ -422,6 +423,7 @@ uv run autoresearch build-portfolio --no-generate-profile-drops
 | `--catch-up-force-rebuild` | bool | config/default | Force full-backtest rebuilds during the optional catch-up phase. |
 | `--catch-up-require-scrutiny-36` | bool | config/default | Only catch up attempts that already have `36mo` scrutiny. |
 | `--generate-profile-drops` | bool | config/default | Enable or disable final portfolio profile-drop PNG generation. |
+| `--export-bundle` | bool | config/default | Enable or disable exporting a dated portfolio bundle with selected profiles and rendered drops. |
 | `--profile-drop-workers` | int | config/default | Override worker count for portfolio profile-drop packaging/rendering. |
 | `--json` | flag | false | Print machine-readable JSON. |
 
@@ -431,6 +433,32 @@ Outputs under `runs/derived/portfolio-report/<portfolio-name>/`:
 - `portfolio-report.csv`
 - `charts/*`
 - `profile-drops/*`
+
+Additional export bundle under `runs/derived/portfolio-exports/<portfolio-name>/<timestamp>/`:
+
+- `profiles/*`
+- `profile-drops/*`
+- `portfolio-report.json`
+- `portfolio-report.csv`
+- `selected-attempts.csv`
+- `bundle-manifest.json`
+
+---
+
+## export-portfolio-bundle
+
+Export the latest portfolio selection into one dated folder that is easy to drag/import elsewhere.
+
+```powershell
+uv run autoresearch export-portfolio-bundle
+uv run autoresearch export-portfolio-bundle --portfolio-report .\runs\derived\portfolio-report\default-portfolio\portfolio-report.json
+uv run autoresearch export-portfolio-bundle --json
+```
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--portfolio-report` | path | latest derived portfolio report | Explicit portfolio-report.json to export. |
+| `--json` | flag | false | Print machine-readable JSON. |
 
 Default config source:
 

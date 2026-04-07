@@ -411,6 +411,7 @@ def _normalize_portfolio_as_shortlist(
         "selected_count": int(report.get("selected_union_count") or len(selected_rows)),
         "alternate_count": len(alternates),
         "selected_basket_summary": report.get("selected_basket_summary") or {},
+        "selected_basket_curve_36m": report.get("selected_basket_curve_36m") or {},
         "selected": selected_rows,
         "alternates": alternates,
         "profile_drops": list(report.get("profile_drops") or []),

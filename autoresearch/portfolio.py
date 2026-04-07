@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from .corpus_tools import (
     build_similarity_payload as build_candidate_similarity_payload,
+    subset_similarity_payload,
     select_promotion_board,
 )
 
@@ -37,6 +38,7 @@ DEFAULT_PORTFOLIO_SPEC: dict[str, Any] = {
     "catch_up_require_scrutiny_36": False,
     "full_backtest_job_timeout_seconds": 2400,
     "generate_profile_drops": True,
+    "export_bundle": True,
     "profile_drop_lookback_months": 36,
     "profile_drop_timeout_seconds": 1800,
     "profile_drop_workers": 4,
@@ -176,6 +178,7 @@ def build_sleeve_selection(
     rows: list[dict[str, Any]],
     sleeve_spec: dict[str, Any],
     similarity_progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    similarity_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     candidate_rows, filter_rejections, max_drawdown_cap = filter_selection_candidate_rows(
         rows,
@@ -186,12 +189,16 @@ def build_sleeve_selection(
         max_drawdown_r=float(sleeve_spec.get("max_drawdown_r", -1.0)),
         require_full_backtest_36=bool(sleeve_spec.get("require_full_backtest_36", True)),
     )
-    similarity_payload = build_candidate_similarity_payload(
-        candidate_rows, progress_callback=similarity_progress_callback
+    effective_similarity_payload = (
+        subset_similarity_payload(similarity_payload, candidate_rows)
+        if similarity_payload is not None
+        else build_candidate_similarity_payload(
+            candidate_rows, progress_callback=similarity_progress_callback
+        )
     )
     board = select_promotion_board(
         candidate_rows,
-        similarity_payload,
+        effective_similarity_payload,
         board_size=int(sleeve_spec.get("shortlist_size", 12)),
         novelty_penalty=float(sleeve_spec.get("novelty_penalty", 18.0)),
         drawdown_penalty=float(sleeve_spec.get("drawdown_penalty", 0.65)),
@@ -221,7 +228,7 @@ def build_sleeve_selection(
         "spec": dict(sleeve_spec),
         "candidate_rows": candidate_rows,
         "filter_rejections": filter_rejections,
-        "similarity_payload": similarity_payload,
+        "similarity_payload": effective_similarity_payload,
         "board": board,
         "selected_rows": selected_rows,
     }

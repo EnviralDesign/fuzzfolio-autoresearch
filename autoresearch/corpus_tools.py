@@ -992,6 +992,7 @@ def build_similarity_payload(
             {
                 **row,
                 "curve_series": curve_series,
+                "curve_dates": set(curve_series.keys()),
                 "active_dates": {
                     date
                     for date, value in curve_series.items()
@@ -999,6 +1000,13 @@ def build_similarity_payload(
                 },
                 "instruments_norm": normalize_tokens(
                     list(row.get("instruments_36m") or row.get("base_instruments") or [])
+                ),
+                "instruments_set": set(
+                    normalize_tokens(
+                        list(
+                            row.get("instruments_36m") or row.get("base_instruments") or []
+                        )
+                    )
                 ),
                 "timeframe_norm": str(
                     row.get("timeframe_36m") or row.get("base_timeframe") or ""
@@ -1045,13 +1053,14 @@ def build_similarity_payload(
         )
 
     for left_index, left in enumerate(prepared):
-        left_dates = set(left["curve_series"].keys())
+        left_dates = left["curve_dates"]
         left_values_map = left["curve_series"]
-        left_instruments = set(left["instruments_norm"])
+        left_instruments = left["instruments_set"]
+        active_left = left["active_dates"]
         for right_index in range(left_index + 1, len(prepared)):
             processed_pairs += 1
             right = prepared[right_index]
-            right_dates = set(right["curve_series"].keys())
+            right_dates = right["curve_dates"]
             common_dates = sorted(left_dates & right_dates)
             if len(common_dates) < 30:
                 if progress_callback is not None and (
@@ -1072,15 +1081,14 @@ def build_similarity_payload(
             right_values = [float(right["curve_series"][date]) for date in common_dates]
             corr = pearson_correlation(left_values, right_values)
             positive_corr = max(0.0, float(corr)) if corr is not None else 0.0
-            right_instruments = set(right["instruments_norm"])
+            right_instruments = right["instruments_set"]
             union_instruments = left_instruments | right_instruments
             instrument_overlap = (
                 len(left_instruments & right_instruments) / len(union_instruments)
                 if union_instruments
                 else 0.0
             )
-            active_left = set(left["active_dates"])
-            active_right = set(right["active_dates"])
+            active_right = right["active_dates"]
             active_union = active_left | active_right
             shared_active_ratio = (
                 len(active_left & active_right) / len(active_union)
@@ -1242,6 +1250,63 @@ def build_similarity_payload(
         "leaders": leaders,
         "pairs": pair_records,
         "matrix_labels": matrix_labels,
+        "matrix_values": matrix_values,
+    }
+
+
+def subset_similarity_payload(
+    similarity_payload: dict[str, Any],
+    candidate_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    wanted_attempt_ids = {
+        str(row.get("attempt_id") or "").strip() for row in candidate_rows if str(row.get("attempt_id") or "").strip()
+    }
+    if not wanted_attempt_ids:
+        return {"leaders": [], "pairs": [], "matrix_labels": [], "matrix_values": []}
+
+    filtered_leaders = [
+        dict(row)
+        for row in list(similarity_payload.get("leaders") or [])
+        if str(row.get("attempt_id") or "").strip() in wanted_attempt_ids
+    ]
+    filtered_pairs = [
+        dict(pair)
+        for pair in list(similarity_payload.get("pairs") or [])
+        if str(pair.get("left_attempt_id") or "").strip() in wanted_attempt_ids
+        and str(pair.get("right_attempt_id") or "").strip() in wanted_attempt_ids
+    ]
+    label_by_attempt_id = {
+        str(row.get("attempt_id") or "").strip(): (
+            f"{row.get('run_id')} | {row.get('candidate_name') or row.get('attempt_id')}"
+        )
+        for row in candidate_rows
+        if str(row.get("attempt_id") or "").strip()
+    }
+    ordered_attempt_ids = [
+        str(row.get("attempt_id") or "").strip()
+        for row in candidate_rows
+        if str(row.get("attempt_id") or "").strip() in wanted_attempt_ids
+    ]
+    pair_lookup: dict[tuple[str, str], float] = {}
+    for pair in filtered_pairs:
+        left = str(pair.get("left_attempt_id") or "").strip()
+        right = str(pair.get("right_attempt_id") or "").strip()
+        if not left or not right:
+            continue
+        pair_lookup[tuple(sorted([left, right]))] = float(pair.get("similarity_score") or 0.0)
+    matrix_values: list[list[float]] = []
+    for left in ordered_attempt_ids:
+        row_values: list[float] = []
+        for right in ordered_attempt_ids:
+            if left == right:
+                row_values.append(1.0)
+                continue
+            row_values.append(float(pair_lookup.get(tuple(sorted([left, right])), 0.0)))
+        matrix_values.append(row_values)
+    return {
+        "leaders": filtered_leaders,
+        "pairs": filtered_pairs,
+        "matrix_labels": [label_by_attempt_id.get(attempt_id, attempt_id) for attempt_id in ordered_attempt_ids],
         "matrix_values": matrix_values,
     }
 
