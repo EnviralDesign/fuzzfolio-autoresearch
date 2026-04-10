@@ -36,3 +36,4 @@ wheels/
 # Generated training / experiment artifacts
 /data/training_pipeline/
 /data/training_runs/
+/data/gguf_exports/

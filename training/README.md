@@ -16,6 +16,56 @@ This directory holds the first adapter-first training scaffold for the explorer 
 
 This produces a LoRA adapter first, not a merged standalone checkpoint.
 
+## GGUF / LM Studio Export
+
+This is a real `yay`: the repo now has a first-class export lane for turning the
+current Gemma adapter into a merged GGUF artifact for faster local serving.
+
+New helper paths:
+
+- `training/merge_adapter.py`
+  - loads the base Hugging Face model plus a PEFT LoRA adapter
+  - merges with `merge_and_unload()`
+  - saves merged Hugging Face weights plus tokenizer
+- `scripts/export_gemma_adapter_to_gguf.ps1`
+  - Windows-first orchestration wrapper
+  - merges adapter -> converts merged HF weights to GGUF via `llama.cpp`
+  - optionally imports the resulting `.gguf` into LM Studio with `lms import`
+
+Current recommended adapter input:
+
+- `data/training_runs/gemma_e4b_openingscaffold_v2_narrow_from_evalcandfix_gpu1/adapter`
+
+Typical dry run:
+
+```powershell
+.\scripts\export_gemma_adapter_to_gguf.ps1 `
+  -AdapterDir data\training_runs\gemma_e4b_openingscaffold_v2_narrow_from_evalcandfix_gpu1\adapter `
+  -ExportRoot data\gguf_exports\gemma4_e4b_openv2 `
+  -ReportOnly
+```
+
+Typical full export + LM Studio import:
+
+```powershell
+.\scripts\export_gemma_adapter_to_gguf.ps1 `
+  -AdapterDir data\training_runs\gemma_e4b_openingscaffold_v2_narrow_from_evalcandfix_gpu1\adapter `
+  -ExportRoot data\gguf_exports\gemma4_e4b_openv2 `
+  -GpuId 1 `
+  -Device cuda `
+  -ImportToLmStudio `
+  -LmsUserRepo local/gemma4-e4b-openv2-tuned
+```
+
+Practical notes:
+
+- LM Studio import is straightforward once the `.gguf` exists.
+- The adapter itself is still the durable training artifact; GGUF is the deployment artifact.
+- `scripts/export_gemma_adapter_to_gguf.ps1` will auto-clone `llama.cpp` under
+  `%LOCALAPPDATA%\codex-cache\llama.cpp` if no `-LlamaCppDir` is provided.
+- The merge step can be heavier than the import step; use `-ReportOnly` first if
+  you want to validate paths and the plan before loading model weights.
+
 ## Current Baseline Read
 
 - This is a real `yay`.
