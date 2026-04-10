@@ -1,0 +1,62 @@
+{
+  "version": "0.1.0",
+  "notes": "Benchmark registry for offline adapter checks and future paired baseline-versus-tuned controller runs.",
+  "benchmarks": [
+    {
+      "id": "offline-forced-val16-v1",
+      "type": "offline_adapter_contract",
+      "description": "Held-out deterministic early-phase next-action benchmark for adapter contract checks.",
+      "reference_path": "data/training_pipeline/benchmarks/offline_forced_val16.jsonl",
+      "selection_notes": [
+        "Validation split only",
+        "A/B grade only",
+        "Deterministic follow-up target required",
+        "Balanced across validate_profile, register_profile, evaluate_candidate, inspect_artifact"
+      ],
+      "expected_count": 16
+    },
+    {
+      "id": "offline-forced-val16-v4",
+      "type": "offline_adapter_contract",
+      "description": "Held-out deterministic follow-up benchmark refreshed from v4 replay and migrated to the active pathless handle contract.",
+      "reference_path": "data/training_pipeline/benchmarks/offline_forced_val16_v4.jsonl",
+      "selection_notes": [
+        "Same 16 example_ids as offline-forced-val16-v1",
+        "Rows refreshed from v4 split build after replay handle enrichment",
+        "Active scoring uses candidate_name/profile_ref instead of model-facing path fields",
+        "Used for compact-v2 offline follow-up contract checks"
+      ],
+      "expected_count": 16
+    },
+    {
+      "id": "offline-opening-scaffold-valtest-v1",
+      "type": "offline_adapter_opening_scaffold",
+      "description": "Held-out opening-step scaffold benchmark for first-action prepare_profile with mode=scaffold_from_seed and candidate_name-based local draft handling.",
+      "reference_path": "data/training_pipeline/benchmarks/offline_opening_scaffold_valtest_v1.jsonl",
+      "selection_notes": [
+        "Validation and test split rows only",
+        "A/B grade only",
+        "Step == 1",
+        "First tool prepare_profile",
+        "Required mode scaffold_from_seed",
+        "Active scoring uses candidate_name grounding, not destination_path"
+      ],
+      "expected_count": 12
+    },
+    {
+      "id": "offline-opening-grounding-nonholdout-v1",
+      "type": "offline_adapter_opening_grounding",
+      "description": "Non-holdout opening-step field-grounding benchmark with compact-v2 opening-grounding handles for instruments and candidate_name-based local draft grounding.",
+      "reference_path": "data/training_pipeline/benchmarks/offline_opening_grounding_nonholdout_v1.jsonl",
+      "selection_notes": [
+        "Built from non-holdout opening_scaffold_train_v2_narrow and opening_scaffold_val_v2_narrow rows",
+        "Step == 1",
+        "Exactly one prepare_profile scaffold_from_seed action",
+        "Carries opening_grounding prompt-state block with starter instruments and candidate_name hint",
+        "Scores concrete instrument grounding and candidate_name grounding in addition to contract validity",
+        "Forbidden synthetic instrument values such as ALL count as failures"
+      ],
+      "expected_count": 12
+    }
+  ]
+}

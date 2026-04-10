@@ -13,6 +13,7 @@ from .corpus_tools import (
 
 
 DEFAULT_SLEEVE_SPEC: dict[str, Any] = {
+    "prefilter_limit": 128,
     "candidate_limit": -1,
     "shortlist_size": 12,
     "min_score_36": 40.0,
@@ -64,6 +65,13 @@ DEFAULT_PORTFOLIO_SPEC: dict[str, Any] = {
 def _safe_float(value: Any) -> float | None:
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None
 
@@ -174,21 +182,116 @@ def filter_selection_candidate_rows(
     return candidate_rows, filter_rejections, max_drawdown_cap
 
 
-def build_sleeve_selection(
+def _trade_rate_bonus(
+    sleeve_spec: dict[str, Any], trades_per_month: Any
+) -> tuple[float, float]:
+    value = _safe_float(trades_per_month)
+    if value is None or value <= 0.0:
+        return 0.0, 0.0
+    weight = max(0.0, float(sleeve_spec.get("trade_rate_bonus_weight", 0.0)))
+    if weight <= 0.0:
+        return 0.0, 0.0
+    target = max(0.1, float(sleeve_spec.get("trade_rate_bonus_target", 8.0)))
+    try:
+        from math import log1p
+
+        fraction = min(1.0, log1p(value) / log1p(target))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return 0.0, 0.0
+    return weight * fraction, fraction
+
+
+def resolve_prefilter_limit(sleeve_spec: dict[str, Any]) -> int:
+    explicit_limit = _safe_int(sleeve_spec.get("prefilter_limit"))
+    if explicit_limit is not None and explicit_limit >= 0:
+        return explicit_limit
+    legacy_limit = _safe_int(sleeve_spec.get("candidate_limit"))
+    if legacy_limit is not None and legacy_limit >= 0:
+        return legacy_limit
+    shortlist_size = max(1, int(sleeve_spec.get("shortlist_size", 12)))
+    return max(64, shortlist_size * 8)
+
+
+def build_prefiltered_candidate_rows(
+    qualified_rows: list[dict[str, Any]],
+    sleeve_spec: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    prefilter_limit = resolve_prefilter_limit(sleeve_spec)
+    ranked_rows: list[dict[str, Any]] = []
+    for row in qualified_rows:
+        drawdown_r = _safe_float(row.get("max_drawdown_r_36m"))
+        drawdown_component = (
+            float(sleeve_spec.get("drawdown_penalty", 0.65)) * float(drawdown_r)
+            if drawdown_r is not None and float(sleeve_spec.get("drawdown_penalty", 0.65)) > 0.0
+            else 0.0
+        )
+        trade_bonus_component, trade_bonus_fraction = _trade_rate_bonus(
+            sleeve_spec, row.get("trades_per_month_36m")
+        )
+        provisional_utility = (
+            float(row.get("score_36m") or float("-inf"))
+            + trade_bonus_component
+            - drawdown_component
+        )
+        ranked_row = dict(row)
+        ranked_row["prefilter_utility"] = provisional_utility
+        ranked_row["prefilter_score_component"] = float(
+            row.get("score_36m") or float("-inf")
+        )
+        ranked_row["prefilter_drawdown_penalty_component"] = drawdown_component
+        ranked_row["prefilter_trade_rate_bonus_component"] = trade_bonus_component
+        ranked_row["prefilter_trade_rate_bonus_fraction"] = trade_bonus_fraction
+        ranked_rows.append(ranked_row)
+    ranked_rows.sort(
+        key=lambda row: (
+            -float(row.get("prefilter_utility") or float("-inf")),
+            -float(_safe_float(row.get("score_36m")) or float("-inf")),
+            -float(_safe_float(row.get("trades_per_month_36m")) or 0.0),
+            str(row.get("attempt_id") or ""),
+        )
+    )
+    retained_rows = ranked_rows[:prefilter_limit]
+    for index, row in enumerate(retained_rows, start=1):
+        row["prefilter_rank"] = index
+    return retained_rows, prefilter_limit
+
+
+def build_sleeve_prefilter(
     rows: list[dict[str, Any]],
     sleeve_spec: dict[str, Any],
-    similarity_progress_callback: Callable[[dict[str, Any]], None] | None = None,
-    similarity_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    candidate_rows, filter_rejections, max_drawdown_cap = filter_selection_candidate_rows(
+    qualified_rows, filter_rejections, max_drawdown_cap = filter_selection_candidate_rows(
         rows,
-        candidate_limit=int(sleeve_spec.get("candidate_limit", -1)),
+        candidate_limit=-1,
         min_score_36=float(sleeve_spec.get("min_score_36", 40.0)),
         min_retention_ratio=float(sleeve_spec.get("min_retention_ratio", 0.0)),
         min_trades_per_month=float(sleeve_spec.get("min_trades_per_month", 0.0)),
         max_drawdown_r=float(sleeve_spec.get("max_drawdown_r", -1.0)),
         require_full_backtest_36=bool(sleeve_spec.get("require_full_backtest_36", True)),
     )
+    candidate_rows, prefilter_limit = build_prefiltered_candidate_rows(
+        qualified_rows, sleeve_spec
+    )
+    return {
+        "name": sleeve_spec.get("name"),
+        "spec": dict(sleeve_spec),
+        "qualified_rows": qualified_rows,
+        "candidate_rows": candidate_rows,
+        "prefilter_limit": prefilter_limit,
+        "prefilter_excluded_count": max(0, len(qualified_rows) - len(candidate_rows)),
+        "filter_rejections": filter_rejections,
+        "max_drawdown_cap": max_drawdown_cap,
+    }
+
+
+def finalize_sleeve_selection(
+    prefilter_result: dict[str, Any],
+    *,
+    similarity_progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    similarity_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    candidate_rows = list(prefilter_result.get("candidate_rows") or [])
+    sleeve_spec = dict(prefilter_result.get("spec") or {})
     effective_similarity_payload = (
         subset_similarity_payload(similarity_payload, candidate_rows)
         if similarity_payload is not None
@@ -204,14 +307,16 @@ def build_sleeve_selection(
         drawdown_penalty=float(sleeve_spec.get("drawdown_penalty", 0.65)),
         trade_rate_bonus_weight=float(sleeve_spec.get("trade_rate_bonus_weight", 0.0)),
         trade_rate_bonus_target=float(sleeve_spec.get("trade_rate_bonus_target", 8.0)),
-        max_drawdown_r=max_drawdown_cap,
+        max_drawdown_r=prefilter_result.get("max_drawdown_cap"),
         max_sameness_to_board=(
             None
             if float(sleeve_spec.get("max_sameness_to_board", 0.78)) < 0.0
             else float(sleeve_spec.get("max_sameness_to_board", 0.78))
         ),
         max_per_run=(
-            None if int(sleeve_spec.get("max_per_run", 1)) < 0 else int(sleeve_spec["max_per_run"])
+            None
+            if int(sleeve_spec.get("max_per_run", 1)) < 0
+            else int(sleeve_spec["max_per_run"])
         ),
         max_per_strategy_key=(
             None
@@ -224,14 +329,25 @@ def build_sleeve_selection(
         row["sleeve_name"] = sleeve_spec.get("name")
         row["sleeve_selection_rank"] = rank
     return {
-        "name": sleeve_spec.get("name"),
-        "spec": dict(sleeve_spec),
-        "candidate_rows": candidate_rows,
-        "filter_rejections": filter_rejections,
+        **dict(prefilter_result),
         "similarity_payload": effective_similarity_payload,
         "board": board,
         "selected_rows": selected_rows,
     }
+
+
+def build_sleeve_selection(
+    rows: list[dict[str, Any]],
+    sleeve_spec: dict[str, Any],
+    similarity_progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    similarity_payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    prefilter_result = build_sleeve_prefilter(rows, sleeve_spec)
+    return finalize_sleeve_selection(
+        prefilter_result,
+        similarity_progress_callback=similarity_progress_callback,
+        similarity_payload=similarity_payload,
+    )
 
 
 def _merge_row_union(

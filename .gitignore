@@ -7,27 +7,32 @@ wheels/
 *.egg-info
 
 # Virtual environments
-.venv
-worktrees/
-results/
-queue/
-runs/
+/.venv
+/.venv-*/
+/worktrees/
+/results/
+/queue/
+/runs/
 
 # Agent prompt files (generated per-session by launchers)
-CLAUDE.md
-AGENTS.md
+/CLAUDE.md
+/AGENTS.md
 
 # Experimental code/artifacts
-dev/
+/dev/
 
 # Results file
-results.tsv
+/results.tsv
 
 # Local runtime config/secrets
 .agentsecrets
-autoresearch.config.json
+/autoresearch.config.json
 
 # Local process-manager bundle
-scripts/simple-rust-process-manager.exe
-scripts/processes.json
-portfolio.config.json
+/scripts/simple-rust-process-manager.exe
+/scripts/processes.json
+/portfolio.config.json
+
+# Generated training / experiment artifacts
+/data/training_pipeline/
+/data/training_runs/

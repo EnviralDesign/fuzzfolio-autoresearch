@@ -52,6 +52,40 @@ def test_run_full_backtest_retries_with_local_profile_on_profile_not_found(
     assert seen_profile_refs == ["stale-cloud-ref", ""]
 
 
+def test_run_full_backtest_retries_with_local_profile_on_missing_curve_message(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifact_dir = tmp_path / "eval"
+    artifact_dir.mkdir()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text("{}", encoding="utf-8")
+    config = _StubConfig(tmp_path)
+    attempt = {
+        "attempt_id": "run-attempt-missing-curve",
+        "artifact_dir": str(artifact_dir),
+        "profile_ref": "stale-cloud-ref",
+        "profile_path": str(profile_path),
+    }
+
+    seen_profile_refs: list[str] = []
+
+    def fake_run_full_backtest(cfg, candidate):
+        seen_profile_refs.append(str(candidate.get("profile_ref") or ""))
+        if len(seen_profile_refs) == 1:
+            raise RuntimeError(
+                "sensitivity-basket did not produce best-cell-path-detail.json. Files in output dir: []"
+            )
+        return {"curve_path": "curve.json", "result_path": "result.json"}
+
+    monkeypatch.setattr(ar_main, "_run_full_backtest_for_attempt", fake_run_full_backtest)
+
+    result = ar_main._run_full_backtest_with_retry(config, attempt)
+
+    assert result["curve_path"] == "curve.json"
+    assert result["retry_mode"] == "local_profile_reupload"
+    assert seen_profile_refs == ["stale-cloud-ref", ""]
+
+
 def test_run_full_backtest_salvages_outputs_after_timeout(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -89,3 +123,23 @@ def test_run_full_backtest_salvages_outputs_after_timeout(
     assert result["result_path"] == str(result_path)
     assert curve_path.exists()
     assert result_path.exists()
+
+
+def test_copy_full_backtest_outputs_surfaces_profile_not_found_from_result_json(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    sensitivity_output_dir = tmp_path / "out"
+    sensitivity_output_dir.mkdir()
+    (sensitivity_output_dir / "sensitivity-response.json").write_text(
+        json.dumps({"error": {"message": "Profile not found"}}),
+        encoding="utf-8",
+    )
+
+    try:
+        dashboard_mod._copy_full_backtest_outputs(artifact_dir, sensitivity_output_dir)
+    except RuntimeError as exc:
+        assert "Profile not found" in str(exc)
+    else:
+        raise AssertionError("Expected RuntimeError")

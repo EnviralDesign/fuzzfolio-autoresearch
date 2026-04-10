@@ -14,7 +14,7 @@
   "sleeves": [
     {
       "name": "quality",
-      "candidate_limit": -1,
+      "prefilter_limit": 128,
       "shortlist_size": 24,
       "min_score_36": 40.0,
       "min_retention_ratio": 0.0,
@@ -31,7 +31,7 @@
     },
     {
       "name": "cadence",
-      "candidate_limit": -1,
+      "prefilter_limit": 96,
       "shortlist_size": 12,
       "min_score_36": 40.0,
       "min_retention_ratio": 0.0,

@@ -20,6 +20,10 @@ class ProviderProfileConfig:
     api_key: str | None = None
     api_key_ref: str | None = None
     api_key_env: str | None = None
+    repo_root: Path | None = None
+    adapter_path: str | None = None
+    quantization: str | None = None
+    trust_remote_code: bool = False
     temperature: float = 0.2
     max_tokens: int = 3200
     timeout_seconds: int = 120
@@ -227,6 +231,10 @@ class AppConfig:
         return self.derived_root / "attempt-catalog-summary.json"
 
     @property
+    def attempt_catalog_manifest_path(self) -> Path:
+        return self.derived_root / "attempt-catalog-manifest.json"
+
+    @property
     def promotion_board_json_path(self) -> Path:
         return self.derived_root / "promotion-board.json"
 
@@ -340,6 +348,14 @@ def _provider_defaults(provider_type: str) -> dict[str, Any]:
             "timeout_seconds": 120,
             "transport": "chat_completions",
         }
+    if normalized == "transformers_local":
+        return {
+            "api_base": None,
+            "command": None,
+            "api_key_env": None,
+            "timeout_seconds": 600,
+            "transport": "chat_completions",
+        }
     return {
         "api_base": "https://api.openai.com/v1",
         "command": None,
@@ -350,6 +366,7 @@ def _provider_defaults(provider_type: str) -> dict[str, Any]:
 
 
 def _load_provider_profiles(
+    repo_root: Path,
     raw_config: dict[str, Any],
     raw_secrets: dict[str, Any],
 ) -> tuple[LlmConfig, dict[str, ProviderProfileConfig]]:
@@ -411,6 +428,18 @@ def _load_provider_profiles(
                 ),
                 api_key_ref=api_key_ref,
                 api_key_env=api_key_env,
+                repo_root=repo_root,
+                adapter_path=(
+                    _env_or_value(
+                        f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_ADAPTER_PATH",
+                        fallback=profile_cfg.get("adapter_path"),
+                    )
+                    or None
+                ),
+                quantization=(
+                    str(profile_cfg.get("quantization") or "").strip() or None
+                ),
+                trust_remote_code=bool(profile_cfg.get("trust_remote_code", False)),
                 temperature=float(
                     profile_cfg.get("temperature", ProviderProfileConfig.temperature)
                 ),
@@ -493,6 +522,10 @@ def _load_provider_profiles(
                 if defaults.get("api_key_env")
                 else None
             ),
+            repo_root=repo_root,
+            adapter_path=None,
+            quantization=None,
+            trust_remote_code=False,
             temperature=shared_temperature,
             max_tokens=shared_max_tokens,
             timeout_seconds=shared_timeout,
@@ -517,7 +550,7 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
     research_cfg = raw_config.get("research", {})
     supervise_cfg = raw_config.get("supervise", raw_config.get("supervisor", {}))
     manager_cfg = raw_config.get("manager", {})
-    llm, providers = _load_provider_profiles(raw_config, raw_secrets)
+    llm, providers = _load_provider_profiles(root, raw_config, raw_secrets)
 
     fuzzfolio = FuzzfolioConfig(
         cli_command=_env_or_value(

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -45,6 +46,136 @@ def test_build_sleeve_selection_annotates_selected_rows() -> None:
     assert len(sleeve["selected_rows"]) == 1
     assert sleeve["selected_rows"][0]["sleeve_name"] == "quality"
     assert sleeve["selected_rows"][0]["sleeve_selection_rank"] == 1
+
+
+def test_resolve_prefilter_limit_uses_legacy_candidate_limit_when_present() -> None:
+    assert (
+        pf.resolve_prefilter_limit(
+            {
+                **pf.DEFAULT_SLEEVE_SPEC,
+                "prefilter_limit": -1,
+                "candidate_limit": 77,
+            }
+        )
+        == 77
+    )
+
+
+def test_build_sleeve_prefilter_uses_sleeve_local_scalar_utility() -> None:
+    rows = [
+        {
+            "attempt_id": "slow-high-score",
+            "run_id": "run-a",
+            "score_36m": 80.0,
+            "trades_per_month_36m": 0.2,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+        {
+            "attempt_id": "fast-lower-score",
+            "run_id": "run-b",
+            "score_36m": 78.0,
+            "trades_per_month_36m": 6.0,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+    ]
+
+    result = pf.build_sleeve_prefilter(
+        rows,
+        {
+            **pf.DEFAULT_SLEEVE_SPEC,
+            "name": "cadence",
+            "prefilter_limit": 1,
+            "trade_rate_bonus_weight": 3.0,
+            "trade_rate_bonus_target": 6.0,
+        },
+    )
+
+    assert result["qualified_rows"][0]["attempt_id"] == "slow-high-score"
+    assert [row["attempt_id"] for row in result["candidate_rows"]] == ["fast-lower-score"]
+    assert result["prefilter_limit"] == 1
+    assert result["prefilter_excluded_count"] == 1
+
+
+def test_build_sleeve_selection_reports_prefilter_counts() -> None:
+    rows = [
+        {
+            "attempt_id": "A",
+            "run_id": "run-a",
+            "score_36m": 80.0,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+        {
+            "attempt_id": "B",
+            "run_id": "run-b",
+            "score_36m": 79.0,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+        {
+            "attempt_id": "C",
+            "run_id": "run-c",
+            "score_36m": 78.0,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+    ]
+
+    sleeve = pf.build_sleeve_selection(
+        rows,
+        {
+            **pf.DEFAULT_SLEEVE_SPEC,
+            "name": "quality",
+            "prefilter_limit": 2,
+            "shortlist_size": 1,
+        },
+    )
+
+    assert len(sleeve["qualified_rows"]) == 3
+    assert len(sleeve["candidate_rows"]) == 2
+    assert sleeve["prefilter_excluded_count"] == 1
+    assert sleeve["prefilter_limit"] == 2
+
+
+def test_materialized_corpus_index_requires_fresh_manifest(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / "run-a"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    attempts_path = run_dir / "attempts.jsonl"
+    attempts_path.write_text("{}", encoding="utf-8")
+    (run_dir / "run-metadata.json").write_text("{}", encoding="utf-8")
+
+    derived_root = runs_root / "derived"
+    derived_root.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"attempt_id": "B", "composite_score": 1.0},
+        {"attempt_id": "A", "composite_score": 2.0},
+    ]
+    (derived_root / "attempt-catalog.json").write_text(
+        json.dumps(rows, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    (derived_root / "attempt-catalog-manifest.json").write_text(
+        json.dumps(
+            ar_main._attempt_catalog_manifest_payload([run_dir], rows),
+            ensure_ascii=True,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    config = SimpleNamespace(
+        attempt_catalog_json_path=derived_root / "attempt-catalog.json",
+        attempt_catalog_manifest_path=derived_root / "attempt-catalog-manifest.json",
+    )
+
+    loaded_rows = ar_main._load_materialized_corpus_index_rows(config, run_dirs=[run_dir])
+    assert [row["attempt_id"] for row in loaded_rows] == ["A", "B"]
+
+    attempts_path.write_text("{}\n{}", encoding="utf-8")
+    assert ar_main._load_materialized_corpus_index_rows(config, run_dirs=[run_dir]) is None
 
 
 def test_merge_portfolio_sleeves_unions_and_labels_overlap() -> None:
@@ -190,7 +321,7 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
     report_root = derived_root / "portfolio-report" / "default-portfolio"
     report_root.mkdir(parents=True, exist_ok=True)
 
-    profile_path = runs_root / "run-a" / "evals" / "candidate-a" / "profile.json"
+    profile_path = runs_root / "run-a" / "profiles" / "alpha.json"
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     profile_path.write_text('{"name":"alpha"}', encoding="utf-8")
 
@@ -211,7 +342,6 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
                 "attempt_id": "attempt-a",
                 "run_id": "run-a",
                 "candidate_name": "alpha",
-                "profile_path": str(profile_path),
                 "profile_ref": "abc123",
             }
         ],
@@ -225,7 +355,7 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
         ],
     }
 
-    config = SimpleNamespace(derived_root=derived_root)
+    config = SimpleNamespace(derived_root=derived_root, runs_root=runs_root)
     summary = ar_main._export_portfolio_bundle(
         config=config,
         payload=payload,
@@ -246,6 +376,25 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
     assert (bundle_root / "bundle-manifest.json").exists() is False
     assert summary["exported_profiles"] == 1
     assert summary["exported_drop_pngs"] == 1
+
+
+def test_public_portfolio_row_strips_path_fields() -> None:
+    public = ar_main._public_portfolio_row(
+        {
+            "attempt_id": "attempt-a",
+            "candidate_name": "alpha",
+            "profile_ref": "ref-a",
+            "profile_path": r"C:\runs\run-a\profiles\alpha.json",
+            "destination_path": r"C:\runs\run-a\profiles\beta.json",
+            "source_profile_path": r"C:\runs\run-a\profiles\alpha.json",
+        }
+    )
+
+    assert public == {
+        "attempt_id": "attempt-a",
+        "candidate_name": "alpha",
+        "profile_ref": "ref-a",
+    }
 
 
 def test_human_bundle_item_token_avoids_collisions() -> None:

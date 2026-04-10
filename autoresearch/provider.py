@@ -9,8 +9,10 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 import requests
@@ -37,6 +39,7 @@ class ProviderTraceContext:
     phase: str | None = None
     provider_type: str | None = None
     model: str | None = None
+    capture_path: str | None = None
 
 
 _PROVIDER_TRACE_STDERR_MODE = "verbose"
@@ -134,6 +137,7 @@ def provider_trace_scope(
     phase: str | None = None,
     provider_type: str | None = None,
     model: str | None = None,
+    capture_path: str | None = None,
 ):
     token = _PROVIDER_TRACE_CONTEXT.set(
         ProviderTraceContext(
@@ -143,6 +147,7 @@ def provider_trace_scope(
             phase=phase,
             provider_type=provider_type,
             model=model,
+            capture_path=capture_path,
         )
     )
     try:
@@ -178,6 +183,62 @@ def _trace_provider_event(event: str, **fields: Any) -> None:
             text = text[:237] + "..."
         parts.append(f"{key}={text}")
     print(" ".join(parts), file=sys.stderr, flush=True)
+
+
+def _provider_capture_safe_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _provider_capture_safe_value(item) for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_provider_capture_safe_value(item) for item in value]
+    try:
+        json.dumps(value, ensure_ascii=True)
+        return value
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _append_provider_capture(
+    event: str,
+    *,
+    content: str | None = None,
+    parsed_payload: Any = None,
+    **fields: Any,
+) -> None:
+    context = _PROVIDER_TRACE_CONTEXT.get()
+    if context is None or not context.capture_path:
+        return
+    payload: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        "label": context.label,
+        "run_id": context.run_id,
+        "step": context.step,
+        "phase": context.phase,
+        "provider_type": context.provider_type,
+        "model": context.model,
+        "source": "provider",
+    }
+    if content is not None:
+        payload["payload_text"] = content
+        payload["payload_text_chars"] = len(content)
+    if parsed_payload is not None:
+        payload["payload_json"] = _provider_capture_safe_value(parsed_payload)
+    for key, value in fields.items():
+        if value is not None:
+            payload[key] = _provider_capture_safe_value(value)
+    path = Path(context.capture_path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except OSError:
+        return
 
 
 def _escape_invalid_json_backslashes(text: str) -> str:
@@ -1053,12 +1114,38 @@ class ChatCompletionsJsonProvider:
             ChatMessage(role="assistant", content=raw_text),
             ChatMessage(role="user", content=JSON_REPAIR_PROMPT),
         ]
+        _append_provider_capture(
+            "repair_request",
+            content=raw_text,
+            payload_kind="assistant_text",
+            max_completion_tokens=max_completion_tokens,
+        )
         try:
             payload = self._request_json(repair_messages, max_completion_tokens)
-            repaired = self._parse_json_object(self._extract_content(payload))
+            repaired_text = self._extract_content(payload)
+            _append_provider_capture(
+                "repair_response",
+                content=repaired_text,
+                payload_kind="assistant_text",
+                max_completion_tokens=max_completion_tokens,
+            )
+            repaired = self._parse_json_object(repaired_text)
+            _append_provider_capture(
+                "provider_parsed_json",
+                parsed_payload=repaired,
+                payload_kind="json_object",
+                max_completion_tokens=max_completion_tokens,
+            )
             _trace_provider_event("json_repair_success")
             return repaired
         except ProviderError as exc:
+            _append_provider_capture(
+                "repair_failed",
+                content=raw_text,
+                payload_kind="assistant_text",
+                max_completion_tokens=max_completion_tokens,
+                error=str(exc),
+            )
             _trace_provider_event("json_repair_failed", error=exc)
             return None
 
@@ -1130,7 +1217,21 @@ class ChatCompletionsJsonProvider:
                     finish_reason = choices[0].get("finish_reason")
                 try:
                     raw_text = self._extract_content(payload)
+                    _append_provider_capture(
+                        "provider_raw_text",
+                        content=raw_text,
+                        payload_kind="assistant_text",
+                        budget=budget,
+                        finish_reason=finish_reason,
+                    )
                     parsed = self._parse_json_object(raw_text)
+                    _append_provider_capture(
+                        "provider_parsed_json",
+                        parsed_payload=parsed,
+                        payload_kind="json_object",
+                        budget=budget,
+                        finish_reason=finish_reason,
+                    )
                     _trace_provider_event("complete_json_success", path="direct")
                     return parsed
                 except ProviderError as exc:
@@ -1149,6 +1250,14 @@ class ChatCompletionsJsonProvider:
                     if malformed_retry:
                         self._refresh_session()
                         if invalid_json and raw_text:
+                            _append_provider_capture(
+                                "provider_invalid_json_before_repair",
+                                content=raw_text,
+                                payload_kind="assistant_text",
+                                budget=budget,
+                                finish_reason=finish_reason,
+                                error=str(exc),
+                            )
                             repaired = self._repair_invalid_json(
                                 messages,
                                 raw_text,
@@ -1172,6 +1281,14 @@ class ChatCompletionsJsonProvider:
                     if should_retry:
                         break
                     if raw_text:
+                        _append_provider_capture(
+                            "provider_final_repair_input",
+                            content=raw_text,
+                            payload_kind="assistant_text",
+                            budget=budget,
+                            finish_reason=finish_reason,
+                            error=str(exc),
+                        )
                         repaired = self._repair_invalid_json(messages, raw_text, max(budget, budgets[-1]))
                         if repaired is not None:
                             _trace_provider_event("complete_json_success", path="final_repair")
@@ -1287,6 +1404,262 @@ class LMStudioProvider(OpenAICompatibleProvider):
         raise last_error or ProviderError(
             "Provider request failed without a specific error."
         )
+
+
+_TRANSFORMERS_LOCAL_CACHE: dict[tuple[str, str | None, str, bool], tuple[Any, Any]] = {}
+_TRANSFORMERS_LOCAL_CACHE_LOCK = threading.Lock()
+
+
+class TransformersLocalProvider:
+    LOCAL_MALFORMED_RETRY_LIMIT = 1
+    LOCAL_REPAIR_MAX_NEW_TOKENS = 256
+
+    def __init__(self, config: ProviderProfileConfig):
+        self.config = config
+
+    def _preferred_dtype(self) -> Any:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+
+    def _resolved_adapter_path(self) -> Path | None:
+        raw = str(self.config.adapter_path or "").strip()
+        if not raw:
+            return None
+        path = Path(raw)
+        if not path.is_absolute():
+            root = self.config.repo_root or Path.cwd()
+            path = root / path
+        return path.resolve()
+
+    def _cache_key(self) -> tuple[str, str | None, str, bool]:
+        adapter_path = self._resolved_adapter_path()
+        return (
+            str(self.config.model or "").strip(),
+            str(adapter_path) if adapter_path is not None else None,
+            str(self.config.quantization or "none").strip().lower(),
+            bool(self.config.trust_remote_code),
+        )
+
+    def _load_components(self) -> tuple[Any, Any]:
+        cache_key = self._cache_key()
+        with _TRANSFORMERS_LOCAL_CACHE_LOCK:
+            cached = _TRANSFORMERS_LOCAL_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+
+            from peft import PeftModel
+            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+            adapter_path = self._resolved_adapter_path()
+            tokenizer_source = str(adapter_path) if adapter_path and adapter_path.exists() else self.config.model
+            tokenizer = AutoTokenizer.from_pretrained(
+                tokenizer_source,
+                trust_remote_code=bool(self.config.trust_remote_code),
+            )
+            if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+
+            model_kwargs: dict[str, Any] = {
+                "trust_remote_code": bool(self.config.trust_remote_code),
+                "dtype": self._preferred_dtype(),
+            }
+            if str(self.config.quantization or "none").strip().lower() == "4bit":
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=self._preferred_dtype(),
+                )
+
+            model = AutoModelForCausalLM.from_pretrained(
+                str(self.config.model),
+                **model_kwargs,
+            )
+            if adapter_path is not None and adapter_path.exists():
+                model = PeftModel.from_pretrained(model, str(adapter_path), is_trainable=False)
+            model.eval()
+            if getattr(model.config, "use_cache", None) is not None:
+                model.config.use_cache = True
+            cached = (model, tokenizer)
+            _TRANSFORMERS_LOCAL_CACHE[cache_key] = cached
+            return cached
+
+    def _build_prompt_text(self, messages: list[ChatMessage], tokenizer: Any) -> str:
+        message_payload = [
+            {"role": message.role, "content": message.content}
+            for message in messages
+        ]
+        if hasattr(tokenizer, "apply_chat_template"):
+            return tokenizer.apply_chat_template(
+                message_payload,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        return "\n".join(f"{message.role}: {message.content}" for message in messages)
+
+    def _messages_for_json_retry(self, messages: list[ChatMessage]) -> list[ChatMessage]:
+        return [
+            *messages,
+            ChatMessage(
+                role="system",
+                content=(
+                    "Return plain assistant text containing exactly one valid JSON object that matches the required schema. "
+                    "Keep reasoning very short. Do not emit markdown, bullets, prose outside JSON, duplicate JSON objects, or suffix junk. "
+                    "Stop immediately after the closing brace."
+                ),
+            ),
+        ]
+
+    def _generate_text(
+        self,
+        messages: list[ChatMessage],
+        *,
+        max_new_tokens: int | None = None,
+    ) -> str:
+        import torch
+
+        model, tokenizer = self._load_components()
+        prompt_text = self._build_prompt_text(messages, tokenizer)
+        model_inputs = tokenizer(prompt_text, return_tensors="pt")
+        prompt_tokens = int(model_inputs["input_ids"].shape[1])
+        max_tokens = max(
+            1,
+            int(
+                max_new_tokens
+                if max_new_tokens is not None
+                else self.config.max_tokens
+            ),
+        )
+        _append_provider_capture(
+            "local_generation_request",
+            payload_kind="local_generation_request",
+            prompt_chars=len(prompt_text),
+            prompt_tokens=prompt_tokens,
+            message_count=len(messages),
+            max_new_tokens=max_tokens,
+            do_sample=bool(float(self.config.temperature or 0.0) > 0.05),
+            model_device=str(getattr(model, "device", "unknown")),
+        )
+        _trace_provider_event(
+            "local_generation_request",
+            prompt_chars=len(prompt_text),
+            prompt_tokens=prompt_tokens,
+            message_count=len(messages),
+            max_new_tokens=max_tokens,
+        )
+        model_inputs = {
+            key: value.to(model.device) if hasattr(value, "to") else value
+            for key, value in model_inputs.items()
+        }
+        do_sample = float(self.config.temperature or 0.0) > 0.05
+        generate_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_tokens,
+            "do_sample": do_sample,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+        }
+        if do_sample:
+            generate_kwargs["temperature"] = float(self.config.temperature)
+        with torch.inference_mode():
+            outputs = model.generate(**model_inputs, **generate_kwargs)
+        prompt_length = int(model_inputs["input_ids"].shape[1])
+        generated = outputs[0][prompt_length:]
+        generated_text = tokenizer.decode(generated, skip_special_tokens=True)
+        _append_provider_capture(
+            "local_generation_response",
+            payload_kind="local_generation_response",
+            generated_chars=len(generated_text),
+            generated_tokens=int(generated.shape[0]),
+        )
+        _trace_provider_event(
+            "local_generation_response",
+            generated_chars=len(generated_text),
+            generated_tokens=int(generated.shape[0]),
+        )
+        return generated_text
+
+    def _repair_invalid_json(self, raw_text: str) -> dict[str, Any] | None:
+        repair_messages = [
+            ChatMessage(role="system", content=JSON_REPAIR_PROMPT),
+            ChatMessage(
+                role="user",
+                content=(
+                    "Repair this invalid or incomplete JSON into one complete valid JSON object only.\n\n"
+                    + raw_text
+                ),
+            ),
+        ]
+        try:
+            repaired_text = self._generate_text(
+                repair_messages,
+                max_new_tokens=min(
+                    self.LOCAL_REPAIR_MAX_NEW_TOKENS,
+                    max(1, int(self.config.max_tokens)),
+                ),
+            )
+            _append_provider_capture(
+                "repair_response",
+                content=repaired_text,
+                payload_kind="assistant_text",
+            )
+            repaired = _parse_provider_json_object(repaired_text)
+            _append_provider_capture(
+                "provider_parsed_json",
+                parsed_payload=repaired,
+                payload_kind="json_object",
+            )
+            return repaired
+        except Exception:
+            return None
+
+    def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
+        _trace_provider_event(
+            "complete_json_start",
+            message_count=len(messages),
+            local_provider="transformers_local",
+            quantization=str(self.config.quantization or "none"),
+        )
+        malformed_attempts = 0
+        request_messages = messages
+        last_error: ProviderError | None = None
+        while True:
+            raw_text: str | None = None
+            try:
+                raw_text = self._generate_text(request_messages)
+                _append_provider_capture(
+                    "provider_raw_text",
+                    content=raw_text,
+                    payload_kind="assistant_text",
+                )
+                parsed = _parse_provider_json_object(raw_text)
+                _append_provider_capture(
+                    "provider_parsed_json",
+                    parsed_payload=parsed,
+                    payload_kind="json_object",
+                )
+                _trace_provider_event("complete_json_success", path="direct")
+                return parsed
+            except Exception as exc:
+                last_error = exc if isinstance(exc, ProviderError) else ProviderError(str(exc))
+                salvaged = _salvage_failed_generation_action(raw_text or "")
+                if salvaged is not None:
+                    _trace_provider_event("complete_json_success", path="tool_salvage")
+                    return salvaged
+                repaired = self._repair_invalid_json(raw_text or "")
+                if repaired is not None:
+                    _trace_provider_event("complete_json_success", path="invalid_json_repair")
+                    return repaired
+                if malformed_attempts < self.LOCAL_MALFORMED_RETRY_LIMIT:
+                    request_messages = self._messages_for_json_retry(messages)
+                    time.sleep(_malformed_success_delay_seconds(malformed_attempts))
+                    malformed_attempts += 1
+                    continue
+                break
+        _trace_provider_event("complete_json_failure", error=last_error or "unknown")
+        raise last_error or ProviderError("Local transformers provider failed without a specific error.")
 
 
 class MiniMaxProvider(OpenAICompatibleProvider):
@@ -1475,12 +1848,38 @@ class ResponsesJsonProvider:
             ChatMessage(role="assistant", content=raw_text),
             ChatMessage(role="user", content=JSON_REPAIR_PROMPT),
         ]
+        _append_provider_capture(
+            "repair_request",
+            content=raw_text,
+            payload_kind="assistant_text",
+            max_completion_tokens=max_completion_tokens,
+        )
         try:
             payload = self._request_json(repair_messages, max_completion_tokens)
-            repaired = self._parse_json_object(self._extract_content(payload))
+            repaired_text = self._extract_content(payload)
+            _append_provider_capture(
+                "repair_response",
+                content=repaired_text,
+                payload_kind="assistant_text",
+                max_completion_tokens=max_completion_tokens,
+            )
+            repaired = self._parse_json_object(repaired_text)
+            _append_provider_capture(
+                "provider_parsed_json",
+                parsed_payload=repaired,
+                payload_kind="json_object",
+                max_completion_tokens=max_completion_tokens,
+            )
             _trace_provider_event("json_repair_success")
             return repaired
         except ProviderError as exc:
+            _append_provider_capture(
+                "repair_failed",
+                content=raw_text,
+                payload_kind="assistant_text",
+                max_completion_tokens=max_completion_tokens,
+                error=str(exc),
+            )
             _trace_provider_event("json_repair_failed", error=exc)
             return None
 
@@ -1549,7 +1948,21 @@ class ResponsesJsonProvider:
                 finish_reason = payload.get("status")
                 try:
                     raw_text = self._extract_content(payload)
+                    _append_provider_capture(
+                        "provider_raw_text",
+                        content=raw_text,
+                        payload_kind="assistant_text",
+                        budget=budget,
+                        finish_reason=finish_reason,
+                    )
                     parsed = self._parse_json_object(raw_text)
+                    _append_provider_capture(
+                        "provider_parsed_json",
+                        parsed_payload=parsed,
+                        payload_kind="json_object",
+                        budget=budget,
+                        finish_reason=finish_reason,
+                    )
                     _trace_provider_event("complete_json_success", path="direct")
                     return parsed
                 except ProviderError as exc:
@@ -1567,6 +1980,14 @@ class ResponsesJsonProvider:
                     if malformed_retry:
                         self._refresh_session()
                         if invalid_json and raw_text:
+                            _append_provider_capture(
+                                "provider_invalid_json_before_repair",
+                                content=raw_text,
+                                payload_kind="assistant_text",
+                                budget=budget,
+                                finish_reason=finish_reason,
+                                error=str(exc),
+                            )
                             repaired = self._repair_invalid_json(
                                 messages,
                                 raw_text,
@@ -1584,6 +2005,14 @@ class ResponsesJsonProvider:
                     if should_retry:
                         break
                     if raw_text:
+                        _append_provider_capture(
+                            "provider_final_repair_input",
+                            content=raw_text,
+                            payload_kind="assistant_text",
+                            budget=budget,
+                            finish_reason=finish_reason,
+                            error=str(exc),
+                        )
                         repaired = self._repair_invalid_json(messages, raw_text, max(budget, budgets[-1]))
                         if repaired is not None:
                             _trace_provider_event("complete_json_success", path="final_repair")
@@ -1606,6 +2035,8 @@ def create_provider(config: ProviderProfileConfig) -> JsonCompletionProvider:
     transport = (config.transport or "chat_completions").strip().lower()
     if normalized == "codex":
         return CodexAppServerProvider(config)
+    if normalized == "transformers_local":
+        return TransformersLocalProvider(config)
     if normalized == "minimax":
         return MiniMaxProvider(config)
     if normalized == "xai":

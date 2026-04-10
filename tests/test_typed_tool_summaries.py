@@ -164,16 +164,16 @@ def test_summarize_candidate_handle_prefers_concrete_refs() -> None:
     summary = ResearchController._summarize_candidate_handle(
         {
             "candidate_summary": {
+                "draft_name": "cand",
                 "family_id": "fam-a|fam-b",
-                "profile_path": r"C:\tmp\cand.json",
             },
             "created_profile_ref": "abc123",
             "next_recommended_action": "evaluate_candidate",
         }
     )
     assert summary == (
-        r"family=fam-a|fam-b, profile_ref=abc123, "
-        r"profile_path=C:\tmp\cand.json, next=evaluate_candidate"
+        r"candidate_name=cand, family=fam-a|fam-b, "
+        r"profile_ref=abc123, next=evaluate_candidate"
     )
 
 

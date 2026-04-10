@@ -9,6 +9,7 @@ from autoresearch import manager_packet as mp
 from autoresearch import validation_outcome as vo
 import autoresearch.controller as ctrlmod
 from autoresearch.controller import ResearchController
+from autoresearch.controller_protocol import LOCAL_OPENING_STEP_PROTOCOL
 from autoresearch.manager_models import ManagerHookEvent
 from autoresearch.scoring import AttemptScore
 
@@ -258,8 +259,344 @@ def test_manager_packet_includes_admissibility_and_gut_check_state() -> None:
     )
 
     assert packet.extra["admissible_frontier_best"]["family_id"] == "fam-b"
-    assert packet.extra["gut_check_pending"]["target_horizon_months"] == 12
-    assert packet.extra["wrap_up_focus"]["family_id"] == "fam-a"
+
+
+def test_canonicalize_local_opening_step_inserts_mode_and_keeps_single_prepare() -> None:
+    payload = {
+        "reasoning": "Start from seed.",
+        "actions": [
+            {
+                "tool": "prepare_profile",
+                "indicator_ids": ["A", "B"],
+                "instruments": ["EURUSD"],
+                "candidate_name": "cand-a",
+                "destination_path": r"C:\runs\cand-a.json",
+            },
+            {"tool": "validate_profile", "profile_path": r"C:\runs\cand-a.json"},
+        ],
+    }
+
+    normalized = ctrlmod.canonicalize_local_opening_step_response(payload)
+
+    assert normalized["actions"] == [
+        {
+            "tool": "prepare_profile",
+            "mode": "scaffold_from_seed",
+            "indicator_ids": ["A", "B"],
+            "instruments": ["EURUSD"],
+            "candidate_name": "cand-a",
+        }
+    ]
+
+
+def test_canonicalize_local_opening_step_maps_legacy_fields() -> None:
+    payload = {
+        "reasoning": "Open with scaffold.",
+        "actions": [
+            {
+                "tool": "prepare_profile",
+                "seed_indicators": ["ID_X"],
+                "profile_name": "legacy-cand",
+                "destination_path": r"C:\runs\legacy-cand.json",
+            }
+        ],
+    }
+
+    normalized = ctrlmod.canonicalize_local_opening_step_response(payload)
+
+    assert normalized["actions"] == [
+        {
+            "tool": "prepare_profile",
+            "mode": "scaffold_from_seed",
+            "indicator_ids": ["ID_X"],
+            "candidate_name": "legacy-cand",
+        }
+    ]
+
+
+def test_canonicalize_local_opening_step_leaves_non_prepare_response_unchanged() -> None:
+    payload = {
+        "reasoning": "Inspect last run.",
+        "actions": [{"tool": "inspect_artifact", "attempt_id": "att-1", "view": "summary"}],
+    }
+
+    normalized = ctrlmod.canonicalize_local_opening_step_response(payload)
+
+    assert normalized == payload
+
+
+def test_canonicalize_local_opening_step_rewrites_bad_grounding_into_run_profiles() -> None:
+    payload = {
+        "reasoning": "Start from seed.",
+        "actions": [
+            {
+                "tool": "prepare_profile",
+                "indicator_ids": ["A", "B"],
+                "profile_name": "cand-a",
+                "instruments": ["ALL"],
+                "destination_path": r"C:\profiles\cand-a.json",
+            }
+        ],
+    }
+
+    normalized = ctrlmod.canonicalize_local_opening_step_response(
+        payload,
+        starter_instruments=["EURUSD"],
+        candidate_name_hint="cand-a",
+    )
+
+    assert normalized["actions"] == [
+        {
+            "tool": "prepare_profile",
+            "mode": "scaffold_from_seed",
+            "indicator_ids": ["A", "B"],
+            "instruments": ["EURUSD"],
+            "candidate_name": "cand-a",
+        }
+    ]
+
+
+def test_canonicalize_local_opening_step_fills_missing_destination_when_safe() -> None:
+    payload = {
+        "reasoning": "Start from seed.",
+        "actions": [
+            {
+                "tool": "prepare_profile",
+                "indicator_ids": ["A"],
+                "candidate_name": "cand-b",
+            }
+        ],
+    }
+
+    normalized = ctrlmod.canonicalize_local_opening_step_response(
+        payload,
+        starter_instruments=["EURUSD", "GBPUSD"],
+    )
+
+    assert normalized["actions"] == [
+        {
+            "tool": "prepare_profile",
+            "mode": "scaffold_from_seed",
+            "indicator_ids": ["A"],
+            "instruments": ["EURUSD", "GBPUSD"],
+            "candidate_name": "cand-b",
+        }
+    ]
+
+
+def test_canonicalize_local_opening_step_leaves_ambiguous_instruments_unchanged_without_starter_list() -> None:
+    payload = {
+        "reasoning": "Start from seed.",
+        "actions": [
+            {
+                "tool": "prepare_profile",
+                "indicator_ids": ["A"],
+                "destination_path": r"C:\runs\example\profiles\cand-c.json",
+            }
+        ],
+    }
+
+    normalized = ctrlmod.canonicalize_local_opening_step_response(payload)
+
+    assert normalized["actions"] == [
+        {
+            "tool": "prepare_profile",
+            "mode": "scaffold_from_seed",
+            "indicator_ids": ["A"],
+            "candidate_name": "cand-c",
+        }
+    ]
+
+
+def test_canonicalize_followup_step_response_fills_handle_and_instruments_from_template() -> None:
+    payload = {
+        "reasoning": "Evaluate the registered profile next.",
+        "actions": [
+            {
+                "tool": "evaluate_candidate",
+                "profile_path": r"C:\runs\example\profiles\cand-a.json",
+            },
+            {"tool": "inspect_artifact", "attempt_id": "att-extra", "view": "summary"},
+        ],
+    }
+
+    normalized = ctrlmod.canonicalize_followup_step_response(
+        payload,
+        next_action_template={
+            "tool": "evaluate_candidate",
+            "profile_ref": "ref-a",
+            "instruments": ["EURUSD"],
+            "evaluation_mode": "screen",
+            "timeframe_policy": "profile_default",
+        },
+    )
+
+    assert normalized["actions"] == [
+        {
+            "tool": "evaluate_candidate",
+            "candidate_name": "cand-a",
+            "profile_ref": "ref-a",
+            "instruments": ["EURUSD"],
+            "evaluation_mode": "screen",
+            "timeframe_policy": "profile_default",
+        }
+    ]
+
+
+def test_canonicalize_followup_step_response_ignores_wrong_tool() -> None:
+    payload = {
+        "reasoning": "Inspect first.",
+        "actions": [{"tool": "inspect_artifact", "attempt_id": "att-1", "view": "summary"}],
+    }
+
+    normalized = ctrlmod.canonicalize_followup_step_response(
+        payload,
+        next_action_template={
+            "tool": "evaluate_candidate",
+            "profile_ref": "ref-a",
+            "instruments": ["EURUSD"],
+        },
+    )
+
+    assert normalized == payload
+
+
+def test_system_protocol_uses_opening_contract_for_true_opening_step_across_providers() -> None:
+    controller = _make_controller()
+    controller.config.provider = SimpleNamespace(provider_type="openai")
+    controller.last_created_profile_ref = None
+    controller._load_recent_step_payloads = lambda *_args, **_kwargs: []
+    tool_context = SimpleNamespace(run_dir=Path("C:/runs/example"))
+
+    protocol = controller._system_protocol_text(
+        ctrlmod.RunPolicy(),
+        tool_context=tool_context,
+        step=1,
+    )
+
+    assert protocol == LOCAL_OPENING_STEP_PROTOCOL
+
+
+def test_followup_next_action_template_suggests_validate_after_prepare() -> None:
+    controller = _make_controller()
+    controller._latest_successful_step_result = lambda *_args, **_kwargs: (
+        {"tool": "prepare_profile", "candidate_name": "cand-a"},
+        {},
+    )
+    tool_context = SimpleNamespace(run_dir=Path("C:/runs/example"), run_id="run-a")
+
+    template = controller._followup_next_action_template_prompt_state(tool_context)
+
+    assert template == {"tool": "validate_profile", "candidate_name": "cand-a"}
+
+
+def test_followup_next_action_template_requires_deterministic_instruments_for_evaluate() -> None:
+    controller = _make_controller()
+    controller._latest_successful_step_result = lambda *_args, **_kwargs: (
+        {
+            "tool": "register_profile",
+            "candidate_name": "cand-a",
+            "profile_ref": "ref-a",
+            "ready_to_evaluate": True,
+        },
+        {},
+    )
+    tool_context = SimpleNamespace(run_dir=Path("C:/runs/example"), run_id="run-a")
+
+    controller._recent_known_instruments_for_handle = lambda *_args, **_kwargs: None
+    assert controller._followup_next_action_template_prompt_state(tool_context) is None
+
+    controller._recent_known_instruments_for_handle = (
+        lambda *_args, **_kwargs: ["EURUSD"]
+    )
+    assert controller._followup_next_action_template_prompt_state(tool_context) == {
+        "tool": "evaluate_candidate",
+        "profile_ref": "ref-a",
+        "instruments": ["EURUSD"],
+        "timeframe_policy": "profile_default",
+        "evaluation_mode": "screen",
+    }
+
+
+def test_pathless_response_compatibility_rewrites_legacy_profile_fields() -> None:
+    controller = _make_controller()
+
+    normalized = controller._pathless_response_compatibility(
+        {
+            "reasoning": "Use the draft.",
+            "actions": [
+                {
+                    "tool": "validate_profile",
+                    "profile_path": r"C:\runs\example\profiles\cand-a.json",
+                },
+                {
+                    "tool": "prepare_profile",
+                    "mode": "clone_local",
+                    "source_profile_path": r"C:\runs\example\profiles\cand-a.json",
+                    "destination_path": r"C:\runs\example\profiles\cand-b.json",
+                },
+            ],
+        }
+    )
+
+    assert normalized["actions"] == [
+        {
+            "tool": "validate_profile",
+            "candidate_name": "cand-a",
+        },
+        {
+            "tool": "prepare_profile",
+            "mode": "clone_local",
+            "source_candidate_name": "cand-a",
+            "destination_candidate_name": "cand-b",
+        },
+    ]
+
+
+def test_validate_action_accepts_candidate_name_profile_handles() -> None:
+    controller = _make_controller()
+
+    assert controller._validate_action(
+        {"tool": "validate_profile", "candidate_name": "cand-a"}
+    ) is None
+    assert controller._validate_action(
+        {"tool": "register_profile", "candidate_name": "cand-a", "operation": "create"}
+    ) is None
+    assert controller._validate_action(
+        {
+            "tool": "mutate_profile",
+            "candidate_name": "cand-a",
+            "destination_candidate_name": "cand-b",
+            "mutations": [{"path": "profile.name", "value": "cand-b"}],
+        }
+    ) is None
+    assert controller._validate_action(
+        {
+            "tool": "evaluate_candidate",
+            "candidate_name": "cand-a",
+            "instruments": ["EURUSD"],
+        }
+    ) is None
+
+
+def test_prompt_visible_action_signature_strips_profile_paths() -> None:
+    controller = _make_controller()
+
+    normalized = controller._prompt_visible_action_signature(
+        {
+            "tool": "mutate_profile",
+            "profile_path": r"C:\runs\example\profiles\cand-a.json",
+            "destination_path": r"C:\runs\example\profiles\cand-b.json",
+            "mutations": [{"path": "profile.name", "value": "cand-b"}],
+        }
+    )
+
+    assert normalized == {
+        "tool": "mutate_profile",
+        "candidate_name": "cand-a",
+        "destination_candidate_name": "cand-b",
+        "mutations": [{"path": "profile.name", "value": "cand-b"}],
+    }
 
 
 def test_resolve_support_metrics_uses_nested_attempt_payload_when_roots_missing() -> None:

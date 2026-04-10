@@ -71,6 +71,15 @@
       "max_tokens": 8192,
       "timeout_seconds": 180
     },
+    "transformers-local-sample": {
+      "type": "transformers_local",
+      "model": "google/gemma-4-E4B-it",
+      "adapter_path": "data/training_runs/gemma_e4b_evalcandfix_v1_len896_from_contractfix_gpu1/adapter",
+      "quantization": "4bit",
+      "temperature": 0.0,
+      "max_tokens": 512,
+      "timeout_seconds": 600
+    },
     "minimax-27-sample": {
       "type": "minimax",
       "api_base": "https://api.minimax.io/v1",

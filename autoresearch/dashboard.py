@@ -52,6 +52,39 @@ def _load_optional_json(path: Path) -> Any | None:
         return None
 
 
+def _iter_string_values(payload: Any) -> list[str]:
+    values: list[str] = []
+    if isinstance(payload, str):
+        values.append(payload)
+        return values
+    if isinstance(payload, dict):
+        for value in payload.values():
+            values.extend(_iter_string_values(value))
+        return values
+    if isinstance(payload, list):
+        for value in payload:
+            values.extend(_iter_string_values(value))
+    return values
+
+
+def _diagnose_missing_full_backtest_curve(sensitivity_output_dir: Path) -> str | None:
+    result_src = sensitivity_output_dir / "sensitivity-response.json"
+    payload = _load_optional_json(result_src)
+    if payload is None:
+        return None
+    message_candidates = [
+        value.strip()
+        for value in _iter_string_values(payload)
+        if isinstance(value, str) and value.strip()
+    ]
+    lowered = [value.lower() for value in message_candidates]
+    for token in ("profile not found", "selected-cell detail has not been computed yet"):
+        for index, candidate in enumerate(lowered):
+            if token in candidate:
+                return message_candidates[index]
+    return None
+
+
 def _run_streaming_subprocess(
     argv: list[str], *, cwd: str, prefix: str
 ) -> tuple[int, str, str]:
@@ -351,6 +384,9 @@ def _copy_full_backtest_outputs(
     curve_src = sensitivity_output_dir / "best-cell-path-detail.json"
     result_src = sensitivity_output_dir / "sensitivity-response.json"
     if not curve_src.exists():
+        diagnosed_message = _diagnose_missing_full_backtest_curve(sensitivity_output_dir)
+        if diagnosed_message:
+            raise RuntimeError(diagnosed_message)
         raise RuntimeError(
             f"sensitivity-basket did not produce best-cell-path-detail.json. "
             f"Files in output dir: {list(sensitivity_output_dir.iterdir())}"

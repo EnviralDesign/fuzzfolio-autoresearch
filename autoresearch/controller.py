@@ -23,6 +23,11 @@ from . import profile_identity as pi
 from . import typed_tools as tt
 from . import validation_outcome as vo
 from .config import AppConfig
+from .controller_protocol import (
+    LOCAL_OPENING_STEP_PROTOCOL,
+    SFT_SYSTEM_PROTOCOL,
+    SYSTEM_PROTOCOL,
+)
 from .fuzzfolio import CliError, CommandResult, FuzzfolioCli
 from .manager_models import ManagerHookEvent
 from .manager_state import ManagerRuntimeState
@@ -39,82 +44,7 @@ from .ledger import (
 from .plotting import compute_frontier, render_progress_artifacts
 from .provider import ChatMessage, ProviderError, create_provider, provider_trace_scope
 from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapshot
-
-SYSTEM_PROTOCOL = """You are operating an autonomous Fuzzfolio research loop.
-
-Your native vocabulary is typed research tools—not raw shell. Default to typed tools for all normal work.
-
-Return JSON only in this exact top-level shape:
-{
-  "reasoning": "one short paragraph",
-  "actions": [
-    {
-      "tool": "prepare_profile" | "mutate_profile" | "validate_profile" | "register_profile" | "evaluate_candidate" | "run_parameter_sweep" | "inspect_artifact" | "compare_artifacts" | "run_cli" | "write_file" | "read_file" | "list_dir" | "log_attempt" | "finish",
-      "... tool specific fields ..."
-    }
-  ]
-}
-
-Tool choice hierarchy (follow this order):
-1) Typed tools: prepare_profile, mutate_profile, validate_profile, register_profile, evaluate_candidate, run_parameter_sweep.
-2) inspect_artifact / compare_artifacts to interpret results or compare candidates (instead of opening many files).
-3) read_file / list_dir only when structured tool output is insufficient.
-4) run_cli last resort: recovery after a typed-tool failure, CLI help, or an operation with no typed equivalent.
-
-Trust structured results first:
-- Typed tools and run_cli return envelopes with fields like ok, status, warnings, errors, score, artifact_dir, auto_log, created_profile_ref, profile_ref, retention_gate (when applicable), and next_recommended_action.
-- Use those before reflexively reading artifacts on disk.
-
-Controller-owned (you observe and adapt; you do not replace these mechanics in your head):
-- Phase horizons and default lookback injection, quality-score preset, finish gating, tool validation, timeframe-mismatch blocking, exploit caps, and ledger bookkeeping. Branch overlay leaders and reseed/suppression policy come from the event-driven manager (see runtime-state manager snapshot); budget mode and validation evidence update mechanically after each eval. The run state packet spells out current phase, horizon target, lifecycle, and mismatch status.
-- Authority precedence: current branch lifecycle, manager guidance, budget mode, and validation evidence outrank raw frontier score when they conflict. Treat the raw frontier as supporting evidence, not leadership authority.
-
-General rules:
-- Use absolute Windows paths. At most 3 actions per response. Raw JSON only; no Markdown as the top-level response.
-- Do not return a raw scoring-profile document at the top level. Build profiles through prepare_profile / mutate_profile / validate_profile / register_profile (or write_file only if unavoidable).
-- Auth and run seed are already handled at start. Do not repeat unless a tool result shows auth failure (recovery: run_cli only).
-- Off-run saved profiles are not candidate seeds unless the user explicitly asks. Work from this run's seed hand and run-owned files under the run directory.
-- indicator.meta.id must be exact catalog ids from the run context. Seed phrases are not ids.
-- Only use profile refs created during this run (or paths the controller can map). Placeholders like <created_profile_ref> are substituted by the controller when provided.
-- Sweeps are normal: use run_parameter_sweep, not ad-hoc repeated manual edits only.
-- Think in months/years of effective evidence, not raw bars. Effective window fields in results matter more than bar counts.
-- `__BASKET__` may appear in summaries; never pass it as an instrument. Use exact catalog symbols; repeat --instrument per symbol in typed fields as multiple entries in the instruments array (evaluate_candidate), not comma-joined tokens.
-- Early phase: diversify instruments/groups before over-focusing one pair. Prune a basket member when it is clearly a drag; do not widen baskets solely from per-instrument screens.
-- If the run packet names a provisional leader, validated leader, structural-contrast priority, or validation-resolution priority, plan around that first. Do not abandon controller/manager priorities just because another candidate has a higher raw score.
-- finish ends the entire run; never use it to mean "step done". Only call finish when stopping now with a concise non-empty summary and the controller allows it. Keep exploring through contrasts while step budget remains.
-
-Normal workflows (all typed):
-- New candidate: prepare_profile -> validate_profile -> register_profile -> evaluate_candidate.
-- Tune locally: mutate_profile -> validate_profile -> evaluate_candidate (reuse the same profile_ref after register).
-- Sweep: run_parameter_sweep -> inspect_artifact -> compare_artifacts -> next evaluate_candidate or mutate as needed.
-- After evaluate_candidate, use inspect_artifact with view "summary" (or compare_artifacts) before read_file on JSON blobs.
-
-Representative examples (adjust paths/ids to the run):
-{"tool":"prepare_profile","mode":"scaffold_from_seed","indicator_ids":["ID_A","ID_B"],"instruments":["EURUSD"],"candidate_name":"cand1","destination_path":"C:\\\\runs\\\\...\\\\profiles\\\\cand1.json"}
-{"tool":"validate_profile","profile_path":"C:\\\\runs\\\\...\\\\profiles\\\\cand1.json"}
-{"tool":"register_profile","profile_path":"C:\\\\runs\\\\...\\\\profiles\\\\cand1.json","operation":"create"}
-{"tool":"evaluate_candidate","profile_ref":"<from prior result>","instruments":["EURUSD","GBPUSD"],"timeframe_policy":"profile_default","evaluation_mode":"screen","candidate_name":"cand1"}
-{"tool":"mutate_profile","profile_path":"C:\\\\runs\\\\...\\\\profiles\\\\cand1.json","mutations":[{"path":"profile.name","value":"cand1b"}],"destination_path":"C:\\\\runs\\\\...\\\\profiles\\\\cand1b.json"}
-{"tool":"run_parameter_sweep","profile_ref":"<ref>","axes":["profile.notificationThreshold=70,75,80"],"instruments":["EURUSD"],"candidate_name_prefix":"sw1"}
-{"tool":"inspect_artifact","attempt_id":"<from ledger>","view":"summary"}
-{"tool":"compare_artifacts","attempt_ids":["id1","id2"]}
-
-run_cli (fallback only):
-- Example: {"tool":"run_cli","args":["help"]} or {"tool":"run_cli","args":["help","profiles"]} when you need authoritative CLI help. Use argv style; do not invent command families (e.g. no top-level "patch").
-
-write_file: only when necessary; must include full non-empty "content". If too large, split across steps.
-
-log_attempt: explicit ledger recovery; auto-log usually fills in after successful evaluations.
-
-Retention and pacing (controller-enforced summary—details in run packet):
-- Families keyed by meta.instanceId; strong scores trigger longer-horizon checks and exploit caps; material degradation forces structural contrast; sparse/selective profiles face stricter checks.
-
-Timeframe mismatch (controller-enforced):
-- Auto-adjusted timeframes are not valid tests of the higher timeframe you asked for; follow run packet warnings. Fix via mutate_profile on indicator timeframes or align intent with effective timeframe.
-
-Behavior digest (after evals in run state):
-- edge_shape, support_shape, drawdown_shape, retention_risk, failure_mode_hint, next_move_hint — use with score, not instead of it.
-"""
+from trainingdatapipeline.normalize_state import build_prompt_variants
 
 _RUNTIME_TRACE_STDERR_MODE = "verbose"
 
@@ -177,10 +107,285 @@ Return a corrected full replacement response in the exact required top-level sha
 Hard requirements:
 - Preserve the same intent. If you were using typed tools (prepare_profile, mutate_profile, validate_profile, register_profile, evaluate_candidate, run_parameter_sweep, inspect_artifact, compare_artifacts), keep them—do not rewrite into run_cli unless the original plan was already run_cli or recovery truly requires it.
 - Every write_file action must include a full non-empty string `content` field.
+- Use candidate_name for local drafts and exact profile_ref for registered profiles. Do not emit profile_path, destination_path, or source_profile_path.
+- evaluate_candidate requires instruments[].
 - If you cannot fit all planned work, reduce the number of actions.
 - Do not omit required fields.
-- Return raw JSON only.
+- Return exactly one raw JSON object only.
 """
+
+LOCAL_OPENING_ALLOWED_FIELDS = (
+    "tool",
+    "mode",
+    "indicator_ids",
+    "instruments",
+    "candidate_name",
+)
+LOCAL_OPENING_ALLOWED_FIELD_SET = frozenset(LOCAL_OPENING_ALLOWED_FIELDS)
+LOCAL_OPENING_PRIORITY_INSTRUMENTS = (
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "AUDUSD",
+    "NZDUSD",
+    "USDCAD",
+    "USDCHF",
+    "EURJPY",
+    "GBPJPY",
+)
+LOCAL_OPENING_BROAD_GOAL_KEYWORDS = (
+    "broad",
+    "breadth",
+    "coverage",
+    "basket",
+    "divers",
+    "clustered positivity",
+)
+LOCAL_OPENING_NARROW_GOAL_KEYWORDS = (
+    "narrow",
+    "selective",
+    "focus",
+    "sharper",
+    "sharp",
+)
+
+
+def _normalize_instrument_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    for item in value:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        normalized.append(text)
+    return normalized
+
+
+def _uses_forbidden_opening_instrument(value: Any) -> bool:
+    instruments = [item.upper() for item in _normalize_instrument_list(value)]
+    return any(item in {"ALL", "__BASKET__"} for item in instruments)
+
+
+def _normalize_windows_path_text(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    return text.replace("/", "\\").rstrip("\\")
+
+
+def _sanitize_opening_candidate_name(value: Any) -> str | None:
+    text = re.sub(r"[^\w\-]+", "_", str(value or "").strip()) or ""
+    return text[:72] if text else None
+
+
+def _candidate_name_from_profile_path_text(value: Any) -> str | None:
+    path_text = _normalize_windows_path_text(value)
+    if not path_text:
+        return None
+    try:
+        return _sanitize_opening_candidate_name(Path(path_text).stem)
+    except Exception:
+        return None
+
+
+def canonicalize_local_opening_step_response(
+    payload: dict[str, Any],
+    *,
+    starter_instruments: list[str] | None = None,
+    candidate_name_hint: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        return payload
+    first_action = next(
+        (item for item in actions if isinstance(item, dict)),
+        None,
+    )
+    if not isinstance(first_action, dict):
+        return payload
+    if str(first_action.get("tool") or "").strip() != "prepare_profile":
+        return payload
+    salvage_hints = (
+        "mode",
+        "indicator_ids",
+        "seed_indicators",
+        "candidate_name",
+        "profile_name",
+        "destination_path",
+        "instruments",
+    )
+    if not any(first_action.get(key) for key in salvage_hints):
+        return payload
+    normalized_action: dict[str, Any] = {"tool": "prepare_profile"}
+    mode = first_action.get("mode")
+    if isinstance(mode, str) and mode.strip():
+        normalized_action["mode"] = mode.strip()
+    indicator_ids = first_action.get("indicator_ids")
+    if not isinstance(indicator_ids, list) or not indicator_ids:
+        seed_indicators = first_action.get("seed_indicators")
+        if isinstance(seed_indicators, list) and seed_indicators:
+            indicator_ids = seed_indicators
+    if isinstance(indicator_ids, list) and indicator_ids:
+        normalized_action["indicator_ids"] = indicator_ids
+    if "mode" not in normalized_action and normalized_action.get("indicator_ids"):
+        normalized_action["mode"] = "scaffold_from_seed"
+    candidate_name = first_action.get("candidate_name")
+    if not isinstance(candidate_name, str) or not candidate_name.strip():
+        profile_name = first_action.get("profile_name")
+        if isinstance(profile_name, str) and profile_name.strip():
+            candidate_name = profile_name
+    if not isinstance(candidate_name, str) or not candidate_name.strip():
+        candidate_name = _candidate_name_from_profile_path_text(
+            first_action.get("destination_path")
+        )
+    if not isinstance(candidate_name, str) or not candidate_name.strip():
+        candidate_name = candidate_name_hint
+    candidate_name_text = _sanitize_opening_candidate_name(candidate_name)
+    if candidate_name_text:
+        normalized_action["candidate_name"] = candidate_name_text
+    resolved_starter_instruments = _normalize_instrument_list(starter_instruments)
+    instruments = _normalize_instrument_list(first_action.get("instruments"))
+    if _uses_forbidden_opening_instrument(instruments):
+        instruments = []
+    if not instruments and resolved_starter_instruments:
+        instruments = resolved_starter_instruments
+    if instruments:
+        normalized_action["instruments"] = instruments
+    cleaned_action = {
+        key: value
+        for key, value in normalized_action.items()
+        if key in LOCAL_OPENING_ALLOWED_FIELD_SET
+    }
+    return {
+        "reasoning": str(payload.get("reasoning", "")).strip(),
+        "actions": [cleaned_action],
+    }
+
+
+LEGACY_MODEL_PATH_FIELDS = frozenset(
+    {
+        "profile_path",
+        "destination_path",
+        "source_profile_path",
+        "metadata_out_path",
+    }
+)
+
+
+def _pathless_action_from_legacy_fields(action: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(action)
+    tool = str(normalized.get("tool") or "").strip()
+    candidate_name = normalized.get("candidate_name")
+    if not isinstance(candidate_name, str) or not candidate_name.strip():
+        candidate_name = _candidate_name_from_profile_path_text(
+            normalized.get("profile_path")
+        ) or _candidate_name_from_profile_path_text(normalized.get("destination_path"))
+    if isinstance(candidate_name, str) and candidate_name.strip():
+        normalized["candidate_name"] = _sanitize_opening_candidate_name(candidate_name)
+
+    source_candidate_name = normalized.get("source_candidate_name")
+    if not isinstance(source_candidate_name, str) or not source_candidate_name.strip():
+        source_candidate_name = _candidate_name_from_profile_path_text(
+            normalized.get("source_profile_path")
+        )
+    if isinstance(source_candidate_name, str) and source_candidate_name.strip():
+        normalized["source_candidate_name"] = _sanitize_opening_candidate_name(
+            source_candidate_name
+        )
+
+    destination_candidate_name = normalized.get("destination_candidate_name")
+    if (
+        not isinstance(destination_candidate_name, str)
+        or not destination_candidate_name.strip()
+    ):
+        destination_candidate_name = _candidate_name_from_profile_path_text(
+            normalized.get("destination_path")
+        )
+    if (
+        isinstance(destination_candidate_name, str)
+        and destination_candidate_name.strip()
+    ):
+        normalized["destination_candidate_name"] = _sanitize_opening_candidate_name(
+            destination_candidate_name
+        )
+
+    if tool == "prepare_profile" and str(normalized.get("mode") or "").strip() == "clone_local":
+        normalized.pop("candidate_name", None)
+        if "destination_candidate_name" not in normalized:
+            derived_name = _candidate_name_from_profile_path_text(
+                normalized.get("destination_path")
+            )
+            if isinstance(derived_name, str) and derived_name.strip():
+                normalized["destination_candidate_name"] = _sanitize_opening_candidate_name(
+                    derived_name
+                )
+
+    for field in LEGACY_MODEL_PATH_FIELDS:
+        normalized.pop(field, None)
+    return normalized
+
+
+def canonicalize_followup_step_response(
+    payload: dict[str, Any],
+    *,
+    next_action_template: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not isinstance(next_action_template, dict):
+        return payload
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        return payload
+    first_action = next((item for item in actions if isinstance(item, dict)), None)
+    if not isinstance(first_action, dict):
+        return payload
+    template = _pathless_action_from_legacy_fields(dict(next_action_template))
+    template_tool = str(template.get("tool") or "").strip()
+    if template_tool not in {
+        "validate_profile",
+        "register_profile",
+        "mutate_profile",
+        "evaluate_candidate",
+    }:
+        return payload
+    normalized_first = _pathless_action_from_legacy_fields(dict(first_action))
+    if str(normalized_first.get("tool") or "").strip() != template_tool:
+        return payload
+    changed = normalized_first != first_action or len(actions) > 1
+    if template_tool == "evaluate_candidate":
+        if (
+            not isinstance(normalized_first.get("instruments"), list)
+            or not normalized_first.get("instruments")
+        ) and isinstance(template.get("instruments"), list) and template.get("instruments"):
+            normalized_first["instruments"] = list(template.get("instruments") or [])
+            changed = True
+    for field in (
+        "candidate_name",
+        "profile_ref",
+        "attempt_id",
+        "artifact_dir",
+        "evaluation_mode",
+        "timeframe_policy",
+        "requested_horizon_months",
+        "view",
+        "operation",
+    ):
+        if normalized_first.get(field) not in (None, "", [], {}):
+            continue
+        if template.get(field) in (None, "", [], {}):
+            continue
+        normalized_first[field] = template.get(field)
+        changed = True
+    if not changed:
+        return payload
+    return {
+        "reasoning": str(payload.get("reasoning", "")).strip(),
+        "actions": [normalized_first],
+    }
 
 
 def _read_json_if_exists(path: Path | None) -> dict[str, Any] | None:
@@ -191,6 +396,18 @@ def _read_json_if_exists(path: Path | None) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _extract_profile_instruments_from_payload(
+    payload: dict[str, Any] | None,
+) -> list[str]:
+    profile = _profile_root(payload)
+    if not isinstance(profile, dict):
+        return []
+    instruments = profile.get("instruments")
+    if not isinstance(instruments, list):
+        return []
+    return [str(item).strip() for item in instruments if str(item).strip()]
 
 
 def _profile_root(payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -337,7 +554,6 @@ def _candidate_summary_from_profile_payload(
         ),
         "instrument_count": len(instruments),
         "indicator_count": len(indicator_ids),
-        "profile_path": str(profile_path) if profile_path is not None else None,
         "profile_ref": str(profile_ref).strip() if profile_ref else None,
     }
     return {
@@ -1094,12 +1310,12 @@ class ResearchController:
                 return None
         if tool == "evaluate_candidate":
             ref = action.get("profile_ref")
-            path = action.get("profile_path")
+            candidate_name = action.get("candidate_name")
             args = []
             if isinstance(ref, str) and ref.strip():
                 args = ["sensitivity-basket", "--profile-ref", ref.strip()]
-            elif isinstance(path, str) and path.strip():
-                args = ["sensitivity-basket", "--profile-ref", path.strip()]
+            elif isinstance(candidate_name, str) and candidate_name.strip():
+                args = ["sensitivity-basket", "--profile-ref", candidate_name.strip()]
             else:
                 return None
             rh = self._positive_int_or_none(action.get("requested_horizon_months"))
@@ -1112,9 +1328,9 @@ class ResearchController:
                 return ["sweep", "run", "--profile-ref", ref.strip()]
             return None
         if tool == "mutate_profile":
-            pp = action.get("profile_path")
-            if isinstance(pp, str) and pp.strip():
-                return ["profiles", "patch", "--file", pp.strip()]
+            candidate_name = action.get("candidate_name")
+            if isinstance(candidate_name, str) and candidate_name.strip():
+                return ["profiles", "patch", "--file", candidate_name.strip()]
             return None
         return None
 
@@ -2223,10 +2439,284 @@ class ResearchController:
             lines.append(f"- {key}: {value}")
         return "\n".join(lines)
 
-    def _system_protocol_text(self, policy: RunPolicy) -> str:
+    def _system_protocol_text(
+        self,
+        policy: RunPolicy,
+        *,
+        tool_context: ToolContext | None = None,
+        step: int | None = None,
+    ) -> str:
+        provider_type = str(self.config.provider.provider_type or "").strip().lower()
+        if (
+            tool_context is not None
+            and step is not None
+            and self._is_true_opening_step(tool_context, step)
+        ):
+            base_protocol = LOCAL_OPENING_STEP_PROTOCOL
+        elif provider_type == "transformers_local":
+            base_protocol = SFT_SYSTEM_PROTOCOL
+        else:
+            base_protocol = SYSTEM_PROTOCOL
         if policy.allow_finish:
-            return SYSTEM_PROTOCOL
-        return SYSTEM_PROTOCOL + "\n" + SUPERVISED_EXTRA_RULES
+            return base_protocol
+        return base_protocol + "\n" + SUPERVISED_EXTRA_RULES
+
+    def _uses_local_transformers_provider(self) -> bool:
+        return (
+            str(self.config.provider.provider_type or "").strip().lower()
+            == "transformers_local"
+        )
+
+    def _is_true_opening_step(
+        self,
+        tool_context: ToolContext,
+        step: int | None,
+    ) -> bool:
+        if step != 1:
+            return False
+        if self._load_recent_step_payloads(tool_context, 1):
+            return False
+        if load_run_attempts(tool_context.run_dir):
+            return False
+        if self.last_created_profile_ref:
+            return False
+        return True
+
+    def _apply_runtime_interventions(
+        self,
+        tool_context: ToolContext,
+        step: int,
+        response: dict[str, Any],
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        updated = response
+        if self._is_true_opening_step(tool_context, step):
+            opening_grounding = self._local_opening_grounding_prompt_state(tool_context) or {}
+            canonicalized = canonicalize_local_opening_step_response(
+                updated,
+                starter_instruments=list(
+                    opening_grounding.get("preferred_initial_instruments") or []
+                ),
+                candidate_name_hint=str(
+                    opening_grounding.get("candidate_name_hint") or "cand1"
+                ),
+            )
+            if canonicalized != updated:
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase=phase,
+                    status="ok",
+                    message="Applied opening-step runtime canonicalization for prepare_profile scaffold.",
+                )
+                self._append_raw_explorer_payload(
+                    tool_context,
+                    step=step,
+                    phase=phase,
+                    event="opening_runtime_canonicalized",
+                    source="controller",
+                    label="opening_runtime",
+                    payload_json=canonicalized,
+                )
+            updated = canonicalized
+        elif isinstance(updated, dict):
+            next_action_template = self._followup_next_action_template_prompt_state(
+                tool_context
+            )
+            canonicalized = canonicalize_followup_step_response(
+                updated,
+                next_action_template=next_action_template,
+            )
+            if canonicalized != updated:
+                self._trace_runtime(
+                    tool_context,
+                    step=step,
+                    phase=phase,
+                    status="ok",
+                    message="Applied follow-up runtime canonicalization for deterministic handle-bound action.",
+                )
+                self._append_raw_explorer_payload(
+                    tool_context,
+                    step=step,
+                    phase=phase,
+                    event="followup_runtime_canonicalized",
+                    source="controller",
+                    label="followup_runtime",
+                    payload_json=canonicalized,
+                )
+            updated = canonicalized
+        compat_normalized = self._pathless_response_compatibility(updated)
+        if compat_normalized != updated:
+            self._trace_runtime(
+                tool_context,
+                step=step,
+                phase=phase,
+                status="ok",
+                message="Applied pathless contract compatibility normalization.",
+            )
+            self._append_raw_explorer_payload(
+                tool_context,
+                step=step,
+                phase=phase,
+                event="pathless_contract_normalized",
+                source="controller",
+                label="pathless_contract",
+                payload_json=compat_normalized,
+            )
+        return compat_normalized
+
+    def _pathless_response_compatibility(
+        self,
+        response: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(response, dict):
+            return response
+        actions = response.get("actions")
+        if not isinstance(actions, list):
+            return response
+        normalized_actions: list[Any] = []
+        changed = False
+        for action in actions:
+            if not isinstance(action, dict):
+                normalized_actions.append(action)
+                continue
+            normalized_action = _pathless_action_from_legacy_fields(action)
+            normalized_actions.append(normalized_action)
+            if normalized_action != action:
+                changed = True
+        if not changed:
+            return response
+        updated = dict(response)
+        updated["actions"] = normalized_actions
+        return updated
+
+    def _local_repair_hint_lines(
+        self,
+        actions: list[Any],
+        errors: list[str],
+        *,
+        next_action_template: dict[str, Any] | None = None,
+    ) -> list[str]:
+        hints: list[str] = []
+        error_blob = "\n".join(errors).lower()
+        if "unknown instrument(s): 'all'" in error_blob:
+            hints.append(
+                "Do not use ALL as an instrument. Use the exact starter instrument symbols from the opening state."
+            )
+        if "evaluate_candidate requires instruments array" in error_blob:
+            hints.append(
+                "For evaluate_candidate, include instruments as an explicit array of exact symbols."
+            )
+        if "requires candidate_name or profile_ref" in error_blob:
+            hints.append(
+                "For draft profiles, use candidate_name. For registered profiles, use profile_ref."
+            )
+        if "prepare_profile requires mode" in error_blob:
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                if str(action.get("tool") or "").strip() != "prepare_profile":
+                    continue
+                if action.get("source_candidate_name") or action.get("source_profile_ref") or action.get("source_profile_path"):
+                    hints.append(
+                        "For prepare_profile cloning, set mode to clone_local and use source_candidate_name or source_profile_ref."
+                    )
+                elif action.get("indicator_ids"):
+                    hints.append(
+                        "For prepare_profile with indicator_ids, set mode to scaffold_from_seed."
+                    )
+                else:
+                    hints.append(
+                        "prepare_profile must include one of: scaffold_from_seed, clone_local, from_template."
+                    )
+                break
+        if isinstance(next_action_template, dict):
+            hints.append(
+                "If controller state exposes next_action_template, match that action shell and required fields unless fresh tool evidence clearly contradicts it."
+            )
+        return hints
+
+    def _compact_repair_messages(
+        self,
+        draft_payload: Any,
+        *,
+        errors: list[str],
+        shape_error: str | None = None,
+        opening_step: bool = False,
+        next_action_template: dict[str, Any] | None = None,
+    ) -> list[ChatMessage]:
+        lines = [RESPONSE_REPAIR_PROMPT]
+        if opening_step:
+            lines.extend(
+                [
+                    "",
+                    "Opening-step repair rules:",
+                    "- Return exactly 1 action only.",
+                    "- That action must be prepare_profile.",
+                    "- For prepare_profile with indicator_ids, set mode to scaffold_from_seed.",
+                    "- Allowed prepare_profile fields only: tool, mode, indicator_ids, instruments, candidate_name.",
+                    "- Do not use ALL as an instrument. Use the exact starter instrument symbols from the opening state.",
+                    "- Use candidate_name only; the controller resolves local draft storage internally.",
+                    "- Do not use profile_name or seed_indicators.",
+                    "- Do not chain validate_profile, register_profile, or evaluate_candidate.",
+                    "- Return raw JSON only with no Markdown fences, duplicate JSON, or suffix text.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "Later-step repair rules:",
+                    "- Use candidate_name for local drafts and profile_ref for registered profiles.",
+                    "- Do not emit profile_path, destination_path, or source_profile_path.",
+                    "- If the tool is evaluate_candidate, include instruments as an explicit array of exact symbols.",
+                    "- Return exactly one raw JSON object only.",
+                    "- Do not append extra actions unless controller state clearly calls for them.",
+                ]
+            )
+            if isinstance(next_action_template, dict):
+                lines.extend(
+                    [
+                        "- Prefer matching this next_action_template unless fresh tool evidence clearly contradicts it:",
+                        json.dumps(next_action_template, ensure_ascii=True),
+                    ]
+                )
+        if shape_error:
+            lines.extend(
+                [
+                    "",
+                    "The previous response was valid JSON but had the wrong top-level shape for the controller.",
+                    f"Problem:\n- {shape_error}",
+                    "Use the same intent, but convert it into controller actions.",
+                    "Do not return a raw scoring-profile JSON document as the top-level response.",
+                ]
+            )
+        elif errors:
+            lines.extend(["", "Problems:"])
+            lines.extend(f"- {error}" for error in errors)
+        hint_lines = self._local_repair_hint_lines(
+            draft_payload.get("actions") if isinstance(draft_payload, dict) else [],
+            errors,
+            next_action_template=next_action_template,
+        )
+        if hint_lines:
+            lines.extend(["", "Deterministic hints:"])
+            lines.extend(f"- {item}" for item in hint_lines)
+        lines.extend(
+            [
+                "",
+                "Invalid draft:",
+                json.dumps(draft_payload, ensure_ascii=True),
+            ]
+        )
+        return [
+            ChatMessage(
+                role="system",
+                content=LOCAL_OPENING_STEP_PROTOCOL if opening_step else SFT_SYSTEM_PROTOCOL,
+            ),
+            ChatMessage(role="user", content="\n".join(lines)),
+        ]
 
     def _normalize_model_response(
         self, payload: dict[str, Any] | list[Any]
@@ -4016,6 +4506,14 @@ class ResearchController:
             else {}
         )
         parts: list[str] = []
+        candidate_name = str(
+            candidate.get("draft_name")
+            or candidate.get("profile_name")
+            or result.get("candidate_name")
+            or ""
+        ).strip()
+        if candidate_name:
+            parts.append(f"candidate_name={candidate_name}")
         family_id = str(candidate.get("family_id") or "").strip()
         if family_id:
             parts.append(f"family={family_id}")
@@ -4027,11 +4525,6 @@ class ResearchController:
         ).strip()
         if profile_ref:
             parts.append(f"profile_ref={profile_ref}")
-        profile_path = str(
-            result.get("profile_path") or candidate.get("profile_path") or ""
-        ).strip()
-        if profile_path:
-            parts.append(f"profile_path={profile_path}")
         next_action = str(result.get("next_recommended_action") or "").strip()
         if next_action:
             parts.append(f"next={next_action}")
@@ -4393,6 +4886,13 @@ class ResearchController:
         step: int | None = None,
         step_limit: int | None = None,
     ) -> str:
+        if self._uses_local_transformers_provider():
+            return self._local_compact_run_state_prompt(
+                tool_context,
+                policy,
+                step=step,
+                step_limit=step_limit,
+            )
         checkpoint_path = self._checkpoint_path(tool_context)
         checkpoint = (
             checkpoint_path.read_text(encoding="utf-8")
@@ -4406,14 +4906,15 @@ class ResearchController:
             effective_step, effective_step_limit, policy
         )
         score_target = self._score_target_snapshot(tool_context)
+        next_action_template_text = self._followup_next_action_template_text(tool_context)
         soft_wrap_note = self._soft_wrap_note(policy)
         tool_reference = (
-            "Typed tool reference (default path — prefer these over run_cli):\n"
-            "- prepare_profile: mode scaffold_from_seed | clone_local | from_template; indicator_ids, instruments, source_profile_path, destination_path, candidate_name as needed.\n"
-            "- mutate_profile: profile_path; mutations [{path, value}][]; optional destination_path.\n"
-            "- validate_profile: profile_path.\n"
-            "- register_profile: profile_path; operation create|update; profile_ref required for update.\n"
-            "- evaluate_candidate: profile_ref or profile_path; instruments[]; timeframe_policy profile_default|explicit; optional timeframe, requested_horizon_months, evaluation_mode, candidate_name.\n"
+            "Typed tool reference (default lane — prefer these over run_cli):\n"
+            "- prepare_profile: mode scaffold_from_seed | clone_local | from_template; use candidate_name for run-owned drafts.\n"
+            "- mutate_profile: candidate_name or profile_ref; mutations [{path, value}][]; optional destination_candidate_name.\n"
+            "- validate_profile: candidate_name or profile_ref.\n"
+            "- register_profile: candidate_name or profile_ref; operation create|update; profile_ref required for update.\n"
+            "- evaluate_candidate: profile_ref first; candidate_name is acceptable for local unregistered drafts; include instruments[] plus optional timeframe_policy/timeframe/requested_horizon_months/evaluation_mode.\n"
             "- run_parameter_sweep: profile_ref; axes[] strings; optional instruments[], output_dir, candidate_name_prefix.\n"
             "- inspect_artifact: artifact_dir or attempt_id; view summary|files|curve_meta|request_meta.\n"
             "- compare_artifacts: attempt_ids[] or artifact_dirs[].\n"
@@ -4437,10 +4938,8 @@ class ResearchController:
             "- If register_profile fails, fix the profile before evaluate_candidate in a later step.\n"
         )
         return (
-            f"Repo root: {self.config.repo_root}\n"
             f"Mode: {policy.mode_name}\n"
             f"Run id: {tool_context.run_id}\n"
-            f"Run dir: {tool_context.run_dir}\n"
             "Auth status: already verified by controller at run start.\n"
             f"Allow finish: {policy.allow_finish}\n"
             f"Step: {effective_step}/{effective_step_limit}\n"
@@ -4451,6 +4950,7 @@ class ResearchController:
             f"Horizon rationale: {horizon_policy['rationale']}\n"
             f"Score target: {score_target['summary']}\n"
             f"Score target rationale: {score_target['rationale']}\n"
+            f"Next action template: {next_action_template_text}\n"
             f"Operating window: {policy.window_start or 'none'} -> {policy.window_end or 'none'} ({policy.timezone_name})\n"
             f"{soft_wrap_note + chr(10) if soft_wrap_note else ''}"
             f"{self._current_research_priority_text(tool_context, effective_step, effective_step_limit, policy)}\n\n"
@@ -4460,15 +4960,8 @@ class ResearchController:
             f"{self._branch_lifecycle_run_packet_text(tool_context, effective_step, effective_step_limit)}\n\n"
             f"{self._retention_and_exploit_status_text(tool_context)}\n\n"
             f"{self._timeframe_mismatch_status_text()}\n\n"
-            f"Profiles dir: {tool_context.profiles_dir}\n"
-            f"Evals dir: {tool_context.evals_dir}\n"
-            f"Notes dir: {tool_context.notes_dir}\n"
-            f"Run attempts ledger: {tool_context.attempts_path}\n"
-            f"Run progress plot: {tool_context.progress_plot_path}\n"
-            f"CLI help catalog path: {tool_context.cli_help_catalog_path}\n"
             f"Program:\n{self._program_text()}\n\n"
             f"Current seed hand:\n{self._seed_text(tool_context)}\n\n"
-            f"Portable profile template path: {tool_context.profile_template_path}\n"
             "Portable profile template note:\n"
             "- The controller can scaffold from the portable template through prepare_profile.\n"
             "- Do not hand-author a full profile from this template unless typed tools are unavailable.\n\n"
@@ -4484,6 +4977,370 @@ class ResearchController:
             f"{self._recent_behavior_digest_text(tool_context)}\n"
             f"\nTool reference:\n{tool_reference}\n"
         )
+
+    def _local_seed_context_prompt_state(
+        self,
+        tool_context: ToolContext,
+    ) -> dict[str, Any] | None:
+        if not tool_context.seed_prompt_path or not tool_context.seed_prompt_path.exists():
+            return None
+        try:
+            payload = json.loads(tool_context.seed_prompt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        exploration_goal = (
+            payload.get("exploration_goal")
+            if isinstance(payload.get("exploration_goal"), dict)
+            else {}
+        )
+        worker_split = (
+            exploration_goal.get("worker_split")
+            if isinstance(exploration_goal.get("worker_split"), list)
+            else []
+        )
+        seed_context = {
+            "exploration_goal_id": exploration_goal.get("id"),
+            "exploration_goal_summary": exploration_goal.get("summary"),
+            "seed_indicators": list(payload.get("indicators") or [])[:6],
+            "timeframes": list(payload.get("timeframes") or [])[:6],
+            "worker_split": [
+                {
+                    "branch": item.get("branch"),
+                    "goal": item.get("goal"),
+                }
+                for item in worker_split[:2]
+                if isinstance(item, dict)
+            ],
+        }
+        return {
+            key: value
+            for key, value in seed_context.items()
+            if value not in (None, "", [], {})
+        } or None
+
+    def _local_opening_seed_payload(
+        self,
+        tool_context: ToolContext,
+    ) -> dict[str, Any]:
+        if not tool_context.seed_prompt_path or not tool_context.seed_prompt_path.exists():
+            return {}
+        try:
+            payload = json.loads(tool_context.seed_prompt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _local_opening_prefers_basket_start(
+        self,
+        tool_context: ToolContext,
+    ) -> bool:
+        payload = self._local_opening_seed_payload(tool_context)
+        exploration_goal = (
+            payload.get("exploration_goal")
+            if isinstance(payload.get("exploration_goal"), dict)
+            else {}
+        )
+        texts: list[str] = []
+        for candidate in (
+            exploration_goal.get("summary"),
+            exploration_goal.get("id"),
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                texts.append(candidate.lower())
+        worker_split = (
+            exploration_goal.get("worker_split")
+            if isinstance(exploration_goal.get("worker_split"), list)
+            else []
+        )
+        for item in worker_split:
+            if not isinstance(item, dict):
+                continue
+            goal_text = item.get("goal")
+            if isinstance(goal_text, str) and goal_text.strip():
+                texts.append(goal_text.lower())
+        joined = "\n".join(texts)
+        if any(keyword in joined for keyword in LOCAL_OPENING_NARROW_GOAL_KEYWORDS):
+            return False
+        return any(keyword in joined for keyword in LOCAL_OPENING_BROAD_GOAL_KEYWORDS)
+
+    def _local_opening_coverage_symbols(self) -> list[str]:
+        coverage_result = self.cli.run(
+            [
+                "market",
+                "coverage",
+                "--timeframe",
+                self.config.research.coverage_reference_timeframe,
+            ],
+            check=False,
+        )
+        if coverage_result.returncode != 0 or not isinstance(
+            coverage_result.parsed_json, dict
+        ):
+            return []
+        coverage_data = coverage_result.parsed_json.get("data")
+        if not isinstance(coverage_data, dict):
+            return []
+        eligible: list[str] = []
+        for symbol, payload in coverage_data.items():
+            if not isinstance(symbol, str) or not isinstance(payload, dict):
+                continue
+            months = payload.get("effective_window_months")
+            if not isinstance(months, (int, float)):
+                continue
+            if float(months) >= float(self.config.research.coverage_min_mid_months):
+                eligible.append(symbol)
+        return sorted(set(eligible))
+
+    def _local_opening_starter_instruments(
+        self,
+        tool_context: ToolContext,
+    ) -> tuple[list[str], str]:
+        symbols = self._local_opening_coverage_symbols()
+        if not symbols:
+            return [], "coverage_unavailable"
+        preferred = [
+            symbol
+            for symbol in LOCAL_OPENING_PRIORITY_INSTRUMENTS
+            if symbol in symbols
+        ]
+        pool = preferred or symbols
+        if self._local_opening_prefers_basket_start(tool_context):
+            return pool[: min(3, len(pool))], "broad_coverage_default"
+        return pool[:1], "single_symbol_default"
+
+    def _local_opening_grounding_prompt_state(
+        self,
+        tool_context: ToolContext,
+    ) -> dict[str, Any] | None:
+        starter_instruments, starter_rule = self._local_opening_starter_instruments(
+            tool_context
+        )
+        candidate_name_hint = "cand1"
+        grounding = {
+            "allowed_seed_instruments": starter_instruments,
+            "preferred_initial_instruments": starter_instruments,
+            "preferred_initial_instrument_rule": starter_rule,
+            "candidate_name_hint": candidate_name_hint,
+        }
+        return {
+            key: value
+            for key, value in grounding.items()
+            if value not in (None, "", [], {})
+        } or None
+
+    def _local_recent_step_window_prompt_state(
+        self,
+        tool_context: ToolContext,
+    ) -> list[dict[str, Any]]:
+        payloads = self._load_recent_step_payloads(
+            tool_context,
+            max(1, int(self.config.research.recent_step_window_steps)),
+        )
+        items: list[dict[str, Any]] = []
+        for payload in payloads[-self.config.research.recent_step_window_steps :]:
+            if not isinstance(payload, dict):
+                continue
+            actions = payload.get("actions") if isinstance(payload.get("actions"), list) else []
+            results = payload.get("results") if isinstance(payload.get("results"), list) else []
+            items.append(
+                {
+                    "step": payload.get("step"),
+                    "action_signatures": [
+                        self._prompt_visible_action_signature(action)
+                        for action in actions
+                        if isinstance(action, dict)
+                    ],
+                    "result_summary": [
+                        self._history_result_summary(result)
+                        for result in results
+                        if isinstance(result, dict)
+                    ],
+                }
+            )
+        return items
+
+    def _recent_known_instruments_for_handle(
+        self,
+        tool_context: ToolContext,
+        *,
+        candidate_name: str | None = None,
+        profile_ref: str | None = None,
+        limit: int = 8,
+    ) -> list[str] | None:
+        candidate_name = str(candidate_name or "").strip() or None
+        profile_ref = str(profile_ref or "").strip() or None
+        observed_sets: list[tuple[str, ...]] = []
+        payloads = self._load_recent_step_payloads(tool_context, max(1, limit))
+        for payload in reversed(payloads):
+            actions = payload.get("actions")
+            if not isinstance(actions, list):
+                continue
+            for action in reversed(actions):
+                if not isinstance(action, dict):
+                    continue
+                action = _pathless_action_from_legacy_fields(action)
+                matches_handle = False
+                if candidate_name and str(action.get("candidate_name") or "").strip() == candidate_name:
+                    matches_handle = True
+                if profile_ref and str(action.get("profile_ref") or "").strip() == profile_ref:
+                    matches_handle = True
+                if not matches_handle:
+                    continue
+                instruments = _normalize_instrument_list(action.get("instruments"))
+                if not instruments or _uses_forbidden_opening_instrument(instruments):
+                    continue
+                token = tuple(instruments)
+                if token not in observed_sets:
+                    observed_sets.append(token)
+        if len(observed_sets) == 1:
+            return list(observed_sets[0])
+        if len(observed_sets) > 1:
+            return None
+        profile_path = self._resolve_local_profile_path(
+            tool_context,
+            candidate_name=candidate_name,
+            profile_ref=profile_ref,
+            require_exists=True,
+        )
+        if profile_path is None:
+            return None
+        instruments = _extract_profile_instruments_from_payload(
+            _read_json_if_exists(profile_path)
+        )
+        if not instruments or _uses_forbidden_opening_instrument(instruments):
+            return None
+        return instruments
+
+    def _followup_next_action_template_prompt_state(
+        self,
+        tool_context: ToolContext,
+    ) -> dict[str, Any] | None:
+        latest_result, _payload = self._latest_successful_step_result(
+            tool_context,
+            tool_names={
+                "prepare_profile",
+                "mutate_profile",
+                "validate_profile",
+                "register_profile",
+            },
+        )
+        if not isinstance(latest_result, dict):
+            return None
+        tool = str(latest_result.get("tool") or "").strip()
+        candidate_summary = (
+            latest_result.get("candidate_summary")
+            if isinstance(latest_result.get("candidate_summary"), dict)
+            else {}
+        )
+        candidate_name = str(
+            latest_result.get("candidate_name")
+            or candidate_summary.get("draft_name")
+            or candidate_summary.get("profile_name")
+            or ""
+        ).strip()
+        profile_ref = str(
+            latest_result.get("profile_ref")
+            or latest_result.get("created_profile_ref")
+            or candidate_summary.get("profile_ref")
+            or ""
+        ).strip()
+        if tool in {"prepare_profile", "mutate_profile"} and candidate_name:
+            return {
+                "tool": "validate_profile",
+                "candidate_name": candidate_name,
+            }
+        if (
+            tool == "validate_profile"
+            and bool(latest_result.get("ready_for_registration"))
+            and candidate_name
+        ):
+            return {
+                "tool": "register_profile",
+                "candidate_name": candidate_name,
+            }
+        if tool == "register_profile" and (
+            bool(latest_result.get("ready_to_evaluate")) or profile_ref or candidate_name
+        ):
+            instruments = self._recent_known_instruments_for_handle(
+                tool_context,
+                candidate_name=candidate_name or None,
+                profile_ref=profile_ref or None,
+            )
+            if not instruments:
+                return None
+            template: dict[str, Any] = {
+                "tool": "evaluate_candidate",
+                "instruments": instruments,
+                "timeframe_policy": "profile_default",
+                "evaluation_mode": "screen",
+            }
+            if profile_ref:
+                template["profile_ref"] = profile_ref
+            elif candidate_name:
+                template["candidate_name"] = candidate_name
+            else:
+                return None
+            return template
+        return None
+
+    def _followup_next_action_template_text(
+        self,
+        tool_context: ToolContext,
+    ) -> str:
+        template = self._followup_next_action_template_prompt_state(tool_context)
+        if not isinstance(template, dict):
+            return "No deterministic next_action_template is active."
+        return json.dumps(template, ensure_ascii=True)
+
+    def _local_compact_run_state_prompt(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int | None = None,
+        step_limit: int | None = None,
+    ) -> str:
+        effective_step = step or 1
+        effective_step_limit = step_limit or self.config.research.max_steps
+        phase_info = self._run_phase_info(effective_step, effective_step_limit, policy)
+        horizon_policy = self._horizon_policy_snapshot(
+            effective_step, effective_step_limit, policy
+        )
+        score_target = self._score_target_snapshot(tool_context)
+        prompt_state = {
+            "run": {
+                "run_id": tool_context.run_id,
+                "run_dir": str(tool_context.run_dir),
+            },
+            "controller": {
+                "step": effective_step,
+                "phase": phase_info.get("name"),
+                "horizon_target": horizon_policy.get("summary"),
+                "score_target": score_target.get("summary"),
+            },
+            "seed_context": self._local_seed_context_prompt_state(tool_context),
+            "opening_grounding": self._local_opening_grounding_prompt_state(
+                tool_context
+            ),
+            "timeframe_status": self._get_timeframe_mismatch_status(),
+            "next_action_template": self._followup_next_action_template_prompt_state(
+                tool_context
+            ),
+            "recent_step_window": self._local_recent_step_window_prompt_state(
+                tool_context
+            ),
+            "recent_attempts": list(
+                load_run_attempts(tool_context.run_dir)[
+                    -self.config.research.recent_attempts_window :
+                ]
+            ),
+        }
+        compact_v2 = build_prompt_variants({"prompt_state": prompt_state}).get(
+            "compact_v2", {}
+        )
+        return json.dumps(compact_v2, ensure_ascii=True)
 
     def _retention_and_exploit_status_text(self, tool_context: ToolContext) -> str:
         exploit_status = self._get_same_family_exploit_status()
@@ -4601,6 +5458,17 @@ class ResearchController:
         if tool in {"read_file", "list_dir", "log_attempt", "finish"}:
             return json.dumps(
                 {key: value for key, value in action.items() if key != "content"},
+                ensure_ascii=True,
+            )
+        if tool in {
+            "prepare_profile",
+            "mutate_profile",
+            "validate_profile",
+            "register_profile",
+            "evaluate_candidate",
+        }:
+            return json.dumps(
+                self._prompt_visible_action_signature(action),
                 ensure_ascii=True,
             )
         return json.dumps(
@@ -4824,32 +5692,52 @@ class ResearchController:
                 if not isinstance(ids, list) or not ids:
                     return "prepare_profile scaffold_from_seed requires indicator_ids array."
             if mode == "clone_local":
-                src = action.get("source_profile_path")
-                if not isinstance(src, str) or not src.strip():
-                    return "prepare_profile clone_local requires source_profile_path."
+                has_source_name = isinstance(action.get("source_candidate_name"), str) and bool(
+                    str(action.get("source_candidate_name")).strip()
+                )
+                has_source_ref = isinstance(action.get("source_profile_ref"), str) and bool(
+                    str(action.get("source_profile_ref")).strip()
+                )
+                if not has_source_name and not has_source_ref:
+                    return "prepare_profile clone_local requires source_candidate_name or source_profile_ref."
             return None
         if tool == "mutate_profile":
-            pp = action.get("profile_path")
-            if not isinstance(pp, str) or not pp.strip():
-                return "mutate_profile requires profile_path."
+            has_name = isinstance(action.get("candidate_name"), str) and bool(
+                str(action.get("candidate_name")).strip()
+            )
+            has_ref = isinstance(action.get("profile_ref"), str) and bool(
+                str(action.get("profile_ref")).strip()
+            )
+            if not has_name and not has_ref:
+                return "mutate_profile requires candidate_name or profile_ref."
             mutations = action.get("mutations")
             if not isinstance(mutations, list) or not mutations:
                 return "mutate_profile requires mutations array."
             return None
         if tool == "validate_profile":
-            pp = action.get("profile_path")
-            if not isinstance(pp, str) or not pp.strip():
-                return "validate_profile requires profile_path."
+            has_name = isinstance(action.get("candidate_name"), str) and bool(
+                str(action.get("candidate_name")).strip()
+            )
+            has_ref = isinstance(action.get("profile_ref"), str) and bool(
+                str(action.get("profile_ref")).strip()
+            )
+            if not has_name and not has_ref:
+                return "validate_profile requires candidate_name or profile_ref."
             return None
         if tool == "register_profile":
-            pp = action.get("profile_path")
-            if not isinstance(pp, str) or not pp.strip():
-                return "register_profile requires profile_path."
             op = str(action.get("operation") or "create").strip().lower()
             if op == "update":
                 ref = action.get("profile_ref")
                 if not isinstance(ref, str) or not ref.strip():
                     return "register_profile update requires profile_ref."
+            has_name = isinstance(action.get("candidate_name"), str) and bool(
+                str(action.get("candidate_name")).strip()
+            )
+            has_ref = isinstance(action.get("profile_ref"), str) and bool(
+                str(action.get("profile_ref")).strip()
+            )
+            if not has_name and not has_ref:
+                return "register_profile requires candidate_name or profile_ref."
             return None
         if tool == "evaluate_candidate":
             inst = action.get("instruments")
@@ -4858,11 +5746,11 @@ class ResearchController:
             has_ref = isinstance(action.get("profile_ref"), str) and bool(
                 str(action.get("profile_ref")).strip()
             )
-            has_path = isinstance(action.get("profile_path"), str) and bool(
-                str(action.get("profile_path")).strip()
+            has_name = isinstance(action.get("candidate_name"), str) and bool(
+                str(action.get("candidate_name")).strip()
             )
-            if not has_ref and not has_path:
-                return "evaluate_candidate requires profile_ref or profile_path."
+            if not has_ref and not has_name:
+                return "evaluate_candidate requires profile_ref or candidate_name."
             return None
         if tool == "run_parameter_sweep":
             ref = action.get("profile_ref")
@@ -5045,24 +5933,62 @@ class ResearchController:
                 action_summaries.append(self._history_action_summary(action))
             else:
                 action_summaries.append(str(action))
-        repair_messages = [
-            *messages,
-            ChatMessage(
-                role="assistant",
-                content=(
-                    f"Reasoning: {reasoning or '(empty)'}\n"
-                    "Planned actions:\n"
-                    + "\n".join(f"- {summary}" for summary in action_summaries)
+        repair_payload = {
+            "reasoning": reasoning,
+            "actions": actions,
+            "errors": errors,
+        }
+        opening_step = self._is_true_opening_step(tool_context, step)
+        next_action_template = (
+            None
+            if opening_step
+            else self._followup_next_action_template_prompt_state(tool_context)
+        )
+        if self._uses_local_transformers_provider() or opening_step:
+            repair_messages = self._compact_repair_messages(
+                {
+                    "reasoning": reasoning,
+                    "actions": actions,
+                },
+                errors=errors,
+                opening_step=opening_step,
+                next_action_template=next_action_template,
+            )
+        else:
+            repair_messages = [
+                *messages,
+                ChatMessage(
+                    role="assistant",
+                    content=(
+                        f"Reasoning: {reasoning or '(empty)'}\n"
+                        "Planned actions:\n"
+                        + "\n".join(f"- {summary}" for summary in action_summaries)
+                    ),
                 ),
-            ),
-            ChatMessage(
-                role="user",
-                content=(
-                    f"{RESPONSE_REPAIR_PROMPT}\n\n"
-                    "Problems:\n" + "\n".join(f"- {error}" for error in errors)
+                ChatMessage(
+                    role="user",
+                    content=(
+                        f"{RESPONSE_REPAIR_PROMPT}\n\n"
+                        "Problems:\n"
+                        + "\n".join(f"- {error}" for error in errors)
+                        + (
+                            "\n\nnext_action_template:\n"
+                            + json.dumps(next_action_template, ensure_ascii=True)
+                            if isinstance(next_action_template, dict)
+                            else ""
+                        )
+                    ),
                 ),
-            ),
-        ]
+            ]
+        self._append_raw_explorer_payload(
+            tool_context,
+            step=step,
+            phase="response_repair",
+            event="repair_request",
+            source="controller",
+            label="response_repair",
+            payload_text=json.dumps(repair_payload, ensure_ascii=True),
+        )
         self._trace_runtime(
             tool_context,
             step=step,
@@ -5080,8 +6006,33 @@ class ResearchController:
                 provider=self.provider,
             ):
                 repaired = self.provider.complete_json(repair_messages)
+            self._append_raw_explorer_payload(
+                tool_context,
+                step=step,
+                phase="response_repair",
+                event="repair_response",
+                source="controller",
+                label="response_repair",
+                payload_json=repaired,
+            )
             normalized = self._normalize_model_response(repaired)
+            normalized = self._apply_runtime_interventions(
+                tool_context,
+                step,
+                normalized,
+                phase="response_repair",
+            )
         except (ProviderError, RuntimeError, TypeError, ValueError) as exc:
+            self._append_raw_explorer_payload(
+                tool_context,
+                step=step,
+                phase="response_repair",
+                event="repair_failed",
+                source="controller",
+                label="response_repair",
+                payload_text="\n".join(errors),
+                error=str(exc),
+            )
             self._trace_runtime(
                 tool_context,
                 step=step,
@@ -5142,20 +6093,39 @@ class ResearchController:
         error: str,
     ) -> dict[str, Any] | None:
         payload_text = json.dumps(payload, ensure_ascii=False)
-        repair_messages = [
-            *messages,
-            ChatMessage(role="assistant", content=payload_text),
-            ChatMessage(
-                role="user",
-                content=(
-                    f"{RESPONSE_REPAIR_PROMPT}\n\n"
-                    "The previous response was valid JSON but had the wrong top-level shape for the controller.\n"
-                    f"Problem:\n- {error}\n\n"
-                    "Use the same intent, but convert it into controller actions. "
-                    "Do not return a raw scoring-profile JSON document as the top-level response."
+        opening_step = self._is_true_opening_step(tool_context, step)
+        if self._uses_local_transformers_provider() or opening_step:
+            repair_messages = self._compact_repair_messages(
+                payload,
+                errors=[],
+                shape_error=error,
+                opening_step=opening_step,
+            )
+        else:
+            repair_messages = [
+                *messages,
+                ChatMessage(role="assistant", content=payload_text),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        f"{RESPONSE_REPAIR_PROMPT}\n\n"
+                        "The previous response was valid JSON but had the wrong top-level shape for the controller.\n"
+                        f"Problem:\n- {error}\n\n"
+                        "Use the same intent, but convert it into controller actions. "
+                        "Do not return a raw scoring-profile JSON document as the top-level response."
+                    ),
                 ),
-            ),
-        ]
+            ]
+        self._append_raw_explorer_payload(
+            tool_context,
+            step=step,
+            phase="payload_shape_repair",
+            event="repair_request",
+            source="controller",
+            label="payload_shape_repair",
+            payload_text=payload_text,
+            error=error,
+        )
         self._trace_runtime(
             tool_context,
             step=step,
@@ -5173,8 +6143,33 @@ class ResearchController:
                 provider=self.provider,
             ):
                 repaired = self.provider.complete_json(repair_messages)
+            self._append_raw_explorer_payload(
+                tool_context,
+                step=step,
+                phase="payload_shape_repair",
+                event="repair_response",
+                source="controller",
+                label="payload_shape_repair",
+                payload_json=repaired,
+            )
             normalized = self._normalize_model_response(repaired)
+            normalized = self._apply_runtime_interventions(
+                tool_context,
+                step,
+                normalized,
+                phase="payload_shape_repair",
+            )
         except (ProviderError, RuntimeError) as exc:
+            self._append_raw_explorer_payload(
+                tool_context,
+                step=step,
+                phase="payload_shape_repair",
+                event="repair_failed",
+                source="controller",
+                label="payload_shape_repair",
+                payload_text=payload_text,
+                error=str(exc),
+            )
             self._trace_runtime(
                 tool_context,
                 step=step,
@@ -5554,6 +6549,94 @@ class ResearchController:
         text = re.sub(r"[^\w\-]+", "_", (raw or "item").strip()) or "item"
         return text[:max_len]
 
+    def _default_profile_path_for_candidate(
+        self,
+        tool_context: ToolContext,
+        candidate_name: str | None,
+    ) -> Path:
+        label = self._sanitize_label(str(candidate_name or "candidate"))
+        return (tool_context.profiles_dir / f"{label}.json").resolve()
+
+    def _resolve_local_profile_path(
+        self,
+        tool_context: ToolContext,
+        *,
+        candidate_name: Any = None,
+        profile_path: Any = None,
+        profile_ref: Any = None,
+        require_exists: bool = True,
+    ) -> Path | None:
+        if isinstance(profile_path, str) and profile_path.strip():
+            path = Path(
+                self._substitute_runtime_placeholders(profile_path.strip())
+            ).resolve()
+            if not require_exists or path.exists():
+                return path
+        if isinstance(candidate_name, str) and candidate_name.strip():
+            path = self._default_profile_path_for_candidate(
+                tool_context,
+                candidate_name.strip(),
+            )
+            if not require_exists or path.exists():
+                return path
+        if isinstance(profile_ref, str) and profile_ref.strip():
+            mapped = self.profile_sources.get(
+                self._substitute_runtime_placeholders(profile_ref.strip())
+            )
+            if isinstance(mapped, Path):
+                path = mapped.resolve()
+                if not require_exists or path.exists():
+                    return path
+        return None
+
+    def _prompt_visible_action_signature(
+        self,
+        action: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(action, dict):
+            return {}
+        normalized = dict(action)
+        candidate_name = normalized.get("candidate_name")
+        if not isinstance(candidate_name, str) or not candidate_name.strip():
+            candidate_name = _candidate_name_from_profile_path_text(
+                normalized.get("profile_path")
+            )
+        if not isinstance(candidate_name, str) or not candidate_name.strip():
+            candidate_name = _candidate_name_from_profile_path_text(
+                normalized.get("destination_path")
+            )
+        if isinstance(candidate_name, str) and candidate_name.strip():
+            normalized["candidate_name"] = self._sanitize_label(candidate_name)
+        source_candidate_name = normalized.get("source_candidate_name")
+        if not isinstance(source_candidate_name, str) or not source_candidate_name.strip():
+            source_candidate_name = _candidate_name_from_profile_path_text(
+                normalized.get("source_profile_path")
+            )
+        if isinstance(source_candidate_name, str) and source_candidate_name.strip():
+            normalized["source_candidate_name"] = self._sanitize_label(
+                source_candidate_name
+            )
+        destination_candidate_name = normalized.get("destination_candidate_name")
+        if not isinstance(destination_candidate_name, str) or not destination_candidate_name.strip():
+            destination_candidate_name = _candidate_name_from_profile_path_text(
+                normalized.get("destination_path")
+            )
+        if (
+            isinstance(destination_candidate_name, str)
+            and destination_candidate_name.strip()
+        ):
+            normalized["destination_candidate_name"] = self._sanitize_label(
+                destination_candidate_name
+            )
+        for field in (
+            "profile_path",
+            "destination_path",
+            "source_profile_path",
+            "metadata_out_path",
+        ):
+            normalized.pop(field, None)
+        return normalized
+
     def _typed_prepare_profile(
         self,
         tool_context: ToolContext,
@@ -5572,7 +6655,7 @@ class ResearchController:
             dest = (
                 Path(str(dest_raw).strip()).resolve()
                 if isinstance(dest_raw, str) and dest_raw.strip()
-                else (profiles_dir / f"{name}_{self._timestamp()}.json").resolve()
+                else self._default_profile_path_for_candidate(tool_context, name)
             )
             tpl = tool_context.profile_template_path
             if not tpl.exists():
@@ -5597,6 +6680,7 @@ class ResearchController:
                 ok=True,
                 profile_path=str(dest),
                 profile_name=name,
+                candidate_name=name,
                 indicator_ids=action.get("indicator_ids"),
                 timeframe_summary=str(action.get("timeframe") or ""),
                 candidate_summary=candidate_summary,
@@ -5606,20 +6690,31 @@ class ResearchController:
                 artifacts={"profile_path": str(dest)},
             )
         if mode == "clone_local":
-            src_raw = action.get("source_profile_path")
-            if not isinstance(src_raw, str) or not src_raw.strip():
+            src = self._resolve_local_profile_path(
+                tool_context,
+                candidate_name=action.get("source_candidate_name"),
+                profile_path=action.get("source_profile_path"),
+                profile_ref=action.get("source_profile_ref"),
+                require_exists=True,
+            )
+            if src is None:
                 return tt.normalized_tool_envelope(
                     "prepare_profile",
                     ok=False,
-                    errors=["prepare_profile clone_local requires source_profile_path."],
+                    errors=[
+                        "prepare_profile clone_local requires source_candidate_name or source_profile_ref."
+                    ],
                     next_recommended_action=None,
                 )
-            src = Path(src_raw.strip()).resolve()
             dest_raw = action.get("destination_path")
+            destination_candidate_name = action.get("destination_candidate_name")
             dest = (
                 Path(str(dest_raw).strip()).resolve()
                 if isinstance(dest_raw, str) and dest_raw.strip()
-                else (profiles_dir / f"{name}_{self._timestamp()}.json").resolve()
+                else self._default_profile_path_for_candidate(
+                    tool_context,
+                    destination_candidate_name or name,
+                )
             )
             args = [
                 "profiles",
@@ -5642,6 +6737,7 @@ class ResearchController:
             )
             base["profile_path"] = str(dest)
             base["profile_name"] = name
+            base["candidate_name"] = name
             base["indicator_ids"] = action.get("indicator_ids")
             base["candidate_summary"] = _candidate_summary_from_profile_payload(
                 _read_json_if_exists(dest),
@@ -5653,7 +6749,7 @@ class ResearchController:
             if base.get("ok"):
                 base["next_recommended_action"] = "validate_profile"
             else:
-                base["next_recommended_action"] = "inspect source_profile_path and retry"
+                base["next_recommended_action"] = "inspect the source draft/reference and retry"
             artifacts = dict(base.get("artifacts") or {})
             artifacts["profile_path"] = str(dest)
             base["artifacts"] = artifacts
@@ -5673,7 +6769,7 @@ class ResearchController:
             dest = (
                 Path(str(dest_raw).strip()).resolve()
                 if isinstance(dest_raw, str) and dest_raw.strip()
-                else (profiles_dir / f"{name}_{self._timestamp()}.json").resolve()
+                else self._default_profile_path_for_candidate(tool_context, name)
             )
             args = ["profiles", "scaffold"]
             for ind in ids:
@@ -5695,6 +6791,7 @@ class ResearchController:
             )
             base["profile_path"] = str(dest)
             base["profile_name"] = name
+            base["candidate_name"] = name
             base["indicator_ids"] = ids
             base["candidate_summary"] = _candidate_summary_from_profile_payload(
                 _read_json_if_exists(dest),
@@ -5725,15 +6822,20 @@ class ResearchController:
         step_limit: int,
         policy: RunPolicy,
     ) -> dict[str, Any]:
-        path_raw = action.get("profile_path")
-        if not isinstance(path_raw, str) or not path_raw.strip():
+        profile_path = self._resolve_local_profile_path(
+            tool_context,
+            candidate_name=action.get("candidate_name"),
+            profile_path=action.get("profile_path"),
+            profile_ref=action.get("profile_ref"),
+            require_exists=True,
+        )
+        if profile_path is None:
             return tt.normalized_tool_envelope(
                 "mutate_profile",
                 ok=False,
-                errors=["mutate_profile requires profile_path."],
+                errors=["mutate_profile requires candidate_name or profile_ref."],
                 next_recommended_action=None,
             )
-        profile_path = Path(path_raw.strip()).resolve()
         mutations = action.get("mutations")
         if not isinstance(mutations, list) or not mutations:
             return tt.normalized_tool_envelope(
@@ -5765,10 +6867,19 @@ class ResearchController:
                 next_recommended_action=None,
             )
         out_raw = action.get("destination_path")
+        destination_candidate_name = action.get("destination_candidate_name")
         out_path = (
             Path(str(out_raw).strip()).resolve()
             if isinstance(out_raw, str) and out_raw.strip()
-            else profile_path
+            else (
+                self._default_profile_path_for_candidate(
+                    tool_context,
+                    destination_candidate_name,
+                )
+                if isinstance(destination_candidate_name, str)
+                and destination_candidate_name.strip()
+                else profile_path
+            )
         )
         args.extend(["--out", str(out_path), "--pretty"])
         base = self._execute_cli_invocation(
@@ -5782,6 +6893,7 @@ class ResearchController:
             result_tool="mutate_profile",
         )
         base["profile_path"] = str(out_path)
+        base["candidate_name"] = str(out_path.stem)
         base["applied_mutations"] = applied
         base["mutation_summary"] = f"{len(applied)} patch operation(s)"
         if base.get("ok"):
@@ -5800,15 +6912,20 @@ class ResearchController:
         step_limit: int,
         policy: RunPolicy,
     ) -> dict[str, Any]:
-        path_raw = action.get("profile_path")
-        if not isinstance(path_raw, str) or not path_raw.strip():
+        path = self._resolve_local_profile_path(
+            tool_context,
+            candidate_name=action.get("candidate_name"),
+            profile_path=action.get("profile_path"),
+            profile_ref=action.get("profile_ref"),
+            require_exists=True,
+        )
+        if path is None:
             return tt.normalized_tool_envelope(
                 "validate_profile",
                 ok=False,
-                errors=["validate_profile requires profile_path."],
+                errors=["validate_profile requires candidate_name or profile_ref."],
                 next_recommended_action=None,
             )
-        path = Path(path_raw.strip()).resolve()
         args = ["profiles", "validate", "--file", str(path), "--pretty"]
         base = self._execute_cli_invocation(
             tool_context,
@@ -5821,6 +6938,7 @@ class ResearchController:
             result_tool="validate_profile",
         )
         base["profile_path"] = str(path)
+        base["candidate_name"] = str(path.stem)
         source_payload = _read_json_if_exists(path)
         parsed = {}
         res = base.get("result")
@@ -5881,16 +6999,21 @@ class ResearchController:
         step_limit: int,
         policy: RunPolicy,
     ) -> dict[str, Any]:
-        path_raw = action.get("profile_path")
-        if not isinstance(path_raw, str) or not path_raw.strip():
+        operation = str(action.get("operation") or "create").strip().lower()
+        path = self._resolve_local_profile_path(
+            tool_context,
+            candidate_name=action.get("candidate_name"),
+            profile_path=action.get("profile_path"),
+            profile_ref=action.get("profile_ref") if operation == "update" else None,
+            require_exists=True,
+        )
+        if path is None:
             return tt.normalized_tool_envelope(
                 "register_profile",
                 ok=False,
-                errors=["register_profile requires profile_path."],
+                errors=["register_profile requires candidate_name or profile_ref."],
                 next_recommended_action=None,
             )
-        path = Path(path_raw.strip()).resolve()
-        operation = str(action.get("operation") or "create").strip().lower()
         out_raw = action.get("metadata_out_path")
         if isinstance(out_raw, str) and out_raw.strip():
             out_path = Path(out_raw.strip()).resolve()
@@ -5945,6 +7068,7 @@ class ResearchController:
                 profile_ref = self._extract_profile_ref(pj)
         base["profile_ref"] = profile_ref
         base["profile_path"] = str(path)
+        base["candidate_name"] = str(path.stem)
         base["created"] = operation != "update"
         base["updated"] = operation == "update"
         base["candidate_summary"] = _candidate_summary_from_profile_payload(
@@ -5983,6 +7107,7 @@ class ResearchController:
         }
         raw_ref = action.get("profile_ref")
         raw_path = action.get("profile_path")
+        raw_name = action.get("candidate_name")
         if isinstance(raw_ref, str) and raw_ref.strip():
             ref = self._substitute_runtime_placeholders(raw_ref.strip())
             return {
@@ -5992,21 +7117,21 @@ class ResearchController:
                 "errors": [],
                 "meta": meta,
             }
-        if not isinstance(raw_path, str) or not raw_path.strip():
+        path = self._resolve_local_profile_path(
+            tool_context,
+            candidate_name=raw_name,
+            profile_path=raw_path,
+            profile_ref=None,
+            require_exists=True,
+        )
+        if path is None:
             return {
                 "ok": False,
                 "ref": None,
                 "warnings": [],
-                "errors": ["profile_path required when profile_ref is absent."],
-                "meta": meta,
-            }
-        path = Path(self._substitute_runtime_placeholders(raw_path.strip())).resolve()
-        if not path.is_file():
-            return {
-                "ok": False,
-                "ref": None,
-                "warnings": [],
-                "errors": [f"profile_path not found: {path}"],
+                "errors": [
+                    "candidate_name or profile_ref required when the profile is not yet registered."
+                ],
                 "meta": meta,
             }
         mapped = self._profile_ref_for_local_file(path)
@@ -6807,6 +7932,9 @@ class ResearchController:
     def _runtime_trace_path(self, tool_context: ToolContext) -> Path:
         return tool_context.run_dir / "runtime-trace.jsonl"
 
+    def _raw_explorer_payloads_path(self, tool_context: ToolContext) -> Path:
+        return tool_context.run_dir / "raw-explorer-payloads.jsonl"
+
     def _json_safe_value(self, value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
@@ -6895,6 +8023,43 @@ class ResearchController:
             return
         print(line, file=sys.stderr, flush=True)
 
+    def _append_raw_explorer_payload(
+        self,
+        tool_context: ToolContext,
+        *,
+        step: int,
+        phase: str,
+        event: str,
+        source: str,
+        label: str,
+        payload_text: str | None = None,
+        payload_json: Any = None,
+        **fields: Any,
+    ) -> None:
+        record: dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": tool_context.run_id,
+            "step": step,
+            "phase": phase,
+            "event": event,
+            "source": source,
+            "label": label,
+        }
+        if payload_text is not None:
+            record["payload_text"] = payload_text
+            record["payload_text_chars"] = len(payload_text)
+        if payload_json is not None:
+            record["payload_json"] = self._json_safe_value(payload_json)
+        for key, value in fields.items():
+            if value is not None:
+                record[key] = self._json_safe_value(value)
+        path = self._raw_explorer_payloads_path(tool_context)
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+        except OSError:
+            return
+
     def _provider_scope(
         self,
         *,
@@ -6912,6 +8077,7 @@ class ResearchController:
             phase=phase,
             provider_type=getattr(provider_config, "provider_type", None),
             model=getattr(provider_config, "model", None),
+            capture_path=str(self._raw_explorer_payloads_path(tool_context)),
         )
 
     def _load_recent_step_payloads(
@@ -7278,7 +8444,14 @@ class ResearchController:
         keep = max(0, self.config.research.compact_keep_recent_messages)
         recent_tail = history_messages[-keep:] if keep else []
         compacted_messages = [
-            ChatMessage(role="system", content=self._system_protocol_text(policy)),
+            ChatMessage(
+                role="system",
+                content=self._system_protocol_text(
+                    policy,
+                    tool_context=tool_context,
+                    step=step,
+                ),
+            ),
             ChatMessage(
                 role="user",
                 content=self._run_state_prompt(
@@ -7458,7 +8631,14 @@ class ResearchController:
                 progress_callback({"event": "window_closed", "result": result})
             return result
         messages: list[ChatMessage] = [
-            ChatMessage(role="system", content=self._system_protocol_text(policy)),
+            ChatMessage(
+                role="system",
+                content=self._system_protocol_text(
+                    policy,
+                    tool_context=tool_context,
+                    step=1,
+                ),
+            ),
             ChatMessage(
                 role="user",
                 content=self._run_state_prompt(
@@ -7543,6 +8723,16 @@ class ResearchController:
                     provider=self.provider,
                 ):
                     raw_response = self.provider.complete_json(messages)
+                self._append_raw_explorer_payload(
+                    tool_context,
+                    step=step,
+                    phase="explorer_provider",
+                    event="controller_received_payload",
+                    source="controller",
+                    label="explorer",
+                    payload_json=raw_response,
+                    message_count=len(messages),
+                )
                 self._trace_runtime(
                     tool_context,
                     step=step,
@@ -7559,6 +8749,21 @@ class ResearchController:
                         message="Normalizing explorer payload.",
                     )
                     response = self._normalize_model_response(raw_response)
+                    response = self._apply_runtime_interventions(
+                        tool_context,
+                        step,
+                        response,
+                        phase="explorer_normalize",
+                    )
+                    self._append_raw_explorer_payload(
+                        tool_context,
+                        step=step,
+                        phase="explorer_normalize",
+                        event="controller_normalized_payload",
+                        source="controller",
+                        label="explorer",
+                        payload_json=response,
+                    )
                     self._trace_runtime(
                         tool_context,
                         step=step,
@@ -7676,6 +8881,16 @@ class ResearchController:
                     message="Controller rejected model response after validation.",
                     error_count=len(validation_errors),
                     level="warning",
+                )
+                self._append_raw_explorer_payload(
+                    tool_context,
+                    step=step,
+                    phase="response_guard",
+                    event="response_guard_rejected",
+                    source="controller",
+                    label="explorer",
+                    payload_json=response,
+                    validation_errors=validation_errors,
                 )
                 horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
                 step_payload = {

@@ -1,0 +1,12 @@
+torch
+torchvision
+transformers>=4.53.0
+datasets>=3.0.0
+accelerate>=1.0.0
+peft>=0.14.0
+trl>=0.20.0
+sentencepiece
+safetensors
+huggingface_hub
+bitsandbytes
+matplotlib

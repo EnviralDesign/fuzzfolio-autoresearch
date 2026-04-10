@@ -72,6 +72,7 @@ if __package__ in {None, ""}:
         load_run_metadata,
         load_run_attempts,
         make_attempt_record,
+        run_metadata_path_for_run_dir,
         write_attempts,
     )
     from autoresearch.plotting import (
@@ -92,7 +93,9 @@ if __package__ in {None, ""}:
         render_validation_scatter_artifacts,
     )
     from autoresearch.portfolio import (
+        build_sleeve_prefilter,
         build_sleeve_selection,
+        finalize_sleeve_selection,
         filter_selection_candidate_rows,
         load_portfolio_spec,
         merge_portfolio_sleeves,
@@ -137,6 +140,7 @@ else:
         load_run_metadata,
         load_run_attempts,
         make_attempt_record,
+        run_metadata_path_for_run_dir,
         write_attempts,
     )
     from .plotting import (
@@ -157,7 +161,9 @@ else:
         render_validation_scatter_artifacts,
     )
     from .portfolio import (
+        build_sleeve_prefilter,
         build_sleeve_selection,
+        finalize_sleeve_selection,
         filter_selection_candidate_rows,
         load_portfolio_spec,
         merge_portfolio_sleeves,
@@ -2699,14 +2705,167 @@ def _catalog_rows_for_run_dirs(
     return rows
 
 
-def _refresh_global_derived_corpus_state(config) -> dict[str, Any]:
-    run_dirs = _matching_run_dirs(config, None)
-    rows = _catalog_rows_for_run_dirs(config, run_dirs)
+def _catalog_file_signature(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "path": str(path),
+            "exists": False,
+            "size": 0,
+            "mtime_ns": None,
+        }
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "exists": True,
+        "size": int(stat.st_size),
+        "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+    }
+
+
+def _attempt_catalog_manifest_payload(run_dirs: list[Path], rows: list[dict[str, Any]]) -> dict[str, Any]:
+    run_items: list[dict[str, Any]] = []
+    for run_dir in run_dirs:
+        run_items.append(
+            {
+                "run_id": run_dir.name,
+                "attempts": _catalog_file_signature(attempts_path_for_run_dir(run_dir)),
+                "run_metadata": _catalog_file_signature(
+                    run_metadata_path_for_run_dir(run_dir)
+                ),
+            }
+        )
+    return {
+        "version": 1,
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "run_count": len(run_dirs),
+        "row_count": len(rows),
+        "runs": run_items,
+    }
+
+
+def _attempt_catalog_manifest_matches_run_dirs(
+    manifest_payload: dict[str, Any] | None,
+    run_dirs: list[Path],
+) -> bool:
+    if not isinstance(manifest_payload, dict):
+        return False
+    raw_runs = manifest_payload.get("runs")
+    if not isinstance(raw_runs, list):
+        return False
+    manifest_by_run_id: dict[str, dict[str, Any]] = {}
+    for item in raw_runs:
+        if not isinstance(item, dict):
+            return False
+        run_id = str(item.get("run_id") or "").strip()
+        if not run_id:
+            return False
+        manifest_by_run_id[run_id] = item
+    expected_run_ids = {run_dir.name for run_dir in run_dirs}
+    if set(manifest_by_run_id) != expected_run_ids:
+        return False
+    for run_dir in run_dirs:
+        manifest_item = manifest_by_run_id.get(run_dir.name) or {}
+        attempts_signature = manifest_item.get("attempts")
+        metadata_signature = manifest_item.get("run_metadata")
+        if attempts_signature != _catalog_file_signature(attempts_path_for_run_dir(run_dir)):
+            return False
+        if metadata_signature != _catalog_file_signature(run_metadata_path_for_run_dir(run_dir)):
+            return False
+    return True
+
+
+def _write_materialized_corpus_index(
+    config,
+    *,
+    run_dirs: list[Path],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
     summary = catalog_summary(rows)
-    audit_payload = build_full_backtest_audit(rows)
     write_json(config.attempt_catalog_json_path, rows)
     write_csv(config.attempt_catalog_csv_path, rows)
     write_json(config.attempt_catalog_summary_path, summary)
+    write_json(
+        config.attempt_catalog_manifest_path,
+        _attempt_catalog_manifest_payload(run_dirs, rows),
+    )
+    return summary
+
+
+def _load_materialized_corpus_index_rows(
+    config,
+    *,
+    run_dirs: list[Path],
+) -> list[dict[str, Any]] | None:
+    rows_payload = load_json_if_exists(config.attempt_catalog_json_path)
+    if not isinstance(rows_payload, list) or not all(
+        isinstance(row, dict) for row in rows_payload
+    ):
+        return None
+    manifest_payload = load_json_if_exists(config.attempt_catalog_manifest_path)
+    if not _attempt_catalog_manifest_matches_run_dirs(manifest_payload, run_dirs):
+        return None
+    rows = [dict(row) for row in rows_payload if isinstance(row, dict)]
+    rows.sort(key=_full_backtest_priority_key)
+    return rows
+
+
+def _selection_corpus_rows(
+    config,
+    *,
+    run_ids: list[str] | None,
+    label: str,
+    as_json: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    run_dirs = _matching_run_dirs(config, run_ids)
+    full_corpus_scope = not run_ids
+    materialized_rows = _load_materialized_corpus_index_rows(config, run_dirs=run_dirs)
+    if materialized_rows is not None:
+        _phase_emit(
+            f"[{label}] using materialized corpus index {config.attempt_catalog_json_path}",
+            as_json=as_json,
+        )
+        return materialized_rows, {
+            "source": "materialized",
+            "path": str(config.attempt_catalog_json_path),
+            "manifest_path": str(config.attempt_catalog_manifest_path),
+            "refreshed": False,
+            "row_count": len(materialized_rows),
+            "run_count": len(run_dirs),
+            "summary": load_json_if_exists(config.attempt_catalog_summary_path),
+        }
+
+    _phase_emit(
+        f"[{label}] rebuilding corpus index from source artifacts",
+        as_json=as_json,
+    )
+    rebuilt_rows = _catalog_rows_for_run_dirs(
+        config,
+        run_dirs,
+        progress_callback=_catalog_phase_callback(label, as_json=as_json),
+    )
+    summary = catalog_summary(rebuilt_rows)
+    if full_corpus_scope:
+        summary = _write_materialized_corpus_index(
+            config,
+            run_dirs=run_dirs,
+            rows=rebuilt_rows,
+        )
+    return rebuilt_rows, {
+        "source": "cold_rebuild",
+        "path": str(config.attempt_catalog_json_path),
+        "manifest_path": str(config.attempt_catalog_manifest_path),
+        "refreshed": bool(full_corpus_scope),
+        "row_count": len(rebuilt_rows),
+        "run_count": len(run_dirs),
+        "summary": summary,
+    }
+
+
+def _refresh_global_derived_corpus_state(config) -> dict[str, Any]:
+    run_dirs = _matching_run_dirs(config, None)
+    rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    summary = _write_materialized_corpus_index(config, run_dirs=run_dirs, rows=rows)
+    audit_payload = build_full_backtest_audit(rows)
     write_json(config.full_backtest_audit_json_path, audit_payload)
     return {
         "run_count": len(run_dirs),
@@ -2714,6 +2873,7 @@ def _refresh_global_derived_corpus_state(config) -> dict[str, Any]:
         "attempt_catalog_json": str(config.attempt_catalog_json_path),
         "attempt_catalog_csv": str(config.attempt_catalog_csv_path),
         "attempt_catalog_summary_json": str(config.attempt_catalog_summary_path),
+        "attempt_catalog_manifest_json": str(config.attempt_catalog_manifest_path),
         "full_backtest_audit_json": str(config.full_backtest_audit_json_path),
         "summary": summary,
         "audit": audit_payload,
@@ -2825,6 +2985,18 @@ def _run_full_backtest_with_retry(
     *,
     job_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
+    def invoke(candidate: dict[str, Any]) -> dict[str, Any]:
+        if job_timeout_seconds is None:
+            return _run_full_backtest_for_attempt(config, candidate)
+        try:
+            return _run_full_backtest_for_attempt(
+                config, candidate, job_timeout_seconds=job_timeout_seconds
+            )
+        except TypeError as exc:
+            if "job_timeout_seconds" not in str(exc):
+                raise
+            return _run_full_backtest_for_attempt(config, candidate)
+
     artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
     if artifact_dir.exists():
         source_payload = resolve_attempt_scrutiny_source(
@@ -2854,9 +3026,7 @@ def _run_full_backtest_with_retry(
                     "seed_source": source_name,
                 }
     try:
-        return _run_full_backtest_for_attempt(
-            config, attempt, job_timeout_seconds=job_timeout_seconds
-        )
+        return invoke(attempt)
     except Exception as exc:
         message = str(exc)
         profile_path_raw = str(attempt.get("profile_path") or "").strip()
@@ -2865,6 +3035,7 @@ def _run_full_backtest_with_retry(
             (
                 "Selected-cell detail has not been computed yet" in message
                 or "Profile not found" in message
+                or "sensitivity-basket did not produce best-cell-path-detail.json" in message
             )
             and profile_path is not None
             and profile_path.exists()
@@ -2873,9 +3044,7 @@ def _run_full_backtest_with_retry(
             raise
     retry_attempt = dict(attempt)
     retry_attempt["profile_ref"] = ""
-    result = _run_full_backtest_for_attempt(
-        config, retry_attempt, job_timeout_seconds=job_timeout_seconds
-    )
+    result = invoke(retry_attempt)
     result["retry_mode"] = "local_profile_reupload"
     return result
 
@@ -4918,15 +5087,14 @@ def cmd_build_attempt_catalog(*, run_ids: list[str] | None, as_json: bool) -> in
     config = load_config()
     run_dirs = _matching_run_dirs(config, run_ids)
     rows = _catalog_rows_for_run_dirs(config, run_dirs)
-    summary = catalog_summary(rows)
-    write_json(config.attempt_catalog_json_path, rows)
-    write_csv(config.attempt_catalog_csv_path, rows)
-    write_json(config.attempt_catalog_summary_path, summary)
+    summary = _write_materialized_corpus_index(config, run_dirs=run_dirs, rows=rows)
     payload = {
         "run_count": len(run_dirs),
+        "attempt_count": len(rows),
         "attempt_catalog_json": str(config.attempt_catalog_json_path),
         "attempt_catalog_csv": str(config.attempt_catalog_csv_path),
         "attempt_catalog_summary_json": str(config.attempt_catalog_summary_path),
+        "attempt_catalog_manifest_json": str(config.attempt_catalog_manifest_path),
         "summary": summary,
     }
     print(json.dumps(payload, ensure_ascii=True, indent=2))
@@ -5497,11 +5665,11 @@ def cmd_build_shortlist_report(
     as_json: bool,
 ) -> int:
     config = load_config()
-    run_dirs = _matching_run_dirs(config, run_ids)
-    full_catalog_rows = _catalog_rows_for_run_dirs(
+    full_catalog_rows, corpus_index_info = _selection_corpus_rows(
         config,
-        run_dirs,
-        progress_callback=_catalog_phase_callback("shortlist", as_json=as_json),
+        run_ids=run_ids,
+        label="shortlist",
+        as_json=as_json,
     )
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
@@ -5666,6 +5834,7 @@ def cmd_build_shortlist_report(
 
     shortlist_payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
+        "corpus_index": corpus_index_info,
         "scope": {
             "is_canonical": is_canonical_report,
             "is_filtered": bool(run_ids or attempt_ids),
@@ -5852,11 +6021,11 @@ def cmd_build_portfolio(
         if exit_code != 0:
             raise SystemExit("Full-backtest catch-up failed during build-portfolio.")
 
-    run_dirs = _matching_run_dirs(config, run_ids)
-    full_catalog_rows = _catalog_rows_for_run_dirs(
+    full_catalog_rows, corpus_index_info = _selection_corpus_rows(
         config,
-        run_dirs,
-        progress_callback=_catalog_phase_callback("portfolio", as_json=as_json),
+        run_ids=run_ids,
+        label="portfolio",
+        as_json=as_json,
     )
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
@@ -5869,27 +6038,17 @@ def cmd_build_portfolio(
     rows.sort(key=_full_backtest_priority_key)
 
     raw_sleeve_specs = list(portfolio_spec.get("sleeves") or [])
-    sleeve_filters: list[dict[str, Any]] = []
+    sleeve_prefilters: list[dict[str, Any]] = []
     for sleeve_spec in raw_sleeve_specs:
         sleeve_name = str(sleeve_spec.get("name") or "sleeve").strip()
-        candidate_rows, filter_rejections, max_drawdown_cap = filter_selection_candidate_rows(
-            rows,
-            candidate_limit=int(sleeve_spec.get("candidate_limit", -1)),
-            min_score_36=float(sleeve_spec.get("min_score_36", 40.0)),
-            min_retention_ratio=float(sleeve_spec.get("min_retention_ratio", 0.0)),
-            min_trades_per_month=float(sleeve_spec.get("min_trades_per_month", 0.0)),
-            max_drawdown_r=float(sleeve_spec.get("max_drawdown_r", -1.0)),
-            require_full_backtest_36=bool(sleeve_spec.get("require_full_backtest_36", True)),
+        prefilter_result = build_sleeve_prefilter(rows, sleeve_spec)
+        _phase_emit(
+            f"[portfolio] sleeve '{sleeve_name}' retained {len(prefilter_result.get('candidate_rows') or [])} "
+            f"of {len(prefilter_result.get('qualified_rows') or [])} qualified "
+            f"(prefilter_limit={prefilter_result.get('prefilter_limit')})",
+            as_json=as_json,
         )
-        sleeve_filters.append(
-            {
-                "name": sleeve_name,
-                "spec": dict(sleeve_spec),
-                "candidate_rows": candidate_rows,
-                "filter_rejections": filter_rejections,
-                "max_drawdown_cap": max_drawdown_cap,
-            }
-        )
+        sleeve_prefilters.append(prefilter_result)
 
     union_candidate_rows = merge_portfolio_sleeves(
         [
@@ -5898,7 +6057,7 @@ def cmd_build_portfolio(
                 "candidate_rows": item["candidate_rows"],
                 "selected_rows": [],
             }
-            for item in sleeve_filters
+            for item in sleeve_prefilters
         ]
     ).get("candidate_rows") or []
 
@@ -5910,57 +6069,16 @@ def cmd_build_portfolio(
     )
 
     sleeve_results = []
-    for sleeve in sleeve_filters:
+    for sleeve in sleeve_prefilters:
         sleeve_name = str(sleeve.get("name") or "sleeve").strip()
         _phase_emit(f"[portfolio] building sleeve '{sleeve_name}'", as_json=as_json)
-        sleeve_similarity_payload = subset_similarity_payload(
-            candidate_similarity_payload,
-            list(sleeve.get("candidate_rows") or []),
+        sleeve_result = finalize_sleeve_selection(
+            sleeve,
+            similarity_payload=candidate_similarity_payload,
         )
-        board = select_promotion_board(
-            list(sleeve.get("candidate_rows") or []),
-            sleeve_similarity_payload,
-            board_size=int(sleeve["spec"].get("shortlist_size", 12)),
-            novelty_penalty=float(sleeve["spec"].get("novelty_penalty", 18.0)),
-            drawdown_penalty=float(sleeve["spec"].get("drawdown_penalty", 0.65)),
-            trade_rate_bonus_weight=float(
-                sleeve["spec"].get("trade_rate_bonus_weight", 0.0)
-            ),
-            trade_rate_bonus_target=float(
-                sleeve["spec"].get("trade_rate_bonus_target", 8.0)
-            ),
-            max_drawdown_r=sleeve.get("max_drawdown_cap"),
-            max_sameness_to_board=(
-                None
-                if float(sleeve["spec"].get("max_sameness_to_board", 0.78)) < 0.0
-                else float(sleeve["spec"].get("max_sameness_to_board", 0.78))
-            ),
-            max_per_run=(
-                None
-                if int(sleeve["spec"].get("max_per_run", 1)) < 0
-                else int(sleeve["spec"]["max_per_run"])
-            ),
-            max_per_strategy_key=(
-                None
-                if int(sleeve["spec"].get("max_per_strategy_key", 1)) < 0
-                else int(sleeve["spec"]["max_per_strategy_key"])
-            ),
-        )
-        selected_rows = [dict(row) for row in (board.get("selected") or [])]
-        for rank, row in enumerate(selected_rows, start=1):
-            row["sleeve_name"] = sleeve_name
-            row["sleeve_selection_rank"] = rank
-        sleeve_result = {
-            "name": sleeve_name,
-            "spec": dict(sleeve["spec"]),
-            "candidate_rows": list(sleeve.get("candidate_rows") or []),
-            "filter_rejections": sleeve.get("filter_rejections") or {},
-            "similarity_payload": sleeve_similarity_payload,
-            "board": board,
-            "selected_rows": selected_rows,
-        }
         _phase_emit(
-            f"[portfolio] sleeve '{sleeve_name}' selected {len(selected_rows)} from {len(sleeve_result.get('candidate_rows') or [])} qualified",
+            f"[portfolio] sleeve '{sleeve_name}' selected {len(sleeve_result.get('selected_rows') or [])} "
+            f"from {len(sleeve_result.get('candidate_rows') or [])} prefiltered candidates",
             as_json=as_json,
         )
         sleeve_results.append(sleeve_result)
@@ -6046,6 +6164,10 @@ def cmd_build_portfolio(
             {
                 "name": sleeve.get("name"),
                 "spec": sleeve.get("spec") or {},
+                "qualified_count": len(sleeve.get("qualified_rows") or []),
+                "prefilter_limit": sleeve.get("prefilter_limit"),
+                "prefilter_retained_count": len(sleeve.get("candidate_rows") or []),
+                "prefilter_excluded_count": int(sleeve.get("prefilter_excluded_count") or 0),
                 "candidate_count": len(sleeve.get("candidate_rows") or []),
                 "selected_count": len(sleeve.get("selected_rows") or []),
                 "alternate_count": len(board.get("alternates") or []),
@@ -6056,20 +6178,31 @@ def cmd_build_portfolio(
                 "candidate_trade_rate_summary": _trade_rate_summary(
                     list(sleeve.get("candidate_rows") or [])
                 ),
-                "selected": list(sleeve.get("selected_rows") or []),
-                "alternates": list(board.get("alternates") or []),
+                "selected": _public_portfolio_rows(
+                    list(sleeve.get("selected_rows") or [])
+                ),
+                "alternates": _public_portfolio_rows(
+                    list(board.get("alternates") or [])
+                ),
             }
         )
 
+    public_portfolio_rows = _public_portfolio_rows(portfolio_rows)
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
         "portfolio_name": portfolio_name,
         "portfolio_config_path": str(spec_path),
         "portfolio_config_defaulted": used_defaults,
         "portfolio_spec": portfolio_spec,
+        "corpus_index": {
+            **corpus_index_info,
+            "scoped_row_count": len(rows),
+        },
         "catch_up_summary": catch_up_summary,
         "run_ids": run_ids,
         "attempt_ids": attempt_ids,
+        "corpus_row_count": corpus_index_info.get("row_count"),
+        "scoped_row_count": len(rows),
         "export_bundle": None,
         "candidate_union_count": len(portfolio_candidate_rows),
         "selected_union_count": len(portfolio_rows),
@@ -6079,7 +6212,7 @@ def cmd_build_portfolio(
         "selected_basket_summary": _build_selection_basket_summary(portfolio_rows),
         "selected_basket_curve_36m": _build_selection_basket_curve(portfolio_rows),
         "sleeves": sleeves_payload,
-        "selected": portfolio_rows,
+        "selected": public_portfolio_rows,
         "charts": {
             "portfolio_candidate_score_vs_trades": str(
                 charts_root / "portfolio-candidate-score-vs-trades-36mo.png"
@@ -6114,7 +6247,7 @@ def cmd_build_portfolio(
     write_json(report_root / "portfolio-report.json", payload)
     write_csv(
         report_root / "portfolio-report.csv",
-        [{"section": "selected", **row} for row in portfolio_rows],
+        [{"section": "selected", **row} for row in public_portfolio_rows],
     )
     profile_drop_results: list[dict[str, Any]] = []
     if bool(portfolio_spec.get("generate_profile_drops")) and portfolio_rows:
@@ -6150,6 +6283,9 @@ def cmd_build_portfolio(
                 "portfolio_json": str(report_root / "portfolio-report.json"),
                 "portfolio_csv": str(report_root / "portfolio-report.csv"),
                 "portfolio_name": portfolio_name,
+                "corpus_index_source": corpus_index_info.get("source"),
+                "corpus_row_count": corpus_index_info.get("row_count"),
+                "scoped_row_count": len(rows),
                 "candidate_union_count": len(portfolio_candidate_rows),
                 "selected_union_count": len(portfolio_rows),
                 "selected_overlap_count": int(merged.get("selected_overlap_count") or 0),
@@ -6161,7 +6297,7 @@ def cmd_build_portfolio(
                 ),
                 "export_bundle": export_bundle_summary,
                 "charts": payload["charts"],
-                "selected": portfolio_rows,
+                "selected": public_portfolio_rows,
             },
             ensure_ascii=True,
             indent=2,
@@ -6725,6 +6861,106 @@ def _human_bundle_item_token(
     return token
 
 
+def _public_portfolio_row(row: dict[str, Any]) -> dict[str, Any]:
+    public = dict(row)
+    public.pop("profile_path", None)
+    public.pop("destination_path", None)
+    public.pop("source_profile_path", None)
+    return public
+
+
+def _public_portfolio_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        _public_portfolio_row(item)
+        for item in rows
+        if isinstance(item, dict)
+    ]
+
+
+def _candidate_profile_path_for_run(run_dir: Path, candidate_name: str) -> Path | None:
+    candidate_name = candidate_name.strip()
+    if not candidate_name:
+        return None
+    modern_path = (run_dir / "profiles" / f"{candidate_name}.json").resolve()
+    if modern_path.exists():
+        return modern_path
+    legacy_path = (run_dir / "evals" / candidate_name / "profile.json").resolve()
+    if legacy_path.exists():
+        return legacy_path
+    return None
+
+
+def _resolve_portfolio_row_profile_path(
+    *,
+    config,
+    row: dict[str, Any],
+    attempts_cache: dict[str, list[dict[str, Any]]] | None = None,
+) -> Path | None:
+    profile_path_raw = str(row.get("profile_path") or "").strip()
+    if profile_path_raw:
+        profile_path = Path(profile_path_raw).resolve()
+        if profile_path.exists():
+            return profile_path
+
+    run_id = str(row.get("run_id") or "").strip()
+    candidate_name = str(row.get("candidate_name") or "").strip()
+    attempt_id = str(row.get("attempt_id") or "").strip()
+    profile_ref = str(row.get("profile_ref") or "").strip()
+    if not run_id:
+        return None
+
+    run_dir = config.runs_root / run_id
+    candidate_path = _candidate_profile_path_for_run(run_dir, candidate_name)
+    if candidate_path is not None:
+        return candidate_path
+
+    attempts_cache = attempts_cache if attempts_cache is not None else {}
+    attempts = attempts_cache.get(run_id)
+    if attempts is None:
+        attempts_path = attempts_path_for_run_dir(run_dir)
+        attempts = load_attempts(attempts_path) if attempts_path.exists() else []
+        attempts_cache[run_id] = attempts
+
+    matched_attempt = None
+    if attempt_id:
+        matched_attempt = next(
+            (
+                attempt
+                for attempt in attempts
+                if str(attempt.get("attempt_id") or "").strip() == attempt_id
+            ),
+            None,
+        )
+    if matched_attempt is None and profile_ref:
+        matched_attempt = next(
+            (
+                attempt
+                for attempt in attempts
+                if str(attempt.get("profile_ref") or "").strip() == profile_ref
+            ),
+            None,
+        )
+    if matched_attempt is None and candidate_name:
+        matched_attempt = next(
+            (
+                attempt
+                for attempt in attempts
+                if str(attempt.get("candidate_name") or "").strip() == candidate_name
+            ),
+            None,
+        )
+    if not isinstance(matched_attempt, dict):
+        return None
+
+    matched_profile_path_raw = str(matched_attempt.get("profile_path") or "").strip()
+    if matched_profile_path_raw:
+        matched_profile_path = Path(matched_profile_path_raw).resolve()
+        if matched_profile_path.exists():
+            return matched_profile_path
+    matched_candidate_name = str(matched_attempt.get("candidate_name") or "").strip()
+    return _candidate_profile_path_for_run(run_dir, matched_candidate_name)
+
+
 def _export_portfolio_bundle(
     *,
     config,
@@ -6752,6 +6988,7 @@ def _export_portfolio_bundle(
     missing_drop_attempts: list[str] = []
     manifest_rows: list[dict[str, Any]] = []
     used_item_tokens: set[str] = set()
+    attempts_cache: dict[str, list[dict[str, Any]]] = {}
 
     for rank, row in enumerate(selected_rows, start=1):
         attempt_id = str(row.get("attempt_id") or "").strip()
@@ -6763,8 +7000,11 @@ def _export_portfolio_bundle(
         )
         item_root = bundle_root / item_token
         item_root.mkdir(parents=True, exist_ok=True)
-        profile_path_raw = str(row.get("profile_path") or "").strip()
-        profile_path = Path(profile_path_raw).resolve() if profile_path_raw else None
+        profile_path = _resolve_portfolio_row_profile_path(
+            config=config,
+            row=row,
+            attempts_cache=attempts_cache,
+        )
         profile_export_path = item_root / f"{item_token}.json"
         has_profile = _copy_if_exists(profile_path, profile_export_path)
         if has_profile:
