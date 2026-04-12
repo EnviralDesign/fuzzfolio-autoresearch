@@ -398,6 +398,13 @@ def _read_json_if_exists(path: Path | None) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _write_json_payload(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def _extract_profile_instruments_from_payload(
     payload: dict[str, Any] | None,
 ) -> list[str]:
@@ -420,6 +427,27 @@ def _profile_root(payload: dict[str, Any] | None) -> dict[str, Any] | None:
     if isinstance(indicators, list):
         return payload
     return None
+
+
+def _ensure_profile_name_matches_candidate(
+    path: Path | None,
+    candidate_name: str | None,
+) -> dict[str, Any] | None:
+    desired = str(candidate_name or "").strip()
+    payload = _read_json_if_exists(path)
+    root = _profile_root(payload)
+    if not desired or path is None or not isinstance(root, dict):
+        return payload
+    current = str(root.get("name") or "").strip()
+    if current == desired:
+        return payload
+    root["name"] = desired
+    if isinstance(payload, dict):
+        try:
+            _write_json_payload(path, payload)
+        except OSError:
+            return payload
+    return payload
 
 
 def _summary_join(
@@ -540,12 +568,14 @@ def _candidate_summary_from_profile_payload(
         source_payload = payload if isinstance(payload, dict) else {"profile": profile}
         fingerprint = pi.fingerprint_for_json_object(source_payload)
     summary: dict[str, Any] = {
+        "candidate_name": str(draft_name or profile.get("name") or "").strip() or None,
         "draft_name": str(draft_name or profile.get("name") or "").strip() or None,
         "profile_name": str(profile.get("name") or "").strip() or None,
         "candidate_fingerprint": fingerprint,
         "family_id": family_id,
         "indicator_ids": indicator_ids,
         "indicator_instance_ids": instance_ids,
+        "instruments": instruments,
         "timeframe_summary": _summary_join(
             timeframes, separator=" + ", max_visible=4
         ),
@@ -561,6 +591,127 @@ def _candidate_summary_from_profile_payload(
         for key, value in summary.items()
         if value is not None and value != ""
     }
+
+
+def _prompt_visible_candidate_fields(
+    summary: dict[str, Any] | None,
+    *,
+    include_strategy: bool,
+    include_profile_ref: bool = True,
+) -> dict[str, Any]:
+    if not isinstance(summary, dict):
+        return {}
+    compact: dict[str, Any] = {}
+    candidate_name = str(
+        summary.get("candidate_name")
+        or summary.get("draft_name")
+        or summary.get("profile_name")
+        or ""
+    ).strip()
+    if candidate_name:
+        compact["candidate_name"] = candidate_name
+    if include_profile_ref:
+        profile_ref = str(summary.get("profile_ref") or "").strip()
+        if profile_ref:
+            compact["profile_ref"] = profile_ref
+    if include_strategy:
+        indicator_ids = summary.get("indicator_ids")
+        if isinstance(indicator_ids, list) and indicator_ids:
+            compact["indicator_ids"] = [
+                str(item).strip()
+                for item in indicator_ids
+                if str(item).strip()
+            ]
+        instruments = summary.get("instruments")
+        if isinstance(instruments, list) and instruments:
+            compact["instruments"] = [
+                str(item).strip() for item in instruments if str(item).strip()
+            ]
+        timeframe_summary = str(summary.get("timeframe_summary") or "").strip()
+        if timeframe_summary:
+            compact["timeframe_summary"] = timeframe_summary
+    return compact
+
+
+def _compact_compare_summary_for_prompt(
+    compare: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(compare, dict):
+        return None
+    best = compare.get("best") if isinstance(compare.get("best"), dict) else {}
+    compact: dict[str, Any] = {}
+    for key in ("quality_score", "signal_count", "timeframe", "dsr"):
+        if best.get(key) is not None:
+            compact[key] = best.get(key)
+    best_cell = best.get("best_cell")
+    if isinstance(best_cell, dict):
+        for key in ("resolved_trades", "avg_net_r_per_closed_trade"):
+            if best_cell.get(key) is not None:
+                compact[key] = best_cell.get(key)
+    best_path = best.get("best_cell_path_metrics")
+    if isinstance(best_path, dict):
+        for key in ("psr", "k_ratio", "sharpe_r", "max_drawdown_r"):
+            if best_path.get(key) is not None:
+                compact[key] = best_path.get(key)
+    market_window = best.get("market_data_window")
+    if isinstance(market_window, dict):
+        for key in ("effective_window_months", "window_truncated"):
+            if market_window.get(key) is not None:
+                compact[key] = market_window.get(key)
+    matrix_summary = best.get("matrix_summary")
+    if isinstance(matrix_summary, dict) and matrix_summary.get("positive_cell_ratio") is not None:
+        compact["positive_cell_ratio"] = matrix_summary.get("positive_cell_ratio")
+    return compact or None
+
+
+def _compact_sweep_summary_for_prompt(
+    summary: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(summary, dict):
+        return None
+    compact: dict[str, Any] = {}
+    for key in (
+        "fitness_metric",
+        "top_score",
+        "top_effective_window_months",
+        "parameter_importance_flat",
+        "recommended_interpretation",
+    ):
+        if summary.get(key) is not None:
+            compact[key] = summary.get(key)
+    top_parameters = summary.get("top_parameters")
+    if isinstance(top_parameters, dict) and top_parameters:
+        compact["top_parameters"] = top_parameters
+    return compact or None
+
+
+def _compact_ranked_comparison_for_prompt(
+    ranked: Any,
+) -> list[dict[str, Any]] | None:
+    if not isinstance(ranked, list) or not ranked:
+        return None
+    compact_rows: list[dict[str, Any]] = []
+    for row in ranked[:2]:
+        if not isinstance(row, dict):
+            continue
+        compact: dict[str, Any] = {}
+        for key in ("label", "artifact_dir", "quality_score"):
+            if row.get(key) is not None:
+                compact[key] = row.get(key)
+        best = row.get("best")
+        if isinstance(best, dict):
+            for key in ("quality_score", "signal_count", "timeframe"):
+                if best.get(key) is not None:
+                    compact[key] = best.get(key)
+            best_cell = best.get("best_cell")
+            if isinstance(best_cell, dict) and best_cell.get("resolved_trades") is not None:
+                compact["resolved_trades"] = best_cell.get("resolved_trades")
+            market_window = best.get("market_data_window")
+            if isinstance(market_window, dict) and market_window.get("effective_window_months") is not None:
+                compact["effective_window_months"] = market_window.get("effective_window_months")
+        if compact:
+            compact_rows.append(compact)
+    return compact_rows or None
 
 
 def _normalized_profile_material_changes(
@@ -2460,6 +2611,9 @@ class ResearchController:
             base_protocol = SFT_SYSTEM_PROTOCOL
         else:
             base_protocol = SYSTEM_PROTOCOL
+        durable_appendix = self._durable_system_appendix_text()
+        if durable_appendix:
+            base_protocol = base_protocol + "\n\n" + durable_appendix
         if policy.allow_finish:
             return base_protocol
         return base_protocol + "\n" + SUPERVISED_EXTRA_RULES
@@ -3188,6 +3342,53 @@ class ResearchController:
 
     def _program_text(self) -> str:
         return self.config.program_path.read_text(encoding="utf-8")
+
+    def _portable_profile_template_note_text(self) -> str:
+        return (
+            "Portable profile template note:\n"
+            "- The controller can scaffold from the portable template through prepare_profile.\n"
+            "- Do not hand-author a full profile from this template unless typed tools are unavailable."
+        )
+
+    def _tool_reference_text(self) -> str:
+        return (
+            "Typed tool reference (default lane — prefer these over run_cli):\n"
+            "- prepare_profile: mode scaffold_from_seed | clone_local | from_template; use candidate_name for run-owned drafts.\n"
+            "- mutate_profile: candidate_name or profile_ref; mutations [{path, value}][]; optional destination_candidate_name.\n"
+            "- validate_profile: candidate_name or profile_ref.\n"
+            "- register_profile: candidate_name or profile_ref; operation create|update; profile_ref required for update.\n"
+            "- evaluate_candidate: profile_ref first; candidate_name is acceptable for local unregistered drafts; include instruments[] plus optional timeframe_policy/timeframe/requested_horizon_months/evaluation_mode.\n"
+            "- run_parameter_sweep: profile_ref; axes[] strings; optional instruments[], output_dir, candidate_name_prefix.\n"
+            "- inspect_artifact: artifact_dir or attempt_id; view summary|files|curve_meta|request_meta.\n"
+            "- compare_artifacts: attempt_ids[] or artifact_dirs[].\n"
+            "Workflows:\n"
+            "- New candidate: prepare_profile -> validate_profile -> register_profile -> evaluate_candidate.\n"
+            "- Iterate: mutate_profile -> validate_profile -> evaluate_candidate.\n"
+            "- Sweep: run_parameter_sweep -> inspect_artifact / compare_artifacts.\n"
+            "- Read tool envelopes (ok, score, artifact_dir, auto_log, effective windows, warnings) before read_file/list_dir.\n"
+            "Controller-managed (do not fight it in tool choice):\n"
+            "- Injected lookback when omitted on evals; quality-score preset; bar-limit policy; phase horizon targets (see run packet).\n"
+            "Catalog discipline:\n"
+            "- Exact indicator meta ids; exact instrument symbols; instruments[] uses one array entry per symbol (no comma-joined tokens); never __BASKET__ as an instrument.\n"
+            "Search discipline:\n"
+            "- Explore multiple candidates; sweeps are normal (run_parameter_sweep); diversify early, prune weak basket members, do not finish early while budget remains.\n"
+            "Artifacts:\n"
+            "- sensitivity-response.json / deep-replay-job.json / best-cell-path-detail.json — prefer inspect_artifact and compare_artifacts over manual compare-sensitivity; no summary.json.\n"
+            "run_cli fallback:\n"
+            "- Help or recovery only, e.g. [\"help\"] or [\"help\",\"profiles\"]. Use typed tools for profiles, evals, and sweeps when available.\n"
+            "Extra:\n"
+            "- MA_CROSSOVER uses fastperiod, slowperiod, matype—not signalperiod.\n"
+            "- If register_profile fails, fix the profile before evaluate_candidate in a later step."
+        )
+
+    def _durable_system_appendix_text(self) -> str:
+        sections = [
+            f"Program:\n{self._program_text()}",
+            self._portable_profile_template_note_text(),
+            self._artifact_layout_text(),
+            f"Tool reference:\n{self._tool_reference_text()}",
+        ]
+        return "\n\n".join(section for section in sections if str(section).strip())
 
     def _short_family_id(self, family_id: str | None, *, limit: int = 28) -> str:
         text = str(family_id or "").strip()
@@ -4510,16 +4711,14 @@ class ResearchController:
         )
         parts: list[str] = []
         candidate_name = str(
-            candidate.get("draft_name")
-            or candidate.get("profile_name")
+            candidate.get("candidate_name")
             or result.get("candidate_name")
+            or candidate.get("draft_name")
+            or candidate.get("profile_name")
             or ""
         ).strip()
         if candidate_name:
             parts.append(f"candidate_name={candidate_name}")
-        family_id = str(candidate.get("family_id") or "").strip()
-        if family_id:
-            parts.append(f"family={family_id}")
         profile_ref = str(
             result.get("profile_ref")
             or result.get("created_profile_ref")
@@ -4911,35 +5110,6 @@ class ResearchController:
         score_target = self._score_target_snapshot(tool_context)
         next_action_template_text = self._followup_next_action_template_text(tool_context)
         soft_wrap_note = self._soft_wrap_note(policy)
-        tool_reference = (
-            "Typed tool reference (default lane — prefer these over run_cli):\n"
-            "- prepare_profile: mode scaffold_from_seed | clone_local | from_template; use candidate_name for run-owned drafts.\n"
-            "- mutate_profile: candidate_name or profile_ref; mutations [{path, value}][]; optional destination_candidate_name.\n"
-            "- validate_profile: candidate_name or profile_ref.\n"
-            "- register_profile: candidate_name or profile_ref; operation create|update; profile_ref required for update.\n"
-            "- evaluate_candidate: profile_ref first; candidate_name is acceptable for local unregistered drafts; include instruments[] plus optional timeframe_policy/timeframe/requested_horizon_months/evaluation_mode.\n"
-            "- run_parameter_sweep: profile_ref; axes[] strings; optional instruments[], output_dir, candidate_name_prefix.\n"
-            "- inspect_artifact: artifact_dir or attempt_id; view summary|files|curve_meta|request_meta.\n"
-            "- compare_artifacts: attempt_ids[] or artifact_dirs[].\n"
-            "Workflows:\n"
-            "- New candidate: prepare_profile -> validate_profile -> register_profile -> evaluate_candidate.\n"
-            "- Iterate: mutate_profile -> validate_profile -> evaluate_candidate.\n"
-            "- Sweep: run_parameter_sweep -> inspect_artifact / compare_artifacts.\n"
-            "- Read tool envelopes (ok, score, artifact_dir, auto_log, effective windows, warnings) before read_file/list_dir.\n"
-            "Controller-managed (do not fight it in tool choice):\n"
-            "- Injected lookback when omitted on evals; quality-score preset; bar-limit policy; phase horizon targets (see packet above).\n"
-            "Catalog discipline:\n"
-            "- Exact indicator meta ids; exact instrument symbols; instruments[] uses one array entry per symbol (no comma-joined tokens); never __BASKET__ as an instrument.\n"
-            "Search discipline:\n"
-            "- Explore multiple candidates; sweeps are normal (run_parameter_sweep); diversify early, prune weak basket members, do not finish early while budget remains.\n"
-            "Artifacts:\n"
-            "- sensitivity-response.json / deep-replay-job.json / best-cell-path-detail.json — prefer inspect_artifact and compare_artifacts over manual compare-sensitivity; no summary.json.\n"
-            "run_cli fallback:\n"
-            "- Help or recovery only, e.g. [\"help\"] or [\"help\",\"profiles\"]. Use typed tools for profiles, evals, and sweeps when available.\n"
-            "Extra:\n"
-            "- MA_CROSSOVER uses fastperiod, slowperiod, matype—not signalperiod.\n"
-            "- If register_profile fails, fix the profile before evaluate_candidate in a later step.\n"
-        )
         return (
             f"Mode: {policy.mode_name}\n"
             f"Run id: {tool_context.run_id}\n"
@@ -4963,22 +5133,16 @@ class ResearchController:
             f"{self._branch_lifecycle_run_packet_text(tool_context, effective_step, effective_step_limit)}\n\n"
             f"{self._retention_and_exploit_status_text(tool_context)}\n\n"
             f"{self._timeframe_mismatch_status_text()}\n\n"
-            f"Program:\n{self._program_text()}\n\n"
             f"Current seed hand:\n{self._seed_text(tool_context)}\n\n"
-            "Portable profile template note:\n"
-            "- The controller can scaffold from the portable template through prepare_profile.\n"
-            "- Do not hand-author a full profile from this template unless typed tools are unavailable.\n\n"
             f"Sticky indicator context:\n{tool_context.indicator_catalog_summary or 'Unavailable'}\n\n"
             f"Seeded indicator parameter hints:\n{tool_context.seed_indicator_parameter_hints or 'Unavailable'}\n\n"
             f"Sticky instrument context:\n{tool_context.instrument_catalog_summary or 'Unavailable'}\n\n"
             f"{self._seed_to_catalog_hints_text(self._seed_indicator_ids(tool_context.seed_prompt_path))}\n\n"
-            f"{self._artifact_layout_text()}\n\n"
             f"Run-owned profiles so far:\n{self._run_owned_profiles_summary(tool_context)}\n\n"
             f"Checkpoint summary:\n{checkpoint}\n\n"
             f"Recent attempts:\n{self._recent_attempts_summary(tool_context)}\n\n"
             f"Raw frontier snapshot (informational only; not leadership authority):\n{self._frontier_snapshot_text(tool_context)}\n\n"
             f"{self._recent_behavior_digest_text(tool_context)}\n"
-            f"\nTool reference:\n{tool_reference}\n"
         )
 
     def _local_seed_context_prompt_state(
@@ -5238,7 +5402,8 @@ class ResearchController:
             else {}
         )
         candidate_name = str(
-            latest_result.get("candidate_name")
+            candidate_summary.get("candidate_name")
+            or latest_result.get("candidate_name")
             or candidate_summary.get("draft_name")
             or candidate_summary.get("profile_name")
             or ""
@@ -5494,94 +5659,39 @@ class ResearchController:
                 "tool": tool,
                 "ok": bool(result.get("ok")),
             }
-            if result.get("created_profile_ref"):
-                summarized["created_profile_ref"] = result.get("created_profile_ref")
-            if result.get("auto_log") is not None:
-                summarized["auto_log"] = result.get("auto_log")
-            if isinstance(result.get("candidate_summary"), dict):
-                summarized["candidate"] = result.get("candidate_summary")
+            candidate_summary = (
+                result.get("candidate_summary")
+                if isinstance(result.get("candidate_summary"), dict)
+                else None
+            )
+            candidate_name = str(
+                result.get("candidate_name")
+                or (candidate_summary or {}).get("candidate_name")
+                or ""
+            ).strip()
+            if candidate_name:
+                summarized["candidate_name"] = candidate_name
+            profile_ref = str(
+                result.get("profile_ref")
+                or result.get("created_profile_ref")
+                or (candidate_summary or {}).get("profile_ref")
+                or ""
+            ).strip()
+            if profile_ref:
+                summarized["profile_ref"] = profile_ref
             if result.get("controller_hint"):
                 summarized["controller_hint"] = str(result.get("controller_hint"))[:220]
-            if result.get("artifact_kind"):
-                summarized["artifact_kind"] = result.get("artifact_kind")
-            if result.get("inspect_ref"):
-                summarized["inspect_ref"] = str(result.get("inspect_ref"))[:120]
-            if result.get("quality_score_preset"):
-                summarized["quality_score_preset"] = str(
-                    result.get("quality_score_preset")
-                )[:80]
-            if result.get("ready_for_registration") is not None:
-                summarized["ready_for_registration"] = bool(
-                    result.get("ready_for_registration")
-                )
-            if result.get("ready_to_evaluate") is not None:
-                summarized["ready_to_evaluate"] = bool(result.get("ready_to_evaluate"))
-            if result.get("material_changes") is not None:
-                summarized["material_changes"] = bool(result.get("material_changes"))
             if isinstance(payload, dict):
                 argv = payload.get("argv")
                 cli_args = argv if isinstance(argv, list) else []
-                command_head = [str(item) for item in cli_args[-3:]]
-                returncode = payload.get("returncode")
-                if returncode is not None:
-                    summarized["returncode"] = returncode
                 stdout = payload.get("stdout")
                 stderr = payload.get("stderr")
                 parsed = payload.get("parsed_json")
                 if isinstance(parsed, dict):
-                    preview_keys = [
-                        "data",
-                        "id",
-                        "requested_timeframe",
-                        "effective_timeframe",
-                        "status",
-                    ]
-                    summarized["parsed_json_keys"] = [
-                        key for key in preview_keys if key in parsed
-                    ][:8]
                     if len(cli_args) >= 1:
                         if "compare-sensitivity" in cli_args:
-                            best = parsed.get("best")
-                            if isinstance(best, dict):
-                                best_cell = best.get("best_cell")
-                                best_path = best.get("best_cell_path_metrics")
-                                market_window = best.get("market_data_window")
-                                matrix_summary = best.get("matrix_summary")
-                                compare_summary: dict[str, Any] = {
-                                    "quality_score": best.get("quality_score"),
-                                    "signal_count": best.get("signal_count"),
-                                    "timeframe": best.get("timeframe"),
-                                }
-                                if isinstance(best_cell, dict):
-                                    compare_summary["resolved_trades"] = best_cell.get(
-                                        "resolved_trades"
-                                    )
-                                    compare_summary["avg_net_r_per_closed_trade"] = (
-                                        best_cell.get("avg_net_r_per_closed_trade")
-                                    )
-                                if isinstance(best_path, dict):
-                                    compare_summary["psr"] = best_path.get("psr")
-                                    compare_summary["dsr"] = best.get("dsr")
-                                    compare_summary["k_ratio"] = best_path.get(
-                                        "k_ratio"
-                                    )
-                                    compare_summary["sharpe_r"] = best_path.get(
-                                        "sharpe_r"
-                                    )
-                                    compare_summary["max_drawdown_r"] = best_path.get(
-                                        "max_drawdown_r"
-                                    )
-                                if isinstance(market_window, dict):
-                                    compare_summary["effective_window_months"] = (
-                                        market_window.get("effective_window_months")
-                                    )
-                                    compare_summary["window_truncated"] = (
-                                        market_window.get("window_truncated")
-                                    )
-                                if isinstance(matrix_summary, dict):
-                                    compare_summary["positive_cell_ratio"] = (
-                                        matrix_summary.get("positive_cell_ratio")
-                                    )
+                            compare_summary = _compact_compare_summary_for_prompt(parsed)
+                            if compare_summary:
                                 summarized["compare_summary"] = compare_summary
                 if bool(result.get("timeframe_auto_adjusted")):
                     summarized["timeframe_auto_adjusted"] = True
@@ -5593,39 +5703,138 @@ class ResearchController:
                     and not bool(result.get("ok"))
                 ):
                     summarized["stderr"] = stderr[:500]
-            if tool == "evaluate_candidate":
+            if tool in {"prepare_profile", "mutate_profile", "validate_profile"}:
+                summarized.update(
+                    _prompt_visible_candidate_fields(
+                        candidate_summary,
+                        include_strategy=True,
+                        include_profile_ref=False,
+                    )
+                )
+                if tool == "mutate_profile" and result.get("mutation_summary"):
+                    summarized["mutation_summary"] = str(result.get("mutation_summary"))[:120]
+            elif tool == "register_profile":
+                summarized.update(
+                    _prompt_visible_candidate_fields(
+                        candidate_summary,
+                        include_strategy=False,
+                        include_profile_ref=True,
+                    )
+                )
+            elif tool == "evaluate_candidate":
+                attempt_id = str(result.get("attempt_id") or "").strip()
+                if attempt_id:
+                    summarized["attempt_id"] = attempt_id
                 if result.get("score") is not None:
-                    summarized["typed_score"] = result.get("score")
+                    summarized["score"] = result.get("score")
+                if result.get("effective_window_months") is not None:
+                    summarized["effective_window_months"] = result.get(
+                        "effective_window_months"
+                    )
+                if result.get("trades_per_month") is not None:
+                    summarized["trades_per_month"] = result.get("trades_per_month")
+                if result.get("resolved_trades") is not None:
+                    summarized["resolved_trades"] = result.get("resolved_trades")
                 if result.get("artifact_dir"):
                     summarized["artifact_dir"] = result.get("artifact_dir")
+                requested_timeframe = str(result.get("requested_timeframe") or "").strip()
+                effective_timeframe = str(result.get("effective_timeframe") or "").strip()
+                if requested_timeframe and effective_timeframe:
+                    summarized["timeframes"] = {
+                        "requested": requested_timeframe,
+                        "effective": effective_timeframe,
+                    }
+            elif tool == "run_parameter_sweep":
+                if result.get("inspect_ref"):
+                    summarized["inspect_ref"] = str(result.get("inspect_ref"))[:120]
+                if result.get("artifact_dir"):
+                    summarized["artifact_dir"] = str(result.get("artifact_dir"))[:260]
+                if result.get("best_score") is not None:
+                    summarized["best_score"] = result.get("best_score")
+                if result.get("quality_score_preset"):
+                    summarized["quality_score_preset"] = str(
+                        result.get("quality_score_preset")
+                    )[:80]
+            if result.get("ready_for_registration") is not None:
+                summarized["ready_for_registration"] = bool(
+                    result.get("ready_for_registration")
+                )
+            if result.get("ready_to_evaluate") is not None:
+                summarized["ready_to_evaluate"] = bool(result.get("ready_to_evaluate"))
+            if result.get("material_changes") is not None:
+                summarized["material_changes"] = bool(result.get("material_changes"))
             return summarized
         if tool == "inspect_artifact":
             summarized = {
                 "tool": tool,
                 "ok": bool(result.get("ok", True)),
                 "artifact_dir": result.get("artifact_dir"),
-                "view": result.get("view"),
             }
+            view = str(result.get("view") or "").strip()
+            if view and view != "summary":
+                summarized["view"] = view
             if result.get("artifact_kind"):
                 summarized["artifact_kind"] = result.get("artifact_kind")
             if isinstance(result.get("sweep_summary"), dict):
-                summarized["sweep_summary"] = result.get("sweep_summary")
+                compact_sweep = _compact_sweep_summary_for_prompt(
+                    result.get("sweep_summary")
+                )
+                if compact_sweep:
+                    summarized["sweep_summary"] = compact_sweep
             if isinstance(result.get("compare_summary"), dict):
-                summarized["compare_summary"] = result.get("compare_summary")
+                compact_compare = _compact_compare_summary_for_prompt(
+                    result.get("compare_summary")
+                )
+                if compact_compare:
+                    summarized["compare_summary"] = compact_compare
             if result.get("effective_window_months_hint") is not None:
                 summarized["effective_window_months_hint"] = result.get(
                     "effective_window_months_hint"
                 )
+            attempt_hint = (
+                result.get("attempt_ledger_hint")
+                if isinstance(result.get("attempt_ledger_hint"), dict)
+                else None
+            )
+            if attempt_hint:
+                compact_attempt_hint = {
+                    key: attempt_hint.get(key)
+                    for key in (
+                        "attempt_id",
+                        "composite_score",
+                        "effective_window_months",
+                        "requested_timeframe",
+                        "effective_timeframe",
+                        "validation_outcome",
+                    )
+                    if attempt_hint.get(key) is not None
+                }
+                if compact_attempt_hint:
+                    summarized["attempt"] = compact_attempt_hint
             if result.get("controller_hint"):
                 summarized["controller_hint"] = str(result.get("controller_hint"))[:220]
             return summarized
         if tool == "compare_artifacts":
-            return {
+            summarized = {
                 "tool": tool,
                 "ok": bool(result.get("ok", True)),
-                "ranked_preview": result.get("ranked_comparison"),
-                "dominant_deltas": result.get("dominant_deltas"),
             }
+            ranked_preview = _compact_ranked_comparison_for_prompt(
+                result.get("ranked_comparison")
+            )
+            if ranked_preview:
+                summarized["ranked_preview"] = ranked_preview
+            dominant_deltas = result.get("dominant_deltas")
+            if isinstance(dominant_deltas, list) and dominant_deltas:
+                summarized["dominant_deltas"] = dominant_deltas[:3]
+            suggested = str(
+                result.get("suggested_next_move")
+                or result.get("next_recommended_action")
+                or ""
+            ).strip()
+            if suggested:
+                summarized["suggested_next_move"] = suggested[:180]
+            return summarized
         if tool == "read_file":
             content = str(result.get("content", ""))
             return {
@@ -5654,6 +5863,20 @@ class ResearchController:
         if tool in {"yield_guard", "finish"}:
             return result
         return result
+
+    def _history_tool_results_message_content(
+        self,
+        results: list[dict[str, Any]],
+    ) -> str:
+        return "Tool results:\n" + json.dumps(
+            [
+                self._history_result_summary(result)
+                for result in results
+                if isinstance(result, dict)
+            ],
+            ensure_ascii=True,
+            indent=2,
+        )
 
     def _validate_action(self, action: Any) -> str | None:
         if not isinstance(action, dict):
@@ -6673,8 +6896,9 @@ class ResearchController:
                 )
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(tpl, dest)
+            payload = _ensure_profile_name_matches_candidate(dest, name)
             candidate_summary = _candidate_summary_from_profile_payload(
-                _read_json_if_exists(dest),
+                payload,
                 profile_path=dest,
                 draft_name=name,
             )
@@ -6742,8 +6966,9 @@ class ResearchController:
             base["profile_name"] = name
             base["candidate_name"] = name
             base["indicator_ids"] = action.get("indicator_ids")
+            payload = _ensure_profile_name_matches_candidate(dest, name)
             base["candidate_summary"] = _candidate_summary_from_profile_payload(
-                _read_json_if_exists(dest),
+                payload,
                 profile_path=dest,
                 draft_name=name,
             )
@@ -6796,8 +7021,9 @@ class ResearchController:
             base["profile_name"] = name
             base["candidate_name"] = name
             base["indicator_ids"] = ids
+            payload = _ensure_profile_name_matches_candidate(dest, name)
             base["candidate_summary"] = _candidate_summary_from_profile_payload(
-                _read_json_if_exists(dest),
+                payload,
                 profile_path=dest,
                 draft_name=name,
             )
@@ -6899,6 +7125,12 @@ class ResearchController:
         base["candidate_name"] = str(out_path.stem)
         base["applied_mutations"] = applied
         base["mutation_summary"] = f"{len(applied)} patch operation(s)"
+        payload = _ensure_profile_name_matches_candidate(out_path, str(out_path.stem))
+        base["candidate_summary"] = _candidate_summary_from_profile_payload(
+            payload,
+            profile_path=out_path if out_path.exists() else None,
+            draft_name=str(out_path.stem),
+        )
         if base.get("ok"):
             base["next_recommended_action"] = "validate_profile"
         arts = dict(base.get("artifacts") or {})
@@ -6961,6 +7193,7 @@ class ResearchController:
             if isinstance(normalized_profile, dict)
             else source_payload,
             profile_path=path if path.exists() else None,
+            draft_name=str(path.stem),
         )
         base["validation_ok"] = bool(base.get("ok"))
         base["candidate_summary"] = candidate_summary
@@ -7077,6 +7310,7 @@ class ResearchController:
         base["candidate_summary"] = _candidate_summary_from_profile_payload(
             _read_json_if_exists(path),
             profile_path=path if path.exists() else None,
+            draft_name=str(path.stem),
             profile_ref=str(profile_ref).strip() if isinstance(profile_ref, str) else None,
         )
         base["ready_to_evaluate"] = bool(base.get("ok") and profile_ref)
@@ -8944,10 +9178,8 @@ class ResearchController:
                 messages.append(
                     ChatMessage(
                         role="user",
-                        content="Tool results:\n"
-                        + json.dumps(
-                            [self._history_result_summary(step_payload["results"][0])],
-                            ensure_ascii=True,
+                        content=self._history_tool_results_message_content(
+                            [step_payload["results"][0]]
                         ),
                     )
                 )
@@ -9116,16 +9348,12 @@ class ResearchController:
             messages.append(
                 ChatMessage(
                     role="user",
-                    content=(
-                        "Tool results:\n"
-                        + json.dumps(
-                            [
-                                self._history_result_summary(result)
-                                for result in step_payload["results"]
-                                if isinstance(result, dict)
-                            ],
-                            ensure_ascii=True,
-                        )
+                    content=self._history_tool_results_message_content(
+                        [
+                            result
+                            for result in step_payload["results"]
+                            if isinstance(result, dict)
+                        ]
                     ),
                 )
             )

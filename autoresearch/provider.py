@@ -254,11 +254,65 @@ def _snapshot_safe_name(value: str | None, *, fallback: str) -> str:
     return normalized or fallback
 
 
+def _pretty_json_text(raw: str) -> str | None:
+    text = str(raw or "").strip()
+    if not text or text[0] not in "[{":
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return json.dumps(payload, ensure_ascii=True, indent=4)
+
+
+def _format_planned_action_line(line: str) -> str:
+    body = str(line or "").rstrip()
+    if not body.startswith("- "):
+        return body
+    payload = body[2:].strip()
+    pretty = _pretty_json_text(payload)
+    if pretty is None:
+        return body
+    pretty_lines = pretty.splitlines()
+    return "\n".join(
+        [f"- {pretty_lines[0]}"] + [f"  {item}" for item in pretty_lines[1:]]
+    )
+
+
+def _format_request_snapshot_message_content(content: str) -> str:
+    text = str(content or "")
+    if text.startswith("Tool results:\n"):
+        raw_json = text.partition("\n")[2]
+        pretty = _pretty_json_text(raw_json)
+        if pretty is not None:
+            return "Tool results:\n" + pretty
+        return text.rstrip()
+    if text.startswith("Reasoning:"):
+        lines = text.splitlines()
+        rendered: list[str] = []
+        in_actions = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped == "Planned actions:":
+                in_actions = True
+                rendered.append("Planned actions:")
+                continue
+            if in_actions:
+                rendered.append(_format_planned_action_line(line))
+            else:
+                rendered.append(line)
+        return "\n".join(rendered).rstrip()
+    pretty = _pretty_json_text(text)
+    if pretty is not None:
+        return pretty
+    return text.rstrip()
+
+
 def _format_request_snapshot_messages(messages: list[ChatMessage]) -> str:
     sections: list[str] = []
     for index, message in enumerate(messages, start=1):
         sections.append(f"[message {index}] role={message.role}")
-        sections.append(message.content)
+        sections.append(_format_request_snapshot_message_content(message.content))
         sections.append("")
     return "\n".join(sections).rstrip()
 

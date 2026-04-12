@@ -466,6 +466,7 @@ def test_system_protocol_uses_opening_contract_for_true_opening_step_across_prov
     controller.config.provider = SimpleNamespace(provider_type="openai")
     controller.last_created_profile_ref = None
     controller._load_recent_step_payloads = lambda *_args, **_kwargs: []
+    controller._durable_system_appendix_text = lambda: "Program:\npolicy"
     tool_context = SimpleNamespace(run_dir=Path("C:/runs/example"))
 
     protocol = controller._system_protocol_text(
@@ -474,7 +475,67 @@ def test_system_protocol_uses_opening_contract_for_true_opening_step_across_prov
         step=1,
     )
 
-    assert protocol == LOCAL_OPENING_STEP_PROTOCOL
+    assert protocol.startswith(LOCAL_OPENING_STEP_PROTOCOL)
+    assert "Program:\npolicy" in protocol
+
+
+def test_run_state_prompt_keeps_live_state_and_moves_durable_doctrine_out_of_user_packet() -> None:
+    controller = _make_controller()
+    controller.config.provider = SimpleNamespace(provider_type="openai")
+    controller._uses_local_transformers_provider = lambda: False
+    controller._checkpoint_path = lambda _tool_context: Path("C:/nonexistent/checkpoint.txt")
+    controller._run_phase_info = lambda *_args, **_kwargs: {
+        "name": "early",
+        "summary": "Phase summary",
+    }
+    controller._horizon_policy_snapshot = lambda *_args, **_kwargs: {
+        "summary": "12 months",
+        "guidance": "Use 12 months",
+        "rationale": "durability",
+    }
+    controller._score_target_snapshot = lambda *_args, **_kwargs: {
+        "summary": "Find a scorer",
+        "rationale": "need evidence",
+    }
+    controller._followup_next_action_template_text = lambda *_args, **_kwargs: "None"
+    controller._soft_wrap_note = lambda *_args, **_kwargs: None
+    controller._current_research_priority_text = lambda *_args, **_kwargs: "Priority block"
+    controller._manager_guidance_text = lambda *_args, **_kwargs: "Manager block"
+    controller._run_outcome_text = lambda *_args, **_kwargs: "Outcome block"
+    controller._working_memory_text = lambda *_args, **_kwargs: "Working memory block"
+    controller._branch_lifecycle_run_packet_text = lambda *_args, **_kwargs: "Branch block"
+    controller._retention_and_exploit_status_text = lambda *_args, **_kwargs: "Retention block"
+    controller._timeframe_mismatch_status_text = lambda *_args, **_kwargs: "Timeframe block"
+    controller._seed_text = lambda *_args, **_kwargs: '{"indicators":["ADX"]}'
+    controller._seed_indicator_ids = lambda *_args, **_kwargs: ["ADX"]
+    controller._seed_to_catalog_hints_text = lambda *_args, **_kwargs: "Seed hints"
+    controller._run_owned_profiles_summary = lambda *_args, **_kwargs: "No profiles"
+    controller._recent_attempts_summary = lambda *_args, **_kwargs: "No attempts"
+    controller._frontier_snapshot_text = lambda *_args, **_kwargs: "No frontier"
+    controller._recent_behavior_digest_text = lambda *_args, **_kwargs: "Behavior digest: none"
+
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        seed_prompt_path=Path("C:/runs/example/seed-prompt.json"),
+        indicator_catalog_summary="Indicator facts",
+        seed_indicator_parameter_hints="Hint block",
+        instrument_catalog_summary="Instrument facts",
+    )
+
+    prompt = controller._run_state_prompt(
+        tool_context,
+        ctrlmod.RunPolicy(mode_name="run"),
+        step=1,
+        step_limit=10,
+    )
+
+    assert "Current seed hand:" in prompt
+    assert "Sticky indicator context:" in prompt
+    assert "Recent attempts:" in prompt
+    assert "Program:" not in prompt
+    assert "Portable profile template note:" not in prompt
+    assert "Tool reference:" not in prompt
+    assert "Sensitivity artifact layout (on disk after evaluations):" not in prompt
 
 
 def test_followup_next_action_template_suggests_validate_after_prepare() -> None:

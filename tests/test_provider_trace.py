@@ -81,3 +81,46 @@ def test_build_parser_accepts_llm_request_snapshot_flag() -> None:
     args = parser.parse_args(["supervise", "--llm-request-snapshots"])
     assert args.command == "supervise"
     assert args.llm_request_snapshots is True
+
+
+def test_request_snapshot_pretty_prints_assistant_actions_and_tool_results(tmp_path: Path) -> None:
+    with provider_trace_scope(
+        label="explorer",
+        run_id="run-b",
+        step=3,
+        phase="explorer_provider",
+        provider_type="lmstudio",
+        model="gemma-4-E4B-it",
+        request_snapshot_dir=str(tmp_path),
+    ):
+        _write_provider_request_snapshot(
+            "chat_completions_request",
+            messages=[
+                ChatMessage(
+                    role="assistant",
+                    content=(
+                        "Reasoning: Validation succeeded.\n"
+                        "Planned actions:\n"
+                        '- {"tool":"register_profile","candidate_name":"cand-a"}'
+                    ),
+                ),
+                ChatMessage(
+                    role="user",
+                    content=(
+                        'Tool results:\n[{"tool":"validate_profile","ok":true,'
+                        '"candidate_name":"cand-a","indicator_ids":["ADX","SAR_TREND"]}]'
+                    ),
+                ),
+            ],
+            request_payload={"model": "gemma-4-E4B-it", "temperature": 0.2},
+        )
+
+    content = next(tmp_path.glob("*.txt")).read_text(encoding="utf-8")
+    assert "[message 1] role=assistant" in content
+    assert "Planned actions:" in content
+    assert '- {' in content
+    assert '  "tool": "register_profile"' in content
+    assert "[message 2] role=user" in content
+    assert "Tool results:\n[" in content
+    assert '    "tool": "validate_profile"' in content
+    assert '        "ADX",' in content

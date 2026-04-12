@@ -1,0 +1,346 @@
+===== INFORMATIONAL ONLY: DIAGNOSTIC SNAPSHOT METADATA (NOT SENT TO API OR MODEL) =====
+{
+  "request_kind": "chat_completions_request",
+  "run_id": "20260412T170706300266Z-agentic-4d8a76",
+  "step": 1,
+  "phase": "explorer_provider",
+  "label": "explorer",
+  "provider_type": "lmstudio",
+  "model": "gemma-4-e4b-it",
+  "request_sequence": 1,
+  "message_count": 2,
+  "max_completion_tokens": 8192
+}
+
+===== INFORMATIONAL ONLY: READABLE VIEW OF MESSAGE CONTENT FROM THE REQUEST =====
+[message 1] role=system
+You are the Fuzzfolio explorer inside an autonomous controller loop.
+
+This is a fresh-run opening step.
+
+Return JSON only in exactly this top-level shape:
+{
+  "reasoning": "one short paragraph",
+    "actions": [
+    {
+      "tool": "prepare_profile",
+      "mode": "scaffold_from_seed",
+      "indicator_ids": ["..."],
+      "instruments": ["..."],
+      "candidate_name": "..."
+    }
+  ]
+}
+
+Opening-step rules:
+- Return exactly 1 action only.
+- That action must be prepare_profile.
+- mode is required and must be scaffold_from_seed.
+- Allowed fields on the action are only: tool, mode, indicator_ids, instruments, candidate_name.
+- Use the exact starter instrument symbols from the opening state. Do not invent ALL or __BASKET__.
+- The controller resolves candidate_name internally. Do not emit path fields.
+- Do not use profile_name.
+- Do not use seed_indicators.
+- Do not chain validate_profile, register_profile, or evaluate_candidate in the same response.
+- Do not wrap JSON in Markdown fences.
+- Do not append a second JSON object or any suffix text.
+- Return raw JSON only.
+
+Canonical example:
+{
+  "reasoning": "Fresh run opening step. Create one seed-guided candidate scaffold now so it can be validated next.",
+  "actions": [
+    {
+      "tool": "prepare_profile",
+      "mode": "scaffold_from_seed",
+      "indicator_ids": ["ID_A", "ID_B"],
+      "instruments": ["EURUSD"],
+      "candidate_name": "cand1"
+    }
+  ]
+}
+
+
+[message 2] role=user
+Mode: run
+Run id: 20260412T170706300266Z-agentic-4d8a76
+Auth status: already verified by controller at run start.
+Allow finish: True
+Step: 1/50
+Run phase: early
+Phase guidance: Early phase: branch broadly, reject weak ideas cheaply, and prioritize fresh contrasts until step 48. Use permissive screening first, include at least one bounded sweep around a promising family before locking into manual tweaks only, and test multiple distinct instruments or small instrument groups before narrowing hard.
+Horizon target: Controller horizon target: use about 3 months of history in this phase. Think in weeks/months/years, not bars.
+Horizon guidance: Target about 3 months of evidence. Favor cheap branch-heavy screening and reject weak ideas quickly.
+Horizon rationale: cheap early screening: test broad branches over a shorter horizon before spending more compute
+Score target: Next target: log the first credible scored candidate for this run.
+Score target rationale: log the first credible scored candidate before chasing higher targets
+Next action template: No deterministic next_action_template is active.
+Operating window: none -> none (America/Chicago)
+Current controller priority (authoritative; follow this over raw frontier score when they conflict):
+- Primary objective: establish the next credible leader through diverse scored evidence.
+- Preferred next moves: prepare/validate/register/evaluate candidates across distinct families or instrument clusters.
+
+Recent manager branch guidance (authoritative for branch-control state):
+- No manager intervention has fired yet in this run.
+- Until a manager hook fires, follow the controller priority and branch lifecycle packet.
+
+Run outcome state (controller-owned; separates live focus from historical bests):
+- official_winner_type: none
+- official_winner: none yet
+- rationale: No official winner: the run ended without a validated leader or a live focus candidate.
+
+Pinned working memory (operational handles; prefer these over guessing ids):
+- No live handles are pinned yet; use typed tool results from this step.
+
+Branch lifecycle (authoritative controller/manager state; this outranks raw frontier score when they conflict):
+- budget_mode: scouting
+- reseed_active: False (collapse_recovery_steps_left=0)
+- provisional_leader_family: none
+- validated_leader_family: none
+- shadow_leader_family: none
+- provisional_leader_promotability: n/a
+- explored_distinct_families: 0
+
+Retention and exploit pacing status:
+- exploit steps: 0/3 (no cap triggered)
+
+Timeframe intent status: No auto-adjustments detected.
+
+Program:
+# Fuzzfolio Autoresearch Program
+
+This repo now runs an autonomous Fuzzfolio research loop instead of a model-training loop.
+
+## Goal
+
+Use the available tools to keep exploring the scoring-profile search space, evaluate candidates, and log every evaluated attempt into the shared attempts ledger. The repo computes the frontier procedurally from that ledger and regenerates the progress image.
+
+## Core Rules
+
+1. Use the harness typed tools (`prepare_profile`, `mutate_profile`, `validate_profile`, `register_profile`, `evaluate_candidate`, `run_parameter_sweep`, `inspect_artifact`, `compare_artifacts`) as the default workflow surface. Use raw `run_cli` only for recovery, CLI help, or gaps without a typed equivalent.
+2. Start fresh from the current run's seed hand. Do not branch inward from old saved profiles that existed before this run.
+3. Only evolve scoring profiles that were created inside the current run directory.
+4. Prefer deterministic tool actions over free-form speculation.
+5. Every evaluated candidate should be logged once with its artifact directory and score.
+6. The attempts ledger is append-only.
+7. The progress plot is derived from all attempts:
+   - new best scores become frontier points
+   - non-frontier attempts become faint gray dots
+8. Do not stop early just because you feel like you have a decent candidate.
+9. If you think you are done, verify that you have actually logged meaningful attempts and met the run goal.
+10. Sweeps are a normal part of healthy search (`run_parameter_sweep`). Do not spend the whole run on one-off manual edits only.
+
+## Workflow
+
+1. Read the fresh dealt hand and branch goals for this run.
+2. Treat the dealt hand as a real constraint set, not loose inspiration.
+3. If the hand is clearly redundant or poor, reshuffle at most once and record that choice in the run notes.
+4. After a reshuffle, fully commit to the new hand. Do not half-follow two different hands.
+5. In the early phase, be permissive: branch broadly, screen cheaply, and accept rough-looking ideas as long as they teach you something.
+6. Author or scaffold run-local profiles using typed tools (`prepare_profile`, then `validate_profile` and `register_profile` as needed) within the seed-guided idea space.
+7. Evaluate with `evaluate_candidate`; interpret results with `inspect_artifact` / `compare_artifacts` before reading raw files.
+8. Probe promising families with `run_parameter_sweep` in early and mid phases before overcommitting to hand-tuned one-off variants.
+9. Update only the profiles created during this run when branching or refining.
+10. As evidence accumulates, become more restrictive: fewer families, tighter hypotheses, longer horizons, and stronger robustness demands—within controller phase and horizon policy shown in the run packet.
+11. Log evaluated attempts so the ledger and plot stay current.
+12. Continue until the controller or the user explicitly stops the run.
+
+## Research Heuristics
+
+- Prefer coherent candidate families over random indicator piles.
+- Start from a market-behavior hypothesis, not just a list of indicators.
+- A good early run can start with one high-timeframe condition doing broad regime selection, then add a lower-timeframe condition for entry timing or confirmation.
+- Use early phase to discover where entries want to live. Use mid and late phases to tighten, layer, and pressure-test that idea rather than endlessly inventing unrelated profiles.
+- Prefer clustered positive expectancy and supportive neighboring cells over isolated local spikes.
+- Prefer sensible selectivity. Be skeptical of profiles that are too sparse to trust or so dense they look saturated.
+- Sparse early peaks are acceptable as discovery hints, but they should usually trigger broader follow-up, not immediate trust.
+- Treat path quality as separate from raw expectancy. A candidate with attractive score but ugly drawdown behavior is suspect.
+- Use contrast branches intentionally. If one branch is sharp and selective, test a steadier counterweight rather than minor cosmetic variants only.
+- Existing saved profiles may be inspected only if the user explicitly asks. They are not the candidate pool for autonomous runs.
+- If you need a benchmark, evaluate it again inside the current run. Do not rely on prior-run artifacts as the current decision surface.
+- Pay attention to the effective tested window. If the requested horizon was not actually satisfied, treat that as an evidence limit and respond accordingly.
+
+## Failure Labels
+
+When rejecting or moving away from a branch, prefer a short explicit failure label:
+
+- saturated signaling
+- too sparse / too few signals
+- isolated best-cell island
+- weak neighbor support
+- narrow instrument dependence
+- incoherent regime logic
+- ugly path quality
+- collapse at longer horizon
+- promising but still benchmark-inferior
+
+## Selection Integrity
+
+- A good incumbent benchmark is not the same thing as a successful new run candidate.
+- If an old incumbent remains strongest, say so plainly instead of treating it as fresh discovery.
+- Prefer keeping the best genuine current-run candidate, or keep nothing if the run did not produce a credible new winner.
+- Do not quietly let prior-run artifacts or unchanged old profiles become the effective winner of the current run.
+
+## Notes
+
+- Keep paths absolute.
+- Keep scratch artifacts under the current run directory.
+- Auth is handled at run start; use `run_cli` recovery only if a tool result indicates an auth problem.
+- Treat CLI probabilistic metrics as authoritative. Prefer `dsr` when available, otherwise `psr`, with `rank_score` as a fallback/secondary view.
+- Existing saved profiles can be inspected only if the user explicitly asks. They are not the candidate pool for autonomous runs.
+
+
+Current seed hand:
+{
+  "catalog_note": "These are valid indicator IDs from the FuzzFolio catalog. Use `indicators --mode index` to see the full catalog.",
+  "exploration_goal": {
+    "id": "stability-breadth",
+    "seed": 17540593755252887326,
+    "summary": "Longer-horizon stability with broader instrument coverage and smoother expectancy.",
+    "worker_split": [
+      {
+        "branch": "stability",
+        "goal": "Prioritize broader instrument coverage, clustered positivity, and smoother longer-horizon behavior."
+      },
+      {
+        "branch": "counterbalance",
+        "goal": "Keep one sharper branch alive so the run does not collapse entirely into conservative averaging."
+      }
+    ]
+  },
+  "indicators": [
+    "ULTOSC_TREND",
+    "CHAIKIN_AD_MEAN_REVERSION",
+    "CHAIKIN_AD_TREND",
+    "CMO_MEAN_REVERSION",
+    "PLUS_DI_MEAN_REVERSION",
+    "STOCHF_TREND",
+    "SAR_TREND",
+    "ADX",
+    "RSI_MEAN_REVERSION",
+    "AROON_MEAN_REVERSION"
+  ],
+  "multi_tf_suggestions": [
+    "M5 + M30 + H4",
+    "M5 + H4",
+    "M1 + D1",
+    "M15 + H1"
+  ],
+  "seed": 17540593755252887326,
+  "single_tf_suggestions": [
+    "M1",
+    "D1",
+    "M5",
+    "M15"
+  ],
+  "timeframes": [
+    "M5",
+    "M15",
+    "D1",
+    "H4",
+    "M1",
+    "M30",
+    "H1"
+  ]
+}
+
+Portable profile template note:
+- The controller can scaffold from the portable template through prepare_profile.
+- Do not hand-author a full profile from this template unless typed tools are unavailable.
+
+Sticky indicator context:
+Supported timeframes: M1, M5, M15, M30, H1, H4, D1
+Only use exact ids from the current seed hand in indicator.meta.id. Do not invent ids from seed wording.
+Seeded indicator ids for this run: ULTOSC_TREND, CHAIKIN_AD_MEAN_REVERSION, CHAIKIN_AD_TREND, CMO_MEAN_REVERSION, PLUS_DI_MEAN_REVERSION, STOCHF_TREND, SAR_TREND, ADX, RSI_MEAN_REVERSION, AROON_MEAN_REVERSION
+
+Seeded indicator parameter hints:
+- ADX: tf_default=M5 | talib=timeperiod=14 | default ranges buy=[20.0, 35.0] sell=[20.0, 35.0] | note=Rates trend strength without caring about direction so you can gate other signals when the move actually has juice.
+- AROON_MEAN_REVERSION: tf_default=M5 | talib=timeperiod=14 | default ranges buy=[-100.0, -50.0] sell=[50.0, 100.0] | note=Mean-reversion Aroon Oscillator for spotting reversals.
+- CHAIKIN_AD_TREND: tf_default=M5 | talib=none | default ranges buy=[0.15, 0.5] sell=[-0.5, -0.15] | note=Trend-following Chaikin A/D Line for tracking accumulation or distribution.
+- CHAIKIN_AD_MEAN_REVERSION: tf_default=M5 | talib=none | default ranges buy=[-0.5, -0.15] sell=[0.15, 0.5] | note=Mean-reversion Chaikin A/D Line for fading extremes in flow.
+- CMO_MEAN_REVERSION: tf_default=M5 | talib=timeperiod=14 | default ranges buy=[-35.0, -10.0] sell=[10.0, 35.0] | note=Mean-reversion Chande Momentum Oscillator for fading extremes.
+- PLUS_DI_MEAN_REVERSION: tf_default=M5 | talib=timeperiod=14 | default ranges buy=[0.0, 15.0] sell=[25.0, 40.0] | note=Mean-reversion Positive Directional Indicator for fading upside pressure.
+- RSI_MEAN_REVERSION: tf_default=M5 | talib=timeperiod=14 | default ranges buy=[20.0, 40.0] sell=[60.0, 80.0] | note=Mean-reversion Relative Strength Index for fading stretched moves.
+- SAR_TREND: tf_default=M5 | talib=acceleration=0.02, maximum=0.2 | default ranges buy=[5.0, 20.0] sell=[-20.0, -5.0] | note=Trend-following Parabolic SAR distance expressed in pip units.
+- STOCHF_TREND: tf_default=M5 | talib=fastk_period=5, fastd_period=3, fastd_matype=0 | default ranges buy=[80.0, 100.0] sell=[0.0, 20.0] | note=Trend-following Stochastic Fast for rapid momentum confirmation.
+- ULTOSC_TREND: tf_default=M5 | talib=timeperiod1=7, timeperiod2=14, timeperiod3=28 | default ranges buy=[55.0, 75.0] sell=[25.0, 45.0] | note=Trend-following Ultimate Oscillator for multi-window momentum confirmation.
+
+Sticky instrument context:
+Asset classes: crypto, energies, fx-major, fx-minor, indices, metals, stocks
+JPY-related exact symbols: AUDJPY, CADJPY, CHFJPY, EURJPY, GBPJPY, NZDJPY, USDJPY
+Coverage-qualified symbols (M15 reference): >= 11 months: AAPL, ABBV, ABT, ADBE, AMD, AMZN, AUDCAD, AUDCHF, AUDJPY, AUDNZD, AUDUSD, AUS200, AVGO, BABA, BAC, BRKB, BTCEUR, BTCUSD, CADCHF, CADJPY
+Long-horizon symbols (M15 reference): >= 34 months: AAPL, ABBV, ABT, ADBE, AMD, AMZN, AUDCAD, AUDCHF, AUDJPY, AUDNZD, AUDUSD, AUS200, AVGO, BABA, BAC, BRKB, BTCEUR, BTCUSD, CADCHF, CADJPY
+Prefer coverage-qualified symbols first so late-phase horizon checks are less likely to be silently truncated.
+Use exact symbols from the catalog. Do not assume aliases like JPY are valid instruments.
+
+Seed indicator guidance:
+- Use only these exact seeded indicator ids unless the user explicitly expands scope: ULTOSC_TREND, CHAIKIN_AD_MEAN_REVERSION, CHAIKIN_AD_TREND, CMO_MEAN_REVERSION, PLUS_DI_MEAN_REVERSION, STOCHF_TREND, SAR_TREND, ADX, RSI_MEAN_REVERSION, AROON_MEAN_REVERSION
+- Seed concepts are not alternate ids; indicator.meta.id must match one of the exact seeded ids.
+- Parameter hints below are only for the seeded ids in this run.
+
+Sensitivity artifact layout (on disk after evaluations):
+- sensitivity-response.json, deep-replay-job.json, best-cell-path-detail.json when available
+Prefer inspect_artifact / compare_artifacts for summaries and scores. Do not expect summary.json.
+Drop to read_file only when those tools lack the detail you need.
+
+Run-owned profiles so far:
+No run-owned profiles created yet.
+
+Checkpoint summary:
+No checkpoint summary exists yet.
+
+Recent attempts:
+No attempts have been logged yet in this run.
+
+Raw frontier snapshot (informational only; not leadership authority):
+No scored frontier points exist yet in this run.
+
+Behavior digest: No evaluated attempts yet.
+
+Tool reference:
+Typed tool reference (default lane — prefer these over run_cli):
+- prepare_profile: mode scaffold_from_seed | clone_local | from_template; use candidate_name for run-owned drafts.
+- mutate_profile: candidate_name or profile_ref; mutations [{path, value}][]; optional destination_candidate_name.
+- validate_profile: candidate_name or profile_ref.
+- register_profile: candidate_name or profile_ref; operation create|update; profile_ref required for update.
+- evaluate_candidate: profile_ref first; candidate_name is acceptable for local unregistered drafts; include instruments[] plus optional timeframe_policy/timeframe/requested_horizon_months/evaluation_mode.
+- run_parameter_sweep: profile_ref; axes[] strings; optional instruments[], output_dir, candidate_name_prefix.
+- inspect_artifact: artifact_dir or attempt_id; view summary|files|curve_meta|request_meta.
+- compare_artifacts: attempt_ids[] or artifact_dirs[].
+Workflows:
+- New candidate: prepare_profile -> validate_profile -> register_profile -> evaluate_candidate.
+- Iterate: mutate_profile -> validate_profile -> evaluate_candidate.
+- Sweep: run_parameter_sweep -> inspect_artifact / compare_artifacts.
+- Read tool envelopes (ok, score, artifact_dir, auto_log, effective windows, warnings) before read_file/list_dir.
+Controller-managed (do not fight it in tool choice):
+- Injected lookback when omitted on evals; quality-score preset; bar-limit policy; phase horizon targets (see packet above).
+Catalog discipline:
+- Exact indicator meta ids; exact instrument symbols; instruments[] uses one array entry per symbol (no comma-joined tokens); never __BASKET__ as an instrument.
+Search discipline:
+- Explore multiple candidates; sweeps are normal (run_parameter_sweep); diversify early, prune weak basket members, do not finish early while budget remains.
+Artifacts:
+- sensitivity-response.json / deep-replay-job.json / best-cell-path-detail.json — prefer inspect_artifact and compare_artifacts over manual compare-sensitivity; no summary.json.
+run_cli fallback:
+- Help or recovery only, e.g. ["help"] or ["help","profiles"]. Use typed tools for profiles, evals, and sweeps when available.
+Extra:
+- MA_CROSSOVER uses fastperiod, slowperiod, matype—not signalperiod.
+- If register_profile fails, fix the profile before evaluate_candidate in a later step.
+
+===== LITERALLY SENT TO API: HTTP REQUEST JSON BODY =====
+{
+  "model": "gemma-4-e4b-it",
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are the Fuzzfolio explorer inside an autonomous controller loop.\n\nThis is a fresh-run opening step.\n\nReturn JSON only in exactly this top-level shape:\n{\n  \"reasoning\": \"one short paragraph\",\n    \"actions\": [\n    {\n      \"tool\": \"prepare_profile\",\n      \"mode\": \"scaffold_from_seed\",\n      \"indicator_ids\": [\"...\"],\n      \"instruments\": [\"...\"],\n      \"candidate_name\": \"...\"\n    }\n  ]\n}\n\nOpening-step rules:\n- Return exactly 1 action only.\n- That action must be prepare_profile.\n- mode is required and must be scaffold_from_seed.\n- Allowed fields on the action are only: tool, mode, indicator_ids, instruments, candidate_name.\n- Use the exact starter instrument symbols from the opening state. Do not invent ALL or __BASKET__.\n- The controller resolves candidate_name internally. Do not emit path fields.\n- Do not use profile_name.\n- Do not use seed_indicators.\n- Do not chain validate_profile, register_profile, or evaluate_candidate in the same response.\n- Do not wrap JSON in Markdown fences.\n- Do not append a second JSON object or any suffix text.\n- Return raw JSON only.\n\nCanonical example:\n{\n  \"reasoning\": \"Fresh run opening step. Create one seed-guided candidate scaffold now so it can be validated next.\",\n  \"actions\": [\n    {\n      \"tool\": \"prepare_profile\",\n      \"mode\": \"scaffold_from_seed\",\n      \"indicator_ids\": [\"ID_A\", \"ID_B\"],\n      \"instruments\": [\"EURUSD\"],\n      \"candidate_name\": \"cand1\"\n    }\n  ]\n}\n"
+    },
+    {
+      "role": "user",
+      "content": "Mode: run\nRun id: 20260412T170706300266Z-agentic-4d8a76\nAuth status: already verified by controller at run start.\nAllow finish: True\nStep: 1/50\nRun phase: early\nPhase guidance: Early phase: branch broadly, reject weak ideas cheaply, and prioritize fresh contrasts until step 48. Use permissive screening first, include at least one bounded sweep around a promising family before locking into manual tweaks only, and test multiple distinct instruments or small instrument groups before narrowing hard.\nHorizon target: Controller horizon target: use about 3 months of history in this phase. Think in weeks/months/years, not bars.\nHorizon guidance: Target about 3 months of evidence. Favor cheap branch-heavy screening and reject weak ideas quickly.\nHorizon rationale: cheap early screening: test broad branches over a shorter horizon before spending more compute\nScore target: Next target: log the first credible scored candidate for this run.\nScore target rationale: log the first credible scored candidate before chasing higher targets\nNext action template: No deterministic next_action_template is active.\nOperating window: none -> none (America/Chicago)\nCurrent controller priority (authoritative; follow this over raw frontier score when they conflict):\n- Primary objective: establish the next credible leader through diverse scored evidence.\n- Preferred next moves: prepare/validate/register/evaluate candidates across distinct families or instrument clusters.\n\nRecent manager branch guidance (authoritative for branch-control state):\n- No manager intervention has fired yet in this run.\n- Until a manager hook fires, follow the controller priority and branch lifecycle packet.\n\nRun outcome state (controller-owned; separates live focus from historical bests):\n- official_winner_type: none\n- official_winner: none yet\n- rationale: No official winner: the run ended without a validated leader or a live focus candidate.\n\nPinned working memory (operational handles; prefer these over guessing ids):\n- No live handles are pinned yet; use typed tool results from this step.\n\nBranch lifecycle (authoritative controller/manager state; this outranks raw frontier score when they conflict):\n- budget_mode: scouting\n- reseed_active: False (collapse_recovery_steps_left=0)\n- provisional_leader_family: none\n- validated_leader_family: none\n- shadow_leader_family: none\n- provisional_leader_promotability: n/a\n- explored_distinct_families: 0\n\nRetention and exploit pacing status:\n- exploit steps: 0/3 (no cap triggered)\n\nTimeframe intent status: No auto-adjustments detected.\n\nProgram:\n# Fuzzfolio Autoresearch Program\n\nThis repo now runs an autonomous Fuzzfolio research loop instead of a model-training loop.\n\n## Goal\n\nUse the available tools to keep exploring the scoring-profile search space, evaluate candidates, and log every evaluated attempt into the shared attempts ledger. The repo computes the frontier procedurally from that ledger and regenerates the progress image.\n\n## Core Rules\n\n1. Use the harness typed tools (`prepare_profile`, `mutate_profile`, `validate_profile`, `register_profile`, `evaluate_candidate`, `run_parameter_sweep`, `inspect_artifact`, `compare_artifacts`) as the default workflow surface. Use raw `run_cli` only for recovery, CLI help, or gaps without a typed equivalent.\n2. Start fresh from the current run's seed hand. Do not branch inward from old saved profiles that existed before this run.\n3. Only evolve scoring profiles that were created inside the current run directory.\n4. Prefer deterministic tool actions over free-form speculation.\n5. Every evaluated candidate should be logged once with its artifact directory and score.\n6. The attempts ledger is append-only.\n7. The progress plot is derived from all attempts:\n   - new best scores become frontier points\n   - non-frontier attempts become faint gray dots\n8. Do not stop early just because you feel like you have a decent candidate.\n9. If you think you are done, verify that you have actually logged meaningful attempts and met the run goal.\n10. Sweeps are a normal part of healthy search (`run_parameter_sweep`). Do not spend the whole run on one-off manual edits only.\n\n## Workflow\n\n1. Read the fresh dealt hand and branch goals for this run.\n2. Treat the dealt hand as a real constraint set, not loose inspiration.\n3. If the hand is clearly redundant or poor, reshuffle at most once and record that choice in the run notes.\n4. After a reshuffle, fully commit to the new hand. Do not half-follow two different hands.\n5. In the early phase, be permissive: branch broadly, screen cheaply, and accept rough-looking ideas as long as they teach you something.\n6. Author or scaffold run-local profiles using typed tools (`prepare_profile`, then `validate_profile` and `register_profile` as needed) within the seed-guided idea space.\n7. Evaluate with `evaluate_candidate`; interpret results with `inspect_artifact` / `compare_artifacts` before reading raw files.\n8. Probe promising families with `run_parameter_sweep` in early and mid phases before overcommitting to hand-tuned one-off variants.\n9. Update only the profiles created during this run when branching or refining.\n10. As evidence accumulates, become more restrictive: fewer families, tighter hypotheses, longer horizons, and stronger robustness demands\u2014within controller phase and horizon policy shown in the run packet.\n11. Log evaluated attempts so the ledger and plot stay current.\n12. Continue until the controller or the user explicitly stops the run.\n\n## Research Heuristics\n\n- Prefer coherent candidate families over random indicator piles.\n- Start from a market-behavior hypothesis, not just a list of indicators.\n- A good early run can start with one high-timeframe condition doing broad regime selection, then add a lower-timeframe condition for entry timing or confirmation.\n- Use early phase to discover where entries want to live. Use mid and late phases to tighten, layer, and pressure-test that idea rather than endlessly inventing unrelated profiles.\n- Prefer clustered positive expectancy and supportive neighboring cells over isolated local spikes.\n- Prefer sensible selectivity. Be skeptical of profiles that are too sparse to trust or so dense they look saturated.\n- Sparse early peaks are acceptable as discovery hints, but they should usually trigger broader follow-up, not immediate trust.\n- Treat path quality as separate from raw expectancy. A candidate with attractive score but ugly drawdown behavior is suspect.\n- Use contrast branches intentionally. If one branch is sharp and selective, test a steadier counterweight rather than minor cosmetic variants only.\n- Existing saved profiles may be inspected only if the user explicitly asks. They are not the candidate pool for autonomous runs.\n- If you need a benchmark, evaluate it again inside the current run. Do not rely on prior-run artifacts as the current decision surface.\n- Pay attention to the effective tested window. If the requested horizon was not actually satisfied, treat that as an evidence limit and respond accordingly.\n\n## Failure Labels\n\nWhen rejecting or moving away from a branch, prefer a short explicit failure label:\n\n- saturated signaling\n- too sparse / too few signals\n- isolated best-cell island\n- weak neighbor support\n- narrow instrument dependence\n- incoherent regime logic\n- ugly path quality\n- collapse at longer horizon\n- promising but still benchmark-inferior\n\n## Selection Integrity\n\n- A good incumbent benchmark is not the same thing as a successful new run candidate.\n- If an old incumbent remains strongest, say so plainly instead of treating it as fresh discovery.\n- Prefer keeping the best genuine current-run candidate, or keep nothing if the run did not produce a credible new winner.\n- Do not quietly let prior-run artifacts or unchanged old profiles become the effective winner of the current run.\n\n## Notes\n\n- Keep paths absolute.\n- Keep scratch artifacts under the current run directory.\n- Auth is handled at run start; use `run_cli` recovery only if a tool result indicates an auth problem.\n- Treat CLI probabilistic metrics as authoritative. Prefer `dsr` when available, otherwise `psr`, with `rank_score` as a fallback/secondary view.\n- Existing saved profiles can be inspected only if the user explicitly asks. They are not the candidate pool for autonomous runs.\n\n\nCurrent seed hand:\n{\n  \"catalog_note\": \"These are valid indicator IDs from the FuzzFolio catalog. Use `indicators --mode index` to see the full catalog.\",\n  \"exploration_goal\": {\n    \"id\": \"stability-breadth\",\n    \"seed\": 17540593755252887326,\n    \"summary\": \"Longer-horizon stability with broader instrument coverage and smoother expectancy.\",\n    \"worker_split\": [\n      {\n        \"branch\": \"stability\",\n        \"goal\": \"Prioritize broader instrument coverage, clustered positivity, and smoother longer-horizon behavior.\"\n      },\n      {\n        \"branch\": \"counterbalance\",\n        \"goal\": \"Keep one sharper branch alive so the run does not collapse entirely into conservative averaging.\"\n      }\n    ]\n  },\n  \"indicators\": [\n    \"ULTOSC_TREND\",\n    \"CHAIKIN_AD_MEAN_REVERSION\",\n    \"CHAIKIN_AD_TREND\",\n    \"CMO_MEAN_REVERSION\",\n    \"PLUS_DI_MEAN_REVERSION\",\n    \"STOCHF_TREND\",\n    \"SAR_TREND\",\n    \"ADX\",\n    \"RSI_MEAN_REVERSION\",\n    \"AROON_MEAN_REVERSION\"\n  ],\n  \"multi_tf_suggestions\": [\n    \"M5 + M30 + H4\",\n    \"M5 + H4\",\n    \"M1 + D1\",\n    \"M15 + H1\"\n  ],\n  \"seed\": 17540593755252887326,\n  \"single_tf_suggestions\": [\n    \"M1\",\n    \"D1\",\n    \"M5\",\n    \"M15\"\n  ],\n  \"timeframes\": [\n    \"M5\",\n    \"M15\",\n    \"D1\",\n    \"H4\",\n    \"M1\",\n    \"M30\",\n    \"H1\"\n  ]\n}\n\nPortable profile template note:\n- The controller can scaffold from the portable template through prepare_profile.\n- Do not hand-author a full profile from this template unless typed tools are unavailable.\n\nSticky indicator context:\nSupported timeframes: M1, M5, M15, M30, H1, H4, D1\nOnly use exact ids from the current seed hand in indicator.meta.id. Do not invent ids from seed wording.\nSeeded indicator ids for this run: ULTOSC_TREND, CHAIKIN_AD_MEAN_REVERSION, CHAIKIN_AD_TREND, CMO_MEAN_REVERSION, PLUS_DI_MEAN_REVERSION, STOCHF_TREND, SAR_TREND, ADX, RSI_MEAN_REVERSION, AROON_MEAN_REVERSION\n\nSeeded indicator parameter hints:\n- ADX: tf_default=M5 | talib=timeperiod=14 | default ranges buy=[20.0, 35.0] sell=[20.0, 35.0] | note=Rates trend strength without caring about direction so you can gate other signals when the move actually has juice.\n- AROON_MEAN_REVERSION: tf_default=M5 | talib=timeperiod=14 | default ranges buy=[-100.0, -50.0] sell=[50.0, 100.0] | note=Mean-reversion Aroon Oscillator for spotting reversals.\n- CHAIKIN_AD_TREND: tf_default=M5 | talib=none | default ranges buy=[0.15, 0.5] sell=[-0.5, -0.15] | note=Trend-following Chaikin A/D Line for tracking accumulation or distribution.\n- CHAIKIN_AD_MEAN_REVERSION: tf_default=M5 | talib=none | default ranges buy=[-0.5, -0.15] sell=[0.15, 0.5] | note=Mean-reversion Chaikin A/D Line for fading extremes in flow.\n- CMO_MEAN_REVERSION: tf_default=M5 | talib=timeperiod=14 | default ranges buy=[-35.0, -10.0] sell=[10.0, 35.0] | note=Mean-reversion Chande Momentum Oscillator for fading extremes.\n- PLUS_DI_MEAN_REVERSION: tf_default=M5 | talib=timeperiod=14 | default ranges buy=[0.0, 15.0] sell=[25.0, 40.0] | note=Mean-reversion Positive Directional Indicator for fading upside pressure.\n- RSI_MEAN_REVERSION: tf_default=M5 | talib=timeperiod=14 | default ranges buy=[20.0, 40.0] sell=[60.0, 80.0] | note=Mean-reversion Relative Strength Index for fading stretched moves.\n- SAR_TREND: tf_default=M5 | talib=acceleration=0.02, maximum=0.2 | default ranges buy=[5.0, 20.0] sell=[-20.0, -5.0] | note=Trend-following Parabolic SAR distance expressed in pip units.\n- STOCHF_TREND: tf_default=M5 | talib=fastk_period=5, fastd_period=3, fastd_matype=0 | default ranges buy=[80.0, 100.0] sell=[0.0, 20.0] | note=Trend-following Stochastic Fast for rapid momentum confirmation.\n- ULTOSC_TREND: tf_default=M5 | talib=timeperiod1=7, timeperiod2=14, timeperiod3=28 | default ranges buy=[55.0, 75.0] sell=[25.0, 45.0] | note=Trend-following Ultimate Oscillator for multi-window momentum confirmation.\n\nSticky instrument context:\nAsset classes: crypto, energies, fx-major, fx-minor, indices, metals, stocks\nJPY-related exact symbols: AUDJPY, CADJPY, CHFJPY, EURJPY, GBPJPY, NZDJPY, USDJPY\nCoverage-qualified symbols (M15 reference): >= 11 months: AAPL, ABBV, ABT, ADBE, AMD, AMZN, AUDCAD, AUDCHF, AUDJPY, AUDNZD, AUDUSD, AUS200, AVGO, BABA, BAC, BRKB, BTCEUR, BTCUSD, CADCHF, CADJPY\nLong-horizon symbols (M15 reference): >= 34 months: AAPL, ABBV, ABT, ADBE, AMD, AMZN, AUDCAD, AUDCHF, AUDJPY, AUDNZD, AUDUSD, AUS200, AVGO, BABA, BAC, BRKB, BTCEUR, BTCUSD, CADCHF, CADJPY\nPrefer coverage-qualified symbols first so late-phase horizon checks are less likely to be silently truncated.\nUse exact symbols from the catalog. Do not assume aliases like JPY are valid instruments.\n\nSeed indicator guidance:\n- Use only these exact seeded indicator ids unless the user explicitly expands scope: ULTOSC_TREND, CHAIKIN_AD_MEAN_REVERSION, CHAIKIN_AD_TREND, CMO_MEAN_REVERSION, PLUS_DI_MEAN_REVERSION, STOCHF_TREND, SAR_TREND, ADX, RSI_MEAN_REVERSION, AROON_MEAN_REVERSION\n- Seed concepts are not alternate ids; indicator.meta.id must match one of the exact seeded ids.\n- Parameter hints below are only for the seeded ids in this run.\n\nSensitivity artifact layout (on disk after evaluations):\n- sensitivity-response.json, deep-replay-job.json, best-cell-path-detail.json when available\nPrefer inspect_artifact / compare_artifacts for summaries and scores. Do not expect summary.json.\nDrop to read_file only when those tools lack the detail you need.\n\nRun-owned profiles so far:\nNo run-owned profiles created yet.\n\nCheckpoint summary:\nNo checkpoint summary exists yet.\n\nRecent attempts:\nNo attempts have been logged yet in this run.\n\nRaw frontier snapshot (informational only; not leadership authority):\nNo scored frontier points exist yet in this run.\n\nBehavior digest: No evaluated attempts yet.\n\nTool reference:\nTyped tool reference (default lane \u2014 prefer these over run_cli):\n- prepare_profile: mode scaffold_from_seed | clone_local | from_template; use candidate_name for run-owned drafts.\n- mutate_profile: candidate_name or profile_ref; mutations [{path, value}][]; optional destination_candidate_name.\n- validate_profile: candidate_name or profile_ref.\n- register_profile: candidate_name or profile_ref; operation create|update; profile_ref required for update.\n- evaluate_candidate: profile_ref first; candidate_name is acceptable for local unregistered drafts; include instruments[] plus optional timeframe_policy/timeframe/requested_horizon_months/evaluation_mode.\n- run_parameter_sweep: profile_ref; axes[] strings; optional instruments[], output_dir, candidate_name_prefix.\n- inspect_artifact: artifact_dir or attempt_id; view summary|files|curve_meta|request_meta.\n- compare_artifacts: attempt_ids[] or artifact_dirs[].\nWorkflows:\n- New candidate: prepare_profile -> validate_profile -> register_profile -> evaluate_candidate.\n- Iterate: mutate_profile -> validate_profile -> evaluate_candidate.\n- Sweep: run_parameter_sweep -> inspect_artifact / compare_artifacts.\n- Read tool envelopes (ok, score, artifact_dir, auto_log, effective windows, warnings) before read_file/list_dir.\nController-managed (do not fight it in tool choice):\n- Injected lookback when omitted on evals; quality-score preset; bar-limit policy; phase horizon targets (see packet above).\nCatalog discipline:\n- Exact indicator meta ids; exact instrument symbols; instruments[] uses one array entry per symbol (no comma-joined tokens); never __BASKET__ as an instrument.\nSearch discipline:\n- Explore multiple candidates; sweeps are normal (run_parameter_sweep); diversify early, prune weak basket members, do not finish early while budget remains.\nArtifacts:\n- sensitivity-response.json / deep-replay-job.json / best-cell-path-detail.json \u2014 prefer inspect_artifact and compare_artifacts over manual compare-sensitivity; no summary.json.\nrun_cli fallback:\n- Help or recovery only, e.g. [\"help\"] or [\"help\",\"profiles\"]. Use typed tools for profiles, evals, and sweeps when available.\nExtra:\n- MA_CROSSOVER uses fastperiod, slowperiod, matype\u2014not signalperiod.\n- If register_profile fails, fix the profile before evaluate_candidate in a later step.\n\n"
+    }
+  ],
+  "temperature": 0.7,
+  "max_completion_tokens": 8192
+}
+
+

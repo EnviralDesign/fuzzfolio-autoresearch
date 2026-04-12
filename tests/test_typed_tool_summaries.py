@@ -40,9 +40,11 @@ def test_candidate_summary_from_profile_payload() -> None:
         draft_name="sharp-growth-momentum",
     )
     assert summary is not None
+    assert summary["candidate_name"] == "sharp-growth-momentum"
     assert summary["draft_name"] == "sharp-growth-momentum"
     assert summary["family_id"] == "scaffold-mfi-trend-2|scaffold-stoch-crossover-1"
     assert summary["indicator_ids"] == ["STOCH_CROSSOVER", "MFI_TREND"]
+    assert summary["instruments"] == ["BTCUSD", "AUDJPY"]
     assert summary["timeframe_summary"] == "M5 + M5"
     assert summary["instrument_summary"] == "BTCUSD, AUDJPY"
     assert summary["instrument_count"] == 2
@@ -164,6 +166,7 @@ def test_summarize_candidate_handle_prefers_concrete_refs() -> None:
     summary = ResearchController._summarize_candidate_handle(
         {
             "candidate_summary": {
+                "candidate_name": "cand",
                 "draft_name": "cand",
                 "family_id": "fam-a|fam-b",
             },
@@ -171,10 +174,7 @@ def test_summarize_candidate_handle_prefers_concrete_refs() -> None:
             "next_recommended_action": "evaluate_candidate",
         }
     )
-    assert summary == (
-        r"candidate_name=cand, family=fam-a|fam-b, "
-        r"profile_ref=abc123, next=evaluate_candidate"
-    )
+    assert summary == r"candidate_name=cand, profile_ref=abc123, next=evaluate_candidate"
 
 
 def test_summarize_sweep_handle_includes_inspect_ref() -> None:
@@ -191,3 +191,101 @@ def test_summarize_sweep_handle_includes_inspect_ref() -> None:
         r"artifact_dir=C:\tmp\sweep_alpha_20260401, "
         r"score_preset=profile-drop, next=inspect_artifact"
     )
+
+
+def test_history_result_summary_compacts_validate_success_for_prompt_visibility() -> None:
+    controller = object.__new__(ResearchController)
+
+    summarized = controller._history_result_summary(
+        {
+            "tool": "validate_profile",
+            "ok": True,
+            "candidate_name": "initial_seed_scaffold",
+            "candidate_summary": {
+                "candidate_name": "initial_seed_scaffold",
+                "draft_name": "initial_seed_scaffold",
+                "profile_name": "Scaffold ADX + SAR_TREND",
+                "candidate_fingerprint": "abc1234567890",
+                "family_id": "scaffold-adx-1|scaffold-sar-trend-2",
+                "indicator_ids": ["ADX", "SAR_TREND"],
+                "indicator_instance_ids": ["scaffold-adx-1", "scaffold-sar-trend-2"],
+                "instruments": ["BTCUSD", "EURUSD"],
+                "timeframe_summary": "M5 + M5",
+            },
+            "controller_hint": "Validation passed. Register next.",
+            "ready_for_registration": True,
+            "material_changes": False,
+            "result": {
+                "argv": ["profiles", "validate", "--file", "cand.json", "--pretty"],
+                "returncode": 0,
+                "parsed_json": {"status": "ok", "data": {"normalized_profile": {}}},
+            },
+        }
+    )
+
+    assert summarized == {
+        "tool": "validate_profile",
+        "ok": True,
+        "candidate_name": "initial_seed_scaffold",
+        "controller_hint": "Validation passed. Register next.",
+        "indicator_ids": ["ADX", "SAR_TREND"],
+        "instruments": ["BTCUSD", "EURUSD"],
+        "timeframe_summary": "M5 + M5",
+        "ready_for_registration": True,
+        "material_changes": False,
+    }
+
+
+def test_history_result_summary_compacts_compare_artifacts_for_prompt_visibility() -> None:
+    controller = object.__new__(ResearchController)
+
+    summarized = controller._history_result_summary(
+        {
+            "tool": "compare_artifacts",
+            "ok": True,
+            "ranked_comparison": [
+                {
+                    "label": "att-1",
+                    "artifact_dir": r"C:\runs\att-1",
+                    "quality_score": 58.2,
+                    "best": {
+                        "quality_score": 58.2,
+                        "signal_count": 44,
+                        "timeframe": "M5",
+                        "best_cell": {"resolved_trades": 19},
+                        "market_data_window": {"effective_window_months": 12.4},
+                    },
+                },
+                {
+                    "label": "att-2",
+                    "artifact_dir": r"C:\runs\att-2",
+                    "quality_score": 41.1,
+                },
+            ],
+            "dominant_deltas": ["score_delta=17.1000", "other=1", "third=2", "ignore=3"],
+            "suggested_next_move": "evaluate_candidate on leader unless retention already satisfied",
+        }
+    )
+
+    assert summarized == {
+        "tool": "compare_artifacts",
+        "ok": True,
+        "ranked_preview": [
+            {
+                "label": "att-1",
+                "artifact_dir": r"C:\runs\att-1",
+                "quality_score": 58.2,
+                "signal_count": 44,
+                "timeframe": "M5",
+                "resolved_trades": 19,
+                "effective_window_months": 12.4,
+            },
+            {
+                "label": "att-2",
+                "artifact_dir": r"C:\runs\att-2",
+                "quality_score": 41.1,
+            },
+        ],
+        "dominant_deltas": ["score_delta=17.1000", "other=1", "third=2"],
+        "suggested_next_move": "evaluate_candidate on leader unless retention already satisfied",
+    }
