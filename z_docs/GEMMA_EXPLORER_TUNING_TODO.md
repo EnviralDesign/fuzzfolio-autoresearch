@@ -42,6 +42,19 @@ Current live baseline:
 - remaining model gap is now later-step follow-up binding under the new handle contract:
 - fixed follow-up handle benchmark: `json_parse_ok 16 / 16`, `validator_ok 11 / 16`, `deterministic_tool_match 16 / 16`
 - next priority should shift to a small pathless follow-up adaptation or prompt-tightening lane before reopening broad training
+- the next actual training lane should now be exploration judgment, not more path/contract work
+- new reviewer-oriented curation tooling now exists:
+- `trainingdatapipeline/build_exploration_review_set.py`
+- `trainingdatapipeline/build_exploration_judgment_dataset.py`
+- first review pack generated:
+- `data/training_pipeline/review_sets/exploration_review_v1_candidates.jsonl`
+- `data/training_pipeline/review_sets/exploration_review_v1_sheet.md`
+- blank labels template:
+- `data/training_pipeline/manual_labels/exploration_judgment_v1_template.jsonl`
+- next human/Codex action for this lane:
+- review by `review_id`
+- keep `keep_gold` and `rewrite_action` only
+- then build the curated dataset before any new Gemma continuation run
 
 ## High Priority
 
@@ -258,6 +271,59 @@ Reference:
 
 - Status: strict single-target compact export complete for train/val/test.
 - Multi-target export still pending.
+
+### 12b. Build exploration-judgment review + dataset lane
+
+- Status: first full v1 pass completed; offline gates failed, so do not promote/export this adapter.
+- Purpose:
+- mine real runs into judgment-heavy review rows instead of more contract-only supervision
+- allow Codex/manual curation of `keep_gold` vs `rewrite_action` rows
+- emit a small additive pathless dataset for exploration-quality fine-tuning
+- new helpers:
+- `trainingdatapipeline/build_exploration_review_set.py`
+- `trainingdatapipeline/build_exploration_judgment_dataset.py`
+- first generated review-set manifest:
+- `data/training_pipeline/review_sets/exploration_review_v1_manifest.json`
+- first generated review-sheet path:
+- `data/training_pipeline/review_sets/exploration_review_v1_sheet.md`
+- label template path:
+- `data/training_pipeline/manual_labels/exploration_judgment_v1_template.jsonl`
+- review-set v1 emitted:
+- `150` candidate rows
+- `47` source runs on the first pass, later refined to `45`
+- current mix after builder tightening:
+- `42` `strategically_weak_but_valid`
+- `22` `productive_scored`
+- remaining rows are mostly `ambiguous` / `stale_loop` and should be reviewed carefully, not assumed good
+- next expected outputs after manual review:
+- curated train / val / benchmark JSONL
+- compact-v2 chat exports
+- one bounded exploration-judgment continuation from the current best adapter
+- current v1 realized outputs:
+- curated dataset manifest:
+  - `data/training_pipeline/targeted_slices/exploration_judgment_v1_manifest.json`
+  - `73` validated manual rows kept
+  - `204` train / `30` val / `24` held-out benchmark rows after anchors and duplication
+- continuation run:
+  - `data/training_runs/gemma_e4b_explorationjudgment_v1_from_openv2_gpu1`
+- old-adapter exploration holdout baseline:
+  - `8 / 24` first-tool match
+  - `21 / 24` validator-clean
+- new-adapter exploration holdout result:
+  - `8 / 24` first-tool match
+  - `19 / 24` validator-clean
+- fixed follow-up result on the new adapter:
+  - `15 / 16` parseable
+  - `14 / 16` validator-clean
+  - `14 / 16` deterministic tool match
+- opening result on the new adapter:
+  - `12 / 12` parseable
+  - `12 / 12` validator-clean
+  - `12 / 12` first-tool match
+- interpretation:
+  - the v1 curation slice preserved opening behavior but did not improve exploration
+  - it likely over-taught mutate-heavy rewrites and introduced some invalid mutate tendencies
+  - next lane should be a second judgment review slice built from the new comparison failures, not immediate export or LM Studio promotion
 - first mixed chat dataset assembled:
 - `data/training_pipeline/final/v0_chat_mix1`
 - full mix counts: `2004` train / `209` val

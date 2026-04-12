@@ -700,8 +700,11 @@ class RunPolicy:
 
 
 class ResearchController:
-    def __init__(self, app_config: AppConfig):
+    def __init__(
+        self, app_config: AppConfig, *, llm_request_snapshots: bool = False
+    ):
         self.config = app_config
+        self._llm_request_snapshots_enabled = bool(llm_request_snapshots)
         self.provider = create_provider(app_config.provider)
         self.manager_providers = [
             (
@@ -7935,6 +7938,11 @@ class ResearchController:
     def _raw_explorer_payloads_path(self, tool_context: ToolContext) -> Path:
         return tool_context.run_dir / "raw-explorer-payloads.jsonl"
 
+    def _llm_request_snapshots_dir(self, tool_context: ToolContext) -> Path | None:
+        if not self._llm_request_snapshots_enabled:
+            return None
+        return tool_context.run_dir / "llm-request-snapshots"
+
     def _json_safe_value(self, value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
@@ -8070,6 +8078,7 @@ class ResearchController:
         provider: Any,
     ):
         provider_config = getattr(provider, "config", None)
+        request_snapshot_dir = self._llm_request_snapshots_dir(tool_context)
         return provider_trace_scope(
             label=label,
             run_id=tool_context.run_id,
@@ -8078,6 +8087,9 @@ class ResearchController:
             provider_type=getattr(provider_config, "provider_type", None),
             model=getattr(provider_config, "model", None),
             capture_path=str(self._raw_explorer_payloads_path(tool_context)),
+            request_snapshot_dir=(
+                str(request_snapshot_dir) if request_snapshot_dir is not None else None
+            ),
         )
 
     def _load_recent_step_payloads(

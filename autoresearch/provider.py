@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextvars
 import subprocess
 import json
+import re
 import shutil
 import sys
 import threading
@@ -40,6 +41,8 @@ class ProviderTraceContext:
     provider_type: str | None = None
     model: str | None = None
     capture_path: str | None = None
+    request_snapshot_dir: str | None = None
+    request_sequence: int = 0
 
 
 _PROVIDER_TRACE_STDERR_MODE = "verbose"
@@ -138,6 +141,7 @@ def provider_trace_scope(
     provider_type: str | None = None,
     model: str | None = None,
     capture_path: str | None = None,
+    request_snapshot_dir: str | None = None,
 ):
     token = _PROVIDER_TRACE_CONTEXT.set(
         ProviderTraceContext(
@@ -148,6 +152,7 @@ def provider_trace_scope(
             provider_type=provider_type,
             model=model,
             capture_path=capture_path,
+            request_snapshot_dir=request_snapshot_dir,
         )
     )
     try:
@@ -237,6 +242,98 @@ def _append_provider_capture(
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except OSError:
+        return
+
+
+def _snapshot_safe_name(value: str | None, *, fallback: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return fallback
+    normalized = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+    return normalized or fallback
+
+
+def _format_request_snapshot_messages(messages: list[ChatMessage]) -> str:
+    sections: list[str] = []
+    for index, message in enumerate(messages, start=1):
+        sections.append(f"[message {index}] role={message.role}")
+        sections.append(message.content)
+        sections.append("")
+    return "\n".join(sections).rstrip()
+
+
+def _write_provider_request_snapshot(
+    request_kind: str,
+    *,
+    messages: list[ChatMessage],
+    request_payload: Any = None,
+    prompt_text: str | None = None,
+    **fields: Any,
+) -> None:
+    context = _PROVIDER_TRACE_CONTEXT.get()
+    if context is None or not context.request_snapshot_dir:
+        return
+    context.request_sequence += 1
+    snapshot_dir = Path(context.request_snapshot_dir)
+    filename = "__".join(
+        [
+            f"step-{int(context.step or 0):04d}",
+            f"req-{context.request_sequence:03d}",
+            _snapshot_safe_name(request_kind, fallback="request"),
+            _snapshot_safe_name(context.phase, fallback="phase"),
+            _snapshot_safe_name(context.label, fallback="label"),
+        ]
+    ) + ".txt"
+    metadata: dict[str, Any] = {
+        "request_kind": request_kind,
+        "run_id": context.run_id,
+        "step": context.step,
+        "phase": context.phase,
+        "label": context.label,
+        "provider_type": context.provider_type,
+        "model": context.model,
+        "request_sequence": context.request_sequence,
+        "message_count": len(messages),
+    }
+    for key, value in fields.items():
+        if value is not None:
+            metadata[key] = _provider_capture_safe_value(value)
+    lines = [
+        "===== INFORMATIONAL ONLY: DIAGNOSTIC SNAPSHOT METADATA (NOT SENT TO API OR MODEL) =====",
+        json.dumps(metadata, ensure_ascii=True, indent=2),
+    ]
+    if request_payload is not None:
+        lines.extend(
+            [
+                "",
+                "===== LITERALLY SENT TO API: HTTP REQUEST JSON BODY =====",
+                json.dumps(
+                    _provider_capture_safe_value(request_payload),
+                    ensure_ascii=True,
+                    indent=2,
+                ),
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "===== INFORMATIONAL ONLY: READABLE VIEW OF MESSAGE CONTENT FROM THE REQUEST =====",
+            _format_request_snapshot_messages(messages),
+        ]
+    )
+    if prompt_text is not None:
+        lines.extend(
+            [
+                "",
+                "===== LITERALLY SENT TO PROVIDER: RENDERED PROMPT TEXT =====",
+                prompt_text,
+            ]
+        )
+    snapshot_path = snapshot_dir / filename
+    try:
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
     except OSError:
         return
 
@@ -933,7 +1030,13 @@ class CodexAppServerProvider:
         )
         session = _CodexAppServerSession(self.config)
         try:
-            turn_id = session.start_turn(self._prompt_from_messages(messages))
+            prompt_text = self._prompt_from_messages(messages)
+            _write_provider_request_snapshot(
+                "codex_app_server_request",
+                messages=messages,
+                prompt_text=prompt_text,
+            )
+            turn_id = session.start_turn(prompt_text)
             outer_payload = _parse_provider_json_object(session.collect_turn_text(turn_id))
             response_json = outer_payload.get("response_json")
             if isinstance(response_json, str) and response_json.strip():
@@ -1089,6 +1192,12 @@ class ChatCompletionsJsonProvider:
         max_completion_tokens: int,
     ) -> dict[str, Any]:
         body = self._build_body(messages, max_completion_tokens)
+        _write_provider_request_snapshot(
+            "chat_completions_request",
+            messages=messages,
+            request_payload=body,
+            max_completion_tokens=max_completion_tokens,
+        )
         return _post_json_with_retry(
             self.session,
             url=self._build_url(),
@@ -1533,6 +1642,18 @@ class TransformersLocalProvider:
                 else self.config.max_tokens
             ),
         )
+        do_sample = float(self.config.temperature or 0.0) > 0.05
+        _write_provider_request_snapshot(
+            "transformers_local_generation",
+            messages=messages,
+            prompt_text=prompt_text,
+            request_payload={
+                "max_new_tokens": max_tokens,
+                "do_sample": do_sample,
+                "temperature": float(self.config.temperature or 0.0),
+            },
+            prompt_tokens=prompt_tokens,
+        )
         _append_provider_capture(
             "local_generation_request",
             payload_kind="local_generation_request",
@@ -1540,7 +1661,7 @@ class TransformersLocalProvider:
             prompt_tokens=prompt_tokens,
             message_count=len(messages),
             max_new_tokens=max_tokens,
-            do_sample=bool(float(self.config.temperature or 0.0) > 0.05),
+            do_sample=do_sample,
             model_device=str(getattr(model, "device", "unknown")),
         )
         _trace_provider_event(
@@ -1554,7 +1675,6 @@ class TransformersLocalProvider:
             key: value.to(model.device) if hasattr(value, "to") else value
             for key, value in model_inputs.items()
         }
-        do_sample = float(self.config.temperature or 0.0) > 0.05
         generate_kwargs: dict[str, Any] = {
             "max_new_tokens": max_tokens,
             "do_sample": do_sample,
@@ -1823,6 +1943,12 @@ class ResponsesJsonProvider:
         max_completion_tokens: int,
     ) -> dict[str, Any]:
         body = self._build_body(messages, max_completion_tokens)
+        _write_provider_request_snapshot(
+            "responses_api_request",
+            messages=messages,
+            request_payload=body,
+            max_completion_tokens=max_completion_tokens,
+        )
         return _post_json_with_retry(
             self.session,
             url=self._build_url(),

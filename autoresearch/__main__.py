@@ -283,6 +283,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use plain line-oriented progress output instead of Rich panels.",
     )
+    run.add_argument(
+        "--llm-request-snapshots",
+        action="store_true",
+        help="Write one human-readable request snapshot per LLM call under the run directory.",
+    )
 
     supervise = subparsers.add_parser(
         "supervise",
@@ -321,6 +326,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--plain-progress",
         action="store_true",
         help="Use plain line-oriented progress output instead of Rich panels.",
+    )
+    supervise.add_argument(
+        "--llm-request-snapshots",
+        action="store_true",
+        help="Write one human-readable request snapshot per LLM call under each session run directory.",
     )
 
     plot = subparsers.add_parser(
@@ -2189,6 +2199,7 @@ def cmd_run(
     explorer_profile: str | None,
     as_json: bool,
     plain_progress: bool,
+    llm_request_snapshots: bool,
 ) -> int:
     _set_plain_progress_mode(plain_progress and not as_json)
     _set_trace_console_mode(plain_progress=plain_progress, as_json=as_json)
@@ -2196,7 +2207,9 @@ def cmd_run(
         explorer_profile=explorer_profile,
     )
     _set_display_context(repo_root=config.repo_root, run_dir=None)
-    controller = ResearchController(config)
+    controller = ResearchController(
+        config, llm_request_snapshots=llm_request_snapshots
+    )
     result = controller.run(
         max_steps=max_steps,
         progress_callback=None if as_json else _emit_run_progress,
@@ -2218,6 +2231,7 @@ def cmd_supervise(
     explorer_profile: str | None,
     as_json: bool,
     plain_progress: bool,
+    llm_request_snapshots: bool,
 ) -> int:
     _set_plain_progress_mode(plain_progress and not as_json)
     _set_trace_console_mode(plain_progress=plain_progress, as_json=as_json)
@@ -2248,7 +2262,9 @@ def cmd_supervise(
                 stop_reason = "soft_wrap_reached"
                 break
         session_index = len(session_results) + 1
-        controller = ResearchController(config)
+        controller = ResearchController(
+            config, llm_request_snapshots=llm_request_snapshots
+        )
 
         def emit_progress(event: dict[str, object]) -> None:
             if as_json:
@@ -7253,6 +7269,7 @@ def main() -> int:
             explorer_profile=args.explorer_profile,
             as_json=bool(args.json),
             plain_progress=bool(args.plain_progress),
+            llm_request_snapshots=bool(args.llm_request_snapshots),
         )
     if args.command == "supervise":
         return cmd_supervise(
@@ -7263,6 +7280,7 @@ def main() -> int:
             explorer_profile=args.explorer_profile,
             as_json=bool(args.json),
             plain_progress=bool(args.plain_progress),
+            llm_request_snapshots=bool(args.llm_request_snapshots),
         )
     if args.command == "plot":
         return cmd_plot(run_id=args.run_id, all_runs=bool(args.all_runs))

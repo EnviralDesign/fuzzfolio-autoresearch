@@ -753,6 +753,45 @@ def build_prompt_variants(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def normalize_record(record: dict[str, Any]) -> dict[str, Any]:
+    prompt_variants = build_prompt_variants(record)
+    prompt_state = (
+        record.get("prompt_state") if isinstance(record.get("prompt_state"), dict) else {}
+    )
+    run_info = prompt_state.get("run") if isinstance(prompt_state.get("run"), dict) else {}
+    run_dir = str(run_info.get("run_dir") or "")
+    normalized = dict(record)
+    normalized["prompt_state_full"] = prompt_variants["full"]
+    normalized["prompt_state_compact"] = prompt_variants["compact"]
+    normalized["prompt_state_compact_v2"] = prompt_variants["compact_v2"]
+    for key in (
+        "prior_action_summary",
+        "current_result_facts",
+        "tool_results_summary",
+        "manager_events",
+        "trace_event_facts",
+    ):
+        if key in record:
+            normalized[key] = _pathless_model_value(record.get(key))
+    normalized["target_response_normalized"] = _canonicalize_value(
+        _pathless_model_value(record.get("target_response")),
+        run_dir,
+    )
+    normalized["target_actions_normalized"] = _canonicalize_value(
+        _pathless_model_value(record.get("target_actions")),
+        run_dir,
+    )
+    normalized["action_signatures_normalized"] = _canonicalize_value(
+        _pathless_model_value(record.get("action_signatures")),
+        run_dir,
+    )
+    return normalized
+
+
+def normalize_model_target(value: Any, run_dir: str = "") -> Any:
+    return _canonicalize_value(_pathless_model_value(value), run_dir)
+
+
 def normalize_records(input_path: Path, output_path: Path, summary_path: Path | None = None) -> dict[str, Any]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     record_count = 0
@@ -766,39 +805,7 @@ def normalize_records(input_path: Path, output_path: Path, summary_path: Path | 
             record = json.loads(line)
             if not isinstance(record, dict):
                 continue
-            prompt_variants = build_prompt_variants(record)
-            prompt_state = (
-                record.get("prompt_state")
-                if isinstance(record.get("prompt_state"), dict)
-                else {}
-            )
-            run_info = prompt_state.get("run") if isinstance(prompt_state.get("run"), dict) else {}
-            run_dir = str(run_info.get("run_dir") or "")
-            normalized = dict(record)
-            normalized["prompt_state_full"] = prompt_variants["full"]
-            normalized["prompt_state_compact"] = prompt_variants["compact"]
-            normalized["prompt_state_compact_v2"] = prompt_variants["compact_v2"]
-            for key in (
-                "prior_action_summary",
-                "current_result_facts",
-                "tool_results_summary",
-                "manager_events",
-                "trace_event_facts",
-            ):
-                if key in record:
-                    normalized[key] = _pathless_model_value(record.get(key))
-            normalized["target_response_normalized"] = _canonicalize_value(
-                _pathless_model_value(record.get("target_response")),
-                run_dir,
-            )
-            normalized["target_actions_normalized"] = _canonicalize_value(
-                _pathless_model_value(record.get("target_actions")),
-                run_dir,
-            )
-            normalized["action_signatures_normalized"] = _canonicalize_value(
-                _pathless_model_value(record.get("action_signatures")),
-                run_dir,
-            )
+            normalized = normalize_record(record)
             sink.write(json.dumps(normalized, ensure_ascii=True) + "\n")
             record_count += 1
     summary = {

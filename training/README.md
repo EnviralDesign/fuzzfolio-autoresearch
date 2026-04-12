@@ -16,6 +16,70 @@ This directory holds the first adapter-first training scaffold for the explorer 
 
 This produces a LoRA adapter first, not a merged standalone checkpoint.
 
+## Exploration-Judgment Curation v1
+
+This is the next `yay-but-be-disciplined` lane after the pathless controller work.
+The goal is to teach better search judgment, not more contract mechanics.
+
+New helper paths:
+
+- `trainingdatapipeline/build_exploration_review_set.py`
+  - mines real runs into reviewer-oriented decision rows
+  - emits stable `review_id` values
+  - outputs a JSONL review set, Markdown sheet, and blank labels template
+- `trainingdatapipeline/build_exploration_judgment_dataset.py`
+  - reads the review-set JSONL plus manual labels
+  - validates kept/rewritten targets against the offline controller validator
+  - mixes curated manual rows with pathless opening and follow-up anchors
+  - exports train / val / held-out benchmark JSONL plus compact-v2 chat exports
+
+Current first-pass generated artifacts:
+
+- review rows:
+  - `data/training_pipeline/review_sets/exploration_review_v1_candidates.jsonl`
+- review sheet:
+  - `data/training_pipeline/review_sets/exploration_review_v1_sheet.md`
+- blank labels template:
+  - `data/training_pipeline/manual_labels/exploration_judgment_v1_template.jsonl`
+
+Expected manual label decisions:
+
+- `keep_gold`
+- `rewrite_action`
+- `drop_infra`
+- `drop_mechanical`
+- `drop_ambiguous`
+
+For `rewrite_action` rows:
+
+- provide one short `corrected_reasoning`
+- provide one pathless `corrected_action`
+- do not emit `profile_path`, `destination_path`, or other legacy path-era fields
+
+The intended use is:
+
+1. generate or refresh the review set
+2. annotate rows by `review_id`
+3. build the curated dataset
+4. run one bounded exploration-judgment continuation from the current best adapter
+5. export the new adapter to GGUF and re-evaluate in LM Studio
+
+Observed v1 result:
+
+- curated dataset manifest:
+  - `data/training_pipeline/targeted_slices/exploration_judgment_v1_manifest.json`
+  - `73` validated manual rows kept
+  - `204` train / `30` val / `24` held-out benchmark rows
+- continuation run:
+  - `data/training_runs/gemma_e4b_explorationjudgment_v1_from_openv2_gpu1`
+- offline gates:
+  - opening held at `12 / 12` parseable, `12 / 12` validator-clean, `12 / 12` first-tool match
+  - fixed follow-up regressed to `15 / 16` parseable, `14 / 16` validator-clean, `14 / 16` deterministic tool match
+  - exploration holdout did not improve over the old adapter: `8 / 24` first-tool match on both, with validator-clean dropping from `21 / 24` to `19 / 24`
+- decision:
+  - do not export or promote `gemma_e4b_explorationjudgment_v1_from_openv2_gpu1`
+  - mine a second judgment review slice before the next tune, with extra care around over-teaching mutate rewrites
+
 ## GGUF / LM Studio Export
 
 This is a real `yay`: the repo now has a first-class export lane for turning the
