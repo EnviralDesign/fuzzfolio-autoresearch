@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from autoresearch import __main__ as ar_main
 from autoresearch import dashboard as dashboard_mod
@@ -13,6 +14,7 @@ class _StubConfig:
     def __init__(self, workspace_root: Path):
         self.validation_cache_root = workspace_root / "validation-cache"
         self.validation_cache_root.mkdir(parents=True, exist_ok=True)
+        self.research = SimpleNamespace(quality_score_preset="profile-drop")
         self.fuzzfolio = FuzzfolioConfig(
             workspace_root=workspace_root,
             cli_command="fuzzfolio-agent-cli",
@@ -123,6 +125,68 @@ def test_run_full_backtest_salvages_outputs_after_timeout(
     assert result["result_path"] == str(result_path)
     assert curve_path.exists()
     assert result_path.exists()
+
+
+def test_run_full_backtest_forwards_normalized_quality_score_preset(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifact_dir = tmp_path / "eval"
+    artifact_dir.mkdir()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text("{}", encoding="utf-8")
+    (artifact_dir / "deep-replay-job.json").write_text(
+        json.dumps(
+            {
+                "request": {
+                    "timeframe": "M15",
+                    "instruments": ["EURUSD", "GBPUSD"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _StubConfig(tmp_path)
+    config.research.quality_score_preset = "profile_drop"
+    attempt = {
+        "attempt_id": "run-attempt-3",
+        "artifact_dir": str(artifact_dir),
+        "profile_ref": "cloud-ref",
+        "profile_path": str(profile_path),
+    }
+
+    seen_args: list[str] = []
+
+    def fake_run(self, args, **kwargs):
+        nonlocal seen_args
+        seen_args = list(args)
+        output_dir = Path(args[args.index("--output-dir") + 1])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "best-cell-path-detail.json").write_text(
+            json.dumps({"curve": {"points": []}}), encoding="utf-8"
+        )
+        (output_dir / "sensitivity-response.json").write_text(
+            json.dumps({"data": {"aggregate": {"quality_score": {"score": 55.0}}}}),
+            encoding="utf-8",
+        )
+
+        class _Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _Result()
+
+    monkeypatch.setattr(dashboard_mod.FuzzfolioCli, "run", fake_run)
+
+    result = dashboard_mod._run_full_backtest_for_attempt(config, attempt)
+
+    assert result["curve_path"] == str(
+        artifact_dir / dashboard_mod.FULL_BACKTEST_CURVE_FILENAME
+    )
+    assert "--quality-score-preset" in seen_args
+    preset_index = seen_args.index("--quality-score-preset")
+    assert seen_args[preset_index + 1] == "profile-drop"
+    assert seen_args.count("--instrument") == 2
 
 
 def test_copy_full_backtest_outputs_surfaces_profile_not_found_from_result_json(

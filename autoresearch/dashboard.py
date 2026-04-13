@@ -85,6 +85,13 @@ def _diagnose_missing_full_backtest_curve(sensitivity_output_dir: Path) -> str |
     return None
 
 
+def _quality_score_preset_cli_value(config: AppConfig) -> str:
+    preset = str(getattr(config.research, "quality_score_preset", "") or "").strip()
+    if preset in {"profile-drop", "profile_drop"}:
+        return "profile-drop"
+    return preset or "profile-drop"
+
+
 def _run_streaming_subprocess(
     argv: list[str], *, cwd: str, prefix: str
 ) -> tuple[int, str, str]:
@@ -501,6 +508,8 @@ def _run_full_backtest_for_attempt(
             "--output-dir",
             str(sensitivity_output_dir),
             "--allow-timeframe-mismatch",
+            "--quality-score-preset",
+            _quality_score_preset_cli_value(config),
         ]
         for instrument in instruments:
             args.extend(["--instrument", instrument])
