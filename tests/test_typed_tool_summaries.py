@@ -288,6 +288,88 @@ def test_history_result_summary_compacts_compare_artifacts_for_prompt_visibility
     }
 
 
+def test_history_result_summary_keeps_sweep_followup_scaffold_preview() -> None:
+    controller = object.__new__(ResearchController)
+
+    summarized = controller._history_result_summary(
+        {
+            "tool": "inspect_artifact",
+            "ok": True,
+            "artifact_kind": "parameter_sweep",
+            "sweep_summary": {
+                "fitness_metric": "quality_score",
+                "top_score": 57.2705,
+                "top_effective_window_months": 11.56,
+                "top_parameters": {
+                    "indicator[0].config.timeframe": "H1",
+                },
+            },
+            "recommended_destination_candidate_name": "cand_sweep_top",
+            "recommended_followup_actions": [
+                {
+                    "tool": "prepare_profile",
+                    "mode": "clone_local",
+                    "source_profile_ref": "ref-a",
+                    "destination_candidate_name": "cand_sweep_top",
+                },
+                {
+                    "tool": "mutate_profile",
+                    "candidate_name": "cand_sweep_top",
+                    "mutations": [
+                        {
+                            "path": "indicator[0].config.timeframe",
+                            "value": "H1",
+                        }
+                    ],
+                },
+                {
+                    "tool": "validate_profile",
+                    "candidate_name": "cand_sweep_top",
+                },
+            ],
+            "controller_hint": "Clone-first sweep follow-up is ready.",
+        }
+    )
+
+    assert summarized == {
+        "tool": "inspect_artifact",
+        "ok": True,
+        "artifact_kind": "parameter_sweep",
+        "sweep_summary": {
+            "fitness_metric": "quality_score",
+            "top_score": 57.2705,
+            "top_effective_window_months": 11.56,
+            "top_parameters": {
+                "indicator[0].config.timeframe": "H1",
+            },
+        },
+        "recommended_destination_candidate_name": "cand_sweep_top",
+        "recommended_followup_actions": [
+            {
+                "tool": "prepare_profile",
+                "mode": "clone_local",
+                "source_profile_ref": "ref-a",
+                "destination_candidate_name": "cand_sweep_top",
+            },
+            {
+                "tool": "mutate_profile",
+                "candidate_name": "cand_sweep_top",
+                "mutations": [
+                    {
+                        "path": "indicator[0].config.timeframe",
+                        "value": "H1",
+                    }
+                ],
+            },
+            {
+                "tool": "validate_profile",
+                "candidate_name": "cand_sweep_top",
+            },
+        ],
+        "controller_hint": "Clone-first sweep follow-up is ready.",
+    }
+
+
 def test_history_result_summary_omits_artifact_paths_for_eval_and_inspect() -> None:
     controller = object.__new__(ResearchController)
 

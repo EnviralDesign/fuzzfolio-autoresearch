@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -470,6 +471,84 @@ def test_canonicalize_followup_step_response_ignores_wrong_tool() -> None:
     assert normalized == payload
 
 
+def test_apply_runtime_interventions_passes_step_limit_and_policy_to_followup_template() -> None:
+    controller = _make_controller()
+    controller._trace_runtime = lambda *_args, **_kwargs: None
+    controller._append_raw_explorer_payload = lambda *_args, **_kwargs: None
+    controller._is_true_opening_step = lambda *_args, **_kwargs: False
+    seen: dict[str, object] = {}
+
+    def followup_template(_tool_context, **kwargs):
+        seen.update(kwargs)
+        return {"tool": "validate_profile", "candidate_name": "cand-a"}
+
+    controller._followup_next_action_template_prompt_state = followup_template
+    tool_context = SimpleNamespace(run_id="run-a", run_dir=Path("C:/runs/example"))
+    policy = ctrlmod.RunPolicy(mode_name="run")
+    response = {
+        "reasoning": "Validate the candidate next.",
+        "actions": [{"tool": "validate_profile", "candidate_name": "cand-a"}],
+    }
+
+    normalized = controller._apply_runtime_interventions(
+        tool_context,
+        2,
+        response,
+        phase="explorer_normalize",
+        step_limit=50,
+        policy=policy,
+    )
+
+    assert normalized == response
+    assert seen["step"] == 2
+    assert seen["step_limit"] == 50
+    assert seen["policy"] is policy
+
+
+def test_repair_invalid_response_passes_step_limit_and_policy_to_followup_template() -> None:
+    controller = _make_controller()
+    controller._trace_runtime = lambda *_args, **_kwargs: None
+    controller._append_raw_explorer_payload = lambda *_args, **_kwargs: None
+    controller._uses_local_transformers_provider = lambda: True
+    controller._compact_repair_messages = lambda payload, **kwargs: payload
+    controller._provider_scope = lambda **_kwargs: nullcontext()
+    controller.provider = SimpleNamespace(complete_json=lambda messages: messages)
+    controller._normalize_model_response = lambda repaired: repaired
+    controller._is_true_opening_step = lambda *_args, **_kwargs: False
+    controller._validate_actions = lambda _actions: []
+    controller._validate_finish_timing = lambda *_args, **_kwargs: []
+    controller._validate_repeated_actions = lambda *_args, **_kwargs: []
+    controller._validate_timeframe_mismatch_block = lambda *_args, **_kwargs: []
+    controller._validate_branch_lifecycle_actions = lambda *_args, **_kwargs: []
+    controller._current_run_policy = None
+    controller._current_step_limit = 50
+    seen: dict[str, object] = {}
+
+    def followup_template(_tool_context, **kwargs):
+        seen.update(kwargs)
+        return {"tool": "validate_profile", "candidate_name": "cand-a"}
+
+    controller._followup_next_action_template_prompt_state = followup_template
+    tool_context = SimpleNamespace(run_id="run-a", run_dir=Path("C:/runs/example"))
+    policy = ctrlmod.RunPolicy(mode_name="run")
+
+    repaired = controller._repair_invalid_response(
+        tool_context,
+        3,
+        [],
+        "Need repair",
+        [{"tool": "validate_profile", "candidate_name": "cand-a"}],
+        ["bad action"],
+        step_limit=50,
+        policy=policy,
+    )
+
+    assert repaired["actions"] == [{"tool": "validate_profile", "candidate_name": "cand-a"}]
+    assert seen["step"] == 3
+    assert seen["step_limit"] == 50
+    assert seen["policy"] is policy
+
+
 def test_system_protocol_stays_stable_and_opening_overlay_moves_to_step_update() -> None:
     controller = _make_controller()
     controller.config.provider = SimpleNamespace(provider_type="openai")
@@ -814,7 +893,7 @@ def test_delta_packet_emits_changed_active_handles_once() -> None:
     assert "candidate_name=cand-b" in second_prompt
 
 
-def test_delta_packet_emits_sweep_and_mutate_context_from_live_handles_once() -> None:
+def test_delta_packet_emits_sweep_priority_and_context_after_eval_plateau() -> None:
     controller = _make_controller()
     controller._run_attempts = lambda _run_id: []
     controller._run_phase_info = lambda *_args, **_kwargs: {
@@ -843,6 +922,40 @@ def test_delta_packet_emits_sweep_and_mutate_context_from_live_handles_once() ->
     controller._recent_known_instruments_for_handle = (
         lambda *_args, **_kwargs: ["EURUSD"]
     )
+    controller._load_recent_step_payloads = lambda *_args, **_kwargs: [
+        {
+            "step": 10,
+            "results": [
+                {
+                    "tool": "evaluate_candidate",
+                    "ok": True,
+                    "profile_ref": "ref-a",
+                    "requested_horizon_months": 24,
+                    "requested_timeframe": "M5",
+                    "effective_timeframe": "M5",
+                    "validation_outcome": vo.VALIDATION_UNRESOLVED,
+                    "coverage_status": "qualified",
+                    "score": 54.0,
+                }
+            ],
+        },
+        {
+            "step": 11,
+            "results": [
+                {
+                    "tool": "evaluate_candidate",
+                    "ok": True,
+                    "profile_ref": "ref-a",
+                    "requested_horizon_months": 24,
+                    "requested_timeframe": "M5",
+                    "effective_timeframe": "M5",
+                    "validation_outcome": vo.VALIDATION_UNRESOLVED,
+                    "coverage_status": "qualified",
+                    "score": 55.0,
+                }
+            ],
+        },
+    ]
 
     def latest_result(
         _tool_context,
@@ -911,10 +1024,276 @@ def test_delta_packet_emits_sweep_and_mutate_context_from_live_handles_once() ->
 
     assert "===== PREPARE OR MUTATE CONTEXT =====" in first_prompt
     assert "mutate_profile is for field-level edits" in first_prompt
+    assert "===== SWEEP PRIORITY =====" in first_prompt
+    assert "preferred_next_tool: run_parameter_sweep" in first_prompt
     assert "===== SWEEP CONTEXT =====" in first_prompt
     assert "indicator[N].config.<field>" in first_prompt
+    assert "===== EVALUATE CONTEXT =====" not in first_prompt
     assert "===== PREPARE OR MUTATE CONTEXT =====" not in second_prompt
+    assert "===== SWEEP PRIORITY =====" not in second_prompt
     assert "===== SWEEP CONTEXT =====" not in second_prompt
+
+
+def test_delta_packet_emits_sweep_priority_after_single_credible_mid_phase_eval() -> None:
+    controller = _make_controller()
+    controller._run_attempts = lambda _run_id: []
+    controller._run_phase_info = lambda *_args, **_kwargs: {
+        "name": "mid",
+        "summary": "Deepen evidence on the strongest families.",
+    }
+    controller._horizon_policy_snapshot = lambda *_args, **_kwargs: {
+        "summary": "12 months",
+        "guidance": "Screen quickly, then refine locally.",
+    }
+    controller._score_target_snapshot = lambda *_args, **_kwargs: {
+        "summary": "Find the best pocket around the current branch",
+    }
+    controller._working_memory_text = lambda *_args, **_kwargs: (
+        "Pinned working memory:\n- current_candidate: candidate_name=cand-a, profile_ref=ref-a"
+    )
+    controller._run_outcome_text = lambda *_args, **_kwargs: (
+        "Run outcome state:\n- official_winner: none yet"
+    )
+    controller._recent_behavior_digest_text = lambda *_args, **_kwargs: (
+        "Behavior digest: One credible branch is active."
+    )
+    controller._timeframe_mismatch_status_text = (
+        lambda *_args, **_kwargs: "Timeframe intent status: No auto-adjustments detected."
+    )
+    controller._recent_known_instruments_for_handle = (
+        lambda *_args, **_kwargs: ["EURUSD"]
+    )
+    controller._load_recent_step_payloads = lambda *_args, **_kwargs: [
+        {
+            "step": 10,
+            "results": [
+                {
+                    "tool": "evaluate_candidate",
+                    "ok": True,
+                    "profile_ref": "ref-a",
+                    "requested_horizon_months": 12,
+                    "requested_timeframe": "M5",
+                    "effective_timeframe": "M5",
+                    "validation_outcome": vo.VALIDATION_UNRESOLVED,
+                    "coverage_status": "ok",
+                    "score": 58.0,
+                    "retention_relevant_flags": {
+                        "evaluation_mode": "screen",
+                    },
+                }
+            ],
+        }
+    ]
+
+    def latest_result(
+        _tool_context,
+        *,
+        tool_names: set[str],
+        limit: int = 12,
+    ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+        if tool_names == {
+            "prepare_profile",
+            "mutate_profile",
+            "validate_profile",
+            "register_profile",
+        }:
+            return (
+                {
+                    "tool": "register_profile",
+                    "candidate_name": "cand-a",
+                    "profile_ref": "ref-a",
+                    "ready_to_evaluate": True,
+                    "candidate_summary": {
+                        "candidate_name": "cand-a",
+                        "profile_ref": "ref-a",
+                        "indicator_ids": ["MACD_CROSSOVER"],
+                    },
+                },
+                {},
+            )
+        return (None, None)
+
+    controller._latest_successful_step_result = latest_result
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        run_dir=Path("C:/runs/example"),
+        evals_dir=Path("C:/runs/example/evals"),
+        profiles_dir=Path("C:/runs/example/profiles"),
+        seed_prompt_path=None,
+        seed_indicator_parameter_hints="",
+        instrument_catalog_summary="Use exact catalog symbols only.",
+    )
+
+    first_prompt, _first_state = controller._build_step_update_packet(
+        tool_context,
+        ctrlmod.RunPolicy(mode_name="run"),
+        step=12,
+        step_limit=50,
+        checkpoint_required=True,
+    )
+
+    assert "===== SWEEP PRIORITY =====" in first_prompt
+    assert "credible screen signal in an exploration phase" in first_prompt
+    assert "===== SWEEP CONTEXT =====" in first_prompt
+    assert "===== EVALUATE CONTEXT =====" not in first_prompt
+    assert '"tool": "evaluate_candidate"' not in first_prompt
+
+
+def test_eval_template_remains_active_when_eval_evidence_changes() -> None:
+    controller = _make_controller()
+    controller._run_attempts = lambda _run_id: []
+    controller._recent_known_instruments_for_handle = (
+        lambda *_args, **_kwargs: ["EURUSD"]
+    )
+    controller._load_recent_step_payloads = lambda *_args, **_kwargs: [
+        {
+            "step": 10,
+            "results": [
+                {
+                    "tool": "evaluate_candidate",
+                    "ok": True,
+                    "profile_ref": "ref-a",
+                    "requested_horizon_months": 12,
+                    "requested_timeframe": "M5",
+                    "effective_timeframe": "M5",
+                    "validation_outcome": vo.VALIDATION_UNRESOLVED,
+                    "coverage_status": "qualified",
+                }
+            ],
+        },
+        {
+            "step": 11,
+            "results": [
+                {
+                    "tool": "evaluate_candidate",
+                    "ok": True,
+                    "profile_ref": "ref-a",
+                    "requested_horizon_months": 24,
+                    "requested_timeframe": "M5",
+                    "effective_timeframe": "M5",
+                    "validation_outcome": vo.VALIDATION_UNRESOLVED,
+                    "coverage_status": "qualified",
+                }
+            ],
+        },
+    ]
+    controller._latest_successful_step_result = lambda *_args, **kwargs: (
+        {
+            "tool": "register_profile",
+            "candidate_name": "cand-a",
+            "profile_ref": "ref-a",
+            "ready_to_evaluate": True,
+            "candidate_summary": {
+                "candidate_name": "cand-a",
+                "profile_ref": "ref-a",
+                "indicator_ids": ["MACD_CROSSOVER"],
+            },
+        },
+        {},
+    ) if kwargs.get("tool_names") == {
+        "prepare_profile",
+        "mutate_profile",
+        "validate_profile",
+        "register_profile",
+    } else (None, None)
+    tool_context = SimpleNamespace(run_id="run-a", run_dir=Path("C:/runs/example"))
+
+    template = controller._followup_next_action_template_prompt_state(
+        tool_context,
+        step=40,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    assert template == {
+        "tool": "evaluate_candidate",
+        "profile_ref": "ref-a",
+        "instruments": ["EURUSD"],
+        "timeframe_policy": "profile_default",
+        "evaluation_mode": "screen",
+    }
+
+
+def test_inspect_artifact_sweep_summary_returns_clone_first_followup(tmp_path: Path) -> None:
+    controller = _make_controller()
+    controller.cli = SimpleNamespace(score_artifact=lambda *_args, **_kwargs: {})
+    tool_context = SimpleNamespace(run_id="run-a", run_dir=tmp_path, evals_dir=tmp_path / "evals")
+    artifact_dir = tool_context.evals_dir / "sweep_alpha_20260401"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "sweep-results.json").write_text(
+        json.dumps(
+            {
+                "data": {
+                    "fitness_metric": "quality_score",
+                    "ranked_permutations": [
+                        {
+                            "rank": 1,
+                            "fitness_value": 57.2705,
+                            "parameters": {
+                                "indicator[0].config.timeframe": "H1",
+                                "indicator[1].talib.timeperiod": 14,
+                            },
+                            "fitness": {
+                                "quality_score_payload": {
+                                    "inputs": {"effective_window_months": 11.56}
+                                }
+                            },
+                        }
+                    ],
+                }
+            },
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
+    controller._load_recent_step_payloads = lambda *_args, **_kwargs: [
+        {
+            "step": 9,
+            "results": [
+                {
+                    "tool": "run_parameter_sweep",
+                    "ok": True,
+                    "inspect_ref": artifact_dir.name,
+                    "artifact_dir": str(artifact_dir.resolve()),
+                    "source_profile_ref": "ref-a",
+                    "source_candidate_name": "cand-a",
+                    "candidate_name_prefix": "cand_a_sweep",
+                }
+            ],
+        }
+    ]
+
+    result = controller._typed_inspect_artifact(
+        tool_context,
+        {"tool": "inspect_artifact", "inspect_ref": artifact_dir.name, "view": "summary"},
+    )
+
+    assert result["next_recommended_action"] == "prepare_profile"
+    assert result["recommended_destination_candidate_name"] == "cand_a_sweep_top"
+    assert result["recommended_mutations"] == [
+        {"path": "indicator[0].config.timeframe", "value": "H1"},
+        {"path": "indicator[1].talib.timeperiod", "value": 14},
+    ]
+    assert result["recommended_followup_actions"] == [
+        {
+            "tool": "prepare_profile",
+            "mode": "clone_local",
+            "source_profile_ref": "ref-a",
+            "destination_candidate_name": "cand_a_sweep_top",
+        },
+        {
+            "tool": "mutate_profile",
+            "candidate_name": "cand_a_sweep_top",
+            "mutations": [
+                {"path": "indicator[0].config.timeframe", "value": "H1"},
+                {"path": "indicator[1].talib.timeperiod", "value": 14},
+            ],
+        },
+        {
+            "tool": "validate_profile",
+            "candidate_name": "cand_a_sweep_top",
+        },
+    ]
 
 
 def test_history_append_keeps_completed_turn_only() -> None:

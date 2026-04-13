@@ -138,6 +138,7 @@ CHUNK_ACTIVE_HANDLES = "ACTIVE HANDLES"
 CHUNK_RECENT_EVIDENCE = "RECENT EVIDENCE"
 CHUNK_OPENING_OVERLAY = "OPENING OVERLAY"
 CHUNK_PREPARE_MUTATE_CONTEXT = "PREPARE OR MUTATE CONTEXT"
+CHUNK_SWEEP_PRIORITY = "SWEEP PRIORITY"
 CHUNK_SWEEP_CONTEXT = "SWEEP CONTEXT"
 CHUNK_EVALUATE_CONTEXT = "EVALUATE CONTEXT"
 CHUNK_RECOVERY_CONTEXT = "RECOVERY CONTEXT"
@@ -152,6 +153,7 @@ DELTA_CHUNK_ORDER = [
     CHUNK_RECENT_EVIDENCE,
     CHUNK_OPENING_OVERLAY,
     CHUNK_PREPARE_MUTATE_CONTEXT,
+    CHUNK_SWEEP_PRIORITY,
     CHUNK_SWEEP_CONTEXT,
     CHUNK_EVALUATE_CONTEXT,
     CHUNK_RECOVERY_CONTEXT,
@@ -161,6 +163,7 @@ DELTA_CHUNK_ORDER = [
 ACTION_CONTEXT_CHUNKS = {
     CHUNK_OPENING_OVERLAY,
     CHUNK_PREPARE_MUTATE_CONTEXT,
+    CHUNK_SWEEP_PRIORITY,
     CHUNK_SWEEP_CONTEXT,
     CHUNK_EVALUATE_CONTEXT,
     CHUNK_RECOVERY_CONTEXT,
@@ -2700,6 +2703,8 @@ class ResearchController:
         response: dict[str, Any],
         *,
         phase: str,
+        step_limit: int | None = None,
+        policy: RunPolicy | None = None,
     ) -> dict[str, Any]:
         updated = response
         if self._is_true_opening_step(tool_context, step):
@@ -2733,7 +2738,10 @@ class ResearchController:
             updated = canonicalized
         elif isinstance(updated, dict):
             next_action_template = self._followup_next_action_template_prompt_state(
-                tool_context
+                tool_context,
+                step=step,
+                step_limit=step_limit,
+                policy=policy,
             )
             canonicalized = canonicalize_followup_step_response(
                 updated,
@@ -4924,36 +4932,46 @@ class ResearchController:
     def _sweep_context_template_prompt_state(
         self,
         tool_context: ToolContext,
+        *,
+        step: int | None = None,
+        step_limit: int | None = None,
+        policy: RunPolicy | None = None,
     ) -> dict[str, Any] | None:
-        latest_eval_result, _payload = self._latest_successful_step_result(
+        sweep_priority = self._sweep_priority_prompt_state(
             tool_context,
-            tool_names={"evaluate_candidate"},
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
         )
-        if not isinstance(latest_eval_result, dict):
+        if not isinstance(sweep_priority, dict):
             return None
-        profile_ref = str(latest_eval_result.get("profile_ref") or "").strip()
-        if not profile_ref:
-            return None
-        if latest_eval_result.get("score") is None:
-            return None
-        template: dict[str, Any] = {"profile_ref": profile_ref}
-        candidate_template = self._latest_candidate_context_template_prompt_state(
-            tool_context
-        ) or {}
-        candidate_name = str(candidate_template.get("candidate_name") or "").strip()
-        if candidate_name:
-            template["candidate_name"] = candidate_name
-        indicator_ids = self._relevant_indicator_ids_for_template(tool_context, template)
-        if indicator_ids:
-            template["indicator_ids"] = indicator_ids
-        instruments = self._recent_known_instruments_for_handle(
-            tool_context,
-            candidate_name=candidate_name or None,
-            profile_ref=profile_ref,
-        )
-        if instruments:
-            template["instruments"] = instruments
+        template: dict[str, Any] = {}
+        for key in ("profile_ref", "candidate_name", "indicator_ids", "instruments"):
+            if sweep_priority.get(key) is not None:
+                template[key] = sweep_priority.get(key)
         return template
+
+    def _sweep_priority_chunk_text(
+        self,
+        sweep_priority: dict[str, Any],
+    ) -> str:
+        handle_bits = self._template_handle_bits(sweep_priority)
+        lines: list[str] = []
+        if handle_bits:
+            lines.append("- live_handle: " + ", ".join(handle_bits[:3]))
+        reason = str(sweep_priority.get("reason") or "").strip()
+        if reason:
+            lines.append(f"- reason: {reason}")
+        trigger = str(sweep_priority.get("trigger") or "").strip()
+        if trigger == "promising_probe":
+            lines.append("- sweep_posture: use a micro-sweep now to map the local pocket around this promising branch.")
+        lines.extend(
+            [
+                "- preferred_next_tool: run_parameter_sweep",
+                "- Use a small sweep burst to probe the local parameter neighborhood before another same-handle eval.",
+            ]
+        )
+        return "\n".join(lines).strip()
 
     def _opening_step_overlay_text(self, tool_context: ToolContext) -> str:
         grounding = self._local_opening_grounding_prompt_state(tool_context) or {}
@@ -5037,7 +5055,12 @@ class ResearchController:
         phase_info = self._run_phase_info(step, step_limit, policy)
         horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
         score_target = self._score_target_snapshot(tool_context)
-        next_action_template = self._followup_next_action_template_prompt_state(tool_context)
+        next_action_template = self._followup_next_action_template_prompt_state(
+            tool_context,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+        )
         phase_name = str(phase_info.get("name") or "").strip()
         compact_phase_guidance = {
             "early": "Branch broadly and get the first credible scorer fast.",
@@ -5258,6 +5281,8 @@ class ResearchController:
                 "- mutate_profile is for field-level edits on an existing profile shape.",
                 "- Do not replace the full indicators array with shorthand ids or partial payloads.",
                 "- For add/remove/swap indicator structures, use prepare_profile scaffold_from_seed or clone_local first, then validate the returned candidate_name.",
+                "- For sweep winners, materialize a cloned branch first, then patch the winning fields on that clone and validate it before evaluation.",
+                "- Do not patch the registered sweep source reference directly when materializing a sweep winner.",
                 "- If you patch indicator fields, preserve the existing meta/config shape and edit the specific field path only.",
             ]
         )
@@ -5407,12 +5432,32 @@ class ResearchController:
             )
             if body:
                 payloads[CHUNK_PREPARE_MUTATE_CONTEXT] = body
-        sweep_context_template = self._sweep_context_template_prompt_state(tool_context)
+        sweep_priority = self._sweep_priority_prompt_state(
+            tool_context,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+        )
+        if isinstance(sweep_priority, dict):
+            body = self._sweep_priority_chunk_text(sweep_priority)
+            if body:
+                payloads[CHUNK_SWEEP_PRIORITY] = body
+        sweep_context_template = self._sweep_context_template_prompt_state(
+            tool_context,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+        )
         if isinstance(sweep_context_template, dict):
             body = self._sweep_context_chunk_text(tool_context, sweep_context_template)
             if body:
                 payloads[CHUNK_SWEEP_CONTEXT] = body
-        template = self._followup_next_action_template_prompt_state(tool_context)
+        template = self._followup_next_action_template_prompt_state(
+            tool_context,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+        )
         if isinstance(template, dict):
             tool = str(template.get("tool") or "").strip()
             if tool == "evaluate_candidate":
@@ -5712,12 +5757,29 @@ class ResearchController:
         tool_names: set[str],
         limit: int = 12,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        recent = self._recent_successful_step_results(
+            tool_context,
+            tool_names=tool_names,
+            limit=limit,
+        )
+        if recent:
+            return recent[-1]
+        return None, None
+
+    def _recent_successful_step_results(
+        self,
+        tool_context: ToolContext,
+        *,
+        tool_names: set[str],
+        limit: int = 12,
+    ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
         payloads = self._load_recent_step_payloads(tool_context, max(1, limit))
-        for payload in reversed(payloads):
+        matches: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        for payload in payloads:
             results = payload.get("results")
             if not isinstance(results, list):
                 continue
-            for result in reversed(results):
+            for result in results:
                 if not isinstance(result, dict):
                     continue
                 tool = str(result.get("tool") or "").strip()
@@ -5725,8 +5787,208 @@ class ResearchController:
                     continue
                 if result.get("ok") is False or result.get("error"):
                     continue
-                return result, payload
-        return None, None
+                matches.append((result, payload))
+        return matches
+
+    @staticmethod
+    def _result_handle_state(result: dict[str, Any]) -> dict[str, str] | None:
+        profile_ref = str(result.get("profile_ref") or "").strip()
+        candidate_summary = (
+            result.get("candidate_summary")
+            if isinstance(result.get("candidate_summary"), dict)
+            else {}
+        )
+        candidate_name = str(
+            result.get("candidate_name")
+            or candidate_summary.get("candidate_name")
+            or candidate_summary.get("draft_name")
+            or candidate_summary.get("profile_name")
+            or ""
+        ).strip()
+        if profile_ref:
+            return {"kind": "profile_ref", "value": profile_ref}
+        if candidate_name:
+            return {"kind": "candidate_name", "value": candidate_name}
+        return None
+
+    @staticmethod
+    def _eval_evidence_signature(result: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any]:
+        validation_outcome = str(result.get("validation_outcome") or "").strip() or None
+        if validation_outcome is None:
+            validation_evidence = (
+                result.get("validation_evidence")
+                if isinstance(result.get("validation_evidence"), dict)
+                else {}
+            )
+            validation_outcome = (
+                str(validation_evidence.get("outcome") or "").strip() or None
+            )
+        coverage_status = str(result.get("coverage_status") or "").strip() or None
+        return (
+            result.get("requested_horizon_months"),
+            str(result.get("requested_timeframe") or "").strip() or None,
+            str(result.get("effective_timeframe") or "").strip() or None,
+            validation_outcome,
+            coverage_status,
+        )
+
+    @staticmethod
+    def _template_matches_handle(
+        template: dict[str, Any] | None,
+        handle: dict[str, str],
+    ) -> bool:
+        if not isinstance(template, dict):
+            return False
+        value = str(template.get(handle["kind"]) or "").strip()
+        return bool(value) and value == handle["value"]
+
+    def _eval_is_credible_for_sweep_probe(self, result: dict[str, Any]) -> bool:
+        try:
+            score = float(result.get("score"))
+        except (TypeError, ValueError):
+            return False
+        min_score = max(
+            float(self.config.research.validated_leader_min_score),
+            1.0,
+        )
+        if score < min_score:
+            return False
+        coverage_status = str(result.get("coverage_status") or "").strip().lower()
+        if coverage_status == vo.COVERAGE_INADEQUATE:
+            return False
+        validation_outcome = str(result.get("validation_outcome") or "").strip().lower()
+        if validation_outcome == vo.VALIDATION_FAILED:
+            return False
+        retention_flags = (
+            result.get("retention_relevant_flags")
+            if isinstance(result.get("retention_relevant_flags"), dict)
+            else {}
+        )
+        evaluation_mode = str(retention_flags.get("evaluation_mode") or "").strip().lower()
+        if evaluation_mode == "validate":
+            return False
+        return True
+
+    def _has_later_sweep_for_handle(
+        self,
+        tool_context: ToolContext,
+        handle: dict[str, str],
+        *,
+        after_step: int | None = None,
+    ) -> bool:
+        recent = self._recent_successful_step_results(
+            tool_context,
+            tool_names={"run_parameter_sweep"},
+            limit=48,
+        )
+        for result, payload in reversed(recent):
+            payload_step = payload.get("step")
+            if isinstance(after_step, int) and isinstance(payload_step, int):
+                if payload_step <= after_step:
+                    continue
+            if handle["kind"] == "profile_ref":
+                value = str(result.get("source_profile_ref") or "").strip()
+            else:
+                value = str(result.get("source_candidate_name") or "").strip()
+            if value and value == handle["value"]:
+                return True
+        return False
+
+    def _sweep_priority_prompt_state(
+        self,
+        tool_context: ToolContext,
+        *,
+        step: int | None = None,
+        step_limit: int | None = None,
+        policy: RunPolicy | None = None,
+    ) -> dict[str, Any] | None:
+        phase_name: str | None = None
+        if (
+            isinstance(step, int)
+            and isinstance(step_limit, int)
+            and isinstance(policy, RunPolicy)
+        ):
+            phase_name = str(
+                self._run_phase_info(step, step_limit, policy).get("name") or ""
+            ).strip()
+        recent = self._recent_successful_step_results(
+            tool_context,
+            tool_names={"evaluate_candidate"},
+            limit=16,
+        )
+        if not recent:
+            return None
+        latest_eval_result, _ = recent[-1]
+        latest_handle = self._result_handle_state(latest_eval_result)
+        if not latest_handle:
+            return None
+        indicator_source = self._latest_candidate_context_template_prompt_state(
+            tool_context
+        ) or {}
+        if indicator_source and not self._template_matches_handle(
+            indicator_source,
+            latest_handle,
+        ):
+            return None
+
+        def build_template(reason: str, *, trigger: str) -> dict[str, Any]:
+            template: dict[str, Any] = dict(latest_handle)
+            indicator_ids = indicator_source.get("indicator_ids")
+            if isinstance(indicator_ids, list) and indicator_ids:
+                template["indicator_ids"] = [
+                    str(item).strip() for item in indicator_ids if str(item).strip()
+                ]
+            instruments = self._recent_known_instruments_for_handle(
+                tool_context,
+                candidate_name=(
+                    latest_handle["value"]
+                    if latest_handle["kind"] == "candidate_name"
+                    else None
+                ),
+                profile_ref=(
+                    latest_handle["value"]
+                    if latest_handle["kind"] == "profile_ref"
+                    else None
+                ),
+            )
+            if instruments:
+                template["instruments"] = instruments
+            template["reason"] = reason
+            template["trigger"] = trigger
+            return template
+
+        if (
+            phase_name in {"early", "mid"}
+            and self._eval_is_credible_for_sweep_probe(latest_eval_result)
+        ):
+            latest_payload = recent[-1][1]
+            latest_step = latest_payload.get("step")
+            if not self._has_later_sweep_for_handle(
+                tool_context,
+                latest_handle,
+                after_step=latest_step if isinstance(latest_step, int) else None,
+            ):
+                return build_template(
+                    "This live branch just produced a credible screen signal in an exploration phase. Probe the local pocket now before spending another 1:1 eval.",
+                    trigger="promising_probe",
+                )
+
+        if len(recent) < 2 or phase_name == "wrap_up":
+            return None
+        prior_eval_result, _ = recent[-2]
+        prior_handle = self._result_handle_state(prior_eval_result)
+        if not prior_handle or latest_handle != prior_handle:
+            return None
+        latest_sig = self._eval_evidence_signature(latest_eval_result)
+        prior_sig = self._eval_evidence_signature(prior_eval_result)
+        if latest_sig != prior_sig:
+            return None
+        template = build_template(
+            "This live branch has been evaluated twice with unchanged horizon, timeframe, validation, and coverage evidence.",
+            trigger="plateau_remeasure",
+        )
+        template["plateau_eval_count"] = 2
+        return template
 
     @staticmethod
     def _summarize_candidate_handle(result: dict[str, Any]) -> str | None:
@@ -5797,6 +6059,90 @@ class ResearchController:
         if not parts:
             return None
         return ", ".join(parts[:5])
+
+    def _candidate_name_for_profile_ref(self, profile_ref: str | None) -> str | None:
+        if not isinstance(profile_ref, str) or not profile_ref.strip():
+            return None
+        source = self.profile_sources.get(profile_ref.strip())
+        if isinstance(source, Path):
+            return self._sanitize_label(source.stem)
+        return None
+
+    def _matching_sweep_source_result(
+        self,
+        tool_context: ToolContext,
+        *,
+        inspect_ref: str | None = None,
+        artifact_dir: Path | None = None,
+    ) -> dict[str, Any] | None:
+        recent = self._recent_successful_step_results(
+            tool_context,
+            tool_names={"run_parameter_sweep"},
+            limit=48,
+        )
+        artifact_text = str(artifact_dir.resolve()) if isinstance(artifact_dir, Path) else ""
+        for result, _payload in reversed(recent):
+            candidate_ref = str(result.get("inspect_ref") or "").strip()
+            if inspect_ref and candidate_ref and candidate_ref == inspect_ref.strip():
+                return result
+            candidate_dir = str(result.get("artifact_dir") or "").strip()
+            if artifact_text and candidate_dir and candidate_dir == artifact_text:
+                return result
+        return None
+
+    def _recommended_sweep_followup_payload(
+        self,
+        sweep_result: dict[str, Any] | None,
+        sweep_summary: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(sweep_result, dict) or not isinstance(sweep_summary, dict):
+            return None
+        source_profile_ref = str(sweep_result.get("source_profile_ref") or "").strip()
+        if not source_profile_ref:
+            return None
+        top_parameters = (
+            sweep_summary.get("top_parameters")
+            if isinstance(sweep_summary.get("top_parameters"), dict)
+            else {}
+        )
+        if not top_parameters:
+            return None
+        prefix = self._sanitize_label(str(sweep_result.get("candidate_name_prefix") or ""))
+        source_candidate_name = str(sweep_result.get("source_candidate_name") or "").strip()
+        if prefix:
+            destination_candidate_name = f"{prefix}_top"
+        elif source_candidate_name:
+            destination_candidate_name = f"{self._sanitize_label(source_candidate_name)}_sweep_top"
+        else:
+            destination_candidate_name = "sweep_top"
+        recommended_mutations = [
+            {"path": str(path).strip(), "value": value}
+            for path, value in top_parameters.items()
+            if str(path).strip()
+        ]
+        if not recommended_mutations:
+            return None
+        return {
+            "recommended_destination_candidate_name": destination_candidate_name,
+            "recommended_mutations": recommended_mutations,
+            "recommended_followup_actions": [
+                {
+                    "tool": "prepare_profile",
+                    "mode": "clone_local",
+                    "source_profile_ref": source_profile_ref,
+                    "destination_candidate_name": destination_candidate_name,
+                },
+                {
+                    "tool": "mutate_profile",
+                    "candidate_name": destination_candidate_name,
+                    "mutations": recommended_mutations,
+                },
+                {
+                    "tool": "validate_profile",
+                    "candidate_name": destination_candidate_name,
+                },
+            ],
+        }
 
     def _run_outcome_text(self, tool_context: ToolContext) -> str:
         outcome = self._run_outcome_snapshot(self._run_attempts(tool_context.run_id))
@@ -6342,6 +6688,10 @@ class ResearchController:
     def _followup_next_action_template_prompt_state(
         self,
         tool_context: ToolContext,
+        *,
+        step: int | None = None,
+        step_limit: int | None = None,
+        policy: RunPolicy | None = None,
     ) -> dict[str, Any] | None:
         latest_result, _payload = self._latest_successful_step_result(
             tool_context,
@@ -6390,6 +6740,13 @@ class ResearchController:
         if tool == "register_profile" and (
             bool(latest_result.get("ready_to_evaluate")) or profile_ref or candidate_name
         ):
+            if self._sweep_priority_prompt_state(
+                tool_context,
+                step=step,
+                step_limit=step_limit,
+                policy=policy,
+            ):
+                return None
             instruments = self._recent_known_instruments_for_handle(
                 tool_context,
                 candidate_name=candidate_name or None,
@@ -6416,7 +6773,12 @@ class ResearchController:
         self,
         tool_context: ToolContext,
     ) -> str:
-        template = self._followup_next_action_template_prompt_state(tool_context)
+        template = self._followup_next_action_template_prompt_state(
+            tool_context,
+            step=effective_step,
+            step_limit=effective_step_limit,
+            policy=policy,
+        )
         if not isinstance(template, dict):
             return "No deterministic next_action_template is active."
         return json.dumps(template, ensure_ascii=True)
@@ -6453,7 +6815,10 @@ class ResearchController:
             ),
             "timeframe_status": self._get_timeframe_mismatch_status(),
             "next_action_template": self._followup_next_action_template_prompt_state(
-                tool_context
+                tool_context,
+                step=effective_step,
+                step_limit=effective_step_limit,
+                policy=policy,
             ),
             "recent_step_window": self._local_recent_step_window_prompt_state(
                 tool_context
@@ -6765,6 +7130,18 @@ class ResearchController:
                 }
                 if compact_attempt_hint:
                     summarized["attempt"] = compact_attempt_hint
+            destination_name = str(
+                result.get("recommended_destination_candidate_name") or ""
+            ).strip()
+            if destination_name:
+                summarized["recommended_destination_candidate_name"] = destination_name
+            followup_actions = result.get("recommended_followup_actions")
+            if isinstance(followup_actions, list) and followup_actions:
+                summarized["recommended_followup_actions"] = [
+                    self._prompt_visible_action_signature(action)
+                    for action in followup_actions[:3]
+                    if isinstance(action, dict)
+                ]
             if result.get("controller_hint"):
                 summarized["controller_hint"] = str(result.get("controller_hint"))[:220]
             return summarized
@@ -7179,6 +7556,9 @@ class ResearchController:
         reasoning: str,
         actions: list[Any],
         errors: list[str],
+        *,
+        step_limit: int | None = None,
+        policy: RunPolicy | None = None,
     ) -> dict[str, Any] | None:
         action_summaries = []
         for action in actions:
@@ -7195,7 +7575,12 @@ class ResearchController:
         next_action_template = (
             None
             if opening_step
-            else self._followup_next_action_template_prompt_state(tool_context)
+            else self._followup_next_action_template_prompt_state(
+                tool_context,
+                step=step,
+                step_limit=step_limit,
+                policy=policy,
+            )
         )
         if self._uses_local_transformers_provider() or opening_step:
             repair_messages = self._compact_repair_messages(
@@ -7274,6 +7659,8 @@ class ResearchController:
                 step,
                 normalized,
                 phase="response_repair",
+                step_limit=step_limit,
+                policy=policy,
             )
         except (ProviderError, RuntimeError, TypeError, ValueError) as exc:
             self._append_raw_explorer_payload(
@@ -7411,6 +7798,8 @@ class ResearchController:
                 step,
                 normalized,
                 phase="payload_shape_repair",
+                step_limit=step_limit,
+                policy=policy,
             )
         except (ProviderError, RuntimeError) as exc:
             self._append_raw_explorer_payload(
@@ -8663,6 +9052,12 @@ class ResearchController:
         base["resolved_trades"] = trades
         base["trades_per_month"] = tpm
         base["positive_cell_ratio"] = pos_ratio
+        base["coverage_status"] = (
+            auto.get("coverage_status") if isinstance(auto, dict) else None
+        )
+        base["validation_outcome"] = (
+            auto.get("validation_outcome") if isinstance(auto, dict) else None
+        )
         base["retention_relevant_flags"] = {
             "evaluation_mode": mode,
             "timeframe_policy": pol,
@@ -8793,6 +9188,14 @@ class ResearchController:
         base["artifact_kind"] = "parameter_sweep"
         base["inspect_ref"] = out_dir.name
         base["quality_score_preset"] = self.config.research.quality_score_preset
+        base["source_profile_ref"] = ref
+        source_candidate_name = str(action.get("source_candidate_name") or "").strip()
+        if not source_candidate_name:
+            source_candidate_name = self._candidate_name_for_profile_ref(ref) or ""
+        if source_candidate_name:
+            base["source_candidate_name"] = source_candidate_name
+        base["candidate_name_prefix"] = prefix
+        base["axes"] = [str(axis) for axis in axes]
         base["controller_hint"] = (
             "Next typed move: inspect_artifact with inspect_ref or artifact_dir from this result. "
             "Do not pass inspect_ref as attempt_id. Do not use run_cli, list_dir, or read_file first unless inspect_artifact fails."
@@ -8959,6 +9362,15 @@ class ResearchController:
                 artifact_dir=path,
             )
             if sweep_summary is not None:
+                sweep_source = self._matching_sweep_source_result(
+                    tool_context,
+                    inspect_ref=path.name,
+                    artifact_dir=path,
+                )
+                followup = self._recommended_sweep_followup_payload(
+                    sweep_source,
+                    sweep_summary,
+                )
                 payload["artifact_kind"] = "parameter_sweep"
                 payload["sweep_summary"] = sweep_summary
                 payload["artifact_resolution"] = {
@@ -8967,11 +9379,18 @@ class ResearchController:
                     "reason": "sweep-results.json present",
                     "has_sweep_results": True,
                 }
-                payload["next_recommended_action"] = "compare_artifacts"
-                payload["controller_hint"] = (
-                    "Top sweep parameters are already summarized. Next typed move: compare_artifacts when you have multiple artifact refs; "
-                    "otherwise mutate_profile with top_parameters and re-evaluate. Avoid run_cli/list_dir/read_file unless summary is missing a needed detail."
-                )
+                payload["next_recommended_action"] = "prepare_profile"
+                if isinstance(followup, dict):
+                    payload.update(followup)
+                    payload["controller_hint"] = (
+                        "Top sweep parameters are already summarized. The clone_local -> mutate_profile -> validate_profile chain is ready; "
+                        "copy it directly instead of synthesizing ad hoc patch steps. Only compare_artifacts if you deliberately need to compare multiple sweep refs."
+                    )
+                else:
+                    payload["controller_hint"] = (
+                        "Top sweep parameters are already summarized. Default next typed move is prepare_profile to materialize the top sweep winner into a draft branch. "
+                        "Only compare_artifacts if you deliberately need to compare multiple sweep refs."
+                    )
                 return payload
         try:
             compare = self.cli.score_artifact(path)
@@ -10051,6 +10470,8 @@ class ResearchController:
                         step,
                         response,
                         phase="explorer_normalize",
+                        step_limit=step_limit,
+                        policy=policy,
                     )
                     self._append_raw_explorer_payload(
                         tool_context,
@@ -10136,6 +10557,8 @@ class ResearchController:
                     reasoning,
                     actions if isinstance(actions, list) else [],
                     validation_errors,
+                    step_limit=step_limit,
+                    policy=policy,
                 )
                 if repaired is not None:
                     response = repaired
