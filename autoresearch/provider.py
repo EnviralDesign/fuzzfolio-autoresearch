@@ -281,6 +281,38 @@ def _format_planned_action_line(line: str) -> str:
 
 def _format_request_snapshot_message_content(content: str) -> str:
     text = str(content or "")
+    if text.startswith("===== TOOL RESULTS FROM PRIOR STEP ====="):
+        lines = text.splitlines()
+        rendered: list[str] = []
+        current_header: str | None = None
+        current_body: list[str] = []
+
+        def flush_section() -> None:
+            if current_header is None:
+                return
+            rendered.append(current_header)
+            body_text = "\n".join(current_body).strip()
+            if "TOOL RESULTS FROM PRIOR STEP" in current_header:
+                pretty = _pretty_json_text(body_text)
+                if pretty is not None:
+                    body_text = pretty
+            elif body_text:
+                pretty = _pretty_json_text(body_text)
+                if pretty is not None:
+                    body_text = pretty
+            if body_text:
+                rendered.append(body_text)
+            rendered.append("")
+
+        for line in lines:
+            if re.match(r"^===== .+ =====$", line.strip()):
+                flush_section()
+                current_header = line.strip()
+                current_body = []
+            else:
+                current_body.append(line)
+        flush_section()
+        return "\n".join(rendered).rstrip()
     if text.startswith("Tool results:\n"):
         raw_json = text.partition("\n")[2]
         pretty = _pretty_json_text(raw_json)

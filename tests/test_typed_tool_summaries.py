@@ -177,7 +177,7 @@ def test_summarize_candidate_handle_prefers_concrete_refs() -> None:
     assert summary == r"candidate_name=cand, profile_ref=abc123, next=evaluate_candidate"
 
 
-def test_summarize_sweep_handle_includes_inspect_ref() -> None:
+def test_summarize_sweep_handle_omits_artifact_path() -> None:
     summary = ResearchController._summarize_sweep_handle(
         {
             "inspect_ref": "sweep_alpha_20260401",
@@ -188,7 +188,6 @@ def test_summarize_sweep_handle_includes_inspect_ref() -> None:
     )
     assert summary == (
         r"inspect_ref=sweep_alpha_20260401, "
-        r"artifact_dir=C:\tmp\sweep_alpha_20260401, "
         r"score_preset=profile-drop, next=inspect_artifact"
     )
 

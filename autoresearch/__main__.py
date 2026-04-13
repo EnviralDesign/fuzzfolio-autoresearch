@@ -2169,10 +2169,61 @@ def _render_context_compaction(event: dict[str, object]) -> None:
     )
 
 
+def _render_history_trim_plain(event: dict[str, object]) -> None:
+    step = event.get("step")
+    before = event.get("approx_tokens_before")
+    after = event.get("approx_tokens_after")
+    evicted = event.get("evicted_chunks")
+    kept = event.get("kept_chunks")
+    if step is not None:
+        label = (
+            f"history trim step {step}: ~{before} tok before, ~{after} tok after, "
+            f"evicted {evicted} chunks, kept {kept}"
+        )
+    else:
+        label = (
+            f"history trim: ~{before} tok before, ~{after} tok after, "
+            f"evicted {evicted} chunks, kept {kept}"
+        )
+    _write_plain_line(_plain_separator(label, fill="="))
+
+
+def _render_history_trim_rich(event: dict[str, object]) -> None:
+    step = event.get("step")
+    before = event.get("approx_tokens_before")
+    after = event.get("approx_tokens_after")
+    trig = event.get("compact_trigger_tokens")
+    evicted = event.get("evicted_chunks")
+    kept = event.get("kept_chunks")
+    lines = [f"Approx prompt tokens: ~{before} -> ~{after}"]
+    if trig is not None:
+        lines.append(f"Trim trigger: {trig}")
+    if evicted is not None or kept is not None:
+        lines.append(f"History chunks: evicted={evicted} kept={kept}")
+    console.print(
+        Panel(
+            Text("\n".join(lines), style="white"),
+            title=f"[bold magenta]History trim[/bold magenta] (step {step})",
+            border_style="magenta",
+            box=box.ROUNDED,
+        )
+    )
+
+
+def _render_history_trim(event: dict[str, object]) -> None:
+    _safe_render(
+        lambda: _render_history_trim_rich(event),
+        lambda: _render_history_trim_plain(event),
+    )
+
+
 def _emit_run_progress(event: dict[str, object]) -> None:
     kind = event.get("event")
     if kind == "context_compaction":
         _render_context_compaction(event)
+        return
+    if kind == "history_trim":
+        _render_history_trim(event)
         return
     if kind == "run_started":
         run_dir = event.get("run_dir")

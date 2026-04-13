@@ -148,6 +148,8 @@ LOCAL_OPENING_NARROW_GOAL_KEYWORDS = (
     "sharper",
     "sharp",
 )
+HISTORY_STRATEGY_CHUNKED_TAIL = "chunked_tail"
+HISTORY_STRATEGY_LLM_SUMMARY = "llm_summary"
 
 
 def _normalize_instrument_list(value: Any) -> list[str]:
@@ -415,6 +417,26 @@ def _extract_profile_instruments_from_payload(
     if not isinstance(instruments, list):
         return []
     return [str(item).strip() for item in instruments if str(item).strip()]
+
+
+def _extract_profile_indicator_ids_from_payload(
+    payload: dict[str, Any] | None,
+) -> list[str]:
+    profile = _profile_root(payload)
+    if not isinstance(profile, dict):
+        return []
+    indicators = profile.get("indicators")
+    if not isinstance(indicators, list):
+        return []
+    result: list[str] = []
+    for item in indicators:
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        indicator_id = str(meta.get("id") or "").strip()
+        if indicator_id:
+            result.append(indicator_id)
+    return result
 
 
 def _profile_root(payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -2601,13 +2623,7 @@ class ResearchController:
         step: int | None = None,
     ) -> str:
         provider_type = str(self.config.provider.provider_type or "").strip().lower()
-        if (
-            tool_context is not None
-            and step is not None
-            and self._is_true_opening_step(tool_context, step)
-        ):
-            base_protocol = LOCAL_OPENING_STEP_PROTOCOL
-        elif provider_type == "transformers_local":
+        if provider_type == "transformers_local":
             base_protocol = SFT_SYSTEM_PROTOCOL
         else:
             base_protocol = SYSTEM_PROTOCOL
@@ -4610,6 +4626,423 @@ class ResearchController:
             "- Parameter hints below are only for the seeded ids in this run."
         )
 
+    def _pinned_supported_timeframes_text(self, tool_context: ToolContext) -> str:
+        summary = str(tool_context.indicator_catalog_summary or "").splitlines()
+        for line in summary:
+            if line.startswith("Supported timeframes:"):
+                return line
+        return "Supported timeframes: unavailable"
+
+    def _seed_parameter_schema_rows(
+        self,
+        tool_context: ToolContext,
+    ) -> list[dict[str, Any]]:
+        lines = str(tool_context.seed_indicator_parameter_hints or "").splitlines()
+        rows: list[dict[str, Any]] = []
+        for raw_line in lines:
+            line = raw_line.strip()
+            if not line.startswith("- "):
+                continue
+            body = line[2:]
+            indicator_id, sep, remainder = body.partition(":")
+            if not sep:
+                continue
+            indicator_id = indicator_id.strip()
+            if not indicator_id:
+                continue
+            fields: dict[str, str] = {}
+            for part in remainder.split(" | "):
+                key, sep, value = part.partition("=")
+                if not sep:
+                    continue
+                fields[key.strip()] = value.strip()
+            talib_text = fields.get("talib", "")
+            parameter_names: list[str] = []
+            for item in talib_text.split(","):
+                token = item.strip()
+                if not token or token == "none":
+                    continue
+                parameter_names.append(token.partition("=")[0].strip())
+            note = fields.get("note", "")
+            if len(note) > 96:
+                note = note[:93] + "..."
+            rows.append(
+                {
+                    "indicator_id": indicator_id,
+                    "tf_default": fields.get("tf_default") or "n/a",
+                    "params": parameter_names,
+                    "note": note or None,
+                }
+            )
+        return rows
+
+    def _compact_seed_parameter_schema_text(
+        self,
+        tool_context: ToolContext,
+        *,
+        indicator_ids: list[str] | None = None,
+        include_notes: bool = True,
+    ) -> str:
+        wanted = {
+            str(indicator_id).strip()
+            for indicator_id in (indicator_ids or [])
+            if str(indicator_id).strip()
+        }
+        rows = self._seed_parameter_schema_rows(tool_context)
+        lines: list[str] = []
+        for row in rows:
+            indicator_id = str(row.get("indicator_id") or "").strip()
+            if wanted and indicator_id not in wanted:
+                continue
+            params = row.get("params") or []
+            params_text = ", ".join(str(item) for item in params) if params else "none"
+            line = (
+                f"- {indicator_id}: tf_default={row.get('tf_default') or 'n/a'}"
+                f" | params={params_text}"
+            )
+            note = str(row.get("note") or "").strip()
+            if include_notes and note and note.lower() != "n/a":
+                line += f" | note={note}"
+            lines.append(line)
+        if not lines:
+            return "No relevant seeded parameter schema is available."
+        return "\n".join(lines)
+
+    def _compact_instrument_reference_text(
+        self,
+        tool_context: ToolContext,
+        *,
+        include_coverage: bool = True,
+    ) -> str:
+        summary_lines = str(tool_context.instrument_catalog_summary or "").splitlines()
+        lines = [
+            "- Use exact catalog symbols only.",
+            "- Do not assume aliases like JPY or __BASKET__ are valid instruments.",
+        ]
+        if include_coverage:
+            for line in summary_lines:
+                if line.startswith("Prefer coverage-qualified symbols first"):
+                    lines.append(f"- {line}")
+                    break
+        return "\n".join(lines)
+
+    def _early_seed_goal_text(self, tool_context: ToolContext) -> str | None:
+        payload = self._local_opening_seed_payload(tool_context)
+        exploration_goal = (
+            payload.get("exploration_goal")
+            if isinstance(payload.get("exploration_goal"), dict)
+            else {}
+        )
+        if not exploration_goal:
+            return None
+        lines: list[str] = ["Early-run seed goal:"]
+        goal_id = str(exploration_goal.get("id") or "").strip()
+        goal_summary = str(exploration_goal.get("summary") or "").strip()
+        if goal_id or goal_summary:
+            lines.append(
+                "- "
+                + " ".join(
+                    part for part in (goal_id, goal_summary) if part
+                ).strip()
+            )
+        worker_split = (
+            exploration_goal.get("worker_split")
+            if isinstance(exploration_goal.get("worker_split"), list)
+            else []
+        )
+        for item in worker_split[:2]:
+            if not isinstance(item, dict):
+                continue
+            branch = str(item.get("branch") or "").strip()
+            goal = str(item.get("goal") or "").strip()
+            if branch or goal:
+                lines.append(f"- {branch}: {goal}".strip())
+        return "\n".join(lines) if len(lines) > 1 else None
+
+    def _compact_recent_attempts_prompt_text(
+        self,
+        tool_context: ToolContext,
+        *,
+        limit: int,
+    ) -> str:
+        attempts = load_run_attempts(tool_context.run_dir)
+        if not attempts:
+            return "Recent attempts: none yet."
+        recent = attempts[-max(1, limit) :]
+        lines = ["Recent attempts:"]
+        for attempt in recent:
+            score = attempt.get("composite_score")
+            window = self._attempt_effective_window_months(attempt)
+            trades = self._attempt_trade_count(attempt)
+            parts = [
+                f"seq={attempt.get('sequence')}",
+                f"candidate={attempt.get('candidate_name') or 'unknown'}",
+                f"score={score if score is not None else 'unscored'}",
+            ]
+            if window is not None:
+                parts.append(f"window={self._format_score(window)}m")
+            if trades is not None:
+                parts.append(f"trades={int(trades)}")
+            lines.append("- " + " ".join(parts))
+        return "\n".join(lines)
+
+    def _active_indicator_ids_for_handle(
+        self,
+        tool_context: ToolContext,
+        *,
+        candidate_name: str | None = None,
+        profile_ref: str | None = None,
+    ) -> list[str]:
+        profile_path = self._resolve_local_profile_path(
+            tool_context,
+            candidate_name=candidate_name,
+            profile_ref=profile_ref,
+            require_exists=True,
+        )
+        if profile_path is None:
+            return []
+        return _extract_profile_indicator_ids_from_payload(
+            _read_json_if_exists(profile_path)
+        )
+
+    def _relevant_indicator_ids_for_template(
+        self,
+        tool_context: ToolContext,
+        template: dict[str, Any],
+    ) -> list[str]:
+        indicator_ids = template.get("indicator_ids")
+        if isinstance(indicator_ids, list):
+            return [
+                str(item).strip()
+                for item in indicator_ids
+                if str(item).strip()
+            ]
+        candidate_name = str(template.get("candidate_name") or "").strip() or None
+        profile_ref = str(template.get("profile_ref") or "").strip() or None
+        return self._active_indicator_ids_for_handle(
+            tool_context,
+            candidate_name=candidate_name,
+            profile_ref=profile_ref,
+        )
+
+    def _opening_step_overlay_text(self, tool_context: ToolContext) -> str:
+        grounding = self._local_opening_grounding_prompt_state(tool_context) or {}
+        starter_instruments = list(grounding.get("preferred_initial_instruments") or [])
+        candidate_name_hint = str(grounding.get("candidate_name_hint") or "cand1")
+        overlay_lines = [
+            "Opening-step overlay:",
+            "- This is the first controller step of a fresh run.",
+            "- Return exactly 1 action only.",
+            "- That action must be prepare_profile.",
+            "- mode is required and must be scaffold_from_seed.",
+            "- Allowed action fields are only: tool, mode, indicator_ids, instruments, candidate_name.",
+            "- The controller resolves candidate_name internally. Do not emit path fields or profile_name.",
+            "- Do not chain validate_profile, register_profile, or evaluate_candidate in the same response.",
+        ]
+        if starter_instruments:
+            overlay_lines.append(
+                "- Use the exact starter instrument symbols from this step: "
+                + ", ".join(starter_instruments)
+            )
+        canonical = {
+            "tool": "prepare_profile",
+            "mode": "scaffold_from_seed",
+            "indicator_ids": ["ID_A", "ID_B"],
+            "instruments": starter_instruments or ["EURUSD"],
+            "candidate_name": candidate_name_hint,
+        }
+        overlay_lines.extend(
+            [
+                "Canonical opening action shell:",
+                json.dumps(canonical, ensure_ascii=True, indent=2),
+            ]
+        )
+        return "\n".join(overlay_lines)
+
+    def _contextual_injections_text(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+    ) -> str:
+        if self._is_true_opening_step(tool_context, step):
+            parts = [self._opening_step_overlay_text(tool_context)]
+            seed_goal = self._early_seed_goal_text(tool_context)
+            if seed_goal:
+                parts.append(seed_goal)
+            return "\n\n".join(part for part in parts if str(part).strip())
+        template = self._followup_next_action_template_prompt_state(tool_context)
+        injections: list[str] = []
+        if isinstance(template, dict):
+            tool = str(template.get("tool") or "").strip()
+            if tool in {"prepare_profile", "mutate_profile"}:
+                relevant_ids = self._relevant_indicator_ids_for_template(
+                    tool_context, template
+                )
+                if relevant_ids:
+                    injections.append(
+                        "Relevant indicator parameter schema:\n"
+                        + self._compact_seed_parameter_schema_text(
+                            tool_context,
+                            indicator_ids=relevant_ids,
+                            include_notes=True,
+                        )
+                    )
+            if tool == "evaluate_candidate":
+                instruments = [
+                    str(item).strip()
+                    for item in (template.get("instruments") or [])
+                    if str(item).strip()
+                ]
+                instrument_lines = ["Instrument reminder:"]
+                if instruments:
+                    instrument_lines.append(
+                        "- Planned evaluation instruments: " + ", ".join(instruments)
+                    )
+                instrument_lines.append(
+                    self._compact_instrument_reference_text(
+                        tool_context,
+                        include_coverage=True,
+                    )
+                )
+                injections.append("\n".join(instrument_lines))
+        phase_name = self._run_phase_info(step, step_limit, policy).get("name")
+        if phase_name == "wrap_up":
+            injections.append(
+                "Wrap-up reminder:\n"
+                "- Wrap-up is active. Extra broadening needs strong justification."
+            )
+        mismatch_text = self._timeframe_mismatch_status_text()
+        if "BLOCKED:" in mismatch_text or "Warning:" in mismatch_text:
+            injections.append(mismatch_text)
+        if not injections:
+            return "No contextual injections are active."
+        return "\n\n".join(injections)
+
+    def _controller_update_text(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+    ) -> str:
+        phase_info = self._run_phase_info(step, step_limit, policy)
+        horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
+        score_target = self._score_target_snapshot(tool_context)
+        next_action_template = self._followup_next_action_template_prompt_state(tool_context)
+        phase_name = str(phase_info.get("name") or "")
+        recent_attempt_limit = 3 if phase_name == "early" else 2 if phase_name == "mid" else 1
+        sections = [
+            f"Step: {step}/{step_limit}",
+            f"Run phase: {phase_name}",
+            f"Phase guidance: {phase_info.get('summary')}",
+            f"Horizon target: {horizon_policy.get('summary')}",
+            f"Horizon guidance: {horizon_policy.get('guidance')}",
+            f"Score target: {score_target.get('summary')}",
+            "Next action template: "
+            + (
+                json.dumps(next_action_template, ensure_ascii=True)
+                if isinstance(next_action_template, dict)
+                else "No deterministic next_action_template is active."
+            ),
+            self._current_research_priority_text(tool_context, step, step_limit, policy),
+            self._manager_guidance_text(step),
+            self._run_outcome_text(tool_context),
+            self._working_memory_text(tool_context),
+            self._branch_lifecycle_run_packet_text(tool_context, step, step_limit),
+            self._retention_and_exploit_status_text(tool_context),
+            self._compact_recent_attempts_prompt_text(
+                tool_context,
+                limit=recent_attempt_limit,
+            ),
+            self._recent_behavior_digest_text(tool_context),
+        ]
+        if phase_name == "early":
+            seed_goal = self._early_seed_goal_text(tool_context)
+            if seed_goal:
+                sections.append(seed_goal)
+        return "\n\n".join(
+            section for section in sections if str(section).strip()
+        ).strip()
+
+    def _prompt_visible_results_payload(
+        self,
+        results: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        for result in results or []:
+            if not isinstance(result, dict):
+                continue
+            payload.append(self._history_result_summary(result))
+        return payload
+
+    def _step_update_prompt(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+        prior_results: list[dict[str, Any]] | None = None,
+    ) -> str:
+        if prior_results:
+            tool_results_text = json.dumps(
+                self._prompt_visible_results_payload(prior_results),
+                ensure_ascii=True,
+                indent=2,
+            )
+        else:
+            tool_results_text = "None. This is the first controller step."
+        controller_update = self._controller_update_text(
+            tool_context,
+            policy,
+            step=step,
+            step_limit=step_limit,
+        )
+        contextual_injections = self._contextual_injections_text(
+            tool_context,
+            policy,
+            step=step,
+            step_limit=step_limit,
+        )
+        return (
+            "===== TOOL RESULTS FROM PRIOR STEP =====\n"
+            f"{tool_results_text}\n\n"
+            "===== CURRENT CONTROLLER UPDATE =====\n"
+            f"{controller_update}\n\n"
+            "===== CONTEXTUAL INJECTIONS =====\n"
+            f"{contextual_injections}"
+        ).strip()
+
+    def _pinned_run_reference_prompt(self, tool_context: ToolContext) -> str:
+        seed_indicator_ids = self._seed_indicator_ids(tool_context.seed_prompt_path)
+        indicator_schema = self._compact_seed_parameter_schema_text(
+            tool_context,
+            indicator_ids=seed_indicator_ids,
+            include_notes=True,
+        )
+        reference_sections = [
+            "Run reference (stable for this run):",
+            self._pinned_supported_timeframes_text(tool_context),
+            (
+                "Exact seeded indicator ids for this run: "
+                + (", ".join(seed_indicator_ids) if seed_indicator_ids else "none")
+            ),
+            (
+                "Indicator id rule: indicator.meta.id must match one of the exact seeded ids unless scope expands."
+            ),
+            "Seeded indicator mutation schema:\n" + indicator_schema,
+            "Instrument symbol discipline:\n"
+            + self._compact_instrument_reference_text(
+                tool_context,
+                include_coverage=True,
+            ),
+        ]
+        return "\n\n".join(reference_sections).strip()
+
     def _run_owned_profiles_summary(self, tool_context: ToolContext) -> str:
         lines: list[str] = []
         for created_file in sorted(tool_context.profiles_dir.glob("*.created.json"))[
@@ -4658,7 +5091,10 @@ class ResearchController:
             f"- latest_hook: {runtime.last_hook} at step {runtime.last_hook_step}"
         )
         if runtime.last_rationale:
-            lines.append(f"- latest_rationale: {runtime.last_rationale}")
+            rationale = " ".join(str(runtime.last_rationale).split())
+            if len(rationale) > 240:
+                rationale = rationale[:237] + "..."
+            lines.append(f"- latest_rationale: {rationale}")
         if runtime.last_actions_applied:
             action_kinds = [
                 str(item.get("kind") or "unknown")
@@ -4668,7 +5104,10 @@ class ResearchController:
             if action_kinds:
                 lines.append("- latest_actions: " + ", ".join(action_kinds[:8]))
         if runtime.manager_notes:
-            lines.append(f"- latest_note: {runtime.manager_notes[-1]}")
+            note = " ".join(str(runtime.manager_notes[-1]).split())
+            if len(note) > 160:
+                note = note[:157] + "..."
+            lines.append(f"- latest_note: {note}")
         if runtime.last_hook_step is not None and step > runtime.last_hook_step:
             lines.append(
                 f"- recency: this guidance is {step - runtime.last_hook_step} step(s) old; follow it unless new evidence clearly changes branch state."
@@ -4746,9 +5185,9 @@ class ResearchController:
         score = result.get("score")
         if score is not None:
             parts.append(f"score={score}")
-        artifact_dir = str(result.get("artifact_dir") or "").strip()
-        if artifact_dir:
-            parts.append(f"artifact_dir={artifact_dir}")
+        effective_window_months = result.get("effective_window_months")
+        if effective_window_months is not None:
+            parts.append(f"window={effective_window_months}")
         next_action = str(result.get("next_recommended_action") or "").strip()
         if next_action:
             parts.append(f"next={next_action}")
@@ -4762,9 +5201,6 @@ class ResearchController:
         inspect_ref = str(result.get("inspect_ref") or "").strip()
         if inspect_ref:
             parts.append(f"inspect_ref={inspect_ref}")
-        artifact_dir = str(result.get("artifact_dir") or "").strip()
-        if artifact_dir:
-            parts.append(f"artifact_dir={artifact_dir}")
         preset = str(result.get("quality_score_preset") or "").strip()
         if preset:
             parts.append(f"score_preset={preset}")
@@ -4778,8 +5214,6 @@ class ResearchController:
     def _run_outcome_text(self, tool_context: ToolContext) -> str:
         outcome = self._run_outcome_snapshot(self._run_attempts(tool_context.run_id))
         lines = ["Run outcome state (controller-owned; separates live focus from historical bests):"]
-        official_type = str(outcome.get("official_winner_type") or "none")
-        lines.append(f"- official_winner_type: {official_type}")
         official = outcome.get("official_winner")
         if isinstance(official, dict):
             lines.append(
@@ -4792,27 +5226,20 @@ class ResearchController:
             )
         else:
             lines.append("- official_winner: none yet")
-        for key in (
-            "best_live_focus",
-            "best_historical_validated",
-            "best_historical_retryable",
-        ):
-            item = outcome.get(key)
-            if not isinstance(item, dict):
-                continue
+        live_focus = outcome.get("best_live_focus")
+        if isinstance(live_focus, dict):
             lines.append(
-                f"- {key}: "
-                f"attempt={item.get('attempt_id') or 'n/a'} "
-                f"family={self._short_family_id(item.get('family_id'))} "
-                f"score={self._format_score(item.get('raw_score'))} "
-                f"window={self._format_score(item.get('effective_window_months'))}m "
-                f"status={item.get('lifecycle_state') or 'n/a'} "
-                f"retention={item.get('retention_status') or 'n/a'} "
-                f"live={item.get('currently_live')}"
+                "- live_focus: "
+                f"attempt={live_focus.get('attempt_id') or 'n/a'} "
+                f"family={self._short_family_id(live_focus.get('family_id'))} "
+                f"score={self._format_score(live_focus.get('raw_score'))} "
+                f"window={self._format_score(live_focus.get('effective_window_months'))}m "
+                f"status={live_focus.get('lifecycle_state') or 'n/a'} "
+                f"retention={live_focus.get('retention_status') or 'n/a'}"
             )
         rationale = str(outcome.get("rationale") or "").strip()
         if rationale:
-            lines.append(f"- rationale: {rationale}")
+            lines.append(f"- summary: {rationale}")
         return "\n".join(lines)
 
     def _working_memory_text(self, tool_context: ToolContext) -> str:
@@ -4824,7 +5251,7 @@ class ResearchController:
         if ov.validated_leader_family_id:
             branch = self._family_branches.get(ov.validated_leader_family_id)
             parts = [
-                f"family={ov.validated_leader_family_id}",
+                f"family={self._short_family_id(ov.validated_leader_family_id)}",
             ]
             if branch:
                 if branch.last_profile_ref:
@@ -4837,7 +5264,7 @@ class ResearchController:
         elif ov.provisional_leader_family_id:
             branch = self._family_branches.get(ov.provisional_leader_family_id)
             parts = [
-                f"family={ov.provisional_leader_family_id}",
+                f"family={self._short_family_id(ov.provisional_leader_family_id)}",
             ]
             if branch:
                 if branch.last_profile_ref:
@@ -4889,22 +5316,14 @@ class ResearchController:
                 "- sweep_rule: sweep outputs are not attempt_ids; inspect via artifact_dir or inspect_ref."
             )
         if isinstance(wrap_up_focus, dict):
-            parts = [f"family={wrap_up_focus.get('family_id')}"]
+            parts = [f"family={self._short_family_id(wrap_up_focus.get('family_id'))}"]
             if wrap_up_focus.get("profile_ref"):
                 parts.append(f"profile_ref={wrap_up_focus.get('profile_ref')}")
-            if wrap_up_focus.get("selected_attempt_id"):
-                parts.append(
-                    f"selected_attempt_id={wrap_up_focus.get('selected_attempt_id')}"
-                )
-            if wrap_up_focus.get("latest_attempt_id"):
-                parts.append(f"latest_attempt_id={wrap_up_focus.get('latest_attempt_id')}")
             if wrap_up_focus.get("promotability_status"):
                 parts.append(
                     f"promotability={wrap_up_focus.get('promotability_status')}"
                 )
-            lines.append("- wrap_up_focus: " + ", ".join(parts[:5]))
-        if self.last_created_profile_ref:
-            lines.append(f"- last_created_profile_ref: {self.last_created_profile_ref}")
+            lines.append("- wrap_up_focus: " + ", ".join(parts[:4]))
         if len(lines) == 1:
             lines.append("- No live handles are pinned yet; use typed tool results from this step.")
         return "\n".join(lines)
@@ -5088,61 +5507,14 @@ class ResearchController:
         step: int | None = None,
         step_limit: int | None = None,
     ) -> str:
-        if self._uses_local_transformers_provider():
-            return self._local_compact_run_state_prompt(
-                tool_context,
-                policy,
-                step=step,
-                step_limit=step_limit,
-            )
-        checkpoint_path = self._checkpoint_path(tool_context)
-        checkpoint = (
-            checkpoint_path.read_text(encoding="utf-8")
-            if checkpoint_path.exists()
-            else "No checkpoint summary exists yet."
-        )
         effective_step = step or 1
         effective_step_limit = step_limit or self.config.research.max_steps
-        phase_info = self._run_phase_info(effective_step, effective_step_limit, policy)
-        horizon_policy = self._horizon_policy_snapshot(
-            effective_step, effective_step_limit, policy
-        )
-        score_target = self._score_target_snapshot(tool_context)
-        next_action_template_text = self._followup_next_action_template_text(tool_context)
-        soft_wrap_note = self._soft_wrap_note(policy)
-        return (
-            f"Mode: {policy.mode_name}\n"
-            f"Run id: {tool_context.run_id}\n"
-            "Auth status: already verified by controller at run start.\n"
-            f"Allow finish: {policy.allow_finish}\n"
-            f"Step: {effective_step}/{effective_step_limit}\n"
-            f"Run phase: {phase_info['name']}\n"
-            f"Phase guidance: {phase_info['summary']}\n"
-            f"Horizon target: {horizon_policy['summary']}\n"
-            f"Horizon guidance: {horizon_policy['guidance']}\n"
-            f"Horizon rationale: {horizon_policy['rationale']}\n"
-            f"Score target: {score_target['summary']}\n"
-            f"Score target rationale: {score_target['rationale']}\n"
-            f"Next action template: {next_action_template_text}\n"
-            f"Operating window: {policy.window_start or 'none'} -> {policy.window_end or 'none'} ({policy.timezone_name})\n"
-            f"{soft_wrap_note + chr(10) if soft_wrap_note else ''}"
-            f"{self._current_research_priority_text(tool_context, effective_step, effective_step_limit, policy)}\n\n"
-            f"{self._manager_guidance_text(effective_step)}\n\n"
-            f"{self._run_outcome_text(tool_context)}\n\n"
-            f"{self._working_memory_text(tool_context)}\n\n"
-            f"{self._branch_lifecycle_run_packet_text(tool_context, effective_step, effective_step_limit)}\n\n"
-            f"{self._retention_and_exploit_status_text(tool_context)}\n\n"
-            f"{self._timeframe_mismatch_status_text()}\n\n"
-            f"Current seed hand:\n{self._seed_text(tool_context)}\n\n"
-            f"Sticky indicator context:\n{tool_context.indicator_catalog_summary or 'Unavailable'}\n\n"
-            f"Seeded indicator parameter hints:\n{tool_context.seed_indicator_parameter_hints or 'Unavailable'}\n\n"
-            f"Sticky instrument context:\n{tool_context.instrument_catalog_summary or 'Unavailable'}\n\n"
-            f"{self._seed_to_catalog_hints_text(self._seed_indicator_ids(tool_context.seed_prompt_path))}\n\n"
-            f"Run-owned profiles so far:\n{self._run_owned_profiles_summary(tool_context)}\n\n"
-            f"Checkpoint summary:\n{checkpoint}\n\n"
-            f"Recent attempts:\n{self._recent_attempts_summary(tool_context)}\n\n"
-            f"Raw frontier snapshot (informational only; not leadership authority):\n{self._frontier_snapshot_text(tool_context)}\n\n"
-            f"{self._recent_behavior_digest_text(tool_context)}\n"
+        return self._step_update_prompt(
+            tool_context,
+            policy,
+            step=effective_step,
+            step_limit=effective_step_limit,
+            prior_results=None,
         )
 
     def _local_seed_context_prompt_state(
@@ -5876,6 +6248,104 @@ class ResearchController:
             ],
             ensure_ascii=True,
             indent=2,
+        )
+
+    def _history_prefix_messages(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+    ) -> list[ChatMessage]:
+        return [
+            ChatMessage(
+                role="system",
+                content=self._system_protocol_text(
+                    policy,
+                    tool_context=tool_context,
+                    step=1,
+                ),
+            ),
+            ChatMessage(
+                role="user",
+                content=self._pinned_run_reference_prompt(tool_context),
+            ),
+        ]
+
+    def _history_message_chunks(
+        self,
+        history_messages: list[ChatMessage],
+    ) -> list[list[ChatMessage]]:
+        chunks: list[list[ChatMessage]] = []
+        current: list[ChatMessage] = []
+        for message in history_messages:
+            if message.role == "user" and current:
+                chunks.append(current)
+                current = [message]
+                continue
+            current.append(message)
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _flatten_message_chunks(
+        self,
+        chunks: list[list[ChatMessage]],
+    ) -> list[ChatMessage]:
+        flattened: list[ChatMessage] = []
+        for chunk in chunks:
+            flattened.extend(chunk)
+        return flattened
+
+    def _checkpoint_summary_message_content(self, summary: str) -> str:
+        return (
+            "===== CHECKPOINT SUMMARY FROM HISTORY TRIM =====\n"
+            + SUMMARY_PREFIX
+            + "\n"
+            + summary.strip()
+        ).strip()
+
+    def _append_step_history_messages(
+        self,
+        messages: list[ChatMessage],
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+        reasoning: str,
+        actions: list[Any],
+        results: list[dict[str, Any]],
+    ) -> None:
+        action_summaries = [
+            self._history_action_summary(action)
+            for action in actions
+            if isinstance(action, dict)
+        ]
+        assistant_summary_lines = [f"Reasoning: {reasoning}"]
+        if action_summaries:
+            assistant_summary_lines.append("Planned actions:")
+            assistant_summary_lines.extend(f"- {item}" for item in action_summaries)
+        messages.append(
+            ChatMessage(
+                role="assistant",
+                content="\n".join(assistant_summary_lines),
+            )
+        )
+        next_step = step + 1
+        if next_step > step_limit:
+            return
+        messages.append(
+            ChatMessage(
+                role="user",
+                content=self._step_update_prompt(
+                    tool_context,
+                    policy,
+                    step=next_step,
+                    step_limit=step_limit,
+                    prior_results=[
+                        result for result in results if isinstance(result, dict)
+                    ],
+                ),
+            )
         )
 
     def _validate_action(self, action: Any) -> str | None:
@@ -8623,6 +9093,95 @@ class ResearchController:
             ),
         ]
 
+    def _trim_message_history(
+        self,
+        messages: list[ChatMessage],
+        tool_context: ToolContext,
+        *,
+        step: int,
+        compact_trigger_tokens: int,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> list[ChatMessage]:
+        prefix = messages[:2]
+        history_messages = messages[2:]
+        if not history_messages:
+            return messages
+        approx_prompt_tokens_before = self._approx_message_tokens(messages)
+        target_ratio = self.config.history_trim_target_ratio_for(
+            self.config.llm.explorer_profile
+        )
+        target_tokens = max(1, int(compact_trigger_tokens * target_ratio))
+        keep_recent_steps = self.config.history_trim_keep_recent_steps_for(
+            self.config.llm.explorer_profile
+        )
+        chunks = self._history_message_chunks(history_messages)
+        if len(chunks) <= keep_recent_steps:
+            return messages
+        protected_floor = max(0, len(chunks) - keep_recent_steps)
+        kept_chunks = list(chunks)
+        evicted_chunks = 0
+        while (
+            evicted_chunks < protected_floor
+            and self._approx_message_tokens(prefix + self._flatten_message_chunks(kept_chunks))
+            > target_tokens
+        ):
+            kept_chunks.pop(0)
+            evicted_chunks += 1
+        if evicted_chunks == 0:
+            return messages
+        trimmed_messages = prefix + self._flatten_message_chunks(kept_chunks)
+        approx_prompt_tokens_after = self._approx_message_tokens(trimmed_messages)
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="history_trim",
+            status="ok",
+            message="Trimmed append-only history in whole step chunks.",
+            approx_prompt_tokens_before=approx_prompt_tokens_before,
+            approx_prompt_tokens_after=approx_prompt_tokens_after,
+            compact_trigger_tokens=compact_trigger_tokens,
+            history_chunks=len(chunks),
+            evicted_chunks=evicted_chunks,
+            kept_chunks=len(kept_chunks),
+            keep_recent_steps=keep_recent_steps,
+        )
+        try:
+            with self._step_log_path(tool_context).open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "event": "history_trim",
+                            "step": step,
+                            "approx_tokens_before": approx_prompt_tokens_before,
+                            "approx_tokens_after": approx_prompt_tokens_after,
+                            "compact_trigger_tokens": compact_trigger_tokens,
+                            "evicted_chunks": evicted_chunks,
+                            "kept_chunks": len(kept_chunks),
+                            "keep_recent_steps": keep_recent_steps,
+                            "target_ratio": target_ratio,
+                        },
+                        ensure_ascii=True,
+                    )
+                    + "\n"
+                )
+        except OSError:
+            pass
+        if progress_callback:
+            progress_callback(
+                {
+                    "event": "history_trim",
+                    "run_id": tool_context.run_id,
+                    "run_dir": str(tool_context.run_dir),
+                    "step": step,
+                    "approx_tokens_before": approx_prompt_tokens_before,
+                    "approx_tokens_after": approx_prompt_tokens_after,
+                    "compact_trigger_tokens": compact_trigger_tokens,
+                    "evicted_chunks": evicted_chunks,
+                    "kept_chunks": len(kept_chunks),
+                }
+            )
+        return trimmed_messages
+
     def _compact_message_history(
         self,
         messages: list[ChatMessage],
@@ -8690,19 +9249,10 @@ class ResearchController:
         keep = max(0, self.config.research.compact_keep_recent_messages)
         recent_tail = history_messages[-keep:] if keep else []
         compacted_messages = [
-            ChatMessage(
-                role="system",
-                content=self._system_protocol_text(
-                    policy,
-                    tool_context=tool_context,
-                    step=step,
-                ),
-            ),
+            *self._history_prefix_messages(tool_context, policy),
             ChatMessage(
                 role="user",
-                content=self._run_state_prompt(
-                    tool_context, policy, step=step, step_limit=step_limit
-                ),
+                content=self._checkpoint_summary_message_content(summary),
             ),
             *recent_tail,
         ]
@@ -8750,6 +9300,15 @@ class ResearchController:
             return messages
         if self._approx_message_tokens(messages) < trigger:
             return messages
+        strategy = self.config.history_strategy_for(self.config.llm.explorer_profile)
+        if strategy == HISTORY_STRATEGY_CHUNKED_TAIL:
+            return self._trim_message_history(
+                messages,
+                tool_context,
+                step=step,
+                compact_trigger_tokens=trigger,
+                progress_callback=progress_callback,
+            )
         return self._compact_message_history(
             messages,
             tool_context,
@@ -8877,18 +9436,15 @@ class ResearchController:
                 progress_callback({"event": "window_closed", "result": result})
             return result
         messages: list[ChatMessage] = [
-            ChatMessage(
-                role="system",
-                content=self._system_protocol_text(
-                    policy,
-                    tool_context=tool_context,
-                    step=1,
-                ),
-            ),
+            *self._history_prefix_messages(tool_context, policy),
             ChatMessage(
                 role="user",
-                content=self._run_state_prompt(
-                    tool_context, policy, step=1, step_limit=effective_step_limit
+                content=self._step_update_prompt(
+                    tool_context,
+                    policy,
+                    step=1,
+                    step_limit=effective_step_limit,
+                    prior_results=None,
                 ),
             ),
         ]
@@ -8926,12 +9482,6 @@ class ResearchController:
                 phase="step",
                 status="start",
                 message="Starting controller step.",
-            )
-            messages[1] = ChatMessage(
-                role="user",
-                content=self._run_state_prompt(
-                    tool_context, policy, step=step, step_limit=step_limit
-                ),
             )
             if step > 1 and not self._within_operating_window(policy):
                 result = {
@@ -9169,19 +9719,19 @@ class ResearchController:
                             "step_payload": step_payload,
                         }
                     )
-                messages.append(
-                    ChatMessage(
-                        role="assistant",
-                        content=f"Reasoning: {reasoning}",
-                    )
-                )
-                messages.append(
-                    ChatMessage(
-                        role="user",
-                        content=self._history_tool_results_message_content(
-                            [step_payload["results"][0]]
-                        ),
-                    )
+                self._append_step_history_messages(
+                    messages,
+                    tool_context,
+                    policy,
+                    step=step,
+                    step_limit=step_limit,
+                    reasoning=reasoning,
+                    actions=actions if isinstance(actions, list) else [],
+                    results=[
+                        step_payload["results"][0]
+                        for _ in [0]
+                        if isinstance(step_payload["results"][0], dict)
+                    ],
                 )
                 continue
 
@@ -9330,32 +9880,19 @@ class ResearchController:
                         "step_payload": step_payload,
                     }
                 )
-            action_summaries = [
-                self._history_action_summary(action)
-                for action in actions
-                if isinstance(action, dict)
-            ]
-            assistant_summary_lines = [f"Reasoning: {reasoning}"]
-            if action_summaries:
-                assistant_summary_lines.append("Planned actions:")
-                assistant_summary_lines.extend(f"- {item}" for item in action_summaries)
-            messages.append(
-                ChatMessage(
-                    role="assistant",
-                    content="\n".join(assistant_summary_lines),
-                )
-            )
-            messages.append(
-                ChatMessage(
-                    role="user",
-                    content=self._history_tool_results_message_content(
-                        [
-                            result
-                            for result in step_payload["results"]
-                            if isinstance(result, dict)
-                        ]
-                    ),
-                )
+            self._append_step_history_messages(
+                messages,
+                tool_context,
+                policy,
+                step=step,
+                step_limit=step_limit,
+                reasoning=reasoning,
+                actions=actions if isinstance(actions, list) else [],
+                results=[
+                    result
+                    for result in step_payload["results"]
+                    if isinstance(result, dict)
+                ],
             )
 
             if finished:

@@ -9,7 +9,6 @@ from autoresearch import manager_packet as mp
 from autoresearch import validation_outcome as vo
 import autoresearch.controller as ctrlmod
 from autoresearch.controller import ResearchController
-from autoresearch.controller_protocol import LOCAL_OPENING_STEP_PROTOCOL
 from autoresearch.manager_models import ManagerHookEvent
 from autoresearch.scoring import AttemptScore
 
@@ -32,6 +31,11 @@ def _make_controller(
             run_wrap_up_steps=3,
         ),
         manager=SimpleNamespace(max_candidate_families_in_packet=8),
+        llm=SimpleNamespace(explorer_profile="test-profile"),
+        history_strategy_for=lambda *_args, **_kwargs: "chunked_tail",
+        history_trim_keep_recent_steps_for=lambda *_args, **_kwargs: 10,
+        history_trim_target_ratio_for=lambda *_args, **_kwargs: 0.75,
+        compact_trigger_tokens_for=lambda *_args, **_kwargs: 12000,
     )
     controller._family_branches = {}
     controller._branch_overlay = bl.BranchRunOverlay()
@@ -461,29 +465,55 @@ def test_canonicalize_followup_step_response_ignores_wrong_tool() -> None:
     assert normalized == payload
 
 
-def test_system_protocol_uses_opening_contract_for_true_opening_step_across_providers() -> None:
+def test_system_protocol_stays_stable_and_opening_overlay_moves_to_step_update() -> None:
     controller = _make_controller()
     controller.config.provider = SimpleNamespace(provider_type="openai")
     controller.last_created_profile_ref = None
     controller._load_recent_step_payloads = lambda *_args, **_kwargs: []
     controller._durable_system_appendix_text = lambda: "Program:\npolicy"
-    tool_context = SimpleNamespace(run_dir=Path("C:/runs/example"))
+    controller._local_opening_grounding_prompt_state = lambda *_args, **_kwargs: {
+        "preferred_initial_instruments": ["EURUSD"],
+        "candidate_name_hint": "cand1",
+    }
+    controller._early_seed_goal_text = lambda *_args, **_kwargs: ""
+    controller._followup_next_action_template_prompt_state = lambda *_args, **_kwargs: None
+    controller._timeframe_mismatch_status_text = lambda *_args, **_kwargs: "No mismatch."
+    tool_context = SimpleNamespace(
+        run_dir=Path("C:/runs/example"),
+        seed_prompt_path=Path("C:/runs/example/seed-prompt.json"),
+    )
 
-    protocol = controller._system_protocol_text(
+    protocol_step_1 = controller._system_protocol_text(
         ctrlmod.RunPolicy(),
         tool_context=tool_context,
         step=1,
     )
+    protocol_step_2 = controller._system_protocol_text(
+        ctrlmod.RunPolicy(),
+        tool_context=tool_context,
+        step=2,
+    )
+    opening_overlay = controller._contextual_injections_text(
+        tool_context,
+        ctrlmod.RunPolicy(),
+        step=1,
+        step_limit=10,
+    )
 
-    assert protocol.startswith(LOCAL_OPENING_STEP_PROTOCOL)
-    assert "Program:\npolicy" in protocol
+    assert protocol_step_1 == protocol_step_2
+    assert "fresh-run opening step" not in protocol_step_1.lower()
+    assert "Program:\npolicy" in protocol_step_1
+    assert "Opening-step overlay:" in opening_overlay
+    assert '"tool": "prepare_profile"' in opening_overlay
 
 
-def test_run_state_prompt_keeps_live_state_and_moves_durable_doctrine_out_of_user_packet() -> None:
+def test_run_state_prompt_uses_step_update_sections_and_keeps_durable_doctrine_out() -> None:
     controller = _make_controller()
     controller.config.provider = SimpleNamespace(provider_type="openai")
     controller._uses_local_transformers_provider = lambda: False
     controller._checkpoint_path = lambda _tool_context: Path("C:/nonexistent/checkpoint.txt")
+    controller._load_recent_step_payloads = lambda *_args, **_kwargs: []
+    controller.last_created_profile_ref = None
     controller._run_phase_info = lambda *_args, **_kwargs: {
         "name": "early",
         "summary": "Phase summary",
@@ -497,7 +527,7 @@ def test_run_state_prompt_keeps_live_state_and_moves_durable_doctrine_out_of_use
         "summary": "Find a scorer",
         "rationale": "need evidence",
     }
-    controller._followup_next_action_template_text = lambda *_args, **_kwargs: "None"
+    controller._followup_next_action_template_prompt_state = lambda *_args, **_kwargs: None
     controller._soft_wrap_note = lambda *_args, **_kwargs: None
     controller._current_research_priority_text = lambda *_args, **_kwargs: "Priority block"
     controller._manager_guidance_text = lambda *_args, **_kwargs: "Manager block"
@@ -509,13 +539,16 @@ def test_run_state_prompt_keeps_live_state_and_moves_durable_doctrine_out_of_use
     controller._seed_text = lambda *_args, **_kwargs: '{"indicators":["ADX"]}'
     controller._seed_indicator_ids = lambda *_args, **_kwargs: ["ADX"]
     controller._seed_to_catalog_hints_text = lambda *_args, **_kwargs: "Seed hints"
-    controller._run_owned_profiles_summary = lambda *_args, **_kwargs: "No profiles"
-    controller._recent_attempts_summary = lambda *_args, **_kwargs: "No attempts"
-    controller._frontier_snapshot_text = lambda *_args, **_kwargs: "No frontier"
+    controller._local_opening_grounding_prompt_state = lambda *_args, **_kwargs: {
+        "preferred_initial_instruments": ["EURUSD"],
+        "candidate_name_hint": "cand1",
+    }
+    controller._early_seed_goal_text = lambda *_args, **_kwargs: ""
     controller._recent_behavior_digest_text = lambda *_args, **_kwargs: "Behavior digest: none"
 
     tool_context = SimpleNamespace(
         run_id="run-a",
+        run_dir=Path("C:/runs/example"),
         seed_prompt_path=Path("C:/runs/example/seed-prompt.json"),
         indicator_catalog_summary="Indicator facts",
         seed_indicator_parameter_hints="Hint block",
@@ -529,13 +562,125 @@ def test_run_state_prompt_keeps_live_state_and_moves_durable_doctrine_out_of_use
         step_limit=10,
     )
 
-    assert "Current seed hand:" in prompt
-    assert "Sticky indicator context:" in prompt
+    assert "===== TOOL RESULTS FROM PRIOR STEP =====" in prompt
+    assert "===== CURRENT CONTROLLER UPDATE =====" in prompt
+    assert "===== CONTEXTUAL INJECTIONS =====" in prompt
+    assert "Opening-step overlay:" in prompt
+    assert "Current seed hand:" not in prompt
+    assert "Sticky indicator context:" not in prompt
     assert "Recent attempts:" in prompt
     assert "Program:" not in prompt
     assert "Portable profile template note:" not in prompt
     assert "Tool reference:" not in prompt
     assert "Sensitivity artifact layout (on disk after evaluations):" not in prompt
+
+
+def test_pinned_run_reference_keeps_seed_schema_but_omits_dynamic_run_state() -> None:
+    controller = _make_controller()
+    controller._seed_indicator_ids = lambda *_args, **_kwargs: ["ADX", "RSI_MEAN_REVERSION"]
+    controller._compact_seed_parameter_schema_text = (
+        lambda *_args, **_kwargs: "- ADX: tf_default=M5 | params=timeperiod\n- RSI_MEAN_REVERSION: tf_default=M5 | params=timeperiod"
+    )
+    controller._compact_instrument_reference_text = (
+        lambda *_args, **_kwargs: "- Use exact symbols from the catalog.\n- Prefer coverage-qualified symbols first."
+    )
+    tool_context = SimpleNamespace(
+        seed_prompt_path=Path("C:/runs/example/seed-prompt.json"),
+        indicator_catalog_summary="Supported timeframes: M1, M5, H1",
+        seed_indicator_parameter_hints="unused",
+        instrument_catalog_summary="Prefer coverage-qualified symbols first",
+    )
+
+    prompt = controller._pinned_run_reference_prompt(tool_context)
+
+    assert "Run reference (stable for this run):" in prompt
+    assert "Exact seeded indicator ids for this run: ADX, RSI_MEAN_REVERSION" in prompt
+    assert "Seeded indicator mutation schema:" in prompt
+    assert "Run-owned profiles so far:" not in prompt
+    assert "Checkpoint summary:" not in prompt
+    assert "Recent attempts:" not in prompt
+
+
+def test_chunked_history_trim_keeps_prefix_and_recent_step_chunks_only(tmp_path: Path) -> None:
+    controller = _make_controller()
+    controller._trace_runtime = lambda *_args, **_kwargs: None
+    controller._approx_message_tokens = lambda messages: len(messages) * 10
+    tool_context = SimpleNamespace(
+        run_dir=tmp_path,
+        run_id="run-a",
+    )
+    prefix = [
+        ctrlmod.ChatMessage(role="system", content="system"),
+        ctrlmod.ChatMessage(role="user", content="run-ref"),
+    ]
+    history = [
+        ctrlmod.ChatMessage(role="user", content="step-1"),
+        ctrlmod.ChatMessage(role="assistant", content="reply-1"),
+        ctrlmod.ChatMessage(role="user", content="step-2"),
+        ctrlmod.ChatMessage(role="assistant", content="reply-2"),
+        ctrlmod.ChatMessage(role="user", content="step-3"),
+        ctrlmod.ChatMessage(role="assistant", content="reply-3"),
+        ctrlmod.ChatMessage(role="user", content="step-4"),
+        ctrlmod.ChatMessage(role="assistant", content="reply-4"),
+    ]
+    messages = prefix + history
+    controller.config.history_trim_keep_recent_steps_for = lambda *_args, **_kwargs: 2
+    controller.config.history_trim_target_ratio_for = lambda *_args, **_kwargs: 0.75
+
+    trimmed = controller._trim_message_history(
+        messages,
+        tool_context,
+        step=8,
+        compact_trigger_tokens=40,
+    )
+
+    assert trimmed[:2] == prefix
+    assert trimmed[2:] == history[-4:]
+    assert not (tmp_path / "checkpoint-summary.txt").exists()
+
+
+def test_compact_recent_attempts_prompt_uses_existing_trade_count_helper(tmp_path: Path) -> None:
+    controller = _make_controller()
+    tool_context = SimpleNamespace(run_dir=tmp_path)
+    attempts_path = tmp_path / "attempts.jsonl"
+    attempts_path.write_text(
+        json.dumps(
+            {
+                "sequence": 1,
+                "candidate_name": "cand-a",
+                "composite_score": 12.5,
+                "best_summary": {
+                    "best_cell": {"resolved_trades": 17},
+                    "market_data_window": {"effective_window_months": 11.9},
+                },
+            },
+            ensure_ascii=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    prompt = controller._compact_recent_attempts_prompt_text(tool_context, limit=2)
+
+    assert "candidate=cand-a" in prompt
+    assert "trades=17" in prompt
+
+
+def test_eval_handle_summary_omits_artifact_path_but_keeps_window() -> None:
+    summary = ctrlmod.ResearchController._summarize_eval_handle(
+        {
+            "attempt_id": "att-1",
+            "profile_ref": "ref-1",
+            "score": 42.1,
+            "effective_window_months": 23.82,
+            "artifact_dir": r"C:\runs\example\evals\artifact",
+            "next_recommended_action": "inspect_artifact",
+        }
+    )
+
+    assert summary is not None
+    assert "artifact_dir=" not in summary
+    assert "window=23.82" in summary
 
 
 def test_followup_next_action_template_suggests_validate_after_prepare() -> None:
