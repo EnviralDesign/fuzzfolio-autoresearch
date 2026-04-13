@@ -272,7 +272,6 @@ def test_history_result_summary_compacts_compare_artifacts_for_prompt_visibility
         "ranked_preview": [
             {
                 "label": "att-1",
-                "artifact_dir": r"C:\runs\att-1",
                 "quality_score": 58.2,
                 "signal_count": 44,
                 "timeframe": "M5",
@@ -281,10 +280,35 @@ def test_history_result_summary_compacts_compare_artifacts_for_prompt_visibility
             },
             {
                 "label": "att-2",
-                "artifact_dir": r"C:\runs\att-2",
                 "quality_score": 41.1,
             },
         ],
         "dominant_deltas": ["score_delta=17.1000", "other=1", "third=2"],
         "suggested_next_move": "evaluate_candidate on leader unless retention already satisfied",
     }
+
+
+def test_history_result_summary_omits_artifact_paths_for_eval_and_inspect() -> None:
+    controller = object.__new__(ResearchController)
+
+    eval_summary = controller._history_result_summary(
+        {
+            "tool": "evaluate_candidate",
+            "ok": True,
+            "profile_ref": "ref-a",
+            "attempt_id": "attempt-1",
+            "effective_window_months": 11.2,
+            "artifact_dir": r"C:\runs\evals\artifact-a",
+        }
+    )
+    inspect_summary = controller._history_result_summary(
+        {
+            "tool": "inspect_artifact",
+            "ok": True,
+            "artifact_dir": r"C:\runs\evals\artifact-a",
+            "artifact_kind": "sensitivity_eval",
+        }
+    )
+
+    assert "artifact_dir" not in eval_summary
+    assert "artifact_dir" not in inspect_summary

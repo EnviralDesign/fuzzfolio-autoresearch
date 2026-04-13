@@ -32,16 +32,21 @@ def _make_controller(
         ),
         manager=SimpleNamespace(max_candidate_families_in_packet=8),
         llm=SimpleNamespace(explorer_profile="test-profile"),
-        history_strategy_for=lambda *_args, **_kwargs: "chunked_tail",
-        history_trim_keep_recent_steps_for=lambda *_args, **_kwargs: 10,
-        history_trim_target_ratio_for=lambda *_args, **_kwargs: 0.75,
         compact_trigger_tokens_for=lambda *_args, **_kwargs: 12000,
+        compact_target_tokens_for=lambda *_args, **_kwargs: 9000,
     )
     controller._family_branches = {}
     controller._branch_overlay = bl.BranchRunOverlay()
     controller._validation_stale_without_validated = 0
     controller._frontier_prior_best = None
     controller.profile_sources = {}
+    controller._manager_runtime = ctrlmod.ManagerRuntimeState()
+    controller._pending_manager_events = []
+    controller._delta_chunk_fingerprints = {}
+    controller._delta_chunk_relevance = {}
+    controller._last_checkpoint_event_state = None
+    controller._checkpoint_required_next_step = False
+    controller.last_created_profile_ref = None
     mapping = family_map or {}
     controller._family_id_for_profile_ref = lambda ref: mapping.get(ref)
     return controller
@@ -468,7 +473,6 @@ def test_canonicalize_followup_step_response_ignores_wrong_tool() -> None:
 def test_system_protocol_stays_stable_and_opening_overlay_moves_to_step_update() -> None:
     controller = _make_controller()
     controller.config.provider = SimpleNamespace(provider_type="openai")
-    controller.last_created_profile_ref = None
     controller._load_recent_step_payloads = lambda *_args, **_kwargs: []
     controller._durable_system_appendix_text = lambda: "Program:\npolicy"
     controller._local_opening_grounding_prompt_state = lambda *_args, **_kwargs: {
@@ -477,8 +481,32 @@ def test_system_protocol_stays_stable_and_opening_overlay_moves_to_step_update()
     }
     controller._early_seed_goal_text = lambda *_args, **_kwargs: ""
     controller._followup_next_action_template_prompt_state = lambda *_args, **_kwargs: None
-    controller._timeframe_mismatch_status_text = lambda *_args, **_kwargs: "No mismatch."
+    controller._timeframe_mismatch_status_text = (
+        lambda *_args, **_kwargs: "Timeframe intent status: No auto-adjustments detected."
+    )
+    controller._run_phase_info = lambda *_args, **_kwargs: {
+        "name": "early",
+        "summary": "Phase summary",
+    }
+    controller._horizon_policy_snapshot = lambda *_args, **_kwargs: {
+        "summary": "12 months",
+        "guidance": "Use 12 months",
+    }
+    controller._score_target_snapshot = lambda *_args, **_kwargs: {
+        "summary": "Find a scorer",
+    }
+    controller._run_attempts = lambda _run_id: []
+    controller._working_memory_text = lambda *_args, **_kwargs: (
+        "Pinned working memory:\n- No live handles are pinned yet."
+    )
+    controller._run_outcome_text = lambda *_args, **_kwargs: (
+        "Run outcome state:\n- official_winner: none yet"
+    )
+    controller._recent_behavior_digest_text = lambda *_args, **_kwargs: (
+        "Behavior digest: No evaluated attempts yet."
+    )
     tool_context = SimpleNamespace(
+        run_id="run-a",
         run_dir=Path("C:/runs/example"),
         seed_prompt_path=Path("C:/runs/example/seed-prompt.json"),
     )
@@ -493,7 +521,7 @@ def test_system_protocol_stays_stable_and_opening_overlay_moves_to_step_update()
         tool_context=tool_context,
         step=2,
     )
-    opening_overlay = controller._contextual_injections_text(
+    step_prompt = controller._step_update_prompt(
         tool_context,
         ctrlmod.RunPolicy(),
         step=1,
@@ -503,17 +531,17 @@ def test_system_protocol_stays_stable_and_opening_overlay_moves_to_step_update()
     assert protocol_step_1 == protocol_step_2
     assert "fresh-run opening step" not in protocol_step_1.lower()
     assert "Program:\npolicy" in protocol_step_1
-    assert "Opening-step overlay:" in opening_overlay
-    assert '"tool": "prepare_profile"' in opening_overlay
+    assert "===== OPENING OVERLAY =====" in step_prompt
+    assert "Opening-step overlay:" in step_prompt
+    assert '"tool": "prepare_profile"' in step_prompt
 
 
 def test_run_state_prompt_uses_step_update_sections_and_keeps_durable_doctrine_out() -> None:
     controller = _make_controller()
     controller.config.provider = SimpleNamespace(provider_type="openai")
     controller._uses_local_transformers_provider = lambda: False
-    controller._checkpoint_path = lambda _tool_context: Path("C:/nonexistent/checkpoint.txt")
     controller._load_recent_step_payloads = lambda *_args, **_kwargs: []
-    controller.last_created_profile_ref = None
+    controller._run_attempts = lambda _run_id: []
     controller._run_phase_info = lambda *_args, **_kwargs: {
         "name": "early",
         "summary": "Phase summary",
@@ -528,23 +556,23 @@ def test_run_state_prompt_uses_step_update_sections_and_keeps_durable_doctrine_o
         "rationale": "need evidence",
     }
     controller._followup_next_action_template_prompt_state = lambda *_args, **_kwargs: None
-    controller._soft_wrap_note = lambda *_args, **_kwargs: None
-    controller._current_research_priority_text = lambda *_args, **_kwargs: "Priority block"
-    controller._manager_guidance_text = lambda *_args, **_kwargs: "Manager block"
-    controller._run_outcome_text = lambda *_args, **_kwargs: "Outcome block"
-    controller._working_memory_text = lambda *_args, **_kwargs: "Working memory block"
-    controller._branch_lifecycle_run_packet_text = lambda *_args, **_kwargs: "Branch block"
-    controller._retention_and_exploit_status_text = lambda *_args, **_kwargs: "Retention block"
-    controller._timeframe_mismatch_status_text = lambda *_args, **_kwargs: "Timeframe block"
-    controller._seed_text = lambda *_args, **_kwargs: '{"indicators":["ADX"]}'
-    controller._seed_indicator_ids = lambda *_args, **_kwargs: ["ADX"]
-    controller._seed_to_catalog_hints_text = lambda *_args, **_kwargs: "Seed hints"
+    controller._run_outcome_text = lambda *_args, **_kwargs: (
+        "Run outcome state:\n- official_winner: none yet"
+    )
+    controller._working_memory_text = lambda *_args, **_kwargs: (
+        "Pinned working memory:\n- current_candidate: candidate_name=cand1"
+    )
+    controller._timeframe_mismatch_status_text = (
+        lambda *_args, **_kwargs: "Timeframe intent status: No auto-adjustments detected."
+    )
     controller._local_opening_grounding_prompt_state = lambda *_args, **_kwargs: {
         "preferred_initial_instruments": ["EURUSD"],
         "candidate_name_hint": "cand1",
     }
     controller._early_seed_goal_text = lambda *_args, **_kwargs: ""
-    controller._recent_behavior_digest_text = lambda *_args, **_kwargs: "Behavior digest: none"
+    controller._recent_behavior_digest_text = lambda *_args, **_kwargs: (
+        "Behavior digest: No evaluated attempts yet."
+    )
 
     tool_context = SimpleNamespace(
         run_id="run-a",
@@ -562,13 +590,15 @@ def test_run_state_prompt_uses_step_update_sections_and_keeps_durable_doctrine_o
         step_limit=10,
     )
 
-    assert "===== TOOL RESULTS FROM PRIOR STEP =====" in prompt
-    assert "===== CURRENT CONTROLLER UPDATE =====" in prompt
-    assert "===== CONTEXTUAL INJECTIONS =====" in prompt
-    assert "Opening-step overlay:" in prompt
+    assert "===== STEP FRAME =====" in prompt
+    assert "===== GOAL STATE =====" in prompt
+    assert "===== BRANCH AUTHORITY =====" in prompt
+    assert "===== ACTIVE HANDLES =====" in prompt
+    assert "===== OPENING OVERLAY =====" in prompt
+    assert "===== CURRENT CONTROLLER UPDATE =====" not in prompt
+    assert "===== CONTEXTUAL INJECTIONS =====" not in prompt
     assert "Current seed hand:" not in prompt
     assert "Sticky indicator context:" not in prompt
-    assert "Recent attempts:" in prompt
     assert "Program:" not in prompt
     assert "Portable profile template note:" not in prompt
     assert "Tool reference:" not in prompt
@@ -624,19 +654,281 @@ def test_chunked_history_trim_keeps_prefix_and_recent_step_chunks_only(tmp_path:
         ctrlmod.ChatMessage(role="assistant", content="reply-4"),
     ]
     messages = prefix + history
-    controller.config.history_trim_keep_recent_steps_for = lambda *_args, **_kwargs: 2
-    controller.config.history_trim_target_ratio_for = lambda *_args, **_kwargs: 0.75
+    controller.config.compact_target_tokens_for = lambda *_args, **_kwargs: 75
 
-    trimmed = controller._trim_message_history(
+    trimmed, did_trim = controller._trim_message_history(
         messages,
         tool_context,
+        current_user_message=ctrlmod.ChatMessage(role="user", content="current-step"),
         step=8,
-        compact_trigger_tokens=40,
+        compact_trigger_tokens=100,
     )
 
+    assert did_trim is True
     assert trimmed[:2] == prefix
     assert trimmed[2:] == history[-4:]
     assert not (tmp_path / "checkpoint-summary.txt").exists()
+    assert controller._checkpoint_required_next_step is True
+
+
+def test_chunked_history_trim_can_shrink_below_preferred_tail_when_required(
+    tmp_path: Path,
+) -> None:
+    controller = _make_controller()
+    controller._trace_runtime = lambda *_args, **_kwargs: None
+    controller._approx_message_tokens = lambda messages: sum(
+        len(str(message.content)) for message in messages
+    )
+    tool_context = SimpleNamespace(
+        run_dir=tmp_path,
+        run_id="run-a",
+    )
+    prefix = [
+        ctrlmod.ChatMessage(role="system", content="system"),
+        ctrlmod.ChatMessage(role="user", content="run-ref"),
+    ]
+    history: list[ctrlmod.ChatMessage] = []
+    for idx in range(1, 7):
+        history.append(ctrlmod.ChatMessage(role="user", content=f"step-{idx}-" + ("u" * 80)))
+        history.append(
+            ctrlmod.ChatMessage(role="assistant", content=f"reply-{idx}-" + ("a" * 80))
+        )
+    messages = prefix + history
+    controller.config.compact_target_tokens_for = lambda *_args, **_kwargs: 200
+
+    trimmed, did_trim = controller._trim_message_history(
+        messages,
+        tool_context,
+        current_user_message=ctrlmod.ChatMessage(role="user", content="current-step"),
+        step=12,
+        compact_trigger_tokens=400,
+    )
+
+    assert did_trim is True
+    assert trimmed[:2] == prefix
+    assert len(trimmed[2:]) < len(history[-8:])
+    assert controller._checkpoint_required_next_step is True
+
+
+def test_delta_packet_omits_unchanged_chunks_after_checkpoint() -> None:
+    controller = _make_controller()
+    controller._run_attempts = lambda _run_id: []
+    controller._run_phase_info = lambda *_args, **_kwargs: {
+        "name": "mid",
+        "summary": "Stay focused.",
+    }
+    controller._horizon_policy_snapshot = lambda *_args, **_kwargs: {
+        "summary": "24 months",
+        "guidance": "Durability check",
+    }
+    controller._score_target_snapshot = lambda *_args, **_kwargs: {
+        "summary": "Find durable scorers",
+    }
+    controller._followup_next_action_template_prompt_state = lambda *_args, **_kwargs: None
+    controller._working_memory_text = lambda *_args, **_kwargs: (
+        "Pinned working memory:\n- current_candidate: candidate_name=cand-a"
+    )
+    controller._run_outcome_text = lambda *_args, **_kwargs: (
+        "Run outcome state:\n- official_winner: none yet"
+    )
+    controller._recent_behavior_digest_text = lambda *_args, **_kwargs: (
+        "Behavior digest: No evaluated attempts yet."
+    )
+    controller._timeframe_mismatch_status_text = (
+        lambda *_args, **_kwargs: "Timeframe intent status: No auto-adjustments detected."
+    )
+    tool_context = SimpleNamespace(run_id="run-a", run_dir=Path("C:/runs/example"))
+
+    first_prompt, first_state = controller._build_step_update_packet(
+        tool_context,
+        ctrlmod.RunPolicy(mode_name="run"),
+        step=2,
+        step_limit=10,
+        prior_results=None,
+        checkpoint_required=True,
+    )
+    controller._commit_sent_step_packet_state(first_state)
+    second_prompt, _second_state = controller._build_step_update_packet(
+        tool_context,
+        ctrlmod.RunPolicy(mode_name="run"),
+        step=3,
+        step_limit=10,
+        prior_results=None,
+    )
+
+    assert "===== GOAL STATE =====" in first_prompt
+    assert "===== BRANCH AUTHORITY =====" in first_prompt
+    assert "===== ACTIVE HANDLES =====" in first_prompt
+    assert "===== STEP FRAME =====" in second_prompt
+    assert "===== GOAL STATE =====" not in second_prompt
+    assert "===== BRANCH AUTHORITY =====" not in second_prompt
+    assert "===== ACTIVE HANDLES =====" not in second_prompt
+
+
+def test_delta_packet_emits_changed_active_handles_once() -> None:
+    controller = _make_controller()
+    controller._run_attempts = lambda _run_id: []
+    controller._run_phase_info = lambda *_args, **_kwargs: {
+        "name": "mid",
+        "summary": "Stay focused.",
+    }
+    controller._horizon_policy_snapshot = lambda *_args, **_kwargs: {
+        "summary": "24 months",
+        "guidance": "Durability check",
+    }
+    controller._score_target_snapshot = lambda *_args, **_kwargs: {
+        "summary": "Find durable scorers",
+    }
+    controller._followup_next_action_template_prompt_state = lambda *_args, **_kwargs: None
+    working_memory = {"text": "Pinned working memory:\n- current_candidate: candidate_name=cand-a"}
+    controller._working_memory_text = lambda *_args, **_kwargs: working_memory["text"]
+    controller._run_outcome_text = lambda *_args, **_kwargs: (
+        "Run outcome state:\n- official_winner: none yet"
+    )
+    controller._recent_behavior_digest_text = lambda *_args, **_kwargs: (
+        "Behavior digest: No evaluated attempts yet."
+    )
+    controller._timeframe_mismatch_status_text = (
+        lambda *_args, **_kwargs: "Timeframe intent status: No auto-adjustments detected."
+    )
+    tool_context = SimpleNamespace(run_id="run-a", run_dir=Path("C:/runs/example"))
+
+    first_prompt, first_state = controller._build_step_update_packet(
+        tool_context,
+        ctrlmod.RunPolicy(mode_name="run"),
+        step=2,
+        step_limit=10,
+        checkpoint_required=True,
+    )
+    controller._commit_sent_step_packet_state(first_state)
+    working_memory["text"] = "Pinned working memory:\n- current_candidate: candidate_name=cand-b"
+    second_prompt, _second_state = controller._build_step_update_packet(
+        tool_context,
+        ctrlmod.RunPolicy(mode_name="run"),
+        step=3,
+        step_limit=10,
+    )
+
+    assert "candidate_name=cand-a" in first_prompt
+    assert "===== ACTIVE HANDLES =====" in second_prompt
+    assert "candidate_name=cand-b" in second_prompt
+
+
+def test_delta_packet_emits_sweep_and_mutate_context_from_live_handles_once() -> None:
+    controller = _make_controller()
+    controller._run_attempts = lambda _run_id: []
+    controller._run_phase_info = lambda *_args, **_kwargs: {
+        "name": "late",
+        "summary": "Pressure-test survivors.",
+    }
+    controller._horizon_policy_snapshot = lambda *_args, **_kwargs: {
+        "summary": "24 months",
+        "guidance": "Durability check",
+    }
+    controller._score_target_snapshot = lambda *_args, **_kwargs: {
+        "summary": "Pressure-test the current leader",
+    }
+    controller._working_memory_text = lambda *_args, **_kwargs: (
+        "Pinned working memory:\n- current_candidate: candidate_name=cand-a, profile_ref=ref-a"
+    )
+    controller._run_outcome_text = lambda *_args, **_kwargs: (
+        "Run outcome state:\n- official_winner: none yet"
+    )
+    controller._recent_behavior_digest_text = lambda *_args, **_kwargs: (
+        "Behavior digest: No evaluated attempts yet."
+    )
+    controller._timeframe_mismatch_status_text = (
+        lambda *_args, **_kwargs: "Timeframe intent status: No auto-adjustments detected."
+    )
+    controller._recent_known_instruments_for_handle = (
+        lambda *_args, **_kwargs: ["EURUSD"]
+    )
+
+    def latest_result(
+        _tool_context,
+        *,
+        tool_names: set[str],
+        limit: int = 12,
+    ) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+        if tool_names == {
+            "prepare_profile",
+            "mutate_profile",
+            "validate_profile",
+            "register_profile",
+        }:
+            return (
+                {
+                    "tool": "register_profile",
+                    "candidate_name": "cand-a",
+                    "profile_ref": "ref-a",
+                    "candidate_summary": {
+                        "candidate_name": "cand-a",
+                        "profile_ref": "ref-a",
+                        "indicator_ids": [
+                            "MACD_CROSSOVER",
+                            "BBANDS_POSITION_TREND",
+                        ],
+                    },
+                },
+                {},
+            )
+        if tool_names == {"evaluate_candidate"}:
+            return (
+                {
+                    "tool": "evaluate_candidate",
+                    "profile_ref": "ref-a",
+                    "score": 55.0,
+                },
+                {},
+            )
+        return None, None
+
+    controller._latest_successful_step_result = latest_result
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        run_dir=Path("C:/runs/example"),
+        evals_dir=Path("C:/runs/example/evals"),
+        profiles_dir=Path("C:/runs/example/profiles"),
+        seed_prompt_path=None,
+        seed_indicator_parameter_hints="",
+        instrument_catalog_summary="Use exact catalog symbols only.",
+    )
+
+    first_prompt, first_state = controller._build_step_update_packet(
+        tool_context,
+        ctrlmod.RunPolicy(mode_name="run"),
+        step=12,
+        step_limit=50,
+        checkpoint_required=True,
+    )
+    controller._commit_sent_step_packet_state(first_state)
+    second_prompt, _second_state = controller._build_step_update_packet(
+        tool_context,
+        ctrlmod.RunPolicy(mode_name="run"),
+        step=13,
+        step_limit=50,
+    )
+
+    assert "===== PREPARE OR MUTATE CONTEXT =====" in first_prompt
+    assert "mutate_profile is for field-level edits" in first_prompt
+    assert "===== SWEEP CONTEXT =====" in first_prompt
+    assert "indicator[N].config.<field>" in first_prompt
+    assert "===== PREPARE OR MUTATE CONTEXT =====" not in second_prompt
+    assert "===== SWEEP CONTEXT =====" not in second_prompt
+
+
+def test_history_append_keeps_completed_turn_only() -> None:
+    controller = _make_controller()
+    messages: list[ctrlmod.ChatMessage] = []
+
+    controller._append_step_history_messages(
+        messages,
+        user_packet_content="===== STEP FRAME =====\n- step: 1/5",
+        reasoning="Do the next thing.",
+        actions=[{"tool": "validate_profile", "candidate_name": "cand-a"}],
+    )
+
+    assert [message.role for message in messages] == ["user", "assistant"]
 
 
 def test_compact_recent_attempts_prompt_uses_existing_trade_count_helper(tmp_path: Path) -> None:
@@ -783,6 +1075,97 @@ def test_validate_action_accepts_candidate_name_profile_handles() -> None:
             "instruments": ["EURUSD"],
         }
     ) is None
+    assert controller._validate_action(
+        {"tool": "inspect_artifact", "inspect_ref": "sweep_alpha_20260401"}
+    ) is None
+
+
+def test_resolve_artifact_path_accepts_inspect_ref(tmp_path: Path) -> None:
+    controller = _make_controller()
+    tool_context = SimpleNamespace(run_dir=tmp_path, evals_dir=tmp_path / "evals")
+    sweep_dir = tool_context.evals_dir / "sweep_alpha_20260401"
+    sweep_dir.mkdir(parents=True)
+
+    resolved = controller._resolve_artifact_path(
+        tool_context,
+        {"inspect_ref": "sweep_alpha_20260401"},
+    )
+
+    assert resolved == sweep_dir.resolve()
+
+
+def test_clone_local_prepare_profile_preserves_destination_candidate_name(
+    tmp_path: Path,
+) -> None:
+    controller = _make_controller()
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    source = profiles_dir / "source-a.json"
+    source.write_text(
+        json.dumps(
+            {
+                "profile": {
+                    "name": "source-a",
+                    "indicators": [
+                        {"meta": {"id": "MACD_CROSSOVER", "instanceId": "macd-1"}}
+                    ],
+                    "instruments": ["EURUSD"],
+                }
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_execute_cli_invocation(
+        _tool_context,
+        *,
+        args,
+        cwd,
+        step,
+        step_limit,
+        policy,
+        source_action,
+        result_tool,
+    ):
+        out_path = Path(args[args.index("--out") + 1])
+        out_path.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+        return {
+            "tool": result_tool,
+            "ok": True,
+            "result": {"argv": args, "returncode": 0, "parsed_json": {}},
+            "warnings": [],
+            "errors": [],
+            "artifacts": {},
+            "state_updates": {},
+            "status": "ok",
+        }
+
+    controller._execute_cli_invocation = fake_execute_cli_invocation
+    tool_context = SimpleNamespace(
+        run_dir=tmp_path,
+        profiles_dir=profiles_dir,
+        evals_dir=tmp_path / "evals",
+    )
+
+    result = controller._typed_prepare_profile(
+        tool_context,
+        {
+            "tool": "prepare_profile",
+            "mode": "clone_local",
+            "source_candidate_name": "source-a",
+            "destination_candidate_name": "cand-b",
+        },
+        step=1,
+        step_limit=10,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    assert result["candidate_name"] == "cand-b"
+    assert result["profile_name"] == "cand-b"
+    assert result["candidate_summary"]["candidate_name"] == "cand-b"
 
 
 def test_prompt_visible_action_signature_strips_profile_paths() -> None:
@@ -1546,3 +1929,105 @@ def test_record_attempt_from_artifact_persists_explicit_requested_horizon(
     )
 
     assert captured["requested_horizon_months"] == 24
+
+
+def test_record_attempt_from_artifact_resolves_relative_sweep_dir_against_evals_dir(
+    tmp_path, monkeypatch
+) -> None:
+    controller = _make_controller()
+    controller._render_run_progress = lambda _tool_context: None
+    controller.profile_sources = {}
+
+    run_dir = tmp_path / "run"
+    evals_dir = run_dir / "evals"
+    artifact_dir = evals_dir / "sweep_sw_final_20260413T182240158728Z"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "sensitivity-response.json").write_text("{}", encoding="utf-8")
+
+    score_calls: list[Path] = []
+
+    def fake_score_artifact(path: Path) -> dict[str, object]:
+        score_calls.append(path)
+        return {"best": {}}
+
+    controller.cli = SimpleNamespace(score_artifact=fake_score_artifact)
+    tool_context = SimpleNamespace(
+        attempts_path=run_dir / "attempts.jsonl",
+        run_id="run-a",
+        progress_plot_path=run_dir / "progress.png",
+        evals_dir=evals_dir,
+        run_dir=run_dir,
+    )
+
+    monkeypatch.setattr(ctrlmod, "attempt_exists", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(ctrlmod, "load_sensitivity_snapshot", lambda _artifact_dir: {})
+    monkeypatch.setattr(
+        ctrlmod,
+        "build_attempt_score",
+        lambda *_args, **_kwargs: AttemptScore(
+            primary_score=12.3,
+            composite_score=12.3,
+            score_basis="v1:psr",
+            metrics={"quality_score": 12.3},
+            best_summary={},
+        ),
+    )
+    monkeypatch.setattr(
+        controller,
+        "_normalized_attempt_record_evidence",
+        lambda *_args, **_kwargs: {
+            "requested_horizon_months": None,
+            "effective_window_months": 11.5,
+            "effective_window_source": "test",
+            "requested_timeframe": "M5",
+            "effective_timeframe": "M5",
+            "validation_outcome": None,
+            "coverage_status": "ok",
+            "job_status": None,
+            "resolved_trades": 50,
+            "trades_per_month": 4.0,
+            "positive_cell_ratio": 0.5,
+        },
+    )
+
+    monkeypatch.setattr(
+        ctrlmod,
+        "make_attempt_record",
+        lambda *args, **kwargs: SimpleNamespace(
+            attempt_id="run-a-attempt-00001",
+            sequence=1,
+            created_at="2026-04-02T00:00:00+00:00",
+            run_id="run-a",
+            candidate_name="eval_case",
+            artifact_dir=str(artifact_dir),
+            profile_ref="ref-a",
+            profile_path=None,
+            primary_score=12.3,
+            composite_score=12.3,
+            score_basis="v1:psr",
+            metrics={"quality_score": 12.3},
+            best_summary={},
+            sensitivity_snapshot_path=None,
+            requested_horizon_months=kwargs.get("requested_horizon_months"),
+            effective_window_months=11.5,
+            requested_timeframe="M5",
+            effective_timeframe="M5",
+            validation_outcome=None,
+            coverage_status="ok",
+            job_status=None,
+            resolved_trades=50,
+            trades_per_month=4.0,
+            positive_cell_ratio=0.5,
+            effective_window_source="test",
+        ),
+    )
+    monkeypatch.setattr(ctrlmod, "append_attempt", lambda *_args, **_kwargs: None)
+
+    controller._record_attempt_from_artifact(
+        tool_context,
+        Path(artifact_dir.name),
+        profile_ref="ref-a",
+        requested_horizon_months=24,
+    )
+
+    assert score_calls == [artifact_dir]

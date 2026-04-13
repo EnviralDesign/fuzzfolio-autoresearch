@@ -499,3 +499,305 @@ def test_apply_profile_drop_description_fallback_rewrites_bundle_profile(tmp_pat
     assert applied is not None
     assert "EURUSD profile on M15 using ADX" in applied
     assert updated["profile"]["description"] == applied
+
+
+def test_render_profile_drop_for_attempt_generates_reuses_and_regenerates_metadata(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output_root = tmp_path / "profile-drops"
+    working_dir = tmp_path
+    writer_calls = {"count": 0}
+    renderer_calls: list[list[str]] = []
+    workspace_root = tmp_path / "Trading-Dashboard"
+    renderer_source_root = workspace_root / "scripts" / "profile-drop-renderer"
+    renderer_source_root.mkdir(parents=True, exist_ok=True)
+    (renderer_source_root / "index.html").write_text("<html></html>", encoding="utf-8")
+
+    class FakeCli:
+        def run(self, args, cwd=None, timeout_seconds=None, check=True):
+            output_root_arg = Path(args[args.index("--output-root") + 1])
+            bundle_dir = output_root_arg / "bundle-0001"
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            (bundle_dir / "profile-document.json").write_text(
+                json.dumps(
+                    {
+                        "profile": {
+                            "name": "cand7",
+                            "description": "Portable scoring profile scaffolded from live indicator templates.",
+                            "directionMode": "both",
+                            "indicators": [
+                                {
+                                    "meta": {"id": "BBANDS"},
+                                    "config": {
+                                        "label": "Bollinger Bands",
+                                        "isActive": True,
+                                        "isTrendFollowing": False,
+                                        "timeframe": "M15",
+                                    },
+                                },
+                                {
+                                    "meta": {"id": "ATR"},
+                                    "config": {
+                                        "label": "ATR",
+                                        "isActive": True,
+                                        "isTrendFollowing": False,
+                                        "timeframe": "M15",
+                                    },
+                                },
+                            ],
+                        }
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    class FakeProvider:
+        def complete_json(self, messages):
+            writer_calls["count"] += 1
+            return {
+                "display_name": "Band Snapback Filter",
+                "tagline": "Fade stretched band breaks after ATR expansion.",
+                "short_description": "Targets Bollinger overshoots only when ATR says the move was forceful enough to mean revert.",
+                "long_description": (
+                    "This profile fades Bollinger overshoots after ATR expands, so it targets forceful "
+                    "pushes that look exhausted and avoids quiet drift that lacks enough pressure to snap back."
+                ),
+            }
+
+    def fake_run_external(argv, cwd=None, timeout_seconds=None):
+        renderer_calls.append(list(argv))
+        png_path = Path(argv[argv.index("--out") + 1])
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        png_path.write_text("png", encoding="utf-8")
+
+    config = SimpleNamespace(
+        research=SimpleNamespace(
+            quality_score_preset="profile-drop",
+            presentation_metadata_provider_profile="writer",
+        ),
+        fuzzfolio=SimpleNamespace(workspace_root=workspace_root),
+        providers={"writer": SimpleNamespace(type="codex")},
+    )
+    row = {
+        "attempt_id": "attempt-0001",
+        "run_id": "run-a",
+        "candidate_name": "cand7",
+        "profile_ref": "prof-7",
+        "composite_score": 67.4,
+        "effective_window_months": 24.0,
+    }
+    attempt = {
+        "attempt_id": "attempt-0001",
+        "candidate_name": "cand7",
+        "profile_ref": "prof-7",
+    }
+
+    monkeypatch.setattr(
+        ar_main,
+        "_build_package_inputs",
+        lambda *_args, **_kwargs: {
+            "profile_ref": "prof-7",
+            "profile_path": tmp_path / "profiles" / "cand7.json",
+            "timeframe": "M15",
+            "instruments": ["EURUSD"],
+            "lookback_months": 36,
+        },
+    )
+    monkeypatch.setattr(ar_main, "_cloud_profile_exists", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ar_main, "create_provider", lambda _profile: FakeProvider())
+    monkeypatch.setattr(ar_main, "_run_external", fake_run_external)
+
+    result_first = ar_main._render_profile_drop_for_attempt(
+        config=config,
+        cli=FakeCli(),
+        renderer_executable=tmp_path / "renderer",
+        working_dir=working_dir,
+        run_dir=run_dir,
+        attempts=[attempt],
+        row=row,
+        attempt=attempt,
+        output_root=output_root,
+        lookback_months=36,
+        force_rebuild=False,
+        timeout_seconds=30,
+        emit=None,
+    )
+
+    manifest_path = Path(result_first["manifest_path"])
+    metadata_path = Path(result_first["presentation_metadata_path"])
+    manifest_payload = ar_main.load_json_if_exists(manifest_path)
+    bundle_dir = output_root / ar_main._profile_drop_attempt_token(row, attempt) / "bundle" / "bundle-0001"
+    bundle_payload = ar_main.load_json_if_exists(bundle_dir / "profile-document.json")
+
+    assert result_first["status"] == "rendered"
+    assert writer_calls["count"] == 1
+    assert "--renderer-root" in renderer_calls[0]
+    assert renderer_calls[0][renderer_calls[0].index("--renderer-root") + 1] == str(
+        renderer_source_root
+    )
+    assert metadata_path.exists() is True
+    assert manifest_payload["display_name"] == "Band Snapback Filter"
+    assert manifest_payload["tagline"] == "Fade stretched band breaks after ATR expansion."
+    assert manifest_payload["presentation_signature"]
+    assert bundle_payload["profile"]["name"] == "Band Snapback Filter"
+    assert bundle_payload["profile"]["description"] == manifest_payload["long_description"]
+
+    result_cached = ar_main._render_profile_drop_for_attempt(
+        config=config,
+        cli=FakeCli(),
+        renderer_executable=tmp_path / "renderer",
+        working_dir=working_dir,
+        run_dir=run_dir,
+        attempts=[attempt],
+        row=row,
+        attempt=attempt,
+        output_root=output_root,
+        lookback_months=36,
+        force_rebuild=False,
+        timeout_seconds=30,
+        emit=None,
+    )
+
+    assert result_cached["status"] == "cached"
+    assert writer_calls["count"] == 1
+
+    stale_metadata = ar_main.load_json_if_exists(metadata_path)
+    stale_metadata["presentation_signature"] = "stale-signature"
+    metadata_path.write_text(json.dumps(stale_metadata, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    result_regenerated = ar_main._render_profile_drop_for_attempt(
+        config=config,
+        cli=FakeCli(),
+        renderer_executable=tmp_path / "renderer",
+        working_dir=working_dir,
+        run_dir=run_dir,
+        attempts=[attempt],
+        row=row,
+        attempt=attempt,
+        output_root=output_root,
+        lookback_months=36,
+        force_rebuild=False,
+        timeout_seconds=30,
+        emit=None,
+    )
+
+    assert result_regenerated["status"] == "rendered"
+    assert writer_calls["count"] == 2
+    assert ar_main.load_json_if_exists(metadata_path)["presentation_signature"] != "stale-signature"
+
+
+def test_render_profile_drop_for_attempt_falls_back_when_metadata_writer_fails(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "runs" / "run-b"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    output_root = tmp_path / "profile-drops"
+    working_dir = tmp_path
+
+    class FakeCli:
+        def run(self, args, cwd=None, timeout_seconds=None, check=True):
+            output_root_arg = Path(args[args.index("--output-root") + 1])
+            bundle_dir = output_root_arg / "bundle-0001"
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            (bundle_dir / "profile-document.json").write_text(
+                json.dumps(
+                    {
+                        "profile": {
+                            "name": "cand9",
+                            "description": "Portable scoring profile scaffolded from live indicator templates.",
+                            "directionMode": "both",
+                            "indicators": [
+                                {
+                                    "meta": {"id": "ADX"},
+                                    "config": {
+                                        "label": "ADX",
+                                        "isActive": True,
+                                        "isTrendFollowing": True,
+                                        "timeframe": "M15",
+                                    },
+                                }
+                            ],
+                        }
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    class FailingProvider:
+        def complete_json(self, messages):
+            raise ar_main.ProviderError("metadata writer offline")
+
+    def fake_run_external(argv, cwd=None, timeout_seconds=None):
+        png_path = Path(argv[argv.index("--out") + 1])
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        png_path.write_text("png", encoding="utf-8")
+
+    config = SimpleNamespace(
+        research=SimpleNamespace(
+            quality_score_preset="profile-drop",
+            presentation_metadata_provider_profile="writer",
+        ),
+        fuzzfolio=SimpleNamespace(workspace_root=None),
+        providers={"writer": SimpleNamespace(type="codex")},
+    )
+    row = {
+        "attempt_id": "attempt-0002",
+        "run_id": "run-b",
+        "candidate_name": "cand9",
+        "profile_ref": "prof-9",
+    }
+    attempt = {
+        "attempt_id": "attempt-0002",
+        "candidate_name": "cand9",
+        "profile_ref": "prof-9",
+    }
+
+    monkeypatch.setattr(
+        ar_main,
+        "_build_package_inputs",
+        lambda *_args, **_kwargs: {
+            "profile_ref": "prof-9",
+            "profile_path": tmp_path / "profiles" / "cand9.json",
+            "timeframe": "M15",
+            "instruments": ["EURUSD"],
+            "lookback_months": 36,
+        },
+    )
+    monkeypatch.setattr(ar_main, "_cloud_profile_exists", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ar_main, "create_provider", lambda _profile: FailingProvider())
+    monkeypatch.setattr(ar_main, "_run_external", fake_run_external)
+
+    result = ar_main._render_profile_drop_for_attempt(
+        config=config,
+        cli=FakeCli(),
+        renderer_executable=tmp_path / "renderer",
+        working_dir=working_dir,
+        run_dir=run_dir,
+        attempts=[attempt],
+        row=row,
+        attempt=attempt,
+        output_root=output_root,
+        lookback_months=36,
+        force_rebuild=False,
+        timeout_seconds=30,
+        emit=None,
+    )
+
+    manifest_payload = ar_main.load_json_if_exists(Path(result["manifest_path"]))
+    bundle_dir = output_root / ar_main._profile_drop_attempt_token(row, attempt) / "bundle" / "bundle-0001"
+    bundle_payload = ar_main.load_json_if_exists(bundle_dir / "profile-document.json")
+
+    assert result["status"] == "rendered"
+    assert manifest_payload["tagline"] is None
+    assert manifest_payload["short_description"] is None
+    assert "EURUSD profile on M15 using ADX" in manifest_payload["long_description"]
+    assert bundle_payload["profile"]["description"] == manifest_payload["long_description"]
+    assert Path(result["presentation_metadata_path"]).exists() is False

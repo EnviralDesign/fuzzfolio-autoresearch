@@ -78,6 +78,10 @@ export type ShortlistProfileDrop = {
   attempt_id: string;
   run_id: string;
   candidate_name?: string | null;
+  display_name?: string | null;
+  tagline?: string | null;
+  short_description?: string | null;
+  long_description?: string | null;
   status?: string;
   png_path?: string | null;
   png_url?: string | null;
@@ -85,6 +89,8 @@ export type ShortlistProfileDrop = {
   manifest_url?: string | null;
   profile_ref?: string | null;
   recreated_profile?: boolean;
+  presentation_metadata_path?: string | null;
+  presentation_signature?: string | null;
 };
 
 export type NumericSummary = {

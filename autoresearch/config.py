@@ -29,9 +29,7 @@ class ProviderProfileConfig:
     timeout_seconds: int = 120
     transport: str = "chat_completions"
     compact_trigger_tokens: int | None = None
-    history_strategy: str | None = None
-    history_trim_keep_recent_steps: int | None = None
-    history_trim_target_ratio: float | None = None
+    compact_target_tokens: int | None = None
     rate_limit_backoff_seconds: list[int] | None = None
     rate_limit_max_retries: int | None = None
 
@@ -61,11 +59,9 @@ class ResearchConfig:
     quality_score_preset: str = "profile-drop"
     plot_lower_is_better: bool = False
     compact_trigger_tokens: int = 12000
-    compact_keep_recent_messages: int = 4
-    history_strategy: str = "chunked_tail"
-    history_trim_keep_recent_steps: int = 10
-    history_trim_target_ratio: float = 0.75
+    compact_target_tokens: int = 9000
     recent_step_window_steps: int = 6
+    presentation_metadata_provider_profile: str | None = None
     finish_min_attempts: int = 4
     run_wrap_up_steps: int = 3
     phase_early_ratio: float = 0.35
@@ -160,30 +156,18 @@ class AppConfig:
             return int(profile.compact_trigger_tokens)
         return int(self.research.compact_trigger_tokens)
 
-    def history_strategy_for(self, profile_name: str) -> str:
-        profile = self.providers[profile_name]
-        candidate = str(
-            profile.history_strategy or self.research.history_strategy
-        ).strip().lower()
-        if candidate not in {"chunked_tail", "llm_summary"}:
-            return ResearchConfig.history_strategy
-        return candidate
-
-    def history_trim_keep_recent_steps_for(self, profile_name: str) -> int:
-        profile = self.providers[profile_name]
-        if profile.history_trim_keep_recent_steps is not None:
-            return max(1, int(profile.history_trim_keep_recent_steps))
-        return max(1, int(self.research.history_trim_keep_recent_steps))
-
-    def history_trim_target_ratio_for(self, profile_name: str) -> float:
+    def compact_target_tokens_for(self, profile_name: str) -> int:
         profile = self.providers[profile_name]
         value = (
-            float(profile.history_trim_target_ratio)
-            if profile.history_trim_target_ratio is not None
-            else float(self.research.history_trim_target_ratio)
+            int(profile.compact_target_tokens)
+            if profile.compact_target_tokens is not None
+            else int(self.research.compact_target_tokens)
         )
-        if value <= 0 or value >= 1:
-            return ResearchConfig.history_trim_target_ratio
+        trigger = self.compact_trigger_tokens_for(profile_name)
+        if value <= 0:
+            return max(1, min(trigger - 1, ResearchConfig.compact_target_tokens))
+        if value >= trigger:
+            return max(1, trigger - 1)
         return value
 
     @property
@@ -444,27 +428,11 @@ def _load_provider_profiles(
                     else None
                 ),
             )
-            history_strategy_value = _env_or_value(
-                f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_HISTORY_STRATEGY",
+            compact_target_value = _env_or_value(
+                f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_COMPACT_TARGET_TOKENS",
                 fallback=(
-                    str(profile_cfg.get("history_strategy")).strip()
-                    if profile_cfg.get("history_strategy") is not None
-                    else None
-                ),
-            )
-            history_trim_keep_recent_steps_value = _env_or_value(
-                f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_HISTORY_TRIM_KEEP_RECENT_STEPS",
-                fallback=(
-                    str(profile_cfg.get("history_trim_keep_recent_steps"))
-                    if profile_cfg.get("history_trim_keep_recent_steps") is not None
-                    else None
-                ),
-            )
-            history_trim_target_ratio_value = _env_or_value(
-                f"AUTORESEARCH_PROVIDER_{profile_name.upper().replace('-', '_')}_HISTORY_TRIM_TARGET_RATIO",
-                fallback=(
-                    str(profile_cfg.get("history_trim_target_ratio"))
-                    if profile_cfg.get("history_trim_target_ratio") is not None
+                    str(profile_cfg.get("compact_target_tokens"))
+                    if profile_cfg.get("compact_target_tokens") is not None
                     else None
                 ),
             )
@@ -519,19 +487,9 @@ def _load_provider_profiles(
                     if compact_trigger_value is not None
                     else None
                 ),
-                history_strategy=(
-                    str(history_strategy_value).strip().lower()
-                    if history_strategy_value is not None
-                    else None
-                ),
-                history_trim_keep_recent_steps=(
-                    int(history_trim_keep_recent_steps_value)
-                    if history_trim_keep_recent_steps_value is not None
-                    else None
-                ),
-                history_trim_target_ratio=(
-                    float(history_trim_target_ratio_value)
-                    if history_trim_target_ratio_value is not None
+                compact_target_tokens=(
+                    int(compact_target_value)
+                    if compact_target_value is not None
                     else None
                 ),
                 rate_limit_backoff_seconds=(
@@ -610,9 +568,7 @@ def _load_provider_profiles(
             timeout_seconds=shared_timeout,
             transport=str(defaults["transport"]),
             compact_trigger_tokens=None,
-            history_strategy=None,
-            history_trim_keep_recent_steps=None,
-            history_trim_target_ratio=None,
+            compact_target_tokens=None,
             rate_limit_backoff_seconds=None,
             rate_limit_max_retries=None,
         ),
@@ -697,26 +653,9 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                 "compact_trigger_tokens", ResearchConfig.compact_trigger_tokens
             )
         ),
-        compact_keep_recent_messages=int(
+        compact_target_tokens=int(
             research_cfg.get(
-                "compact_keep_recent_messages",
-                ResearchConfig.compact_keep_recent_messages,
-            )
-        ),
-        history_strategy=str(
-            research_cfg.get("history_strategy", ResearchConfig.history_strategy)
-        ).strip()
-        or ResearchConfig.history_strategy,
-        history_trim_keep_recent_steps=int(
-            research_cfg.get(
-                "history_trim_keep_recent_steps",
-                ResearchConfig.history_trim_keep_recent_steps,
-            )
-        ),
-        history_trim_target_ratio=float(
-            research_cfg.get(
-                "history_trim_target_ratio",
-                ResearchConfig.history_trim_target_ratio,
+                "compact_target_tokens", ResearchConfig.compact_target_tokens
             )
         ),
         recent_step_window_steps=int(
@@ -727,6 +666,15 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                     ResearchConfig.recent_step_window_steps,
                 ),
             )
+        ),
+        presentation_metadata_provider_profile=(
+            str(
+                research_cfg.get(
+                    "presentation_metadata_provider_profile",
+                    ResearchConfig.presentation_metadata_provider_profile or "",
+                )
+            ).strip()
+            or None
         ),
         finish_min_attempts=int(
             research_cfg.get(

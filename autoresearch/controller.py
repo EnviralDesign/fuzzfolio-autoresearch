@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import sys
@@ -77,25 +78,6 @@ SUPERVISED_EXTRA_RULES = """
 - When you have a good candidate, keep exploring nearby and contrasting branches instead of trying to end the run.
 """
 
-COMPACTION_PROMPT = """You are writing a handoff summary for the same research controller.
-
-Include:
-- Current progress
-- Important decisions
-- Constraints and user preferences
-- Concrete next steps
-- Critical paths or artifact locations
-
-Return JSON with this shape only:
-{
-  "checkpoint_summary": "concise multi-line summary"
-}
-"""
-
-SUMMARY_PREFIX = """Another language model started to solve this problem and produced a summary of its thinking process.
-Use the summary below to continue the same autonomous Fuzzfolio research run without repeating old work.
-"""
-
 RESPONSE_REPAIR_PROMPT = """Your previous JSON response was structurally invalid for the controller.
 
 Return a corrected full replacement response in the exact required top-level shape:
@@ -148,8 +130,42 @@ LOCAL_OPENING_NARROW_GOAL_KEYWORDS = (
     "sharper",
     "sharp",
 )
-HISTORY_STRATEGY_CHUNKED_TAIL = "chunked_tail"
-HISTORY_STRATEGY_LLM_SUMMARY = "llm_summary"
+CHUNK_STEP_FRAME = "STEP FRAME"
+CHUNK_TOOL_RESULTS = "TOOL RESULTS FROM PRIOR STEP"
+CHUNK_GOAL_STATE = "GOAL STATE"
+CHUNK_BRANCH_AUTHORITY = "BRANCH AUTHORITY"
+CHUNK_ACTIVE_HANDLES = "ACTIVE HANDLES"
+CHUNK_RECENT_EVIDENCE = "RECENT EVIDENCE"
+CHUNK_OPENING_OVERLAY = "OPENING OVERLAY"
+CHUNK_PREPARE_MUTATE_CONTEXT = "PREPARE OR MUTATE CONTEXT"
+CHUNK_SWEEP_CONTEXT = "SWEEP CONTEXT"
+CHUNK_EVALUATE_CONTEXT = "EVALUATE CONTEXT"
+CHUNK_RECOVERY_CONTEXT = "RECOVERY CONTEXT"
+CHUNK_WRAP_UP_CONTEXT = "WRAP-UP CONTEXT"
+
+DELTA_CHUNK_ORDER = [
+    CHUNK_STEP_FRAME,
+    CHUNK_TOOL_RESULTS,
+    CHUNK_GOAL_STATE,
+    CHUNK_BRANCH_AUTHORITY,
+    CHUNK_ACTIVE_HANDLES,
+    CHUNK_RECENT_EVIDENCE,
+    CHUNK_OPENING_OVERLAY,
+    CHUNK_PREPARE_MUTATE_CONTEXT,
+    CHUNK_SWEEP_CONTEXT,
+    CHUNK_EVALUATE_CONTEXT,
+    CHUNK_RECOVERY_CONTEXT,
+    CHUNK_WRAP_UP_CONTEXT,
+]
+
+ACTION_CONTEXT_CHUNKS = {
+    CHUNK_OPENING_OVERLAY,
+    CHUNK_PREPARE_MUTATE_CONTEXT,
+    CHUNK_SWEEP_CONTEXT,
+    CHUNK_EVALUATE_CONTEXT,
+    CHUNK_RECOVERY_CONTEXT,
+    CHUNK_WRAP_UP_CONTEXT,
+}
 
 
 def _normalize_instrument_list(value: Any) -> list[str]:
@@ -717,7 +733,7 @@ def _compact_ranked_comparison_for_prompt(
         if not isinstance(row, dict):
             continue
         compact: dict[str, Any] = {}
-        for key in ("label", "artifact_dir", "quality_score"):
+        for key in ("label", "quality_score"):
             if row.get(key) is not None:
                 compact[key] = row.get(key)
         best = row.get("best")
@@ -914,6 +930,10 @@ class ResearchController:
         self._tool_usage_counts: dict[str, int] = {}
         self._validation_stale_without_validated: int = 0
         self._pending_manager_events: list[dict[str, Any]] = []
+        self._delta_chunk_fingerprints: dict[str, str] = {}
+        self._delta_chunk_relevance: dict[str, bool] = {}
+        self._last_checkpoint_event_state: dict[str, Any] | None = None
+        self._checkpoint_required_next_step: bool = False
 
     def _reset_run_state(self) -> None:
         self._family_mutation_counts = {}
@@ -934,6 +954,10 @@ class ResearchController:
         self._pending_manager_events = []
         self._manager_runtime = ManagerRuntimeState()
         self._frontier_prior_best = None
+        self._delta_chunk_fingerprints = {}
+        self._delta_chunk_relevance = {}
+        self._last_checkpoint_event_state = None
+        self._checkpoint_required_next_step = False
 
     def _bump_tool_usage(self, tool: str) -> None:
         key = str(tool).strip() or "unknown"
@@ -967,6 +991,20 @@ class ResearchController:
         events = list(self._pending_manager_events)
         self._pending_manager_events = []
         return events
+
+    def _ensure_delta_packet_runtime_state(self) -> None:
+        if not hasattr(self, "_delta_chunk_fingerprints") or not isinstance(
+            self._delta_chunk_fingerprints, dict
+        ):
+            self._delta_chunk_fingerprints = {}
+        if not hasattr(self, "_delta_chunk_relevance") or not isinstance(
+            self._delta_chunk_relevance, dict
+        ):
+            self._delta_chunk_relevance = {}
+        if not hasattr(self, "_last_checkpoint_event_state"):
+            self._last_checkpoint_event_state = None
+        if not hasattr(self, "_checkpoint_required_next_step"):
+            self._checkpoint_required_next_step = False
 
     def _parse_lookback_months_from_cli_args(self, args: list[str]) -> int | None:
         if "--lookback-months" not in args:
@@ -3375,7 +3413,7 @@ class ResearchController:
             "- register_profile: candidate_name or profile_ref; operation create|update; profile_ref required for update.\n"
             "- evaluate_candidate: profile_ref first; candidate_name is acceptable for local unregistered drafts; include instruments[] plus optional timeframe_policy/timeframe/requested_horizon_months/evaluation_mode.\n"
             "- run_parameter_sweep: profile_ref; axes[] strings; optional instruments[], output_dir, candidate_name_prefix.\n"
-            "- inspect_artifact: artifact_dir or attempt_id; view summary|files|curve_meta|request_meta.\n"
+            "- inspect_artifact: artifact_dir or inspect_ref or attempt_id; view summary|files|curve_meta|request_meta.\n"
             "- compare_artifacts: attempt_ids[] or artifact_dirs[].\n"
             "Workflows:\n"
             "- New candidate: prepare_profile -> validate_profile -> register_profile -> evaluate_candidate.\n"
@@ -4586,9 +4624,6 @@ class ResearchController:
             "Use exact symbols from the catalog. Do not assume aliases like JPY are valid instruments."
         )
 
-    def _checkpoint_path(self, tool_context: ToolContext) -> Path:
-        return tool_context.run_dir / "checkpoint-summary.txt"
-
     def _approx_token_count(self, text: str) -> int:
         compact = " ".join(text.split())
         return max(1, len(compact) // 4)
@@ -4825,6 +4860,101 @@ class ResearchController:
             profile_ref=profile_ref,
         )
 
+    @staticmethod
+    def _template_handle_bits(template: dict[str, Any]) -> list[str]:
+        bits: list[str] = []
+        candidate_name = str(template.get("candidate_name") or "").strip()
+        profile_ref = str(template.get("profile_ref") or "").strip()
+        if candidate_name:
+            bits.append(f"candidate_name={candidate_name}")
+        if profile_ref:
+            bits.append(f"profile_ref={profile_ref}")
+        return bits
+
+    def _latest_candidate_context_template_prompt_state(
+        self,
+        tool_context: ToolContext,
+    ) -> dict[str, Any] | None:
+        latest_result, _payload = self._latest_successful_step_result(
+            tool_context,
+            tool_names={
+                "prepare_profile",
+                "mutate_profile",
+                "validate_profile",
+                "register_profile",
+            },
+        )
+        if not isinstance(latest_result, dict):
+            return None
+        candidate_summary = (
+            latest_result.get("candidate_summary")
+            if isinstance(latest_result.get("candidate_summary"), dict)
+            else {}
+        )
+        template: dict[str, Any] = {}
+        candidate_name = str(
+            latest_result.get("candidate_name")
+            or candidate_summary.get("candidate_name")
+            or candidate_summary.get("draft_name")
+            or candidate_summary.get("profile_name")
+            or ""
+        ).strip()
+        profile_ref = str(
+            latest_result.get("profile_ref")
+            or latest_result.get("created_profile_ref")
+            or candidate_summary.get("profile_ref")
+            or ""
+        ).strip()
+        if candidate_name:
+            template["candidate_name"] = candidate_name
+        if profile_ref:
+            template["profile_ref"] = profile_ref
+        indicator_ids = candidate_summary.get("indicator_ids")
+        if not isinstance(indicator_ids, list) or not indicator_ids:
+            indicator_ids = self._relevant_indicator_ids_for_template(
+                tool_context,
+                template,
+            )
+        if indicator_ids:
+            template["indicator_ids"] = [
+                str(item).strip() for item in indicator_ids if str(item).strip()
+            ]
+        return template or None
+
+    def _sweep_context_template_prompt_state(
+        self,
+        tool_context: ToolContext,
+    ) -> dict[str, Any] | None:
+        latest_eval_result, _payload = self._latest_successful_step_result(
+            tool_context,
+            tool_names={"evaluate_candidate"},
+        )
+        if not isinstance(latest_eval_result, dict):
+            return None
+        profile_ref = str(latest_eval_result.get("profile_ref") or "").strip()
+        if not profile_ref:
+            return None
+        if latest_eval_result.get("score") is None:
+            return None
+        template: dict[str, Any] = {"profile_ref": profile_ref}
+        candidate_template = self._latest_candidate_context_template_prompt_state(
+            tool_context
+        ) or {}
+        candidate_name = str(candidate_template.get("candidate_name") or "").strip()
+        if candidate_name:
+            template["candidate_name"] = candidate_name
+        indicator_ids = self._relevant_indicator_ids_for_template(tool_context, template)
+        if indicator_ids:
+            template["indicator_ids"] = indicator_ids
+        instruments = self._recent_known_instruments_for_handle(
+            tool_context,
+            candidate_name=candidate_name or None,
+            profile_ref=profile_ref,
+        )
+        if instruments:
+            template["instruments"] = instruments
+        return template
+
     def _opening_step_overlay_text(self, tool_context: ToolContext) -> str:
         grounding = self._local_opening_grounding_prompt_state(tool_context) or {}
         starter_instruments = list(grounding.get("preferred_initial_instruments") or [])
@@ -4859,69 +4989,44 @@ class ResearchController:
         )
         return "\n".join(overlay_lines)
 
-    def _contextual_injections_text(
+    @staticmethod
+    def _strip_packet_heading(text: str) -> str:
+        lines = [line.rstrip() for line in str(text or "").splitlines()]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        if lines:
+            first = lines[0].strip()
+            if first.endswith(":") and not first.startswith("-"):
+                lines = lines[1:]
+        return "\n".join(line for line in lines if line.strip()).strip()
+
+    @staticmethod
+    def _packet_chunk_text(title: str, body: str) -> str | None:
+        text = str(body or "").strip()
+        if not text:
+            return None
+        return f"===== {title} =====\n{text}"
+
+    @staticmethod
+    def _packet_chunk_fingerprint(text: str) -> str:
+        return hashlib.sha1(str(text or "").encode("utf-8")).hexdigest()
+
+    def _step_frame_chunk_text(
         self,
-        tool_context: ToolContext,
         policy: RunPolicy,
         *,
         step: int,
         step_limit: int,
     ) -> str:
-        if self._is_true_opening_step(tool_context, step):
-            parts = [self._opening_step_overlay_text(tool_context)]
-            seed_goal = self._early_seed_goal_text(tool_context)
-            if seed_goal:
-                parts.append(seed_goal)
-            return "\n\n".join(part for part in parts if str(part).strip())
-        template = self._followup_next_action_template_prompt_state(tool_context)
-        injections: list[str] = []
-        if isinstance(template, dict):
-            tool = str(template.get("tool") or "").strip()
-            if tool in {"prepare_profile", "mutate_profile"}:
-                relevant_ids = self._relevant_indicator_ids_for_template(
-                    tool_context, template
-                )
-                if relevant_ids:
-                    injections.append(
-                        "Relevant indicator parameter schema:\n"
-                        + self._compact_seed_parameter_schema_text(
-                            tool_context,
-                            indicator_ids=relevant_ids,
-                            include_notes=True,
-                        )
-                    )
-            if tool == "evaluate_candidate":
-                instruments = [
-                    str(item).strip()
-                    for item in (template.get("instruments") or [])
-                    if str(item).strip()
-                ]
-                instrument_lines = ["Instrument reminder:"]
-                if instruments:
-                    instrument_lines.append(
-                        "- Planned evaluation instruments: " + ", ".join(instruments)
-                    )
-                instrument_lines.append(
-                    self._compact_instrument_reference_text(
-                        tool_context,
-                        include_coverage=True,
-                    )
-                )
-                injections.append("\n".join(instrument_lines))
-        phase_name = self._run_phase_info(step, step_limit, policy).get("name")
-        if phase_name == "wrap_up":
-            injections.append(
-                "Wrap-up reminder:\n"
-                "- Wrap-up is active. Extra broadening needs strong justification."
-            )
-        mismatch_text = self._timeframe_mismatch_status_text()
-        if "BLOCKED:" in mismatch_text or "Warning:" in mismatch_text:
-            injections.append(mismatch_text)
-        if not injections:
-            return "No contextual injections are active."
-        return "\n\n".join(injections)
+        phase_info = self._run_phase_info(step, step_limit, policy)
+        return "\n".join(
+            [
+                f"- step: {step}/{step_limit}",
+                f"- phase: {phase_info.get('name') or 'unknown'}",
+            ]
+        )
 
-    def _controller_update_text(
+    def _goal_state_chunk_text(
         self,
         tool_context: ToolContext,
         policy: RunPolicy,
@@ -4933,40 +5038,540 @@ class ResearchController:
         horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
         score_target = self._score_target_snapshot(tool_context)
         next_action_template = self._followup_next_action_template_prompt_state(tool_context)
-        phase_name = str(phase_info.get("name") or "")
-        recent_attempt_limit = 3 if phase_name == "early" else 2 if phase_name == "mid" else 1
-        sections = [
-            f"Step: {step}/{step_limit}",
-            f"Run phase: {phase_name}",
-            f"Phase guidance: {phase_info.get('summary')}",
-            f"Horizon target: {horizon_policy.get('summary')}",
-            f"Horizon guidance: {horizon_policy.get('guidance')}",
-            f"Score target: {score_target.get('summary')}",
-            "Next action template: "
-            + (
-                json.dumps(next_action_template, ensure_ascii=True)
-                if isinstance(next_action_template, dict)
-                else "No deterministic next_action_template is active."
+        phase_name = str(phase_info.get("name") or "").strip()
+        compact_phase_guidance = {
+            "early": "Branch broadly and get the first credible scorer fast.",
+            "mid": "Narrow onto the strongest families and deepen evidence.",
+            "late": "Stop spraying branches; pressure-test one or two survivors.",
+            "wrap_up": "Use the remaining budget for decisive longest-horizon evidence.",
+        }.get(phase_name, str(phase_info.get("summary") or "").strip())
+        lines = [
+            f"- phase_guidance: {compact_phase_guidance}",
+            f"- horizon_target: {horizon_policy.get('summary')}",
+            f"- score_target: {score_target.get('summary')}",
+        ]
+        if isinstance(next_action_template, dict):
+            lines.append(
+                "- next_action_template: "
+                + json.dumps(next_action_template, ensure_ascii=True)
+            )
+        return "\n".join(lines)
+
+    def _branch_priority_summary(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+    ) -> str:
+        ov = self._branch_overlay
+        attempts = self._run_attempts(tool_context.run_id)
+        validation_digest = (
+            ov.last_scored_validation_digest
+            if isinstance(ov.last_scored_validation_digest, dict)
+            else {}
+        )
+        validation_evidence = (
+            validation_digest.get("validation_evidence")
+            if isinstance(validation_digest.get("validation_evidence"), dict)
+            else {}
+        )
+        unresolved_validation = (
+            validation_evidence.get("outcome") == vo.VALIDATION_UNRESOLVED
+        )
+        contrast_required = any(
+            branch.structural_contrast_required
+            for branch in self._family_branches.values()
+        )
+        phase_name = str(self._run_phase_info(step, step_limit, policy).get("name") or "")
+        wrap_up_focus = self._current_wrap_up_focus_state(attempts)
+        if ov.validated_leader_family_id:
+            return (
+                "protect_validated_leader "
+                + self._short_family_id(ov.validated_leader_family_id)
+            )
+        if ov.provisional_leader_family_id and unresolved_validation:
+            return (
+                "resolve_provisional_validation "
+                + self._short_family_id(ov.provisional_leader_family_id)
+            )
+        if ov.provisional_leader_family_id:
+            return (
+                "promote_or_replace_provisional_leader "
+                + self._short_family_id(ov.provisional_leader_family_id)
+            )
+        if ov.budget_mode == bl.BUDGET_COLLAPSE_RECOVERY or contrast_required:
+            return "structural_contrast"
+        if ov.budget_mode == bl.BUDGET_WRAP_UP:
+            if isinstance(wrap_up_focus, dict) and wrap_up_focus.get("family_id"):
+                return (
+                    "decisive_wrap_up_evidence "
+                    + self._short_family_id(wrap_up_focus.get("family_id"))
+                )
+            return "decisive_wrap_up_evidence"
+        if phase_name == "wrap_up":
+            return "resolve_remaining_survivor_evidence"
+        return "establish_next_leader"
+
+    def _branch_authority_chunk_text(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+    ) -> str:
+        ov = self._branch_overlay
+        wrap_up_focus = self._current_wrap_up_focus_state(
+            self._run_attempts(tool_context.run_id)
+        )
+        lines = [
+            "- priority: "
+            + self._branch_priority_summary(
+                tool_context,
+                policy,
+                step=step,
+                step_limit=step_limit,
             ),
-            self._current_research_priority_text(tool_context, step, step_limit, policy),
-            self._manager_guidance_text(step),
-            self._run_outcome_text(tool_context),
-            self._working_memory_text(tool_context),
-            self._branch_lifecycle_run_packet_text(tool_context, step, step_limit),
-            self._retention_and_exploit_status_text(tool_context),
+            f"- budget_mode: {ov.budget_mode}",
+        ]
+        family_parts = [
+            f"provisional={self._short_family_id(ov.provisional_leader_family_id)}",
+            f"validated={self._short_family_id(ov.validated_leader_family_id)}",
+            f"shadow={self._short_family_id(ov.shadow_leader_family_id)}",
+        ]
+        lines.append("- branch_families: " + ", ".join(family_parts))
+        if ov.provisional_leader_promotability:
+            lines.append(
+                f"- provisional_promotability: {ov.provisional_leader_promotability}"
+            )
+        if ov.reseed_active or ov.collapse_recovery_remaining > 0:
+            lines.append(
+                "- recovery_budget: "
+                f"reseed_active={ov.reseed_active} "
+                f"collapse_recovery_steps_left={ov.collapse_recovery_remaining}"
+            )
+        if self._validation_stale_without_validated > 0:
+            threshold = self.config.research.reseed_after_stale_validation_steps
+            lines.append(
+                "- validation_stale_without_validated: "
+                f"{self._validation_stale_without_validated}/{threshold}"
+            )
+        if isinstance(wrap_up_focus, dict) and wrap_up_focus.get("family_id"):
+            parts = [f"family={self._short_family_id(wrap_up_focus.get('family_id'))}"]
+            if wrap_up_focus.get("profile_ref"):
+                parts.append(f"profile_ref={wrap_up_focus.get('profile_ref')}")
+            if wrap_up_focus.get("promotability_status"):
+                parts.append(
+                    f"promotability={wrap_up_focus.get('promotability_status')}"
+                )
+            lines.append("- wrap_up_focus: " + ", ".join(parts[:4]))
+        runtime = self._manager_runtime
+        if runtime.last_hook:
+            hook_line = f"- manager_hook: {runtime.last_hook} at step {runtime.last_hook_step}"
+            action_kinds = [
+                str(item.get("kind") or "unknown")
+                for item in runtime.last_actions_applied
+                if isinstance(item, dict)
+            ]
+            if action_kinds:
+                hook_line += " | actions=" + ",".join(action_kinds[:4])
+            lines.append(hook_line)
+            if runtime.last_rationale:
+                rationale = " ".join(str(runtime.last_rationale).split())
+                if len(rationale) > 180:
+                    rationale = rationale[:177] + "..."
+                lines.append(f"- manager_rationale: {rationale}")
+        elif step == 1:
+            lines.append("- manager_hook: none yet")
+        if runtime.invocation_incomplete:
+            lines.append(
+                f"- manager_status: incomplete ({runtime.last_error or 'unknown_error'})"
+            )
+        return "\n".join(lines)
+
+    def _active_handles_chunk_text(self, tool_context: ToolContext) -> str:
+        return self._strip_packet_heading(self._working_memory_text(tool_context))
+
+    def _recent_evidence_chunk_text(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+    ) -> str:
+        phase_name = str(self._run_phase_info(step, step_limit, policy).get("name") or "")
+        recent_attempt_limit = 2 if phase_name in {"early", "mid"} else 1
+        lines: list[str] = []
+        attempts = self._run_attempts(tool_context.run_id)
+        scored_attempts = [
+            attempt for attempt in attempts if attempt.get("composite_score") is not None
+        ]
+        if scored_attempts:
+            outcome = self._strip_packet_heading(self._run_outcome_text(tool_context))
+            if outcome:
+                lines.extend(outcome.splitlines())
+        attempts_text = self._strip_packet_heading(
             self._compact_recent_attempts_prompt_text(
                 tool_context,
                 limit=recent_attempt_limit,
-            ),
-            self._recent_behavior_digest_text(tool_context),
+            )
+        )
+        if attempts_text and "none yet" not in attempts_text.lower():
+            lines.extend(attempts_text.splitlines())
+        elif not lines:
+            lines.append("- scored_attempts: none yet")
+        digest = self._strip_packet_heading(self._recent_behavior_digest_text(tool_context))
+        if (
+            digest
+            and "No evaluated attempts yet." not in digest
+            and "No scored attempts yet." not in digest
+        ):
+            lines.extend(digest.splitlines())
+        return "\n".join(line for line in lines if str(line).strip()).strip()
+
+    def _opening_overlay_chunk_text(self, tool_context: ToolContext) -> str:
+        parts = [self._opening_step_overlay_text(tool_context)]
+        seed_goal = self._early_seed_goal_text(tool_context)
+        if seed_goal:
+            parts.append(seed_goal)
+        return "\n\n".join(part for part in parts if str(part).strip()).strip()
+
+    def _prepare_or_mutate_context_chunk_text(
+        self,
+        tool_context: ToolContext,
+        template: dict[str, Any],
+    ) -> str:
+        relevant_ids = self._relevant_indicator_ids_for_template(tool_context, template)
+        handle_bits = self._template_handle_bits(template)
+        if not relevant_ids and not handle_bits:
+            return ""
+        lines: list[str] = []
+        if handle_bits:
+            lines.append("- live_handle: " + ", ".join(handle_bits[:3]))
+        if relevant_ids:
+            lines.append("- relevant_indicator_ids: " + ", ".join(relevant_ids))
+        lines.extend(
+            [
+                "- mutate_profile is for field-level edits on an existing profile shape.",
+                "- Do not replace the full indicators array with shorthand ids or partial payloads.",
+                "- For add/remove/swap indicator structures, use prepare_profile scaffold_from_seed or clone_local first, then validate the returned candidate_name.",
+                "- If you patch indicator fields, preserve the existing meta/config shape and edit the specific field path only.",
+            ]
+        )
+        if relevant_ids:
+            lines.append(
+                self._compact_seed_parameter_schema_text(
+                    tool_context,
+                    indicator_ids=relevant_ids,
+                    include_notes=True,
+                )
+            )
+        return "\n".join(line for line in lines if str(line).strip()).strip()
+
+    def _sweep_context_chunk_text(
+        self,
+        tool_context: ToolContext,
+        template: dict[str, Any],
+    ) -> str:
+        handle_bits = self._template_handle_bits(template)
+        indicator_ids = self._relevant_indicator_ids_for_template(tool_context, template)
+        instruments = [
+            str(item).strip()
+            for item in (template.get("instruments") or [])
+            if str(item).strip()
         ]
-        if phase_name == "early":
-            seed_goal = self._early_seed_goal_text(tool_context)
-            if seed_goal:
-                sections.append(seed_goal)
-        return "\n\n".join(
-            section for section in sections if str(section).strip()
-        ).strip()
+        lines: list[str] = []
+        if handle_bits:
+            lines.append("- live_handle: " + ", ".join(handle_bits[:3]))
+        if indicator_ids:
+            lines.append("- active_indicator_ids: " + ", ".join(indicator_ids))
+        if instruments:
+            lines.append("- last_known_instruments: " + ", ".join(instruments[:4]))
+        lines.extend(
+            [
+                "- Next typed tuning move is run_parameter_sweep on profile_ref.",
+                "- Valid axis grammar only: indicator[N].config.<field>=... or indicator[N].talib.<param>=...",
+                "- Valid examples: indicator[0].config.timeframe=M5,H1 ; indicator[1].talib.timeperiod=10,14,20",
+                "- Invalid examples: profile.indicators[1].params.fastperiod=... ; indicators[1].config.fastperiod=... ; indicator[1].params.fastperiod=...",
+            ]
+        )
+        return "\n".join(lines).strip()
+
+    def _evaluate_context_chunk_text(
+        self,
+        tool_context: ToolContext,
+        template: dict[str, Any],
+    ) -> str:
+        instruments = [
+            str(item).strip()
+            for item in (template.get("instruments") or [])
+            if str(item).strip()
+        ]
+        lines: list[str] = []
+        if instruments:
+            lines.append("- planned_instruments: " + ", ".join(instruments))
+        lines.append(
+            self._compact_instrument_reference_text(
+                tool_context,
+                include_coverage=True,
+            )
+        )
+        return "\n".join(line for line in lines if str(line).strip()).strip()
+
+    def _recovery_context_chunk_text(self, tool_context: ToolContext) -> str:
+        lines: list[str] = []
+        mismatch_text = self._timeframe_mismatch_status_text()
+        if "No auto-adjustments detected" not in mismatch_text:
+            lines.append(mismatch_text)
+        issues = self._execution_issue_lines(tool_context, None, 4)
+        if issues:
+            lines.append("Recent execution issues:")
+            lines.extend(issues[:4])
+        return "\n".join(lines).strip()
+
+    def _wrap_up_context_chunk_text(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+    ) -> str:
+        phase_name = str(self._run_phase_info(step, step_limit, policy).get("name") or "")
+        if phase_name != "wrap_up":
+            return ""
+        lines = ["- Wrap-up is active. Extra broadening needs strong justification."]
+        wrap_up_focus = self._current_wrap_up_focus_state(self._run_attempts(tool_context.run_id))
+        if isinstance(wrap_up_focus, dict) and wrap_up_focus.get("family_id"):
+            focus_bits = [f"family={self._short_family_id(wrap_up_focus.get('family_id'))}"]
+            if wrap_up_focus.get("profile_ref"):
+                focus_bits.append(f"profile_ref={wrap_up_focus.get('profile_ref')}")
+            lines.append("- focus: " + ", ".join(focus_bits[:3]))
+        return "\n".join(lines)
+
+    def _chunk_payloads_for_step_packet(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+        prior_results: list[dict[str, Any]] | None,
+    ) -> dict[str, str]:
+        payloads: dict[str, str] = {
+            CHUNK_STEP_FRAME: self._step_frame_chunk_text(
+                policy,
+                step=step,
+                step_limit=step_limit,
+            ),
+            CHUNK_GOAL_STATE: self._goal_state_chunk_text(
+                tool_context,
+                policy,
+                step=step,
+                step_limit=step_limit,
+            ),
+            CHUNK_BRANCH_AUTHORITY: self._branch_authority_chunk_text(
+                tool_context,
+                policy,
+                step=step,
+                step_limit=step_limit,
+            ),
+            CHUNK_ACTIVE_HANDLES: self._active_handles_chunk_text(tool_context),
+            CHUNK_RECENT_EVIDENCE: self._recent_evidence_chunk_text(
+                tool_context,
+                policy,
+                step=step,
+                step_limit=step_limit,
+            ),
+        }
+        if prior_results:
+            payloads[CHUNK_TOOL_RESULTS] = json.dumps(
+                self._prompt_visible_results_payload(prior_results),
+                ensure_ascii=True,
+                indent=2,
+            )
+        if self._is_true_opening_step(tool_context, step):
+            payloads[CHUNK_OPENING_OVERLAY] = self._opening_overlay_chunk_text(
+                tool_context
+            )
+        candidate_context_template = self._latest_candidate_context_template_prompt_state(
+            tool_context
+        )
+        if isinstance(candidate_context_template, dict):
+            body = self._prepare_or_mutate_context_chunk_text(
+                tool_context,
+                candidate_context_template,
+            )
+            if body:
+                payloads[CHUNK_PREPARE_MUTATE_CONTEXT] = body
+        sweep_context_template = self._sweep_context_template_prompt_state(tool_context)
+        if isinstance(sweep_context_template, dict):
+            body = self._sweep_context_chunk_text(tool_context, sweep_context_template)
+            if body:
+                payloads[CHUNK_SWEEP_CONTEXT] = body
+        template = self._followup_next_action_template_prompt_state(tool_context)
+        if isinstance(template, dict):
+            tool = str(template.get("tool") or "").strip()
+            if tool == "evaluate_candidate":
+                body = self._evaluate_context_chunk_text(tool_context, template)
+                if body:
+                    payloads[CHUNK_EVALUATE_CONTEXT] = body
+        recovery_text = self._recovery_context_chunk_text(tool_context)
+        if recovery_text:
+            payloads[CHUNK_RECOVERY_CONTEXT] = recovery_text
+        wrap_up_text = self._wrap_up_context_chunk_text(
+            tool_context,
+            policy,
+            step=step,
+            step_limit=step_limit,
+        )
+        if wrap_up_text:
+            payloads[CHUNK_WRAP_UP_CONTEXT] = wrap_up_text
+        return payloads
+
+    def _checkpoint_event_state(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+    ) -> dict[str, Any]:
+        runtime = self._manager_runtime
+        ov = self._branch_overlay
+        wrap_up_focus = self._current_wrap_up_focus_state(
+            self._run_attempts(tool_context.run_id)
+        )
+        recovery_text = self._recovery_context_chunk_text(tool_context)
+        return {
+            "phase": str(self._run_phase_info(step, step_limit, policy).get("name") or ""),
+            "manager_hook": runtime.last_hook,
+            "manager_hook_step": runtime.last_hook_step,
+            "manager_incomplete": bool(runtime.invocation_incomplete),
+            "budget_mode": ov.budget_mode,
+            "provisional_family": ov.provisional_leader_family_id,
+            "validated_family": ov.validated_leader_family_id,
+            "shadow_family": ov.shadow_leader_family_id,
+            "provisional_promotability": ov.provisional_leader_promotability,
+            "wrap_up_focus_family": (
+                str(wrap_up_focus.get("family_id") or "").strip()
+                if isinstance(wrap_up_focus, dict)
+                else None
+            ),
+            "wrap_up_focus_promotability": (
+                str(wrap_up_focus.get("promotability_status") or "").strip()
+                if isinstance(wrap_up_focus, dict)
+                else None
+            ),
+            "recovery_active": bool(recovery_text),
+        }
+
+    def _should_emit_checkpoint_packet(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+    ) -> tuple[bool, dict[str, Any]]:
+        self._ensure_delta_packet_runtime_state()
+        event_state = self._checkpoint_event_state(
+            tool_context,
+            policy,
+            step=step,
+            step_limit=step_limit,
+        )
+        if step == 1 or self._checkpoint_required_next_step:
+            return True, event_state
+        if self._last_checkpoint_event_state != event_state:
+            return True, event_state
+        return False, event_state
+
+    def _build_step_update_packet(
+        self,
+        tool_context: ToolContext,
+        policy: RunPolicy,
+        *,
+        step: int,
+        step_limit: int,
+        prior_results: list[dict[str, Any]] | None = None,
+        checkpoint_required: bool | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        self._ensure_delta_packet_runtime_state()
+        implicit_checkpoint, event_state = self._should_emit_checkpoint_packet(
+            tool_context,
+            policy,
+            step=step,
+            step_limit=step_limit,
+        )
+        emit_checkpoint = (
+            implicit_checkpoint if checkpoint_required is None else bool(checkpoint_required)
+        )
+        chunk_payloads = self._chunk_payloads_for_step_packet(
+            tool_context,
+            policy,
+            step=step,
+            step_limit=step_limit,
+            prior_results=prior_results,
+        )
+        blocks: list[str] = []
+        emitted_fingerprints: dict[str, str] = {}
+        emitted_relevance: dict[str, bool] = {}
+        for title in DELTA_CHUNK_ORDER:
+            body = str(chunk_payloads.get(title) or "").strip()
+            relevant = bool(body)
+            emitted_relevance[title] = relevant
+            if title == CHUNK_STEP_FRAME:
+                should_emit = True
+            elif title == CHUNK_TOOL_RESULTS:
+                should_emit = relevant
+            elif emit_checkpoint:
+                should_emit = relevant
+            elif not relevant:
+                should_emit = False
+            else:
+                fingerprint = self._packet_chunk_fingerprint(body)
+                should_emit = (
+                    not bool(self._delta_chunk_relevance.get(title))
+                    or self._delta_chunk_fingerprints.get(title) != fingerprint
+                )
+            if not should_emit or not relevant:
+                continue
+            blocks.append(self._packet_chunk_text(title, body) or "")
+            emitted_fingerprints[title] = self._packet_chunk_fingerprint(body)
+        packet_text = "\n\n".join(block for block in blocks if block).strip()
+        packet_state = {
+            "checkpoint_required": emit_checkpoint,
+            "checkpoint_event_state": event_state,
+            "chunk_relevance": emitted_relevance,
+            "chunk_fingerprints": emitted_fingerprints,
+        }
+        return packet_text, packet_state
+
+    def _commit_sent_step_packet_state(self, packet_state: dict[str, Any]) -> None:
+        self._ensure_delta_packet_runtime_state()
+        relevance = (
+            packet_state.get("chunk_relevance")
+            if isinstance(packet_state.get("chunk_relevance"), dict)
+            else {}
+        )
+        for title, is_relevant in relevance.items():
+            self._delta_chunk_relevance[str(title)] = bool(is_relevant)
+        fingerprints = (
+            packet_state.get("chunk_fingerprints")
+            if isinstance(packet_state.get("chunk_fingerprints"), dict)
+            else {}
+        )
+        for title, fingerprint in fingerprints.items():
+            self._delta_chunk_fingerprints[str(title)] = str(fingerprint)
+        if packet_state.get("checkpoint_required"):
+            event_state = packet_state.get("checkpoint_event_state")
+            if isinstance(event_state, dict):
+                self._last_checkpoint_event_state = event_state
+        self._checkpoint_required_next_step = False
 
     def _prompt_visible_results_payload(
         self,
@@ -4987,35 +5592,17 @@ class ResearchController:
         step: int,
         step_limit: int,
         prior_results: list[dict[str, Any]] | None = None,
+        checkpoint_required: bool | None = None,
     ) -> str:
-        if prior_results:
-            tool_results_text = json.dumps(
-                self._prompt_visible_results_payload(prior_results),
-                ensure_ascii=True,
-                indent=2,
-            )
-        else:
-            tool_results_text = "None. This is the first controller step."
-        controller_update = self._controller_update_text(
+        packet_text, _packet_state = self._build_step_update_packet(
             tool_context,
             policy,
             step=step,
             step_limit=step_limit,
+            prior_results=prior_results,
+            checkpoint_required=checkpoint_required,
         )
-        contextual_injections = self._contextual_injections_text(
-            tool_context,
-            policy,
-            step=step,
-            step_limit=step_limit,
-        )
-        return (
-            "===== TOOL RESULTS FROM PRIOR STEP =====\n"
-            f"{tool_results_text}\n\n"
-            "===== CURRENT CONTROLLER UPDATE =====\n"
-            f"{controller_update}\n\n"
-            "===== CONTEXTUAL INJECTIONS =====\n"
-            f"{contextual_injections}"
-        ).strip()
+        return packet_text
 
     def _pinned_run_reference_prompt(self, tool_context: ToolContext) -> str:
         seed_indicator_ids = self._seed_indicator_ids(tool_context.seed_prompt_path)
@@ -5313,7 +5900,7 @@ class ResearchController:
         if sweep_summary:
             lines.append("- latest_sweep: " + sweep_summary)
             lines.append(
-                "- sweep_rule: sweep outputs are not attempt_ids; inspect via artifact_dir or inspect_ref."
+                "- sweep_rule: sweep outputs are not attempt_ids; use inspect_artifact with inspect_ref or artifact_dir."
             )
         if isinstance(wrap_up_focus, dict):
             parts = [f"family={self._short_family_id(wrap_up_focus.get('family_id'))}"]
@@ -6107,8 +6694,6 @@ class ResearchController:
                     summarized["trades_per_month"] = result.get("trades_per_month")
                 if result.get("resolved_trades") is not None:
                     summarized["resolved_trades"] = result.get("resolved_trades")
-                if result.get("artifact_dir"):
-                    summarized["artifact_dir"] = result.get("artifact_dir")
                 requested_timeframe = str(result.get("requested_timeframe") or "").strip()
                 effective_timeframe = str(result.get("effective_timeframe") or "").strip()
                 if requested_timeframe and effective_timeframe:
@@ -6119,8 +6704,6 @@ class ResearchController:
             elif tool == "run_parameter_sweep":
                 if result.get("inspect_ref"):
                     summarized["inspect_ref"] = str(result.get("inspect_ref"))[:120]
-                if result.get("artifact_dir"):
-                    summarized["artifact_dir"] = str(result.get("artifact_dir"))[:260]
                 if result.get("best_score") is not None:
                     summarized["best_score"] = result.get("best_score")
                 if result.get("quality_score_preset"):
@@ -6140,7 +6723,6 @@ class ResearchController:
             summarized = {
                 "tool": tool,
                 "ok": bool(result.get("ok", True)),
-                "artifact_dir": result.get("artifact_dir"),
             }
             view = str(result.get("view") or "").strip()
             if view and view != "summary":
@@ -6295,32 +6877,23 @@ class ResearchController:
             flattened.extend(chunk)
         return flattened
 
-    def _checkpoint_summary_message_content(self, summary: str) -> str:
-        return (
-            "===== CHECKPOINT SUMMARY FROM HISTORY TRIM =====\n"
-            + SUMMARY_PREFIX
-            + "\n"
-            + summary.strip()
-        ).strip()
-
     def _append_step_history_messages(
         self,
         messages: list[ChatMessage],
-        tool_context: ToolContext,
-        policy: RunPolicy,
         *,
-        step: int,
-        step_limit: int,
+        user_packet_content: str,
         reasoning: str,
         actions: list[Any],
-        results: list[dict[str, Any]],
     ) -> None:
+        messages.append(ChatMessage(role="user", content=user_packet_content))
         action_summaries = [
             self._history_action_summary(action)
             for action in actions
             if isinstance(action, dict)
         ]
-        assistant_summary_lines = [f"Reasoning: {reasoning}"]
+        assistant_summary_lines: list[str] = []
+        if str(reasoning or "").strip():
+            assistant_summary_lines.append(f"Reasoning: {reasoning}")
         if action_summaries:
             assistant_summary_lines.append("Planned actions:")
             assistant_summary_lines.extend(f"- {item}" for item in action_summaries)
@@ -6328,23 +6901,6 @@ class ResearchController:
             ChatMessage(
                 role="assistant",
                 content="\n".join(assistant_summary_lines),
-            )
-        )
-        next_step = step + 1
-        if next_step > step_limit:
-            return
-        messages.append(
-            ChatMessage(
-                role="user",
-                content=self._step_update_prompt(
-                    tool_context,
-                    policy,
-                    step=next_step,
-                    step_limit=step_limit,
-                    prior_results=[
-                        result for result in results if isinstance(result, dict)
-                    ],
-                ),
             )
         )
 
@@ -6458,11 +7014,12 @@ class ResearchController:
             return None
         if tool == "inspect_artifact":
             ad = action.get("artifact_dir")
+            inspect_ref = action.get("inspect_ref")
             aid = action.get("attempt_id")
             if (not isinstance(ad, str) or not ad.strip()) and (
-                not isinstance(aid, str) or not aid.strip()
-            ):
-                return "inspect_artifact requires artifact_dir or attempt_id."
+                not isinstance(inspect_ref, str) or not inspect_ref.strip()
+            ) and (not isinstance(aid, str) or not aid.strip()):
+                return "inspect_artifact requires artifact_dir or inspect_ref or attempt_id."
             return None
         if tool == "compare_artifacts":
             ids = action.get("attempt_ids") or action.get("artifact_dirs")
@@ -6958,7 +7515,10 @@ class ResearchController:
         note: str | None = None,
         requested_horizon_months: int | None = None,
     ) -> dict[str, Any]:
-        artifact_dir = artifact_dir.resolve()
+        resolved_artifact_dir = self._resolve_existing_artifact_dir(
+            tool_context, artifact_dir
+        )
+        artifact_dir = resolved_artifact_dir or artifact_dir.resolve()
         if attempt_exists(tool_context.attempts_path, artifact_dir):
             attempts = load_attempts(tool_context.attempts_path)
             existing = next(
@@ -7089,6 +7649,29 @@ class ResearchController:
             profile_ref=profile_ref,
             requested_horizon_months=requested_horizon_months,
         )
+
+    def _resolve_existing_artifact_dir(
+        self, tool_context: ToolContext, artifact_dir: Path
+    ) -> Path | None:
+        """Resolve an artifact directory, preferring run-local evals for relative paths."""
+        candidates: list[Path] = []
+        if artifact_dir.is_absolute():
+            candidates.append(artifact_dir)
+        else:
+            candidates.append(artifact_dir)
+            evals_dir = getattr(tool_context, "evals_dir", None)
+            if isinstance(evals_dir, Path):
+                candidates.append((evals_dir / artifact_dir).resolve())
+            run_dir = getattr(tool_context, "run_dir", None)
+            if isinstance(run_dir, Path):
+                candidates.append((run_dir / artifact_dir).resolve())
+        for candidate in candidates:
+            try:
+                if candidate.exists() and candidate.is_dir():
+                    return candidate.resolve()
+            except (OSError, RuntimeError, TypeError, ValueError):
+                continue
+        return None
 
     def _execute_cli_invocation(
         self,
@@ -7344,7 +7927,13 @@ class ResearchController:
     ) -> dict[str, Any]:
         mode = str(action.get("mode") or "").strip()
         profiles_dir = tool_context.profiles_dir
-        name = self._sanitize_label(str(action.get("candidate_name") or "candidate"))
+        name = self._sanitize_label(
+            str(
+                action.get("candidate_name")
+                or action.get("destination_candidate_name")
+                or "candidate"
+            )
+        )
         warnings: list[str] = []
         if mode == "from_template":
             dest_raw = action.get("destination_path")
@@ -7402,15 +7991,18 @@ class ResearchController:
                         "prepare_profile clone_local requires source_candidate_name or source_profile_ref."
                     ],
                     next_recommended_action=None,
-                )
+            )
             dest_raw = action.get("destination_path")
             destination_candidate_name = action.get("destination_candidate_name")
+            destination_name = self._sanitize_label(
+                str(destination_candidate_name or name or "candidate")
+            )
             dest = (
                 Path(str(dest_raw).strip()).resolve()
                 if isinstance(dest_raw, str) and dest_raw.strip()
                 else self._default_profile_path_for_candidate(
                     tool_context,
-                    destination_candidate_name or name,
+                    destination_name,
                 )
             )
             args = [
@@ -7433,14 +8025,14 @@ class ResearchController:
                 result_tool="prepare_profile",
             )
             base["profile_path"] = str(dest)
-            base["profile_name"] = name
-            base["candidate_name"] = name
+            base["profile_name"] = destination_name
+            base["candidate_name"] = destination_name
             base["indicator_ids"] = action.get("indicator_ids")
-            payload = _ensure_profile_name_matches_candidate(dest, name)
+            payload = _ensure_profile_name_matches_candidate(dest, destination_name)
             base["candidate_summary"] = _candidate_summary_from_profile_payload(
                 payload,
                 profile_path=dest,
-                draft_name=name,
+                draft_name=destination_name,
             )
             if base.get("candidate_summary"):
                 base["controller_hint"] = "Local clone is ready. Validate this candidate next instead of inspecting the cloned file."
@@ -8202,7 +8794,8 @@ class ResearchController:
         base["inspect_ref"] = out_dir.name
         base["quality_score_preset"] = self.config.research.quality_score_preset
         base["controller_hint"] = (
-            "Inspect this sweep using artifact_dir or inspect_ref. Sweep outputs are not attempt_ids."
+            "Next typed move: inspect_artifact with inspect_ref or artifact_dir from this result. "
+            "Do not pass inspect_ref as attempt_id. Do not use run_cli, list_dir, or read_file first unless inspect_artifact fails."
         )
         if base.get("ok"):
             base["next_recommended_action"] = "inspect_artifact"
@@ -8216,7 +8809,17 @@ class ResearchController:
     ) -> Path | None:
         ad = action.get("artifact_dir")
         if isinstance(ad, str) and ad.strip():
+            candidate = self._resolve_existing_artifact_dir(
+                tool_context, Path(ad.strip())
+            )
+            if candidate is not None:
+                return candidate
             return Path(ad.strip()).resolve()
+        inspect_ref = action.get("inspect_ref")
+        if isinstance(inspect_ref, str) and inspect_ref.strip():
+            candidate = (tool_context.evals_dir / inspect_ref.strip()).resolve()
+            if candidate.exists():
+                return candidate
         aid = action.get("attempt_id")
         if isinstance(aid, str) and aid.strip():
             needle = aid.strip()
@@ -8253,7 +8856,7 @@ class ResearchController:
             return tt.normalized_tool_envelope(
                 "inspect_artifact",
                 ok=False,
-                errors=["inspect_artifact needs artifact_dir or a known attempt_id."],
+                errors=["inspect_artifact needs artifact_dir or inspect_ref or a known attempt_id."],
                 next_recommended_action="evaluate_candidate",
             )
         explicit_ad = action.get("artifact_dir")
@@ -8366,7 +8969,8 @@ class ResearchController:
                 }
                 payload["next_recommended_action"] = "compare_artifacts"
                 payload["controller_hint"] = (
-                    "Sweep summary already identifies the top permutation. Compare or evaluate from this summary before opening raw sweep JSON."
+                    "Top sweep parameters are already summarized. Next typed move: compare_artifacts when you have multiple artifact refs; "
+                    "otherwise mutate_profile with top_parameters and re-evaluate. Avoid run_cli/list_dir/read_file unless summary is missing a needed detail."
                 )
                 return payload
         try:
@@ -8407,9 +9011,9 @@ class ResearchController:
             if not isinstance(item, str) or not item.strip():
                 continue
             token = item.strip()
-            p = Path(token)
-            if p.exists() and p.is_dir():
-                resolved.append((token, p.resolve()))
+            p = self._resolve_existing_artifact_dir(tool_context, Path(token))
+            if p is not None:
+                resolved.append((token, p))
                 continue
             r = self._resolve_artifact_path(
                 tool_context, {"attempt_id": token, "artifact_dir": ""}
@@ -9075,62 +9679,46 @@ class ResearchController:
 
         return "\n".join(lines)
 
-    def _checkpoint_messages(
-        self, history_messages: list[ChatMessage]
-    ) -> list[ChatMessage]:
-        serialized_history = [
-            {"role": message.role, "content": message.content}
-            for message in history_messages
-        ]
-        return [
-            ChatMessage(role="system", content=COMPACTION_PROMPT),
-            ChatMessage(
-                role="user",
-                content=(
-                    "Summarize this controller history for the next continuation turn.\n\n"
-                    + json.dumps(serialized_history, ensure_ascii=True)
-                ),
-            ),
-        ]
-
     def _trim_message_history(
         self,
         messages: list[ChatMessage],
         tool_context: ToolContext,
         *,
+        current_user_message: ChatMessage | None,
         step: int,
         compact_trigger_tokens: int,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
-    ) -> list[ChatMessage]:
+    ) -> tuple[list[ChatMessage], bool]:
         prefix = messages[:2]
         history_messages = messages[2:]
         if not history_messages:
-            return messages
-        approx_prompt_tokens_before = self._approx_message_tokens(messages)
-        target_ratio = self.config.history_trim_target_ratio_for(
-            self.config.llm.explorer_profile
+            return messages, False
+        approx_prompt_tokens_before = self._approx_message_tokens(
+            messages + ([current_user_message] if current_user_message else [])
         )
-        target_tokens = max(1, int(compact_trigger_tokens * target_ratio))
-        keep_recent_steps = self.config.history_trim_keep_recent_steps_for(
+        target_tokens = self.config.compact_target_tokens_for(
             self.config.llm.explorer_profile
         )
         chunks = self._history_message_chunks(history_messages)
-        if len(chunks) <= keep_recent_steps:
-            return messages
-        protected_floor = max(0, len(chunks) - keep_recent_steps)
         kept_chunks = list(chunks)
         evicted_chunks = 0
-        while (
-            evicted_chunks < protected_floor
-            and self._approx_message_tokens(prefix + self._flatten_message_chunks(kept_chunks))
-            > target_tokens
-        ):
+
+        def _current_prompt_tokens() -> int:
+            return self._approx_message_tokens(
+                prefix
+                + self._flatten_message_chunks(kept_chunks)
+                + ([current_user_message] if current_user_message else [])
+            )
+
+        while len(kept_chunks) > 1 and _current_prompt_tokens() > target_tokens:
             kept_chunks.pop(0)
             evicted_chunks += 1
         if evicted_chunks == 0:
-            return messages
+            return messages, False
         trimmed_messages = prefix + self._flatten_message_chunks(kept_chunks)
-        approx_prompt_tokens_after = self._approx_message_tokens(trimmed_messages)
+        approx_prompt_tokens_after = self._approx_message_tokens(
+            trimmed_messages + ([current_user_message] if current_user_message else [])
+        )
         self._trace_runtime(
             tool_context,
             step=step,
@@ -9140,10 +9728,10 @@ class ResearchController:
             approx_prompt_tokens_before=approx_prompt_tokens_before,
             approx_prompt_tokens_after=approx_prompt_tokens_after,
             compact_trigger_tokens=compact_trigger_tokens,
+            compact_target_tokens=target_tokens,
             history_chunks=len(chunks),
             evicted_chunks=evicted_chunks,
             kept_chunks=len(kept_chunks),
-            keep_recent_steps=keep_recent_steps,
         )
         try:
             with self._step_log_path(tool_context).open("a", encoding="utf-8") as handle:
@@ -9155,10 +9743,9 @@ class ResearchController:
                             "approx_tokens_before": approx_prompt_tokens_before,
                             "approx_tokens_after": approx_prompt_tokens_after,
                             "compact_trigger_tokens": compact_trigger_tokens,
+                            "compact_target_tokens": target_tokens,
                             "evicted_chunks": evicted_chunks,
                             "kept_chunks": len(kept_chunks),
-                            "keep_recent_steps": keep_recent_steps,
-                            "target_ratio": target_ratio,
                         },
                         ensure_ascii=True,
                     )
@@ -9176,112 +9763,13 @@ class ResearchController:
                     "approx_tokens_before": approx_prompt_tokens_before,
                     "approx_tokens_after": approx_prompt_tokens_after,
                     "compact_trigger_tokens": compact_trigger_tokens,
+                    "compact_target_tokens": target_tokens,
                     "evicted_chunks": evicted_chunks,
                     "kept_chunks": len(kept_chunks),
                 }
             )
-        return trimmed_messages
-
-    def _compact_message_history(
-        self,
-        messages: list[ChatMessage],
-        tool_context: ToolContext,
-        policy: RunPolicy,
-        step: int,
-        step_limit: int,
-        *,
-        compact_trigger_tokens: int,
-        progress_callback: Callable[[dict[str, Any]], None] | None = None,
-    ) -> list[ChatMessage]:
-        history_messages = messages[2:]
-        if not history_messages:
-            return messages
-        approx_prompt_tokens_before = self._approx_message_tokens(messages)
-        self._trace_runtime(
-            tool_context,
-            step=step,
-            phase="compaction",
-            status="start",
-            message="Compacting message history.",
-            history_messages=len(history_messages),
-            approx_prompt_tokens_before=approx_prompt_tokens_before,
-            compact_trigger_tokens=compact_trigger_tokens,
-        )
-        try:
-            with self._provider_scope(
-                tool_context=tool_context,
-                step=step,
-                label="compaction",
-                phase="compaction",
-                provider=self.provider,
-            ):
-                payload = self.provider.complete_json(
-                    self._checkpoint_messages(history_messages)
-                )
-        except ProviderError as exc:
-            self._trace_runtime(
-                tool_context,
-                step=step,
-                phase="compaction",
-                status="failed",
-                message="Compaction request failed; keeping full message history.",
-                error=exc,
-                level="warning",
-            )
-            return messages
-        summary = payload.get("checkpoint_summary")
-        if not isinstance(summary, str) or not summary.strip():
-            self._trace_runtime(
-                tool_context,
-                step=step,
-                phase="compaction",
-                status="empty",
-                message="Compaction returned no summary; keeping full message history.",
-                level="warning",
-            )
-            return messages
-
-        checkpoint_text = f"{SUMMARY_PREFIX}\n{summary.strip()}"
-        self._checkpoint_path(tool_context).write_text(
-            checkpoint_text, encoding="utf-8"
-        )
-
-        keep = max(0, self.config.research.compact_keep_recent_messages)
-        recent_tail = history_messages[-keep:] if keep else []
-        compacted_messages = [
-            *self._history_prefix_messages(tool_context, policy),
-            ChatMessage(
-                role="user",
-                content=self._checkpoint_summary_message_content(summary),
-            ),
-            *recent_tail,
-        ]
-        approx_prompt_tokens_after = self._approx_message_tokens(compacted_messages)
-        self._trace_runtime(
-            tool_context,
-            step=step,
-            phase="compaction",
-            status="ok",
-            message="Compaction succeeded.",
-            approx_prompt_tokens_before=approx_prompt_tokens_before,
-            approx_prompt_tokens_after=approx_prompt_tokens_after,
-            compact_trigger_tokens=compact_trigger_tokens,
-            history_messages=len(history_messages),
-            compacted_message_count=len(compacted_messages),
-        )
-        if progress_callback:
-            progress_callback(
-                {
-                    "event": "context_compaction",
-                    "run_id": tool_context.run_id,
-                    "run_dir": str(tool_context.run_dir),
-                    "step": step,
-                    "approx_tokens_before": approx_prompt_tokens_before,
-                    "approx_tokens_after": approx_prompt_tokens_after,
-                    "compact_trigger_tokens": compact_trigger_tokens,
-                }
-            )
-        return compacted_messages
+        self._checkpoint_required_next_step = True
+        return trimmed_messages, True
 
     def _maybe_compact_messages(
         self,
@@ -9291,30 +9779,22 @@ class ResearchController:
         step: int,
         step_limit: int,
         *,
+        current_user_message: ChatMessage | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
-    ) -> list[ChatMessage]:
+    ) -> tuple[list[ChatMessage], bool]:
         trigger = self.config.compact_trigger_tokens_for(
             self.config.llm.explorer_profile
         )
         if trigger <= 0:
-            return messages
-        if self._approx_message_tokens(messages) < trigger:
-            return messages
-        strategy = self.config.history_strategy_for(self.config.llm.explorer_profile)
-        if strategy == HISTORY_STRATEGY_CHUNKED_TAIL:
-            return self._trim_message_history(
-                messages,
-                tool_context,
-                step=step,
-                compact_trigger_tokens=trigger,
-                progress_callback=progress_callback,
-            )
-        return self._compact_message_history(
+            return messages, False
+        prompt_messages = messages + ([current_user_message] if current_user_message else [])
+        if self._approx_message_tokens(prompt_messages) < trigger:
+            return messages, False
+        return self._trim_message_history(
             messages,
             tool_context,
-            policy,
-            step,
-            step_limit,
+            step=step,
+            current_user_message=current_user_message,
             compact_trigger_tokens=trigger,
             progress_callback=progress_callback,
         )
@@ -9435,19 +9915,8 @@ class ResearchController:
             if progress_callback:
                 progress_callback({"event": "window_closed", "result": result})
             return result
-        messages: list[ChatMessage] = [
-            *self._history_prefix_messages(tool_context, policy),
-            ChatMessage(
-                role="user",
-                content=self._step_update_prompt(
-                    tool_context,
-                    policy,
-                    step=1,
-                    step_limit=effective_step_limit,
-                    prior_results=None,
-                ),
-            ),
-        ]
+        messages: list[ChatMessage] = self._history_prefix_messages(tool_context, policy)
+        prior_results: list[dict[str, Any]] | None = None
 
         step_limit = effective_step_limit
         self._current_step_limit = step_limit
@@ -9494,14 +9963,46 @@ class ResearchController:
                 if progress_callback:
                     progress_callback({"event": "window_closed", "result": result})
                 return result
-            messages = self._maybe_compact_messages(
+            current_user_packet, current_user_packet_state = self._build_step_update_packet(
+                tool_context,
+                policy,
+                step=step,
+                step_limit=step_limit,
+                prior_results=prior_results,
+            )
+            current_user_message = ChatMessage(role="user", content=current_user_packet)
+            messages, trimmed_history = self._maybe_compact_messages(
                 messages,
                 tool_context,
                 policy,
                 step,
                 step_limit,
+                current_user_message=current_user_message,
                 progress_callback=progress_callback,
             )
+            if trimmed_history:
+                current_user_packet, current_user_packet_state = self._build_step_update_packet(
+                    tool_context,
+                    policy,
+                    step=step,
+                    step_limit=step_limit,
+                    prior_results=prior_results,
+                    checkpoint_required=True,
+                )
+                current_user_message = ChatMessage(
+                    role="user",
+                    content=current_user_packet,
+                )
+                messages, _ = self._maybe_compact_messages(
+                    messages,
+                    tool_context,
+                    policy,
+                    step,
+                    step_limit,
+                    current_user_message=current_user_message,
+                    progress_callback=progress_callback,
+                )
+            messages_for_provider = [*messages, current_user_message]
             try:
                 self._trace_runtime(
                     tool_context,
@@ -9509,7 +10010,7 @@ class ResearchController:
                     phase="explorer_provider",
                     status="waiting",
                     message="Waiting for explorer provider response.",
-                    message_count=len(messages),
+                    message_count=len(messages_for_provider),
                 )
                 with self._provider_scope(
                     tool_context=tool_context,
@@ -9518,7 +10019,7 @@ class ResearchController:
                     phase="explorer_provider",
                     provider=self.provider,
                 ):
-                    raw_response = self.provider.complete_json(messages)
+                    raw_response = self.provider.complete_json(messages_for_provider)
                 self._append_raw_explorer_payload(
                     tool_context,
                     step=step,
@@ -9527,7 +10028,7 @@ class ResearchController:
                     source="controller",
                     label="explorer",
                     payload_json=raw_response,
-                    message_count=len(messages),
+                    message_count=len(messages_for_provider),
                 )
                 self._trace_runtime(
                     tool_context,
@@ -9571,7 +10072,7 @@ class ResearchController:
                     repaired_shape = self._repair_invalid_payload_shape(
                         tool_context,
                         step,
-                        messages,
+                        messages_for_provider,
                         raw_response,
                         str(exc),
                     )
@@ -9631,7 +10132,7 @@ class ResearchController:
                 repaired = self._repair_invalid_response(
                     tool_context,
                     step,
-                    messages,
+                    messages_for_provider,
                     reasoning,
                     actions if isinstance(actions, list) else [],
                     validation_errors,
@@ -9721,18 +10222,16 @@ class ResearchController:
                     )
                 self._append_step_history_messages(
                     messages,
-                    tool_context,
-                    policy,
-                    step=step,
-                    step_limit=step_limit,
+                    user_packet_content=current_user_message.content,
                     reasoning=reasoning,
                     actions=actions if isinstance(actions, list) else [],
-                    results=[
-                        step_payload["results"][0]
-                        for _ in [0]
-                        if isinstance(step_payload["results"][0], dict)
-                    ],
                 )
+                self._commit_sent_step_packet_state(current_user_packet_state)
+                prior_results = [
+                    result
+                    for result in step_payload["results"]
+                    if isinstance(result, dict)
+                ]
                 continue
 
             horizon_policy = self._horizon_policy_snapshot(step, step_limit, policy)
@@ -9882,18 +10381,16 @@ class ResearchController:
                 )
             self._append_step_history_messages(
                 messages,
-                tool_context,
-                policy,
-                step=step,
-                step_limit=step_limit,
+                user_packet_content=current_user_message.content,
                 reasoning=reasoning,
                 actions=actions if isinstance(actions, list) else [],
-                results=[
-                    result
-                    for result in step_payload["results"]
-                    if isinstance(result, dict)
-                ],
             )
+            self._commit_sent_step_packet_state(current_user_packet_state)
+            prior_results = [
+                result
+                for result in step_payload["results"]
+                if isinstance(result, dict)
+            ]
 
             if finished:
                 self._trace_runtime(

@@ -39,10 +39,10 @@ export function ProfileDropGrid({ items }: ProfileDropGridProps) {
               </div>
               <div className="space-y-1">
                 <CardTitle className="text-base leading-6">
-                  {item.candidate_name || item.attempt_id}
+                  {item.display_name || item.candidate_name || item.attempt_id}
                 </CardTitle>
                 <CardDescription className="text-xs">
-                  {item.run_id}
+                  {item.tagline || item.short_description || item.run_id}
                 </CardDescription>
               </div>
             </CardHeader>
@@ -51,7 +51,7 @@ export function ProfileDropGrid({ items }: ProfileDropGridProps) {
                 <div className="overflow-hidden rounded-3xl border border-border/60 bg-background/70">
                   <img
                     src={item.png_url}
-                    alt={item.candidate_name || item.attempt_id}
+                    alt={item.display_name || item.candidate_name || item.attempt_id}
                     className="h-auto w-full object-cover"
                   />
                 </div>
@@ -68,7 +68,9 @@ export function ProfileDropGrid({ items }: ProfileDropGridProps) {
         isOpen={selectedItem !== null}
         onClose={() => setSelectedItem(null)}
         profilePathUrl={selectedItem?.png_url ?? null}
-        candidateName={selectedItem?.candidate_name || selectedItem?.attempt_id || ""}
+        candidateName={
+          selectedItem?.display_name || selectedItem?.candidate_name || selectedItem?.attempt_id || ""
+        }
       />
     </>
   );

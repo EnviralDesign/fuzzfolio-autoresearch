@@ -92,6 +92,16 @@ if __package__ in {None, ""}:
         render_validation_delta_artifacts,
         render_validation_scatter_artifacts,
     )
+    from autoresearch.presentation_metadata import (
+        apply_metadata_to_profile_document,
+        build_metadata_artifact,
+        build_writer_messages,
+        compute_presentation_signature,
+        load_cached_metadata,
+        load_profile_document,
+        presentation_metadata_path,
+        validate_generated_metadata,
+    )
     from autoresearch.portfolio import (
         build_sleeve_prefilter,
         build_sleeve_selection,
@@ -159,6 +169,16 @@ else:
         render_tradeoff_leaderboard_artifacts,
         render_validation_delta_artifacts,
         render_validation_scatter_artifacts,
+    )
+    from .presentation_metadata import (
+        apply_metadata_to_profile_document,
+        build_metadata_artifact,
+        build_writer_messages,
+        compute_presentation_signature,
+        load_cached_metadata,
+        load_profile_document,
+        presentation_metadata_path,
+        validate_generated_metadata,
     )
     from .portfolio import (
         build_sleeve_prefilter,
@@ -2133,42 +2153,6 @@ def _render_run_footer(result: dict[str, object]) -> None:
     )
 
 
-def _render_context_compaction_plain(event: dict[str, object]) -> None:
-    step = event.get("step")
-    before = event.get("approx_tokens_before")
-    after = event.get("approx_tokens_after")
-    if step is not None:
-        label = f"compaction step {step}: ~{before} tok before, ~{after} tok after"
-    else:
-        label = f"compaction: ~{before} tok before, ~{after} tok after"
-    _write_plain_line(_plain_separator(label, fill="="))
-
-
-def _render_context_compaction_rich(event: dict[str, object]) -> None:
-    step = event.get("step")
-    before = event.get("approx_tokens_before")
-    after = event.get("approx_tokens_after")
-    trig = event.get("compact_trigger_tokens")
-    lines = [f"Approx prompt tokens: ~{before} → ~{after}"]
-    if trig is not None:
-        lines.append(f"Compaction trigger: {trig}")
-    console.print(
-        Panel(
-            Text("\n".join(lines), style="white"),
-            title=f"[bold magenta]Context compaction[/bold magenta] (step {step})",
-            border_style="magenta",
-            box=box.ROUNDED,
-        )
-    )
-
-
-def _render_context_compaction(event: dict[str, object]) -> None:
-    _safe_render(
-        lambda: _render_context_compaction_rich(event),
-        lambda: _render_context_compaction_plain(event),
-    )
-
-
 def _render_history_trim_plain(event: dict[str, object]) -> None:
     step = event.get("step")
     before = event.get("approx_tokens_before")
@@ -2219,9 +2203,6 @@ def _render_history_trim(event: dict[str, object]) -> None:
 
 def _emit_run_progress(event: dict[str, object]) -> None:
     kind = event.get("event")
-    if kind == "context_compaction":
-        _render_context_compaction(event)
-        return
     if kind == "history_trim":
         _render_history_trim(event)
         return
@@ -2620,10 +2601,10 @@ def cmd_dashboard(
 def _trading_dashboard_roots(config) -> list[Path]:
     candidates: list[Path] = []
     seen: set[str] = set()
-    raw_candidates = [
-        config.fuzzfolio.workspace_root,
-        config.repo_root.parent / "Trading-Dashboard",
-    ]
+    raw_candidates = [getattr(config.fuzzfolio, "workspace_root", None)]
+    repo_root = getattr(config, "repo_root", None)
+    if repo_root is not None:
+        raw_candidates.append(Path(repo_root).parent / "Trading-Dashboard")
     for candidate in raw_candidates:
         if candidate is None:
             continue
@@ -2666,6 +2647,26 @@ def _resolve_drop_renderer_executable(config) -> tuple[Path, Path | None]:
     raise FileNotFoundError(
         "Could not resolve fuzzfolio-drop-renderer. Set AUTORESEARCH_DROP_RENDERER or build the renderer under Trading-Dashboard."
     )
+
+
+def _resolve_drop_renderer_assets_root(
+    config, workspace_root: Path | None = None
+) -> Path | None:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    if workspace_root is not None:
+        candidates.append(workspace_root)
+    candidates.extend(_trading_dashboard_roots(config))
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        renderer_root = resolved / "scripts" / "profile-drop-renderer"
+        if renderer_root.joinpath("index.html").exists():
+            return renderer_root
+    return None
 
 
 def _run_external(
@@ -3991,6 +3992,141 @@ def _apply_profile_drop_description_fallback(
     return description
 
 
+def _presentation_writer_profile_name(config) -> str | None:
+    value = str(config.research.presentation_metadata_provider_profile or "").strip()
+    return value or None
+
+
+def _profile_drop_source_profile_snapshot_path(
+    attempt_root: Path, lookback_months: int
+) -> Path:
+    return attempt_root / f"profile-drop-{int(lookback_months)}mo.source-profile-document.json"
+
+
+def _profile_drop_visible_fields_from_payload(
+    profile_document_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    profile = _extract_profile_document_profile(profile_document_payload) or {}
+    display_name = str(profile.get("name") or "").strip() or None
+    long_description = str(profile.get("description") or "").strip() or None
+    return {
+        "display_name": display_name,
+        "tagline": None,
+        "short_description": None,
+        "long_description": long_description,
+    }
+
+
+def _profile_drop_presentation_fields(
+    *,
+    metadata_artifact_path: Path | None,
+    presentation_signature: str | None,
+    metadata_payload: dict[str, Any] | None,
+    visible_fields: dict[str, Any] | None,
+) -> dict[str, Any]:
+    merged = dict(visible_fields or {})
+    if isinstance(metadata_payload, dict):
+        for key in ("display_name", "tagline", "short_description", "long_description"):
+            merged[key] = metadata_payload.get(key)
+    return {
+        "presentation_metadata_path": (
+            str(metadata_artifact_path) if metadata_artifact_path is not None else None
+        ),
+        "presentation_signature": presentation_signature,
+        "display_name": merged.get("display_name"),
+        "tagline": merged.get("tagline"),
+        "short_description": merged.get("short_description"),
+        "long_description": merged.get("long_description"),
+    }
+
+
+def _profile_drop_result_from_manifest(
+    *,
+    status: str,
+    manifest_payload: dict[str, Any],
+    png_path: Path,
+    manifest_path: Path,
+    profile_ref: str,
+    recreated_profile: bool,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "png_path": str(png_path),
+        "manifest_path": str(manifest_path),
+        "profile_ref": profile_ref,
+        "recreated_profile": recreated_profile,
+        "display_name": manifest_payload.get("display_name"),
+        "tagline": manifest_payload.get("tagline"),
+        "short_description": manifest_payload.get("short_description"),
+        "long_description": manifest_payload.get("long_description"),
+        "presentation_metadata_path": manifest_payload.get("presentation_metadata_path"),
+        "presentation_signature": manifest_payload.get("presentation_signature"),
+    }
+
+
+def _generate_presentation_metadata(
+    *,
+    config,
+    run_dir: Path,
+    row: dict[str, Any],
+    attempt: dict[str, Any],
+    package_inputs: dict[str, Any],
+    lookback_months: int,
+    profile_ref: str,
+    profile_document_payload: dict[str, Any],
+    presentation_signature: str,
+    metadata_artifact_path: Path,
+    emit: Callable[[str], None] | None,
+) -> dict[str, Any] | None:
+    writer_profile_name = _presentation_writer_profile_name(config)
+    if not writer_profile_name:
+        return None
+    provider_profile = config.providers.get(writer_profile_name)
+    if provider_profile is None:
+        raise RuntimeError(
+            "Configured presentation metadata provider profile "
+            f"{writer_profile_name!r} does not exist."
+        )
+    provider = create_provider(provider_profile)
+    messages = build_writer_messages(
+        profile_document_payload=profile_document_payload,
+        package_inputs=package_inputs,
+        lookback_months=lookback_months,
+        row=row,
+        attempt=attempt,
+    )
+    try:
+        raw_payload = provider.complete_json(messages)
+    except ProviderError as exc:
+        if emit:
+            emit(
+                f"  presentation metadata writer failed for {attempt.get('attempt_id')}: {exc}"
+            )
+        return None
+    metadata = validate_generated_metadata(raw_payload)
+    if metadata is None:
+        if emit:
+            emit(
+                f"  presentation metadata invalid for {attempt.get('attempt_id')}; using fallback copy"
+            )
+        return None
+    artifact_payload = build_metadata_artifact(
+        run_id=run_dir.name,
+        attempt_id=str(row.get("attempt_id") or attempt.get("attempt_id") or ""),
+        candidate_name=str(row.get("candidate_name") or attempt.get("candidate_name") or ""),
+        profile_ref=profile_ref,
+        writer_profile=writer_profile_name,
+        presentation_signature=presentation_signature,
+        metadata=metadata,
+    )
+    _write_json_file(metadata_artifact_path, artifact_payload)
+    if emit:
+        emit(
+            f"  presentation metadata generated for {attempt.get('attempt_id')} via {writer_profile_name}"
+        )
+    return artifact_payload
+
+
 def _validation_cache_dir(config, run_id: str, lookback_months: int) -> Path:
     return config.validation_cache_root / run_id / f"{int(lookback_months)}mo"
 
@@ -4648,6 +4784,7 @@ def cmd_sync_profile_drop_pngs(
     cli = FuzzfolioCli(config.fuzzfolio)
     cli.ensure_login()
     renderer_executable, workspace_root = _resolve_drop_renderer_executable(config)
+    renderer_root = _resolve_drop_renderer_assets_root(config, workspace_root)
     working_dir = workspace_root or config.repo_root
 
     all_run_dirs = list_run_dirs(config.runs_root)
@@ -4826,6 +4963,8 @@ def cmd_sync_profile_drop_pngs(
                     renderer_argv = [str(renderer_executable)]
                     if workspace_root is not None:
                         renderer_argv.extend(["--workspace-root", str(workspace_root)])
+                    if renderer_root is not None:
+                        renderer_argv.extend(["--renderer-root", str(renderer_root)])
                     renderer_argv.extend(
                         [
                             "render",
@@ -5261,6 +5400,10 @@ def _render_profile_drop_for_attempt(
 ) -> dict[str, Any]:
     package_inputs = _build_package_inputs(attempt, run_dir=run_dir, attempts=attempts)
     profile_path = package_inputs.get("profile_path")
+    attempt_id = str(row.get("attempt_id") or attempt.get("attempt_id") or "")
+    candidate_name = str(
+        row.get("candidate_name") or attempt.get("candidate_name") or ""
+    ).strip()
     profile_ref = str(
         package_inputs.get("profile_ref") or attempt.get("profile_ref") or ""
     ).strip()
@@ -5284,32 +5427,85 @@ def _render_profile_drop_for_attempt(
     package_output_root = attempt_root / "bundle"
     png_path = attempt_root / f"profile-drop-{int(lookback_months)}mo.png"
     manifest_path = attempt_root / f"profile-drop-{int(lookback_months)}mo.manifest.json"
-    manifest_payload = {
-        "version": 1,
+    source_profile_snapshot_path = _profile_drop_source_profile_snapshot_path(
+        attempt_root, lookback_months
+    )
+    writer_profile_name = _presentation_writer_profile_name(config)
+    metadata_artifact_path = (
+        presentation_metadata_path(
+            run_dir,
+            attempt_id,
+            package_inputs=package_inputs,
+            lookback_months=lookback_months,
+        )
+        if writer_profile_name
+        else None
+    )
+    base_manifest_payload = {
+        "version": 2,
         "run_id": run_dir.name,
-        "attempt_id": str(row.get("attempt_id") or attempt.get("attempt_id") or ""),
-        "candidate_name": str(
-            row.get("candidate_name") or attempt.get("candidate_name") or ""
-        ),
+        "attempt_id": attempt_id,
+        "candidate_name": candidate_name,
         "profile_ref": profile_ref,
         "timeframe": str(package_inputs["timeframe"]),
         "instruments": list(package_inputs["instruments"]),
         "lookback_months": int(lookback_months),
         "quality_score_preset": str(config.research.quality_score_preset),
     }
-    if (
-        (not force_rebuild)
-        and png_path.exists()
-        and manifest_path.exists()
-        and _load_json_if_exists(manifest_path) == manifest_payload
-    ):
-        return {
-            "status": "cached",
-            "png_path": str(png_path),
-            "manifest_path": str(manifest_path),
-            "profile_ref": profile_ref,
-            "recreated_profile": recreated_profile,
-        }
+
+    expected_cached_manifest: dict[str, Any] | None = None
+    cache_ready = False
+    if (not force_rebuild) and png_path.exists() and manifest_path.exists():
+        source_snapshot_payload = (
+            load_json_if_exists(source_profile_snapshot_path)
+            if source_profile_snapshot_path.exists()
+            else None
+        )
+        cached_bundle_payload: dict[str, Any] | None = None
+        if package_output_root.exists():
+            try:
+                cached_bundle_dir = _discover_bundle_dir(package_output_root)
+            except RuntimeError:
+                cached_bundle_dir = None
+            if cached_bundle_dir is not None:
+                _, cached_bundle_payload = load_profile_document(cached_bundle_dir)
+        if isinstance(source_snapshot_payload, dict):
+            presentation_signature = compute_presentation_signature(
+                source_snapshot_payload,
+                package_inputs=package_inputs,
+                lookback_months=lookback_months,
+                writer_profile=writer_profile_name,
+            )
+            cached_metadata = (
+                load_cached_metadata(
+                    metadata_artifact_path,
+                    expected_signature=presentation_signature,
+                )
+                if metadata_artifact_path is not None
+                else None
+            )
+            visible_fields = _profile_drop_visible_fields_from_payload(
+                cached_bundle_payload if isinstance(cached_bundle_payload, dict) else source_snapshot_payload
+            )
+            expected_cached_manifest = {
+                **base_manifest_payload,
+                **_profile_drop_presentation_fields(
+                    metadata_artifact_path=metadata_artifact_path,
+                    presentation_signature=presentation_signature,
+                    metadata_payload=cached_metadata,
+                    visible_fields=visible_fields,
+                ),
+            }
+            cache_ready = (writer_profile_name is None) or (cached_metadata is not None)
+    if cache_ready and _load_json_if_exists(manifest_path) == expected_cached_manifest:
+        return _profile_drop_result_from_manifest(
+            status="cached",
+            manifest_payload=expected_cached_manifest or base_manifest_payload,
+            png_path=png_path,
+            manifest_path=manifest_path,
+            profile_ref=profile_ref,
+            recreated_profile=recreated_profile,
+        )
 
     if attempt_root.exists():
         shutil.rmtree(attempt_root)
@@ -5342,17 +5538,77 @@ def _render_profile_drop_for_attempt(
     cli.run(package_args, cwd=working_dir, timeout_seconds=float(timeout_seconds))
 
     bundle_dir = _discover_bundle_dir(package_output_root)
-    description_override = _apply_profile_drop_description_fallback(
-        bundle_dir,
+    profile_document_path, source_profile_document_payload = load_profile_document(bundle_dir)
+    if not isinstance(source_profile_document_payload, dict):
+        raise RuntimeError(
+            f"Packaged bundle is missing a valid profile-document.json: {profile_document_path}"
+        )
+    _write_json_file(source_profile_snapshot_path, source_profile_document_payload)
+    presentation_signature = compute_presentation_signature(
+        source_profile_document_payload,
         package_inputs=package_inputs,
-        row=row,
-        attempt=attempt,
+        lookback_months=lookback_months,
+        writer_profile=writer_profile_name,
     )
-    if emit and description_override:
-        emit(f"  profile summary fallback applied for {attempt.get('attempt_id')}")
+    metadata_payload = (
+        load_cached_metadata(
+            metadata_artifact_path,
+            expected_signature=presentation_signature,
+        )
+        if metadata_artifact_path is not None
+        else None
+    )
+    if metadata_payload is None and metadata_artifact_path is not None:
+        metadata_payload = _generate_presentation_metadata(
+            config=config,
+            run_dir=run_dir,
+            row=row,
+            attempt=attempt,
+            package_inputs=package_inputs,
+            lookback_months=lookback_months,
+            profile_ref=profile_ref,
+            profile_document_payload=source_profile_document_payload,
+            presentation_signature=presentation_signature,
+            metadata_artifact_path=metadata_artifact_path,
+            emit=emit,
+        )
+    if metadata_payload is not None:
+        patched_payload = apply_metadata_to_profile_document(
+            source_profile_document_payload,
+            metadata_payload,
+        )
+        if patched_payload is not None:
+            _write_json_file(profile_document_path, patched_payload)
+            if emit:
+                emit(f"  profile presentation copy applied for {attempt.get('attempt_id')}")
+    if metadata_payload is None:
+        description_override = _apply_profile_drop_description_fallback(
+            bundle_dir,
+            package_inputs=package_inputs,
+            row=row,
+            attempt=attempt,
+        )
+        if emit and description_override:
+            emit(f"  profile summary fallback applied for {attempt.get('attempt_id')}")
+    _, final_profile_document_payload = load_profile_document(bundle_dir)
+    visible_fields = _profile_drop_visible_fields_from_payload(final_profile_document_payload)
+    manifest_payload = {
+        **base_manifest_payload,
+        **_profile_drop_presentation_fields(
+            metadata_artifact_path=metadata_artifact_path,
+            presentation_signature=presentation_signature,
+            metadata_payload=metadata_payload,
+            visible_fields=visible_fields,
+        ),
+    }
     renderer_argv = [str(renderer_executable)]
     if config.fuzzfolio.workspace_root is not None:
         renderer_argv.extend(["--workspace-root", str(config.fuzzfolio.workspace_root)])
+    renderer_root = _resolve_drop_renderer_assets_root(
+        config, config.fuzzfolio.workspace_root
+    )
+    if renderer_root is not None:
+        renderer_argv.extend(["--renderer-root", str(renderer_root)])
     renderer_argv.extend(["render", "--bundle", str(bundle_dir), "--out", str(png_path)])
     _run_external(renderer_argv, cwd=working_dir, timeout_seconds=float(timeout_seconds))
     _write_json_file(manifest_path, manifest_payload)
@@ -5364,13 +5620,14 @@ def _render_profile_drop_for_attempt(
         raise RuntimeError(
             f"Profile-drop render reported success but manifest is missing: {manifest_path}"
         )
-    return {
-        "status": "rendered",
-        "png_path": str(png_path),
-        "manifest_path": str(manifest_path),
-        "profile_ref": profile_ref,
-        "recreated_profile": recreated_profile,
-    }
+    return _profile_drop_result_from_manifest(
+        status="rendered",
+        manifest_payload=manifest_payload,
+        png_path=png_path,
+        manifest_path=manifest_path,
+        profile_ref=profile_ref,
+        recreated_profile=recreated_profile,
+    )
 
 
 def _should_retry_profile_drop_error(message: str) -> bool:

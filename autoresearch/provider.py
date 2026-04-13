@@ -10,7 +10,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,6 +89,10 @@ DEFAULT_RATE_LIMIT_MAX_RETRIES = 18
 DEFAULT_TRANSIENT_MAX_RETRIES = 4
 DEFAULT_MALFORMED_SUCCESS_RETRIES = 5
 DEFAULT_MALFORMED_SUCCESS_BACKOFF_SECONDS = [2, 5, 10, 20, 30]
+DEFAULT_CODEX_USAGE_LIMIT_RETRIES = 1
+DEFAULT_CODEX_USAGE_LIMIT_FALLBACK_SECONDS = 5 * 60 * 60 + 60
+DEFAULT_CODEX_USAGE_LIMIT_BUFFER_SECONDS = 60
+DEFAULT_CODEX_USAGE_LIMIT_MAX_WAIT_SECONDS = 6 * 60 * 60
 TRANSIENT_STATUS_CODES = {408, 425, 500, 502, 503, 504}
 RATE_LIMIT_STATUS_CODES = {429, 529}
 HARD_QUOTA_MARKERS = (
@@ -106,6 +110,10 @@ RATE_LIMIT_MARKERS = (
     "retry after",
     "requests rate limit",
     "temporarily rate limited",
+)
+CODEX_USAGE_LIMIT_MARKERS = (
+    "usage limit",
+    "try again at",
 )
 TOOL_USE_FAILED_MARKERS = (
     "tool_use_failed",
@@ -527,6 +535,44 @@ def _looks_like_rate_limit(text: str) -> bool:
     return any(marker in lowered for marker in RATE_LIMIT_MARKERS)
 
 
+def _looks_like_codex_usage_limit(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in CODEX_USAGE_LIMIT_MARKERS)
+
+
+def _parse_codex_usage_limit_delay_seconds(
+    text: str,
+    *,
+    now: datetime | None = None,
+) -> int | None:
+    if not _looks_like_codex_usage_limit(text):
+        return None
+    local_now = (now or datetime.now().astimezone()).astimezone()
+    match = re.search(r"try again at\s+(\d{1,2}:\d{2}(?:\s*[AaPp][Mm])?)", text)
+    if match:
+        raw_time = " ".join(match.group(1).split())
+        parsed_time = None
+        for fmt in ("%I:%M %p", "%H:%M"):
+            try:
+                parsed_time = datetime.strptime(raw_time.upper(), fmt).time()
+                break
+            except ValueError:
+                continue
+        if parsed_time is not None:
+            candidate = local_now.replace(
+                hour=parsed_time.hour,
+                minute=parsed_time.minute,
+                second=0,
+                microsecond=0,
+            )
+            if candidate <= local_now:
+                candidate = candidate + timedelta(days=1)
+            delay_seconds = int((candidate - local_now).total_seconds()) + DEFAULT_CODEX_USAGE_LIMIT_BUFFER_SECONDS
+            if 0 < delay_seconds <= DEFAULT_CODEX_USAGE_LIMIT_MAX_WAIT_SECONDS:
+                return delay_seconds
+    return DEFAULT_CODEX_USAGE_LIMIT_FALLBACK_SECONDS
+
+
 def _is_malformed_success_error(error: ProviderError) -> bool:
     lowered = str(error).lower()
     return (
@@ -869,7 +915,7 @@ class _CodexAppServerSession:
     def _command(self) -> list[str]:
         command = (self.config.command or "codex").strip() or "codex"
         resolved = shutil.which(command) or command
-        return [resolved, "app-server", "--listen", "stdio://", "--session-source", "cli"]
+        return [resolved, "app-server", "--listen", "stdio://"]
 
     def _start(self) -> None:
         try:
@@ -1000,7 +1046,29 @@ class _CodexAppServerSession:
                 }
             )
 
-    def start_turn(self, prompt: str) -> str:
+    def default_turn_summary_enabled(self) -> bool:
+        model_name = str(self.config.model or "").strip().lower()
+        if "spark" in model_name:
+            return False
+        return True
+
+    def _turn_start_params(self, prompt: str, *, include_summary: bool) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "threadId": "",
+            "input": [{"type": "text", "text": prompt}],
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "readOnly"},
+            "model": self.config.model,
+            "personality": "none",
+            "outputSchema": CODEX_OUTPUT_SCHEMA,
+        }
+        if include_summary:
+            params["summary"] = "concise"
+        return params
+
+    def start_turn(self, prompt: str, *, include_summary: bool | None = None) -> str:
+        if include_summary is None:
+            include_summary = self.default_turn_summary_enabled()
         thread = self._request(
             "thread/start",
             {
@@ -1012,18 +1080,11 @@ class _CodexAppServerSession:
         if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
             raise ProviderError("Codex app-server did not return a usable thread id.")
         thread_id = thread["id"]
+        turn_params = self._turn_start_params(prompt, include_summary=include_summary)
+        turn_params["threadId"] = thread_id
         turn_result = self._request(
             "turn/start",
-            {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": prompt}],
-                "approvalPolicy": "never",
-                "sandboxPolicy": {"type": "readOnly"},
-                "model": self.config.model,
-                "summary": "concise",
-                "personality": "none",
-                "outputSchema": CODEX_OUTPUT_SCHEMA,
-            },
+            turn_params,
         )
         turn = turn_result.get("turn")
         if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
@@ -1109,30 +1170,241 @@ class CodexAppServerProvider:
             sections.append(f"{message.role.upper()}:\n{message.content}")
         return "\n\n".join(sections)
 
+    def _repair_invalid_json(
+        self,
+        session: _CodexAppServerSession,
+        messages: list[ChatMessage],
+        raw_text: str,
+    ) -> dict[str, Any] | None:
+        _trace_provider_event(
+            "json_repair_start",
+            raw_preview=raw_text[:240],
+        )
+        repair_messages = [
+            *messages,
+            ChatMessage(role="assistant", content=raw_text),
+            ChatMessage(role="user", content=JSON_REPAIR_PROMPT),
+        ]
+        _append_provider_capture(
+            "repair_request",
+            content=raw_text,
+            payload_kind="assistant_text",
+        )
+        try:
+            repair_prompt = self._prompt_from_messages(repair_messages)
+            turn_id = session.start_turn(repair_prompt)
+            repaired_outer_text = session.collect_turn_text(turn_id)
+            _append_provider_capture(
+                "repair_response",
+                content=repaired_outer_text,
+                payload_kind="assistant_text",
+            )
+            repaired_outer_payload = _parse_provider_json_object(repaired_outer_text)
+            repaired_response_json = repaired_outer_payload.get("response_json")
+            if isinstance(repaired_response_json, str) and repaired_response_json.strip():
+                repaired = _parse_provider_json_object(repaired_response_json)
+            else:
+                repaired = repaired_outer_payload
+            _append_provider_capture(
+                "provider_parsed_json",
+                parsed_payload=repaired,
+                payload_kind="json_object",
+            )
+            _trace_provider_event("json_repair_success")
+            return repaired
+        except ProviderError as exc:
+            _append_provider_capture(
+                "repair_failed",
+                content=raw_text,
+                payload_kind="assistant_text",
+                error=str(exc),
+            )
+            _trace_provider_event("json_repair_failed", error=exc)
+            return None
+
+    @staticmethod
+    def _is_unsupported_turn_summary_error(exc: ProviderError) -> bool:
+        text = str(exc)
+        return "unsupported_parameter" in text and "reasoning.summary" in text
+
+    @staticmethod
+    def _codex_usage_limit_delay_seconds(exc: ProviderError) -> int | None:
+        return _parse_codex_usage_limit_delay_seconds(str(exc))
+
+    @staticmethod
+    def _is_tool_disabled_payload(payload: dict[str, Any]) -> bool:
+        status = str(payload.get("status") or "").strip().lower()
+        reason = str(payload.get("reason") or "").strip().lower()
+        message = str(payload.get("message") or "").strip().lower()
+        if status != "blocked":
+            return False
+        combined = " ".join(part for part in (reason, message) if part)
+        return "tool use is disabled" in combined or "no run action was taken" in combined
+
+    def _blocked_tool_retry_messages(
+        self,
+        messages: list[ChatMessage],
+        blocked_payload_text: str,
+    ) -> list[ChatMessage]:
+        return [
+            *messages,
+            ChatMessage(role="assistant", content=blocked_payload_text),
+            ChatMessage(
+                role="user",
+                content=(
+                    "The previous response incorrectly claimed tool use is disabled.\n\n"
+                    "Native/provider tools are disabled, but the controller still requires a normal JSON response "
+                    "with reasoning and a non-empty actions array using typed controller tools.\n"
+                    "Do not return status/reason/message wrappers.\n"
+                    "Do not say 'No run action was taken.'\n"
+                    "Do not use finish unless the current run rules explicitly allow it.\n"
+                    "Return exactly one valid JSON object matching the controller contract."
+                ),
+            ),
+        ]
+
     def complete_json(self, messages: list[ChatMessage]) -> dict[str, Any]:
         _trace_provider_event(
             "complete_json_start",
             message_count=len(messages),
         )
-        session = _CodexAppServerSession(self.config)
-        try:
-            prompt_text = self._prompt_from_messages(messages)
-            _write_provider_request_snapshot(
-                "codex_app_server_request",
-                messages=messages,
-                prompt_text=prompt_text,
-            )
-            turn_id = session.start_turn(prompt_text)
-            outer_payload = _parse_provider_json_object(session.collect_turn_text(turn_id))
-            response_json = outer_payload.get("response_json")
-            if isinstance(response_json, str) and response_json.strip():
-                parsed = _parse_provider_json_object(response_json)
-                _trace_provider_event("complete_json_success", message_count=len(messages))
-                return parsed
-            _trace_provider_event("complete_json_success", message_count=len(messages))
-            return outer_payload
-        finally:
-            session.close()
+        prompt_text = self._prompt_from_messages(messages)
+        _write_provider_request_snapshot(
+            "codex_app_server_request",
+            messages=messages,
+            prompt_text=prompt_text,
+        )
+        usage_limit_retries = 0
+        while True:
+            session = _CodexAppServerSession(self.config)
+            try:
+                try:
+                    include_summary = session.default_turn_summary_enabled()
+                    try:
+                        turn_id = session.start_turn(prompt_text, include_summary=include_summary)
+                        raw_text = session.collect_turn_text(turn_id)
+                    except ProviderError as exc:
+                        if not include_summary or not self._is_unsupported_turn_summary_error(exc):
+                            raise
+                        _trace_provider_event(
+                            "codex_turn_retry_without_summary",
+                            model=self.config.model,
+                        )
+                        turn_id = session.start_turn(prompt_text, include_summary=False)
+                        raw_text = session.collect_turn_text(turn_id)
+                    _append_provider_capture(
+                        "provider_raw_text",
+                        content=raw_text,
+                        payload_kind="assistant_text",
+                    )
+                    try:
+                        outer_payload = _parse_provider_json_object(raw_text)
+                    except ProviderError:
+                        repaired = self._repair_invalid_json(session, messages, raw_text)
+                        if repaired is not None:
+                            _trace_provider_event("complete_json_success", path="outer_invalid_json_repair")
+                            return repaired
+                        raise
+                    if self._is_tool_disabled_payload(outer_payload):
+                        _trace_provider_event("codex_blocked_payload_retry", model=self.config.model)
+                        retry_messages = self._blocked_tool_retry_messages(
+                            messages,
+                            json.dumps(outer_payload, ensure_ascii=False),
+                        )
+                        retry_prompt = self._prompt_from_messages(retry_messages)
+                        retry_turn_id = session.start_turn(
+                            retry_prompt,
+                            include_summary=session.default_turn_summary_enabled(),
+                        )
+                        retry_raw_text = session.collect_turn_text(retry_turn_id)
+                        _append_provider_capture(
+                            "provider_raw_text",
+                            content=retry_raw_text,
+                            payload_kind="assistant_text",
+                            retry_kind="tool_disabled_payload",
+                        )
+                        outer_payload = _parse_provider_json_object(retry_raw_text)
+                        if self._is_tool_disabled_payload(outer_payload):
+                            raise ProviderError(
+                                "Codex provider returned a repeated blocked payload claiming tool use is disabled."
+                            )
+                    response_json = outer_payload.get("response_json")
+                    if isinstance(response_json, str) and response_json.strip():
+                        try:
+                            parsed = _parse_provider_json_object(response_json)
+                        except ProviderError:
+                            salvaged = _salvage_failed_generation_action(response_json)
+                            if salvaged is not None:
+                                _trace_provider_event("complete_json_success", path="tool_salvage")
+                                return salvaged
+                            repaired = self._repair_invalid_json(session, messages, response_json)
+                            if repaired is not None:
+                                _trace_provider_event("complete_json_success", path="invalid_json_repair")
+                                return repaired
+                            raise
+                        if self._is_tool_disabled_payload(parsed):
+                            _trace_provider_event("codex_blocked_payload_retry", model=self.config.model)
+                            retry_messages = self._blocked_tool_retry_messages(messages, response_json)
+                            retry_prompt = self._prompt_from_messages(retry_messages)
+                            retry_turn_id = session.start_turn(
+                                retry_prompt,
+                                include_summary=session.default_turn_summary_enabled(),
+                            )
+                            retry_raw_text = session.collect_turn_text(retry_turn_id)
+                            _append_provider_capture(
+                                "provider_raw_text",
+                                content=retry_raw_text,
+                                payload_kind="assistant_text",
+                                retry_kind="tool_disabled_payload",
+                            )
+                            retry_outer_payload = _parse_provider_json_object(retry_raw_text)
+                            retry_response_json = retry_outer_payload.get("response_json")
+                            if isinstance(retry_response_json, str) and retry_response_json.strip():
+                                parsed = _parse_provider_json_object(retry_response_json)
+                            else:
+                                parsed = retry_outer_payload
+                            if self._is_tool_disabled_payload(parsed):
+                                raise ProviderError(
+                                    "Codex provider returned a repeated blocked payload claiming tool use is disabled."
+                                )
+                        _append_provider_capture(
+                            "provider_parsed_json",
+                            parsed_payload=parsed,
+                            payload_kind="json_object",
+                        )
+                        _trace_provider_event("complete_json_success", path="direct")
+                        return parsed
+                    _append_provider_capture(
+                        "provider_parsed_json",
+                        parsed_payload=outer_payload,
+                        payload_kind="json_object",
+                    )
+                    _trace_provider_event("complete_json_success", path="outer_direct")
+                    return outer_payload
+                except ProviderError:
+                    raise
+            except ProviderError as exc:
+                delay_seconds = self._codex_usage_limit_delay_seconds(exc)
+                if delay_seconds is None or usage_limit_retries >= DEFAULT_CODEX_USAGE_LIMIT_RETRIES:
+                    raise
+                usage_limit_retries += 1
+                _trace_provider_event(
+                    "codex_usage_limit_wait",
+                    model=self.config.model,
+                    delay_seconds=delay_seconds,
+                    retry_index=usage_limit_retries,
+                )
+                _append_provider_capture(
+                    "codex_usage_limit_wait",
+                    payload_kind="provider_backoff",
+                    delay_seconds=delay_seconds,
+                    retry_index=usage_limit_retries,
+                    error=str(exc),
+                )
+                time.sleep(delay_seconds)
+                continue
+            finally:
+                session.close()
 
 
 class ChatCompletionsJsonProvider:
