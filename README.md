@@ -70,6 +70,9 @@ Command hierarchy at a glance:
 - `export-portfolio-bundle`
   - export-only leaf command for an existing portfolio report
   - does not rerun catch-up or portfolio selection
+- `render-portfolio-profile-drops`
+  - repair-only leaf command for an existing portfolio report
+  - rerenders `profile-drops/*` without rerunning catch-up or portfolio selection
 - `nuke-deep-caches`
   - reset helper
   - clears rebuildable deep artifacts so the next `build-portfolio` regenerates them from source
@@ -83,6 +86,7 @@ uv run autoresearch build-portfolio
 uv run autoresearch calculate-full-backtests
 uv run autoresearch build-shortlist-report
 uv run autoresearch export-portfolio-bundle
+uv run autoresearch render-portfolio-profile-drops
 uv run autoresearch nuke-deep-caches
 uv run autoresearch build-attempt-catalog
 uv run autoresearch audit-full-backtests
@@ -514,6 +518,7 @@ uv run autoresearch build-portfolio --no-generate-profile-drops
 - The promotion board is the stricter gate.
 - `build-portfolio` writes portfolio artifacts under `runs/derived/portfolio-report/...`, not under individual `runs/<run-id>/` folders.
 - `export-portfolio-bundle` repackages an existing portfolio report; it does not rerun selection.
+- `render-portfolio-profile-drops` rerenders missing portfolio profile-drop artifacts from an existing `portfolio-report.json`.
 - The dashboard is read-only and should be treated as a viewer, not as an orchestrator.
 - Most heavy commands support `--json` for machine-readable summaries.
 

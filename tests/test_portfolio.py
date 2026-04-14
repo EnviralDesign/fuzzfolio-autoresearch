@@ -427,6 +427,82 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
     assert summary["exported_drop_pngs"] == 1
 
 
+def test_render_portfolio_profile_drops_updates_existing_report(
+    tmp_path: Path, monkeypatch
+) -> None:
+    derived_root = tmp_path / "runs" / "derived"
+    report_root = derived_root / "portfolio-report" / "default-portfolio"
+    report_root.mkdir(parents=True, exist_ok=True)
+    report_path = report_root / "portfolio-report.json"
+    payload = {
+        "portfolio_name": "default-portfolio",
+        "portfolio_spec": {
+            "generate_profile_drops": False,
+            "profile_drop_lookback_months": 36,
+            "profile_drop_timeout_seconds": 1800,
+            "profile_drop_workers": 3,
+        },
+        "profile_drop_phase": "skipped",
+        "profile_drops": [],
+        "selected": [
+            {
+                "attempt_id": "attempt-a",
+                "run_id": "run-a",
+                "candidate_name": "alpha",
+            }
+        ],
+    }
+    report_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = SimpleNamespace(
+        derived_root=derived_root,
+        repo_root=tmp_path,
+        fuzzfolio=SimpleNamespace(),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+
+    seen: dict[str, object] = {}
+
+    def fake_render_profile_drop_rows(**kwargs):
+        seen.update(kwargs)
+        return [
+            {
+                "attempt_id": "attempt-a",
+                "run_id": "run-a",
+                "candidate_name": "alpha",
+                "status": "rendered",
+                "png_path": str(report_root / "profile-drops" / "alpha" / "profile-drop-36mo.png"),
+                "manifest_path": str(
+                    report_root / "profile-drops" / "alpha" / "profile-drop-36mo.manifest.json"
+                ),
+            }
+        ]
+
+    monkeypatch.setattr(ar_main, "_render_profile_drop_rows", fake_render_profile_drop_rows)
+
+    exit_code = ar_main.cmd_render_portfolio_profile_drops(
+        portfolio_report=str(report_path),
+        profile_drop_workers=None,
+        force_rebuild=False,
+        as_json=True,
+    )
+
+    assert exit_code == 0
+    assert seen["rows"] == payload["selected"]
+    assert seen["output_root"] == report_root / "profile-drops"
+    assert seen["lookback_months"] == 36
+    assert seen["timeout_seconds"] == 1800
+    assert seen["profile_drop_workers"] == 3
+    assert seen["force_rebuild"] is False
+    assert seen["progress_label"] == "portfolio profile drops"
+
+    updated_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert updated_payload["profile_drop_phase"] == "complete"
+    assert len(updated_payload["profile_drops"]) == 1
+    assert updated_payload["profile_drops"][0]["status"] == "rendered"
+    assert "generated_at" in updated_payload
+
+
 def test_public_portfolio_row_strips_path_fields() -> None:
     public = ar_main._public_portfolio_row(
         {

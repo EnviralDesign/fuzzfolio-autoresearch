@@ -947,6 +947,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
+    render_portfolio_profile_drops = subparsers.add_parser(
+        "render-portfolio-profile-drops",
+        help="Render portfolio profile drops from an existing portfolio-report.json without rebuilding the portfolio selection.",
+    )
+    render_portfolio_profile_drops.add_argument(
+        "--portfolio-report",
+        default=None,
+        help="Path to a portfolio-report.json. Defaults to the latest derived portfolio report.",
+    )
+    render_portfolio_profile_drops.add_argument(
+        "--profile-drop-workers",
+        type=int,
+        default=None,
+        help="Optional override for profile-drop worker count. Defaults to the worker count recorded in the report spec.",
+    )
+    render_portfolio_profile_drops.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Re-render portfolio profile drops even when cached artifacts already exist.",
+    )
+    render_portfolio_profile_drops.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
     nuke_deep_caches = subparsers.add_parser(
         "nuke-deep-caches",
         help="Delete rebuildable deep/backtest/scrutiny/profile-drop/derived cache artifacts. Rebuild afterward with build-portfolio.",
@@ -7412,6 +7436,101 @@ def cmd_export_portfolio_bundle(*, portfolio_report: str | None, as_json: bool) 
     return 0
 
 
+def cmd_render_portfolio_profile_drops(
+    *,
+    portfolio_report: str | None,
+    profile_drop_workers: int | None,
+    force_rebuild: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    report_path = (
+        Path(portfolio_report).resolve() if portfolio_report else _latest_portfolio_report_path(config)
+    )
+    if report_path is None or not report_path.exists():
+        raise SystemExit("No portfolio-report.json found to render profile drops from.")
+    payload = load_json_if_exists(report_path)
+    if not isinstance(payload, dict) or not payload:
+        raise SystemExit(f"Portfolio report is missing or invalid: {report_path}")
+
+    selected_rows = [
+        dict(item) for item in list(payload.get("selected") or []) if isinstance(item, dict)
+    ]
+    if not selected_rows:
+        raise SystemExit(f"Portfolio report has no selected rows to render: {report_path}")
+
+    portfolio_spec = (
+        dict(payload.get("portfolio_spec") or {})
+        if isinstance(payload.get("portfolio_spec"), dict)
+        else {}
+    )
+    lookback_months = int(portfolio_spec.get("profile_drop_lookback_months", 36))
+    timeout_seconds = int(portfolio_spec.get("profile_drop_timeout_seconds", 1800))
+    worker_count = (
+        max(1, int(profile_drop_workers))
+        if profile_drop_workers is not None
+        else max(1, int(portfolio_spec.get("profile_drop_workers", 4)))
+    )
+    report_root = report_path.parent
+    _, profile_drop_root = _portfolio_chart_paths(report_root)
+    profile_drop_results = _render_profile_drop_rows(
+        config=config,
+        rows=selected_rows,
+        output_root=profile_drop_root,
+        lookback_months=lookback_months,
+        timeout_seconds=timeout_seconds,
+        force_rebuild=bool(force_rebuild),
+        profile_drop_workers=worker_count,
+        as_json=as_json,
+        progress_label="portfolio profile drops",
+    )
+
+    payload["generated_at"] = datetime.now().astimezone().isoformat()
+    payload["profile_drop_phase"] = "complete"
+    payload["profile_drops"] = profile_drop_results
+    write_json(report_path, payload)
+
+    summary = {
+        "generated_at": payload["generated_at"],
+        "portfolio_name": str(payload.get("portfolio_name") or "default-portfolio"),
+        "report_path": str(report_path),
+        "selected_count": len(selected_rows),
+        "profile_drop_rendered": sum(
+            1 for row in profile_drop_results if row.get("status") == "rendered"
+        ),
+        "profile_drop_cached": sum(
+            1 for row in profile_drop_results if row.get("status") == "cached"
+        ),
+        "profile_drop_failed": sum(
+            1 for row in profile_drop_results if row.get("status") == "failed"
+        ),
+        "profile_drop_workers": worker_count,
+        "force_rebuild": bool(force_rebuild),
+        "profile_drop_root": str(profile_drop_root),
+    }
+    if as_json:
+        print(json.dumps(summary, ensure_ascii=True, indent=2))
+        return 0
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Portfolio: {summary['portfolio_name']}",
+                    f"Report: {summary['report_path']}",
+                    f"Selected rows: {summary['selected_count']}",
+                    f"Rendered: {summary['profile_drop_rendered']}",
+                    f"Cached: {summary['profile_drop_cached']}",
+                    f"Failed: {summary['profile_drop_failed']}",
+                    f"Profile drops: {summary['profile_drop_root']}",
+                ]
+            ),
+            title="Portfolio Profile Drops",
+            border_style="cyan",
+        )
+    )
+    return 0
+
+
 def cmd_score(artifact_dir: Path) -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
@@ -7710,6 +7829,13 @@ def main() -> int:
     if args.command == "export-portfolio-bundle":
         return cmd_export_portfolio_bundle(
             portfolio_report=args.portfolio_report,
+            as_json=bool(args.json),
+        )
+    if args.command == "render-portfolio-profile-drops":
+        return cmd_render_portfolio_profile_drops(
+            portfolio_report=args.portfolio_report,
+            profile_drop_workers=args.profile_drop_workers,
+            force_rebuild=bool(args.force_rebuild),
             as_json=bool(args.json),
         )
     if args.command == "nuke-deep-caches":

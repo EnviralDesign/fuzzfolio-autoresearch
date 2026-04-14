@@ -460,6 +460,24 @@ uv run autoresearch export-portfolio-bundle --json
 | `--portfolio-report` | path | latest derived portfolio report | Explicit portfolio-report.json to export. |
 | `--json` | flag | false | Print machine-readable JSON. |
 
+## render-portfolio-profile-drops
+
+Render `profile-drops/*` for an existing portfolio report without rerunning `build-portfolio`.
+
+```powershell
+uv run autoresearch render-portfolio-profile-drops
+uv run autoresearch render-portfolio-profile-drops --portfolio-report .\runs\derived\portfolio-report\default-portfolio\portfolio-report.json
+uv run autoresearch render-portfolio-profile-drops --profile-drop-workers 8
+uv run autoresearch render-portfolio-profile-drops --force-rebuild
+```
+
+| Argument | Type | Default | Description |
+|---|---|---|---|
+| `--portfolio-report` | path | latest derived portfolio report | Explicit portfolio-report.json to repair or refresh. |
+| `--profile-drop-workers` | int | report spec/default | Override worker count for the render pass. |
+| `--force-rebuild` | flag | false | Re-render profile drops even if cached artifacts already exist. |
+| `--json` | flag | false | Print machine-readable JSON. |
+
 Default config source:
 
 - `portfolio.config.json` at the repo root if present
