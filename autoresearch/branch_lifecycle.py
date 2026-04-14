@@ -30,6 +30,44 @@ BUDGET_VALIDATION = "validation"
 BUDGET_COLLAPSE_RECOVERY = "collapse_recovery"
 BUDGET_WRAP_UP = "wrap_up"
 
+LOCAL_POCKET_STAGE_IDLE = "idle"
+LOCAL_POCKET_STAGE_PROBE = "probe_local_pocket"
+LOCAL_POCKET_STAGE_MATERIALIZE = "materialize_winner"
+LOCAL_POCKET_STAGE_DURABILITY = "durability_check"
+
+
+@dataclass
+class LocalPocketState:
+    stage: str = LOCAL_POCKET_STAGE_IDLE
+    anchor_family_id: str | None = None
+    anchor_profile_ref: str | None = None
+    anchor_candidate_name: str | None = None
+    anchor_score: float | None = None
+    anchor_effective_window_months: float | None = None
+    anchor_support_quality: str | None = None
+    generation: int = 0
+    sweep_count_used: int = 0
+    sweep_cap: int = 3
+    used_axes: list[str] = field(default_factory=list)
+    last_sweep_inspect_ref: str | None = None
+    last_sweep_fertile: bool | None = None
+    expected_materialized_candidate_name: str | None = None
+    expected_materialized_mutations: list[dict[str, Any]] = field(default_factory=list)
+    last_materialized_profile_ref: str | None = None
+    last_materialized_candidate_name: str | None = None
+    gut_check_due: bool = False
+    gut_check_target_horizon_months: int | None = None
+    gut_check_completed_for_generation: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def from_dict(payload: dict[str, Any]) -> LocalPocketState:
+        known = {f.name for f in LocalPocketState.__dataclass_fields__.values()}
+        kwargs = {k: v for k, v in payload.items() if k in known}
+        return LocalPocketState(**kwargs)
+
 
 @dataclass
 class FamilyBranchState:
@@ -125,6 +163,7 @@ class BranchRunOverlay:
     collapse_recovery_remaining: int = 0
     recent_retention_failures: list[int] = field(default_factory=list)
     explored_family_count: int = 0
+    local_pocket: LocalPocketState = field(default_factory=LocalPocketState)
 
 
 def ensure_family_branch(

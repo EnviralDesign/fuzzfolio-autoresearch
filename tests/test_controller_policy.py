@@ -21,6 +21,7 @@ def _make_controller(
     controller.config = SimpleNamespace(
         research=SimpleNamespace(
             plot_lower_is_better=False,
+            quality_score_preset="profile-drop",
             validated_leader_min_horizon_months=12,
             horizon_late_months=24,
             horizon_wrap_up_months=36,
@@ -1027,6 +1028,7 @@ def test_delta_packet_emits_sweep_priority_and_context_after_eval_plateau() -> N
     assert "===== SWEEP PRIORITY =====" in first_prompt
     assert "preferred_next_tool: run_parameter_sweep" in first_prompt
     assert "===== SWEEP CONTEXT =====" in first_prompt
+    assert "1-2 axes with 5-6 values each" in first_prompt
     assert "indicator[N].config.<field>" in first_prompt
     assert "===== EVALUATE CONTEXT =====" not in first_prompt
     assert "===== PREPARE OR MUTATE CONTEXT =====" not in second_prompt
@@ -1123,20 +1125,61 @@ def test_delta_packet_emits_sweep_priority_after_single_credible_mid_phase_eval(
         seed_indicator_parameter_hints="",
         instrument_catalog_summary="Use exact catalog symbols only.",
     )
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "evaluate_candidate", "profile_ref": "ref-a"},
+        {
+            "tool": "evaluate_candidate",
+            "ok": True,
+            "profile_ref": "ref-a",
+            "candidate_name": "cand-a",
+            "requested_horizon_months": 12,
+            "requested_timeframe": "M5",
+            "effective_timeframe": "M5",
+            "validation_outcome": vo.VALIDATION_UNRESOLVED,
+            "coverage_status": "ok",
+            "score": 58.0,
+            "retention_relevant_flags": {
+                "evaluation_mode": "screen",
+            },
+        },
+        step=11,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
 
     first_prompt, _first_state = controller._build_step_update_packet(
         tool_context,
         ctrlmod.RunPolicy(mode_name="run"),
         step=12,
         step_limit=50,
+        prior_results=[
+            {
+                "tool": "evaluate_candidate",
+                "ok": True,
+                "profile_ref": "ref-a",
+                "candidate_name": "cand-a",
+                "requested_horizon_months": 12,
+                "requested_timeframe": "M5",
+                "effective_timeframe": "M5",
+                "validation_outcome": vo.VALIDATION_UNRESOLVED,
+                "coverage_status": "ok",
+                "score": 58.0,
+                "retention_relevant_flags": {"evaluation_mode": "screen"},
+            }
+        ],
         checkpoint_required=True,
     )
 
+    assert "===== LOCAL POCKET CADENCE =====" in first_prompt
+    assert "stage: probe_local_pocket" in first_prompt
+    assert "preferred_move_family: run_parameter_sweep" in first_prompt
     assert "===== SWEEP PRIORITY =====" in first_prompt
-    assert "credible screen signal in an exploration phase" in first_prompt
+    assert "slightly broader neighboring sweep" in first_prompt
     assert "===== SWEEP CONTEXT =====" in first_prompt
     assert "===== EVALUATE CONTEXT =====" not in first_prompt
-    assert '"tool": "evaluate_candidate"' not in first_prompt
+    assert "- next_action_template:" not in first_prompt
+    assert "===== REFLECTION PROMPTS =====" in first_prompt
 
 
 def test_eval_template_remains_active_when_eval_evidence_changes() -> None:
@@ -1191,6 +1234,7 @@ def test_eval_template_remains_active_when_eval_evidence_changes() -> None:
         },
         {},
     ) if kwargs.get("tool_names") == {
+        "inspect_artifact",
         "prepare_profile",
         "mutate_profile",
         "validate_profile",
@@ -1296,6 +1340,555 @@ def test_inspect_artifact_sweep_summary_returns_clone_first_followup(tmp_path: P
     ]
 
 
+def test_typed_run_parameter_sweep_forwards_profile_drop_quality_score_preset(tmp_path: Path) -> None:
+    controller = _make_controller()
+    captured: dict[str, object] = {}
+
+    def fake_execute(
+        _tool_context,
+        *,
+        args,
+        cwd,
+        step,
+        step_limit,
+        policy,
+        source_action,
+        result_tool="run_cli",
+    ):
+        captured["args"] = list(args)
+        return {
+            "tool": result_tool,
+            "ok": True,
+            "result": {
+                "parsed_json": {
+                    "sweep_id": "sw-1",
+                    "ranked": [],
+                }
+            },
+            "artifacts": {},
+        }
+
+    controller._execute_cli_invocation = fake_execute
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        run_dir=tmp_path,
+        evals_dir=tmp_path / "evals",
+    )
+    tool_context.evals_dir.mkdir(parents=True, exist_ok=True)
+
+    result = controller._typed_run_parameter_sweep(
+        tool_context,
+        {
+            "tool": "run_parameter_sweep",
+            "profile_ref": "ref-a",
+            "axes": ["indicator[0].talib.timeperiod=10,14,20,26"],
+        },
+        step=5,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    args = captured["args"]
+    assert "--quality-score-preset" in args
+    flag_index = args.index("--quality-score-preset") + 1
+    assert args[flag_index] == "profile-drop"
+    assert result["quality_score_preset"] == "profile-drop"
+
+
+def test_late_phase_does_not_autostart_local_pocket_cycle() -> None:
+    controller = _make_controller()
+    tool_context = SimpleNamespace(run_id="run-a", run_dir=Path("C:/runs/example"))
+
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "evaluate_candidate", "profile_ref": "ref-a"},
+        {
+            "tool": "evaluate_candidate",
+            "ok": True,
+            "profile_ref": "ref-a",
+            "candidate_name": "cand-a",
+            "requested_horizon_months": 12,
+            "requested_timeframe": "M5",
+            "effective_timeframe": "M5",
+            "validation_outcome": vo.VALIDATION_UNRESOLVED,
+            "coverage_status": "qualified",
+            "score": 58.0,
+            "retention_relevant_flags": {"evaluation_mode": "screen"},
+        },
+        step=40,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    assert controller._branch_overlay.local_pocket.stage == bl.LOCAL_POCKET_STAGE_IDLE
+
+
+def test_first_fertile_mid_phase_sweep_stays_in_probe_and_biases_one_more_neighbor() -> None:
+    controller = _make_controller({"ref-a": "fam-a"})
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        run_dir=Path("C:/runs/example"),
+        profiles_dir=Path("C:/runs/example/profiles"),
+        evals_dir=Path("C:/runs/example/evals"),
+    )
+
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "evaluate_candidate", "profile_ref": "ref-a"},
+        {
+            "tool": "evaluate_candidate",
+            "ok": True,
+            "profile_ref": "ref-a",
+            "candidate_name": "cand-a",
+            "requested_horizon_months": 3,
+            "requested_timeframe": "M5",
+            "effective_timeframe": "M5",
+            "validation_outcome": vo.VALIDATION_UNRESOLVED,
+            "coverage_status": "qualified",
+            "score": 58.0,
+            "effective_window_months": 2.9,
+            "retention_relevant_flags": {"evaluation_mode": "screen"},
+        },
+        step=10,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "run_parameter_sweep", "profile_ref": "ref-a"},
+        {
+            "tool": "run_parameter_sweep",
+            "ok": True,
+            "profile_ref": "ref-a",
+            "source_profile_ref": "ref-a",
+            "inspect_ref": "sweep-a",
+            "axes": ["indicator[0].config.timeframe=M5,H1"],
+        },
+        step=11,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "inspect_artifact", "inspect_ref": "sweep-a"},
+        {
+            "tool": "inspect_artifact",
+            "ok": True,
+            "artifact_kind": "parameter_sweep",
+            "artifact_dir": "C:/runs/example/evals/sweep-a",
+            "sweep_summary": {
+                "top_score": 60.0,
+                "top_effective_window_months": 3.1,
+                "parameter_importance_flat": False,
+            },
+            "recommended_destination_candidate_name": "cand_a_top",
+            "recommended_mutations": [
+                {"path": "indicator[0].config.timeframe", "value": "H1"}
+            ],
+        },
+        step=12,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    pocket = controller._branch_overlay.local_pocket
+    cadence = controller._local_pocket_cadence_prompt_state(
+        tool_context,
+        step=13,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    assert pocket.stage == bl.LOCAL_POCKET_STAGE_PROBE
+    assert pocket.last_sweep_fertile is True
+    assert pocket.expected_materialized_candidate_name == "cand_a_top"
+    assert cadence is not None
+    assert cadence["preferred_move_family"] == "run_parameter_sweep"
+    assert cadence["destination_candidate_name"] == "cand_a_top"
+
+
+def test_second_fertile_mid_phase_sweep_transitions_to_materialize() -> None:
+    controller = _make_controller({"ref-a": "fam-a"})
+    controller._branch_overlay.local_pocket = bl.LocalPocketState(
+        stage=bl.LOCAL_POCKET_STAGE_PROBE,
+        anchor_family_id="fam-a",
+        anchor_profile_ref="ref-a",
+        anchor_candidate_name="cand-a",
+        generation=1,
+        sweep_count_used=1,
+        sweep_cap=3,
+        used_axes=["indicator[0].config.timeframe=M5,H1"],
+        last_sweep_inspect_ref="sweep-a",
+        last_sweep_fertile=True,
+        expected_materialized_candidate_name="cand_a_top",
+        expected_materialized_mutations=[
+            {"path": "indicator[0].config.timeframe", "value": "H1"}
+        ],
+    )
+
+    controller._mark_local_pocket_sweep_started(
+        {
+            "tool": "run_parameter_sweep",
+            "ok": True,
+            "profile_ref": "ref-a",
+            "source_profile_ref": "ref-a",
+            "inspect_ref": "sweep-b",
+            "axes": ["indicator[0].talib.fastperiod=8,12,16"],
+        }
+    )
+    controller._mark_local_pocket_sweep_inspected(
+        {
+            "tool": "inspect_artifact",
+            "ok": True,
+            "artifact_kind": "parameter_sweep",
+            "artifact_dir": "C:/runs/example/evals/sweep-b",
+            "sweep_summary": {
+                "top_score": 61.0,
+                "top_effective_window_months": 3.2,
+                "parameter_importance_flat": False,
+            },
+            "recommended_destination_candidate_name": "cand_a_top",
+            "recommended_mutations": [
+                {"path": "indicator[0].talib.fastperiod", "value": 12}
+            ],
+        },
+        phase_name="mid",
+    )
+
+    pocket = controller._branch_overlay.local_pocket
+    assert pocket.stage == bl.LOCAL_POCKET_STAGE_MATERIALIZE
+    assert pocket.expected_materialized_candidate_name == "cand_a_top"
+    assert pocket.expected_materialized_mutations == [
+        {"path": "indicator[0].talib.fastperiod", "value": 12}
+    ]
+
+
+def test_local_pocket_register_sets_gut_check_due_and_packet_emits_context() -> None:
+    controller = _make_controller({"ref-a": "fam-a"})
+    controller._run_attempts = lambda _run_id: []
+    controller._run_phase_info = lambda *_args, **_kwargs: {
+        "name": "mid",
+        "summary": "Deepen evidence on the strongest families.",
+    }
+    controller._horizon_policy_snapshot = lambda *_args, **_kwargs: {
+        "summary": "12 months",
+        "guidance": "Screen quickly, then refine locally.",
+    }
+    controller._score_target_snapshot = lambda *_args, **_kwargs: {
+        "summary": "Find the best pocket around the current branch",
+    }
+    controller._working_memory_text = lambda *_args, **_kwargs: (
+        "Pinned working memory:\n- current_candidate: candidate_name=cand-a, profile_ref=ref-a"
+    )
+    controller._run_outcome_text = lambda *_args, **_kwargs: (
+        "Run outcome state:\n- official_winner: none yet"
+    )
+    controller._recent_behavior_digest_text = lambda *_args, **_kwargs: (
+        "Behavior digest: One credible branch is active."
+    )
+    controller._timeframe_mismatch_status_text = (
+        lambda *_args, **_kwargs: "Timeframe intent status: No auto-adjustments detected."
+    )
+    controller._recent_known_instruments_for_handle = (
+        lambda *_args, **_kwargs: ["EURUSD"]
+    )
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        run_dir=Path("C:/runs/example"),
+        evals_dir=Path("C:/runs/example/evals"),
+        profiles_dir=Path("C:/runs/example/profiles"),
+        seed_prompt_path=None,
+        seed_indicator_parameter_hints="",
+        instrument_catalog_summary="Use exact catalog symbols only.",
+    )
+
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "evaluate_candidate", "profile_ref": "ref-a"},
+        {
+            "tool": "evaluate_candidate",
+            "ok": True,
+            "profile_ref": "ref-a",
+            "candidate_name": "cand-a",
+            "requested_horizon_months": 3,
+            "requested_timeframe": "M5",
+            "effective_timeframe": "M5",
+            "validation_outcome": vo.VALIDATION_UNRESOLVED,
+            "coverage_status": "qualified",
+            "score": 58.0,
+            "effective_window_months": 2.9,
+            "retention_relevant_flags": {"evaluation_mode": "screen"},
+        },
+        step=10,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "run_parameter_sweep", "profile_ref": "ref-a"},
+        {
+            "tool": "run_parameter_sweep",
+            "ok": True,
+            "profile_ref": "ref-a",
+            "source_profile_ref": "ref-a",
+            "inspect_ref": "sweep-a",
+            "axes": ["indicator[0].config.timeframe=M5,H1"],
+        },
+        step=11,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "inspect_artifact", "inspect_ref": "sweep-a"},
+        {
+            "tool": "inspect_artifact",
+            "ok": True,
+            "artifact_kind": "parameter_sweep",
+            "sweep_summary": {
+                "top_score": 60.0,
+                "top_effective_window_months": 3.1,
+                "parameter_importance_flat": False,
+            },
+            "recommended_destination_candidate_name": "cand_a_top",
+        },
+        step=12,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "run_parameter_sweep", "profile_ref": "ref-a"},
+        {
+            "tool": "run_parameter_sweep",
+            "ok": True,
+            "profile_ref": "ref-a",
+            "source_profile_ref": "ref-a",
+            "inspect_ref": "sweep-b",
+            "axes": ["indicator[0].talib.fastperiod=8,12,16"],
+        },
+        step=13,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "inspect_artifact", "inspect_ref": "sweep-b"},
+        {
+            "tool": "inspect_artifact",
+            "ok": True,
+            "artifact_kind": "parameter_sweep",
+            "sweep_summary": {
+                "top_score": 61.0,
+                "top_effective_window_months": 3.2,
+                "parameter_importance_flat": False,
+            },
+            "recommended_destination_candidate_name": "cand_a_top",
+        },
+        step=14,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    assert controller._branch_overlay.local_pocket.stage == bl.LOCAL_POCKET_STAGE_MATERIALIZE
+
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "register_profile", "candidate_name": "cand_a_top"},
+        {
+            "tool": "register_profile",
+            "ok": True,
+            "candidate_name": "cand_a_top",
+            "profile_ref": "ref-a-top",
+            "ready_to_evaluate": True,
+        },
+        step=15,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    prompt, _state = controller._build_step_update_packet(
+        tool_context,
+        ctrlmod.RunPolicy(mode_name="run"),
+        step=16,
+        step_limit=50,
+        checkpoint_required=True,
+    )
+
+    assert controller._branch_overlay.local_pocket.gut_check_due is True
+    assert controller._branch_overlay.local_pocket.stage == bl.LOCAL_POCKET_STAGE_DURABILITY
+    assert "===== GUT CHECK CONTEXT =====" in prompt
+    assert "target_horizon_months: 12" in prompt
+    assert "Durability evidence now takes priority" in prompt
+    assert "===== SWEEP PRIORITY =====" not in prompt
+    assert "===== SWEEP CONTEXT =====" not in prompt
+    assert '"tool": "evaluate_candidate"' not in prompt
+
+
+def test_local_pocket_validation_blocks_fourth_sweep_and_repeated_axes() -> None:
+    controller = _make_controller({"ref-a": "fam-a"})
+    controller._branch_overlay.local_pocket = bl.LocalPocketState(
+        stage=bl.LOCAL_POCKET_STAGE_PROBE,
+        anchor_family_id="fam-a",
+        anchor_profile_ref="ref-a",
+        anchor_candidate_name="cand-a",
+        generation=1,
+        sweep_count_used=3,
+        sweep_cap=3,
+        used_axes=["indicator[0].config.timeframe=M5,H1"],
+        last_sweep_fertile=True,
+    )
+
+    errors = controller._validate_branch_lifecycle_actions(
+        SimpleNamespace(run_id="run-a", run_dir=None),
+        actions=[
+            {
+                "tool": "run_parameter_sweep",
+                "profile_ref": "ref-a",
+                "axes": ["indicator[0].config.timeframe=M5,H1"],
+            }
+        ],
+        step=20,
+        step_limit=80,
+        policy=SimpleNamespace(allow_finish=True),
+    )
+
+    assert any("same-pocket sweep budget exhausted" in error for error in errors)
+    assert any("repeated same-pocket sweep axes are blocked" in error for error in errors)
+
+
+def test_local_pocket_validation_blocks_additional_same_pocket_sweep_after_flat_result() -> None:
+    controller = _make_controller({"ref-a": "fam-a"})
+    controller._branch_overlay.local_pocket = bl.LocalPocketState(
+        stage=bl.LOCAL_POCKET_STAGE_PROBE,
+        anchor_family_id="fam-a",
+        anchor_profile_ref="ref-a",
+        anchor_candidate_name="cand-a",
+        generation=1,
+        sweep_count_used=1,
+        sweep_cap=3,
+        used_axes=["indicator[0].config.timeframe=M5,H1"],
+        last_sweep_fertile=False,
+    )
+
+    errors = controller._validate_branch_lifecycle_actions(
+        SimpleNamespace(run_id="run-a", run_dir=None),
+        actions=[
+            {
+                "tool": "run_parameter_sweep",
+                "profile_ref": "ref-a",
+                "axes": ["indicator[0].talib.fastperiod=8,12,16"],
+            }
+        ],
+        step=20,
+        step_limit=80,
+        policy=SimpleNamespace(allow_finish=True),
+    )
+
+    assert any("did not look fertile" in error for error in errors)
+
+
+def test_local_pocket_gut_check_success_reopens_probe_cycle_in_mid_phase() -> None:
+    controller = _make_controller({"ref-a-top": "fam-a"})
+    controller._branch_overlay.local_pocket = bl.LocalPocketState(
+        stage=bl.LOCAL_POCKET_STAGE_DURABILITY,
+        anchor_family_id="fam-a",
+        anchor_profile_ref="ref-a",
+        anchor_candidate_name="cand-a",
+        generation=1,
+        sweep_count_used=1,
+        sweep_cap=3,
+        last_materialized_profile_ref="ref-a-top",
+        last_materialized_candidate_name="cand_a_top",
+        gut_check_due=True,
+        gut_check_target_horizon_months=12,
+    )
+    tool_context = SimpleNamespace(run_id="run-a", run_dir=Path("C:/runs/example"))
+
+    controller._update_local_pocket_after_result(
+        tool_context,
+        {"tool": "evaluate_candidate", "profile_ref": "ref-a-top"},
+        {
+            "tool": "evaluate_candidate",
+            "ok": True,
+            "profile_ref": "ref-a-top",
+            "candidate_name": "cand_a_top",
+            "requested_horizon_months": 12,
+            "requested_timeframe": "M5",
+            "effective_timeframe": "M5",
+            "validation_outcome": vo.VALIDATION_PASSED,
+            "coverage_status": "qualified",
+            "score": 63.0,
+            "effective_window_months": 12.4,
+            "retention_relevant_flags": {"evaluation_mode": "validate"},
+        },
+        step=20,
+        step_limit=60,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    pocket = controller._branch_overlay.local_pocket
+    assert pocket.stage == bl.LOCAL_POCKET_STAGE_PROBE
+    assert pocket.generation == 2
+    assert pocket.anchor_profile_ref == "ref-a-top"
+    assert pocket.gut_check_due is False
+
+
+def test_reflection_prompts_do_not_appear_on_ordinary_mechanical_followup() -> None:
+    controller = _make_controller()
+    controller._run_attempts = lambda _run_id: []
+    controller._run_phase_info = lambda *_args, **_kwargs: {
+        "name": "mid",
+        "summary": "Deepen evidence on the strongest families.",
+    }
+    controller._horizon_policy_snapshot = lambda *_args, **_kwargs: {
+        "summary": "12 months",
+        "guidance": "Screen quickly, then refine locally.",
+    }
+    controller._score_target_snapshot = lambda *_args, **_kwargs: {
+        "summary": "Find the best pocket around the current branch",
+    }
+    controller._working_memory_text = lambda *_args, **_kwargs: (
+        "Pinned working memory:\n- current_candidate: candidate_name=cand-a, profile_ref=ref-a"
+    )
+    controller._run_outcome_text = lambda *_args, **_kwargs: (
+        "Run outcome state:\n- official_winner: none yet"
+    )
+    controller._recent_behavior_digest_text = lambda *_args, **_kwargs: (
+        "Behavior digest: One credible branch is active."
+    )
+    controller._timeframe_mismatch_status_text = (
+        lambda *_args, **_kwargs: "Timeframe intent status: No auto-adjustments detected."
+    )
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        run_dir=Path("C:/runs/example"),
+        evals_dir=Path("C:/runs/example/evals"),
+        profiles_dir=Path("C:/runs/example/profiles"),
+        seed_prompt_path=None,
+        seed_indicator_parameter_hints="",
+        instrument_catalog_summary="Use exact catalog symbols only.",
+    )
+
+    prompt, _state = controller._build_step_update_packet(
+        tool_context,
+        ctrlmod.RunPolicy(mode_name="run"),
+        step=8,
+        step_limit=50,
+        prior_results=[
+            {
+                "tool": "validate_profile",
+                "ok": True,
+                "candidate_name": "cand-a",
+                "ready_for_registration": True,
+            }
+        ],
+        checkpoint_required=True,
+    )
+
+    assert "===== REFLECTION PROMPTS =====" not in prompt
+
+
 def test_history_append_keeps_completed_turn_only() -> None:
     controller = _make_controller()
     messages: list[ctrlmod.ChatMessage] = []
@@ -1367,6 +1960,102 @@ def test_followup_next_action_template_suggests_validate_after_prepare() -> None
     assert template == {"tool": "validate_profile", "candidate_name": "cand-a"}
 
 
+def test_followup_next_action_template_prefers_mutate_after_clone_local_sweep_prepare() -> None:
+    controller = _make_controller()
+    controller._branch_overlay.local_pocket = bl.LocalPocketState(
+        stage=bl.LOCAL_POCKET_STAGE_MATERIALIZE,
+        expected_materialized_candidate_name="cand-a",
+        expected_materialized_mutations=[
+            {"path": "indicator[0].config.timeframe", "value": "H1"}
+        ],
+    )
+    controller._latest_successful_step_result = lambda *_args, **_kwargs: (
+        {"tool": "prepare_profile", "candidate_name": "cand-a"},
+        {},
+    )
+    tool_context = SimpleNamespace(run_dir=Path("C:/runs/example"), run_id="run-a")
+
+    template = controller._followup_next_action_template_prompt_state(tool_context)
+
+    assert template == {
+        "tool": "mutate_profile",
+        "candidate_name": "cand-a",
+        "mutations": [
+            {"path": "indicator[0].config.timeframe", "value": "H1"}
+        ],
+    }
+
+
+def test_followup_next_action_template_prefers_mutate_when_probe_stage_keeps_expected_winner() -> None:
+    controller = _make_controller()
+    controller._branch_overlay.local_pocket = bl.LocalPocketState(
+        stage=bl.LOCAL_POCKET_STAGE_PROBE,
+        expected_materialized_candidate_name="cand-a",
+        expected_materialized_mutations=[
+            {"path": "indicator[0].config.timeframe", "value": "H1"}
+        ],
+    )
+    controller._latest_successful_step_result = lambda *_args, **_kwargs: (
+        {"tool": "prepare_profile", "candidate_name": "cand-a"},
+        {},
+    )
+    tool_context = SimpleNamespace(run_dir=Path("C:/runs/example"), run_id="run-a")
+
+    template = controller._followup_next_action_template_prompt_state(tool_context)
+
+    assert template == {
+        "tool": "mutate_profile",
+        "candidate_name": "cand-a",
+        "mutations": [
+            {"path": "indicator[0].config.timeframe", "value": "H1"}
+        ],
+    }
+
+
+def test_followup_next_action_template_prefers_prepare_after_sweep_inspect() -> None:
+    controller = _make_controller()
+    controller._branch_overlay.local_pocket = bl.LocalPocketState(
+        stage=bl.LOCAL_POCKET_STAGE_MATERIALIZE,
+        anchor_profile_ref="ref-anchor",
+        expected_materialized_candidate_name="cand-a",
+        expected_materialized_mutations=[
+            {"path": "indicator[0].config.timeframe", "value": "H1"}
+        ],
+    )
+    controller._latest_successful_step_result = lambda *_args, **_kwargs: (
+        {
+            "tool": "inspect_artifact",
+            "artifact_kind": "parameter_sweep",
+            "recommended_followup_actions": [
+                {
+                    "tool": "prepare_profile",
+                    "mode": "clone_local",
+                    "source_profile_ref": "ref-anchor",
+                    "destination_candidate_name": "cand-a",
+                },
+                {
+                    "tool": "mutate_profile",
+                    "candidate_name": "cand-a",
+                    "mutations": [
+                        {"path": "indicator[0].config.timeframe", "value": "H1"}
+                    ],
+                },
+            ],
+        },
+        {},
+    )
+    tool_context = SimpleNamespace(run_dir=Path("C:/runs/example"), run_id="run-a")
+
+    template = controller._followup_next_action_template_prompt_state(tool_context)
+
+    assert template == {
+        "tool": "prepare_profile",
+        "mode": "clone_local",
+        "source_profile_ref": "ref-anchor",
+        "destination_candidate_name": "cand-a",
+    }
+
+
 def test_followup_next_action_template_requires_deterministic_instruments_for_evaluate() -> None:
     controller = _make_controller()
     controller._latest_successful_step_result = lambda *_args, **_kwargs: (
@@ -1427,6 +2116,75 @@ def test_pathless_response_compatibility_rewrites_legacy_profile_fields() -> Non
             "source_candidate_name": "cand-a",
             "destination_candidate_name": "cand-b",
         },
+    ]
+
+
+def test_followup_response_canonicalization_overrides_mutate_profile_with_template_mutations() -> None:
+    normalized = ctrlmod.canonicalize_followup_step_response(
+        {
+            "reasoning": "Patch the sweep winner.",
+            "actions": [
+                {
+                    "tool": "validate_profile",
+                    "candidate_name": "sw1_top",
+                }
+            ],
+        },
+        next_action_template={
+            "tool": "mutate_profile",
+            "candidate_name": "sw1_top",
+            "mutations": [
+                {
+                    "path": "cc231442-54d5-554c-88a5-395fe850eff5.timeperiod",
+                    "value": 30,
+                }
+            ],
+        },
+    )
+
+    assert normalized["actions"] == [
+        {
+            "tool": "mutate_profile",
+            "candidate_name": "sw1_top",
+            "mutations": [
+                {
+                    "path": "cc231442-54d5-554c-88a5-395fe850eff5.timeperiod",
+                    "value": 30,
+                }
+            ],
+        }
+    ]
+
+
+def test_followup_response_canonicalization_overrides_prepare_profile_with_template_clone() -> None:
+    normalized = ctrlmod.canonicalize_followup_step_response(
+        {
+            "reasoning": "Clone the sweep winner.",
+            "actions": [
+                {
+                    "tool": "prepare_profile",
+                    "mode": "clone_local",
+                    "source_profile_ref": "ref-anchor",
+                    "candidate_name": "candidate",
+                    "indicator_ids": ["wrong-extra"],
+                }
+            ],
+        },
+        next_action_template={
+            "tool": "prepare_profile",
+            "mode": "clone_local",
+            "source_profile_ref": "ref-anchor",
+            "destination_candidate_name": "sw1_top",
+        },
+    )
+
+    assert normalized["actions"] == [
+        {
+            "tool": "prepare_profile",
+            "mode": "clone_local",
+            "source_profile_ref": "ref-anchor",
+            "destination_candidate_name": "sw1_top",
+        }
     ]
 
 

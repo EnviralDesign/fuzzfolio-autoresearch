@@ -134,6 +134,8 @@ CHUNK_STEP_FRAME = "STEP FRAME"
 CHUNK_TOOL_RESULTS = "TOOL RESULTS FROM PRIOR STEP"
 CHUNK_GOAL_STATE = "GOAL STATE"
 CHUNK_BRANCH_AUTHORITY = "BRANCH AUTHORITY"
+CHUNK_LOCAL_POCKET_CADENCE = "LOCAL POCKET CADENCE"
+CHUNK_GUT_CHECK_CONTEXT = "GUT CHECK CONTEXT"
 CHUNK_ACTIVE_HANDLES = "ACTIVE HANDLES"
 CHUNK_RECENT_EVIDENCE = "RECENT EVIDENCE"
 CHUNK_OPENING_OVERLAY = "OPENING OVERLAY"
@@ -141,6 +143,7 @@ CHUNK_PREPARE_MUTATE_CONTEXT = "PREPARE OR MUTATE CONTEXT"
 CHUNK_SWEEP_PRIORITY = "SWEEP PRIORITY"
 CHUNK_SWEEP_CONTEXT = "SWEEP CONTEXT"
 CHUNK_EVALUATE_CONTEXT = "EVALUATE CONTEXT"
+CHUNK_REFLECTION_PROMPTS = "REFLECTION PROMPTS"
 CHUNK_RECOVERY_CONTEXT = "RECOVERY CONTEXT"
 CHUNK_WRAP_UP_CONTEXT = "WRAP-UP CONTEXT"
 
@@ -149,6 +152,8 @@ DELTA_CHUNK_ORDER = [
     CHUNK_TOOL_RESULTS,
     CHUNK_GOAL_STATE,
     CHUNK_BRANCH_AUTHORITY,
+    CHUNK_LOCAL_POCKET_CADENCE,
+    CHUNK_GUT_CHECK_CONTEXT,
     CHUNK_ACTIVE_HANDLES,
     CHUNK_RECENT_EVIDENCE,
     CHUNK_OPENING_OVERLAY,
@@ -156,16 +161,20 @@ DELTA_CHUNK_ORDER = [
     CHUNK_SWEEP_PRIORITY,
     CHUNK_SWEEP_CONTEXT,
     CHUNK_EVALUATE_CONTEXT,
+    CHUNK_REFLECTION_PROMPTS,
     CHUNK_RECOVERY_CONTEXT,
     CHUNK_WRAP_UP_CONTEXT,
 ]
 
 ACTION_CONTEXT_CHUNKS = {
+    CHUNK_LOCAL_POCKET_CADENCE,
+    CHUNK_GUT_CHECK_CONTEXT,
     CHUNK_OPENING_OVERLAY,
     CHUNK_PREPARE_MUTATE_CONTEXT,
     CHUNK_SWEEP_PRIORITY,
     CHUNK_SWEEP_CONTEXT,
     CHUNK_EVALUATE_CONTEXT,
+    CHUNK_REFLECTION_PROMPTS,
     CHUNK_RECOVERY_CONTEXT,
     CHUNK_WRAP_UP_CONTEXT,
 }
@@ -367,6 +376,7 @@ def canonicalize_followup_step_response(
     template = _pathless_action_from_legacy_fields(dict(next_action_template))
     template_tool = str(template.get("tool") or "").strip()
     if template_tool not in {
+        "prepare_profile",
         "validate_profile",
         "register_profile",
         "mutate_profile",
@@ -374,15 +384,27 @@ def canonicalize_followup_step_response(
     }:
         return payload
     normalized_first = _pathless_action_from_legacy_fields(dict(first_action))
-    if str(normalized_first.get("tool") or "").strip() != template_tool:
-        return payload
-    changed = normalized_first != first_action or len(actions) > 1
+    first_tool = str(normalized_first.get("tool") or "").strip()
+    if template_tool in {"prepare_profile", "mutate_profile"}:
+        changed = normalized_first != template or len(actions) > 1
+        normalized_first = dict(template)
+    else:
+        if first_tool != template_tool:
+            return payload
+        changed = normalized_first != first_action or len(actions) > 1
     if template_tool == "evaluate_candidate":
         if (
             not isinstance(normalized_first.get("instruments"), list)
             or not normalized_first.get("instruments")
         ) and isinstance(template.get("instruments"), list) and template.get("instruments"):
             normalized_first["instruments"] = list(template.get("instruments") or [])
+            changed = True
+    if template_tool == "mutate_profile":
+        template_mutations = (
+            template.get("mutations") if isinstance(template.get("mutations"), list) else []
+        )
+        if template_mutations and normalized_first.get("mutations") != template_mutations:
+            normalized_first["mutations"] = list(template_mutations)
             changed = True
     for field in (
         "candidate_name",
@@ -1151,6 +1173,17 @@ class ResearchController:
                 return None
         return None
 
+    @staticmethod
+    def _coerce_float_score(value: Any) -> float | None:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if value is not None and str(value).strip() not in {"", "none"}:
+            try:
+                return float(str(value).strip())
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def _extract_effective_window_months(
         self,
         best_summary: dict[str, Any],
@@ -1623,6 +1656,11 @@ class ResearchController:
             )
             self._sync_branch_budget_mode(step, step_limit, policy)
             self._persist_branch_runtime_state(tool_context, step)
+        self._sync_local_pocket_state(
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+        )
 
     def _sync_branch_budget_mode(
         self,
@@ -1937,6 +1975,7 @@ class ResearchController:
             ],
             "last_scored_validation_digest": overlay.last_scored_validation_digest,
             "wrap_up_focus": wrap_up_focus,
+            "local_pocket": self._local_pocket_state().to_dict(),
             "run_outcome": run_outcome,
             "families_on_cooldown": cooldown,
             "families": {
@@ -2005,6 +2044,52 @@ class ResearchController:
             )
         return "\n".join(lines)
 
+    def _local_pocket_same_cycle_sweep_errors(
+        self,
+        action: dict[str, Any],
+        *,
+        index: int,
+    ) -> list[str]:
+        if str(action.get("tool") or "").strip() != "run_parameter_sweep":
+            return []
+        pocket = self._local_pocket_state()
+        if pocket.stage == bl.LOCAL_POCKET_STAGE_IDLE:
+            return []
+        profile_ref = str(action.get("profile_ref") or "").strip()
+        if not pocket.anchor_profile_ref or not profile_ref or profile_ref != pocket.anchor_profile_ref:
+            return []
+        errors: list[str] = []
+        if pocket.gut_check_due or pocket.stage == bl.LOCAL_POCKET_STAGE_DURABILITY:
+            errors.append(
+                f"Action {index}: local pocket durability check is due for {pocket.anchor_profile_ref}; "
+                "do not run another same-pocket sweep before the immediate gut-check eval."
+            )
+            return errors
+        if pocket.stage == bl.LOCAL_POCKET_STAGE_MATERIALIZE:
+            errors.append(
+                f"Action {index}: a fertile sweep winner is ready to materialize for {pocket.anchor_profile_ref}; "
+                "finish the clone_local -> mutate_profile -> validate_profile path before another same-pocket sweep."
+            )
+            return errors
+        if pocket.sweep_count_used >= int(pocket.sweep_cap or 3):
+            errors.append(
+                f"Action {index}: same-pocket sweep budget exhausted ({pocket.sweep_count_used}/{int(pocket.sweep_cap or 3)}). "
+                "Materialize the best winner or run the durability check before more same-pocket sweeping."
+            )
+        if pocket.sweep_count_used >= 1 and pocket.last_sweep_fertile is not True:
+            errors.append(
+                f"Action {index}: the previous same-pocket sweep did not look fertile. "
+                "Do not repeat another same-pocket sweep; materialize the best variant or move to a different pocket."
+            )
+        axes = action.get("axes") if isinstance(action.get("axes"), list) else []
+        axis_signature = self._local_pocket_axes_signature(axes)
+        if axis_signature and axis_signature in pocket.used_axes:
+            errors.append(
+                f"Action {index}: repeated same-pocket sweep axes are blocked. "
+                f"Axis slice already used in this cycle: {axis_signature}"
+            )
+        return errors
+
     def _validate_branch_lifecycle_actions(
         self,
         tool_context: ToolContext,
@@ -2020,6 +2105,9 @@ class ResearchController:
         for index, action in enumerate(actions, start=1):
             if not isinstance(action, dict):
                 continue
+            errors.extend(
+                self._local_pocket_same_cycle_sweep_errors(action, index=index)
+            )
             args = self._synthetic_cli_args_for_branch_validation(action)
             action_families = self._action_family_ids_for_branch_validation(
                 tool_context, action, synthetic_args=args
@@ -4166,6 +4254,333 @@ class ResearchController:
             "phase_name": phase_name,
         }
 
+    def _local_pocket_state(self) -> bl.LocalPocketState:
+        pocket = getattr(self._branch_overlay, "local_pocket", None)
+        if isinstance(pocket, bl.LocalPocketState):
+            return pocket
+        pocket = bl.LocalPocketState()
+        self._branch_overlay.local_pocket = pocket
+        return pocket
+
+    def _clear_local_pocket_state(self) -> None:
+        self._branch_overlay.local_pocket = bl.LocalPocketState()
+
+    @staticmethod
+    def _local_pocket_axes_signature(axes: list[Any]) -> str:
+        normalized = sorted(str(axis).strip() for axis in axes if str(axis).strip())
+        return " | ".join(normalized)
+
+    @staticmethod
+    def _local_pocket_handle_bits_from_state(
+        pocket: bl.LocalPocketState,
+    ) -> list[str]:
+        bits: list[str] = []
+        if pocket.anchor_candidate_name:
+            bits.append(f"candidate_name={pocket.anchor_candidate_name}")
+        if pocket.anchor_profile_ref:
+            bits.append(f"profile_ref={pocket.anchor_profile_ref}")
+        if pocket.anchor_family_id:
+            bits.append(f"family={pocket.anchor_family_id[:24]}")
+        return bits
+
+    def _result_support_quality(self, result: dict[str, Any]) -> str:
+        return self._cadence_support_quality(
+            trades_per_month=result.get("trades_per_month"),
+            positive_ratio=result.get("positive_cell_ratio"),
+            effective_window_months=result.get("effective_window_months"),
+        )
+
+    def _eval_is_local_pocket_survivor(self, result: dict[str, Any]) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if self._attempt_has_timeframe_mismatch(result):
+            return False
+        try:
+            score = float(result.get("score"))
+        except (TypeError, ValueError):
+            return False
+        if score < float(self.config.research.validated_leader_min_score):
+            return False
+        coverage_status = str(result.get("coverage_status") or "").strip().lower()
+        if coverage_status == vo.COVERAGE_INADEQUATE:
+            return False
+        validation_outcome = str(result.get("validation_outcome") or "").strip().lower()
+        return validation_outcome != vo.VALIDATION_FAILED
+
+    def _begin_local_pocket_cycle(
+        self,
+        eval_result: dict[str, Any],
+        *,
+        reopen: bool = False,
+    ) -> None:
+        pocket = self._local_pocket_state()
+        handle = self._result_handle_state(eval_result) or {}
+        profile_ref = str(eval_result.get("profile_ref") or "").strip() or None
+        candidate_name = str(eval_result.get("candidate_name") or "").strip() or None
+        if handle.get("kind") == "profile_ref":
+            profile_ref = handle.get("value")
+        elif handle.get("kind") == "candidate_name":
+            candidate_name = handle.get("value")
+        family_id = self._family_id_for_profile_ref(profile_ref) if profile_ref else None
+        prior_generation = int(pocket.generation or 0)
+        self._branch_overlay.local_pocket = bl.LocalPocketState(
+            stage=bl.LOCAL_POCKET_STAGE_PROBE,
+            anchor_family_id=family_id,
+            anchor_profile_ref=profile_ref,
+            anchor_candidate_name=candidate_name,
+            anchor_score=self._coerce_float_score(eval_result.get("score")),
+            anchor_effective_window_months=self._coerce_float_months(
+                eval_result.get("effective_window_months")
+            ),
+            anchor_support_quality=self._result_support_quality(eval_result),
+            generation=max(1, prior_generation + 1 if reopen or prior_generation else 1),
+            sweep_cap=3,
+            last_materialized_profile_ref=profile_ref if reopen else None,
+            last_materialized_candidate_name=candidate_name if reopen else None,
+        )
+
+    def _mark_local_pocket_sweep_started(self, result: dict[str, Any]) -> None:
+        pocket = self._local_pocket_state()
+        if pocket.stage != bl.LOCAL_POCKET_STAGE_PROBE:
+            return
+        source_profile_ref = str(
+            result.get("source_profile_ref") or result.get("profile_ref") or ""
+        ).strip()
+        if pocket.anchor_profile_ref and source_profile_ref != pocket.anchor_profile_ref:
+            return
+        inspect_ref = str(result.get("inspect_ref") or "").strip() or None
+        axes = result.get("axes") if isinstance(result.get("axes"), list) else []
+        axis_signature = self._local_pocket_axes_signature(axes)
+        if axis_signature:
+            pocket.used_axes.append(axis_signature)
+        pocket.sweep_count_used += 1
+        pocket.last_sweep_inspect_ref = inspect_ref
+
+    def _sweep_is_fertile(
+        self,
+        pocket: bl.LocalPocketState,
+        sweep_summary: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(sweep_summary, dict):
+            return False
+        top_score = self._coerce_float_score(sweep_summary.get("top_score"))
+        top_window = self._coerce_float_months(
+            sweep_summary.get("top_effective_window_months")
+        )
+        importance_flat = bool(sweep_summary.get("parameter_importance_flat"))
+        anchor_score = self._coerce_float_score(pocket.anchor_score)
+        anchor_window = self._coerce_float_months(pocket.anchor_effective_window_months)
+        score_improved = (
+            top_score is not None
+            and anchor_score is not None
+            and self._score_better(top_score, anchor_score)
+        )
+        window_kept = (
+            top_window is not None
+            and anchor_window is not None
+            and top_window >= anchor_window
+        )
+        return bool(score_improved or not importance_flat or window_kept)
+
+    def _mark_local_pocket_sweep_inspected(
+        self,
+        result: dict[str, Any],
+        *,
+        phase_name: str = "",
+    ) -> None:
+        pocket = self._local_pocket_state()
+        if pocket.stage != bl.LOCAL_POCKET_STAGE_PROBE:
+            return
+        if str(result.get("artifact_kind") or "").strip() != "parameter_sweep":
+            return
+        artifact_dir = str(result.get("artifact_dir") or "").strip()
+        if pocket.last_sweep_inspect_ref and artifact_dir:
+            if Path(artifact_dir).name != pocket.last_sweep_inspect_ref:
+                return
+        fertile = self._sweep_is_fertile(
+            pocket,
+            result.get("sweep_summary")
+            if isinstance(result.get("sweep_summary"), dict)
+            else None,
+        )
+        pocket.last_sweep_fertile = fertile
+        destination = str(
+            result.get("recommended_destination_candidate_name") or ""
+        ).strip() or None
+        recommended_mutations = (
+            result.get("recommended_mutations")
+            if isinstance(result.get("recommended_mutations"), list)
+            else []
+        )
+        if fertile and destination:
+            pocket.expected_materialized_candidate_name = destination
+            pocket.expected_materialized_mutations = [
+                mutation
+                for mutation in recommended_mutations
+                if isinstance(mutation, dict)
+            ]
+            if phase_name in {"early", "mid"} and pocket.sweep_count_used < 2:
+                pocket.stage = bl.LOCAL_POCKET_STAGE_PROBE
+            else:
+                pocket.stage = bl.LOCAL_POCKET_STAGE_MATERIALIZE
+        elif not pocket.expected_materialized_candidate_name:
+            pocket.expected_materialized_candidate_name = None
+            pocket.expected_materialized_mutations = []
+
+    def _mark_local_pocket_materialized_winner(self, result: dict[str, Any]) -> None:
+        pocket = self._local_pocket_state()
+        if pocket.stage not in {
+            bl.LOCAL_POCKET_STAGE_PROBE,
+            bl.LOCAL_POCKET_STAGE_MATERIALIZE,
+        }:
+            return
+        candidate_name = str(
+            result.get("candidate_name")
+            or (
+                result.get("candidate_summary", {}).get("candidate_name")
+                if isinstance(result.get("candidate_summary"), dict)
+                else ""
+            )
+            or ""
+        ).strip() or None
+        if pocket.expected_materialized_candidate_name and (
+            candidate_name != pocket.expected_materialized_candidate_name
+        ):
+            return
+        if (
+            pocket.stage == bl.LOCAL_POCKET_STAGE_PROBE
+            and not pocket.expected_materialized_candidate_name
+        ):
+            return
+        profile_ref = str(
+            result.get("profile_ref")
+            or result.get("created_profile_ref")
+            or ""
+        ).strip() or None
+        pocket.last_materialized_candidate_name = candidate_name
+        pocket.last_materialized_profile_ref = profile_ref
+        pocket.expected_materialized_mutations = []
+        pocket.gut_check_due = True
+        pocket.gut_check_target_horizon_months = int(
+            self.config.research.validated_leader_min_horizon_months
+        )
+        pocket.gut_check_completed_for_generation = False
+        pocket.stage = bl.LOCAL_POCKET_STAGE_DURABILITY
+
+    def _complete_local_pocket_gut_check(
+        self,
+        result: dict[str, Any],
+        *,
+        phase_name: str,
+    ) -> None:
+        pocket = self._local_pocket_state()
+        if pocket.stage != bl.LOCAL_POCKET_STAGE_DURABILITY or not pocket.gut_check_due:
+            return
+        profile_ref = str(result.get("profile_ref") or "").strip()
+        candidate_name = str(result.get("candidate_name") or "").strip()
+        target = int(pocket.gut_check_target_horizon_months or 0)
+        try:
+            requested_horizon = int(result.get("requested_horizon_months"))
+        except (TypeError, ValueError):
+            requested_horizon = 0
+        if target > 0 and requested_horizon < target:
+            return
+        if pocket.last_materialized_profile_ref and profile_ref:
+            if profile_ref != pocket.last_materialized_profile_ref:
+                return
+        elif pocket.last_materialized_candidate_name and candidate_name:
+            if candidate_name != pocket.last_materialized_candidate_name:
+                return
+        if not self._eval_is_local_pocket_survivor(result):
+            self._clear_local_pocket_state()
+            return
+        pocket.gut_check_due = False
+        pocket.gut_check_completed_for_generation = True
+        if phase_name in {"early", "mid"}:
+            self._begin_local_pocket_cycle(result, reopen=True)
+        else:
+            pocket.stage = bl.LOCAL_POCKET_STAGE_IDLE
+
+    def _sync_local_pocket_state(
+        self,
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> None:
+        pocket = self._local_pocket_state()
+        if pocket.stage == bl.LOCAL_POCKET_STAGE_IDLE and not pocket.gut_check_due:
+            return
+        phase_name = str(self._run_phase_info(step, step_limit, policy).get("name") or "")
+        if phase_name == "wrap_up":
+            self._clear_local_pocket_state()
+            return
+        if self._branch_overlay.budget_mode in {
+            bl.BUDGET_COLLAPSE_RECOVERY,
+            bl.BUDGET_WRAP_UP,
+        }:
+            self._clear_local_pocket_state()
+            return
+        authoritative_family = (
+            self._branch_overlay.validated_leader_family_id
+            or self._branch_overlay.provisional_leader_family_id
+        )
+        if pocket.anchor_family_id and authoritative_family and authoritative_family != pocket.anchor_family_id:
+            self._clear_local_pocket_state()
+            return
+        if pocket.anchor_family_id:
+            branch = self._family_branches.get(pocket.anchor_family_id)
+            if branch and (
+                branch.exploit_dead
+                or branch.lifecycle_state == bl.LIFECYCLE_COLLAPSED
+            ):
+                self._clear_local_pocket_state()
+
+    def _update_local_pocket_after_result(
+        self,
+        tool_context: ToolContext,
+        action: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        step: int,
+        step_limit: int,
+        policy: RunPolicy,
+    ) -> None:
+        if not isinstance(result, dict) or result.get("error") or result.get("ok") is False:
+            return
+        phase_name = str(self._run_phase_info(step, step_limit, policy).get("name") or "")
+        tool = str(result.get("tool") or action.get("tool") or "").strip()
+        if tool == "evaluate_candidate":
+            pocket = self._local_pocket_state()
+            if pocket.stage == bl.LOCAL_POCKET_STAGE_DURABILITY and pocket.gut_check_due:
+                self._complete_local_pocket_gut_check(result, phase_name=phase_name)
+                return
+            if phase_name in {"early", "mid"} and self._eval_is_credible_for_sweep_probe(result):
+                handle = self._result_handle_state(result)
+                if not isinstance(handle, dict):
+                    return
+                active_profile_ref = pocket.anchor_profile_ref
+                active_candidate_name = pocket.anchor_candidate_name
+                same_anchor = bool(
+                    (handle.get("kind") == "profile_ref" and active_profile_ref and handle.get("value") == active_profile_ref)
+                    or (
+                        handle.get("kind") == "candidate_name"
+                        and active_candidate_name
+                        and handle.get("value") == active_candidate_name
+                    )
+                )
+                if pocket.stage == bl.LOCAL_POCKET_STAGE_IDLE or not same_anchor:
+                    self._begin_local_pocket_cycle(result)
+            return
+        if tool == "run_parameter_sweep":
+            self._mark_local_pocket_sweep_started(result)
+            return
+        if tool == "inspect_artifact":
+            self._mark_local_pocket_sweep_inspected(result, phase_name=phase_name)
+            return
+        if tool == "register_profile":
+            self._mark_local_pocket_materialized_winner(result)
+
     def _format_score(self, value: Any) -> str:
         try:
             number = float(value)
@@ -4963,12 +5378,12 @@ class ResearchController:
         if reason:
             lines.append(f"- reason: {reason}")
         trigger = str(sweep_priority.get("trigger") or "").strip()
-        if trigger == "promising_probe":
-            lines.append("- sweep_posture: use a micro-sweep now to map the local pocket around this promising branch.")
+        if trigger in {"promising_probe", "local_pocket_cadence"}:
+            lines.append("- sweep_posture: use a slightly broader local sweep now to map the pocket around this promising branch.")
         lines.extend(
             [
                 "- preferred_next_tool: run_parameter_sweep",
-                "- Use a small sweep burst to probe the local parameter neighborhood before another same-handle eval.",
+                "- Use a local sweep burst before another same-handle eval: usually 1-2 axes with 5-6 values each; use 3 axes only when the pocket already looks unusually strong.",
             ]
         )
         return "\n".join(lines).strip()
@@ -5319,7 +5734,8 @@ class ResearchController:
             [
                 "- Next typed tuning move is run_parameter_sweep on profile_ref.",
                 "- Valid axis grammar only: indicator[N].config.<field>=... or indicator[N].talib.<param>=...",
-                "- Valid examples: indicator[0].config.timeframe=M5,H1 ; indicator[1].talib.timeperiod=10,14,20",
+                "- Prefer slightly broader local probes: usually 1-2 axes with 5-6 values each; reserve 3-axis sweeps for unusually strong pockets.",
+                "- Valid examples: indicator[0].config.timeframe=M5,M15,M30,H1,H4 ; indicator[1].talib.timeperiod=8,10,14,20,26",
                 "- Invalid examples: profile.indicators[1].params.fastperiod=... ; indicators[1].config.fastperiod=... ; indicator[1].params.fastperiod=...",
             ]
         )
@@ -5422,6 +5838,22 @@ class ResearchController:
             payloads[CHUNK_OPENING_OVERLAY] = self._opening_overlay_chunk_text(
                 tool_context
             )
+        local_pocket_cadence = self._local_pocket_cadence_prompt_state(
+            tool_context,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+        )
+        if isinstance(local_pocket_cadence, dict):
+            body = self._local_pocket_cadence_chunk_text(local_pocket_cadence)
+            if body:
+                payloads[CHUNK_LOCAL_POCKET_CADENCE] = body
+            gut_check_body = self._gut_check_context_chunk_text(
+                tool_context,
+                local_pocket_cadence,
+            )
+            if gut_check_body:
+                payloads[CHUNK_GUT_CHECK_CONTEXT] = gut_check_body
         candidate_context_template = self._latest_candidate_context_template_prompt_state(
             tool_context
         )
@@ -5464,6 +5896,13 @@ class ResearchController:
                 body = self._evaluate_context_chunk_text(tool_context, template)
                 if body:
                     payloads[CHUNK_EVALUATE_CONTEXT] = body
+        reflection_text = self._reflection_prompts_chunk_text(
+            tool_context,
+            prior_results,
+            local_pocket_cadence,
+        )
+        if reflection_text:
+            payloads[CHUNK_REFLECTION_PROMPTS] = reflection_text
         recovery_text = self._recovery_context_chunk_text(tool_context)
         if recovery_text:
             payloads[CHUNK_RECOVERY_CONTEXT] = recovery_text
@@ -5497,6 +5936,9 @@ class ResearchController:
             "manager_hook_step": runtime.last_hook_step,
             "manager_incomplete": bool(runtime.invocation_incomplete),
             "budget_mode": ov.budget_mode,
+            "local_pocket_stage": self._local_pocket_state().stage,
+            "local_pocket_generation": self._local_pocket_state().generation,
+            "local_pocket_gut_check_due": bool(self._local_pocket_state().gut_check_due),
             "provisional_family": ov.provisional_leader_family_id,
             "validated_family": ov.validated_leader_family_id,
             "shadow_family": ov.shadow_leader_family_id,
@@ -5843,6 +6285,8 @@ class ResearchController:
         return bool(value) and value == handle["value"]
 
     def _eval_is_credible_for_sweep_probe(self, result: dict[str, Any]) -> bool:
+        if self._attempt_has_timeframe_mismatch(result):
+            return False
         try:
             score = float(result.get("score"))
         except (TypeError, ValueError):
@@ -5894,6 +6338,248 @@ class ResearchController:
                 return True
         return False
 
+    def _local_pocket_cadence_prompt_state(
+        self,
+        tool_context: ToolContext,
+        *,
+        step: int | None = None,
+        step_limit: int | None = None,
+        policy: RunPolicy | None = None,
+    ) -> dict[str, Any] | None:
+        pocket = self._local_pocket_state()
+        if pocket.stage == bl.LOCAL_POCKET_STAGE_IDLE and not pocket.gut_check_due:
+            return None
+        phase_name = ""
+        if (
+            isinstance(step, int)
+            and isinstance(step_limit, int)
+            and isinstance(policy, RunPolicy)
+        ):
+            phase_name = str(
+                self._run_phase_info(step, step_limit, policy).get("name") or ""
+            ).strip()
+        template: dict[str, Any] = {
+            "stage": pocket.stage,
+            "generation": int(pocket.generation or 0),
+            "sweep_count_used": int(pocket.sweep_count_used or 0),
+            "sweep_cap": int(pocket.sweep_cap or 3),
+            "gut_check_due": bool(pocket.gut_check_due),
+            "gut_check_target_horizon_months": pocket.gut_check_target_horizon_months,
+            "phase_name": phase_name,
+        }
+        if pocket.anchor_profile_ref:
+            template["profile_ref"] = pocket.anchor_profile_ref
+        if pocket.anchor_candidate_name:
+            template["candidate_name"] = pocket.anchor_candidate_name
+        if pocket.anchor_family_id:
+            template["family_id"] = pocket.anchor_family_id
+        indicator_ids = self._active_indicator_ids_for_handle(
+            tool_context,
+            candidate_name=pocket.anchor_candidate_name,
+            profile_ref=pocket.anchor_profile_ref,
+        )
+        if indicator_ids:
+            template["indicator_ids"] = indicator_ids
+        instruments = self._recent_known_instruments_for_handle(
+            tool_context,
+            candidate_name=pocket.anchor_candidate_name,
+            profile_ref=pocket.anchor_profile_ref,
+        )
+        if instruments:
+            template["instruments"] = instruments
+        if pocket.used_axes:
+            template["used_axes"] = list(pocket.used_axes[-3:])
+        if pocket.expected_materialized_candidate_name:
+            template["destination_candidate_name"] = (
+                pocket.expected_materialized_candidate_name
+            )
+        if pocket.stage == bl.LOCAL_POCKET_STAGE_PROBE:
+            if pocket.sweep_count_used <= 0:
+                template["preferred_move_family"] = "run_parameter_sweep"
+                template["rationale"] = (
+                    "A credible anchor exists. Probe the immediate local pocket with a slightly broader neighboring sweep before another point eval."
+                )
+                template["trigger"] = "credible_anchor"
+            elif pocket.last_sweep_fertile:
+                template["preferred_move_family"] = "run_parameter_sweep"
+                template["rationale"] = (
+                    "The prior sweep looked fertile. One more slightly broader neighboring sweep is allowed before the durability check."
+                )
+                template["trigger"] = "fertile_neighbor_probe"
+            else:
+                template["preferred_move_family"] = "materialize_or_move_on"
+                template["rationale"] = (
+                    "This pocket looks flat. Materialize only if the best variant is still interesting; otherwise move on instead of repeating the same sweep."
+                )
+                template["trigger"] = "flat_pocket"
+        elif pocket.stage == bl.LOCAL_POCKET_STAGE_MATERIALIZE:
+            template["preferred_move_family"] = "clone_local_then_validate"
+            template["rationale"] = (
+                "The last sweep exposed a fertile local pocket. Materialize the top winner through the clone-first lane before any durability check."
+            )
+            template["trigger"] = "materialize_sweep_winner"
+            if pocket.expected_materialized_candidate_name:
+                template["destination_candidate_name"] = (
+                    pocket.expected_materialized_candidate_name
+                )
+        elif pocket.stage == bl.LOCAL_POCKET_STAGE_DURABILITY:
+            template["preferred_move_family"] = "evaluate_candidate"
+            template["rationale"] = (
+                "A sweep-derived winner has been materialized. Durability evidence now outranks further same-pocket tuning."
+            )
+            template["trigger"] = "gut_check_due"
+            if pocket.last_materialized_profile_ref:
+                template["survivor_profile_ref"] = pocket.last_materialized_profile_ref
+            if pocket.last_materialized_candidate_name:
+                template["survivor_candidate_name"] = (
+                    pocket.last_materialized_candidate_name
+                )
+        return template
+
+    def _local_pocket_cadence_chunk_text(self, cadence: dict[str, Any]) -> str:
+        stage = str(cadence.get("stage") or "").strip() or bl.LOCAL_POCKET_STAGE_IDLE
+        handle_bits = self._template_handle_bits(cadence)
+        if cadence.get("family_id"):
+            handle_bits.append(
+                f"family={str(cadence.get('family_id') or '')[:24]}"
+            )
+        lines = [
+            f"- stage: {stage}",
+            f"- sweep_budget: {int(cadence.get('sweep_count_used') or 0)}/{int(cadence.get('sweep_cap') or 3)}",
+        ]
+        if handle_bits:
+            lines.append("- anchor_handle: " + ", ".join(handle_bits[:3]))
+        preferred_move_family = str(cadence.get("preferred_move_family") or "").strip()
+        if preferred_move_family:
+            lines.append(f"- preferred_move_family: {preferred_move_family}")
+        destination = str(cadence.get("destination_candidate_name") or "").strip()
+        if destination:
+            lines.append(f"- destination_candidate_name: {destination}")
+        used_axes = cadence.get("used_axes")
+        if isinstance(used_axes, list) and used_axes:
+            lines.append("- recent_axes: " + " ; ".join(str(item) for item in used_axes[:3]))
+        rationale = str(cadence.get("rationale") or "").strip()
+        if rationale:
+            lines.append(f"- rationale: {rationale}")
+        return "\n".join(lines).strip()
+
+    def _gut_check_context_chunk_text(
+        self,
+        tool_context: ToolContext,
+        cadence: dict[str, Any],
+    ) -> str:
+        if not bool(cadence.get("gut_check_due")):
+            return ""
+        target_horizon = int(cadence.get("gut_check_target_horizon_months") or 0)
+        profile_ref = str(
+            cadence.get("survivor_profile_ref") or cadence.get("profile_ref") or ""
+        ).strip()
+        candidate_name = str(
+            cadence.get("survivor_candidate_name")
+            or cadence.get("candidate_name")
+            or ""
+        ).strip()
+        lines: list[str] = [
+            "- preferred_next_tool: evaluate_candidate",
+            f"- target_horizon_months: {target_horizon}",
+            "- Durability evidence now takes priority over further same-pocket tuning.",
+        ]
+        if candidate_name or profile_ref:
+            handle_bits: list[str] = []
+            if candidate_name:
+                handle_bits.append(f"candidate_name={candidate_name}")
+            if profile_ref:
+                handle_bits.append(f"profile_ref={profile_ref}")
+            lines.append("- survivor_handle: " + ", ".join(handle_bits[:2]))
+        instruments = self._recent_known_instruments_for_handle(
+            tool_context,
+            candidate_name=candidate_name or None,
+            profile_ref=profile_ref or None,
+        )
+        if instruments:
+            lines.append("- planned_instruments: " + ", ".join(instruments))
+        lines.append(
+            self._compact_instrument_reference_text(
+                tool_context,
+                include_coverage=True,
+            )
+        )
+        return "\n".join(line for line in lines if str(line).strip()).strip()
+
+    def _reflection_prompts_chunk_text(
+        self,
+        tool_context: ToolContext,
+        prior_results: list[dict[str, Any]] | None,
+        cadence: dict[str, Any] | None,
+    ) -> str:
+        if not isinstance(cadence, dict) or not isinstance(prior_results, list):
+            return ""
+        pocket = self._local_pocket_state()
+        phase_name = str(cadence.get("phase_name") or "").strip()
+        results = [result for result in prior_results if isinstance(result, dict)]
+        if not results:
+            return ""
+        questions: list[str] = []
+        if (
+            phase_name in {"early", "mid"}
+            and str(cadence.get("stage") or "") == bl.LOCAL_POCKET_STAGE_PROBE
+            and int(cadence.get("sweep_count_used") or 0) == 0
+            and any(
+                str(result.get("tool") or "").strip() == "evaluate_candidate"
+                and self._eval_is_credible_for_sweep_probe(result)
+                for result in results
+            )
+        ):
+            questions = [
+                "Which local sub-slice is least tested here: timeframe, primary speed, or the next neighboring parameter band?",
+                "If this anchor is real, what is the highest-information micro-sweep around it right now?",
+            ]
+        elif any(
+            str(result.get("tool") or "").strip() == "inspect_artifact"
+            and str(result.get("artifact_kind") or "").strip() == "parameter_sweep"
+            and self._sweep_is_fertile(
+                pocket,
+                result.get("sweep_summary")
+                if isinstance(result.get("sweep_summary"), dict)
+                else None,
+            )
+            for result in results
+        ):
+            questions = [
+                "Did this sweep expose a real pocket or just a narrow ridge with one lucky top permutation?",
+                "Which neighboring slice would add the most information before the 12m gut-check closes the loop?",
+            ]
+        elif (
+            phase_name in {"early", "mid"}
+            and str(cadence.get("stage") or "").strip() == bl.LOCAL_POCKET_STAGE_PROBE
+            and int(cadence.get("generation") or 0) > 1
+            and any(
+                str(result.get("tool") or "").strip() == "evaluate_candidate"
+                and self._eval_is_local_pocket_survivor(result)
+                for result in results
+            )
+        ):
+            questions = [
+                "This pocket survived the durability check; which neighboring slice is now the next highest-information probe?",
+                "What would falsify this survivor fastest before you spend another sweep on the same family?",
+            ]
+        elif (
+            str(cadence.get("stage") or "").strip() == bl.LOCAL_POCKET_STAGE_PROBE
+            and int(cadence.get("sweep_count_used") or 0) >= 2
+            and not pocket.last_materialized_profile_ref
+            and any(
+                str(result.get("tool") or "").strip() in {"run_parameter_sweep", "inspect_artifact"}
+                for result in results
+            )
+        ):
+            questions = [
+                "Have these sweeps shown a genuine pocket, or are you still scanning a flat neighborhood with weak tuning signal?",
+                "What is the cleaner next move here: one last varied sweep, materialize the best variant, or pivot to a new pocket entirely?",
+            ]
+        if not questions:
+            return ""
+        return "\n".join(f"- {question}" for question in questions[:2])
+
     def _sweep_priority_prompt_state(
         self,
         tool_context: ToolContext,
@@ -5911,12 +6597,34 @@ class ResearchController:
             phase_name = str(
                 self._run_phase_info(step, step_limit, policy).get("name") or ""
             ).strip()
+        cadence = self._local_pocket_cadence_prompt_state(
+            tool_context,
+            step=step,
+            step_limit=step_limit,
+            policy=policy,
+        )
+        if (
+            isinstance(cadence, dict)
+            and str(cadence.get("stage") or "").strip() == bl.LOCAL_POCKET_STAGE_PROBE
+            and str(cadence.get("preferred_move_family") or "").strip() == "run_parameter_sweep"
+        ):
+            template: dict[str, Any] = {
+                "reason": str(cadence.get("rationale") or "").strip(),
+                "trigger": "local_pocket_cadence",
+            }
+            for key in ("profile_ref", "candidate_name", "indicator_ids", "instruments"):
+                if cadence.get(key) not in (None, "", [], {}):
+                    template[key] = cadence.get(key)
+            return template
+
+        if phase_name not in {"late", "wrap_up"}:
+            return None
         recent = self._recent_successful_step_results(
             tool_context,
             tool_names={"evaluate_candidate"},
             limit=16,
         )
-        if not recent:
+        if len(recent) < 2:
             return None
         latest_eval_result, _ = recent[-1]
         latest_handle = self._result_handle_state(latest_eval_result)
@@ -5930,51 +6638,6 @@ class ResearchController:
             latest_handle,
         ):
             return None
-
-        def build_template(reason: str, *, trigger: str) -> dict[str, Any]:
-            template: dict[str, Any] = dict(latest_handle)
-            indicator_ids = indicator_source.get("indicator_ids")
-            if isinstance(indicator_ids, list) and indicator_ids:
-                template["indicator_ids"] = [
-                    str(item).strip() for item in indicator_ids if str(item).strip()
-                ]
-            instruments = self._recent_known_instruments_for_handle(
-                tool_context,
-                candidate_name=(
-                    latest_handle["value"]
-                    if latest_handle["kind"] == "candidate_name"
-                    else None
-                ),
-                profile_ref=(
-                    latest_handle["value"]
-                    if latest_handle["kind"] == "profile_ref"
-                    else None
-                ),
-            )
-            if instruments:
-                template["instruments"] = instruments
-            template["reason"] = reason
-            template["trigger"] = trigger
-            return template
-
-        if (
-            phase_name in {"early", "mid"}
-            and self._eval_is_credible_for_sweep_probe(latest_eval_result)
-        ):
-            latest_payload = recent[-1][1]
-            latest_step = latest_payload.get("step")
-            if not self._has_later_sweep_for_handle(
-                tool_context,
-                latest_handle,
-                after_step=latest_step if isinstance(latest_step, int) else None,
-            ):
-                return build_template(
-                    "This live branch just produced a credible screen signal in an exploration phase. Probe the local pocket now before spending another 1:1 eval.",
-                    trigger="promising_probe",
-                )
-
-        if len(recent) < 2 or phase_name == "wrap_up":
-            return None
         prior_eval_result, _ = recent[-2]
         prior_handle = self._result_handle_state(prior_eval_result)
         if not prior_handle or latest_handle != prior_handle:
@@ -5983,10 +6646,31 @@ class ResearchController:
         prior_sig = self._eval_evidence_signature(prior_eval_result)
         if latest_sig != prior_sig:
             return None
-        template = build_template(
-            "This live branch has been evaluated twice with unchanged horizon, timeframe, validation, and coverage evidence.",
-            trigger="plateau_remeasure",
+        template: dict[str, Any] = dict(latest_handle)
+        indicator_ids = indicator_source.get("indicator_ids")
+        if isinstance(indicator_ids, list) and indicator_ids:
+            template["indicator_ids"] = [
+                str(item).strip() for item in indicator_ids if str(item).strip()
+            ]
+        instruments = self._recent_known_instruments_for_handle(
+            tool_context,
+            candidate_name=(
+                latest_handle["value"]
+                if latest_handle["kind"] == "candidate_name"
+                else None
+            ),
+            profile_ref=(
+                latest_handle["value"]
+                if latest_handle["kind"] == "profile_ref"
+                else None
+            ),
         )
+        if instruments:
+            template["instruments"] = instruments
+        template["reason"] = (
+            "This live branch has been evaluated twice with unchanged horizon, timeframe, validation, and coverage evidence.",
+        )
+        template["trigger"] = "plateau_remeasure"
         template["plateau_eval_count"] = 2
         return template
 
@@ -6248,6 +6932,21 @@ class ResearchController:
             lines.append(
                 "- sweep_rule: sweep outputs are not attempt_ids; use inspect_artifact with inspect_ref or artifact_dir."
             )
+        pocket = self._local_pocket_state()
+        if pocket.stage != bl.LOCAL_POCKET_STAGE_IDLE or pocket.gut_check_due:
+            parts = [f"stage={pocket.stage}"]
+            if pocket.anchor_candidate_name:
+                parts.append(f"candidate_name={pocket.anchor_candidate_name}")
+            if pocket.anchor_profile_ref:
+                parts.append(f"profile_ref={pocket.anchor_profile_ref}")
+            parts.append(
+                f"sweeps={int(pocket.sweep_count_used or 0)}/{int(pocket.sweep_cap or 3)}"
+            )
+            if pocket.gut_check_due and pocket.gut_check_target_horizon_months:
+                parts.append(
+                    f"gut_check={int(pocket.gut_check_target_horizon_months)}m"
+                )
+            lines.append("- local_pocket: " + ", ".join(parts[:5]))
         if isinstance(wrap_up_focus, dict):
             parts = [f"family={self._short_family_id(wrap_up_focus.get('family_id'))}"]
             if wrap_up_focus.get("profile_ref"):
@@ -6696,6 +7395,7 @@ class ResearchController:
         latest_result, _payload = self._latest_successful_step_result(
             tool_context,
             tool_names={
+                "inspect_artifact",
                 "prepare_profile",
                 "mutate_profile",
                 "validate_profile",
@@ -6723,7 +7423,57 @@ class ResearchController:
             or candidate_summary.get("profile_ref")
             or ""
         ).strip()
+        pocket = self._local_pocket_state()
+        if (
+            tool == "inspect_artifact"
+            and str(latest_result.get("artifact_kind") or "").strip()
+            == "parameter_sweep"
+            and pocket.stage == bl.LOCAL_POCKET_STAGE_MATERIALIZE
+        ):
+            followup_actions = (
+                latest_result.get("recommended_followup_actions")
+                if isinstance(latest_result.get("recommended_followup_actions"), list)
+                else []
+            )
+            for followup_action in followup_actions:
+                if not isinstance(followup_action, dict):
+                    continue
+                normalized_followup = _pathless_action_from_legacy_fields(
+                    dict(followup_action)
+                )
+                if str(normalized_followup.get("tool") or "").strip() != "prepare_profile":
+                    continue
+                if str(normalized_followup.get("mode") or "").strip() != "clone_local":
+                    continue
+                return normalized_followup
+            if pocket.expected_materialized_candidate_name:
+                template: dict[str, Any] = {
+                    "tool": "prepare_profile",
+                    "mode": "clone_local",
+                    "destination_candidate_name": pocket.expected_materialized_candidate_name,
+                }
+                if pocket.anchor_profile_ref:
+                    template["source_profile_ref"] = pocket.anchor_profile_ref
+                elif pocket.anchor_candidate_name:
+                    template["source_candidate_name"] = pocket.anchor_candidate_name
+                return template
         if tool in {"prepare_profile", "mutate_profile"} and candidate_name:
+            if (
+                tool == "prepare_profile"
+                and pocket.stage
+                in {
+                    bl.LOCAL_POCKET_STAGE_PROBE,
+                    bl.LOCAL_POCKET_STAGE_MATERIALIZE,
+                }
+                and pocket.expected_materialized_candidate_name
+                and candidate_name == pocket.expected_materialized_candidate_name
+                and pocket.expected_materialized_mutations
+            ):
+                return {
+                    "tool": "mutate_profile",
+                    "candidate_name": candidate_name,
+                    "mutations": list(pocket.expected_materialized_mutations),
+                }
             return {
                 "tool": "validate_profile",
                 "candidate_name": candidate_name,
@@ -6740,6 +7490,21 @@ class ResearchController:
         if tool == "register_profile" and (
             bool(latest_result.get("ready_to_evaluate")) or profile_ref or candidate_name
         ):
+            cadence = self._local_pocket_cadence_prompt_state(
+                tool_context,
+                step=step,
+                step_limit=step_limit,
+                policy=policy,
+            )
+            if (
+                isinstance(cadence, dict)
+                and str(cadence.get("stage") or "").strip()
+                in {
+                    bl.LOCAL_POCKET_STAGE_PROBE,
+                    bl.LOCAL_POCKET_STAGE_DURABILITY,
+                }
+            ):
+                return None
             if self._sweep_priority_prompt_state(
                 tool_context,
                 step=step,
@@ -9135,6 +9900,7 @@ class ResearchController:
         prefix = self._sanitize_label(
             str(action.get("candidate_name_prefix") or "sweep")
         )
+        quality_score_preset = self._configured_quality_score_preset()
         out_raw = action.get("output_dir")
         if isinstance(out_raw, str) and out_raw.strip():
             out_dir = Path(out_raw.strip()).resolve()
@@ -9150,6 +9916,8 @@ class ResearchController:
             ref,
             "--output-dir",
             str(out_dir),
+            "--quality-score-preset",
+            quality_score_preset,
         ]
         instruments = action.get("instruments")
         if isinstance(instruments, list):
@@ -9187,7 +9955,7 @@ class ResearchController:
         base["artifact_dir"] = str(out_dir)
         base["artifact_kind"] = "parameter_sweep"
         base["inspect_ref"] = out_dir.name
-        base["quality_score_preset"] = self.config.research.quality_score_preset
+        base["quality_score_preset"] = quality_score_preset
         base["source_profile_ref"] = ref
         source_candidate_name = str(action.get("source_candidate_name") or "").strip()
         if not source_candidate_name:
@@ -10725,6 +11493,15 @@ class ResearchController:
                     level="warning" if result.get("error") else "info",
                 )
                 step_payload["results"].append(result)
+                if isinstance(action, dict):
+                    self._update_local_pocket_after_result(
+                        tool_context,
+                        action,
+                        result,
+                        step=step,
+                        step_limit=step_limit,
+                        policy=policy,
+                    )
                 hard_failure = bool(result.get("error"))
                 res_tool = str(result.get("tool") or "")
                 if res_tool in tt.CLI_OK_TOOLS and not bool(result.get("ok", True)):
