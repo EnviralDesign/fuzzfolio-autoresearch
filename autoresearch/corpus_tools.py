@@ -173,6 +173,66 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def compute_scalar_metric_bonus(
+    row: dict[str, Any], scalar_metric_terms: list[dict[str, Any]] | None
+) -> tuple[float, list[dict[str, Any]]]:
+    total = 0.0
+    resolved_terms: list[dict[str, Any]] = []
+    for index, term in enumerate(list(scalar_metric_terms or []), start=1):
+        if not isinstance(term, dict):
+            continue
+        weight = _safe_float(term.get("weight"))
+        if weight is None or weight <= 0.0:
+            continue
+        direction = str(term.get("direction") or "higher").strip().lower()
+        name = str(term.get("name") or f"metric-{index}").strip() or f"metric-{index}"
+        field_candidates: list[str] = []
+        field = str(term.get("field") or "").strip()
+        if field:
+            field_candidates.append(field)
+        raw_candidates = term.get("field_candidates")
+        if isinstance(raw_candidates, list):
+            for candidate in raw_candidates:
+                token = str(candidate or "").strip()
+                if token and token not in field_candidates:
+                    field_candidates.append(token)
+        if not field_candidates:
+            continue
+        used_field = None
+        raw_value = None
+        for candidate in field_candidates:
+            value = _safe_float(row.get(candidate))
+            if value is None:
+                continue
+            used_field = candidate
+            raw_value = value
+            break
+        if used_field is None or raw_value is None:
+            continue
+        target = _safe_float(term.get("target"))
+        baseline = target if target is not None and target > 0.0 else 1.0
+        if direction == "lower":
+            fraction = 1.0 - (raw_value / baseline)
+        else:
+            fraction = raw_value / baseline
+        fraction = max(0.0, min(1.0, fraction))
+        component = float(weight) * fraction
+        total += component
+        resolved_terms.append(
+            {
+                "name": name,
+                "field": used_field,
+                "raw_value": raw_value,
+                "direction": "lower" if direction == "lower" else "higher",
+                "target": baseline,
+                "fraction": fraction,
+                "component": component,
+                "weight": float(weight),
+            }
+        )
+    return total, resolved_terms
+
+
 def _best_summary(attempt: dict[str, Any]) -> dict[str, Any]:
     best_summary = attempt.get("best_summary")
     return best_summary if isinstance(best_summary, dict) else {}
@@ -1320,6 +1380,7 @@ def select_promotion_board(
     drawdown_penalty: float = 0.0,
     trade_rate_bonus_weight: float = 0.0,
     trade_rate_bonus_target: float = 8.0,
+    scalar_metric_terms: list[dict[str, Any]] | None = None,
     max_drawdown_r: float | None = None,
     max_sameness_to_board: float | None = None,
     max_per_run: int | None = None,
@@ -1419,9 +1480,13 @@ def select_promotion_board(
             trade_bonus_component, trade_bonus_fraction = trade_rate_bonus(
                 row.get("trades_per_month_36m")
             )
+            scalar_metric_bonus_component, scalar_metric_bonus_terms = (
+                compute_scalar_metric_bonus(row, scalar_metric_terms)
+            )
             utility = (
                 float(row.get("score_36m") or float("-inf"))
                 + trade_bonus_component
+                + scalar_metric_bonus_component
                 - (float(novelty_penalty) * max_sameness_to_selected)
                 - drawdown_component
             )
@@ -1431,6 +1496,8 @@ def select_promotion_board(
             candidate["drawdown_penalty_component"] = drawdown_component
             candidate["trade_rate_bonus_component"] = trade_bonus_component
             candidate["trade_rate_bonus_fraction"] = trade_bonus_fraction
+            candidate["scalar_metric_bonus_component"] = scalar_metric_bonus_component
+            candidate["scalar_metric_bonus_terms"] = scalar_metric_bonus_terms
             candidate["max_sameness_to_selected"] = max_sameness_to_selected
             candidate["avg_sameness_to_selected"] = avg_sameness_to_selected
             candidate["closest_selected_attempt_id"] = closest_selected_attempt_id
@@ -1506,11 +1573,17 @@ def select_promotion_board(
         trade_bonus_component, trade_bonus_fraction = trade_rate_bonus(
             row.get("trades_per_month_36m")
         )
+        scalar_metric_bonus_component, scalar_metric_bonus_terms = compute_scalar_metric_bonus(
+            row, scalar_metric_terms
+        )
         candidate["trade_rate_bonus_component"] = trade_bonus_component
         candidate["trade_rate_bonus_fraction"] = trade_bonus_fraction
+        candidate["scalar_metric_bonus_component"] = scalar_metric_bonus_component
+        candidate["scalar_metric_bonus_terms"] = scalar_metric_bonus_terms
         candidate["selection_utility"] = (
             float(row.get("score_36m") or float("-inf"))
             + trade_bonus_component
+            + scalar_metric_bonus_component
             - (float(novelty_penalty) * candidate["max_sameness_to_board"])
         )
         alternates.append(candidate)

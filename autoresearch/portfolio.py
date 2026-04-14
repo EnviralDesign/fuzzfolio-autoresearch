@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from .corpus_tools import (
     build_similarity_payload as build_candidate_similarity_payload,
+    compute_scalar_metric_bonus,
     subset_similarity_payload,
     select_promotion_board,
 )
@@ -28,7 +29,60 @@ DEFAULT_SLEEVE_SPEC: dict[str, Any] = {
     "max_per_strategy_key": 1,
     "max_sameness_to_board": 0.78,
     "require_full_backtest_36": True,
+    "scalar_metric_terms": [],
 }
+
+DEFAULT_BREADTH_SCALAR_METRIC_TERMS: list[dict[str, Any]] = [
+    {
+        "name": "breadth_score",
+        "field_candidates": [
+            "breadth_score_36m",
+            "durability_score_36m",
+            "gain_breadth_score_36m",
+        ],
+        "direction": "higher",
+        "target": 1.0,
+        "weight": 6.0,
+    },
+    {
+        "name": "effective_profitable_episodes",
+        "field": "effective_profitable_episodes_36m",
+        "direction": "higher",
+        "target": 8.0,
+        "weight": 3.0,
+    },
+    {
+        "name": "active_gain_weeks_ratio",
+        "field": "active_gain_weeks_ratio_36m",
+        "direction": "higher",
+        "target": 0.35,
+        "weight": 3.0,
+    },
+    {
+        "name": "top_3_episode_share",
+        "field": "top_3_episode_share_36m",
+        "direction": "lower",
+        "target": 1.0,
+        "weight": 3.0,
+    },
+    {
+        "name": "gain_concentration_risk",
+        "field_candidates": [
+            "gain_concentration_risk_36m",
+            "episode_concentration_risk_36m",
+        ],
+        "direction": "lower",
+        "target": 1.0,
+        "weight": 3.0,
+    },
+    {
+        "name": "overlap_factor",
+        "field": "overlap_factor_36m",
+        "direction": "lower",
+        "target": 6.0,
+        "weight": 2.0,
+    },
+]
 
 
 DEFAULT_PORTFOLIO_SPEC: dict[str, Any] = {
@@ -58,6 +112,12 @@ DEFAULT_PORTFOLIO_SPEC: dict[str, Any] = {
             "trade_rate_bonus_weight": 8.0,
             "trade_rate_bonus_target": 4.0,
         },
+        {
+            **DEFAULT_SLEEVE_SPEC,
+            "name": "breadth",
+            "shortlist_size": 12,
+            "scalar_metric_terms": deepcopy(DEFAULT_BREADTH_SCALAR_METRIC_TERMS),
+        },
     ],
 }
 
@@ -81,9 +141,14 @@ def default_portfolio_spec() -> dict[str, Any]:
 
 
 def _merge_sleeve_spec(raw_spec: dict[str, Any], index: int) -> dict[str, Any]:
-    merged = {**DEFAULT_SLEEVE_SPEC, **dict(raw_spec)}
+    merged = deepcopy(DEFAULT_SLEEVE_SPEC)
+    merged.update(dict(raw_spec))
     name = str(merged.get("name") or "").strip()
     merged["name"] = name or f"sleeve-{index + 1}"
+    scalar_metric_terms = merged.get("scalar_metric_terms")
+    merged["scalar_metric_terms"] = (
+        deepcopy(scalar_metric_terms) if isinstance(scalar_metric_terms, list) else []
+    )
     return merged
 
 
@@ -217,6 +282,7 @@ def build_prefiltered_candidate_rows(
     sleeve_spec: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], int]:
     prefilter_limit = resolve_prefilter_limit(sleeve_spec)
+    scalar_metric_terms = list(sleeve_spec.get("scalar_metric_terms") or [])
     ranked_rows: list[dict[str, Any]] = []
     for row in qualified_rows:
         drawdown_r = _safe_float(row.get("max_drawdown_r_36m"))
@@ -228,9 +294,13 @@ def build_prefiltered_candidate_rows(
         trade_bonus_component, trade_bonus_fraction = _trade_rate_bonus(
             sleeve_spec, row.get("trades_per_month_36m")
         )
+        scalar_metric_bonus_component, scalar_metric_bonus_terms = (
+            compute_scalar_metric_bonus(row, scalar_metric_terms)
+        )
         provisional_utility = (
             float(row.get("score_36m") or float("-inf"))
             + trade_bonus_component
+            + scalar_metric_bonus_component
             - drawdown_component
         )
         ranked_row = dict(row)
@@ -241,6 +311,8 @@ def build_prefiltered_candidate_rows(
         ranked_row["prefilter_drawdown_penalty_component"] = drawdown_component
         ranked_row["prefilter_trade_rate_bonus_component"] = trade_bonus_component
         ranked_row["prefilter_trade_rate_bonus_fraction"] = trade_bonus_fraction
+        ranked_row["prefilter_scalar_metric_bonus_component"] = scalar_metric_bonus_component
+        ranked_row["prefilter_scalar_metric_bonus_terms"] = scalar_metric_bonus_terms
         ranked_rows.append(ranked_row)
     ranked_rows.sort(
         key=lambda row: (
@@ -307,6 +379,7 @@ def finalize_sleeve_selection(
         drawdown_penalty=float(sleeve_spec.get("drawdown_penalty", 0.65)),
         trade_rate_bonus_weight=float(sleeve_spec.get("trade_rate_bonus_weight", 0.0)),
         trade_rate_bonus_target=float(sleeve_spec.get("trade_rate_bonus_target", 8.0)),
+        scalar_metric_terms=list(sleeve_spec.get("scalar_metric_terms") or []),
         max_drawdown_r=prefilter_result.get("max_drawdown_cap"),
         max_sameness_to_board=(
             None

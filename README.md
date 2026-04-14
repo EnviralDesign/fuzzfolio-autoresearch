@@ -51,16 +51,41 @@ uv run autoresearch test-providers
 
 ## Daily Commands
 
+`build-portfolio` is the normal top-level daily ops command. With the repo-root `portfolio.config.json` in its default shape, it can catch up missing `36mo` full backtests, rebuild the portfolio snapshot, render portfolio profile drops, and export a dated bundle.
+
+Command hierarchy at a glance:
+
+- `build-portfolio`
+  - umbrella command for normal daily rebuilds
+  - optionally runs the same catch-up engine exposed directly as `calculate-full-backtests`
+  - then writes the canonical portfolio snapshot under `runs/derived/portfolio-report/<portfolio-name>/`
+  - optionally renders PNGs under `runs/derived/portfolio-report/<portfolio-name>/profile-drops/`
+  - optionally exports a dated bundle under `runs/derived/portfolio-exports/<portfolio-name>/<timestamp>/`
+- `calculate-full-backtests`
+  - leaf backfill command
+  - use it directly when you want to repair or advance `36mo` coverage without rebuilding portfolio artifacts
+- `build-shortlist-report`
+  - single-board sibling to `build-portfolio`
+  - useful for shortlist tuning and chart iteration
+- `export-portfolio-bundle`
+  - export-only leaf command for an existing portfolio report
+  - does not rerun catch-up or portfolio selection
+- `nuke-deep-caches`
+  - reset helper
+  - clears rebuildable deep artifacts so the next `build-portfolio` regenerates them from source
+- `build-attempt-catalog`, `audit-full-backtests`, `build-promotion-board`, `plot-corpus-score-vs-trades`, `dashboard`
+  - support and inspection commands
+
 Most useful root commands:
 
 ```powershell
+uv run autoresearch build-portfolio
 uv run autoresearch calculate-full-backtests
+uv run autoresearch build-shortlist-report
+uv run autoresearch export-portfolio-bundle
+uv run autoresearch nuke-deep-caches
 uv run autoresearch build-attempt-catalog
 uv run autoresearch audit-full-backtests
-uv run autoresearch build-shortlist-report
-uv run autoresearch build-portfolio
-uv run autoresearch nuke-deep-caches
-uv run autoresearch export-portfolio-bundle
 uv run autoresearch build-promotion-board
 uv run autoresearch plot-corpus-score-vs-trades
 uv run autoresearch dashboard
@@ -92,7 +117,7 @@ What it does not delete:
 
 ### 2. Resume corpus backfill
 
-This is the main heavy command. It fills missing attempt-local `36mo` full backtests, uses the detected dev sim-worker count by default, and is resumable when you do not pass `--force-rebuild`.
+This is the main backfill subcommand. It fills missing attempt-local `36mo` full backtests, uses the detected dev sim-worker count by default, and is resumable when you do not pass `--force-rebuild`.
 
 ```powershell
 uv run autoresearch calculate-full-backtests
@@ -172,7 +197,7 @@ Outputs:
 
 Note: most mutating CLI commands now refresh the catalog automatically when they finish.
 
-### 4. Audit whether the corpus is trustworthy yet
+### 5. Audit whether the corpus is trustworthy yet
 
 This is the readiness check. It does not generate cache.
 
@@ -198,9 +223,9 @@ What it tells you:
 - whether artifacts validate cleanly
 - whether shortlist and promotion outputs are still provisional
 
-### 5. Build the shortlist report
+### 6. Build the shortlist report
 
-This is the main selection command. It filters, applies similarity pressure, renders charts, and by default generates official profile-drop PNGs for the selected candidates.
+This is the main single-board selection command. It filters, applies similarity pressure, renders charts, and by default generates official profile-drop PNGs for the selected candidates.
 
 ```powershell
 uv run autoresearch build-shortlist-report
@@ -273,7 +298,9 @@ Useful chart files:
 - [corpus-score-vs-drawdown-36mo.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts/corpus-score-vs-drawdown-36mo.png)
 - [shortlist-similarity-heatmap.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts/shortlist-similarity-heatmap.png)
 
-### 6. Build a multi-sleeve portfolio
+### 7. Build a multi-sleeve portfolio
+
+This is the canonical top-level derived-output command. Use it when you want the normal portfolio rebuild path instead of running lower-level commands one by one.
 
 Use this when one shortlist is not enough and you want separate sleeves, such as:
 
@@ -292,6 +319,14 @@ Main command:
 ```powershell
 uv run autoresearch build-portfolio
 ```
+
+What it wraps when enabled by config or CLI overrides:
+
+- optional `36mo` full-backtest catch-up
+- corpus catalog refresh/load for selection
+- multi-sleeve portfolio selection and charts
+- optional portfolio profile-drop rendering
+- optional dated export bundle generation
 
 Important config keys in `portfolio.config.json`:
 
@@ -315,13 +350,18 @@ uv run autoresearch build-portfolio --portfolio-config .\portfolio.config.json
 
 Important notes:
 
+- `build-portfolio` is the normal umbrella command for daily portfolio rebuilds
 - `build-portfolio` wraps multiple shortlist-style sleeves from config
 - sleeves are unioned, not collapsed into one weighted sum
 - profile-drop PNG generation runs in parallel here too
 - optional catch-up can backfill missing `36mo` full-backtests before portfolio selection
-- by default it also exports a dated import bundle under `runs/derived/portfolio-exports/`
+- the canonical portfolio snapshot is not written inside an individual `runs/<run-id>/` folder
+- portfolio reports live under `runs/derived/portfolio-report/<portfolio-name>/`
+- portfolio export bundles live under `runs/derived/portfolio-exports/<portfolio-name>/<timestamp>/`
+- the `profile-drops/` folder is under the derived portfolio report root; PNGs appear there when generation is enabled and rendering succeeds
+- with the checked-in default `portfolio.config.json`, export is enabled
 
-Outputs:
+Canonical outputs:
 
 - `runs/derived/portfolio-report/<portfolio-name>/portfolio-report.json`
 - `runs/derived/portfolio-report/<portfolio-name>/portfolio-report.csv`
@@ -329,7 +369,7 @@ Outputs:
 - `runs/derived/portfolio-report/<portfolio-name>/profile-drops/*`
 - `runs/derived/portfolio-exports/<portfolio-name>/<timestamp>/*`
 
-### 7. Build a stricter promotion board
+### 8. Build a stricter promotion board
 
 Use this when you want a smaller, cleaner promotion gate rather than a richer shortlist/report package.
 
@@ -367,7 +407,7 @@ Outputs:
 - [promotion-board.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/promotion-board.json)
 - [promotion-board.csv](/C:/repos/fuzzfolio-autoresearch/runs/derived/promotion-board.csv)
 
-### 8. Generate the corpus trade-rate chart
+### 9. Generate the corpus trade-rate chart
 
 This renders the attempt-level `36mo` score vs trades/month scatter.
 
@@ -390,7 +430,7 @@ Outputs:
 
 Default x-axis cap is `300 trades/month`.
 
-### 9. Open the dashboard viewer
+### 10. Open the dashboard viewer
 
 The dashboard is now read-only. It does not rebuild or refresh corpus data.
 
@@ -441,7 +481,13 @@ Main derived outputs live under [runs/derived](/C:/repos/fuzzfolio-autoresearch/
 
 ## Recommended Defaults
 
-If you just want the practical sequence:
+If you just want the normal daily umbrella command:
+
+```powershell
+uv run autoresearch build-portfolio
+```
+
+If you want the explicit lower-level sequence instead:
 
 ```powershell
 uv run autoresearch calculate-full-backtests
@@ -466,6 +512,8 @@ uv run autoresearch build-portfolio --no-generate-profile-drops
 - `36mo` is the primary long-horizon evidence target.
 - The shortlist command is richer than the promotion board command.
 - The promotion board is the stricter gate.
+- `build-portfolio` writes portfolio artifacts under `runs/derived/portfolio-report/...`, not under individual `runs/<run-id>/` folders.
+- `export-portfolio-bundle` repackages an existing portfolio report; it does not rerun selection.
 - The dashboard is read-only and should be treated as a viewer, not as an orchestrator.
 - Most heavy commands support `--json` for machine-readable summaries.
 

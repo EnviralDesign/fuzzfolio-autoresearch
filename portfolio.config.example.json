@@ -45,6 +45,67 @@
       "max_per_strategy_key": 1,
       "max_sameness_to_board": 0.78,
       "require_full_backtest_36": true
+    },
+    {
+      "name": "breadth",
+      "prefilter_limit": 128,
+      "shortlist_size": 12,
+      "min_score_36": 40.0,
+      "min_retention_ratio": 0.0,
+      "min_trades_per_month": 0.0,
+      "max_drawdown_r": -1.0,
+      "drawdown_penalty": 0.65,
+      "trade_rate_bonus_weight": 0.0,
+      "trade_rate_bonus_target": 8.0,
+      "novelty_penalty": 18.0,
+      "max_per_run": 1,
+      "max_per_strategy_key": 1,
+      "max_sameness_to_board": 0.78,
+      "require_full_backtest_36": true,
+      "scalar_metric_terms": [
+        {
+          "name": "breadth_score",
+          "field_candidates": ["breadth_score_36m", "durability_score_36m", "gain_breadth_score_36m"],
+          "direction": "higher",
+          "target": 1.0,
+          "weight": 6.0
+        },
+        {
+          "name": "effective_profitable_episodes",
+          "field": "effective_profitable_episodes_36m",
+          "direction": "higher",
+          "target": 8.0,
+          "weight": 3.0
+        },
+        {
+          "name": "active_gain_weeks_ratio",
+          "field": "active_gain_weeks_ratio_36m",
+          "direction": "higher",
+          "target": 0.35,
+          "weight": 3.0
+        },
+        {
+          "name": "top_3_episode_share",
+          "field": "top_3_episode_share_36m",
+          "direction": "lower",
+          "target": 1.0,
+          "weight": 3.0
+        },
+        {
+          "name": "gain_concentration_risk",
+          "field_candidates": ["gain_concentration_risk_36m", "episode_concentration_risk_36m"],
+          "direction": "lower",
+          "target": 1.0,
+          "weight": 3.0
+        },
+        {
+          "name": "overlap_factor",
+          "field": "overlap_factor_36m",
+          "direction": "lower",
+          "target": 6.0,
+          "weight": 2.0
+        }
+      ]
     }
   ]
 }

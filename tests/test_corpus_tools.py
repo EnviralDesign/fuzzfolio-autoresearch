@@ -364,6 +364,48 @@ def test_select_promotion_board_can_reward_higher_trade_cadence():
     assert float(selected[0]["trade_rate_bonus_component"]) > 0.0
 
 
+def test_select_promotion_board_can_reward_breadth_metrics():
+    rows = [
+        {
+            "attempt_id": "A",
+            "run_id": "run-a",
+            "score_36m": 80.0,
+            "breadth_score_36m": 0.1,
+        },
+        {
+            "attempt_id": "B",
+            "run_id": "run-b",
+            "score_36m": 76.0,
+            "breadth_score_36m": 1.0,
+        },
+    ]
+    similarity_payload = {"leaders": [], "pairs": []}
+
+    board = ct.select_promotion_board(
+        rows,
+        similarity_payload,
+        board_size=1,
+        novelty_penalty=0.0,
+        scalar_metric_terms=[
+            {
+                "name": "breadth_score",
+                "field": "breadth_score_36m",
+                "direction": "higher",
+                "target": 1.0,
+                "weight": 6.0,
+            }
+        ],
+        max_sameness_to_board=None,
+        max_per_run=None,
+        max_per_strategy_key=None,
+    )
+
+    selected = board["selected"]
+    assert [row["attempt_id"] for row in selected] == ["B"]
+    assert float(selected[0]["scalar_metric_bonus_component"]) == 6.0
+    assert selected[0]["scalar_metric_bonus_terms"][0]["field"] == "breadth_score_36m"
+
+
 def test_catalog_summary_reports_full_backtest_validation_counts():
     rows = [
         {

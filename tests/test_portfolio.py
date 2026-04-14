@@ -12,7 +12,11 @@ def test_load_portfolio_spec_defaults_when_file_missing(tmp_path: Path) -> None:
     assert defaulted is True
     assert spec["portfolio_name"] == "default-portfolio"
     assert spec["full_backtest_job_timeout_seconds"] == 2400
-    assert [sleeve["name"] for sleeve in spec["sleeves"]] == ["quality", "cadence"]
+    assert [sleeve["name"] for sleeve in spec["sleeves"]] == [
+        "quality",
+        "cadence",
+        "breadth",
+    ]
 
 
 def test_build_sleeve_selection_annotates_selected_rows() -> None:
@@ -96,6 +100,51 @@ def test_build_sleeve_prefilter_uses_sleeve_local_scalar_utility() -> None:
     assert [row["attempt_id"] for row in result["candidate_rows"]] == ["fast-lower-score"]
     assert result["prefilter_limit"] == 1
     assert result["prefilter_excluded_count"] == 1
+
+
+def test_build_sleeve_prefilter_can_reward_breadth_metrics() -> None:
+    rows = [
+        {
+            "attempt_id": "narrow-higher-score",
+            "run_id": "run-a",
+            "score_36m": 80.0,
+            "durability_score_36m": 0.1,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+        {
+            "attempt_id": "broad-lower-score",
+            "run_id": "run-b",
+            "score_36m": 76.0,
+            "durability_score_36m": 1.0,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+    ]
+
+    result = pf.build_sleeve_prefilter(
+        rows,
+        {
+            **pf.DEFAULT_SLEEVE_SPEC,
+            "name": "breadth",
+            "prefilter_limit": 1,
+            "scalar_metric_terms": [
+                {
+                    "name": "breadth_score",
+                    "field_candidates": ["breadth_score_36m", "durability_score_36m"],
+                    "direction": "higher",
+                    "target": 1.0,
+                    "weight": 6.0,
+                }
+            ],
+        },
+    )
+
+    assert [row["attempt_id"] for row in result["candidate_rows"]] == ["broad-lower-score"]
+    assert float(result["candidate_rows"][0]["prefilter_scalar_metric_bonus_component"]) == 6.0
+    assert result["candidate_rows"][0]["prefilter_scalar_metric_bonus_terms"][0]["field"] == (
+        "durability_score_36m"
+    )
 
 
 def test_build_sleeve_selection_reports_prefilter_counts() -> None:
