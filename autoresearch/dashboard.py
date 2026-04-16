@@ -451,6 +451,11 @@ def _run_full_backtest_for_attempt(
 
     attempt_id = str(attempt.get("attempt_id") or "")
     print(f"[calculate-backtest] starting for attempt={attempt_id}", flush=True)
+    cli = FuzzfolioCli(config.fuzzfolio)
+    try:
+        cli.ensure_login()
+    except Exception as exc:
+        raise RuntimeError(f"Failed to authenticate fuzzfolio CLI: {exc}") from exc
 
     profile_ref = str(attempt.get("profile_ref") or "").strip()
     profile_path = _attempt_profile_path(attempt)
@@ -473,12 +478,11 @@ def _run_full_backtest_for_attempt(
         instruments = []
 
     if not profile_ref and profile_path is not None and profile_path.exists():
-        cli_for_upload = FuzzfolioCli(config.fuzzfolio)
         try:
             print(
                 f"[calculate-backtest] uploading local profile to cloud...", flush=True
             )
-            profile_ref = cli_for_upload.create_cloud_profile(profile_path)
+            profile_ref = cli.create_cloud_profile(profile_path)
         except Exception as exc:
             raise RuntimeError(f"Failed to upload profile to cloud: {exc}") from exc
 
@@ -518,7 +522,6 @@ def _run_full_backtest_for_attempt(
             f"[calculate-backtest] running sensitivity-basket: {' '.join(args)}",
             flush=True,
         )
-        cli = FuzzfolioCli(config.fuzzfolio)
         try:
             result = cli.run(
                 args,

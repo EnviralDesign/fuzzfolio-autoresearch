@@ -115,6 +115,11 @@ def test_run_full_backtest_salvages_outputs_after_timeout(
         )
         raise CliError("Command timed out after 1800s: fuzzfolio-agent-cli ...")
 
+    monkeypatch.setattr(
+        dashboard_mod.FuzzfolioCli,
+        "ensure_login",
+        lambda self: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
     monkeypatch.setattr(dashboard_mod.FuzzfolioCli, "run", fake_run)
 
     result = dashboard_mod._run_full_backtest_for_attempt(config, attempt)
@@ -176,6 +181,11 @@ def test_run_full_backtest_forwards_normalized_quality_score_preset(
 
         return _Result()
 
+    monkeypatch.setattr(
+        dashboard_mod.FuzzfolioCli,
+        "ensure_login",
+        lambda self: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
     monkeypatch.setattr(dashboard_mod.FuzzfolioCli, "run", fake_run)
 
     result = dashboard_mod._run_full_backtest_for_attempt(config, attempt)
@@ -187,6 +197,62 @@ def test_run_full_backtest_forwards_normalized_quality_score_preset(
     preset_index = seen_args.index("--quality-score-preset")
     assert seen_args[preset_index + 1] == "profile-drop"
     assert seen_args.count("--instrument") == 2
+
+
+def test_run_full_backtest_ensures_login_before_running_sensitivity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifact_dir = tmp_path / "eval"
+    artifact_dir.mkdir()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text("{}", encoding="utf-8")
+    (artifact_dir / "deep-replay-job.json").write_text(
+        json.dumps(
+            {
+                "request": {
+                    "timeframe": "M5",
+                    "instruments": ["EURUSD"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _StubConfig(tmp_path)
+    attempt = {
+        "attempt_id": "run-attempt-auth-refresh",
+        "artifact_dir": str(artifact_dir),
+        "profile_ref": "cloud-ref",
+        "profile_path": str(profile_path),
+    }
+
+    call_order: list[str] = []
+
+    def fake_ensure_login(self):
+        call_order.append("ensure_login")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_run(self, args, **kwargs):
+        call_order.append("run")
+        output_dir = Path(args[args.index("--output-dir") + 1])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "best-cell-path-detail.json").write_text(
+            json.dumps({"curve": {"points": []}}), encoding="utf-8"
+        )
+        (output_dir / "sensitivity-response.json").write_text(
+            json.dumps({"data": {"aggregate": {"quality_score": {"score": 55.0}}}}),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(dashboard_mod.FuzzfolioCli, "ensure_login", fake_ensure_login)
+    monkeypatch.setattr(dashboard_mod.FuzzfolioCli, "run", fake_run)
+
+    result = dashboard_mod._run_full_backtest_for_attempt(config, attempt)
+
+    assert result["curve_path"] == str(
+        artifact_dir / dashboard_mod.FULL_BACKTEST_CURVE_FILENAME
+    )
+    assert call_order[:2] == ["ensure_login", "run"]
 
 
 def test_copy_full_backtest_outputs_surfaces_profile_not_found_from_result_json(

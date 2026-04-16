@@ -503,6 +503,429 @@ def test_render_portfolio_profile_drops_updates_existing_report(
     assert "generated_at" in updated_payload
 
 
+def test_cmd_build_portfolio_continues_when_catch_up_reports_failures(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    derived_root = tmp_path / "runs" / "derived"
+    derived_root.mkdir(parents=True, exist_ok=True)
+    attempt_catalog_summary_path = derived_root / "attempt-catalog-summary.json"
+    full_backtest_failures_json_path = derived_root / "full-backtest-failures.json"
+    attempt_catalog_summary_path.write_text(
+        json.dumps({"attempt_count": 1}, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    full_backtest_failures_json_path.write_text(
+        json.dumps({"failed_count": 7}, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        derived_root=derived_root,
+        attempt_catalog_summary_path=attempt_catalog_summary_path,
+        full_backtest_failures_json_path=full_backtest_failures_json_path,
+        fuzzfolio=SimpleNamespace(),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+
+    portfolio_spec = {
+        "portfolio_name": "default-portfolio",
+        "catch_up_full_backtests": True,
+        "catch_up_force_rebuild": False,
+        "catch_up_require_scrutiny_36": False,
+        "generate_profile_drops": False,
+        "export_bundle": False,
+        "sleeves": [{"name": "quality"}],
+    }
+    monkeypatch.setattr(
+        ar_main,
+        "load_portfolio_spec",
+        lambda _path: (portfolio_spec, False),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "cmd_calculate_full_backtests",
+        lambda **_kwargs: 1,
+    )
+
+    rows = [
+        {
+            "attempt_id": "attempt-a",
+            "run_id": "run-a",
+            "candidate_name": "alpha",
+            "profile_ref": "profile-a",
+            "score_36m": 88.0,
+            "composite_score": 88.0,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        }
+    ]
+    monkeypatch.setattr(
+        ar_main,
+        "_selection_corpus_rows",
+        lambda *_args, **_kwargs: (rows, {"source": "materialized", "row_count": 1}),
+    )
+
+    monkeypatch.setattr(
+        ar_main,
+        "build_sleeve_prefilter",
+        lambda _rows, sleeve_spec: {
+            "name": sleeve_spec.get("name"),
+            "spec": sleeve_spec,
+            "qualified_rows": list(rows),
+            "candidate_rows": list(rows),
+            "prefilter_limit": 1,
+            "prefilter_excluded_count": 0,
+            "filter_rejections": {},
+        },
+    )
+    monkeypatch.setattr(ar_main, "build_candidate_similarity_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        ar_main,
+        "finalize_sleeve_selection",
+        lambda sleeve, similarity_payload=None: {
+            **sleeve,
+            "selected_rows": list(rows),
+            "board": {"alternates": []},
+        },
+    )
+
+    def fake_merge_portfolio_sleeves(items):
+        candidate_rows: list[dict[str, object]] = []
+        selected_rows: list[dict[str, object]] = []
+        for item in items:
+            candidate_rows.extend(list(item.get("candidate_rows") or []))
+            selected_rows.extend(list(item.get("selected_rows") or []))
+        return {
+            "candidate_rows": candidate_rows,
+            "selected_rows": selected_rows,
+            "selected_overlap_count": 0,
+        }
+
+    monkeypatch.setattr(ar_main, "merge_portfolio_sleeves", fake_merge_portfolio_sleeves)
+    monkeypatch.setattr(ar_main, "subset_similarity_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ar_main, "render_attempt_tradeoff_scatter_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ar_main, "render_attempt_tradeoff_overlay_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ar_main, "render_attempt_drawdown_scatter_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ar_main, "render_similarity_scatter_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ar_main, "render_similarity_heatmap_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ar_main, "_build_selection_basket_summary", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ar_main, "_build_selection_basket_curve", lambda *_args, **_kwargs: {})
+
+    exit_code = ar_main.cmd_build_portfolio(
+        run_ids=None,
+        attempt_ids=None,
+        portfolio_config=None,
+        catch_up_full_backtests=None,
+        catch_up_force_rebuild=None,
+        catch_up_require_scrutiny_36=None,
+        generate_profile_drops=None,
+        export_bundle=None,
+        profile_drop_workers=None,
+        as_json=True,
+    )
+
+    assert exit_code == 0
+
+    report_path = derived_root / "portfolio-report" / "default-portfolio" / "portfolio-report.json"
+    assert report_path.exists() is True
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report_payload["catch_up_summary"]["exit_code"] == 1
+    assert report_payload["catch_up_summary"]["status"] == "partial_failure"
+    assert report_payload["selected_union_count"] == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["catch_up_exit_code"] == 1
+    assert payload["catch_up_status"] == "partial_failure"
+    assert payload["selected_union_count"] == 1
+
+
+def test_build_parser_includes_render_corpus_profile_drops_defaults() -> None:
+    parser = ar_main.build_parser()
+
+    args = parser.parse_args(["render-corpus-profile-drops"])
+
+    assert args.command == "render-corpus-profile-drops"
+    assert args.top_results == 100
+    assert args.rank_start == 0
+    assert args.lookback_months == 36
+    assert args.profile_drop_workers == 4
+    assert args.profile_drop_timeout_seconds == 1800
+    assert args.force_rebuild is False
+    assert args.run_id is None
+    assert args.attempt_id is None
+
+
+def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=tmp_path / "runs",
+        fuzzfolio=SimpleNamespace(),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+
+    first_rows = [
+        {
+            "attempt_id": "attempt-a",
+            "run_id": "run-a",
+            "candidate_name": "alpha",
+            "score_36m": 90.0,
+            "composite_score": 80.0,
+            "artifact_dir": str(tmp_path / "runs" / "run-a" / "evals" / "alpha"),
+            "has_full_backtest_36m": False,
+            "full_backtest_validation_status_36m": "missing",
+        },
+        {
+            "attempt_id": "attempt-b",
+            "run_id": "run-b",
+            "candidate_name": "beta",
+            "score_36m": 70.0,
+            "composite_score": 65.0,
+            "artifact_dir": str(tmp_path / "runs" / "run-b" / "evals" / "beta"),
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+    ]
+    refreshed_rows = [
+        {
+            **first_rows[0],
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+        first_rows[1],
+    ]
+    selection_calls = {"count": 0}
+
+    def fake_selection_corpus_rows(*_args, **_kwargs):
+        selection_calls["count"] += 1
+        rows = first_rows if selection_calls["count"] == 1 else refreshed_rows
+        return rows, {"source": "materialized"}
+
+    monkeypatch.setattr(ar_main, "_selection_corpus_rows", fake_selection_corpus_rows)
+
+    catchup_calls: list[dict[str, object]] = []
+
+    def fake_calculate_full_backtests(**kwargs):
+        catchup_calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(ar_main, "cmd_calculate_full_backtests", fake_calculate_full_backtests)
+
+    render_calls: list[dict[str, object]] = []
+
+    def fake_render_profile_drop_rows(**kwargs):
+        render_calls.append(kwargs)
+        return [
+            {
+                "attempt_id": "attempt-a",
+                "run_id": "run-a",
+                "candidate_name": "alpha",
+                "status": "rendered",
+                "png_path": str(tmp_path / "runs" / "run-a" / "evals" / "alpha" / "profile-drop-36mo.png"),
+                "manifest_path": str(
+                    tmp_path / "runs" / "run-a" / "evals" / "alpha" / "profile-drop-36mo.manifest.json"
+                ),
+            }
+        ]
+
+    monkeypatch.setattr(ar_main, "_render_profile_drop_rows", fake_render_profile_drop_rows)
+
+    exit_code = ar_main.cmd_render_corpus_profile_drops(
+        run_ids=None,
+        attempt_ids=None,
+        top_results=1,
+        rank_start=0,
+        lookback_months=36,
+        profile_drop_workers=3,
+        profile_drop_timeout_seconds=90,
+        force_rebuild=False,
+        as_json=True,
+    )
+
+    assert exit_code == 0
+    assert len(catchup_calls) == 1
+    assert catchup_calls[0]["attempt_ids"] == ["attempt-a"]
+    assert catchup_calls[0]["force_rebuild"] is False
+    assert catchup_calls[0]["require_scrutiny_36"] is False
+    assert selection_calls["count"] == 2
+    assert len(render_calls) == 1
+    assert render_calls[0]["layout_mode"] == "attempt_local"
+    assert render_calls[0]["output_root"] is None
+    assert [row["attempt_id"] for row in render_calls[0]["rows"]] == ["attempt-a"]
+    assert render_calls[0]["rows"][0]["full_backtest_validation_status_36m"] == "valid"
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_count"] == 1
+    assert payload["rank_start"] == 0
+    assert payload["healed_full_backtests"] == 1
+    assert payload["profile_drop_rendered"] == 1
+    assert payload["profile_drop_cached"] == 0
+    assert payload["profile_drop_failed"] == 0
+
+
+def test_cmd_render_corpus_profile_drops_continues_when_catch_up_returns_nonzero(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=tmp_path / "runs",
+        fuzzfolio=SimpleNamespace(),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+
+    rows = [
+        {
+            "attempt_id": "attempt-a",
+            "run_id": "run-a",
+            "candidate_name": "alpha",
+            "score_36m": 90.0,
+            "composite_score": 80.0,
+            "artifact_dir": str(tmp_path / "runs" / "run-a" / "evals" / "alpha"),
+            "has_full_backtest_36m": False,
+            "full_backtest_validation_status_36m": "missing",
+        }
+    ]
+
+    selection_calls = {"count": 0}
+
+    def fake_selection_corpus_rows(*_args, **_kwargs):
+        selection_calls["count"] += 1
+        return rows, {"source": "materialized"}
+
+    monkeypatch.setattr(ar_main, "_selection_corpus_rows", fake_selection_corpus_rows)
+    monkeypatch.setattr(
+        ar_main,
+        "cmd_calculate_full_backtests",
+        lambda **_kwargs: 1,
+    )
+
+    render_calls: list[dict[str, object]] = []
+
+    def fake_render_profile_drop_rows(**kwargs):
+        render_calls.append(kwargs)
+        return [
+            {
+                "attempt_id": "attempt-a",
+                "run_id": "run-a",
+                "candidate_name": "alpha",
+                "status": "failed",
+                "error": "missing full-backtest artifacts",
+            }
+        ]
+
+    monkeypatch.setattr(ar_main, "_render_profile_drop_rows", fake_render_profile_drop_rows)
+
+    exit_code = ar_main.cmd_render_corpus_profile_drops(
+        run_ids=None,
+        attempt_ids=None,
+        top_results=1,
+        rank_start=0,
+        lookback_months=36,
+        profile_drop_workers=2,
+        profile_drop_timeout_seconds=60,
+        force_rebuild=False,
+        as_json=True,
+    )
+
+    assert exit_code == 1
+    assert selection_calls["count"] == 2
+    assert len(render_calls) == 1
+    assert render_calls[0]["layout_mode"] == "attempt_local"
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_count"] == 1
+    assert payload["rank_start"] == 0
+    assert payload["full_backtest_catch_up_exit_code"] == 1
+    assert payload["profile_drop_rendered"] == 0
+    assert payload["profile_drop_cached"] == 0
+    assert payload["profile_drop_failed"] == 1
+
+
+def test_cmd_render_corpus_profile_drops_respects_rank_start(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=tmp_path / "runs",
+        fuzzfolio=SimpleNamespace(),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+
+    rows = [
+        {
+            "attempt_id": "attempt-a",
+            "run_id": "run-a",
+            "candidate_name": "alpha",
+            "score_36m": 95.0,
+            "composite_score": 95.0,
+            "artifact_dir": str(tmp_path / "runs" / "run-a" / "evals" / "alpha"),
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+        {
+            "attempt_id": "attempt-b",
+            "run_id": "run-b",
+            "candidate_name": "beta",
+            "score_36m": 85.0,
+            "composite_score": 85.0,
+            "artifact_dir": str(tmp_path / "runs" / "run-b" / "evals" / "beta"),
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+        {
+            "attempt_id": "attempt-c",
+            "run_id": "run-c",
+            "candidate_name": "gamma",
+            "score_36m": 75.0,
+            "composite_score": 75.0,
+            "artifact_dir": str(tmp_path / "runs" / "run-c" / "evals" / "gamma"),
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+    ]
+
+    monkeypatch.setattr(
+        ar_main,
+        "_selection_corpus_rows",
+        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "cmd_calculate_full_backtests",
+        lambda **_kwargs: 0,
+    )
+
+    render_calls: list[dict[str, object]] = []
+
+    def fake_render_profile_drop_rows(**kwargs):
+        render_calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(ar_main, "_render_profile_drop_rows", fake_render_profile_drop_rows)
+
+    exit_code = ar_main.cmd_render_corpus_profile_drops(
+        run_ids=None,
+        attempt_ids=None,
+        top_results=1,
+        rank_start=1,
+        lookback_months=36,
+        profile_drop_workers=2,
+        profile_drop_timeout_seconds=60,
+        force_rebuild=False,
+        as_json=True,
+    )
+
+    assert exit_code == 0
+    assert len(render_calls) == 1
+    assert [row["attempt_id"] for row in render_calls[0]["rows"]] == ["attempt-b"]
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_count"] == 1
+    assert payload["rank_start"] == 1
+
+
 def test_public_portfolio_row_strips_path_fields() -> None:
     public = ar_main._public_portfolio_row(
         {
@@ -926,3 +1349,245 @@ def test_render_profile_drop_for_attempt_falls_back_when_metadata_writer_fails(
     assert "EURUSD profile on M15 using ADX" in manifest_payload["long_description"]
     assert bundle_payload["profile"]["description"] == manifest_payload["long_description"]
     assert Path(result["presentation_metadata_path"]).exists() is False
+
+
+def test_render_profile_drop_for_attempt_attempt_local_layout_caches_in_hidden_folder(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "runs" / "run-c"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = run_dir / "evals" / "cand-local"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    (artifact_dir / "notes").mkdir(parents=True, exist_ok=True)
+    working_dir = tmp_path
+
+    class FakeCli:
+        def run(self, args, cwd=None, timeout_seconds=None, check=True):
+            output_root_arg = Path(args[args.index("--output-root") + 1])
+            bundle_dir = output_root_arg / "bundle-0001"
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            (bundle_dir / "profile-document.json").write_text(
+                json.dumps(
+                    {
+                        "profile": {
+                            "name": "cand-local",
+                            "description": "Local profile description.",
+                            "directionMode": "both",
+                            "indicators": [],
+                        }
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_run_external(argv, cwd=None, timeout_seconds=None):
+        png_path = Path(argv[argv.index("--out") + 1])
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        png_path.write_text("png", encoding="utf-8")
+
+    config = SimpleNamespace(
+        research=SimpleNamespace(
+            quality_score_preset="profile-drop",
+            presentation_metadata_provider_profile="",
+        ),
+        fuzzfolio=SimpleNamespace(workspace_root=None),
+        providers={},
+    )
+    row = {
+        "attempt_id": "attempt-local-1",
+        "run_id": "run-c",
+        "candidate_name": "cand-local",
+        "profile_ref": "prof-local",
+    }
+    attempt = {
+        "attempt_id": "attempt-local-1",
+        "candidate_name": "cand-local",
+        "profile_ref": "prof-local",
+        "artifact_dir": str(artifact_dir),
+    }
+
+    monkeypatch.setattr(
+        ar_main,
+        "_build_package_inputs",
+        lambda *_args, **_kwargs: {
+            "artifact_dir": artifact_dir,
+            "profile_ref": "prof-local",
+            "profile_path": tmp_path / "profiles" / "cand-local.json",
+            "timeframe": "M15",
+            "instruments": ["EURUSD"],
+            "lookback_months": 36,
+        },
+    )
+    monkeypatch.setattr(ar_main, "_cloud_profile_exists", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ar_main, "_run_external", fake_run_external)
+
+    result_first = ar_main._render_profile_drop_for_attempt(
+        config=config,
+        cli=FakeCli(),
+        renderer_executable=tmp_path / "renderer",
+        working_dir=working_dir,
+        run_dir=run_dir,
+        attempts=[attempt],
+        row=row,
+        attempt=attempt,
+        output_root=None,
+        lookback_months=36,
+        force_rebuild=False,
+        timeout_seconds=30,
+        emit=None,
+        layout_mode="attempt_local",
+    )
+
+    hidden_root = artifact_dir / ".profile-drop-36mo"
+    bundle_dir = hidden_root / "bundle" / "bundle-0001"
+    assert result_first["status"] == "rendered"
+    assert Path(result_first["png_path"]) == artifact_dir / "profile-drop-36mo.png"
+    assert Path(result_first["manifest_path"]) == artifact_dir / "profile-drop-36mo.manifest.json"
+    assert hidden_root.exists() is True
+    assert bundle_dir.exists() is True
+    assert (artifact_dir / "notes").exists() is True
+
+    result_cached = ar_main._render_profile_drop_for_attempt(
+        config=config,
+        cli=FakeCli(),
+        renderer_executable=tmp_path / "renderer",
+        working_dir=working_dir,
+        run_dir=run_dir,
+        attempts=[attempt],
+        row=row,
+        attempt=attempt,
+        output_root=None,
+        lookback_months=36,
+        force_rebuild=False,
+        timeout_seconds=30,
+        emit=None,
+        layout_mode="attempt_local",
+    )
+
+    assert result_cached["status"] == "cached"
+    assert (artifact_dir / "notes").exists() is True
+
+
+def test_render_profile_drop_for_attempt_uses_cache_before_cloud_profile_repair(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "runs" / "run-d"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = run_dir / "evals" / "cand-cache"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    working_dir = tmp_path
+    renderer_calls: list[list[str]] = []
+
+    class FakeCli:
+        def run(self, args, cwd=None, timeout_seconds=None, check=True):
+            output_root_arg = Path(args[args.index("--output-root") + 1])
+            bundle_dir = output_root_arg / "bundle-0001"
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            (bundle_dir / "profile-document.json").write_text(
+                json.dumps(
+                    {
+                        "profile": {
+                            "name": "cand-cache",
+                            "description": "Local profile description.",
+                            "directionMode": "both",
+                            "indicators": [],
+                        }
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_run_external(argv, cwd=None, timeout_seconds=None):
+        renderer_calls.append(list(argv))
+        png_path = Path(argv[argv.index("--out") + 1])
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        png_path.write_text("png", encoding="utf-8")
+
+    config = SimpleNamespace(
+        research=SimpleNamespace(
+            quality_score_preset="profile-drop",
+            presentation_metadata_provider_profile="",
+        ),
+        fuzzfolio=SimpleNamespace(workspace_root=None),
+        providers={},
+    )
+    row = {
+        "attempt_id": "attempt-cache-1",
+        "run_id": "run-d",
+        "candidate_name": "cand-cache",
+        "profile_ref": "prof-stale",
+    }
+    attempt = {
+        "attempt_id": "attempt-cache-1",
+        "candidate_name": "cand-cache",
+        "profile_ref": "prof-stale",
+        "artifact_dir": str(artifact_dir),
+    }
+
+    monkeypatch.setattr(
+        ar_main,
+        "_build_package_inputs",
+        lambda *_args, **_kwargs: {
+            "artifact_dir": artifact_dir,
+            "profile_ref": "prof-stale",
+            "profile_path": tmp_path / "profiles" / "cand-cache.json",
+            "timeframe": "M15",
+            "instruments": ["EURUSD"],
+            "lookback_months": 36,
+        },
+    )
+    monkeypatch.setattr(ar_main, "_cloud_profile_exists", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ar_main, "_run_external", fake_run_external)
+
+    result_first = ar_main._render_profile_drop_for_attempt(
+        config=config,
+        cli=FakeCli(),
+        renderer_executable=tmp_path / "renderer",
+        working_dir=working_dir,
+        run_dir=run_dir,
+        attempts=[attempt],
+        row=row,
+        attempt=attempt,
+        output_root=None,
+        lookback_months=36,
+        force_rebuild=False,
+        timeout_seconds=30,
+        emit=None,
+        layout_mode="attempt_local",
+    )
+
+    assert result_first["status"] == "rendered"
+    assert len(renderer_calls) == 1
+
+    monkeypatch.setattr(ar_main, "_cloud_profile_exists", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        ar_main,
+        "_create_cloud_profile",
+        lambda *_args, **_kwargs: pytest.fail("cached render should not recreate cloud profile"),
+    )
+
+    result_second = ar_main._render_profile_drop_for_attempt(
+        config=config,
+        cli=FakeCli(),
+        renderer_executable=tmp_path / "renderer",
+        working_dir=working_dir,
+        run_dir=run_dir,
+        attempts=[attempt],
+        row=row,
+        attempt=attempt,
+        output_root=None,
+        lookback_months=36,
+        force_rebuild=False,
+        timeout_seconds=30,
+        emit=None,
+        layout_mode="attempt_local",
+    )
+
+    assert result_second["status"] == "cached"
+    assert len(renderer_calls) == 1
