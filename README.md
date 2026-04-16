@@ -73,6 +73,10 @@ Command hierarchy at a glance:
 - `render-portfolio-profile-drops`
   - repair-only leaf command for an existing portfolio report
   - rerenders `profile-drops/*` without rerunning catch-up or portfolio selection
+- `render-corpus-profile-drops`
+  - corpus browsing leaf command
+  - renders attempt-local `profile-drop-36mo.*` artifacts in place for ranked corpus slices
+  - heals missing `36mo` full backtests first when possible, then skips already-cached in-place drops unless forced
 - `nuke-deep-caches`
   - reset helper
   - clears rebuildable deep artifacts so the next `build-portfolio` regenerates them from source
@@ -87,6 +91,7 @@ uv run autoresearch calculate-full-backtests
 uv run autoresearch build-shortlist-report
 uv run autoresearch export-portfolio-bundle
 uv run autoresearch render-portfolio-profile-drops
+uv run autoresearch render-corpus-profile-drops
 uv run autoresearch nuke-deep-caches
 uv run autoresearch build-attempt-catalog
 uv run autoresearch audit-full-backtests
@@ -185,7 +190,54 @@ Important flags:
 - `--force-rebuild`
   - ignore current scrutiny caches and rebuild them
 
-### 4. Rebuild the corpus catalog
+### 4. Render corpus profile drops in place
+
+Use this when you want large-scale visual inspection across the corpus without rebuilding shortlist or portfolio derived outputs.
+
+```powershell
+uv run autoresearch render-corpus-profile-drops --top-results 1000
+```
+
+Default behavior:
+
+- selects ranked corpus rows from the same catalog used by shortlist and portfolio selection
+- optionally heals missing attempt-local `36mo` full backtests first
+- writes visible artifacts directly into each attempt `artifact_dir`
+- keeps bundle/cache internals under a hidden attempt-local `.profile-drop-36mo/` folder
+- skips existing matching drops unless `--force-rebuild` is passed
+
+Useful variants:
+
+```powershell
+uv run autoresearch render-corpus-profile-drops --top-results 250
+uv run autoresearch render-corpus-profile-drops --rank-start 1000 --top-results 250
+uv run autoresearch render-corpus-profile-drops --attempt-id 20260327T205658482523Z-agentic-aebf78-attempt-00045
+uv run autoresearch render-corpus-profile-drops --run-id 20260327T205658482523Z-agentic-aebf78 --top-results 50
+uv run autoresearch render-corpus-profile-drops --top-results 250 --force-rebuild
+uv run autoresearch render-corpus-profile-drops --top-results 250 --json
+```
+
+Important flags:
+
+- `--top-results`
+  - size of the ranked slice to consider
+- `--rank-start`
+  - zero-based ranked offset before taking `--top-results`
+  - useful for browsing top, middle, and lower-ranked windows separately
+- `--run-id`
+  - repeatable run scope filter
+- `--attempt-id`
+  - repeatable exact attempt filter
+- `--force-rebuild`
+  - rerender even when the in-place PNG and manifest are already current
+
+Artifacts written:
+
+- attempt-local `profile-drop-36mo.png`
+- attempt-local `profile-drop-36mo.manifest.json`
+- attempt-local hidden cache folder `.profile-drop-36mo/`
+
+### 5. Rebuild the corpus catalog
 
 This indexes the whole corpus and summarizes what evidence exists per attempt.
 
@@ -201,7 +253,7 @@ Outputs:
 
 Note: most mutating CLI commands now refresh the catalog automatically when they finish.
 
-### 5. Audit whether the corpus is trustworthy yet
+### 6. Audit whether the corpus is trustworthy yet
 
 This is the readiness check. It does not generate cache.
 
@@ -227,7 +279,7 @@ What it tells you:
 - whether artifacts validate cleanly
 - whether shortlist and promotion outputs are still provisional
 
-### 6. Build the shortlist report
+### 7. Build the shortlist report
 
 This is the main single-board selection command. It filters, applies similarity pressure, renders charts, and by default generates official profile-drop PNGs for the selected candidates.
 
@@ -302,7 +354,7 @@ Useful chart files:
 - [corpus-score-vs-drawdown-36mo.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts/corpus-score-vs-drawdown-36mo.png)
 - [shortlist-similarity-heatmap.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts/shortlist-similarity-heatmap.png)
 
-### 7. Build a multi-sleeve portfolio
+### 8. Build a multi-sleeve portfolio
 
 This is the canonical top-level derived-output command. Use it when you want the normal portfolio rebuild path instead of running lower-level commands one by one.
 
@@ -373,7 +425,7 @@ Canonical outputs:
 - `runs/derived/portfolio-report/<portfolio-name>/profile-drops/*`
 - `runs/derived/portfolio-exports/<portfolio-name>/<timestamp>/*`
 
-### 8. Build a stricter promotion board
+### 9. Build a stricter promotion board
 
 Use this when you want a smaller, cleaner promotion gate rather than a richer shortlist/report package.
 
@@ -411,7 +463,7 @@ Outputs:
 - [promotion-board.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/promotion-board.json)
 - [promotion-board.csv](/C:/repos/fuzzfolio-autoresearch/runs/derived/promotion-board.csv)
 
-### 9. Generate the corpus trade-rate chart
+### 10. Generate the corpus trade-rate chart
 
 This renders the attempt-level `36mo` score vs trades/month scatter.
 
@@ -434,7 +486,7 @@ Outputs:
 
 Default x-axis cap is `300 trades/month`.
 
-### 10. Open the dashboard viewer
+### 11. Open the dashboard viewer
 
 The dashboard is now read-only. It does not rebuild or refresh corpus data.
 
