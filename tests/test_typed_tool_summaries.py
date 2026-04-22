@@ -119,6 +119,7 @@ def test_summarize_sweep_results_payload_plateau() -> None:
         artifact_dir=Path(r"C:\tmp\sweep"),
     )
     assert summary is not None
+    assert summary["mode"] == "deterministic"
     assert summary["fitness_metric"] == "quality_score"
     assert summary["top_score"] == 57.2705
     assert summary["top_parameters"] == {
@@ -182,12 +183,13 @@ def test_summarize_sweep_handle_omits_artifact_path() -> None:
         {
             "inspect_ref": "sweep_alpha_20260401",
             "artifact_dir": r"C:\tmp\sweep_alpha_20260401",
+            "mode": "deterministic",
             "quality_score_preset": "profile-drop",
             "next_recommended_action": "inspect_artifact",
         }
     )
     assert summary == (
-        r"inspect_ref=sweep_alpha_20260401, "
+        r"inspect_ref=sweep_alpha_20260401, mode=deterministic, "
         r"score_preset=profile-drop, next=inspect_artifact"
     )
 

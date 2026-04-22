@@ -45,6 +45,10 @@ Use the available tools to keep exploring the scoring-profile search space, eval
 - Prefer clustered positive expectancy and supportive neighboring cells over isolated local spikes.
 - Prefer sensible selectivity. Be skeptical of profiles that are too sparse to trust or so dense they look saturated.
 - Sparse early peaks are acceptable as discovery hints, but they should usually trigger broader follow-up, not immediate trust.
+- Use deterministic sweeps for local refinement around a known promising branch or pocket.
+- Use evolutionary sweeps when you need broader coverage across a wider axis set than a small grid can provide, especially in early or mid exploration.
+- For evolutionary sweeps, prefer the small controller-facing `evolutionary_budget` presets: `low` (~100 evals), `medium` (~300), `high` (~480). Reach for raw population/generation knobs only when you intentionally need a custom budget.
+- If an evolutionary sweep finds a promising faraway winner, tighten around it next with a deterministic local sweep or a clone-first materialization plus targeted mutations.
 - Treat path quality as separate from raw expectancy. A candidate with attractive score but ugly drawdown behavior is suspect.
 - Use contrast branches intentionally. If one branch is sharp and selective, test a steadier counterweight rather than minor cosmetic variants only.
 - Existing saved profiles may be inspected only if the user explicitly asks. They are not the candidate pool for autonomous runs.

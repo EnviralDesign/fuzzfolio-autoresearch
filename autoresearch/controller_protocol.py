@@ -39,6 +39,7 @@ General rules:
 - For run-owned local draft profiles, think in candidate_name handles, not filesystem paths. The controller resolves candidate_name to the real run-local file.
 - Only use profile refs created during this run (or candidate_name handles the controller can map). Placeholders like <created_profile_ref> are substituted by the controller when provided.
 - Sweeps are normal: use run_parameter_sweep, not ad-hoc repeated manual edits only.
+- Sweep mode playbook: deterministic sweeps are for local grid refinement around a concrete branch; evolutionary sweeps are for broader discovery over wider axis space. Prefer `evolutionary_budget` presets (`low`, `medium`, `high`) over raw population/generation knobs unless you intentionally need a custom budget. A good default pattern is evolutionary discovery first, then deterministic local refinement around the winner.
 - Think in months/years of effective evidence, not raw bars. Effective window fields in results matter more than bar counts.
 - `__BASKET__` may appear in summaries; never pass it as an instrument. Use exact catalog symbols; repeat --instrument per symbol in typed fields as multiple entries in the instruments array (evaluate_candidate), not comma-joined tokens.
 - Early phase: diversify instruments/groups before over-focusing one pair. Prune a basket member when it is clearly a drag; do not widen baskets solely from per-instrument screens.
@@ -58,6 +59,7 @@ Representative examples (adjust names/ids to the run):
 {"tool":"evaluate_candidate","profile_ref":"<from prior result>","instruments":["EURUSD","GBPUSD"],"timeframe_policy":"profile_default","evaluation_mode":"screen","candidate_name":"cand1"}
 {"tool":"mutate_profile","candidate_name":"cand1","mutations":[{"path":"profile.name","value":"cand1b"}],"destination_candidate_name":"cand1b"}
 {"tool":"run_parameter_sweep","profile_ref":"<ref>","axes":["profile.notificationThreshold=70,75,80"],"instruments":["EURUSD"],"candidate_name_prefix":"sw1"}
+{"tool":"run_parameter_sweep","profile_ref":"<ref>","axes":["indicator[0].config.timeframe=M5,M15,M30,H1,H4","indicator[1].talib.timeperiod=8,10,14,20,26"],"mode":"evolutionary","evolutionary_budget":"medium","instruments":["EURUSD","GBPUSD"],"candidate_name_prefix":"sw_evo1"}
 {"tool":"inspect_artifact","attempt_id":"<from ledger>","view":"summary"}
 {"tool":"compare_artifacts","attempt_ids":["id1","id2"]}
 
@@ -101,6 +103,7 @@ Rules:
   - prepare_profile -> validate_profile -> register_profile -> evaluate_candidate
   - evaluate_candidate -> inspect_artifact or compare_artifacts
   - run_parameter_sweep -> inspect_artifact -> compare_artifacts
+- Sweep mode playbook: deterministic sweeps are for local grid refinement around a concrete branch; evolutionary sweeps are for broader discovery over wider axis space. Prefer `evolutionary_budget` presets (`low`, `medium`, `high`) over raw population/generation knobs unless you intentionally need a custom budget.
 - Use inspect_artifact and compare_artifacts before read_file on JSON artifacts. Use read_file or list_dir only when structured tools are insufficient.
 - run_cli is last resort only for recovery or when no typed equivalent exists.
 - Use candidate_name for run-owned draft profiles and exact profile_ref values for registered profiles. The controller resolves candidate_name to the run-local file.

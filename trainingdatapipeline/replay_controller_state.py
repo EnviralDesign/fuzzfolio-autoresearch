@@ -287,6 +287,9 @@ def _action_signature(action: Any) -> dict[str, Any]:
         "candidate_name",
         "destination_candidate_name",
         "candidate_name_prefix",
+        "evolutionary_budget",
+        "population_size",
+        "max_generations",
         "requested_horizon_months",
         "evaluation_mode",
     ):

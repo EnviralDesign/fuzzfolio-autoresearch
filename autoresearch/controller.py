@@ -96,6 +96,13 @@ Hard requirements:
 - Return exactly one raw JSON object only.
 """
 
+EVOLUTIONARY_BUDGET_PRESET_PARAMS: dict[str, tuple[int, int]] = {
+    "low": (20, 5),
+    "medium": (30, 10),
+    "high": (40, 12),
+}
+MAX_AUTORESEARCH_EVOLUTIONARY_EVALUATIONS = 500
+
 LOCAL_OPENING_ALLOWED_FIELDS = (
     "tool",
     "mode",
@@ -734,6 +741,7 @@ def _compact_sweep_summary_for_prompt(
         return None
     compact: dict[str, Any] = {}
     for key in (
+        "mode",
         "fitness_metric",
         "top_score",
         "top_effective_window_months",
@@ -1057,6 +1065,64 @@ class ResearchController:
             except (TypeError, ValueError):
                 return None
         return None
+
+    @staticmethod
+    def _normalize_sweep_mode(val: Any) -> str | None:
+        if not isinstance(val, str) or not val.strip():
+            return None
+        normalized = val.strip().lower()
+        if normalized in {"deterministic", "evolutionary"}:
+            return normalized
+        return None
+
+    @staticmethod
+    def _normalize_evolutionary_budget(val: Any) -> str | None:
+        if not isinstance(val, str) or not val.strip():
+            return None
+        normalized = str(val).strip().lower()
+        normalized = {"med": "medium", "mid": "medium"}.get(normalized, normalized)
+        if normalized in EVOLUTIONARY_BUDGET_PRESET_PARAMS:
+            return normalized
+        return None
+
+    @staticmethod
+    def _resolve_evolutionary_budget_params(
+        budget: Any,
+    ) -> tuple[str, int, int] | None:
+        normalized = ResearchController._normalize_evolutionary_budget(budget)
+        if normalized is None:
+            return None
+        population_size, max_generations = EVOLUTIONARY_BUDGET_PRESET_PARAMS[
+            normalized
+        ]
+        return normalized, population_size, max_generations
+
+    @staticmethod
+    def _matching_evolutionary_budget_preset(
+        population_size: int | None,
+        max_generations: int | None,
+    ) -> str | None:
+        if population_size is None or max_generations is None:
+            return None
+        for preset, (
+            preset_population_size,
+            preset_max_generations,
+        ) in EVOLUTIONARY_BUDGET_PRESET_PARAMS.items():
+            if (
+                population_size == preset_population_size
+                and max_generations == preset_max_generations
+            ):
+                return preset
+        return None
+
+    @staticmethod
+    def _evolutionary_evaluation_budget(
+        population_size: int | None,
+        max_generations: int | None,
+    ) -> int | None:
+        if population_size is None or max_generations is None:
+            return None
+        return int(population_size) * int(max_generations)
 
     def _requested_horizon_from_source_action(
         self, source_action: dict[str, Any]
@@ -3508,7 +3574,7 @@ class ResearchController:
             "- validate_profile: candidate_name or profile_ref.\n"
             "- register_profile: candidate_name or profile_ref; operation create|update; profile_ref required for update.\n"
             "- evaluate_candidate: profile_ref first; candidate_name is acceptable for local unregistered drafts; include instruments[] plus optional timeframe_policy/timeframe/requested_horizon_months/evaluation_mode.\n"
-            "- run_parameter_sweep: profile_ref; axes[] strings; optional instruments[], output_dir, candidate_name_prefix.\n"
+            "- run_parameter_sweep: profile_ref; axes[] strings; optional instruments[], output_dir, candidate_name_prefix, mode deterministic|evolutionary, evolutionary_budget low|medium|high; advanced override via population_size + max_generations.\n"
             "- inspect_artifact: artifact_dir or inspect_ref or attempt_id; view summary|files|curve_meta|request_meta.\n"
             "- compare_artifacts: attempt_ids[] or artifact_dirs[].\n"
             "Workflows:\n"
@@ -3522,6 +3588,7 @@ class ResearchController:
             "- Exact indicator meta ids; exact instrument symbols; instruments[] uses one array entry per symbol (no comma-joined tokens); never __BASKET__ as an instrument.\n"
             "Search discipline:\n"
             "- Explore multiple candidates; sweeps are normal (run_parameter_sweep); diversify early, prune weak basket members, do not finish early while budget remains.\n"
+            "- Sweep playbook: use deterministic sweeps for local pocket mapping and nearby refinement; use evolutionary sweeps for broader discovery over a wider axis set; prefer evolutionary_budget presets first (low=100 evals, medium=300, high=480; autoresearch cap 500) and use raw population_size/max_generations only when you truly need a custom budget.\n"
             "Artifacts:\n"
             "- sensitivity-response.json / deep-replay-job.json / best-cell-path-detail.json — prefer inspect_artifact and compare_artifacts over manual compare-sensitivity; no summary.json.\n"
             "run_cli fallback:\n"
@@ -5378,12 +5445,20 @@ class ResearchController:
         if reason:
             lines.append(f"- reason: {reason}")
         trigger = str(sweep_priority.get("trigger") or "").strip()
+        preferred_mode = self._normalize_sweep_mode(
+            sweep_priority.get("preferred_mode")
+        )
         if trigger in {"promising_probe", "local_pocket_cadence"}:
             lines.append("- sweep_posture: use a slightly broader local sweep now to map the pocket around this promising branch.")
+        elif trigger == "plateau_remeasure":
+            lines.append("- sweep_posture: use a local sweep to break the plateau before spending another same-handle eval.")
+        if preferred_mode:
+            lines.append(f"- preferred_sweep_mode: {preferred_mode}")
         lines.extend(
             [
                 "- preferred_next_tool: run_parameter_sweep",
-                "- Use a local sweep burst before another same-handle eval: usually 1-2 axes with 5-6 values each; use 3 axes only when the pocket already looks unusually strong.",
+                "- Deterministic mode is the default for local pocket mapping: usually 1-2 axes with 5-6 values each; use 3 axes only when the pocket already looks unusually strong.",
+                "- Evolutionary mode is for broader discovery when a tiny local grid is too restrictive; if it finds a strong faraway winner, follow with a tighter deterministic sweep or clone-first materialization around that winner.",
             ]
         )
         return "\n".join(lines).strip()
@@ -5733,8 +5808,12 @@ class ResearchController:
         lines.extend(
             [
                 "- Next typed tuning move is run_parameter_sweep on profile_ref.",
+                "- Sweep mode choices: deterministic for local grid refinement; evolutionary for broader discovery across a wider axis set.",
                 "- Valid axis grammar only: indicator[N].config.<field>=... or indicator[N].talib.<param>=...",
-                "- Prefer slightly broader local probes: usually 1-2 axes with 5-6 values each; reserve 3-axis sweeps for unusually strong pockets.",
+                "- Deterministic local probes: usually 1-2 axes with 5-6 values each; reserve 3-axis sweeps for unusually strong pockets.",
+                "- Evolutionary probes: use when you want broader coverage than a tiny grid, especially early or mid exploration or after narrow local probes stall. Prefer evolutionary_budget presets: low=100 evals (20x5), medium=300 (30x10), high=480 (40x12); autoresearch clamps custom evolutionary runs at 500 evals.",
+                "- Use raw population_size + max_generations only when you intentionally need a custom evolutionary budget.",
+                "- Common pattern: evolutionary discovery -> inspect_artifact -> materialize or clone the best winner -> deterministic local refinement around the top parameters.",
                 "- Valid examples: indicator[0].config.timeframe=M5,M15,M30,H1,H4 ; indicator[1].talib.timeperiod=8,10,14,20,26",
                 "- Invalid examples: profile.indicators[1].params.fastperiod=... ; indicators[1].config.fastperiod=... ; indicator[1].params.fastperiod=...",
             ]
@@ -6611,6 +6690,7 @@ class ResearchController:
             template: dict[str, Any] = {
                 "reason": str(cadence.get("rationale") or "").strip(),
                 "trigger": "local_pocket_cadence",
+                "preferred_mode": "deterministic",
             }
             for key in ("profile_ref", "candidate_name", "indicator_ids", "instruments"):
                 if cadence.get(key) not in (None, "", [], {}):
@@ -6672,6 +6752,7 @@ class ResearchController:
         )
         template["trigger"] = "plateau_remeasure"
         template["plateau_eval_count"] = 2
+        template["preferred_mode"] = "deterministic"
         return template
 
     @staticmethod
@@ -6734,6 +6815,12 @@ class ResearchController:
         inspect_ref = str(result.get("inspect_ref") or "").strip()
         if inspect_ref:
             parts.append(f"inspect_ref={inspect_ref}")
+        mode = str(result.get("mode") or "").strip()
+        if mode:
+            parts.append(f"mode={mode}")
+        budget = str(result.get("evolutionary_budget") or "").strip()
+        if budget:
+            parts.append(f"budget={budget}")
         preset = str(result.get("quality_score_preset") or "").strip()
         if preset:
             parts.append(f"score_preset={preset}")
@@ -7834,6 +7921,16 @@ class ResearchController:
             elif tool == "run_parameter_sweep":
                 if result.get("inspect_ref"):
                     summarized["inspect_ref"] = str(result.get("inspect_ref"))[:120]
+                if result.get("mode"):
+                    summarized["mode"] = str(result.get("mode"))[:40]
+                if result.get("evolutionary_budget"):
+                    summarized["evolutionary_budget"] = str(
+                        result.get("evolutionary_budget")
+                    )[:20]
+                if result.get("planned_evaluations") is not None:
+                    summarized["planned_evaluations"] = result.get(
+                        "planned_evaluations"
+                    )
                 if result.get("best_score") is not None:
                     summarized["best_score"] = result.get("best_score")
                 if result.get("quality_score_preset"):
@@ -8153,6 +8250,57 @@ class ResearchController:
             axes = action.get("axes")
             if not isinstance(axes, list) or not axes:
                 return "run_parameter_sweep requires axes array."
+            mode = action.get("mode")
+            if mode not in (None, "") and self._normalize_sweep_mode(mode) is None:
+                return "run_parameter_sweep mode must be deterministic or evolutionary."
+            normalized_mode = self._normalize_sweep_mode(mode) or "deterministic"
+            evolutionary_budget = action.get("evolutionary_budget")
+            if evolutionary_budget not in (None, "") and self._normalize_evolutionary_budget(
+                evolutionary_budget
+            ) is None:
+                return (
+                    "run_parameter_sweep evolutionary_budget must be low, medium, or high."
+                )
+            raw_population_size = self._positive_int_or_none(action.get("population_size"))
+            raw_max_generations = self._positive_int_or_none(action.get("max_generations"))
+            has_raw_budget = action.get("population_size") not in (
+                None,
+                "",
+            ) or action.get("max_generations") not in (None, "")
+            if normalized_mode != "evolutionary":
+                if evolutionary_budget not in (None, "") or has_raw_budget:
+                    return (
+                        "run_parameter_sweep evolutionary_budget, population_size, and "
+                        "max_generations require mode=evolutionary."
+                    )
+            elif evolutionary_budget not in (None, "") and has_raw_budget:
+                return (
+                    "run_parameter_sweep use either evolutionary_budget or "
+                    "population_size/max_generations, not both."
+                )
+            for key in ("population_size", "max_generations"):
+                if action.get(key) in (None, ""):
+                    continue
+                if self._positive_int_or_none(action.get(key)) is None:
+                    return f"run_parameter_sweep {key} must be a positive integer."
+            if normalized_mode == "evolutionary" and has_raw_budget:
+                if raw_population_size is None or raw_max_generations is None:
+                    return (
+                        "run_parameter_sweep custom evolutionary budget requires both "
+                        "population_size and max_generations."
+                    )
+                planned_evaluations = self._evolutionary_evaluation_budget(
+                    raw_population_size,
+                    raw_max_generations,
+                )
+                if (
+                    planned_evaluations is not None
+                    and planned_evaluations > MAX_AUTORESEARCH_EVOLUTIONARY_EVALUATIONS
+                ):
+                    return (
+                        "run_parameter_sweep evolutionary budget exceeds autoresearch cap "
+                        f"of {MAX_AUTORESEARCH_EVOLUTIONARY_EVALUATIONS} evaluations."
+                    )
             return None
         if tool == "inspect_artifact":
             ad = action.get("artifact_dir")
@@ -9897,6 +10045,91 @@ class ResearchController:
                 errors=["run_parameter_sweep requires axes array of sweep axis strings."],
                 next_recommended_action=None,
             )
+        mode = self._normalize_sweep_mode(action.get("mode")) or "deterministic"
+        evolutionary_budget = self._normalize_evolutionary_budget(
+            action.get("evolutionary_budget")
+        )
+        population_size = self._positive_int_or_none(action.get("population_size"))
+        max_generations = self._positive_int_or_none(action.get("max_generations"))
+        has_raw_evolutionary_budget = action.get("population_size") not in (
+            None,
+            "",
+        ) or action.get("max_generations") not in (None, "")
+        if mode != "evolutionary" and (
+            action.get("evolutionary_budget") not in (None, "") or has_raw_evolutionary_budget
+        ):
+            return tt.normalized_tool_envelope(
+                "run_parameter_sweep",
+                ok=False,
+                errors=[
+                    "run_parameter_sweep evolutionary_budget, population_size, and "
+                    "max_generations require mode=evolutionary."
+                ],
+                next_recommended_action=None,
+            )
+        if mode == "evolutionary":
+            if evolutionary_budget is not None and has_raw_evolutionary_budget:
+                return tt.normalized_tool_envelope(
+                    "run_parameter_sweep",
+                    ok=False,
+                    errors=[
+                        "run_parameter_sweep use either evolutionary_budget or "
+                        "population_size/max_generations, not both."
+                    ],
+                    next_recommended_action=None,
+                )
+            if evolutionary_budget is not None:
+                resolved_budget = self._resolve_evolutionary_budget_params(
+                    evolutionary_budget
+                )
+                if resolved_budget is None:
+                    return tt.normalized_tool_envelope(
+                        "run_parameter_sweep",
+                        ok=False,
+                        errors=[
+                            "run_parameter_sweep evolutionary_budget must be low, "
+                            "medium, or high."
+                        ],
+                        next_recommended_action=None,
+                    )
+                evolutionary_budget, population_size, max_generations = resolved_budget
+            elif not has_raw_evolutionary_budget:
+                resolved_budget = self._resolve_evolutionary_budget_params("medium")
+                assert resolved_budget is not None
+                evolutionary_budget, population_size, max_generations = resolved_budget
+            elif population_size is None or max_generations is None:
+                return tt.normalized_tool_envelope(
+                    "run_parameter_sweep",
+                    ok=False,
+                    errors=[
+                        "run_parameter_sweep custom evolutionary budget requires both "
+                        "population_size and max_generations."
+                    ],
+                    next_recommended_action=None,
+                )
+            else:
+                evolutionary_budget = self._matching_evolutionary_budget_preset(
+                    population_size,
+                    max_generations,
+                )
+        planned_evaluations = self._evolutionary_evaluation_budget(
+            population_size,
+            max_generations,
+        )
+        if (
+            mode == "evolutionary"
+            and planned_evaluations is not None
+            and planned_evaluations > MAX_AUTORESEARCH_EVOLUTIONARY_EVALUATIONS
+        ):
+            return tt.normalized_tool_envelope(
+                "run_parameter_sweep",
+                ok=False,
+                errors=[
+                    "run_parameter_sweep evolutionary budget exceeds autoresearch cap "
+                    f"of {MAX_AUTORESEARCH_EVOLUTIONARY_EVALUATIONS} evaluations."
+                ],
+                next_recommended_action=None,
+            )
         prefix = self._sanitize_label(
             str(action.get("candidate_name_prefix") or "sweep")
         )
@@ -9918,7 +10151,14 @@ class ResearchController:
             str(out_dir),
             "--quality-score-preset",
             quality_score_preset,
+            "--mode",
+            mode,
         ]
+        if mode == "evolutionary":
+            if population_size is not None:
+                args.extend(["--population-size", str(population_size)])
+            if max_generations is not None:
+                args.extend(["--max-generations", str(max_generations)])
         instruments = action.get("instruments")
         if isinstance(instruments, list):
             for ins in instruments:
@@ -9955,6 +10195,15 @@ class ResearchController:
         base["artifact_dir"] = str(out_dir)
         base["artifact_kind"] = "parameter_sweep"
         base["inspect_ref"] = out_dir.name
+        base["mode"] = mode
+        if evolutionary_budget is not None:
+            base["evolutionary_budget"] = evolutionary_budget
+        if population_size is not None:
+            base["population_size"] = population_size
+        if max_generations is not None:
+            base["max_generations"] = max_generations
+        if planned_evaluations is not None:
+            base["planned_evaluations"] = planned_evaluations
         base["quality_score_preset"] = quality_score_preset
         base["source_profile_ref"] = ref
         source_candidate_name = str(action.get("source_candidate_name") or "").strip()
@@ -9964,10 +10213,27 @@ class ResearchController:
             base["source_candidate_name"] = source_candidate_name
         base["candidate_name_prefix"] = prefix
         base["axes"] = [str(axis) for axis in axes]
-        base["controller_hint"] = (
-            "Next typed move: inspect_artifact with inspect_ref or artifact_dir from this result. "
-            "Do not pass inspect_ref as attempt_id. Do not use run_cli, list_dir, or read_file first unless inspect_artifact fails."
-        )
+        if mode == "evolutionary":
+            budget_phrase = (
+                f"{evolutionary_budget} ({planned_evaluations} evals)"
+                if evolutionary_budget and planned_evaluations is not None
+                else (
+                    f"custom ({planned_evaluations} evals)"
+                    if planned_evaluations is not None
+                    else "custom"
+                )
+            )
+            base["controller_hint"] = (
+                "Next typed move: inspect_artifact with inspect_ref or artifact_dir from this result. "
+                f"This sweep used {budget_phrase}. "
+                "If the best evolutionary winner looks real, clone or materialize it and then use a tighter deterministic sweep for local refinement. "
+                "Do not pass inspect_ref as attempt_id. Do not use run_cli, list_dir, or read_file first unless inspect_artifact fails."
+            )
+        else:
+            base["controller_hint"] = (
+                "Next typed move: inspect_artifact with inspect_ref or artifact_dir from this result. "
+                "Do not pass inspect_ref as attempt_id. Do not use run_cli, list_dir, or read_file first unless inspect_artifact fails."
+            )
         if base.get("ok"):
             base["next_recommended_action"] = "inspect_artifact"
         arts = dict(base.get("artifacts") or {})

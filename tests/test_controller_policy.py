@@ -1028,6 +1028,8 @@ def test_delta_packet_emits_sweep_priority_and_context_after_eval_plateau() -> N
     assert "===== SWEEP PRIORITY =====" in first_prompt
     assert "preferred_next_tool: run_parameter_sweep" in first_prompt
     assert "===== SWEEP CONTEXT =====" in first_prompt
+    assert "evolutionary for broader discovery across a wider axis set" in first_prompt
+    assert "low=100 evals" in first_prompt
     assert "1-2 axes with 5-6 values each" in first_prompt
     assert "indicator[N].config.<field>" in first_prompt
     assert "===== EVALUATE CONTEXT =====" not in first_prompt
@@ -1175,6 +1177,7 @@ def test_delta_packet_emits_sweep_priority_after_single_credible_mid_phase_eval(
     assert "stage: probe_local_pocket" in first_prompt
     assert "preferred_move_family: run_parameter_sweep" in first_prompt
     assert "===== SWEEP PRIORITY =====" in first_prompt
+    assert "preferred_sweep_mode: deterministic" in first_prompt
     assert "slightly broader neighboring sweep" in first_prompt
     assert "===== SWEEP CONTEXT =====" in first_prompt
     assert "===== EVALUATE CONTEXT =====" not in first_prompt
@@ -1393,6 +1396,210 @@ def test_typed_run_parameter_sweep_forwards_profile_drop_quality_score_preset(tm
     flag_index = args.index("--quality-score-preset") + 1
     assert args[flag_index] == "profile-drop"
     assert result["quality_score_preset"] == "profile-drop"
+    assert "--mode" in args
+    mode_index = args.index("--mode") + 1
+    assert args[mode_index] == "deterministic"
+    assert result["mode"] == "deterministic"
+
+
+def test_typed_run_parameter_sweep_uses_medium_evolutionary_budget_by_default(
+    tmp_path: Path,
+) -> None:
+    controller = _make_controller()
+    captured: dict[str, object] = {}
+
+    def fake_execute(
+        _tool_context,
+        *,
+        args,
+        cwd,
+        step,
+        step_limit,
+        policy,
+        source_action,
+        result_tool="run_cli",
+    ):
+        captured["args"] = list(args)
+        return {
+            "tool": result_tool,
+            "ok": True,
+            "result": {
+                "parsed_json": {
+                    "sweep_id": "sw-evo-default",
+                    "ranked": [],
+                }
+            },
+            "artifacts": {},
+        }
+
+    controller._execute_cli_invocation = fake_execute
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        run_dir=tmp_path,
+        evals_dir=tmp_path / "evals",
+    )
+    tool_context.evals_dir.mkdir(parents=True, exist_ok=True)
+
+    result = controller._typed_run_parameter_sweep(
+        tool_context,
+        {
+            "tool": "run_parameter_sweep",
+            "profile_ref": "ref-a",
+            "axes": [
+                "indicator[0].config.timeframe=M5,M15,M30,H1,H4",
+                "indicator[1].talib.timeperiod=8,10,14,20,26",
+            ],
+            "mode": "evolutionary",
+        },
+        step=5,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    args = captured["args"]
+    assert "--mode" in args
+    assert args[args.index("--mode") + 1] == "evolutionary"
+    assert "--population-size" in args
+    assert args[args.index("--population-size") + 1] == "30"
+    assert "--max-generations" in args
+    assert args[args.index("--max-generations") + 1] == "10"
+    assert result["mode"] == "evolutionary"
+    assert result["evolutionary_budget"] == "medium"
+    assert result["population_size"] == 30
+    assert result["max_generations"] == 10
+    assert result["planned_evaluations"] == 300
+
+
+def test_typed_run_parameter_sweep_maps_evolutionary_budget_preset(tmp_path: Path) -> None:
+    controller = _make_controller()
+    captured: dict[str, object] = {}
+
+    def fake_execute(
+        _tool_context,
+        *,
+        args,
+        cwd,
+        step,
+        step_limit,
+        policy,
+        source_action,
+        result_tool="run_cli",
+    ):
+        captured["args"] = list(args)
+        return {
+            "tool": result_tool,
+            "ok": True,
+            "result": {
+                "parsed_json": {
+                    "sweep_id": "sw-evo-1",
+                    "ranked": [],
+                }
+            },
+            "artifacts": {},
+        }
+
+    controller._execute_cli_invocation = fake_execute
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        run_dir=tmp_path,
+        evals_dir=tmp_path / "evals",
+    )
+    tool_context.evals_dir.mkdir(parents=True, exist_ok=True)
+
+    result = controller._typed_run_parameter_sweep(
+        tool_context,
+        {
+            "tool": "run_parameter_sweep",
+            "profile_ref": "ref-a",
+            "axes": [
+                "indicator[0].config.timeframe=M5,M15,M30,H1,H4",
+                "indicator[1].talib.timeperiod=8,10,14,20,26",
+            ],
+            "mode": "evolutionary",
+            "evolutionary_budget": "high",
+        },
+        step=5,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    args = captured["args"]
+    assert "--mode" in args
+    assert args[args.index("--mode") + 1] == "evolutionary"
+    assert "--population-size" in args
+    assert args[args.index("--population-size") + 1] == "40"
+    assert "--max-generations" in args
+    assert args[args.index("--max-generations") + 1] == "12"
+    assert result["mode"] == "evolutionary"
+    assert result["evolutionary_budget"] == "high"
+    assert result["population_size"] == 40
+    assert result["max_generations"] == 12
+    assert result["planned_evaluations"] == 480
+
+
+def test_typed_run_parameter_sweep_forwards_custom_evolutionary_controls(
+    tmp_path: Path,
+) -> None:
+    controller = _make_controller()
+    captured: dict[str, object] = {}
+
+    def fake_execute(
+        _tool_context,
+        *,
+        args,
+        cwd,
+        step,
+        step_limit,
+        policy,
+        source_action,
+        result_tool="run_cli",
+    ):
+        captured["args"] = list(args)
+        return {
+            "tool": result_tool,
+            "ok": True,
+            "result": {
+                "parsed_json": {
+                    "sweep_id": "sw-evo-1",
+                    "ranked": [],
+                }
+            },
+            "artifacts": {},
+        }
+
+    controller._execute_cli_invocation = fake_execute
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        run_dir=tmp_path,
+        evals_dir=tmp_path / "evals",
+    )
+    tool_context.evals_dir.mkdir(parents=True, exist_ok=True)
+
+    result = controller._typed_run_parameter_sweep(
+        tool_context,
+        {
+            "tool": "run_parameter_sweep",
+            "profile_ref": "ref-a",
+            "axes": [
+                "indicator[0].config.timeframe=M5,M15,M30,H1,H4",
+                "indicator[1].talib.timeperiod=8,10,14,20,26",
+            ],
+            "mode": "evolutionary",
+            "population_size": 25,
+            "max_generations": 8,
+        },
+        step=5,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    args = captured["args"]
+    assert "--population-size" in args
+    assert args[args.index("--population-size") + 1] == "25"
+    assert "--max-generations" in args
+    assert args[args.index("--max-generations") + 1] == "8"
+    assert "evolutionary_budget" not in result
+    assert result["planned_evaluations"] == 200
 
 
 def test_late_phase_does_not_autostart_local_pocket_cycle() -> None:
@@ -2215,6 +2422,57 @@ def test_validate_action_accepts_candidate_name_profile_handles() -> None:
     assert controller._validate_action(
         {"tool": "inspect_artifact", "inspect_ref": "sweep_alpha_20260401"}
     ) is None
+
+
+def test_validate_action_accepts_evolutionary_budget_preset() -> None:
+    controller = _make_controller()
+
+    assert controller._validate_action(
+        {
+            "tool": "run_parameter_sweep",
+            "profile_ref": "ref-a",
+            "axes": ["indicator[0].config.timeframe=M5,M15,M30,H1,H4"],
+            "mode": "evolutionary",
+            "evolutionary_budget": "med",
+        }
+    ) is None
+
+
+def test_validate_action_rejects_mixed_evolutionary_budget_controls() -> None:
+    controller = _make_controller()
+
+    assert controller._validate_action(
+        {
+            "tool": "run_parameter_sweep",
+            "profile_ref": "ref-a",
+            "axes": ["indicator[0].config.timeframe=M5,M15,M30,H1,H4"],
+            "mode": "evolutionary",
+            "evolutionary_budget": "high",
+            "population_size": 40,
+            "max_generations": 12,
+        }
+    ) == (
+        "run_parameter_sweep use either evolutionary_budget or "
+        "population_size/max_generations, not both."
+    )
+
+
+def test_validate_action_rejects_oversized_custom_evolutionary_budget() -> None:
+    controller = _make_controller()
+
+    assert controller._validate_action(
+        {
+            "tool": "run_parameter_sweep",
+            "profile_ref": "ref-a",
+            "axes": ["indicator[0].config.timeframe=M5,M15,M30,H1,H4"],
+            "mode": "evolutionary",
+            "population_size": 50,
+            "max_generations": 11,
+        }
+    ) == (
+        "run_parameter_sweep evolutionary budget exceeds autoresearch cap "
+        "of 500 evaluations."
+    )
 
 
 def test_resolve_artifact_path_accepts_inspect_ref(tmp_path: Path) -> None:
