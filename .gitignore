@@ -13,6 +13,8 @@ wheels/
 /results/
 /queue/
 /runs/
+/.pytest_cache/
+/.ruff_cache/
 
 # Agent prompt files (generated per-session by launchers)
 /CLAUDE.md
@@ -32,8 +34,13 @@ wheels/
 /scripts/simple-rust-process-manager.exe
 /scripts/processes.json
 /portfolio.config.json
+/portfolio.account-presets.json
 
 # Generated training / experiment artifacts
 /data/training_pipeline/
 /data/training_runs/
 /data/gguf_exports/
+
+# Local sweep scratch / diagnostics
+/sweeps/
+/scratch_snapshot.txt

@@ -96,6 +96,7 @@ if __package__ in {None, ""}:
         apply_metadata_to_profile_document,
         build_metadata_artifact,
         build_writer_messages,
+        compute_legacy_presentation_signature,
         compute_presentation_signature,
         load_cached_metadata,
         load_profile_document,
@@ -105,8 +106,10 @@ if __package__ in {None, ""}:
     from autoresearch.portfolio import (
         build_sleeve_prefilter,
         build_sleeve_selection,
+        enrich_rows_for_account,
         finalize_sleeve_selection,
         filter_selection_candidate_rows,
+        load_portfolio_build_specs,
         load_portfolio_spec,
         merge_portfolio_sleeves,
     )
@@ -174,6 +177,7 @@ else:
         apply_metadata_to_profile_document,
         build_metadata_artifact,
         build_writer_messages,
+        compute_legacy_presentation_signature,
         compute_presentation_signature,
         load_cached_metadata,
         load_profile_document,
@@ -183,8 +187,10 @@ else:
     from .portfolio import (
         build_sleeve_prefilter,
         build_sleeve_selection,
+        enrich_rows_for_account,
         finalize_sleeve_selection,
         filter_selection_candidate_rows,
+        load_portfolio_build_specs,
         load_portfolio_spec,
         merge_portfolio_sleeves,
     )
@@ -892,7 +898,7 @@ def build_parser() -> argparse.ArgumentParser:
     portfolio_report.add_argument(
         "--portfolio-config",
         default=None,
-        help="Path to a JSON portfolio config. Defaults to repo-root portfolio.config.json, falling back to built-in defaults if missing.",
+        help="Path to a JSON portfolio config. Defaults to repo-root portfolio.account-presets.json when present, otherwise portfolio.config.json, falling back to built-in defaults if neither exists.",
     )
     portfolio_report.add_argument(
         "--catch-up-full-backtests",
@@ -3373,6 +3379,71 @@ def _build_selection_basket_summary(rows: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
+def _build_selection_deployment_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    avg_open_positions_values: list[float] = []
+    peak_open_positions_values: list[float] = []
+    avg_margin_load_values: list[float] = []
+    peak_margin_load_values: list[float] = []
+    avg_holding_hours_values: list[float] = []
+    stop_loss_percent_values: list[float] = []
+    final_equity_r_values: list[float] = []
+    primary_asset_class_counts: dict[str, int] = {}
+    asset_class_counts: dict[str, int] = {}
+
+    for row in rows:
+        avg_open_positions = _safe_float_value(row.get("estimated_avg_open_positions_36m"))
+        if avg_open_positions is not None:
+            avg_open_positions_values.append(avg_open_positions)
+        peak_open_positions = _safe_float_value(row.get("estimated_peak_open_positions_36m"))
+        if peak_open_positions is not None:
+            peak_open_positions_values.append(peak_open_positions)
+        avg_margin_load = _safe_float_value(
+            row.get("account_estimated_avg_margin_load_pct_36m")
+        )
+        if avg_margin_load is not None:
+            avg_margin_load_values.append(avg_margin_load)
+        peak_margin_load = _safe_float_value(
+            row.get("account_estimated_peak_margin_load_pct_36m")
+        )
+        if peak_margin_load is not None:
+            peak_margin_load_values.append(peak_margin_load)
+        avg_holding_hours = _safe_float_value(row.get("avg_holding_hours_36m"))
+        if avg_holding_hours is not None:
+            avg_holding_hours_values.append(avg_holding_hours)
+        stop_loss_percent = _safe_float_value(row.get("stop_loss_percent_36m"))
+        if stop_loss_percent is not None:
+            stop_loss_percent_values.append(stop_loss_percent)
+        final_equity_r = _safe_float_value(row.get("final_equity_r_36m"))
+        if final_equity_r is not None:
+            final_equity_r_values.append(final_equity_r)
+        primary_asset_class = str(row.get("primary_asset_class_36m") or "").strip()
+        if primary_asset_class:
+            primary_asset_class_counts[primary_asset_class] = (
+                primary_asset_class_counts.get(primary_asset_class, 0) + 1
+            )
+        for asset_class in list(row.get("asset_classes_36m") or []):
+            token = str(asset_class or "").strip()
+            if token:
+                asset_class_counts[token] = asset_class_counts.get(token, 0) + 1
+
+    return {
+        "strategy_count": len(rows),
+        "asset_class_counts": dict(sorted(asset_class_counts.items())),
+        "primary_asset_class_counts": dict(sorted(primary_asset_class_counts.items())),
+        "estimated_avg_open_positions_36m": _summary_from_values(avg_open_positions_values),
+        "estimated_peak_open_positions_36m": _summary_from_values(peak_open_positions_values),
+        "avg_holding_hours_36m": _summary_from_values(avg_holding_hours_values),
+        "stop_loss_percent_36m": _summary_from_values(stop_loss_percent_values),
+        "final_equity_r_36m": _summary_from_values(final_equity_r_values),
+        "account_estimated_avg_margin_load_pct_36m": _summary_from_values(
+            avg_margin_load_values
+        ),
+        "account_estimated_peak_margin_load_pct_36m": _summary_from_values(
+            peak_margin_load_values
+        ),
+    }
+
+
 def _coerce_curve_points(curve_path: Path | None) -> list[dict[str, Any]]:
     if curve_path is None or not curve_path.exists():
         return []
@@ -3451,7 +3522,6 @@ def _build_selection_basket_curve(rows: list[dict[str, Any]]) -> dict[str, Any]:
     per_series_states = [
         {
             "equity_r": 0.0,
-            "drawdown_r": 0.0,
             "realized_r": 0.0,
             "closed_trade_count": 0,
         }
@@ -3467,18 +3537,18 @@ def _build_selection_basket_curve(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 point = series[series_index]
                 per_series_states[index] = {
                     "equity_r": float(point.get("equity_r") or 0.0),
-                    "drawdown_r": float(point.get("drawdown_r") or 0.0),
                     "realized_r": float(point.get("realized_r") or 0.0),
                     "closed_trade_count": int(point.get("closed_trade_count") or 0),
                 }
                 series_index += 1
             per_series_indexes[index] = series_index
         equity_r = sum(float(state["equity_r"]) for state in per_series_states)
-        drawdown_r = sum(float(state["drawdown_r"]) for state in per_series_states)
         realized_r = sum(float(state["realized_r"]) for state in per_series_states)
         closed_trade_count = sum(
             int(state["closed_trade_count"]) for state in per_series_states
         )
+        max_equity_r = equity_r if max_equity_r is None else max(max_equity_r, equity_r)
+        drawdown_r = max(0.0, float(max_equity_r) - equity_r)
         point_date = datetime.fromtimestamp(timestamp).date().isoformat()
         basket_points.append(
             {
@@ -3490,7 +3560,6 @@ def _build_selection_basket_curve(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "closed_trade_count": closed_trade_count,
             }
         )
-        max_equity_r = equity_r if max_equity_r is None else max(max_equity_r, equity_r)
         max_drawdown_r = (
             drawdown_r if max_drawdown_r is None else max(max_drawdown_r, drawdown_r)
         )
@@ -5598,10 +5667,19 @@ def _render_profile_drop_for_attempt(
                 lookback_months=lookback_months,
                 writer_profile=writer_profile_name,
             )
+            legacy_presentation_signature = compute_legacy_presentation_signature(
+                source_snapshot_payload,
+                package_inputs=package_inputs,
+                lookback_months=lookback_months,
+                writer_profile=writer_profile_name,
+            )
             cached_metadata = (
                 load_cached_metadata(
                     metadata_artifact_path,
                     expected_signature=presentation_signature,
+                    accepted_signatures={legacy_presentation_signature},
+                    fallback_writer_profile=writer_profile_name,
+                    fallback_profile_ref=profile_ref,
                 )
                 if metadata_artifact_path is not None
                 else None
@@ -5690,10 +5768,19 @@ def _render_profile_drop_for_attempt(
         lookback_months=lookback_months,
         writer_profile=writer_profile_name,
     )
+    legacy_presentation_signature = compute_legacy_presentation_signature(
+        source_profile_document_payload,
+        package_inputs=package_inputs,
+        lookback_months=lookback_months,
+        writer_profile=writer_profile_name,
+    )
     metadata_payload = (
         load_cached_metadata(
             metadata_artifact_path,
             expected_signature=presentation_signature,
+            accepted_signatures={legacy_presentation_signature},
+            fallback_writer_profile=writer_profile_name,
+            fallback_profile_ref=profile_ref,
         )
         if metadata_artifact_path is not None
         else None
@@ -6426,25 +6513,45 @@ def cmd_build_portfolio(
     spec_path = (
         Path(portfolio_config).resolve()
         if portfolio_config
-        else (config.repo_root / "portfolio.config.json")
+        else _default_portfolio_config_path(config)
     )
-    portfolio_spec, used_defaults = load_portfolio_spec(spec_path)
+    portfolio_specs, used_defaults = load_portfolio_build_specs(spec_path)
 
-    if catch_up_full_backtests is not None:
-        portfolio_spec["catch_up_full_backtests"] = bool(catch_up_full_backtests)
-    if catch_up_force_rebuild is not None:
-        portfolio_spec["catch_up_force_rebuild"] = bool(catch_up_force_rebuild)
-    if catch_up_require_scrutiny_36 is not None:
-        portfolio_spec["catch_up_require_scrutiny_36"] = bool(catch_up_require_scrutiny_36)
-    if generate_profile_drops is not None:
-        portfolio_spec["generate_profile_drops"] = bool(generate_profile_drops)
-    if export_bundle is not None:
-        portfolio_spec["export_bundle"] = bool(export_bundle)
-    if profile_drop_workers is not None:
-        portfolio_spec["profile_drop_workers"] = max(1, int(profile_drop_workers))
+    for portfolio_spec in portfolio_specs:
+        if catch_up_full_backtests is not None:
+            portfolio_spec["catch_up_full_backtests"] = bool(catch_up_full_backtests)
+        if catch_up_force_rebuild is not None:
+            portfolio_spec["catch_up_force_rebuild"] = bool(catch_up_force_rebuild)
+        if catch_up_require_scrutiny_36 is not None:
+            portfolio_spec["catch_up_require_scrutiny_36"] = bool(
+                catch_up_require_scrutiny_36
+            )
+        if generate_profile_drops is not None:
+            portfolio_spec["generate_profile_drops"] = bool(generate_profile_drops)
+        if export_bundle is not None:
+            portfolio_spec["export_bundle"] = bool(export_bundle)
+        if profile_drop_workers is not None:
+            portfolio_spec["profile_drop_workers"] = max(1, int(profile_drop_workers))
 
     catch_up_summary: dict[str, Any] | None = None
-    if bool(portfolio_spec.get("catch_up_full_backtests")):
+    catch_up_requested = any(
+        bool(portfolio_spec.get("catch_up_full_backtests")) for portfolio_spec in portfolio_specs
+    )
+    catch_up_require_scrutiny = any(
+        bool(portfolio_spec.get("catch_up_require_scrutiny_36")) for portfolio_spec in portfolio_specs
+    )
+    catch_up_force = any(
+        bool(portfolio_spec.get("catch_up_force_rebuild")) for portfolio_spec in portfolio_specs
+    )
+    catch_up_timeout_candidates = [
+        int(portfolio_spec.get("full_backtest_job_timeout_seconds"))
+        for portfolio_spec in portfolio_specs
+        if portfolio_spec.get("full_backtest_job_timeout_seconds") is not None
+    ]
+    catch_up_timeout_seconds = (
+        max(catch_up_timeout_candidates) if catch_up_timeout_candidates else None
+    )
+    if catch_up_requested:
         if as_json:
             with io.StringIO() as capture, redirect_stdout(capture):
                 exit_code = cmd_calculate_full_backtests(
@@ -6453,16 +6560,9 @@ def cmd_build_portfolio(
                     limit=None,
                     max_workers=None,
                     use_dev_sim_worker_count=True,
-                    require_scrutiny_36=bool(
-                        portfolio_spec.get("catch_up_require_scrutiny_36")
-                    ),
-                    force_rebuild=bool(portfolio_spec.get("catch_up_force_rebuild")),
-                    job_timeout_seconds=(
-                        int(portfolio_spec.get("full_backtest_job_timeout_seconds"))
-                        if portfolio_spec.get("full_backtest_job_timeout_seconds")
-                        is not None
-                        else None
-                    ),
+                    require_scrutiny_36=catch_up_require_scrutiny,
+                    force_rebuild=catch_up_force,
+                    job_timeout_seconds=catch_up_timeout_seconds,
                     as_json=True,
                 )
         else:
@@ -6472,13 +6572,9 @@ def cmd_build_portfolio(
                 limit=None,
                 max_workers=None,
                 use_dev_sim_worker_count=True,
-                require_scrutiny_36=bool(portfolio_spec.get("catch_up_require_scrutiny_36")),
-                force_rebuild=bool(portfolio_spec.get("catch_up_force_rebuild")),
-                job_timeout_seconds=(
-                    int(portfolio_spec.get("full_backtest_job_timeout_seconds"))
-                    if portfolio_spec.get("full_backtest_job_timeout_seconds") is not None
-                    else None
-                ),
+                require_scrutiny_36=catch_up_require_scrutiny,
+                force_rebuild=catch_up_force,
+                job_timeout_seconds=catch_up_timeout_seconds,
                 as_json=False,
             )
         full_backtest_failures = load_json_if_exists(config.full_backtest_failures_json_path)
@@ -6512,282 +6608,326 @@ def cmd_build_portfolio(
         ]
     rows.sort(key=_full_backtest_priority_key)
 
-    raw_sleeve_specs = list(portfolio_spec.get("sleeves") or [])
-    sleeve_prefilters: list[dict[str, Any]] = []
-    for sleeve_spec in raw_sleeve_specs:
-        sleeve_name = str(sleeve_spec.get("name") or "sleeve").strip()
-        prefilter_result = build_sleeve_prefilter(rows, sleeve_spec)
+    def build_portfolio_variant(
+        variant_spec: dict[str, Any],
+        variant_rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        portfolio_name = str(variant_spec.get("portfolio_name") or "default-portfolio").strip()
+        raw_sleeve_specs = list(variant_spec.get("sleeves") or [])
+        sleeve_prefilters: list[dict[str, Any]] = []
+        for sleeve_spec in raw_sleeve_specs:
+            sleeve_name = str(sleeve_spec.get("name") or "sleeve").strip()
+            prefilter_result = build_sleeve_prefilter(variant_rows, sleeve_spec)
+            _phase_emit(
+                f"[portfolio:{portfolio_name}] sleeve '{sleeve_name}' retained {len(prefilter_result.get('candidate_rows') or [])} "
+                f"of {len(prefilter_result.get('qualified_rows') or [])} qualified "
+                f"(prefilter_limit={prefilter_result.get('prefilter_limit')})",
+                as_json=as_json,
+            )
+            sleeve_prefilters.append(prefilter_result)
+
+        union_candidate_rows = merge_portfolio_sleeves(
+            [
+                {
+                    "name": item["name"],
+                    "candidate_rows": item["candidate_rows"],
+                    "selected_rows": [],
+                }
+                for item in sleeve_prefilters
+            ]
+        ).get("candidate_rows") or []
+
+        candidate_similarity_payload = build_candidate_similarity_payload(
+            list(union_candidate_rows),
+            progress_callback=_similarity_phase_callback(
+                f"portfolio-union:{portfolio_name}", as_json=as_json
+            ),
+        )
+
+        sleeve_results = []
+        for sleeve in sleeve_prefilters:
+            sleeve_name = str(sleeve.get("name") or "sleeve").strip()
+            _phase_emit(
+                f"[portfolio:{portfolio_name}] building sleeve '{sleeve_name}'",
+                as_json=as_json,
+            )
+            sleeve_result = finalize_sleeve_selection(
+                sleeve,
+                similarity_payload=candidate_similarity_payload,
+            )
+            _phase_emit(
+                f"[portfolio:{portfolio_name}] sleeve '{sleeve_name}' selected {len(sleeve_result.get('selected_rows') or [])} "
+                f"from {len(sleeve_result.get('candidate_rows') or [])} prefiltered candidates",
+                as_json=as_json,
+            )
+            sleeve_results.append(sleeve_result)
+
+        merged = merge_portfolio_sleeves(sleeve_results)
+        portfolio_rows = list(merged.get("selected_rows") or [])
+        portfolio_candidate_rows = list(merged.get("candidate_rows") or [])
         _phase_emit(
-            f"[portfolio] sleeve '{sleeve_name}' retained {len(prefilter_result.get('candidate_rows') or [])} "
-            f"of {len(prefilter_result.get('qualified_rows') or [])} qualified "
-            f"(prefilter_limit={prefilter_result.get('prefilter_limit')})",
+            f"[portfolio:{portfolio_name}] merged {len(portfolio_rows)} final selections from {len(portfolio_candidate_rows)} union candidates",
             as_json=as_json,
         )
-        sleeve_prefilters.append(prefilter_result)
-
-    union_candidate_rows = merge_portfolio_sleeves(
-        [
-            {
-                "name": item["name"],
-                "candidate_rows": item["candidate_rows"],
-                "selected_rows": [],
-            }
-            for item in sleeve_prefilters
-        ]
-    ).get("candidate_rows") or []
-
-    candidate_similarity_payload = build_candidate_similarity_payload(
-        list(union_candidate_rows),
-        progress_callback=_similarity_phase_callback(
-            "portfolio-union", as_json=as_json
-        ),
-    )
-
-    sleeve_results = []
-    for sleeve in sleeve_prefilters:
-        sleeve_name = str(sleeve.get("name") or "sleeve").strip()
-        _phase_emit(f"[portfolio] building sleeve '{sleeve_name}'", as_json=as_json)
-        sleeve_result = finalize_sleeve_selection(
-            sleeve,
-            similarity_payload=candidate_similarity_payload,
-        )
-        _phase_emit(
-            f"[portfolio] sleeve '{sleeve_name}' selected {len(sleeve_result.get('selected_rows') or [])} "
-            f"from {len(sleeve_result.get('candidate_rows') or [])} prefiltered candidates",
-            as_json=as_json,
-        )
-        sleeve_results.append(sleeve_result)
-
-    merged = merge_portfolio_sleeves(sleeve_results)
-    portfolio_rows = list(merged.get("selected_rows") or [])
-    portfolio_candidate_rows = list(merged.get("candidate_rows") or [])
-    _phase_emit(
-        f"[portfolio] merged {len(portfolio_rows)} final selections from {len(portfolio_candidate_rows)} union candidates",
-        as_json=as_json,
-    )
-    portfolio_similarity_payload = subset_similarity_payload(
-        candidate_similarity_payload,
-        portfolio_rows,
-    )
-
-    portfolio_name = str(portfolio_spec.get("portfolio_name") or "default-portfolio").strip()
-    report_root = config.derived_root / "portfolio-report" / _slug_token(portfolio_name)
-    report_root.mkdir(parents=True, exist_ok=True)
-    charts_root, profile_drop_root = _portfolio_chart_paths(report_root)
-
-    trades_x_cap = (
-        None
-        if float(portfolio_spec.get("chart_trades_x_max", 300.0)) < 0.0
-        else float(portfolio_spec.get("chart_trades_x_max", 300.0))
-    )
-    render_attempt_tradeoff_scatter_artifacts(
-        portfolio_candidate_rows,
-        charts_root / "portfolio-candidate-score-vs-trades-36mo.png",
-        charts_root / "portfolio-candidate-score-vs-trades-36mo.json",
-        require_full_backtest_36=True,
-        x_axis_max=trades_x_cap,
-        title_prefix="Portfolio Candidate Union",
-    )
-    render_attempt_tradeoff_scatter_artifacts(
-        portfolio_rows,
-        charts_root / "portfolio-score-vs-trades-36mo.png",
-        charts_root / "portfolio-score-vs-trades-36mo.json",
-        require_full_backtest_36=True,
-        x_axis_max=trades_x_cap,
-        title_prefix="Portfolio",
-    )
-    render_attempt_tradeoff_overlay_artifacts(
-        portfolio_candidate_rows,
-        portfolio_rows,
-        charts_root / "portfolio-overlay-score-vs-trades-36mo.png",
-        charts_root / "portfolio-overlay-score-vs-trades-36mo.json",
-        x_axis_max=trades_x_cap,
-        title_prefix="Portfolio Overlay",
-    )
-    render_attempt_drawdown_scatter_artifacts(
-        portfolio_candidate_rows,
-        charts_root / "portfolio-candidate-score-vs-drawdown-36mo.png",
-        charts_root / "portfolio-candidate-score-vs-drawdown-36mo.json",
-        require_full_backtest_36=True,
-        title_prefix="Portfolio Candidate Union",
-    )
-    render_attempt_drawdown_scatter_artifacts(
-        portfolio_rows,
-        charts_root / "portfolio-score-vs-drawdown-36mo.png",
-        charts_root / "portfolio-score-vs-drawdown-36mo.json",
-        require_full_backtest_36=True,
-        title_prefix="Portfolio",
-    )
-    render_similarity_scatter_artifacts(
-        candidate_similarity_payload,
-        charts_root / "portfolio-candidate-score-vs-sameness-36mo.png",
-    )
-    render_similarity_scatter_artifacts(
-        portfolio_similarity_payload,
-        charts_root / "portfolio-score-vs-sameness-36mo.png",
-    )
-    render_similarity_heatmap_artifacts(
-        portfolio_similarity_payload,
-        charts_root / "portfolio-similarity-heatmap.png",
-        charts_root / "portfolio-similarity-heatmap.json",
-    )
-
-    sleeves_payload: list[dict[str, Any]] = []
-    for sleeve in sleeve_results:
-        board = sleeve.get("board") or {}
-        sleeves_payload.append(
-            {
-                "name": sleeve.get("name"),
-                "spec": sleeve.get("spec") or {},
-                "qualified_count": len(sleeve.get("qualified_rows") or []),
-                "prefilter_limit": sleeve.get("prefilter_limit"),
-                "prefilter_retained_count": len(sleeve.get("candidate_rows") or []),
-                "prefilter_excluded_count": int(sleeve.get("prefilter_excluded_count") or 0),
-                "candidate_count": len(sleeve.get("candidate_rows") or []),
-                "selected_count": len(sleeve.get("selected_rows") or []),
-                "alternate_count": len(board.get("alternates") or []),
-                "filter_rejections": sleeve.get("filter_rejections") or {},
-                "selected_trade_rate_summary": _trade_rate_summary(
-                    list(sleeve.get("selected_rows") or [])
-                ),
-                "candidate_trade_rate_summary": _trade_rate_summary(
-                    list(sleeve.get("candidate_rows") or [])
-                ),
-                "selected": _public_portfolio_rows(
-                    list(sleeve.get("selected_rows") or [])
-                ),
-                "alternates": _public_portfolio_rows(
-                    list(board.get("alternates") or [])
-                ),
-            }
+        portfolio_similarity_payload = subset_similarity_payload(
+            candidate_similarity_payload,
+            portfolio_rows,
         )
 
-    public_portfolio_rows = _public_portfolio_rows(portfolio_rows)
-    payload = {
-        "generated_at": datetime.now().astimezone().isoformat(),
-        "portfolio_name": portfolio_name,
-        "portfolio_config_path": str(spec_path),
-        "portfolio_config_defaulted": used_defaults,
-        "portfolio_spec": portfolio_spec,
-        "corpus_index": {
-            **corpus_index_info,
-            "scoped_row_count": len(rows),
-        },
-        "catch_up_summary": catch_up_summary,
-        "run_ids": run_ids,
-        "attempt_ids": attempt_ids,
-        "corpus_row_count": corpus_index_info.get("row_count"),
-        "scoped_row_count": len(rows),
-        "export_bundle": None,
-        "candidate_union_count": len(portfolio_candidate_rows),
-        "selected_union_count": len(portfolio_rows),
-        "selected_overlap_count": int(merged.get("selected_overlap_count") or 0),
-        "candidate_trade_rate_summary": _trade_rate_summary(portfolio_candidate_rows),
-        "selected_trade_rate_summary": _trade_rate_summary(portfolio_rows),
-        "selected_basket_summary": _build_selection_basket_summary(portfolio_rows),
-        "selected_basket_curve_36m": _build_selection_basket_curve(portfolio_rows),
-        "sleeves": sleeves_payload,
-        "selected": public_portfolio_rows,
-        "charts": {
-            "portfolio_candidate_score_vs_trades": str(
-                charts_root / "portfolio-candidate-score-vs-trades-36mo.png"
-            ),
-            "portfolio_score_vs_trades": str(
-                charts_root / "portfolio-score-vs-trades-36mo.png"
-            ),
-            "portfolio_overlay_score_vs_trades": str(
-                charts_root / "portfolio-overlay-score-vs-trades-36mo.png"
-            ),
-            "portfolio_candidate_score_vs_drawdown": str(
-                charts_root / "portfolio-candidate-score-vs-drawdown-36mo.png"
-            ),
-            "portfolio_score_vs_drawdown": str(
-                charts_root / "portfolio-score-vs-drawdown-36mo.png"
-            ),
-            "portfolio_candidate_score_vs_sameness": str(
-                charts_root / "portfolio-candidate-score-vs-sameness-36mo.png"
-            ),
-            "portfolio_score_vs_sameness": str(
-                charts_root / "portfolio-score-vs-sameness-36mo.png"
-            ),
-            "portfolio_similarity_heatmap": str(
-                charts_root / "portfolio-similarity-heatmap.png"
-            ),
-        },
-        "profile_drop_phase": "pending"
-        if bool(portfolio_spec.get("generate_profile_drops")) and portfolio_rows
-        else "skipped",
-        "profile_drops": [],
-    }
-    write_json(report_root / "portfolio-report.json", payload)
-    write_csv(
-        report_root / "portfolio-report.csv",
-        [{"section": "selected", **row} for row in public_portfolio_rows],
-    )
-    profile_drop_results: list[dict[str, Any]] = []
-    if bool(portfolio_spec.get("generate_profile_drops")) and portfolio_rows:
-        profile_drop_results = _render_profile_drop_rows(
-            config=config,
-            rows=portfolio_rows,
-            output_root=profile_drop_root,
-            lookback_months=int(portfolio_spec.get("profile_drop_lookback_months", 36)),
-            timeout_seconds=int(portfolio_spec.get("profile_drop_timeout_seconds", 1800)),
-            force_rebuild=False,
-            profile_drop_workers=int(portfolio_spec.get("profile_drop_workers", 4)),
-            as_json=as_json,
-            progress_label="portfolio profile drops",
+        report_root = config.derived_root / "portfolio-report" / _slug_token(portfolio_name)
+        report_root.mkdir(parents=True, exist_ok=True)
+        charts_root, profile_drop_root = _portfolio_chart_paths(report_root)
+
+        trades_x_cap = (
+            None
+            if float(variant_spec.get("chart_trades_x_max", 300.0)) < 0.0
+            else float(variant_spec.get("chart_trades_x_max", 300.0))
         )
-        payload["generated_at"] = datetime.now().astimezone().isoformat()
-        payload["profile_drop_phase"] = "complete"
-        payload["profile_drops"] = profile_drop_results
+        render_attempt_tradeoff_scatter_artifacts(
+            portfolio_candidate_rows,
+            charts_root / "portfolio-candidate-score-vs-trades-36mo.png",
+            charts_root / "portfolio-candidate-score-vs-trades-36mo.json",
+            require_full_backtest_36=True,
+            x_axis_max=trades_x_cap,
+            title_prefix="Portfolio Candidate Union",
+        )
+        render_attempt_tradeoff_scatter_artifacts(
+            portfolio_rows,
+            charts_root / "portfolio-score-vs-trades-36mo.png",
+            charts_root / "portfolio-score-vs-trades-36mo.json",
+            require_full_backtest_36=True,
+            x_axis_max=trades_x_cap,
+            title_prefix="Portfolio",
+        )
+        render_attempt_tradeoff_overlay_artifacts(
+            portfolio_candidate_rows,
+            portfolio_rows,
+            charts_root / "portfolio-overlay-score-vs-trades-36mo.png",
+            charts_root / "portfolio-overlay-score-vs-trades-36mo.json",
+            x_axis_max=trades_x_cap,
+            title_prefix="Portfolio Overlay",
+        )
+        render_attempt_drawdown_scatter_artifacts(
+            portfolio_candidate_rows,
+            charts_root / "portfolio-candidate-score-vs-drawdown-36mo.png",
+            charts_root / "portfolio-candidate-score-vs-drawdown-36mo.json",
+            require_full_backtest_36=True,
+            title_prefix="Portfolio Candidate Union",
+        )
+        render_attempt_drawdown_scatter_artifacts(
+            portfolio_rows,
+            charts_root / "portfolio-score-vs-drawdown-36mo.png",
+            charts_root / "portfolio-score-vs-drawdown-36mo.json",
+            require_full_backtest_36=True,
+            title_prefix="Portfolio",
+        )
+        render_similarity_scatter_artifacts(
+            candidate_similarity_payload,
+            charts_root / "portfolio-candidate-score-vs-sameness-36mo.png",
+        )
+        render_similarity_scatter_artifacts(
+            portfolio_similarity_payload,
+            charts_root / "portfolio-score-vs-sameness-36mo.png",
+        )
+        render_similarity_heatmap_artifacts(
+            portfolio_similarity_payload,
+            charts_root / "portfolio-similarity-heatmap.png",
+            charts_root / "portfolio-similarity-heatmap.json",
+        )
+
+        sleeves_payload: list[dict[str, Any]] = []
+        for sleeve in sleeve_results:
+            board = sleeve.get("board") or {}
+            sleeves_payload.append(
+                {
+                    "name": sleeve.get("name"),
+                    "spec": sleeve.get("spec") or {},
+                    "qualified_count": len(sleeve.get("qualified_rows") or []),
+                    "prefilter_limit": sleeve.get("prefilter_limit"),
+                    "prefilter_retained_count": len(sleeve.get("candidate_rows") or []),
+                    "prefilter_excluded_count": int(
+                        sleeve.get("prefilter_excluded_count") or 0
+                    ),
+                    "candidate_count": len(sleeve.get("candidate_rows") or []),
+                    "selected_count": len(sleeve.get("selected_rows") or []),
+                    "alternate_count": len(board.get("alternates") or []),
+                    "filter_rejections": sleeve.get("filter_rejections") or {},
+                    "selected_trade_rate_summary": _trade_rate_summary(
+                        list(sleeve.get("selected_rows") or [])
+                    ),
+                    "candidate_trade_rate_summary": _trade_rate_summary(
+                        list(sleeve.get("candidate_rows") or [])
+                    ),
+                    "selected": _public_portfolio_rows(
+                        list(sleeve.get("selected_rows") or [])
+                    ),
+                    "alternates": _public_portfolio_rows(
+                        list(board.get("alternates") or [])
+                    ),
+                }
+            )
+
+        public_portfolio_rows = _public_portfolio_rows(portfolio_rows)
+        payload = {
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "portfolio_name": portfolio_name,
+            "portfolio_config_path": str(spec_path),
+            "portfolio_config_defaulted": used_defaults,
+            "portfolio_spec": variant_spec,
+            "account": variant_spec.get("account") or {},
+            "corpus_index": {
+                **corpus_index_info,
+                "scoped_row_count": len(variant_rows),
+            },
+            "catch_up_summary": catch_up_summary,
+            "run_ids": run_ids,
+            "attempt_ids": attempt_ids,
+            "corpus_row_count": corpus_index_info.get("row_count"),
+            "scoped_row_count": len(variant_rows),
+            "export_bundle": None,
+            "candidate_union_count": len(portfolio_candidate_rows),
+            "selected_union_count": len(portfolio_rows),
+            "selected_overlap_count": int(merged.get("selected_overlap_count") or 0),
+            "candidate_trade_rate_summary": _trade_rate_summary(portfolio_candidate_rows),
+            "selected_trade_rate_summary": _trade_rate_summary(portfolio_rows),
+            "selected_basket_summary": _build_selection_basket_summary(portfolio_rows),
+            "selected_deployment_summary": _build_selection_deployment_summary(
+                portfolio_rows
+            ),
+            "selected_basket_curve_36m": _build_selection_basket_curve(portfolio_rows),
+            "sleeves": sleeves_payload,
+            "selected": public_portfolio_rows,
+            "charts": {
+                "portfolio_candidate_score_vs_trades": str(
+                    charts_root / "portfolio-candidate-score-vs-trades-36mo.png"
+                ),
+                "portfolio_score_vs_trades": str(
+                    charts_root / "portfolio-score-vs-trades-36mo.png"
+                ),
+                "portfolio_overlay_score_vs_trades": str(
+                    charts_root / "portfolio-overlay-score-vs-trades-36mo.png"
+                ),
+                "portfolio_candidate_score_vs_drawdown": str(
+                    charts_root / "portfolio-candidate-score-vs-drawdown-36mo.png"
+                ),
+                "portfolio_score_vs_drawdown": str(
+                    charts_root / "portfolio-score-vs-drawdown-36mo.png"
+                ),
+                "portfolio_candidate_score_vs_sameness": str(
+                    charts_root / "portfolio-candidate-score-vs-sameness-36mo.png"
+                ),
+                "portfolio_score_vs_sameness": str(
+                    charts_root / "portfolio-score-vs-sameness-36mo.png"
+                ),
+                "portfolio_similarity_heatmap": str(
+                    charts_root / "portfolio-similarity-heatmap.png"
+                ),
+            },
+            "profile_drop_phase": "pending"
+            if bool(variant_spec.get("generate_profile_drops")) and portfolio_rows
+            else "skipped",
+            "profile_drops": [],
+        }
         write_json(report_root / "portfolio-report.json", payload)
-    export_bundle_summary = None
-    if bool(portfolio_spec.get("export_bundle")):
-        export_bundle_summary = _export_portfolio_bundle(
-            config=config,
-            payload=payload,
+        write_csv(
+            report_root / "portfolio-report.csv",
+            [{"section": "selected", **row} for row in public_portfolio_rows],
+        )
+        profile_drop_results: list[dict[str, Any]] = []
+        if bool(variant_spec.get("generate_profile_drops")) and portfolio_rows:
+            profile_drop_results = _render_profile_drop_rows(
+                config=config,
+                rows=portfolio_rows,
+                output_root=profile_drop_root,
+                lookback_months=int(variant_spec.get("profile_drop_lookback_months", 36)),
+                timeout_seconds=int(variant_spec.get("profile_drop_timeout_seconds", 1800)),
+                force_rebuild=False,
+                profile_drop_workers=int(variant_spec.get("profile_drop_workers", 4)),
+                as_json=as_json,
+                progress_label=f"portfolio profile drops:{portfolio_name}",
+            )
+            payload["generated_at"] = datetime.now().astimezone().isoformat()
+            payload["profile_drop_phase"] = "complete"
+            payload["profile_drops"] = profile_drop_results
+            write_json(report_root / "portfolio-report.json", payload)
+        report_markdown_path = _write_portfolio_markdown_report(
             report_root=report_root,
+            payload=payload,
             report_path=report_root / "portfolio-report.json",
         )
-        payload["export_bundle"] = export_bundle_summary
+        payload["portfolio_markdown"] = str(report_markdown_path)
         write_json(report_root / "portfolio-report.json", payload)
-    print(
-        json.dumps(
-            {
-                "report_root": str(report_root),
-                "portfolio_json": str(report_root / "portfolio-report.json"),
-                "portfolio_csv": str(report_root / "portfolio-report.csv"),
-                "portfolio_name": portfolio_name,
-                "corpus_index_source": corpus_index_info.get("source"),
-                "corpus_row_count": corpus_index_info.get("row_count"),
-                "scoped_row_count": len(rows),
-                "candidate_union_count": len(portfolio_candidate_rows),
-                "selected_union_count": len(portfolio_rows),
-                "selected_overlap_count": int(merged.get("selected_overlap_count") or 0),
-                "catch_up_exit_code": (
-                    catch_up_summary.get("exit_code")
-                    if isinstance(catch_up_summary, dict)
-                    else None
-                ),
-                "catch_up_status": (
-                    catch_up_summary.get("status")
-                    if isinstance(catch_up_summary, dict)
-                    else None
-                ),
-                "profile_drop_rendered": sum(
-                    1 for row in profile_drop_results if row.get("status") in {"rendered", "cached"}
-                ),
-                "profile_drop_failed": sum(
-                    1 for row in profile_drop_results if row.get("status") == "failed"
-                ),
-                "export_bundle": export_bundle_summary,
-                "charts": payload["charts"],
-                "selected": public_portfolio_rows,
-            },
-            ensure_ascii=True,
-            indent=2,
-        )
-    )
+        export_bundle_summary = None
+        if bool(variant_spec.get("export_bundle")):
+            export_bundle_summary = _export_portfolio_bundle(
+                config=config,
+                payload=payload,
+                report_root=report_root,
+                report_path=report_root / "portfolio-report.json",
+            )
+            payload["export_bundle"] = export_bundle_summary
+            write_json(report_root / "portfolio-report.json", payload)
+
+        return {
+            "report_root": str(report_root),
+            "portfolio_json": str(report_root / "portfolio-report.json"),
+            "portfolio_csv": str(report_root / "portfolio-report.csv"),
+            "portfolio_markdown": str(report_markdown_path),
+            "portfolio_name": portfolio_name,
+            "account": variant_spec.get("account") or {},
+            "corpus_index_source": corpus_index_info.get("source"),
+            "corpus_row_count": corpus_index_info.get("row_count"),
+            "scoped_row_count": len(variant_rows),
+            "candidate_union_count": len(portfolio_candidate_rows),
+            "selected_union_count": len(portfolio_rows),
+            "selected_overlap_count": int(merged.get("selected_overlap_count") or 0),
+            "catch_up_exit_code": (
+                catch_up_summary.get("exit_code")
+                if isinstance(catch_up_summary, dict)
+                else None
+            ),
+            "catch_up_status": (
+                catch_up_summary.get("status")
+                if isinstance(catch_up_summary, dict)
+                else None
+            ),
+            "profile_drop_rendered": sum(
+                1
+                for row in profile_drop_results
+                if row.get("status") in {"rendered", "cached"}
+            ),
+            "profile_drop_failed": sum(
+                1 for row in profile_drop_results if row.get("status") == "failed"
+            ),
+            "export_bundle": export_bundle_summary,
+            "charts": payload["charts"],
+            "selected": public_portfolio_rows,
+        }
+
+    summaries: list[dict[str, Any]] = []
+    for portfolio_spec in portfolio_specs:
+        variant_rows = enrich_rows_for_account(rows, portfolio_spec.get("account") or {})
+        summaries.append(build_portfolio_variant(portfolio_spec, variant_rows))
+
+    if len(summaries) == 1:
+        output_payload = summaries[0]
+    else:
+        output_payload = {
+            "portfolio_count": len(summaries),
+            "portfolio_names": [item.get("portfolio_name") for item in summaries],
+            "catch_up_exit_code": (
+                catch_up_summary.get("exit_code")
+                if isinstance(catch_up_summary, dict)
+                else None
+            ),
+            "catch_up_status": (
+                catch_up_summary.get("status")
+                if isinstance(catch_up_summary, dict)
+                else None
+            ),
+            "portfolios": summaries,
+        }
+    print(json.dumps(output_payload, ensure_ascii=True, indent=2))
     return 0
 
 
@@ -7319,6 +7459,20 @@ def _latest_portfolio_report_path(config) -> Path | None:
     return candidates[0] if candidates else None
 
 
+PORTFOLIO_RISK_SCENARIO_PCTS = (0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0)
+PORTFOLIO_GROWTH_TRACK_CHECKPOINT_DAYS = (30, 90, 180, 365)
+
+
+def _default_portfolio_config_path(config) -> Path:
+    modern_path = config.repo_root / "portfolio.account-presets.json"
+    if modern_path.exists():
+        return modern_path
+    legacy_path = config.repo_root / "portfolio.config.json"
+    if legacy_path.exists():
+        return legacy_path
+    return modern_path
+
+
 def _portfolio_bundle_root(config, portfolio_name: str) -> Path:
     return config.derived_root / "portfolio-exports" / _slug_token(portfolio_name)
 
@@ -7329,6 +7483,459 @@ def _copy_if_exists(source: Path | None, destination: Path) -> bool:
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, destination)
     return True
+
+
+def _safe_percentile(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    clamped = max(0.0, min(100.0, float(percentile)))
+    rank = (clamped / 100.0) * (len(ordered) - 1)
+    lower_index = int(rank)
+    upper_index = min(len(ordered) - 1, lower_index + 1)
+    fraction = rank - lower_index
+    lower_value = ordered[lower_index]
+    upper_value = ordered[upper_index]
+    return lower_value + (upper_value - lower_value) * fraction
+
+
+def _format_decimal(value: Any, digits: int = 2, default: str = "n/a") -> str:
+    numeric = _safe_float_value(value)
+    if numeric is None:
+        return default
+    return f"{numeric:.{digits}f}"
+
+
+def _format_percent(value: Any, digits: int = 2, default: str = "n/a") -> str:
+    numeric = _safe_float_value(value)
+    if numeric is None:
+        return default
+    return f"{numeric:.{digits}f}%"
+
+
+def _format_money(value: Any, currency: str = "USD", digits: int = 2, default: str = "n/a") -> str:
+    numeric = _safe_float_value(value)
+    if numeric is None:
+        return default
+    token = str(currency or "").strip().upper()
+    if token:
+        return f"{numeric:.{digits}f} {token}"
+    return f"{numeric:.{digits}f}"
+
+
+def _format_multiple(value: Any, digits: int = 2, default: str = "n/a") -> str:
+    numeric = _safe_float_value(value)
+    if numeric is None:
+        return default
+    return f"{numeric:.{digits}f}x"
+
+
+def _format_markdown_table(headers: list[str], rows: list[list[str]]) -> str:
+    if not headers:
+        return ""
+    header_row = "| " + " | ".join(headers) + " |"
+    separator_row = "| " + " | ".join(["---"] * len(headers)) + " |"
+    body_rows = ["| " + " | ".join(row) + " |" for row in rows]
+    return "\n".join([header_row, separator_row, *body_rows])
+
+
+def _coerce_curve_date(point: dict[str, Any]) -> str:
+    date_token = str(point.get("date") or "").strip()
+    if date_token:
+        return date_token
+    timestamp = _safe_float_value(point.get("time"))
+    if timestamp is None:
+        return ""
+    return datetime.fromtimestamp(int(timestamp)).date().isoformat()
+
+
+def _simulate_compounded_curve(
+    points: list[dict[str, Any]],
+    *,
+    starting_balance: float,
+    risk_pct: float,
+) -> dict[str, Any]:
+    if starting_balance <= 0.0:
+        starting_balance = 1.0
+    if risk_pct <= 0.0:
+        risk_pct = 0.0
+    if not points:
+        return {
+            "point_balances": [],
+            "daily_balances": [],
+            "daily_returns_pct": [],
+            "max_drawdown_pct": 0.0,
+            "final_balance": starting_balance,
+        }
+
+    risk_fraction = risk_pct / 100.0
+    previous_equity_r = 0.0
+    balance = starting_balance
+    peak_balance = starting_balance
+    max_drawdown_pct = 0.0
+    point_balances: list[dict[str, Any]] = []
+    last_balance_by_date: dict[str, float] = {}
+
+    for point_index, point in enumerate(points):
+        current_equity_r = _safe_float_value(point.get("equity_r"))
+        if current_equity_r is None:
+            current_equity_r = previous_equity_r
+        delta_r = 0.0 if point_index == 0 else (current_equity_r - previous_equity_r)
+        step_multiplier = 1.0 + (risk_fraction * delta_r)
+        if step_multiplier <= 0.0:
+            balance = 0.0
+        else:
+            balance *= step_multiplier
+        if balance > peak_balance:
+            peak_balance = balance
+        drawdown_pct = 0.0
+        if peak_balance > 0.0:
+            drawdown_pct = 100.0 * max(0.0, peak_balance - balance) / peak_balance
+        max_drawdown_pct = max(max_drawdown_pct, drawdown_pct)
+        date_token = _coerce_curve_date(point)
+        last_balance_by_date[date_token] = balance
+        point_balances.append(
+            {
+                "date": date_token,
+                "balance": balance,
+                "drawdown_pct": drawdown_pct,
+            }
+        )
+        previous_equity_r = current_equity_r
+
+    valid_dates = [item["date"] for item in point_balances if item.get("date")]
+    if not valid_dates:
+        return {
+            "point_balances": point_balances,
+            "daily_balances": [],
+            "daily_returns_pct": [],
+            "max_drawdown_pct": max_drawdown_pct,
+            "final_balance": balance,
+        }
+
+    start_date = datetime.fromisoformat(valid_dates[0]).date()
+    end_date = datetime.fromisoformat(valid_dates[-1]).date()
+    cursor = start_date
+    carry_balance = starting_balance
+    previous_day_balance = starting_balance
+    daily_balances: list[dict[str, Any]] = []
+    daily_returns_pct: list[float] = []
+
+    while cursor <= end_date:
+        date_token = cursor.isoformat()
+        if date_token in last_balance_by_date:
+            carry_balance = last_balance_by_date[date_token]
+        day_return_pct = 0.0
+        if previous_day_balance > 0.0:
+            day_return_pct = 100.0 * ((carry_balance / previous_day_balance) - 1.0)
+        daily_balances.append(
+            {
+                "date": date_token,
+                "balance": carry_balance,
+                "day_return_pct": day_return_pct,
+            }
+        )
+        daily_returns_pct.append(day_return_pct)
+        previous_day_balance = carry_balance
+        cursor += timedelta(days=1)
+
+    return {
+        "point_balances": point_balances,
+        "daily_balances": daily_balances,
+        "daily_returns_pct": daily_returns_pct,
+        "max_drawdown_pct": max_drawdown_pct,
+        "final_balance": balance,
+    }
+
+
+def _portfolio_risk_scenarios(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    account = dict(payload.get("account") or {})
+    account_size = _safe_float_value(account.get("account_size_usd")) or 100.0
+    base_risk_pct = _safe_float_value(account.get("risk_per_trade_pct"))
+    deployment_summary = dict(payload.get("selected_deployment_summary") or {})
+    avg_load_summary = dict(deployment_summary.get("account_estimated_avg_margin_load_pct_36m") or {})
+    peak_load_summary = dict(deployment_summary.get("account_estimated_peak_margin_load_pct_36m") or {})
+    avg_load_baseline_pct = _safe_float_value(avg_load_summary.get("sum"))
+    peak_load_baseline_pct = _safe_float_value(peak_load_summary.get("sum"))
+    basket_curve = dict(payload.get("selected_basket_curve_36m") or {})
+    points = [dict(item) for item in list(basket_curve.get("points") or []) if isinstance(item, dict)]
+
+    scenarios: list[dict[str, Any]] = []
+    for risk_pct in PORTFOLIO_RISK_SCENARIO_PCTS:
+        growth = _simulate_compounded_curve(
+            points,
+            starting_balance=account_size,
+            risk_pct=risk_pct,
+        )
+        daily_returns_pct = list(growth.get("daily_returns_pct") or [])
+        final_balance = _safe_float_value(growth.get("final_balance"))
+        if final_balance is None:
+            final_balance = account_size
+        final_return_pct = None
+        if account_size > 0.0:
+            final_return_pct = 100.0 * ((final_balance / account_size) - 1.0)
+        geometric_daily_return_pct = None
+        daily_balances = list(growth.get("daily_balances") or [])
+        if account_size > 0.0 and final_balance > 0.0 and daily_balances:
+            geometric_daily_return_pct = 100.0 * (
+                (final_balance / account_size) ** (1.0 / len(daily_balances)) - 1.0
+            )
+        scale = None
+        if base_risk_pct is not None and base_risk_pct > 0.0:
+            scale = risk_pct / base_risk_pct
+        avg_load_pct = avg_load_baseline_pct * scale if scale is not None and avg_load_baseline_pct is not None else None
+        peak_load_pct = peak_load_baseline_pct * scale if scale is not None and peak_load_baseline_pct is not None else None
+        checkpoints: dict[int, float] = {}
+        for checkpoint in PORTFOLIO_GROWTH_TRACK_CHECKPOINT_DAYS:
+            if not daily_balances:
+                checkpoints[checkpoint] = account_size
+                continue
+            index = min(checkpoint - 1, len(daily_balances) - 1)
+            checkpoint_balance = _safe_float_value(daily_balances[index].get("balance"))
+            checkpoints[checkpoint] = (
+                account_size if checkpoint_balance is None else checkpoint_balance
+            )
+        scenarios.append(
+            {
+                "risk_pct": risk_pct,
+                "final_balance": final_balance,
+                "final_return_pct": final_return_pct,
+                "geometric_daily_return_pct": geometric_daily_return_pct,
+                "mean_daily_return_pct": (
+                    sum(daily_returns_pct) / len(daily_returns_pct) if daily_returns_pct else None
+                ),
+                "median_daily_return_pct": _safe_percentile(daily_returns_pct, 50.0),
+                "p25_daily_return_pct": _safe_percentile(daily_returns_pct, 25.0),
+                "p75_daily_return_pct": _safe_percentile(daily_returns_pct, 75.0),
+                "best_day_return_pct": max(daily_returns_pct) if daily_returns_pct else None,
+                "worst_day_return_pct": min(daily_returns_pct) if daily_returns_pct else None,
+                "positive_day_ratio_pct": (
+                    100.0 * len([value for value in daily_returns_pct if value > 0.0]) / len(daily_returns_pct)
+                    if daily_returns_pct
+                    else None
+                ),
+                "max_drawdown_pct": _safe_float_value(growth.get("max_drawdown_pct")),
+                "avg_margin_load_pct": avg_load_pct,
+                "peak_margin_load_pct": peak_load_pct,
+                "avg_margin_load_usd": (
+                    account_size * avg_load_pct / 100.0
+                    if avg_load_pct is not None
+                    else None
+                ),
+                "peak_margin_load_usd": (
+                    account_size * peak_load_pct / 100.0
+                    if peak_load_pct is not None
+                    else None
+                ),
+                "checkpoints": checkpoints,
+            }
+        )
+    return scenarios
+
+
+def _render_portfolio_markdown_report(payload: dict[str, Any], *, report_path: Path | None = None) -> str:
+    portfolio_name = str(payload.get("portfolio_name") or "default-portfolio").strip()
+    generated_at = str(payload.get("generated_at") or "").strip()
+    account = dict(payload.get("account") or {})
+    account_name = str(account.get("name") or account.get("account_preset_name") or "").strip()
+    account_size = _safe_float_value(account.get("account_size_usd"))
+    account_currency = str(account.get("account_currency") or "USD").strip().upper() or "USD"
+    leverage = _safe_float_value(account.get("leverage"))
+    configured_risk_pct = _safe_float_value(account.get("risk_per_trade_pct"))
+    allowed_asset_classes = list(account.get("allowed_asset_classes") or [])
+    blocked_asset_classes = list(account.get("blocked_asset_classes") or [])
+    selected_basket_summary = dict(payload.get("selected_basket_summary") or {})
+    selected_deployment_summary = dict(payload.get("selected_deployment_summary") or {})
+    selected_basket_curve = dict(payload.get("selected_basket_curve_36m") or {})
+    selected_rows = [dict(item) for item in list(payload.get("selected") or []) if isinstance(item, dict)]
+    scenarios = _portfolio_risk_scenarios(payload)
+    curve_points = [
+        dict(item) for item in list(selected_basket_curve.get("points") or []) if isinstance(item, dict)
+    ]
+    horizon_start = _coerce_curve_date(curve_points[0]) if curve_points else ""
+    horizon_end = _coerce_curve_date(curve_points[-1]) if curve_points else ""
+
+    trades_per_month_sum = _safe_float_value(
+        _nested_get(selected_basket_summary, ["trades_per_month", "sum"])
+    )
+    final_equity_r = _safe_float_value(selected_basket_curve.get("final_equity_r"))
+    max_drawdown_r = _safe_float_value(selected_basket_curve.get("max_drawdown_r"))
+    final_drawdown_r = _safe_float_value(selected_basket_curve.get("final_drawdown_r"))
+    avg_load_pct = _safe_float_value(
+        _nested_get(selected_deployment_summary, ["account_estimated_avg_margin_load_pct_36m", "sum"])
+    )
+    peak_load_pct = _safe_float_value(
+        _nested_get(selected_deployment_summary, ["account_estimated_peak_margin_load_pct_36m", "sum"])
+    )
+    avg_holding_hours = _safe_float_value(
+        _nested_get(selected_deployment_summary, ["avg_holding_hours_36m", "mean"])
+    )
+    asset_class_counts = dict(selected_deployment_summary.get("asset_class_counts") or {})
+    asset_mix = ", ".join(
+        f"{asset_class} x{count}" for asset_class, count in sorted(asset_class_counts.items())
+    ) or "n/a"
+
+    lines: list[str] = []
+    lines.append(f"# {portfolio_name} Portfolio Report")
+    lines.append("")
+    if generated_at:
+        lines.append(f"- Generated at: `{generated_at}`")
+    if report_path is not None:
+        lines.append(f"- Source report: `{report_path}`")
+    if account_name:
+        lines.append(f"- Account preset: `{account_name}`")
+    if horizon_start and horizon_end:
+        lines.append(f"- Scenario horizon: `36mo ({horizon_start} to {horizon_end})`")
+    lines.append("")
+
+    overview_rows = [
+        ["Strategies", str(len(selected_rows))],
+        ["Asset mix", asset_mix],
+        ["Account size", _format_money(account_size, account_currency)],
+        ["Leverage", f"1:{_format_decimal(leverage, 0)}" if leverage is not None else "n/a"],
+        ["Configured risk/trade", _format_percent(configured_risk_pct)],
+        ["Allowed asset classes", ", ".join(str(token) for token in allowed_asset_classes) or "n/a"],
+        ["Blocked asset classes", ", ".join(str(token) for token in blocked_asset_classes) or "none"],
+        ["Trades/month (basket)", _format_decimal(trades_per_month_sum, 2)],
+        ["36mo terminal equity", f"{_format_decimal(final_equity_r, 2)}R"],
+        ["36mo max basket drawdown", f"{_format_decimal(max_drawdown_r, 2)}R"],
+        ["36mo final drawdown", f"{_format_decimal(final_drawdown_r, 2)}R"],
+        ["Est avg deposit load @ configured risk", _format_percent(avg_load_pct)],
+        ["Est stacked peak load @ configured risk", _format_percent(peak_load_pct)],
+        ["Avg holding hours", _format_decimal(avg_holding_hours, 2)],
+    ]
+    lines.append("## Portfolio Snapshot")
+    lines.append("")
+    lines.append(_format_markdown_table(["Field", "Value"], overview_rows))
+    lines.append("")
+
+    scenario_rows: list[list[str]] = []
+    for scenario in scenarios:
+        scenario_rows.append(
+            [
+                _format_percent(scenario.get("risk_pct")),
+                _format_money(scenario.get("final_balance"), account_currency),
+                _format_percent(scenario.get("final_return_pct")),
+                _format_percent(scenario.get("geometric_daily_return_pct")),
+                _format_percent(scenario.get("mean_daily_return_pct")),
+                _format_percent(scenario.get("median_daily_return_pct")),
+                f"{_format_percent(scenario.get('p25_daily_return_pct'))} / {_format_percent(scenario.get('p75_daily_return_pct'))}",
+                _format_percent(scenario.get("max_drawdown_pct")),
+                _format_percent(scenario.get("avg_margin_load_pct")),
+                _format_percent(scenario.get("peak_margin_load_pct")),
+            ]
+        )
+    lines.append("## Risk Scenarios")
+    lines.append("")
+    lines.append(
+        _format_markdown_table(
+            [
+                "Risk / trade",
+                "Final balance",
+                "Final return",
+                "Geom day",
+                "Arith mean day",
+                "Median day",
+                "P25 / P75 day",
+                "Max DD",
+                "Est avg load",
+                "Est stacked peak load",
+            ],
+            scenario_rows,
+        )
+    )
+    lines.append("")
+
+    lines.append("## Growth Tracks")
+    lines.append("")
+    for scenario in scenarios:
+        checkpoints = dict(scenario.get("checkpoints") or {})
+        checkpoint_tokens = [
+            f"{days}d {_format_money(checkpoints.get(days), account_currency)}"
+            for days in PORTFOLIO_GROWTH_TRACK_CHECKPOINT_DAYS
+        ]
+        checkpoint_tokens.append(f"final {_format_money(scenario.get('final_balance'), account_currency)}")
+        lines.append(
+            f"- `{_format_percent(scenario.get('risk_pct'))}`: "
+            + " | ".join(checkpoint_tokens)
+            + f" | max DD {_format_percent(scenario.get('max_drawdown_pct'))}"
+            + f" | avg load {_format_percent(scenario.get('avg_margin_load_pct'))}"
+            + f" | peak load {_format_percent(scenario.get('peak_margin_load_pct'))}"
+        )
+    lines.append("")
+
+    profile_drop_lookup = {
+        str(item.get("attempt_id") or "").strip(): dict(item)
+        for item in list(payload.get("profile_drops") or [])
+        if str(item.get("attempt_id") or "").strip()
+    }
+
+    selected_rows_md: list[list[str]] = []
+    for row in sorted(selected_rows, key=lambda item: int(_safe_float_value(item.get("portfolio_rank")) or 0)):
+        attempt_id = str(row.get("attempt_id") or "").strip()
+        drop_item = profile_drop_lookup.get(attempt_id) or {}
+        display_name = str(drop_item.get("display_name") or "").strip()
+        candidate_name = str(row.get("candidate_name") or "").strip()
+        selected_rows_md.append(
+            [
+                str(int(_safe_float_value(row.get("portfolio_rank")) or 0)),
+                display_name or candidate_name,
+                str(row.get("primary_asset_class_36m") or ""),
+                _format_decimal(row.get("score_36m"), 2),
+                _format_decimal(row.get("trades_per_month_36m"), 2),
+                f"{_format_decimal(row.get('max_drawdown_r_36m'), 2)}R",
+                f"{_format_decimal(row.get('final_equity_r_36m'), 2)}R",
+                _format_percent(row.get("account_estimated_avg_margin_load_pct_36m")),
+                _format_percent(row.get("account_estimated_peak_margin_load_pct_36m")),
+            ]
+        )
+    if selected_rows_md:
+        lines.append("## Selected Profiles")
+        lines.append("")
+        lines.append(
+            _format_markdown_table(
+                [
+                    "#",
+                    "Candidate",
+                    "Asset",
+                    "Score",
+                    "Trades/mo",
+                    "Max DD",
+                    "Final Equity",
+                    "Avg Load",
+                    "Peak Load",
+                ],
+                selected_rows_md,
+            )
+        )
+        lines.append("")
+
+    lines.append("## Notes")
+    lines.append("")
+    lines.append("- Growth scenarios compound the portfolio `equity_r` curve at each risk tier, so the path is derived from the actual basket curve rather than a flat CAGR shortcut.")
+    lines.append("- `Final balance` and `Final return` cover the full 36-month scenario horizon. Use the `365d` checkpoint in Growth Tracks for a one-year intuition check.")
+    lines.append("- `Geom day` is the full-horizon equivalent compounded daily rate. `Arith mean day` is the simple average of realized daily returns and can read higher when the path has many flat days plus occasional bursts.")
+    lines.append("- Deposit-load scenarios scale linearly from the configured account `risk_per_trade_pct` using the portfolio's estimated avg and peak open-position pressure.")
+    lines.append("- `Risk / trade` is a per-trade sizing assumption, not a cap on daily return. A day can move much more than that when multiple trades or strategies realize PnL together.")
+    lines.append("- `Est stacked peak load` is a stress estimate from summed per-strategy peak pressure, not a broker-recorded synchronized time-series peak.")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _write_portfolio_markdown_report(
+    *,
+    report_root: Path,
+    payload: dict[str, Any],
+    report_path: Path | None = None,
+) -> Path:
+    report_root.mkdir(parents=True, exist_ok=True)
+    markdown_path = report_root / "portfolio-report.md"
+    markdown_path.write_text(
+        _render_portfolio_markdown_report(payload, report_path=report_path),
+        encoding="utf-8",
+    )
+    return markdown_path
 
 
 def _human_bundle_item_token(
@@ -7459,6 +8066,15 @@ def _export_portfolio_bundle(
     timestamp_token = datetime.now().astimezone().strftime("%Y%m%dT%H%M%S")
     bundle_root = export_root / timestamp_token
     bundle_root.mkdir(parents=True, exist_ok=True)
+    report_markdown_path = report_root / "portfolio-report.md"
+    if not report_markdown_path.exists():
+        report_markdown_path = _write_portfolio_markdown_report(
+            report_root=report_root,
+            payload=payload,
+            report_path=report_path,
+        )
+    bundle_markdown_path = bundle_root / "portfolio-report.md"
+    exported_markdown = _copy_if_exists(report_markdown_path, bundle_markdown_path)
 
     selected_rows = list(payload.get("selected") or [])
     profile_drop_lookup = {
@@ -7470,7 +8086,9 @@ def _export_portfolio_bundle(
     exported_profiles = 0
     missing_profiles: list[str] = []
     exported_drop_pngs = 0
+    exported_drop_manifests = 0
     missing_drop_attempts: list[str] = []
+    missing_drop_manifest_attempts: list[str] = []
     manifest_rows: list[dict[str, Any]] = []
     used_item_tokens: set[str] = set()
     attempts_cache: dict[str, list[dict[str, Any]]] = {}
@@ -7500,24 +8118,64 @@ def _export_portfolio_bundle(
         drop_item = profile_drop_lookup.get(attempt_id) or {}
         png_path_raw = str(drop_item.get("png_path") or "").strip()
         png_path = Path(png_path_raw).resolve() if png_path_raw else None
+        manifest_path_raw = str(drop_item.get("manifest_path") or "").strip()
+        drop_manifest_path = Path(manifest_path_raw).resolve() if manifest_path_raw else None
+        drop_manifest_payload = (
+            load_json_if_exists(drop_manifest_path)
+            if drop_manifest_path is not None and drop_manifest_path.exists()
+            else None
+        )
+        if not isinstance(drop_manifest_payload, dict):
+            drop_manifest_payload = {}
         png_export_path = item_root / f"{item_token}.png"
+        drop_manifest_export_path = item_root / (
+            drop_manifest_path.name
+            if drop_manifest_path is not None
+            else "profile-drop.manifest.json"
+        )
         has_drop_png = False
         if _copy_if_exists(png_path, png_export_path):
             exported_drop_pngs += 1
             has_drop_png = True
         if not has_drop_png:
             missing_drop_attempts.append(attempt_id)
+        has_drop_manifest = False
+        if _copy_if_exists(drop_manifest_path, drop_manifest_export_path):
+            exported_drop_manifests += 1
+            has_drop_manifest = True
+        if not has_drop_manifest:
+            missing_drop_manifest_attempts.append(attempt_id)
 
+        display_name = drop_manifest_payload.get("display_name") or drop_item.get("display_name")
+        tagline = drop_manifest_payload.get("tagline") or drop_item.get("tagline")
+        short_description = drop_manifest_payload.get("short_description") or drop_item.get(
+            "short_description"
+        )
+        long_description = drop_manifest_payload.get("long_description") or drop_item.get(
+            "long_description"
+        )
         manifest_rows.append(
             {
                 "selection_rank": rank,
                 "attempt_id": attempt_id,
                 "run_id": str(row.get("run_id") or ""),
                 "candidate_name": candidate_name,
-                "profile_ref": str(drop_item.get("profile_ref") or row.get("profile_ref") or ""),
+                "display_name": display_name,
+                "tagline": tagline,
+                "short_description": short_description,
+                "long_description": long_description,
+                "profile_ref": str(
+                    drop_manifest_payload.get("profile_ref")
+                    or drop_item.get("profile_ref")
+                    or row.get("profile_ref")
+                    or ""
+                ),
                 "export_dir": str(item_root),
                 "profile_export_path": str(profile_export_path) if has_profile else None,
                 "drop_png_export_path": str(png_export_path) if has_drop_png else None,
+                "drop_manifest_export_path": (
+                    str(drop_manifest_export_path) if has_drop_manifest else None
+                ),
             }
         )
 
@@ -7526,11 +8184,15 @@ def _export_portfolio_bundle(
         "portfolio_name": portfolio_name,
         "bundle_root": str(bundle_root),
         "report_path": str(report_path),
+        "report_markdown_path": str(report_markdown_path) if report_markdown_path.exists() else None,
+        "bundle_markdown_path": str(bundle_markdown_path) if exported_markdown else None,
         "selected_count": len(selected_rows),
         "exported_profiles": exported_profiles,
         "missing_profiles": missing_profiles,
         "exported_drop_pngs": exported_drop_pngs,
+        "exported_drop_manifests": exported_drop_manifests,
         "missing_drop_attempts": missing_drop_attempts,
+        "missing_drop_manifest_attempts": missing_drop_manifest_attempts,
         "selected_rows": manifest_rows,
     }
     return summary

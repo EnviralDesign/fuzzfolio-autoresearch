@@ -45,6 +45,8 @@ def test_load_cached_metadata_requires_matching_signature_and_valid_copy(tmp_pat
     payload = {
         "version": 1,
         "presentation_signature": "sig-1",
+        "writer_profile": "codex-54-mini",
+        "profile_ref": "profile-1",
         "display_name": "Breakout Pressure Fade",
         "tagline": "Fade failed expansion after breakout pressure peaks.",
         "short_description": "Targets exhausted breakouts that reverse after volatility spikes and momentum fades.",
@@ -57,6 +59,15 @@ def test_load_cached_metadata_requires_matching_signature_and_valid_copy(tmp_pat
 
     assert pm.load_cached_metadata(path, expected_signature="sig-1") is not None
     assert pm.load_cached_metadata(path, expected_signature="sig-2") is None
+    assert (
+        pm.load_cached_metadata(
+            path,
+            expected_signature="sig-2",
+            fallback_writer_profile="codex-54-mini",
+            fallback_profile_ref="profile-1",
+        )
+        is not None
+    )
 
 
 def test_apply_metadata_to_profile_document_rewrites_visible_fields() -> None:
@@ -101,3 +112,87 @@ def test_compute_presentation_signature_changes_with_writer_profile() -> None:
     )
 
     assert left != right
+
+
+def test_compute_presentation_signature_ignores_volatile_profile_fields() -> None:
+    package_inputs = {"timeframe": "M15", "instruments": ["CADJPY"]}
+    left_payload = {
+        "format": "fuzzfolio.scoring-profile",
+        "formatVersion": 1,
+        "profile": {
+            "name": "Old Nice Name",
+            "description": "Old description",
+            "executionConfig": None,
+            "notificationThreshold": 80,
+            "isActive": False,
+            "directionMode": "both",
+            "indicators": [
+                {
+                    "meta": {"id": "BBANDS_MEAN_REVERSION", "instanceId": "left-1"},
+                    "config": {
+                        "timeframe": "M15",
+                        "ranges": {"buy": [-2.0, -1.0], "sell": [1.0, 2.0]},
+                        "weight": 1.0,
+                    },
+                }
+            ],
+        },
+    }
+    right_payload = {
+        "format": "fuzzfolio.scoring-profile",
+        "formatVersion": 1,
+        "profile": {
+            "name": "New Nice Name",
+            "description": "New description",
+            "executionConfig": {
+                "exitPolicy": {
+                    "selectedCell": {
+                        "stopLossPercent": 0.08,
+                        "rewardMultiple": 12.0,
+                        "takeProfitPercent": 0.96,
+                    }
+                }
+            },
+            "notificationThreshold": 95,
+            "isActive": True,
+            "directionMode": "both",
+            "indicators": [
+                {
+                    "meta": {"id": "BBANDS_MEAN_REVERSION", "instanceId": "right-9"},
+                    "config": {
+                        "timeframe": "M15",
+                        "ranges": {"buy": [-2.0, -1.0], "sell": [1.0, 2.0]},
+                        "weight": 1.0,
+                    },
+                }
+            ],
+        },
+    }
+
+    left = pm.compute_presentation_signature(
+        left_payload,
+        package_inputs=package_inputs,
+        lookback_months=36,
+        writer_profile="codex-54-mini",
+    )
+    right = pm.compute_presentation_signature(
+        right_payload,
+        package_inputs=package_inputs,
+        lookback_months=36,
+        writer_profile="codex-54-mini",
+    )
+    legacy_left = pm.compute_legacy_presentation_signature(
+        left_payload,
+        package_inputs=package_inputs,
+        lookback_months=36,
+        writer_profile="codex-54-mini",
+    )
+    legacy_right = pm.compute_legacy_presentation_signature(
+        right_payload,
+        package_inputs=package_inputs,
+        lookback_months=36,
+        writer_profile="codex-54-mini",
+    )
+
+    assert left == right
+    assert legacy_left != legacy_right

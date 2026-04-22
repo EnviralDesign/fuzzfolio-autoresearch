@@ -1,0 +1,302 @@
+{
+  "version": 2,
+  "catch_up_full_backtests": false,
+  "catch_up_force_rebuild": false,
+  "catch_up_require_scrutiny_36": false,
+  "generate_profile_drops": true,
+  "export_bundle": true,
+  "profile_drop_workers": 4,
+  "chart_trades_x_max": 300.0,
+  "account_presets": {
+    "tiny-live-fx": {
+      "name": "Tiny Live FX",
+      "account_size_usd": 124,
+      "leverage": 500,
+      "risk_per_trade_pct": 0.75,
+      "allowed_asset_classes": [
+        "fx"
+      ]
+    },
+    "darwinex-zero": {
+      "name": "Darwinex Zero",
+      "account_size_usd": 100000,
+      "leverage": 200,
+      "risk_per_trade_pct": 0.3,
+      "allowed_asset_classes": [
+        "fx",
+        "metal",
+        "index"
+      ],
+      "blocked_asset_classes": [
+        "crypto",
+        "equity"
+      ]
+    }
+  },
+  "portfolio_variants": [
+    {
+      "portfolio_name": "tiny-live-fx",
+      "account_preset": "tiny-live-fx",
+      "sleeves": [
+        {
+          "name": "micro-survival",
+          "prefilter_limit": 160,
+          "shortlist_size": 3,
+          "min_score_36": 78.0,
+          "min_trades_per_month": 4.0,
+          "max_drawdown_r": 3.0,
+          "drawdown_penalty": 1.25,
+          "trade_rate_bonus_weight": 2.0,
+          "trade_rate_bonus_target": 20.0,
+          "novelty_penalty": 20.0,
+          "max_per_run": 1,
+          "max_per_strategy_key": 1,
+          "max_sameness_to_board": 0.68,
+          "require_full_backtest_36": true,
+          "field_filters": [
+            {
+              "name": "allowed_asset_class",
+              "field": "account_disallowed_asset_class_count_36m",
+              "direction": "lower",
+              "target": 0.0
+            },
+            {
+              "name": "avg_open_positions",
+              "field": "estimated_avg_open_positions_36m",
+              "direction": "lower",
+              "target": 3.0
+            },
+            {
+              "name": "avg_holding_hours",
+              "field": "avg_holding_hours_36m",
+              "direction": "lower",
+              "target": 96.0
+            },
+            {
+              "name": "peak_margin_load",
+              "field": "account_estimated_peak_margin_load_pct_36m",
+              "direction": "lower",
+              "target": 35.0,
+              "allow_missing": true
+            },
+            {
+              "name": "instrument_count",
+              "field": "instrument_count",
+              "direction": "lower",
+              "target": 3.0
+            }
+          ],
+          "scalar_metric_terms": [
+            {
+              "name": "final_equity_r",
+              "field": "final_equity_r_36m",
+              "direction": "higher",
+              "target": 200.0,
+              "weight": 5.0
+            },
+            {
+              "name": "positive_cell_ratio",
+              "field": "positive_cell_ratio_36m",
+              "direction": "higher",
+              "target": 0.75,
+              "weight": 4.0
+            },
+            {
+              "name": "avg_margin_load",
+              "field": "account_estimated_avg_margin_load_pct_36m",
+              "direction": "lower",
+              "target": 12.0,
+              "weight": 3.0
+            }
+          ]
+        },
+        {
+          "name": "micro-growth",
+          "prefilter_limit": 160,
+          "shortlist_size": 2,
+          "min_score_36": 77.0,
+          "min_trades_per_month": 10.0,
+          "max_drawdown_r": 3.5,
+          "drawdown_penalty": 1.0,
+          "trade_rate_bonus_weight": 4.0,
+          "trade_rate_bonus_target": 24.0,
+          "novelty_penalty": 16.0,
+          "max_per_run": 1,
+          "max_per_strategy_key": 1,
+          "max_sameness_to_board": 0.7,
+          "require_full_backtest_36": true,
+          "field_filters": [
+            {
+              "name": "allowed_asset_class",
+              "field": "account_disallowed_asset_class_count_36m",
+              "direction": "lower",
+              "target": 0.0
+            },
+            {
+              "name": "avg_open_positions",
+              "field": "estimated_avg_open_positions_36m",
+              "direction": "lower",
+              "target": 4.0
+            },
+            {
+              "name": "peak_margin_load",
+              "field": "account_estimated_peak_margin_load_pct_36m",
+              "direction": "lower",
+              "target": 45.0,
+              "allow_missing": true
+            },
+            {
+              "name": "instrument_count",
+              "field": "instrument_count",
+              "direction": "lower",
+              "target": 2.0
+            }
+          ],
+          "scalar_metric_terms": [
+            {
+              "name": "final_equity_r",
+              "field": "final_equity_r_36m",
+              "direction": "higher",
+              "target": 300.0,
+              "weight": 6.0
+            },
+            {
+              "name": "edge_rate",
+              "field": "edge_rate_r_per_month_36m",
+              "direction": "higher",
+              "target": 10.0,
+              "weight": 5.0
+            },
+            {
+              "name": "avg_margin_load",
+              "field": "account_estimated_avg_margin_load_pct_36m",
+              "direction": "lower",
+              "target": 14.0,
+              "weight": 2.0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "portfolio_name": "darwinex-zero",
+      "account_preset": "darwinex-zero",
+      "sleeves": [
+        {
+          "name": "prop-core",
+          "prefilter_limit": 240,
+          "shortlist_size": 4,
+          "min_score_36": 78.0,
+          "min_trades_per_month": 8.0,
+          "max_drawdown_r": 4.0,
+          "drawdown_penalty": 0.95,
+          "trade_rate_bonus_weight": 6.0,
+          "trade_rate_bonus_target": 40.0,
+          "novelty_penalty": 18.0,
+          "max_per_run": 1,
+          "max_per_strategy_key": 1,
+          "max_sameness_to_board": 0.74,
+          "require_full_backtest_36": true,
+          "field_filters": [
+            {
+              "name": "blocked_asset_class",
+              "field": "account_disallowed_asset_class_count_36m",
+              "direction": "lower",
+              "target": 0.0
+            },
+            {
+              "name": "peak_margin_load",
+              "field": "account_estimated_peak_margin_load_pct_36m",
+              "direction": "lower",
+              "target": 30.0,
+              "allow_missing": true
+            },
+            {
+              "name": "avg_open_positions",
+              "field": "estimated_avg_open_positions_36m",
+              "direction": "lower",
+              "target": 12.0
+            }
+          ],
+          "scalar_metric_terms": [
+            {
+              "name": "final_equity_r",
+              "field": "final_equity_r_36m",
+              "direction": "higher",
+              "target": 300.0,
+              "weight": 6.0
+            },
+            {
+              "name": "edge_rate",
+              "field": "edge_rate_r_per_month_36m",
+              "direction": "higher",
+              "target": 20.0,
+              "weight": 5.0
+            },
+            {
+              "name": "positive_week_ratio",
+              "field": "positive_week_ratio_36m",
+              "direction": "higher",
+              "target": 0.9,
+              "weight": 3.0
+            }
+          ]
+        },
+        {
+          "name": "prop-anchor",
+          "prefilter_limit": 200,
+          "shortlist_size": 2,
+          "min_score_36": 76.0,
+          "min_trades_per_month": 2.0,
+          "max_drawdown_r": 2.5,
+          "drawdown_penalty": 1.3,
+          "trade_rate_bonus_weight": 1.0,
+          "trade_rate_bonus_target": 12.0,
+          "novelty_penalty": 22.0,
+          "max_per_run": 1,
+          "max_per_strategy_key": 1,
+          "max_sameness_to_board": 0.68,
+          "require_full_backtest_36": true,
+          "field_filters": [
+            {
+              "name": "blocked_asset_class",
+              "field": "account_disallowed_asset_class_count_36m",
+              "direction": "lower",
+              "target": 0.0
+            },
+            {
+              "name": "peak_margin_load",
+              "field": "account_estimated_peak_margin_load_pct_36m",
+              "direction": "lower",
+              "target": 20.0,
+              "allow_missing": true
+            }
+          ],
+          "scalar_metric_terms": [
+            {
+              "name": "positive_cell_ratio",
+              "field": "positive_cell_ratio_36m",
+              "direction": "higher",
+              "target": 0.7,
+              "weight": 4.0
+            },
+            {
+              "name": "avg_margin_load",
+              "field": "account_estimated_avg_margin_load_pct_36m",
+              "direction": "lower",
+              "target": 10.0,
+              "weight": 3.0
+            },
+            {
+              "name": "final_equity_r",
+              "field": "final_equity_r_36m",
+              "direction": "higher",
+              "target": 150.0,
+              "weight": 3.0
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

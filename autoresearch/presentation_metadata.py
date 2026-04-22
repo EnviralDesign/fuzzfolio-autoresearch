@@ -30,6 +30,7 @@ _BANNED_OPERATIONAL_PATTERNS = (
     re.compile(r"\bseed(?:ed|ing)?\b", re.IGNORECASE),
     re.compile(r"\bv\d+\b", re.IGNORECASE),
 )
+_VOLATILE_PROFILE_FIELDS = {"name", "description", "executionConfig", "notificationThreshold", "isActive"}
 
 
 def _normalize_whitespace(text: Any) -> str:
@@ -144,7 +145,30 @@ def load_profile_document(bundle_dir: Path) -> tuple[Path, dict[str, Any] | None
     return profile_document_path, payload if isinstance(payload, dict) else None
 
 
-def compute_presentation_signature(
+def _stable_profile_document_payload(
+    profile_document_payload: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(profile_document_payload, dict):
+        return None
+
+    def prune(value: Any, path: tuple[str, ...] = ()) -> Any:
+        if isinstance(value, dict):
+            result: dict[str, Any] = {}
+            for key, child in value.items():
+                if path == ("profile",) and key in _VOLATILE_PROFILE_FIELDS:
+                    continue
+                if key == "instanceId":
+                    continue
+                result[str(key)] = prune(child, path + (str(key),))
+            return result
+        if isinstance(value, list):
+            return [prune(item, path + ("[]",)) for item in value]
+        return value
+
+    return prune(profile_document_payload)
+
+
+def compute_legacy_presentation_signature(
     profile_document_payload: dict[str, Any] | None,
     *,
     package_inputs: dict[str, Any],
@@ -155,6 +179,23 @@ def compute_presentation_signature(
         "presentation_generation_version": PRESENTATION_GENERATION_VERSION,
         "writer_profile": str(writer_profile or "").strip() or None,
         "profile_document": profile_document_payload if isinstance(profile_document_payload, dict) else None,
+        "package": _canonical_package_inputs(package_inputs, lookback_months=lookback_months),
+    }
+    serialized = json.dumps(canonical, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def compute_presentation_signature(
+    profile_document_payload: dict[str, Any] | None,
+    *,
+    package_inputs: dict[str, Any],
+    lookback_months: int,
+    writer_profile: str | None,
+) -> str:
+    canonical = {
+        "presentation_generation_version": PRESENTATION_GENERATION_VERSION,
+        "writer_profile": str(writer_profile or "").strip() or None,
+        "profile_document": _stable_profile_document_payload(profile_document_payload),
         "package": _canonical_package_inputs(package_inputs, lookback_months=lookback_months),
     }
     serialized = json.dumps(canonical, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
@@ -264,6 +305,9 @@ def load_cached_metadata(
     path: Path,
     *,
     expected_signature: str,
+    accepted_signatures: set[str] | None = None,
+    fallback_writer_profile: str | None = None,
+    fallback_profile_ref: str | None = None,
 ) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -273,7 +317,19 @@ def load_cached_metadata(
         return None
     if not isinstance(payload, dict):
         return None
-    if str(payload.get("presentation_signature") or "") != str(expected_signature):
+    accepted = {str(expected_signature)}
+    if accepted_signatures:
+        accepted.update(str(signature) for signature in accepted_signatures if str(signature).strip())
+    payload_signature = str(payload.get("presentation_signature") or "")
+    fallback_allowed = (
+        str(fallback_writer_profile or "").strip()
+        and str(fallback_profile_ref or "").strip()
+        and str(payload.get("writer_profile") or "").strip()
+        == str(fallback_writer_profile or "").strip()
+        and str(payload.get("profile_ref") or "").strip()
+        == str(fallback_profile_ref or "").strip()
+    )
+    if payload_signature not in accepted and not fallback_allowed:
         return None
     normalized = validate_generated_metadata(payload)
     if normalized is None:

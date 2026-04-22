@@ -19,6 +19,82 @@ def test_load_portfolio_spec_defaults_when_file_missing(tmp_path: Path) -> None:
     ]
 
 
+def test_load_portfolio_build_specs_supports_variants_and_account_presets(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "portfolio-variants.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "catch_up_full_backtests": False,
+                "generate_profile_drops": False,
+                "export_bundle": False,
+                "sleeves": [{"name": "shared-quality"}],
+                "account_presets": {
+                    "tiny-live": {
+                        "name": "Tiny Live",
+                        "account_size_usd": 124,
+                        "leverage": 500,
+                        "risk_per_trade_pct": 0.75,
+                        "allowed_asset_classes": ["forex"],
+                    }
+                },
+                "portfolio_variants": [
+                    {
+                        "portfolio_name": "micro-live",
+                        "account_preset": "tiny-live",
+                    },
+                    {
+                        "portfolio_name": "darwinex-zero",
+                        "account": {
+                            "name": "Darwinex Zero",
+                            "account_size_usd": 100000,
+                            "leverage": 200,
+                            "blocked_asset_classes": ["crypto"],
+                        },
+                        "sleeves": [{"name": "prop-growth"}],
+                    },
+                ],
+            },
+            ensure_ascii=True,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    specs, defaulted = pf.load_portfolio_build_specs(config_path)
+
+    assert defaulted is False
+    assert [item["portfolio_name"] for item in specs] == ["micro-live", "darwinex-zero"]
+    assert specs[0]["account"]["account_preset_name"] == "tiny-live"
+    assert specs[0]["account"]["allowed_asset_classes"] == ["fx"]
+    assert specs[0]["account"]["leverage"] == 500.0
+    assert [sleeve["name"] for sleeve in specs[0]["sleeves"]] == ["shared-quality"]
+    assert specs[1]["account"]["blocked_asset_classes"] == ["crypto"]
+    assert [sleeve["name"] for sleeve in specs[1]["sleeves"]] == ["prop-growth"]
+
+
+def test_default_portfolio_config_path_prefers_account_presets(tmp_path: Path) -> None:
+    modern_path = tmp_path / "portfolio.account-presets.json"
+    legacy_path = tmp_path / "portfolio.config.json"
+    modern_path.write_text("{}", encoding="utf-8")
+    legacy_path.write_text("{}", encoding="utf-8")
+
+    config = SimpleNamespace(repo_root=tmp_path)
+
+    assert ar_main._default_portfolio_config_path(config) == modern_path
+
+
+def test_default_portfolio_config_path_falls_back_to_legacy(tmp_path: Path) -> None:
+    legacy_path = tmp_path / "portfolio.config.json"
+    legacy_path.write_text("{}", encoding="utf-8")
+
+    config = SimpleNamespace(repo_root=tmp_path)
+
+    assert ar_main._default_portfolio_config_path(config) == legacy_path
+
+
 def test_build_sleeve_selection_annotates_selected_rows() -> None:
     rows = [
         {
@@ -50,6 +126,86 @@ def test_build_sleeve_selection_annotates_selected_rows() -> None:
     assert len(sleeve["selected_rows"]) == 1
     assert sleeve["selected_rows"][0]["sleeve_name"] == "quality"
     assert sleeve["selected_rows"][0]["sleeve_selection_rank"] == 1
+
+
+def test_build_selection_basket_curve_recomputes_drawdown_from_basket_equity(
+    tmp_path: Path,
+) -> None:
+    curve_a = tmp_path / "curve-a.json"
+    curve_b = tmp_path / "curve-b.json"
+    curve_a.write_text(
+        json.dumps(
+            {
+                "curve": {
+                    "points": [
+                        {
+                            "time": 1704067200,
+                            "date": "2024-01-01",
+                            "equity_r": 10.0,
+                            "drawdown_r": 0.0,
+                            "realized_r": 10.0,
+                            "closed_trade_count": 1,
+                        },
+                        {
+                            "time": 1704153600,
+                            "date": "2024-01-02",
+                            "equity_r": 7.0,
+                            "drawdown_r": 3.0,
+                            "realized_r": 7.0,
+                            "closed_trade_count": 2,
+                        },
+                    ]
+                }
+            },
+            ensure_ascii=True,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    curve_b.write_text(
+        json.dumps(
+            {
+                "curve": {
+                    "points": [
+                        {
+                            "time": 1704067200,
+                            "date": "2024-01-01",
+                            "equity_r": 10.0,
+                            "drawdown_r": 0.0,
+                            "realized_r": 10.0,
+                            "closed_trade_count": 1,
+                        },
+                        {
+                            "time": 1704153600,
+                            "date": "2024-01-02",
+                            "equity_r": 20.0,
+                            "drawdown_r": 0.0,
+                            "realized_r": 20.0,
+                            "closed_trade_count": 2,
+                        },
+                    ]
+                }
+            },
+            ensure_ascii=True,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    basket = ar_main._build_selection_basket_curve(
+        [
+            {"full_backtest_curve_path_36m": str(curve_a)},
+            {"full_backtest_curve_path_36m": str(curve_b)},
+        ]
+    )
+
+    assert basket["point_count"] == 2
+    assert basket["points"][0]["equity_r"] == 20.0
+    assert basket["points"][0]["drawdown_r"] == 0.0
+    assert basket["points"][1]["equity_r"] == 27.0
+    assert basket["points"][1]["drawdown_r"] == 0.0
+    assert basket["max_drawdown_r"] == 0.0
+    assert basket["final_drawdown_r"] == 0.0
 
 
 def test_resolve_prefilter_limit_uses_legacy_candidate_limit_when_present() -> None:
@@ -145,6 +301,124 @@ def test_build_sleeve_prefilter_can_reward_breadth_metrics() -> None:
     assert result["candidate_rows"][0]["prefilter_scalar_metric_bonus_terms"][0]["field"] == (
         "durability_score_36m"
     )
+
+
+def test_build_sleeve_prefilter_can_apply_field_filters() -> None:
+    rows = [
+        {
+            "attempt_id": "too-heavy",
+            "run_id": "run-a",
+            "score_36m": 82.0,
+            "account_estimated_avg_margin_load_pct_36m": 28.0,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+        {
+            "attempt_id": "fits-budget",
+            "run_id": "run-b",
+            "score_36m": 81.0,
+            "account_estimated_avg_margin_load_pct_36m": 11.0,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+    ]
+
+    result = pf.build_sleeve_prefilter(
+        rows,
+        {
+            **pf.DEFAULT_SLEEVE_SPEC,
+            "name": "margin-aware",
+            "field_filters": [
+                {
+                    "name": "avg_margin_load",
+                    "field": "account_estimated_avg_margin_load_pct_36m",
+                    "direction": "lower",
+                    "target": 20.0,
+                }
+            ],
+        },
+    )
+
+    assert [row["attempt_id"] for row in result["qualified_rows"]] == ["fits-budget"]
+    assert result["filter_rejections"]["field_filter_failed_avg_margin_load"] == 1
+
+
+def test_enrich_rows_for_account_computes_account_metrics(tmp_path: Path) -> None:
+    result_path = tmp_path / "full-backtest-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "data": {
+                    "aggregate": {
+                        "behavior_summary": {
+                            "signal_coverage_ratio": 0.12,
+                            "signal_density": 0.12,
+                            "bars_per_signal": 18.0,
+                            "signal_selectivity": "selective",
+                        },
+                        "best_cell": {
+                            "profit_factor": 1.4,
+                            "avg_net_r_per_closed_trade": 0.22,
+                            "stop_loss_percent": 0.5,
+                        },
+                        "best_cell_path_metrics": {
+                            "avg_holding_hours": 36.0,
+                            "p90_holding_hours": 72.0,
+                            "max_holding_hours": 120.0,
+                            "time_under_water_ratio": 0.18,
+                            "final_equity_r": 240.0,
+                        },
+                        "matrix_summary": {
+                            "positive_cell_ratio": 0.75,
+                            "robust_cell": {
+                                "avg_net_r_per_closed_trade": 0.19,
+                                "stop_loss_percent": 0.6,
+                            },
+                        },
+                        "quality_score": {
+                            "inputs": {"edge_rate_r_per_month": 9.0}
+                        },
+                    }
+                }
+            },
+            ensure_ascii=True,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    rows = [
+        {
+            "attempt_id": "attempt-a",
+            "run_id": "run-a",
+            "candidate_name": "alpha",
+            "score_36m": 82.0,
+            "trades_per_month_36m": 24.0,
+            "instruments_36m": ["EURUSD"],
+            "full_backtest_result_path_36m": str(result_path),
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        }
+    ]
+
+    enriched = pf.enrich_rows_for_account(
+        rows,
+        {
+            "name": "Tiny Live",
+            "account_size_usd": 124,
+            "leverage": 500,
+            "risk_per_trade_pct": 0.75,
+            "allowed_asset_classes": ["fx"],
+        },
+    )
+
+    row = enriched[0]
+    assert row["asset_classes_36m"] == ["fx"]
+    assert row["primary_asset_class_36m"] == "fx"
+    assert row["estimated_avg_open_positions_36m"] is not None
+    assert row["account_asset_class_allowed_flag_36m"] == 1.0
+    assert row["account_estimated_avg_margin_load_pct_36m"] is not None
+    assert row["account_estimated_peak_margin_load_pct_36m"] >= row["account_estimated_avg_margin_load_pct_36m"]
 
 
 def test_build_sleeve_selection_reports_prefilter_counts() -> None:
@@ -386,12 +660,45 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
 
     payload = {
         "portfolio_name": "default-portfolio",
+        "account": {
+            "name": "Test Account",
+            "account_size_usd": 1000.0,
+            "leverage": 100.0,
+            "risk_per_trade_pct": 1.0,
+            "allowed_asset_classes": ["fx"],
+        },
+        "selected_basket_summary": {
+            "trades_per_month": {"sum": 10.0},
+        },
+        "selected_deployment_summary": {
+            "asset_class_counts": {"fx": 1},
+            "account_estimated_avg_margin_load_pct_36m": {"sum": 4.0},
+            "account_estimated_peak_margin_load_pct_36m": {"sum": 8.0},
+            "avg_holding_hours_36m": {"mean": 12.0},
+        },
+        "selected_basket_curve_36m": {
+            "final_equity_r": 5.0,
+            "max_drawdown_r": 1.5,
+            "final_drawdown_r": 0.0,
+            "points": [
+                {"date": "2024-01-01", "equity_r": 1.0, "drawdown_r": 0.0},
+                {"date": "2024-01-02", "equity_r": 2.0, "drawdown_r": 0.5},
+            ],
+        },
         "selected": [
             {
+                "portfolio_rank": 1,
                 "attempt_id": "attempt-a",
                 "run_id": "run-a",
                 "candidate_name": "alpha",
                 "profile_ref": "abc123",
+                "primary_asset_class_36m": "fx",
+                "score_36m": 90.0,
+                "trades_per_month_36m": 10.0,
+                "max_drawdown_r_36m": 1.5,
+                "final_equity_r_36m": 5.0,
+                "account_estimated_avg_margin_load_pct_36m": 4.0,
+                "account_estimated_peak_margin_load_pct_36m": 8.0,
             }
         ],
         "profile_drops": [
@@ -400,6 +707,10 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
                 "profile_ref": "abc123",
                 "png_path": str(source_drop_png),
                 "manifest_path": str(source_drop_manifest),
+                "display_name": "Alpha Prime",
+                "tagline": "Fast FX cadence",
+                "short_description": "Short copy",
+                "long_description": "Long copy",
             }
         ],
     }
@@ -418,13 +729,146 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
     assert item_root.exists() is True
     assert (item_root / "alpha.json").exists() is True
     assert (item_root / "alpha.png").exists() is True
-    assert (item_root / "profile-drop-36mo.manifest.json").exists() is False
+    assert (item_root / "profile-drop-36mo.manifest.json").exists() is True
+    assert (report_root / "portfolio-report.md").exists() is True
+    assert (bundle_root / "portfolio-report.md").exists() is True
     assert (bundle_root / "portfolio-report.json").exists() is False
     assert (bundle_root / "portfolio-report.csv").exists() is False
     assert (bundle_root / "selected-attempts.csv").exists() is False
     assert (bundle_root / "bundle-manifest.json").exists() is False
     assert summary["exported_profiles"] == 1
     assert summary["exported_drop_pngs"] == 1
+    assert summary["exported_drop_manifests"] == 1
+    assert summary["bundle_markdown_path"] == str(bundle_root / "portfolio-report.md")
+    assert summary["selected_rows"][0]["display_name"] == "Alpha Prime"
+    assert summary["selected_rows"][0]["drop_manifest_export_path"] == str(
+        item_root / "profile-drop-36mo.manifest.json"
+    )
+    markdown_text = (bundle_root / "portfolio-report.md").read_text(encoding="utf-8")
+    assert "## Risk Scenarios" in markdown_text
+    assert "## Growth Tracks" in markdown_text
+    assert "Alpha Prime" in markdown_text
+
+
+def test_portfolio_risk_scenarios_scale_growth_and_margin_load() -> None:
+    payload = {
+        "account": {
+            "account_size_usd": 1000.0,
+            "risk_per_trade_pct": 0.5,
+        },
+        "selected_deployment_summary": {
+            "account_estimated_avg_margin_load_pct_36m": {"sum": 10.0},
+            "account_estimated_peak_margin_load_pct_36m": {"sum": 20.0},
+        },
+        "selected_basket_curve_36m": {
+            "points": [
+                {"date": "2024-01-01", "equity_r": 1.0, "drawdown_r": 0.0},
+                {"date": "2024-01-02", "equity_r": 2.0, "drawdown_r": 0.25},
+            ]
+        },
+    }
+
+    scenarios = ar_main._portfolio_risk_scenarios(payload)
+    one_pct = next(item for item in scenarios if abs(item["risk_pct"] - 1.0) < 1e-9)
+
+    assert abs(one_pct["avg_margin_load_pct"] - 20.0) < 1e-9
+    assert abs(one_pct["peak_margin_load_pct"] - 40.0) < 1e-9
+    assert abs(one_pct["final_balance"] - 1010.0) < 1e-6
+    assert abs(one_pct["geometric_daily_return_pct"] - 0.498756211208895) < 1e-9
+    assert one_pct["checkpoints"][30] == one_pct["final_balance"]
+
+
+def test_portfolio_risk_scenarios_preserve_zero_balance_outcomes() -> None:
+    payload = {
+        "account": {
+            "account_size_usd": 1000.0,
+            "risk_per_trade_pct": 1.0,
+        },
+        "selected_basket_curve_36m": {
+            "points": [
+                {"date": "2024-01-01", "equity_r": 0.0, "drawdown_r": 0.0},
+                {"date": "2024-01-02", "equity_r": -100.0, "drawdown_r": 100.0},
+            ]
+        },
+    }
+
+    scenarios = ar_main._portfolio_risk_scenarios(payload)
+    one_pct = next(item for item in scenarios if abs(item["risk_pct"] - 1.0) < 1e-9)
+
+    assert one_pct["final_balance"] == 0.0
+    assert one_pct["final_return_pct"] == -100.0
+    assert one_pct["checkpoints"][30] == 0.0
+
+
+def test_render_portfolio_markdown_report_includes_growth_tracks() -> None:
+    payload = {
+        "generated_at": "2026-04-22T00:00:00-05:00",
+        "portfolio_name": "tiny-live-fx",
+        "account": {
+            "name": "Tiny Live FX",
+            "account_size_usd": 124.0,
+            "leverage": 500.0,
+            "risk_per_trade_pct": 0.75,
+            "allowed_asset_classes": ["fx"],
+            "blocked_asset_classes": [],
+        },
+        "selected_basket_summary": {
+            "trades_per_month": {"sum": 12.5},
+        },
+        "selected_deployment_summary": {
+            "asset_class_counts": {"fx": 2},
+            "avg_holding_hours_36m": {"mean": 8.5},
+            "account_estimated_avg_margin_load_pct_36m": {"sum": 0.5},
+            "account_estimated_peak_margin_load_pct_36m": {"sum": 1.2},
+        },
+        "selected_basket_curve_36m": {
+            "final_equity_r": 25.0,
+            "max_drawdown_r": 3.0,
+            "final_drawdown_r": 0.0,
+            "points": [
+                {"date": "2024-01-01", "equity_r": 1.0, "drawdown_r": 0.0},
+                {"date": "2024-01-02", "equity_r": 1.5, "drawdown_r": 0.25},
+                {"date": "2024-01-03", "equity_r": 3.0, "drawdown_r": 0.0},
+            ],
+        },
+        "selected": [
+            {
+                "portfolio_rank": 1,
+                "attempt_id": "attempt-a",
+                "candidate_name": "alpha",
+                "primary_asset_class_36m": "fx",
+                "score_36m": 88.0,
+                "trades_per_month_36m": 6.0,
+                "max_drawdown_r_36m": 1.2,
+                "final_equity_r_36m": 10.0,
+                "account_estimated_avg_margin_load_pct_36m": 0.2,
+                "account_estimated_peak_margin_load_pct_36m": 0.5,
+            }
+        ],
+        "profile_drops": [
+            {
+                "attempt_id": "attempt-a",
+                "display_name": "Alpha Prime",
+            }
+        ],
+    }
+
+    markdown = ar_main._render_portfolio_markdown_report(
+        payload,
+        report_path=Path("C:/tmp/portfolio-report.json"),
+    )
+
+    assert "# tiny-live-fx Portfolio Report" in markdown
+    assert "## Portfolio Snapshot" in markdown
+    assert "## Risk Scenarios" in markdown
+    assert "## Growth Tracks" in markdown
+    assert "## Selected Profiles" in markdown
+    assert "Scenario horizon" in markdown
+    assert "Geom day" in markdown
+    assert "Arith mean day" in markdown
+    assert "0.50%" in markdown
+    assert "30d" in markdown
+    assert "Alpha Prime" in markdown
 
 
 def test_render_portfolio_profile_drops_updates_existing_report(
@@ -537,10 +981,16 @@ def test_cmd_build_portfolio_continues_when_catch_up_reports_failures(
         "export_bundle": False,
         "sleeves": [{"name": "quality"}],
     }
+    load_spec_calls: list[Path] = []
+
+    def fake_load_portfolio_build_specs(path: Path):
+        load_spec_calls.append(path)
+        return [portfolio_spec], False
+
     monkeypatch.setattr(
         ar_main,
-        "load_portfolio_spec",
-        lambda _path: (portfolio_spec, False),
+        "load_portfolio_build_specs",
+        fake_load_portfolio_build_specs,
     )
     monkeypatch.setattr(
         ar_main,
@@ -626,6 +1076,7 @@ def test_cmd_build_portfolio_continues_when_catch_up_reports_failures(
     )
 
     assert exit_code == 0
+    assert load_spec_calls == [tmp_path / "portfolio.account-presets.json"]
 
     report_path = derived_root / "portfolio-report" / "default-portfolio" / "portfolio-report.json"
     assert report_path.exists() is True
