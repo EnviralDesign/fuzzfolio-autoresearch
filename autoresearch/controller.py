@@ -137,6 +137,46 @@ LOCAL_OPENING_NARROW_GOAL_KEYWORDS = (
     "sharper",
     "sharp",
 )
+TRIGGER_INDICATOR_IDS = frozenset(
+    {
+        "BREAKOUT_FIRST_CLOSE",
+        "CHANNEL_REENTRY",
+        "MA_CROSSOVER",
+        "MACD_CROSSOVER",
+        "PRICE_RECLAIM_MA",
+        "RSI_CROSSBACK",
+        "STOCH_CROSSOVER",
+        "STOCHRSI_CROSSBACK",
+        "WICK_REJECTION",
+        "CANDLESTICK_PATTERNS",
+    }
+)
+SETUP_INDICATOR_TOKENS = (
+    "MEAN_REVERSION",
+    "BBANDS_POSITION",
+    "KELTNER_CHANNEL",
+    "DONCHIAN_CHANNEL",
+    "RSI",
+    "STOCH",
+    "CCI",
+    "CMO",
+    "MFI",
+    "WILLR",
+    "ULTOSC",
+)
+CONTEXT_INDICATOR_TOKENS = (
+    "_TREND",
+    "ADX",
+    "ATR_VOLATILITY_FILTER",
+    "MA_SLOPE",
+    "MA_SPREAD",
+    "PLUS_DI",
+    "MINUS_DI",
+    "SAR",
+    "ADOSC",
+    "OBV",
+    "CHAIKIN",
+)
 CHUNK_STEP_FRAME = "STEP FRAME"
 CHUNK_TOOL_RESULTS = "TOOL RESULTS FROM PRIOR STEP"
 CHUNK_GOAL_STATE = "GOAL STATE"
@@ -4951,6 +4991,87 @@ class ResearchController:
                 result.append(item.strip())
         return result
 
+    @staticmethod
+    def _seed_indicator_role_groups(seed_indicator_ids: list[str]) -> dict[str, list[str]]:
+        groups: dict[str, list[str]] = {
+            "trigger": [],
+            "setup": [],
+            "context": [],
+            "state": [],
+        }
+        for raw_id in seed_indicator_ids:
+            indicator_id = str(raw_id or "").strip()
+            if not indicator_id:
+                continue
+            upper_id = indicator_id.upper()
+            if upper_id in TRIGGER_INDICATOR_IDS:
+                groups["trigger"].append(indicator_id)
+            elif any(token in upper_id for token in SETUP_INDICATOR_TOKENS):
+                groups["setup"].append(indicator_id)
+            elif any(token in upper_id for token in CONTEXT_INDICATOR_TOKENS):
+                groups["context"].append(indicator_id)
+            else:
+                groups["state"].append(indicator_id)
+        return groups
+
+    def _role_balanced_seed_indicator_ids(
+        self,
+        seed_indicator_ids: list[str],
+        *,
+        max_count: int = 4,
+    ) -> list[str]:
+        groups = self._seed_indicator_role_groups(seed_indicator_ids)
+        selected: list[str] = []
+
+        def add_first(role: str) -> None:
+            for candidate in groups.get(role, []):
+                if candidate not in selected:
+                    selected.append(candidate)
+                    return
+
+        add_first("context")
+        add_first("setup")
+        add_first("trigger")
+
+        for candidate in seed_indicator_ids:
+            if len(selected) >= max_count:
+                break
+            if candidate not in selected:
+                selected.append(candidate)
+        return selected[:max_count]
+
+    def _seed_indicator_balance_guidance_text(self, seed_indicator_ids: list[str]) -> str:
+        if not seed_indicator_ids:
+            return (
+                "Indicator composition guidance:\n"
+                "- No seed hand is available; prefer a context/setup/trigger profile shape when exact catalog ids are known."
+            )
+        groups = self._seed_indicator_role_groups(seed_indicator_ids)
+        suggested = self._role_balanced_seed_indicator_ids(seed_indicator_ids)
+
+        def role_line(role: str, label: str) -> str:
+            values = groups.get(role, [])
+            return f"- {label}: {', '.join(values) if values else 'none'}"
+
+        lines = [
+            "Indicator composition guidance:",
+            "- Target shape: higher/mid timeframe context, setup/stretch condition, lowest-timeframe trigger.",
+            role_line("context", "seed context/filter candidates"),
+            role_line("setup", "seed setup/state candidates"),
+            role_line("trigger", "seed trigger candidates"),
+        ]
+        if groups.get("trigger"):
+            lines.append(
+                "- Opening scaffold should include at least one seed trigger id unless a manager/template constraint says otherwise."
+            )
+        else:
+            lines.append(
+                "- Seed hand has no clean trigger id; treat this as a state-only risk and use the sharpest available state/setup proxy rather than pretending it is a precise entry."
+            )
+        if suggested:
+            lines.append("- Role-balanced opening suggestion: " + ", ".join(suggested))
+        return "\n".join(lines)
+
     def _indicator_catalog_summary(self, seed_indicator_ids: list[str]) -> str:
         result = self.cli.run(["indicators", "--mode", "index"], check=False)
         if result.returncode != 0 or not isinstance(result.parsed_json, dict):
@@ -5466,6 +5587,11 @@ class ResearchController:
     def _opening_step_overlay_text(self, tool_context: ToolContext) -> str:
         grounding = self._local_opening_grounding_prompt_state(tool_context) or {}
         starter_instruments = list(grounding.get("preferred_initial_instruments") or [])
+        preferred_indicator_ids = [
+            str(item).strip()
+            for item in (grounding.get("preferred_initial_indicator_ids") or [])
+            if str(item).strip()
+        ]
         candidate_name_hint = str(grounding.get("candidate_name_hint") or "cand1")
         overlay_lines = [
             "Opening-step overlay:",
@@ -5482,10 +5608,20 @@ class ResearchController:
                 "- Use the exact starter instrument symbols from this step: "
                 + ", ".join(starter_instruments)
             )
+        if preferred_indicator_ids:
+            overlay_lines.append(
+                "- Prefer this role-balanced seed indicator order for the opening scaffold: "
+                + ", ".join(preferred_indicator_ids)
+            )
+        balance_note = str(grounding.get("indicator_balance_note") or "").strip()
+        if balance_note == "seed_hand_has_no_clean_trigger":
+            overlay_lines.append(
+                "- The seed hand has no clean trigger indicator; keep this first candidate as a baseline and look for trigger-backed structural contrast later."
+            )
         canonical = {
             "tool": "prepare_profile",
             "mode": "scaffold_from_seed",
-            "indicator_ids": ["ID_A", "ID_B"],
+            "indicator_ids": preferred_indicator_ids or ["ID_A", "ID_B"],
             "instruments": starter_instruments or ["EURUSD"],
             "candidate_name": candidate_name_hint,
         }
@@ -6187,6 +6323,7 @@ class ResearchController:
             (
                 "Indicator id rule: indicator.meta.id must match one of the exact seeded ids unless scope expands."
             ),
+            self._seed_indicator_balance_guidance_text(seed_indicator_ids),
             "Seeded indicator mutation schema:\n" + indicator_schema,
             "Instrument symbol discipline:\n"
             + self._compact_instrument_reference_text(
@@ -7375,11 +7512,25 @@ class ResearchController:
         starter_instruments, starter_rule = self._local_opening_starter_instruments(
             tool_context
         )
+        seed_indicator_ids = self._seed_indicator_ids(tool_context.seed_prompt_path)
+        preferred_indicator_ids = self._role_balanced_seed_indicator_ids(
+            seed_indicator_ids
+        )
         candidate_name_hint = "cand1"
         grounding = {
             "allowed_seed_instruments": starter_instruments,
             "preferred_initial_instruments": starter_instruments,
             "preferred_initial_instrument_rule": starter_rule,
+            "preferred_initial_indicator_ids": preferred_indicator_ids,
+            "indicator_balance_note": (
+                "context_setup_trigger_preferred"
+                if preferred_indicator_ids
+                and any(
+                    indicator_id in TRIGGER_INDICATOR_IDS
+                    for indicator_id in preferred_indicator_ids
+                )
+                else "seed_hand_has_no_clean_trigger"
+            ),
             "candidate_name_hint": candidate_name_hint,
         }
         return {

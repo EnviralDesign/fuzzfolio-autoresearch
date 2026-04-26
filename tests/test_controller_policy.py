@@ -705,10 +705,57 @@ def test_pinned_run_reference_keeps_seed_schema_but_omits_dynamic_run_state() ->
 
     assert "Run reference (stable for this run):" in prompt
     assert "Exact seeded indicator ids for this run: ADX, RSI_MEAN_REVERSION" in prompt
+    assert "Indicator composition guidance:" in prompt
+    assert "Seed hand has no clean trigger id" in prompt
     assert "Seeded indicator mutation schema:" in prompt
     assert "Run-owned profiles so far:" not in prompt
     assert "Checkpoint summary:" not in prompt
     assert "Recent attempts:" not in prompt
+
+
+def test_role_balanced_seed_indicator_ids_prioritize_context_setup_trigger() -> None:
+    controller = _make_controller()
+
+    selected = controller._role_balanced_seed_indicator_ids(
+        [
+            "RSI_MEAN_REVERSION",
+            "STOCHRSI_CROSSBACK",
+            "ADX",
+            "MFI_TREND",
+            "STOCHRSI_MEAN_REVERSION",
+        ]
+    )
+
+    assert selected[:3] == ["ADX", "RSI_MEAN_REVERSION", "STOCHRSI_CROSSBACK"]
+
+
+def test_opening_overlay_uses_role_balanced_seed_indicator_suggestion(
+    tmp_path: Path,
+) -> None:
+    controller = _make_controller()
+    seed_path = tmp_path / "seed-prompt.json"
+    seed_path.write_text(
+        json.dumps(
+            {
+                "indicators": [
+                    "RSI_MEAN_REVERSION",
+                    "PRICE_RECLAIM_MA",
+                    "ADX",
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    controller._local_opening_starter_instruments = lambda *_args, **_kwargs: (
+        ["XAUUSD"],
+        "test",
+    )
+    tool_context = SimpleNamespace(seed_prompt_path=seed_path)
+
+    prompt = controller._opening_step_overlay_text(tool_context)
+
+    assert "Prefer this role-balanced seed indicator order" in prompt
+    assert '"indicator_ids": [\n    "ADX",\n    "RSI_MEAN_REVERSION",\n    "PRICE_RECLAIM_MA"\n  ]' in prompt
 
 
 def test_chunked_history_trim_keeps_prefix_and_recent_step_chunks_only(tmp_path: Path) -> None:

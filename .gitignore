@@ -44,3 +44,4 @@ wheels/
 # Local sweep scratch / diagnostics
 /sweeps/
 /scratch_snapshot.txt
+/.codex-harness

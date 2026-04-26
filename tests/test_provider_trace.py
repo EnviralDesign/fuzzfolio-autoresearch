@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 
@@ -142,6 +143,114 @@ def test_codex_app_server_command_uses_stdio_without_legacy_session_source() -> 
     assert command[1:] == ["app-server", "--listen", "stdio://"]
     assert Path(command[0]).name.lower() in {"codex", "codex.cmd", "codex.exe"}
     assert "--session-source" not in command
+
+
+def test_prepare_isolated_codex_home_copies_auth_files(tmp_path: Path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    source_home = tmp_path / "source-codex"
+    source_home.mkdir()
+    (source_home / "auth.json").write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    (source_home / "config.toml").write_text('model = "gpt-5.4-mini"\n', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+
+    isolated = provider_module._prepare_isolated_codex_home(
+        ProviderProfileConfig(
+            provider_type="codex",
+            command="codex",
+            repo_root=repo_root,
+        )
+    )
+
+    assert isolated == (repo_root / ".codex-harness" / "codex-home").resolve()
+    assert isolated != source_home.resolve()
+    assert (isolated / "auth.json").read_text(encoding="utf-8") == '{"auth_mode":"chatgpt"}\n'
+    assert (isolated / "config.toml").read_text(encoding="utf-8") == 'model = "gpt-5.4-mini"\n'
+
+
+def test_codex_app_server_session_reuses_thread_within_run() -> None:
+    session = object.__new__(_CodexAppServerSession)
+    session.config = ProviderProfileConfig(
+        provider_type="codex",
+        command="codex",
+        model="gpt-5.4-mini",
+    )
+    session.process = None
+    session._request_id = 0
+    session._stderr_lines = deque(maxlen=40)
+    session._stderr_thread = None
+    session._thread_ids_by_key = {}
+
+    requests: list[tuple[str, dict[str, object]]] = []
+
+    def fake_request(method: str, params: dict[str, object]) -> dict[str, object]:
+        requests.append((method, dict(params)))
+        if method == "thread/start":
+            thread_count = sum(1 for name, _ in requests if name == "thread/start")
+            return {"thread": {"id": f"thread-{thread_count}"}}
+        if method == "turn/start":
+            turn_count = sum(1 for name, _ in requests if name == "turn/start")
+            return {"turn": {"id": f"turn-{turn_count}"}}
+        raise AssertionError(f"unexpected method: {method}")
+
+    session._request = fake_request  # type: ignore[method-assign]
+
+    with provider_trace_scope(label="explorer", run_id="run-123"):
+        first_turn = session.start_turn("hello")
+        second_turn = session.start_turn("again")
+
+    assert first_turn == "turn-1"
+    assert second_turn == "turn-2"
+    assert [method for method, _ in requests].count("thread/start") == 1
+    turn_start_requests = [params for method, params in requests if method == "turn/start"]
+    assert [params["threadId"] for params in turn_start_requests] == ["thread-1", "thread-1"]
+
+
+def test_codex_provider_reuses_session_across_calls(monkeypatch) -> None:
+    class FakeSession:
+        instance_count = 0
+
+        def __init__(self, config: ProviderProfileConfig):
+            self.config = config
+            self.turn_count = 0
+            FakeSession.instance_count += 1
+
+        def is_alive(self) -> bool:
+            return True
+
+        def default_turn_summary_enabled(self) -> bool:
+            return False
+
+        def start_turn(self, prompt: str, *, include_summary: bool | None = None) -> str:
+            self.turn_count += 1
+            return f"turn-{self.turn_count}"
+
+        def collect_turn_text(self, turn_id: str) -> str:
+            return (
+                '{"response_json":"{\\"mode\\":\\"runtime_shape\\",'
+                '\\"reasoning\\":\\"ok\\",\\"actions\\":[]}"}'
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(provider_module, "_CodexAppServerSession", FakeSession)
+
+    provider = CodexAppServerProvider(
+        ProviderProfileConfig(
+            provider_type="codex",
+            command="codex",
+            model="gpt-5.4-mini",
+        )
+    )
+
+    with provider_trace_scope(label="explorer", run_id="run-123"):
+        first = provider.complete_json([ChatMessage(role="user", content="hello")])
+        second = provider.complete_json([ChatMessage(role="user", content="again")])
+
+    assert first == {"mode": "runtime_shape", "reasoning": "ok", "actions": []}
+    assert second == {"mode": "runtime_shape", "reasoning": "ok", "actions": []}
+    assert FakeSession.instance_count == 1
 
 
 def test_codex_app_server_turn_start_params_skip_summary_for_spark() -> None:

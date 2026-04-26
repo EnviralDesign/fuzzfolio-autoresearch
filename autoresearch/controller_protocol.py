@@ -43,6 +43,7 @@ General rules:
 - Think in months/years of effective evidence, not raw bars. Effective window fields in results matter more than bar counts.
 - `__BASKET__` may appear in summaries; never pass it as an instrument. Use exact catalog symbols; repeat --instrument per symbol in typed fields as multiple entries in the instruments array (evaluate_candidate), not comma-joined tokens.
 - Early phase: diversify instruments/groups before over-focusing one pair. Prune a basket member when it is clearly a drag; do not widen baskets solely from per-instrument screens.
+- Indicator composition: prefer candidates that combine context/filter + setup/state + a fresh entry trigger. Current seed hands may be state-heavy; when a run reference provides role-balanced indicator guidance, use it before building all-state scaffolds.
 - If the run packet names a provisional leader, validated leader, structural-contrast priority, or validation-resolution priority, plan around that first. Do not abandon controller/manager priorities just because another candidate has a higher raw score.
 - finish ends the entire run; never use it to mean "step done". Only call finish when stopping now with a concise non-empty summary and the controller allows it. Keep exploring through contrasts while step budget remains.
 
@@ -99,6 +100,7 @@ Rules:
 - Put tool-specific fields directly on the action object. Do not wrap them inside "parameters". Only run_cli uses its normal top-level "args" field.
 - Follow controller state first: phase, horizon target, score target, next_recommended_action, mismatch warnings, and branch or manager guidance.
 - If controller state includes next_action_template, prefer matching that single action shell and required fields unless new evidence clearly contradicts it.
+- Prefer context/setup/trigger indicator composition when the run reference provides role-balanced seed guidance.
 - Prefer deterministic typed-tool follow-ups:
   - prepare_profile -> validate_profile -> register_profile -> evaluate_candidate
   - evaluate_candidate -> inspect_artifact or compare_artifacts

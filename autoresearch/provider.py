@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import contextvars
-import subprocess
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -115,6 +116,7 @@ CODEX_USAGE_LIMIT_MARKERS = (
     "usage limit",
     "try again at",
 )
+CODEX_HOME_MIRROR_FILES = ("auth.json", "config.toml")
 TOOL_USE_FAILED_MARKERS = (
     "tool_use_failed",
     "tool choice is none, but model called a tool",
@@ -196,6 +198,63 @@ def _trace_provider_event(event: str, **fields: Any) -> None:
             text = text[:237] + "..."
         parts.append(f"{key}={text}")
     print(" ".join(parts), file=sys.stderr, flush=True)
+
+
+def _provider_trace_context() -> ProviderTraceContext | None:
+    return _PROVIDER_TRACE_CONTEXT.get()
+
+
+def _current_codex_run_id() -> str | None:
+    context = _provider_trace_context()
+    if context is None or not isinstance(context.run_id, str):
+        return None
+    run_id = context.run_id.strip()
+    return run_id or None
+
+
+def _resolve_codex_source_home() -> Path:
+    configured = (
+        os.environ.get("AUTORESEARCH_CODEX_SOURCE_HOME")
+        or os.environ.get("CODEX_HOME")
+    )
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return (Path.home() / ".codex").resolve()
+
+
+def _resolve_isolated_codex_home(config: ProviderProfileConfig) -> Path:
+    configured = os.environ.get("AUTORESEARCH_CODEX_HOME")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    root = (config.repo_root or Path.cwd()).resolve()
+    return (root / ".codex-harness" / "codex-home").resolve()
+
+
+def _copy_codex_home_file(source_home: Path, target_home: Path, filename: str) -> None:
+    source = source_home / filename
+    if not source.exists() or not source.is_file():
+        return
+    target = target_home / filename
+    try:
+        source_bytes = source.read_bytes()
+    except OSError:
+        return
+    try:
+        if target.exists() and target.read_bytes() == source_bytes:
+            return
+    except OSError:
+        pass
+    shutil.copy2(source, target)
+
+
+def _prepare_isolated_codex_home(config: ProviderProfileConfig) -> Path:
+    target_home = _resolve_isolated_codex_home(config)
+    target_home.mkdir(parents=True, exist_ok=True)
+    source_home = _resolve_codex_source_home()
+    if source_home != target_home:
+        for filename in CODEX_HOME_MIRROR_FILES:
+            _copy_codex_home_file(source_home, target_home, filename)
+    return target_home
 
 
 def _provider_capture_safe_value(value: Any) -> Any:
@@ -906,16 +965,23 @@ class JsonCompletionProvider(Protocol):
 class _CodexAppServerSession:
     def __init__(self, config: ProviderProfileConfig):
         self.config = config
+        self._isolated_codex_home = _prepare_isolated_codex_home(config)
         self.process: subprocess.Popen[str] | None = None
         self._request_id = 0
         self._stderr_lines: deque[str] = deque(maxlen=40)
         self._stderr_thread: threading.Thread | None = None
+        self._thread_ids_by_key: dict[str, str] = {}
         self._start()
 
     def _command(self) -> list[str]:
         command = (self.config.command or "codex").strip() or "codex"
         resolved = shutil.which(command) or command
         return [resolved, "app-server", "--listen", "stdio://"]
+
+    def _start_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(self._isolated_codex_home)
+        return env
 
     def _start(self) -> None:
         try:
@@ -928,6 +994,7 @@ class _CodexAppServerSession:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
+                env=self._start_env(),
             )
         except FileNotFoundError as exc:
             raise ProviderError(
@@ -1052,6 +1119,44 @@ class _CodexAppServerSession:
             return False
         return True
 
+    def is_alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def _thread_key(self) -> str:
+        return _current_codex_run_id() or "__default__"
+
+    def _thread_start_request(self) -> dict[str, Any]:
+        return {
+            "model": self.config.model,
+            "approvalPolicy": "never",
+            "sandbox": "read-only",
+            "personality": "none",
+        }
+
+    @staticmethod
+    def _is_missing_thread_error(exc: ProviderError) -> bool:
+        text = str(exc).strip().lower()
+        if "thread" not in text:
+            return False
+        missing_markers = (
+            "not found",
+            "does not exist",
+            "unknown thread",
+            "invalid thread",
+        )
+        return any(marker in text for marker in missing_markers)
+
+    def _ensure_thread_id(self, thread_key: str) -> str:
+        existing = self._thread_ids_by_key.get(thread_key)
+        if existing:
+            return existing
+        thread = self._request("thread/start", self._thread_start_request()).get("thread")
+        if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
+            raise ProviderError("Codex app-server did not return a usable thread id.")
+        thread_id = thread["id"]
+        self._thread_ids_by_key[thread_key] = thread_id
+        return thread_id
+
     def _turn_start_params(self, prompt: str, *, include_summary: bool) -> dict[str, Any]:
         params: dict[str, Any] = {
             "threadId": "",
@@ -1069,23 +1174,19 @@ class _CodexAppServerSession:
     def start_turn(self, prompt: str, *, include_summary: bool | None = None) -> str:
         if include_summary is None:
             include_summary = self.default_turn_summary_enabled()
-        thread = self._request(
-            "thread/start",
-            {
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-                "personality": "none",
-            },
-        ).get("thread")
-        if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
-            raise ProviderError("Codex app-server did not return a usable thread id.")
-        thread_id = thread["id"]
+        thread_key = self._thread_key()
+        thread_id = self._ensure_thread_id(thread_key)
         turn_params = self._turn_start_params(prompt, include_summary=include_summary)
         turn_params["threadId"] = thread_id
-        turn_result = self._request(
-            "turn/start",
-            turn_params,
-        )
+        try:
+            turn_result = self._request("turn/start", turn_params)
+        except ProviderError as exc:
+            if not self._is_missing_thread_error(exc):
+                raise
+            self._thread_ids_by_key.pop(thread_key, None)
+            thread_id = self._ensure_thread_id(thread_key)
+            turn_params["threadId"] = thread_id
+            turn_result = self._request("turn/start", turn_params)
         turn = turn_result.get("turn")
         if not isinstance(turn, dict) or not isinstance(turn.get("id"), str):
             raise ProviderError("Codex app-server did not return a usable turn id.")
@@ -1155,6 +1256,38 @@ class _CodexAppServerSession:
 class CodexAppServerProvider:
     def __init__(self, config: ProviderProfileConfig):
         self.config = config
+        self._session: _CodexAppServerSession | None = None
+        self._session_lock = threading.Lock()
+
+    def _get_session(self) -> _CodexAppServerSession:
+        with self._session_lock:
+            if self._session is not None:
+                is_alive = getattr(self._session, "is_alive", None)
+                if callable(is_alive):
+                    if is_alive():
+                        return self._session
+                else:
+                    return self._session
+                self._session.close()
+                self._session = None
+            self._session = _CodexAppServerSession(self.config)
+            return self._session
+
+    def _reset_session(self) -> None:
+        with self._session_lock:
+            session = self._session
+            self._session = None
+        if session is not None:
+            session.close()
+
+    def close(self) -> None:
+        self._reset_session()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _prompt_from_messages(self, messages: list[ChatMessage]) -> str:
         sections = [
@@ -1276,7 +1409,7 @@ class CodexAppServerProvider:
         )
         usage_limit_retries = 0
         while True:
-            session = _CodexAppServerSession(self.config)
+            session = self._get_session()
             try:
                 try:
                     include_summary = session.default_turn_summary_enabled()
@@ -1384,6 +1517,7 @@ class CodexAppServerProvider:
                 except ProviderError:
                     raise
             except ProviderError as exc:
+                self._reset_session()
                 delay_seconds = self._codex_usage_limit_delay_seconds(exc)
                 if delay_seconds is None or usage_limit_retries >= DEFAULT_CODEX_USAGE_LIMIT_RETRIES:
                     raise
@@ -1403,8 +1537,6 @@ class CodexAppServerProvider:
                 )
                 time.sleep(delay_seconds)
                 continue
-            finally:
-                session.close()
 
 
 class ChatCompletionsJsonProvider:
