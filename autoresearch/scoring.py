@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+CANONICAL_SCORE_LAB_VERSION = "score_lab_v1"
+
+
 @dataclass
 class AttemptScore:
     primary_score: float | None
@@ -60,6 +63,23 @@ def _find_numeric_by_key(payload: Any, key: str) -> float | None:
     return None
 
 
+def _find_mapping_by_key(payload: Any, key: str) -> dict[str, Any] | None:
+    if isinstance(payload, dict):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            return value
+        for nested in payload.values():
+            found = _find_mapping_by_key(nested, key)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for item in payload:
+            found = _find_mapping_by_key(item, key)
+            if found is not None:
+                return found
+    return None
+
+
 def _extract_metric(
     key: str,
     *,
@@ -81,12 +101,55 @@ def _extract_metric(
     return None
 
 
+def _extract_score_lab_payload(
+    *,
+    best_summary: dict[str, Any],
+    compare_payload: dict[str, Any],
+    sensitivity_snapshot: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    preferred_paths = [
+        ["score_lab"],
+        ["score_lab_payload"],
+        ["best", "score_lab"],
+        ["best", "score_lab_payload"],
+        ["data", "aggregate", "score_lab"],
+        ["data", "score_lab"],
+        ["aggregate", "score_lab"],
+    ]
+    for source in [best_summary, compare_payload, sensitivity_snapshot]:
+        if not isinstance(source, dict):
+            continue
+        for path in preferred_paths:
+            value = _get_nested(source, path)
+            if isinstance(value, dict):
+                return value
+        found = _find_mapping_by_key(source, "score_lab")
+        if found is not None:
+            return found
+    return None
+
+
 def build_attempt_score(
     compare_payload: dict[str, Any],
     sensitivity_snapshot: dict[str, Any] | None = None,
 ) -> AttemptScore:
     best = _best_summary(compare_payload)
-    quality_score = _extract_metric(
+    score_lab_payload = _extract_score_lab_payload(
+        best_summary=best,
+        compare_payload=compare_payload,
+        sensitivity_snapshot=sensitivity_snapshot,
+    )
+    score_lab_version = (
+        str(score_lab_payload.get("version") or "").strip()
+        if isinstance(score_lab_payload, dict)
+        else ""
+    )
+    score_lab_score = (
+        _safe_float(score_lab_payload.get("score"))
+        if isinstance(score_lab_payload, dict)
+        else None
+    )
+    legacy_quality_score = _extract_metric(
         "quality_score",
         best_summary=best,
         compare_payload=compare_payload,
@@ -100,7 +163,7 @@ def build_attempt_score(
             ["data", "quality_score", "score"],
         ],
     )
-    quality_score_version = (
+    legacy_quality_score_version = (
         _get_nested(best, ["quality_score_version"])
         or _get_nested(compare_payload, ["quality_score_version"])
         or _get_nested(sensitivity_snapshot or {}, ["data", "aggregate", "quality_score", "version"])
@@ -158,17 +221,32 @@ def build_attempt_score(
         ],
     )
     metrics = {
-        "quality_score": quality_score,
+        "score_lab": score_lab_score,
+        "legacy_quality_score": legacy_quality_score,
+        "quality_score": legacy_quality_score,
         "dsr": dsr,
         "psr": psr,
         "k_ratio": k_ratio,
         "sharpe_r": sharpe_r,
     }
-    composite_score = quality_score
+    composite_score = (
+        score_lab_score
+        if score_lab_version == CANONICAL_SCORE_LAB_VERSION and score_lab_score is not None
+        else None
+    )
     if composite_score is not None:
+        combiner = (
+            str(score_lab_payload.get("combiner") or "").strip()
+            if isinstance(score_lab_payload, dict)
+            else ""
+        )
+        score_basis = f"{CANONICAL_SCORE_LAB_VERSION}:{combiner or 'canonical'}"
+    elif score_lab_version:
+        score_basis = f"stale_score_lab:{score_lab_version}"
+    elif legacy_quality_score is not None:
         version_text = (
-            str(quality_score_version).strip()
-            if isinstance(quality_score_version, str) and quality_score_version.strip()
+            str(legacy_quality_score_version).strip()
+            if isinstance(legacy_quality_score_version, str) and legacy_quality_score_version.strip()
             else "quality"
         )
         belief_text = (
@@ -176,7 +254,7 @@ def build_attempt_score(
             if isinstance(quality_score_belief_basis, str) and quality_score_belief_basis.strip()
             else "unknown"
         )
-        score_basis = f"{version_text}:{belief_text}"
+        score_basis = f"missing_{CANONICAL_SCORE_LAB_VERSION}:{version_text}:{belief_text}"
     else:
         score_basis = "unscored"
 

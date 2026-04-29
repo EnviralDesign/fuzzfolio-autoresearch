@@ -9,10 +9,16 @@ def _write_json(path, payload):
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
-def _sample_sensitivity_payload(score: float) -> dict:
+def _sample_sensitivity_payload(score: float, *, score_lab_version: str = "score_lab_v1") -> dict:
     return {
         "data": {
             "aggregate": {
+                "score_lab": {
+                    "version": score_lab_version,
+                    "score": score,
+                    "combiner": "geometric_mean",
+                    "axes": {},
+                },
                 "quality_score": score,
                 "quality_score_version": "v1",
                 "quality_score_belief_basis": "psr",
@@ -404,6 +410,56 @@ def test_select_promotion_board_can_reward_breadth_metrics():
     assert [row["attempt_id"] for row in selected] == ["B"]
     assert float(selected[0]["scalar_metric_bonus_component"]) == 6.0
     assert selected[0]["scalar_metric_bonus_terms"][0]["field"] == "breadth_score_36m"
+
+
+def test_score_lab_v1_is_canonical_and_legacy_quality_is_diagnostic(tmp_path):
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_RESULT_FILENAME,
+        _sample_sensitivity_payload(61.25),
+    )
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_CURVE_FILENAME,
+        _sample_curve_payload(1.0),
+    )
+
+    attempt = {
+        "run_id": "run-1",
+        "attempt_id": "attempt-1",
+        "artifact_dir": str(artifact_dir),
+    }
+    row = ct.extract_attempt_catalog_row(attempt, {})
+
+    assert row["score_36m"] == 61.25
+    assert row["score_lab_score_36m"] == 61.25
+    assert row["legacy_quality_score_36m"] == 61.25
+    assert row["score_basis_36m"] == "score_lab_v1:geometric_mean"
+
+
+def test_legacy_only_full_backtest_is_not_canonical_score(tmp_path):
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_RESULT_FILENAME,
+        _sample_sensitivity_payload(61.25, score_lab_version="score_lab_v0"),
+    )
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_CURVE_FILENAME,
+        _sample_curve_payload(1.0),
+    )
+
+    attempt = {
+        "run_id": "run-1",
+        "attempt_id": "attempt-1",
+        "artifact_dir": str(artifact_dir),
+    }
+    row = ct.extract_attempt_catalog_row(attempt, {})
+
+    assert row["score_36m"] is None
+    assert row["score_lab_score_36m"] == 61.25
+    assert row["legacy_quality_score_36m"] == 61.25
+    assert row["score_basis_36m"] == "stale_score_lab:score_lab_v0"
 
 
 def test_catalog_summary_reports_full_backtest_validation_counts():

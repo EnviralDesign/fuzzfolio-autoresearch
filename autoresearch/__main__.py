@@ -4921,10 +4921,22 @@ def _build_validation_rows(
                     f"validate skip {run_id} {best_attempt.get('attempt_id')}: {detail}"
                 )
             return index, None
+        validation_12_metrics = validation_12.get("metrics")
+        if not isinstance(validation_12_metrics, dict):
+            validation_12_metrics = {}
+        validation_36_metrics = validation_36.get("metrics")
+        if not isinstance(validation_36_metrics, dict):
+            validation_36_metrics = {}
         row.update(
             {
                 "score_12m": validation_12.get("score"),
                 "score_basis_12m": validation_12.get("score_basis"),
+                "score_lab_score_12m": _safe_float_value(validation_12_metrics.get("score_lab")),
+                "legacy_quality_score_12m": _safe_float_value(
+                    validation_12_metrics.get("legacy_quality_score")
+                    if validation_12_metrics.get("legacy_quality_score") is not None
+                    else validation_12_metrics.get("quality_score")
+                ),
                 "trades_per_month_12m": validation_12.get("trades_per_month"),
                 "trade_count_12m": validation_12.get("trade_count"),
                 "effective_window_months_12m": validation_12.get(
@@ -4934,6 +4946,12 @@ def _build_validation_rows(
                 "artifact_dir_12m": validation_12.get("artifact_dir"),
                 "score_36m": validation_36.get("score"),
                 "score_basis_36m": validation_36.get("score_basis"),
+                "score_lab_score_36m": _safe_float_value(validation_36_metrics.get("score_lab")),
+                "legacy_quality_score_36m": _safe_float_value(
+                    validation_36_metrics.get("legacy_quality_score")
+                    if validation_36_metrics.get("legacy_quality_score") is not None
+                    else validation_36_metrics.get("quality_score")
+                ),
                 "trades_per_month_36m": validation_36.get("trades_per_month"),
                 "trade_count_36m": validation_36.get("trade_count"),
                 "effective_window_months_36m": validation_36.get(

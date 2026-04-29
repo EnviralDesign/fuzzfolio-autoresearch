@@ -6,6 +6,12 @@ export type AttemptCatalogRow = {
   composite_score?: number | null;
   score_36m?: number | null;
   score_12m?: number | null;
+  score_lab_score?: number | null;
+  score_lab_score_36m?: number | null;
+  score_lab_score_12m?: number | null;
+  legacy_quality_score?: number | null;
+  legacy_quality_score_36m?: number | null;
+  legacy_quality_score_12m?: number | null;
   trades_per_month_36m?: number | null;
   trade_count_36m?: number | null;
   max_drawdown_r_36m?: number | null;

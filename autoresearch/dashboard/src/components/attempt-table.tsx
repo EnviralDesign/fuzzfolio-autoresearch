@@ -35,12 +35,18 @@ const baseColumns: ColumnDef<AttemptCatalogRow, unknown>[] = [
   },
   {
     accessorKey: "score_36m",
-    header: "Score",
+    header: "Score Lab",
     cell: ({ row }) => (
       <span className={scoreTone(row.original.score_36m ?? null)}>
         {formatNumber(row.original.score_36m ?? null, 2)}
       </span>
     ),
+    enableSorting: true,
+  },
+  {
+    accessorKey: "legacy_quality_score_36m",
+    header: "Legacy",
+    cell: ({ row }) => formatNumber(row.original.legacy_quality_score_36m ?? null, 2),
     enableSorting: true,
   },
   {

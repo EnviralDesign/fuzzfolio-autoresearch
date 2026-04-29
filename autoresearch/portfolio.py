@@ -153,35 +153,22 @@ FX_CODES = {
     "ZAR",
 }
 
-METAL_SYMBOLS = {"XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"}
-COMMODITY_SYMBOLS = {"USOIL", "UKOIL", "WTI", "BRENT", "NATGAS", "NGAS"}
+METAL_SYMBOLS = {"XAUUSD", "XAGUSD"}
+COMMODITY_SYMBOLS = {"XTIUSD", "XBRUSD"}
 INDEX_SYMBOLS = {
     "US30",
     "US500",
-    "SPX500",
-    "NAS100",
-    "USTEC",
+    "USTECH",
+    "RUSS2000",
     "DE40",
-    "GER40",
     "UK100",
     "JP225",
-    "AUS200",
     "HK50",
-    "EU50",
 }
 CRYPTO_BASES = {
-    "ADA",
-    "AVAX",
-    "BCH",
-    "BNB",
     "BTC",
-    "DOGE",
-    "DOT",
     "ETH",
-    "LTC",
     "SOL",
-    "XLM",
-    "XMR",
     "XRP",
 }
 HOURS_PER_MONTH = 24.0 * 365.25 / 12.0
@@ -443,7 +430,7 @@ def infer_instrument_asset_class(instrument: Any) -> str:
     token = str(instrument or "").strip().upper()
     if not token:
         return "other"
-    if token in METAL_SYMBOLS or token.startswith(("XAU", "XAG", "XPT", "XPD")):
+    if token in METAL_SYMBOLS or token.startswith(("XAU", "XAG")):
         return "metal"
     if token in COMMODITY_SYMBOLS:
         return "commodity"

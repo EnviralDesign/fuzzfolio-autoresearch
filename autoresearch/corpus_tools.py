@@ -612,6 +612,15 @@ def extract_attempt_catalog_row(
     )
     score_12 = _safe_float(scrutiny_12.get("score"))
     score_36 = _safe_float(scrutiny_36.get("score"))
+    attempt_metrics = attempt.get("metrics")
+    if not isinstance(attempt_metrics, dict):
+        attempt_metrics = {}
+    scrutiny_12_metrics = scrutiny_12.get("metrics")
+    if not isinstance(scrutiny_12_metrics, dict):
+        scrutiny_12_metrics = {}
+    scrutiny_36_metrics = scrutiny_36.get("metrics")
+    if not isinstance(scrutiny_36_metrics, dict):
+        scrutiny_36_metrics = {}
     base_strategy_key = strategy_key(timeframe, instruments)
     strategy_key_12m = strategy_key(
         scrutiny_12.get("timeframe"),
@@ -634,6 +643,12 @@ def extract_attempt_catalog_row(
         "profile_path": str(profile_path) if profile_path is not None else None,
         "composite_score": attempt.get("composite_score"),
         "score_basis": attempt.get("score_basis"),
+        "score_lab_score": _safe_float(attempt_metrics.get("score_lab")),
+        "legacy_quality_score": _safe_float(
+            attempt_metrics.get("legacy_quality_score")
+            if attempt_metrics.get("legacy_quality_score") is not None
+            else attempt_metrics.get("quality_score")
+        ),
         "explorer_model": (run_metadata or {}).get("explorer_model"),
         "explorer_profile": (run_metadata or {}).get("explorer_profile"),
         "requested_timeframe": attempt.get("requested_timeframe"),
@@ -666,6 +681,12 @@ def extract_attempt_catalog_row(
         "scrutiny_curve_path_12m": scrutiny_12.get("curve_path"),
         "score_12m": score_12,
         "score_basis_12m": scrutiny_12.get("score_basis"),
+        "score_lab_score_12m": _safe_float(scrutiny_12_metrics.get("score_lab")),
+        "legacy_quality_score_12m": _safe_float(
+            scrutiny_12_metrics.get("legacy_quality_score")
+            if scrutiny_12_metrics.get("legacy_quality_score") is not None
+            else scrutiny_12_metrics.get("quality_score")
+        ),
         "trade_count_12m": scrutiny_12.get("trade_count"),
         "trades_per_month_12m": scrutiny_12.get("trades_per_month"),
         "effective_window_months_12m": scrutiny_12.get("effective_window_months"),
@@ -679,6 +700,12 @@ def extract_attempt_catalog_row(
         "scrutiny_curve_path_36m": scrutiny_36.get("curve_path"),
         "score_36m": score_36,
         "score_basis_36m": scrutiny_36.get("score_basis"),
+        "score_lab_score_36m": _safe_float(scrutiny_36_metrics.get("score_lab")),
+        "legacy_quality_score_36m": _safe_float(
+            scrutiny_36_metrics.get("legacy_quality_score")
+            if scrutiny_36_metrics.get("legacy_quality_score") is not None
+            else scrutiny_36_metrics.get("quality_score")
+        ),
         "trade_count_36m": scrutiny_36.get("trade_count"),
         "trades_per_month_36m": scrutiny_36.get("trades_per_month"),
         "effective_window_months_36m": scrutiny_36.get("effective_window_months"),
