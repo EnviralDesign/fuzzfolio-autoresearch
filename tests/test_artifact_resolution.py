@@ -37,11 +37,11 @@ def test_fully_scored_with_mock_scorer(tmp_path: Path) -> None:
     (d / "sensitivity-response.json").write_text("{}", encoding="utf-8")
 
     def score_artifact(_p: Path) -> dict:
-        return {"best": {"quality_score": 55.5, "market_data_window": {}}}
+        return {"best": {"score_lab": 55.5, "market_data_window": {}}}
 
     st = artifact_resolution_status(d, score_artifact=score_artifact)
     assert st["resolution"] == RESOLUTION_FULLY_SCORED
-    assert st.get("quality_score") == 55.5
+    assert st.get("score_lab") == 55.5
 
 
 def test_attempt_mismatch(tmp_path: Path) -> None:

@@ -41,6 +41,10 @@ class AttemptRecord:
     trades_per_month: float | None = None
     positive_cell_ratio: float | None = None
     effective_window_source: str | None = None
+    signal_coverage_ratio: float | None = None
+    bars_per_signal: float | None = None
+    max_consecutive_signal_run: float | None = None
+    trigger_indicator_count: float | None = None
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -50,7 +54,7 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
-            if not line:
+            if not line or not line.strip("\x00").strip():
                 continue
             rows.append(json.loads(line))
     return rows
@@ -157,6 +161,10 @@ def make_attempt_record(
     trades_per_month: float | None = None,
     positive_cell_ratio: float | None = None,
     effective_window_source: str | None = None,
+    signal_coverage_ratio: float | None = None,
+    bars_per_signal: float | None = None,
+    max_consecutive_signal_run: float | None = None,
+    trigger_indicator_count: float | None = None,
 ) -> AttemptRecord:
     existing = load_attempts(attempts_path)
     sequence = len(existing) + 1
@@ -188,4 +196,8 @@ def make_attempt_record(
         trades_per_month=trades_per_month,
         positive_cell_ratio=positive_cell_ratio,
         effective_window_source=effective_window_source,
+        signal_coverage_ratio=signal_coverage_ratio,
+        bars_per_signal=bars_per_signal,
+        max_consecutive_signal_run=max_consecutive_signal_run,
+        trigger_indicator_count=trigger_indicator_count,
     )

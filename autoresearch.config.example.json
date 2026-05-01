@@ -88,6 +88,55 @@
       "temperature": 0.2,
       "max_tokens": 8192,
       "timeout_seconds": 180
+    },
+    "opencode-go-kimi-k26-sample": {
+      "type": "opencode_go",
+      "api_key_ref": "opencode_go_main",
+      "model": "kimi-k2.6",
+      "temperature": 0.2,
+      "max_tokens": 8192,
+      "timeout_seconds": 180
+    },
+    "opencode-go-qwen35-plus-sample": {
+      "type": "opencode_go",
+      "api_key_ref": "opencode_go_main",
+      "model": "qwen3.5-plus",
+      "temperature": 0.2,
+      "max_tokens": 2048,
+      "timeout_seconds": 180
+    },
+    "opencode-go-qwen36-plus-sample": {
+      "type": "opencode_go",
+      "api_key_ref": "opencode_go_main",
+      "model": "qwen3.6-plus",
+      "temperature": 0.2,
+      "max_tokens": 8192,
+      "timeout_seconds": 180
+    },
+    "opencode-go-minimax-m27-sample": {
+      "type": "opencode_go",
+      "transport": "messages",
+      "api_key_ref": "opencode_go_main",
+      "model": "minimax-m2.7",
+      "temperature": 0.2,
+      "max_tokens": 8192,
+      "timeout_seconds": 180
+    },
+    "opencode-go-deepseek-v4-flash-sample": {
+      "type": "opencode_go",
+      "api_key_ref": "opencode_go_main",
+      "model": "deepseek-v4-flash",
+      "temperature": 0.2,
+      "max_tokens": 8192,
+      "timeout_seconds": 180
+    },
+    "opencode-go-deepseek-v4-pro-sample": {
+      "type": "opencode_go",
+      "api_key_ref": "opencode_go_main",
+      "model": "deepseek-v4-pro",
+      "temperature": 0.2,
+      "max_tokens": 8192,
+      "timeout_seconds": 180
     }
   },
   "fuzzfolio": {

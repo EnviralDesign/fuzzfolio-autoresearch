@@ -9,10 +9,13 @@ from autoresearch.__main__ import build_parser
 from autoresearch.provider import (
     ChatMessage,
     CodexAppServerProvider,
+    OpenCodeGoProvider,
+    OpenCodeGoMessagesProvider,
     ProviderProfileConfig,
     ProviderError,
     _CodexAppServerSession,
     _parse_codex_usage_limit_delay_seconds,
+    create_provider,
     _write_provider_request_snapshot,
     provider_trace_scope,
 )
@@ -152,6 +155,9 @@ def test_prepare_isolated_codex_home_copies_auth_files(tmp_path: Path, monkeypat
     source_home.mkdir()
     (source_home / "auth.json").write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
     (source_home / "config.toml").write_text('model = "gpt-5.4-mini"\n', encoding="utf-8")
+    source_agents = source_home / "agents"
+    source_agents.mkdir()
+    (source_agents / "explorer.mini.toml").write_text('model = "gpt-5.4-mini"\n', encoding="utf-8")
     monkeypatch.setenv("CODEX_HOME", str(source_home))
 
     isolated = provider_module._prepare_isolated_codex_home(
@@ -166,6 +172,7 @@ def test_prepare_isolated_codex_home_copies_auth_files(tmp_path: Path, monkeypat
     assert isolated != source_home.resolve()
     assert (isolated / "auth.json").read_text(encoding="utf-8") == '{"auth_mode":"chatgpt"}\n'
     assert (isolated / "config.toml").read_text(encoding="utf-8") == 'model = "gpt-5.4-mini"\n'
+    assert (isolated / "agents" / "explorer.mini.toml").read_text(encoding="utf-8") == 'model = "gpt-5.4-mini"\n'
 
 
 def test_codex_app_server_session_reuses_thread_within_run() -> None:
@@ -204,6 +211,66 @@ def test_codex_app_server_session_reuses_thread_within_run() -> None:
     assert [method for method, _ in requests].count("thread/start") == 1
     turn_start_requests = [params for method, params in requests if method == "turn/start"]
     assert [params["threadId"] for params in turn_start_requests] == ["thread-1", "thread-1"]
+
+
+def test_codex_provider_sends_incremental_transcript_after_first_call(monkeypatch) -> None:
+    prompts: list[str] = []
+
+    class FakeSession:
+        def __init__(self, config: ProviderProfileConfig):
+            self.config = config
+            self.turn_count = 0
+
+        def is_alive(self) -> bool:
+            return True
+
+        def default_turn_summary_enabled(self) -> bool:
+            return False
+
+        def start_turn(self, prompt: str, *, include_summary: bool | None = None) -> str:
+            prompts.append(prompt)
+            self.turn_count += 1
+            return f"turn-{self.turn_count}"
+
+        def collect_turn_text(self, turn_id: str) -> str:
+            return (
+                '{"response_json":"{\\"mode\\":\\"runtime_shape\\",'
+                '\\"reasoning\\":\\"ok\\",\\"actions\\":[]}"}'
+            )
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(provider_module, "_CodexAppServerSession", FakeSession)
+    provider = CodexAppServerProvider(
+        ProviderProfileConfig(
+            provider_type="codex",
+            command="codex",
+            model="gpt-5.5",
+        )
+    )
+    first_messages = [
+        ChatMessage(role="system", content="protocol"),
+        ChatMessage(role="user", content="run ref"),
+        ChatMessage(role="user", content="step 1"),
+    ]
+    second_messages = [
+        *first_messages,
+        ChatMessage(role="assistant", content="step 1 action"),
+        ChatMessage(role="user", content="step 2"),
+    ]
+
+    with provider_trace_scope(label="explorer", run_id="run-123"):
+        provider.complete_json(first_messages)
+        provider.complete_json(second_messages)
+
+    assert "Conversation transcript:" in prompts[0]
+    assert "SYSTEM:\nprotocol" in prompts[0]
+    assert "New conversation transcript entries:" in prompts[1]
+    assert "SYSTEM:\nprotocol" not in prompts[1]
+    assert "USER:\nrun ref" not in prompts[1]
+    assert "ASSISTANT:\nstep 1 action" in prompts[1]
+    assert "USER:\nstep 2" in prompts[1]
 
 
 def test_codex_provider_reuses_session_across_calls(monkeypatch) -> None:
@@ -279,6 +346,56 @@ def test_codex_app_server_turn_start_params_keep_summary_for_non_spark() -> None
 
     assert params["summary"] == "concise"
     assert params["model"] == "gpt-5.4"
+
+
+def test_opencode_go_provider_uses_go_chat_shape() -> None:
+    provider = create_provider(
+        ProviderProfileConfig(
+            provider_type="opencode_go",
+            api_base="https://opencode.ai/zen/go/v1",
+            api_key="key",
+            model="kimi-k2.6",
+            max_tokens=8192,
+        )
+    )
+
+    assert isinstance(provider, OpenCodeGoProvider)
+    assert provider._build_url() == "https://opencode.ai/zen/go/v1/chat/completions"
+    body = provider._build_body([ChatMessage(role="user", content="Return JSON.")], 1234)
+    assert body["model"] == "kimi-k2.6"
+    assert body["max_tokens"] == 1234
+    assert "max_completion_tokens" not in body
+    assert "response_format" not in body
+
+
+def test_opencode_go_messages_provider_uses_anthropic_messages_shape() -> None:
+    provider = create_provider(
+        ProviderProfileConfig(
+            provider_type="opencode_go",
+            transport="messages",
+            api_base="https://opencode.ai/zen/go/v1",
+            api_key="key",
+            model="minimax-m2.7",
+            max_tokens=8192,
+        )
+    )
+
+    assert isinstance(provider, OpenCodeGoMessagesProvider)
+    assert provider._build_url() == "https://opencode.ai/zen/go/v1/messages"
+    assert provider._build_headers()["x-api-key"] == "key"
+    assert provider._build_headers()["anthropic-version"] == "2023-06-01"
+    body = provider._build_body(
+        [
+            ChatMessage(role="system", content="Return JSON only."),
+            ChatMessage(role="user", content="Probe."),
+        ],
+        1234,
+    )
+    assert body["model"] == "minimax-m2.7"
+    assert body["system"] == "Return JSON only."
+    assert body["messages"] == [{"role": "user", "content": "Probe."}]
+    assert body["max_tokens"] == 1234
+    assert "response_format" not in body
 
 
 def test_codex_provider_retries_without_summary_on_unsupported_summary_error(monkeypatch) -> None:

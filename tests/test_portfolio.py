@@ -1107,6 +1107,15 @@ def test_build_parser_includes_render_corpus_profile_drops_defaults() -> None:
     assert args.attempt_id is None
 
 
+def test_build_parser_sync_profile_drop_pngs_defaults_to_36mo_only() -> None:
+    parser = ar_main.build_parser()
+
+    args = parser.parse_args(["sync-profile-drop-pngs"])
+
+    assert args.command == "sync-profile-drop-pngs"
+    assert args.lookback_months == 36
+
+
 def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:

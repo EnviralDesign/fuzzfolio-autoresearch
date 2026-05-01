@@ -729,6 +729,27 @@ def test_role_balanced_seed_indicator_ids_prioritize_context_setup_trigger() -> 
     assert selected[:3] == ["ADX", "RSI_MEAN_REVERSION", "STOCHRSI_CROSSBACK"]
 
 
+def test_role_balanced_seed_indicator_ids_keeps_second_trigger_when_available() -> None:
+    controller = _make_controller()
+
+    selected = controller._role_balanced_seed_indicator_ids(
+        [
+            "RSI_MEAN_REVERSION",
+            "STOCHRSI_CROSSBACK",
+            "ADX",
+            "PRICE_RECLAIM_MA",
+            "MFI_TREND",
+        ]
+    )
+
+    assert selected == [
+        "ADX",
+        "RSI_MEAN_REVERSION",
+        "STOCHRSI_CROSSBACK",
+        "PRICE_RECLAIM_MA",
+    ]
+
+
 def test_opening_overlay_uses_role_balanced_seed_indicator_suggestion(
     tmp_path: Path,
 ) -> None:
@@ -1447,6 +1468,65 @@ def test_typed_run_parameter_sweep_forwards_profile_drop_quality_score_preset(tm
     mode_index = args.index("--mode") + 1
     assert args[mode_index] == "deterministic"
     assert result["mode"] == "deterministic"
+
+
+def test_typed_run_parameter_sweep_normalizes_common_axis_aliases(tmp_path: Path) -> None:
+    controller = _make_controller()
+    captured: dict[str, object] = {}
+
+    def fake_execute(
+        _tool_context,
+        *,
+        args,
+        cwd,
+        step,
+        step_limit,
+        policy,
+        source_action,
+        result_tool="run_cli",
+    ):
+        captured["args"] = list(args)
+        return {
+            "tool": result_tool,
+            "ok": True,
+            "result": {"parsed_json": {"sweep_id": "sw-1", "ranked": []}},
+            "artifacts": {},
+        }
+
+    controller._execute_cli_invocation = fake_execute
+    tool_context = SimpleNamespace(
+        run_id="run-a",
+        run_dir=tmp_path,
+        evals_dir=tmp_path / "evals",
+    )
+    tool_context.evals_dir.mkdir(parents=True, exist_ok=True)
+
+    result = controller._typed_run_parameter_sweep(
+        tool_context,
+        {
+            "tool": "run_parameter_sweep",
+            "profile_ref": "ref-a",
+            "axes": [
+                "indicators[2].config.timeperiod=7,9,11,14",
+                "profile.indicators[3].config.lookbackBars=1,2,3",
+            ],
+        },
+        step=5,
+        step_limit=50,
+        policy=ctrlmod.RunPolicy(mode_name="run"),
+    )
+
+    args = captured["args"]
+    axis_values = [
+        args[index + 1]
+        for index, value in enumerate(args)
+        if value == "--axis"
+    ]
+    assert axis_values == [
+        "indicator[2].talib.timeperiod=7,9,11,14",
+        "indicator[3].config.lookbackBars=1,2,3",
+    ]
+    assert result["axes"] == axis_values
 
 
 def test_typed_run_parameter_sweep_uses_medium_evolutionary_budget_by_default(
@@ -2704,6 +2784,43 @@ def test_normalized_attempt_record_evidence_backfills_nested_metrics(tmp_path) -
     assert evidence["positive_cell_ratio"] == 0.625
 
 
+def test_normalized_attempt_record_evidence_includes_signal_behavior(tmp_path) -> None:
+    controller = _make_controller()
+    controller.config.research.effective_coverage_min_ratio = 0.8
+    controller._requested_horizon_from_artifact_dir = lambda _artifact_dir: 36
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    best_summary = {
+        "best_cell": {"resolved_trades": 120},
+        "market_data_window": {"effective_window_months": 36.0},
+        "behavior_summary": {
+            "signal_coverage_ratio": 0.018,
+            "bars_per_signal": 55.5,
+            "max_consecutive_signal_run": 2,
+            "trigger_indicator_count": 2,
+        },
+    }
+    score = AttemptScore(
+        primary_score=67.2,
+        composite_score=67.2,
+        score_basis="score_lab_v2_3:geometric_mean",
+        metrics={},
+        best_summary=best_summary,
+    )
+
+    evidence = controller._normalized_attempt_record_evidence(
+        artifact_dir=artifact_dir,
+        sensitivity_snapshot={},
+        score=score,
+        compare_payload={"best": best_summary},
+    )
+
+    assert evidence["signal_coverage_ratio"] == 0.018
+    assert evidence["bars_per_signal"] == 55.5
+    assert evidence["max_consecutive_signal_run"] == 2.0
+    assert evidence["trigger_indicator_count"] == 2.0
+
+
 def test_current_wrap_up_focus_prefers_retryable_provisional_line() -> None:
     controller = _make_controller({"ref-a": "fam-a", "ref-b": "fam-b"})
     controller._family_branches = {
@@ -3151,6 +3268,72 @@ def test_wrap_up_validation_blocks_terminal_compare_on_focus_family() -> None:
 
     assert len(errors) == 1
     assert "only decisive focus-path actions are allowed" in errors[0]
+
+
+def test_terminal_step_invalid_response_repairs_to_finish() -> None:
+    controller = _make_controller()
+    traces: list[dict[str, object]] = []
+    controller._trace_runtime = lambda *args, **kwargs: traces.append(kwargs)
+    controller._allow_finish = lambda *_args, **_kwargs: (True, "")
+
+    repaired = controller._terminal_step_finish_repair(
+        SimpleNamespace(run_id="run-a"),
+        step=12,
+        step_limit=12,
+        policy=SimpleNamespace(allow_finish=True),
+        errors=["Action 1: blocked"],
+    )
+
+    assert repaired is not None
+    assert repaired["actions"] == [
+        {
+            "tool": "finish",
+            "summary": (
+                "Step limit reached; stopping with the best available evidence after "
+                "the final proposed action failed controller validation."
+            ),
+        }
+    ]
+    assert traces[-1]["status"] == "terminal_finish"
+
+
+def test_branch_validation_does_not_reject_finish_action() -> None:
+    controller = _make_controller({"ref-a": "fam-a"})
+    controller._family_branches = {
+        "fam-a": bl.FamilyBranchState(
+            family_id="fam-a",
+            lifecycle_state=bl.LIFECYCLE_PROVISIONAL_LEADER,
+            promotability_status=vo.PROMOTABILITY_RETRY_RECOMMENDED,
+            retention_status=bl.RETENTION_PASSED,
+        )
+    }
+    controller._branch_overlay = bl.BranchRunOverlay(
+        provisional_leader_family_id="fam-a",
+        budget_mode=bl.BUDGET_WRAP_UP,
+    )
+    attempts = [
+        _make_attempt(
+            sequence=1,
+            name="focus",
+            profile_ref="ref-a",
+            score=24.2299,
+            horizon_months=12,
+            effective_window_months=11.27,
+            trades_per_month=163.35,
+            resolved_trades=1841,
+        )
+    ]
+    controller._run_attempts = lambda _run_id: attempts
+
+    errors = controller._validate_branch_lifecycle_actions(
+        SimpleNamespace(run_id="run-a", run_dir=None),
+        actions=[{"tool": "finish", "summary": "Step limit reached."}],
+        step=12,
+        step_limit=12,
+        policy=SimpleNamespace(allow_finish=True),
+    )
+
+    assert errors == []
 
 
 def test_branch_validation_handles_non_cli_action_on_exploit_dead_family() -> None:

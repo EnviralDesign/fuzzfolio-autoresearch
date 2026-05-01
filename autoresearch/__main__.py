@@ -119,7 +119,11 @@ if __package__ in {None, ""}:
         create_provider,
         set_provider_trace_stderr_mode,
     )
-    from autoresearch.scoring import build_attempt_score, load_sensitivity_snapshot
+    from autoresearch.scoring import (
+        CANONICAL_SCORE_LAB_VERSION,
+        build_attempt_score,
+        load_sensitivity_snapshot,
+    )
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
@@ -200,7 +204,11 @@ else:
         create_provider,
         set_provider_trace_stderr_mode,
     )
-    from .scoring import build_attempt_score, load_sensitivity_snapshot
+    from .scoring import (
+        CANONICAL_SCORE_LAB_VERSION,
+        build_attempt_score,
+        load_sensitivity_snapshot,
+    )
     from .typed_tools import CLI_OK_TOOLS
 
 
@@ -431,8 +439,8 @@ def build_parser() -> argparse.ArgumentParser:
     profile_drop_pngs.add_argument(
         "--lookback-months",
         type=int,
-        default=12,
-        help="Fixed deep-replay lookback window in months for rebuilt profile-drop cards. Default: 12.",
+        default=36,
+        help="Fixed deep-replay lookback window in months for rebuilt profile-drop cards. Default: 36.",
     )
     profile_drop_pngs.add_argument(
         "--force-rebuild",
@@ -3127,15 +3135,54 @@ def _detect_dev_sim_worker_count(*, timeout_seconds: float = 2.0) -> int | None:
         command = str(item.get("command") or "").strip().lower()
         if status != "running":
             continue
-        if name.startswith("sim worker") or command.endswith("sim-worker"):
+        if (
+            name.startswith("replay worker")
+            or name.startswith("sim worker")
+            or "sim_worker_replay" in command
+            or command.endswith("sim-worker")
+        ):
             count += 1
     return count if count > 0 else None
+
+
+def _result_has_canonical_score_lab(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    candidates: list[Any] = []
+    if isinstance(payload, dict):
+        candidates.extend(
+            [
+                payload.get("score_lab"),
+                payload.get("scoreLab"),
+            ]
+        )
+        aggregate = payload.get("aggregate")
+        if isinstance(aggregate, dict):
+            candidates.extend([aggregate.get("score_lab"), aggregate.get("scoreLab")])
+        data = payload.get("data")
+        if isinstance(data, dict):
+            candidates.extend([data.get("score_lab"), data.get("scoreLab")])
+            data_aggregate = data.get("aggregate")
+            if isinstance(data_aggregate, dict):
+                candidates.extend(
+                    [data_aggregate.get("score_lab"), data_aggregate.get("scoreLab")]
+                )
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        version = str(candidate.get("version") or "").strip()
+        if version == CANONICAL_SCORE_LAB_VERSION and candidate.get("score") is not None:
+            return True
+    return False
 
 
 def _run_full_backtest_with_retry(
     config,
     attempt: dict[str, Any],
     *,
+    force_rebuild: bool = False,
     job_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     def invoke(candidate: dict[str, Any]) -> dict[str, Any]:
@@ -3151,7 +3198,7 @@ def _run_full_backtest_with_retry(
             return _run_full_backtest_for_attempt(config, candidate)
 
     artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
-    if artifact_dir.exists():
+    if artifact_dir.exists() and not force_rebuild:
         source_payload = resolve_attempt_scrutiny_source(
             attempt,
             36,
@@ -3168,7 +3215,11 @@ def _run_full_backtest_with_retry(
         ):
             source_result_path = Path(result_path_raw)
             source_curve_path = Path(curve_path_raw)
-            if source_result_path.exists() and source_curve_path.exists():
+            if (
+                source_result_path.exists()
+                and source_curve_path.exists()
+                and _result_has_canonical_score_lab(source_result_path)
+            ):
                 dest_curve = artifact_dir / "full-backtest-36mo-curve.json"
                 dest_result = artifact_dir / "full-backtest-36mo-result.json"
                 shutil.copy2(source_curve_path, dest_curve)
@@ -5111,7 +5162,7 @@ def cmd_sync_profile_drop_pngs(
                     shutil.rmtree(temp_root)
                 rendered_pngs: list[str] = []
                 skipped_horizons: list[int] = []
-                requested_horizons = sorted({12, int(lookback_months), 36})
+                requested_horizons = [int(lookback_months)]
                 for horizon_months in requested_horizons:
                     horizon_manifest_payload = {
                         "version": 1,
@@ -5403,6 +5454,7 @@ def cmd_calculate_full_backtests(
                             _run_full_backtest_with_retry,
                             config,
                             attempt,
+                            force_rebuild=force_rebuild,
                             job_timeout_seconds=job_timeout_seconds,
                         )
                         in_flight[future] = (run_dir, attempt, row, pytime.time())
@@ -5438,6 +5490,18 @@ def cmd_calculate_full_backtests(
                                 result_entry["retry_mode"] = retry_mode
                             if recovery_mode:
                                 result_entry["recovery_mode"] = recovery_mode
+                            try:
+                                validation_score = _load_validation_score(
+                                    Path(str(attempt.get("artifact_dir") or "")).resolve()
+                                )
+                            except Exception:
+                                validation_score = {}
+                            if validation_score.get("score") is not None:
+                                result_entry["score_36m"] = validation_score.get("score")
+                            if validation_score.get("score_basis") is not None:
+                                result_entry["score_basis_36m"] = validation_score.get(
+                                    "score_basis"
+                                )
                             calculated += 1
                             if seed_source:
                                 seeded_materialized += 1

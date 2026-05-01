@@ -356,6 +356,14 @@ def _provider_defaults(provider_type: str) -> dict[str, Any]:
             "timeout_seconds": 180,
             "transport": "chat_completions",
         }
+    if normalized == "opencode_go":
+        return {
+            "api_base": "https://opencode.ai/zen/go/v1",
+            "command": None,
+            "api_key_env": "OPENCODE_GO_API_KEY",
+            "timeout_seconds": 180,
+            "transport": "chat_completions",
+        }
     if normalized == "openai_compatible":
         return {
             "api_base": None,

@@ -44,7 +44,12 @@ from .ledger import (
 )
 from .plotting import compute_frontier, render_progress_artifacts
 from .provider import ChatMessage, ProviderError, create_provider, provider_trace_scope
-from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapshot
+from .scoring import (
+    CANONICAL_SCORE_LAB_VERSION,
+    AttemptScore,
+    build_attempt_score,
+    load_sensitivity_snapshot,
+)
 from trainingdatapipeline.normalize_state import build_prompt_variants
 
 _RUNTIME_TRACE_STDERR_MODE = "verbose"
@@ -750,7 +755,7 @@ def _compact_compare_summary_for_prompt(
         return None
     best = compare.get("best") if isinstance(compare.get("best"), dict) else {}
     compact: dict[str, Any] = {}
-    for key in ("quality_score", "signal_count", "timeframe", "dsr"):
+    for key in ("score_lab", "quality_score", "signal_count", "timeframe", "dsr"):
         if best.get(key) is not None:
             compact[key] = best.get(key)
     best_cell = best.get("best_cell")
@@ -806,12 +811,12 @@ def _compact_ranked_comparison_for_prompt(
         if not isinstance(row, dict):
             continue
         compact: dict[str, Any] = {}
-        for key in ("label", "quality_score"):
+        for key in ("label", "score_lab", "quality_score"):
             if row.get(key) is not None:
                 compact[key] = row.get(key)
         best = row.get("best")
         if isinstance(best, dict):
-            for key in ("quality_score", "signal_count", "timeframe"):
+            for key in ("score_lab", "quality_score", "signal_count", "timeframe"):
                 if best.get(key) is not None:
                     compact[key] = best.get(key)
             best_cell = best.get("best_cell")
@@ -913,7 +918,7 @@ def _summarize_sweep_results_payload(
         "top_score": (
             top.get("fitness_value")
             if isinstance(top, dict) and top.get("fitness_value") is not None
-            else fitness.get("quality_score")
+            else fitness.get("score_lab")
         ),
         "top_parameters": top_parameters,
         "top_effective_window_months": _extract_effective_window_from_sweep_fitness(
@@ -1114,6 +1119,39 @@ class ResearchController:
         if normalized in {"deterministic", "evolutionary"}:
             return normalized
         return None
+
+    @staticmethod
+    def _normalize_sweep_axis(axis: Any) -> str | None:
+        if not isinstance(axis, str) or not axis.strip():
+            return None
+        text = axis.strip()
+        if "=" in text:
+            path, values = text.split("=", 1)
+            suffix = "=" + values
+        else:
+            path, suffix = text, ""
+        path = path.strip()
+        if path.startswith("profile.indicators["):
+            path = "indicator[" + path[len("profile.indicators[") :]
+        elif path.startswith("indicators["):
+            path = "indicator[" + path[len("indicators[") :]
+        talib_param_names = {
+            "aggregation",
+            "fastd_matype",
+            "fastd_period",
+            "fastk_period",
+            "fastperiod",
+            "lower_threshold",
+            "patterns",
+            "signalperiod",
+            "slowperiod",
+            "timeperiod",
+            "upper_threshold",
+        }
+        match = re.match(r"^(indicator\[\d+\])\.config\.([A-Za-z_][\w]*)$", path)
+        if match and match.group(2) in talib_param_names:
+            path = f"{match.group(1)}.talib.{match.group(2)}"
+        return path + suffix
 
     @staticmethod
     def _normalize_evolutionary_budget(val: Any) -> str | None:
@@ -1394,6 +1432,23 @@ class ResearchController:
             pcr = score.metrics.get("positive_cell_ratio")
             if isinstance(pcr, (int, float)):
                 positive_cell_ratio = float(pcr)
+        behavior_summary = (
+            best.get("behavior_summary")
+            if isinstance(best.get("behavior_summary"), dict)
+            else {}
+        )
+        signal_coverage_ratio = self._coerce_float_score(
+            behavior_summary.get("signal_coverage_ratio")
+        )
+        bars_per_signal = self._coerce_float_score(
+            behavior_summary.get("bars_per_signal")
+        )
+        max_consecutive_signal_run = self._coerce_float_score(
+            behavior_summary.get("max_consecutive_signal_run")
+        )
+        trigger_indicator_count = self._coerce_float_score(
+            behavior_summary.get("trigger_indicator_count")
+        )
         support_attempt = {
             "best_summary": best if isinstance(best, dict) else {},
             "effective_window_months": eff_w,
@@ -1433,6 +1488,10 @@ class ResearchController:
             "resolved_trades": resolved_trades,
             "trades_per_month": trades_per_month,
             "positive_cell_ratio": positive_cell_ratio,
+            "signal_coverage_ratio": signal_coverage_ratio,
+            "bars_per_signal": bars_per_signal,
+            "max_consecutive_signal_run": max_consecutive_signal_run,
+            "trigger_indicator_count": trigger_indicator_count,
         }
 
     def _scored_attempt_count(self, tool_context: ToolContext) -> int:
@@ -2211,6 +2270,7 @@ class ResearchController:
         for index, action in enumerate(actions, start=1):
             if not isinstance(action, dict):
                 continue
+            tool = str(action.get("tool", "")).strip()
             errors.extend(
                 self._local_pocket_same_cycle_sweep_errors(action, index=index)
             )
@@ -2226,6 +2286,8 @@ class ResearchController:
                     action_families.add(family_id)
             if not family_id and action_families:
                 family_id = next(iter(action_families))
+            if tool == "finish":
+                continue
             branch = self._family_branches.get(family_id)
             is_exploit = self._is_same_family_exploit_action(action)
             if branch and branch.exploit_dead and self._cli_action_hits_family_exploit_surface(
@@ -2353,6 +2415,17 @@ class ResearchController:
                         )
                         if family_id:
                             families.add(family_id)
+        if tool in {"validate_profile", "mutate_profile", "register_profile"}:
+            profile_path = self._resolve_local_profile_path(
+                tool_context,
+                candidate_name=action.get("candidate_name"),
+                profile_path=action.get("profile_path"),
+                profile_ref=action.get("profile_ref"),
+                require_exists=True,
+            )
+            family_id = self._derive_family_id_from_profile(profile_path)
+            if family_id:
+                families.add(family_id)
         return families
 
     def _is_decisive_wrap_up_focus_action(
@@ -2370,6 +2443,10 @@ class ResearchController:
         steps_remaining_after = max(step_limit - step, 0)
         if tool == "evaluate_candidate":
             return families == {focus_family}
+        if tool == "register_profile":
+            return families == {focus_family} and steps_remaining_after >= 1
+        if tool == "validate_profile":
+            return families == {focus_family} and steps_remaining_after >= 2
         if tool == "inspect_artifact":
             return families == {focus_family} and steps_remaining_after >= 1
         if tool == "compare_artifacts":
@@ -3626,8 +3703,12 @@ class ResearchController:
             "- Injected lookback when omitted on evals; quality-score preset; bar-limit policy; phase horizon targets (see run packet).\n"
             "Catalog discipline:\n"
             "- Exact indicator meta ids; exact instrument symbols; instruments[] uses one array entry per symbol (no comma-joined tokens); never __BASKET__ as an instrument.\n"
+            "Score discipline:\n"
+            f"- Use the canonical top-level score as the ranking target. Current canonical score payload is {CANONICAL_SCORE_LAB_VERSION}; score axes/components are diagnostics, not separate optimization targets.\n"
             "Search discipline:\n"
             "- Explore multiple candidates; sweeps are normal (run_parameter_sweep); diversify early, prune weak basket members, do not finish early while budget remains.\n"
+            "- Prefer explicit trigger-backed entry structures over vague oscillator-only entries. A strong default profile shape is context/filter + setup/stretch + one or two lowest-timeframe trigger indicators.\n"
+            "- LookbackBars coverage requirement: when a profile has trigger-style entry indicators, the first refinement sweep for that branch should include indicator[N].config.lookbackBars=1,2,3 unless the branch has already tested it. This is search-space coverage, not final score-policy tuning.\n"
             "- Sweep playbook: use deterministic sweeps for local pocket mapping and nearby refinement; use evolutionary sweeps for broader discovery over a wider axis set; prefer evolutionary_budget presets first (low=100 evals, medium=300, high=480; autoresearch cap 500) and use raw population_size/max_generations only when you truly need a custom budget.\n"
             "Artifacts:\n"
             "- sensitivity-response.json / deep-replay-job.json / best-cell-path-detail.json — prefer inspect_artifact and compare_artifacts over manual compare-sensitivity; no summary.json.\n"
@@ -4374,7 +4455,11 @@ class ResearchController:
 
     @staticmethod
     def _local_pocket_axes_signature(axes: list[Any]) -> str:
-        normalized = sorted(str(axis).strip() for axis in axes if str(axis).strip())
+        normalized = sorted(
+            axis_text
+            for axis in axes
+            if (axis_text := ResearchController._normalize_sweep_axis(axis)) is not None
+        )
         return " | ".join(normalized)
 
     @staticmethod
@@ -4836,12 +4921,12 @@ class ResearchController:
             )
         elif self.config.research.plot_lower_is_better:
             summary = (
-                f"Next target: get admissible quality_score <= {self._format_score(target_score)}. "
+                f"Next target: get admissible score_lab/composite_score <= {self._format_score(target_score)}. "
                 f"Current admissible best={self._format_score(current_score)}."
             )
         else:
             summary = (
-                f"Next target: get admissible quality_score >= {self._format_score(target_score)}. "
+                f"Next target: get admissible score_lab/composite_score >= {self._format_score(target_score)}. "
                 f"Current admissible best={self._format_score(current_score)}."
             )
         if current_score is not None and raw_best_score is not None:
@@ -5032,6 +5117,7 @@ class ResearchController:
         add_first("context")
         add_first("setup")
         add_first("trigger")
+        add_first("trigger")
 
         for candidate in seed_indicator_ids:
             if len(selected) >= max_count:
@@ -5055,14 +5141,17 @@ class ResearchController:
 
         lines = [
             "Indicator composition guidance:",
-            "- Target shape: higher/mid timeframe context, setup/stretch condition, lowest-timeframe trigger.",
+            "- Target shape: higher/mid timeframe context, setup/stretch condition, and one or two lowest-timeframe triggers.",
             role_line("context", "seed context/filter candidates"),
             role_line("setup", "seed setup/state candidates"),
             role_line("trigger", "seed trigger candidates"),
         ]
         if groups.get("trigger"):
             lines.append(
-                "- Opening scaffold should include at least one seed trigger id unless a manager/template constraint says otherwise."
+                "- Opening scaffold should include at least one seed trigger id, and two when the seed hand offers two distinct trigger ids."
+            )
+            lines.append(
+                "- After the first scored baseline, make the first refinement sweep include trigger lookbackBars 1/2/3 so entries can line up without bar-to-bar saturation."
             )
         else:
             lines.append(
@@ -5618,6 +5707,16 @@ class ResearchController:
             overlay_lines.append(
                 "- The seed hand has no clean trigger indicator; keep this first candidate as a baseline and look for trigger-backed structural contrast later."
             )
+        elif len(
+            [
+                indicator_id
+                for indicator_id in preferred_indicator_ids
+                if indicator_id.upper() in TRIGGER_INDICATOR_IDS
+            ]
+        ) >= 2:
+            overlay_lines.append(
+                "- This opening scaffold has two trigger-style indicators; keep both unless validation shows the pair is too sparse."
+            )
         canonical = {
             "tool": "prepare_profile",
             "mode": "scaffold_from_seed",
@@ -5947,10 +6046,11 @@ class ResearchController:
                 "- Sweep mode choices: deterministic for local grid refinement; evolutionary for broader discovery across a wider axis set.",
                 "- Valid axis grammar only: indicator[N].config.<field>=... or indicator[N].talib.<param>=...",
                 "- Deterministic local probes: usually 1-2 axes with 5-6 values each; reserve 3-axis sweeps for unusually strong pockets.",
+                "- Entry trigger probes: if a branch has a trigger-style indicator and no prior lookbackBars coverage, include indicator[N].config.lookbackBars=1,2,3 in the next sweep. Treat this as required branch coverage, not optional polish.",
                 "- Evolutionary probes: use when you want broader coverage than a tiny grid, especially early or mid exploration or after narrow local probes stall. Prefer evolutionary_budget presets: low=100 evals (20x5), medium=300 (30x10), high=480 (40x12); autoresearch clamps custom evolutionary runs at 500 evals.",
                 "- Use raw population_size + max_generations only when you intentionally need a custom evolutionary budget.",
                 "- Common pattern: evolutionary discovery -> inspect_artifact -> materialize or clone the best winner -> deterministic local refinement around the top parameters.",
-                "- Valid examples: indicator[0].config.timeframe=M5,M15,M30,H1,H4 ; indicator[1].talib.timeperiod=8,10,14,20,26",
+                "- Valid examples: indicator[0].config.timeframe=M5,M15,M30,H1,H4 ; indicator[1].config.lookbackBars=1,2,3 ; indicator[1].talib.timeperiod=8,10,14,20,26",
                 "- Invalid examples: profile.indicators[1].params.fastperiod=... ; indicators[1].config.fastperiod=... ; indicator[1].params.fastperiod=...",
             ]
         )
@@ -6324,6 +6424,9 @@ class ResearchController:
                 "Indicator id rule: indicator.meta.id must match one of the exact seeded ids unless scope expands."
             ),
             self._seed_indicator_balance_guidance_text(seed_indicator_ids),
+            "Entry lookback policy:\n"
+            "- For trigger-style entry indicators, the first refinement sweep should explicitly explore config.lookbackBars values 1,2,3.\n"
+            "- Use lookbackBars as entry alignment tolerance; do not use it as the only repeated same-family tweak after retention fails.",
             "Seeded indicator mutation schema:\n" + indicator_schema,
             "Instrument symbol discipline:\n"
             + self._compact_instrument_reference_text(
@@ -8624,6 +8727,15 @@ class ResearchController:
         step_limit: int | None = None,
         policy: RunPolicy | None = None,
     ) -> dict[str, Any] | None:
+        terminal_repair = self._terminal_step_finish_repair(
+            tool_context,
+            step,
+            step_limit,
+            policy,
+            errors=errors,
+        )
+        if terminal_repair is not None:
+            return terminal_repair
         action_summaries = []
         for action in actions:
             if isinstance(action, dict):
@@ -8787,6 +8899,48 @@ class ResearchController:
             else None,
         )
         return normalized
+
+    def _terminal_step_finish_repair(
+        self,
+        tool_context: ToolContext,
+        step: int,
+        step_limit: int | None,
+        policy: RunPolicy | None,
+        *,
+        errors: list[str],
+    ) -> dict[str, Any] | None:
+        if not isinstance(step_limit, int) or step < step_limit:
+            return None
+        active_policy = policy or self._current_run_policy or RunPolicy()
+        summary = (
+            "Step limit reached; stopping with the best available evidence after "
+            "the final proposed action failed controller validation."
+        )
+        allow, _message = self._allow_finish(
+            tool_context,
+            step,
+            step_limit,
+            summary,
+            active_policy,
+        )
+        if not allow:
+            return None
+        self._trace_runtime(
+            tool_context,
+            step=step,
+            phase="response_repair",
+            status="terminal_finish",
+            message="Converted terminal invalid response into finish.",
+            error_count=len(errors),
+        )
+        return {
+            "reasoning": (
+                "The run is at its step limit, so the controller is closing with "
+                "the best available evidence instead of spending the terminal step "
+                "on an invalid follow-up action."
+            ),
+            "actions": [{"tool": "finish", "summary": summary}],
+        }
 
     def _repair_invalid_payload_shape(
         self,
@@ -9028,7 +9182,7 @@ class ResearchController:
                 effective_window_months = market_window.get("effective_window_months")
         auto_log_reason = None
         if record.composite_score is None:
-            auto_log_reason = "quality_score was null in the evaluation artifacts"
+            auto_log_reason = f"canonical {CANONICAL_SCORE_LAB_VERSION} was missing in the evaluation artifacts"
         eff_from_ev = record.effective_window_months
         if eff_from_ev is None and effective_window_months is not None:
             eff_from_ev = effective_window_months
@@ -9060,6 +9214,10 @@ class ResearchController:
             "positive_cell_ratio": derived_positive_cell_ratio,
             "effective_window_months": eff_from_ev,
             "effective_window_source": record.effective_window_source,
+            "signal_coverage_ratio": getattr(record, "signal_coverage_ratio", None),
+            "bars_per_signal": getattr(record, "bars_per_signal", None),
+            "max_consecutive_signal_run": getattr(record, "max_consecutive_signal_run", None),
+            "trigger_indicator_count": getattr(record, "trigger_indicator_count", None),
             "requested_horizon_months": record.requested_horizon_months,
             "requested_timeframe": record.requested_timeframe,
             "effective_timeframe": record.effective_timeframe,
@@ -10196,6 +10354,18 @@ class ResearchController:
                 errors=["run_parameter_sweep requires axes array of sweep axis strings."],
                 next_recommended_action=None,
             )
+        axes = [
+            normalized
+            for axis in axes
+            if (normalized := self._normalize_sweep_axis(axis)) is not None
+        ]
+        if not axes:
+            return tt.normalized_tool_envelope(
+                "run_parameter_sweep",
+                ok=False,
+                errors=["run_parameter_sweep requires at least one valid sweep axis string."],
+                next_recommended_action=None,
+            )
         mode = self._normalize_sweep_mode(action.get("mode")) or "deterministic"
         evolutionary_budget = self._normalize_evolutionary_budget(
             action.get("evolutionary_budget")
@@ -10315,7 +10485,7 @@ class ResearchController:
             for ins in instruments:
                 args.extend(["--instrument", str(ins)])
         for ax in axes:
-            args.extend(["--axis", str(ax)])
+            args.extend(["--axis", ax])
         args.append("--pretty")
         base = self._execute_cli_invocation(
             tool_context,
@@ -10342,7 +10512,7 @@ class ResearchController:
         base["ranked_results"] = ranked
         base["best_variant"] = best
         if isinstance(best, dict):
-            base["best_score"] = best.get("quality_score")
+            base["best_score"] = best.get("score_lab")
         base["artifact_dir"] = str(out_dir)
         base["artifact_kind"] = "parameter_sweep"
         base["inspect_ref"] = out_dir.name
@@ -10363,7 +10533,7 @@ class ResearchController:
         if source_candidate_name:
             base["source_candidate_name"] = source_candidate_name
         base["candidate_name_prefix"] = prefix
-        base["axes"] = [str(axis) for axis in axes]
+        base["axes"] = list(axes)
         if mode == "evolutionary":
             budget_phrase = (
                 f"{evolutionary_budget} ({planned_evaluations} evals)"
@@ -10639,12 +10809,12 @@ class ResearchController:
                 score = None
                 best = payload.get("best")
                 if isinstance(best, dict):
-                    score = best.get("quality_score")
+                    score = best.get("score_lab")
                 scored.append(
                     {
                         "label": label,
                         "artifact_dir": str(p),
-                        "quality_score": score,
+                        "score_lab": score,
                         "best": best,
                     }
                 )
@@ -10660,7 +10830,7 @@ class ResearchController:
         lower_better = bool(self.config.research.plot_lower_is_better)
 
         def _rank_key(row: dict[str, Any]) -> float:
-            v = row.get("quality_score")
+            v = row.get("score_lab")
             try:
                 f = float(v)
             except (TypeError, ValueError):
@@ -10675,10 +10845,10 @@ class ResearchController:
         leader = ranked[0]
         trailer = ranked[-1] if len(ranked) > 1 else None
         deltas: list[str] = []
-        if trailer and leader.get("quality_score") is not None:
+        if trailer and leader.get("score_lab") is not None:
             try:
                 deltas.append(
-                    f"score_delta={float(leader['quality_score']) - float(trailer.get('quality_score')):.4f}"
+                    f"score_delta={float(leader['score_lab']) - float(trailer.get('score_lab')):.4f}"
                 )
             except (TypeError, ValueError):
                 pass
@@ -11128,6 +11298,22 @@ class ResearchController:
             return None
         return value
 
+    def _attempt_signal_behavior_metric(
+        self,
+        attempt: dict[str, Any],
+        key: str,
+    ) -> float | None:
+        value = self._coerce_float_score(attempt.get(key))
+        if value is not None:
+            return value
+        best_summary = attempt.get("best_summary")
+        if not isinstance(best_summary, dict):
+            return None
+        behavior_summary = best_summary.get("behavior_summary")
+        if not isinstance(behavior_summary, dict):
+            return None
+        return self._coerce_float_score(behavior_summary.get(key))
+
     def _recent_scored_attempts_text(
         self, tool_context: ToolContext, limit: int
     ) -> str:
@@ -11157,6 +11343,23 @@ class ResearchController:
                 parts.append(
                     f"positive_cell_ratio={self._format_score(positive_cell_ratio)}"
                 )
+            signal_coverage = self._attempt_signal_behavior_metric(
+                attempt, "signal_coverage_ratio"
+            )
+            bars_per_signal = self._attempt_signal_behavior_metric(
+                attempt, "bars_per_signal"
+            )
+            signal_run = self._attempt_signal_behavior_metric(
+                attempt, "max_consecutive_signal_run"
+            )
+            if signal_coverage is not None:
+                parts.append(
+                    f"signal_coverage={self._format_score(signal_coverage * 100.0)}%"
+                )
+            if bars_per_signal is not None:
+                parts.append(f"bars_per_signal={self._format_score(bars_per_signal)}")
+            if signal_run is not None:
+                parts.append(f"max_signal_run={self._format_score(signal_run)}")
             lines.append("- " + " ".join(parts))
         return "\n".join(lines)
 

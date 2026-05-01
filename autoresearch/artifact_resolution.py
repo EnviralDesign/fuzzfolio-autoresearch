@@ -137,14 +137,14 @@ def artifact_resolution_status(
     best = compare.get("best")
     score_val = None
     if isinstance(best, dict):
-        score_val = best.get("quality_score")
+        score_val = best.get("score_lab")
     if score_val is not None:
         out["resolution"] = RESOLUTION_FULLY_SCORED
-        out["reason"] = "compare payload includes quality_score"
-        out["quality_score"] = score_val
+        out["reason"] = "compare payload includes canonical score_lab"
+        out["score_lab"] = score_val
     else:
         out["resolution"] = RESOLUTION_READY_TO_SCORE
-        out["reason"] = "compare ran but no quality_score on best cell"
+        out["reason"] = "compare ran but no canonical score_lab on best cell"
     out["compare_keys"] = (
         list(compare.keys())[:20] if isinstance(compare, dict) else None
     )

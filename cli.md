@@ -166,7 +166,7 @@ uv run autoresearch sync-profile-drop-pngs --json
 | Argument | Type | Default | Description |
 |---|---|---|---|
 | `--run-id` | string (repeatable) | all runs | Only process the named run id. Can be repeated to process multiple specific runs. |
-| `--lookback-months` | int | 12 | Fixed deep-replay lookback window in months for rebuilt profile-drop cards. Always renders `12mo` and `36mo` cards plus the requested horizon. |
+| `--lookback-months` | int | 36 | Fixed deep-replay lookback window in months for rebuilt profile-drop cards. Renders only this horizon. |
 | `--force-rebuild` | flag | false | Ignore existing profile-drop PNG/manifests and rerender every requested horizon. |
 | `--keep-temp` | flag | false | Keep temporary package bundles under each run directory instead of deleting them after a successful render. |
 | `--json` | flag | false | Print machine-readable JSON. |

@@ -1,0 +1,359 @@
+[
+  {
+    "indicator": "ULTOSC_TREND",
+    "n_unique": 10,
+    "median_score": 81.4874,
+    "max_score": 81.4874,
+    "ge70_unique": 8
+  },
+  {
+    "indicator": "MFI_MEAN_REVERSION",
+    "n_unique": 18,
+    "median_score": 80.2574,
+    "max_score": 86.8414,
+    "ge70_unique": 17
+  },
+  {
+    "indicator": "STOCHF_MEAN_REVERSION",
+    "n_unique": 17,
+    "median_score": 80.2574,
+    "max_score": 86.8414,
+    "ge70_unique": 14
+  },
+  {
+    "indicator": "OBV_MEAN_REVERSION",
+    "n_unique": 3,
+    "median_score": 79.8425,
+    "max_score": 79.8425,
+    "ge70_unique": 2
+  },
+  {
+    "indicator": "RSI_CROSSBACK",
+    "n_unique": 26,
+    "median_score": 78.8033,
+    "max_score": 86.8414,
+    "ge70_unique": 20
+  },
+  {
+    "indicator": "MACD_HISTOGRAM_PIPS_TREND",
+    "n_unique": 18,
+    "median_score": 76.6615,
+    "max_score": 77.2388,
+    "ge70_unique": 13
+  },
+  {
+    "indicator": "PLUS_DI_MEAN_REVERSION",
+    "n_unique": 17,
+    "median_score": 76.6615,
+    "max_score": 77.2388,
+    "ge70_unique": 12
+  },
+  {
+    "indicator": "BBANDS_POSITION_TREND",
+    "n_unique": 9,
+    "median_score": 76.2156,
+    "max_score": 76.2156,
+    "ge70_unique": 6
+  },
+  {
+    "indicator": "CHAIKIN_AD_MEAN_REVERSION",
+    "n_unique": 19,
+    "median_score": 75.5669,
+    "max_score": 85.7947,
+    "ge70_unique": 13
+  },
+  {
+    "indicator": "MINUS_DI_TREND",
+    "n_unique": 6,
+    "median_score": 75.406,
+    "max_score": 76.7794,
+    "ge70_unique": 4
+  },
+  {
+    "indicator": "PLUS_DI_TREND",
+    "n_unique": 20,
+    "median_score": 73.2787,
+    "max_score": 83.5863,
+    "ge70_unique": 17
+  },
+  {
+    "indicator": "MA_SLOPE_TREND",
+    "n_unique": 38,
+    "median_score": 73.2787,
+    "max_score": 80.584,
+    "ge70_unique": 24
+  },
+  {
+    "indicator": "AROON_TREND",
+    "n_unique": 35,
+    "median_score": 73.2787,
+    "max_score": 79.8647,
+    "ge70_unique": 20
+  },
+  {
+    "indicator": "CHANNEL_REENTRY",
+    "n_unique": 8,
+    "median_score": 71.7095,
+    "max_score": 80.0245,
+    "ge70_unique": 6
+  },
+  {
+    "indicator": "CCI_MEAN_REVERSION",
+    "n_unique": 6,
+    "median_score": 71.7095,
+    "max_score": 80.0245,
+    "ge70_unique": 6
+  },
+  {
+    "indicator": "WICK_REJECTION",
+    "n_unique": 55,
+    "median_score": 71.1927,
+    "max_score": 85.7947,
+    "ge70_unique": 32
+  },
+  {
+    "indicator": "KELTNER_CHANNEL_MEAN_REVERSION",
+    "n_unique": 11,
+    "median_score": 71.1927,
+    "max_score": 71.1927,
+    "ge70_unique": 7
+  },
+  {
+    "indicator": "ATR_VOLATILITY_FILTER",
+    "n_unique": 37,
+    "median_score": 71.1256,
+    "max_score": 85.7947,
+    "ge70_unique": 29
+  },
+  {
+    "indicator": "STOCH_CROSSOVER",
+    "n_unique": 44,
+    "median_score": 71.1256,
+    "max_score": 79.3949,
+    "ge70_unique": 28
+  },
+  {
+    "indicator": "MFI_TREND",
+    "n_unique": 14,
+    "median_score": 71.1256,
+    "max_score": 72.433,
+    "ge70_unique": 14
+  },
+  {
+    "indicator": "MA_SPREAD_MEAN_REVERSION",
+    "n_unique": 19,
+    "median_score": 71.0064,
+    "max_score": 81.4874,
+    "ge70_unique": 11
+  },
+  {
+    "indicator": "OBV_TREND",
+    "n_unique": 42,
+    "median_score": 70.7863,
+    "max_score": 85.7947,
+    "ge70_unique": 21
+  },
+  {
+    "indicator": "STOCHRSI_MEAN_REVERSION",
+    "n_unique": 9,
+    "median_score": 67.541,
+    "max_score": 76.7794,
+    "ge70_unique": 4
+  },
+  {
+    "indicator": "MA_CROSSOVER",
+    "n_unique": 2,
+    "median_score": 66.2393,
+    "max_score": 67.541,
+    "ge70_unique": 0
+  },
+  {
+    "indicator": "MA_SPREAD_TREND",
+    "n_unique": 53,
+    "median_score": 66.0112,
+    "max_score": 78.8949,
+    "ge70_unique": 24
+  },
+  {
+    "indicator": "STOCHRSI_CROSSBACK",
+    "n_unique": 61,
+    "median_score": 65.193,
+    "max_score": 80.0245,
+    "ge70_unique": 27
+  },
+  {
+    "indicator": "SAR_TREND",
+    "n_unique": 22,
+    "median_score": 65.1818,
+    "max_score": 75.0161,
+    "ge70_unique": 5
+  },
+  {
+    "indicator": "SAR_MEAN_REVERSION",
+    "n_unique": 15,
+    "median_score": 63.789,
+    "max_score": 79.3949,
+    "ge70_unique": 2
+  },
+  {
+    "indicator": "PRICE_RECLAIM_MA",
+    "n_unique": 86,
+    "median_score": 61.8346,
+    "max_score": 79.8425,
+    "ge70_unique": 26
+  },
+  {
+    "indicator": "MACD_CROSSOVER",
+    "n_unique": 69,
+    "median_score": 61.6757,
+    "max_score": 80.584,
+    "ge70_unique": 19
+  },
+  {
+    "indicator": "KELTNER_CHANNEL_BREAKOUT",
+    "n_unique": 3,
+    "median_score": 59.5936,
+    "max_score": 59.5936,
+    "ge70_unique": 0
+  },
+  {
+    "indicator": "ADOSC_TREND",
+    "n_unique": 3,
+    "median_score": 58.8988,
+    "max_score": 67.7258,
+    "ge70_unique": 0
+  },
+  {
+    "indicator": "STOCH_TREND",
+    "n_unique": 19,
+    "median_score": 58.4693,
+    "max_score": 79.8425,
+    "ge70_unique": 2
+  },
+  {
+    "indicator": "STOCHF_TREND",
+    "n_unique": 23,
+    "median_score": 58.0331,
+    "max_score": 76.5612,
+    "ge70_unique": 8
+  },
+  {
+    "indicator": "ADOSC_MEAN_REVERSION",
+    "n_unique": 4,
+    "median_score": 57.7918,
+    "max_score": 66.0112,
+    "ge70_unique": 0
+  },
+  {
+    "indicator": "MOM_TREND",
+    "n_unique": 10,
+    "median_score": 56.634,
+    "max_score": 79.3949,
+    "ge70_unique": 2
+  },
+  {
+    "indicator": "CCI_TREND",
+    "n_unique": 48,
+    "median_score": 56.2636,
+    "max_score": 78.8949,
+    "ge70_unique": 9
+  },
+  {
+    "indicator": "CMO_TREND",
+    "n_unique": 3,
+    "median_score": 55.9012,
+    "max_score": 55.9012,
+    "ge70_unique": 0
+  },
+  {
+    "indicator": "CANDLESTICK_PATTERNS",
+    "n_unique": 65,
+    "median_score": 52.8674,
+    "max_score": 83.5863,
+    "ge70_unique": 10
+  },
+  {
+    "indicator": "ADX",
+    "n_unique": 32,
+    "median_score": 52.8674,
+    "max_score": 83.5863,
+    "ge70_unique": 8
+  },
+  {
+    "indicator": "BBANDS_POSITION_MEAN_REVERSION",
+    "n_unique": 6,
+    "median_score": 52.8674,
+    "max_score": 52.8674,
+    "ge70_unique": 0
+  },
+  {
+    "indicator": "AROON_MEAN_REVERSION",
+    "n_unique": 2,
+    "median_score": 50.3252,
+    "max_score": 54.5825,
+    "ge70_unique": 0
+  },
+  {
+    "indicator": "ULTOSC_MEAN_REVERSION",
+    "n_unique": 17,
+    "median_score": 49.7249,
+    "max_score": 72.433,
+    "ge70_unique": 1
+  },
+  {
+    "indicator": "MOM_MEAN_REVERSION",
+    "n_unique": 15,
+    "median_score": 48.6782,
+    "max_score": 74.9482,
+    "ge70_unique": 2
+  },
+  {
+    "indicator": "MA_DISTANCE_TREND",
+    "n_unique": 8,
+    "median_score": 47.3107,
+    "max_score": 67.2842,
+    "ge70_unique": 0
+  },
+  {
+    "indicator": "MA_DISTANCE_MEAN_REVERSION",
+    "n_unique": 25,
+    "median_score": 46.7898,
+    "max_score": 83.5863,
+    "ge70_unique": 7
+  },
+  {
+    "indicator": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+    "n_unique": 15,
+    "median_score": 46.7898,
+    "max_score": 61.1609,
+    "ge70_unique": 0
+  },
+  {
+    "indicator": "WILLR_MEAN_REVERSION",
+    "n_unique": 14,
+    "median_score": 46.7898,
+    "max_score": 61.1609,
+    "ge70_unique": 0
+  },
+  {
+    "indicator": "STOCHRSI_TREND",
+    "n_unique": 8,
+    "median_score": 43.7787,
+    "max_score": 72.7931,
+    "ge70_unique": 2
+  },
+  {
+    "indicator": "CHAIKIN_AD_TREND",
+    "n_unique": 42,
+    "median_score": 41.3972,
+    "max_score": 76.5612,
+    "ge70_unique": 5
+  },
+  {
+    "indicator": "BREAKOUT_FIRST_CLOSE",
+    "n_unique": 20,
+    "median_score": 22.971,
+    "max_score": 34.1162,
+    "ge70_unique": 0
+  }
+]

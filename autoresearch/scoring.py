@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-CANONICAL_SCORE_LAB_VERSION = "score_lab_v1"
+CANONICAL_SCORE_LAB_VERSION = "score_lab_v2_3"
 
 
 @dataclass
@@ -110,11 +110,18 @@ def _extract_score_lab_payload(
     preferred_paths = [
         ["score_lab"],
         ["score_lab_payload"],
+        ["scoreLab"],
+        ["scoreLabPayload"],
         ["best", "score_lab"],
         ["best", "score_lab_payload"],
+        ["best", "scoreLab"],
+        ["best", "scoreLabPayload"],
         ["data", "aggregate", "score_lab"],
+        ["data", "aggregate", "scoreLab"],
         ["data", "score_lab"],
+        ["data", "scoreLab"],
         ["aggregate", "score_lab"],
+        ["aggregate", "scoreLab"],
     ]
     for source in [best_summary, compare_payload, sensitivity_snapshot]:
         if not isinstance(source, dict):

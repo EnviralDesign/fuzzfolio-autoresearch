@@ -117,6 +117,7 @@ CODEX_USAGE_LIMIT_MARKERS = (
     "try again at",
 )
 CODEX_HOME_MIRROR_FILES = ("auth.json", "config.toml")
+CODEX_HOME_MIRROR_DIRS = ("agents",)
 TOOL_USE_FAILED_MARKERS = (
     "tool_use_failed",
     "tool choice is none, but model called a tool",
@@ -247,6 +248,17 @@ def _copy_codex_home_file(source_home: Path, target_home: Path, filename: str) -
     shutil.copy2(source, target)
 
 
+def _copy_codex_home_dir(source_home: Path, target_home: Path, dirname: str) -> None:
+    source = source_home / dirname
+    if not source.exists() or not source.is_dir():
+        return
+    target = target_home / dirname
+    try:
+        shutil.copytree(source, target, dirs_exist_ok=True)
+    except OSError:
+        return
+
+
 def _prepare_isolated_codex_home(config: ProviderProfileConfig) -> Path:
     target_home = _resolve_isolated_codex_home(config)
     target_home.mkdir(parents=True, exist_ok=True)
@@ -254,6 +266,8 @@ def _prepare_isolated_codex_home(config: ProviderProfileConfig) -> Path:
     if source_home != target_home:
         for filename in CODEX_HOME_MIRROR_FILES:
             _copy_codex_home_file(source_home, target_home, filename)
+        for dirname in CODEX_HOME_MIRROR_DIRS:
+            _copy_codex_home_dir(source_home, target_home, dirname)
     return target_home
 
 
@@ -1258,6 +1272,7 @@ class CodexAppServerProvider:
         self.config = config
         self._session: _CodexAppServerSession | None = None
         self._session_lock = threading.Lock()
+        self._sent_message_count_by_thread_key: dict[str, int] = {}
 
     def _get_session(self) -> _CodexAppServerSession:
         with self._session_lock:
@@ -1277,6 +1292,7 @@ class CodexAppServerProvider:
         with self._session_lock:
             session = self._session
             self._session = None
+            self._sent_message_count_by_thread_key = {}
         if session is not None:
             session.close()
 
@@ -1289,19 +1305,53 @@ class CodexAppServerProvider:
         except Exception:
             pass
 
-    def _prompt_from_messages(self, messages: list[ChatMessage]) -> str:
-        sections = [
-            "You are not allowed to use native tools, shell commands, file edits, MCP tools, or approvals.",
-            "Answer directly as plain assistant text.",
-            "Your final assistant message is schema-constrained.",
-            "Set response_json to the exact raw JSON object string the caller expects.",
-            "Do not wrap it in Markdown. Escape Windows paths correctly inside JSON strings.",
-            "",
-            "Conversation transcript:",
-        ]
-        for message in messages:
+    def _thread_key(self) -> str:
+        return _current_codex_run_id() or "__default__"
+
+    def _prompt_from_messages(
+        self,
+        messages: list[ChatMessage],
+        *,
+        already_sent_count: int = 0,
+    ) -> str:
+        if already_sent_count <= 0 or already_sent_count >= len(messages):
+            sections = [
+                "You are not allowed to use native tools, shell commands, file edits, MCP tools, or approvals.",
+                "Answer directly as plain assistant text.",
+                "Your final assistant message is schema-constrained.",
+                "Set response_json to the exact raw JSON object string the caller expects.",
+                "Do not wrap it in Markdown. Escape Windows paths correctly inside JSON strings.",
+                "",
+                "Conversation transcript:",
+            ]
+            prompt_messages = messages
+        else:
+            sections = [
+                "Continue the same autoresearch controller conversation and protocol.",
+                "Use the previous system protocol, pinned run reference, and conversation history already in this thread.",
+                "Answer directly as plain assistant text with response_json set to the exact raw JSON object string the caller expects.",
+                "Do not wrap it in Markdown. Escape Windows paths correctly inside JSON strings.",
+                "",
+                "New conversation transcript entries:",
+            ]
+            prompt_messages = messages[already_sent_count:]
+        for message in prompt_messages:
             sections.append(f"{message.role.upper()}:\n{message.content}")
         return "\n\n".join(sections)
+
+    def _codex_prompt_for_messages(self, messages: list[ChatMessage]) -> tuple[str, int]:
+        thread_key = self._thread_key()
+        already_sent_count = self._sent_message_count_by_thread_key.get(thread_key, 0)
+        if already_sent_count >= len(messages):
+            already_sent_count = 0
+        prompt_text = self._prompt_from_messages(
+            messages,
+            already_sent_count=already_sent_count,
+        )
+        return prompt_text, already_sent_count
+
+    def _mark_messages_sent(self, messages: list[ChatMessage]) -> None:
+        self._sent_message_count_by_thread_key[self._thread_key()] = len(messages)
 
     def _repair_invalid_json(
         self,
@@ -1324,7 +1374,10 @@ class CodexAppServerProvider:
             payload_kind="assistant_text",
         )
         try:
-            repair_prompt = self._prompt_from_messages(repair_messages)
+            repair_prompt = self._prompt_from_messages(
+                repair_messages,
+                already_sent_count=len(messages),
+            )
             turn_id = session.start_turn(repair_prompt)
             repaired_outer_text = session.collect_turn_text(turn_id)
             _append_provider_capture(
@@ -1401,11 +1454,12 @@ class CodexAppServerProvider:
             "complete_json_start",
             message_count=len(messages),
         )
-        prompt_text = self._prompt_from_messages(messages)
+        prompt_text, already_sent_count = self._codex_prompt_for_messages(messages)
         _write_provider_request_snapshot(
             "codex_app_server_request",
             messages=messages,
             prompt_text=prompt_text,
+            incremental_from_message=already_sent_count,
         )
         usage_limit_retries = 0
         while True:
@@ -1435,6 +1489,7 @@ class CodexAppServerProvider:
                     except ProviderError:
                         repaired = self._repair_invalid_json(session, messages, raw_text)
                         if repaired is not None:
+                            self._mark_messages_sent(messages)
                             _trace_provider_event("complete_json_success", path="outer_invalid_json_repair")
                             return repaired
                         raise
@@ -1444,7 +1499,10 @@ class CodexAppServerProvider:
                             messages,
                             json.dumps(outer_payload, ensure_ascii=False),
                         )
-                        retry_prompt = self._prompt_from_messages(retry_messages)
+                        retry_prompt = self._prompt_from_messages(
+                            retry_messages,
+                            already_sent_count=len(messages),
+                        )
                         retry_turn_id = session.start_turn(
                             retry_prompt,
                             include_summary=session.default_turn_summary_enabled(),
@@ -1468,17 +1526,22 @@ class CodexAppServerProvider:
                         except ProviderError:
                             salvaged = _salvage_failed_generation_action(response_json)
                             if salvaged is not None:
+                                self._mark_messages_sent(messages)
                                 _trace_provider_event("complete_json_success", path="tool_salvage")
                                 return salvaged
                             repaired = self._repair_invalid_json(session, messages, response_json)
                             if repaired is not None:
+                                self._mark_messages_sent(messages)
                                 _trace_provider_event("complete_json_success", path="invalid_json_repair")
                                 return repaired
                             raise
                         if self._is_tool_disabled_payload(parsed):
                             _trace_provider_event("codex_blocked_payload_retry", model=self.config.model)
                             retry_messages = self._blocked_tool_retry_messages(messages, response_json)
-                            retry_prompt = self._prompt_from_messages(retry_messages)
+                            retry_prompt = self._prompt_from_messages(
+                                retry_messages,
+                                already_sent_count=len(messages),
+                            )
                             retry_turn_id = session.start_turn(
                                 retry_prompt,
                                 include_summary=session.default_turn_summary_enabled(),
@@ -1505,6 +1568,7 @@ class CodexAppServerProvider:
                             parsed_payload=parsed,
                             payload_kind="json_object",
                         )
+                        self._mark_messages_sent(messages)
                         _trace_provider_event("complete_json_success", path="direct")
                         return parsed
                     _append_provider_capture(
@@ -1512,6 +1576,7 @@ class CodexAppServerProvider:
                         parsed_payload=outer_payload,
                         payload_kind="json_object",
                     )
+                    self._mark_messages_sent(messages)
                     _trace_provider_event("complete_json_success", path="outer_direct")
                     return outer_payload
                 except ProviderError:
@@ -1903,6 +1968,79 @@ class OpenAIProvider(ChatCompletionsJsonProvider):
 
 class OpenAICompatibleProvider(ChatCompletionsJsonProvider):
     pass
+
+
+class OpenCodeGoProvider(OpenAICompatibleProvider):
+    def _completion_budget_fields(self, max_completion_tokens: int) -> dict[str, Any]:
+        return {"max_tokens": max_completion_tokens}
+
+    def _response_format(self) -> dict[str, Any] | None:
+        # Go routes across several open-model backends. Keep the JSON contract in
+        # the prompt and let the local repair path handle malformed text.
+        return None
+
+
+class OpenCodeGoMessagesProvider(OpenCodeGoProvider):
+    def _build_headers(self) -> dict[str, str]:
+        return {
+            "x-api-key": str(self.config.api_key or ""),
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+
+    def _build_url(self) -> str:
+        api_base = (self.config.api_base or "").rstrip("/")
+        if not api_base:
+            raise ProviderError(
+                f"Provider {self.config.provider_type!r} is missing api_base."
+            )
+        return api_base + "/messages"
+
+    def _build_body(
+        self,
+        messages: list[ChatMessage],
+        max_completion_tokens: int,
+    ) -> dict[str, Any]:
+        system_parts: list[str] = []
+        request_messages: list[dict[str, str]] = []
+        for message in messages:
+            role = (message.role or "").strip().lower()
+            if role == "system":
+                system_parts.append(message.content)
+                continue
+            if role not in {"user", "assistant"}:
+                role = "user"
+            request_messages.append({"role": role, "content": message.content})
+        body: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": request_messages,
+            "temperature": self.config.temperature,
+        }
+        if system_parts:
+            body["system"] = "\n\n".join(system_parts)
+        body.update(self._completion_budget_fields(max_completion_tokens))
+        return body
+
+    def _extract_content(self, payload: dict[str, Any]) -> str:
+        content = payload.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "") == "text":
+                    parts.append(str(item.get("text", "")))
+            text = "".join(parts)
+            if text.strip():
+                return text
+        error_payload = payload.get("error")
+        if isinstance(error_payload, dict):
+            detail = json.dumps(error_payload, ensure_ascii=True)[:800]
+            raise ProviderError(f"Provider response had no text content. error={detail}")
+        preview = json.dumps(payload, ensure_ascii=True)[:800]
+        raise ProviderError(f"Provider response had no text content. payload={preview}")
 
 
 class LMStudioProvider(OpenAICompatibleProvider):
@@ -2669,6 +2807,10 @@ def create_provider(config: ProviderProfileConfig) -> JsonCompletionProvider:
         return OpenRouterProvider(config)
     if normalized == "lmstudio":
         return LMStudioProvider(config)
+    if normalized == "opencode_go":
+        if transport in {"messages", "anthropic_messages"}:
+            return OpenCodeGoMessagesProvider(config)
+        return OpenCodeGoProvider(config)
     if normalized == "openai_compatible":
         return OpenAICompatibleProvider(config)
     if normalized == "openai":
