@@ -3,9 +3,12 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import FuzzfolioConfig
 
@@ -90,6 +93,100 @@ class FuzzfolioCli:
             parsed_json=parsed_json,
         )
         if check and proc.returncode != 0:
+            raise CliError(self.format_result(result))
+        return result
+
+    def run_with_heartbeat(
+        self,
+        args: list[str],
+        *,
+        cwd: Path | None = None,
+        check: bool = True,
+        timeout_seconds: float | None = None,
+        heartbeat_seconds: float = 30.0,
+        heartbeat: Callable[[float], None] | None = None,
+        echo_output: bool = False,
+    ) -> CommandResult:
+        argv = [*self.build_base_argv(), *args]
+        working_dir = cwd or self.config.workspace_root or Path.cwd()
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(working_dir),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+        )
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+
+        def reader(stream: Any, parts: list[str], *, stderr: bool = False) -> None:
+            try:
+                for line in iter(stream.readline, ""):
+                    parts.append(line)
+                    if echo_output:
+                        target = sys.stderr if stderr else sys.stdout
+                        print(line, end="", file=target)
+            finally:
+                stream.close()
+
+        stdout_thread = threading.Thread(
+            target=reader,
+            args=(proc.stdout, stdout_parts),
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=reader,
+            args=(proc.stderr, stderr_parts),
+            kwargs={"stderr": True},
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        started = time.monotonic()
+        next_heartbeat = started + max(1.0, float(heartbeat_seconds))
+        while True:
+            returncode = proc.poll()
+            now = time.monotonic()
+            if returncode is not None:
+                break
+            elapsed = now - started
+            if timeout_seconds is not None and elapsed > timeout_seconds:
+                proc.kill()
+                stdout_thread.join(timeout=2)
+                stderr_thread.join(timeout=2)
+                raise CliError(
+                    f"Command timed out after {timeout_seconds:.0f}s: {' '.join(argv)}\n"
+                    f"cwd: {working_dir}\n"
+                    f"stdout:\n{''.join(stdout_parts).strip()[:1600]}\n\n"
+                    f"stderr:\n{''.join(stderr_parts).strip()[:1600]}"
+                )
+            if heartbeat is not None and now >= next_heartbeat:
+                heartbeat(elapsed)
+                next_heartbeat = now + max(1.0, float(heartbeat_seconds))
+            time.sleep(0.25)
+
+        stdout_thread.join(timeout=5)
+        stderr_thread.join(timeout=5)
+        stdout = "".join(stdout_parts)
+        stderr = "".join(stderr_parts)
+        parsed_json = None
+        stdout_stripped = stdout.strip()
+        if stdout_stripped.startswith("{") or stdout_stripped.startswith("["):
+            try:
+                parsed_json = json.loads(stdout_stripped)
+            except json.JSONDecodeError:
+                parsed_json = None
+        result = CommandResult(
+            argv=argv,
+            cwd=Path(working_dir),
+            returncode=int(proc.returncode or 0),
+            stdout=stdout,
+            stderr=stderr,
+            parsed_json=parsed_json,
+        )
+        if check and result.returncode != 0:
             raise CliError(self.format_result(result))
         return result
 

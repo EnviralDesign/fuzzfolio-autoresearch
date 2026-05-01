@@ -124,6 +124,7 @@ if __package__ in {None, ""}:
         build_attempt_score,
         load_sensitivity_snapshot,
     )
+    from autoresearch.play_hand import cmd_play_hand
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
@@ -209,6 +210,7 @@ else:
         build_attempt_score,
         load_sensitivity_snapshot,
     )
+    from .play_hand import cmd_play_hand
     from .typed_tools import CLI_OK_TOOLS
 
 
@@ -321,6 +323,80 @@ def build_parser() -> argparse.ArgumentParser:
         "--llm-request-snapshots",
         action="store_true",
         help="Write one human-readable request snapshot per LLM call under the run directory.",
+    )
+
+    play_hand = subparsers.add_parser(
+        "play-hand",
+        help="Run the deterministic coarse-to-fine play-hand explorer.",
+    )
+    play_hand.add_argument(
+        "--instrument",
+        action="append",
+        default=None,
+        help="Pinned instrument to evaluate. Can be repeated. When omitted, play-hand deals one instrument from the pool.",
+    )
+    play_hand.add_argument(
+        "--instrument-pool",
+        action="append",
+        default=None,
+        help="Instrument pool to shuffle from when --instrument is omitted. Can be repeated.",
+    )
+    play_hand.add_argument(
+        "--timeframe",
+        default="M5",
+        help="Timeframe to scaffold and evaluate. Default: M5.",
+    )
+    play_hand.add_argument(
+        "--max-indicators",
+        type=int,
+        default=4,
+        help="Number of shuffled seed indicators to deal into the hand. Default: 4.",
+    )
+    play_hand.add_argument(
+        "--max-sweep-permutations",
+        type=int,
+        default=625,
+        help="Maximum deterministic sweep permutations per play-hand phase. Values above 256 use --allow-large-sweep. Default: 625.",
+    )
+    play_hand.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional deterministic shuffle seed.",
+    )
+    play_hand.add_argument(
+        "--screen-months",
+        type=int,
+        default=3,
+        help="Short-horizon screening window. Default: 3.",
+    )
+    play_hand.add_argument(
+        "--scrutiny-months",
+        type=int,
+        default=36,
+        help="Final scrutiny window. Default: 36.",
+    )
+    play_hand.add_argument(
+        "--coarse-mode",
+        choices=["deterministic", "evolutionary"],
+        default="deterministic",
+        help="Mode for the coarse parameter sweep. Default: deterministic.",
+    )
+    play_hand.add_argument(
+        "--evolutionary-budget",
+        choices=["low", "medium", "high"],
+        default="low",
+        help="Evolutionary budget preset when coarse mode is evolutionary. Default: low.",
+    )
+    play_hand.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write a run folder and phase plan without calling backend compute.",
+    )
+    play_hand.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
     )
 
     supervise = subparsers.add_parser(
@@ -8736,6 +8812,21 @@ def main() -> int:
             as_json=bool(args.json),
             plain_progress=bool(args.plain_progress),
             llm_request_snapshots=bool(args.llm_request_snapshots),
+        )
+    if args.command == "play-hand":
+        return cmd_play_hand(
+            instrument=args.instrument,
+            instrument_pool=args.instrument_pool,
+            timeframe=args.timeframe,
+            max_sweep_permutations=args.max_sweep_permutations,
+            max_indicators=args.max_indicators,
+            seed=args.seed,
+            screen_months=args.screen_months,
+            scrutiny_months=args.scrutiny_months,
+            coarse_mode=args.coarse_mode,
+            evolutionary_budget=args.evolutionary_budget,
+            dry_run=bool(args.dry_run),
+            as_json=bool(args.json),
         )
     if args.command == "supervise":
         return cmd_supervise(

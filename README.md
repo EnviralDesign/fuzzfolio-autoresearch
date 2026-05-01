@@ -522,6 +522,40 @@ uv run autoresearch purge-cloud-profiles
 
 Use them when you are actively generating new runs or maintaining the local research environment.
 
+### Play-hand v1
+
+`play-hand` is the first procedural coarse-to-fine explorer. A run deals a shuffled hand of seed indicators plus one primary instrument, scaffolds one strategy, screens it, sweeps timeframe-aware `lookbackBars` across every active indicator, runs a coarse parameter sweep, optionally runs a focused sweep from parameter-importance feedback, then finishes with a `36mo` scrutiny pass.
+
+```powershell
+uv run autoresearch play-hand
+uv run autoresearch play-hand --instrument EURUSD --seed 123 --max-indicators 4
+uv run autoresearch play-hand --instrument XAUUSD --seed 123
+uv run autoresearch play-hand --timeframe M15 --instrument XAUUSD
+uv run autoresearch play-hand --instrument-pool EURUSD --instrument-pool GBPUSD --instrument-pool XAUUSD
+uv run autoresearch play-hand --instrument EURUSD --coarse-mode evolutionary --evolutionary-budget low
+uv run autoresearch play-hand --max-sweep-permutations 625
+uv run autoresearch play-hand --dry-run --json
+```
+
+When `--instrument` is omitted, play-hand shuffles one primary instrument from the default pool: `EURUSD`, `GBPUSD`, `AUDUSD`, `USDCAD`, `NZDUSD`, `USDJPY`, `USDCHF`, `XAUUSD`. Passing `--instrument` pins the run to that market instead, which is useful for targeted gap-filling like gold-only exploration.
+
+The default timeframe is `M5`; pass `--timeframe` to pin a different scaffold/evaluation timeframe.
+
+The timing sweep is universal, not trigger-only: `M1/M5/M15` indicators sweep `lookbackBars=1..5`, `M30/H1/H2/H3` sweep `1..3`, and higher timeframes sweep `1..2`.
+
+The default deterministic sweep cap is `625` permutations per phase. When a phase exceeds the CLI's normal `256` hard threshold but remains within the play-hand cap, play-hand passes `--allow-large-sweep` and records the cap/permutation count in run metadata and events. Axes are only dropped when they exceed the play-hand cap.
+
+Play-hand runs intentionally live in the normal `runs/` root so the existing ledger, catalog, plotting, and backfill tools can still find them. They are separated by run id and metadata: `runs/<timestamp>-playhand-v1/` with `runner: "play_hand_v1"` in `run-metadata.json`.
+
+Watchable artifacts:
+
+- `play-hand-events.jsonl`
+- `play-hand-summary.json`
+- `attempts.jsonl`
+- `progress.png`
+- `profiles/*.json`
+- `evals/eval_*` and `evals/sweep_*`
+
 ## Derived Artifact Map
 
 Main derived outputs live under [runs/derived](/C:/repos/fuzzfolio-autoresearch/runs/derived):
