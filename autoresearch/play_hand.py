@@ -40,6 +40,12 @@ DEFAULT_INSTRUMENT_POOL = (
 
 SWEEP_PERMUTATION_HARD_LIMIT = 256
 PLAY_HAND_SWEEP_PERMUTATION_LIMIT = 625
+INSTRUMENT_SCOUT_DEFAULT_SIZE = 5
+INSTRUMENT_SCOUT_DEFAULT_MAX_SELECTED = 3
+INSTRUMENT_SCOUT_MIN_SCORE = 45.0
+INSTRUMENT_SCOUT_SCORE_TOLERANCE = 12.0
+INSTRUMENT_SCOUT_MAX_SIMILARITY = 0.72
+INSTRUMENT_SCOUT_MIN_RESOLVED_TRADES = 3
 
 CANDLESTICK_PATTERN_BUNDLES: dict[str, list[str]] = {
     "broad_default": [
@@ -1061,6 +1067,480 @@ def _evaluate_profile(
     }
 
 
+def _as_float(value: Any) -> float | None:
+    try:
+        if value is None or isinstance(value, bool):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int(value: Any) -> int | None:
+    numeric = _as_float(value)
+    if numeric is None:
+        return None
+    return int(numeric)
+
+
+def _sensitivity_aggregate_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+    data = snapshot.get("data") if isinstance(snapshot.get("data"), dict) else snapshot
+    aggregate = data.get("aggregate") if isinstance(data, dict) else None
+    if isinstance(aggregate, dict):
+        return aggregate
+    return data if isinstance(data, dict) else {}
+
+
+def _score_lab_score_from_snapshot(snapshot: dict[str, Any]) -> float | None:
+    aggregate = _sensitivity_aggregate_payload(snapshot)
+    score_lab = aggregate.get("score_lab") if isinstance(aggregate.get("score_lab"), dict) else {}
+    return _as_float(score_lab.get("score"))
+
+
+def _curve_points_from_artifact(artifact_dir: Path) -> list[dict[str, Any]]:
+    payload = _load_json(artifact_dir / "best-cell-path-detail.json")
+    curve = payload.get("curve") if isinstance(payload.get("curve"), dict) else {}
+    points = curve.get("points") if isinstance(curve, dict) else None
+    return [point for point in points if isinstance(point, dict)] if isinstance(points, list) else []
+
+
+def _coerce_curve_date(point: dict[str, Any]) -> str:
+    date_value = str(point.get("date") or "").strip()
+    if date_value:
+        return date_value[:10]
+    timestamp = _as_float(point.get("time"))
+    if timestamp is None:
+        return ""
+    return datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+
+
+def _curve_value(point: dict[str, Any]) -> float | None:
+    for key in ("equity_r", "realized_r", "cumulative_realized_r"):
+        value = _as_float(point.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _curve_realized_value(point: dict[str, Any]) -> float | None:
+    for key in ("realized_r", "cumulative_realized_r", "equity_r"):
+        value = _as_float(point.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _curve_features(points: list[dict[str, Any]]) -> dict[str, Any]:
+    dated: dict[str, dict[str, Any]] = {}
+    for point in points:
+        date_key = _coerce_curve_date(point)
+        value = _curve_value(point)
+        if not date_key or value is None:
+            continue
+        dated[date_key] = {
+            "value": value,
+            "realized": _curve_realized_value(point),
+            "drawdown": _as_float(point.get("drawdown_r")) or 0.0,
+            "closed_trades": _as_int(point.get("closed_trade_count")),
+        }
+    ordered_dates = sorted(dated)
+    series = {date_key: float(dated[date_key]["value"]) for date_key in ordered_dates}
+    daily_changes: dict[str, float] = {}
+    active_dates: set[str] = set()
+    previous_value: float | None = None
+    previous_realized: float | None = None
+    previous_closed: int | None = None
+    max_drawdown = max((float(item["drawdown"]) for item in dated.values()), default=0.0)
+    drawdown_threshold = max(0.25, max_drawdown * 0.25)
+    drawdown_dates = {
+        date_key
+        for date_key, item in dated.items()
+        if max_drawdown > 0.0 and float(item["drawdown"]) >= drawdown_threshold
+    }
+    for date_key in ordered_dates:
+        item = dated[date_key]
+        value = float(item["value"])
+        realized = _as_float(item.get("realized"))
+        closed = _as_int(item.get("closed_trades"))
+        delta = 0.0 if previous_value is None else value - previous_value
+        daily_changes[date_key] = delta
+        realized_delta = (
+            None if previous_realized is None or realized is None else realized - previous_realized
+        )
+        if (
+            abs(delta) > 1e-9
+            or (realized_delta is not None and abs(realized_delta) > 1e-9)
+            or (previous_closed is not None and closed is not None and closed != previous_closed)
+        ):
+            active_dates.add(date_key)
+        previous_value = value
+        previous_realized = realized
+        previous_closed = closed
+    return {
+        "series": series,
+        "daily_changes": daily_changes,
+        "active_dates": active_dates,
+        "drawdown_dates": drawdown_dates,
+        "point_count": len(ordered_dates),
+        "max_drawdown_r": max_drawdown,
+    }
+
+
+def _pearson_correlation(left: list[float], right: list[float]) -> float | None:
+    if len(left) != len(right) or len(left) < 5:
+        return None
+    left_mean = sum(left) / len(left)
+    right_mean = sum(right) / len(right)
+    left_var = sum((value - left_mean) ** 2 for value in left)
+    right_var = sum((value - right_mean) ** 2 for value in right)
+    if left_var <= 0.0 or right_var <= 0.0:
+        return None
+    covariance = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right))
+    return covariance / (left_var**0.5 * right_var**0.5)
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left & right) / len(union)
+
+
+def _instrument_curve_similarity(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]:
+    left_features = left.get("_curve_features") if isinstance(left.get("_curve_features"), dict) else {}
+    right_features = right.get("_curve_features") if isinstance(right.get("_curve_features"), dict) else {}
+    left_changes = left_features.get("daily_changes") if isinstance(left_features.get("daily_changes"), dict) else {}
+    right_changes = right_features.get("daily_changes") if isinstance(right_features.get("daily_changes"), dict) else {}
+    common_dates = sorted(set(left_changes) & set(right_changes))
+    correlation = None
+    if len(common_dates) >= 5:
+        correlation = _pearson_correlation(
+            [float(left_changes[date]) for date in common_dates],
+            [float(right_changes[date]) for date in common_dates],
+        )
+    positive_correlation = max(0.0, float(correlation)) if correlation is not None else 0.0
+    active_overlap = _jaccard(
+        set(left_features.get("active_dates") or set()),
+        set(right_features.get("active_dates") or set()),
+    )
+    drawdown_overlap = _jaccard(
+        set(left_features.get("drawdown_dates") or set()),
+        set(right_features.get("drawdown_dates") or set()),
+    )
+    similarity_score = max(
+        0.0,
+        min(1.0, positive_correlation * 0.60 + active_overlap * 0.25 + drawdown_overlap * 0.15),
+    )
+    return {
+        "left_instrument": left.get("instrument"),
+        "right_instrument": right.get("instrument"),
+        "correlation": round(correlation, 6) if correlation is not None else None,
+        "positive_correlation": round(positive_correlation, 6),
+        "active_overlap_ratio": round(active_overlap, 6),
+        "drawdown_overlap_ratio": round(drawdown_overlap, 6),
+        "overlap_days": len(common_dates),
+        "similarity_score": round(similarity_score, 6),
+    }
+
+
+def _public_scout_record(record: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in record.items()
+        if key != "_curve_features"
+    }
+
+
+def _instrument_scout_record(
+    instrument: str,
+    evaluation: dict[str, Any],
+) -> dict[str, Any]:
+    artifact_dir_raw = str(evaluation.get("artifact_dir") or "").strip()
+    artifact_dir = Path(artifact_dir_raw) if artifact_dir_raw else Path("__missing__")
+    snapshot = load_sensitivity_snapshot(artifact_dir) if artifact_dir.exists() else None
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    aggregate = _sensitivity_aggregate_payload(snapshot)
+    best_cell = aggregate.get("best_cell") if isinstance(aggregate.get("best_cell"), dict) else {}
+    matrix_summary = (
+        aggregate.get("matrix_summary") if isinstance(aggregate.get("matrix_summary"), dict) else {}
+    )
+    path_metrics = (
+        aggregate.get("best_cell_path_metrics")
+        if isinstance(aggregate.get("best_cell_path_metrics"), dict)
+        else {}
+    )
+    score = _as_float(evaluation.get("score"))
+    if score is None:
+        score = _score_lab_score_from_snapshot(snapshot)
+    resolved_trades = _as_int(best_cell.get("resolved_trades"))
+    if resolved_trades is None:
+        resolved_trades = _as_int(path_metrics.get("trade_count"))
+    curve_features = _curve_features(_curve_points_from_artifact(artifact_dir))
+    return {
+        "instrument": instrument,
+        "artifact_dir": artifact_dir_raw,
+        "attempt_id": evaluation.get("attempt_id"),
+        "score": score,
+        "score_basis": evaluation.get("score_basis"),
+        "resolved_trades": resolved_trades,
+        "expectancy_r": _as_float(best_cell.get("avg_net_r_per_closed_trade")),
+        "profit_factor": _as_float(best_cell.get("profit_factor")),
+        "max_drawdown_r": _as_float(path_metrics.get("max_drawdown_r")),
+        "reward_ridge_label": matrix_summary.get("reward_ridge_label"),
+        "normal_r_positive_cell_ratio": _as_float(
+            matrix_summary.get("normal_r_positive_cell_ratio")
+        ),
+        "curve_point_count": curve_features.get("point_count"),
+        "_curve_features": curve_features,
+    }
+
+
+def _select_instrument_scout_records(
+    primary: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    *,
+    max_selected: int = INSTRUMENT_SCOUT_DEFAULT_MAX_SELECTED,
+    min_score: float = INSTRUMENT_SCOUT_MIN_SCORE,
+    score_tolerance: float = INSTRUMENT_SCOUT_SCORE_TOLERANCE,
+    max_similarity: float = INSTRUMENT_SCOUT_MAX_SIMILARITY,
+    min_resolved_trades: int = INSTRUMENT_SCOUT_MIN_RESOLVED_TRADES,
+) -> dict[str, Any]:
+    primary_score = _as_float(primary.get("score"))
+    score_floor = (
+        min_score if primary_score is None else max(min_score, primary_score - score_tolerance)
+    )
+    selected = [{**primary, "decision": "accepted", "decision_reason": "primary_anchor"}]
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    primary_features = primary.get("_curve_features") if isinstance(primary.get("_curve_features"), dict) else {}
+    primary_curve_available = bool(primary_features.get("daily_changes"))
+    ranked_candidates = sorted(
+        candidates,
+        key=lambda item: _as_float(item.get("score")) if _as_float(item.get("score")) is not None else float("-inf"),
+        reverse=True,
+    )
+    for candidate in ranked_candidates:
+        reasons: list[str] = []
+        score = _as_float(candidate.get("score"))
+        if score is None:
+            reasons.append("missing_score")
+        elif score < score_floor:
+            reasons.append("score_below_floor")
+        resolved_trades = _as_int(candidate.get("resolved_trades"))
+        if resolved_trades is not None and resolved_trades < min_resolved_trades:
+            reasons.append("too_few_resolved_trades")
+        expectancy = _as_float(candidate.get("expectancy_r"))
+        if expectancy is not None and expectancy <= 0.0:
+            reasons.append("non_positive_expectancy")
+        curve_features = candidate.get("_curve_features") if isinstance(candidate.get("_curve_features"), dict) else {}
+        if not curve_features.get("daily_changes"):
+            reasons.append("missing_curve")
+        if not primary_curve_available:
+            reasons.append("missing_primary_curve")
+
+        similarities = [
+            _instrument_curve_similarity(candidate, selected_record)
+            for selected_record in selected
+            if isinstance(selected_record.get("_curve_features"), dict)
+            and selected_record["_curve_features"].get("daily_changes")
+        ]
+        max_pair = max(
+            similarities,
+            key=lambda item: float(item.get("similarity_score") or 0.0),
+            default=None,
+        )
+        if max_pair and float(max_pair.get("similarity_score") or 0.0) > max_similarity:
+            reasons.append("too_similar_to_selected")
+        if len(selected) >= max(1, int(max_selected)):
+            reasons.append("basket_full")
+
+        decorated = {
+            **candidate,
+            "score_floor": round(score_floor, 4),
+            "similarity_to_selected": similarities,
+            "max_similarity_to_selected": (
+                float(max_pair.get("similarity_score")) if max_pair else None
+            ),
+        }
+        if reasons:
+            rejected.append(
+                {
+                    **decorated,
+                    "decision": "rejected",
+                    "decision_reasons": reasons,
+                }
+            )
+            continue
+        accepted_record = {
+            **decorated,
+            "decision": "accepted",
+            "decision_reasons": ["performance_and_diversification_gate_passed"],
+        }
+        selected.append(accepted_record)
+        accepted.append(accepted_record)
+
+    return {
+        "version": "instrument_scout_v1",
+        "policy": {
+            "min_score": min_score,
+            "score_tolerance": score_tolerance,
+            "score_floor": round(score_floor, 4),
+            "max_similarity": max_similarity,
+            "max_selected": max(1, int(max_selected)),
+            "min_resolved_trades": min_resolved_trades,
+            "similarity_basis": "daily strategy-output changes, active-day overlap, and drawdown-overlap ratio",
+        },
+        "selected_instruments": [str(item.get("instrument")) for item in selected],
+        "primary": _public_scout_record(selected[0]),
+        "accepted": [_public_scout_record(item) for item in accepted],
+        "rejected": [_public_scout_record(item) for item in rejected],
+        "ranked_candidates": [_public_scout_record(item) for item in ranked_candidates],
+    }
+
+
+def _run_instrument_scout(
+    ctx: PlayHandContext,
+    *,
+    stage: PlayHandStage,
+    profile_ref: str,
+    profile_path: Path,
+    instrument_deal: dict[str, Any],
+    instruments: list[str],
+    timeframe: str,
+    lookback_months: int,
+    rng: random.Random,
+    enabled: bool,
+    scout_size: int,
+    max_selected: int,
+) -> dict[str, Any]:
+    primary = str((instruments or [instrument_deal.get("primary_instrument")])[0] or "").strip().upper()
+    pool = _clean_tokens(instrument_deal.get("instrument_pool") or [])
+    candidates = [instrument for instrument in pool if instrument != primary]
+    rng.shuffle(candidates)
+    candidates = candidates[: max(0, int(scout_size))]
+    artifact_path = ctx.run_dir / "instrument-scout.json"
+    if not enabled:
+        result = {
+            "version": "instrument_scout_v1",
+            "status": "skipped",
+            "reason": "disabled",
+            "selected_instruments": instruments,
+        }
+        _write_json(artifact_path, result)
+        _append_event(ctx, "instrument_scout", "skipped", stage=stage, reason="disabled")
+        return result
+    if str(instrument_deal.get("source") or "") == "pinned":
+        result = {
+            "version": "instrument_scout_v1",
+            "status": "skipped",
+            "reason": "pinned_instruments",
+            "selected_instruments": instruments,
+        }
+        _write_json(artifact_path, result)
+        _append_event(ctx, "instrument_scout", "skipped", stage=stage, reason="pinned_instruments")
+        return result
+    if not primary or not candidates or max_selected <= 1:
+        result = {
+            "version": "instrument_scout_v1",
+            "status": "skipped",
+            "reason": "no_candidate_instruments",
+            "primary_instrument": primary,
+            "candidate_instruments": candidates,
+            "selected_instruments": [primary] if primary else instruments,
+        }
+        _write_json(artifact_path, result)
+        _append_event(
+            ctx,
+            "instrument_scout",
+            "skipped",
+            stage=stage,
+            reason="no_candidate_instruments",
+            candidate_instruments=candidates,
+        )
+        return result
+    if ctx.dry_run:
+        result = {
+            "version": "instrument_scout_v1",
+            "status": "dry_run",
+            "primary_instrument": primary,
+            "candidate_instruments": candidates,
+            "selected_instruments": [primary],
+            "lookback_months": lookback_months,
+        }
+        _write_json(artifact_path, result)
+        _append_event(
+            ctx,
+            "instrument_scout",
+            "dry_run",
+            stage=stage,
+            primary_instrument=primary,
+            candidate_instruments=candidates,
+        )
+        return result
+
+    _append_event(
+        ctx,
+        "instrument_scout",
+        "started",
+        stage=stage,
+        primary_instrument=primary,
+        candidate_instruments=candidates,
+        lookback_months=lookback_months,
+        max_selected=max_selected,
+    )
+    primary_eval = _evaluate_profile(
+        ctx,
+        stage=stage,
+        phase=f"instrument_scout_{_safe_label(primary)}_{lookback_months}mo",
+        profile_ref=profile_ref,
+        profile_path=profile_path,
+        instruments=[primary],
+        timeframe=timeframe,
+        lookback_months=lookback_months,
+    )
+    primary_record = _instrument_scout_record(primary, primary_eval)
+    candidate_records: list[dict[str, Any]] = []
+    for instrument in candidates:
+        evaluation = _evaluate_profile(
+            ctx,
+            stage=stage,
+            phase=f"instrument_scout_{_safe_label(instrument)}_{lookback_months}mo",
+            profile_ref=profile_ref,
+            profile_path=profile_path,
+            instruments=[instrument],
+            timeframe=timeframe,
+            lookback_months=lookback_months,
+        )
+        candidate_records.append(_instrument_scout_record(instrument, evaluation))
+
+    result = _select_instrument_scout_records(
+        primary_record,
+        candidate_records,
+        max_selected=max_selected,
+    )
+    result.update(
+        {
+            "status": "completed",
+            "primary_instrument": primary,
+            "candidate_instruments": candidates,
+            "lookback_months": lookback_months,
+            "artifact_path": str(artifact_path.resolve()),
+        }
+    )
+    _write_json(artifact_path, result)
+    _append_event(
+        ctx,
+        "instrument_scout",
+        "completed",
+        stage=stage,
+        artifact_path=str(artifact_path),
+        selected_instruments=result.get("selected_instruments"),
+        accepted_count=len(result.get("accepted") or []),
+        rejected_count=len(result.get("rejected") or []),
+    )
+    return result
+
+
 def _run_sweep(
     ctx: PlayHandContext,
     *,
@@ -1525,6 +2005,10 @@ def cmd_play_hand(
     scrutiny_months: int,
     coarse_mode: str,
     evolutionary_budget: str,
+    instrument_scout: bool,
+    instrument_scout_size: int,
+    instrument_scout_max_selected: int,
+    instrument_scout_months: int | None,
     final_artifacts: bool,
     final_profile_drop_count: int,
     final_profile_drop_workers: int,
@@ -1603,6 +2087,10 @@ def cmd_play_hand(
         "scrutiny_months": scrutiny_months,
         "coarse_mode": coarse_mode,
         "evolutionary_budget": evolutionary_budget,
+        "instrument_scout": bool(instrument_scout),
+        "instrument_scout_size": int(instrument_scout_size),
+        "instrument_scout_max_selected": int(instrument_scout_max_selected),
+        "instrument_scout_months": int(instrument_scout_months or screen_months),
         "final_artifacts": bool(final_artifacts),
         "final_profile_drop_count": int(final_profile_drop_count),
         "final_profile_drop_workers": int(final_profile_drop_workers),
@@ -1621,7 +2109,7 @@ def cmd_play_hand(
         scrutiny_months=scrutiny_months,
         coarse_mode=coarse_mode,
     )
-    stage_total = 8
+    stage_total = 9
     stages = {
         "deal": PlayHandStage(1, stage_total, "Deal hand"),
         "scaffold": PlayHandStage(2, stage_total, "Scaffold profile"),
@@ -1629,8 +2117,9 @@ def cmd_play_hand(
         "lookback": PlayHandStage(4, stage_total, "Lookback timing sweep"),
         "coarse": PlayHandStage(5, stage_total, "Coarse parameter sweep"),
         "focused": PlayHandStage(6, stage_total, "Focused refinement sweep"),
-        "scrutiny": PlayHandStage(7, stage_total, "Final scrutiny"),
-        "artifacts": PlayHandStage(8, stage_total, "Finalize artifacts"),
+        "instrument_scout": PlayHandStage(7, stage_total, "Instrument scout"),
+        "scrutiny": PlayHandStage(8, stage_total, "Final scrutiny"),
+        "artifacts": PlayHandStage(9, stage_total, "Finalize artifacts"),
     }
     _append_event(
         ctx,
@@ -1850,6 +2339,39 @@ def cmd_play_hand(
     else:
         _append_event(ctx, "focused", "skipped", stage=stages["focused"], reason="no high-impact axes available from previous sweep")
 
+    scout_result = _run_instrument_scout(
+        ctx,
+        stage=stages["instrument_scout"],
+        profile_ref=current_profile_ref,
+        profile_path=current_profile_path,
+        instrument_deal=instrument_deal,
+        instruments=instruments,
+        timeframe=current_evaluation_timeframe,
+        lookback_months=int(instrument_scout_months or screen_months),
+        rng=rng,
+        enabled=bool(instrument_scout),
+        scout_size=int(instrument_scout_size),
+        max_selected=int(instrument_scout_max_selected),
+    )
+    scout_selected = _clean_tokens(list(scout_result.get("selected_instruments") or []))
+    if scout_selected:
+        instruments = scout_selected
+        metadata["instruments"] = instruments
+        metadata["instrument_scout"] = scout_result
+        write_run_metadata(run_dir, metadata)
+    scout_status = str(scout_result.get("status") or "")
+    scout_detail = ", ".join(instruments)
+    if scout_result.get("accepted"):
+        scout_detail += f" ({len(scout_result.get('accepted') or [])} added)"
+    phase_rows.append(
+        {
+            "phase": "instrument scout",
+            "status": scout_status or "completed",
+            "score": None,
+            "detail": scout_detail,
+        }
+    )
+
     scrutiny = _evaluate_profile(
         ctx,
         stage=stages["scrutiny"],
@@ -1860,7 +2382,7 @@ def cmd_play_hand(
         timeframe=current_evaluation_timeframe,
         lookback_months=scrutiny_months,
     )
-    phase_rows.append({"phase": "scrutiny", "status": "evaluated", "score": scrutiny.get("score"), "detail": f"{scrutiny_months}mo"})
+    phase_rows.append({"phase": "scrutiny", "status": "evaluated", "score": scrutiny.get("score"), "detail": f"{scrutiny_months}mo on {', '.join(instruments)}"})
 
     final_artifact_summary: dict[str, Any]
     if final_artifacts:
@@ -1919,6 +2441,7 @@ def cmd_play_hand(
         "requested_timeframe": timeframe,
         "indicator_timeframes": _profile_timeframes(_load_json(current_profile_path)),
         "max_sweep_permutations": max_sweep_permutations,
+        "instrument_scout": scout_result,
         "final_profile_ref": current_profile_ref,
         "final_profile_path": str(current_profile_path.resolve()),
         "final_score": scrutiny.get("score"),

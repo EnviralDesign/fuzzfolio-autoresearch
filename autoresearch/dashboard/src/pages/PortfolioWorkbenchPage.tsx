@@ -210,8 +210,12 @@ const BROKER_PRESETS: BrokerPreset[] = [
   {
     id: "coinexx-500",
     label: "Coinexx 500:1",
-    description: "Offshore high-leverage account",
-    account: DEFAULT_ACCOUNT,
+    description: "$100 offshore high-leverage account",
+    account: {
+      ...DEFAULT_ACCOUNT,
+      balanceUsd: 100,
+      riskPerRPercent: 1,
+    },
   },
   {
     id: "darwinex-zero-cfd",

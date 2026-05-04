@@ -398,6 +398,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Evolutionary budget preset when coarse mode is evolutionary. Default: low.",
     )
     play_hand.add_argument(
+        "--no-instrument-scout",
+        action="store_true",
+        help=(
+            "Skip the late play-hand instrument scout. By default play-hand tests a shuffled "
+            "subset of the instrument pool after focused refinement and only keeps useful, "
+            "non-duplicate exposures."
+        ),
+    )
+    play_hand.add_argument(
+        "--instrument-scout-size",
+        type=int,
+        default=5,
+        help="Number of non-primary instruments to test in the late instrument scout. Default: 5.",
+    )
+    play_hand.add_argument(
+        "--instrument-scout-max-selected",
+        type=int,
+        default=3,
+        help="Maximum selected instruments after the scout, including the primary. Default: 3.",
+    )
+    play_hand.add_argument(
+        "--instrument-scout-months",
+        type=int,
+        default=None,
+        help="Scout screening window in months. Defaults to --screen-months.",
+    )
+    play_hand.add_argument(
         "--no-final-artifacts",
         action="store_true",
         help=(
@@ -8595,6 +8622,10 @@ def main() -> int:
             scrutiny_months=args.scrutiny_months,
             coarse_mode=args.coarse_mode,
             evolutionary_budget=args.evolutionary_budget,
+            instrument_scout=not bool(args.no_instrument_scout),
+            instrument_scout_size=args.instrument_scout_size,
+            instrument_scout_max_selected=args.instrument_scout_max_selected,
+            instrument_scout_months=args.instrument_scout_months,
             final_artifacts=not bool(args.no_final_artifacts),
             final_profile_drop_count=args.final_profile_drop_count,
             final_profile_drop_workers=args.final_profile_drop_workers,

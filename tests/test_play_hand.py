@@ -3,10 +3,13 @@ from pathlib import Path
 
 from autoresearch.play_hand import (
     _best_sweep_parameters,
+    _curve_features,
+    _instrument_curve_similarity,
     _json_payload_from_stdout,
     _normalize_sweep_payload,
     _parameter_importance,
     _play_hand_artifact_commands,
+    _select_instrument_scout_records,
     _top_sweep_score,
     apply_play_hand_profile_defaults,
     build_coarse_axes,
@@ -131,6 +134,65 @@ def test_deal_instruments_shuffles_from_pool_when_unpinned() -> None:
     assert dealt["primary_instrument"] in {"EURUSD", "GBPUSD", "XAUUSD"}
     assert dealt["instruments"] == [dealt["primary_instrument"]]
     assert dealt["instrument_pool"] == ["EURUSD", "GBPUSD", "XAUUSD"]
+
+
+def _scout_record(instrument: str, score: float, equity_values: list[float]) -> dict:
+    peak = max(equity_values) if equity_values else 0.0
+    points = [
+        {
+            "date": f"2026-01-{index + 1:02d}",
+            "equity_r": value,
+            "realized_r": value,
+            "drawdown_r": max(0.0, peak - value),
+            "closed_trade_count": index,
+        }
+        for index, value in enumerate(equity_values)
+    ]
+    return {
+        "instrument": instrument,
+        "score": score,
+        "resolved_trades": 12,
+        "expectancy_r": 0.2,
+        "_curve_features": _curve_features(points),
+    }
+
+
+def test_instrument_curve_similarity_uses_strategy_output_changes() -> None:
+    primary = _scout_record("EURUSD", 80.0, [0, 1, 2, 3, 4, 5])
+    clone = _scout_record("GBPUSD", 78.0, [0, 2, 4, 6, 8, 10])
+
+    similarity = _instrument_curve_similarity(clone, primary)
+
+    assert similarity["positive_correlation"] == 1.0
+    assert similarity["similarity_score"] > 0.72
+
+
+def test_instrument_scout_selects_viable_different_instrument() -> None:
+    primary = _scout_record("EURUSD", 82.0, [0, 1, 2, 3, 4, 5])
+    clone = _scout_record("GBPUSD", 80.0, [0, 2, 4, 6, 8, 10])
+    different = _scout_record("AUDUSD", 76.0, [0, 1, 0, 1, 0, 1])
+
+    result = _select_instrument_scout_records(
+        primary,
+        [clone, different],
+        max_selected=3,
+    )
+
+    assert result["selected_instruments"] == ["EURUSD", "AUDUSD"]
+    assert result["accepted"][0]["instrument"] == "AUDUSD"
+    assert result["rejected"][0]["instrument"] == "GBPUSD"
+    assert "too_similar_to_selected" in result["rejected"][0]["decision_reasons"]
+
+
+def test_instrument_scout_rejects_large_score_drop_even_when_different() -> None:
+    primary = _scout_record("EURUSD", 82.0, [0, 1, 2, 3, 4, 5])
+    weak = _scout_record("AUDUSD", 55.0, [0, 1, 0, 1, 0, 1])
+
+    result = _select_instrument_scout_records(primary, [weak], max_selected=3)
+
+    assert result["selected_instruments"] == ["EURUSD"]
+    assert result["rejected"][0]["instrument"] == "AUDUSD"
+    assert "score_below_floor" in result["rejected"][0]["decision_reasons"]
 
 
 def test_deal_indicator_count_varies_inside_min_max_range() -> None:
