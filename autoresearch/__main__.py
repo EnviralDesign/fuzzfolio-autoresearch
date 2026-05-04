@@ -362,10 +362,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     play_hand.add_argument(
+        "--sweep-budget",
+        choices=["low", "medium", "high"],
+        default=None,
+        help=(
+            "Shared sweep work budget for deterministic and evolutionary modes: "
+            "low=256, medium=640, high=1024 planned work units. Default: high."
+        ),
+    )
+    play_hand.add_argument(
         "--max-sweep-permutations",
         type=int,
-        default=625,
-        help="Maximum deterministic sweep permutations per play-hand phase. Values above 256 use --allow-large-sweep. Default: 625.",
+        default=None,
+        help=(
+            "Deprecated custom deterministic sweep cap. Prefer --sweep-budget. "
+            "When provided, this exact value overrides the tier budget."
+        ),
+    )
+    play_hand.add_argument(
+        "--max-reward-r",
+        "--max-r",
+        dest="max_reward_r",
+        type=float,
+        default=None,
+        help=(
+            "Optional cap for the reward/R search matrix used by play-hand sweeps and evaluations. "
+            "For example, --max-reward-r 4 limits searched reward cells to <=4R."
+        ),
     )
     play_hand.add_argument(
         "--seed",
@@ -394,8 +417,11 @@ def build_parser() -> argparse.ArgumentParser:
     play_hand.add_argument(
         "--evolutionary-budget",
         choices=["low", "medium", "high"],
-        default="low",
-        help="Evolutionary budget preset when coarse mode is evolutionary. Default: low.",
+        default=None,
+        help=(
+            "Deprecated alias for --sweep-budget when using evolutionary coarse mode. "
+            "Use --sweep-budget instead."
+        ),
     )
     play_hand.add_argument(
         "--no-instrument-scout",
@@ -8614,7 +8640,9 @@ def main() -> int:
             instrument=args.instrument,
             instrument_pool=args.instrument_pool,
             timeframe=args.timeframe,
+            sweep_budget=args.sweep_budget,
             max_sweep_permutations=args.max_sweep_permutations,
+            max_reward_r=args.max_reward_r,
             min_indicators=args.min_indicators,
             max_indicators=args.max_indicators,
             seed=args.seed,

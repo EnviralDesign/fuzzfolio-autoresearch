@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import re
 import subprocess
@@ -39,13 +40,157 @@ DEFAULT_INSTRUMENT_POOL = (
 )
 
 SWEEP_PERMUTATION_HARD_LIMIT = 256
-PLAY_HAND_SWEEP_PERMUTATION_LIMIT = 625
+PLAY_HAND_SWEEP_PERMUTATION_LIMIT = 1024
+SWEEP_BUDGET_PRESETS: dict[str, int] = {
+    "low": 256,
+    "medium": 640,
+    "high": 1024,
+}
 INSTRUMENT_SCOUT_DEFAULT_SIZE = 5
 INSTRUMENT_SCOUT_DEFAULT_MAX_SELECTED = 3
 INSTRUMENT_SCOUT_MIN_SCORE = 45.0
 INSTRUMENT_SCOUT_SCORE_TOLERANCE = 12.0
 INSTRUMENT_SCOUT_MAX_SIMILARITY = 0.72
 INSTRUMENT_SCOUT_MIN_RESOLVED_TRADES = 3
+EVOLUTIONARY_AXIS_MAX_VALUE_COUNT = 9
+EVOLUTIONARY_BUDGET_PRESETS: dict[str, tuple[int, int]] = {
+    "low": (32, 8),
+    "medium": (40, 16),
+    "high": (64, 16),
+}
+PLAY_HAND_REWARD_STEP_R = 0.5
+PLAY_HAND_REWARD_COLUMN_LIMIT = 25
+PLAY_HAND_DEFAULT_MAX_REWARD_R = PLAY_HAND_REWARD_STEP_R * PLAY_HAND_REWARD_COLUMN_LIMIT
+
+
+def play_hand_reward_matrix(max_reward_r: float | None) -> dict[str, Any] | None:
+    if max_reward_r is None:
+        return None
+    requested = float(max_reward_r)
+    if not math.isfinite(requested) or requested <= 0:
+        raise ValueError("--max-reward-r must be a positive finite number")
+    columns = int(math.floor((requested / PLAY_HAND_REWARD_STEP_R) + 1e-9))
+    if columns < 1:
+        raise ValueError(
+            f"--max-reward-r must be at least {PLAY_HAND_REWARD_STEP_R:g} "
+            "with the current play-hand reward matrix step"
+        )
+    columns = min(columns, PLAY_HAND_REWARD_COLUMN_LIMIT)
+    effective_max = round(PLAY_HAND_REWARD_STEP_R * columns, 6)
+    return {
+        "requested_max_reward_r": requested,
+        "reward_step_r": PLAY_HAND_REWARD_STEP_R,
+        "reward_columns": columns,
+        "effective_max_reward_r": effective_max,
+        "default_max_reward_r": PLAY_HAND_DEFAULT_MAX_REWARD_R,
+        "is_active_cap": effective_max < PLAY_HAND_DEFAULT_MAX_REWARD_R,
+    }
+
+
+def _reward_matrix_cli_args(reward_matrix: dict[str, Any] | None) -> list[str]:
+    if not reward_matrix:
+        return []
+    return [
+        "--reward-step-r",
+        f"{float(reward_matrix['reward_step_r']):g}",
+        "--reward-columns",
+        str(int(reward_matrix["reward_columns"])),
+    ]
+
+
+_SWEEP_REWARD_MATRIX_SUPPORT: bool | None = None
+
+
+def _sweep_reward_matrix_supported(cli: FuzzfolioCli) -> bool:
+    global _SWEEP_REWARD_MATRIX_SUPPORT
+    if _SWEEP_REWARD_MATRIX_SUPPORT is not None:
+        return _SWEEP_REWARD_MATRIX_SUPPORT
+    try:
+        result = cli.run(
+            ["sweep", "run", "--help"],
+            check=False,
+            timeout_seconds=10,
+        )
+    except Exception:
+        _SWEEP_REWARD_MATRIX_SUPPORT = False
+        return False
+    text = f"{result.stdout}\n{result.stderr}"
+    _SWEEP_REWARD_MATRIX_SUPPORT = (
+        result.returncode == 0
+        and "--reward-step-r" in text
+        and "--reward-columns" in text
+    )
+    return _SWEEP_REWARD_MATRIX_SUPPORT
+
+
+def resolve_sweep_budget(
+    *,
+    sweep_budget: str | None = None,
+    max_sweep_permutations: int | None = None,
+    evolutionary_budget: str | None = None,
+) -> dict[str, Any]:
+    if max_sweep_permutations is not None:
+        value = max(1, int(max_sweep_permutations))
+        return {
+            "label": f"custom:{value}",
+            "tier": None,
+            "value": value,
+            "source": "max_sweep_permutations",
+        }
+    tier = str(sweep_budget or evolutionary_budget or "high").strip().lower()
+    if tier not in SWEEP_BUDGET_PRESETS:
+        tier = "high"
+    return {
+        "label": tier,
+        "tier": tier,
+        "value": SWEEP_BUDGET_PRESETS[tier],
+        "source": (
+            "sweep_budget"
+            if sweep_budget
+            else "evolutionary_budget"
+            if evolutionary_budget
+            else "default"
+        ),
+    }
+
+
+def _evolutionary_shape_for_budget(evaluation_budget: int) -> tuple[int, int]:
+    budget = max(1, int(evaluation_budget))
+    min_population = min(16, budget)
+    max_population = min(64, budget)
+    best_population = max_population
+    best_generations = 1
+    best_score: tuple[int, int, int] | None = None
+    for population_size in range(min_population, max_population + 1):
+        max_generations = max(1, (budget + population_size - 1) // population_size)
+        planned = population_size * max_generations
+        score = (planned - budget, -population_size, max_generations)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_population = population_size
+            best_generations = max_generations
+    return best_population, best_generations
+
+
+def evolutionary_budget_settings(sweep_budget: str | int, evaluation_budget: int | None = None) -> dict[str, int]:
+    tier = str(sweep_budget or "").strip().lower()
+    if tier in EVOLUTIONARY_BUDGET_PRESETS:
+        population_size, max_generations = EVOLUTIONARY_BUDGET_PRESETS[tier]
+    else:
+        if evaluation_budget is not None:
+            budget_value = evaluation_budget
+        else:
+            try:
+                budget_value = int(sweep_budget)
+            except (TypeError, ValueError):
+                budget_value = SWEEP_BUDGET_PRESETS["high"]
+        population_size, max_generations = _evolutionary_shape_for_budget(budget_value)
+    return {
+        "population_size": population_size,
+        "max_generations": max_generations,
+        "evaluation_budget": population_size * max_generations,
+    }
+
 
 CANDLESTICK_PATTERN_BUNDLES: dict[str, list[str]] = {
     "broad_default": [
@@ -154,6 +299,46 @@ class SeedIndicator:
             "signalRole": self.signal_role,
             "signalPersistence": self.signal_persistence,
             "preferredTimeframeRole": self.preferred_timeframe_role,
+        }
+
+
+@dataclass(frozen=True)
+class SweepAxisCandidate:
+    axis: str
+    key: str
+    values: list[Any]
+    current_value: Any
+    kind: str
+    role: str
+    priority: float
+    min_count: int
+    max_count: int
+
+
+@dataclass(frozen=True)
+class SweepAxisPlan:
+    axes: list[str]
+    original_axes: list[str]
+    original_permutations: int
+    selected_permutations: int
+    max_permutations: int
+    search_mode: str
+    axis_plans: list[dict[str, Any]]
+    anchored_axes: list[dict[str, Any]]
+    dropped_axes: list[dict[str, Any]]
+
+    def event_payload(self) -> dict[str, Any]:
+        return {
+            "planner": "procedural_sweep_axis_planner_v1",
+            "original_axes": self.original_axes,
+            "selected_axes": self.axes,
+            "anchored_axes": self.anchored_axes,
+            "dropped_axes": self.dropped_axes,
+            "axis_plans": self.axis_plans,
+            "original_permutations": self.original_permutations,
+            "selected_permutations": self.selected_permutations,
+            "max_permutations": self.max_permutations,
+            "search_mode": self.search_mode,
         }
 
 
@@ -333,10 +518,12 @@ def _render_dealt_hand(
     max_indicators: int,
     instrument_deal: dict[str, Any],
     timeframe: str,
-    max_sweep_permutations: int,
+    sweep_budget_label: str,
+    sweep_budget_value: int,
     screen_months: int,
     scrutiny_months: int,
     coarse_mode: str,
+    reward_matrix: dict[str, Any] | None = None,
 ) -> None:
     table = Table(title="Play-hand dealt", show_header=False, show_lines=False)
     table.add_column("Field", style="cyan")
@@ -347,7 +534,14 @@ def _render_dealt_hand(
     table.add_row("Screen", f"{screen_months}mo")
     table.add_row("Scrutiny", f"{scrutiny_months}mo")
     table.add_row("Coarse mode", coarse_mode)
-    table.add_row("Sweep cap", str(max_sweep_permutations))
+    table.add_row("Sweep budget", f"{sweep_budget_label} ({sweep_budget_value})")
+    if reward_matrix:
+        table.add_row(
+            "Reward cap",
+            f"{float(reward_matrix['effective_max_reward_r']):g}R "
+            f"({int(reward_matrix['reward_columns'])} x "
+            f"{float(reward_matrix['reward_step_r']):g}R)",
+        )
     console.print(table)
 
 
@@ -361,19 +555,36 @@ def _render_sweep_plan(
     original_permutations: int,
     max_permutations: int,
     mode: str,
+    evaluation_budget: int | None = None,
+    reward_matrix: dict[str, Any] | None = None,
 ) -> None:
     title = f"{stage.prefix} {phase} sweep" if stage is not None else f"{phase} sweep"
     table = Table(title=title, show_header=False, show_lines=False)
     table.add_column("Field", style="cyan")
     table.add_column("Value")
     table.add_row("Mode", mode)
-    table.add_row(
-        "Permutations",
-        f"{permutation_count}"
-        + (f" / {original_permutations} original" if original_permutations != permutation_count else ""),
-    )
-    table.add_row("Cap", str(max_permutations))
-    table.add_row("Large sweep", "yes" if permutation_count > SWEEP_PERMUTATION_HARD_LIMIT else "no")
+    if evaluation_budget is None:
+        table.add_row(
+            "Permutations",
+            f"{permutation_count}"
+            + (f" / {original_permutations} original" if original_permutations != permutation_count else ""),
+        )
+        table.add_row("Cap", str(max_permutations))
+        table.add_row("Large sweep", "yes" if permutation_count > SWEEP_PERMUTATION_HARD_LIMIT else "no")
+    else:
+        table.add_row("Eval budget", str(evaluation_budget))
+        table.add_row(
+            "Search space",
+            f"{permutation_count}"
+            + (f" / {original_permutations} original" if original_permutations != permutation_count else ""),
+        )
+        table.add_row("Planner cap", "not applied to evolutionary search space")
+        table.add_row("CLI large-sweep bypass", "yes" if permutation_count > SWEEP_PERMUTATION_HARD_LIMIT else "no")
+    if reward_matrix:
+        table.add_row(
+            "Reward cap",
+            f"{float(reward_matrix['effective_max_reward_r']):g}R",
+        )
     axis_bits = []
     for axis in axes:
         key, values = _parse_axis_values(axis)
@@ -384,7 +595,7 @@ def _render_sweep_plan(
         for axis in dropped_axes:
             key, values = _parse_axis_values(axis)
             dropped_bits.append(f"{key} ({len(values)})")
-        table.add_row("Dropped", "; ".join(dropped_bits))
+        table.add_row("Constrained", "; ".join(dropped_bits))
     console.print(table)
 
 
@@ -679,7 +890,7 @@ def _numeric_axis_values(value: float) -> list[Any]:
     return sorted(candidate for candidate in candidates if candidate > 0)
 
 
-def build_coarse_axes(profile_payload: dict[str, Any], *, max_axes: int = 6) -> list[str]:
+def build_coarse_axes(profile_payload: dict[str, Any], *, max_axes: int | None = None) -> list[str]:
     profile = _extract_profile(profile_payload)
     axes: list[str] = []
     for index, item in enumerate(profile.get("indicators") or []):
@@ -703,7 +914,7 @@ def build_coarse_axes(profile_payload: dict[str, Any], *, max_axes: int = 6) -> 
                     f"indicator[{index}].talib.{name}="
                     + ",".join(_format_axis_value(candidate) for candidate in values)
                 )
-            if len(axes) >= max_axes:
+            if max_axes is not None and len(axes) >= max_axes:
                 return axes
     return axes
 
@@ -745,46 +956,561 @@ def _permutation_count(axes: list[str]) -> int:
     return total
 
 
+def _axis_index(axis_key: str) -> int | None:
+    match = re.match(r"indicator\[(\d+)\]\.", axis_key)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _axis_indicator_item(profile_payload: dict[str, Any], axis_key: str) -> dict[str, Any] | None:
+    index = _axis_index(axis_key)
+    if index is None:
+        return None
+    indicators = _extract_profile(profile_payload).get("indicators")
+    if not isinstance(indicators, list) or index >= len(indicators):
+        return None
+    item = indicators[index]
+    return item if isinstance(item, dict) else None
+
+
+def _axis_current_value(profile_payload: dict[str, Any] | None, axis_key: str) -> Any:
+    if not isinstance(profile_payload, dict):
+        return None
+    item = _axis_indicator_item(profile_payload, axis_key)
+    if not isinstance(item, dict):
+        return None
+    match = re.fullmatch(r"indicator\[(\d+)\]\.(config|talib)\.([A-Za-z0-9_]+)", axis_key)
+    if not match:
+        return None
+    section = match.group(2)
+    key = match.group(3)
+    config = item.get("config") if isinstance(item.get("config"), dict) else {}
+    if section == "config":
+        return config.get(key)
+    for parameter in _talib_config(item):
+        if isinstance(parameter, dict) and parameter.get("name") == key:
+            return parameter.get("value")
+    return None
+
+
+def _axis_role(profile_payload: dict[str, Any] | None, axis_key: str) -> str:
+    if not isinstance(profile_payload, dict):
+        return "state"
+    item = _axis_indicator_item(profile_payload, axis_key)
+    return _profile_indicator_role(item) if isinstance(item, dict) else "state"
+
+
+def _axis_kind(axis_key: str) -> str:
+    normalized = axis_key.lower()
+    if ".config.timeframe" in normalized:
+        return "timeframe"
+    if ".config.lookbackbars" in normalized:
+        return "lookback"
+    if ".talib." not in normalized:
+        return "other"
+    name = normalized.rsplit(".", 1)[-1]
+    if "signal" in name or "smooth" in name or name in {"slowk_period", "slowd_period"}:
+        return "smoothing"
+    if any(token in name for token in ("threshold", "multiplier", "deviation", "factor", "delta", "fraction")):
+        return "threshold_scale"
+    if name in {"levels", "acceleration", "maximum", "minimum"}:
+        return "threshold_scale"
+    if any(token in name for token in ("period", "window", "length", "fast", "slow", "roc", "sma", "ema", "normalize", "hp_", "lp_")):
+        return "period"
+    return "numeric"
+
+
+def _axis_priority(axis_key: str, *, phase: str, role: str, kind: str) -> float:
+    phase_token = str(phase or "").lower()
+    if "focused" in phase_token:
+        base = 100.0
+    elif kind == "timeframe":
+        base = 96.0
+    elif kind == "threshold_scale":
+        base = 86.0
+    elif kind == "period":
+        base = 82.0
+    elif kind == "lookback":
+        base = 74.0
+    elif kind == "smoothing":
+        base = 62.0
+    elif kind == "numeric":
+        base = 58.0
+    else:
+        base = 45.0
+
+    role_bonus = {
+        "trigger": 8.0,
+        "setup": 5.0,
+        "context": 2.0,
+        "filter": 1.0,
+    }.get(role, 0.0)
+    name = axis_key.lower().rsplit(".", 1)[-1]
+    if any(token in name for token in ("fast", "slow")) and kind == "period":
+        role_bonus += 3.0
+    if "signal" in name:
+        role_bonus -= 2.0
+    return base + role_bonus
+
+
+def _values_numeric(values: list[Any]) -> bool:
+    return bool(values) and all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values)
+
+
+def _closest_value(values: list[Any], target: Any) -> Any | None:
+    if target is None or not values:
+        return None
+    if target in values:
+        return target
+    target_float = _as_float(target)
+    if target_float is None:
+        target_text = str(target).strip().upper()
+        for value in values:
+            if str(value).strip().upper() == target_text:
+                return value
+        return None
+    numeric_values = [value for value in values if _as_float(value) is not None]
+    if not numeric_values:
+        return None
+    return min(numeric_values, key=lambda value: abs(float(value) - target_float))
+
+
+def _select_representative_values(
+    values: list[Any],
+    count: int,
+    *,
+    current_value: Any = None,
+) -> list[Any]:
+    if count <= 0:
+        return []
+    unique_values: list[Any] = []
+    for value in values:
+        if value not in unique_values:
+            unique_values.append(value)
+    if len(unique_values) <= count:
+        return unique_values
+
+    selected: list[Any] = []
+    current = _closest_value(unique_values, current_value)
+    if current is not None:
+        selected.append(current)
+
+    def add(value: Any) -> None:
+        if value not in selected and len(selected) < count:
+            selected.append(value)
+
+    if _values_numeric(unique_values):
+        ordered = sorted(unique_values, key=lambda value: float(value))
+    else:
+        ordered = unique_values
+
+    if count >= 3:
+        add(ordered[0])
+        add(ordered[-1])
+    elif count == 2:
+        if current is None:
+            add(ordered[0])
+            add(ordered[-1])
+        else:
+            current_index = ordered.index(current)
+            lower_distance = current_index
+            upper_distance = len(ordered) - 1 - current_index
+            if lower_distance == upper_distance:
+                choose_lower = sum(ord(char) for char in str(current_value)) % 2 == 0
+                add(ordered[0] if choose_lower else ordered[-1])
+            else:
+                add(ordered[0] if lower_distance > upper_distance else ordered[-1])
+
+    while len(selected) < count:
+        if not selected:
+            add(ordered[len(ordered) // 2])
+            continue
+        best_value = None
+        best_distance = -1
+        selected_indexes = [ordered.index(value) for value in selected if value in ordered]
+        for index, value in enumerate(ordered):
+            if value in selected:
+                continue
+            distance = min(abs(index - selected_index) for selected_index in selected_indexes)
+            if distance > best_distance:
+                best_value = value
+                best_distance = distance
+        if best_value is None:
+            break
+        add(best_value)
+
+    order_lookup = {value: index for index, value in enumerate(unique_values)}
+    return sorted(selected, key=lambda value: order_lookup.get(value, 0))
+
+
+def _format_axis(axis_key: str, values: list[Any]) -> str:
+    return axis_key + "=" + ",".join(_format_axis_value(value) for value in values)
+
+
+def _evolutionary_axis_values(
+    values: list[Any],
+    *,
+    current_value: Any = None,
+    max_count: int = EVOLUTIONARY_AXIS_MAX_VALUE_COUNT,
+) -> list[Any]:
+    unique_values: list[Any] = []
+    for value in values:
+        if value not in unique_values:
+            unique_values.append(value)
+    if len(unique_values) < 2 or not _values_numeric(unique_values):
+        return unique_values
+
+    ordered = sorted(unique_values, key=lambda value: float(value))
+    expanded: list[Any] = list(ordered)
+    all_integral = all(float(value).is_integer() for value in ordered)
+    for left, right in zip(ordered, ordered[1:]):
+        midpoint = (float(left) + float(right)) / 2.0
+        candidate: Any = int(midpoint + 0.5) if all_integral else round(midpoint, 6)
+        if candidate > 0 and candidate not in expanded:
+            expanded.append(candidate)
+    expanded = sorted(expanded, key=lambda value: float(value))
+    if len(expanded) > max_count:
+        expanded = _select_representative_values(
+            expanded,
+            max_count,
+            current_value=current_value,
+        )
+    return expanded
+
+
+def _build_axis_candidates(
+    axes: list[str],
+    *,
+    profile_payload: dict[str, Any] | None,
+    phase: str,
+) -> list[SweepAxisCandidate]:
+    candidates: list[SweepAxisCandidate] = []
+    for axis in axes:
+        key, values = _parse_axis_values(axis)
+        unique_values: list[Any] = []
+        for value in values:
+            if value not in unique_values:
+                unique_values.append(value)
+        if not key or not unique_values:
+            continue
+        current_value = _axis_current_value(profile_payload, key)
+        kind = _axis_kind(key)
+        role = _axis_role(profile_payload, key)
+        max_count = len(unique_values)
+        min_count = 2 if max_count >= 2 else 1
+        candidates.append(
+            SweepAxisCandidate(
+                axis=axis,
+                key=key,
+                values=unique_values,
+                current_value=current_value,
+                kind=kind,
+                role=role,
+                priority=_axis_priority(key, phase=phase, role=role, kind=kind),
+                min_count=min_count,
+                max_count=max_count,
+            )
+        )
+    return candidates
+
+
+def plan_sweep_axes(
+    axes: list[str],
+    *,
+    profile_payload: dict[str, Any] | None = None,
+    phase: str = "sweep",
+    max_permutations: int = SWEEP_PERMUTATION_HARD_LIMIT,
+    search_mode: str = "deterministic",
+) -> SweepAxisPlan:
+    original_axes = list(axes)
+    original_permutations = _permutation_count(original_axes)
+    max_permutations = max(1, int(max_permutations or 1))
+    normalized_search_mode = str(search_mode or "deterministic").strip().lower()
+    if normalized_search_mode not in {"deterministic", "evolutionary"}:
+        normalized_search_mode = "deterministic"
+    candidates = _build_axis_candidates(
+        original_axes,
+        profile_payload=profile_payload,
+        phase=phase,
+    )
+    if normalized_search_mode == "evolutionary":
+        selected_axes: list[str] = []
+        axis_plans: list[dict[str, Any]] = []
+        dropped: list[dict[str, Any]] = []
+        for candidate in candidates:
+            sampled_values = _evolutionary_axis_values(
+                candidate.values,
+                current_value=candidate.current_value,
+            )
+            if len(sampled_values) >= 2:
+                selected_axes.append(_format_axis(candidate.key, sampled_values))
+                status = "selected"
+                selected_values = sampled_values
+                selected_value_count = len(sampled_values)
+            else:
+                status = "dropped"
+                selected_values = sampled_values[:1]
+                selected_value_count = 1
+                dropped.append(
+                    {
+                        "axis": candidate.axis,
+                        "key": candidate.key,
+                        "reason": "not_enough_values",
+                        "kind": candidate.kind,
+                        "role": candidate.role,
+                        "priority": round(candidate.priority, 3),
+                    }
+                )
+            axis_plans.append(
+                {
+                    "axis": candidate.axis,
+                    "key": candidate.key,
+                    "kind": candidate.kind,
+                    "role": candidate.role,
+                    "priority": round(candidate.priority, 3),
+                    "status": status,
+                    "original_value_count": len(candidate.values),
+                    "selected_value_count": selected_value_count,
+                    "selected_values": selected_values,
+                    "current_value": candidate.current_value,
+                }
+            )
+        return SweepAxisPlan(
+            axes=selected_axes,
+            original_axes=original_axes,
+            original_permutations=original_permutations,
+            selected_permutations=_permutation_count(selected_axes),
+            max_permutations=max_permutations,
+            search_mode=normalized_search_mode,
+            axis_plans=axis_plans,
+            anchored_axes=[],
+            dropped_axes=dropped,
+        )
+
+    counts = {candidate.key: candidate.min_count for candidate in candidates}
+    active = {candidate.key for candidate in candidates if counts.get(candidate.key, 0) >= 2}
+    anchored: dict[str, dict[str, Any]] = {}
+    dropped: list[dict[str, Any]] = []
+
+    def active_product() -> int:
+        product = 1
+        for candidate in candidates:
+            if candidate.key in active:
+                product *= max(1, int(counts.get(candidate.key, 1)))
+        return product
+
+    while active and active_product() > max_permutations:
+        active_counts_by_indicator: dict[int, int] = {}
+        for candidate in candidates:
+            if candidate.key not in active:
+                continue
+            index = _axis_index(candidate.key)
+            if index is not None:
+                active_counts_by_indicator[index] = active_counts_by_indicator.get(index, 0) + 1
+        eligible = []
+        for candidate in candidates:
+            if candidate.key not in active:
+                continue
+            index = _axis_index(candidate.key)
+            if index is None or active_counts_by_indicator.get(index, 0) > 1:
+                eligible.append(candidate)
+        if not eligible:
+            eligible = [candidate for candidate in candidates if candidate.key in active]
+        lowest = min(
+            eligible,
+            key=lambda candidate: (candidate.priority, candidate.max_count, -original_axes.index(candidate.axis)),
+        )
+        active.remove(lowest.key)
+        counts[lowest.key] = 1
+        anchored[lowest.key] = {
+            "axis": lowest.axis,
+            "key": lowest.key,
+            "reason": "anchored_to_fit_budget",
+            "kind": lowest.kind,
+            "role": lowest.role,
+            "priority": round(lowest.priority, 3),
+            "current_value": lowest.current_value,
+        }
+
+    improved = True
+    while improved:
+        improved = False
+        current_product = active_product()
+        upgrade_candidates: list[tuple[float, SweepAxisCandidate]] = []
+        for candidate in candidates:
+            if candidate.key not in active:
+                continue
+            current_count = int(counts.get(candidate.key, 1))
+            if current_count >= candidate.max_count:
+                continue
+            next_product = current_product // max(1, current_count) * (current_count + 1)
+            if next_product <= max_permutations:
+                # Prioritize important axes, but give under-sampled broad axes a small boost.
+                remaining_room = candidate.max_count - current_count
+                score = candidate.priority + min(6.0, remaining_room * 1.5)
+                upgrade_candidates.append((score, candidate))
+        if not upgrade_candidates:
+            break
+        _score, best = max(
+            upgrade_candidates,
+            key=lambda item: (item[0], -original_axes.index(item[1].axis)),
+        )
+        counts[best.key] = int(counts.get(best.key, 1)) + 1
+        improved = True
+
+    selected_axes: list[str] = []
+    axis_plans: list[dict[str, Any]] = []
+    for candidate in candidates:
+        count = int(counts.get(candidate.key, 1))
+        sampled_values = _select_representative_values(
+            candidate.values,
+            count,
+            current_value=candidate.current_value,
+        )
+        if candidate.key in active and len(sampled_values) >= 2:
+            axis_text = _format_axis(candidate.key, sampled_values)
+            selected_axes.append(axis_text)
+            status = "selected"
+        elif len(candidate.values) >= 2:
+            status = "anchored"
+            anchored.setdefault(
+                candidate.key,
+                {
+                    "axis": candidate.axis,
+                    "key": candidate.key,
+                    "reason": "anchored_to_fit_budget",
+                    "kind": candidate.kind,
+                    "role": candidate.role,
+                    "priority": round(candidate.priority, 3),
+                    "current_value": candidate.current_value,
+                },
+            )
+        else:
+            status = "dropped"
+            dropped.append(
+                {
+                    "axis": candidate.axis,
+                    "key": candidate.key,
+                    "reason": "not_enough_values",
+                    "kind": candidate.kind,
+                    "role": candidate.role,
+                    "priority": round(candidate.priority, 3),
+                }
+            )
+        axis_plans.append(
+            {
+                "axis": candidate.axis,
+                "key": candidate.key,
+                "kind": candidate.kind,
+                "role": candidate.role,
+                "priority": round(candidate.priority, 3),
+                "status": status,
+                "original_value_count": len(candidate.values),
+                "selected_value_count": len(sampled_values) if status == "selected" else 1,
+                "selected_values": sampled_values if status == "selected" else sampled_values[:1],
+                "current_value": candidate.current_value,
+            }
+        )
+
+    selected_permutations = _permutation_count(selected_axes)
+    return SweepAxisPlan(
+        axes=selected_axes,
+        original_axes=original_axes,
+        original_permutations=original_permutations,
+        selected_permutations=selected_permutations,
+        max_permutations=max_permutations,
+        search_mode=normalized_search_mode,
+        axis_plans=axis_plans,
+        anchored_axes=list(anchored.values()),
+        dropped_axes=dropped,
+    )
+
+
 def fit_axes_to_permutation_budget(
     axes: list[str],
     *,
     max_permutations: int = SWEEP_PERMUTATION_HARD_LIMIT,
 ) -> tuple[list[str], list[str], int]:
-    selected: list[str] = []
-    dropped: list[str] = []
-    selected_count = 1
-    original_count = _permutation_count(axes)
-    for axis in axes:
-        next_count = selected_count * _axis_cardinality(axis)
-        if next_count <= max_permutations:
-            selected.append(axis)
-            selected_count = next_count
-        else:
-            dropped.append(axis)
-    return selected, dropped, original_count
+    plan = plan_sweep_axes(axes, max_permutations=max_permutations)
+    constrained = [
+        str(item.get("axis"))
+        for item in [*plan.anchored_axes, *plan.dropped_axes]
+        if item.get("axis")
+    ]
+    return plan.axes, constrained, plan.original_permutations
 
 
 def _refine_values(values: list[Any], best_value: Any) -> list[Any]:
     if not isinstance(best_value, (int, float)) or isinstance(best_value, bool):
         return [best_value] if best_value not in (None, "") else values[:1]
     numeric_values = sorted(
-        float(value)
-        for value in values
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        {
+            float(value)
+            for value in values
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
     )
-    best = float(best_value)
+    if not numeric_values:
+        return []
+    lower_bound = numeric_values[0]
+    upper_bound = numeric_values[-1]
+    best = min(max(float(best_value), lower_bound), upper_bound)
     diffs = [
         abs(right - left)
         for left, right in zip(numeric_values, numeric_values[1:])
         if abs(right - left) > 0
     ]
     step = min(diffs) / 2.0 if diffs else max(abs(best) * 0.1, 1.0)
-    if float(best_value).is_integer() and all(float(v).is_integer() for v in numeric_values):
+    all_integral = float(best_value).is_integer() and all(float(v).is_integer() for v in numeric_values)
+    target_count = 5
+    offsets = [-2, -1, 0, 1, 2]
+
+    def in_bounds(value: float) -> bool:
+        return lower_bound <= value <= upper_bound
+
+    if all_integral:
         int_step = max(1, int(round(step)))
-        candidates = [max(1, int(round(best)) + offset * int_step) for offset in (-2, -1, 0, 1, 2)]
-        return sorted(set(candidates))
-    candidates = [round(max(0.000001, best + offset * step), 6) for offset in (-2, -1, 0, 1, 2)]
-    return sorted(set(candidates))
+        best_int = int(round(best))
+        candidates: set[int] = {
+            int(best_int + offset * int_step)
+            for offset in offsets
+            if in_bounds(best_int + offset * int_step)
+        }
+        distance = 3
+        while len(candidates) < target_count:
+            added = False
+            for side in (-1, 1):
+                candidate = int(best_int + side * distance * int_step)
+                if in_bounds(candidate) and candidate not in candidates:
+                    candidates.add(candidate)
+                    added = True
+                    if len(candidates) >= target_count:
+                        break
+            if not added:
+                break
+            distance += 1
+        return sorted(candidates)
+
+    candidates_float: set[float] = {
+        round(best + offset * step, 6)
+        for offset in offsets
+        if in_bounds(best + offset * step)
+    }
+    distance = 3
+    while len(candidates_float) < target_count:
+        added = False
+        for side in (-1, 1):
+            candidate = round(best + side * distance * step, 6)
+            if in_bounds(candidate) and candidate not in candidates_float:
+                candidates_float.add(candidate)
+                added = True
+                if len(candidates_float) >= target_count:
+                    break
+        if not added:
+            break
+        distance += 1
+    return sorted(candidates_float)
 
 
 def build_focused_axes(
@@ -998,12 +1724,21 @@ def _evaluate_profile(
     instruments: list[str],
     timeframe: str,
     lookback_months: int,
+    reward_matrix: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     out_dir = (ctx.evals_dir / f"eval_{phase}_{_utc_stamp()}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     if ctx.dry_run:
         score = None
-        _append_event(ctx, phase, "dry_run", stage=stage, artifact_dir=str(out_dir), score=score)
+        _append_event(
+            ctx,
+            phase,
+            "dry_run",
+            stage=stage,
+            artifact_dir=str(out_dir),
+            score=score,
+            reward_matrix=reward_matrix,
+        )
         return {"artifact_dir": str(out_dir), "score": score, "profile_ref": profile_ref}
     args = [
         "sensitivity-basket",
@@ -1016,6 +1751,7 @@ def _evaluate_profile(
         "--lookback-months",
         str(int(lookback_months)),
     ]
+    args.extend(_reward_matrix_cli_args(reward_matrix))
     for instrument in instruments:
         args.extend(["--instrument", instrument])
     args.append("--pretty")
@@ -1056,6 +1792,7 @@ def _evaluate_profile(
         attempt_id=record.attempt_id,
         score=record.composite_score,
         score_basis=record.score_basis,
+        reward_matrix=reward_matrix,
     )
     return {
         "artifact_dir": str(out_dir),
@@ -1412,6 +2149,7 @@ def _run_instrument_scout(
     enabled: bool,
     scout_size: int,
     max_selected: int,
+    reward_matrix: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     primary = str((instruments or [instrument_deal.get("primary_instrument")])[0] or "").strip().upper()
     pool = _clean_tokens(instrument_deal.get("instrument_pool") or [])
@@ -1487,6 +2225,7 @@ def _run_instrument_scout(
         candidate_instruments=candidates,
         lookback_months=lookback_months,
         max_selected=max_selected,
+        reward_matrix=reward_matrix,
     )
     primary_eval = _evaluate_profile(
         ctx,
@@ -1497,6 +2236,7 @@ def _run_instrument_scout(
         instruments=[primary],
         timeframe=timeframe,
         lookback_months=lookback_months,
+        reward_matrix=reward_matrix,
     )
     primary_record = _instrument_scout_record(primary, primary_eval)
     candidate_records: list[dict[str, Any]] = []
@@ -1510,6 +2250,7 @@ def _run_instrument_scout(
             instruments=[instrument],
             timeframe=timeframe,
             lookback_months=lookback_months,
+            reward_matrix=reward_matrix,
         )
         candidate_records.append(_instrument_scout_record(instrument, evaluation))
 
@@ -1525,6 +2266,7 @@ def _run_instrument_scout(
             "candidate_instruments": candidates,
             "lookback_months": lookback_months,
             "artifact_path": str(artifact_path.resolve()),
+            "reward_matrix": reward_matrix,
         }
     )
     _write_json(artifact_path, result)
@@ -1537,8 +2279,127 @@ def _run_instrument_scout(
         selected_instruments=result.get("selected_instruments"),
         accepted_count=len(result.get("accepted") or []),
         rejected_count=len(result.get("rejected") or []),
+        reward_matrix=reward_matrix,
     )
     return result
+
+
+def _sweep_id_from_stderr(stderr: str) -> str | None:
+    sweep_id = None
+    for match in re.finditer(r"\[sweep\]\s+Submitted sweep\s+(sweep-[A-Za-z0-9\-]+)", stderr or ""):
+        sweep_id = match.group(1)
+    return sweep_id
+
+
+def _sweep_state_from_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, dict):
+        return data
+    return payload if isinstance(payload, dict) else {}
+
+
+def _sweep_progress_from_state(state: dict[str, Any], *, fallback_mode: str) -> dict[str, Any] | None:
+    progress = state.get("progress") if isinstance(state.get("progress"), dict) else None
+    if not isinstance(progress, dict):
+        return None
+    mode = str(state.get("mode") or fallback_mode or "").strip().lower()
+    completed = _as_int(progress.get("completed"))
+    total = _as_int(progress.get("total"))
+    failed = _as_int(progress.get("failed")) or 0
+    generation = _as_int(progress.get("generation"))
+    max_generations = _as_int(progress.get("max_generations"))
+    best_fitness = _as_float(progress.get("best_fitness"))
+
+    percent: float | None = None
+    if completed is not None and total and total > 0:
+        percent = min(100.0, max(0.0, (float(completed) / float(total)) * 100.0))
+    elif generation is not None and max_generations and max_generations > 0:
+        percent = min(100.0, max(0.0, (float(generation) / float(max_generations)) * 100.0))
+
+    if percent is None:
+        return None
+
+    display_bits: list[str] = []
+    unit = "evals" if mode == "evolutionary" else "perms"
+    if completed is not None and total:
+        display_bits.append(f"{completed}/{total} {unit}")
+    if failed:
+        display_bits.append(f"{failed} failed")
+    if generation is not None and max_generations:
+        display_bits.append(f"gen {generation}/{max_generations}")
+    if best_fitness is not None:
+        display_bits.append(f"best={best_fitness:.4f}")
+
+    return {
+        "mode": mode,
+        "percent": round(percent, 1),
+        "completed": completed,
+        "total": total,
+        "failed": failed,
+        "generation": generation,
+        "max_generations": max_generations,
+        "best_fitness": best_fitness,
+        "display": f"{percent:.1f}% ({', '.join(display_bits)})",
+    }
+
+
+def _sweep_progress_from_cli_stderr(stderr: str, *, fallback_mode: str) -> dict[str, Any] | None:
+    progress: dict[str, Any] | None = None
+    for line in (stderr or "").splitlines():
+        deterministic = re.search(
+            r"\[sweep\]\s+(\d+)/(\d+)\s+permutations complete\s+\((\d+)\s+failed\)",
+            line,
+        )
+        if deterministic:
+            completed = int(deterministic.group(1))
+            total = int(deterministic.group(2))
+            failed = int(deterministic.group(3))
+            state = {
+                "mode": "deterministic",
+                "progress": {"completed": completed, "total": total, "failed": failed},
+            }
+            progress = _sweep_progress_from_state(state, fallback_mode=fallback_mode)
+            continue
+        evolutionary = re.search(
+            r"\[sweep\]\s+generation\s+(\d+)/(\d+)(?:,\s+best fitness:\s+([-+]?\d+(?:\.\d+)?))?",
+            line,
+        )
+        if evolutionary:
+            generation = int(evolutionary.group(1))
+            max_generations = int(evolutionary.group(2))
+            best_fitness = _as_float(evolutionary.group(3))
+            state = {
+                "mode": "evolutionary",
+                "progress": {
+                    "generation": generation,
+                    "max_generations": max_generations,
+                    "best_fitness": best_fitness,
+                },
+            }
+            progress = _sweep_progress_from_state(state, fallback_mode=fallback_mode)
+    return progress
+
+
+def _fetch_sweep_progress(
+    cli: FuzzfolioCli,
+    sweep_id: str | None,
+    *,
+    fallback_mode: str,
+) -> dict[str, Any] | None:
+    if not sweep_id:
+        return None
+    try:
+        result = cli.run(
+            ["sweep", "status", "--sweep-id", sweep_id],
+            check=False,
+            timeout_seconds=10,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0 or not isinstance(result.parsed_json, dict):
+        return None
+    state = _sweep_state_from_status_payload(result.parsed_json)
+    return _sweep_progress_from_state(state, fallback_mode=fallback_mode)
 
 
 def _run_sweep(
@@ -1547,30 +2408,75 @@ def _run_sweep(
     stage: PlayHandStage,
     phase: str,
     profile_ref: str,
+    profile_payload: dict[str, Any] | None,
     instruments: list[str],
     axes: list[str],
     mode: str,
-    evolutionary_budget: str,
+    sweep_budget: str,
     max_permutations: int,
+    reward_matrix: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     original_axes = list(axes)
-    axes, dropped_axes, original_permutations = fit_axes_to_permutation_budget(
-        original_axes,
-        max_permutations=max_permutations,
+    sweep_reward_matrix = reward_matrix
+    if reward_matrix and not ctx.dry_run and not _sweep_reward_matrix_supported(ctx.cli):
+        sweep_reward_matrix = None
+        _append_event(
+            ctx,
+            phase,
+            "reward_matrix_not_supported",
+            stage=stage,
+            reward_matrix=reward_matrix,
+            reason="active fuzzfolio-agent-cli sweep run does not expose --reward-step-r/--reward-columns",
+        )
+        console.print(
+            f"{stage.prefix} [cyan]{phase}[/] [yellow]reward cap not applied to sweep[/] "
+            "(active fuzzfolio-agent-cli needs rebuild)"
+        )
+    evolutionary_settings = (
+        evolutionary_budget_settings(sweep_budget, evaluation_budget=max_permutations)
+        if mode == "evolutionary"
+        else None
     )
-    selected_permutations = _permutation_count(axes)
-    if dropped_axes:
+    evaluation_budget = (
+        int(evolutionary_settings["evaluation_budget"])
+        if evolutionary_settings is not None
+        else None
+    )
+    axis_plan = plan_sweep_axes(
+        original_axes,
+        profile_payload=profile_payload,
+        phase=phase,
+        max_permutations=max_permutations,
+        search_mode=mode,
+    )
+    axes = axis_plan.axes
+    original_permutations = axis_plan.original_permutations
+    selected_permutations = axis_plan.selected_permutations
+    axis_plan_payload = axis_plan.event_payload()
+    axis_plan_payload["sweep_budget"] = sweep_budget
+    if sweep_reward_matrix:
+        axis_plan_payload["reward_matrix"] = sweep_reward_matrix
+    if evolutionary_settings is not None:
+        axis_plan_payload.update(
+            {
+                "population_size": evolutionary_settings["population_size"],
+                "max_generations": evolutionary_settings["max_generations"],
+                "evaluation_budget": evolutionary_settings["evaluation_budget"],
+                "search_space_permutations": selected_permutations,
+            }
+        )
+    constrained_axes = [
+        str(item.get("axis"))
+        for item in [*axis_plan.anchored_axes, *axis_plan.dropped_axes]
+        if item.get("axis")
+    ]
+    if constrained_axes or selected_permutations != original_permutations:
         _append_event(
             ctx,
             phase,
             "budgeted",
             stage=stage,
-            original_axes=original_axes,
-            selected_axes=axes,
-            dropped_axes=dropped_axes,
-            original_permutations=original_permutations,
-            selected_permutations=selected_permutations,
-            max_permutations=max_permutations,
+            **axis_plan_payload,
         )
     if not axes:
         result = {
@@ -1589,20 +2495,26 @@ def _run_sweep(
             original_axes=original_axes,
             original_permutations=original_permutations,
             max_permutations=max_permutations,
+            sweep_budget=sweep_budget,
+            evaluation_budget=evaluation_budget,
+            reward_matrix=sweep_reward_matrix,
         )
         return {"artifact_dir": None, "result": result, "axes": []}
     _render_sweep_plan(
         stage=stage,
         phase=phase,
         axes=axes,
-        dropped_axes=dropped_axes,
+        dropped_axes=constrained_axes,
         permutation_count=selected_permutations,
         original_permutations=original_permutations,
         max_permutations=max_permutations,
         mode=mode,
+        evaluation_budget=evaluation_budget,
+        reward_matrix=sweep_reward_matrix,
     )
     out_dir = (ctx.evals_dir / f"sweep_{phase}_{_utc_stamp()}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(out_dir / "sweep-axis-plan.json", axis_plan_payload)
     if ctx.dry_run:
         result = {
             "sweep_id": f"dry-{phase}",
@@ -1610,6 +2522,7 @@ def _run_sweep(
             "ranked_permutations": [],
             "parameter_importance": [],
             "axes": axes,
+            "axis_plan": axis_plan_payload,
         }
         _write_json(out_dir / "sweep-results.json", result)
         _append_event(
@@ -1620,6 +2533,9 @@ def _run_sweep(
             artifact_dir=str(out_dir),
             axes=axes,
             permutation_count=selected_permutations,
+            sweep_budget=sweep_budget,
+            evaluation_budget=evaluation_budget,
+            reward_matrix=sweep_reward_matrix,
         )
         return {"artifact_dir": str(out_dir), "result": result, "axes": axes}
     args = [
@@ -1634,13 +2550,16 @@ def _run_sweep(
         "--mode",
         mode,
     ]
-    if mode == "evolutionary":
-        if evolutionary_budget == "low":
-            args.extend(["--population-size", "20", "--max-generations", "5"])
-        elif evolutionary_budget == "high":
-            args.extend(["--population-size", "40", "--max-generations", "12"])
-        else:
-            args.extend(["--population-size", "30", "--max-generations", "10"])
+    args.extend(_reward_matrix_cli_args(sweep_reward_matrix))
+    if evolutionary_settings is not None:
+        args.extend(
+            [
+                "--population-size",
+                str(evolutionary_settings["population_size"]),
+                "--max-generations",
+                str(evolutionary_settings["max_generations"]),
+            ]
+        )
     for instrument in instruments:
         args.extend(["--instrument", instrument])
     for axis in axes:
@@ -1648,9 +2567,26 @@ def _run_sweep(
     if selected_permutations > SWEEP_PERMUTATION_HARD_LIMIT:
         args.append("--allow-large-sweep")
     args.append("--pretty")
+    planned_work_count = evaluation_budget if evaluation_budget is not None else selected_permutations
+    planned_work_label = "evolutionary evaluations" if evaluation_budget is not None else "permutations"
+    live_sweep_id: str | None = None
 
-    def heartbeat(elapsed: float) -> None:
+    def heartbeat(elapsed: float, stdout_snapshot: str = "", stderr_snapshot: str = "") -> None:
+        nonlocal live_sweep_id
         elapsed_text = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+        detected_sweep_id = _sweep_id_from_stderr(stderr_snapshot)
+        if detected_sweep_id:
+            live_sweep_id = detected_sweep_id
+        progress = _fetch_sweep_progress(
+            ctx.cli,
+            live_sweep_id,
+            fallback_mode=mode,
+        ) or _sweep_progress_from_cli_stderr(stderr_snapshot, fallback_mode=mode)
+        progress_text = (
+            str(progress.get("display"))
+            if isinstance(progress, dict) and progress.get("display")
+            else f"{planned_work_count} planned {planned_work_label}"
+        )
         ctx.events_path.parent.mkdir(parents=True, exist_ok=True)
         with ctx.events_path.open("a", encoding="utf-8") as handle:
             handle.write(
@@ -1663,7 +2599,17 @@ def _run_sweep(
                         **stage.event_payload(),
                         "elapsed_seconds": round(elapsed, 1),
                         "permutation_count": selected_permutations,
-                        "progress_text": f"{selected_permutations} planned permutations",
+                        "evaluation_budget": evaluation_budget,
+                        "sweep_id": live_sweep_id,
+                        "progress_percent": progress.get("percent") if isinstance(progress, dict) else None,
+                        "progress_completed": progress.get("completed") if isinstance(progress, dict) else None,
+                        "progress_total": progress.get("total") if isinstance(progress, dict) else None,
+                        "progress_failed": progress.get("failed") if isinstance(progress, dict) else None,
+                        "progress_generation": progress.get("generation") if isinstance(progress, dict) else None,
+                        "progress_max_generations": progress.get("max_generations") if isinstance(progress, dict) else None,
+                        "progress_best_fitness": progress.get("best_fitness") if isinstance(progress, dict) else None,
+                        "progress_text": progress_text,
+                        "reward_matrix": sweep_reward_matrix,
                     },
                     ensure_ascii=True,
                 )
@@ -1671,14 +2617,14 @@ def _run_sweep(
             )
         console.print(
             f"{stage.prefix} [cyan]{phase}[/] [bold]running[/] "
-            f"{selected_permutations} planned permutations elapsed={elapsed_text}"
+            f"{progress_text} elapsed={elapsed_text}"
         )
 
     result = ctx.cli.run_with_heartbeat(
         args,
         timeout_seconds=1800,
         heartbeat_seconds=30,
-        heartbeat=heartbeat,
+        heartbeat_snapshot=heartbeat,
     )
     payload = result.parsed_json if isinstance(result.parsed_json, dict) else _load_json(out_dir / "sweep-results.json")
     _normalize_sweep_payload(payload, requested_axes=axes, definition_path=out_dir / "sweep-definition.json")
@@ -1689,11 +2635,21 @@ def _run_sweep(
         stage=stage,
         artifact_dir=str(out_dir),
         axes=axes,
+        axis_plan_path=str(out_dir / "sweep-axis-plan.json"),
+        axis_plans=axis_plan.axis_plans,
+        anchored_axes=axis_plan.anchored_axes,
+        dropped_axes=axis_plan.dropped_axes,
         mode=mode,
+        sweep_budget=sweep_budget,
         permutation_count=selected_permutations,
+        search_space_permutations=selected_permutations,
+        evaluation_budget=evaluation_budget,
+        population_size=evolutionary_settings["population_size"] if evolutionary_settings is not None else None,
+        max_generations=evolutionary_settings["max_generations"] if evolutionary_settings is not None else None,
         max_permutations=max_permutations,
         allow_large_sweep=selected_permutations > SWEEP_PERMUTATION_HARD_LIMIT,
         top_score=_top_sweep_score(payload),
+        reward_matrix=sweep_reward_matrix,
     )
     return {"artifact_dir": str(out_dir), "result": payload, "axes": axes}
 
@@ -1774,16 +2730,34 @@ def _top_sweep_score(payload: dict[str, Any]) -> float | None:
 
 
 def _best_sweep_parameters(payload: dict[str, Any]) -> dict[str, Any]:
+    candidates = _sweep_parameter_candidates(payload)
+    return dict(candidates[0]) if candidates else {}
+
+
+def _sweep_parameter_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
     data = _sweep_data(payload)
+    candidates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(parameters: Any) -> None:
+        if not isinstance(parameters, dict) or not parameters:
+            return
+        candidate = dict(parameters)
+        signature = json.dumps(candidate, sort_keys=True, default=str)
+        if signature in seen:
+            return
+        seen.add(signature)
+        candidates.append(candidate)
+
     ranked = data.get("ranked_permutations") or data.get("ranked") or []
-    if isinstance(ranked, list) and ranked:
-        first = ranked[0]
-        if isinstance(first, dict) and isinstance(first.get("parameters"), dict):
-            return dict(first["parameters"])
+    if isinstance(ranked, list):
+        for item in ranked:
+            if isinstance(item, dict):
+                add(item.get("parameters"))
     best = data.get("best")
-    if isinstance(best, dict) and isinstance(best.get("parameters"), dict):
-        return dict(best["parameters"])
-    return {}
+    if isinstance(best, dict):
+        add(best.get("parameters"))
+    return candidates
 
 
 def _parameter_importance(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1799,6 +2773,7 @@ def _materialize_and_register(
     source_profile_path: Path,
     parameters: dict[str, Any],
     phase: str,
+    candidate_rank: int = 1,
 ) -> tuple[Path, str]:
     output_path = ctx.profiles_dir / f"{phase}_top.json"
     materialize_profile_variant(
@@ -1816,8 +2791,43 @@ def _materialize_and_register(
         profile_path=str(output_path),
         profile_ref=profile_ref,
         parameters=parameters,
+        candidate_rank=candidate_rank,
     )
     return output_path, profile_ref
+
+
+def _materialize_and_register_best_sweep_candidate(
+    ctx: PlayHandContext,
+    *,
+    stage: PlayHandStage,
+    source_profile_path: Path,
+    sweep_payload: dict[str, Any],
+    phase: str,
+) -> tuple[Path, str, dict[str, Any]] | None:
+    candidates = _sweep_parameter_candidates(sweep_payload)
+    for rank, parameters in enumerate(candidates, start=1):
+        try:
+            output_path, profile_ref = _materialize_and_register(
+                ctx,
+                stage=stage,
+                source_profile_path=source_profile_path,
+                parameters=parameters,
+                phase=phase,
+                candidate_rank=rank,
+            )
+        except CliError as exc:
+            _append_event(
+                ctx,
+                phase,
+                "materialize_rejected",
+                stage=stage,
+                candidate_rank=rank,
+                parameters=parameters,
+                error=str(exc)[:2000],
+            )
+            continue
+        return output_path, profile_ref, parameters
+    return None
 
 
 def _render_phase_table(rows: list[dict[str, Any]]) -> None:
@@ -1838,6 +2848,7 @@ def _play_hand_artifact_commands(
     run_id: str,
     profile_drop_count: int,
     profile_drop_workers: int,
+    final_attempt_id: str | None = None,
 ) -> list[list[str]]:
     drop_count = max(0, int(profile_drop_count))
     drop_workers = max(1, int(profile_drop_workers))
@@ -1853,23 +2864,24 @@ def _play_hand_artifact_commands(
         ]
     ]
     if drop_count > 0:
-        commands.append(
-            [
-                sys.executable,
-                "-m",
-                "autoresearch",
-                "render-corpus-profile-drops",
-                "--run-id",
-                run_id,
-                "--top-results",
-                str(drop_count),
-                "--lookback-months",
-                "36",
-                "--profile-drop-workers",
-                str(drop_workers),
-                "--json",
-            ]
-        )
+        drop_command = [
+            sys.executable,
+            "-m",
+            "autoresearch",
+            "render-corpus-profile-drops",
+            "--run-id",
+            run_id,
+            "--lookback-months",
+            "36",
+            "--profile-drop-workers",
+            str(drop_workers),
+        ]
+        if final_attempt_id:
+            drop_command.extend(["--attempt-id", str(final_attempt_id)])
+        else:
+            drop_command.extend(["--top-results", str(drop_count)])
+        drop_command.append("--json")
+        commands.append(drop_command)
     return commands
 
 
@@ -1923,6 +2935,7 @@ def _finalize_run_artifacts(
     stage: PlayHandStage,
     profile_drop_count: int,
     profile_drop_workers: int,
+    final_attempt_id: str | None = None,
 ) -> dict[str, Any]:
     if ctx.dry_run:
         payload = {
@@ -1938,6 +2951,7 @@ def _finalize_run_artifacts(
         run_id=ctx.run_id,
         profile_drop_count=profile_drop_count,
         profile_drop_workers=profile_drop_workers,
+        final_attempt_id=final_attempt_id,
     )
     full_backtests: dict[str, Any] | None = None
     profile_drops: dict[str, Any] | None = None
@@ -1948,6 +2962,7 @@ def _finalize_run_artifacts(
         stage=stage,
         profile_drop_count=max(0, int(profile_drop_count)),
         profile_drop_workers=max(1, int(profile_drop_workers)),
+        final_attempt_id=final_attempt_id,
     )
     try:
         if commands:
@@ -1976,6 +2991,7 @@ def _finalize_run_artifacts(
                 rendered=profile_drops.get("profile_drop_rendered"),
                 cached=profile_drops.get("profile_drop_cached"),
                 failed=profile_drops.get("profile_drop_failed"),
+                final_attempt_id=final_attempt_id,
             )
         return {
             "status": "completed",
@@ -1997,14 +3013,16 @@ def cmd_play_hand(
     instrument: list[str] | None = None,
     instrument_pool: list[str] | None = None,
     timeframe: str,
-    max_sweep_permutations: int,
+    sweep_budget: str | None,
+    max_sweep_permutations: int | None,
+    max_reward_r: float | None,
     min_indicators: int,
     max_indicators: int,
     seed: int | None,
     screen_months: int,
     scrutiny_months: int,
     coarse_mode: str,
-    evolutionary_budget: str,
+    evolutionary_budget: str | None,
     instrument_scout: bool,
     instrument_scout_size: int,
     instrument_scout_max_selected: int,
@@ -2061,7 +3079,15 @@ def cmd_play_hand(
     )
     instruments = list(instrument_deal["instruments"])
     timeframe = str(timeframe or "M5").strip().upper() or "M5"
-    max_sweep_permutations = max(1, int(max_sweep_permutations or PLAY_HAND_SWEEP_PERMUTATION_LIMIT))
+    budget = resolve_sweep_budget(
+        sweep_budget=sweep_budget,
+        max_sweep_permutations=max_sweep_permutations,
+        evolutionary_budget=evolutionary_budget,
+    )
+    sweep_budget_label = str(budget["label"])
+    sweep_budget_value = int(budget["value"])
+    max_sweep_permutations = sweep_budget_value
+    reward_matrix = play_hand_reward_matrix(max_reward_r)
 
     metadata = {
         "run_id": run_id,
@@ -2086,7 +3112,16 @@ def cmd_play_hand(
         "screen_months": screen_months,
         "scrutiny_months": scrutiny_months,
         "coarse_mode": coarse_mode,
-        "evolutionary_budget": evolutionary_budget,
+        "sweep_budget": sweep_budget_label,
+        "sweep_budget_tier": budget.get("tier"),
+        "sweep_budget_value": sweep_budget_value,
+        "sweep_budget_source": budget.get("source"),
+        "legacy_evolutionary_budget": evolutionary_budget,
+        "max_reward_r": max_reward_r,
+        "reward_matrix": reward_matrix,
+        "reward_step_r": reward_matrix.get("reward_step_r") if reward_matrix else None,
+        "reward_columns": reward_matrix.get("reward_columns") if reward_matrix else None,
+        "effective_max_reward_r": reward_matrix.get("effective_max_reward_r") if reward_matrix else None,
         "instrument_scout": bool(instrument_scout),
         "instrument_scout_size": int(instrument_scout_size),
         "instrument_scout_max_selected": int(instrument_scout_max_selected),
@@ -2104,10 +3139,12 @@ def cmd_play_hand(
         max_indicators=max_indicators,
         instrument_deal=instrument_deal,
         timeframe=timeframe,
-        max_sweep_permutations=max_sweep_permutations,
+        sweep_budget_label=sweep_budget_label,
+        sweep_budget_value=sweep_budget_value,
         screen_months=screen_months,
         scrutiny_months=scrutiny_months,
         coarse_mode=coarse_mode,
+        reward_matrix=reward_matrix,
     )
     stage_total = 9
     stages = {
@@ -2137,6 +3174,7 @@ def cmd_play_hand(
         instruments=instruments,
         timeframe=timeframe,
         seed=seed,
+        reward_matrix=reward_matrix,
     )
 
     phase_rows: list[dict[str, Any]] = []
@@ -2202,6 +3240,7 @@ def cmd_play_hand(
         instruments=instruments,
         timeframe=evaluation_timeframe,
         lookback_months=screen_months,
+        reward_matrix=reward_matrix,
     )
     phase_rows.append({"phase": "baseline", "status": "evaluated", "score": baseline.get("score"), "detail": profile_ref})
 
@@ -2218,23 +3257,25 @@ def cmd_play_hand(
             stage=stages["lookback"],
             phase="lookback_timing",
             profile_ref=current_profile_ref,
+            profile_payload=profile_payload,
             instruments=instruments,
             axes=lookback_axes,
             mode="deterministic",
-            evolutionary_budget=evolutionary_budget,
+            sweep_budget=sweep_budget_label,
             max_permutations=max_sweep_permutations,
+            reward_matrix=reward_matrix,
         )
         last_sweep_payload = sweep["result"]
         last_sweep_axes = list(sweep.get("axes") or lookback_axes)
-        params = _best_sweep_parameters(last_sweep_payload)
-        if params:
-            current_profile_path, current_profile_ref = _materialize_and_register(
-                ctx,
-                stage=stages["lookback"],
-                source_profile_path=current_profile_path,
-                parameters=params,
-                phase="lookback_timing",
-            )
+        materialized = _materialize_and_register_best_sweep_candidate(
+            ctx,
+            stage=stages["lookback"],
+            source_profile_path=current_profile_path,
+            sweep_payload=last_sweep_payload,
+            phase="lookback_timing",
+        )
+        if materialized:
+            current_profile_path, current_profile_ref, _params = materialized
             current_evaluation_timeframe = _lowest_profile_timeframe(
                 _load_json(current_profile_path),
                 timeframe,
@@ -2248,35 +3289,39 @@ def cmd_play_hand(
                 instruments=instruments,
                 timeframe=current_evaluation_timeframe,
                 lookback_months=screen_months,
+                reward_matrix=reward_matrix,
             )
             phase_rows.append({"phase": "lookback", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(lookback_axes)})
     else:
         _append_event(ctx, "lookback_timing", "skipped", stage=stages["lookback"], reason="no active indicators available")
 
-    coarse_axes = build_coarse_axes(_load_json(current_profile_path), max_axes=6)
+    current_profile_payload = _load_json(current_profile_path)
+    coarse_axes = build_coarse_axes(current_profile_payload)
     if coarse_axes:
         sweep = _run_sweep(
             ctx,
             stage=stages["coarse"],
             phase="coarse",
             profile_ref=current_profile_ref,
+            profile_payload=current_profile_payload,
             instruments=instruments,
             axes=coarse_axes,
             mode=coarse_mode,
-            evolutionary_budget=evolutionary_budget,
+            sweep_budget=sweep_budget_label,
             max_permutations=max_sweep_permutations,
+            reward_matrix=reward_matrix,
         )
         last_sweep_payload = sweep["result"]
         last_sweep_axes = list(sweep.get("axes") or coarse_axes)
-        params = _best_sweep_parameters(last_sweep_payload)
-        if params:
-            current_profile_path, current_profile_ref = _materialize_and_register(
-                ctx,
-                stage=stages["coarse"],
-                source_profile_path=current_profile_path,
-                parameters=params,
-                phase="coarse",
-            )
+        materialized = _materialize_and_register_best_sweep_candidate(
+            ctx,
+            stage=stages["coarse"],
+            source_profile_path=current_profile_path,
+            sweep_payload=last_sweep_payload,
+            phase="coarse",
+        )
+        if materialized:
+            current_profile_path, current_profile_ref, _params = materialized
             current_evaluation_timeframe = _lowest_profile_timeframe(
                 _load_json(current_profile_path),
                 timeframe,
@@ -2290,6 +3335,7 @@ def cmd_play_hand(
                 instruments=instruments,
                 timeframe=current_evaluation_timeframe,
                 lookback_months=screen_months,
+                reward_matrix=reward_matrix,
             )
             phase_rows.append({"phase": "coarse", "status": "top evaluated", "score": result.get("score"), "detail": f"{len(coarse_axes)} axes"})
     else:
@@ -2306,21 +3352,23 @@ def cmd_play_hand(
             stage=stages["focused"],
             phase="focused",
             profile_ref=current_profile_ref,
+            profile_payload=_load_json(current_profile_path),
             instruments=instruments,
             axes=focused_axes,
             mode="deterministic",
-            evolutionary_budget=evolutionary_budget,
+            sweep_budget=sweep_budget_label,
             max_permutations=max_sweep_permutations,
+            reward_matrix=reward_matrix,
         )
-        params = _best_sweep_parameters(sweep["result"])
-        if params:
-            current_profile_path, current_profile_ref = _materialize_and_register(
-                ctx,
-                stage=stages["focused"],
-                source_profile_path=current_profile_path,
-                parameters=params,
-                phase="focused",
-            )
+        materialized = _materialize_and_register_best_sweep_candidate(
+            ctx,
+            stage=stages["focused"],
+            source_profile_path=current_profile_path,
+            sweep_payload=sweep["result"],
+            phase="focused",
+        )
+        if materialized:
+            current_profile_path, current_profile_ref, _params = materialized
             current_evaluation_timeframe = _lowest_profile_timeframe(
                 _load_json(current_profile_path),
                 timeframe,
@@ -2334,6 +3382,7 @@ def cmd_play_hand(
                 instruments=instruments,
                 timeframe=current_evaluation_timeframe,
                 lookback_months=screen_months,
+                reward_matrix=reward_matrix,
             )
             phase_rows.append({"phase": "focused", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(focused_axes)})
     else:
@@ -2352,6 +3401,7 @@ def cmd_play_hand(
         enabled=bool(instrument_scout),
         scout_size=int(instrument_scout_size),
         max_selected=int(instrument_scout_max_selected),
+        reward_matrix=reward_matrix,
     )
     scout_selected = _clean_tokens(list(scout_result.get("selected_instruments") or []))
     if scout_selected:
@@ -2381,6 +3431,7 @@ def cmd_play_hand(
         instruments=instruments,
         timeframe=current_evaluation_timeframe,
         lookback_months=scrutiny_months,
+        reward_matrix=reward_matrix,
     )
     phase_rows.append({"phase": "scrutiny", "status": "evaluated", "score": scrutiny.get("score"), "detail": f"{scrutiny_months}mo on {', '.join(instruments)}"})
 
@@ -2391,6 +3442,7 @@ def cmd_play_hand(
             stage=stages["artifacts"],
             profile_drop_count=final_profile_drop_count,
             profile_drop_workers=final_profile_drop_workers,
+            final_attempt_id=str(scrutiny.get("attempt_id") or ""),
         )
         status = str(final_artifact_summary.get("status") or "")
         detail_bits: list[str] = []
@@ -2440,7 +3492,12 @@ def cmd_play_hand(
         "timeframe": current_evaluation_timeframe,
         "requested_timeframe": timeframe,
         "indicator_timeframes": _profile_timeframes(_load_json(current_profile_path)),
+        "sweep_budget": sweep_budget_label,
+        "sweep_budget_value": sweep_budget_value,
+        "sweep_budget_source": budget.get("source"),
         "max_sweep_permutations": max_sweep_permutations,
+        "max_reward_r": max_reward_r,
+        "reward_matrix": reward_matrix,
         "instrument_scout": scout_result,
         "final_profile_ref": current_profile_ref,
         "final_profile_path": str(current_profile_path.resolve()),

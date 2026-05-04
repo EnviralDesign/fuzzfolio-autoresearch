@@ -531,8 +531,10 @@ uv run autoresearch play-hand --instrument EURUSD --seed 123 --max-indicators 4
 uv run autoresearch play-hand --instrument XAUUSD --seed 123
 uv run autoresearch play-hand --timeframe M15 --instrument XAUUSD
 uv run autoresearch play-hand --instrument-pool EURUSD --instrument-pool GBPUSD --instrument-pool XAUUSD
-uv run autoresearch play-hand --instrument EURUSD --coarse-mode evolutionary --evolutionary-budget low
-uv run autoresearch play-hand --max-sweep-permutations 625
+uv run autoresearch play-hand --sweep-budget medium
+uv run autoresearch play-hand --instrument EURUSD --coarse-mode evolutionary --sweep-budget high
+uv run autoresearch play-hand --max-reward-r 4
+uv run autoresearch play-hand --max-sweep-permutations 333
 uv run autoresearch play-hand --dry-run --json
 ```
 
@@ -542,7 +544,13 @@ The default timeframe is `M5`; pass `--timeframe` to pin a different scaffold/ev
 
 The timing sweep is universal, not trigger-only: `M1/M5/M15` indicators sweep `lookbackBars=1..5`, `M30/H1/H2/H3` sweep `1..3`, and higher timeframes sweep `1..2`.
 
-The default deterministic sweep cap is `625` permutations per phase. When a phase exceeds the CLI's normal `256` hard threshold but remains within the play-hand cap, play-hand passes `--allow-large-sweep` and records the cap/permutation count in run metadata and events. Axes are only dropped when they exceed the play-hand cap.
+The default sweep budget is `high`, currently `1024` planned work units. Use `--sweep-budget low|medium|high` for the normal tiers: `low=256`, `medium=640`, `high=1024`. Deterministic phases interpret the budget as the maximum selected Cartesian permutations. Evolutionary coarse sweeps interpret the same budget as planned evaluations while keeping a broader search space; for example `--coarse-mode evolutionary --sweep-budget high` runs roughly `1024` evaluations even when the axis search space is much larger.
+
+When a phase exceeds the CLI's normal `256` hard threshold but remains within the play-hand budget, play-hand passes `--allow-large-sweep` and records the budget, permutation count, and evaluation count in run metadata and events. Running sweep heartbeat events also include progress percentage when Fuzzfolio status is available. Deterministic axes are only constrained when they exceed the active budget. Evolutionary axes are kept broader and metered by the evaluation budget.
+
+`--max-sweep-permutations` is still accepted as a deprecated custom deterministic cap and overrides `--sweep-budget` when provided. `--evolutionary-budget low|medium|high` is still accepted as a deprecated alias for `--sweep-budget` on evolutionary runs, but new commands should prefer `--sweep-budget`.
+
+`--max-reward-r` (alias `--max-r`) is an optional reward-multiple cap for curiosity or constrained research runs. Play-hand converts it into the Fuzzfolio reward matrix controls (`--reward-step-r 0.5` plus a reduced `--reward-columns`) and applies it to play-hand sweeps, screening passes, instrument scout evaluations, and final scrutiny. For example, `--max-reward-r 4` limits the searched reward cells to `0.5R..4R`; omit it to keep the normal `0.5R..12.5R` matrix.
 
 Play-hand runs intentionally live in the normal `runs/` root so the existing ledger, catalog, plotting, and backfill tools can still find them. They are separated by run id and metadata: `runs/<timestamp>-playhand-v1/` with `runner: "play_hand_v1"` in `run-metadata.json`.
 

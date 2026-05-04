@@ -105,6 +105,7 @@ class FuzzfolioCli:
         timeout_seconds: float | None = None,
         heartbeat_seconds: float = 30.0,
         heartbeat: Callable[[float], None] | None = None,
+        heartbeat_snapshot: Callable[[float, str, str], None] | None = None,
         echo_output: bool = False,
     ) -> CommandResult:
         argv = [*self.build_base_argv(), *args]
@@ -162,8 +163,15 @@ class FuzzfolioCli:
                     f"stdout:\n{''.join(stdout_parts).strip()[:1600]}\n\n"
                     f"stderr:\n{''.join(stderr_parts).strip()[:1600]}"
                 )
-            if heartbeat is not None and now >= next_heartbeat:
-                heartbeat(elapsed)
+            if now >= next_heartbeat:
+                if heartbeat_snapshot is not None:
+                    heartbeat_snapshot(
+                        elapsed,
+                        "".join(list(stdout_parts)),
+                        "".join(list(stderr_parts)),
+                    )
+                elif heartbeat is not None:
+                    heartbeat(elapsed)
                 next_heartbeat = now + max(1.0, float(heartbeat_seconds))
             time.sleep(0.25)
 
