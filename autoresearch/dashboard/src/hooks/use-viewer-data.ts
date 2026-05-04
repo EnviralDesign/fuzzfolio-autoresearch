@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   fetchAttemptDetail,
   fetchCatalog,
+  fetchLivePortfolio,
   fetchRunDetail,
   fetchRuns,
   fetchViewerState,
@@ -51,5 +52,13 @@ export function useAttemptDetail(attemptId: string | undefined) {
     queryFn: () => fetchAttemptDetail(attemptId!),
     enabled: Boolean(attemptId),
     staleTime: 30_000,
+  });
+}
+
+export function useLivePortfolio() {
+  return useQuery({
+    queryKey: ["live-portfolio"],
+    queryFn: fetchLivePortfolio,
+    staleTime: 5_000,
   });
 }

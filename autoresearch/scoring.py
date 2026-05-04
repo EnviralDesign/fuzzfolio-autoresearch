@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-CANONICAL_SCORE_LAB_VERSION = "score_lab_v2_5_1"
+CANONICAL_SCORE_LAB_VERSION = "score_lab_v2_5_2"
 
 
 @dataclass

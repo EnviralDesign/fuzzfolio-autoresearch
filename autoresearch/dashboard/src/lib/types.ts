@@ -28,6 +28,14 @@ export type AttemptCatalogRow = {
   full_backtest_result_path_36m_url?: string | null;
   full_backtest_curve_path_36m?: string | null;
   full_backtest_curve_path_36m_url?: string | null;
+  profile_drop_36m_png_path?: string | null;
+  profile_drop_36m_png_url?: string | null;
+  profile_drop_36m_manifest_path?: string | null;
+  profile_drop_36m_manifest_url?: string | null;
+  reward_multiple_36m?: number | null;
+  reward_multiple_basis_36m?: string | null;
+  selected_stop_loss_percent_36m?: number | null;
+  selected_take_profit_percent_36m?: number | null;
   selection_rank?: number | null;
   selection_utility?: number | null;
   score_component?: number | null;
@@ -240,4 +248,11 @@ export type AttemptDetail = {
   attempt: AttemptCatalogRow;
   full_backtest_result: Record<string, unknown> | null;
   full_backtest_curve: Record<string, unknown> | null;
+};
+
+export type LivePortfolio = {
+  selected_attempt_ids: string[];
+  updated_at?: string | null;
+  path?: string | null;
+  path_url?: string | null;
 };

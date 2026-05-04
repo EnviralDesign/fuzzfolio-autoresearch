@@ -1,6 +1,7 @@
 import type {
   AttemptDetail,
   CatalogResponse,
+  LivePortfolio,
   RunDetail,
   RunsResponse,
   ViewerState,
@@ -35,4 +36,18 @@ export function fetchRunDetail(runId: string): Promise<RunDetail> {
 
 export function fetchAttemptDetail(attemptId: string): Promise<AttemptDetail> {
   return fetchJson<AttemptDetail>(`/api/attempts/${encodeURIComponent(attemptId)}`);
+}
+
+export function fetchLivePortfolio(): Promise<LivePortfolio> {
+  return fetchJson<LivePortfolio>("/api/live-portfolio");
+}
+
+export function saveLivePortfolio(selectedAttemptIds: string[]): Promise<LivePortfolio> {
+  return fetchJson<LivePortfolio>("/api/live-portfolio", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ selected_attempt_ids: selectedAttemptIds }),
+  });
 }

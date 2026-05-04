@@ -142,46 +142,6 @@ LOCAL_OPENING_NARROW_GOAL_KEYWORDS = (
     "sharper",
     "sharp",
 )
-TRIGGER_INDICATOR_IDS = frozenset(
-    {
-        "BREAKOUT_FIRST_CLOSE",
-        "CHANNEL_REENTRY",
-        "MA_CROSSOVER",
-        "MACD_CROSSOVER",
-        "PRICE_RECLAIM_MA",
-        "RSI_CROSSBACK",
-        "STOCH_CROSSOVER",
-        "STOCHRSI_CROSSBACK",
-        "WICK_REJECTION",
-        "CANDLESTICK_PATTERNS",
-    }
-)
-SETUP_INDICATOR_TOKENS = (
-    "MEAN_REVERSION",
-    "BBANDS_POSITION",
-    "KELTNER_CHANNEL",
-    "DONCHIAN_CHANNEL",
-    "RSI",
-    "STOCH",
-    "CCI",
-    "CMO",
-    "MFI",
-    "WILLR",
-    "ULTOSC",
-)
-CONTEXT_INDICATOR_TOKENS = (
-    "_TREND",
-    "ADX",
-    "ATR_VOLATILITY_FILTER",
-    "MA_SLOPE",
-    "MA_SPREAD",
-    "PLUS_DI",
-    "MINUS_DI",
-    "SAR",
-    "ADOSC",
-    "OBV",
-    "CHAIKIN",
-)
 CHUNK_STEP_FRAME = "STEP FRAME"
 CHUNK_TOOL_RESULTS = "TOOL RESULTS FROM PRIOR STEP"
 CHUNK_GOAL_STATE = "GOAL STATE"
@@ -3707,7 +3667,7 @@ class ResearchController:
             f"- Use the canonical top-level score as the ranking target. Current canonical score payload is {CANONICAL_SCORE_LAB_VERSION}; score axes/components are diagnostics, not separate optimization targets.\n"
             "Search discipline:\n"
             "- Explore multiple candidates; sweeps are normal (run_parameter_sweep); diversify early, prune weak basket members, do not finish early while budget remains.\n"
-            "- Prefer explicit trigger-backed entry structures over vague oscillator-only entries. A strong default profile shape is context/filter + setup/stretch + one or two lowest-timeframe trigger indicators.\n"
+            "- Prefer explicit trigger-backed entry structures over vague oscillator-only entries. A strong default profile shape is context/filter on M30/H1/H4/D1 + setup/stretch on M5/M15/M30/H1 + one or two trigger entries on M1/M5/M15.\n"
             "- LookbackBars coverage requirement: when a profile has trigger-style entry indicators, the first refinement sweep for that branch should include indicator[N].config.lookbackBars=1,2,3 unless the branch has already tested it. This is search-space coverage, not final score-policy tuning.\n"
             "- Sweep playbook: use deterministic sweeps for local pocket mapping and nearby refinement; use evolutionary sweeps for broader discovery over a wider axis set; prefer evolutionary_budget presets first (low=100 evals, medium=300, high=480; autoresearch cap 500) and use raw population_size/max_generations only when you truly need a custom budget.\n"
             "Artifacts:\n"
@@ -5076,8 +5036,62 @@ class ResearchController:
                 result.append(item.strip())
         return result
 
+    def _seed_indicator_metadata(
+        self, seed_prompt_path: Path | None
+    ) -> dict[str, dict[str, Any]]:
+        if not seed_prompt_path or not seed_prompt_path.exists():
+            return {}
+        try:
+            payload = json.loads(seed_prompt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        metadata_items = payload.get("indicator_metadata")
+        if not isinstance(metadata_items, list):
+            metadata_items = payload.get("indicators")
+        if not isinstance(metadata_items, list):
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        for item in metadata_items:
+            if not isinstance(item, dict):
+                continue
+            indicator_id = str(item.get("id") or "").strip()
+            if not indicator_id:
+                continue
+            result[indicator_id.upper()] = item
+        return result
+
     @staticmethod
-    def _seed_indicator_role_groups(seed_indicator_ids: list[str]) -> dict[str, list[str]]:
+    def _seed_indicator_role(
+        indicator_id: str,
+        indicator_metadata: dict[str, dict[str, Any]] | None = None,
+    ) -> str:
+        metadata = (indicator_metadata or {}).get(str(indicator_id or "").strip().upper())
+        if not isinstance(metadata, dict):
+            return "state"
+        role = str(
+            metadata.get("signal_role") or metadata.get("signalRole") or ""
+        ).strip().lower()
+        if role in {"trigger", "setup", "context", "filter"}:
+            return role
+        preferred_timeframe_role = str(
+            metadata.get("preferred_timeframe_role")
+            or metadata.get("preferredTimeframeRole")
+            or ""
+        ).strip().lower()
+        if preferred_timeframe_role == "higher-context":
+            return "context"
+        if preferred_timeframe_role == "mid-setup":
+            return "setup"
+        if preferred_timeframe_role == "entry":
+            return "trigger"
+        return "state"
+
+    @classmethod
+    def _seed_indicator_role_groups(
+        cls,
+        seed_indicator_ids: list[str],
+        indicator_metadata: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, list[str]]:
         groups: dict[str, list[str]] = {
             "trigger": [],
             "setup": [],
@@ -5088,12 +5102,12 @@ class ResearchController:
             indicator_id = str(raw_id or "").strip()
             if not indicator_id:
                 continue
-            upper_id = indicator_id.upper()
-            if upper_id in TRIGGER_INDICATOR_IDS:
+            role = cls._seed_indicator_role(indicator_id, indicator_metadata)
+            if role == "trigger":
                 groups["trigger"].append(indicator_id)
-            elif any(token in upper_id for token in SETUP_INDICATOR_TOKENS):
+            elif role == "setup":
                 groups["setup"].append(indicator_id)
-            elif any(token in upper_id for token in CONTEXT_INDICATOR_TOKENS):
+            elif role in {"context", "filter"}:
                 groups["context"].append(indicator_id)
             else:
                 groups["state"].append(indicator_id)
@@ -5104,8 +5118,12 @@ class ResearchController:
         seed_indicator_ids: list[str],
         *,
         max_count: int = 4,
+        indicator_metadata: dict[str, dict[str, Any]] | None = None,
     ) -> list[str]:
-        groups = self._seed_indicator_role_groups(seed_indicator_ids)
+        groups = self._seed_indicator_role_groups(
+            seed_indicator_ids,
+            indicator_metadata,
+        )
         selected: list[str] = []
 
         def add_first(role: str) -> None:
@@ -5126,14 +5144,24 @@ class ResearchController:
                 selected.append(candidate)
         return selected[:max_count]
 
-    def _seed_indicator_balance_guidance_text(self, seed_indicator_ids: list[str]) -> str:
+    def _seed_indicator_balance_guidance_text(
+        self,
+        seed_indicator_ids: list[str],
+        indicator_metadata: dict[str, dict[str, Any]] | None = None,
+    ) -> str:
         if not seed_indicator_ids:
             return (
                 "Indicator composition guidance:\n"
                 "- No seed hand is available; prefer a context/setup/trigger profile shape when exact catalog ids are known."
             )
-        groups = self._seed_indicator_role_groups(seed_indicator_ids)
-        suggested = self._role_balanced_seed_indicator_ids(seed_indicator_ids)
+        groups = self._seed_indicator_role_groups(
+            seed_indicator_ids,
+            indicator_metadata,
+        )
+        suggested = self._role_balanced_seed_indicator_ids(
+            seed_indicator_ids,
+            indicator_metadata=indicator_metadata,
+        )
 
         def role_line(role: str, label: str) -> str:
             values = groups.get(role, [])
@@ -5141,7 +5169,7 @@ class ResearchController:
 
         lines = [
             "Indicator composition guidance:",
-            "- Target shape: higher/mid timeframe context, setup/stretch condition, and one or two lowest-timeframe triggers.",
+            "- Target shape: context/filter on M30/H1/H4/D1, setup/stretch on M5/M15/M30/H1, and one or two trigger entries on M1/M5/M15.",
             role_line("context", "seed context/filter candidates"),
             role_line("setup", "seed setup/state candidates"),
             role_line("trigger", "seed trigger candidates"),
@@ -5707,13 +5735,7 @@ class ResearchController:
             overlay_lines.append(
                 "- The seed hand has no clean trigger indicator; keep this first candidate as a baseline and look for trigger-backed structural contrast later."
             )
-        elif len(
-            [
-                indicator_id
-                for indicator_id in preferred_indicator_ids
-                if indicator_id.upper() in TRIGGER_INDICATOR_IDS
-            ]
-        ) >= 2:
+        elif int(grounding.get("preferred_initial_trigger_count") or 0) >= 2:
             overlay_lines.append(
                 "- This opening scaffold has two trigger-style indicators; keep both unless validation shows the pair is too sparse."
             )
@@ -6408,6 +6430,9 @@ class ResearchController:
 
     def _pinned_run_reference_prompt(self, tool_context: ToolContext) -> str:
         seed_indicator_ids = self._seed_indicator_ids(tool_context.seed_prompt_path)
+        seed_indicator_metadata = self._seed_indicator_metadata(
+            tool_context.seed_prompt_path
+        )
         indicator_schema = self._compact_seed_parameter_schema_text(
             tool_context,
             indicator_ids=seed_indicator_ids,
@@ -6423,7 +6448,10 @@ class ResearchController:
             (
                 "Indicator id rule: indicator.meta.id must match one of the exact seeded ids unless scope expands."
             ),
-            self._seed_indicator_balance_guidance_text(seed_indicator_ids),
+            self._seed_indicator_balance_guidance_text(
+                seed_indicator_ids,
+                seed_indicator_metadata,
+            ),
             "Entry lookback policy:\n"
             "- For trigger-style entry indicators, the first refinement sweep should explicitly explore config.lookbackBars values 1,2,3.\n"
             "- Use lookbackBars as entry alignment tolerance; do not use it as the only repeated same-family tweak after retention fails.",
@@ -7616,8 +7644,18 @@ class ResearchController:
             tool_context
         )
         seed_indicator_ids = self._seed_indicator_ids(tool_context.seed_prompt_path)
+        seed_indicator_metadata = self._seed_indicator_metadata(
+            tool_context.seed_prompt_path
+        )
         preferred_indicator_ids = self._role_balanced_seed_indicator_ids(
-            seed_indicator_ids
+            seed_indicator_ids,
+            indicator_metadata=seed_indicator_metadata,
+        )
+        preferred_trigger_count = sum(
+            1
+            for indicator_id in preferred_indicator_ids
+            if self._seed_indicator_role(indicator_id, seed_indicator_metadata)
+            == "trigger"
         )
         candidate_name_hint = "cand1"
         grounding = {
@@ -7625,13 +7663,10 @@ class ResearchController:
             "preferred_initial_instruments": starter_instruments,
             "preferred_initial_instrument_rule": starter_rule,
             "preferred_initial_indicator_ids": preferred_indicator_ids,
+            "preferred_initial_trigger_count": preferred_trigger_count,
             "indicator_balance_note": (
                 "context_setup_trigger_preferred"
-                if preferred_indicator_ids
-                and any(
-                    indicator_id in TRIGGER_INDICATOR_IDS
-                    for indicator_id in preferred_indicator_ids
-                )
+                if preferred_trigger_count > 0
                 else "seed_hand_has_no_clean_trigger"
             ),
             "candidate_name_hint": candidate_name_hint,
@@ -9679,6 +9714,7 @@ class ResearchController:
             if isinstance(instruments, list):
                 for sym in instruments:
                     args.extend(["--instrument", str(sym)])
+            args.append("--role-timeframes")
             args.extend(["--out", str(dest), "--pretty"])
             base = self._execute_cli_invocation(
                 tool_context,

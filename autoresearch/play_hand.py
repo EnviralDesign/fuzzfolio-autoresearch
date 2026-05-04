@@ -27,15 +27,6 @@ from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 console = Console(safe_box=True)
 
-TRIGGER_ID_TOKENS = (
-    "CROSS",
-    "REJECTION",
-    "REENTRY",
-    "FIRST_CLOSE",
-    "BREAKOUT",
-    "RECLAIM",
-)
-
 DEFAULT_INSTRUMENT_POOL = (
     "EURUSD",
     "GBPUSD",
@@ -94,6 +85,23 @@ CANDLESTICK_PATTERN_BUNDLES: dict[str, list[str]] = {
     ],
 }
 
+ROLE_TIMEFRAME_POOLS: dict[str, tuple[str, ...]] = {
+    "trigger": ("M1", "M5", "M15"),
+    "setup": ("M5", "M15", "M30", "H1"),
+    "context": ("M30", "H1", "H4", "D1"),
+    "filter": ("M30", "H1", "H4", "D1"),
+}
+
+TIMEFRAME_MINUTES: dict[str, int] = {
+    "M1": 1,
+    "M5": 5,
+    "M15": 15,
+    "M30": 30,
+    "H1": 60,
+    "H4": 240,
+    "D1": 1440,
+}
+
 
 @dataclass
 class PlayHandContext:
@@ -127,6 +135,22 @@ class PlayHandStage:
         }
 
 
+@dataclass(frozen=True)
+class SeedIndicator:
+    id: str
+    signal_role: str | None = None
+    signal_persistence: str | None = None
+    preferred_timeframe_role: str | None = None
+
+    def as_metadata(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "signalRole": self.signal_role,
+            "signalPersistence": self.signal_persistence,
+            "preferredTimeframeRole": self.preferred_timeframe_role,
+        }
+
+
 def _utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
@@ -146,6 +170,46 @@ def _clean_tokens(values: list[str] | tuple[str, ...] | None) -> list[str]:
         cleaned.append(token)
         seen.add(token)
     return cleaned
+
+
+def _normalize_role(value: Any) -> str | None:
+    text = str(value or "").strip().lower()
+    return text or None
+
+
+def _seed_indicator_role(indicator: SeedIndicator) -> str:
+    role = _normalize_role(indicator.signal_role)
+    if role in {"trigger", "setup", "context", "filter"}:
+        return role
+    preferred = _normalize_role(indicator.preferred_timeframe_role)
+    if preferred == "higher-context":
+        return "context"
+    if preferred == "mid-setup":
+        return "setup"
+    if preferred == "entry":
+        return "trigger"
+    return "state"
+
+
+def _profile_indicator_role(item: dict[str, Any]) -> str:
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    role = _normalize_role(meta.get("signalRole") or meta.get("signal_role"))
+    if role in {"trigger", "setup", "context", "filter"}:
+        return role
+    preferred = _normalize_role(
+        meta.get("preferredTimeframeRole") or meta.get("preferred_timeframe_role")
+    )
+    if preferred == "higher-context":
+        return "context"
+    if preferred == "mid-setup":
+        return "setup"
+    if preferred == "entry":
+        return "trigger"
+    return "state"
+
+
+def _role_timeframe_pool(role: str) -> tuple[str, ...]:
+    return ROLE_TIMEFRAME_POOLS.get(role, ("M5", "M15", "M30"))
 
 
 def deal_instruments(
@@ -189,6 +253,45 @@ def deal_indicator_count(
     if lower == upper:
         return upper
     return rng.randint(lower, upper)
+
+
+def deal_role_balanced_indicators(
+    indicators: list[SeedIndicator],
+    *,
+    target_count: int,
+) -> list[SeedIndicator]:
+    selected: list[SeedIndicator] = []
+
+    def add_first(*roles: str) -> None:
+        for candidate in indicators:
+            if len(selected) >= target_count:
+                return
+            if candidate in selected:
+                continue
+            if _seed_indicator_role(candidate) in set(roles):
+                selected.append(candidate)
+                return
+
+    if target_count <= 0:
+        return []
+    if target_count == 1:
+        add_first("trigger")
+    elif target_count == 2:
+        add_first("setup", "context", "filter")
+        add_first("trigger")
+    else:
+        add_first("context", "filter")
+        add_first("setup")
+        add_first("trigger")
+        if target_count >= 4:
+            add_first("trigger")
+
+    for candidate in indicators:
+        if len(selected) >= target_count:
+            break
+        if candidate not in selected:
+            selected.append(candidate)
+    return selected[:target_count]
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -315,10 +418,7 @@ def _trigger_indicator_indexes(profile_payload: dict[str, Any]) -> list[int]:
     for index, item in enumerate(profile.get("indicators") or []):
         if not isinstance(item, dict):
             continue
-        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-        indicator_id = str(meta.get("id") or "").upper()
-        role = str(meta.get("signalRole") or meta.get("preferredTimeframeRole") or "").lower()
-        if role == "trigger" or any(token in indicator_id for token in TRIGGER_ID_TOKENS):
+        if _profile_indicator_role(item) == "trigger":
             indexes.append(index)
     return indexes
 
@@ -336,7 +436,8 @@ def _lookback_values_for_timeframe(timeframe: str | None) -> list[int]:
 
 def build_lookback_axes(profile_payload: dict[str, Any]) -> list[str]:
     profile = _extract_profile(profile_payload)
-    axes: list[str] = []
+    staged_axes: list[tuple[int, str]] = []
+    role_priority = {"trigger": 0, "setup": 1, "context": 2, "filter": 2}
     for index, item in enumerate(profile.get("indicators") or []):
         if not isinstance(item, dict):
             continue
@@ -344,11 +445,44 @@ def build_lookback_axes(profile_payload: dict[str, Any]) -> list[str]:
         if config.get("isActive") is False:
             continue
         values = _lookback_values_for_timeframe(str(config.get("timeframe") or ""))
-        axes.append(
-            f"indicator[{index}].config.lookbackBars="
-            + ",".join(str(value) for value in values)
+        staged_axes.append(
+            (
+                role_priority.get(_profile_indicator_role(item), 3),
+                f"indicator[{index}].config.lookbackBars="
+                + ",".join(str(value) for value in values),
+            )
         )
-    return axes
+    return [axis for _, axis in sorted(staged_axes, key=lambda item: item[0])]
+
+
+def build_timeframe_axes(profile_payload: dict[str, Any]) -> list[str]:
+    profile = _extract_profile(profile_payload)
+    staged_axes: list[tuple[int, str]] = []
+    role_priority = {"trigger": 0, "setup": 1, "context": 2, "filter": 2}
+    for index, item in enumerate(profile.get("indicators") or []):
+        if not isinstance(item, dict):
+            continue
+        config = item.get("config") if isinstance(item.get("config"), dict) else {}
+        if config.get("isActive") is False:
+            continue
+        role = _profile_indicator_role(item)
+        values = _role_timeframe_pool(role)
+        current = str(config.get("timeframe") or "").strip().upper()
+        if current and current not in values:
+            values = (*values, current)
+        if len(values) < 2:
+            continue
+        staged_axes.append(
+            (
+                role_priority.get(role, 3),
+                f"indicator[{index}].config.timeframe=" + ",".join(values),
+            )
+        )
+    return [axis for _, axis in sorted(staged_axes, key=lambda item: item[0])]
+
+
+def build_timing_axes(profile_payload: dict[str, Any]) -> list[str]:
+    return [*build_timeframe_axes(profile_payload), *build_lookback_axes(profile_payload)]
 
 
 def _talib_config(item: dict[str, Any]) -> list[dict[str, Any]]:
@@ -412,6 +546,108 @@ def apply_play_hand_profile_defaults(
             }
         )
     return changes
+
+
+def apply_seed_indicator_metadata(
+    profile_payload: dict[str, Any],
+    seed_indicators: list[SeedIndicator],
+) -> list[dict[str, Any]]:
+    profile = _extract_profile(profile_payload)
+    by_id = {indicator.id.upper(): indicator for indicator in seed_indicators}
+    changes: list[dict[str, Any]] = []
+    for index, item in enumerate(profile.get("indicators") or []):
+        if not isinstance(item, dict):
+            continue
+        meta = item.setdefault("meta", {})
+        if not isinstance(meta, dict):
+            item["meta"] = {}
+            meta = item["meta"]
+        indicator_id = str(meta.get("id") or "").strip().upper()
+        seed_indicator = by_id.get(indicator_id)
+        if seed_indicator is None:
+            continue
+        updates = {
+            "signalRole": seed_indicator.signal_role,
+            "signalPersistence": seed_indicator.signal_persistence,
+            "preferredTimeframeRole": seed_indicator.preferred_timeframe_role,
+        }
+        applied: dict[str, Any] = {}
+        for key, value in updates.items():
+            if value and not meta.get(key):
+                meta[key] = value
+                applied[key] = value
+        if applied:
+            changes.append(
+                {
+                    "indicator_index": index,
+                    "indicator_id": indicator_id,
+                    "metadata": applied,
+                }
+            )
+    return changes
+
+
+def apply_role_timeframe_defaults(
+    profile_payload: dict[str, Any],
+    *,
+    rng: random.Random,
+) -> list[dict[str, Any]]:
+    profile = _extract_profile(profile_payload)
+    changes: list[dict[str, Any]] = []
+    for index, item in enumerate(profile.get("indicators") or []):
+        if not isinstance(item, dict):
+            continue
+        config = item.setdefault("config", {})
+        if not isinstance(config, dict):
+            item["config"] = {}
+            config = item["config"]
+        if config.get("isActive") is False:
+            continue
+        role = _profile_indicator_role(item)
+        pool = _role_timeframe_pool(role)
+        timeframe = rng.choice(pool)
+        previous = str(config.get("timeframe") or "").strip().upper() or None
+        config["timeframe"] = timeframe
+        changes.append(
+            {
+                "indicator_index": index,
+                "indicator_id": str(
+                    (item.get("meta") if isinstance(item.get("meta"), dict) else {}).get("id")
+                    or ""
+                ).strip(),
+                "role": role,
+                "previous_timeframe": previous,
+                "timeframe": timeframe,
+                "pool": list(pool),
+            }
+        )
+    return changes
+
+
+def _profile_timeframes(profile_payload: dict[str, Any]) -> list[str]:
+    profile = _extract_profile(profile_payload)
+    timeframes: list[str] = []
+    for item in profile.get("indicators") or []:
+        if not isinstance(item, dict):
+            continue
+        config = item.get("config") if isinstance(item.get("config"), dict) else {}
+        if config.get("isActive") is False:
+            continue
+        timeframe = str(config.get("timeframe") or "").strip().upper()
+        if timeframe and timeframe not in timeframes:
+            timeframes.append(timeframe)
+    return timeframes
+
+
+def _lowest_profile_timeframe(profile_payload: dict[str, Any], fallback: str) -> str:
+    candidates = [
+        timeframe
+        for timeframe in _profile_timeframes(profile_payload)
+        if timeframe in TIMEFRAME_MINUTES
+    ]
+    if not candidates:
+        return str(fallback or "M5").strip().upper() or "M5"
+    return min(candidates, key=lambda timeframe: TIMEFRAME_MINUTES[timeframe])
 
 
 def _numeric_axis_values(value: float) -> list[Any]:
@@ -628,12 +864,61 @@ def materialize_profile_variant(
     return output_profile_path
 
 
-def _seed_hand(config: AppConfig, cli: FuzzfolioCli, run_dir: Path) -> list[str]:
+def _metadata_value(item: dict[str, Any], snake_key: str, camel_key: str) -> str | None:
+    value = item.get(snake_key) or item.get(camel_key)
+    text = str(value or "").strip()
+    return text or None
+
+
+def _seed_indicator_from_metadata(indicator_id: str, metadata: dict[str, Any] | None) -> SeedIndicator:
+    metadata = metadata or {}
+    return SeedIndicator(
+        id=indicator_id,
+        signal_role=_metadata_value(metadata, "signal_role", "signalRole"),
+        signal_persistence=_metadata_value(
+            metadata,
+            "signal_persistence",
+            "signalPersistence",
+        ),
+        preferred_timeframe_role=_metadata_value(
+            metadata,
+            "preferred_timeframe_role",
+            "preferredTimeframeRole",
+        ),
+    )
+
+
+def _seed_hand(config: AppConfig, cli: FuzzfolioCli, run_dir: Path) -> list[SeedIndicator]:
     seed_path = run_dir / "seed-prompt.json"
     result = cli.seed_prompt(seed_path)
     payload = result.parsed_json if isinstance(result.parsed_json, dict) else _load_json(seed_path)
     indicators = payload.get("indicators") if isinstance(payload, dict) else None
-    return [str(item).strip() for item in indicators or [] if str(item).strip()]
+    metadata_items = payload.get("indicator_metadata") if isinstance(payload, dict) else None
+    metadata_by_id: dict[str, dict[str, Any]] = {}
+    if isinstance(metadata_items, list):
+        for item in metadata_items:
+            if not isinstance(item, dict):
+                continue
+            indicator_id = str(item.get("id") or "").strip()
+            if indicator_id:
+                metadata_by_id[indicator_id.upper()] = item
+
+    hand: list[SeedIndicator] = []
+    for item in indicators or []:
+        if isinstance(item, dict):
+            indicator_id = str(item.get("id") or "").strip()
+            metadata_by_id.setdefault(indicator_id.upper(), item)
+        else:
+            indicator_id = str(item).strip()
+        if not indicator_id:
+            continue
+        hand.append(
+            _seed_indicator_from_metadata(
+                indicator_id,
+                metadata_by_id.get(indicator_id.upper()),
+            )
+        )
+    return hand
 
 
 def _register_profile(ctx: PlayHandContext, profile_path: Path) -> str:
@@ -1268,11 +1553,11 @@ def cmd_play_hand(
     evals_dir.mkdir(parents=True, exist_ok=True)
 
     hand = _seed_hand(config, cli, run_dir) if not dry_run else [
-        "RSI_CROSSBACK",
-        "STOCH_CROSSOVER",
-        "MA_SLOPE_TREND",
-        "ADX",
-        "WICK_REJECTION",
+        SeedIndicator("RSI_CROSSBACK", "trigger", "event-with-lookback", "entry"),
+        SeedIndicator("STOCH_CROSSOVER", "trigger", "event-with-lookback", "entry"),
+        SeedIndicator("MA_SLOPE_TREND", "context", "state", "higher-context"),
+        SeedIndicator("ADX", "filter", "state", "higher-context"),
+        SeedIndicator("WICK_REJECTION", "trigger", "event-with-lookback", "entry"),
     ]
     rng = random.Random(seed)
     shuffled = list(hand)
@@ -1283,7 +1568,8 @@ def cmd_play_hand(
         max_indicators=max_indicators,
         rng=rng,
     )
-    dealt = shuffled[:dealt_count]
+    dealt_entries = deal_role_balanced_indicators(shuffled, target_count=dealt_count)
+    dealt = [indicator.id for indicator in dealt_entries]
     instrument_deal = deal_instruments(
         instrument=instrument,
         instrument_pool=instrument_pool,
@@ -1297,14 +1583,19 @@ def cmd_play_hand(
         "run_id": run_id,
         "runner": "play_hand_v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "canonical_score_lab_version": "score_lab_v2_5_1",
+        "canonical_score_lab_version": "score_lab_v2_5_2",
         "seed": seed,
         "instrument_source": instrument_deal["source"],
         "primary_instrument": instrument_deal["primary_instrument"],
         "instrument_pool": instrument_deal["instrument_pool"],
         "instruments": instruments,
         "timeframe": timeframe,
+        "requested_timeframe": timeframe,
+        "effective_timeframe": timeframe,
         "dealt_indicator_ids": dealt,
+        "dealt_indicator_metadata": [
+            indicator.as_metadata() for indicator in dealt_entries
+        ],
         "dealt_indicator_count": len(dealt),
         "min_indicators": min_indicators,
         "max_indicators": max_indicators,
@@ -1347,6 +1638,7 @@ def cmd_play_hand(
         "dealt",
         stage=stages["deal"],
         indicators=dealt,
+        indicator_metadata=[indicator.as_metadata() for indicator in dealt_entries],
         dealt_indicator_count=len(dealt),
         min_indicators=min_indicators,
         max_indicators=max_indicators,
@@ -1361,9 +1653,38 @@ def cmd_play_hand(
     phase_rows: list[dict[str, Any]] = []
     profile_path = _scaffold_profile(ctx, dealt, instruments, timeframe, "hand_base")
     profile_payload = _load_json(profile_path)
+    metadata_changes = apply_seed_indicator_metadata(profile_payload, dealt_entries)
+    timeframe_changes = apply_role_timeframe_defaults(profile_payload, rng=rng)
     default_changes = apply_play_hand_profile_defaults(profile_payload, rng=rng)
-    if default_changes:
+    if metadata_changes or timeframe_changes or default_changes:
         _write_json(profile_path, profile_payload)
+    if metadata_changes:
+        _append_event(
+            ctx,
+            "scaffold",
+            "metadata_applied",
+            stage=stages["scaffold"],
+            profile_path=str(profile_path),
+            changes=metadata_changes,
+        )
+    if timeframe_changes:
+        _append_event(
+            ctx,
+            "scaffold",
+            "role_timeframes_applied",
+            stage=stages["scaffold"],
+            profile_path=str(profile_path),
+            changes=timeframe_changes,
+        )
+        metadata["indicator_timeframes"] = _profile_timeframes(profile_payload)
+        metadata["timeframe_assignment"] = timeframe_changes
+        metadata["effective_timeframe"] = _lowest_profile_timeframe(
+            profile_payload,
+            timeframe,
+        )
+        metadata["timeframe"] = metadata["effective_timeframe"]
+        write_run_metadata(run_dir, metadata)
+    if default_changes:
         _append_event(
             ctx,
             "scaffold",
@@ -1372,6 +1693,7 @@ def cmd_play_hand(
             profile_path=str(profile_path),
             changes=default_changes,
         )
+    evaluation_timeframe = _lowest_profile_timeframe(profile_payload, timeframe)
     profile_ref = _register_profile(ctx, profile_path)
     _append_event(
         ctx,
@@ -1389,17 +1711,18 @@ def cmd_play_hand(
         profile_ref=profile_ref,
         profile_path=profile_path,
         instruments=instruments,
-        timeframe=timeframe,
+        timeframe=evaluation_timeframe,
         lookback_months=screen_months,
     )
     phase_rows.append({"phase": "baseline", "status": "evaluated", "score": baseline.get("score"), "detail": profile_ref})
 
     current_profile_path = profile_path
     current_profile_ref = profile_ref
+    current_evaluation_timeframe = evaluation_timeframe
     last_sweep_payload: dict[str, Any] | None = None
     last_sweep_axes: list[str] = []
 
-    lookback_axes = build_lookback_axes(profile_payload)
+    lookback_axes = build_timing_axes(profile_payload)
     if lookback_axes:
         sweep = _run_sweep(
             ctx,
@@ -1423,6 +1746,10 @@ def cmd_play_hand(
                 parameters=params,
                 phase="lookback_timing",
             )
+            current_evaluation_timeframe = _lowest_profile_timeframe(
+                _load_json(current_profile_path),
+                timeframe,
+            )
             result = _evaluate_profile(
                 ctx,
                 stage=stages["lookback"],
@@ -1430,7 +1757,7 @@ def cmd_play_hand(
                 profile_ref=current_profile_ref,
                 profile_path=current_profile_path,
                 instruments=instruments,
-                timeframe=timeframe,
+                timeframe=current_evaluation_timeframe,
                 lookback_months=screen_months,
             )
             phase_rows.append({"phase": "lookback", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(lookback_axes)})
@@ -1461,6 +1788,10 @@ def cmd_play_hand(
                 parameters=params,
                 phase="coarse",
             )
+            current_evaluation_timeframe = _lowest_profile_timeframe(
+                _load_json(current_profile_path),
+                timeframe,
+            )
             result = _evaluate_profile(
                 ctx,
                 stage=stages["coarse"],
@@ -1468,7 +1799,7 @@ def cmd_play_hand(
                 profile_ref=current_profile_ref,
                 profile_path=current_profile_path,
                 instruments=instruments,
-                timeframe=timeframe,
+                timeframe=current_evaluation_timeframe,
                 lookback_months=screen_months,
             )
             phase_rows.append({"phase": "coarse", "status": "top evaluated", "score": result.get("score"), "detail": f"{len(coarse_axes)} axes"})
@@ -1501,6 +1832,10 @@ def cmd_play_hand(
                 parameters=params,
                 phase="focused",
             )
+            current_evaluation_timeframe = _lowest_profile_timeframe(
+                _load_json(current_profile_path),
+                timeframe,
+            )
             result = _evaluate_profile(
                 ctx,
                 stage=stages["focused"],
@@ -1508,7 +1843,7 @@ def cmd_play_hand(
                 profile_ref=current_profile_ref,
                 profile_path=current_profile_path,
                 instruments=instruments,
-                timeframe=timeframe,
+                timeframe=current_evaluation_timeframe,
                 lookback_months=screen_months,
             )
             phase_rows.append({"phase": "focused", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(focused_axes)})
@@ -1522,7 +1857,7 @@ def cmd_play_hand(
         profile_ref=current_profile_ref,
         profile_path=current_profile_path,
         instruments=instruments,
-        timeframe=timeframe,
+        timeframe=current_evaluation_timeframe,
         lookback_months=scrutiny_months,
     )
     phase_rows.append({"phase": "scrutiny", "status": "evaluated", "score": scrutiny.get("score"), "detail": f"{scrutiny_months}mo"})
@@ -1580,7 +1915,9 @@ def cmd_play_hand(
         "primary_instrument": instrument_deal["primary_instrument"],
         "instrument_pool": instrument_deal["instrument_pool"],
         "instruments": instruments,
-        "timeframe": timeframe,
+        "timeframe": current_evaluation_timeframe,
+        "requested_timeframe": timeframe,
+        "indicator_timeframes": _profile_timeframes(_load_json(current_profile_path)),
         "max_sweep_permutations": max_sweep_permutations,
         "final_profile_ref": current_profile_ref,
         "final_profile_path": str(current_profile_path.resolve()),

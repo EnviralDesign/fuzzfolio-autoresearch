@@ -9,7 +9,7 @@ def _write_json(path, payload):
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
 
 
-def _sample_sensitivity_payload(score: float, *, score_lab_version: str = "score_lab_v2_5_1") -> dict:
+def _sample_sensitivity_payload(score: float, *, score_lab_version: str = "score_lab_v2_5_2") -> dict:
     return {
         "data": {
             "aggregate": {
@@ -412,7 +412,7 @@ def test_select_promotion_board_can_reward_breadth_metrics():
     assert selected[0]["scalar_metric_bonus_terms"][0]["field"] == "breadth_score_36m"
 
 
-def test_score_lab_v2_5_1_is_canonical_and_legacy_quality_is_diagnostic(tmp_path):
+def test_score_lab_v2_5_2_is_canonical_and_legacy_quality_is_diagnostic(tmp_path):
     artifact_dir = tmp_path / "artifact"
     artifact_dir.mkdir()
     _write_json(
@@ -434,7 +434,7 @@ def test_score_lab_v2_5_1_is_canonical_and_legacy_quality_is_diagnostic(tmp_path
     assert row["score_36m"] == 61.25
     assert row["score_lab_score_36m"] == 61.25
     assert row["legacy_quality_score_36m"] == 61.25
-    assert row["score_basis_36m"] == "score_lab_v2_5_1:geometric_mean"
+    assert row["score_basis_36m"] == "score_lab_v2_5_2:geometric_mean"
 
 
 def test_legacy_only_full_backtest_is_not_canonical_score(tmp_path):

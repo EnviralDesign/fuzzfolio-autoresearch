@@ -18,6 +18,9 @@ from .ledger import list_run_dirs, load_run_metadata
 DASHBOARD_APP_ROOT = Path(__file__).resolve().parent / "dashboard"
 DASHBOARD_DIST_ROOT = DASHBOARD_APP_ROOT / "dist"
 SHORTLIST_REPORT_ROOTNAME = "shortlist-report"
+_CURVE_CELL_CACHE: dict[str, tuple[tuple[str, bool, int | None, int | None], dict[str, Any]]] = {}
+_RESULT_CELL_CACHE: dict[str, tuple[tuple[str, bool, int | None, int | None], dict[str, Any]]] = {}
+LIVE_PORTFOLIO_CACHE_FILENAME = "dashboard-live-portfolio.json"
 
 
 def _read_json(path: Path) -> Any:
@@ -68,7 +71,20 @@ def _dashboard_frontend_signature() -> tuple[tuple[str, bool, int | None, int | 
 def _ensure_dashboard_dist() -> None:
     index_path = DASHBOARD_DIST_ROOT / "index.html"
     if index_path.exists():
-        return
+        source_paths = [
+            DASHBOARD_APP_ROOT / "src" / "App.tsx",
+            DASHBOARD_APP_ROOT / "src" / "main.tsx",
+            DASHBOARD_APP_ROOT / "src" / "index.css",
+            DASHBOARD_APP_ROOT / "src" / "pages" / "PortfolioWorkbenchPage.tsx",
+            DASHBOARD_APP_ROOT / "package.json",
+        ]
+        dist_mtime = index_path.stat().st_mtime_ns
+        if all((not path.exists()) or path.stat().st_mtime_ns <= dist_mtime for path in source_paths):
+            return
+    if index_path.exists():
+        print("Autoresearch dashboard source changed; rebuilding frontend bundle...", flush=True)
+    else:
+        print("Autoresearch dashboard bundle missing; building frontend bundle...", flush=True)
     subprocess.run(
         ["npm", "run", "build"],
         cwd=str(DASHBOARD_APP_ROOT),
@@ -123,6 +139,69 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
+def _load_curve_cell_prefix(path: Path) -> dict[str, Any]:
+    signature = _file_signature(path)
+    cache_key = str(path)
+    cached = _CURVE_CELL_CACHE.get(cache_key)
+    if cached and cached[0] == signature:
+        return dict(cached[1])
+    if not signature[1]:
+        _CURVE_CELL_CACHE[cache_key] = (signature, {})
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            prefix = handle.read(16384)
+    except Exception:
+        _CURVE_CELL_CACHE[cache_key] = (signature, {})
+        return {}
+    marker_index = prefix.find('"cell"')
+    if marker_index < 0:
+        _CURVE_CELL_CACHE[cache_key] = (signature, {})
+        return {}
+    colon_index = prefix.find(":", marker_index)
+    if colon_index < 0:
+        _CURVE_CELL_CACHE[cache_key] = (signature, {})
+        return {}
+    decoder = json.JSONDecoder()
+    try:
+        value, _ = decoder.raw_decode(prefix[colon_index + 1 :].lstrip())
+    except json.JSONDecodeError:
+        value = {}
+    cell = value if isinstance(value, dict) else {}
+    _CURVE_CELL_CACHE[cache_key] = (signature, dict(cell))
+    return dict(cell)
+
+
+def _load_result_recommended_cell(path: Path) -> dict[str, Any]:
+    signature = _file_signature(path)
+    cache_key = str(path)
+    cached = _RESULT_CELL_CACHE.get(cache_key)
+    if cached and cached[0] == signature:
+        return dict(cached[1])
+    if not signature[1]:
+        _RESULT_CELL_CACHE[cache_key] = (signature, {})
+        return {}
+    payload = _load_optional_json(path)
+    if not isinstance(payload, dict):
+        _RESULT_CELL_CACHE[cache_key] = (signature, {})
+        return {}
+    aggregate = payload.get("data")
+    if isinstance(aggregate, dict) and isinstance(aggregate.get("aggregate"), dict):
+        aggregate = aggregate.get("aggregate")
+    if not isinstance(aggregate, dict):
+        aggregate = payload
+
+    cell = aggregate.get("recommended_cell")
+    if not isinstance(cell, dict):
+        matrix_summary = aggregate.get("matrix_summary")
+        if isinstance(matrix_summary, dict):
+            cell = matrix_summary.get("robust_cell")
+    if not isinstance(cell, dict):
+        cell = {}
+    _RESULT_CELL_CACHE[cache_key] = (signature, dict(cell))
+    return dict(cell)
+
+
 def _normalize_chart_entry(config: AppConfig, raw_path: str | None) -> dict[str, Any] | None:
     if not raw_path:
         return None
@@ -149,6 +228,50 @@ def _normalize_path_fields(config: AppConfig, row: dict[str, Any]) -> dict[str, 
         value = normalized.get(key)
         if isinstance(value, str) and value.strip():
             normalized[f"{key}_url"] = _file_url(config, Path(value))
+    artifact_dir = normalized.get("artifact_dir")
+    if isinstance(artifact_dir, str) and artifact_dir.strip():
+        artifact_path = Path(artifact_dir)
+        profile_drop_png = artifact_path / "profile-drop-36mo.png"
+        profile_drop_manifest = artifact_path / "profile-drop-36mo.manifest.json"
+        if not profile_drop_png.exists():
+            run_id = str(normalized.get("run_id") or "").strip()
+            run_drop_png = config.runs_root / run_id / "profile-drop-36mo.png"
+            run_drop_manifest = config.runs_root / run_id / "profile-drop-36mo.manifest.json"
+            if run_id and run_drop_png.exists():
+                profile_drop_png = run_drop_png
+                profile_drop_manifest = run_drop_manifest
+        normalized["profile_drop_36m_png_path"] = str(profile_drop_png)
+        normalized["profile_drop_36m_png_url"] = (
+            _file_url(config, profile_drop_png) if profile_drop_png.exists() else None
+        )
+        normalized["profile_drop_36m_manifest_path"] = str(profile_drop_manifest)
+        normalized["profile_drop_36m_manifest_url"] = (
+            _file_url(config, profile_drop_manifest)
+            if profile_drop_manifest.exists()
+            else None
+        )
+    curve_path_value = normalized.get("full_backtest_curve_path_36m")
+    setup_cell: dict[str, Any] = {}
+    if isinstance(curve_path_value, str) and curve_path_value.strip():
+        curve_cell = _load_curve_cell_prefix(Path(curve_path_value))
+        setup_cell.update(curve_cell)
+        if curve_cell:
+            normalized["reward_multiple_basis_36m"] = "curve_cell"
+    result_path_value = normalized.get("full_backtest_result_path_36m")
+    if isinstance(result_path_value, str) and result_path_value.strip():
+        recommended_cell = _load_result_recommended_cell(Path(result_path_value))
+        if recommended_cell:
+            setup_cell.update(recommended_cell)
+            normalized["reward_multiple_basis_36m"] = "recommended_cell"
+    reward_multiple = _safe_float(setup_cell.get("reward_multiple"))
+    stop_loss_percent = _safe_float(setup_cell.get("stop_loss_percent"))
+    take_profit_percent = _safe_float(setup_cell.get("take_profit_percent"))
+    if reward_multiple is not None:
+        normalized["reward_multiple_36m"] = reward_multiple
+    if stop_loss_percent is not None:
+        normalized["selected_stop_loss_percent_36m"] = stop_loss_percent
+    if take_profit_percent is not None:
+        normalized["selected_take_profit_percent_36m"] = take_profit_percent
     return normalized
 
 
@@ -626,6 +749,49 @@ def _attempt_detail_payload(
     }
 
 
+def _live_portfolio_cache_path(config: AppConfig) -> Path:
+    return config.derived_root / LIVE_PORTFOLIO_CACHE_FILENAME
+
+
+def _normalize_attempt_id_list(value: Any) -> list[str]:
+    seen: set[str] = set()
+    attempt_ids: list[str] = []
+    for item in list(value or []):
+        attempt_id = str(item or "").strip()
+        if not attempt_id or attempt_id in seen:
+            continue
+        seen.add(attempt_id)
+        attempt_ids.append(attempt_id)
+    return attempt_ids
+
+
+def _live_portfolio_payload(config: AppConfig) -> dict[str, Any]:
+    path = _live_portfolio_cache_path(config)
+    payload = _load_optional_json(path)
+    payload = payload if isinstance(payload, dict) else {}
+    attempt_ids = _normalize_attempt_id_list(payload.get("selected_attempt_ids"))
+    return {
+        "selected_attempt_ids": attempt_ids,
+        "updated_at": payload.get("updated_at"),
+        "path": str(path),
+        "path_url": _file_url(config, path) if path.exists() else None,
+    }
+
+
+def _write_live_portfolio_payload(config: AppConfig, attempt_ids: list[str]) -> dict[str, Any]:
+    path = _live_portfolio_cache_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": 1,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "selected_attempt_ids": _normalize_attempt_id_list(attempt_ids),
+    }
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True, indent=2)
+        handle.write("\n")
+    return _live_portfolio_payload(config)
+
+
 def _json_bytes(payload: Any) -> bytes:
     return json.dumps(payload, ensure_ascii=True, indent=2).encode("utf-8")
 
@@ -656,6 +822,8 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
             parsed = urlparse(self.path)
             if parsed.path in {"/api/state", "/api/overview"}:
                 return self._send_json(state.snapshot())
+            if parsed.path == "/api/live-portfolio":
+                return self._send_json(_live_portfolio_payload(state.config))
             if parsed.path == "/api/catalog":
                 rows = [_normalize_path_fields(state.config, row) for row in state.catalog_rows()]
                 return self._send_json(
@@ -712,6 +880,42 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
             return self._send_dist_index()
 
         def do_POST(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/live-portfolio":
+                try:
+                    content_length = int(self.headers.get("Content-Length", "0") or "0")
+                except ValueError:
+                    content_length = 0
+                body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+                try:
+                    payload = json.loads(body.decode("utf-8") or "{}")
+                except json.JSONDecodeError:
+                    return self._send_json({"error": "invalid_json"}, status=400)
+                if not isinstance(payload, dict):
+                    return self._send_json({"error": "invalid_payload"}, status=400)
+                attempt_ids = _normalize_attempt_id_list(payload.get("selected_attempt_ids"))
+                known_attempt_ids = {
+                    str(row.get("attempt_id") or "")
+                    for row in state.catalog_rows()
+                    if row.get("attempt_id")
+                }
+                unknown = [
+                    attempt_id
+                    for attempt_id in attempt_ids
+                    if known_attempt_ids and attempt_id not in known_attempt_ids
+                ]
+                if unknown:
+                    return self._send_json(
+                        {"error": "unknown_attempt_ids", "attempt_ids": unknown[:20]},
+                        status=400,
+                    )
+                return self._send_json(_write_live_portfolio_payload(state.config, attempt_ids))
+            return self._send_json({"error": "read_only_viewer"}, status=405)
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            parsed = urlparse(self.path)
+            if parsed.path == "/api/live-portfolio":
+                return self._send_json(_write_live_portfolio_payload(state.config, []))
             return self._send_json({"error": "read_only_viewer"}, status=405)
 
         def log_message(self, format: str, *args: object) -> None:
