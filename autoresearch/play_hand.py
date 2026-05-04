@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import random
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -173,6 +175,22 @@ def deal_instruments(
     }
 
 
+def deal_indicator_count(
+    *,
+    available_count: int,
+    min_indicators: int,
+    max_indicators: int,
+    rng: random.Random,
+) -> int:
+    available = max(1, int(available_count))
+    upper = max(1, min(int(max_indicators or 1), available))
+    lower = max(1, int(min_indicators or 1))
+    lower = min(lower, upper)
+    if lower == upper:
+        return upper
+    return rng.randint(lower, upper)
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -202,6 +220,8 @@ def _append_event(ctx: PlayHandContext, phase: str, status: str, **payload: Any)
 def _render_dealt_hand(
     *,
     indicators: list[str],
+    min_indicators: int,
+    max_indicators: int,
     instrument_deal: dict[str, Any],
     timeframe: str,
     max_sweep_permutations: int,
@@ -214,7 +234,7 @@ def _render_dealt_hand(
     table.add_column("Value")
     table.add_row("Instrument", f"{instrument_deal['primary_instrument']} ({instrument_deal['source']})")
     table.add_row("Timeframe", timeframe)
-    table.add_row("Indicators", ", ".join(indicators))
+    table.add_row("Indicators", f"{len(indicators)} dealt from {min_indicators}-{max_indicators}: " + ", ".join(indicators))
     table.add_row("Screen", f"{screen_months}mo")
     table.add_row("Scrutiny", f"{scrutiny_months}mo")
     table.add_row("Coarse mode", coarse_mode)
@@ -1048,18 +1068,181 @@ def _render_phase_table(rows: list[dict[str, Any]]) -> None:
     console.print(table)
 
 
+def _play_hand_artifact_commands(
+    *,
+    run_id: str,
+    profile_drop_count: int,
+    profile_drop_workers: int,
+) -> list[list[str]]:
+    drop_count = max(0, int(profile_drop_count))
+    drop_workers = max(1, int(profile_drop_workers))
+    commands = [
+        [
+            sys.executable,
+            "-m",
+            "autoresearch",
+            "calculate-full-backtests",
+            "--run-ids",
+            run_id,
+            "--json",
+        ]
+    ]
+    if drop_count > 0:
+        commands.append(
+            [
+                sys.executable,
+                "-m",
+                "autoresearch",
+                "render-corpus-profile-drops",
+                "--run-id",
+                run_id,
+                "--top-results",
+                str(drop_count),
+                "--lookback-months",
+                "36",
+                "--profile-drop-workers",
+                str(drop_workers),
+                "--json",
+            ]
+        )
+    return commands
+
+
+def _json_payload_from_stdout(stdout: str) -> dict[str, Any]:
+    text = str(stdout or "").strip()
+    if not text:
+        return {}
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else {"value": payload}
+    except json.JSONDecodeError:
+        start = text.rfind("\n{")
+        if start >= 0:
+            start += 1
+        else:
+            start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end >= start:
+            try:
+                payload = json.loads(text[start : end + 1])
+                return payload if isinstance(payload, dict) else {"value": payload}
+            except json.JSONDecodeError:
+                pass
+    return {"raw_stdout": text[-4000:]}
+
+
+def _run_child_autoresearch_command(args: list[str], *, cwd: Path) -> dict[str, Any]:
+    result = subprocess.run(
+        args,
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    payload = _json_payload_from_stdout(result.stdout)
+    payload["_returncode"] = result.returncode
+    if result.stderr.strip():
+        payload["_stderr"] = result.stderr.strip()[-4000:]
+    if result.returncode != 0:
+        rendered = " ".join(args)
+        raise RuntimeError(
+            f"Child autoresearch command failed ({result.returncode}): {rendered}"
+            + (f"\n{payload.get('_stderr')}" if payload.get("_stderr") else "")
+        )
+    return payload
+
+
+def _finalize_run_artifacts(
+    ctx: PlayHandContext,
+    *,
+    stage: PlayHandStage,
+    profile_drop_count: int,
+    profile_drop_workers: int,
+) -> dict[str, Any]:
+    if ctx.dry_run:
+        payload = {
+            "status": "skipped",
+            "reason": "dry_run",
+            "full_backtests": None,
+            "profile_drops": None,
+        }
+        _append_event(ctx, "final_artifacts", "skipped", stage=stage, reason="dry_run")
+        return payload
+
+    commands = _play_hand_artifact_commands(
+        run_id=ctx.run_id,
+        profile_drop_count=profile_drop_count,
+        profile_drop_workers=profile_drop_workers,
+    )
+    full_backtests: dict[str, Any] | None = None
+    profile_drops: dict[str, Any] | None = None
+    _append_event(
+        ctx,
+        "final_artifacts",
+        "started",
+        stage=stage,
+        profile_drop_count=max(0, int(profile_drop_count)),
+        profile_drop_workers=max(1, int(profile_drop_workers)),
+    )
+    try:
+        if commands:
+            console.print(f"{stage.prefix} [cyan]final_artifacts[/] [bold]full backtests[/]")
+            full_backtests = _run_child_autoresearch_command(commands[0], cwd=ctx.config.repo_root)
+            _append_event(
+                ctx,
+                "final_artifacts",
+                "full_backtests_done",
+                stage=stage,
+                matched_attempts=full_backtests.get("matched_attempts"),
+                eligible_attempts=full_backtests.get("eligible_attempts"),
+                calculated=full_backtests.get("calculated"),
+                skipped=full_backtests.get("skipped"),
+                failed=full_backtests.get("failed"),
+            )
+        if len(commands) > 1:
+            console.print(f"{stage.prefix} [cyan]final_artifacts[/] [bold]profile drops[/]")
+            profile_drops = _run_child_autoresearch_command(commands[1], cwd=ctx.config.repo_root)
+            _append_event(
+                ctx,
+                "final_artifacts",
+                "profile_drops_done",
+                stage=stage,
+                selected_count=profile_drops.get("selected_count"),
+                rendered=profile_drops.get("profile_drop_rendered"),
+                cached=profile_drops.get("profile_drop_cached"),
+                failed=profile_drops.get("profile_drop_failed"),
+            )
+        return {
+            "status": "completed",
+            "full_backtests": full_backtests,
+            "profile_drops": profile_drops,
+        }
+    except Exception as exc:
+        _append_event(ctx, "final_artifacts", "failed", stage=stage, error=str(exc))
+        return {
+            "status": "failed",
+            "error": str(exc),
+            "full_backtests": full_backtests,
+            "profile_drops": profile_drops,
+        }
+
+
 def cmd_play_hand(
     *,
     instrument: list[str] | None = None,
     instrument_pool: list[str] | None = None,
     timeframe: str,
     max_sweep_permutations: int,
+    min_indicators: int,
     max_indicators: int,
     seed: int | None,
     screen_months: int,
     scrutiny_months: int,
     coarse_mode: str,
     evolutionary_budget: str,
+    final_artifacts: bool,
+    final_profile_drop_count: int,
+    final_profile_drop_workers: int,
     dry_run: bool,
     as_json: bool,
 ) -> int:
@@ -1094,7 +1277,13 @@ def cmd_play_hand(
     rng = random.Random(seed)
     shuffled = list(hand)
     rng.shuffle(shuffled)
-    dealt = shuffled[: max(1, int(max_indicators))]
+    dealt_count = deal_indicator_count(
+        available_count=len(shuffled),
+        min_indicators=min_indicators,
+        max_indicators=max_indicators,
+        rng=rng,
+    )
+    dealt = shuffled[:dealt_count]
     instrument_deal = deal_instruments(
         instrument=instrument,
         instrument_pool=instrument_pool,
@@ -1108,7 +1297,7 @@ def cmd_play_hand(
         "run_id": run_id,
         "runner": "play_hand_v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "canonical_score_lab_version": "score_lab_v2_3",
+        "canonical_score_lab_version": "score_lab_v2_5_1",
         "seed": seed,
         "instrument_source": instrument_deal["source"],
         "primary_instrument": instrument_deal["primary_instrument"],
@@ -1116,16 +1305,24 @@ def cmd_play_hand(
         "instruments": instruments,
         "timeframe": timeframe,
         "dealt_indicator_ids": dealt,
+        "dealt_indicator_count": len(dealt),
+        "min_indicators": min_indicators,
+        "max_indicators": max_indicators,
         "screen_months": screen_months,
         "scrutiny_months": scrutiny_months,
         "coarse_mode": coarse_mode,
         "evolutionary_budget": evolutionary_budget,
+        "final_artifacts": bool(final_artifacts),
+        "final_profile_drop_count": int(final_profile_drop_count),
+        "final_profile_drop_workers": int(final_profile_drop_workers),
         "max_sweep_permutations": max_sweep_permutations,
         "dry_run": dry_run,
     }
     write_run_metadata(run_dir, metadata)
     _render_dealt_hand(
         indicators=dealt,
+        min_indicators=min_indicators,
+        max_indicators=max_indicators,
         instrument_deal=instrument_deal,
         timeframe=timeframe,
         max_sweep_permutations=max_sweep_permutations,
@@ -1133,7 +1330,7 @@ def cmd_play_hand(
         scrutiny_months=scrutiny_months,
         coarse_mode=coarse_mode,
     )
-    stage_total = 7
+    stage_total = 8
     stages = {
         "deal": PlayHandStage(1, stage_total, "Deal hand"),
         "scaffold": PlayHandStage(2, stage_total, "Scaffold profile"),
@@ -1142,6 +1339,7 @@ def cmd_play_hand(
         "coarse": PlayHandStage(5, stage_total, "Coarse parameter sweep"),
         "focused": PlayHandStage(6, stage_total, "Focused refinement sweep"),
         "scrutiny": PlayHandStage(7, stage_total, "Final scrutiny"),
+        "artifacts": PlayHandStage(8, stage_total, "Finalize artifacts"),
     }
     _append_event(
         ctx,
@@ -1149,6 +1347,9 @@ def cmd_play_hand(
         "dealt",
         stage=stages["deal"],
         indicators=dealt,
+        dealt_indicator_count=len(dealt),
+        min_indicators=min_indicators,
+        max_indicators=max_indicators,
         instrument_source=instrument_deal["source"],
         primary_instrument=instrument_deal["primary_instrument"],
         instrument_pool=instrument_deal["instrument_pool"],
@@ -1326,11 +1527,55 @@ def cmd_play_hand(
     )
     phase_rows.append({"phase": "scrutiny", "status": "evaluated", "score": scrutiny.get("score"), "detail": f"{scrutiny_months}mo"})
 
+    final_artifact_summary: dict[str, Any]
+    if final_artifacts:
+        final_artifact_summary = _finalize_run_artifacts(
+            ctx,
+            stage=stages["artifacts"],
+            profile_drop_count=final_profile_drop_count,
+            profile_drop_workers=final_profile_drop_workers,
+        )
+        status = str(final_artifact_summary.get("status") or "")
+        detail_bits: list[str] = []
+        full_backtests = final_artifact_summary.get("full_backtests")
+        if isinstance(full_backtests, dict):
+            detail_bits.append(
+                "full "
+                f"calc={full_backtests.get('calculated', 0)} "
+                f"skip={full_backtests.get('skipped', 0)} "
+                f"fail={full_backtests.get('failed', 0)}"
+            )
+        profile_drops = final_artifact_summary.get("profile_drops")
+        if isinstance(profile_drops, dict):
+            detail_bits.append(
+                "drop "
+                f"render={profile_drops.get('profile_drop_rendered', 0)} "
+                f"cache={profile_drops.get('profile_drop_cached', 0)} "
+                f"fail={profile_drops.get('profile_drop_failed', 0)}"
+            )
+        phase_rows.append(
+            {
+                "phase": "artifacts",
+                "status": status,
+                "score": None,
+                "detail": "; ".join(detail_bits) or final_artifact_summary.get("error") or "",
+            }
+        )
+    else:
+        final_artifact_summary = {
+            "status": "skipped",
+            "reason": "disabled",
+        }
+        _append_event(ctx, "final_artifacts", "skipped", stage=stages["artifacts"], reason="disabled")
+
     summary = {
         "run_id": run_id,
         "run_dir": str(run_dir.resolve()),
         "runner": "play_hand_v1",
         "dealt_indicator_ids": dealt,
+        "dealt_indicator_count": len(dealt),
+        "min_indicators": min_indicators,
+        "max_indicators": max_indicators,
         "instrument_source": instrument_deal["source"],
         "primary_instrument": instrument_deal["primary_instrument"],
         "instrument_pool": instrument_deal["instrument_pool"],
@@ -1343,6 +1588,7 @@ def cmd_play_hand(
         "events_path": str(ctx.events_path.resolve()),
         "attempts_path": str(ctx.attempts_path.resolve()),
         "phase_rows": phase_rows,
+        "final_artifacts": final_artifact_summary,
     }
     _write_json(ctx.summary_path, summary)
     if as_json:

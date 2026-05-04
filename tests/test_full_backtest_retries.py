@@ -273,3 +273,36 @@ def test_copy_full_backtest_outputs_surfaces_profile_not_found_from_result_json(
         assert "Profile not found" in str(exc)
     else:
         raise AssertionError("Expected RuntimeError")
+
+
+def test_attempt_has_backtestable_cell_requires_best_or_robust_cell() -> None:
+    assert (
+        ar_main._attempt_has_backtestable_cell(
+            {"best_summary": {"best_cell": {"reward_multiple": 2.0}}}
+        )
+        is True
+    )
+    assert (
+        ar_main._attempt_has_backtestable_cell(
+            {
+                "best_summary": {
+                    "best_cell": None,
+                    "matrix_summary": {
+                        "robust_cell": {"reward_multiple": 2.0},
+                    },
+                }
+            }
+        )
+        is True
+    )
+    assert (
+        ar_main._attempt_has_backtestable_cell(
+            {
+                "best_summary": {
+                    "best_cell": None,
+                    "matrix_summary": {"robust_cell": None},
+                }
+            }
+        )
+        is False
+    )

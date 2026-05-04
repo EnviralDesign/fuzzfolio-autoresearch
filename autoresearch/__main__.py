@@ -347,10 +347,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Timeframe to scaffold and evaluate. Default: M5.",
     )
     play_hand.add_argument(
+        "--min-indicators",
+        type=int,
+        default=1,
+        help="Minimum number of shuffled seed indicators to deal into the hand. Default: 1.",
+    )
+    play_hand.add_argument(
         "--max-indicators",
         type=int,
         default=4,
-        help="Number of shuffled seed indicators to deal into the hand. Default: 4.",
+        help=(
+            "Maximum number of shuffled seed indicators to deal into the hand. "
+            "Default: 4. Set --min-indicators to the same value for an exact hand size."
+        ),
     )
     play_hand.add_argument(
         "--max-sweep-permutations",
@@ -387,6 +396,26 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["low", "medium", "high"],
         default="low",
         help="Evolutionary budget preset when coarse mode is evolutionary. Default: low.",
+    )
+    play_hand.add_argument(
+        "--no-final-artifacts",
+        action="store_true",
+        help=(
+            "Skip the end-of-run 36mo full-backtest catch-up and profile-drop render. "
+            "By default play-hand heals missing 36mo artifacts for the run and renders the top run-local profile drop."
+        ),
+    )
+    play_hand.add_argument(
+        "--final-profile-drop-count",
+        type=int,
+        default=1,
+        help="How many top run-local attempts to render as 36mo profile drops at wrapup. Default: 1.",
+    )
+    play_hand.add_argument(
+        "--final-profile-drop-workers",
+        type=int,
+        default=1,
+        help="Concurrent profile-drop workers for the play-hand wrapup render. Default: 1.",
     )
     play_hand.add_argument(
         "--dry-run",
@@ -496,35 +525,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-refresh-on-start",
         action="store_true",
         help="Legacy no-op kept for compatibility. The dashboard is always read-only and serves current derived artifacts.",
-    )
-    profile_drop_pngs = subparsers.add_parser(
-        "sync-profile-drop-pngs",
-        help="Rebuild run-local profile-drop PNGs for each run's best scored attempt.",
-    )
-    profile_drop_pngs.add_argument(
-        "--run-id",
-        action="append",
-        default=None,
-        help="Only process the named run id. Can be repeated.",
-    )
-    profile_drop_pngs.add_argument(
-        "--keep-temp",
-        action="store_true",
-        help="Keep temporary package bundles under each run directory instead of deleting them after a successful render.",
-    )
-    profile_drop_pngs.add_argument(
-        "--lookback-months",
-        type=int,
-        default=36,
-        help="Fixed deep-replay lookback window in months for rebuilt profile-drop cards. Default: 36.",
-    )
-    profile_drop_pngs.add_argument(
-        "--force-rebuild",
-        action="store_true",
-        help="Ignore existing profile-drop PNG/manifests and rerender every requested horizon.",
-    )
-    profile_drop_pngs.add_argument(
-        "--json", action="store_true", help="Print machine-readable JSON."
     )
     subparsers.add_parser(
         "reset-runs",
@@ -1063,13 +1063,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     render_corpus_profile_drops = subparsers.add_parser(
         "render-corpus-profile-drops",
-        help="Render attempt-local corpus profile drops for the top ranked attempts, healing missing 36mo full-backtests when needed.",
+        help="Render attempt-local corpus profile drops for attempts, healing missing 36mo full-backtests when needed.",
     )
     render_corpus_profile_drops.add_argument(
         "--top-results",
         type=int,
-        default=100,
-        help="How many ranked corpus attempts to consider. Default: 100",
+        default=None,
+        help="How many ranked corpus attempts to consider. Default: all matched attempts.",
     )
     render_corpus_profile_drops.add_argument(
         "--rank-start",
@@ -3186,6 +3186,20 @@ def _full_backtest_priority_key(row: dict[str, Any] | None) -> tuple[bool, float
     )
 
 
+def _attempt_has_backtestable_cell(attempt: dict[str, Any]) -> bool:
+    best_summary = attempt.get("best_summary")
+    if not isinstance(best_summary, dict):
+        return False
+    if isinstance(best_summary.get("best_cell"), dict):
+        return True
+    matrix_summary = best_summary.get("matrix_summary")
+    if isinstance(matrix_summary, dict) and isinstance(
+        matrix_summary.get("robust_cell"), dict
+    ):
+        return True
+    return False
+
+
 def _detect_dev_sim_worker_count(*, timeout_seconds: float = 2.0) -> int | None:
     try:
         with urllib.request.urlopen(
@@ -4410,10 +4424,6 @@ def _validation_manifest_path(config, run_id: str, lookback_months: int) -> Path
     return _validation_cache_dir(config, run_id, lookback_months) / "manifest.json"
 
 
-def _profile_drop_manifest_path(run_dir: Path, lookback_months: int) -> Path:
-    return run_dir / f"profile-drop-{int(lookback_months)}mo.manifest.json"
-
-
 def _attempt_local_profile_drop_cache_root(
     artifact_dir: Path, lookback_months: int
 ) -> Path:
@@ -4521,6 +4531,7 @@ def _scrutiny_manifest_payload(
         "instruments": list(package_inputs["instruments"]),
         "lookback_months": int(lookback_months),
         "quality_score_preset": str(config.research.quality_score_preset),
+        "score_lab_version": CANONICAL_SCORE_LAB_VERSION,
     }
 
 
@@ -4570,6 +4581,7 @@ def _try_seed_attempt_scrutiny_cache(
         legacy_manifest_path.exists()
         and (legacy_dir / "sensitivity-response.json").exists()
         and (legacy_dir / "best-cell-path-detail.json").exists()
+        and _result_has_canonical_score_lab(legacy_dir / "sensitivity-response.json")
     ):
         legacy_manifest = load_json_if_exists(legacy_manifest_path)
         if (
@@ -4591,7 +4603,11 @@ def _try_seed_attempt_scrutiny_cache(
     if lookback_months == 36:
         full_result_path = artifact_dir / "full-backtest-36mo-result.json"
         full_curve_path = artifact_dir / "full-backtest-36mo-curve.json"
-        if full_result_path.exists() and full_curve_path.exists():
+        if (
+            full_result_path.exists()
+            and full_curve_path.exists()
+            and _result_has_canonical_score_lab(full_result_path)
+        ):
             if cache_dir.exists():
                 shutil.rmtree(cache_dir)
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -5115,266 +5131,6 @@ def _build_validation_rows(
     ]
 
 
-def cmd_sync_profile_drop_pngs(
-    *,
-    run_ids: list[str] | None,
-    keep_temp: bool,
-    lookback_months: int,
-    force_rebuild: bool,
-    as_json: bool,
-) -> int:
-    config = load_config()
-    cli = FuzzfolioCli(config.fuzzfolio)
-    cli.ensure_login()
-    renderer_executable, workspace_root = _resolve_drop_renderer_executable(config)
-    renderer_root = _resolve_drop_renderer_assets_root(config, workspace_root)
-    working_dir = workspace_root or config.repo_root
-
-    all_run_dirs = list_run_dirs(config.runs_root)
-    if run_ids:
-        wanted = {token.strip() for token in run_ids if str(token).strip()}
-        run_dirs = [run_dir for run_dir in all_run_dirs if run_dir.name in wanted]
-        missing = sorted(wanted - {run_dir.name for run_dir in run_dirs})
-        if missing:
-            raise SystemExit(f"Run directories do not exist: {', '.join(missing)}")
-    else:
-        run_dirs = all_run_dirs
-
-    results: list[dict[str, Any]] = []
-    rendered = 0
-    skipped = 0
-    failed = 0
-
-    total_runs = len(run_dirs)
-    use_progress = (
-        (not as_json)
-        and (not PLAIN_PROGRESS_MODE)
-        and bool(getattr(console, "is_terminal", False))
-    )
-    progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[bold cyan]{task.description}"),
-        BarColumn(bar_width=32),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        transient=False,
-        disable=not use_progress,
-    )
-
-    def emit(message: str) -> None:
-        if as_json:
-            return
-        if use_progress:
-            progress.console.print(message)
-            return
-        _write_plain_line(message)
-
-    with progress:
-        task_id = progress.add_task("sync profile drops", total=total_runs or 1)
-        for index, run_dir in enumerate(run_dirs, start=1):
-            progress.update(
-                task_id,
-                description=(
-                    f"sync {index}/{total_runs} "
-                    f"[green]ok={rendered}[/green] "
-                    f"[yellow]skip={skipped}[/yellow] "
-                    f"[red]fail={failed}[/red] "
-                    f"{run_dir.name}"
-                ),
-            )
-            temp_root = run_dir / ".profile-drop-sync"
-            result: dict[str, Any] = {"run_id": run_dir.name}
-            try:
-                emit(f"sync {index}/{total_runs} {run_dir.name}")
-                attempts = load_run_attempts(run_dir)
-                best_attempt = _best_attempt_for_run(
-                    attempts,
-                    lower_is_better=config.research.plot_lower_is_better,
-                )
-                if best_attempt is None:
-                    skipped += 1
-                    result["status"] = "skipped"
-                    result["reason"] = "No scored attempts exist for this run."
-                    emit("  skipped: no scored attempts")
-                    results.append(result)
-                    progress.advance(task_id, 1)
-                    continue
-
-                emit(
-                    "  best attempt: "
-                    f"{best_attempt.get('attempt_id')} "
-                    f"score={float(best_attempt.get('composite_score')):.3f}"
-                )
-                package_inputs = _build_package_inputs(
-                    best_attempt, run_dir=run_dir, attempts=attempts
-                )
-                profile_path = package_inputs.get("profile_path")
-                profile_ref = str(
-                    package_inputs.get("profile_ref")
-                    or best_attempt.get("profile_ref")
-                    or ""
-                ).strip()
-                recreated_profile = False
-
-                if profile_ref:
-                    emit(f"  checking cloud profile: {profile_ref}")
-                    if not _cloud_profile_exists(cli, profile_ref):
-                        profile_ref = ""
-                if not profile_ref:
-                    if not isinstance(profile_path, Path) or not profile_path.exists():
-                        raise RuntimeError(
-                            f"Best attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
-                        )
-                    emit("  cloud profile missing, recreating from local profile")
-                    profile_ref = _create_cloud_profile(cli, profile_path)
-                    _update_attempt_profile_ref(
-                        run_dir, str(best_attempt.get("attempt_id") or ""), profile_ref
-                    )
-                    recreated_profile = True
-
-                if temp_root.exists():
-                    shutil.rmtree(temp_root)
-                rendered_pngs: list[str] = []
-                skipped_horizons: list[int] = []
-                requested_horizons = [int(lookback_months)]
-                for horizon_months in requested_horizons:
-                    horizon_manifest_payload = {
-                        "version": 1,
-                        "run_id": run_dir.name,
-                        "attempt_id": str(best_attempt.get("attempt_id") or ""),
-                        "candidate_name": str(best_attempt.get("candidate_name") or ""),
-                        "profile_ref": profile_ref,
-                        "timeframe": str(package_inputs["timeframe"]),
-                        "instruments": list(package_inputs["instruments"]),
-                        "lookback_months": int(horizon_months),
-                        "quality_score_preset": str(
-                            config.research.quality_score_preset
-                        ),
-                    }
-                    horizon_manifest_path = _profile_drop_manifest_path(
-                        run_dir, horizon_months
-                    )
-                    png_path = run_dir / f"profile-drop-{horizon_months}mo.png"
-                    if (
-                        not force_rebuild
-                        and png_path.exists()
-                        and horizon_manifest_path.exists()
-                        and _load_json_if_exists(horizon_manifest_path)
-                        == horizon_manifest_payload
-                    ):
-                        emit(f"  skipping {png_path.name}: up to date")
-                        rendered_pngs.append(str(png_path))
-                        skipped_horizons.append(horizon_months)
-                        continue
-                    package_output_root = temp_root / f"package-root-{horizon_months}mo"
-                    package_output_root.mkdir(parents=True, exist_ok=True)
-                    emit(
-                        "  packaging: "
-                        f"timeframe={package_inputs['timeframe']} "
-                        f"instruments={','.join(package_inputs['instruments'])} "
-                        f"lookback={horizon_months}mo"
-                    )
-                    if package_inputs.get("recovered_from_sweep"):
-                        emit("  recovered package inputs from sweep base profile")
-                    package_args = [
-                        "package",
-                        "--profile-ref",
-                        profile_ref,
-                        "--timeframe",
-                        str(package_inputs["timeframe"]),
-                        "--lookback-months",
-                        str(horizon_months),
-                        "--output-root",
-                        str(package_output_root),
-                        "--label",
-                        f"{run_dir.name}-{horizon_months}mo",
-                        "--skip-catalogs",
-                        "--skip-render-capture",
-                        "--allow-timeframe-mismatch",
-                        "--quality-score-preset",
-                        str(config.research.quality_score_preset),
-                    ]
-                    for instrument in package_inputs["instruments"]:
-                        package_args.extend(["--instrument", str(instrument)])
-                    cli.run(package_args, cwd=working_dir)
-
-                    bundle_dir = _discover_bundle_dir(package_output_root)
-                    png_path = run_dir / f"profile-drop-{horizon_months}mo.png"
-                    emit(f"  rendering {png_path.name}")
-                    renderer_argv = [str(renderer_executable)]
-                    if workspace_root is not None:
-                        renderer_argv.extend(["--workspace-root", str(workspace_root)])
-                    if renderer_root is not None:
-                        renderer_argv.extend(["--renderer-root", str(renderer_root)])
-                    renderer_argv.extend(
-                        [
-                            "render",
-                            "--bundle",
-                            str(bundle_dir),
-                            "--out",
-                            str(png_path),
-                        ]
-                    )
-                    _run_external(renderer_argv, cwd=working_dir)
-                    _write_json_file(horizon_manifest_path, horizon_manifest_payload)
-                    rendered_pngs.append(str(png_path))
-
-                if not keep_temp:
-                    if temp_root.exists():
-                        shutil.rmtree(temp_root)
-
-                rendered_horizons = [
-                    months
-                    for months in requested_horizons
-                    if months not in skipped_horizons
-                ]
-                if rendered_horizons or recreated_profile:
-                    rendered += 1
-                    emit(
-                        "  done"
-                        + (" (recreated cloud profile)" if recreated_profile else "")
-                    )
-                    status = "rendered"
-                else:
-                    skipped += 1
-                    emit("  skipped: all requested horizons already up to date")
-                    status = "skipped"
-                result.update(
-                    {
-                        "status": status,
-                        "png_paths": rendered_pngs,
-                        "profile_ref": profile_ref,
-                        "recreated_profile": recreated_profile,
-                        "lookback_months": lookback_months,
-                        "rendered_horizons": rendered_horizons,
-                        "skipped_horizons": skipped_horizons,
-                        "attempt_id": best_attempt.get("attempt_id"),
-                        "candidate_name": best_attempt.get("candidate_name"),
-                    }
-                )
-            except Exception as exc:
-                failed += 1
-                result["status"] = "failed"
-                result["error"] = str(exc)
-                emit(f"  failed: {exc}")
-                if temp_root.exists():
-                    result["temp_root"] = str(temp_root)
-            results.append(result)
-            progress.advance(task_id, 1)
-
-    payload = {
-        "runs_considered": len(run_dirs),
-        "rendered": rendered,
-        "skipped": skipped,
-        "failed": failed,
-        "results": results,
-    }
-    print(json.dumps(payload, ensure_ascii=True, indent=2))
-    return 0 if failed == 0 else 1
-
-
 def cmd_calculate_full_backtests(
     *,
     run_ids: list[str] | None,
@@ -5419,12 +5175,16 @@ def cmd_calculate_full_backtests(
     filter_rejections = {
         "already_has_full_backtest": 0,
         "missing_scrutiny_36m": 0,
+        "no_backtestable_cell": 0,
     }
     eligible_items: list[tuple[Path, dict[str, Any], dict[str, Any]]] = []
     for run_dir, _attempts, attempt in matched_items:
         row = catalog_by_attempt_id.get(str(attempt.get("attempt_id") or "")) or {}
         if not needs_calculation(attempt):
             filter_rejections["already_has_full_backtest"] += 1
+            continue
+        if not _attempt_has_backtestable_cell(attempt):
+            filter_rejections["no_backtestable_cell"] += 1
             continue
         if require_scrutiny_36 and not bool(row.get("has_scrutiny_36m")):
             filter_rejections["missing_scrutiny_36m"] += 1
@@ -5800,6 +5560,7 @@ def _render_profile_drop_for_attempt(
         "instruments": list(package_inputs["instruments"]),
         "lookback_months": int(lookback_months),
         "quality_score_preset": str(config.research.quality_score_preset),
+        "score_lab_version": CANONICAL_SCORE_LAB_VERSION,
     }
 
     expected_cached_manifest: dict[str, Any] | None = None
@@ -5914,6 +5675,12 @@ def _render_profile_drop_for_attempt(
     cli.run(package_args, cwd=working_dir, timeout_seconds=float(timeout_seconds))
 
     bundle_dir = _discover_bundle_dir(package_output_root)
+    bundle_response_path = bundle_dir / "sensitivity-response.json"
+    if not _result_has_canonical_score_lab(bundle_response_path):
+        raise RuntimeError(
+            "Packaged profile-drop bundle is missing canonical "
+            f"{CANONICAL_SCORE_LAB_VERSION} score_lab: {bundle_response_path}"
+        )
     profile_document_path, source_profile_document_payload = load_profile_document(bundle_dir)
     if not isinstance(source_profile_document_payload, dict):
         raise RuntimeError(
@@ -8492,7 +8259,7 @@ def cmd_render_corpus_profile_drops(
     *,
     run_ids: list[str] | None,
     attempt_ids: list[str] | None,
-    top_results: int,
+    top_results: int | None,
     rank_start: int,
     lookback_months: int,
     profile_drop_workers: int,
@@ -8501,7 +8268,7 @@ def cmd_render_corpus_profile_drops(
     as_json: bool,
 ) -> int:
     config = load_config()
-    limit = max(1, int(top_results))
+    limit = None if top_results is None else max(1, int(top_results))
     rank_start = max(0, int(rank_start))
     lookback_months = int(lookback_months)
     worker_count = max(1, int(profile_drop_workers))
@@ -8519,6 +8286,8 @@ def cmd_render_corpus_profile_drops(
                 if str(row.get("attempt_id") or "").strip() in wanted_attempt_ids
             ]
         rows.sort(key=_full_backtest_priority_key)
+        if limit is None:
+            return rows[rank_start:]
         return rows[rank_start : rank_start + limit]
 
     full_catalog_rows, corpus_index_info = _selection_corpus_rows(
@@ -8819,12 +8588,16 @@ def main() -> int:
             instrument_pool=args.instrument_pool,
             timeframe=args.timeframe,
             max_sweep_permutations=args.max_sweep_permutations,
+            min_indicators=args.min_indicators,
             max_indicators=args.max_indicators,
             seed=args.seed,
             screen_months=args.screen_months,
             scrutiny_months=args.scrutiny_months,
             coarse_mode=args.coarse_mode,
             evolutionary_budget=args.evolutionary_budget,
+            final_artifacts=not bool(args.no_final_artifacts),
+            final_profile_drop_count=args.final_profile_drop_count,
+            final_profile_drop_workers=args.final_profile_drop_workers,
             dry_run=bool(args.dry_run),
             as_json=bool(args.json),
         )
@@ -8850,14 +8623,6 @@ def main() -> int:
             limit=int(args.limit),
             refresh_on_start=not bool(args.no_refresh_on_start),
             force_rebuild=bool(args.force_rebuild),
-        )
-    if args.command == "sync-profile-drop-pngs":
-        return cmd_sync_profile_drop_pngs(
-            run_ids=args.run_id,
-            keep_temp=bool(args.keep_temp),
-            lookback_months=int(args.lookback_months),
-            force_rebuild=bool(args.force_rebuild),
-            as_json=bool(args.json),
         )
     if args.command == "calculate-full-backtests":
         return cmd_calculate_full_backtests(
@@ -8972,7 +8737,7 @@ def main() -> int:
         return cmd_render_corpus_profile_drops(
             run_ids=args.run_id,
             attempt_ids=args.attempt_id,
-            top_results=int(args.top_results),
+            top_results=args.top_results,
             rank_start=int(args.rank_start),
             lookback_months=int(args.lookback_months),
             profile_drop_workers=int(args.profile_drop_workers),

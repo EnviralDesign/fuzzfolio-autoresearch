@@ -1097,7 +1097,7 @@ def test_build_parser_includes_render_corpus_profile_drops_defaults() -> None:
     args = parser.parse_args(["render-corpus-profile-drops"])
 
     assert args.command == "render-corpus-profile-drops"
-    assert args.top_results == 100
+    assert args.top_results is None
     assert args.rank_start == 0
     assert args.lookback_months == 36
     assert args.profile_drop_workers == 4
@@ -1105,15 +1105,6 @@ def test_build_parser_includes_render_corpus_profile_drops_defaults() -> None:
     assert args.force_rebuild is False
     assert args.run_id is None
     assert args.attempt_id is None
-
-
-def test_build_parser_sync_profile_drop_pngs_defaults_to_36mo_only() -> None:
-    parser = ar_main.build_parser()
-
-    args = parser.parse_args(["sync-profile-drop-pngs"])
-
-    assert args.command == "sync-profile-drop-pngs"
-    assert args.lookback_months == 36
 
 
 def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(
@@ -1509,6 +1500,26 @@ def test_apply_profile_drop_description_fallback_rewrites_bundle_profile(tmp_pat
     assert updated["profile"]["description"] == applied
 
 
+def _write_canonical_profile_drop_response(bundle_dir: Path) -> None:
+    (bundle_dir / "sensitivity-response.json").write_text(
+        json.dumps(
+            {
+                "data": {
+                    "aggregate": {
+                        "score_lab": {
+                            "version": ar_main.CANONICAL_SCORE_LAB_VERSION,
+                            "score": 42.0,
+                        }
+                    }
+                }
+            },
+            ensure_ascii=True,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_render_profile_drop_for_attempt_generates_reuses_and_regenerates_metadata(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -1528,6 +1539,7 @@ def test_render_profile_drop_for_attempt_generates_reuses_and_regenerates_metada
             output_root_arg = Path(args[args.index("--output-root") + 1])
             bundle_dir = output_root_arg / "bundle-0001"
             bundle_dir.mkdir(parents=True, exist_ok=True)
+            _write_canonical_profile_drop_response(bundle_dir)
             (bundle_dir / "profile-document.json").write_text(
                 json.dumps(
                     {
@@ -1676,6 +1688,7 @@ def test_render_profile_drop_for_attempt_generates_reuses_and_regenerates_metada
 
     stale_metadata = ar_main.load_json_if_exists(metadata_path)
     stale_metadata["presentation_signature"] = "stale-signature"
+    stale_metadata["writer_profile"] = "stale-writer"
     metadata_path.write_text(json.dumps(stale_metadata, ensure_ascii=True, indent=2), encoding="utf-8")
 
     result_regenerated = ar_main._render_profile_drop_for_attempt(
@@ -1712,6 +1725,7 @@ def test_render_profile_drop_for_attempt_falls_back_when_metadata_writer_fails(
             output_root_arg = Path(args[args.index("--output-root") + 1])
             bundle_dir = output_root_arg / "bundle-0001"
             bundle_dir.mkdir(parents=True, exist_ok=True)
+            _write_canonical_profile_drop_response(bundle_dir)
             (bundle_dir / "profile-document.json").write_text(
                 json.dumps(
                     {
@@ -1826,6 +1840,7 @@ def test_render_profile_drop_for_attempt_attempt_local_layout_caches_in_hidden_f
             output_root_arg = Path(args[args.index("--output-root") + 1])
             bundle_dir = output_root_arg / "bundle-0001"
             bundle_dir.mkdir(parents=True, exist_ok=True)
+            _write_canonical_profile_drop_response(bundle_dir)
             (bundle_dir / "profile-document.json").write_text(
                 json.dumps(
                     {
@@ -1946,6 +1961,7 @@ def test_render_profile_drop_for_attempt_uses_cache_before_cloud_profile_repair(
             output_root_arg = Path(args[args.index("--output-root") + 1])
             bundle_dir = output_root_arg / "bundle-0001"
             bundle_dir.mkdir(parents=True, exist_ok=True)
+            _write_canonical_profile_drop_response(bundle_dir)
             (bundle_dir / "profile-document.json").write_text(
                 json.dumps(
                     {

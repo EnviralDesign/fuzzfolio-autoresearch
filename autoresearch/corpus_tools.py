@@ -6,7 +6,7 @@ from math import log1p
 from pathlib import Path
 from typing import Any, Callable
 
-from .scoring import build_attempt_score
+from .scoring import CANONICAL_SCORE_LAB_VERSION, build_attempt_score
 
 
 SCRUTINY_CACHE_DIRNAME = "scrutiny-cache"
@@ -406,6 +406,18 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
         aggregate = nested_get(result_payload, ["data"])
     if result_exists and not isinstance(aggregate, dict):
         issues.append("missing_result_aggregate")
+    if result_exists and isinstance(aggregate, dict):
+        score_lab = aggregate.get("score_lab")
+        if not isinstance(score_lab, dict):
+            score_lab = aggregate.get("scoreLab")
+        if not isinstance(score_lab, dict):
+            issues.append("missing_canonical_score_lab")
+        else:
+            score_lab_version = str(score_lab.get("version") or "").strip()
+            if score_lab_version != CANONICAL_SCORE_LAB_VERSION:
+                issues.append(f"stale_score_lab:{score_lab_version or 'missing'}")
+            if score_lab.get("score") is None:
+                issues.append("missing_score_lab_score")
 
     curve_points = nested_get(curve_payload, ["curve", "points"])
     if curve_exists and not isinstance(curve_points, list):

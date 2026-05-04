@@ -3,18 +3,68 @@ from pathlib import Path
 
 from autoresearch.play_hand import (
     _best_sweep_parameters,
+    _json_payload_from_stdout,
     _normalize_sweep_payload,
     _parameter_importance,
+    _play_hand_artifact_commands,
     _top_sweep_score,
     apply_play_hand_profile_defaults,
     build_coarse_axes,
     build_focused_axes,
     build_lookback_axes,
     build_required_lookback_axes,
+    deal_indicator_count,
     deal_instruments,
     fit_axes_to_permutation_budget,
     materialize_profile_variant,
 )
+
+
+def test_play_hand_artifact_commands_heal_full_backtests_and_top_drop() -> None:
+    commands = _play_hand_artifact_commands(
+        run_id="run-123",
+        profile_drop_count=1,
+        profile_drop_workers=2,
+    )
+
+    assert commands[0][-4:] == [
+        "calculate-full-backtests",
+        "--run-ids",
+        "run-123",
+        "--json",
+    ]
+    drop_command = commands[1]
+    assert drop_command[:3][-2:] == ["-m", "autoresearch"]
+    for expected in (
+        "render-corpus-profile-drops",
+        "--run-id",
+        "run-123",
+        "--top-results",
+        "1",
+        "--lookback-months",
+        "36",
+        "--profile-drop-workers",
+        "2",
+        "--json",
+    ):
+        assert expected in drop_command
+
+
+def test_play_hand_artifact_commands_can_skip_profile_drops() -> None:
+    commands = _play_hand_artifact_commands(
+        run_id="run-123",
+        profile_drop_count=0,
+        profile_drop_workers=1,
+    )
+
+    assert len(commands) == 1
+    assert "calculate-full-backtests" in commands[0]
+
+
+def test_json_payload_from_stdout_accepts_trailing_json_payload() -> None:
+    payload = _json_payload_from_stdout('noise\\n{"calculated": 2, "failed": 0}\\n')
+
+    assert payload == {"calculated": 2, "failed": 0}
 
 
 def _profile_payload() -> dict:
@@ -81,6 +131,45 @@ def test_deal_instruments_shuffles_from_pool_when_unpinned() -> None:
     assert dealt["primary_instrument"] in {"EURUSD", "GBPUSD", "XAUUSD"}
     assert dealt["instruments"] == [dealt["primary_instrument"]]
     assert dealt["instrument_pool"] == ["EURUSD", "GBPUSD", "XAUUSD"]
+
+
+def test_deal_indicator_count_varies_inside_min_max_range() -> None:
+    counts = {
+        deal_indicator_count(
+            available_count=8,
+            min_indicators=1,
+            max_indicators=4,
+            rng=random.Random(seed),
+        )
+        for seed in range(20)
+    }
+
+    assert counts <= {1, 2, 3, 4}
+    assert len(counts) >= 2
+
+
+def test_deal_indicator_count_supports_exact_hand_size() -> None:
+    assert (
+        deal_indicator_count(
+            available_count=8,
+            min_indicators=4,
+            max_indicators=4,
+            rng=random.Random(1),
+        )
+        == 4
+    )
+
+
+def test_deal_indicator_count_clamps_to_available_hand() -> None:
+    assert (
+        deal_indicator_count(
+            available_count=3,
+            min_indicators=2,
+            max_indicators=8,
+            rng=random.Random(1),
+        )
+        <= 3
+    )
 
 
 def test_coarse_axes_uses_numeric_talib_parameters() -> None:

@@ -514,7 +514,6 @@ uv run autoresearch run --max-steps 20
 uv run autoresearch supervise
 uv run autoresearch plot --all-runs
 uv run autoresearch leaderboard
-uv run autoresearch sync-profile-drop-pngs
 uv run autoresearch prune-runs
 uv run autoresearch stop-all-runs
 uv run autoresearch purge-cloud-profiles
