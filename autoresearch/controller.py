@@ -5061,13 +5061,52 @@ class ResearchController:
         return result
 
     @staticmethod
+    def _seed_indicator_role_from_id(indicator_id: str) -> str:
+        token = str(indicator_id or "").strip().upper()
+        if not token:
+            return "state"
+        if any(
+            marker in token
+            for marker in (
+                "CROSSBACK",
+                "CROSSOVER",
+                "RECLAIM",
+                "REENTRY",
+                "BREAKOUT",
+                "WICK_REJECTION",
+            )
+        ):
+            return "trigger"
+        if token in {"ADX", "ATR_VOLATILITY_FILTER"} or "FILTER" in token:
+            return "context"
+        if any(
+            marker in token
+            for marker in (
+                "MEAN_REVERSION",
+                "STRETCH",
+                "OSCILLATOR",
+                "RSI",
+                "STOCH",
+                "CCI",
+                "CMO",
+                "MFI",
+                "WILLR",
+            )
+        ):
+            return "setup"
+        if any(marker in token for marker in ("TREND", "SLOPE", "SPREAD", "CHANNEL")):
+            return "context"
+        return "state"
+
+    @classmethod
     def _seed_indicator_role(
+        cls,
         indicator_id: str,
         indicator_metadata: dict[str, dict[str, Any]] | None = None,
     ) -> str:
         metadata = (indicator_metadata or {}).get(str(indicator_id or "").strip().upper())
         if not isinstance(metadata, dict):
-            return "state"
+            return cls._seed_indicator_role_from_id(indicator_id)
         role = str(
             metadata.get("signal_role") or metadata.get("signalRole") or ""
         ).strip().lower()

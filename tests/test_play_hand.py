@@ -4,8 +4,10 @@ from pathlib import Path
 import pytest
 
 from autoresearch.play_hand import (
+    PlayHandContext,
     _best_sweep_parameters,
     _curve_features,
+    _finalize_play_hand_attempt_metadata,
     _instrument_curve_similarity,
     _json_payload_from_stdout,
     _normalize_sweep_payload,
@@ -34,6 +36,7 @@ from autoresearch.play_hand import (
     play_hand_reward_matrix,
     resolve_sweep_budget,
 )
+from autoresearch.ledger import load_attempts, write_attempts
 
 
 def test_play_hand_artifact_commands_heal_full_backtests_and_top_drop() -> None:
@@ -89,6 +92,86 @@ def test_play_hand_artifact_commands_target_final_attempt_for_profile_drop() -> 
     assert "--attempt-id" in drop_command
     assert "run-123-attempt-00011" in drop_command
     assert "--top-results" not in drop_command
+
+
+def test_finalize_play_hand_attempt_metadata_marks_canonical_and_scout_decisions(tmp_path: Path) -> None:
+    attempts_path = tmp_path / "attempts.jsonl"
+    write_attempts(
+        attempts_path,
+        [
+            {
+                "attempt_id": "run-1-attempt-00001",
+                "run_id": "run-1",
+                "candidate_name": "baseline_3mo",
+            },
+            {
+                "attempt_id": "run-1-attempt-00002",
+                "run_id": "run-1",
+                "candidate_name": "instrument_scout_USDJPY_3mo",
+            },
+            {
+                "attempt_id": "run-1-attempt-00003",
+                "run_id": "run-1",
+                "candidate_name": "instrument_scout_USDCHF_3mo",
+            },
+            {
+                "attempt_id": "run-1-attempt-00004",
+                "run_id": "run-1",
+                "candidate_name": "final_36mo",
+            },
+        ],
+    )
+    ctx = PlayHandContext(
+        config=None,
+        cli=None,
+        run_id="run-1",
+        run_dir=tmp_path,
+        profiles_dir=tmp_path / "profiles",
+        evals_dir=tmp_path / "evals",
+        attempts_path=attempts_path,
+        events_path=tmp_path / "events.jsonl",
+        summary_path=tmp_path / "summary.json",
+    )
+
+    reward_matrix = play_hand_reward_matrix(4)
+    summary = _finalize_play_hand_attempt_metadata(
+        ctx,
+        final_attempt_id="run-1-attempt-00004",
+        scout_result={
+            "primary": {
+                "attempt_id": "run-1-attempt-00002",
+                "instrument": "USDJPY",
+            },
+            "accepted": [],
+            "rejected": [
+                {
+                    "attempt_id": "run-1-attempt-00003",
+                    "instrument": "USDCHF",
+                    "decision_reasons": ["too_similar_to_selected"],
+                }
+            ],
+        },
+        selected_instruments=["XAUUSD", "USDJPY"],
+        reward_matrix=reward_matrix,
+    )
+
+    attempts = {row["attempt_id"]: row for row in load_attempts(attempts_path)}
+    assert summary["updated_count"] == 4
+    assert attempts["run-1-attempt-00001"]["attempt_decision"] == "intermediate"
+    assert attempts["run-1-attempt-00002"]["attempt_decision"] == "accepted"
+    assert attempts["run-1-attempt-00003"]["attempt_decision"] == "rejected"
+    assert attempts["run-1-attempt-00003"]["attempt_decision_reasons"] == [
+        "too_similar_to_selected"
+    ]
+    final_attempt = attempts["run-1-attempt-00004"]
+    assert final_attempt["is_canonical_playhand_attempt"] is True
+    assert final_attempt["attempt_role"] == "final"
+    assert final_attempt["attempt_decision"] == "canonical"
+    assert final_attempt["canonical_attempt_id"] == "run-1-attempt-00004"
+    assert final_attempt["play_hand_selected_instruments"] == ["XAUUSD", "USDJPY"]
+    assert final_attempt["reward_step_r"] == 0.5
+    assert final_attempt["reward_columns"] == 8
+    assert final_attempt["effective_max_reward_r"] == 4.0
 
 
 def test_play_hand_reward_matrix_caps_default_reward_grid() -> None:

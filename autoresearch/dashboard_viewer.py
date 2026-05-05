@@ -13,6 +13,12 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import AppConfig
 from .ledger import list_run_dirs, load_run_metadata
+from .portfolio import (
+    dashboard_attempt_score_sort_key,
+    dashboard_run_attempt_sort_key,
+    is_dashboard_canonical_attempt,
+    select_dashboard_preferred_attempt_rows,
+)
 
 
 DASHBOARD_APP_ROOT = Path(__file__).resolve().parent / "dashboard"
@@ -62,6 +68,12 @@ def _dashboard_frontend_signature() -> tuple[tuple[str, bool, int | None, int | 
         DASHBOARD_APP_ROOT / "src" / "App.tsx",
         DASHBOARD_APP_ROOT / "src" / "main.tsx",
         DASHBOARD_APP_ROOT / "src" / "index.css",
+        DASHBOARD_APP_ROOT / "src" / "lib" / "types.ts",
+        DASHBOARD_APP_ROOT / "src" / "components" / "attempt-table.tsx",
+        DASHBOARD_APP_ROOT / "src" / "pages" / "CatalogPage.tsx",
+        DASHBOARD_APP_ROOT / "src" / "pages" / "PortfolioWorkbenchPage.tsx",
+        DASHBOARD_APP_ROOT / "src" / "pages" / "RunDetailPage.tsx",
+        DASHBOARD_APP_ROOT / "src" / "pages" / "RunsPage.tsx",
         DASHBOARD_APP_ROOT / "package.json",
         DASHBOARD_DIST_ROOT / "index.html",
     ]
@@ -75,7 +87,12 @@ def _ensure_dashboard_dist() -> None:
             DASHBOARD_APP_ROOT / "src" / "App.tsx",
             DASHBOARD_APP_ROOT / "src" / "main.tsx",
             DASHBOARD_APP_ROOT / "src" / "index.css",
+            DASHBOARD_APP_ROOT / "src" / "lib" / "types.ts",
+            DASHBOARD_APP_ROOT / "src" / "components" / "attempt-table.tsx",
+            DASHBOARD_APP_ROOT / "src" / "pages" / "CatalogPage.tsx",
             DASHBOARD_APP_ROOT / "src" / "pages" / "PortfolioWorkbenchPage.tsx",
+            DASHBOARD_APP_ROOT / "src" / "pages" / "RunDetailPage.tsx",
+            DASHBOARD_APP_ROOT / "src" / "pages" / "RunsPage.tsx",
             DASHBOARD_APP_ROOT / "package.json",
         ]
         dist_mtime = index_path.stat().st_mtime_ns
@@ -275,21 +292,17 @@ def _normalize_path_fields(config: AppConfig, row: dict[str, Any]) -> dict[str, 
     return normalized
 
 
-def _score_sort_key(row: dict[str, Any]) -> tuple[bool, float, float, str]:
-    score_36 = _safe_float(row.get("score_36m"))
-    composite = _safe_float(row.get("composite_score"))
-    primary = (
-        score_36
-        if score_36 is not None
-        else (composite if composite is not None else float("-inf"))
-    )
-    secondary = composite if composite is not None else float("-inf")
-    return (
-        primary == float("-inf"),
-        -primary,
-        -secondary,
-        str(row.get("attempt_id") or ""),
-    )
+def _is_canonical_playhand_attempt(row: dict[str, Any]) -> bool:
+    return is_dashboard_canonical_attempt(row)
+
+
+def _preferred_run_attempt(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    selected, _info = select_dashboard_preferred_attempt_rows(rows)
+    return selected[0] if selected else None
+
+
+def _run_attempt_sort_key(row: dict[str, Any]) -> tuple[bool, tuple[bool, float, float, str]]:
+    return dashboard_run_attempt_sort_key(row)
 
 
 def _build_run_summaries(config: AppConfig, catalog_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -307,8 +320,7 @@ def _build_run_summaries(config: AppConfig, catalog_rows: list[dict[str, Any]]) 
     run_summaries: list[dict[str, Any]] = []
     for run_id, rows in grouped.items():
         metadata = metadata_by_run_id.get(run_id) or {}
-        sorted_rows = sorted(rows, key=_score_sort_key)
-        best_row = sorted_rows[0] if sorted_rows else None
+        best_row = _preferred_run_attempt(rows)
         created_at_values = [str(row.get("created_at") or "") for row in rows if row.get("created_at")]
         latest_created_at = max(created_at_values) if created_at_values else None
         progress_png = config.runs_root / run_id / "progress.png"
@@ -333,6 +345,8 @@ def _build_run_summaries(config: AppConfig, catalog_rows: list[dict[str, Any]]) 
                     1 for row in rows if _safe_float(row.get("score_36m")) is not None
                 ),
                 "best_attempt": _normalize_path_fields(config, best_row) if best_row else None,
+                "canonical_attempt_id": metadata.get("canonical_attempt_id"),
+                "canonical_candidate_name": metadata.get("canonical_candidate_name"),
                 "progress_png_url": _file_url(config, progress_png) if progress_png.exists() else None,
             }
         )
@@ -487,7 +501,7 @@ def _merge_attempt_unions(
             prior[label_field] = labels
             prior[f"{label_field}_count"] = len(labels)
     merged_rows = list(merged.values())
-    merged_rows.sort(key=_score_sort_key)
+    merged_rows.sort(key=dashboard_attempt_score_sort_key)
     return merged_rows
 
 
@@ -714,7 +728,7 @@ def _run_detail_payload(
         (row for row in _build_run_summaries(config, catalog_rows) if row["run_id"] == run_id),
         None,
     )
-    attempts.sort(key=_score_sort_key)
+    attempts.sort(key=_run_attempt_sort_key)
     return {
         "run": run_summary,
         "attempts": attempts,

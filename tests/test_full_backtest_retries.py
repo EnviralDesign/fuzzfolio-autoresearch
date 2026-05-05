@@ -157,6 +157,11 @@ def test_run_full_backtest_forwards_normalized_quality_score_preset(
         "artifact_dir": str(artifact_dir),
         "profile_ref": "cloud-ref",
         "profile_path": str(profile_path),
+        "reward_matrix": {
+            "reward_step_r": 0.5,
+            "reward_columns": 8,
+            "effective_max_reward_r": 4.0,
+        },
     }
 
     seen_args: list[str] = []
@@ -196,6 +201,10 @@ def test_run_full_backtest_forwards_normalized_quality_score_preset(
     assert "--quality-score-preset" in seen_args
     preset_index = seen_args.index("--quality-score-preset")
     assert seen_args[preset_index + 1] == "profile-drop"
+    reward_step_index = seen_args.index("--reward-step-r")
+    assert seen_args[reward_step_index + 1] == "0.5"
+    reward_columns_index = seen_args.index("--reward-columns")
+    assert seen_args[reward_columns_index + 1] == "8"
     assert seen_args.count("--instrument") == 2
 
 
@@ -306,3 +315,55 @@ def test_attempt_has_backtestable_cell_requires_best_or_robust_cell() -> None:
         )
         is False
     )
+
+
+def test_result_matches_attempt_reward_matrix_rejects_expanded_reward_grid(
+    tmp_path: Path,
+) -> None:
+    result_path = tmp_path / "full-backtest-36mo-result.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "data": {
+                    "aggregate": {
+                        "matrix_summary": {
+                            "reward_column_summaries": [
+                                {"reward_multiple": 0.5},
+                                {"reward_multiple": 4.0},
+                                {"reward_multiple": 12.5},
+                            ]
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    attempt = {
+        "reward_matrix": {
+            "reward_step_r": 0.5,
+            "reward_columns": 8,
+            "effective_max_reward_r": 4.0,
+        }
+    }
+
+    assert ar_main._result_matches_attempt_reward_matrix(result_path, attempt) is False
+
+
+def test_attempt_with_run_reward_matrix_uses_run_metadata() -> None:
+    attempt = {"attempt_id": "run-attempt-1"}
+    merged = ar_main._attempt_with_run_reward_matrix(
+        attempt,
+        run_metadata={
+            "reward_matrix": {
+                "requested_max_reward_r": 4.0,
+                "reward_step_r": 0.5,
+                "reward_columns": 8,
+                "effective_max_reward_r": 4.0,
+            }
+        },
+    )
+
+    assert merged["max_reward_r"] == 4.0
+    assert merged["reward_columns"] == 8
+    assert attempt.get("reward_columns") is None

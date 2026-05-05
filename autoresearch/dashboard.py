@@ -92,6 +92,68 @@ def _quality_score_preset_cli_value(config: AppConfig) -> str:
     return preset or "profile-drop"
 
 
+def _positive_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _reward_matrix_from_attempt(attempt: dict[str, Any]) -> dict[str, Any] | None:
+    raw_matrix = attempt.get("reward_matrix")
+    if isinstance(raw_matrix, dict):
+        reward_step = _positive_float(raw_matrix.get("reward_step_r"))
+        reward_columns = _positive_int(raw_matrix.get("reward_columns"))
+        if reward_step is not None and reward_columns is not None:
+            effective_max = _positive_float(raw_matrix.get("effective_max_reward_r"))
+            if effective_max is None:
+                effective_max = round(reward_step * reward_columns, 6)
+            return {
+                **raw_matrix,
+                "reward_step_r": reward_step,
+                "reward_columns": reward_columns,
+                "effective_max_reward_r": effective_max,
+            }
+
+    reward_step = _positive_float(attempt.get("reward_step_r"))
+    reward_columns = _positive_int(attempt.get("reward_columns"))
+    if reward_step is None or reward_columns is None:
+        return None
+    effective_max = _positive_float(attempt.get("effective_max_reward_r"))
+    if effective_max is None:
+        effective_max = round(reward_step * reward_columns, 6)
+    matrix: dict[str, Any] = {
+        "reward_step_r": reward_step,
+        "reward_columns": reward_columns,
+        "effective_max_reward_r": effective_max,
+    }
+    requested_max = _positive_float(attempt.get("max_reward_r"))
+    if requested_max is not None:
+        matrix["requested_max_reward_r"] = requested_max
+    return matrix
+
+
+def _reward_matrix_cli_args_from_attempt(attempt: dict[str, Any]) -> list[str]:
+    matrix = _reward_matrix_from_attempt(attempt)
+    if not matrix:
+        return []
+    return [
+        "--reward-step-r",
+        f"{float(matrix['reward_step_r']):g}",
+        "--reward-columns",
+        str(int(matrix["reward_columns"])),
+    ]
+
+
 def _run_streaming_subprocess(
     argv: list[str], *, cwd: str, prefix: str
 ) -> tuple[int, str, str]:
@@ -515,6 +577,7 @@ def _run_full_backtest_for_attempt(
             "--quality-score-preset",
             _quality_score_preset_cli_value(config),
         ]
+        args.extend(_reward_matrix_cli_args_from_attempt(attempt))
         for instrument in instruments:
             args.extend(["--instrument", instrument])
 

@@ -43,14 +43,14 @@ export function RunDetailPage() {
                   {run.explorer_model || run.explorer_profile || "Unknown explorer"}
                 </CardTitle>
                 <CardDescription className="max-w-3xl text-base leading-7">
-                  A provenance view for one run. Useful for understanding how many attempts it produced and what its best 36-month survivor looked like.
+                  A provenance view for one run. Play-hand runs surface their canonical final attempt first, with the full attempt trail below.
                 </CardDescription>
               </div>
             </CardHeader>
             <CardContent className="grid gap-4 md:grid-cols-3">
               <RunFact label="Attempts" value={formatInt(run.attempt_count)} />
               <RunFact label="36mo scores" value={formatInt(run.score_36m_count)} />
-              <RunFact label="Best 36mo" value={formatNumber(run.best_attempt?.score_36m ?? null, 2)} />
+              <RunFact label="Chosen 36mo" value={formatNumber(run.best_attempt?.score_36m ?? null, 2)} />
             </CardContent>
           </Card>
 
@@ -71,7 +71,7 @@ export function RunDetailPage() {
           <CardHeader>
             <CardTitle className="text-2xl tracking-tight">Attempts in run</CardTitle>
             <CardDescription>
-              Sorted by 36-month score when present, otherwise by composite score.
+              Canonical play-hand attempts appear first, then rows fall back to 36-month score and composite score.
             </CardDescription>
           </CardHeader>
           <CardContent>

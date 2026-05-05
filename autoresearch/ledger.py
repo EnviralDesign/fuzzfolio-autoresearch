@@ -34,6 +34,11 @@ class AttemptRecord:
     effective_window_months: float | None = None
     requested_timeframe: str | None = None
     effective_timeframe: str | None = None
+    max_reward_r: float | None = None
+    reward_matrix: dict[str, Any] | None = None
+    reward_step_r: float | None = None
+    reward_columns: int | None = None
+    effective_max_reward_r: float | None = None
     validation_outcome: str | None = None
     coverage_status: str | None = None
     job_status: str | None = None
@@ -45,6 +50,17 @@ class AttemptRecord:
     bars_per_signal: float | None = None
     max_consecutive_signal_run: float | None = None
     trigger_indicator_count: float | None = None
+    runner: str | None = None
+    attempt_role: str | None = None
+    attempt_decision: str | None = None
+    attempt_decision_reasons: list[str] | None = None
+    strategy_family_id: str | None = None
+    canonical_attempt_id: str | None = None
+    is_canonical_playhand_attempt: bool = False
+    play_hand_role: str | None = None
+    play_hand_stage: str | None = None
+    play_hand_instrument: str | None = None
+    play_hand_selected_instruments: list[str] | None = None
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -154,6 +170,11 @@ def make_attempt_record(
     effective_window_months: float | None = None,
     requested_timeframe: str | None = None,
     effective_timeframe: str | None = None,
+    max_reward_r: float | None = None,
+    reward_matrix: dict[str, Any] | None = None,
+    reward_step_r: float | None = None,
+    reward_columns: int | None = None,
+    effective_max_reward_r: float | None = None,
     validation_outcome: str | None = None,
     coverage_status: str | None = None,
     job_status: str | None = None,
@@ -165,6 +186,17 @@ def make_attempt_record(
     bars_per_signal: float | None = None,
     max_consecutive_signal_run: float | None = None,
     trigger_indicator_count: float | None = None,
+    runner: str | None = None,
+    attempt_role: str | None = None,
+    attempt_decision: str | None = None,
+    attempt_decision_reasons: list[str] | None = None,
+    strategy_family_id: str | None = None,
+    canonical_attempt_id: str | None = None,
+    is_canonical_playhand_attempt: bool = False,
+    play_hand_role: str | None = None,
+    play_hand_stage: str | None = None,
+    play_hand_instrument: str | None = None,
+    play_hand_selected_instruments: list[str] | None = None,
 ) -> AttemptRecord:
     existing = load_attempts(attempts_path)
     sequence = len(existing) + 1
@@ -189,6 +221,11 @@ def make_attempt_record(
         effective_window_months=effective_window_months,
         requested_timeframe=requested_timeframe,
         effective_timeframe=effective_timeframe,
+        max_reward_r=max_reward_r,
+        reward_matrix=reward_matrix,
+        reward_step_r=reward_step_r,
+        reward_columns=reward_columns,
+        effective_max_reward_r=effective_max_reward_r,
         validation_outcome=validation_outcome,
         coverage_status=coverage_status,
         job_status=job_status,
@@ -200,4 +237,15 @@ def make_attempt_record(
         bars_per_signal=bars_per_signal,
         max_consecutive_signal_run=max_consecutive_signal_run,
         trigger_indicator_count=trigger_indicator_count,
+        runner=runner,
+        attempt_role=attempt_role,
+        attempt_decision=attempt_decision,
+        attempt_decision_reasons=attempt_decision_reasons,
+        strategy_family_id=strategy_family_id,
+        canonical_attempt_id=canonical_attempt_id,
+        is_canonical_playhand_attempt=is_canonical_playhand_attempt,
+        play_hand_role=play_hand_role,
+        play_hand_stage=play_hand_stage,
+        play_hand_instrument=play_hand_instrument,
+        play_hand_selected_instruments=play_hand_selected_instruments,
     )

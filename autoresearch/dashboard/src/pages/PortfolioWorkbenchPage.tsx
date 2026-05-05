@@ -31,6 +31,13 @@ import { ProfileDropModal } from "@/components/profile-drop-modal";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   ChartContainer,
   ChartTooltip,
   type ChartConfig,
@@ -132,6 +139,7 @@ type PortfolioMetrics = {
 };
 
 type RunSortMode = "recent" | "score";
+type CandidateScope = "promoted" | "all";
 type PortfolioChartMode = "equity" | "drawdown" | "margin";
 
 type SimilarityPair = {
@@ -286,6 +294,7 @@ export function PortfolioWorkbenchPage() {
   const [query, setQuery] = useState("");
   const [minScore, setMinScore] = useState(40);
   const [validOnly, setValidOnly] = useState(true);
+  const [candidateScope, setCandidateScope] = useState<CandidateScope>("promoted");
   const [runSortMode, setRunSortMode] = useState<RunSortMode>("recent");
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [account, setAccount] = useState<AccountConfig>(DEFAULT_ACCOUNT);
@@ -337,8 +346,10 @@ export function PortfolioWorkbenchPage() {
 
   const filteredAttempts = useMemo(() => {
     const needle = query.trim().toLowerCase();
+    const preferredByRun = buildDashboardPreferredAttemptMap(rows);
     return rows
       .filter((row) => activeRunId === "all" || row.run_id === activeRunId)
+      .filter((row) => candidateScope === "all" || isInPromotedCandidateScope(row, preferredByRun))
       .filter((row) => !validOnly || row.full_backtest_validation_status_36m === "valid")
       .filter((row) => Number(row.score_36m ?? -Infinity) >= minScore)
       .filter((row) => {
@@ -357,7 +368,7 @@ export function PortfolioWorkbenchPage() {
           .includes(needle);
       })
       .sort((a, b) => Number(b.score_36m ?? -Infinity) - Number(a.score_36m ?? -Infinity));
-  }, [activeRunId, minScore, query, rows, validOnly]);
+  }, [activeRunId, candidateScope, minScore, query, rows, validOnly]);
 
   const sortedRuns = useMemo(
     () => sortRuns(runs?.runs ?? [], runSortMode),
@@ -494,7 +505,7 @@ export function PortfolioWorkbenchPage() {
           </section>
 
           <Panel className="p-4">
-            <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_140px_120px_auto]">
+            <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_150px_140px_120px_auto]">
               <label className="relative block">
                 <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
                 <Input
@@ -503,6 +514,18 @@ export function PortfolioWorkbenchPage() {
                   placeholder="Search attempts, symbols, strategy keys"
                   className="rounded-lg pl-9"
                 />
+              </label>
+              <label className="grid gap-1 text-xs text-muted-foreground">
+                <span>Scope</span>
+                <Select value={candidateScope} onValueChange={(value) => setCandidateScope(value as CandidateScope)}>
+                  <SelectTrigger className="h-10 rounded-lg">
+                    <SelectValue placeholder="Candidate scope" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="promoted">Chosen</SelectItem>
+                    <SelectItem value="all">All attempts</SelectItem>
+                  </SelectContent>
+                </Select>
               </label>
               <label className="grid gap-1 text-xs text-muted-foreground">
                 <span>Min score</span>
@@ -534,6 +557,7 @@ export function PortfolioWorkbenchPage() {
                   setQuery("");
                   setMinScore(40);
                   setValidOnly(true);
+                  setCandidateScope("promoted");
                 }}
               >
                 <RotateCcw className="h-4 w-4" />
@@ -597,6 +621,8 @@ function AttemptCard({
   onPreview: () => void;
 }) {
   const title = String(attempt.candidate_name || attempt.attempt_id);
+  const role = String(attempt.attempt_role || attempt.play_hand_role || "").trim();
+  const decision = String(attempt.attempt_decision || "").trim();
   return (
     <article
       className={`overflow-hidden rounded-lg border bg-card/78 transition ${
@@ -627,6 +653,25 @@ function AttemptCard({
             {formatNumber(attempt.score_36m ?? null, 1)}
           </span>
         </div>
+        {attempt.is_canonical_playhand_attempt || role || decision ? (
+          <div className="flex flex-wrap gap-1.5">
+            {attempt.is_canonical_playhand_attempt ? (
+              <span className="rounded border border-emerald-400/40 bg-emerald-400/10 px-2 py-0.5 text-[0.68rem] uppercase tracking-wide text-emerald-200">
+                Canonical
+              </span>
+            ) : null}
+            {role ? (
+              <span className="rounded border border-border/70 bg-background/45 px-2 py-0.5 text-[0.68rem] uppercase tracking-wide text-muted-foreground">
+                {role.replaceAll("_", " ")}
+              </span>
+            ) : null}
+            {decision && decision !== "canonical" ? (
+              <span className="rounded border border-border/70 bg-background/45 px-2 py-0.5 text-[0.68rem] uppercase tracking-wide text-muted-foreground">
+                {decision.replaceAll("_", " ")}
+              </span>
+            ) : null}
+          </div>
+        ) : null}
         <div className="grid grid-cols-3 gap-2 text-xs">
           <TinyStat label="DD" value={`${formatNumber(attempt.max_drawdown_r_36m ?? null, 2)}R`} />
           <TinyStat label="Trades/mo" value={formatNumber(attempt.trades_per_month_36m ?? null, 1)} />
@@ -1977,6 +2022,63 @@ function runTimestamp(run: RunSummary) {
 function runScore(run: RunSummary) {
   const score = Number(run.best_attempt?.score_36m);
   return Number.isFinite(score) ? score : Number.NEGATIVE_INFINITY;
+}
+
+function isCanonicalPlayHandAttempt(row: AttemptCatalogRow) {
+  if (row.is_canonical_playhand_attempt) return true;
+  const attemptId = String(row.attempt_id || "").trim();
+  const canonicalAttemptId = String(row.canonical_attempt_id || "").trim();
+  return Boolean(attemptId && canonicalAttemptId && attemptId === canonicalAttemptId);
+}
+
+function compareDashboardAttemptScore(left: AttemptCatalogRow, right: AttemptCatalogRow) {
+  const leftScore36 = Number(left.score_36m);
+  const rightScore36 = Number(right.score_36m);
+  const leftComposite = Number(left.composite_score);
+  const rightComposite = Number(right.composite_score);
+  const leftPrimary = Number.isFinite(leftScore36)
+    ? leftScore36
+    : Number.isFinite(leftComposite)
+      ? leftComposite
+      : -Infinity;
+  const rightPrimary = Number.isFinite(rightScore36)
+    ? rightScore36
+    : Number.isFinite(rightComposite)
+      ? rightComposite
+      : -Infinity;
+  if (leftPrimary !== rightPrimary) return rightPrimary - leftPrimary;
+  const leftSecondary = Number.isFinite(leftComposite) ? leftComposite : -Infinity;
+  const rightSecondary = Number.isFinite(rightComposite) ? rightComposite : -Infinity;
+  if (leftSecondary !== rightSecondary) return rightSecondary - leftSecondary;
+  return String(left.attempt_id || "").localeCompare(String(right.attempt_id || ""));
+}
+
+function buildDashboardPreferredAttemptMap(rows: AttemptCatalogRow[]) {
+  const byRun = new Map<string, AttemptCatalogRow[]>();
+  rows.forEach((row) => {
+    const runId = String(row.run_id || "").trim();
+    if (!runId) return;
+    if (!byRun.has(runId)) {
+      byRun.set(runId, []);
+    }
+    byRun.get(runId)?.push(row);
+  });
+  const preferredByRun = new Map<string, string>();
+  byRun.forEach((group, runId) => {
+    const canonicalRows = group.filter(isCanonicalPlayHandAttempt);
+    const candidates = canonicalRows.length > 0 ? canonicalRows : group;
+    const preferred = [...candidates].sort(compareDashboardAttemptScore)[0];
+    const attemptId = String(preferred?.attempt_id || "").trim();
+    if (attemptId) preferredByRun.set(runId, attemptId);
+  });
+  return preferredByRun;
+}
+
+function isInPromotedCandidateScope(row: AttemptCatalogRow, preferredByRun: Map<string, string>) {
+  const runId = String(row.run_id || "").trim();
+  const preferredAttemptId = preferredByRun.get(runId);
+  if (!preferredAttemptId) return true;
+  return preferredAttemptId === String(row.attempt_id || "").trim();
 }
 
 function formatTickDate(value: unknown) {

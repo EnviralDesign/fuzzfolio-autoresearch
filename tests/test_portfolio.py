@@ -343,6 +343,81 @@ def test_build_sleeve_prefilter_can_apply_field_filters() -> None:
     assert result["filter_rejections"]["field_filter_failed_avg_margin_load"] == 1
 
 
+def test_filter_play_hand_candidate_scope_keeps_canonical_and_non_playhand_rows() -> None:
+    rows = [
+        {
+            "attempt_id": "run-a-attempt-00001",
+            "run_id": "run-a-playhand-v1",
+            "runner": "play_hand_v1",
+            "score_36m": 90.0,
+        },
+        {
+            "attempt_id": "run-a-attempt-00002",
+            "run_id": "run-a-playhand-v1",
+            "runner": "play_hand_v1",
+            "score_36m": 80.0,
+            "canonical_attempt_id": "run-a-attempt-00002",
+        },
+        {
+            "attempt_id": "manual-attempt-00001",
+            "run_id": "manual-run",
+            "score_36m": 70.0,
+        },
+    ]
+
+    filtered, scope = pf.filter_play_hand_candidate_scope(rows, "promoted")
+
+    assert [row["attempt_id"] for row in filtered] == [
+        "run-a-attempt-00002",
+        "manual-attempt-00001",
+    ]
+    assert scope["dropped_count"] == 1
+    assert scope["playhand_runs_with_canonical"] == 1
+
+
+def test_select_dashboard_preferred_attempt_rows_matches_reader_logic() -> None:
+    rows = [
+        {
+            "run_id": "playhand-run",
+            "attempt_id": "playhand-run-attempt-00001",
+            "runner": "play_hand_v1",
+            "score_36m": 95.0,
+            "composite_score": 95.0,
+            "canonical_attempt_id": "playhand-run-attempt-00002",
+        },
+        {
+            "run_id": "playhand-run",
+            "attempt_id": "playhand-run-attempt-00002",
+            "runner": "play_hand_v1",
+            "score_36m": 80.0,
+            "composite_score": 80.0,
+            "canonical_attempt_id": "playhand-run-attempt-00002",
+            "is_canonical_playhand_attempt": True,
+        },
+        {
+            "run_id": "explorer-run",
+            "attempt_id": "explorer-run-attempt-00001",
+            "score_36m": 65.0,
+            "composite_score": 70.0,
+        },
+        {
+            "run_id": "explorer-run",
+            "attempt_id": "explorer-run-attempt-00002",
+            "score_36m": 75.0,
+            "composite_score": 72.0,
+        },
+    ]
+
+    selected, info = pf.select_dashboard_preferred_attempt_rows(rows)
+
+    assert [row["attempt_id"] for row in selected] == [
+        "playhand-run-attempt-00002",
+        "explorer-run-attempt-00002",
+    ]
+    assert info["canonical_run_count"] == 1
+    assert info["score_selected_run_count"] == 1
+
+
 def test_enrich_rows_for_account_computes_account_metrics(tmp_path: Path) -> None:
     result_path = tmp_path / "full-backtest-result.json"
     result_path.write_text(
@@ -1105,6 +1180,118 @@ def test_build_parser_includes_render_corpus_profile_drops_defaults() -> None:
     assert args.force_rebuild is False
     assert args.run_id is None
     assert args.attempt_id is None
+
+
+def test_build_parser_includes_finalize_corpus_defaults() -> None:
+    parser = ar_main.build_parser()
+
+    args = parser.parse_args(["finalize-corpus"])
+
+    assert args.command == "finalize-corpus"
+    assert args.scope == "dashboard"
+    assert args.lookback_months == 36
+    assert args.profile_drop_workers == 4
+    assert args.profile_drop_timeout_seconds == 1800
+    assert args.force_rebuild is False
+    assert args.dry_run is False
+    assert args.run_id is None
+    assert args.attempt_id is None
+
+
+def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=tmp_path / "runs",
+        fuzzfolio=SimpleNamespace(),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+    rows = [
+        {
+            "run_id": "playhand-run",
+            "attempt_id": "playhand-run-attempt-00001",
+            "runner": "play_hand_v1",
+            "score_36m": 95.0,
+            "composite_score": 95.0,
+            "canonical_attempt_id": "playhand-run-attempt-00002",
+        },
+        {
+            "run_id": "playhand-run",
+            "attempt_id": "playhand-run-attempt-00002",
+            "runner": "play_hand_v1",
+            "score_36m": 80.0,
+            "composite_score": 80.0,
+            "canonical_attempt_id": "playhand-run-attempt-00002",
+            "is_canonical_playhand_attempt": True,
+        },
+        {
+            "run_id": "explorer-run",
+            "attempt_id": "explorer-run-attempt-00001",
+            "score_36m": 65.0,
+            "composite_score": 70.0,
+        },
+        {
+            "run_id": "explorer-run",
+            "attempt_id": "explorer-run-attempt-00002",
+            "score_36m": 75.0,
+            "composite_score": 72.0,
+        },
+    ]
+    monkeypatch.setattr(
+        ar_main,
+        "_selection_corpus_rows",
+        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+    )
+    render_calls: list[dict[str, object]] = []
+
+    def fake_render_corpus_profile_drops(**kwargs):
+        render_calls.append(kwargs)
+        print(
+            json.dumps(
+                {
+                    "selected_count": len(kwargs["attempt_ids"]),
+                    "profile_drop_rendered": len(kwargs["attempt_ids"]),
+                    "profile_drop_cached": 0,
+                    "profile_drop_failed": 0,
+                }
+            )
+        )
+        return 0
+
+    monkeypatch.setattr(
+        ar_main, "cmd_render_corpus_profile_drops", fake_render_corpus_profile_drops
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_refresh_global_derived_corpus_state",
+        lambda _config: {"attempt_count": len(rows)},
+    )
+
+    exit_code = ar_main.cmd_finalize_corpus(
+        run_ids=None,
+        attempt_ids=None,
+        scope="dashboard",
+        lookback_months=36,
+        profile_drop_workers=2,
+        profile_drop_timeout_seconds=90,
+        force_rebuild=False,
+        dry_run=False,
+        as_json=True,
+    )
+
+    assert exit_code == 0
+    assert render_calls[0]["attempt_ids"] == [
+        "playhand-run-attempt-00002",
+        "explorer-run-attempt-00002",
+    ]
+    assert render_calls[0]["profile_drop_workers"] == 2
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_count"] == 2
+    assert payload["selection"]["selection_scope"] == "dashboard"
+    assert payload["selection"]["canonical_run_count"] == 1
+    assert payload["selection"]["score_selected_run_count"] == 1
+    assert payload["refresh_summary"]["attempt_count"] == 4
 
 
 def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(

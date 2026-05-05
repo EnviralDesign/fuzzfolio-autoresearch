@@ -437,6 +437,36 @@ def test_score_lab_v2_5_2_is_canonical_and_legacy_quality_is_diagnostic(tmp_path
     assert row["score_basis_36m"] == "score_lab_v2_5_2:geometric_mean"
 
 
+def test_extract_attempt_catalog_row_propagates_play_hand_canonical_metadata(tmp_path):
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    attempt = {
+        "run_id": "run-1",
+        "attempt_id": "run-1-attempt-00004",
+        "artifact_dir": str(artifact_dir),
+        "runner": "play_hand_v1",
+        "attempt_role": "final",
+        "attempt_decision": "canonical",
+        "strategy_family_id": "run-1",
+    }
+
+    row = ct.extract_attempt_catalog_row(
+        attempt,
+        {
+            "runner": "play_hand_v1",
+            "canonical_attempt_id": "run-1-attempt-00004",
+            "canonical_instruments": ["XAUUSD", "USDJPY"],
+        },
+    )
+
+    assert row["runner"] == "play_hand_v1"
+    assert row["attempt_role"] == "final"
+    assert row["attempt_decision"] == "canonical"
+    assert row["canonical_attempt_id"] == "run-1-attempt-00004"
+    assert row["is_canonical_playhand_attempt"] is True
+    assert row["play_hand_selected_instruments"] == ["XAUUSD", "USDJPY"]
+
+
 def test_legacy_only_full_backtest_is_not_canonical_score(tmp_path):
     artifact_dir = tmp_path / "artifact"
     artifact_dir.mkdir()

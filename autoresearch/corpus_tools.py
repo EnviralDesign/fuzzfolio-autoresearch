@@ -643,10 +643,39 @@ def extract_attempt_catalog_row(
         list(scrutiny_36.get("instruments") or []),
     )
     full_backtest_validation = validate_full_backtest_artifacts(attempt)
+    metadata = run_metadata or {}
+    runner = (
+        str(attempt.get("runner") or attempt.get("play_hand_runner") or metadata.get("runner") or "")
+        .strip()
+        or None
+    )
+    canonical_attempt_id = (
+        str(attempt.get("canonical_attempt_id") or metadata.get("canonical_attempt_id") or "")
+        .strip()
+        or None
+    )
+    attempt_id = str(attempt.get("attempt_id") or "")
+    is_canonical_playhand_attempt = bool(attempt.get("is_canonical_playhand_attempt")) or (
+        bool(canonical_attempt_id)
+        and bool(attempt_id)
+        and attempt_id == canonical_attempt_id
+        and str(runner or "") == "play_hand_v1"
+    )
+    attempt_role = str(attempt.get("attempt_role") or attempt.get("play_hand_role") or "").strip() or None
+    attempt_decision = str(attempt.get("attempt_decision") or "").strip() or None
+    raw_decision_reasons = attempt.get("attempt_decision_reasons")
+    if isinstance(raw_decision_reasons, list):
+        attempt_decision_reasons = [
+            str(reason) for reason in raw_decision_reasons if str(reason).strip()
+        ]
+    elif isinstance(raw_decision_reasons, str) and raw_decision_reasons.strip():
+        attempt_decision_reasons = [raw_decision_reasons.strip()]
+    else:
+        attempt_decision_reasons = []
 
     return {
         "run_id": str(attempt.get("run_id") or ""),
-        "attempt_id": str(attempt.get("attempt_id") or ""),
+        "attempt_id": attempt_id,
         "sequence": attempt.get("sequence"),
         "created_at": attempt.get("created_at"),
         "candidate_name": attempt.get("candidate_name"),
@@ -661,8 +690,29 @@ def extract_attempt_catalog_row(
             if attempt_metrics.get("legacy_quality_score") is not None
             else attempt_metrics.get("quality_score")
         ),
-        "explorer_model": (run_metadata or {}).get("explorer_model"),
-        "explorer_profile": (run_metadata or {}).get("explorer_profile"),
+        "runner": runner,
+        "attempt_role": attempt_role,
+        "attempt_decision": attempt_decision,
+        "attempt_decision_reasons": attempt_decision_reasons,
+        "strategy_family_id": (
+            str(attempt.get("strategy_family_id") or metadata.get("strategy_family_id") or "").strip()
+            or None
+        ),
+        "canonical_attempt_id": canonical_attempt_id,
+        "is_canonical_playhand_attempt": is_canonical_playhand_attempt,
+        "play_hand_role": str(attempt.get("play_hand_role") or attempt_role or "").strip() or None,
+        "play_hand_stage": str(attempt.get("play_hand_stage") or "").strip() or None,
+        "play_hand_instrument": str(attempt.get("play_hand_instrument") or "").strip() or None,
+        "play_hand_selected_instruments": normalize_tokens(
+            list(
+                attempt.get("play_hand_selected_instruments")
+                or metadata.get("canonical_instruments")
+                or []
+            )
+        ),
+        "run_canonical_attempt_id": str(metadata.get("canonical_attempt_id") or "").strip() or None,
+        "explorer_model": metadata.get("explorer_model"),
+        "explorer_profile": metadata.get("explorer_profile"),
         "requested_timeframe": attempt.get("requested_timeframe"),
         "effective_timeframe": attempt.get("effective_timeframe"),
         "base_timeframe": timeframe,
@@ -805,10 +855,18 @@ def catalog_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     attempt_count = len(rows)
     scrutiny_36_count = len(scrutiny_36)
     full_backtest_36_count = len(full_backtest_36)
+    canonical_playhand_rows = [
+        row for row in rows if bool(row.get("is_canonical_playhand_attempt"))
+    ]
+    playhand_rows = [
+        row for row in rows if str(row.get("runner") or "") == "play_hand_v1"
+    ]
     return {
         "run_count": len(run_ids),
         "attempt_count": attempt_count,
         "scored_attempt_count": len(scored_rows),
+        "playhand_attempt_count": len(playhand_rows),
+        "canonical_playhand_attempt_count": len(canonical_playhand_rows),
         "unique_base_strategy_count": len(base_strategy_keys),
         "unique_strategy_count_36m": len(strategy_keys_36),
         "unique_full_backtest_strategy_count_36m": len(full_backtest_strategy_keys_36),

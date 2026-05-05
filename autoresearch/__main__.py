@@ -59,7 +59,12 @@ if __package__ in {None, ""}:
         RunPolicy,
         set_runtime_trace_stderr_mode,
     )
-    from autoresearch.dashboard import _has_full_backtest, _run_full_backtest_for_attempt
+    from autoresearch.dashboard import (
+        _has_full_backtest,
+        _reward_matrix_cli_args_from_attempt,
+        _reward_matrix_from_attempt,
+        _run_full_backtest_for_attempt,
+    )
     from autoresearch.dashboard_viewer import serve_dashboard
     from autoresearch.fuzzfolio import CliError, FuzzfolioCli
     from autoresearch.ledger import (
@@ -108,10 +113,12 @@ if __package__ in {None, ""}:
         build_sleeve_selection,
         enrich_rows_for_account,
         finalize_sleeve_selection,
+        filter_play_hand_candidate_scope,
         filter_selection_candidate_rows,
         load_portfolio_build_specs,
         load_portfolio_spec,
         merge_portfolio_sleeves,
+        select_dashboard_preferred_attempt_rows,
     )
     from autoresearch.provider import (
         ChatMessage,
@@ -145,7 +152,12 @@ else:
         write_json,
     )
     from .controller import ResearchController, RunPolicy, set_runtime_trace_stderr_mode
-    from .dashboard import _has_full_backtest, _run_full_backtest_for_attempt
+    from .dashboard import (
+        _has_full_backtest,
+        _reward_matrix_cli_args_from_attempt,
+        _reward_matrix_from_attempt,
+        _run_full_backtest_for_attempt,
+    )
     from .dashboard_viewer import serve_dashboard
     from .fuzzfolio import CliError, FuzzfolioCli
     from .ledger import (
@@ -194,10 +206,12 @@ else:
         build_sleeve_selection,
         enrich_rows_for_account,
         finalize_sleeve_selection,
+        filter_play_hand_candidate_scope,
         filter_selection_candidate_rows,
         load_portfolio_build_specs,
         load_portfolio_spec,
         merge_portfolio_sleeves,
+        select_dashboard_preferred_attempt_rows,
     )
     from .provider import (
         ChatMessage,
@@ -811,6 +825,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum number of candidate attempts to consider after score sorting. Default: 250",
     )
     promotion_board.add_argument(
+        "--candidate-scope",
+        choices=["promoted", "all"],
+        default="promoted",
+        help="Use canonical play-hand attempts when available, or include every attempt. Default: promoted",
+    )
+    promotion_board.add_argument(
         "--board-size",
         type=int,
         default=12,
@@ -898,6 +918,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=-1,
         help="Optional cap on ranked candidates before similarity/selection. Use -1 for all qualified candidates. Default: -1",
+    )
+    shortlist_report.add_argument(
+        "--candidate-scope",
+        choices=["promoted", "all"],
+        default="promoted",
+        help="Use canonical play-hand attempts when available, or include every attempt. Default: promoted",
     )
     shortlist_report.add_argument(
         "--shortlist-size",
@@ -1038,6 +1064,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to a JSON portfolio config. Defaults to repo-root portfolio.account-presets.json when present, otherwise portfolio.config.json, falling back to built-in defaults if neither exists.",
     )
     portfolio_report.add_argument(
+        "--candidate-scope",
+        choices=["promoted", "all"],
+        default=None,
+        help="Override portfolio config candidate scope. 'promoted' uses canonical play-hand attempts when available; 'all' includes every attempt.",
+    )
+    portfolio_report.add_argument(
         "--catch-up-full-backtests",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -1143,6 +1175,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only consider the named attempt id. Can be repeated.",
     )
     render_corpus_profile_drops.add_argument(
+        "--canonical-only",
+        action="store_true",
+        help="Only render canonical/promoted play-hand attempts when a run declares one; non-play-hand runs are unchanged.",
+    )
+    render_corpus_profile_drops.add_argument(
         "--lookback-months",
         type=int,
         default=36,
@@ -1166,6 +1203,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-render attempt-local profile drops even when cached artifacts already exist.",
     )
     render_corpus_profile_drops.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    finalize_corpus = subparsers.add_parser(
+        "finalize-corpus",
+        help="Catch up dashboard-visible corpus artifacts for the promoted attempt from each run.",
+    )
+    finalize_corpus.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only finalize attempts from the named run id. Can be repeated.",
+    )
+    finalize_corpus.add_argument(
+        "--attempt-id",
+        action="append",
+        default=None,
+        help="Finalize the named attempt id directly. Can be repeated.",
+    )
+    finalize_corpus.add_argument(
+        "--scope",
+        choices=("dashboard", "all"),
+        default="dashboard",
+        help="Attempt selection scope. Default: dashboard, using the same chosen-attempt logic as the dashboard reader.",
+    )
+    finalize_corpus.add_argument(
+        "--lookback-months",
+        type=int,
+        default=36,
+        help="Lookback used for attempt-local profile-drop PNG generation. Default: 36",
+    )
+    finalize_corpus.add_argument(
+        "--profile-drop-workers",
+        type=int,
+        default=4,
+        help="Concurrent workers for profile-drop packaging/rendering. Default: 4",
+    )
+    finalize_corpus.add_argument(
+        "--profile-drop-timeout-seconds",
+        type=int,
+        default=1800,
+        help="Per-attempt timeout for packaging/rendering profile-drop PNGs. Default: 1800",
+    )
+    finalize_corpus.add_argument(
+        "--force-rebuild",
+        action="store_true",
+        help="Re-render attempt-local profile drops even when cached artifacts already exist.",
+    )
+    finalize_corpus.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show which attempts would be finalized without rendering or refreshing derived indexes.",
+    )
+    finalize_corpus.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
@@ -3105,6 +3196,7 @@ def _selection_corpus_rows(
     run_ids: list[str] | None,
     label: str,
     as_json: bool,
+    materialize_full_corpus: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     run_dirs = _matching_run_dirs(config, run_ids)
     full_corpus_scope = not run_ids
@@ -3134,7 +3226,7 @@ def _selection_corpus_rows(
         progress_callback=_catalog_phase_callback(label, as_json=as_json),
     )
     summary = catalog_summary(rebuilt_rows)
-    if full_corpus_scope:
+    if full_corpus_scope and materialize_full_corpus:
         summary = _write_materialized_corpus_index(
             config,
             run_dirs=run_dirs,
@@ -3144,7 +3236,7 @@ def _selection_corpus_rows(
         "source": "cold_rebuild",
         "path": str(config.attempt_catalog_json_path),
         "manifest_path": str(config.attempt_catalog_manifest_path),
-        "refreshed": bool(full_corpus_scope),
+        "refreshed": bool(full_corpus_scope and materialize_full_corpus),
         "row_count": len(rebuilt_rows),
         "run_count": len(run_dirs),
         "summary": summary,
@@ -3321,13 +3413,81 @@ def _result_has_canonical_score_lab(path: Path) -> bool:
     return False
 
 
+def _attempt_with_run_reward_matrix(
+    attempt: dict[str, Any],
+    *,
+    run_metadata: dict[str, Any] | None = None,
+    run_dir: Path | None = None,
+) -> dict[str, Any]:
+    if _reward_matrix_from_attempt(attempt) is not None:
+        return dict(attempt)
+    metadata = run_metadata
+    if metadata is None and run_dir is not None:
+        metadata = load_run_metadata(run_dir)
+    matrix = _reward_matrix_from_attempt(metadata or {})
+    if not matrix:
+        return dict(attempt)
+    merged = dict(attempt)
+    merged["reward_matrix"] = matrix
+    merged["reward_step_r"] = matrix.get("reward_step_r")
+    merged["reward_columns"] = matrix.get("reward_columns")
+    merged["effective_max_reward_r"] = matrix.get("effective_max_reward_r")
+    if matrix.get("requested_max_reward_r") is not None:
+        merged["max_reward_r"] = matrix.get("requested_max_reward_r")
+    return merged
+
+
+def _collect_reward_multiples(payload: Any) -> list[float]:
+    values: list[float] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in {"reward_multiple", "rewardMultiple"}:
+                numeric = _safe_float_value(value)
+                if numeric is not None:
+                    values.append(numeric)
+                else:
+                    values.extend(_collect_reward_multiples(value))
+                continue
+            values.extend(_collect_reward_multiples(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            values.extend(_collect_reward_multiples(item))
+    return values
+
+
+def _result_matches_attempt_reward_matrix(path: Path, attempt: dict[str, Any]) -> bool:
+    matrix = _reward_matrix_from_attempt(attempt)
+    if not matrix:
+        return True
+    payload = _load_json_if_exists(path)
+    reward_values = _collect_reward_multiples(payload)
+    if not reward_values:
+        return False
+    effective_max = _safe_float_value(matrix.get("effective_max_reward_r"))
+    if effective_max is None:
+        reward_step = _safe_float_value(matrix.get("reward_step_r"))
+        reward_columns = _safe_float_value(matrix.get("reward_columns"))
+        if reward_step is None or reward_columns is None:
+            return True
+        effective_max = reward_step * reward_columns
+    return max(reward_values) <= (float(effective_max) + 1e-6)
+
+
 def _run_full_backtest_with_retry(
     config,
     attempt: dict[str, Any],
     *,
+    run_dir: Path | None = None,
+    run_metadata: dict[str, Any] | None = None,
     force_rebuild: bool = False,
     job_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
+    attempt = _attempt_with_run_reward_matrix(
+        attempt,
+        run_metadata=run_metadata,
+        run_dir=run_dir,
+    )
+
     def invoke(candidate: dict[str, Any]) -> dict[str, Any]:
         if job_timeout_seconds is None:
             return _run_full_backtest_for_attempt(config, candidate)
@@ -3362,6 +3522,7 @@ def _run_full_backtest_with_retry(
                 source_result_path.exists()
                 and source_curve_path.exists()
                 and _result_has_canonical_score_lab(source_result_path)
+                and _result_matches_attempt_reward_matrix(source_result_path, attempt)
             ):
                 dest_curve = artifact_dir / "full-backtest-36mo-curve.json"
                 dest_result = artifact_dir / "full-backtest-36mo-result.json"
@@ -5223,15 +5384,23 @@ def cmd_calculate_full_backtests(
         if force_rebuild:
             return True
         curve_path = artifact_dir / "full-backtest-36mo-curve.json"
-        return not curve_path.exists()
+        result_path = artifact_dir / "full-backtest-36mo-result.json"
+        if not curve_path.exists() or not result_path.exists():
+            return True
+        return not _result_matches_attempt_reward_matrix(result_path, attempt)
 
     filter_rejections = {
         "already_has_full_backtest": 0,
         "missing_scrutiny_36m": 0,
         "no_backtestable_cell": 0,
     }
-    eligible_items: list[tuple[Path, dict[str, Any], dict[str, Any]]] = []
+    eligible_items: list[tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
     for run_dir, _attempts, attempt in matched_items:
+        run_metadata = load_run_metadata(run_dir)
+        attempt = _attempt_with_run_reward_matrix(
+            attempt,
+            run_metadata=run_metadata,
+        )
         row = catalog_by_attempt_id.get(str(attempt.get("attempt_id") or "")) or {}
         if not needs_calculation(attempt):
             filter_rejections["already_has_full_backtest"] += 1
@@ -5242,7 +5411,7 @@ def cmd_calculate_full_backtests(
         if require_scrutiny_36 and not bool(row.get("has_scrutiny_36m")):
             filter_rejections["missing_scrutiny_36m"] += 1
             continue
-        eligible_items.append((run_dir, attempt, row))
+        eligible_items.append((run_dir, attempt, row, run_metadata))
 
     eligible_items.sort(key=lambda item: _full_backtest_priority_key(item[2]))
     to_calculate = list(eligible_items)
@@ -5311,7 +5480,10 @@ def cmd_calculate_full_backtests(
             )
         else:
             pending_items = list(to_calculate)
-            in_flight: dict[Any, tuple[Path, dict[str, Any], dict[str, Any], float]] = {}
+            in_flight: dict[
+                Any,
+                tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any], float],
+            ] = {}
 
             def refresh_progress(active_run_id: str | None = None) -> None:
                 queued_count = len(pending_items)
@@ -5333,7 +5505,7 @@ def cmd_calculate_full_backtests(
             with ThreadPoolExecutor(max_workers=resolved_max_workers) as executor:
                 while pending_items or in_flight:
                     while pending_items and len(in_flight) < resolved_max_workers:
-                        run_dir, attempt, row = pending_items.pop(0)
+                        run_dir, attempt, row, run_metadata = pending_items.pop(0)
                         attempt_id = str(attempt.get("attempt_id") or "")
                         emit(
                             f"queue {calculated + failed + len(in_flight) + 1}/{total} "
@@ -5343,17 +5515,25 @@ def cmd_calculate_full_backtests(
                             _run_full_backtest_with_retry,
                             config,
                             attempt,
+                            run_dir=run_dir,
+                            run_metadata=run_metadata,
                             force_rebuild=force_rebuild,
                             job_timeout_seconds=job_timeout_seconds,
                         )
-                        in_flight[future] = (run_dir, attempt, row, pytime.time())
+                        in_flight[future] = (
+                            run_dir,
+                            attempt,
+                            row,
+                            run_metadata,
+                            pytime.time(),
+                        )
                         refresh_progress(run_dir.name)
                     done, _ = wait(
                         set(in_flight.keys()),
                         return_when=FIRST_COMPLETED,
                     )
                     for future in done:
-                        run_dir, attempt, row, started_at = in_flight.pop(future)
+                        run_dir, attempt, row, _run_metadata, started_at = in_flight.pop(future)
                         attempt_id = str(attempt.get("attempt_id") or "")
                         result_entry: dict[str, Any] = {
                             "run_id": run_dir.name,
@@ -5568,6 +5748,7 @@ def _render_profile_drop_for_attempt(
     emit: Callable[[str], None] | None,
     layout_mode: str = "derived",
 ) -> dict[str, Any]:
+    attempt = _attempt_with_run_reward_matrix(attempt, run_dir=run_dir)
     package_inputs = _build_package_inputs(attempt, run_dir=run_dir, attempts=attempts)
     profile_path = package_inputs.get("profile_path")
     attempt_id = str(row.get("attempt_id") or attempt.get("attempt_id") or "")
@@ -5615,6 +5796,9 @@ def _render_profile_drop_for_attempt(
         "quality_score_preset": str(config.research.quality_score_preset),
         "score_lab_version": CANONICAL_SCORE_LAB_VERSION,
     }
+    reward_matrix = _reward_matrix_from_attempt(attempt)
+    if reward_matrix:
+        base_manifest_payload["reward_matrix"] = reward_matrix
 
     expected_cached_manifest: dict[str, Any] | None = None
     cache_ready = False
@@ -5723,6 +5907,7 @@ def _render_profile_drop_for_attempt(
         "--quality-score-preset",
         str(config.research.quality_score_preset),
     ]
+    package_args.extend(_reward_matrix_cli_args_from_attempt(attempt))
     for instrument in package_inputs["instruments"]:
         package_args.extend(["--instrument", str(instrument)])
     cli.run(package_args, cwd=working_dir, timeout_seconds=float(timeout_seconds))
@@ -6177,6 +6362,7 @@ def cmd_build_shortlist_report(
     run_ids: list[str] | None,
     attempt_ids: list[str] | None,
     candidate_limit: int,
+    candidate_scope: str = "promoted",
     shortlist_size: int,
     min_score_36: float,
     min_retention_ratio: float,
@@ -6213,6 +6399,15 @@ def cmd_build_shortlist_report(
         rows = [
             row for row in rows if str(row.get("attempt_id") or "") in wanted_attempt_ids
         ]
+    scope_info = {
+        "candidate_scope": "explicit_attempts",
+        "input_count": len(rows),
+        "output_count": len(rows),
+        "dropped_count": 0,
+        "playhand_runs_with_canonical": 0,
+    }
+    if not wanted_attempt_ids:
+        rows, scope_info = filter_play_hand_candidate_scope(rows, candidate_scope)
     rows.sort(key=_full_backtest_priority_key)
     if candidate_limit >= 0:
         rows = rows[:candidate_limit]
@@ -6377,6 +6572,7 @@ def cmd_build_shortlist_report(
         "filters": {
             "run_ids": run_ids,
             "attempt_ids": attempt_ids,
+            "candidate_scope": scope_info,
             "candidate_limit": candidate_limit,
             "shortlist_size": shortlist_size,
             "min_score_36": min_score_36,
@@ -6456,6 +6652,7 @@ def cmd_build_shortlist_report(
                 "shortlist_json": str(report_root / "shortlist-report.json"),
                 "shortlist_csv": str(report_root / "shortlist-report.csv"),
                 "candidate_count": len(candidate_rows),
+                "candidate_scope": scope_info,
                 "selected_count": len(shortlist_rows),
                 "alternate_count": len(shortlist_board.get("alternates") or []),
                 "profile_drop_rendered": sum(
@@ -6479,6 +6676,7 @@ def cmd_build_portfolio(
     run_ids: list[str] | None,
     attempt_ids: list[str] | None,
     portfolio_config: str | None,
+    candidate_scope: str | None = None,
     catch_up_full_backtests: bool | None,
     catch_up_force_rebuild: bool | None,
     catch_up_require_scrutiny_36: bool | None,
@@ -6510,6 +6708,8 @@ def cmd_build_portfolio(
             portfolio_spec["export_bundle"] = bool(export_bundle)
         if profile_drop_workers is not None:
             portfolio_spec["profile_drop_workers"] = max(1, int(profile_drop_workers))
+        if candidate_scope is not None:
+            portfolio_spec["candidate_scope"] = candidate_scope
 
     catch_up_summary: dict[str, Any] | None = None
     catch_up_requested = any(
@@ -6584,6 +6784,13 @@ def cmd_build_portfolio(
         rows = [
             row for row in rows if str(row.get("attempt_id") or "") in wanted_attempt_ids
         ]
+    base_scope_info = {
+        "candidate_scope": "explicit_attempts",
+        "input_count": len(rows),
+        "output_count": len(rows),
+        "dropped_count": 0,
+        "playhand_runs_with_canonical": 0,
+    }
     rows.sort(key=_full_backtest_priority_key)
 
     def build_portfolio_variant(
@@ -6591,6 +6798,13 @@ def cmd_build_portfolio(
         variant_rows: list[dict[str, Any]],
     ) -> dict[str, Any]:
         portfolio_name = str(variant_spec.get("portfolio_name") or "default-portfolio").strip()
+        variant_scope_info = dict(base_scope_info)
+        if not wanted_attempt_ids:
+            variant_rows, variant_scope_info = filter_play_hand_candidate_scope(
+                variant_rows,
+                variant_spec.get("candidate_scope", "promoted"),
+            )
+            variant_rows.sort(key=_full_backtest_priority_key)
         raw_sleeve_specs = list(variant_spec.get("sleeves") or [])
         sleeve_prefilters: list[dict[str, Any]] = []
         for sleeve_spec in raw_sleeve_specs:
@@ -6757,6 +6971,7 @@ def cmd_build_portfolio(
                 **corpus_index_info,
                 "scoped_row_count": len(variant_rows),
             },
+            "candidate_scope": variant_scope_info,
             "catch_up_summary": catch_up_summary,
             "run_ids": run_ids,
             "attempt_ids": attempt_ids,
@@ -6856,6 +7071,7 @@ def cmd_build_portfolio(
             "corpus_index_source": corpus_index_info.get("source"),
             "corpus_row_count": corpus_index_info.get("row_count"),
             "scoped_row_count": len(variant_rows),
+            "candidate_scope": variant_scope_info,
             "candidate_union_count": len(portfolio_candidate_rows),
             "selected_union_count": len(portfolio_rows),
             "selected_overlap_count": int(merged.get("selected_overlap_count") or 0),
@@ -7045,6 +7261,7 @@ def cmd_build_promotion_board(
     run_ids: list[str] | None,
     attempt_ids: list[str] | None,
     candidate_limit: int,
+    candidate_scope: str = "promoted",
     board_size: int,
     min_score_36: float,
     min_retention_ratio: float,
@@ -7096,6 +7313,18 @@ def cmd_build_promotion_board(
             for row in initial_rows
             if str(row.get("attempt_id") or "") in wanted_attempt_ids
         ]
+    initial_scope_info = {
+        "candidate_scope": "explicit_attempts",
+        "input_count": len(initial_rows),
+        "output_count": len(initial_rows),
+        "dropped_count": 0,
+        "playhand_runs_with_canonical": 0,
+    }
+    if not wanted_attempt_ids:
+        initial_rows, initial_scope_info = filter_play_hand_candidate_scope(
+            initial_rows,
+            candidate_scope,
+        )
     initial_rows.sort(key=promotion_sort_key)
     if candidate_limit >= 0:
         initial_rows = initial_rows[:candidate_limit]
@@ -7132,6 +7361,9 @@ def cmd_build_promotion_board(
         rows = [
             row for row in rows if str(row.get("attempt_id") or "") in wanted_attempt_ids
         ]
+    scope_info = dict(initial_scope_info)
+    if not wanted_attempt_ids:
+        rows, scope_info = filter_play_hand_candidate_scope(rows, candidate_scope)
     rows.sort(key=promotion_sort_key)
     if candidate_limit >= 0:
         rows = rows[:candidate_limit]
@@ -7207,6 +7439,7 @@ def cmd_build_promotion_board(
         "filters": {
             "run_ids": run_ids,
             "attempt_ids": attempt_ids,
+            "candidate_scope": scope_info,
             "candidate_limit": candidate_limit,
             "board_size": board_size,
             "min_score_36": min_score_36,
@@ -8314,6 +8547,7 @@ def cmd_render_corpus_profile_drops(
     attempt_ids: list[str] | None,
     top_results: int | None,
     rank_start: int,
+    canonical_only: bool = False,
     lookback_months: int,
     profile_drop_workers: int,
     profile_drop_timeout_seconds: int,
@@ -8338,6 +8572,8 @@ def cmd_render_corpus_profile_drops(
                 for row in rows
                 if str(row.get("attempt_id") or "").strip() in wanted_attempt_ids
             ]
+        elif canonical_only:
+            rows, _scope_info = filter_play_hand_candidate_scope(rows, "promoted")
         rows.sort(key=_full_backtest_priority_key)
         if limit is None:
             return rows[rank_start:]
@@ -8357,6 +8593,7 @@ def cmd_render_corpus_profile_drops(
             "top_results": limit,
             "rank_start": rank_start,
             "lookback_months": lookback_months,
+            "canonical_only": bool(canonical_only),
             "corpus_index_source": corpus_index_info.get("source"),
         }
         print(json.dumps(payload, ensure_ascii=True, indent=2))
@@ -8429,6 +8666,7 @@ def cmd_render_corpus_profile_drops(
         "top_results": limit,
         "rank_start": rank_start,
         "lookback_months": lookback_months,
+        "canonical_only": bool(canonical_only),
         "selected_count": len(selected_rows),
         "healed_full_backtests": healed_full_backtests,
         "full_backtest_catch_up_exit_code": catch_up_exit_code,
@@ -8459,6 +8697,7 @@ def cmd_render_corpus_profile_drops(
                     f"Cached: {summary['profile_drop_cached']}",
                     f"Failed: {summary['profile_drop_failed']}",
                     f"Lookback: {summary['lookback_months']}mo",
+                    f"Canonical-only: {'yes' if summary['canonical_only'] else 'no'}",
                 ]
             ),
             title="Corpus Profile Drops",
@@ -8466,6 +8705,192 @@ def cmd_render_corpus_profile_drops(
         )
     )
     return 0 if summary["profile_drop_failed"] == 0 else 1
+
+
+def _select_finalize_corpus_rows(
+    rows: list[dict[str, Any]],
+    *,
+    scope: str,
+    attempt_ids: list[str] | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    wanted_attempt_ids = {
+        token.strip() for token in (attempt_ids or []) if str(token).strip()
+    }
+    if wanted_attempt_ids:
+        selected = [
+            row
+            for row in rows
+            if str(row.get("attempt_id") or "").strip() in wanted_attempt_ids
+        ]
+        matched_attempt_ids = {
+            str(row.get("attempt_id") or "").strip()
+            for row in selected
+            if str(row.get("attempt_id") or "").strip()
+        }
+        missing = sorted(wanted_attempt_ids - matched_attempt_ids)
+        if missing:
+            raise SystemExit(f"Attempt ids do not exist: {', '.join(missing)}")
+        selected.sort(key=_full_backtest_priority_key)
+        return selected, {
+            "selection_scope": "attempt_id",
+            "input_count": len(rows),
+            "output_count": len(selected),
+            "run_count": len({str(row.get("run_id") or "").strip() for row in selected}),
+        }
+    if scope == "all":
+        selected = list(rows)
+        selected.sort(key=_full_backtest_priority_key)
+        return selected, {
+            "selection_scope": "all",
+            "input_count": len(rows),
+            "output_count": len(selected),
+            "run_count": len({str(row.get("run_id") or "").strip() for row in selected}),
+        }
+    selected, info = select_dashboard_preferred_attempt_rows(rows)
+    selected.sort(key=_full_backtest_priority_key)
+    return selected, {"selection_scope": "dashboard", **info}
+
+
+def cmd_finalize_corpus(
+    *,
+    run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    scope: str,
+    lookback_months: int,
+    profile_drop_workers: int,
+    profile_drop_timeout_seconds: int,
+    force_rebuild: bool,
+    dry_run: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    scope = str(scope or "dashboard").strip().lower()
+    if scope not in {"dashboard", "all"}:
+        raise SystemExit("Unsupported finalize scope; expected 'dashboard' or 'all'.")
+    full_catalog_rows, corpus_index_info = _selection_corpus_rows(
+        config,
+        run_ids=run_ids,
+        label="finalize-corpus",
+        as_json=as_json,
+        materialize_full_corpus=not dry_run,
+    )
+    selected_rows, selection_info = _select_finalize_corpus_rows(
+        full_catalog_rows,
+        scope=scope,
+        attempt_ids=attempt_ids,
+    )
+    selected_attempt_ids = [
+        str(row.get("attempt_id") or "").strip()
+        for row in selected_rows
+        if str(row.get("attempt_id") or "").strip()
+    ]
+    selected_preview = [
+        {
+            "run_id": row.get("run_id"),
+            "attempt_id": row.get("attempt_id"),
+            "candidate_name": row.get("candidate_name"),
+            "score_36m": row.get("score_36m"),
+            "composite_score": row.get("composite_score"),
+            "is_canonical_playhand_attempt": bool(row.get("is_canonical_playhand_attempt")),
+            "has_full_backtest_36m": bool(row.get("has_full_backtest_36m")),
+            "full_backtest_validation_status_36m": row.get(
+                "full_backtest_validation_status_36m"
+            ),
+        }
+        for row in selected_rows
+    ]
+    summary: dict[str, Any] = {
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "status": "dry_run" if dry_run else "pending",
+        "corpus_index_source": corpus_index_info.get("source"),
+        "selection": selection_info,
+        "selected_count": len(selected_rows),
+        "selected_attempt_ids": selected_attempt_ids,
+        "lookback_months": int(lookback_months),
+        "profile_drop_workers": max(1, int(profile_drop_workers)),
+        "profile_drop_timeout_seconds": max(1, int(profile_drop_timeout_seconds)),
+        "force_rebuild": bool(force_rebuild),
+        "dry_run": bool(dry_run),
+        "selected": selected_preview,
+    }
+    if dry_run or not selected_attempt_ids:
+        summary["status"] = "dry_run" if dry_run else "no_attempts"
+        if as_json:
+            print(json.dumps(summary, ensure_ascii=True, indent=2))
+        else:
+            console.print(
+                Panel.fit(
+                    "\n".join(
+                        [
+                            f"Selected attempts: {summary['selected_count']}",
+                            f"Scope: {selection_info.get('selection_scope')}",
+                            f"Dry run: {'yes' if dry_run else 'no'}",
+                        ]
+                    ),
+                    title="Finalize Corpus",
+                    border_style="cyan",
+                )
+            )
+        return 0
+
+    render_summary: dict[str, Any] | None = None
+    if as_json:
+        with io.StringIO() as capture, redirect_stdout(capture):
+            render_exit_code = cmd_render_corpus_profile_drops(
+                run_ids=run_ids,
+                attempt_ids=selected_attempt_ids,
+                top_results=None,
+                rank_start=0,
+                canonical_only=False,
+                lookback_months=int(lookback_months),
+                profile_drop_workers=max(1, int(profile_drop_workers)),
+                profile_drop_timeout_seconds=max(1, int(profile_drop_timeout_seconds)),
+                force_rebuild=bool(force_rebuild),
+                as_json=True,
+            )
+            render_output = capture.getvalue().strip()
+        if render_output:
+            try:
+                render_summary = json.loads(render_output)
+            except json.JSONDecodeError:
+                render_summary = {"raw_output": render_output}
+    else:
+        render_exit_code = cmd_render_corpus_profile_drops(
+            run_ids=run_ids,
+            attempt_ids=selected_attempt_ids,
+            top_results=None,
+            rank_start=0,
+            canonical_only=False,
+            lookback_months=int(lookback_months),
+            profile_drop_workers=max(1, int(profile_drop_workers)),
+            profile_drop_timeout_seconds=max(1, int(profile_drop_timeout_seconds)),
+            force_rebuild=bool(force_rebuild),
+            as_json=False,
+        )
+
+    refresh_summary = _refresh_global_derived_corpus_state(config)
+    summary["status"] = "complete" if render_exit_code == 0 else "partial_failure"
+    summary["render_exit_code"] = render_exit_code
+    summary["render_summary"] = render_summary
+    summary["refresh_summary"] = refresh_summary
+    if as_json:
+        print(json.dumps(summary, ensure_ascii=True, indent=2))
+    else:
+        console.print(
+            Panel.fit(
+                "\n".join(
+                    [
+                        f"Selected attempts: {summary['selected_count']}",
+                        f"Scope: {selection_info.get('selection_scope')}",
+                        f"Render exit code: {render_exit_code}",
+                        f"Refreshed catalog rows: {refresh_summary.get('attempt_count')}",
+                    ]
+                ),
+                title="Finalize Corpus",
+                border_style="green" if render_exit_code == 0 else "yellow",
+            )
+        )
+    return int(render_exit_code)
 
 
 def cmd_score(artifact_dir: Path) -> int:
@@ -8728,6 +9153,7 @@ def main() -> int:
             run_ids=args.run_id,
             attempt_ids=args.attempt_id,
             candidate_limit=int(args.candidate_limit),
+            candidate_scope=str(args.candidate_scope),
             board_size=int(args.board_size),
             min_score_36=float(args.min_score_36),
             min_retention_ratio=float(args.min_retention_ratio),
@@ -8746,6 +9172,7 @@ def main() -> int:
             run_ids=args.run_id,
             attempt_ids=args.attempt_id,
             candidate_limit=int(args.candidate_limit),
+            candidate_scope=str(args.candidate_scope),
             shortlist_size=int(args.shortlist_size),
             min_score_36=float(args.min_score_36),
             min_retention_ratio=float(args.min_retention_ratio),
@@ -8772,6 +9199,7 @@ def main() -> int:
             run_ids=args.run_id,
             attempt_ids=args.attempt_id,
             portfolio_config=args.portfolio_config,
+            candidate_scope=args.candidate_scope,
             catch_up_full_backtests=args.catch_up_full_backtests,
             catch_up_force_rebuild=args.catch_up_force_rebuild,
             catch_up_require_scrutiny_36=args.catch_up_require_scrutiny_36,
@@ -8798,10 +9226,23 @@ def main() -> int:
             attempt_ids=args.attempt_id,
             top_results=args.top_results,
             rank_start=int(args.rank_start),
+            canonical_only=bool(args.canonical_only),
             lookback_months=int(args.lookback_months),
             profile_drop_workers=int(args.profile_drop_workers),
             profile_drop_timeout_seconds=int(args.profile_drop_timeout_seconds),
             force_rebuild=bool(args.force_rebuild),
+            as_json=bool(args.json),
+        )
+    if args.command == "finalize-corpus":
+        return cmd_finalize_corpus(
+            run_ids=args.run_id,
+            attempt_ids=args.attempt_id,
+            scope=args.scope,
+            lookback_months=int(args.lookback_months),
+            profile_drop_workers=int(args.profile_drop_workers),
+            profile_drop_timeout_seconds=int(args.profile_drop_timeout_seconds),
+            force_rebuild=bool(args.force_rebuild),
+            dry_run=bool(args.dry_run),
             as_json=bool(args.json),
         )
     if args.command == "nuke-deep-caches":

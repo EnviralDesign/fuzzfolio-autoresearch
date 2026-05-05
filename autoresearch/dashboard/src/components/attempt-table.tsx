@@ -20,11 +20,32 @@ const baseColumns: ColumnDef<AttemptCatalogRow, unknown>[] = [
     header: "Candidate",
     cell: ({ row }) => {
       const r = row.original;
+      const role = String(r.attempt_role || r.play_hand_role || "").trim();
+      const decision = String(r.attempt_decision || "").trim();
       return (
         <div className="space-y-1">
           <div className="font-medium text-foreground">
             {String(r.candidate_name || r.attempt_id)}
           </div>
+          {role || decision || r.is_canonical_playhand_attempt ? (
+            <div className="flex flex-wrap gap-1">
+              {r.is_canonical_playhand_attempt ? (
+                <span className="rounded border border-emerald-400/40 bg-emerald-400/10 px-1.5 py-0.5 text-[0.66rem] uppercase tracking-wide text-emerald-200">
+                  Canonical
+                </span>
+              ) : null}
+              {role ? (
+                <span className="rounded border border-border/70 bg-background/45 px-1.5 py-0.5 text-[0.66rem] uppercase tracking-wide text-muted-foreground">
+                  {role.replaceAll("_", " ")}
+                </span>
+              ) : null}
+              {decision && decision !== "canonical" ? (
+                <span className="rounded border border-border/70 bg-background/45 px-1.5 py-0.5 text-[0.66rem] uppercase tracking-wide text-muted-foreground">
+                  {decision.replaceAll("_", " ")}
+                </span>
+              ) : null}
+            </div>
+          ) : null}
           <div className="text-xs text-muted-foreground">
             {String(r.attempt_id)}
           </div>

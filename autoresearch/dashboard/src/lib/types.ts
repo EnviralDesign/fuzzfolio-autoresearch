@@ -92,6 +92,17 @@ export type ShortlistProfileDrop = {
   attempt_id: string;
   run_id: string;
   candidate_name?: string | null;
+  runner?: string | null;
+  attempt_role?: string | null;
+  attempt_decision?: string | null;
+  attempt_decision_reasons?: string[] | null;
+  strategy_family_id?: string | null;
+  canonical_attempt_id?: string | null;
+  is_canonical_playhand_attempt?: boolean;
+  play_hand_role?: string | null;
+  play_hand_stage?: string | null;
+  play_hand_instrument?: string | null;
+  play_hand_selected_instruments?: string[] | null;
   display_name?: string | null;
   tagline?: string | null;
   short_description?: string | null;
@@ -204,6 +215,8 @@ export type RunSummary = {
   full_backtest_36m_count: number;
   score_36m_count: number;
   best_attempt?: AttemptCatalogRow | null;
+  canonical_attempt_id?: string | null;
+  canonical_candidate_name?: string | null;
   progress_png_url?: string | null;
 };
 

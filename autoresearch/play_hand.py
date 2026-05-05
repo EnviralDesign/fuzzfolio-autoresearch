@@ -19,7 +19,9 @@ from .fuzzfolio import FuzzfolioCli
 from .ledger import (
     append_attempt,
     attempts_path_for_run_dir,
+    load_attempts,
     make_attempt_record,
+    write_attempts,
     write_run_metadata,
 )
 from .plotting import render_progress_artifacts
@@ -61,6 +63,7 @@ EVOLUTIONARY_BUDGET_PRESETS: dict[str, tuple[int, int]] = {
 PLAY_HAND_REWARD_STEP_R = 0.5
 PLAY_HAND_REWARD_COLUMN_LIMIT = 25
 PLAY_HAND_DEFAULT_MAX_REWARD_R = PLAY_HAND_REWARD_STEP_R * PLAY_HAND_REWARD_COLUMN_LIMIT
+PLAY_HAND_RUNNER = "play_hand_v1"
 
 
 def play_hand_reward_matrix(max_reward_r: float | None) -> dict[str, Any] | None:
@@ -509,6 +512,150 @@ def _append_event(ctx: PlayHandContext, phase: str, status: str, **payload: Any)
     detail = f" score={score:.4f}" if isinstance(score, (int, float)) else ""
     prefix = f"{stage.prefix} " if isinstance(stage, PlayHandStage) else ""
     console.print(f"{prefix}[cyan]{phase}[/] [bold]{status}[/]{detail}")
+
+
+def _play_hand_role_for_phase(phase: str) -> str:
+    token = str(phase or "").strip().lower()
+    if token == "baseline_3mo":
+        return "baseline"
+    if token == "lookback_timing_top_3mo":
+        return "lookback_top"
+    if token == "coarse_top_3mo":
+        return "coarse_top"
+    if token == "focused_top_3mo":
+        return "focused_top"
+    if token.startswith("instrument_scout_"):
+        return "instrument_scout"
+    if token == "final_36mo":
+        return "final"
+    return token or "evaluation"
+
+
+def _play_hand_default_decision(role: str) -> str:
+    if role == "final":
+        return "canonical"
+    if role == "instrument_scout":
+        return "scout_pending"
+    return "intermediate"
+
+
+def _play_hand_instrument_for_phase(phase: str) -> str | None:
+    match = re.match(r"^instrument_scout_([^_]+)_\d+mo$", str(phase or ""), re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).upper()
+
+
+def _attempt_decision_updates_from_scout(
+    scout_result: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    if not isinstance(scout_result, dict):
+        return result
+    for item in [scout_result.get("primary")]:
+        if not isinstance(item, dict):
+            continue
+        attempt_id = str(item.get("attempt_id") or "").strip()
+        if not attempt_id:
+            continue
+        result[attempt_id] = {
+            "attempt_decision": "accepted",
+            "attempt_decision_reasons": ["primary_anchor"],
+            "play_hand_instrument": str(item.get("instrument") or "").strip().upper() or None,
+        }
+    for bucket, decision in (("accepted", "accepted"), ("rejected", "rejected")):
+        for item in list(scout_result.get(bucket) or []):
+            if not isinstance(item, dict):
+                continue
+            attempt_id = str(item.get("attempt_id") or "").strip()
+            if not attempt_id:
+                continue
+            reasons = list(item.get("decision_reasons") or item.get("decision_reason") or [])
+            if isinstance(item.get("decision_reason"), str):
+                reasons = [str(item.get("decision_reason"))]
+            result[attempt_id] = {
+                "attempt_decision": decision,
+                "attempt_decision_reasons": [str(reason) for reason in reasons if str(reason).strip()],
+                "play_hand_instrument": str(item.get("instrument") or "").strip().upper() or None,
+            }
+    return result
+
+
+def _finalize_play_hand_attempt_metadata(
+    ctx: PlayHandContext,
+    *,
+    final_attempt_id: str,
+    scout_result: dict[str, Any] | None,
+    selected_instruments: list[str],
+    reward_matrix: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    attempts = load_attempts(ctx.attempts_path)
+    if not attempts:
+        return {
+            "attempt_count": 0,
+            "updated_count": 0,
+            "canonical_attempt_id": final_attempt_id or None,
+        }
+    scout_updates = _attempt_decision_updates_from_scout(scout_result)
+    selected = _clean_tokens(selected_instruments)
+    matrix = dict(reward_matrix) if isinstance(reward_matrix, dict) else None
+    updated = 0
+    for attempt in attempts:
+        candidate_name = str(attempt.get("candidate_name") or "")
+        role = str(attempt.get("attempt_role") or attempt.get("play_hand_role") or "").strip()
+        if not role:
+            role = _play_hand_role_for_phase(candidate_name)
+        decision = str(attempt.get("attempt_decision") or "").strip()
+        if not decision:
+            decision = _play_hand_default_decision(role)
+        attempt_id = str(attempt.get("attempt_id") or "").strip()
+        if attempt_id in scout_updates:
+            decision = str(scout_updates[attempt_id].get("attempt_decision") or decision)
+        is_canonical = bool(final_attempt_id and attempt_id == final_attempt_id)
+        if is_canonical:
+            role = "final"
+            decision = "canonical"
+        prior = dict(attempt)
+        attempt["runner"] = PLAY_HAND_RUNNER
+        attempt["attempt_role"] = role
+        attempt["play_hand_role"] = role
+        attempt["play_hand_stage"] = str(attempt.get("play_hand_stage") or role)
+        attempt["attempt_decision"] = decision
+        attempt["strategy_family_id"] = ctx.run_id
+        attempt["canonical_attempt_id"] = final_attempt_id or None
+        attempt["is_canonical_playhand_attempt"] = is_canonical
+        if selected:
+            attempt["play_hand_selected_instruments"] = selected
+        if matrix:
+            attempt["max_reward_r"] = matrix.get("requested_max_reward_r")
+            attempt["reward_matrix"] = matrix
+            attempt["reward_step_r"] = matrix.get("reward_step_r")
+            attempt["reward_columns"] = matrix.get("reward_columns")
+            attempt["effective_max_reward_r"] = matrix.get("effective_max_reward_r")
+        instrument = str(attempt.get("play_hand_instrument") or "").strip().upper()
+        if not instrument:
+            instrument = _play_hand_instrument_for_phase(candidate_name) or ""
+        update = scout_updates.get(attempt_id) or {}
+        if update.get("play_hand_instrument"):
+            instrument = str(update.get("play_hand_instrument") or "").strip().upper()
+        if instrument:
+            attempt["play_hand_instrument"] = instrument
+        reasons = list(attempt.get("attempt_decision_reasons") or [])
+        if update.get("attempt_decision_reasons"):
+            reasons = list(update.get("attempt_decision_reasons") or [])
+        if is_canonical:
+            reasons = ["final_scrutiny_attempt"]
+        attempt["attempt_decision_reasons"] = [
+            str(reason) for reason in reasons if str(reason).strip()
+        ]
+        if attempt != prior:
+            updated += 1
+    write_attempts(ctx.attempts_path, attempts)
+    return {
+        "attempt_count": len(attempts),
+        "updated_count": updated,
+        "canonical_attempt_id": final_attempt_id or None,
+    }
 
 
 def _render_dealt_hand(
@@ -1760,6 +1907,8 @@ def _evaluate_profile(
     snapshot_path = out_dir / "sensitivity-response.json"
     snapshot = load_sensitivity_snapshot(out_dir) if snapshot_path.exists() else None
     attempt_score = build_attempt_score(compare_payload, snapshot)
+    play_hand_role = _play_hand_role_for_phase(phase)
+    play_hand_decision = _play_hand_default_decision(play_hand_role)
     record = make_attempt_record(
         ctx.config,
         ctx.attempts_path,
@@ -1773,6 +1922,36 @@ def _evaluate_profile(
         note=f"play_hand_v1:{phase}",
         requested_horizon_months=int(lookback_months),
         requested_timeframe=timeframe,
+        max_reward_r=(
+            reward_matrix.get("requested_max_reward_r")
+            if isinstance(reward_matrix, dict)
+            else None
+        ),
+        reward_matrix=dict(reward_matrix) if isinstance(reward_matrix, dict) else None,
+        reward_step_r=(
+            reward_matrix.get("reward_step_r")
+            if isinstance(reward_matrix, dict)
+            else None
+        ),
+        reward_columns=(
+            reward_matrix.get("reward_columns")
+            if isinstance(reward_matrix, dict)
+            else None
+        ),
+        effective_max_reward_r=(
+            reward_matrix.get("effective_max_reward_r")
+            if isinstance(reward_matrix, dict)
+            else None
+        ),
+        runner=PLAY_HAND_RUNNER,
+        attempt_role=play_hand_role,
+        attempt_decision=play_hand_decision,
+        strategy_family_id=ctx.run_id,
+        canonical_attempt_id=None,
+        is_canonical_playhand_attempt=False,
+        play_hand_role=play_hand_role,
+        play_hand_stage=stage.label,
+        play_hand_instrument=_play_hand_instrument_for_phase(phase),
     )
     append_attempt(ctx.attempts_path, record)
     from .ledger import load_attempts
@@ -3433,6 +3612,33 @@ def cmd_play_hand(
         lookback_months=scrutiny_months,
         reward_matrix=reward_matrix,
     )
+    final_attempt_id = str(scrutiny.get("attempt_id") or "").strip()
+    attempt_metadata_summary = _finalize_play_hand_attempt_metadata(
+        ctx,
+        final_attempt_id=final_attempt_id,
+        scout_result=scout_result,
+        selected_instruments=instruments,
+        reward_matrix=reward_matrix,
+    )
+    metadata.update(
+        {
+            "canonical_attempt_id": final_attempt_id or None,
+            "canonical_attempt_role": "final",
+            "canonical_candidate_name": "final_36mo",
+            "canonical_score": scrutiny.get("score"),
+            "canonical_instruments": instruments,
+            "strategy_family_id": run_id,
+            "attempt_metadata": attempt_metadata_summary,
+        }
+    )
+    write_run_metadata(run_dir, metadata)
+    _append_event(
+        ctx,
+        "attempt_metadata",
+        "updated",
+        stage=stages["scrutiny"],
+        **attempt_metadata_summary,
+    )
     phase_rows.append({"phase": "scrutiny", "status": "evaluated", "score": scrutiny.get("score"), "detail": f"{scrutiny_months}mo on {', '.join(instruments)}"})
 
     final_artifact_summary: dict[str, Any]
@@ -3442,7 +3648,7 @@ def cmd_play_hand(
             stage=stages["artifacts"],
             profile_drop_count=final_profile_drop_count,
             profile_drop_workers=final_profile_drop_workers,
-            final_attempt_id=str(scrutiny.get("attempt_id") or ""),
+            final_attempt_id=final_attempt_id,
         )
         status = str(final_artifact_summary.get("status") or "")
         detail_bits: list[str] = []
@@ -3499,6 +3705,11 @@ def cmd_play_hand(
         "max_reward_r": max_reward_r,
         "reward_matrix": reward_matrix,
         "instrument_scout": scout_result,
+        "canonical_attempt_id": final_attempt_id or None,
+        "canonical_attempt_role": "final",
+        "canonical_candidate_name": "final_36mo",
+        "strategy_family_id": run_id,
+        "attempt_metadata": attempt_metadata_summary,
         "final_profile_ref": current_profile_ref,
         "final_profile_path": str(current_profile_path.resolve()),
         "final_score": scrutiny.get("score"),

@@ -49,7 +49,7 @@ const runsColumns: ColumnDef<RunSummary, unknown>[] = [
   },
   {
     accessorKey: "best_attempt.score_36m",
-    header: "Best 36mo",
+    header: "Chosen 36mo",
     cell: ({ row }) => (
       <span className={scoreTone(row.original.best_attempt?.score_36m ?? null)}>
         {formatNumber(row.original.best_attempt?.score_36m ?? null, 2)}
@@ -105,7 +105,7 @@ export function RunsPage() {
                 Runs are provenance, not the primary ranking unit anymore.
               </CardTitle>
               <CardDescription className="max-w-3xl text-base leading-7">
-                This page keeps run lineage visible so you can still audit where shortlisted or promoted candidates came from without letting "best per run" dominate the whole corpus story.
+                This page keeps run lineage visible so you can audit where shortlisted or promoted candidates came from without letting score-only run winners dominate the corpus story.
               </CardDescription>
             </div>
           </CardHeader>
