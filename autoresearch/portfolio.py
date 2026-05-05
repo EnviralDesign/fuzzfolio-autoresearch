@@ -158,6 +158,18 @@ def _row_is_play_hand(row: dict[str, Any]) -> bool:
 def _row_is_canonical_play_hand(row: dict[str, Any]) -> bool:
     if bool(row.get("is_canonical_playhand_attempt")):
         return True
+    if bool(row.get("is_canonical_attempt")) and _row_is_play_hand(row):
+        return True
+    canonical_attempt_id = str(row.get("canonical_attempt_id") or "").strip()
+    attempt_id = str(row.get("attempt_id") or "").strip()
+    return bool(canonical_attempt_id and attempt_id and canonical_attempt_id == attempt_id)
+
+
+def _row_is_canonical_attempt(row: dict[str, Any]) -> bool:
+    if bool(row.get("is_canonical_attempt")) or bool(
+        row.get("is_canonical_playhand_attempt")
+    ):
+        return True
     canonical_attempt_id = str(row.get("canonical_attempt_id") or "").strip()
     attempt_id = str(row.get("attempt_id") or "").strip()
     return bool(canonical_attempt_id and attempt_id and canonical_attempt_id == attempt_id)
@@ -188,7 +200,7 @@ def dashboard_attempt_score_sort_key(row: dict[str, Any]) -> tuple[bool, float, 
 
 
 def is_dashboard_canonical_attempt(row: dict[str, Any]) -> bool:
-    return _row_is_canonical_play_hand(row)
+    return _row_is_canonical_attempt(row)
 
 
 def select_dashboard_preferred_attempt_rows(
@@ -269,16 +281,24 @@ def filter_play_hand_candidate_scope(
     dropped = 0
     for key in run_order:
         group = grouped[key]
-        if not any(_row_is_play_hand(row) for row in group):
+        canonical_rows = [
+            row for row in group if _row_is_canonical_attempt(row)
+        ]
+        if canonical_rows:
+            if any(_row_is_play_hand(row) for row in group):
+                playhand_runs_with_canonical += 1
+        elif any(_row_is_play_hand(row) for row in group):
+            canonical_rows = [
+                row for row in group if _row_is_canonical_play_hand(row)
+            ]
+            if canonical_rows:
+                playhand_runs_with_canonical += 1
+        else:
             filtered.extend(group)
             continue
-        canonical_rows = [
-            row for row in group if _row_is_canonical_play_hand(row)
-        ]
         if not canonical_rows:
             filtered.extend(group)
             continue
-        playhand_runs_with_canonical += 1
         canonical_ids = {
             str(row.get("attempt_id") or "").strip()
             for row in canonical_rows

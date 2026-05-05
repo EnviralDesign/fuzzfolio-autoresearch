@@ -4,8 +4,10 @@ from collections import deque
 from pathlib import Path
 from datetime import datetime
 
+import pytest
+
 import autoresearch.provider as provider_module
-from autoresearch.__main__ import build_parser
+from autoresearch.__main__ import _argv_for_invocation, build_parser
 from autoresearch.provider import (
     ChatMessage,
     CodexAppServerProvider,
@@ -28,7 +30,7 @@ def test_request_snapshot_writes_human_readable_text_files(tmp_path: Path) -> No
         step=7,
         phase="explorer_provider",
         provider_type="lmstudio",
-        model="gemma-4-E4B-it",
+        model="lmstudio-json-test-model",
         request_snapshot_dir=str(tmp_path),
     ):
         _write_provider_request_snapshot(
@@ -37,12 +39,12 @@ def test_request_snapshot_writes_human_readable_text_files(tmp_path: Path) -> No
                 ChatMessage(role="system", content="Return JSON only."),
                 ChatMessage(role="user", content="Pick the next tool."),
             ],
-            request_payload={"model": "gemma-4-E4B-it", "temperature": 0.2},
+            request_payload={"model": "lmstudio-json-test-model", "temperature": 0.2},
         )
         _write_provider_request_snapshot(
             "chat_completions_request",
             messages=[ChatMessage(role="user", content="Retry with one action.")],
-            request_payload={"model": "gemma-4-E4B-it", "temperature": 0.2},
+            request_payload={"model": "lmstudio-json-test-model", "temperature": 0.2},
         )
 
     snapshots = sorted(tmp_path.glob("*.txt"))
@@ -63,7 +65,7 @@ def test_request_snapshot_writes_human_readable_text_files(tmp_path: Path) -> No
     assert '"request_sequence": 1' in content
     assert "[message 1] role=system" in content
     assert "Return JSON only." in content
-    assert '"model": "gemma-4-E4B-it"' in content
+    assert '"model": "lmstudio-json-test-model"' in content
 
 
 def test_request_snapshot_is_noop_without_snapshot_dir(tmp_path: Path) -> None:
@@ -73,7 +75,7 @@ def test_request_snapshot_is_noop_without_snapshot_dir(tmp_path: Path) -> None:
         step=7,
         phase="explorer_provider",
         provider_type="lmstudio",
-        model="gemma-4-E4B-it",
+        model="lmstudio-json-test-model",
     ):
         _write_provider_request_snapshot(
             "chat_completions_request",
@@ -89,9 +91,16 @@ def test_build_parser_accepts_llm_request_snapshot_flag() -> None:
     assert args.command == "run"
     assert args.llm_request_snapshots is True
 
-    args = parser.parse_args(["supervise", "--llm-request-snapshots"])
-    assert args.command == "supervise"
-    assert args.llm_request_snapshots is True
+    with pytest.raises(SystemExit):
+        parser.parse_args(["supervise", "--llm-request-snapshots"])
+
+
+def test_direct_script_invocation_infers_public_command() -> None:
+    assert _argv_for_invocation(["--json"], invoked_as="doctor") == ["doctor", "--json"]
+    assert _argv_for_invocation(
+        ["--dry-run", "--json"], invoked_as="play-hand"
+    ) == ["play-hand", "--dry-run", "--json"]
+    assert _argv_for_invocation(["doctor"], invoked_as="autoresearch") == ["doctor"]
 
 
 def test_request_snapshot_pretty_prints_assistant_actions_and_tool_results(tmp_path: Path) -> None:
@@ -101,7 +110,7 @@ def test_request_snapshot_pretty_prints_assistant_actions_and_tool_results(tmp_p
         step=3,
         phase="explorer_provider",
         provider_type="lmstudio",
-        model="gemma-4-E4B-it",
+        model="lmstudio-json-test-model",
         request_snapshot_dir=str(tmp_path),
     ):
         _write_provider_request_snapshot(
@@ -123,7 +132,7 @@ def test_request_snapshot_pretty_prints_assistant_actions_and_tool_results(tmp_p
                     ),
                 ),
             ],
-            request_payload={"model": "gemma-4-E4B-it", "temperature": 0.2},
+            request_payload={"model": "lmstudio-json-test-model", "temperature": 0.2},
         )
 
     content = next(tmp_path.glob("*.txt")).read_text(encoding="utf-8")

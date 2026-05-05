@@ -43,6 +43,9 @@ export type AttemptCatalogRow = {
   max_sameness_to_selected?: number | null;
   max_sameness_to_board?: number | null;
   closest_selected_attempt_id?: string | null;
+  canonical_attempt_id?: string | null;
+  is_canonical_attempt?: boolean;
+  is_canonical_playhand_attempt?: boolean;
   [key: string]: unknown;
 };
 
@@ -98,6 +101,7 @@ export type ShortlistProfileDrop = {
   attempt_decision_reasons?: string[] | null;
   strategy_family_id?: string | null;
   canonical_attempt_id?: string | null;
+  is_canonical_attempt?: boolean;
   is_canonical_playhand_attempt?: boolean;
   play_hand_role?: string | null;
   play_hand_stage?: string | null;
@@ -268,4 +272,21 @@ export type LivePortfolio = {
   updated_at?: string | null;
   path?: string | null;
   path_url?: string | null;
+};
+
+export type DashboardJob = {
+  id?: string;
+  kind?: string;
+  status: string;
+  created_at?: string | null;
+  started_at?: string | null;
+  ended_at?: string | null;
+  command?: string[];
+  cwd?: string | null;
+  returncode?: number | null;
+  log_path?: string | null;
+  log_tail?: string;
+  portfolio_config_path?: string | null;
+  error?: string | null;
+  message?: string | null;
 };

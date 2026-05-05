@@ -71,7 +71,7 @@ export function RunDetailPage() {
           <CardHeader>
             <CardTitle className="text-2xl tracking-tight">Attempts in run</CardTitle>
             <CardDescription>
-              Canonical play-hand attempts appear first, then rows fall back to 36-month score and composite score.
+              Canonical attempts appear first, then rows fall back to 36-month score and composite score.
             </CardDescription>
           </CardHeader>
           <CardContent>

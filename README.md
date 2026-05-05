@@ -1,682 +1,115 @@
 # fuzzfolio-autoresearch
 
-CLI-first tooling for turning a large Fuzzfolio runs corpus into usable long-horizon evidence, shortlist artifacts, and a read-only dashboard.
+Auto Research is the local strategy-generation and portfolio-assembly workspace for Fuzzfolio.
 
-The important shift is:
+The repo now has one product shape:
 
-- heavy computation happens in CLI commands
-- attempt-local caches are treated as first-class artifacts
-- `36mo` evidence is the main promotion horizon
-- the dashboard is only a viewer of already-computed data
+1. Generate strategy runs.
+2. Promote one canonical winner per run.
+3. Finalize that winner with 36-month scrutiny/full-backtest artifacts, presentation metadata, and a profile-drop card.
+4. Build a portfolio automatically, or assemble one manually in the dashboard from the canonical candidate corpus.
 
-Everything below assumes you are running from the repo root:
-
-```powershell
-cd C:\repos\fuzzfolio-autoresearch
-```
-
-## What This Repo Is For
-
-There are two lanes:
-
-1. Controller/runtime lane
-   - autonomous research runs
-   - per-run ledgers
-   - scored attempts
-
-2. Corpus analysis lane
-   - corpus-wide attempt catalog
-   - portable `12mo` and `36mo` scrutiny
-   - attempt-local `36mo` full backtests
-   - shortlist and promotion selection
-   - derived charts and dashboard viewing
-
-If you only care about surfacing the best validated strategies, the corpus analysis lane is the one that matters.
+Play Hand is the preferred generator. Explorer is still available through `run` as a legacy advanced generator, but the local model fine-tuning branch has been removed.
 
 ## Setup
 
-Copy the local config templates:
-
 ```powershell
+cd C:\repos\fuzzfolio-autoresearch
 Copy-Item autoresearch.config.example.json autoresearch.config.json
 Copy-Item .agentsecrets.example .agentsecrets
+uv run doctor
+uv run test-providers
 ```
 
-Then verify the stack:
+## Public Commands
+
+- `doctor` checks config, Fuzzfolio CLI access, auth, and seed prompt state.
+- `test-providers` smoke-tests configured remote/provider-backed LLM profiles.
+- `play-hand` runs the deterministic strategy generator and finalizes the run winner.
+- `run` runs the legacy Explorer controller and finalizes the best scored attempt when it exits.
+- `finalize-corpus` catches up canonical attempts across existing runs.
+- `build-portfolio` builds the automatic portfolio report from canonical candidates.
+- `dashboard` opens the manual/auto portfolio workbench and local job controls.
+- `record-attempt` manually scores and records an artifact directory.
+- `nuke-deep-caches` deletes rebuildable deep artifacts.
+
+See [cli.md](cli.md) for arguments.
+
+## Two Paths
+
+### Path A: Full Auto
 
 ```powershell
-uv run autoresearch doctor
-uv run autoresearch test-providers
+uv run play-hand
+uv run finalize-corpus
+uv run build-portfolio
+uv run dashboard
 ```
 
-## Daily Commands
+`play-hand` creates a run, promotes a canonical attempt, runs the canonical finalization path, and writes final profile-drop artifacts. `build-portfolio` consumes canonical candidates and produces the latest portfolio report under `runs/derived/portfolio-report/`.
 
-`build-portfolio` is the normal top-level daily ops command. With the repo-root `portfolio.config.json` in its default shape, it can catch up missing `36mo` full backtests, rebuild the portfolio snapshot, render portfolio profile drops, and export a dated bundle.
-
-Command hierarchy at a glance:
-
-- `build-portfolio`
-  - umbrella command for normal daily rebuilds
-  - optionally runs the same catch-up engine exposed directly as `calculate-full-backtests`
-  - then writes the canonical portfolio snapshot under `runs/derived/portfolio-report/<portfolio-name>/`
-  - optionally renders PNGs under `runs/derived/portfolio-report/<portfolio-name>/profile-drops/`
-  - optionally exports a dated bundle under `runs/derived/portfolio-exports/<portfolio-name>/<timestamp>/`
-- `calculate-full-backtests`
-  - leaf backfill command
-  - use it directly when you want to repair or advance `36mo` coverage without rebuilding portfolio artifacts
-- `build-shortlist-report`
-  - single-board sibling to `build-portfolio`
-  - useful for shortlist tuning and chart iteration
-- `export-portfolio-bundle`
-  - export-only leaf command for an existing portfolio report
-  - does not rerun catch-up or portfolio selection
-- `render-portfolio-profile-drops`
-  - repair-only leaf command for an existing portfolio report
-  - rerenders `profile-drops/*` without rerunning catch-up or portfolio selection
-- `finalize-corpus`
-  - default dashboard-readiness catch-up command
-  - selects exactly the attempt each run page would surface first: play-hand canonical when present, otherwise the best scored run attempt
-  - heals missing attempt-local `36mo` full backtests and renders attempt-local profile drops for that selected set
-  - refreshes the materialized corpus catalog afterward
-- `render-corpus-profile-drops`
-  - corpus browsing leaf command
-  - renders attempt-local `profile-drop-36mo.*` artifacts in place for ranked corpus slices
-  - can render everything explicitly; importance is determined by attempt metadata, not by the renderer
-  - heals missing `36mo` full backtests first when possible, then skips already-cached in-place drops unless forced
-- `nuke-deep-caches`
-  - reset helper
-  - clears rebuildable deep artifacts so the next `build-portfolio` regenerates them from source
-- `build-attempt-catalog`, `audit-full-backtests`, `build-promotion-board`, `plot-corpus-score-vs-trades`, `dashboard`
-  - support and inspection commands
-
-Most useful root commands:
+### Path B: Manual Assembly
 
 ```powershell
-uv run autoresearch build-portfolio
-uv run autoresearch calculate-full-backtests
-uv run autoresearch build-shortlist-report
-uv run autoresearch export-portfolio-bundle
-uv run autoresearch render-portfolio-profile-drops
-uv run autoresearch finalize-corpus
-uv run autoresearch render-corpus-profile-drops
-uv run autoresearch nuke-deep-caches
-uv run autoresearch build-attempt-catalog
-uv run autoresearch audit-full-backtests
-uv run autoresearch build-promotion-board
-uv run autoresearch plot-corpus-score-vs-trades
-uv run autoresearch dashboard
+uv run play-hand
+uv run finalize-corpus
+uv run dashboard
 ```
 
-## Common Workflows
+Open the dashboard Portfolio Workbench, use the Manual mode to select canonical candidates, inspect the 36-month basket curve, and persist the draft selection. Auto Build mode can run `finalize-corpus` and `build-portfolio` from the dashboard using local-only job APIs.
 
-### 1. Cold-reset all rebuildable deep caches
+## Run Contract
 
-Use this when deep-replay semantics changed and you want the next portfolio build to regenerate backtests, scrutiny, charts, and profile drops from source.
+Every generator should end with one canonical attempt per run. Canonical metadata is shared across Play Hand, Explorer, dashboard, and portfolio building:
 
-```powershell
-uv run autoresearch nuke-deep-caches
-uv run autoresearch build-portfolio
-```
+- `runner`
+- `attempt_role`
+- `attempt_decision`
+- `attempt_decision_reasons`
+- `strategy_family_id`
+- `canonical_attempt_id`
+- `is_canonical_attempt`
 
-What it deletes:
+Play Hand compatibility aliases remain in existing ledgers, but new readers should prefer the universal fields.
 
-- attempt-local `full-backtest-36mo-*`
-- attempt-local `scrutiny-cache/`
-- run-local `profile-drop-*.png` and manifests
-- everything under `runs/derived/`
+## Finalization
 
-What it does not delete:
+`finalize-corpus` is the catch-up command for dashboard/build-portfolio readiness. With no arguments it uses the same selection logic as the dashboard: one canonical attempt per run when present, otherwise the best scored attempt in that run.
 
-- original run folders
-- attempt ledgers
-- base sensitivity/source artifacts like `sensitivity-response.json`
+Finalization prepares:
 
-### 2. Resume corpus backfill
-
-This is the main backfill subcommand. It fills missing attempt-local `36mo` full backtests, uses the detected dev sim-worker count by default, and is resumable when you do not pass `--force-rebuild`.
-
-```powershell
-uv run autoresearch calculate-full-backtests
-```
-
-Useful variants:
-
-```powershell
-uv run autoresearch calculate-full-backtests --require-scrutiny-36
-uv run autoresearch calculate-full-backtests --attempt-id 20260327T205658482523Z-agentic-aebf78-attempt-00045
-uv run autoresearch calculate-full-backtests --limit 10
-uv run autoresearch calculate-full-backtests --max-workers 12
-uv run autoresearch calculate-full-backtests --force-rebuild
-uv run autoresearch calculate-full-backtests --json
-```
-
-Important flags:
-
-- `--require-scrutiny-36`
-  - only backfill attempts that already have `36mo` scrutiny
-  - good for targeted completion
-- `--limit`
-  - smoke-test on a small slice
-- `--attempt-id`
-  - isolate a broken or interesting candidate
-- `--force-rebuild`
-  - recompute even if the full-backtest files already exist
-  - not resumable in the normal sense
-- `--no-use-dev-sim-worker-count`
-  - disable auto sizing from the running dev sim-worker fleet
-
-Artifacts and summaries written:
-
-- attempt-local `full-backtest-36mo-curve.json`
-- attempt-local `full-backtest-36mo-result.json`
-- [runs/derived/full-backtest-failures.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/full-backtest-failures.json)
-- refreshed catalog and audit files under `runs/derived`
-
-### 3. Rebuild scrutiny caches
-
-This heals or rebuilds portable attempt-local scrutiny caches. Use it when `12mo` or `36mo` scrutiny is missing or stale.
-
-```powershell
-uv run autoresearch hydrate-scrutiny-cache
-```
-
-Useful variants:
-
-```powershell
-uv run autoresearch hydrate-scrutiny-cache --lookback-months 36
-uv run autoresearch hydrate-scrutiny-cache --attempt-id 20260327T205658482523Z-agentic-aebf78-attempt-00045
-uv run autoresearch hydrate-scrutiny-cache --limit 20
-uv run autoresearch hydrate-scrutiny-cache --force-rebuild
-```
-
-Important flags:
-
-- `--lookback-months`
-  - repeatable
-  - defaults to `12` and `36`
-- `--force-rebuild`
-  - ignore current scrutiny caches and rebuild them
-
-### 4. Finalize dashboard-visible corpus artifacts
-
-Use this when you want the dashboard and portfolio tools to have the final artifacts they expect without rendering every intermediate attempt. With no flags, this is the default catch-up behavior for the promoted attempt from each run.
-
-```powershell
-uv run autoresearch finalize-corpus
-```
-
-Default behavior:
-
-- loads the same attempt catalog the dashboard reads
-- selects one reader-visible attempt per run
-- prefers `canonical_attempt_id` for play-hand runs
-- falls back to the best scored attempt for explorer/manual runs
-- heals missing attempt-local `36mo` full backtests
-- renders attempt-local `profile-drop-36mo.*` artifacts
-- refreshes the materialized corpus catalog afterward
-
-Useful variants:
-
-```powershell
-uv run autoresearch finalize-corpus --dry-run
-uv run autoresearch finalize-corpus --run-id 20260327T205658482523Z-agentic-aebf78
-uv run autoresearch finalize-corpus --scope all
-uv run autoresearch finalize-corpus --force-rebuild
-uv run autoresearch finalize-corpus --json
-```
-
-Important flags:
-
-- `--scope dashboard`
-  - default
-  - uses the same chosen-attempt logic as the dashboard reader
-- `--scope all`
-  - explicitly finalize every matched attempt
-  - useful for archival coverage, not normal dashboard readiness
-- `--dry-run`
-  - show the selected attempts without generating artifacts
-- `--attempt-id`
-  - bypasses run-level selection and finalizes exact attempts
-
-### 5. Render corpus profile drops in place
-
-Use this when you want large-scale visual inspection across the corpus without rebuilding shortlist or portfolio derived outputs.
-
-```powershell
-uv run autoresearch render-corpus-profile-drops --top-results 1000
-```
-
-Default behavior:
-
-- selects ranked corpus rows from the same catalog used by shortlist and portfolio selection
-- optionally heals missing attempt-local `36mo` full backtests first
-- writes visible artifacts directly into each attempt `artifact_dir`
-- keeps bundle/cache internals under a hidden attempt-local `.profile-drop-36mo/` folder
-- skips existing matching drops unless `--force-rebuild` is passed
-
-Useful variants:
-
-```powershell
-uv run autoresearch render-corpus-profile-drops --top-results 250
-uv run autoresearch render-corpus-profile-drops --rank-start 1000 --top-results 250
-uv run autoresearch render-corpus-profile-drops --attempt-id 20260327T205658482523Z-agentic-aebf78-attempt-00045
-uv run autoresearch render-corpus-profile-drops --run-id 20260327T205658482523Z-agentic-aebf78 --top-results 50
-uv run autoresearch render-corpus-profile-drops --run-id 20260327T205658482523Z-agentic-aebf78 --canonical-only
-uv run autoresearch render-corpus-profile-drops --top-results 250 --force-rebuild
-uv run autoresearch render-corpus-profile-drops --top-results 250 --json
-```
-
-Important flags:
-
-- `--top-results`
-  - size of the ranked slice to consider
-- `--rank-start`
-  - zero-based ranked offset before taking `--top-results`
-  - useful for browsing top, middle, and lower-ranked windows separately
-- `--run-id`
-  - repeatable run scope filter
-- `--attempt-id`
-  - repeatable exact attempt filter
-- `--canonical-only`
-  - render canonical/promoted play-hand attempts when a run declares one
-  - non-play-hand runs and older play-hand runs without canonical metadata are left unchanged
-- `--force-rebuild`
-  - rerender even when the in-place PNG and manifest are already current
-
-Artifacts written:
-
+- the selected attempt's 36-month full backtest
+- presentation metadata when a writer profile is configured
 - attempt-local `profile-drop-36mo.png`
-- attempt-local `profile-drop-36mo.manifest.json`
-- attempt-local hidden cache folder `.profile-drop-36mo/`
+- refreshed derived corpus/catalog artifacts
 
-### 6. Rebuild the corpus catalog
+Presentation metadata failures mark finalization incomplete by default. Use `--allow-presentation-fallback` only when ugly operational copy is acceptable.
 
-This indexes the whole corpus and summarizes what evidence exists per attempt.
+## Dashboard Jobs
 
-```powershell
-uv run autoresearch build-attempt-catalog
-```
+The dashboard exposes local-only job endpoints for desktop automation:
 
-Outputs:
+- `POST /api/jobs/finalize-corpus`
+- `POST /api/jobs/build-portfolio`
+- `GET /api/jobs/current`
+- `GET /api/jobs/{id}`
+- `POST /api/jobs/cancel`
 
-- [attempt-catalog.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/attempt-catalog.json)
-- [attempt-catalog.csv](/C:/repos/fuzzfolio-autoresearch/runs/derived/attempt-catalog.csv)
-- [attempt-catalog-summary.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/attempt-catalog-summary.json)
+Jobs run one at a time as `python -m autoresearch ...` subprocesses. Records and logs are written under `runs/derived/dashboard-jobs/`. Dashboard-owned portfolio configs are stored under `runs/derived/dashboard-portfolio-configs/`.
 
-Note: most mutating CLI commands now refresh the catalog automatically when they finish.
+## Legacy Explorer
 
-### 7. Audit whether the corpus is trustworthy yet
+`uv run run` remains available for Explorer runs. Treat it as advanced/legacy. It no longer supports direct local Hugging Face/Gemma inference, local adapters, quantization settings, or fine-tuning/export workflows.
 
-This is the readiness check. It does not generate cache.
+The old `uv run autoresearch <command>` umbrella is still accepted for compatibility, but the direct scripts above are the preferred form.
 
-```powershell
-uv run autoresearch audit-full-backtests
-```
+## Do Not Delete
 
-Useful variants:
+The cleanup commands and docs assume these folders are part of the current working corpus:
 
-```powershell
-uv run autoresearch audit-full-backtests --run-id 20260327T205658482523Z-agentic-aebf78
-uv run autoresearch audit-full-backtests --attempt-id 20260327T205658482523Z-agentic-aebf78-attempt-00045
-```
-
-Output:
-
-- [full-backtest-audit.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/full-backtest-audit.json)
-
-What it tells you:
-
-- how many attempts have valid local `36mo` full backtests
-- how many are still missing
-- whether artifacts validate cleanly
-- whether shortlist and promotion outputs are still provisional
-
-### 8. Build the shortlist report
-
-This is the main single-board selection command. It filters, applies similarity pressure, renders charts, and by default generates official profile-drop PNGs for the selected candidates.
-
-```powershell
-uv run autoresearch build-shortlist-report
-```
-
-Default behavior:
-
-- uses valid local `36mo` full backtests
-- applies a `36mo` score floor
-- penalizes sameness
-- penalizes drawdown
-- enforces per-run and per-strategy caps
-- writes charts and a JSON/CSV report
-- renders official profile-drop PNGs for the shortlist
-
-Useful variants:
-
-```powershell
-uv run autoresearch build-shortlist-report --shortlist-size 24
-uv run autoresearch build-shortlist-report --shortlist-size 24 --no-generate-profile-drops
-uv run autoresearch build-shortlist-report --candidate-scope all
-uv run autoresearch build-shortlist-report --min-trades-per-month 1
-uv run autoresearch build-shortlist-report --trade-rate-bonus-weight 8 --trade-rate-bonus-target 4
-uv run autoresearch build-shortlist-report --trade-rate-bonus-weight 15 --trade-rate-bonus-target 2
-uv run autoresearch build-shortlist-report --shortlist-size 24 --profile-drop-workers 8
-uv run autoresearch build-shortlist-report --max-sameness-to-board 0.72
-uv run autoresearch build-shortlist-report --chart-trades-x-max 500
-```
-
-Important flags:
-
-- `--shortlist-size`
-  - widens or narrows the board
-  - this is the easiest way to explore more names
-- `--candidate-scope`
-  - `promoted` by default
-  - uses canonical play-hand attempts when metadata exists, while preserving non-play-hand rows and older runs without canonical metadata
-  - use `all` when you explicitly want every intermediate/scout attempt to compete
-- `--min-score-36`
-  - hard score floor
-- `--min-trades-per-month`
-  - hard cadence floor
-  - blunt but sometimes useful
-- `--trade-rate-bonus-weight`
-  - soft positive reward for higher cadence
-  - better than a hard floor when you want more active names without forcing junk in
-- `--trade-rate-bonus-target`
-  - cadence level where the bonus saturates
-- `--profile-drop-workers`
-  - parallel worker count for official shortlist profile-drop packaging and rendering
-- `--drawdown-penalty`
-  - subtracts utility for deeper drawdowns
-- `--novelty-penalty`
-  - subtracts utility for similar names
-- `--max-per-run`
-  - cap from the same run
-- `--max-per-strategy-key`
-  - cap from the same normalized timeframe + instrument shape
-- `--max-sameness-to-board`
-  - hard similarity ceiling to the already selected board
-- `--no-generate-profile-drops`
-  - much faster for selection iteration
-
-Outputs:
-
-- [shortlist-report.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/shortlist-report.json)
-- [shortlist-report.csv](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/shortlist-report.csv)
-- chart PNGs under [shortlist-report/charts](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts)
-- profile-drop PNGs under [shortlist-report/profile-drops](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/profile-drops)
-
-Useful chart files:
-
-- [corpus-score-vs-trades-36mo.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts/corpus-score-vs-trades-36mo.png)
-- [shortlist-overlay-score-vs-trades-36mo.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts/shortlist-overlay-score-vs-trades-36mo.png)
-- [corpus-score-vs-drawdown-36mo.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts/corpus-score-vs-drawdown-36mo.png)
-- [shortlist-similarity-heatmap.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/charts/shortlist-similarity-heatmap.png)
-
-### 9. Build a multi-sleeve portfolio
-
-This is the canonical top-level derived-output command. Use it when you want the normal portfolio rebuild path instead of running lower-level commands one by one.
-
-Use this when one shortlist is not enough and you want separate sleeves, such as:
-
-- a quality sleeve that keeps rare high-score names even at low cadence
-- a cadence sleeve that intentionally leans toward more active names
-- a final union report with charts and optional official profile-drop PNGs
-
-Start from the repo-root example config:
-
-```powershell
-Copy-Item portfolio.config.example.json portfolio.config.json
-```
-
-Main command:
-
-```powershell
-uv run autoresearch build-portfolio
-```
-
-What it wraps when enabled by config or CLI overrides:
-
-- optional `36mo` full-backtest catch-up
-- corpus catalog refresh/load for selection
-- multi-sleeve portfolio selection and charts
-- optional portfolio profile-drop rendering
-- optional dated export bundle generation
-
-Important config keys in `portfolio.config.json`:
-
-- `catch_up_full_backtests`
-- `catch_up_force_rebuild`
-- `catch_up_require_scrutiny_36`
-- `full_backtest_job_timeout_seconds`
-- `candidate_scope`
-  - defaults to `promoted`
-  - set to `all` for broad, score-only selection across every attempt
-- `profile_drop_workers`
-- `export_bundle`
-
-Useful variants:
-
-```powershell
-uv run autoresearch build-portfolio --profile-drop-workers 8
-uv run autoresearch build-portfolio --no-generate-profile-drops
-uv run autoresearch build-portfolio --no-export-bundle
-uv run autoresearch build-portfolio --catch-up-full-backtests
-uv run autoresearch build-portfolio --catch-up-full-backtests --catch-up-require-scrutiny-36
-uv run autoresearch build-portfolio --candidate-scope all
-uv run autoresearch build-portfolio --portfolio-config .\portfolio.config.json
-```
-
-Important notes:
-
-- `build-portfolio` is the normal umbrella command for daily portfolio rebuilds
-- `build-portfolio` wraps multiple shortlist-style sleeves from config
-- sleeves are unioned, not collapsed into one weighted sum
-- profile-drop PNG generation runs in parallel here too
-- optional catch-up can backfill missing `36mo` full-backtests before portfolio selection
-- by default, portfolio selection treats play-hand runs as strategy families and only lets the canonical final attempt compete when that metadata exists
-- the canonical portfolio snapshot is not written inside an individual `runs/<run-id>/` folder
-- portfolio reports live under `runs/derived/portfolio-report/<portfolio-name>/`
-- portfolio export bundles live under `runs/derived/portfolio-exports/<portfolio-name>/<timestamp>/`
-- the `profile-drops/` folder is under the derived portfolio report root; PNGs appear there when generation is enabled and rendering succeeds
-- with the checked-in default `portfolio.config.json`, export is enabled
-
-Canonical outputs:
-
-- `runs/derived/portfolio-report/<portfolio-name>/portfolio-report.json`
-- `runs/derived/portfolio-report/<portfolio-name>/portfolio-report.csv`
-- `runs/derived/portfolio-report/<portfolio-name>/charts/*`
-- `runs/derived/portfolio-report/<portfolio-name>/profile-drops/*`
-- `runs/derived/portfolio-exports/<portfolio-name>/<timestamp>/*`
-
-### 10. Build a stricter promotion board
-
-Use this when you want a smaller, cleaner promotion gate rather than a richer shortlist/report package.
-
-```powershell
-uv run autoresearch build-promotion-board
-```
-
-Useful variants:
-
-```powershell
-uv run autoresearch build-promotion-board --board-size 12 --candidate-limit 250
-uv run autoresearch build-promotion-board --require-full-backtest-36
-uv run autoresearch build-promotion-board --max-per-run 1 --max-per-strategy-key 1
-uv run autoresearch build-promotion-board --min-trades-per-month 1
-uv run autoresearch build-promotion-board --hydrate-missing
-```
-
-Important flags:
-
-- `--board-size`
-- `--candidate-limit`
-- `--min-score-36`
-- `--min-trades-per-month`
-- `--novelty-penalty`
-- `--max-per-run`
-- `--max-per-strategy-key`
-- `--max-sameness-to-board`
-- `--require-full-backtest-36`
-  - strictest mode
-- `--hydrate-missing`
-  - heal missing scrutiny before ranking
-
-Outputs:
-
-- [promotion-board.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/promotion-board.json)
-- [promotion-board.csv](/C:/repos/fuzzfolio-autoresearch/runs/derived/promotion-board.csv)
-
-### 10. Generate the corpus trade-rate chart
-
-This renders the attempt-level `36mo` score vs trades/month scatter.
-
-```powershell
-uv run autoresearch plot-corpus-score-vs-trades
-```
-
-Useful variants:
-
-```powershell
-uv run autoresearch plot-corpus-score-vs-trades --require-full-backtest-36
-uv run autoresearch plot-corpus-score-vs-trades --x-axis-max 500
-uv run autoresearch plot-corpus-score-vs-trades --x-axis-max -1
-```
-
-Outputs:
-
-- [corpus-score-vs-trades-36mo.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/corpus-score-vs-trades-36mo.png)
-- [corpus-score-vs-trades-36mo.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/corpus-score-vs-trades-36mo.json)
-
-Default x-axis cap is `300 trades/month`.
-
-### 11. Open the dashboard viewer
-
-The dashboard is now read-only. It does not rebuild or refresh corpus data.
-
-```powershell
-uv run autoresearch dashboard
-```
-
-Useful variant:
-
-```powershell
-uv run autoresearch dashboard --port 47832
-```
-
-Notes:
-
-- `--limit`, `--force-rebuild`, and `--no-refresh-on-start` are legacy no-ops kept for compatibility
-- generate data first with the CLI, then open the viewer
-
-## Controller Commands
-
-These are still useful, but they are not the main corpus-analysis path:
-
-```powershell
-uv run autoresearch run --max-steps 20
-uv run autoresearch supervise
-uv run autoresearch plot --all-runs
-uv run autoresearch leaderboard
-uv run autoresearch prune-runs
-uv run autoresearch stop-all-runs
-uv run autoresearch purge-cloud-profiles
-```
-
-Use them when you are actively generating new runs or maintaining the local research environment.
-
-### Play-hand v1
-
-`play-hand` is the first procedural coarse-to-fine explorer. A run deals a shuffled hand of seed indicators plus one primary instrument, scaffolds one strategy, screens it, sweeps timeframe-aware `lookbackBars` across every active indicator, runs a coarse parameter sweep, optionally runs a focused sweep from parameter-importance feedback, then finishes with a `36mo` scrutiny pass.
-
-```powershell
-uv run autoresearch play-hand
-uv run autoresearch play-hand --instrument EURUSD --seed 123 --max-indicators 4
-uv run autoresearch play-hand --instrument XAUUSD --seed 123
-uv run autoresearch play-hand --timeframe M15 --instrument XAUUSD
-uv run autoresearch play-hand --instrument-pool EURUSD --instrument-pool GBPUSD --instrument-pool XAUUSD
-uv run autoresearch play-hand --sweep-budget medium
-uv run autoresearch play-hand --instrument EURUSD --coarse-mode evolutionary --sweep-budget high
-uv run autoresearch play-hand --max-reward-r 4
-uv run autoresearch play-hand --max-sweep-permutations 333
-uv run autoresearch play-hand --dry-run --json
-```
-
-When `--instrument` is omitted, play-hand shuffles one primary instrument from the default pool: `EURUSD`, `GBPUSD`, `AUDUSD`, `USDCAD`, `NZDUSD`, `USDJPY`, `USDCHF`, `XAUUSD`. Passing `--instrument` pins the run to that market instead, which is useful for targeted gap-filling like gold-only exploration.
-
-The default timeframe is `M5`; pass `--timeframe` to pin a different scaffold/evaluation timeframe.
-
-The timing sweep is universal, not trigger-only: `M1/M5/M15` indicators sweep `lookbackBars=1..5`, `M30/H1/H2/H3` sweep `1..3`, and higher timeframes sweep `1..2`.
-
-The default sweep budget is `high`, currently `1024` planned work units. Use `--sweep-budget low|medium|high` for the normal tiers: `low=256`, `medium=640`, `high=1024`. Deterministic phases interpret the budget as the maximum selected Cartesian permutations. Evolutionary coarse sweeps interpret the same budget as planned evaluations while keeping a broader search space; for example `--coarse-mode evolutionary --sweep-budget high` runs roughly `1024` evaluations even when the axis search space is much larger.
-
-When a phase exceeds the CLI's normal `256` hard threshold but remains within the play-hand budget, play-hand passes `--allow-large-sweep` and records the budget, permutation count, and evaluation count in run metadata and events. Running sweep heartbeat events also include progress percentage when Fuzzfolio status is available. Deterministic axes are only constrained when they exceed the active budget. Evolutionary axes are kept broader and metered by the evaluation budget.
-
-`--max-sweep-permutations` is still accepted as a deprecated custom deterministic cap and overrides `--sweep-budget` when provided. `--evolutionary-budget low|medium|high` is still accepted as a deprecated alias for `--sweep-budget` on evolutionary runs, but new commands should prefer `--sweep-budget`.
-
-`--max-reward-r` (alias `--max-r`) is an optional reward-multiple cap for curiosity or constrained research runs. Play-hand converts it into the Fuzzfolio reward matrix controls (`--reward-step-r 0.5` plus a reduced `--reward-columns`) and applies it to play-hand sweeps, screening passes, instrument scout evaluations, and final scrutiny. For example, `--max-reward-r 4` limits the searched reward cells to `0.5R..4R`; omit it to keep the normal `0.5R..12.5R` matrix.
-
-Play-hand runs intentionally live in the normal `runs/` root so the existing ledger, catalog, plotting, and backfill tools can still find them. They are separated by run id and metadata: `runs/<timestamp>-playhand-v1/` with `runner: "play_hand_v1"` in `run-metadata.json`.
-
-Play-hand also writes canonical selection metadata. The final scrutiny attempt is recorded as `canonical_attempt_id` in `run-metadata.json`, and every run-local attempt receives role/decision fields such as `attempt_role`, `attempt_decision`, `strategy_family_id`, `canonical_attempt_id`, and `is_canonical_playhand_attempt`. Dashboard and portfolio commands use this metadata so intermediate sweeps and rejected instrument scouts remain inspectable without competing as independent strategy families by default.
-
-Watchable artifacts:
-
-- `play-hand-events.jsonl`
-- `play-hand-summary.json`
-- `attempts.jsonl`
-- `progress.png`
-- `profiles/*.json`
-- `evals/eval_*` and `evals/sweep_*`
-
-## Derived Artifact Map
-
-Main derived outputs live under [runs/derived](/C:/repos/fuzzfolio-autoresearch/runs/derived):
-
-- [attempt-catalog.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/attempt-catalog.json)
-- [attempt-catalog-summary.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/attempt-catalog-summary.json)
-- [full-backtest-audit.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/full-backtest-audit.json)
-- [full-backtest-failures.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/full-backtest-failures.json)
-- [promotion-board.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/promotion-board.json)
-- [shortlist-report/shortlist-report.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/shortlist-report/shortlist-report.json)
-- [portfolio-report/default-portfolio/portfolio-report.json](/C:/repos/fuzzfolio-autoresearch/runs/derived/portfolio-report/default-portfolio/portfolio-report.json)
-- [corpus-score-vs-trades-36mo.png](/C:/repos/fuzzfolio-autoresearch/runs/derived/corpus-score-vs-trades-36mo.png)
-
-## Recommended Defaults
-
-If you just want the normal daily umbrella command:
-
-```powershell
-uv run autoresearch build-portfolio
-```
-
-If you want the explicit lower-level sequence instead:
-
-```powershell
-uv run autoresearch calculate-full-backtests
-uv run autoresearch audit-full-backtests
-uv run autoresearch build-shortlist-report --shortlist-size 24
-uv run autoresearch build-portfolio
-uv run autoresearch build-promotion-board --board-size 12 --require-full-backtest-36 --max-per-run 1 --max-per-strategy-key 1
-uv run autoresearch dashboard
-```
-
-If you want to iterate on shortlist shape quickly:
-
-```powershell
-uv run autoresearch build-shortlist-report --shortlist-size 24 --no-generate-profile-drops
-uv run autoresearch build-shortlist-report --shortlist-size 24 --trade-rate-bonus-weight 8 --trade-rate-bonus-target 4 --no-generate-profile-drops
-uv run autoresearch build-shortlist-report --shortlist-size 24 --min-trades-per-month 1 --no-generate-profile-drops
-uv run autoresearch build-portfolio --no-generate-profile-drops
-```
-
-## Notes
-
-- `36mo` is the primary long-horizon evidence target.
-- The shortlist command is richer than the promotion board command.
-- The promotion board is the stricter gate.
-- `build-portfolio` writes portfolio artifacts under `runs/derived/portfolio-report/...`, not under individual `runs/<run-id>/` folders.
-- `export-portfolio-bundle` repackages an existing portfolio report; it does not rerun selection.
-- `render-portfolio-profile-drops` rerenders missing portfolio profile-drop artifacts from an existing `portfolio-report.json`.
-- The dashboard is read-only and should be treated as a viewer, not as an orchestrator.
-- Most heavy commands support `--json` for machine-readable summaries.
-
-For the exhaustive argument tables, see [cli.md](/C:/repos/fuzzfolio-autoresearch/cli.md).
+- `runs/`
+- `runs_archive/`
+- `sweeps/`
+- `.venv/`
+- portfolio configs
+- current derived corpus artifacts unless explicitly using `nuke-deep-caches`

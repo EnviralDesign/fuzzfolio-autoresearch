@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import subprocess
 import sys
 import re
 import shlex
@@ -25,8 +26,8 @@ from . import typed_tools as tt
 from . import validation_outcome as vo
 from .config import AppConfig
 from .controller_protocol import (
-    LOCAL_OPENING_STEP_PROTOCOL,
-    SFT_SYSTEM_PROTOCOL,
+    COMPACT_SYSTEM_PROTOCOL,
+    OPENING_STEP_PROTOCOL,
     SYSTEM_PROTOCOL,
 )
 from .fuzzfolio import CliError, CommandResult, FuzzfolioCli
@@ -40,6 +41,7 @@ from .ledger import (
     load_attempts,
     load_run_attempts,
     make_attempt_record,
+    write_attempts,
     write_run_metadata,
 )
 from .plotting import compute_frontier, render_progress_artifacts
@@ -50,7 +52,7 @@ from .scoring import (
     build_attempt_score,
     load_sensitivity_snapshot,
 )
-from trainingdatapipeline.normalize_state import build_prompt_variants
+from .prompt_state import build_prompt_variants
 
 _RUNTIME_TRACE_STDERR_MODE = "verbose"
 
@@ -2894,23 +2896,13 @@ class ResearchController:
         tool_context: ToolContext | None = None,
         step: int | None = None,
     ) -> str:
-        provider_type = str(self.config.provider.provider_type or "").strip().lower()
-        if provider_type == "transformers_local":
-            base_protocol = SFT_SYSTEM_PROTOCOL
-        else:
-            base_protocol = SYSTEM_PROTOCOL
+        base_protocol = SYSTEM_PROTOCOL
         durable_appendix = self._durable_system_appendix_text()
         if durable_appendix:
             base_protocol = base_protocol + "\n\n" + durable_appendix
         if policy.allow_finish:
             return base_protocol
         return base_protocol + "\n" + SUPERVISED_EXTRA_RULES
-
-    def _uses_local_transformers_provider(self) -> bool:
-        return (
-            str(self.config.provider.provider_type or "").strip().lower()
-            == "transformers_local"
-        )
 
     def _is_true_opening_step(
         self,
@@ -3163,7 +3155,7 @@ class ResearchController:
         return [
             ChatMessage(
                 role="system",
-                content=LOCAL_OPENING_STEP_PROTOCOL if opening_step else SFT_SYSTEM_PROTOCOL,
+                content=OPENING_STEP_PROTOCOL if opening_step else COMPACT_SYSTEM_PROTOCOL,
             ),
             ChatMessage(role="user", content="\n".join(lines)),
         ]
@@ -8832,7 +8824,7 @@ class ResearchController:
                 policy=policy,
             )
         )
-        if self._uses_local_transformers_provider() or opening_step:
+        if opening_step:
             repair_messages = self._compact_repair_messages(
                 {
                     "reasoning": reasoning,
@@ -9026,7 +9018,7 @@ class ResearchController:
     ) -> dict[str, Any] | None:
         payload_text = json.dumps(payload, ensure_ascii=False)
         opening_step = self._is_true_opening_step(tool_context, step)
-        if self._uses_local_transformers_provider() or opening_step:
+        if opening_step:
             repair_messages = self._compact_repair_messages(
                 payload,
                 errors=[],
@@ -11743,6 +11735,167 @@ class ResearchController:
             ),
         )
 
+    def _canonical_attempt_sort_key(self, attempt: dict[str, Any]) -> tuple[bool, float, float, str]:
+        def _float_value(value: Any) -> float | None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        composite = _float_value(attempt.get("composite_score"))
+        primary = _float_value(attempt.get("primary_score"))
+        score = composite if composite is not None else primary
+        return (
+            score is None,
+            -(score if score is not None else float("-inf")),
+            -(primary if primary is not None else float("-inf")),
+            str(attempt.get("attempt_id") or ""),
+        )
+
+    def _promote_canonical_attempt(
+        self,
+        tool_context: ToolContext,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        attempts = load_run_attempts(tool_context.run_dir)
+        if not attempts:
+            metadata = load_run_metadata(tool_context.run_dir)
+            metadata.update(
+                {
+                    "runner": metadata.get("runner") or "explorer_legacy",
+                    "canonical_attempt_id": None,
+                    "canonical_attempt_role": None,
+                    "canonical_candidate_name": None,
+                    "canonical_score": None,
+                    "canonical_decision_reason": reason,
+                }
+            )
+            write_run_metadata(tool_context.run_dir, metadata)
+            return {
+                "status": "no_attempts",
+                "canonical_attempt_id": None,
+                "reason": reason,
+            }
+
+        selected = sorted(attempts, key=self._canonical_attempt_sort_key)[0]
+        selected_id = str(selected.get("attempt_id") or "").strip()
+        selected_name = str(selected.get("candidate_name") or selected_id).strip()
+        selected_score = selected.get("composite_score")
+        updated = 0
+        for attempt in attempts:
+            attempt_id = str(attempt.get("attempt_id") or "").strip()
+            is_canonical = bool(selected_id and attempt_id == selected_id)
+            prior = dict(attempt)
+            attempt["runner"] = str(attempt.get("runner") or "explorer_legacy")
+            attempt["strategy_family_id"] = str(
+                attempt.get("strategy_family_id") or tool_context.run_id
+            )
+            attempt["canonical_attempt_id"] = selected_id or None
+            attempt["is_canonical_attempt"] = is_canonical
+            if is_canonical:
+                attempt["attempt_role"] = "final"
+                attempt["attempt_decision"] = "canonical"
+                attempt["attempt_decision_reasons"] = [reason]
+            else:
+                attempt["attempt_role"] = str(
+                    attempt.get("attempt_role") or "intermediate"
+                )
+                attempt["attempt_decision"] = str(
+                    attempt.get("attempt_decision") or "intermediate"
+                )
+            if attempt != prior:
+                updated += 1
+        write_attempts(tool_context.attempts_path, attempts)
+
+        metadata = load_run_metadata(tool_context.run_dir)
+        metadata.update(
+            {
+                "runner": metadata.get("runner") or "explorer_legacy",
+                "strategy_family_id": metadata.get("strategy_family_id")
+                or tool_context.run_id,
+                "canonical_attempt_id": selected_id or None,
+                "canonical_attempt_role": "final" if selected_id else None,
+                "canonical_candidate_name": selected_name or None,
+                "canonical_score": selected_score,
+                "canonical_decision_reason": reason,
+            }
+        )
+        write_run_metadata(tool_context.run_dir, metadata)
+        return {
+            "status": "promoted",
+            "attempt_count": len(attempts),
+            "updated_count": updated,
+            "canonical_attempt_id": selected_id or None,
+            "canonical_candidate_name": selected_name or None,
+            "canonical_score": selected_score,
+            "reason": reason,
+        }
+
+    def _finalize_canonical_attempt_artifacts(
+        self,
+        tool_context: ToolContext,
+        *,
+        attempt_id: str | None,
+    ) -> dict[str, Any]:
+        if not attempt_id:
+            return {"status": "skipped", "reason": "missing_canonical_attempt_id"}
+        command = [
+            sys.executable,
+            "-m",
+            "autoresearch",
+            "finalize-corpus",
+            "--run-id",
+            tool_context.run_id,
+            "--attempt-id",
+            attempt_id,
+            "--json",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                cwd=str(self.config.repo_root),
+                text=True,
+                capture_output=True,
+                timeout=7200,
+                check=False,
+            )
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "attempt_id": attempt_id,
+                "error": str(exc),
+            }
+        payload: dict[str, Any] | None = None
+        stdout = str(result.stdout or "").strip()
+        if stdout:
+            try:
+                parsed = json.loads(stdout)
+                payload = parsed if isinstance(parsed, dict) else {"value": parsed}
+            except json.JSONDecodeError:
+                payload = {"raw_stdout": stdout[-4000:]}
+        return {
+            "status": "complete" if result.returncode == 0 else "failed",
+            "attempt_id": attempt_id,
+            "exit_code": int(result.returncode),
+            "command": command,
+            "summary": payload,
+            "stderr": str(result.stderr or "").strip()[-4000:] or None,
+        }
+
+    def _promote_and_finalize_explorer_run(
+        self,
+        tool_context: ToolContext,
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        promotion = self._promote_canonical_attempt(tool_context, reason=reason)
+        artifacts = self._finalize_canonical_attempt_artifacts(
+            tool_context,
+            attempt_id=str(promotion.get("canonical_attempt_id") or "").strip() or None,
+        )
+        return {"promotion": promotion, "artifacts": artifacts}
+
     def run(
         self,
         max_steps: int | None = None,
@@ -12288,6 +12441,10 @@ class ResearchController:
             ]
 
             if finished:
+                finalization = self._promote_and_finalize_explorer_run(
+                    tool_context,
+                    reason="model_finish",
+                )
                 self._trace_runtime(
                     tool_context,
                     step=step,
@@ -12302,6 +12459,10 @@ class ResearchController:
                     "attempts_path": str(tool_context.attempts_path),
                     "run_progress_plot": str(tool_context.progress_plot_path),
                     "summary": finish_summary,
+                    "canonical_attempt_id": finalization.get("promotion", {}).get(
+                        "canonical_attempt_id"
+                    ),
+                    "finalization": finalization,
                 }
 
         self._trace_runtime(
@@ -12313,10 +12474,18 @@ class ResearchController:
             level="warning",
         )
         self._persist_branch_runtime_state(tool_context, step_limit)
+        finalization = self._promote_and_finalize_explorer_run(
+            tool_context,
+            reason="step_limit_reached",
+        )
         return {
             "status": "step_limit_reached",
             "run_id": tool_context.run_id,
             "run_dir": str(tool_context.run_dir),
             "attempts_path": str(tool_context.attempts_path),
             "run_progress_plot": str(tool_context.progress_plot_path),
+            "canonical_attempt_id": finalization.get("promotion", {}).get(
+                "canonical_attempt_id"
+            ),
+            "finalization": finalization,
         }

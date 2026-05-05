@@ -661,6 +661,11 @@ def extract_attempt_catalog_row(
         and attempt_id == canonical_attempt_id
         and str(runner or "") == "play_hand_v1"
     )
+    is_canonical_attempt = bool(attempt.get("is_canonical_attempt")) or (
+        bool(canonical_attempt_id)
+        and bool(attempt_id)
+        and attempt_id == canonical_attempt_id
+    )
     attempt_role = str(attempt.get("attempt_role") or attempt.get("play_hand_role") or "").strip() or None
     attempt_decision = str(attempt.get("attempt_decision") or "").strip() or None
     raw_decision_reasons = attempt.get("attempt_decision_reasons")
@@ -699,6 +704,7 @@ def extract_attempt_catalog_row(
             or None
         ),
         "canonical_attempt_id": canonical_attempt_id,
+        "is_canonical_attempt": is_canonical_attempt,
         "is_canonical_playhand_attempt": is_canonical_playhand_attempt,
         "play_hand_role": str(attempt.get("play_hand_role") or attempt_role or "").strip() or None,
         "play_hand_stage": str(attempt.get("play_hand_stage") or "").strip() or None,
@@ -858,6 +864,9 @@ def catalog_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     canonical_playhand_rows = [
         row for row in rows if bool(row.get("is_canonical_playhand_attempt"))
     ]
+    canonical_rows = [
+        row for row in rows if bool(row.get("is_canonical_attempt"))
+    ]
     playhand_rows = [
         row for row in rows if str(row.get("runner") or "") == "play_hand_v1"
     ]
@@ -866,6 +875,7 @@ def catalog_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "attempt_count": attempt_count,
         "scored_attempt_count": len(scored_rows),
         "playhand_attempt_count": len(playhand_rows),
+        "canonical_attempt_count": len(canonical_rows),
         "canonical_playhand_attempt_count": len(canonical_playhand_rows),
         "unique_base_strategy_count": len(base_strategy_keys),
         "unique_strategy_count_36m": len(strategy_keys_36),

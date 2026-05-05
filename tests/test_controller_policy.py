@@ -510,10 +510,14 @@ def test_repair_invalid_response_passes_step_limit_and_policy_to_followup_templa
     controller = _make_controller()
     controller._trace_runtime = lambda *_args, **_kwargs: None
     controller._append_raw_explorer_payload = lambda *_args, **_kwargs: None
-    controller._uses_local_transformers_provider = lambda: True
     controller._compact_repair_messages = lambda payload, **kwargs: payload
     controller._provider_scope = lambda **_kwargs: nullcontext()
-    controller.provider = SimpleNamespace(complete_json=lambda messages: messages)
+    controller.provider = SimpleNamespace(
+        complete_json=lambda _messages: {
+            "reasoning": "fixed",
+            "actions": [{"tool": "validate_profile", "candidate_name": "cand-a"}],
+        }
+    )
     controller._normalize_model_response = lambda repaired: repaired
     controller._is_true_opening_step = lambda *_args, **_kwargs: False
     controller._validate_actions = lambda _actions: []
@@ -619,7 +623,6 @@ def test_system_protocol_stays_stable_and_opening_overlay_moves_to_step_update()
 def test_run_state_prompt_uses_step_update_sections_and_keeps_durable_doctrine_out() -> None:
     controller = _make_controller()
     controller.config.provider = SimpleNamespace(provider_type="openai")
-    controller._uses_local_transformers_provider = lambda: False
     controller._load_recent_step_payloads = lambda *_args, **_kwargs: []
     controller._run_attempts = lambda _run_id: []
     controller._run_phase_info = lambda *_args, **_kwargs: {

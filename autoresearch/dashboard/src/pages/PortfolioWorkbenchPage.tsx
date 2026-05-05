@@ -11,6 +11,7 @@ import {
   YAxis,
 } from "recharts";
 import {
+  Bot,
   ChevronDown,
   Check,
   Clock3,
@@ -19,9 +20,11 @@ import {
   Fingerprint,
   Layers3,
   Plus,
+  Play,
   RotateCcw,
   Search,
   SlidersHorizontal,
+  StopCircle,
   Trophy,
   Trash2,
   X,
@@ -47,9 +50,16 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { useCatalog, useLivePortfolio, useRuns } from "@/hooks/use-viewer-data";
-import { fetchAttemptDetail, saveLivePortfolio } from "@/lib/api";
-import type { AttemptCatalogRow, AttemptDetail, RunSummary } from "@/lib/types";
+import { useCatalog, useDashboardJob, useLivePortfolio, useRuns } from "@/hooks/use-viewer-data";
+import {
+  cancelDashboardJob,
+  fetchAttemptDetail,
+  fetchDashboardPortfolioConfig,
+  saveLivePortfolio,
+  startBuildPortfolioJob,
+  startFinalizeCorpusJob,
+} from "@/lib/api";
+import type { AttemptCatalogRow, AttemptDetail, DashboardJob, RunSummary } from "@/lib/types";
 import {
   compactRunId,
   formatDateTime,
@@ -141,6 +151,7 @@ type PortfolioMetrics = {
 type RunSortMode = "recent" | "score";
 type CandidateScope = "promoted" | "all";
 type PortfolioChartMode = "equity" | "drawdown" | "margin";
+type WorkbenchMode = "manual" | "auto";
 
 type SimilarityPair = {
   leftAttemptId: string;
@@ -290,6 +301,8 @@ export function PortfolioWorkbenchPage() {
   const { data: catalog, isLoading: catalogLoading, error: catalogError } = useCatalog();
   const { data: runs } = useRuns();
   const { data: livePortfolio } = useLivePortfolio();
+  const { data: dashboardJob } = useDashboardJob();
+  const [workbenchMode, setWorkbenchMode] = useState<WorkbenchMode>("manual");
   const [activeRunId, setActiveRunId] = useState<string>("all");
   const [query, setQuery] = useState("");
   const [minScore, setMinScore] = useState(40);
@@ -299,6 +312,8 @@ export function PortfolioWorkbenchPage() {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [account, setAccount] = useState<AccountConfig>(DEFAULT_ACCOUNT);
   const [preview, setPreview] = useState<AttemptCatalogRow | null>(null);
+  const [autoConfigText, setAutoConfigText] = useState("");
+  const [autoConfigError, setAutoConfigError] = useState<string | null>(null);
   const lastAppliedLiveSelection = useRef<string | null>(null);
   const hasHydratedLiveSelection = useRef(false);
 
@@ -313,6 +328,28 @@ export function PortfolioWorkbenchPage() {
     onSuccess: (payload) => {
       queryClient.setQueryData(["live-portfolio"], payload);
       lastAppliedLiveSelection.current = stableSelectionKey(payload.selected_attempt_ids);
+    },
+  });
+
+  const finalizeMutation = useMutation({
+    mutationFn: () => startFinalizeCorpusJob({ scope: "dashboard" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["dashboard-job-current"] });
+    },
+  });
+
+  const buildPortfolioMutation = useMutation({
+    mutationFn: (portfolioConfig: Record<string, unknown>) =>
+      startBuildPortfolioJob({ portfolio_config: portfolioConfig }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["dashboard-job-current"] });
+    },
+  });
+
+  const cancelJobMutation = useMutation({
+    mutationFn: (jobId?: string) => cancelDashboardJob(jobId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["dashboard-job-current"] });
     },
   });
 
@@ -390,6 +427,24 @@ export function PortfolioWorkbenchPage() {
     setSelectedIds(incomingIds);
   }, [livePortfolio]);
 
+  useEffect(() => {
+    let canceled = false;
+    fetchDashboardPortfolioConfig()
+      .then((payload) => {
+        if (!canceled) {
+          setAutoConfigText(JSON.stringify(payload, null, 2));
+        }
+      })
+      .catch((error: unknown) => {
+        if (!canceled) {
+          setAutoConfigError(error instanceof Error ? error.message : "Could not load auto config.");
+        }
+      });
+    return () => {
+      canceled = true;
+    };
+  }, []);
+
   const persistSelectedIds = (nextIds: string[]) => {
     const normalizedIds = normalizeSelectedIds(nextIds);
     setSelectedIds(normalizedIds);
@@ -403,6 +458,29 @@ export function PortfolioWorkbenchPage() {
         ? selectedIds.filter((item) => item !== attemptId)
         : [...selectedIds, attemptId],
     );
+  };
+
+  const startAutoBuild = () => {
+    try {
+      const parsed = JSON.parse(autoConfigText || "{}");
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Auto portfolio config must be a JSON object.");
+      }
+      setAutoConfigError(null);
+      buildPortfolioMutation.mutate(parsed as Record<string, unknown>);
+    } catch (error) {
+      setAutoConfigError(error instanceof Error ? error.message : "Invalid auto config JSON.");
+    }
+  };
+
+  const importAutoSelection = () => {
+    const selected = rows
+      .filter((row) => Number(row.selection_rank ?? Infinity) > 0)
+      .sort((a, b) => Number(a.selection_rank ?? Infinity) - Number(b.selection_rank ?? Infinity))
+      .map((row) => row.attempt_id);
+    if (selected.length) {
+      persistSelectedIds(selected);
+    }
   };
 
   if (catalogLoading) {
@@ -489,12 +567,26 @@ export function PortfolioWorkbenchPage() {
         <main className="space-y-5">
           <section className="grid gap-4 min-[1700px]:grid-cols-[minmax(0,1fr)_360px]">
             <div className="space-y-3">
-              <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
-                <Layers3 className="h-3.5 w-3.5" />
-                Manual portfolio builder
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                  <Layers3 className="h-3.5 w-3.5" />
+                  Portfolio workbench
+                </div>
+                <div className="grid grid-cols-2 gap-1 rounded-lg border border-border/60 bg-background/35 p-1">
+                  <ModeButton active={workbenchMode === "manual"} onClick={() => setWorkbenchMode("manual")}>
+                    <Layers3 className="h-3.5 w-3.5" />
+                    Manual
+                  </ModeButton>
+                  <ModeButton active={workbenchMode === "auto"} onClick={() => setWorkbenchMode("auto")}>
+                    <Bot className="h-3.5 w-3.5" />
+                    Auto
+                  </ModeButton>
+                </div>
               </div>
               <h1 className="max-w-5xl text-3xl font-semibold leading-tight tracking-tight md:text-5xl">
-                Select attempts, watch the 36mo basket curve change immediately.
+                {workbenchMode === "manual"
+                  ? "Select attempts, watch the 36mo basket curve change immediately."
+                  : "Run portfolio automation, inspect the log, then import the selected basket."}
               </h1>
             </div>
             <Panel className="grid grid-cols-3 gap-3 p-3">
@@ -503,6 +595,22 @@ export function PortfolioWorkbenchPage() {
               <Metric label="Loaded" value={`${formatInt(loadedCount)}/${formatInt(selectedIds.length)}`} />
             </Panel>
           </section>
+
+          {workbenchMode === "auto" ? (
+            <AutoBuildPanel
+              configText={autoConfigText}
+              setConfigText={setAutoConfigText}
+              configError={autoConfigError}
+              job={dashboardJob}
+              onFinalize={() => finalizeMutation.mutate()}
+              onBuild={startAutoBuild}
+              onCancel={() => cancelJobMutation.mutate(dashboardJob?.id)}
+              onImport={importAutoSelection}
+              isStartingFinalize={finalizeMutation.isPending}
+              isStartingBuild={buildPortfolioMutation.isPending}
+              isCanceling={cancelJobMutation.isPending}
+            />
+          ) : null}
 
           <Panel className="p-4">
             <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_150px_140px_120px_auto]">
@@ -623,6 +731,7 @@ function AttemptCard({
   const title = String(attempt.candidate_name || attempt.attempt_id);
   const role = String(attempt.attempt_role || attempt.play_hand_role || "").trim();
   const decision = String(attempt.attempt_decision || "").trim();
+  const canonical = Boolean(attempt.is_canonical_attempt || attempt.is_canonical_playhand_attempt);
   return (
     <article
       className={`overflow-hidden rounded-lg border bg-card/78 transition ${
@@ -653,9 +762,9 @@ function AttemptCard({
             {formatNumber(attempt.score_36m ?? null, 1)}
           </span>
         </div>
-        {attempt.is_canonical_playhand_attempt || role || decision ? (
+        {canonical || role || decision ? (
           <div className="flex flex-wrap gap-1.5">
-            {attempt.is_canonical_playhand_attempt ? (
+            {canonical ? (
               <span className="rounded border border-emerald-400/40 bg-emerald-400/10 px-2 py-0.5 text-[0.68rem] uppercase tracking-wide text-emerald-200">
                 Canonical
               </span>
@@ -1648,6 +1757,139 @@ function Panel({ className, children }: { className?: string; children: ReactNod
   return <div className={`rounded-lg border border-border/60 bg-card/80 shadow-xl shadow-black/15 ${className ?? ""}`}>{children}</div>;
 }
 
+function ModeButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={`inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-3 text-xs font-medium transition ${
+        active
+          ? "bg-amber-300/18 text-amber-100"
+          : "text-muted-foreground hover:bg-background/50 hover:text-foreground"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function AutoBuildPanel({
+  configText,
+  setConfigText,
+  configError,
+  job,
+  onFinalize,
+  onBuild,
+  onCancel,
+  onImport,
+  isStartingFinalize,
+  isStartingBuild,
+  isCanceling,
+}: {
+  configText: string;
+  setConfigText: (value: string) => void;
+  configError: string | null;
+  job?: DashboardJob;
+  onFinalize: () => void;
+  onBuild: () => void;
+  onCancel: () => void;
+  onImport: () => void;
+  isStartingFinalize: boolean;
+  isStartingBuild: boolean;
+  isCanceling: boolean;
+}) {
+  const isRunning = job?.status === "running" || job?.status === "canceling";
+  return (
+    <Panel className="p-4">
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
+                <Bot className="h-3.5 w-3.5" />
+                Auto build
+              </div>
+              <div className="mt-2 text-sm text-muted-foreground">
+                Status: <span className="font-medium text-foreground">{job?.status ?? "idle"}</span>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                className="rounded-lg"
+                disabled={isRunning || isStartingFinalize}
+                onClick={onFinalize}
+              >
+                <Play className="h-4 w-4" />
+                Finalize
+              </Button>
+              <Button
+                type="button"
+                className="rounded-lg"
+                disabled={isRunning || isStartingBuild}
+                onClick={onBuild}
+              >
+                <Play className="h-4 w-4" />
+                Build
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                className="rounded-lg"
+                disabled={!isRunning || isCanceling}
+                onClick={onCancel}
+              >
+                <StopCircle className="h-4 w-4" />
+                Cancel
+              </Button>
+            </div>
+          </div>
+          <label className="block">
+            <span className="mb-2 block text-xs uppercase tracking-[0.14em] text-muted-foreground">
+              Portfolio config
+            </span>
+            <textarea
+              value={configText}
+              onChange={(event) => setConfigText(event.target.value)}
+              spellCheck={false}
+              className="min-h-80 w-full resize-y rounded-lg border border-border/60 bg-background/45 p-3 font-mono text-xs leading-5 outline-none focus:ring-2 focus:ring-ring/25"
+            />
+          </label>
+          {configError ? (
+            <div className="rounded-lg border border-rose-300/40 bg-rose-300/10 px-3 py-2 text-sm text-rose-100">
+              {configError}
+            </div>
+          ) : null}
+          <Button type="button" variant="secondary" className="rounded-lg" onClick={onImport}>
+            <Plus className="h-4 w-4" />
+            Import auto selection
+          </Button>
+        </div>
+        <div className="space-y-3">
+          <div className="grid grid-cols-3 gap-2">
+            <TinyStat label="Job" value={job?.kind ?? "-"} />
+            <TinyStat label="Return" value={job?.returncode == null ? "-" : String(job.returncode)} />
+            <TinyStat label="Started" value={formatDateTime(job?.started_at ?? null)} />
+          </div>
+          <pre className="min-h-96 max-h-[38rem] overflow-auto rounded-lg border border-border/60 bg-black/35 p-3 font-mono text-xs leading-5 text-muted-foreground">
+            {job?.log_tail?.trim() || "No job log yet."}
+          </pre>
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
 function Metric({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-border/60 bg-background/35 p-3">
@@ -2025,7 +2267,7 @@ function runScore(run: RunSummary) {
 }
 
 function isCanonicalPlayHandAttempt(row: AttemptCatalogRow) {
-  if (row.is_canonical_playhand_attempt) return true;
+  if (row.is_canonical_attempt || row.is_canonical_playhand_attempt) return true;
   const attemptId = String(row.attempt_id || "").trim();
   const canonicalAttemptId = String(row.canonical_attempt_id || "").trim();
   return Boolean(attemptId && canonicalAttemptId && attemptId === canonicalAttemptId);

@@ -56,6 +56,7 @@ class AttemptRecord:
     attempt_decision_reasons: list[str] | None = None
     strategy_family_id: str | None = None
     canonical_attempt_id: str | None = None
+    is_canonical_attempt: bool = False
     is_canonical_playhand_attempt: bool = False
     play_hand_role: str | None = None
     play_hand_stage: str | None = None
@@ -192,6 +193,7 @@ def make_attempt_record(
     attempt_decision_reasons: list[str] | None = None,
     strategy_family_id: str | None = None,
     canonical_attempt_id: str | None = None,
+    is_canonical_attempt: bool = False,
     is_canonical_playhand_attempt: bool = False,
     play_hand_role: str | None = None,
     play_hand_stage: str | None = None,
@@ -243,6 +245,7 @@ def make_attempt_record(
         attempt_decision_reasons=attempt_decision_reasons,
         strategy_family_id=strategy_family_id,
         canonical_attempt_id=canonical_attempt_id,
+        is_canonical_attempt=is_canonical_attempt,
         is_canonical_playhand_attempt=is_canonical_playhand_attempt,
         play_hand_role=play_hand_role,
         play_hand_stage=play_hand_stage,

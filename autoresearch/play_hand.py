@@ -623,6 +623,7 @@ def _finalize_play_hand_attempt_metadata(
         attempt["attempt_decision"] = decision
         attempt["strategy_family_id"] = ctx.run_id
         attempt["canonical_attempt_id"] = final_attempt_id or None
+        attempt["is_canonical_attempt"] = is_canonical
         attempt["is_canonical_playhand_attempt"] = is_canonical
         if selected:
             attempt["play_hand_selected_instruments"] = selected
@@ -1948,6 +1949,7 @@ def _evaluate_profile(
         attempt_decision=play_hand_decision,
         strategy_family_id=ctx.run_id,
         canonical_attempt_id=None,
+        is_canonical_attempt=False,
         is_canonical_playhand_attempt=False,
         play_hand_role=play_hand_role,
         play_hand_stage=stage.label,
@@ -3031,37 +3033,26 @@ def _play_hand_artifact_commands(
 ) -> list[list[str]]:
     drop_count = max(0, int(profile_drop_count))
     drop_workers = max(1, int(profile_drop_workers))
-    commands = [
-        [
-            sys.executable,
-            "-m",
-            "autoresearch",
-            "calculate-full-backtests",
-            "--run-ids",
-            run_id,
-            "--json",
-        ]
+    if drop_count <= 0:
+        return []
+    command = [
+        sys.executable,
+        "-m",
+        "autoresearch",
+        "finalize-corpus",
+        "--run-id",
+        run_id,
+        "--lookback-months",
+        "36",
+        "--profile-drop-workers",
+        str(drop_workers),
+        "--json",
     ]
-    if drop_count > 0:
-        drop_command = [
-            sys.executable,
-            "-m",
-            "autoresearch",
-            "render-corpus-profile-drops",
-            "--run-id",
-            run_id,
-            "--lookback-months",
-            "36",
-            "--profile-drop-workers",
-            str(drop_workers),
-        ]
-        if final_attempt_id:
-            drop_command.extend(["--attempt-id", str(final_attempt_id)])
-        else:
-            drop_command.extend(["--top-results", str(drop_count)])
-        drop_command.append("--json")
-        commands.append(drop_command)
-    return commands
+    if final_attempt_id:
+        command.extend(["--attempt-id", str(final_attempt_id)])
+    else:
+        command.extend(["--scope", "dashboard"])
+    return [command]
 
 
 def _json_payload_from_stdout(stdout: str) -> dict[str, Any]:
@@ -3145,31 +3136,28 @@ def _finalize_run_artifacts(
     )
     try:
         if commands:
-            console.print(f"{stage.prefix} [cyan]final_artifacts[/] [bold]full backtests[/]")
+            console.print(f"{stage.prefix} [cyan]final_artifacts[/] [bold]finalize corpus[/]")
             full_backtests = _run_child_autoresearch_command(commands[0], cwd=ctx.config.repo_root)
             _append_event(
                 ctx,
                 "final_artifacts",
                 "full_backtests_done",
                 stage=stage,
-                matched_attempts=full_backtests.get("matched_attempts"),
-                eligible_attempts=full_backtests.get("eligible_attempts"),
-                calculated=full_backtests.get("calculated"),
-                skipped=full_backtests.get("skipped"),
-                failed=full_backtests.get("failed"),
+                selected_count=full_backtests.get("selected_count"),
+                render_exit_code=full_backtests.get("render_exit_code"),
+                status=full_backtests.get("status"),
             )
-        if len(commands) > 1:
-            console.print(f"{stage.prefix} [cyan]final_artifacts[/] [bold]profile drops[/]")
-            profile_drops = _run_child_autoresearch_command(commands[1], cwd=ctx.config.repo_root)
+            if isinstance(full_backtests.get("render_summary"), dict):
+                profile_drops = dict(full_backtests["render_summary"])
             _append_event(
                 ctx,
                 "final_artifacts",
                 "profile_drops_done",
                 stage=stage,
-                selected_count=profile_drops.get("selected_count"),
-                rendered=profile_drops.get("profile_drop_rendered"),
-                cached=profile_drops.get("profile_drop_cached"),
-                failed=profile_drops.get("profile_drop_failed"),
+                selected_count=profile_drops.get("selected_count") if profile_drops else None,
+                rendered=profile_drops.get("profile_drop_rendered") if profile_drops else None,
+                cached=profile_drops.get("profile_drop_cached") if profile_drops else None,
+                failed=profile_drops.get("profile_drop_failed") if profile_drops else None,
                 final_attempt_id=final_attempt_id,
             )
         return {
@@ -3655,10 +3643,10 @@ def cmd_play_hand(
         full_backtests = final_artifact_summary.get("full_backtests")
         if isinstance(full_backtests, dict):
             detail_bits.append(
-                "full "
-                f"calc={full_backtests.get('calculated', 0)} "
-                f"skip={full_backtests.get('skipped', 0)} "
-                f"fail={full_backtests.get('failed', 0)}"
+                "finalize "
+                f"selected={full_backtests.get('selected_count', 0)} "
+                f"status={full_backtests.get('status') or 'unknown'} "
+                f"exit={full_backtests.get('render_exit_code')}"
             )
         profile_drops = final_artifact_summary.get("profile_drops")
         if isinstance(profile_drops, dict):

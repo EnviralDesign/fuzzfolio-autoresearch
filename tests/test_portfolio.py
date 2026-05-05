@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from autoresearch import __main__ as ar_main
 from autoresearch import portfolio as pf
 
@@ -1166,20 +1168,11 @@ def test_cmd_build_portfolio_continues_when_catch_up_reports_failures(
     assert payload["selected_union_count"] == 1
 
 
-def test_build_parser_includes_render_corpus_profile_drops_defaults() -> None:
+def test_build_parser_rejects_removed_leaf_commands() -> None:
     parser = ar_main.build_parser()
 
-    args = parser.parse_args(["render-corpus-profile-drops"])
-
-    assert args.command == "render-corpus-profile-drops"
-    assert args.top_results is None
-    assert args.rank_start == 0
-    assert args.lookback_months == 36
-    assert args.profile_drop_workers == 4
-    assert args.profile_drop_timeout_seconds == 1800
-    assert args.force_rebuild is False
-    assert args.run_id is None
-    assert args.attempt_id is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(["render-corpus-profile-drops"])
 
 
 def test_build_parser_includes_finalize_corpus_defaults() -> None:
@@ -1193,6 +1186,7 @@ def test_build_parser_includes_finalize_corpus_defaults() -> None:
     assert args.profile_drop_workers == 4
     assert args.profile_drop_timeout_seconds == 1800
     assert args.force_rebuild is False
+    assert args.allow_presentation_fallback is False
     assert args.dry_run is False
     assert args.run_id is None
     assert args.attempt_id is None
@@ -1276,6 +1270,7 @@ def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(
         profile_drop_workers=2,
         profile_drop_timeout_seconds=90,
         force_rebuild=False,
+        require_presentation_metadata=True,
         dry_run=False,
         as_json=True,
     )

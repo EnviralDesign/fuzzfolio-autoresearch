@@ -13,15 +13,18 @@ dependencies = [
 [dependency-groups]
 dev = ["pytest>=8.0"]
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project.scripts]
 autoresearch = "autoresearch.__main__:main"
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu128" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
-explicit = true
+doctor = "autoresearch.__main__:main"
+test-providers = "autoresearch.__main__:main"
+play-hand = "autoresearch.__main__:main"
+run = "autoresearch.__main__:main"
+finalize-corpus = "autoresearch.__main__:main"
+build-portfolio = "autoresearch.__main__:main"
+dashboard = "autoresearch.__main__:main"
+record-attempt = "autoresearch.__main__:main"
+nuke-deep-caches = "autoresearch.__main__:main"

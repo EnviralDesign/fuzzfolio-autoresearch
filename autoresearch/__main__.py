@@ -291,8 +291,71 @@ def _install_safe_std_streams() -> None:
 _install_safe_std_streams()
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Fuzzfolio autoresearch runtime.")
+PUBLIC_CLI_COMMANDS = {
+    "doctor",
+    "test-providers",
+    "play-hand",
+    "run",
+    "finalize-corpus",
+    "build-portfolio",
+    "dashboard",
+    "record-attempt",
+    "nuke-deep-caches",
+}
+
+
+def _limit_public_subparsers(
+    subparsers: argparse._SubParsersAction,  # type: ignore[name-defined]
+    public_commands: set[str],
+) -> None:
+    choices = getattr(subparsers, "choices", None)
+    if isinstance(choices, dict):
+        for command in list(choices):
+            if command not in public_commands:
+                choices.pop(command, None)
+    name_map = getattr(subparsers, "_name_parser_map", None)
+    if isinstance(name_map, dict):
+        for command in list(name_map):
+            if command not in public_commands:
+                name_map.pop(command, None)
+    choices_actions = getattr(subparsers, "_choices_actions", None)
+    if isinstance(choices_actions, list):
+        choices_actions[:] = [
+            action
+            for action in choices_actions
+            if str(getattr(action, "dest", "")) in public_commands
+        ]
+    subparsers.metavar = "{" + ",".join(sorted(public_commands)) + "}"
+
+
+def _command_from_invocation_name(raw_name: str | None) -> str | None:
+    stem = Path(str(raw_name or "")).stem
+    if stem.endswith("-script"):
+        stem = stem[: -len("-script")]
+    return stem if stem in PUBLIC_CLI_COMMANDS else None
+
+
+def _argv_for_invocation(
+    argv: list[str] | None = None,
+    *,
+    invoked_as: str | None = None,
+) -> list[str]:
+    args = list(sys.argv[1:] if argv is None else argv)
+    command = _command_from_invocation_name(
+        sys.argv[0] if invoked_as is None else invoked_as
+    )
+    if not command:
+        return args
+    if args and args[0] == command:
+        return args
+    return [command, *args]
+
+
+def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Fuzzfolio autoresearch runtime.",
+        prog=prog,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     doctor = subparsers.add_parser(
@@ -476,7 +539,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--final-profile-drop-count",
         type=int,
         default=1,
-        help="How many top run-local attempts to render as 36mo profile drops at wrapup. Default: 1.",
+        help="Positive values finalize the canonical run winner; 0 skips final profile-drop rendering. Default: 1.",
     )
     play_hand.add_argument(
         "--final-profile-drop-workers",
@@ -569,7 +632,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dashboard = subparsers.add_parser(
         "dashboard",
-        help="Serve the read-only dashboard viewer from already-computed derived artifacts.",
+        help="Serve the dashboard workbench and local-only corpus/portfolio job controls.",
     )
     dashboard.add_argument(
         "--host", default="0.0.0.0", help="Bind host. Default: 0.0.0.0"
@@ -591,7 +654,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument(
         "--no-refresh-on-start",
         action="store_true",
-        help="Legacy no-op kept for compatibility. The dashboard is always read-only and serves current derived artifacts.",
+        help="Legacy no-op kept for compatibility. The dashboard serves current derived artifacts on startup.",
     )
     subparsers.add_parser(
         "reset-runs",
@@ -1252,6 +1315,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Re-render attempt-local profile drops even when cached artifacts already exist.",
     )
     finalize_corpus.add_argument(
+        "--allow-presentation-fallback",
+        action="store_true",
+        help="Allow profile-drop rendering to fall back to operational source names when presentation metadata generation fails.",
+    )
+    finalize_corpus.add_argument(
         "--dry-run",
         action="store_true",
         help="Show which attempts would be finalized without rendering or refreshing derived indexes.",
@@ -1288,6 +1356,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recompute scores for the existing attempts ledger using the current scoring config.",
     )
 
+    _limit_public_subparsers(subparsers, PUBLIC_CLI_COMMANDS)
     return parser
 
 
@@ -5747,6 +5816,7 @@ def _render_profile_drop_for_attempt(
     timeout_seconds: int,
     emit: Callable[[str], None] | None,
     layout_mode: str = "derived",
+    require_presentation_metadata: bool = False,
 ) -> dict[str, Any]:
     attempt = _attempt_with_run_reward_matrix(attempt, run_dir=run_dir)
     package_inputs = _build_package_inputs(attempt, run_dir=run_dir, attempts=attempts)
@@ -5962,6 +6032,16 @@ def _render_profile_drop_for_attempt(
             metadata_artifact_path=metadata_artifact_path,
             emit=emit,
         )
+    if (
+        metadata_payload is None
+        and metadata_artifact_path is not None
+        and require_presentation_metadata
+    ):
+        raise RuntimeError(
+            "Presentation metadata generation failed or returned invalid copy for "
+            f"attempt {attempt_id}; rerun with presentation fallback allowed to render "
+            "the operational source name."
+        )
     if metadata_payload is not None:
         patched_payload = apply_metadata_to_profile_document(
             source_profile_document_payload,
@@ -6045,6 +6125,7 @@ def _render_profile_drop_rows(
     as_json: bool,
     progress_label: str,
     layout_mode: str = "derived",
+    require_presentation_metadata: bool = False,
 ) -> list[dict[str, Any]]:
     if not rows:
         return []
@@ -6157,6 +6238,7 @@ def _render_profile_drop_rows(
                     timeout_seconds=int(timeout_seconds),
                     emit=None,
                     layout_mode=layout_mode,
+                    require_presentation_metadata=require_presentation_metadata,
                 )
                 return {
                     "attempt_id": row.get("attempt_id"),
@@ -7038,6 +7120,7 @@ def cmd_build_portfolio(
                 profile_drop_workers=int(variant_spec.get("profile_drop_workers", 4)),
                 as_json=as_json,
                 progress_label=f"portfolio profile drops:{portfolio_name}",
+                require_presentation_metadata=True,
             )
             payload["generated_at"] = datetime.now().astimezone().isoformat()
             payload["profile_drop_phase"] = "complete"
@@ -7648,7 +7731,7 @@ def cmd_nuke_deep_caches(*, as_json: bool) -> int:
                     f"Run profile-drop manifests deleted: {summary['deleted_run_profile_drop_manifests']}",
                     f"Derived entries reset: {summary['derived_entries_before_reset']}",
                     f"Summary: {summary['summary_path']}",
-                    "Next: uv run autoresearch build-portfolio",
+                    "Next: uv run build-portfolio",
                 ]
             ),
             title="Deep Cache Reset",
@@ -8493,6 +8576,7 @@ def cmd_render_portfolio_profile_drops(
         profile_drop_workers=worker_count,
         as_json=as_json,
         progress_label="portfolio profile drops",
+        require_presentation_metadata=True,
     )
 
     payload["generated_at"] = datetime.now().astimezone().isoformat()
@@ -8552,6 +8636,7 @@ def cmd_render_corpus_profile_drops(
     profile_drop_workers: int,
     profile_drop_timeout_seconds: int,
     force_rebuild: bool,
+    require_presentation_metadata: bool = False,
     as_json: bool,
 ) -> int:
     config = load_config()
@@ -8658,6 +8743,7 @@ def cmd_render_corpus_profile_drops(
         as_json=as_json,
         progress_label="corpus profile drops",
         layout_mode="attempt_local",
+        require_presentation_metadata=require_presentation_metadata,
     )
 
     summary = {
@@ -8682,6 +8768,7 @@ def cmd_render_corpus_profile_drops(
         "profile_drop_workers": worker_count,
         "profile_drop_timeout_seconds": timeout_seconds,
         "force_rebuild": bool(force_rebuild),
+        "require_presentation_metadata": bool(require_presentation_metadata),
         "results": profile_drop_results,
     }
     if as_json:
@@ -8760,6 +8847,7 @@ def cmd_finalize_corpus(
     profile_drop_workers: int,
     profile_drop_timeout_seconds: int,
     force_rebuild: bool,
+    require_presentation_metadata: bool,
     dry_run: bool,
     as_json: bool,
 ) -> int:
@@ -8791,6 +8879,7 @@ def cmd_finalize_corpus(
             "candidate_name": row.get("candidate_name"),
             "score_36m": row.get("score_36m"),
             "composite_score": row.get("composite_score"),
+            "is_canonical_attempt": bool(row.get("is_canonical_attempt")),
             "is_canonical_playhand_attempt": bool(row.get("is_canonical_playhand_attempt")),
             "has_full_backtest_36m": bool(row.get("has_full_backtest_36m")),
             "full_backtest_validation_status_36m": row.get(
@@ -8810,6 +8899,7 @@ def cmd_finalize_corpus(
         "profile_drop_workers": max(1, int(profile_drop_workers)),
         "profile_drop_timeout_seconds": max(1, int(profile_drop_timeout_seconds)),
         "force_rebuild": bool(force_rebuild),
+        "require_presentation_metadata": bool(require_presentation_metadata),
         "dry_run": bool(dry_run),
         "selected": selected_preview,
     }
@@ -8846,6 +8936,7 @@ def cmd_finalize_corpus(
                 profile_drop_workers=max(1, int(profile_drop_workers)),
                 profile_drop_timeout_seconds=max(1, int(profile_drop_timeout_seconds)),
                 force_rebuild=bool(force_rebuild),
+                require_presentation_metadata=bool(require_presentation_metadata),
                 as_json=True,
             )
             render_output = capture.getvalue().strip()
@@ -8865,6 +8956,7 @@ def cmd_finalize_corpus(
             profile_drop_workers=max(1, int(profile_drop_workers)),
             profile_drop_timeout_seconds=max(1, int(profile_drop_timeout_seconds)),
             force_rebuild=bool(force_rebuild),
+            require_presentation_metadata=bool(require_presentation_metadata),
             as_json=False,
         )
 
@@ -9045,9 +9137,10 @@ def cmd_rescore_attempts() -> int:
     return 0
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+def main(argv: list[str] | None = None) -> int:
+    direct_command = _command_from_invocation_name(sys.argv[0]) if argv is None else None
+    parser = build_parser(prog="uv run" if direct_command else None)
+    args = parser.parse_args(_argv_for_invocation(argv))
     if args.command == "doctor":
         return cmd_doctor()
     if args.command == "test-providers":
@@ -9242,6 +9335,7 @@ def main() -> int:
             profile_drop_workers=int(args.profile_drop_workers),
             profile_drop_timeout_seconds=int(args.profile_drop_timeout_seconds),
             force_rebuild=bool(args.force_rebuild),
+            require_presentation_metadata=not bool(args.allow_presentation_fallback),
             dry_run=bool(args.dry_run),
             as_json=bool(args.json),
         )

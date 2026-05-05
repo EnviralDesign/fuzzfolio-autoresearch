@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   fetchAttemptDetail,
   fetchCatalog,
+  fetchDashboardJobCurrent,
   fetchLivePortfolio,
   fetchRunDetail,
   fetchRuns,
@@ -60,5 +61,14 @@ export function useLivePortfolio() {
     queryKey: ["live-portfolio"],
     queryFn: fetchLivePortfolio,
     staleTime: 5_000,
+  });
+}
+
+export function useDashboardJob() {
+  return useQuery({
+    queryKey: ["dashboard-job-current"],
+    queryFn: fetchDashboardJobCurrent,
+    refetchInterval: 2_500,
+    staleTime: 1_000,
   });
 }

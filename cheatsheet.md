@@ -1,5 +1,5 @@
-uv run autoresearch build-portfolio
-uv run autoresearch calculate-full-backtests
-uv run autoresearch calculate-full-backtests --force-rebuild
-uv run autoresearch render-corpus-profile-drops
-uv run autoresearch render-corpus-profile-drops --force-rebuild
+uv run play-hand
+uv run finalize-corpus
+uv run build-portfolio
+uv run dashboard
+uv run nuke-deep-caches

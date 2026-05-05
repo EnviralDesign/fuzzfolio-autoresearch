@@ -1,15 +1,11 @@
-"""Normalize replayed raw step records into trainable prompt variants."""
+"""Compact controller prompt state for explorer repair and follow-up prompts."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-from . import PIPELINE_VERSION
 
 
 def _canonicalize_text(text: str, run_dir: str) -> str:
@@ -790,59 +786,3 @@ def normalize_record(record: dict[str, Any]) -> dict[str, Any]:
 
 def normalize_model_target(value: Any, run_dir: str = "") -> Any:
     return _canonicalize_value(_pathless_model_value(value), run_dir)
-
-
-def normalize_records(input_path: Path, output_path: Path, summary_path: Path | None = None) -> dict[str, Any]:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    record_count = 0
-    with input_path.open("r", encoding="utf-8") as source, output_path.open(
-        "w", encoding="utf-8"
-    ) as sink:
-        for line in source:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            if not isinstance(record, dict):
-                continue
-            normalized = normalize_record(record)
-            sink.write(json.dumps(normalized, ensure_ascii=True) + "\n")
-            record_count += 1
-    summary = {
-        "pipeline_version": PIPELINE_VERSION,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "input_path": str(input_path.resolve()),
-        "output_path": str(output_path.resolve()),
-        "record_count": record_count,
-    }
-    if summary_path is not None:
-        summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(
-            json.dumps(summary, ensure_ascii=True, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    return summary
-
-
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Normalize replayed step records into prompt variants."
-    )
-    parser.add_argument("--input", type=Path, required=True, help="Input JSONL path.")
-    parser.add_argument("--out", type=Path, required=True, help="Output JSONL path.")
-    parser.add_argument(
-        "--summary-out",
-        type=Path,
-        help="Optional JSON summary report path.",
-    )
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = _parse_args()
-    normalize_records(args.input, args.out, args.summary_out)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

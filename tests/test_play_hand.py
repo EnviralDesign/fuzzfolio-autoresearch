@@ -46,20 +46,15 @@ def test_play_hand_artifact_commands_heal_full_backtests_and_top_drop() -> None:
         profile_drop_workers=2,
     )
 
-    assert commands[0][-4:] == [
-        "calculate-full-backtests",
-        "--run-ids",
-        "run-123",
-        "--json",
-    ]
-    drop_command = commands[1]
+    assert len(commands) == 1
+    drop_command = commands[0]
     assert drop_command[:3][-2:] == ["-m", "autoresearch"]
     for expected in (
-        "render-corpus-profile-drops",
+        "finalize-corpus",
         "--run-id",
         "run-123",
-        "--top-results",
-        "1",
+        "--scope",
+        "dashboard",
         "--lookback-months",
         "36",
         "--profile-drop-workers",
@@ -76,8 +71,7 @@ def test_play_hand_artifact_commands_can_skip_profile_drops() -> None:
         profile_drop_workers=1,
     )
 
-    assert len(commands) == 1
-    assert "calculate-full-backtests" in commands[0]
+    assert commands == []
 
 
 def test_play_hand_artifact_commands_target_final_attempt_for_profile_drop() -> None:
@@ -88,10 +82,10 @@ def test_play_hand_artifact_commands_target_final_attempt_for_profile_drop() -> 
         final_attempt_id="run-123-attempt-00011",
     )
 
-    drop_command = commands[1]
+    drop_command = commands[0]
     assert "--attempt-id" in drop_command
     assert "run-123-attempt-00011" in drop_command
-    assert "--top-results" not in drop_command
+    assert "--scope" not in drop_command
 
 
 def test_finalize_play_hand_attempt_metadata_marks_canonical_and_scout_decisions(tmp_path: Path) -> None:

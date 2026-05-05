@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import mimetypes
 import subprocess
+import sys
 import threading
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,6 +29,30 @@ SHORTLIST_REPORT_ROOTNAME = "shortlist-report"
 _CURVE_CELL_CACHE: dict[str, tuple[tuple[str, bool, int | None, int | None], dict[str, Any]]] = {}
 _RESULT_CELL_CACHE: dict[str, tuple[tuple[str, bool, int | None, int | None], dict[str, Any]]] = {}
 LIVE_PORTFOLIO_CACHE_FILENAME = "dashboard-live-portfolio.json"
+DASHBOARD_JOB_ROOTNAME = "dashboard-jobs"
+DASHBOARD_PORTFOLIO_CONFIG_ROOTNAME = "dashboard-portfolio-configs"
+LOCAL_JOB_CLIENTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _default_dashboard_portfolio_config() -> dict[str, Any]:
+    return {
+        "portfolio_name": "dashboard-auto-portfolio",
+        "candidate_scope": "promoted",
+        "catch_up_full_backtests": True,
+        "catch_up_require_scrutiny_36": False,
+        "catch_up_force_rebuild": False,
+        "generate_profile_drops": True,
+        "export_bundle": False,
+        "profile_drop_workers": 4,
+        "sleeves": [
+            {"name": "core", "shortlist_size": 8},
+            {"name": "breadth", "shortlist_size": 8},
+        ],
+    }
 
 
 def _read_json(path: Path) -> Any:
@@ -41,6 +67,304 @@ def _load_optional_json(path: Path) -> Any | None:
         return _read_json(path)
     except Exception:
         return None
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=True, indent=2)
+        handle.write("\n")
+
+
+def _tail_text(path: Path, *, max_chars: int = 12000) -> str:
+    if not path.exists():
+        return ""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - max_chars))
+            data = handle.read()
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return [str(value)]
+
+
+class DashboardJobManager:
+    def __init__(
+        self,
+        config: AppConfig,
+        *,
+        popen_factory: Any = subprocess.Popen,
+    ):
+        self.config = config
+        self.job_root = config.derived_root / DASHBOARD_JOB_ROOTNAME
+        self.config_root = config.derived_root / DASHBOARD_PORTFOLIO_CONFIG_ROOTNAME
+        self._popen_factory = popen_factory
+        self._lock = threading.RLock()
+        self._records: dict[str, dict[str, Any]] = {}
+        self._processes: dict[str, Any] = {}
+        self.job_root.mkdir(parents=True, exist_ok=True)
+        self.config_root.mkdir(parents=True, exist_ok=True)
+        self._load_records()
+
+    def _load_records(self) -> None:
+        for path in sorted(self.job_root.glob("*.json")):
+            record = _load_optional_json(path)
+            if not isinstance(record, dict):
+                continue
+            job_id = str(record.get("id") or path.stem).strip()
+            if not job_id:
+                continue
+            if record.get("status") == "running":
+                record["status"] = "unknown"
+                record["ended_at"] = record.get("ended_at") or _now_iso()
+                record["error"] = "Dashboard restarted before this job status was observed."
+                _write_json(path, record)
+            self._records[job_id] = record
+
+    def _record_path(self, job_id: str) -> Path:
+        return self.job_root / f"{job_id}.json"
+
+    def _write_record(self, record: dict[str, Any]) -> None:
+        job_id = str(record.get("id") or "").strip()
+        if not job_id:
+            raise ValueError("Job record is missing an id.")
+        _write_json(self._record_path(job_id), record)
+        self._records[job_id] = dict(record)
+
+    def _record_payload(self, record: dict[str, Any] | None) -> dict[str, Any] | None:
+        if record is None:
+            return None
+        payload = dict(record)
+        log_path = Path(str(payload.get("log_path") or ""))
+        payload["log_tail"] = _tail_text(log_path)
+        return payload
+
+    def _active_record_unlocked(self) -> dict[str, Any] | None:
+        for record in self._records.values():
+            if str(record.get("status") or "") in {"running", "canceling"}:
+                return record
+        return None
+
+    def _latest_record_unlocked(self) -> dict[str, Any] | None:
+        if not self._records:
+            return None
+        return sorted(
+            self._records.values(),
+            key=lambda item: str(item.get("created_at") or ""),
+            reverse=True,
+        )[0]
+
+    def current(self) -> dict[str, Any] | None:
+        with self._lock:
+            return self._record_payload(
+                self._active_record_unlocked() or self._latest_record_unlocked()
+            )
+
+    def get(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._record_payload(self._records.get(str(job_id)))
+
+    def latest_dashboard_portfolio_config(self) -> dict[str, Any]:
+        path = self.config_root / "latest-dashboard-auto-portfolio.json"
+        payload = _load_optional_json(path)
+        if isinstance(payload, dict):
+            return payload
+        return _default_dashboard_portfolio_config()
+
+    def _write_dashboard_portfolio_config(self, payload: dict[str, Any]) -> Path:
+        config_payload = dict(payload or {})
+        if not config_payload:
+            config_payload = _default_dashboard_portfolio_config()
+        if not isinstance(config_payload.get("sleeves"), list):
+            config_payload["sleeves"] = _default_dashboard_portfolio_config()["sleeves"]
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        path = self.config_root / f"{timestamp}-dashboard-auto-portfolio.json"
+        latest_path = self.config_root / "latest-dashboard-auto-portfolio.json"
+        _write_json(path, config_payload)
+        _write_json(latest_path, config_payload)
+        return path
+
+    def _finalize_command(self, payload: dict[str, Any]) -> list[str]:
+        command = [sys.executable, "-m", "autoresearch", "finalize-corpus", "--json"]
+        for run_id in _string_list(payload.get("run_ids") or payload.get("run_id")):
+            token = str(run_id).strip()
+            if token:
+                command.extend(["--run-id", token])
+        for attempt_id in _string_list(payload.get("attempt_ids") or payload.get("attempt_id")):
+            token = str(attempt_id).strip()
+            if token:
+                command.extend(["--attempt-id", token])
+        scope = str(payload.get("scope") or "dashboard").strip()
+        if scope in {"dashboard", "all"}:
+            command.extend(["--scope", scope])
+        for key, option in [
+            ("lookback_months", "--lookback-months"),
+            ("profile_drop_workers", "--profile-drop-workers"),
+            ("profile_drop_timeout_seconds", "--profile-drop-timeout-seconds"),
+        ]:
+            if payload.get(key) is not None:
+                command.extend([option, str(payload[key])])
+        if payload.get("force_rebuild"):
+            command.append("--force-rebuild")
+        if payload.get("allow_presentation_fallback"):
+            command.append("--allow-presentation-fallback")
+        if payload.get("dry_run"):
+            command.append("--dry-run")
+        return command
+
+    def _build_portfolio_command(self, payload: dict[str, Any]) -> tuple[list[str], Path]:
+        raw_config = payload.get("portfolio_config")
+        config_payload = raw_config if isinstance(raw_config, dict) else self.latest_dashboard_portfolio_config()
+        config_path = self._write_dashboard_portfolio_config(config_payload)
+        command = [
+            sys.executable,
+            "-m",
+            "autoresearch",
+            "build-portfolio",
+            "--portfolio-config",
+            str(config_path),
+            "--json",
+        ]
+        for run_id in _string_list(payload.get("run_ids") or payload.get("run_id")):
+            token = str(run_id).strip()
+            if token:
+                command.extend(["--run-id", token])
+        for attempt_id in _string_list(payload.get("attempt_ids") or payload.get("attempt_id")):
+            token = str(attempt_id).strip()
+            if token:
+                command.extend(["--attempt-id", token])
+        if payload.get("candidate_scope") in {"promoted", "all"}:
+            command.extend(["--candidate-scope", str(payload["candidate_scope"])])
+        for key, true_option, false_option in [
+            ("catch_up_full_backtests", "--catch-up-full-backtests", "--no-catch-up-full-backtests"),
+            ("catch_up_force_rebuild", "--catch-up-force-rebuild", "--no-catch-up-force-rebuild"),
+            ("catch_up_require_scrutiny_36", "--catch-up-require-scrutiny-36", "--no-catch-up-require-scrutiny-36"),
+            ("generate_profile_drops", "--generate-profile-drops", "--no-generate-profile-drops"),
+            ("export_bundle", "--export-bundle", "--no-export-bundle"),
+        ]:
+            if payload.get(key) is not None:
+                command.append(true_option if payload.get(key) else false_option)
+        if payload.get("profile_drop_workers") is not None:
+            command.extend(["--profile-drop-workers", str(payload["profile_drop_workers"])])
+        return command, config_path
+
+    def start(self, kind: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = dict(payload or {})
+        kind = str(kind or "").strip()
+        with self._lock:
+            active = self._active_record_unlocked()
+            if active is not None:
+                raise RuntimeError(f"Dashboard job already running: {active.get('id')}")
+        if kind == "finalize-corpus":
+            command = self._finalize_command(payload)
+            config_path = None
+        elif kind == "build-portfolio":
+            command, config_path = self._build_portfolio_command(payload)
+        else:
+            raise ValueError(f"Unsupported dashboard job kind: {kind}")
+
+        with self._lock:
+            active = self._active_record_unlocked()
+            if active is not None:
+                raise RuntimeError(f"Dashboard job already running: {active.get('id')}")
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            job_id = f"{timestamp}-{kind.replace('-', '_')}-{uuid.uuid4().hex[:8]}"
+            log_path = self.job_root / f"{job_id}.log"
+            record = {
+                "id": job_id,
+                "kind": kind,
+                "status": "running",
+                "created_at": _now_iso(),
+                "started_at": _now_iso(),
+                "ended_at": None,
+                "command": command,
+                "cwd": str(self.config.repo_root),
+                "returncode": None,
+                "log_path": str(log_path),
+                "portfolio_config_path": str(config_path) if config_path is not None else None,
+            }
+            log_handle = log_path.open("w", encoding="utf-8")
+            log_handle.write("$ " + " ".join(command) + "\n\n")
+            log_handle.flush()
+            try:
+                process = self._popen_factory(
+                    command,
+                    cwd=str(self.config.repo_root),
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                )
+            except Exception:
+                log_handle.close()
+                raise
+            self._processes[job_id] = process
+            self._write_record(record)
+            thread = threading.Thread(
+                target=self._monitor_job,
+                args=(job_id, process, log_handle),
+                daemon=True,
+            )
+            thread.start()
+            return self._record_payload(record) or record
+
+    def _monitor_job(self, job_id: str, process: Any, log_handle: Any) -> None:
+        error: str | None = None
+        try:
+            returncode = int(process.wait())
+        except Exception as exc:
+            returncode = -1
+            error = str(exc)
+        finally:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+        with self._lock:
+            record = dict(self._records.get(job_id) or {})
+            prior_status = str(record.get("status") or "")
+            record["returncode"] = returncode
+            record["ended_at"] = _now_iso()
+            if prior_status == "canceling":
+                record["status"] = "canceled"
+            elif returncode == 0:
+                record["status"] = "completed"
+            else:
+                record["status"] = "failed"
+            if error:
+                record["error"] = error
+            self._processes.pop(job_id, None)
+            self._write_record(record)
+
+    def cancel(self, job_id: str | None = None) -> dict[str, Any] | None:
+        with self._lock:
+            record = self._records.get(str(job_id)) if job_id else self._active_record_unlocked()
+            if record is None:
+                return None
+            job_id = str(record.get("id") or "")
+            process = self._processes.get(job_id)
+            if process is None or str(record.get("status") or "") not in {"running", "canceling"}:
+                return self._record_payload(record)
+            record = dict(record)
+            record["status"] = "canceling"
+            record["cancel_requested_at"] = _now_iso()
+            self._write_record(record)
+            try:
+                process.terminate()
+            except Exception as exc:
+                record["error"] = str(exc)
+                self._write_record(record)
+            return self._record_payload(record)
 
 
 def _latest_portfolio_report_path(config: AppConfig) -> Path | None:
@@ -674,6 +998,7 @@ def _build_viewer_payload(config: AppConfig, catalog_rows: list[dict[str, Any]])
 class ViewerState:
     def __init__(self, config: AppConfig):
         self.config = config
+        self.job_manager = DashboardJobManager(config)
         self._lock = threading.RLock()
         self._snapshot: dict[str, Any] | None = None
         self._snapshot_signature: tuple[Any, ...] | None = None
@@ -832,12 +1157,51 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
             index_path = DASHBOARD_DIST_ROOT / "index.html"
             self._send(200, index_path.read_bytes(), "text/html; charset=utf-8")
 
+        def _read_json_body(self) -> dict[str, Any] | None:
+            try:
+                content_length = int(self.headers.get("Content-Length", "0") or "0")
+            except ValueError:
+                content_length = 0
+            body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+            try:
+                payload = json.loads(body.decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                return None
+            return payload if isinstance(payload, dict) else None
+
+        def _is_local_request(self) -> bool:
+            client_host = str((self.client_address or ("",))[0] or "")
+            return client_host in LOCAL_JOB_CLIENTS or client_host.startswith("127.")
+
+        def _require_local_jobs(self) -> bool:
+            if self._is_local_request():
+                return True
+            self._send_json({"error": "local_only_job_api"}, status=403)
+            return False
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path in {"/api/state", "/api/overview"}:
                 return self._send_json(state.snapshot())
             if parsed.path == "/api/live-portfolio":
                 return self._send_json(_live_portfolio_payload(state.config))
+            if parsed.path == "/api/portfolio-config":
+                if not self._require_local_jobs():
+                    return
+                return self._send_json(state.job_manager.latest_dashboard_portfolio_config())
+            if parsed.path == "/api/jobs/current":
+                if not self._require_local_jobs():
+                    return
+                return self._send_json(state.job_manager.current() or {"status": "idle"})
+            if parsed.path.startswith("/api/jobs/"):
+                if not self._require_local_jobs():
+                    return
+                parts = [unquote(part) for part in parsed.path.split("/") if part]
+                if len(parts) == 3:
+                    job = state.job_manager.get(parts[2])
+                    if job is None:
+                        return self._send_json({"error": "job_not_found"}, status=404)
+                    return self._send_json(job)
             if parsed.path == "/api/catalog":
                 rows = [_normalize_path_fields(state.config, row) for row in state.catalog_rows()]
                 return self._send_json(
@@ -895,18 +1259,56 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
-            if parsed.path == "/api/live-portfolio":
-                try:
-                    content_length = int(self.headers.get("Content-Length", "0") or "0")
-                except ValueError:
-                    content_length = 0
-                body = self.rfile.read(content_length) if content_length > 0 else b"{}"
-                try:
-                    payload = json.loads(body.decode("utf-8") or "{}")
-                except json.JSONDecodeError:
+            if parsed.path == "/api/jobs/finalize-corpus":
+                if not self._require_local_jobs():
+                    return
+                payload = self._read_json_body()
+                if payload is None:
                     return self._send_json({"error": "invalid_json"}, status=400)
-                if not isinstance(payload, dict):
-                    return self._send_json({"error": "invalid_payload"}, status=400)
+                try:
+                    return self._send_json(
+                        state.job_manager.start("finalize-corpus", payload),
+                        status=202,
+                    )
+                except RuntimeError as exc:
+                    return self._send_json({"error": "job_active", "message": str(exc)}, status=409)
+                except Exception as exc:
+                    return self._send_json({"error": "job_start_failed", "message": str(exc)}, status=400)
+            if parsed.path == "/api/jobs/build-portfolio":
+                if not self._require_local_jobs():
+                    return
+                payload = self._read_json_body()
+                if payload is None:
+                    return self._send_json({"error": "invalid_json"}, status=400)
+                try:
+                    return self._send_json(
+                        state.job_manager.start("build-portfolio", payload),
+                        status=202,
+                    )
+                except RuntimeError as exc:
+                    return self._send_json({"error": "job_active", "message": str(exc)}, status=409)
+                except Exception as exc:
+                    return self._send_json({"error": "job_start_failed", "message": str(exc)}, status=400)
+            if parsed.path == "/api/jobs/cancel":
+                if not self._require_local_jobs():
+                    return
+                payload = self._read_json_body() or {}
+                job = state.job_manager.cancel(str(payload.get("id") or "").strip() or None)
+                if job is None:
+                    return self._send_json({"error": "job_not_found"}, status=404)
+                return self._send_json(job)
+            if parsed.path == "/api/portfolio-config":
+                if not self._require_local_jobs():
+                    return
+                payload = self._read_json_body()
+                if payload is None:
+                    return self._send_json({"error": "invalid_json"}, status=400)
+                path = state.job_manager._write_dashboard_portfolio_config(payload)
+                return self._send_json({"path": str(path), "config": payload})
+            if parsed.path == "/api/live-portfolio":
+                payload = self._read_json_body()
+                if payload is None:
+                    return self._send_json({"error": "invalid_json"}, status=400)
                 attempt_ids = _normalize_attempt_id_list(payload.get("selected_attempt_ids"))
                 known_attempt_ids = {
                     str(row.get("attempt_id") or "")

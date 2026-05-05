@@ -22,14 +22,15 @@ const baseColumns: ColumnDef<AttemptCatalogRow, unknown>[] = [
       const r = row.original;
       const role = String(r.attempt_role || r.play_hand_role || "").trim();
       const decision = String(r.attempt_decision || "").trim();
+      const canonical = Boolean(r.is_canonical_attempt || r.is_canonical_playhand_attempt);
       return (
         <div className="space-y-1">
           <div className="font-medium text-foreground">
             {String(r.candidate_name || r.attempt_id)}
           </div>
-          {role || decision || r.is_canonical_playhand_attempt ? (
+          {role || decision || canonical ? (
             <div className="flex flex-wrap gap-1">
-              {r.is_canonical_playhand_attempt ? (
+              {canonical ? (
                 <span className="rounded border border-emerald-400/40 bg-emerald-400/10 px-1.5 py-0.5 text-[0.66rem] uppercase tracking-wide text-emerald-200">
                   Canonical
                 </span>

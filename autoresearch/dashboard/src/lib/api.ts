@@ -1,6 +1,7 @@
 import type {
   AttemptDetail,
   CatalogResponse,
+  DashboardJob,
   LivePortfolio,
   RunDetail,
   RunsResponse,
@@ -50,4 +51,42 @@ export function saveLivePortfolio(selectedAttemptIds: string[]): Promise<LivePor
     },
     body: JSON.stringify({ selected_attempt_ids: selectedAttemptIds }),
   });
+}
+
+export function fetchDashboardJobCurrent(): Promise<DashboardJob> {
+  return fetchJson<DashboardJob>("/api/jobs/current");
+}
+
+export function startFinalizeCorpusJob(payload: Record<string, unknown> = {}): Promise<DashboardJob> {
+  return fetchJson<DashboardJob>("/api/jobs/finalize-corpus", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function startBuildPortfolioJob(payload: Record<string, unknown> = {}): Promise<DashboardJob> {
+  return fetchJson<DashboardJob>("/api/jobs/build-portfolio", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function cancelDashboardJob(id?: string): Promise<DashboardJob> {
+  return fetchJson<DashboardJob>("/api/jobs/cancel", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(id ? { id } : {}),
+  });
+}
+
+export function fetchDashboardPortfolioConfig(): Promise<Record<string, unknown>> {
+  return fetchJson<Record<string, unknown>>("/api/portfolio-config");
 }

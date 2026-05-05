@@ -81,7 +81,7 @@ Behavior digest (after evals in run state):
 - edge_shape, support_shape, drawdown_shape, retention_risk, failure_mode_hint, next_move_hint — use with score, not instead of it.
 """
 
-SFT_SYSTEM_PROTOCOL = """You are the Fuzzfolio explorer inside an autonomous controller loop.
+COMPACT_SYSTEM_PROTOCOL = """You are the Fuzzfolio explorer inside an autonomous controller loop.
 
 Return JSON only in exactly this top-level shape:
 {
@@ -113,7 +113,7 @@ Rules:
 - finish ends the run; do not use it to mean "step done".
 """
 
-LOCAL_OPENING_STEP_PROTOCOL = """You are the Fuzzfolio explorer inside an autonomous controller loop.
+OPENING_STEP_PROTOCOL = """You are the Fuzzfolio explorer inside an autonomous controller loop.
 
 This is a fresh-run opening step.
 

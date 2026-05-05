@@ -1,4 +1,6 @@
-# Fuzzfolio Autoresearch Program
+# Legacy Explorer Program
+
+This is the advanced/legacy guide for `uv run run`. Play Hand plus `finalize-corpus` is the preferred strategy-generation path for normal work.
 
 This repo now runs an autonomous Fuzzfolio research loop instead of a model-training loop.
 
