@@ -11841,9 +11841,8 @@ class ResearchController:
         if not attempt_id:
             return {"status": "skipped", "reason": "missing_canonical_attempt_id"}
         command = [
-            sys.executable,
-            "-m",
-            "autoresearch",
+            "uv",
+            "run",
             "finalize-corpus",
             "--run-id",
             tool_context.run_id,

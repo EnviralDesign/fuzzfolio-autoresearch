@@ -100,7 +100,6 @@ def test_direct_script_invocation_infers_public_command() -> None:
     assert _argv_for_invocation(
         ["--dry-run", "--json"], invoked_as="play-hand"
     ) == ["play-hand", "--dry-run", "--json"]
-    assert _argv_for_invocation(["doctor"], invoked_as="autoresearch") == ["doctor"]
 
 
 def test_request_snapshot_pretty_prints_assistant_actions_and_tool_results(tmp_path: Path) -> None:

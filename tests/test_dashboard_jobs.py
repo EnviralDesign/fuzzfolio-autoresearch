@@ -58,6 +58,7 @@ def test_dashboard_job_manager_starts_completes_and_persists(tmp_path) -> None:
 
     job = manager.start("finalize-corpus", {"dry_run": True})
     assert job["status"] == "running"
+    assert job["command"][:3] == ["uv", "run", "finalize-corpus"]
     assert "finalize-corpus" in job["command"]
 
     processes[0].finish(0)
@@ -119,6 +120,7 @@ def test_dashboard_job_manager_build_portfolio_writes_dashboard_config(tmp_path)
         },
     )
 
+    assert job["command"][:3] == ["uv", "run", "build-portfolio"]
     assert "build-portfolio" in job["command"]
     assert "--portfolio-config" in job["command"]
     assert job["portfolio_config_path"].endswith("dashboard-auto-portfolio.json")

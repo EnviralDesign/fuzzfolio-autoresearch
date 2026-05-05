@@ -3036,9 +3036,8 @@ def _play_hand_artifact_commands(
     if drop_count <= 0:
         return []
     command = [
-        sys.executable,
-        "-m",
-        "autoresearch",
+        "uv",
+        "run",
         "finalize-corpus",
         "--run-id",
         run_id,
@@ -3078,7 +3077,7 @@ def _json_payload_from_stdout(stdout: str) -> dict[str, Any]:
     return {"raw_stdout": text[-4000:]}
 
 
-def _run_child_autoresearch_command(args: list[str], *, cwd: Path) -> dict[str, Any]:
+def _run_child_public_command(args: list[str], *, cwd: Path) -> dict[str, Any]:
     result = subprocess.run(
         args,
         cwd=str(cwd),
@@ -3093,7 +3092,7 @@ def _run_child_autoresearch_command(args: list[str], *, cwd: Path) -> dict[str, 
     if result.returncode != 0:
         rendered = " ".join(args)
         raise RuntimeError(
-            f"Child autoresearch command failed ({result.returncode}): {rendered}"
+            f"Child command failed ({result.returncode}): {rendered}"
             + (f"\n{payload.get('_stderr')}" if payload.get("_stderr") else "")
         )
     return payload
@@ -3137,7 +3136,9 @@ def _finalize_run_artifacts(
     try:
         if commands:
             console.print(f"{stage.prefix} [cyan]final_artifacts[/] [bold]finalize corpus[/]")
-            full_backtests = _run_child_autoresearch_command(commands[0], cwd=ctx.config.repo_root)
+            full_backtests = _run_child_public_command(
+                commands[0], cwd=ctx.config.repo_root
+            )
             _append_event(
                 ctx,
                 "final_artifacts",

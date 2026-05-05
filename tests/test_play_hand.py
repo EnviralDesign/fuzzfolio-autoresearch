@@ -48,7 +48,7 @@ def test_play_hand_artifact_commands_heal_full_backtests_and_top_drop() -> None:
 
     assert len(commands) == 1
     drop_command = commands[0]
-    assert drop_command[:3][-2:] == ["-m", "autoresearch"]
+    assert drop_command[:2] == ["uv", "run"]
     for expected in (
         "finalize-corpus",
         "--run-id",

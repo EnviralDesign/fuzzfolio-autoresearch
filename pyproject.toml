@@ -18,7 +18,6 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-autoresearch = "autoresearch.__main__:main"
 doctor = "autoresearch.__main__:main"
 test-providers = "autoresearch.__main__:main"
 play-hand = "autoresearch.__main__:main"

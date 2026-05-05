@@ -95,13 +95,11 @@ The dashboard exposes local-only job endpoints for desktop automation:
 - `GET /api/jobs/{id}`
 - `POST /api/jobs/cancel`
 
-Jobs run one at a time as `python -m autoresearch ...` subprocesses. Records and logs are written under `runs/derived/dashboard-jobs/`. Dashboard-owned portfolio configs are stored under `runs/derived/dashboard-portfolio-configs/`.
+Jobs run one at a time through the same direct `uv run finalize-corpus` and `uv run build-portfolio` commands used at the terminal. Records and logs are written under `runs/derived/dashboard-jobs/`. Dashboard-owned portfolio configs are stored under `runs/derived/dashboard-portfolio-configs/`.
 
 ## Legacy Explorer
 
 `uv run run` remains available for Explorer runs. Treat it as advanced/legacy. It no longer supports direct local Hugging Face/Gemma inference, local adapters, quantization settings, or fine-tuning/export workflows.
-
-The old `uv run autoresearch <command>` umbrella is still accepted for compatibility, but the direct scripts above are the preferred form.
 
 ## Do Not Delete
 

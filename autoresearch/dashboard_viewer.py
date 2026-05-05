@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import mimetypes
 import subprocess
-import sys
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -197,7 +196,7 @@ class DashboardJobManager:
         return path
 
     def _finalize_command(self, payload: dict[str, Any]) -> list[str]:
-        command = [sys.executable, "-m", "autoresearch", "finalize-corpus", "--json"]
+        command = ["uv", "run", "finalize-corpus", "--json"]
         for run_id in _string_list(payload.get("run_ids") or payload.get("run_id")):
             token = str(run_id).strip()
             if token:
@@ -229,9 +228,8 @@ class DashboardJobManager:
         config_payload = raw_config if isinstance(raw_config, dict) else self.latest_dashboard_portfolio_config()
         config_path = self._write_dashboard_portfolio_config(config_payload)
         command = [
-            sys.executable,
-            "-m",
-            "autoresearch",
+            "uv",
+            "run",
             "build-portfolio",
             "--portfolio-config",
             str(config_path),

@@ -257,25 +257,11 @@ def refresh_dashboard_sources(
     print("dashboard refresh: running leaderboard pipeline", flush=True)
     if force_rebuild:
         print("dashboard refresh: force rebuild enabled", flush=True)
-    leaderboard_argv = [
-        sys.executable,
-        "-m",
-        "autoresearch",
-        "leaderboard",
-        "--limit",
-        str(limit),
-    ]
-    if force_rebuild:
-        leaderboard_argv.append("--force-rebuild")
-    return_code, stdout_tail, stderr_tail = _run_streaming_subprocess(
-        leaderboard_argv,
-        cwd=str(config.repo_root),
-        prefix="  leaderboard | ",
-    )
+    from .__main__ import cmd_leaderboard
+
+    return_code = cmd_leaderboard(limit=limit, force_rebuild=force_rebuild)
     if return_code != 0:
-        raise RuntimeError(
-            f"leaderboard refresh failed\nstdout:\n{stdout_tail[:1600]}\n\nstderr:\n{stderr_tail[:1600]}"
-        )
+        raise RuntimeError(f"leaderboard refresh failed with exit code {return_code}")
     print("dashboard refresh: done", flush=True)
     return {
         "aggregate_plot": str(config.aggregate_plot_path),

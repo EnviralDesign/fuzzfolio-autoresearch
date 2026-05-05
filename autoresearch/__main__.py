@@ -9139,6 +9139,16 @@ def cmd_rescore_attempts() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     direct_command = _command_from_invocation_name(sys.argv[0]) if argv is None else None
+    if argv is None and direct_command is None:
+        usage = ", ".join(sorted(PUBLIC_CLI_COMMANDS))
+        parser = argparse.ArgumentParser(
+            prog="uv run <command>",
+            description="Fuzzfolio autoresearch runtime.",
+        )
+        parser.error(
+            "the autoresearch umbrella entry point has been removed; "
+            f"use one of the direct commands instead: {usage}"
+        )
     parser = build_parser(prog="uv run" if direct_command else None)
     args = parser.parse_args(_argv_for_invocation(argv))
     if args.command == "doctor":
