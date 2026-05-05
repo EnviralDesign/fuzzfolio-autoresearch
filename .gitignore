@@ -46,3 +46,4 @@ wheels/
 /scratch_snapshot.txt
 /.codex-harness
 /runs_archive
+/.tmp

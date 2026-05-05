@@ -3,11 +3,8 @@ from __future__ import annotations
 import json
 import mimetypes
 import shutil
-import subprocess
-import sys
 import threading
 import uuid
-from collections import deque
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -152,47 +149,6 @@ def _reward_matrix_cli_args_from_attempt(attempt: dict[str, Any]) -> list[str]:
         "--reward-columns",
         str(int(matrix["reward_columns"])),
     ]
-
-
-def _run_streaming_subprocess(
-    argv: list[str], *, cwd: str, prefix: str
-) -> tuple[int, str, str]:
-    process = subprocess.Popen(
-        argv,
-        cwd=cwd,
-        text=True,
-        encoding="utf-8",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        bufsize=1,
-    )
-    stdout_tail: deque[str] = deque(maxlen=60)
-    stderr_tail: deque[str] = deque(maxlen=60)
-
-    def pump(stream: Any, sink: Any, tail: deque[str], label: str) -> None:
-        if stream is None:
-            return
-        for raw_line in stream:
-            line = raw_line.rstrip("\n")
-            tail.append(line)
-            print(f"{prefix}{label}{line}", file=sink, flush=True)
-
-    stdout_thread = threading.Thread(
-        target=pump,
-        args=(process.stdout, sys.stdout, stdout_tail, ""),
-        daemon=True,
-    )
-    stderr_thread = threading.Thread(
-        target=pump,
-        args=(process.stderr, sys.stderr, stderr_tail, "stderr: "),
-        daemon=True,
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-    return_code = process.wait()
-    stdout_thread.join(timeout=2)
-    stderr_thread.join(timeout=2)
-    return return_code, "\n".join(stdout_tail), "\n".join(stderr_tail)
 
 
 def _metric_value(payload: dict[str, Any], *path: str) -> float | None:
