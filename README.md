@@ -21,6 +21,25 @@ uv run doctor
 uv run test-providers
 ```
 
+### Codex Provider Auth
+
+Codex-backed provider profiles use AutoResearch's dedicated Codex home, not the default Codex CLI home. By default that home is:
+
+```powershell
+C:\repos\fuzzfolio-autoresearch\.codex-harness\codex-home
+```
+
+Login against that isolated home:
+
+```powershell
+$env:CODEX_HOME = "C:\repos\fuzzfolio-autoresearch\.codex-harness\codex-home"
+codex login status
+codex login --device-auth
+Remove-Item Env:\CODEX_HOME
+```
+
+Set `AUTORESEARCH_CODEX_HOME` only if you want a different dedicated home. Set `AUTORESEARCH_CODEX_SOURCE_HOME` only for an explicit one-time bootstrap/mirror source; AutoResearch does not copy from the ambient default `CODEX_HOME`.
+
 ## Public Commands
 
 - `doctor` checks config, Fuzzfolio CLI access, auth, and seed prompt state.
@@ -37,16 +56,20 @@ See [cli.md](cli.md) for arguments.
 
 ## Two Paths
 
-### Path A: Full Auto
+### Path A: Auto Build
 
 ```powershell
 uv run play-hand
 uv run finalize-corpus
-uv run build-portfolio
 uv run dashboard
 ```
 
-`play-hand` creates a run, promotes a canonical attempt, runs the canonical finalization path, and writes final profile-drop artifacts. `build-portfolio` consumes canonical candidates and produces the latest portfolio report under `runs/derived/portfolio-report/`.
+`play-hand` creates a run, promotes a canonical attempt, runs the canonical finalization path, and writes final profile-drop artifacts. `finalize-corpus` catches up older canonical runs.
+
+From there you can build the portfolio either way:
+
+- In the dashboard, use Portfolio Workbench -> Auto Build. The dashboard writes a dashboard-owned config under `runs/derived/dashboard-portfolio-configs/`, starts a local `build-portfolio` job, shows status/logs, and can import the auto-selected result into the manual draft.
+- At the terminal, run `uv run build-portfolio` directly. This uses the same canonical candidate corpus and writes the latest report under `runs/derived/portfolio-report/`.
 
 ### Path B: Manual Assembly
 
@@ -56,7 +79,7 @@ uv run finalize-corpus
 uv run dashboard
 ```
 
-Open the dashboard Portfolio Workbench, use the Manual mode to select canonical candidates, inspect the 36-month basket curve, and persist the draft selection. Auto Build mode can run `finalize-corpus` and `build-portfolio` from the dashboard using local-only job APIs.
+Open the dashboard Portfolio Workbench, use Manual mode to select canonical candidates, inspect the 36-month basket curve, and persist the draft selection. Auto Build mode is available in the same dashboard when you want the automatic `build-portfolio` path instead.
 
 ## Run Contract
 
@@ -95,7 +118,7 @@ The dashboard exposes local-only job endpoints for desktop automation:
 - `GET /api/jobs/{id}`
 - `POST /api/jobs/cancel`
 
-Jobs run one at a time through the same direct `uv run finalize-corpus` and `uv run build-portfolio` commands used at the terminal. Records and logs are written under `runs/derived/dashboard-jobs/`. Dashboard-owned portfolio configs are stored under `runs/derived/dashboard-portfolio-configs/`.
+Jobs run one at a time through the same direct `uv run finalize-corpus` and `uv run build-portfolio` commands used at the terminal. You do not need a separate AutoResearch worker process; `uv run dashboard` owns these local job subprocesses. Records and logs are written under `runs/derived/dashboard-jobs/`. Dashboard-owned portfolio configs are stored under `runs/derived/dashboard-portfolio-configs/`.
 
 ## Legacy Explorer
 

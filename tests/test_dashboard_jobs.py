@@ -36,6 +36,7 @@ def _manager(tmp_path, processes: list[FakeProcess]) -> DashboardJobManager:
     def fake_popen(command, **_kwargs):
         process = FakeProcess()
         process.command = command
+        process.popen_kwargs = dict(_kwargs)
         processes.append(process)
         return process
 
@@ -60,6 +61,11 @@ def test_dashboard_job_manager_starts_completes_and_persists(tmp_path) -> None:
     assert job["status"] == "running"
     assert job["command"][:3] == ["uv", "run", "finalize-corpus"]
     assert "finalize-corpus" in job["command"]
+    assert (
+        processes[0].popen_kwargs["env"]["AUTORESEARCH_CODEX_HOME"]
+        == str(tmp_path / ".codex-harness" / "codex-home")
+    )
+    assert "CODEX_HOME" not in processes[0].popen_kwargs["env"]
 
     processes[0].finish(0)
     completed = _wait_status(manager, job["id"], "completed")

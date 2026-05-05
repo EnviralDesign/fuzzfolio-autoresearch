@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import redirect_stdout
 import io
@@ -101,12 +102,14 @@ if __package__ in {None, ""}:
         apply_metadata_to_profile_document,
         build_metadata_artifact,
         build_writer_messages,
+        build_writer_repair_messages,
         compute_legacy_presentation_signature,
         compute_presentation_signature,
         load_cached_metadata,
         load_profile_document,
         presentation_metadata_path,
         validate_generated_metadata,
+        validate_generated_metadata_with_reasons,
     )
     from autoresearch.portfolio import (
         build_sleeve_prefilter,
@@ -123,6 +126,9 @@ if __package__ in {None, ""}:
     from autoresearch.provider import (
         ChatMessage,
         ProviderError,
+        codex_home_for_provider,
+        codex_isolated_login_hint,
+        codex_source_home_for_provider,
         create_provider,
         set_provider_trace_stderr_mode,
     )
@@ -194,12 +200,14 @@ else:
         apply_metadata_to_profile_document,
         build_metadata_artifact,
         build_writer_messages,
+        build_writer_repair_messages,
         compute_legacy_presentation_signature,
         compute_presentation_signature,
         load_cached_metadata,
         load_profile_document,
         presentation_metadata_path,
         validate_generated_metadata,
+        validate_generated_metadata_with_reasons,
     )
     from .portfolio import (
         build_sleeve_prefilter,
@@ -216,6 +224,9 @@ else:
     from .provider import (
         ChatMessage,
         ProviderError,
+        codex_home_for_provider,
+        codex_isolated_login_hint,
+        codex_source_home_for_provider,
         create_provider,
         set_provider_trace_stderr_mode,
     )
@@ -1655,12 +1666,45 @@ def _print_json_payload(payload: Any) -> None:
         _write_plain_text(text + "\n")
 
 
+def _provider_runtime_details(profile: Any) -> dict[str, Any]:
+    provider_type = str(getattr(profile, "provider_type", "") or "").strip().lower()
+    details: dict[str, Any] = {
+        "uses_managed_auth": provider_type == "codex",
+    }
+    if provider_type != "codex":
+        return details
+    codex_home = codex_home_for_provider(profile)
+    source_home = codex_source_home_for_provider()
+    details.update(
+        {
+            "codex_home": str(codex_home),
+            "codex_bootstrap_source_home": str(source_home) if source_home is not None else None,
+            "codex_login_command": codex_isolated_login_hint(codex_home),
+        }
+    )
+    return details
+
+
 def cmd_doctor() -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
     cli_path = cli.resolve_executable()
     auth = cli.ensure_login()
     seed = cli.seed_prompt()
+    explorer_runtime = _provider_runtime_details(config.provider)
+    presentation_profile_name = str(
+        config.research.presentation_metadata_provider_profile or ""
+    ).strip()
+    presentation_profile = (
+        config.providers.get(presentation_profile_name)
+        if presentation_profile_name
+        else None
+    )
+    presentation_runtime = (
+        _provider_runtime_details(presentation_profile)
+        if presentation_profile is not None
+        else None
+    )
     payload = {
         "repo_root": str(config.repo_root),
         "config_path": str(config.config_path),
@@ -1673,10 +1717,33 @@ def cmd_doctor() -> int:
         "explorer_api_base": config.provider.api_base,
         "explorer_command": config.provider.command,
         "explorer_has_api_key": bool(config.provider.api_key),
-        "explorer_uses_managed_auth": config.provider.provider_type.strip().lower()
-        == "codex",
+        "explorer_uses_managed_auth": explorer_runtime["uses_managed_auth"],
+        "explorer_codex_home": explorer_runtime.get("codex_home"),
+        "explorer_codex_bootstrap_source_home": explorer_runtime.get(
+            "codex_bootstrap_source_home"
+        ),
+        "explorer_codex_login_command": explorer_runtime.get("codex_login_command"),
         "explorer_compact_trigger_tokens": config.compact_trigger_tokens_for(
             config.llm.explorer_profile
+        ),
+        "presentation_metadata_provider_profile": presentation_profile_name or None,
+        "presentation_metadata_provider_type": (
+            presentation_profile.provider_type if presentation_profile is not None else None
+        ),
+        "presentation_metadata_codex_home": (
+            presentation_runtime.get("codex_home")
+            if presentation_runtime is not None
+            else None
+        ),
+        "presentation_metadata_codex_bootstrap_source_home": (
+            presentation_runtime.get("codex_bootstrap_source_home")
+            if presentation_runtime is not None
+            else None
+        ),
+        "presentation_metadata_codex_login_command": (
+            presentation_runtime.get("codex_login_command")
+            if presentation_runtime is not None
+            else None
         ),
         "supervise_max_steps": config.supervise.max_steps,
         "supervise_window_enabled": config.supervise.window_enabled,
@@ -2050,6 +2117,7 @@ def cmd_test_providers(
     overall_ok = True
 
     for profile_name, profile in selected.items():
+        runtime_details = _provider_runtime_details(profile)
         provider = create_provider(profile)
         profile_result: dict[str, Any] = {
             "profile": profile_name,
@@ -2058,7 +2126,12 @@ def cmd_test_providers(
             "api_base": profile.api_base,
             "command": profile.command,
             "has_api_key": bool(profile.api_key),
-            "uses_managed_auth": profile.provider_type.strip().lower() == "codex",
+            "uses_managed_auth": runtime_details["uses_managed_auth"],
+            "codex_home": runtime_details.get("codex_home"),
+            "codex_bootstrap_source_home": runtime_details.get(
+                "codex_bootstrap_source_home"
+            ),
+            "codex_login_command": runtime_details.get("codex_login_command"),
             "scenarios": [],
             "ok": True,
         }
@@ -4636,6 +4709,487 @@ def _profile_drop_result_from_manifest(
     }
 
 
+def _profile_drop_package_timestamp_utc() -> str:
+    return datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+
+def _profile_drop_quality_score_preset(config, response_payload: dict[str, Any]) -> str:
+    configured = str(
+        getattr(getattr(config, "research", None), "quality_score_preset", "") or ""
+    ).strip()
+    if configured:
+        return configured
+    candidate = (
+        _nested_get(response_payload, ["data", "aggregate", "quality_score", "preset"])
+        or _nested_get(response_payload, ["data", "quality_score", "preset"])
+    )
+    return str(candidate or "profile_drop")
+
+
+def _profile_drop_package_analysis(response_payload: dict[str, Any]) -> dict[str, Any]:
+    data = response_payload.get("data") if isinstance(response_payload, dict) else None
+    if isinstance(data, dict) and isinstance(data.get("aggregate"), dict):
+        return data["aggregate"]
+    if isinstance(data, dict):
+        return data
+    aggregate = response_payload.get("aggregate") if isinstance(response_payload, dict) else None
+    return aggregate if isinstance(aggregate, dict) else {}
+
+
+def _cell_stop_reward_from_payload(cell: Any) -> tuple[float, float] | None:
+    if not isinstance(cell, dict):
+        return None
+    stop_loss = _safe_float_value(
+        cell.get("stop_loss_percent") if "stop_loss_percent" in cell else cell.get("stopLossPercent")
+    )
+    reward = _safe_float_value(
+        cell.get("reward_multiple") if "reward_multiple" in cell else cell.get("rewardMultiple")
+    )
+    if stop_loss is None or reward is None:
+        return None
+    return stop_loss, reward
+
+
+def _cells_match_by_stop_reward(left: Any, right: Any) -> bool:
+    left_values = _cell_stop_reward_from_payload(left)
+    right_values = _cell_stop_reward_from_payload(right)
+    if left_values is None or right_values is None:
+        return False
+    return (
+        abs(left_values[0] - right_values[0]) < 1e-9
+        and abs(left_values[1] - right_values[1]) < 1e-9
+    )
+
+
+def _merge_detail_cell_with_metric_cell(
+    metric_cell: dict[str, Any] | None,
+    detail_cell: dict[str, Any],
+) -> dict[str, Any]:
+    merged = copy.deepcopy(metric_cell) if isinstance(metric_cell, dict) else {}
+    for key, value in detail_cell.items():
+        if value is not None:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _round_exit_policy_metric(value: float) -> float:
+    return round(float(value), 6)
+
+
+def _build_exit_policy_cell_payload(cell: dict[str, Any]) -> dict[str, float] | None:
+    stop_reward = _cell_stop_reward_from_payload(cell)
+    if stop_reward is None:
+        return None
+    stop_loss, reward = stop_reward
+    take_profit = _safe_float_value(
+        cell.get("take_profit_percent")
+        if "take_profit_percent" in cell
+        else cell.get("takeProfitPercent")
+    )
+    if take_profit is None:
+        take_profit = stop_loss * reward
+    return {
+        "stopLossPercent": _round_exit_policy_metric(stop_loss),
+        "rewardMultiple": _round_exit_policy_metric(reward),
+        "takeProfitPercent": _round_exit_policy_metric(take_profit),
+    }
+
+
+def _trim_to_char_limit(value: str, max_chars: int) -> str:
+    return "".join(str(value or "")[:max_chars]).strip()
+
+
+def _normalize_profile_import_name(value: str) -> str:
+    trimmed = str(value or "").strip()
+    if len(trimmed) <= 120:
+        return trimmed
+    prefix = "Scaffold "
+    if trimmed.startswith(prefix):
+        shortened = trimmed[len(prefix) :].strip()
+        if len(shortened) <= 120:
+            return shortened
+        return _trim_to_char_limit(shortened, 120)
+    return _trim_to_char_limit(trimmed, 120)
+
+
+def _coerce_portable_profile_schema_version_for_import(
+    profile_document: dict[str, Any],
+) -> dict[str, Any]:
+    patched = copy.deepcopy(profile_document)
+    profile = patched.get("profile")
+    if not isinstance(profile, dict):
+        return patched
+    if str(profile.get("version") or "") != "v1":
+        profile["version"] = "v1"
+    name = profile.get("name")
+    if isinstance(name, str):
+        normalized_name = _normalize_profile_import_name(name)
+        if normalized_name != name:
+            profile["name"] = normalized_name
+    return patched
+
+
+def _load_profile_document_for_existing_bundle(profile_path: Path | None) -> dict[str, Any] | None:
+    if profile_path is None or not profile_path.exists():
+        return None
+    payload = _load_json_if_exists(profile_path)
+    if not isinstance(payload, dict) or not payload:
+        return None
+    if isinstance(payload.get("profile"), dict):
+        return _coerce_portable_profile_schema_version_for_import(payload)
+    if payload.get("name") or payload.get("indicators"):
+        wrapped = {
+            "format": "fuzzfolio.scoring-profile",
+            "formatVersion": 1,
+            "profile": payload,
+        }
+        return _coerce_portable_profile_schema_version_for_import(wrapped)
+    return None
+
+
+def _apply_recommended_exit_policy_to_profile_document(
+    profile_document: dict[str, Any],
+    recommended_cell: dict[str, Any] | None,
+    *,
+    basis: str,
+    job_id: str,
+    lookback_months: int,
+    market_data_source: str,
+    timeframe: str,
+    computed_at: str,
+) -> dict[str, Any]:
+    if not isinstance(recommended_cell, dict):
+        return profile_document
+    selected_cell = _build_exit_policy_cell_payload(recommended_cell)
+    if selected_cell is None:
+        return profile_document
+
+    patched = copy.deepcopy(profile_document)
+    profile = patched.setdefault("profile", {})
+    if not isinstance(profile, dict):
+        patched["profile"] = {}
+        profile = patched["profile"]
+    execution_config = profile.setdefault("executionConfig", {})
+    if not isinstance(execution_config, dict):
+        profile["executionConfig"] = {}
+        execution_config = profile["executionConfig"]
+    execution_config["exitPolicy"] = {
+        "selectedCell": selected_cell,
+        "recommendation": {
+            "cell": selected_cell,
+            "basis": str(basis or "best_cell"),
+            "lookbackMonths": int(lookback_months),
+            "marketDataSource": str(market_data_source or "lake_bars"),
+            "timeframe": str(timeframe or ""),
+            "computedAt": computed_at,
+            "sourceJobId": str(job_id or ""),
+        },
+        "updatedAt": computed_at,
+        "appliedAt": computed_at,
+        "sourceJobId": str(job_id or ""),
+        "sourceKind": "replay",
+        "evidenceStatus": "ready",
+        "lookbackMonths": int(lookback_months),
+        "timeframe": str(timeframe or ""),
+    }
+    return patched
+
+
+def _existing_profile_drop_artifact_sources(
+    *,
+    package_inputs: dict[str, Any],
+    attempt: dict[str, Any],
+    lookback_months: int,
+) -> dict[str, Path | str] | None:
+    if int(lookback_months) != 36:
+        return None
+    artifact_dir = Path(str(package_inputs.get("artifact_dir") or "")).resolve()
+    if not artifact_dir.exists():
+        return None
+    response_path = artifact_dir / "full-backtest-36mo-result.json"
+    detail_path = artifact_dir / "full-backtest-36mo-curve.json"
+    if not response_path.exists() or not detail_path.exists():
+        return None
+    if not _result_has_canonical_score_lab(response_path):
+        return None
+    if not _result_matches_attempt_reward_matrix(response_path, attempt):
+        return None
+    return {
+        "artifact_dir": artifact_dir,
+        "response_path": response_path,
+        "detail_path": detail_path,
+        "source_kind": "full_backtest_36mo",
+    }
+
+
+def _align_profile_drop_response_to_detail(
+    response_payload: dict[str, Any],
+    detail_payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None, str, str]:
+    bundle_response = copy.deepcopy(response_payload)
+    data = bundle_response.get("data") if isinstance(bundle_response, dict) else None
+    if isinstance(data, dict) and isinstance(data.get("aggregate"), dict):
+        data.setdefault("mode", "basket")
+    analysis = _profile_drop_package_analysis(bundle_response)
+    if not analysis:
+        return bundle_response, None, "best_cell", "none"
+
+    detail_cell = detail_payload.get("cell") if isinstance(detail_payload, dict) else None
+    recommended_cell = analysis.get("recommended_cell")
+    recommended_basis = str(analysis.get("recommended_cell_basis") or "best_cell")
+    if isinstance(detail_cell, dict):
+        detail_path_metrics = detail_payload.get("path_metrics")
+        best_cell = analysis.get("best_cell")
+        matrix_summary = analysis.get("matrix_summary")
+        robust_cell = (
+            matrix_summary.get("robust_cell")
+            if isinstance(matrix_summary, dict)
+            else None
+        )
+        if _cells_match_by_stop_reward(recommended_cell, detail_cell):
+            aligned_cell = _merge_detail_cell_with_metric_cell(
+                recommended_cell if isinstance(recommended_cell, dict) else None,
+                detail_cell,
+            )
+        else:
+            aligned_source_cell: dict[str, Any] | None = None
+            if _cells_match_by_stop_reward(best_cell, detail_cell) and isinstance(best_cell, dict):
+                aligned_source_cell = best_cell
+                recommended_basis = "best_cell"
+            elif _cells_match_by_stop_reward(robust_cell, detail_cell) and isinstance(robust_cell, dict):
+                aligned_source_cell = robust_cell
+                recommended_basis = "robust_cell"
+            else:
+                recommended_basis = "artifact_cell"
+            aligned_cell = _merge_detail_cell_with_metric_cell(aligned_source_cell, detail_cell)
+            analysis["_autoresearch_profile_drop_bundle"] = {
+                "cell_detail_source": "existing_full_backtest_cell_detail",
+                "original_recommended_cell_basis": analysis.get("recommended_cell_basis"),
+                "original_recommended_cell": copy.deepcopy(recommended_cell)
+                if isinstance(recommended_cell, dict)
+                else None,
+            }
+        analysis["recommended_cell"] = aligned_cell
+        analysis["recommended_cell_basis"] = recommended_basis
+        recommended_cell = analysis["recommended_cell"]
+        if isinstance(detail_path_metrics, dict):
+            analysis["recommended_cell_path_metrics"] = copy.deepcopy(detail_path_metrics)
+        return bundle_response, copy.deepcopy(recommended_cell), recommended_basis, "detail_cell"
+
+    if isinstance(recommended_cell, dict):
+        return bundle_response, copy.deepcopy(recommended_cell), recommended_basis, "response_recommended_cell"
+    best_cell = analysis.get("best_cell")
+    if isinstance(best_cell, dict):
+        analysis["recommended_cell"] = copy.deepcopy(best_cell)
+        analysis["recommended_cell_basis"] = "best_cell"
+        return bundle_response, copy.deepcopy(best_cell), "best_cell", "response_best_cell"
+    return bundle_response, None, recommended_basis, "none"
+
+
+def _profile_drop_analysis_metadata_from_existing_artifacts(
+    *,
+    config,
+    package_inputs: dict[str, Any],
+    response_payload: dict[str, Any],
+    job_payload: dict[str, Any],
+    detail_payload: dict[str, Any],
+    lookback_months: int,
+    profile_ref: str,
+    quality_score_preset: str,
+    source_kind: str,
+    source_result_path: Path,
+    source_detail_path: Path,
+) -> dict[str, Any]:
+    request_payload = job_payload.get("request") if isinstance(job_payload, dict) else {}
+    request_payload = request_payload if isinstance(request_payload, dict) else {}
+    request_options = request_payload.get("options")
+    request_options = request_options if isinstance(request_options, dict) else {}
+    request_matrix = request_payload.get("matrix")
+    request_matrix = request_matrix if isinstance(request_matrix, dict) else {}
+    analysis = _profile_drop_package_analysis(response_payload)
+    market_window = analysis.get("market_data_window") if isinstance(analysis, dict) else {}
+    market_window = market_window if isinstance(market_window, dict) else {}
+
+    return {
+        "instruments": list(package_inputs.get("instruments") or []),
+        "timeframe": str(package_inputs.get("timeframe") or ""),
+        "market_data_source": str(
+            market_window.get("source")
+            or request_payload.get("market_data_source")
+            or "lake_bars"
+        ),
+        "analysis_window_start": (
+            market_window.get("requested_window_start")
+            or market_window.get("effective_window_start")
+            or request_payload.get("analysis_window_start")
+        ),
+        "analysis_window_end": (
+            market_window.get("requested_window_end")
+            or market_window.get("effective_window_end")
+            or request_payload.get("analysis_window_end")
+        ),
+        "bar_limit": (
+            market_window.get("effective_bar_limit")
+            or analysis.get("bar_limit")
+            or request_payload.get("bar_limit")
+        ),
+        "alert_threshold": request_payload.get("alert_threshold"),
+        "view_mode": request_payload.get("view_mode") or "overview",
+        "direction_mode": request_payload.get("direction_mode") or "both",
+        "sl_step_percent": request_matrix.get("sl_step_percent"),
+        "sl_rows": request_matrix.get("sl_rows"),
+        "reward_step_r": request_matrix.get("reward_step_r"),
+        "reward_columns": request_matrix.get("reward_columns"),
+        "include_signal_samples": bool(request_options.get("include_signal_samples", False)),
+        "path_metrics_mode": request_options.get("path_metrics_mode") or "highlighted",
+        "quality_score_preset": quality_score_preset,
+        "include_per_instrument": bool(request_options.get("include_per_instrument", False)),
+        "per_instrument_mode": request_options.get("per_instrument_mode") or "summary",
+        "lookback_months": int(lookback_months),
+        "profile_id": profile_ref,
+        "analysis_backend": "deep_replay_existing_artifact",
+        "deep_replay_job_id": str(
+            detail_payload.get("job_id")
+            or job_payload.get("job_id")
+            or request_payload.get("job_id")
+            or ""
+        ),
+        "recommended_cell_basis": analysis.get("recommended_cell_basis"),
+        "render_capture_pending": False,
+        "source_artifact_kind": source_kind,
+        "source_result_path": str(source_result_path),
+        "source_cell_detail_path": str(source_detail_path),
+        "base_url": str(getattr(getattr(config, "fuzzfolio", None), "base_url", "") or ""),
+    }
+
+
+def _materialize_profile_drop_bundle_from_existing_artifacts(
+    *,
+    config,
+    attempt: dict[str, Any],
+    package_inputs: dict[str, Any],
+    package_output_root: Path,
+    lookback_months: int,
+    profile_ref: str,
+    attempt_token: str,
+    layout_mode: str,
+) -> Path | None:
+    sources = _existing_profile_drop_artifact_sources(
+        package_inputs=package_inputs,
+        attempt=attempt,
+        lookback_months=int(lookback_months),
+    )
+    if sources is None:
+        return None
+
+    profile_document = _load_profile_document_for_existing_bundle(
+        package_inputs.get("profile_path")
+        if isinstance(package_inputs.get("profile_path"), Path)
+        else None
+    )
+    if profile_document is None:
+        return None
+
+    response_path = Path(sources["response_path"])
+    detail_path = Path(sources["detail_path"])
+    artifact_dir = Path(sources["artifact_dir"])
+    source_kind = str(sources["source_kind"])
+    response_payload = _load_json_if_exists(response_path)
+    detail_payload = _load_json_if_exists(detail_path)
+    if not response_payload or not detail_payload:
+        return None
+
+    bundle_response, recommended_cell, recommended_basis, cell_detail_source = (
+        _align_profile_drop_response_to_detail(response_payload, detail_payload)
+    )
+    quality_score_preset = _profile_drop_quality_score_preset(config, bundle_response)
+    job_payload = _load_json_if_exists(artifact_dir / "deep-replay-job.json")
+    generated_at_utc = _profile_drop_package_timestamp_utc()
+    analysis_metadata = _profile_drop_analysis_metadata_from_existing_artifacts(
+        config=config,
+        package_inputs=package_inputs,
+        response_payload=bundle_response,
+        job_payload=job_payload,
+        detail_payload=detail_payload,
+        lookback_months=int(lookback_months),
+        profile_ref=profile_ref,
+        quality_score_preset=quality_score_preset,
+        source_kind=source_kind,
+        source_result_path=response_path,
+        source_detail_path=detail_path,
+    )
+    profile_document = _apply_recommended_exit_policy_to_profile_document(
+        profile_document,
+        recommended_cell,
+        basis=recommended_basis,
+        job_id=str(analysis_metadata.get("deep_replay_job_id") or profile_ref),
+        lookback_months=int(lookback_months),
+        market_data_source=str(analysis_metadata.get("market_data_source") or "lake_bars"),
+        timeframe=str(package_inputs.get("timeframe") or ""),
+        computed_at=generated_at_utc,
+    )
+
+    label = (
+        f"shortlist-{attempt_token}"
+        if layout_mode == "derived"
+        else f"corpus-{attempt_token}"
+    )
+    bundle_name = (
+        f"{generated_at_utc}-{_slug_token(label)}-basket-"
+        f"{len(list(package_inputs.get('instruments') or []))}i-"
+        f"{_slug_token(str(package_inputs.get('timeframe') or 'mixed'))}"
+    )
+    bundle_dir = package_output_root / bundle_name
+    package_output_root.mkdir(parents=True, exist_ok=True)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+
+    sensitivity_request = {
+        "profile_document": profile_document,
+        "analysis": {
+            "instruments": list(package_inputs.get("instruments") or []),
+            "timeframe": str(package_inputs.get("timeframe") or ""),
+            "lookback_months": int(lookback_months),
+            "market_data_source": analysis_metadata.get("market_data_source"),
+            "quality_score_preset": quality_score_preset,
+        },
+        "source": {
+            "kind": "existing_profile_drop_artifacts",
+            "artifact_kind": source_kind,
+            "artifact_dir": str(artifact_dir),
+            "result_path": str(response_path),
+            "cell_detail_path": str(detail_path),
+            "cell_detail_source": cell_detail_source,
+        },
+    }
+    run_metadata = {
+        "generated_at_utc": generated_at_utc,
+        "base_url": analysis_metadata.get("base_url"),
+        "mode": "basket",
+        "label": label,
+        "paths": {
+            "profile_document": "profile-document.json",
+            "sensitivity_request": "sensitivity-request.json",
+            "sensitivity_response": "sensitivity-response.json",
+            "recommended_cell_path_detail": "recommended-cell-path-detail.json",
+            "best_cell_path_detail": "best-cell-path-detail.json",
+            "draft_post": None,
+            "instruments_index": None,
+            "indicators_index": None,
+        },
+        "analysis": analysis_metadata,
+    }
+
+    _write_json_file(bundle_dir / "profile-document.json", profile_document)
+    _write_json_file(bundle_dir / "sensitivity-request.json", sensitivity_request)
+    _write_json_file(bundle_dir / "sensitivity-response.json", bundle_response)
+    _write_json_file(bundle_dir / "recommended-cell-path-detail.json", detail_payload)
+    _write_json_file(bundle_dir / "best-cell-path-detail.json", detail_payload)
+    _write_json_file(bundle_dir / "run-metadata.json", run_metadata)
+    if job_payload:
+        _write_json_file(bundle_dir / "deep-replay-job.json", job_payload)
+    return bundle_dir
+
+
 def _generate_presentation_metadata(
     *,
     config,
@@ -4667,19 +5221,54 @@ def _generate_presentation_metadata(
         row=row,
         attempt=attempt,
     )
+    raw_payload: Any = None
+    metadata: dict[str, str] | None = None
+    validation_reasons: list[str] = []
+    request_messages = messages
+    max_attempts = 3
     try:
-        raw_payload = provider.complete_json(messages)
-    except ProviderError as exc:
-        if emit:
-            emit(
-                f"  presentation metadata writer failed for {attempt.get('attempt_id')}: {exc}"
+        for repair_index in range(max_attempts):
+            try:
+                raw_payload = provider.complete_json(request_messages)
+            except ProviderError as exc:
+                if emit:
+                    emit(
+                        f"  presentation metadata writer failed for {attempt.get('attempt_id')}: {exc}"
+                    )
+                return None
+            metadata, validation_reasons = validate_generated_metadata_with_reasons(
+                raw_payload
             )
-        return None
-    metadata = validate_generated_metadata(raw_payload)
+            if metadata is not None:
+                if repair_index > 0 and emit:
+                    emit(
+                        f"  presentation metadata repaired for {attempt.get('attempt_id')} "
+                        f"after {repair_index} retry"
+                    )
+                break
+            if repair_index >= max_attempts - 1:
+                break
+            request_messages = build_writer_repair_messages(
+                original_messages=messages,
+                previous_payload=raw_payload,
+                rejection_reasons=validation_reasons,
+            )
+            if emit:
+                reason_text = "; ".join(validation_reasons[:3]) or "invalid copy"
+                emit(
+                    f"  presentation metadata repair requested for {attempt.get('attempt_id')}: "
+                    f"{_short_text(reason_text, limit=180)}"
+                )
+    finally:
+        close = getattr(provider, "close", None)
+        if callable(close):
+            close()
     if metadata is None:
         if emit:
+            reason_text = "; ".join(validation_reasons[:4]) or "invalid copy"
             emit(
-                f"  presentation metadata invalid for {attempt.get('attempt_id')}; using fallback copy"
+                f"  presentation metadata invalid for {attempt.get('attempt_id')}: "
+                f"{_short_text(reason_text, limit=220)}"
             )
         return None
     artifact_payload = build_metadata_artifact(
@@ -4697,6 +5286,46 @@ def _generate_presentation_metadata(
             f"  presentation metadata generated for {attempt.get('attempt_id')} via {writer_profile_name}"
         )
     return artifact_payload
+
+
+def _preflight_presentation_metadata_provider(config) -> None:
+    writer_profile_name = _presentation_writer_profile_name(config)
+    if not writer_profile_name:
+        return
+    provider_profile = getattr(config, "providers", {}).get(writer_profile_name)
+    if provider_profile is None:
+        raise RuntimeError(
+            "Configured presentation metadata provider profile "
+            f"{writer_profile_name!r} does not exist."
+        )
+    provider = create_provider(provider_profile)
+    try:
+        payload = provider.complete_json(
+            [
+                ChatMessage(
+                    role="system",
+                    content="Return exactly one JSON object. No markdown.",
+                ),
+                ChatMessage(
+                    role="user",
+                    content='Return {"status":"ok"} now.',
+                ),
+            ]
+        )
+    except ProviderError as exc:
+        raise RuntimeError(
+            "Presentation metadata provider preflight failed for "
+            f"{writer_profile_name!r}: {exc}"
+        ) from exc
+    finally:
+        close = getattr(provider, "close", None)
+        if callable(close):
+            close()
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            "Presentation metadata provider preflight failed for "
+            f"{writer_profile_name!r}: provider did not return a JSON object."
+        )
 
 
 def _validation_cache_dir(config, run_id: str, lookback_months: int) -> Path:
@@ -5950,39 +6579,56 @@ def _render_profile_drop_for_attempt(
     if attempt_root.exists():
         shutil.rmtree(attempt_root)
     package_output_root.mkdir(parents=True, exist_ok=True)
-    if emit:
-        emit(
-            f"  package {attempt.get('attempt_id')} timeframe={package_inputs['timeframe']} "
-            f"instruments={','.join(package_inputs['instruments'])} lookback={lookback_months}mo"
-        )
-    package_args = [
-        "package",
-        "--profile-ref",
-        profile_ref,
-        "--timeframe",
-        str(package_inputs["timeframe"]),
-        "--lookback-months",
-        str(int(lookback_months)),
-        "--output-root",
-        str(package_output_root),
-        "--label",
-        (
-            f"shortlist-{attempt_token}"
-            if layout_mode == "derived"
-            else f"corpus-{attempt_token}"
-        ),
-        "--skip-catalogs",
-        "--skip-render-capture",
-        "--allow-timeframe-mismatch",
-        "--quality-score-preset",
-        str(config.research.quality_score_preset),
-    ]
-    package_args.extend(_reward_matrix_cli_args_from_attempt(attempt))
-    for instrument in package_inputs["instruments"]:
-        package_args.extend(["--instrument", str(instrument)])
-    cli.run(package_args, cwd=working_dir, timeout_seconds=float(timeout_seconds))
+    bundle_dir = _materialize_profile_drop_bundle_from_existing_artifacts(
+        config=config,
+        attempt=attempt,
+        package_inputs=package_inputs,
+        package_output_root=package_output_root,
+        lookback_months=int(lookback_months),
+        profile_ref=profile_ref,
+        attempt_token=attempt_token,
+        layout_mode=layout_mode,
+    )
+    if bundle_dir is not None:
+        if emit:
+            emit(
+                f"  package reused existing {lookback_months}mo artifacts for "
+                f"{attempt.get('attempt_id')}"
+            )
+    else:
+        if emit:
+            emit(
+                f"  package {attempt.get('attempt_id')} timeframe={package_inputs['timeframe']} "
+                f"instruments={','.join(package_inputs['instruments'])} lookback={lookback_months}mo"
+            )
+        package_args = [
+            "package",
+            "--profile-ref",
+            profile_ref,
+            "--timeframe",
+            str(package_inputs["timeframe"]),
+            "--lookback-months",
+            str(int(lookback_months)),
+            "--output-root",
+            str(package_output_root),
+            "--label",
+            (
+                f"shortlist-{attempt_token}"
+                if layout_mode == "derived"
+                else f"corpus-{attempt_token}"
+            ),
+            "--skip-catalogs",
+            "--skip-render-capture",
+            "--allow-timeframe-mismatch",
+            "--quality-score-preset",
+            str(config.research.quality_score_preset),
+        ]
+        package_args.extend(_reward_matrix_cli_args_from_attempt(attempt))
+        for instrument in package_inputs["instruments"]:
+            package_args.extend(["--instrument", str(instrument)])
+        cli.run(package_args, cwd=working_dir, timeout_seconds=float(timeout_seconds))
 
-    bundle_dir = _discover_bundle_dir(package_output_root)
+        bundle_dir = _discover_bundle_dir(package_output_root)
     bundle_response_path = bundle_dir / "sensitivity-response.json"
     if not _result_has_canonical_score_lab(bundle_response_path):
         raise RuntimeError(
@@ -6113,6 +6759,16 @@ def _should_retry_profile_drop_error(message: str) -> bool:
     return any(token in normalized for token in retry_tokens)
 
 
+def _profile_drop_progress_error(result: dict[str, Any]) -> str:
+    if str(result.get("status") or "") != "failed":
+        return ""
+    error = str(result.get("error") or "").strip()
+    if not error:
+        return ""
+    error = " ".join(error.split())
+    return f" error={_short_text(error, limit=220)}"
+
+
 def _render_profile_drop_rows(
     *,
     config,
@@ -6129,6 +6785,9 @@ def _render_profile_drop_rows(
 ) -> list[dict[str, Any]]:
     if not rows:
         return []
+
+    if require_presentation_metadata:
+        _preflight_presentation_metadata_provider(config)
 
     cli = FuzzfolioCli(config.fuzzfolio)
     cli.ensure_login()
@@ -6183,6 +6842,7 @@ def _render_profile_drop_rows(
         run_dir, attempts, attempt = matched
         work_items.append((index, row, run_dir, attempts, attempt))
 
+    worker_count = max(1, int(profile_drop_workers))
     use_progress = (
         (not as_json)
         and (not PLAIN_PROGRESS_MODE)
@@ -6203,6 +6863,16 @@ def _render_profile_drop_rows(
     cached_count = 0
     rendered_count = 0
     failed_count = sum(1 for row in ordered_results if row.get("status") == "failed")
+    started_at = pytime.monotonic()
+
+    _job_status_emit(
+        f"[{progress_label}] selected={len(rows)} queued={len(work_items)} "
+        f"missing_ledger={failed_count} cached=0 rendered=0 failed={failed_count} "
+        f"workers={worker_count} lookback={int(lookback_months)}mo "
+        f"force_rebuild={'yes' if force_rebuild else 'no'}",
+        as_json=as_json,
+        use_progress=use_progress,
+    )
 
     def _progress_description() -> str:
         return (
@@ -6254,7 +6924,6 @@ def _render_profile_drop_rows(
                 pytime.sleep(2.0)
         raise RuntimeError(str(last_error) if last_error is not None else "Unknown render error")
 
-    worker_count = max(1, int(profile_drop_workers))
     with progress:
         task_id = progress.add_task(
             _progress_description(),
@@ -6280,6 +6949,19 @@ def _render_profile_drop_rows(
                 else:
                     rendered_count += 1
                 ordered_results.append({"_row_index": index, **result})
+                completed_count = len(ordered_results)
+                remaining_count = max(0, len(rows) - completed_count)
+                percent = (completed_count / max(1, len(rows))) * 100.0
+                _job_status_emit(
+                    f"[{progress_label}] {completed_count}/{len(rows)} complete "
+                    f"({percent:.1f}%) rendered={rendered_count} cached={cached_count} "
+                    f"failed={failed_count} remaining={remaining_count} "
+                    f"last={row.get('attempt_id')} status={status or 'rendered'} "
+                    f"elapsed={_elapsed_text(started_at)}"
+                    f"{_profile_drop_progress_error(result)}",
+                    as_json=as_json,
+                    use_progress=use_progress,
+                )
                 progress.advance(task_id, 1)
                 progress.update(task_id, description=_progress_description())
         else:
@@ -6308,6 +6990,19 @@ def _render_profile_drop_rows(
                     else:
                         rendered_count += 1
                     ordered_results.append({"_row_index": index, **result})
+                    completed_count = len(ordered_results)
+                    remaining_count = max(0, len(rows) - completed_count)
+                    percent = (completed_count / max(1, len(rows))) * 100.0
+                    _job_status_emit(
+                        f"[{progress_label}] {completed_count}/{len(rows)} complete "
+                        f"({percent:.1f}%) rendered={rendered_count} cached={cached_count} "
+                        f"failed={failed_count} remaining={remaining_count} "
+                        f"last={row.get('attempt_id')} status={status or 'rendered'} "
+                        f"elapsed={_elapsed_text(started_at)}"
+                        f"{_profile_drop_progress_error(result)}",
+                        as_json=as_json,
+                        use_progress=use_progress,
+                    )
                     progress.advance(task_id, 1)
                     progress.update(task_id, description=_progress_description())
 
@@ -6381,6 +7076,21 @@ def _phase_emit(message: str, *, as_json: bool) -> None:
     if as_json:
         return
     _write_plain_line(message)
+
+
+def _job_status_emit(message: str, *, as_json: bool, use_progress: bool = False) -> None:
+    if use_progress and not as_json:
+        return
+    normalized = _short_text(message, limit=2000)
+    if as_json:
+        print(normalized, file=sys.stderr, flush=True)
+        return
+    _write_plain_line(normalized)
+
+
+def _elapsed_text(started_at: float) -> str:
+    elapsed = max(0.0, pytime.monotonic() - started_at)
+    return f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
 
 
 def _catalog_phase_callback(label: str, *, as_json: bool) -> Callable[[dict[str, Any]], None]:
@@ -8639,6 +9349,7 @@ def cmd_render_corpus_profile_drops(
     require_presentation_metadata: bool = False,
     as_json: bool,
 ) -> int:
+    set_provider_trace_stderr_mode("warnings_only")
     config = load_config()
     limit = None if top_results is None else max(1, int(top_results))
     rank_start = max(0, int(rank_start))
@@ -8671,6 +9382,15 @@ def cmd_render_corpus_profile_drops(
         as_json=as_json,
     )
     selected_rows = select_rows(full_catalog_rows)
+    skipped_by_selection = max(0, len(full_catalog_rows) - len(selected_rows))
+    _job_status_emit(
+        f"[render-corpus-profile-drops] selected {len(selected_rows)}/{len(full_catalog_rows)} "
+        f"attempts (skipped_by_selection={skipped_by_selection}, rank_start={rank_start}, "
+        f"top_results={limit if limit is not None else 'all'}, "
+        f"canonical_only={'yes' if canonical_only else 'no'}, workers={worker_count}, "
+        f"lookback={lookback_months}mo, force_rebuild={'yes' if force_rebuild else 'no'})",
+        as_json=as_json,
+    )
     if not selected_rows:
         payload = {
             "status": "no_attempts",
@@ -8695,6 +9415,11 @@ def cmd_render_corpus_profile_drops(
 
     catch_up_exit_code = 0
     if lookback_months == 36 and selected_attempt_ids:
+        _job_status_emit(
+            f"[render-corpus-profile-drops] full-backtest catch-up starting for "
+            f"{len(selected_attempt_ids)} selected attempts",
+            as_json=as_json,
+        )
         with io.StringIO() as capture, redirect_stdout(capture):
             catch_up_exit_code = cmd_calculate_full_backtests(
                 run_ids=run_ids,
@@ -8731,6 +9456,14 @@ def cmd_render_corpus_profile_drops(
             and str(row.get("full_backtest_validation_status_36m") or "") == "valid"
         ):
             healed_full_backtests += 1
+
+    if lookback_months == 36 and selected_attempt_ids:
+        _job_status_emit(
+            f"[render-corpus-profile-drops] full-backtest catch-up complete "
+            f"exit={catch_up_exit_code} healed={healed_full_backtests}/"
+            f"{len(selected_attempt_ids)}",
+            as_json=as_json,
+        )
 
     profile_drop_results = _render_profile_drop_rows(
         config=config,
@@ -8851,6 +9584,7 @@ def cmd_finalize_corpus(
     dry_run: bool,
     as_json: bool,
 ) -> int:
+    set_provider_trace_stderr_mode("warnings_only")
     config = load_config()
     scope = str(scope or "dashboard").strip().lower()
     if scope not in {"dashboard", "all"}:
@@ -8872,6 +9606,15 @@ def cmd_finalize_corpus(
         for row in selected_rows
         if str(row.get("attempt_id") or "").strip()
     ]
+    skipped_by_selection = max(0, len(full_catalog_rows) - len(selected_rows))
+    _job_status_emit(
+        f"[finalize-corpus] selected {len(selected_rows)}/{len(full_catalog_rows)} "
+        f"attempts (skipped_by_selection={skipped_by_selection}, "
+        f"scope={selection_info.get('selection_scope')}, "
+        f"runs={selection_info.get('run_count')}, workers={max(1, int(profile_drop_workers))}, "
+        f"lookback={int(lookback_months)}mo, dry_run={'yes' if dry_run else 'no'})",
+        as_json=as_json,
+    )
     selected_preview = [
         {
             "run_id": row.get("run_id"),

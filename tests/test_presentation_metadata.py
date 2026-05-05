@@ -40,6 +40,34 @@ def test_validate_generated_metadata_rejects_operational_or_overlong_copy() -> N
     )
 
 
+def test_validate_generated_metadata_clips_near_miss_copy_to_card_limits() -> None:
+    payload = {
+        "display_name": "Gold Pullback Breakout Strategy Extra Words",
+        "tagline": "Trend context with pullback entries on gold and enough extra words to exceed the slot.",
+        "short_description": (
+            "Uses higher-timeframe trend, a pullback setup, and candle triggers for XAUUSD with extra detail."
+        ),
+        "long_description": (
+            "Reads the broader gold trend first, then waits for a brief pullback and a clear candle trigger on M15. "
+            "It can act in both directions, but only when trend context and entry timing agree."
+        ),
+    }
+
+    validated = pm.validate_generated_metadata(payload)
+
+    assert validated is not None
+    assert validated["display_name"] == "Gold Pullback Breakout Strategy Extra"
+    assert len(validated["tagline"]) <= pm.TAGLINE_MAX_CHARS
+    assert len(validated["short_description"]) <= pm.SHORT_DESCRIPTION_MAX_CHARS
+    assert not validated["short_description"].endswith(" and")
+    assert (
+        pm.LONG_DESCRIPTION_MIN_CHARS
+        <= len(validated["long_description"])
+        <= pm.LONG_DESCRIPTION_MAX_CHARS
+    )
+    assert validated["long_description"].endswith(".")
+
+
 def test_load_cached_metadata_requires_matching_signature_and_valid_copy(tmp_path: Path) -> None:
     path = tmp_path / "presentation.json"
     payload = {

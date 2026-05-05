@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import subprocess
 import threading
 import uuid
@@ -258,6 +259,15 @@ class DashboardJobManager:
             command.extend(["--profile-drop-workers", str(payload["profile_drop_workers"])])
         return command, config_path
 
+    def _job_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        codex_home = env.get("AUTORESEARCH_CODEX_HOME")
+        if not codex_home:
+            codex_home = str(self.config.repo_root / ".codex-harness" / "codex-home")
+            env["AUTORESEARCH_CODEX_HOME"] = codex_home
+        env.pop("CODEX_HOME", None)
+        return env
+
     def start(self, kind: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = dict(payload or {})
         kind = str(kind or "").strip()
@@ -300,6 +310,7 @@ class DashboardJobManager:
                 process = self._popen_factory(
                     command,
                     cwd=str(self.config.repo_root),
+                    env=self._job_env(),
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
                 )

@@ -156,7 +156,9 @@ def test_codex_app_server_command_uses_stdio_without_legacy_session_source() -> 
     assert "--session-source" not in command
 
 
-def test_prepare_isolated_codex_home_copies_auth_files(tmp_path: Path, monkeypatch) -> None:
+def test_prepare_isolated_codex_home_copies_auth_files_from_explicit_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     source_home = tmp_path / "source-codex"
@@ -166,7 +168,8 @@ def test_prepare_isolated_codex_home_copies_auth_files(tmp_path: Path, monkeypat
     source_agents = source_home / "agents"
     source_agents.mkdir()
     (source_agents / "explorer.mini.toml").write_text('model = "gpt-5.4-mini"\n', encoding="utf-8")
-    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setenv("AUTORESEARCH_CODEX_SOURCE_HOME", str(source_home))
+    monkeypatch.delenv("AUTORESEARCH_CODEX_HOME", raising=False)
 
     isolated = provider_module._prepare_isolated_codex_home(
         ProviderProfileConfig(
@@ -181,6 +184,86 @@ def test_prepare_isolated_codex_home_copies_auth_files(tmp_path: Path, monkeypat
     assert (isolated / "auth.json").read_text(encoding="utf-8") == '{"auth_mode":"chatgpt"}\n'
     assert (isolated / "config.toml").read_text(encoding="utf-8") == 'model = "gpt-5.4-mini"\n'
     assert (isolated / "agents" / "explorer.mini.toml").read_text(encoding="utf-8") == 'model = "gpt-5.4-mini"\n'
+
+
+def test_prepare_isolated_codex_home_ignores_ambient_codex_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    ambient_home = tmp_path / "ambient-codex"
+    ambient_home.mkdir()
+    (ambient_home / "auth.json").write_text('{"auth_mode":"chatgpt"}\n', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(ambient_home))
+    monkeypatch.delenv("AUTORESEARCH_CODEX_SOURCE_HOME", raising=False)
+    monkeypatch.delenv("AUTORESEARCH_CODEX_HOME", raising=False)
+
+    isolated = provider_module._prepare_isolated_codex_home(
+        ProviderProfileConfig(
+            provider_type="codex",
+            command="codex",
+            repo_root=repo_root,
+        )
+    )
+
+    assert isolated == (repo_root / ".codex-harness" / "codex-home").resolve()
+    assert not (isolated / "auth.json").exists()
+
+
+def test_autoresearch_codex_home_env_overrides_isolated_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    configured_home = tmp_path / "dedicated-autoresearch-codex"
+    monkeypatch.setenv("AUTORESEARCH_CODEX_HOME", str(configured_home))
+
+    isolated = provider_module._prepare_isolated_codex_home(
+        ProviderProfileConfig(
+            provider_type="codex",
+            command="codex",
+            repo_root=repo_root,
+        )
+    )
+
+    assert isolated == configured_home.resolve()
+    assert isolated.exists()
+
+
+def test_codex_isolated_login_hint_targets_dedicated_home(tmp_path: Path) -> None:
+    codex_home = tmp_path / "dedicated codex"
+
+    hint = provider_module.codex_isolated_login_hint(codex_home)
+
+    assert hint == f"$env:CODEX_HOME='{codex_home}'; codex login --device-auth"
+
+
+def test_codex_login_status_ok_requires_logged_in_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def fake_run(command, **kwargs):
+        calls.append((list(command), dict(kwargs["env"])))
+        return type(
+            "Result",
+            (),
+            {"returncode": 0, "stdout": "Logged in using ChatGPT\n", "stderr": ""},
+        )()
+
+    monkeypatch.setattr(provider_module.subprocess, "run", fake_run)
+
+    assert provider_module._codex_login_status_ok("codex", {"CODEX_HOME": "X"}) is True
+    assert calls == [(["codex", "login", "status"], {"CODEX_HOME": "X"})]
+
+
+def test_codex_login_status_ok_rejects_non_logged_in_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_run(_command, **_kwargs):
+        return type("Result", (), {"returncode": 0, "stdout": "Not logged in\n", "stderr": ""})()
+
+    monkeypatch.setattr(provider_module.subprocess, "run", fake_run)
+
+    assert provider_module._codex_login_status_ok("codex", {"CODEX_HOME": "X"}) is False
 
 
 def test_codex_app_server_session_reuses_thread_within_run() -> None:

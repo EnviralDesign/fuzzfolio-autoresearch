@@ -31,6 +31,26 @@ _BANNED_OPERATIONAL_PATTERNS = (
     re.compile(r"\bv\d+\b", re.IGNORECASE),
 )
 _VOLATILE_PROFILE_FIELDS = {"name", "description", "executionConfig", "notificationThreshold", "isActive"}
+_DANGLING_TRAILING_WORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "of",
+    "on",
+    "or",
+    "the",
+    "to",
+    "using",
+    "when",
+    "while",
+    "with",
+}
 
 
 def _normalize_whitespace(text: Any) -> str:
@@ -71,6 +91,54 @@ def _sentence_count(text: str) -> int:
 
 def _word_count(text: str) -> int:
     return len([token for token in text.split() if token.strip()])
+
+
+def _clip_copy_to_limit(
+    text: str,
+    max_chars: int,
+    *,
+    max_words: int | None = None,
+    sentence_copy: bool = False,
+) -> str:
+    clipped = _normalize_whitespace(text)
+    if max_words is not None:
+        words = [word for word in clipped.split() if word.strip()]
+        if len(words) > max_words:
+            clipped = " ".join(words[:max_words])
+    clipped = _drop_dangling_trailing_word(clipped)
+    if len(clipped) <= max_chars:
+        return clipped
+    clipped = clipped[:max_chars].rstrip()
+    last_space = clipped.rfind(" ")
+    if last_space >= int(max_chars * 0.65):
+        clipped = clipped[:last_space].rstrip()
+    clipped = _drop_dangling_trailing_word(clipped)
+    if sentence_copy and clipped and clipped[-1] not in ".!?":
+        clipped = (clipped + ".") if len(clipped) < max_chars else clipped[:-1].rstrip() + "."
+    return clipped
+
+
+def _drop_dangling_trailing_word(text: str) -> str:
+    clipped = text.rstrip(" ,;:-")
+    while True:
+        words = clipped.split()
+        if len(words) <= 1:
+            return clipped
+        trailing = words[-1].strip(".,;:!?").lower()
+        if trailing not in _DANGLING_TRAILING_WORDS:
+            return clipped
+        clipped = " ".join(words[:-1]).rstrip(" ,;:-")
+
+
+def _limit_sentence_count(text: str, max_sentences: int) -> str:
+    parts = [
+        part.strip()
+        for part in re.findall(r"[^.!?]+[.!?]?", text)
+        if part.strip()
+    ]
+    if len(parts) <= max_sentences:
+        return text
+    return _normalize_whitespace(" ".join(parts[:max_sentences]))
 
 
 def _extract_profile(payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -263,42 +331,113 @@ def build_writer_messages(
     ]
 
 
-def validate_generated_metadata(payload: dict[str, Any] | None) -> dict[str, str] | None:
+def build_writer_repair_messages(
+    *,
+    original_messages: list[ChatMessage],
+    previous_payload: Any,
+    rejection_reasons: list[str],
+) -> list[ChatMessage]:
+    reasons = [str(reason).strip() for reason in rejection_reasons if str(reason).strip()]
+    reason_text = "\n".join(f"- {reason}" for reason in reasons) or "- Unknown validation failure."
+    repair_prompt = (
+        "The previous JSON was close but failed the card-copy validator.\n\n"
+        "Validation failures:\n"
+        f"{reason_text}\n\n"
+        "Return one corrected JSON object only with the same four keys: "
+        "display_name, tagline, short_description, long_description.\n"
+        f"- display_name: <= {DISPLAY_NAME_MAX_CHARS} chars, <= {DISPLAY_NAME_MAX_WORDS} words\n"
+        f"- tagline: <= {TAGLINE_MAX_CHARS} chars\n"
+        f"- short_description: <= {SHORT_DESCRIPTION_MAX_CHARS} chars, complete phrase\n"
+        f"- long_description: {LONG_DESCRIPTION_MIN_CHARS}-{LONG_DESCRIPTION_MAX_CHARS} chars, 1-2 complete sentences\n"
+        "- Avoid cand/scaffold/seed/v2/version wording and raw metrics.\n"
+        "- Prefer 130-165 chars for long_description to leave margin.\n\n"
+        "Previous JSON:\n"
+        f"{json.dumps(previous_payload, ensure_ascii=True, indent=2)}"
+    )
+    return [
+        *original_messages,
+        ChatMessage(
+            role="assistant",
+            content=json.dumps(previous_payload, ensure_ascii=True),
+        ),
+        ChatMessage(role="user", content=repair_prompt),
+    ]
+
+
+def validate_generated_metadata_with_reasons(
+    payload: dict[str, Any] | None,
+) -> tuple[dict[str, str] | None, list[str]]:
+    reasons: list[str] = []
     if not isinstance(payload, dict):
-        return None
-    display_name = _normalize_display_name(payload.get("display_name"))
-    tagline = _clean_copy(payload.get("tagline"))
-    short_description = _clean_copy(payload.get("short_description"))
-    long_description = _clean_copy(payload.get("long_description"))
+        return None, ["payload is not a JSON object"]
+    display_name = _clip_copy_to_limit(
+        _normalize_display_name(payload.get("display_name")),
+        DISPLAY_NAME_MAX_CHARS,
+        max_words=DISPLAY_NAME_MAX_WORDS,
+    )
+    tagline = _clip_copy_to_limit(_clean_copy(payload.get("tagline")), TAGLINE_MAX_CHARS)
+    short_description = _clip_copy_to_limit(
+        _clean_copy(payload.get("short_description")),
+        SHORT_DESCRIPTION_MAX_CHARS,
+    )
+    long_description = _limit_sentence_count(
+        _clean_copy(payload.get("long_description")),
+        2,
+    )
+    long_description = _clip_copy_to_limit(
+        long_description,
+        LONG_DESCRIPTION_MAX_CHARS,
+        sentence_copy=True,
+    )
     if not all((display_name, tagline, short_description, long_description)):
-        return None
+        for key, value in (
+            ("display_name", display_name),
+            ("tagline", tagline),
+            ("short_description", short_description),
+            ("long_description", long_description),
+        ):
+            if not value:
+                reasons.append(f"{key} is missing or empty")
+        return None, reasons
     if len(display_name) > DISPLAY_NAME_MAX_CHARS or _word_count(display_name) > DISPLAY_NAME_MAX_WORDS:
-        return None
+        reasons.append(
+            f"display_name exceeds limits after normalization ({len(display_name)} chars, {_word_count(display_name)} words)"
+        )
     if len(tagline) > TAGLINE_MAX_CHARS:
-        return None
+        reasons.append(f"tagline exceeds {TAGLINE_MAX_CHARS} chars")
     if len(short_description) > SHORT_DESCRIPTION_MAX_CHARS:
-        return None
+        reasons.append(f"short_description exceeds {SHORT_DESCRIPTION_MAX_CHARS} chars")
     if not (LONG_DESCRIPTION_MIN_CHARS <= len(long_description) <= LONG_DESCRIPTION_MAX_CHARS):
-        return None
+        reasons.append(
+            f"long_description length {len(long_description)} is outside "
+            f"{LONG_DESCRIPTION_MIN_CHARS}-{LONG_DESCRIPTION_MAX_CHARS} chars"
+        )
     if _sentence_count(long_description) > 2:
-        return None
+        reasons.append("long_description has more than 2 sentences")
     normalized_long = _normalize_text_key(long_description)
     if normalized_long in _GENERIC_DESCRIPTION_TOKENS:
-        return None
+        reasons.append("long_description is generic operational copy")
     if _contains_banned_operational_text(display_name):
-        return None
+        reasons.append("display_name contains operational wording")
     if _contains_banned_operational_text(tagline):
-        return None
+        reasons.append("tagline contains operational wording")
     if _contains_banned_operational_text(short_description):
-        return None
+        reasons.append("short_description contains operational wording")
     if _contains_banned_operational_text(long_description):
-        return None
+        reasons.append("long_description contains operational wording")
+    if reasons:
+        return None, reasons
     return {
         "display_name": display_name,
         "tagline": tagline,
         "short_description": short_description,
         "long_description": long_description,
-    }
+    }, []
+
+
+def validate_generated_metadata(payload: dict[str, Any] | None) -> dict[str, str] | None:
+    metadata, _reasons = validate_generated_metadata_with_reasons(payload)
+    return metadata
 
 
 def load_cached_metadata(

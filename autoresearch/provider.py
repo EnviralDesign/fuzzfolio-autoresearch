@@ -116,6 +116,8 @@ CODEX_USAGE_LIMIT_MARKERS = (
     "usage limit",
     "try again at",
 )
+AUTORESEARCH_CODEX_HOME_ENV = "AUTORESEARCH_CODEX_HOME"
+AUTORESEARCH_CODEX_SOURCE_HOME_ENV = "AUTORESEARCH_CODEX_SOURCE_HOME"
 CODEX_HOME_MIRROR_FILES = ("auth.json", "config.toml")
 CODEX_HOME_MIRROR_DIRS = ("agents",)
 TOOL_USE_FAILED_MARKERS = (
@@ -213,22 +215,58 @@ def _current_codex_run_id() -> str | None:
     return run_id or None
 
 
-def _resolve_codex_source_home() -> Path:
-    configured = (
-        os.environ.get("AUTORESEARCH_CODEX_SOURCE_HOME")
-        or os.environ.get("CODEX_HOME")
-    )
+def _resolve_codex_source_home() -> Path | None:
+    configured = os.environ.get(AUTORESEARCH_CODEX_SOURCE_HOME_ENV)
     if configured:
         return Path(configured).expanduser().resolve()
-    return (Path.home() / ".codex").resolve()
+    return None
 
 
 def _resolve_isolated_codex_home(config: ProviderProfileConfig) -> Path:
-    configured = os.environ.get("AUTORESEARCH_CODEX_HOME")
+    configured = os.environ.get(AUTORESEARCH_CODEX_HOME_ENV)
     if configured:
         return Path(configured).expanduser().resolve()
     root = (config.repo_root or Path.cwd()).resolve()
     return (root / ".codex-harness" / "codex-home").resolve()
+
+
+def codex_home_for_provider(config: ProviderProfileConfig) -> Path:
+    """Return the dedicated Codex home AutoResearch will use for this profile."""
+
+    return _resolve_isolated_codex_home(config)
+
+
+def codex_source_home_for_provider() -> Path | None:
+    """Return an explicitly configured Codex bootstrap source, if any."""
+
+    return _resolve_codex_source_home()
+
+
+def codex_isolated_login_hint(codex_home: Path) -> str:
+    escaped = str(codex_home).replace("'", "''")
+    return (
+        "$env:CODEX_HOME="
+        + f"'{escaped}'"
+        + "; codex login --device-auth"
+    )
+
+
+def _codex_login_status_ok(command: str, env: dict[str, str]) -> bool:
+    try:
+        result = subprocess.run(
+            [command, "login", "status"],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    output = f"{result.stdout}\n{result.stderr}".strip().lower()
+    if "not logged in" in output:
+        return False
+    return result.returncode == 0 and "logged in" in output
 
 
 def _copy_codex_home_file(source_home: Path, target_home: Path, filename: str) -> None:
@@ -263,7 +301,7 @@ def _prepare_isolated_codex_home(config: ProviderProfileConfig) -> Path:
     target_home = _resolve_isolated_codex_home(config)
     target_home.mkdir(parents=True, exist_ok=True)
     source_home = _resolve_codex_source_home()
-    if source_home != target_home:
+    if source_home is not None and source_home != target_home:
         for filename in CODEX_HOME_MIRROR_FILES:
             _copy_codex_home_file(source_home, target_home, filename)
         for dirname in CODEX_HOME_MIRROR_DIRS:
@@ -995,9 +1033,11 @@ class _CodexAppServerSession:
     def _start_env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["CODEX_HOME"] = str(self._isolated_codex_home)
+        env[AUTORESEARCH_CODEX_HOME_ENV] = str(self._isolated_codex_home)
         return env
 
     def _start(self) -> None:
+        start_env = self._start_env()
         try:
             self.process = subprocess.Popen(
                 self._command(),
@@ -1008,7 +1048,7 @@ class _CodexAppServerSession:
                 encoding="utf-8",
                 errors="replace",
                 bufsize=1,
-                env=self._start_env(),
+                env=start_env,
             )
         except FileNotFoundError as exc:
             raise ProviderError(
@@ -1040,10 +1080,19 @@ class _CodexAppServerSession:
             self.close()
             raise ProviderError("Codex app-server returned an invalid account/read response.")
         if account_result.get("requiresOpenaiAuth") and not account_result.get("account"):
+            command = self._command()[0]
+            if _codex_login_status_ok(command, start_env):
+                _trace_provider_event(
+                    "codex_account_read_empty_login_status_ok",
+                    codex_home=self._isolated_codex_home,
+                )
+                return
             self.close()
+            login_hint = codex_isolated_login_hint(self._isolated_codex_home)
             raise ProviderError(
-                "Codex app-server requires OpenAI auth but no local account is active. "
-                "Run `codex login` first."
+                "Codex app-server requires OpenAI auth but no account is active in "
+                f"AutoResearch's isolated Codex home: {self._isolated_codex_home}. "
+                f"Login that dedicated home with: {login_hint}"
             )
 
     def _capture_stderr(self) -> None:

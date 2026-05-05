@@ -1559,6 +1559,182 @@ def test_cmd_render_corpus_profile_drops_respects_rank_start(
     assert payload["rank_start"] == 1
 
 
+def test_render_profile_drop_rows_emits_plain_progress(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        fuzzfolio=SimpleNamespace(),
+    )
+    run_dir = tmp_path / "runs" / "run-a"
+    run_dir.mkdir(parents=True)
+    png_path = tmp_path / "profile-drop-36mo.png"
+    manifest_path = tmp_path / "profile-drop-36mo.manifest.json"
+    png_path.write_bytes(b"png")
+    manifest_path.write_text("{}", encoding="utf-8")
+    row = {
+        "attempt_id": "attempt-a",
+        "run_id": "run-a",
+        "candidate_name": "alpha",
+    }
+    attempt = {"attempt_id": "attempt-a", "candidate_name": "alpha"}
+
+    class FakeCli:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ensure_login(self) -> None:
+            return None
+
+    monkeypatch.setattr(ar_main, "FuzzfolioCli", FakeCli)
+    monkeypatch.setattr(
+        ar_main,
+        "_resolve_drop_renderer_executable",
+        lambda _config: (tmp_path / "renderer.exe", tmp_path),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_matched_attempt_items",
+        lambda *_args, **_kwargs: [(run_dir, [attempt], attempt)],
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_render_profile_drop_for_attempt",
+        lambda **_kwargs: {
+            "status": "cached",
+            "png_path": str(png_path),
+            "manifest_path": str(manifest_path),
+            "profile_ref": "profile-ref",
+        },
+    )
+
+    results = ar_main._render_profile_drop_rows(
+        config=config,
+        rows=[row],
+        output_root=None,
+        lookback_months=36,
+        timeout_seconds=60,
+        force_rebuild=False,
+        profile_drop_workers=1,
+        as_json=False,
+        progress_label="corpus profile drops",
+        layout_mode="attempt_local",
+    )
+
+    assert results[0]["status"] == "cached"
+    captured = capsys.readouterr()
+    assert "[corpus profile drops] selected=1 queued=1" in captured.out
+    assert "[corpus profile drops] 1/1 complete (100.0%)" in captured.out
+    assert "cached=1" in captured.out
+    assert captured.err == ""
+
+
+def test_render_profile_drop_rows_preflights_required_metadata_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        fuzzfolio=SimpleNamespace(),
+        research=SimpleNamespace(presentation_metadata_provider_profile="writer"),
+        providers={"writer": SimpleNamespace(type="codex")},
+    )
+
+    class FakeProvider:
+        def complete_json(self, _messages):
+            raise ar_main.ProviderError("writer offline")
+
+    class UnexpectedCli:
+        def __init__(self, *_args, **_kwargs):
+            pytest.fail("Fuzzfolio CLI should not initialize when metadata preflight fails")
+
+    monkeypatch.setattr(ar_main, "create_provider", lambda _profile: FakeProvider())
+    monkeypatch.setattr(ar_main, "FuzzfolioCli", UnexpectedCli)
+
+    with pytest.raises(RuntimeError, match="Presentation metadata provider preflight failed"):
+        ar_main._render_profile_drop_rows(
+            config=config,
+            rows=[
+                {
+                    "attempt_id": "attempt-a",
+                    "run_id": "run-a",
+                    "candidate_name": "alpha",
+                }
+            ],
+            output_root=None,
+            lookback_months=36,
+            timeout_seconds=60,
+            force_rebuild=False,
+            profile_drop_workers=1,
+            as_json=False,
+            progress_label="corpus profile drops",
+            layout_mode="attempt_local",
+            require_presentation_metadata=True,
+        )
+
+
+def test_generate_presentation_metadata_repairs_invalid_writer_copy(
+    tmp_path: Path, monkeypatch
+) -> None:
+    calls: list[list[ar_main.ChatMessage]] = []
+
+    class RepairingProvider:
+        def complete_json(self, messages):
+            calls.append(messages)
+            if len(calls) == 1:
+                return {
+                    "display_name": "Gold Pullback",
+                    "tagline": "Trend context with pullback entries.",
+                    "short_description": "Trades XAUUSD pullbacks when trend and trigger agree.",
+                    "long_description": "Too short.",
+                }
+            return {
+                "display_name": "Gold Pullback",
+                "tagline": "Trend context with pullback entries.",
+                "short_description": "Trades XAUUSD pullbacks when trend and trigger agree.",
+                "long_description": (
+                    "Reads the broader gold trend first, then waits for a brief pullback and a clear "
+                    "M15 trigger. It trades only when context and timing agree."
+                ),
+            }
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(ar_main, "create_provider", lambda _profile: RepairingProvider())
+    config = SimpleNamespace(
+        providers={"writer": SimpleNamespace(type="codex")},
+        research=SimpleNamespace(presentation_metadata_provider_profile="writer"),
+    )
+    metadata_path = tmp_path / "presentation.json"
+
+    result = ar_main._generate_presentation_metadata(
+        config=config,
+        run_dir=tmp_path / "run-a",
+        row={"attempt_id": "attempt-a", "candidate_name": "candidate"},
+        attempt={"attempt_id": "attempt-a", "candidate_name": "candidate"},
+        package_inputs={"timeframe": "M15", "instruments": ["XAUUSD"]},
+        lookback_months=36,
+        profile_ref="profile-a",
+        profile_document_payload={
+            "profile": {
+                "name": "candidate",
+                "description": "Portable scoring profile scaffolded from live indicator templates.",
+                "directionMode": "both",
+                "indicators": [],
+            }
+        },
+        presentation_signature="sig-a",
+        metadata_artifact_path=metadata_path,
+        emit=None,
+    )
+
+    assert result is not None
+    assert len(calls) == 2
+    assert "Validation failures" in calls[1][-1].content
+    assert result["display_name"] == "Gold Pullback"
+    assert metadata_path.exists() is True
+
+
 def test_public_portfolio_row_strips_path_fields() -> None:
     public = ar_main._public_portfolio_row(
         {
@@ -2249,3 +2425,315 @@ def test_render_profile_drop_for_attempt_uses_cache_before_cloud_profile_repair(
 
     assert result_second["status"] == "cached"
     assert len(renderer_calls) == 1
+
+
+def _write_existing_full_backtest_profile_drop_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    artifact_dir = tmp_path / "runs" / "run-fast" / "evals" / "candidate"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    profile_path = tmp_path / "profiles" / "candidate.json"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(
+        json.dumps(
+            {
+                "format": "fuzzfolio.scoring-profile",
+                "formatVersion": 1,
+                "profile": {
+                    "name": "Scaffold Candidate " + ("X" * 150),
+                    "version": "v9",
+                    "description": "Portable scoring profile scaffolded from live indicator templates.",
+                    "directionMode": "both",
+                    "instruments": ["EURUSD"],
+                    "indicators": [
+                        {
+                            "meta": {"id": "RSI"},
+                            "config": {
+                                "label": "RSI",
+                                "isActive": True,
+                                "isTrendFollowing": False,
+                                "timeframe": "M15",
+                            },
+                        }
+                    ],
+                },
+            },
+            ensure_ascii=True,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    response = {
+        "data": {
+            "aggregate": {
+                "axes": {
+                    "stop_loss_percent": [0.05, 0.1],
+                    "reward_multiple": [2.0, 3.0],
+                },
+                "bar_limit": 1000,
+                "best_cell": {
+                    "stop_loss_percent": 0.1,
+                    "reward_multiple": 3.0,
+                    "take_profit_percent": 0.3,
+                    "avg_net_r_per_closed_trade": 0.4,
+                    "profit_factor": 2.5,
+                    "resolved_trades": 27,
+                },
+                "market_data_window": {
+                    "effective_bar_limit": 2000,
+                    "requested_window_start": "2023-01-01T00:00:00+00:00",
+                    "requested_window_end": "2026-01-01T00:00:00+00:00",
+                    "source": "lake_bars",
+                },
+                "matrix": {"avg_net_r_per_closed_trade": [[0.1, 0.2], [0.3, 0.4]]},
+                "matrix_summary": {},
+                "mode": "basket",
+                "recommended_cell": {
+                    "stop_loss_percent": 0.05,
+                    "reward_multiple": 2.0,
+                    "take_profit_percent": 0.1,
+                },
+                "recommended_cell_basis": "robust_cell",
+                "score_lab": {
+                    "version": ar_main.CANONICAL_SCORE_LAB_VERSION,
+                    "score": 73.5,
+                },
+            }
+        }
+    }
+    detail = {
+        "artifact_mode": "profile_drop_cell_detail_compact_v1",
+        "job_id": "deepreplay-fast-1",
+        "cell": {
+            "stop_loss_percent": 0.1,
+            "reward_multiple": 3.0,
+            "take_profit_percent": 0.3,
+        },
+        "path_metrics": {"final_equity_r": 12.3, "max_drawdown_r": 1.2},
+        "curve": {
+            "points": [
+                {
+                    "time": 1704067200,
+                    "date": "2024-01-01",
+                    "equity_r": 0.0,
+                    "drawdown_r": 0.0,
+                    "realized_r": 0.0,
+                    "closed_trade_count": 0,
+                },
+                {
+                    "time": 1704153600,
+                    "date": "2024-01-02",
+                    "equity_r": 12.3,
+                    "drawdown_r": 0.0,
+                    "realized_r": 12.3,
+                    "closed_trade_count": 4,
+                },
+            ]
+        },
+    }
+    job = {
+        "job_id": "deepreplay-fast-1",
+        "request": {
+            "alert_threshold": 80.0,
+            "analysis_window_start": "2023-01-01T00:00:00Z",
+            "analysis_window_end": "2026-01-01T00:00:00Z",
+            "bar_limit": 1000,
+            "direction_mode": "both",
+            "instruments": ["EURUSD"],
+            "market_data_source": "lake_bars",
+            "matrix": {
+                "sl_step_percent": 0.05,
+                "sl_rows": 2,
+                "reward_step_r": 1.0,
+                "reward_columns": 2,
+            },
+            "options": {
+                "path_metrics_mode": "highlighted",
+                "quality_score_preset": "profile_drop",
+            },
+            "timeframe": "M15",
+            "view_mode": "overview",
+        },
+    }
+    (artifact_dir / "full-backtest-36mo-result.json").write_text(
+        json.dumps(response, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "full-backtest-36mo-curve.json").write_text(
+        json.dumps(detail, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "deep-replay-job.json").write_text(
+        json.dumps(job, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    return artifact_dir, profile_path
+
+
+def test_materialize_profile_drop_bundle_reuses_existing_full_backtest_artifacts(
+    tmp_path: Path,
+) -> None:
+    artifact_dir, profile_path = _write_existing_full_backtest_profile_drop_inputs(tmp_path)
+    config = SimpleNamespace(
+        research=SimpleNamespace(quality_score_preset="profile-drop"),
+        fuzzfolio=SimpleNamespace(base_url="http://localhost:7946/api/dev"),
+    )
+    package_output_root = tmp_path / "bundle-root"
+
+    bundle_dir = ar_main._materialize_profile_drop_bundle_from_existing_artifacts(
+        config=config,
+        attempt={"attempt_id": "attempt-fast", "artifact_dir": str(artifact_dir)},
+        package_inputs={
+            "artifact_dir": artifact_dir,
+            "profile_path": profile_path,
+            "timeframe": "M15",
+            "instruments": ["EURUSD"],
+        },
+        package_output_root=package_output_root,
+        lookback_months=36,
+        profile_ref="profile-fast",
+        attempt_token="attempt-fast",
+        layout_mode="attempt_local",
+    )
+
+    assert bundle_dir is not None
+    profile_document = ar_main.load_json_if_exists(bundle_dir / "profile-document.json")
+    bundle_response = ar_main.load_json_if_exists(bundle_dir / "sensitivity-response.json")
+    run_metadata = ar_main.load_json_if_exists(bundle_dir / "run-metadata.json")
+
+    assert (bundle_dir / "recommended-cell-path-detail.json").exists() is True
+    assert (bundle_dir / "best-cell-path-detail.json").exists() is True
+    assert bundle_response["data"]["mode"] == "basket"
+    assert bundle_response["data"]["aggregate"]["recommended_cell_basis"] == "best_cell"
+    assert bundle_response["data"]["aggregate"]["recommended_cell"]["reward_multiple"] == 3.0
+    assert (
+        bundle_response["data"]["aggregate"]["recommended_cell"][
+            "avg_net_r_per_closed_trade"
+        ]
+        == 0.4
+    )
+    assert bundle_response["data"]["aggregate"]["recommended_cell"]["resolved_trades"] == 27
+    assert profile_document["profile"]["version"] == "v1"
+    assert len(profile_document["profile"]["name"]) <= 120
+    exit_policy = profile_document["profile"]["executionConfig"]["exitPolicy"]
+    assert exit_policy["selectedCell"]["stopLossPercent"] == 0.1
+    assert exit_policy["selectedCell"]["rewardMultiple"] == 3.0
+    assert exit_policy["recommendation"]["basis"] == "best_cell"
+    assert run_metadata["analysis"]["analysis_backend"] == "deep_replay_existing_artifact"
+    assert run_metadata["analysis"]["source_artifact_kind"] == "full_backtest_36mo"
+    assert run_metadata["analysis"]["deep_replay_job_id"] == "deepreplay-fast-1"
+
+
+def test_align_profile_drop_response_to_detail_preserves_matching_recommended_metrics() -> None:
+    response = {
+        "data": {
+            "aggregate": {
+                "recommended_cell": {
+                    "stop_loss_percent": 0.08,
+                    "reward_multiple": 4.0,
+                    "take_profit_percent": 0.32,
+                    "avg_net_r_per_closed_trade": 1.25,
+                    "profit_factor": 3.4,
+                    "resolved_trades": 52,
+                },
+                "recommended_cell_basis": "robust_cell",
+                "best_cell": {
+                    "stop_loss_percent": 0.1,
+                    "reward_multiple": 3.0,
+                    "avg_net_r_per_closed_trade": 0.9,
+                },
+            }
+        }
+    }
+    detail = {
+        "cell": {
+            "stop_loss_percent": 0.08,
+            "reward_multiple": 4.0,
+            "take_profit_percent": 0.32,
+        },
+        "path_metrics": {"equity_curve_r_squared": 0.98},
+    }
+
+    bundle_response, recommended_cell, basis, source = (
+        ar_main._align_profile_drop_response_to_detail(response, detail)
+    )
+
+    aggregate = bundle_response["data"]["aggregate"]
+    assert source == "detail_cell"
+    assert basis == "robust_cell"
+    assert recommended_cell["avg_net_r_per_closed_trade"] == 1.25
+    assert recommended_cell["profit_factor"] == 3.4
+    assert recommended_cell["stop_loss_percent"] == 0.08
+    assert aggregate["recommended_cell"]["resolved_trades"] == 52
+    assert aggregate["recommended_cell_path_metrics"]["equity_curve_r_squared"] == 0.98
+
+
+def test_render_profile_drop_for_attempt_skips_cli_package_when_full_artifacts_exist(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "runs" / "run-fast"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir, profile_path = _write_existing_full_backtest_profile_drop_inputs(tmp_path)
+    renderer_calls: list[list[str]] = []
+
+    class FakeCli:
+        def run(self, args, cwd=None, timeout_seconds=None, check=True):
+            if args and args[0] == "package":
+                pytest.fail("profile-drop rendering should reuse existing full-backtest artifacts")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def fake_run_external(argv, cwd=None, timeout_seconds=None):
+        renderer_calls.append(list(argv))
+        png_path = Path(argv[argv.index("--out") + 1])
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        png_path.write_text("png", encoding="utf-8")
+
+    config = SimpleNamespace(
+        research=SimpleNamespace(
+            quality_score_preset="profile-drop",
+            presentation_metadata_provider_profile="",
+        ),
+        fuzzfolio=SimpleNamespace(workspace_root=None, base_url="http://localhost:7946/api/dev"),
+        providers={},
+    )
+    row = {
+        "attempt_id": "attempt-fast",
+        "run_id": "run-fast",
+        "candidate_name": "candidate",
+        "profile_ref": "profile-fast",
+    }
+    attempt = {
+        "attempt_id": "attempt-fast",
+        "candidate_name": "candidate",
+        "profile_ref": "profile-fast",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+    }
+
+    monkeypatch.setattr(ar_main, "_cloud_profile_exists", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(ar_main, "_run_external", fake_run_external)
+
+    result = ar_main._render_profile_drop_for_attempt(
+        config=config,
+        cli=FakeCli(),
+        renderer_executable=tmp_path / "renderer",
+        working_dir=tmp_path,
+        run_dir=run_dir,
+        attempts=[attempt],
+        row=row,
+        attempt=attempt,
+        output_root=None,
+        lookback_months=36,
+        force_rebuild=False,
+        timeout_seconds=30,
+        emit=None,
+        layout_mode="attempt_local",
+    )
+
+    hidden_root = artifact_dir / ".profile-drop-36mo"
+    bundle_dirs = list((hidden_root / "bundle").iterdir())
+    assert result["status"] == "rendered"
+    assert len(renderer_calls) == 1
+    assert Path(result["png_path"]) == artifact_dir / "profile-drop-36mo.png"
+    assert len(bundle_dirs) == 1
+    assert ar_main.load_json_if_exists(bundle_dirs[0] / "run-metadata.json")["analysis"][
+        "analysis_backend"
+    ] == "deep_replay_existing_artifact"

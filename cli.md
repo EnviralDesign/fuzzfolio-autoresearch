@@ -11,6 +11,8 @@ uv run doctor --json
 
 Checks local config, CLI access, auth, and seed prompt state.
 
+For Codex-backed profiles, the JSON output includes `*_codex_home` and `*_codex_login_command`. Use that command to log into AutoResearch's isolated Codex home; a normal `codex login` without `CODEX_HOME` targets the default Codex home and is intentionally not used by AutoResearch.
+
 ## test-providers
 
 ```powershell
@@ -23,6 +25,8 @@ Arguments:
 
 - `--profile`: repeatable provider profile filter.
 - `--json`: print machine-readable output.
+
+Codex profile results include `codex_home` and `codex_login_command`. If auth fails, log into that dedicated home and rerun the same `test-providers` command.
 
 ## play-hand
 
