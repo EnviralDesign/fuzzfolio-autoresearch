@@ -10,11 +10,13 @@ import os
 import re
 import shutil
 import subprocess
+import struct
 import sys
 import threading
 import time as pytime
 import urllib.error
 import urllib.request
+import zlib
 from datetime import datetime, time, timedelta
 from math import ceil
 from pathlib import Path
@@ -8571,6 +8573,201 @@ def _copy_if_exists(source: Path | None, destination: Path) -> bool:
     return True
 
 
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+PROFILE_DOCUMENT_PNG_METADATA_KEY = "fuzzfolio.profile_document"
+PROFILE_IMPORT_NAME_MAX_CHARS = 120
+
+
+def _normalize_profile_import_name(value: Any) -> str:
+    cleaned = str(value or "").strip()
+    if len(cleaned) <= PROFILE_IMPORT_NAME_MAX_CHARS:
+        return cleaned
+    scaffold_prefix = "Scaffold "
+    if cleaned.startswith(scaffold_prefix):
+        without_prefix = cleaned[len(scaffold_prefix) :].strip()
+        if len(without_prefix) <= PROFILE_IMPORT_NAME_MAX_CHARS:
+            return without_prefix
+        return without_prefix[:PROFILE_IMPORT_NAME_MAX_CHARS].rstrip()
+    return cleaned[:PROFILE_IMPORT_NAME_MAX_CHARS].rstrip()
+
+
+def _portable_profile_document_for_import(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    document = copy.deepcopy(payload)
+    profile = document.get("profile")
+    if not isinstance(profile, dict):
+        return None
+    document["format"] = "fuzzfolio.scoring-profile"
+    document["formatVersion"] = 1
+    profile["name"] = _normalize_profile_import_name(profile.get("name"))
+    profile["version"] = "v1"
+    indicators = profile.get("indicators")
+    if isinstance(indicators, list):
+        for index, indicator in enumerate(indicators):
+            if not isinstance(indicator, dict):
+                continue
+            meta = indicator.get("meta")
+            meta = meta if isinstance(meta, dict) else {}
+            indicator_id = str(meta.get("id") or "").strip()
+            instance_id = str(meta.get("instanceId") or "").strip()
+            if not instance_id:
+                instance_id = _sanitize_report_token(
+                    f"{indicator_id or 'indicator'}-{index + 1}",
+                    fallback=f"indicator-{index + 1}",
+                )[:64]
+            indicator["meta"] = {
+                "id": indicator_id,
+                "instanceId": instance_id,
+            }
+    return document
+
+
+def _png_text_keyword(chunk_type: bytes, payload: bytes) -> str | None:
+    if chunk_type not in (b"tEXt", b"zTXt", b"iTXt"):
+        return None
+    separator_index = payload.find(b"\x00")
+    if separator_index <= 0:
+        return None
+    try:
+        return payload[:separator_index].decode("latin-1")
+    except UnicodeDecodeError:
+        return None
+
+
+def _decode_png_itxt_payload(payload: bytes) -> str | None:
+    separator_index = payload.find(b"\x00")
+    if separator_index < 0:
+        return None
+    cursor = separator_index + 1
+    if cursor + 2 > len(payload):
+        return None
+    compression_flag = payload[cursor]
+    compression_method = payload[cursor + 1]
+    cursor += 2
+    language_end = payload.find(b"\x00", cursor)
+    if language_end < 0:
+        return None
+    translated_end = payload.find(b"\x00", language_end + 1)
+    if translated_end < 0 or compression_flag != 0 or compression_method != 0:
+        return None
+    try:
+        return payload[translated_end + 1 :].decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def _load_png_profile_document(path: Path | None) -> dict[str, Any] | None:
+    if path is None or not path.exists():
+        return None
+    raw_png = path.read_bytes()
+    if len(raw_png) < len(PNG_SIGNATURE) or raw_png[: len(PNG_SIGNATURE)] != PNG_SIGNATURE:
+        return None
+    offset = len(PNG_SIGNATURE)
+    while offset + 12 <= len(raw_png):
+        chunk_length = struct.unpack(">I", raw_png[offset : offset + 4])[0]
+        chunk_type_start = offset + 4
+        chunk_data_start = offset + 8
+        chunk_data_end = chunk_data_start + chunk_length
+        chunk_end = chunk_data_end + 4
+        if chunk_end > len(raw_png):
+            return None
+        chunk_type = raw_png[chunk_type_start : chunk_type_start + 4]
+        chunk_payload = raw_png[chunk_data_start:chunk_data_end]
+        if (
+            chunk_type == b"iTXt"
+            and _png_text_keyword(chunk_type, chunk_payload)
+            == PROFILE_DOCUMENT_PNG_METADATA_KEY
+        ):
+            value = _decode_png_itxt_payload(chunk_payload)
+            if value:
+                try:
+                    payload = json.loads(value)
+                except json.JSONDecodeError:
+                    payload = None
+                return payload if isinstance(payload, dict) else None
+        offset = chunk_end
+        if chunk_type == b"IEND":
+            break
+    return None
+
+
+def _build_png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+    crc = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+    return struct.pack(">I", len(payload)) + chunk_type + payload + struct.pack(">I", crc)
+
+
+def _build_png_itxt_payload(*, key: str, value: str) -> bytes:
+    key_bytes = key.encode("latin-1")
+    return key_bytes + b"\x00\x00\x00\x00\x00" + value.encode("utf-8")
+
+
+def _embed_profile_document_metadata_in_png(
+    png_path: Path,
+    profile_document: dict[str, Any],
+) -> bool:
+    if not png_path.exists():
+        return False
+    portable_document = _portable_profile_document_for_import(profile_document)
+    if portable_document is None:
+        return False
+    raw_png = png_path.read_bytes()
+    if len(raw_png) < len(PNG_SIGNATURE) or raw_png[: len(PNG_SIGNATURE)] != PNG_SIGNATURE:
+        return False
+    profile_document_json = json.dumps(
+        portable_document,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    output = bytearray(PNG_SIGNATURE)
+    offset = len(PNG_SIGNATURE)
+    inserted = False
+    while offset + 12 <= len(raw_png):
+        chunk_length = struct.unpack(">I", raw_png[offset : offset + 4])[0]
+        chunk_type_start = offset + 4
+        chunk_data_start = offset + 8
+        chunk_data_end = chunk_data_start + chunk_length
+        chunk_end = chunk_data_end + 4
+        if chunk_end > len(raw_png):
+            return False
+        chunk_type = raw_png[chunk_type_start : chunk_type_start + 4]
+        chunk_payload = raw_png[chunk_data_start:chunk_data_end]
+        if _png_text_keyword(chunk_type, chunk_payload) == PROFILE_DOCUMENT_PNG_METADATA_KEY:
+            offset = chunk_end
+            continue
+        if not inserted and chunk_type == b"IEND":
+            output.extend(
+                _build_png_chunk(
+                    b"iTXt",
+                    _build_png_itxt_payload(
+                        key=PROFILE_DOCUMENT_PNG_METADATA_KEY,
+                        value=profile_document_json,
+                    ),
+                )
+            )
+            inserted = True
+        output.extend(raw_png[offset:chunk_end])
+        offset = chunk_end
+        if chunk_type == b"IEND":
+            break
+    if not inserted:
+        return False
+    png_path.write_bytes(bytes(output))
+    return True
+
+
+def _write_portable_profile_document(
+    destination: Path,
+    profile_document: dict[str, Any],
+) -> bool:
+    portable_document = _portable_profile_document_for_import(profile_document)
+    if portable_document is None:
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _write_json_file(destination, portable_document)
+    return True
+
+
 def _safe_percentile(values: list[float], percentile: float) -> float | None:
     if not values:
         return None
@@ -9200,20 +9397,32 @@ def _export_portfolio_bundle(
         )
         item_root = bundle_root / item_token
         item_root.mkdir(parents=True, exist_ok=True)
+        png_path_raw = str(drop_item.get("png_path") or "").strip()
+        png_path = Path(png_path_raw).resolve() if png_path_raw else None
+        embedded_profile_document = _load_png_profile_document(png_path)
         profile_path = _resolve_portfolio_row_profile_path(
             config=config,
             row=row,
             attempts_cache=attempts_cache,
         )
         profile_export_path = item_root / f"{item_token}.json"
-        has_profile = _copy_if_exists(profile_path, profile_export_path)
+        source_profile_document = (
+            embedded_profile_document
+            if isinstance(embedded_profile_document, dict)
+            else load_json_if_exists(profile_path)
+            if profile_path is not None and profile_path.exists()
+            else None
+        )
+        has_profile = (
+            _write_portable_profile_document(profile_export_path, source_profile_document)
+            if isinstance(source_profile_document, dict)
+            else False
+        )
         if has_profile:
             exported_profiles += 1
         else:
             missing_profiles.append(attempt_id)
 
-        png_path_raw = str(drop_item.get("png_path") or "").strip()
-        png_path = Path(png_path_raw).resolve() if png_path_raw else None
         png_export_path = item_root / f"{item_token}.png"
         drop_manifest_export_path = item_root / (
             drop_manifest_path.name
@@ -9222,6 +9431,11 @@ def _export_portfolio_bundle(
         )
         has_drop_png = False
         if _copy_if_exists(png_path, png_export_path):
+            if isinstance(source_profile_document, dict):
+                _embed_profile_document_metadata_in_png(
+                    png_export_path,
+                    source_profile_document,
+                )
             exported_drop_pngs += 1
             has_drop_png = True
         if not has_drop_png:

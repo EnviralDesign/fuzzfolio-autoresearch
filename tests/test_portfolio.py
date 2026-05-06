@@ -1,4 +1,6 @@
 import json
+import struct
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -6,6 +8,24 @@ import pytest
 
 from autoresearch import __main__ as ar_main
 from autoresearch import portfolio as pf
+
+
+def _write_minimal_png(path: Path) -> None:
+    def chunk(chunk_type: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+        return (
+            struct.pack(">I", len(payload))
+            + chunk_type
+            + payload
+            + struct.pack(">I", crc)
+        )
+
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b"\x00\x00\x00\x00\x00"))
+        + chunk(b"IEND", b"")
+    )
 
 
 def test_load_portfolio_spec_defaults_when_file_missing(tmp_path: Path) -> None:
@@ -729,13 +749,34 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
 
     profile_path = runs_root / "run-a" / "profiles" / "alpha.json"
     profile_path.parent.mkdir(parents=True, exist_ok=True)
-    profile_path.write_text('{"name":"alpha"}', encoding="utf-8")
+    profile_document = {
+        "format": "legacy",
+        "formatVersion": 99,
+        "profile": {
+            "name": "Alpha Prime",
+            "version": "v7",
+            "directionMode": "both",
+            "indicators": [
+                {
+                    "meta": {
+                        "id": "RSI",
+                        "instanceId": "rsi-1",
+                        "signalRole": "trigger",
+                        "strategyRole": "mean-reversion",
+                    },
+                    "config": {"isActive": True},
+                }
+            ],
+        },
+    }
+    profile_path.write_text(json.dumps(profile_document), encoding="utf-8")
 
     source_drop_root = report_root / "profile-drops" / "1-attempt-a-alpha"
     source_drop_root.mkdir(parents=True, exist_ok=True)
     source_drop_png = source_drop_root / "profile-drop-36mo.png"
     source_drop_manifest = source_drop_root / "profile-drop-36mo.manifest.json"
-    source_drop_png.write_text("png", encoding="utf-8")
+    _write_minimal_png(source_drop_png)
+    assert ar_main._embed_profile_document_metadata_in_png(source_drop_png, profile_document) is True
     source_drop_manifest.write_text(
         '{"display_name":"Alpha Prime","tagline":"Fast FX cadence"}',
         encoding="utf-8",
@@ -815,6 +856,19 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
     assert item_root.exists() is True
     assert (item_root / "Alpha-Prime.json").exists() is True
     assert (item_root / "Alpha-Prime.png").exists() is True
+    exported_profile = ar_main.load_json_if_exists(item_root / "Alpha-Prime.json")
+    assert exported_profile["format"] == "fuzzfolio.scoring-profile"
+    assert exported_profile["formatVersion"] == 1
+    assert exported_profile["profile"]["version"] == "v1"
+    assert exported_profile["profile"]["indicators"][0]["meta"] == {
+        "id": "RSI",
+        "instanceId": "rsi-1",
+    }
+    embedded_exported_profile = ar_main._load_png_profile_document(item_root / "Alpha-Prime.png")
+    assert embedded_exported_profile["profile"]["indicators"][0]["meta"] == {
+        "id": "RSI",
+        "instanceId": "rsi-1",
+    }
     assert (item_root / "profile-drop-36mo.manifest.json").exists() is True
     assert (report_root / "portfolio-report.md").exists() is True
     assert (bundle_root / "portfolio-report.md").exists() is True
@@ -1929,6 +1983,72 @@ def test_human_bundle_item_token_avoids_collisions() -> None:
 
     assert first == "alpha"
     assert second == "alpha-2"
+
+
+def test_portable_profile_document_for_import_strips_rich_indicator_meta() -> None:
+    payload = {
+        "format": "fuzzfolio.scoring-profile",
+        "formatVersion": 1,
+        "profile": {
+            "name": "Scaffold " + ("x" * 160),
+            "version": "v9",
+            "indicators": [
+                {
+                    "meta": {
+                        "id": "RSI",
+                        "instanceId": "rsi-1",
+                        "signalRole": "trigger",
+                        "strategyRole": "mean-reversion",
+                    },
+                    "config": {},
+                }
+            ],
+        },
+    }
+
+    portable = ar_main._portable_profile_document_for_import(payload)
+
+    assert portable["format"] == "fuzzfolio.scoring-profile"
+    assert portable["formatVersion"] == 1
+    assert portable["profile"]["version"] == "v1"
+    assert portable["profile"]["name"] == "x" * 120
+    assert portable["profile"]["indicators"][0]["meta"] == {
+        "id": "RSI",
+        "instanceId": "rsi-1",
+    }
+
+
+def test_embed_profile_document_metadata_in_png_rewrites_import_payload(tmp_path: Path) -> None:
+    png_path = tmp_path / "profile-drop-36mo.png"
+    _write_minimal_png(png_path)
+    payload = {
+        "profile": {
+            "name": "Momentum Pullback",
+            "version": "v5",
+            "indicators": [
+                {
+                    "meta": {
+                        "id": "TRENDFLEX",
+                        "instanceId": "trendflex-1",
+                        "preferredTimeframeRole": "context",
+                        "signalPersistence": "sparse",
+                    },
+                    "config": {"timeframe": "H1"},
+                }
+            ],
+        },
+    }
+
+    assert ar_main._embed_profile_document_metadata_in_png(png_path, payload) is True
+
+    embedded = ar_main._load_png_profile_document(png_path)
+    assert embedded["format"] == "fuzzfolio.scoring-profile"
+    assert embedded["formatVersion"] == 1
+    assert embedded["profile"]["version"] == "v1"
+    assert embedded["profile"]["indicators"][0]["meta"] == {
+        "id": "TRENDFLEX",
+        "instanceId": "trendflex-1",
+    }
 
 
 def test_profile_drop_description_fallback_detects_generic_text() -> None:
