@@ -2278,17 +2278,12 @@ function compareDashboardAttemptScore(left: AttemptCatalogRow, right: AttemptCat
   const rightScore36 = Number(right.score_36m);
   const leftComposite = Number(left.composite_score);
   const rightComposite = Number(right.composite_score);
-  const leftPrimary = Number.isFinite(leftScore36)
-    ? leftScore36
-    : Number.isFinite(leftComposite)
-      ? leftComposite
-      : -Infinity;
-  const rightPrimary = Number.isFinite(rightScore36)
-    ? rightScore36
-    : Number.isFinite(rightComposite)
-      ? rightComposite
-      : -Infinity;
-  if (leftPrimary !== rightPrimary) return rightPrimary - leftPrimary;
+  const leftHasScore36 = Number.isFinite(leftScore36);
+  const rightHasScore36 = Number.isFinite(rightScore36);
+  if (leftHasScore36 !== rightHasScore36) return leftHasScore36 ? -1 : 1;
+  if (leftHasScore36 && rightHasScore36 && leftScore36 !== rightScore36) {
+    return rightScore36 - leftScore36;
+  }
   const leftSecondary = Number.isFinite(leftComposite) ? leftComposite : -Infinity;
   const rightSecondary = Number.isFinite(rightComposite) ? rightComposite : -Infinity;
   if (leftSecondary !== rightSecondary) return rightSecondary - leftSecondary;

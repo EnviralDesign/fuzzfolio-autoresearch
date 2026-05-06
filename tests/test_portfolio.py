@@ -408,6 +408,12 @@ def test_select_dashboard_preferred_attempt_rows_matches_reader_logic() -> None:
             "score_36m": 75.0,
             "composite_score": 72.0,
         },
+        {
+            "run_id": "explorer-run",
+            "attempt_id": "explorer-run-attempt-00003",
+            "score_36m": None,
+            "composite_score": 99.0,
+        },
     ]
 
     selected, info = pf.select_dashboard_preferred_attempt_rows(rows)
@@ -1396,6 +1402,78 @@ def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(
     assert payload["profile_drop_rendered"] == 1
     assert payload["profile_drop_cached"] == 0
     assert payload["profile_drop_failed"] == 0
+
+
+def test_cmd_render_corpus_profile_drops_streams_catch_up_progress_in_plain_mode(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=tmp_path / "runs",
+        fuzzfolio=SimpleNamespace(),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+
+    rows = [
+        {
+            "attempt_id": "attempt-a",
+            "run_id": "run-a",
+            "candidate_name": "alpha",
+            "score_36m": 90.0,
+            "composite_score": 80.0,
+            "artifact_dir": str(tmp_path / "runs" / "run-a" / "evals" / "alpha"),
+            "has_full_backtest_36m": False,
+            "full_backtest_validation_status_36m": "missing",
+        }
+    ]
+    monkeypatch.setattr(
+        ar_main,
+        "_selection_corpus_rows",
+        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+    )
+
+    catchup_calls: list[dict[str, object]] = []
+
+    def fake_calculate_full_backtests(**kwargs):
+        catchup_calls.append(kwargs)
+        print("queue 1/1 streamed-catchup")
+        print("  done: run-a attempt-a")
+        return 0
+
+    monkeypatch.setattr(ar_main, "cmd_calculate_full_backtests", fake_calculate_full_backtests)
+    monkeypatch.setattr(
+        ar_main,
+        "_render_profile_drop_rows",
+        lambda **_kwargs: [
+            {
+                "attempt_id": "attempt-a",
+                "run_id": "run-a",
+                "candidate_name": "alpha",
+                "status": "skipped",
+                "reason": "test",
+            }
+        ],
+    )
+
+    exit_code = ar_main.cmd_render_corpus_profile_drops(
+        run_ids=None,
+        attempt_ids=["attempt-a"],
+        top_results=None,
+        rank_start=0,
+        lookback_months=36,
+        profile_drop_workers=3,
+        profile_drop_timeout_seconds=90,
+        force_rebuild=False,
+        as_json=False,
+    )
+
+    assert exit_code == 0
+    assert catchup_calls[0]["as_json"] is False
+    assert catchup_calls[0]["emit_summary"] is False
+    captured = capsys.readouterr()
+    assert "queue 1/1 streamed-catchup" in captured.out
+    assert "done: run-a attempt-a" in captured.out
+    assert "full-backtest catch-up complete" in captured.out
 
 
 def test_cmd_render_corpus_profile_drops_continues_when_catch_up_returns_nonzero(

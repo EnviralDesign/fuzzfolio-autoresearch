@@ -6054,6 +6054,7 @@ def cmd_calculate_full_backtests(
     force_rebuild: bool,
     job_timeout_seconds: int | None,
     as_json: bool,
+    emit_summary: bool = True,
 ) -> int:
     config = load_config()
     run_dirs = _matching_run_dirs(config, run_ids)
@@ -6068,11 +6069,12 @@ def cmd_calculate_full_backtests(
         require_scored=False,
     )
     if not matched_items:
-        print(
-            json.dumps(
-                {"status": "no_attempts", "considered": 0}, ensure_ascii=True, indent=2
+        if emit_summary:
+            print(
+                json.dumps(
+                    {"status": "no_attempts", "considered": 0}, ensure_ascii=True, indent=2
+                )
             )
-        )
         return 0
 
     def needs_calculation(attempt: dict[str, Any]) -> bool:
@@ -6084,6 +6086,8 @@ def cmd_calculate_full_backtests(
         curve_path = artifact_dir / "full-backtest-36mo-curve.json"
         result_path = artifact_dir / "full-backtest-36mo-result.json"
         if not curve_path.exists() or not result_path.exists():
+            return True
+        if not _result_has_canonical_score_lab(result_path):
             return True
         return not _result_matches_attempt_reward_matrix(result_path, attempt)
 
@@ -6332,7 +6336,8 @@ def cmd_calculate_full_backtests(
         "derived_refresh": derived_refresh,
         "results": results,
     }
-    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    if emit_summary:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
     return 0 if failed == 0 else 1
 
 
@@ -9501,7 +9506,20 @@ def cmd_render_corpus_profile_drops(
             f"{len(selected_attempt_ids)} selected attempts",
             as_json=as_json,
         )
-        with io.StringIO() as capture, redirect_stdout(capture):
+        if as_json:
+            with io.StringIO() as capture, redirect_stdout(capture):
+                catch_up_exit_code = cmd_calculate_full_backtests(
+                    run_ids=run_ids,
+                    attempt_ids=selected_attempt_ids,
+                    limit=None,
+                    max_workers=None,
+                    use_dev_sim_worker_count=True,
+                    require_scrutiny_36=False,
+                    force_rebuild=False,
+                    job_timeout_seconds=None,
+                    as_json=True,
+                )
+        else:
             catch_up_exit_code = cmd_calculate_full_backtests(
                 run_ids=run_ids,
                 attempt_ids=selected_attempt_ids,
@@ -9511,7 +9529,8 @@ def cmd_render_corpus_profile_drops(
                 require_scrutiny_36=False,
                 force_rebuild=False,
                 job_timeout_seconds=None,
-                as_json=True,
+                as_json=False,
+                emit_summary=False,
             )
         refreshed_rows, _ = _selection_corpus_rows(
             config,

@@ -317,6 +317,102 @@ def test_attempt_has_backtestable_cell_requires_best_or_robust_cell() -> None:
     )
 
 
+def test_calculate_full_backtests_rebuilds_stale_score_lab_result(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "final"
+    artifact_dir.mkdir(parents=True)
+    result_path = artifact_dir / "full-backtest-36mo-result.json"
+    curve_path = artifact_dir / "full-backtest-36mo-curve.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "data": {
+                    "aggregate": {
+                        "score_lab": {"version": "score_lab_v2_5_1", "score": 72.0},
+                        "matrix_summary": {
+                            "reward_column_summaries": [
+                                {"reward_multiple": 0.5},
+                                {"reward_multiple": 1.0},
+                            ]
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    curve_path.write_text(json.dumps({"curve": {"points": []}}), encoding="utf-8")
+    attempt = {
+        "attempt_id": "run-a-attempt-00001",
+        "run_id": "run-a",
+        "candidate_name": "final",
+        "artifact_dir": str(artifact_dir),
+        "best_summary": {"best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0}},
+        "reward_matrix": {
+            "reward_step_r": 0.5,
+            "reward_columns": 2,
+            "effective_max_reward_r": 1.0,
+        },
+    }
+    row = {
+        "attempt_id": attempt["attempt_id"],
+        "run_id": "run-a",
+        "candidate_name": "final",
+        "full_backtest_validation_status_36m": "invalid",
+    }
+    config = SimpleNamespace(
+        runs_root=tmp_path / "runs",
+        research=SimpleNamespace(validation_max_concurrency=1),
+        full_backtest_failures_json_path=tmp_path / "full-backtest-failures.json",
+    )
+
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [run_dir])
+    monkeypatch.setattr(ar_main, "_catalog_rows_for_run_dirs", lambda *_args, **_kwargs: [row])
+    monkeypatch.setattr(
+        ar_main,
+        "_matched_attempt_items",
+        lambda *_args, **_kwargs: [(run_dir, [attempt], attempt)],
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_refresh_global_derived_corpus_state",
+        lambda _config: {"status": "refreshed"},
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_run_full_backtest_with_retry(*_args, **kwargs):
+        calls.append(kwargs)
+        return {"curve_path": str(curve_path), "result_path": str(result_path)}
+
+    monkeypatch.setattr(
+        ar_main,
+        "_run_full_backtest_with_retry",
+        fake_run_full_backtest_with_retry,
+    )
+
+    exit_code = ar_main.cmd_calculate_full_backtests(
+        run_ids=["run-a"],
+        attempt_ids=[str(attempt["attempt_id"])],
+        limit=None,
+        max_workers=1,
+        use_dev_sim_worker_count=False,
+        require_scrutiny_36=False,
+        force_rebuild=False,
+        job_timeout_seconds=None,
+        as_json=True,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert len(calls) == 1
+    assert calls[0]["force_rebuild"] is False
+    assert payload["eligible_attempts"] == 1
+    assert payload["calculated"] == 1
+
+
 def test_result_matches_attempt_reward_matrix_rejects_expanded_reward_grid(
     tmp_path: Path,
 ) -> None:

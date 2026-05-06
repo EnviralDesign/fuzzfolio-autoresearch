@@ -182,18 +182,16 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
-def dashboard_attempt_score_sort_key(row: dict[str, Any]) -> tuple[bool, float, float, str]:
+def dashboard_attempt_score_sort_key(
+    row: dict[str, Any],
+) -> tuple[bool, float, bool, float, str]:
     score_36 = _safe_float(row.get("score_36m"))
     composite = _safe_float(row.get("composite_score"))
-    primary = (
-        score_36
-        if score_36 is not None
-        else (composite if composite is not None else float("-inf"))
-    )
     secondary = composite if composite is not None else float("-inf")
     return (
-        primary == float("-inf"),
-        -primary,
+        score_36 is None,
+        -(score_36 if score_36 is not None else float("-inf")),
+        composite is None,
         -secondary,
         str(row.get("attempt_id") or ""),
     )
@@ -247,7 +245,7 @@ def select_dashboard_preferred_attempt_rows(
 
 def dashboard_run_attempt_sort_key(
     row: dict[str, Any],
-) -> tuple[bool, tuple[bool, float, float, str]]:
+) -> tuple[bool, tuple[bool, float, bool, float, str]]:
     return (not is_dashboard_canonical_attempt(row), dashboard_attempt_score_sort_key(row))
 
 

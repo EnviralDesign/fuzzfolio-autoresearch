@@ -3146,7 +3146,7 @@ def _finalize_run_artifacts(
                 stage=stage,
                 selected_count=full_backtests.get("selected_count"),
                 render_exit_code=full_backtests.get("render_exit_code"),
-                status=full_backtests.get("status"),
+                finalize_status=full_backtests.get("status"),
             )
             if isinstance(full_backtests.get("render_summary"), dict):
                 profile_drops = dict(full_backtests["render_summary"])
