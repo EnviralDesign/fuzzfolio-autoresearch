@@ -1577,7 +1577,14 @@ def test_render_profile_drop_rows_emits_plain_progress(
         "run_id": "run-a",
         "candidate_name": "alpha",
     }
-    attempt = {"attempt_id": "attempt-a", "candidate_name": "alpha"}
+    attempt = {
+        "attempt_id": "attempt-a",
+        "candidate_name": "alpha",
+        "best_summary": {
+            "best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 2.0},
+            "matrix_summary": {},
+        },
+    }
 
     class FakeCli:
         def __init__(self, *_args, **_kwargs):
@@ -1627,6 +1634,85 @@ def test_render_profile_drop_rows_emits_plain_progress(
     assert "[corpus profile drops] 1/1 complete (100.0%)" in captured.out
     assert "cached=1" in captured.out
     assert captured.err == ""
+
+
+def test_render_profile_drop_rows_skips_attempt_without_renderable_exit_cell(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        fuzzfolio=SimpleNamespace(),
+    )
+    run_dir = tmp_path / "runs" / "run-empty"
+    artifact_dir = run_dir / "evals" / "final"
+    artifact_dir.mkdir(parents=True)
+    row = {
+        "attempt_id": "attempt-empty",
+        "run_id": "run-empty",
+        "candidate_name": "empty",
+        "full_backtest_validation_status_36m": "missing",
+    }
+    attempt = {
+        "attempt_id": "attempt-empty",
+        "candidate_name": "empty",
+        "artifact_dir": str(artifact_dir),
+        "best_summary": {
+            "best_cell": None,
+            "matrix_summary": {"robust_cell": None},
+            "signal_count": 0,
+        },
+    }
+
+    class FakeCli:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def ensure_login(self) -> None:
+            return None
+
+    monkeypatch.setattr(ar_main, "FuzzfolioCli", FakeCli)
+    monkeypatch.setattr(
+        ar_main,
+        "_resolve_drop_renderer_executable",
+        lambda _config: (tmp_path / "renderer.exe", tmp_path),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_matched_attempt_items",
+        lambda *_args, **_kwargs: [(run_dir, [attempt], attempt)],
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_render_profile_drop_for_attempt",
+        lambda **_kwargs: pytest.fail("unrenderable attempts should be skipped before rendering"),
+    )
+
+    results = ar_main._render_profile_drop_rows(
+        config=config,
+        rows=[row],
+        output_root=None,
+        lookback_months=36,
+        timeout_seconds=60,
+        force_rebuild=False,
+        profile_drop_workers=1,
+        as_json=False,
+        progress_label="corpus profile drops",
+        layout_mode="attempt_local",
+    )
+
+    assert results == [
+        {
+            "attempt_id": "attempt-empty",
+            "run_id": "run-empty",
+            "candidate_name": "empty",
+            "status": "skipped",
+            "reason": "no_backtestable_exit_cell",
+        }
+    ]
+    captured = capsys.readouterr()
+    assert "[corpus profile drops] selected=1 queued=0" in captured.out
+    assert "skipped=1" in captured.out
+    assert "failed=0" in captured.out
 
 
 def test_render_profile_drop_rows_preflights_required_metadata_provider(

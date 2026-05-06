@@ -3158,6 +3158,7 @@ def _finalize_run_artifacts(
                 selected_count=profile_drops.get("selected_count") if profile_drops else None,
                 rendered=profile_drops.get("profile_drop_rendered") if profile_drops else None,
                 cached=profile_drops.get("profile_drop_cached") if profile_drops else None,
+                skipped=profile_drops.get("profile_drop_skipped") if profile_drops else None,
                 failed=profile_drops.get("profile_drop_failed") if profile_drops else None,
                 final_attempt_id=final_attempt_id,
             )
@@ -3655,6 +3656,7 @@ def cmd_play_hand(
                 "drop "
                 f"render={profile_drops.get('profile_drop_rendered', 0)} "
                 f"cache={profile_drops.get('profile_drop_cached', 0)} "
+                f"skip={profile_drops.get('profile_drop_skipped', 0)} "
                 f"fail={profile_drops.get('profile_drop_failed', 0)}"
             )
         phase_rows.append(

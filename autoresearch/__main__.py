@@ -6769,6 +6769,37 @@ def _profile_drop_progress_error(result: dict[str, Any]) -> str:
     return f" error={_short_text(error, limit=220)}"
 
 
+def _profile_drop_skip_reason_for_attempt(
+    *,
+    row: dict[str, Any],
+    attempt: dict[str, Any],
+    run_dir: Path,
+    lookback_months: int,
+) -> str | None:
+    attempt = _attempt_with_run_reward_matrix(attempt, run_dir=run_dir)
+    if _attempt_has_backtestable_cell(attempt):
+        return None
+
+    artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+    full_result_path = artifact_dir / f"full-backtest-{int(lookback_months)}mo-result.json"
+    full_curve_path = artifact_dir / f"full-backtest-{int(lookback_months)}mo-curve.json"
+    if (
+        int(lookback_months) == 36
+        and full_result_path.exists()
+        and full_curve_path.exists()
+        and _result_has_canonical_score_lab(full_result_path)
+        and _result_matches_attempt_reward_matrix(full_result_path, attempt)
+    ):
+        return None
+
+    validation_status = str(
+        row.get(f"full_backtest_validation_status_{int(lookback_months)}m") or ""
+    ).strip()
+    if validation_status and validation_status not in {"valid", "missing"}:
+        return f"full_backtest_{int(lookback_months)}m_{validation_status}"
+    return "no_backtestable_exit_cell"
+
+
 def _render_profile_drop_rows(
     *,
     config,
@@ -6840,6 +6871,24 @@ def _render_profile_drop_rows(
             )
             continue
         run_dir, attempts, attempt = matched
+        skip_reason = _profile_drop_skip_reason_for_attempt(
+            row=row,
+            attempt=attempt,
+            run_dir=run_dir,
+            lookback_months=int(lookback_months),
+        )
+        if skip_reason is not None:
+            ordered_results.append(
+                {
+                    "_row_index": index,
+                    "attempt_id": row.get("attempt_id"),
+                    "run_id": row.get("run_id"),
+                    "candidate_name": row.get("candidate_name"),
+                    "status": "skipped",
+                    "reason": skip_reason,
+                }
+            )
+            continue
         work_items.append((index, row, run_dir, attempts, attempt))
 
     worker_count = max(1, int(profile_drop_workers))
@@ -6862,12 +6911,14 @@ def _render_profile_drop_rows(
 
     cached_count = 0
     rendered_count = 0
+    skipped_count = sum(1 for row in ordered_results if row.get("status") == "skipped")
     failed_count = sum(1 for row in ordered_results if row.get("status") == "failed")
     started_at = pytime.monotonic()
 
     _job_status_emit(
         f"[{progress_label}] selected={len(rows)} queued={len(work_items)} "
-        f"missing_ledger={failed_count} cached=0 rendered=0 failed={failed_count} "
+        f"missing_ledger={failed_count} skipped={skipped_count} "
+        f"cached=0 rendered=0 failed={failed_count} "
         f"workers={worker_count} lookback={int(lookback_months)}mo "
         f"force_rebuild={'yes' if force_rebuild else 'no'}",
         as_json=as_json,
@@ -6879,6 +6930,7 @@ def _render_profile_drop_rows(
             f"{progress_label} "
             f"[green]rendered={rendered_count}[/green] "
             f"[cyan]cached={cached_count}[/cyan] "
+            f"[yellow]skipped={skipped_count}[/yellow] "
             f"[red]failed={failed_count}[/red]"
         )
 
@@ -6927,8 +6979,11 @@ def _render_profile_drop_rows(
     with progress:
         task_id = progress.add_task(
             _progress_description(),
-            total=max(1, len(work_items)),
+            total=max(1, len(rows)),
         )
+        if ordered_results:
+            progress.advance(task_id, len(ordered_results))
+            progress.update(task_id, description=_progress_description())
         if worker_count == 1:
             for index, row, run_dir, attempts, attempt in work_items:
                 try:
@@ -6946,6 +7001,8 @@ def _render_profile_drop_rows(
                     cached_count += 1
                 elif status == "failed":
                     failed_count += 1
+                elif status == "skipped":
+                    skipped_count += 1
                 else:
                     rendered_count += 1
                 ordered_results.append({"_row_index": index, **result})
@@ -6955,7 +7012,7 @@ def _render_profile_drop_rows(
                 _job_status_emit(
                     f"[{progress_label}] {completed_count}/{len(rows)} complete "
                     f"({percent:.1f}%) rendered={rendered_count} cached={cached_count} "
-                    f"failed={failed_count} remaining={remaining_count} "
+                    f"skipped={skipped_count} failed={failed_count} remaining={remaining_count} "
                     f"last={row.get('attempt_id')} status={status or 'rendered'} "
                     f"elapsed={_elapsed_text(started_at)}"
                     f"{_profile_drop_progress_error(result)}",
@@ -6987,6 +7044,8 @@ def _render_profile_drop_rows(
                         cached_count += 1
                     elif status == "failed":
                         failed_count += 1
+                    elif status == "skipped":
+                        skipped_count += 1
                     else:
                         rendered_count += 1
                     ordered_results.append({"_row_index": index, **result})
@@ -6996,7 +7055,7 @@ def _render_profile_drop_rows(
                     _job_status_emit(
                         f"[{progress_label}] {completed_count}/{len(rows)} complete "
                         f"({percent:.1f}%) rendered={rendered_count} cached={cached_count} "
-                        f"failed={failed_count} remaining={remaining_count} "
+                        f"skipped={skipped_count} failed={failed_count} remaining={remaining_count} "
                         f"last={row.get('attempt_id')} status={status or 'rendered'} "
                         f"elapsed={_elapsed_text(started_at)}"
                         f"{_profile_drop_progress_error(result)}",
@@ -7005,6 +7064,18 @@ def _render_profile_drop_rows(
                     )
                     progress.advance(task_id, 1)
                     progress.update(task_id, description=_progress_description())
+
+        if not work_items and ordered_results:
+            completed_count = len(ordered_results)
+            percent = (completed_count / max(1, len(rows))) * 100.0
+            _job_status_emit(
+                f"[{progress_label}] {completed_count}/{len(rows)} complete "
+                f"({percent:.1f}%) rendered={rendered_count} cached={cached_count} "
+                f"skipped={skipped_count} failed={failed_count} remaining=0 "
+                f"elapsed={_elapsed_text(started_at)}",
+                as_json=as_json,
+                use_progress=use_progress,
+            )
 
     ordered_results.sort(key=lambda row: int(row.get("_row_index") or 0))
     for row in ordered_results:
@@ -7450,6 +7521,9 @@ def cmd_build_shortlist_report(
                 "profile_drop_rendered": sum(
                     1 for row in profile_drop_results if row.get("status") in {"rendered", "cached"}
                 ),
+                "profile_drop_skipped": sum(
+                    1 for row in profile_drop_results if row.get("status") == "skipped"
+                ),
                 "profile_drop_failed": sum(
                     1 for row in profile_drop_results if row.get("status") == "failed"
                 ),
@@ -7882,6 +7956,9 @@ def cmd_build_portfolio(
                 1
                 for row in profile_drop_results
                 if row.get("status") in {"rendered", "cached"}
+            ),
+            "profile_drop_skipped": sum(
+                1 for row in profile_drop_results if row.get("status") == "skipped"
             ),
             "profile_drop_failed": sum(
                 1 for row in profile_drop_results if row.get("status") == "failed"
@@ -9305,6 +9382,9 @@ def cmd_render_portfolio_profile_drops(
         "profile_drop_cached": sum(
             1 for row in profile_drop_results if row.get("status") == "cached"
         ),
+        "profile_drop_skipped": sum(
+            1 for row in profile_drop_results if row.get("status") == "skipped"
+        ),
         "profile_drop_failed": sum(
             1 for row in profile_drop_results if row.get("status") == "failed"
         ),
@@ -9324,6 +9404,7 @@ def cmd_render_portfolio_profile_drops(
                     f"Selected rows: {summary['selected_count']}",
                     f"Rendered: {summary['profile_drop_rendered']}",
                     f"Cached: {summary['profile_drop_cached']}",
+                    f"Skipped: {summary['profile_drop_skipped']}",
                     f"Failed: {summary['profile_drop_failed']}",
                     f"Profile drops: {summary['profile_drop_root']}",
                 ]
@@ -9495,6 +9576,9 @@ def cmd_render_corpus_profile_drops(
         "profile_drop_cached": sum(
             1 for row in profile_drop_results if row.get("status") == "cached"
         ),
+        "profile_drop_skipped": sum(
+            1 for row in profile_drop_results if row.get("status") == "skipped"
+        ),
         "profile_drop_failed": sum(
             1 for row in profile_drop_results if row.get("status") == "failed"
         ),
@@ -9515,6 +9599,7 @@ def cmd_render_corpus_profile_drops(
                     f"Healed 36mo full-backtests: {summary['healed_full_backtests']}",
                     f"Rendered: {summary['profile_drop_rendered']}",
                     f"Cached: {summary['profile_drop_cached']}",
+                    f"Skipped: {summary['profile_drop_skipped']}",
                     f"Failed: {summary['profile_drop_failed']}",
                     f"Lookback: {summary['lookback_months']}mo",
                     f"Canonical-only: {'yes' if summary['canonical_only'] else 'no'}",
