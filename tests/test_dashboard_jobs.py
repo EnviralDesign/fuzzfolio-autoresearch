@@ -132,3 +132,36 @@ def test_dashboard_job_manager_build_portfolio_writes_dashboard_config(tmp_path)
     assert job["portfolio_config_path"].endswith("dashboard-auto-portfolio.json")
     processes[0].finish(0)
     _wait_status(manager, job["id"], "completed")
+
+
+def test_dashboard_job_manager_build_portfolio_supports_manual_config_label_and_attempts(tmp_path) -> None:
+    processes: list[FakeProcess] = []
+    manager = _manager(tmp_path, processes)
+
+    job = manager.start(
+        "build-portfolio",
+        {
+            "attempt_ids": ["attempt-a", "attempt-b"],
+            "portfolio_config_label": "manual",
+            "portfolio_config": {
+                "portfolio_name": "dashboard-manual-test",
+                "sleeves": [{"name": "manual", "shortlist_size": 2}],
+            },
+        },
+    )
+
+    assert job["command"][:3] == ["uv", "run", "build-portfolio"]
+    assert job["portfolio_config_path"].endswith("dashboard-manual-portfolio.json")
+    assert "--attempt-id" in job["command"]
+    assert job["command"].count("--attempt-id") == 2
+    assert "attempt-a" in job["command"]
+    assert "attempt-b" in job["command"]
+    assert (
+        tmp_path
+        / "runs"
+        / "derived"
+        / "dashboard-portfolio-configs"
+        / "latest-dashboard-manual-portfolio.json"
+    ).exists()
+    processes[0].finish(0)
+    _wait_status(manager, job["id"], "completed")

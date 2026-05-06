@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import threading
 import uuid
@@ -28,6 +29,9 @@ DASHBOARD_DIST_ROOT = DASHBOARD_APP_ROOT / "dist"
 SHORTLIST_REPORT_ROOTNAME = "shortlist-report"
 _CURVE_CELL_CACHE: dict[str, tuple[tuple[str, bool, int | None, int | None], dict[str, Any]]] = {}
 _RESULT_CELL_CACHE: dict[str, tuple[tuple[str, bool, int | None, int | None], dict[str, Any]]] = {}
+_PROFILE_DROP_EXIT_POLICY_CACHE: dict[
+    str, tuple[tuple[str, bool, int | None, int | None], dict[str, Any]]
+] = {}
 LIVE_PORTFOLIO_CACHE_FILENAME = "dashboard-live-portfolio.json"
 DASHBOARD_JOB_ROOTNAME = "dashboard-jobs"
 DASHBOARD_PORTFOLIO_CONFIG_ROOTNAME = "dashboard-portfolio-configs"
@@ -51,6 +55,55 @@ def _default_dashboard_portfolio_config() -> dict[str, Any]:
         "sleeves": [
             {"name": "core", "shortlist_size": 8},
             {"name": "breadth", "shortlist_size": 8},
+        ],
+    }
+
+
+def _default_dashboard_manual_portfolio_config(
+    selected_count: int,
+    *,
+    account: dict[str, Any] | None = None,
+    portfolio_name: str | None = None,
+) -> dict[str, Any]:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    size = max(1, int(selected_count))
+    return {
+        "version": 1,
+        "portfolio_name": portfolio_name or f"dashboard-manual-{timestamp}",
+        "candidate_scope": "all",
+        "dashboard_source": "manual_live_portfolio",
+        "catch_up_full_backtests": True,
+        "catch_up_force_rebuild": False,
+        "catch_up_require_scrutiny_36": False,
+        "full_backtest_job_timeout_seconds": 2400,
+        "generate_profile_drops": True,
+        "export_bundle": True,
+        "profile_drop_lookback_months": 36,
+        "profile_drop_timeout_seconds": 1800,
+        "profile_drop_workers": 4,
+        "chart_trades_x_max": 300.0,
+        "account": dict(account or {}),
+        "sleeves": [
+            {
+                "name": "manual",
+                "prefilter_limit": size,
+                "candidate_limit": -1,
+                "shortlist_size": size,
+                "min_score_36": 0.0,
+                "min_retention_ratio": 0.0,
+                "min_trades_per_month": 0.0,
+                "max_drawdown_r": -1.0,
+                "drawdown_penalty": 0.0,
+                "trade_rate_bonus_weight": 0.0,
+                "trade_rate_bonus_target": 8.0,
+                "novelty_penalty": 0.0,
+                "max_per_run": -1,
+                "max_per_strategy_key": -1,
+                "max_sameness_to_board": -1.0,
+                "require_full_backtest_36": True,
+                "scalar_metric_terms": [],
+                "field_filters": [],
+            }
         ],
     }
 
@@ -183,15 +236,23 @@ class DashboardJobManager:
             return payload
         return _default_dashboard_portfolio_config()
 
-    def _write_dashboard_portfolio_config(self, payload: dict[str, Any]) -> Path:
+    def _write_dashboard_portfolio_config(
+        self,
+        payload: dict[str, Any],
+        *,
+        label: str = "auto",
+    ) -> Path:
         config_payload = dict(payload or {})
         if not config_payload:
             config_payload = _default_dashboard_portfolio_config()
         if not isinstance(config_payload.get("sleeves"), list):
             config_payload["sleeves"] = _default_dashboard_portfolio_config()["sleeves"]
+        label_token = re.sub(r"[^a-z0-9_-]+", "-", str(label or "auto").strip().lower()).strip("-")
+        if not label_token:
+            label_token = "auto"
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        path = self.config_root / f"{timestamp}-dashboard-auto-portfolio.json"
-        latest_path = self.config_root / "latest-dashboard-auto-portfolio.json"
+        path = self.config_root / f"{timestamp}-dashboard-{label_token}-portfolio.json"
+        latest_path = self.config_root / f"latest-dashboard-{label_token}-portfolio.json"
         _write_json(path, config_payload)
         _write_json(latest_path, config_payload)
         return path
@@ -227,7 +288,10 @@ class DashboardJobManager:
     def _build_portfolio_command(self, payload: dict[str, Any]) -> tuple[list[str], Path]:
         raw_config = payload.get("portfolio_config")
         config_payload = raw_config if isinstance(raw_config, dict) else self.latest_dashboard_portfolio_config()
-        config_path = self._write_dashboard_portfolio_config(config_payload)
+        config_path = self._write_dashboard_portfolio_config(
+            config_payload,
+            label=str(payload.get("portfolio_config_label") or "auto"),
+        )
         command = [
             "uv",
             "run",
@@ -552,6 +616,95 @@ def _load_result_recommended_cell(path: Path) -> dict[str, Any]:
     return dict(cell)
 
 
+def _normalize_exit_policy_cell(cell: dict[str, Any], *, basis: str | None = None) -> dict[str, Any]:
+    reward_multiple = _safe_float(cell.get("reward_multiple", cell.get("rewardMultiple")))
+    stop_loss_percent = _safe_float(cell.get("stop_loss_percent", cell.get("stopLossPercent")))
+    take_profit_percent = _safe_float(
+        cell.get("take_profit_percent", cell.get("takeProfitPercent"))
+    )
+    normalized: dict[str, Any] = {}
+    if reward_multiple is not None:
+        normalized["reward_multiple"] = reward_multiple
+    if stop_loss_percent is not None:
+        normalized["stop_loss_percent"] = stop_loss_percent
+    if take_profit_percent is not None:
+        normalized["take_profit_percent"] = take_profit_percent
+    if basis:
+        normalized["_basis"] = basis
+    return normalized
+
+
+def _load_profile_document_exit_policy_cell(path: Path) -> dict[str, Any]:
+    signature = _file_signature(path)
+    cache_key = str(path)
+    cached = _PROFILE_DROP_EXIT_POLICY_CACHE.get(cache_key)
+    if cached and cached[0] == signature:
+        return dict(cached[1])
+    if not signature[1]:
+        _PROFILE_DROP_EXIT_POLICY_CACHE[cache_key] = (signature, {})
+        return {}
+    document = _load_optional_json(path)
+    if not isinstance(document, dict):
+        _PROFILE_DROP_EXIT_POLICY_CACHE[cache_key] = (signature, {})
+        return {}
+    profile_document = document.get("profile") if isinstance(document.get("profile"), dict) else document
+    execution_config = profile_document.get("executionConfig")
+    execution_config = execution_config if isinstance(execution_config, dict) else {}
+    exit_policy = execution_config.get("exitPolicy")
+    exit_policy = exit_policy if isinstance(exit_policy, dict) else {}
+    recommendation = exit_policy.get("recommendation")
+    recommendation = recommendation if isinstance(recommendation, dict) else {}
+    recommended_cell = recommendation.get("cell")
+    basis = str(recommendation.get("basis") or "").strip() or None
+    if isinstance(recommended_cell, dict):
+        normalized = _normalize_exit_policy_cell(recommended_cell, basis=basis)
+        if normalized:
+            _PROFILE_DROP_EXIT_POLICY_CACHE[cache_key] = (signature, dict(normalized))
+            return dict(normalized)
+
+    selected_cell = exit_policy.get("selectedCell")
+    if isinstance(selected_cell, dict):
+        normalized = _normalize_exit_policy_cell(
+            selected_cell,
+            basis=basis or "profile_drop_exit_policy",
+        )
+        _PROFILE_DROP_EXIT_POLICY_CACHE[cache_key] = (signature, dict(normalized))
+        return dict(normalized)
+
+    _PROFILE_DROP_EXIT_POLICY_CACHE[cache_key] = (signature, {})
+    return {}
+
+
+def _profile_drop_document_candidates(root: Path) -> list[Path]:
+    package_root = root / ".profile-drop-36mo"
+    if not package_root.exists():
+        return []
+    candidates = [
+        path
+        for path in package_root.glob("bundle/*/profile-document.json")
+        if path.exists() and path.is_file()
+    ]
+    candidates.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+    source_document = package_root / "profile-drop-36mo.source-profile-document.json"
+    if source_document.exists() and source_document.is_file():
+        candidates.append(source_document)
+    return candidates
+
+
+def _load_profile_drop_exit_policy_cell(*roots: Path) -> dict[str, Any]:
+    seen: set[Path] = set()
+    for root in roots:
+        for candidate in _profile_drop_document_candidates(root):
+            resolved = candidate.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            cell = _load_profile_document_exit_policy_cell(candidate)
+            if cell:
+                return dict(cell)
+    return {}
+
+
 def _normalize_chart_entry(config: AppConfig, raw_path: str | None) -> dict[str, Any] | None:
     if not raw_path:
         return None
@@ -613,6 +766,17 @@ def _normalize_path_fields(config: AppConfig, row: dict[str, Any]) -> dict[str, 
         if recommended_cell:
             setup_cell.update(recommended_cell)
             normalized["reward_multiple_basis_36m"] = "recommended_cell"
+    profile_drop_roots: list[Path] = []
+    if isinstance(artifact_dir, str) and artifact_dir.strip():
+        profile_drop_roots.append(Path(artifact_dir))
+    run_id = str(normalized.get("run_id") or "").strip()
+    if run_id:
+        profile_drop_roots.append(config.runs_root / run_id)
+    profile_drop_cell = _load_profile_drop_exit_policy_cell(*profile_drop_roots)
+    if profile_drop_cell:
+        basis = str(profile_drop_cell.pop("_basis", "") or "").strip()
+        setup_cell.update(profile_drop_cell)
+        normalized["reward_multiple_basis_36m"] = basis or "profile_drop_exit_policy"
     reward_multiple = _safe_float(setup_cell.get("reward_multiple"))
     stop_loss_percent = _safe_float(setup_cell.get("stop_loss_percent"))
     take_profit_percent = _safe_float(setup_cell.get("take_profit_percent"))
@@ -1292,6 +1456,56 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                 try:
                     return self._send_json(
                         state.job_manager.start("build-portfolio", payload),
+                        status=202,
+                    )
+                except RuntimeError as exc:
+                    return self._send_json({"error": "job_active", "message": str(exc)}, status=409)
+                except Exception as exc:
+                    return self._send_json({"error": "job_start_failed", "message": str(exc)}, status=400)
+            if parsed.path == "/api/jobs/export-live-portfolio":
+                if not self._require_local_jobs():
+                    return
+                payload = self._read_json_body()
+                if payload is None:
+                    return self._send_json({"error": "invalid_json"}, status=400)
+                attempt_ids = _normalize_attempt_id_list(
+                    payload.get("selected_attempt_ids")
+                    or _live_portfolio_payload(state.config).get("selected_attempt_ids")
+                )
+                if not attempt_ids:
+                    return self._send_json({"error": "empty_live_portfolio"}, status=400)
+                known_attempt_ids = {
+                    str(row.get("attempt_id") or "")
+                    for row in state.catalog_rows()
+                    if row.get("attempt_id")
+                }
+                unknown = [
+                    attempt_id
+                    for attempt_id in attempt_ids
+                    if known_attempt_ids and attempt_id not in known_attempt_ids
+                ]
+                if unknown:
+                    return self._send_json(
+                        {"error": "unknown_attempt_ids", "attempt_ids": unknown[:20]},
+                        status=400,
+                    )
+                account = payload.get("account") if isinstance(payload.get("account"), dict) else {}
+                portfolio_name = str(payload.get("portfolio_name") or "").strip() or None
+                portfolio_config = _default_dashboard_manual_portfolio_config(
+                    len(attempt_ids),
+                    account=account,
+                    portfolio_name=portfolio_name,
+                )
+                try:
+                    return self._send_json(
+                        state.job_manager.start(
+                            "build-portfolio",
+                            {
+                                "attempt_ids": attempt_ids,
+                                "portfolio_config": portfolio_config,
+                                "portfolio_config_label": "manual",
+                            },
+                        ),
                         status=202,
                     )
                 except RuntimeError as exc:

@@ -77,6 +77,16 @@ export function startBuildPortfolioJob(payload: Record<string, unknown> = {}): P
   });
 }
 
+export function startExportLivePortfolioJob(payload: Record<string, unknown> = {}): Promise<DashboardJob> {
+  return fetchJson<DashboardJob>("/api/jobs/export-live-portfolio", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+}
+
 export function cancelDashboardJob(id?: string): Promise<DashboardJob> {
   return fetchJson<DashboardJob>("/api/jobs/cancel", {
     method: "POST",

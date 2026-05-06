@@ -9182,8 +9182,19 @@ def _export_portfolio_bundle(
     for rank, row in enumerate(selected_rows, start=1):
         attempt_id = str(row.get("attempt_id") or "").strip()
         candidate_name = str(row.get("candidate_name") or "").strip()
+        drop_item = profile_drop_lookup.get(attempt_id) or {}
+        manifest_path_raw = str(drop_item.get("manifest_path") or "").strip()
+        drop_manifest_path = Path(manifest_path_raw).resolve() if manifest_path_raw else None
+        drop_manifest_payload = (
+            load_json_if_exists(drop_manifest_path)
+            if drop_manifest_path is not None and drop_manifest_path.exists()
+            else None
+        )
+        if not isinstance(drop_manifest_payload, dict):
+            drop_manifest_payload = {}
+        display_name = drop_manifest_payload.get("display_name") or drop_item.get("display_name")
         item_token = _human_bundle_item_token(
-            candidate_name=candidate_name,
+            candidate_name=str(display_name or candidate_name),
             attempt_id=attempt_id,
             used_tokens=used_item_tokens,
         )
@@ -9201,18 +9212,8 @@ def _export_portfolio_bundle(
         else:
             missing_profiles.append(attempt_id)
 
-        drop_item = profile_drop_lookup.get(attempt_id) or {}
         png_path_raw = str(drop_item.get("png_path") or "").strip()
         png_path = Path(png_path_raw).resolve() if png_path_raw else None
-        manifest_path_raw = str(drop_item.get("manifest_path") or "").strip()
-        drop_manifest_path = Path(manifest_path_raw).resolve() if manifest_path_raw else None
-        drop_manifest_payload = (
-            load_json_if_exists(drop_manifest_path)
-            if drop_manifest_path is not None and drop_manifest_path.exists()
-            else None
-        )
-        if not isinstance(drop_manifest_payload, dict):
-            drop_manifest_payload = {}
         png_export_path = item_root / f"{item_token}.png"
         drop_manifest_export_path = item_root / (
             drop_manifest_path.name
@@ -9232,7 +9233,6 @@ def _export_portfolio_bundle(
         if not has_drop_manifest:
             missing_drop_manifest_attempts.append(attempt_id)
 
-        display_name = drop_manifest_payload.get("display_name") or drop_item.get("display_name")
         tagline = drop_manifest_payload.get("tagline") or drop_item.get("tagline")
         short_description = drop_manifest_payload.get("short_description") or drop_item.get(
             "short_description"

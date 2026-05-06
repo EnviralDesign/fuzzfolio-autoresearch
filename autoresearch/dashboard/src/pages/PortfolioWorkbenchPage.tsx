@@ -15,6 +15,7 @@ import {
   ChevronDown,
   Check,
   Clock3,
+  Download,
   Eye,
   Filter,
   Fingerprint,
@@ -57,6 +58,7 @@ import {
   fetchDashboardPortfolioConfig,
   saveLivePortfolio,
   startBuildPortfolioJob,
+  startExportLivePortfolioJob,
   startFinalizeCorpusJob,
 } from "@/lib/api";
 import type { AttemptCatalogRow, AttemptDetail, DashboardJob, RunSummary } from "@/lib/types";
@@ -225,6 +227,25 @@ const DEFAULT_ACCOUNT: AccountConfig = {
   slippageRPerTrade: 0.005,
 };
 
+function dashboardPortfolioAccountSpec(account: AccountConfig): Record<string, unknown> {
+  return {
+    name: "dashboard-manual",
+    account_size_usd: account.balanceUsd,
+    balance_usd: account.balanceUsd,
+    leverage: account.leverage,
+    risk_per_trade_pct: account.riskPerRPercent,
+    dashboard_risk_basis: account.riskBasis,
+    min_lot: account.minLot,
+    lot_step: account.lotStep,
+    notional_usd_per_lot: account.notionalUsdPerLot,
+    margin_call_level_pct: account.marginCallLevelPercent,
+    stop_out_level_pct: account.stopOutLevelPercent,
+    commission_r_per_trade: account.commissionRPerTrade,
+    spread_r_per_trade: account.spreadRPerTrade,
+    slippage_r_per_trade: account.slippageRPerTrade,
+  };
+}
+
 const BROKER_PRESETS: BrokerPreset[] = [
   {
     id: "coinexx-500",
@@ -305,7 +326,7 @@ export function PortfolioWorkbenchPage() {
   const [workbenchMode, setWorkbenchMode] = useState<WorkbenchMode>("manual");
   const [activeRunId, setActiveRunId] = useState<string>("all");
   const [query, setQuery] = useState("");
-  const [minScore, setMinScore] = useState(40);
+  const [minScore, setMinScore] = useState(60);
   const [validOnly, setValidOnly] = useState(true);
   const [candidateScope, setCandidateScope] = useState<CandidateScope>("promoted");
   const [runSortMode, setRunSortMode] = useState<RunSortMode>("recent");
@@ -346,6 +367,17 @@ export function PortfolioWorkbenchPage() {
     },
   });
 
+  const exportLivePortfolioMutation = useMutation({
+    mutationFn: () =>
+      startExportLivePortfolioJob({
+        selected_attempt_ids: selectedIds,
+        account: dashboardPortfolioAccountSpec(account),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["dashboard-job-current"] });
+    },
+  });
+
   const cancelJobMutation = useMutation({
     mutationFn: (jobId?: string) => cancelDashboardJob(jobId),
     onSuccess: () => {
@@ -381,35 +413,29 @@ export function PortfolioWorkbenchPage() {
     [details, selectedIds.length, selectedRows],
   );
 
+  const preferredByRun = useMemo(() => buildDashboardPreferredAttemptMap(rows), [rows]);
+
   const filteredAttempts = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    const preferredByRun = buildDashboardPreferredAttemptMap(rows);
     return rows
       .filter((row) => activeRunId === "all" || row.run_id === activeRunId)
-      .filter((row) => candidateScope === "all" || isInPromotedCandidateScope(row, preferredByRun))
-      .filter((row) => !validOnly || row.full_backtest_validation_status_36m === "valid")
-      .filter((row) => Number(row.score_36m ?? -Infinity) >= minScore)
-      .filter((row) => {
-        if (!needle) return true;
-        return [
-          row.candidate_name,
-          row.attempt_id,
-          row.run_id,
-          row.strategy_key_36m,
-          row.timeframe_36m,
-          ...(row.instruments_36m ?? []),
-        ]
-          .filter(Boolean)
-          .join(" ")
-          .toLowerCase()
-          .includes(needle);
-      })
+      .filter((row) => isWorkbenchCandidate(row, { candidateScope, minScore, needle, preferredByRun, validOnly }))
       .sort((a, b) => Number(b.score_36m ?? -Infinity) - Number(a.score_36m ?? -Infinity));
-  }, [activeRunId, candidateScope, minScore, query, rows, validOnly]);
+  }, [activeRunId, candidateScope, minScore, preferredByRun, query, rows, validOnly]);
+
+  const runListRunIds = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return new Set(
+      rows
+        .filter((row) => isWorkbenchCandidate(row, { candidateScope, minScore, needle, preferredByRun, validOnly }))
+        .map((row) => String(row.run_id || "").trim())
+        .filter(Boolean),
+    );
+  }, [candidateScope, minScore, preferredByRun, query, rows, validOnly]);
 
   const sortedRuns = useMemo(
-    () => sortRuns(runs?.runs ?? [], runSortMode),
-    [runSortMode, runs?.runs],
+    () => sortRuns(runs?.runs ?? [], runSortMode).filter((run) => runListRunIds.has(run.run_id)),
+    [runListRunIds, runSortMode, runs?.runs],
   );
 
   const visibleAttempts = filteredAttempts.slice(0, 120);
@@ -533,11 +559,11 @@ export function PortfolioWorkbenchPage() {
             >
               <div className="flex items-center justify-between gap-3">
                 <span className="font-medium">All runs</span>
-                <span>{formatInt(catalog.attempt_count)}</span>
+                <span>{formatInt(sortedRuns.length)}</span>
               </div>
             </button>
             <div className="mt-3 space-y-2">
-              {sortedRuns.slice(0, 80).map((run) => (
+              {sortedRuns.map((run) => (
                 <button
                   key={run.run_id}
                   type="button"
@@ -612,16 +638,19 @@ export function PortfolioWorkbenchPage() {
             />
           ) : null}
 
-          <Panel className="p-4">
-            <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_150px_140px_120px_auto]">
-              <label className="relative block">
-                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-                <Input
-                  value={query}
-                  onChange={(event) => setQuery(event.target.value)}
-                  placeholder="Search attempts, symbols, strategy keys"
-                  className="rounded-lg pl-9"
-                />
+          <Panel className="p-3">
+            <div className="grid items-end gap-2.5 sm:grid-cols-2 lg:grid-cols-[minmax(220px,1fr)_124px_112px_120px_100px]">
+              <label className="grid gap-1 text-xs text-muted-foreground">
+                <span>Search</span>
+                <span className="relative block">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder="Attempts or symbols"
+                    className="h-10 rounded-lg pl-9"
+                  />
+                </span>
               </label>
               <label className="grid gap-1 text-xs text-muted-foreground">
                 <span>Scope</span>
@@ -643,13 +672,13 @@ export function PortfolioWorkbenchPage() {
                   min={0}
                   max={100}
                   onChange={(event) => setMinScore(toNumber(event.target.value, 0))}
-                  className="rounded-lg"
+                  className="h-10 rounded-lg"
                 />
               </label>
               <button
                 type="button"
                 onClick={() => setValidOnly((value) => !value)}
-                className={`flex h-14 items-center justify-center gap-2 rounded-lg border px-3 text-sm transition ${
+                className={`flex h-10 items-center justify-center gap-2 whitespace-nowrap rounded-lg border px-3 text-sm transition ${
                   validOnly
                     ? "border-emerald-300/50 bg-emerald-300/10 text-emerald-100"
                     : "border-border/60 bg-background/30 text-muted-foreground"
@@ -660,10 +689,10 @@ export function PortfolioWorkbenchPage() {
               </button>
               <Button
                 variant="outline"
-                className="h-14 rounded-lg"
+                className="h-10 rounded-lg"
                 onClick={() => {
                   setQuery("");
-                  setMinScore(40);
+                  setMinScore(60);
                   setValidOnly(true);
                   setCandidateScope("promoted");
                 }}
@@ -703,6 +732,11 @@ export function PortfolioWorkbenchPage() {
             similarity={similarity}
             loadingSelectionCount={loadingSelectionCount}
             isSavingLivePortfolio={livePortfolioMutation.isPending}
+            job={dashboardJob}
+            onExport={() => exportLivePortfolioMutation.mutate()}
+            onCancelJob={() => cancelJobMutation.mutate(dashboardJob?.id)}
+            isStartingExport={exportLivePortfolioMutation.isPending}
+            isCancelingJob={cancelJobMutation.isPending}
           />
         </aside>
       </div>
@@ -819,6 +853,11 @@ function PortfolioPanel({
   similarity,
   loadingSelectionCount,
   isSavingLivePortfolio,
+  job,
+  onExport,
+  onCancelJob,
+  isStartingExport,
+  isCancelingJob,
 }: {
   account: AccountConfig;
   setAccount: (value: AccountConfig) => void;
@@ -829,8 +868,14 @@ function PortfolioPanel({
   similarity: PortfolioSimilarity;
   loadingSelectionCount: number;
   isSavingLivePortfolio: boolean;
+  job?: DashboardJob;
+  onExport: () => void;
+  onCancelJob: () => void;
+  isStartingExport: boolean;
+  isCancelingJob: boolean;
 }) {
   const metrics = portfolio.metrics;
+  const isJobRunning = job?.status === "running" || job?.status === "canceling";
   const [hoveredChart, setHoveredChart] = useState<PortfolioChartMode | null>(null);
   const tooltipFor = (mode: PortfolioChartMode) => (
     <PortfolioTooltip mode={mode} enabled={hoveredChart === mode} />
@@ -1129,13 +1174,57 @@ function PortfolioPanel({
               <div className="mt-1 text-xs text-muted-foreground">Saving selection...</div>
             ) : null}
           </div>
-          {selectedIds.length ? (
-            <Button variant="outline" size="sm" className="rounded-lg" onClick={() => persistSelectedIds([])}>
-              <Trash2 className="h-4 w-4" />
-              Clear
+          <div className="flex shrink-0 items-center gap-2">
+            <Button
+              type="button"
+              size="sm"
+              className="rounded-lg"
+              disabled={!selectedIds.length || isJobRunning || isStartingExport}
+              onClick={onExport}
+            >
+              <Download className="h-4 w-4" />
+              Export
             </Button>
-          ) : null}
+            {selectedIds.length ? (
+              <Button variant="outline" size="sm" className="rounded-lg" onClick={() => persistSelectedIds([])}>
+                <Trash2 className="h-4 w-4" />
+                Clear
+              </Button>
+            ) : null}
+          </div>
         </div>
+        {job?.kind ? (
+          <div className="mb-3 rounded-lg border border-border/60 bg-background/35 p-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="truncate text-xs uppercase tracking-[0.14em] text-muted-foreground">
+                  Portfolio job
+                </div>
+                <div className="mt-1 truncate text-sm font-medium">
+                  {job.kind} / {job.status}
+                </div>
+              </div>
+              {isJobRunning ? (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="rounded-lg"
+                  disabled={isCancelingJob}
+                  onClick={onCancelJob}
+                >
+                  <StopCircle className="h-4 w-4" />
+                  Cancel
+                </Button>
+              ) : null}
+            </div>
+            {job.portfolio_config_path ? (
+              <div className="mt-2 truncate text-xs text-muted-foreground" title={job.portfolio_config_path}>
+                Config: {job.portfolio_config_path}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
         <div className="space-y-2">
           {selectedRows.length ? (
             selectedRows.map((row) => (
@@ -2066,8 +2155,16 @@ function formatSetupTooltip(attempt: AttemptCatalogRow) {
   }
   const stopLoss = nullableNumber(attempt.selected_stop_loss_percent_36m);
   const takeProfit = nullableNumber(attempt.selected_take_profit_percent_36m);
-  const basis = attempt.reward_multiple_basis_36m === "recommended_cell"
-    ? "recommended robust cell"
+  const basisLabels: Record<string, string> = {
+    recommended_cell: "raw recommended cell",
+    best_cell: "profile-drop best cell",
+    robust_cell: "profile-drop robust cell",
+    artifact_cell: "profile-drop artifact cell",
+    profile_drop_exit_policy: "profile-drop exit policy",
+    curve_cell: "curve cell",
+  };
+  const basis = attempt.reward_multiple_basis_36m
+    ? basisLabels[attempt.reward_multiple_basis_36m] ?? attempt.reward_multiple_basis_36m
     : "curve cell";
   const parts = [`RR ${reward}`, basis];
   if (stopLoss != null) {
@@ -2309,6 +2406,40 @@ function buildDashboardPreferredAttemptMap(rows: AttemptCatalogRow[]) {
     if (attemptId) preferredByRun.set(runId, attemptId);
   });
   return preferredByRun;
+}
+
+function isWorkbenchCandidate(
+  row: AttemptCatalogRow,
+  {
+    candidateScope,
+    minScore,
+    needle,
+    preferredByRun,
+    validOnly,
+  }: {
+    candidateScope: CandidateScope;
+    minScore: number;
+    needle: string;
+    preferredByRun: Map<string, string>;
+    validOnly: boolean;
+  },
+) {
+  if (candidateScope !== "all" && !isInPromotedCandidateScope(row, preferredByRun)) return false;
+  if (validOnly && row.full_backtest_validation_status_36m !== "valid") return false;
+  if (Number(row.score_36m ?? -Infinity) < minScore) return false;
+  if (!needle) return true;
+  return [
+    row.candidate_name,
+    row.attempt_id,
+    row.run_id,
+    row.strategy_key_36m,
+    row.timeframe_36m,
+    ...(row.instruments_36m ?? []),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase()
+    .includes(needle);
 }
 
 function isInPromotedCandidateScope(row: AttemptCatalogRow, preferredByRun: Map<string, string>) {

@@ -736,7 +736,10 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
     source_drop_png = source_drop_root / "profile-drop-36mo.png"
     source_drop_manifest = source_drop_root / "profile-drop-36mo.manifest.json"
     source_drop_png.write_text("png", encoding="utf-8")
-    source_drop_manifest.write_text("{}", encoding="utf-8")
+    source_drop_manifest.write_text(
+        '{"display_name":"Alpha Prime","tagline":"Fast FX cadence"}',
+        encoding="utf-8",
+    )
 
     report_path = report_root / "portfolio-report.json"
     report_path.write_text("{}", encoding="utf-8")
@@ -807,11 +810,11 @@ def test_export_portfolio_bundle_uses_human_strategy_folders(tmp_path: Path) -> 
     )
 
     bundle_root = Path(summary["bundle_root"])
-    item_root = bundle_root / "alpha"
+    item_root = bundle_root / "Alpha-Prime"
 
     assert item_root.exists() is True
-    assert (item_root / "alpha.json").exists() is True
-    assert (item_root / "alpha.png").exists() is True
+    assert (item_root / "Alpha-Prime.json").exists() is True
+    assert (item_root / "Alpha-Prime.png").exists() is True
     assert (item_root / "profile-drop-36mo.manifest.json").exists() is True
     assert (report_root / "portfolio-report.md").exists() is True
     assert (bundle_root / "portfolio-report.md").exists() is True
