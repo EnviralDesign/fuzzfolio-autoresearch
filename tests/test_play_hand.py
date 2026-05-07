@@ -1,7 +1,10 @@
 import random
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+import autoresearch.play_hand as play_hand_mod
 
 from autoresearch.play_hand import (
     PlayHandContext,
@@ -37,6 +40,54 @@ from autoresearch.play_hand import (
     resolve_sweep_budget,
 )
 from autoresearch.ledger import load_attempts, write_attempts
+
+
+def test_cmd_play_hand_authenticates_before_seed_prompt(monkeypatch, tmp_path: Path) -> None:
+    events: list[str] = []
+
+    class FakeCli:
+        def ensure_login(self) -> None:
+            events.append("ensure_login")
+
+    def fake_seed_hand(_config, _cli, _run_dir):
+        events.append("seed_hand")
+        raise RuntimeError("stop after auth")
+
+    monkeypatch.setattr(
+        play_hand_mod,
+        "load_config",
+        lambda: SimpleNamespace(runs_root=tmp_path, fuzzfolio=SimpleNamespace()),
+    )
+    monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
+    monkeypatch.setattr(play_hand_mod, "_seed_hand", fake_seed_hand)
+
+    with pytest.raises(RuntimeError, match="stop after auth"):
+        play_hand_mod.cmd_play_hand(
+            instrument=None,
+            instrument_pool=None,
+            timeframe="M5",
+            sweep_budget=None,
+            max_sweep_permutations=None,
+            max_reward_r=None,
+            min_indicators=2,
+            max_indicators=4,
+            seed=1,
+            screen_months=3,
+            scrutiny_months=12,
+            coarse_mode="grid",
+            evolutionary_budget=None,
+            instrument_scout=False,
+            instrument_scout_size=0,
+            instrument_scout_max_selected=0,
+            instrument_scout_months=None,
+            final_artifacts=False,
+            final_profile_drop_count=0,
+            final_profile_drop_workers=1,
+            dry_run=False,
+            as_json=True,
+        )
+
+    assert events == ["ensure_login", "seed_hand"]
 
 
 def test_play_hand_artifact_commands_heal_full_backtests_and_top_drop() -> None:

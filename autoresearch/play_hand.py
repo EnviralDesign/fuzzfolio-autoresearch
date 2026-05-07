@@ -3223,6 +3223,9 @@ def cmd_play_hand(
     profiles_dir.mkdir(parents=True, exist_ok=True)
     evals_dir.mkdir(parents=True, exist_ok=True)
 
+    if not dry_run:
+        cli.ensure_login()
+
     hand = _seed_hand(config, cli, run_dir) if not dry_run else [
         SeedIndicator("RSI_CROSSBACK", "trigger", "event-with-lookback", "entry"),
         SeedIndicator("STOCH_CROSSOVER", "trigger", "event-with-lookback", "entry"),
