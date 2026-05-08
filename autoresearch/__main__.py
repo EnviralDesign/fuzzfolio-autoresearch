@@ -17,7 +17,7 @@ import time as pytime
 import urllib.error
 import urllib.request
 import zlib
-from datetime import datetime, time, timedelta
+from datetime import datetime, time, timedelta, timezone
 from math import ceil
 from pathlib import Path
 from typing import Any, Callable
@@ -4941,6 +4941,20 @@ def _align_profile_drop_response_to_detail(
     recommended_basis = str(analysis.get("recommended_cell_basis") or "best_cell")
     if isinstance(detail_cell, dict):
         detail_path_metrics = detail_payload.get("path_metrics")
+        if _cells_match_by_stop_reward(recommended_cell, detail_cell):
+            aligned_cell = _merge_detail_cell_with_metric_cell(
+                recommended_cell if isinstance(recommended_cell, dict) else None,
+                detail_cell,
+            )
+            analysis["recommended_cell"] = aligned_cell
+            analysis["recommended_cell_basis"] = recommended_basis
+            recommended_cell = analysis["recommended_cell"]
+            if isinstance(detail_path_metrics, dict):
+                analysis["recommended_cell_path_metrics"] = copy.deepcopy(
+                    detail_path_metrics
+                )
+            return bundle_response, copy.deepcopy(recommended_cell), recommended_basis, "detail_cell"
+
         best_cell = analysis.get("best_cell")
         matrix_summary = analysis.get("matrix_summary")
         robust_cell = (
@@ -4948,29 +4962,45 @@ def _align_profile_drop_response_to_detail(
             if isinstance(matrix_summary, dict)
             else None
         )
-        if _cells_match_by_stop_reward(recommended_cell, detail_cell):
-            aligned_cell = _merge_detail_cell_with_metric_cell(
-                recommended_cell if isinstance(recommended_cell, dict) else None,
-                detail_cell,
-            )
-        else:
-            aligned_source_cell: dict[str, Any] | None = None
-            if _cells_match_by_stop_reward(best_cell, detail_cell) and isinstance(best_cell, dict):
-                aligned_source_cell = best_cell
-                recommended_basis = "best_cell"
-            elif _cells_match_by_stop_reward(robust_cell, detail_cell) and isinstance(robust_cell, dict):
-                aligned_source_cell = robust_cell
-                recommended_basis = "robust_cell"
-            else:
-                recommended_basis = "artifact_cell"
-            aligned_cell = _merge_detail_cell_with_metric_cell(aligned_source_cell, detail_cell)
+        detail_role = "artifact_cell"
+        if _cells_match_by_stop_reward(best_cell, detail_cell) and isinstance(best_cell, dict):
+            detail_role = "best_cell"
+        elif _cells_match_by_stop_reward(robust_cell, detail_cell) and isinstance(robust_cell, dict):
+            detail_role = "robust_cell"
+
+        if isinstance(recommended_cell, dict):
             analysis["_autoresearch_profile_drop_bundle"] = {
-                "cell_detail_source": "existing_full_backtest_cell_detail",
-                "original_recommended_cell_basis": analysis.get("recommended_cell_basis"),
-                "original_recommended_cell": copy.deepcopy(recommended_cell)
-                if isinstance(recommended_cell, dict)
-                else None,
+                "cell_detail_source": "existing_full_backtest_cell_detail_mismatch",
+                "cell_detail_role": detail_role,
+                "detail_cell": copy.deepcopy(detail_cell),
+                "recommended_cell_preserved": True,
+                "recommended_cell_detail_available": False,
             }
+            return (
+                bundle_response,
+                copy.deepcopy(recommended_cell),
+                recommended_basis,
+                "response_recommended_cell_detail_mismatch",
+            )
+
+        aligned_source_cell: dict[str, Any] | None = None
+        if detail_role == "best_cell" and isinstance(best_cell, dict):
+            aligned_source_cell = best_cell
+            recommended_basis = "best_cell"
+        elif detail_role == "robust_cell" and isinstance(robust_cell, dict):
+            aligned_source_cell = robust_cell
+            recommended_basis = "robust_cell"
+        else:
+            recommended_basis = "artifact_cell"
+        aligned_cell = _merge_detail_cell_with_metric_cell(aligned_source_cell, detail_cell)
+        analysis["_autoresearch_profile_drop_bundle"] = {
+            "cell_detail_source": "existing_full_backtest_cell_detail",
+            "cell_detail_role": detail_role,
+            "original_recommended_cell_basis": analysis.get("recommended_cell_basis"),
+            "original_recommended_cell": copy.deepcopy(recommended_cell)
+            if isinstance(recommended_cell, dict)
+            else None,
+        }
         analysis["recommended_cell"] = aligned_cell
         analysis["recommended_cell_basis"] = recommended_basis
         recommended_cell = analysis["recommended_cell"]
@@ -4986,6 +5016,235 @@ def _align_profile_drop_response_to_detail(
         analysis["recommended_cell_basis"] = "best_cell"
         return bundle_response, copy.deepcopy(best_cell), "best_cell", "response_best_cell"
     return bundle_response, None, recommended_basis, "none"
+
+
+def _compact_profile_drop_cell_detail_payload(detail_payload: Any) -> Any:
+    if not isinstance(detail_payload, dict):
+        return copy.deepcopy(detail_payload)
+    compact: dict[str, Any] = {
+        "artifact_mode": "profile_drop_cell_detail_compact_v1",
+    }
+    for key in [
+        "scope",
+        "instrument",
+        "cell",
+        "path_metrics",
+        "curve",
+        "market_data_window",
+        "analysis_notes",
+        "job_id",
+    ]:
+        if key in detail_payload:
+            compact[key] = copy.deepcopy(detail_payload[key])
+    return compact
+
+
+def _apply_recommended_cell_detail_to_profile_drop_response(
+    response_payload: dict[str, Any],
+    detail_payload: dict[str, Any],
+    *,
+    recommended_basis: str,
+) -> dict[str, Any] | None:
+    analysis = _profile_drop_package_analysis(response_payload)
+    if not analysis:
+        return None
+    recommended_cell = analysis.get("recommended_cell")
+    detail_cell = detail_payload.get("cell") if isinstance(detail_payload, dict) else None
+    if not _cells_match_by_stop_reward(recommended_cell, detail_cell):
+        return None
+    merged = _merge_detail_cell_with_metric_cell(
+        recommended_cell if isinstance(recommended_cell, dict) else None,
+        detail_cell,
+    )
+    analysis["recommended_cell"] = merged
+    analysis["recommended_cell_basis"] = str(recommended_basis or "best_cell")
+    detail_path_metrics = detail_payload.get("path_metrics")
+    if isinstance(detail_path_metrics, dict):
+        analysis["recommended_cell_path_metrics"] = copy.deepcopy(detail_path_metrics)
+    bundle_meta = analysis.get("_autoresearch_profile_drop_bundle")
+    if isinstance(bundle_meta, dict):
+        bundle_meta["recommended_cell_detail_available"] = True
+        bundle_meta["recommended_cell_detail_source"] = "deep_replay_cell_detail"
+    return copy.deepcopy(merged)
+
+
+def _profile_drop_detail_scope_args(
+    detail_payload: dict[str, Any],
+    package_inputs: dict[str, Any],
+) -> tuple[str, str | None] | None:
+    instruments = [str(item) for item in package_inputs.get("instruments") or [] if item]
+    scope = str(detail_payload.get("scope") or "").strip().lower()
+    if scope not in {"aggregate", "instrument"}:
+        scope = "aggregate" if len(instruments) > 1 else "instrument"
+    instrument = str(detail_payload.get("instrument") or "").strip()
+    if scope == "instrument":
+        if not instrument and instruments:
+            instrument = instruments[0]
+        if not instrument:
+            return None
+        return scope, instrument
+    return "aggregate", None
+
+
+def _deep_replay_job_id_candidates(
+    detail_payload: dict[str, Any],
+    job_payload: dict[str, Any],
+) -> list[str]:
+    live_state = _deep_replay_job_payload_live_state(job_payload)
+    if live_state is False:
+        return []
+    if live_state is None and not job_payload:
+        return []
+
+    candidates: list[str] = []
+    for source in [
+        detail_payload,
+        job_payload,
+        job_payload.get("job") if isinstance(job_payload, dict) else None,
+        job_payload.get("data") if isinstance(job_payload, dict) else None,
+    ]:
+        if not isinstance(source, dict):
+            continue
+        raw = str(source.get("job_id") or source.get("id") or "").strip()
+        if not raw or raw.startswith("deepdetail-") or raw in candidates:
+            continue
+        candidates.append(raw)
+    return candidates
+
+
+def _deep_replay_job_payload_live_state(job_payload: dict[str, Any]) -> bool | None:
+    if not isinstance(job_payload, dict) or not job_payload:
+        return None
+
+    ttl_remaining = _safe_float_value(job_payload.get("ttl_remaining_seconds"))
+    if ttl_remaining is not None:
+        return ttl_remaining > 0
+
+    status = str(job_payload.get("status") or "").strip().lower()
+    if status in {"expired", "not_found", "deleted"}:
+        return False
+    if status and status not in {"completed", "succeeded", "success", "done"}:
+        return False
+
+    expires_at = str(job_payload.get("expires_at") or "").strip()
+    if not expires_at:
+        return None
+    try:
+        parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed > datetime.now(parsed.tzinfo)
+
+
+def _fetch_profile_drop_recommended_cell_detail(
+    *,
+    cli: FuzzfolioCli,
+    working_dir: Path,
+    detail_payload: dict[str, Any],
+    job_payload: dict[str, Any],
+    package_inputs: dict[str, Any],
+    recommended_cell: dict[str, Any],
+    output_path: Path,
+    timeout_seconds: int,
+) -> dict[str, Any] | None:
+    stop_reward = _cell_stop_reward_from_payload(recommended_cell)
+    if stop_reward is None:
+        return None
+    scope_args = _profile_drop_detail_scope_args(detail_payload, package_inputs)
+    if scope_args is None:
+        return None
+    scope, instrument = scope_args
+    job_ids = _deep_replay_job_id_candidates(detail_payload, job_payload)
+    if not job_ids:
+        return None
+
+    stop_loss, reward = stop_reward
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    last_error: Exception | None = None
+    for job_id in job_ids:
+        if output_path.exists():
+            output_path.unlink()
+        args = [
+            "deep-replay",
+            "cell-detail",
+            "--job-id",
+            job_id,
+            "--scope",
+            scope,
+            "--stop-loss-percent",
+            f"{stop_loss:g}",
+            "--reward-multiple",
+            f"{reward:g}",
+            "--max-points",
+            "512",
+            "--out",
+            str(output_path),
+        ]
+        if scope == "instrument" and instrument:
+            args.extend(["--instrument", instrument])
+        try:
+            cli.run(
+                args,
+                cwd=working_dir,
+                timeout_seconds=float(max(30, int(timeout_seconds))),
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+        payload = _load_json_if_exists(output_path)
+        if not isinstance(payload, dict):
+            continue
+        if not _cells_match_by_stop_reward(payload.get("cell"), recommended_cell):
+            continue
+        compact = _compact_profile_drop_cell_detail_payload(payload)
+        _write_json_file(output_path, compact)
+        return compact if isinstance(compact, dict) else None
+
+    if output_path.exists():
+        output_path.unlink()
+    if last_error is not None:
+        return None
+    return None
+
+
+def _validate_profile_drop_bundle_recommended_detail(
+    *,
+    bundle_dir: Path,
+    response_payload: dict[str, Any],
+    profile_document_payload: dict[str, Any],
+) -> None:
+    analysis = _profile_drop_package_analysis(response_payload)
+    recommended_cell = analysis.get("recommended_cell") if analysis else None
+    if not isinstance(recommended_cell, dict):
+        return
+
+    detail_path = bundle_dir / "recommended-cell-path-detail.json"
+    if not detail_path.exists():
+        raise RuntimeError(
+            "Packaged profile-drop bundle is missing recommended-cell-path-detail.json "
+            f"for the selected recommended cell: {bundle_dir}"
+        )
+    detail_payload = _load_json_if_exists(detail_path)
+    detail_cell = detail_payload.get("cell") if isinstance(detail_payload, dict) else None
+    if not _cells_match_by_stop_reward(detail_cell, recommended_cell):
+        raise RuntimeError(
+            "Packaged profile-drop bundle recommended-cell-path-detail.json does not "
+            f"match the selected recommended cell: {detail_path}"
+        )
+
+    selected_cell = _nested_get(
+        profile_document_payload,
+        ["profile", "executionConfig", "exitPolicy", "selectedCell"],
+    )
+    if isinstance(selected_cell, dict) and not _cells_match_by_stop_reward(
+        detail_cell, selected_cell
+    ):
+        raise RuntimeError(
+            "Packaged profile-drop bundle recommended-cell-path-detail.json does not "
+            f"match the profile exitPolicy selectedCell: {detail_path}"
+        )
 
 
 def _profile_drop_analysis_metadata_from_existing_artifacts(
@@ -5068,6 +5327,8 @@ def _profile_drop_analysis_metadata_from_existing_artifacts(
 def _materialize_profile_drop_bundle_from_existing_artifacts(
     *,
     config,
+    cli: FuzzfolioCli | None = None,
+    working_dir: Path | None = None,
     attempt: dict[str, Any],
     package_inputs: dict[str, Any],
     package_output_root: Path,
@@ -5075,6 +5336,7 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
     profile_ref: str,
     attempt_token: str,
     layout_mode: str,
+    timeout_seconds: int = 1800,
 ) -> Path | None:
     sources = _existing_profile_drop_artifact_sources(
         package_inputs=package_inputs,
@@ -5145,6 +5407,45 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
     package_output_root.mkdir(parents=True, exist_ok=True)
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
+    analysis = _profile_drop_package_analysis(bundle_response)
+    detail_cell = detail_payload.get("cell") if isinstance(detail_payload, dict) else None
+    best_cell = analysis.get("best_cell") if isinstance(analysis, dict) else None
+    recommended_detail_payload = (
+        detail_payload
+        if _cells_match_by_stop_reward(recommended_cell, detail_cell)
+        else None
+    )
+    best_detail_payload = (
+        detail_payload if _cells_match_by_stop_reward(best_cell, detail_cell) else None
+    )
+    if isinstance(recommended_cell, dict) and recommended_detail_payload is None:
+        if cli is None:
+            shutil.rmtree(bundle_dir, ignore_errors=True)
+            return None
+        fetched_detail = _fetch_profile_drop_recommended_cell_detail(
+            cli=cli,
+            working_dir=working_dir or getattr(config, "repo_root", Path.cwd()),
+            detail_payload=detail_payload,
+            job_payload=job_payload,
+            package_inputs=package_inputs,
+            recommended_cell=recommended_cell,
+            output_path=bundle_dir / "recommended-cell-path-detail.json",
+            timeout_seconds=int(timeout_seconds),
+        )
+        if fetched_detail is None:
+            shutil.rmtree(bundle_dir, ignore_errors=True)
+            return None
+        refreshed_cell = _apply_recommended_cell_detail_to_profile_drop_response(
+            bundle_response,
+            fetched_detail,
+            recommended_basis=recommended_basis,
+        )
+        if refreshed_cell is None:
+            shutil.rmtree(bundle_dir, ignore_errors=True)
+            return None
+        recommended_cell = refreshed_cell
+        recommended_detail_payload = fetched_detail
+
     sensitivity_request = {
         "profile_document": profile_document,
         "analysis": {
@@ -5161,6 +5462,15 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
             "result_path": str(response_path),
             "cell_detail_path": str(detail_path),
             "cell_detail_source": cell_detail_source,
+            "recommended_cell_detail_source": (
+                "existing_cell_detail"
+                if recommended_detail_payload is detail_payload
+                else (
+                    "deep_replay_cell_detail"
+                    if recommended_detail_payload is not None
+                    else None
+                )
+            ),
         },
     }
     run_metadata = {
@@ -5172,8 +5482,14 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
             "profile_document": "profile-document.json",
             "sensitivity_request": "sensitivity-request.json",
             "sensitivity_response": "sensitivity-response.json",
-            "recommended_cell_path_detail": "recommended-cell-path-detail.json",
-            "best_cell_path_detail": "best-cell-path-detail.json",
+            "recommended_cell_path_detail": (
+                "recommended-cell-path-detail.json"
+                if recommended_detail_payload is not None
+                else None
+            ),
+            "best_cell_path_detail": (
+                "best-cell-path-detail.json" if best_detail_payload is not None else None
+            ),
             "draft_post": None,
             "instruments_index": None,
             "indicators_index": None,
@@ -5184,8 +5500,16 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
     _write_json_file(bundle_dir / "profile-document.json", profile_document)
     _write_json_file(bundle_dir / "sensitivity-request.json", sensitivity_request)
     _write_json_file(bundle_dir / "sensitivity-response.json", bundle_response)
-    _write_json_file(bundle_dir / "recommended-cell-path-detail.json", detail_payload)
-    _write_json_file(bundle_dir / "best-cell-path-detail.json", detail_payload)
+    if recommended_detail_payload is not None:
+        _write_json_file(
+            bundle_dir / "recommended-cell-path-detail.json",
+            _compact_profile_drop_cell_detail_payload(recommended_detail_payload),
+        )
+    if best_detail_payload is not None:
+        _write_json_file(
+            bundle_dir / "best-cell-path-detail.json",
+            _compact_profile_drop_cell_detail_payload(best_detail_payload),
+        )
     _write_json_file(bundle_dir / "run-metadata.json", run_metadata)
     if job_payload:
         _write_json_file(bundle_dir / "deep-replay-job.json", job_payload)
@@ -6588,6 +6912,8 @@ def _render_profile_drop_for_attempt(
     package_output_root.mkdir(parents=True, exist_ok=True)
     bundle_dir = _materialize_profile_drop_bundle_from_existing_artifacts(
         config=config,
+        cli=cli,
+        working_dir=working_dir,
         attempt=attempt,
         package_inputs=package_inputs,
         package_output_root=package_output_root,
@@ -6595,6 +6921,7 @@ def _render_profile_drop_for_attempt(
         profile_ref=profile_ref,
         attempt_token=attempt_token,
         layout_mode=layout_mode,
+        timeout_seconds=int(timeout_seconds),
     )
     if bundle_dir is not None:
         if emit:
@@ -6642,11 +6969,17 @@ def _render_profile_drop_for_attempt(
             "Packaged profile-drop bundle is missing canonical "
             f"{CANONICAL_SCORE_LAB_VERSION} score_lab: {bundle_response_path}"
         )
+    bundle_response_payload = _load_json_if_exists(bundle_response_path)
     profile_document_path, source_profile_document_payload = load_profile_document(bundle_dir)
     if not isinstance(source_profile_document_payload, dict):
         raise RuntimeError(
             f"Packaged bundle is missing a valid profile-document.json: {profile_document_path}"
         )
+    _validate_profile_drop_bundle_recommended_detail(
+        bundle_dir=bundle_dir,
+        response_payload=bundle_response_payload,
+        profile_document_payload=source_profile_document_payload,
+    )
     _write_json_file(source_profile_snapshot_path, source_profile_document_payload)
     presentation_signature = compute_presentation_signature(
         source_profile_document_payload,

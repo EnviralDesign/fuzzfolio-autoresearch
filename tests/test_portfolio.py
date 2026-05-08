@@ -2859,6 +2859,29 @@ def test_materialize_profile_drop_bundle_reuses_existing_full_backtest_artifacts
     tmp_path: Path,
 ) -> None:
     artifact_dir, profile_path = _write_existing_full_backtest_profile_drop_inputs(tmp_path)
+    cell_detail_calls: list[list[str]] = []
+
+    class FakeCli:
+        def run(self, args, cwd=None, timeout_seconds=None, check=True):
+            cell_detail_calls.append(list(args))
+            out_path = Path(args[args.index("--out") + 1])
+            payload = {
+                "artifact_mode": "profile_drop_cell_detail_v1",
+                "job_id": "deepreplay-fast-1",
+                "scope": "instrument",
+                "instrument": "EURUSD",
+                "cell": {
+                    "stop_loss_percent": 0.05,
+                    "reward_multiple": 2.0,
+                    "take_profit_percent": 0.1,
+                },
+                "path_metrics": {"final_equity_r": 8.2, "max_drawdown_r": 0.9},
+                "curve": {"points": []},
+            }
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(payload), encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="", parsed_json=payload)
+
     config = SimpleNamespace(
         research=SimpleNamespace(quality_score_preset="profile-drop"),
         fuzzfolio=SimpleNamespace(base_url="http://localhost:7946/api/dev"),
@@ -2867,6 +2890,8 @@ def test_materialize_profile_drop_bundle_reuses_existing_full_backtest_artifacts
 
     bundle_dir = ar_main._materialize_profile_drop_bundle_from_existing_artifacts(
         config=config,
+        cli=FakeCli(),
+        working_dir=tmp_path,
         attempt={"attempt_id": "attempt-fast", "artifact_dir": str(artifact_dir)},
         package_inputs={
             "artifact_dir": artifact_dir,
@@ -2885,25 +2910,37 @@ def test_materialize_profile_drop_bundle_reuses_existing_full_backtest_artifacts
     profile_document = ar_main.load_json_if_exists(bundle_dir / "profile-document.json")
     bundle_response = ar_main.load_json_if_exists(bundle_dir / "sensitivity-response.json")
     run_metadata = ar_main.load_json_if_exists(bundle_dir / "run-metadata.json")
+    recommended_detail = ar_main.load_json_if_exists(
+        bundle_dir / "recommended-cell-path-detail.json"
+    )
+    best_detail = ar_main.load_json_if_exists(bundle_dir / "best-cell-path-detail.json")
 
+    assert cell_detail_calls
+    assert cell_detail_calls[0][:2] == ["deep-replay", "cell-detail"]
+    assert cell_detail_calls[0][cell_detail_calls[0].index("--stop-loss-percent") + 1] == "0.05"
+    assert cell_detail_calls[0][cell_detail_calls[0].index("--reward-multiple") + 1] == "2"
     assert (bundle_dir / "recommended-cell-path-detail.json").exists() is True
     assert (bundle_dir / "best-cell-path-detail.json").exists() is True
+    assert recommended_detail["cell"]["stop_loss_percent"] == 0.05
+    assert recommended_detail["cell"]["reward_multiple"] == 2.0
+    assert best_detail["cell"]["stop_loss_percent"] == 0.1
+    assert best_detail["cell"]["reward_multiple"] == 3.0
     assert bundle_response["data"]["mode"] == "basket"
-    assert bundle_response["data"]["aggregate"]["recommended_cell_basis"] == "best_cell"
-    assert bundle_response["data"]["aggregate"]["recommended_cell"]["reward_multiple"] == 3.0
+    assert bundle_response["data"]["aggregate"]["recommended_cell_basis"] == "robust_cell"
+    assert bundle_response["data"]["aggregate"]["recommended_cell"]["reward_multiple"] == 2.0
+    assert bundle_response["data"]["aggregate"]["recommended_cell"]["stop_loss_percent"] == 0.05
     assert (
-        bundle_response["data"]["aggregate"]["recommended_cell"][
-            "avg_net_r_per_closed_trade"
+        bundle_response["data"]["aggregate"]["recommended_cell_path_metrics"][
+            "final_equity_r"
         ]
-        == 0.4
+        == 8.2
     )
-    assert bundle_response["data"]["aggregate"]["recommended_cell"]["resolved_trades"] == 27
     assert profile_document["profile"]["version"] == "v1"
     assert len(profile_document["profile"]["name"]) <= 120
     exit_policy = profile_document["profile"]["executionConfig"]["exitPolicy"]
-    assert exit_policy["selectedCell"]["stopLossPercent"] == 0.1
-    assert exit_policy["selectedCell"]["rewardMultiple"] == 3.0
-    assert exit_policy["recommendation"]["basis"] == "best_cell"
+    assert exit_policy["selectedCell"]["stopLossPercent"] == 0.05
+    assert exit_policy["selectedCell"]["rewardMultiple"] == 2.0
+    assert exit_policy["recommendation"]["basis"] == "robust_cell"
     assert run_metadata["analysis"]["analysis_backend"] == "deep_replay_existing_artifact"
     assert run_metadata["analysis"]["source_artifact_kind"] == "full_backtest_36mo"
     assert run_metadata["analysis"]["deep_replay_job_id"] == "deepreplay-fast-1"
@@ -2953,6 +2990,54 @@ def test_align_profile_drop_response_to_detail_preserves_matching_recommended_me
     assert aggregate["recommended_cell_path_metrics"]["equity_curve_r_squared"] == 0.98
 
 
+def test_align_profile_drop_response_to_detail_preserves_mismatched_recommended_cell() -> None:
+    response = {
+        "data": {
+            "aggregate": {
+                "recommended_cell": {
+                    "stop_loss_percent": 0.08,
+                    "reward_multiple": 2.5,
+                    "avg_net_r_per_closed_trade": 0.42,
+                },
+                "recommended_cell_basis": "robust_cell",
+                "best_cell": {
+                    "stop_loss_percent": 0.04,
+                    "reward_multiple": 4.0,
+                    "avg_net_r_per_closed_trade": 0.9,
+                },
+            }
+        }
+    }
+    detail = {
+        "cell": {
+            "stop_loss_percent": 0.04,
+            "reward_multiple": 4.0,
+            "take_profit_percent": 0.16,
+        },
+        "path_metrics": {"equity_curve_r_squared": 0.99},
+    }
+
+    bundle_response, recommended_cell, basis, source = (
+        ar_main._align_profile_drop_response_to_detail(response, detail)
+    )
+
+    aggregate = bundle_response["data"]["aggregate"]
+    assert source == "response_recommended_cell_detail_mismatch"
+    assert basis == "robust_cell"
+    assert recommended_cell["stop_loss_percent"] == 0.08
+    assert recommended_cell["reward_multiple"] == 2.5
+    assert aggregate["recommended_cell"]["stop_loss_percent"] == 0.08
+    assert aggregate["recommended_cell"]["reward_multiple"] == 2.5
+    assert "recommended_cell_path_metrics" not in aggregate
+    assert aggregate["_autoresearch_profile_drop_bundle"]["cell_detail_role"] == "best_cell"
+    assert (
+        aggregate["_autoresearch_profile_drop_bundle"][
+            "recommended_cell_preserved"
+        ]
+        is True
+    )
+
+
 def test_render_profile_drop_for_attempt_skips_cli_package_when_full_artifacts_exist(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -2965,6 +3050,29 @@ def test_render_profile_drop_for_attempt_skips_cli_package_when_full_artifacts_e
         def run(self, args, cwd=None, timeout_seconds=None, check=True):
             if args and args[0] == "package":
                 pytest.fail("profile-drop rendering should reuse existing full-backtest artifacts")
+            if args[:2] == ["deep-replay", "cell-detail"]:
+                out_path = Path(args[args.index("--out") + 1])
+                payload = {
+                    "artifact_mode": "profile_drop_cell_detail_v1",
+                    "job_id": "deepreplay-fast-1",
+                    "scope": "instrument",
+                    "instrument": "EURUSD",
+                    "cell": {
+                        "stop_loss_percent": 0.05,
+                        "reward_multiple": 2.0,
+                        "take_profit_percent": 0.1,
+                    },
+                    "path_metrics": {"final_equity_r": 8.2, "max_drawdown_r": 0.9},
+                    "curve": {"points": []},
+                }
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_path.write_text(json.dumps(payload), encoding="utf-8")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(payload),
+                    stderr="",
+                    parsed_json=payload,
+                )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def fake_run_external(argv, cwd=None, timeout_seconds=None):
