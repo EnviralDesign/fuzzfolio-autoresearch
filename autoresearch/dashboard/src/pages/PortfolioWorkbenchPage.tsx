@@ -114,6 +114,7 @@ type PortfolioPoint = {
   margin_level_pct: number | null;
   stop_out_headroom_pct: number | null;
   margin_call_headroom_pct: number | null;
+  gross_margin_load_pct: number;
   margin_risk_pct: number;
   realized_r: number;
   closed_trade_count: number;
@@ -139,6 +140,7 @@ type PortfolioMetrics = {
   minLotForcedTrades: number;
   maxUsedMarginUsd: number;
   maxStopOutEquityUsd: number;
+  maxGrossMarginLoadPercent: number | null;
   maxDepositLoadPercent: number | null;
   usedMarginAtMaxDepositLoadUsd: number | null;
   openTradesAtMaxDepositLoad: number;
@@ -148,6 +150,9 @@ type PortfolioMetrics = {
   marginLiquidated: boolean;
   firstLiquidationDate: string | null;
   costRPerTrade: number;
+  sampledCurveCount: number;
+  sampledEventPointCount: number;
+  sampledReturnedPointCount: number;
 };
 
 type RunSortMode = "recent" | "score";
@@ -195,6 +200,14 @@ type LotSizing = {
   instrument: string | null;
   stopLossPercent: number | null;
   riskPerLotDollars: number | null;
+};
+
+type NormalizedSeries = {
+  points: NormalizedPoint[];
+  sizing: LotSizing;
+  downsampled: boolean;
+  eventPointCount: number | null;
+  pointCount: number | null;
 };
 
 type SimilarityPrepared = {
@@ -299,9 +312,13 @@ const drawdownChartConfig = {
 } satisfies ChartConfig;
 
 const marginRiskChartConfig = {
-  margin_risk_pct: {
-    label: "Margin risk",
+  gross_margin_load_pct: {
+    label: "Gross margin load",
     color: "oklch(0.86 0.16 82)",
+  },
+  margin_risk_pct: {
+    label: "Stop-out pressure",
+    color: "oklch(0.7 0.18 28)",
   },
 } satisfies ChartConfig;
 
@@ -989,8 +1006,20 @@ function PortfolioPanel({
           {account.riskBasis === "current" ? ` and ends at ${formatCurrency(metrics.finalRiskDollars)}` : ""}.
           Lot sizing floors to {formatNumber(account.lotStep, 2)} lot steps with a {formatNumber(account.minLot, 2)} minimum lot.
           {metrics.minLotForcedTrades ? ` ${formatInt(metrics.minLotForcedTrades)} trades were forced to minimum lot. ` : " "}
-          {metrics.maxOpenTrades ? `Peak open exposure was ${formatInt(metrics.maxOpenTrades)} trades using ${formatCurrency(metrics.maxUsedMarginUsd)} margin. ` : ""}
-          Stop-out uses equity divided by used margin; {metrics.marginLiquidated ? `first stop-out ${metrics.firstLiquidationDate}.` : "no stop-out detected."}
+          {metrics.maxOpenTrades ? `Peak simultaneous open trades: ${formatInt(metrics.maxOpenTrades)}. ` : ""}
+          {metrics.maxUsedMarginUsd ? `Peak used margin: ${formatCurrency(metrics.maxUsedMarginUsd)} (${formatPercentDecimal(metrics.maxGrossMarginLoadPercent)} of starting balance). ` : ""}
+          {metrics.maxDepositLoadPercent != null ? `Worst equity load: ${formatPercentDecimal(metrics.maxDepositLoadPercent)} at ${formatInt(metrics.openTradesAtMaxDepositLoad)} open / ${formatCurrency(metrics.usedMarginAtMaxDepositLoadUsd)}. ` : ""}
+          Stop-out pressure uses current equity divided by used margin, so it can improve when a newly added strategy raises equity before the pressure peak.
+          {metrics.marginLiquidated ? ` First stop-out ${metrics.firstLiquidationDate}.` : " No stop-out detected."}
+          {metrics.sampledCurveCount ? (
+            <span className="mt-2 block text-amber-100/85">
+              Using sampled profile-drop curves for {formatInt(metrics.sampledCurveCount)} strategy(s)
+              {metrics.sampledEventPointCount && metrics.sampledReturnedPointCount
+                ? ` (${formatInt(metrics.sampledReturnedPointCount)} displayed points from ${formatInt(metrics.sampledEventPointCount)} source events)`
+                : ""}
+              ; intraday margin peaks may be understated until the simulator reads event-level trade ledgers.
+            </span>
+          ) : null}
         </div>
       </Panel>
 
@@ -1017,7 +1046,12 @@ function PortfolioPanel({
             secondary={metrics.marginLiquidated ? "stop-out" : metrics.blown ? "breached" : "floor"}
           />
           <PortfolioMetric
-            label="Max load"
+            label="Gross load"
+            primary={formatPercentDecimal(metrics.maxGrossMarginLoadPercent)}
+            secondary={`${formatCurrency(metrics.maxUsedMarginUsd)} peak margin`}
+          />
+          <PortfolioMetric
+            label="Equity load"
             primary={formatPercentDecimal(metrics.maxDepositLoadPercent)}
             secondary={`${formatInt(metrics.openTradesAtMaxDepositLoad)} open / ${formatCurrency(metrics.usedMarginAtMaxDepositLoadUsd)}`}
           />
@@ -1093,8 +1127,8 @@ function PortfolioPanel({
             </ChartContainer>
             <div className="rounded-lg border border-border/60 bg-background/25 px-2 py-2">
               <div className="mb-1 flex items-center justify-between gap-3 px-1 text-[0.68rem] uppercase tracking-[0.14em] text-muted-foreground">
-                <span>Margin risk</span>
-                <span>0% calm / 100% stop-out</span>
+                <span>Margin exposure</span>
+                <span>yellow raw load / red stop-out pressure</span>
               </div>
               <ChartContainer config={marginRiskChartConfig} className="h-24 w-full">
                 <ComposedChart
@@ -1131,22 +1165,37 @@ function PortfolioPanel({
                     cursor={chartCursor}
                     content={tooltipFor("margin")}
                   />
-                <Line
-                  yAxisId="margin"
-                  type="monotone"
-                  dataKey="margin_risk_pct"
-                  stroke="var(--color-margin_risk_pct)"
-                  strokeWidth={1.6}
-                  dot={false}
-                  activeDot={chartActiveDot}
-                  connectNulls={false}
-                />
+                  <Line
+                    yAxisId="margin"
+                    type="monotone"
+                    dataKey="gross_margin_load_pct"
+                    stroke="var(--color-gross_margin_load_pct)"
+                    strokeWidth={1.8}
+                    dot={false}
+                    activeDot={chartActiveDot}
+                    connectNulls={false}
+                  />
+                  <Line
+                    yAxisId="margin"
+                    type="monotone"
+                    dataKey="margin_risk_pct"
+                    stroke="var(--color-margin_risk_pct)"
+                    strokeDasharray="4 4"
+                    strokeWidth={1.5}
+                    dot={false}
+                    activeDot={chartActiveDot}
+                    connectNulls={false}
+                  />
               </ComposedChart>
               </ChartContainer>
               <div className="mt-1 flex items-center justify-end gap-3 px-1 text-[0.68rem] uppercase tracking-[0.14em] text-muted-foreground">
                 <span className="inline-flex items-center gap-1.5">
                   <span className="h-0.5 w-5 rounded bg-[oklch(0.86_0.16_82)]" />
-                  Risk
+                  Load
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="h-0.5 w-5 rounded border-t border-dashed border-[oklch(0.7_0.18_28)]" />
+                  Pressure
                 </span>
                 <span className="inline-flex items-center gap-1.5">
                   <span className="h-0.5 w-5 rounded border-t border-dashed border-[oklch(0.84_0.16_82)]" />
@@ -1427,13 +1476,19 @@ function buildPortfolioCurve(
     0,
     account.commissionRPerTrade + account.spreadRPerTrade + account.slippageRPerTrade,
   );
-  const series = details
-    .map((detail) => ({
-      points: normalizeCurvePoints(detail.full_backtest_curve),
-      sizing: buildLotSizing(detail.attempt, account),
-    }))
+  const series: NormalizedSeries[] = details
+    .map((detail) => {
+      const points = normalizeCurvePoints(detail.full_backtest_curve);
+      const sampling = curveSamplingInfo(detail.full_backtest_curve, points.length);
+      return {
+        points,
+        sizing: buildLotSizing(detail.attempt, account),
+        ...sampling,
+      };
+    })
     .filter((item) => item.points.length > 0);
   const times = [...new Set(series.flatMap((item) => item.points.map((point) => point.time)))].sort((a, b) => a - b);
+  const sampledSeries = series.filter((item) => item.downsampled);
 
   const metrics: PortfolioMetrics = {
     selectedCount,
@@ -1454,6 +1509,7 @@ function buildPortfolioCurve(
     minLotForcedTrades: 0,
     maxUsedMarginUsd: 0,
     maxStopOutEquityUsd: 0,
+    maxGrossMarginLoadPercent: null,
     maxDepositLoadPercent: null,
     usedMarginAtMaxDepositLoadUsd: null,
     openTradesAtMaxDepositLoad: 0,
@@ -1463,6 +1519,9 @@ function buildPortfolioCurve(
     marginLiquidated: false,
     firstLiquidationDate: null,
     costRPerTrade,
+    sampledCurveCount: sampledSeries.length,
+    sampledEventPointCount: sampledSeries.reduce((sum, item) => sum + Math.max(0, item.eventPointCount ?? 0), 0),
+    sampledReturnedPointCount: sampledSeries.reduce((sum, item) => sum + Math.max(0, item.pointCount ?? item.points.length), 0),
   };
 
   if (!times.length) {
@@ -1483,6 +1542,7 @@ function buildPortfolioCurve(
   let minLotForcedTrades = 0;
   let maxUsedMarginUsd = 0;
   let maxStopOutEquityUsd = 0;
+  let maxGrossMarginLoadPercent = 0;
   let maxDepositLoadPercent = 0;
   let usedMarginAtMaxDepositLoadUsd = 0;
   let openTradesAtMaxDepositLoad = 0;
@@ -1556,6 +1616,9 @@ function buildPortfolioCurve(
       totalCostUsd = round(totalCostUsd + costDeltaUsd, 2);
     }
     const stopOutEquityUsd = round(usedMarginUsd * Math.max(0, account.stopOutLevelPercent) / 100, 2);
+    const grossMarginLoadPercent = startingBalanceUsd > 0
+      ? round((usedMarginUsd / startingBalanceUsd) * 100, 2)
+      : Number.POSITIVE_INFINITY;
     const depositLoadPercent = balanceUsd > 0 ? round((usedMarginUsd / balanceUsd) * 100, 2) : Number.POSITIVE_INFINITY;
     const marginLevelPercent = usedMarginUsd > 0 ? round((balanceUsd / usedMarginUsd) * 100, 2) : null;
     const stopOutHeadroomPercent = marginLevelPercent == null
@@ -1573,6 +1636,9 @@ function buildPortfolioCurve(
     }
     maxUsedMarginUsd = Math.max(maxUsedMarginUsd, usedMarginUsd);
     maxStopOutEquityUsd = Math.max(maxStopOutEquityUsd, stopOutEquityUsd);
+    if (Number.isFinite(grossMarginLoadPercent)) {
+      maxGrossMarginLoadPercent = Math.max(maxGrossMarginLoadPercent, grossMarginLoadPercent);
+    }
     maxOpenTrades = Math.max(maxOpenTrades, openTradeCount);
     if (Number.isFinite(depositLoadPercent) && depositLoadPercent > maxDepositLoadPercent) {
       maxDepositLoadPercent = depositLoadPercent;
@@ -1600,6 +1666,7 @@ function buildPortfolioCurve(
       margin_level_pct: marginLevelPercent,
       stop_out_headroom_pct: stopOutHeadroomPercent,
       margin_call_headroom_pct: marginCallHeadroomPercent,
+      gross_margin_load_pct: grossMarginLoadPercent,
       margin_risk_pct: marginRiskPercent,
       realized_r: netRealizedR,
       closed_trade_count: cumulativeTrades,
@@ -1622,6 +1689,7 @@ function buildPortfolioCurve(
   metrics.minLotForcedTrades = minLotForcedTrades;
   metrics.maxUsedMarginUsd = round(maxUsedMarginUsd, 2);
   metrics.maxStopOutEquityUsd = round(maxStopOutEquityUsd, 2);
+  metrics.maxGrossMarginLoadPercent = maxGrossMarginLoadPercent > 0 ? round(maxGrossMarginLoadPercent, 2) : null;
   metrics.maxDepositLoadPercent = maxDepositLoadPercent > 0 ? round(maxDepositLoadPercent, 2) : null;
   metrics.usedMarginAtMaxDepositLoadUsd = maxDepositLoadPercent > 0 ? round(usedMarginAtMaxDepositLoadUsd, 2) : null;
   metrics.openTradesAtMaxDepositLoad = openTradesAtMaxDepositLoad;
@@ -1790,9 +1858,10 @@ function PortfolioTooltip({
           </>
         ) : mode === "margin" ? (
           <>
-            <TooltipMetric label="Margin risk" value={formatPercentDecimal(point.margin_risk_pct)} />
+            <TooltipMetric label="Gross load" value={formatPercentDecimal(point.gross_margin_load_pct)} />
+            <TooltipMetric label="Stop pressure" value={formatPercentDecimal(point.margin_risk_pct)} />
             <TooltipMetric label="Margin level" value={formatPercentDecimal(point.margin_level_pct)} />
-            <TooltipMetric label="Deposit load" value={formatPercentDecimal(point.deposit_load_pct)} />
+            <TooltipMetric label="Equity load" value={formatPercentDecimal(point.deposit_load_pct)} />
             <TooltipMetric label="Used margin" value={formatCurrency(point.used_margin_usd)} />
             <TooltipMetric label="Open trades" value={formatInt(point.open_trade_count)} />
           </>
@@ -1815,6 +1884,26 @@ function TooltipMetric({ label, value }: { label: string; value: string }) {
       <span className="text-right font-medium tabular-nums text-foreground">{value}</span>
     </div>
   );
+}
+
+function curveSamplingInfo(
+  payload: Record<string, unknown> | null,
+  normalizedPointCount: number,
+): Pick<NormalizedSeries, "downsampled" | "eventPointCount" | "pointCount"> {
+  const curve = (payload as { curve?: Record<string, unknown> } | null)?.curve ?? {};
+  const pointCount = nullableNumber(curve.point_count) ?? normalizedPointCount;
+  const eventPointCount = nullableNumber(
+    curve.event_point_count
+      ?? curve.source_point_count
+      ?? curve.original_point_count,
+  );
+  const downsampled = Boolean(curve.downsampled)
+    || (eventPointCount != null && pointCount > 0 && eventPointCount > pointCount);
+  return {
+    downsampled,
+    eventPointCount,
+    pointCount,
+  };
 }
 
 function normalizeCurvePoints(payload: Record<string, unknown> | null): NormalizedPoint[] {
