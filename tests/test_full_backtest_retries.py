@@ -109,6 +109,18 @@ def test_run_full_backtest_salvages_outputs_after_timeout(
         (output_dir / "best-cell-path-detail.json").write_text(
             json.dumps({"curve": {"points": []}}), encoding="utf-8"
         )
+        (output_dir / "recommended-cell-path-detail.json").write_text(
+            json.dumps(
+                {
+                    "cell": {
+                        "stop_loss_percent": 0.05,
+                        "reward_multiple": 2.0,
+                    },
+                    "curve": {"points": []},
+                }
+            ),
+            encoding="utf-8",
+        )
         (output_dir / "sensitivity-response.json").write_text(
             json.dumps({"data": {"aggregate": {"quality_score": {"score": 55.0}}}}),
             encoding="utf-8",
@@ -174,6 +186,18 @@ def test_run_full_backtest_forwards_normalized_quality_score_preset(
         (output_dir / "best-cell-path-detail.json").write_text(
             json.dumps({"curve": {"points": []}}), encoding="utf-8"
         )
+        (output_dir / "recommended-cell-path-detail.json").write_text(
+            json.dumps(
+                {
+                    "cell": {
+                        "stop_loss_percent": 0.05,
+                        "reward_multiple": 2.0,
+                    },
+                    "curve": {"points": []},
+                }
+            ),
+            encoding="utf-8",
+        )
         (output_dir / "sensitivity-response.json").write_text(
             json.dumps({"data": {"aggregate": {"quality_score": {"score": 55.0}}}}),
             encoding="utf-8",
@@ -201,11 +225,16 @@ def test_run_full_backtest_forwards_normalized_quality_score_preset(
     assert "--quality-score-preset" in seen_args
     preset_index = seen_args.index("--quality-score-preset")
     assert seen_args[preset_index + 1] == "profile-drop"
+    detail_mode_index = seen_args.index("--cell-detail-artifacts")
+    assert seen_args[detail_mode_index + 1] == "both"
     reward_step_index = seen_args.index("--reward-step-r")
     assert seen_args[reward_step_index + 1] == "0.5"
     reward_columns_index = seen_args.index("--reward-columns")
     assert seen_args[reward_columns_index + 1] == "8"
     assert seen_args.count("--instrument") == 2
+    recommended_path = artifact_dir / dashboard_mod.FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+    assert result["recommended_curve_path"] == str(recommended_path)
+    assert recommended_path.exists()
 
 
 def test_run_full_backtest_ensures_login_before_running_sensitivity(
@@ -262,6 +291,70 @@ def test_run_full_backtest_ensures_login_before_running_sensitivity(
         artifact_dir / dashboard_mod.FULL_BACKTEST_CURVE_FILENAME
     )
     assert call_order[:2] == ["ensure_login", "run"]
+
+
+def test_run_full_backtest_retries_without_cell_detail_artifacts_for_old_cli(
+    tmp_path: Path, monkeypatch
+) -> None:
+    artifact_dir = tmp_path / "eval"
+    artifact_dir.mkdir()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text("{}", encoding="utf-8")
+    (artifact_dir / "deep-replay-job.json").write_text(
+        json.dumps(
+            {
+                "request": {
+                    "timeframe": "M5",
+                    "instruments": ["EURUSD"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _StubConfig(tmp_path)
+    attempt = {
+        "attempt_id": "run-attempt-old-cli",
+        "artifact_dir": str(artifact_dir),
+        "profile_ref": "cloud-ref",
+        "profile_path": str(profile_path),
+    }
+
+    seen_args: list[list[str]] = []
+
+    def fake_run(self, args, **kwargs):
+        seen_args.append(list(args))
+        output_dir = Path(args[args.index("--output-dir") + 1])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if "--cell-detail-artifacts" in args:
+            return SimpleNamespace(
+                returncode=2,
+                stdout="",
+                stderr="error: unexpected argument '--cell-detail-artifacts'",
+            )
+        (output_dir / "best-cell-path-detail.json").write_text(
+            json.dumps({"curve": {"points": []}}), encoding="utf-8"
+        )
+        (output_dir / "sensitivity-response.json").write_text(
+            json.dumps({"data": {"aggregate": {"quality_score": {"score": 55.0}}}}),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        dashboard_mod.FuzzfolioCli,
+        "ensure_login",
+        lambda self: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(dashboard_mod.FuzzfolioCli, "run", fake_run)
+
+    result = dashboard_mod._run_full_backtest_for_attempt(config, attempt)
+
+    assert result["curve_path"] == str(
+        artifact_dir / dashboard_mod.FULL_BACKTEST_CURVE_FILENAME
+    )
+    assert len(seen_args) == 2
+    assert "--cell-detail-artifacts" in seen_args[0]
+    assert "--cell-detail-artifacts" not in seen_args[1]
 
 
 def test_copy_full_backtest_outputs_surfaces_profile_not_found_from_result_json(

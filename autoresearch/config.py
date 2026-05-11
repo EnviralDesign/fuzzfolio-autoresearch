@@ -6,6 +6,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .execution_costs import (
+    DEFAULT_COMMISSION_BPS,
+    DEFAULT_EXECUTION_COST_MODE,
+    DEFAULT_SLIPPAGE_BPS,
+    DEFAULT_SPREAD_BPS,
+    normalize_execution_cost_mode,
+)
+
 
 CONFIG_FILE_NAME = "autoresearch.config.json"
 SECRETS_FILE_NAME = ".agentsecrets"
@@ -54,6 +62,10 @@ class ResearchConfig:
     label_prefix: str = "agentic"
     auto_seed_prompt: bool = True
     quality_score_preset: str = "profile-drop"
+    execution_cost_mode: str = DEFAULT_EXECUTION_COST_MODE
+    execution_cost_spread_bps: float = DEFAULT_SPREAD_BPS
+    execution_cost_slippage_bps: float = DEFAULT_SLIPPAGE_BPS
+    execution_cost_commission_bps: float = DEFAULT_COMMISSION_BPS
     plot_lower_is_better: bool = False
     compact_trigger_tokens: int = 12000
     compact_target_tokens: int = 9000
@@ -626,6 +638,30 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
             )
         ).strip()
         or ResearchConfig.quality_score_preset,
+        execution_cost_mode=normalize_execution_cost_mode(
+            research_cfg.get(
+                "execution_cost_mode",
+                ResearchConfig.execution_cost_mode,
+            )
+        ),
+        execution_cost_spread_bps=float(
+            research_cfg.get(
+                "execution_cost_spread_bps",
+                ResearchConfig.execution_cost_spread_bps,
+            )
+        ),
+        execution_cost_slippage_bps=float(
+            research_cfg.get(
+                "execution_cost_slippage_bps",
+                ResearchConfig.execution_cost_slippage_bps,
+            )
+        ),
+        execution_cost_commission_bps=float(
+            research_cfg.get(
+                "execution_cost_commission_bps",
+                ResearchConfig.execution_cost_commission_bps,
+            )
+        ),
         plot_lower_is_better=bool(
             research_cfg.get(
                 "plot_lower_is_better", ResearchConfig.plot_lower_is_better

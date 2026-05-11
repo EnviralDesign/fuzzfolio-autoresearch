@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .config import AppConfig, load_config
+from .execution_costs import execution_cost_cli_args
 from .fuzzfolio import FuzzfolioCli
 from .ledger import (
     append_attempt,
@@ -1859,7 +1860,48 @@ def _scaffold_profile(
     args.extend(["--timeframe", timeframe])
     args.extend(["--out", str(out_path), "--pretty"])
     ctx.cli.run(args)
+    _repair_degenerate_profile_ranges(out_path)
     return out_path
+
+
+def _repair_degenerate_profile_ranges(profile_path: Path) -> bool:
+    payload = _load_json(profile_path)
+    profile = payload.get("profile") if isinstance(payload, dict) else None
+    indicators = profile.get("indicators") if isinstance(profile, dict) else None
+    if not isinstance(indicators, list):
+        return False
+    changed = False
+    for indicator in indicators:
+        config = indicator.get("config") if isinstance(indicator, dict) else None
+        ranges = config.get("ranges") if isinstance(config, dict) else None
+        if not isinstance(ranges, dict):
+            continue
+        for side in ("buy", "sell"):
+            values = ranges.get(side)
+            if not isinstance(values, list) or len(values) != 2:
+                continue
+            try:
+                lower = float(values[0])
+                upper = float(values[1])
+            except (TypeError, ValueError):
+                continue
+            if lower < upper:
+                continue
+            midpoint = lower
+            if lower > upper:
+                lower, upper = upper, lower
+            if lower == upper:
+                if midpoint >= 1.0:
+                    lower, upper = midpoint - 0.5, midpoint
+                elif midpoint <= 0.0:
+                    lower, upper = midpoint, midpoint + 0.5
+                else:
+                    lower, upper = midpoint - 0.25, midpoint + 0.25
+            ranges[side] = [lower, upper]
+            changed = True
+    if changed:
+        _write_json(profile_path, payload)
+    return changed
 
 
 def _evaluate_profile(
@@ -1900,6 +1942,7 @@ def _evaluate_profile(
         str(int(lookback_months)),
     ]
     args.extend(_reward_matrix_cli_args(reward_matrix))
+    args.extend(execution_cost_cli_args(ctx.config))
     for instrument in instruments:
         args.extend(["--instrument", instrument])
     args.append("--pretty")
@@ -2732,6 +2775,7 @@ def _run_sweep(
         mode,
     ]
     args.extend(_reward_matrix_cli_args(sweep_reward_matrix))
+    args.extend(execution_cost_cli_args(ctx.config))
     if evolutionary_settings is not None:
         args.extend(
             [

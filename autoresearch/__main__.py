@@ -63,12 +63,18 @@ if __package__ in {None, ""}:
         set_runtime_trace_stderr_mode,
     )
     from autoresearch.dashboard import (
+        FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
         _has_full_backtest,
         _reward_matrix_cli_args_from_attempt,
         _reward_matrix_from_attempt,
         _run_full_backtest_for_attempt,
     )
     from autoresearch.dashboard_viewer import serve_dashboard
+    from autoresearch.execution_costs import (
+        execution_cost_cli_args,
+        execution_cost_manifest_payload,
+        result_matches_execution_cost_model,
+    )
     from autoresearch.fuzzfolio import CliError, FuzzfolioCli
     from autoresearch.ledger import (
         append_attempt,
@@ -161,12 +167,18 @@ else:
     )
     from .controller import ResearchController, RunPolicy, set_runtime_trace_stderr_mode
     from .dashboard import (
+        FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
         _has_full_backtest,
         _reward_matrix_cli_args_from_attempt,
         _reward_matrix_from_attempt,
         _run_full_backtest_for_attempt,
     )
     from .dashboard_viewer import serve_dashboard
+    from .execution_costs import (
+        execution_cost_cli_args,
+        execution_cost_manifest_payload,
+        result_matches_execution_cost_model,
+    )
     from .fuzzfolio import CliError, FuzzfolioCli
     from .ledger import (
         append_attempt,
@@ -1268,6 +1280,21 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Concurrent workers for corpus profile-drop packaging/rendering. Default: 4",
     )
     render_corpus_profile_drops.add_argument(
+        "--full-backtest-workers",
+        type=int,
+        default=None,
+        help=(
+            "Concurrent 36mo full-backtest jobs to submit during catch-up. "
+            "Default: auto-detect local dev Sim Worker count, falling back to config."
+        ),
+    )
+    render_corpus_profile_drops.add_argument(
+        "--full-backtest-job-timeout-seconds",
+        type=int,
+        default=2400,
+        help="Maximum seconds to wait for each deep replay full-backtest job during catch-up. Default: 2400",
+    )
+    render_corpus_profile_drops.add_argument(
         "--profile-drop-timeout-seconds",
         type=int,
         default=1800,
@@ -1315,6 +1342,21 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         type=int,
         default=4,
         help="Concurrent workers for profile-drop packaging/rendering. Default: 4",
+    )
+    finalize_corpus.add_argument(
+        "--full-backtest-workers",
+        type=int,
+        default=None,
+        help=(
+            "Concurrent 36mo full-backtest jobs to submit during catch-up. "
+            "Use this to fan out across local and LAN replay workers."
+        ),
+    )
+    finalize_corpus.add_argument(
+        "--full-backtest-job-timeout-seconds",
+        type=int,
+        default=2400,
+        help="Maximum seconds to wait for each deep replay full-backtest job during catch-up. Default: 2400",
     )
     finalize_corpus.add_argument(
         "--profile-drop-timeout-seconds",
@@ -3667,16 +3709,27 @@ def _run_full_backtest_with_retry(
                 and source_curve_path.exists()
                 and _result_has_canonical_score_lab(source_result_path)
                 and _result_matches_attempt_reward_matrix(source_result_path, attempt)
+                and result_matches_execution_cost_model(source_result_path, config)
             ):
                 dest_curve = artifact_dir / "full-backtest-36mo-curve.json"
                 dest_result = artifact_dir / "full-backtest-36mo-result.json"
                 shutil.copy2(source_curve_path, dest_curve)
                 shutil.copy2(source_result_path, dest_result)
-                return {
+                result = {
                     "curve_path": str(dest_curve),
                     "result_path": str(dest_result),
                     "seed_source": source_name,
                 }
+                source_recommended_path = (
+                    source_curve_path.parent / "recommended-cell-path-detail.json"
+                )
+                if source_recommended_path.exists():
+                    dest_recommended = (
+                        artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+                    )
+                    shutil.copy2(source_recommended_path, dest_recommended)
+                    result["recommended_curve_path"] = str(dest_recommended)
+                return result
     try:
         return invoke(attempt)
     except Exception as exc:
@@ -4916,10 +4969,14 @@ def _existing_profile_drop_artifact_sources(
         return None
     if not _result_matches_attempt_reward_matrix(response_path, attempt):
         return None
+    recommended_detail_path = artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
     return {
         "artifact_dir": artifact_dir,
         "response_path": response_path,
         "detail_path": detail_path,
+        "recommended_detail_path": (
+            recommended_detail_path if recommended_detail_path.exists() else ""
+        ),
         "source_kind": "full_backtest_36mo",
     }
 
@@ -5356,10 +5413,21 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
 
     response_path = Path(sources["response_path"])
     detail_path = Path(sources["detail_path"])
+    recommended_detail_path_raw = sources.get("recommended_detail_path")
+    recommended_detail_path = (
+        Path(recommended_detail_path_raw)
+        if str(recommended_detail_path_raw or "").strip()
+        else None
+    )
     artifact_dir = Path(sources["artifact_dir"])
     source_kind = str(sources["source_kind"])
     response_payload = _load_json_if_exists(response_path)
     detail_payload = _load_json_if_exists(detail_path)
+    recommended_detail_file_payload = (
+        _load_json_if_exists(recommended_detail_path)
+        if recommended_detail_path is not None and recommended_detail_path.exists()
+        else None
+    )
     if not response_payload or not detail_payload:
         return None
 
@@ -5410,11 +5478,23 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
     analysis = _profile_drop_package_analysis(bundle_response)
     detail_cell = detail_payload.get("cell") if isinstance(detail_payload, dict) else None
     best_cell = analysis.get("best_cell") if isinstance(analysis, dict) else None
-    recommended_detail_payload = (
-        detail_payload
-        if _cells_match_by_stop_reward(recommended_cell, detail_cell)
+    recommended_detail_file_cell = (
+        recommended_detail_file_payload.get("cell")
+        if isinstance(recommended_detail_file_payload, dict)
         else None
     )
+    recommended_detail_payload = None
+    if _cells_match_by_stop_reward(recommended_cell, detail_cell):
+        recommended_detail_payload = detail_payload
+    elif _cells_match_by_stop_reward(recommended_cell, recommended_detail_file_cell):
+        recommended_detail_payload = recommended_detail_file_payload
+        refreshed_cell = _apply_recommended_cell_detail_to_profile_drop_response(
+            bundle_response,
+            recommended_detail_file_payload,
+            recommended_basis=recommended_basis,
+        )
+        if refreshed_cell is not None:
+            recommended_cell = refreshed_cell
     best_detail_payload = (
         detail_payload if _cells_match_by_stop_reward(best_cell, detail_cell) else None
     )
@@ -5461,14 +5541,26 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
             "artifact_dir": str(artifact_dir),
             "result_path": str(response_path),
             "cell_detail_path": str(detail_path),
+            "recommended_cell_detail_path": (
+                str(recommended_detail_path)
+                if recommended_detail_path is not None
+                else None
+            ),
             "cell_detail_source": cell_detail_source,
             "recommended_cell_detail_source": (
                 "existing_cell_detail"
                 if recommended_detail_payload is detail_payload
                 else (
-                    "deep_replay_cell_detail"
-                    if recommended_detail_payload is not None
-                    else None
+                    "existing_recommended_cell_detail"
+                    if (
+                        recommended_detail_payload is not None
+                        and recommended_detail_payload is recommended_detail_file_payload
+                    )
+                    else (
+                        "deep_replay_cell_detail"
+                        if recommended_detail_payload is not None
+                        else None
+                    )
                 )
             ),
         },
@@ -5770,6 +5862,7 @@ def _scrutiny_manifest_payload(
         "lookback_months": int(lookback_months),
         "quality_score_preset": str(config.research.quality_score_preset),
         "score_lab_version": CANONICAL_SCORE_LAB_VERSION,
+        **execution_cost_manifest_payload(config),
     }
 
 
@@ -5820,6 +5913,10 @@ def _try_seed_attempt_scrutiny_cache(
         and (legacy_dir / "sensitivity-response.json").exists()
         and (legacy_dir / "best-cell-path-detail.json").exists()
         and _result_has_canonical_score_lab(legacy_dir / "sensitivity-response.json")
+        and result_matches_execution_cost_model(
+            legacy_dir / "sensitivity-response.json",
+            config,
+        )
     ):
         legacy_manifest = load_json_if_exists(legacy_manifest_path)
         if (
@@ -5845,12 +5942,21 @@ def _try_seed_attempt_scrutiny_cache(
             full_result_path.exists()
             and full_curve_path.exists()
             and _result_has_canonical_score_lab(full_result_path)
+            and result_matches_execution_cost_model(full_result_path, config)
         ):
             if cache_dir.exists():
                 shutil.rmtree(cache_dir)
             cache_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(full_result_path, cache_dir / "sensitivity-response.json")
             shutil.copy2(full_curve_path, cache_dir / "best-cell-path-detail.json")
+            full_recommended_path = (
+                artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+            )
+            if full_recommended_path.exists():
+                shutil.copy2(
+                    full_recommended_path,
+                    cache_dir / "recommended-cell-path-detail.json",
+                )
             job_path = artifact_dir / "deep-replay-job.json"
             if job_path.exists():
                 shutil.copy2(job_path, cache_dir / "deep-replay-job.json")
@@ -6168,6 +6274,7 @@ def _ensure_attempt_scrutiny_artifacts(
         "--quality-score-preset",
         str(config.research.quality_score_preset),
     ]
+    args.extend(execution_cost_cli_args(config))
     for instrument in package_inputs["instruments"]:
         args.extend(["--instrument", str(instrument)])
     cli.run(args, timeout_seconds=420)
@@ -6414,6 +6521,8 @@ def cmd_calculate_full_backtests(
         if not curve_path.exists() or not result_path.exists():
             return True
         if not _result_has_canonical_score_lab(result_path):
+            return True
+        if not result_matches_execution_cost_model(result_path, config):
             return True
         return not _result_matches_attempt_reward_matrix(result_path, attempt)
 
@@ -6825,6 +6934,7 @@ def _render_profile_drop_for_attempt(
         "lookback_months": int(lookback_months),
         "quality_score_preset": str(config.research.quality_score_preset),
         "score_lab_version": CANONICAL_SCORE_LAB_VERSION,
+        **execution_cost_manifest_payload(config),
     }
     reward_matrix = _reward_matrix_from_attempt(attempt)
     if reward_matrix:
@@ -6958,6 +7068,7 @@ def _render_profile_drop_for_attempt(
             str(config.research.quality_score_preset),
         ]
         package_args.extend(_reward_matrix_cli_args_from_attempt(attempt))
+        package_args.extend(execution_cost_cli_args(config))
         for instrument in package_inputs["instruments"]:
             package_args.extend(["--instrument", str(instrument)])
         cli.run(package_args, cwd=working_dir, timeout_seconds=float(timeout_seconds))
@@ -7111,6 +7222,7 @@ def _profile_drop_progress_error(result: dict[str, Any]) -> str:
 
 def _profile_drop_skip_reason_for_attempt(
     *,
+    config,
     row: dict[str, Any],
     attempt: dict[str, Any],
     run_dir: Path,
@@ -7129,6 +7241,7 @@ def _profile_drop_skip_reason_for_attempt(
         and full_curve_path.exists()
         and _result_has_canonical_score_lab(full_result_path)
         and _result_matches_attempt_reward_matrix(full_result_path, attempt)
+        and result_matches_execution_cost_model(full_result_path, config)
     ):
         return None
 
@@ -7212,6 +7325,7 @@ def _render_profile_drop_rows(
             continue
         run_dir, attempts, attempt = matched
         skip_reason = _profile_drop_skip_reason_for_attempt(
+            config=config,
             row=row,
             attempt=attempt,
             run_dir=run_dir,
@@ -9979,6 +10093,8 @@ def cmd_render_corpus_profile_drops(
     profile_drop_workers: int,
     profile_drop_timeout_seconds: int,
     force_rebuild: bool,
+    full_backtest_workers: int | None = None,
+    full_backtest_job_timeout_seconds: int | None = 2400,
     require_presentation_metadata: bool = False,
     as_json: bool,
 ) -> int:
@@ -9988,6 +10104,16 @@ def cmd_render_corpus_profile_drops(
     rank_start = max(0, int(rank_start))
     lookback_months = int(lookback_months)
     worker_count = max(1, int(profile_drop_workers))
+    full_backtest_worker_count = (
+        max(1, int(full_backtest_workers))
+        if full_backtest_workers is not None
+        else None
+    )
+    full_backtest_job_timeout = (
+        max(1, int(full_backtest_job_timeout_seconds))
+        if full_backtest_job_timeout_seconds is not None
+        else None
+    )
     timeout_seconds = max(1, int(profile_drop_timeout_seconds))
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
@@ -10021,6 +10147,8 @@ def cmd_render_corpus_profile_drops(
         f"attempts (skipped_by_selection={skipped_by_selection}, rank_start={rank_start}, "
         f"top_results={limit if limit is not None else 'all'}, "
         f"canonical_only={'yes' if canonical_only else 'no'}, workers={worker_count}, "
+        f"full_backtest_workers={full_backtest_worker_count if full_backtest_worker_count is not None else 'auto'}, "
+        f"full_backtest_job_timeout={full_backtest_job_timeout if full_backtest_job_timeout is not None else 'default'}, "
         f"lookback={lookback_months}mo, force_rebuild={'yes' if force_rebuild else 'no'})",
         as_json=as_json,
     )
@@ -10059,11 +10187,11 @@ def cmd_render_corpus_profile_drops(
                     run_ids=run_ids,
                     attempt_ids=selected_attempt_ids,
                     limit=None,
-                    max_workers=None,
+                    max_workers=full_backtest_worker_count,
                     use_dev_sim_worker_count=True,
                     require_scrutiny_36=False,
-                    force_rebuild=False,
-                    job_timeout_seconds=None,
+                    force_rebuild=bool(force_rebuild),
+                    job_timeout_seconds=full_backtest_job_timeout,
                     as_json=True,
                 )
         else:
@@ -10071,11 +10199,11 @@ def cmd_render_corpus_profile_drops(
                 run_ids=run_ids,
                 attempt_ids=selected_attempt_ids,
                 limit=None,
-                max_workers=None,
+                max_workers=full_backtest_worker_count,
                 use_dev_sim_worker_count=True,
                 require_scrutiny_36=False,
-                force_rebuild=False,
-                job_timeout_seconds=None,
+                force_rebuild=bool(force_rebuild),
+                job_timeout_seconds=full_backtest_job_timeout,
                 as_json=False,
                 emit_summary=False,
             )
@@ -10126,8 +10254,25 @@ def cmd_render_corpus_profile_drops(
         require_presentation_metadata=require_presentation_metadata,
     )
 
+    profile_drop_rendered = sum(
+        1 for row in profile_drop_results if row.get("status") == "rendered"
+    )
+    profile_drop_cached = sum(
+        1 for row in profile_drop_results if row.get("status") == "cached"
+    )
+    profile_drop_skipped = sum(
+        1 for row in profile_drop_results if row.get("status") == "skipped"
+    )
+    profile_drop_failed = sum(
+        1 for row in profile_drop_results if row.get("status") == "failed"
+    )
+    catch_up_failed = int(catch_up_exit_code) != 0
+    render_failed = profile_drop_failed > 0
+    status = "partial_failure" if catch_up_failed or render_failed else "complete"
+
     summary = {
         "generated_at": datetime.now().astimezone().isoformat(),
+        "status": status,
         "corpus_index_source": corpus_index_info.get("source"),
         "top_results": limit,
         "rank_start": rank_start,
@@ -10136,19 +10281,13 @@ def cmd_render_corpus_profile_drops(
         "selected_count": len(selected_rows),
         "healed_full_backtests": healed_full_backtests,
         "full_backtest_catch_up_exit_code": catch_up_exit_code,
-        "profile_drop_rendered": sum(
-            1 for row in profile_drop_results if row.get("status") == "rendered"
-        ),
-        "profile_drop_cached": sum(
-            1 for row in profile_drop_results if row.get("status") == "cached"
-        ),
-        "profile_drop_skipped": sum(
-            1 for row in profile_drop_results if row.get("status") == "skipped"
-        ),
-        "profile_drop_failed": sum(
-            1 for row in profile_drop_results if row.get("status") == "failed"
-        ),
+        "profile_drop_rendered": profile_drop_rendered,
+        "profile_drop_cached": profile_drop_cached,
+        "profile_drop_skipped": profile_drop_skipped,
+        "profile_drop_failed": profile_drop_failed,
         "profile_drop_workers": worker_count,
+        "full_backtest_workers": full_backtest_worker_count,
+        "full_backtest_job_timeout_seconds": full_backtest_job_timeout,
         "profile_drop_timeout_seconds": timeout_seconds,
         "force_rebuild": bool(force_rebuild),
         "require_presentation_metadata": bool(require_presentation_metadata),
@@ -10156,13 +10295,15 @@ def cmd_render_corpus_profile_drops(
     }
     if as_json:
         print(json.dumps(summary, ensure_ascii=True, indent=2))
-        return 0 if summary["profile_drop_failed"] == 0 else 1
+        return 0 if summary["status"] == "complete" else 1
     console.print(
         Panel.fit(
             "\n".join(
                 [
+                    f"Status: {summary['status']}",
                     f"Selected attempts: {summary['selected_count']}",
                     f"Healed 36mo full-backtests: {summary['healed_full_backtests']}",
+                    f"Full-backtest catch-up exit: {summary['full_backtest_catch_up_exit_code']}",
                     f"Rendered: {summary['profile_drop_rendered']}",
                     f"Cached: {summary['profile_drop_cached']}",
                     f"Skipped: {summary['profile_drop_skipped']}",
@@ -10175,7 +10316,7 @@ def cmd_render_corpus_profile_drops(
             border_style="cyan",
         )
     )
-    return 0 if summary["profile_drop_failed"] == 0 else 1
+    return 0 if summary["status"] == "complete" else 1
 
 
 def _select_finalize_corpus_rows(
@@ -10234,12 +10375,24 @@ def cmd_finalize_corpus(
     require_presentation_metadata: bool,
     dry_run: bool,
     as_json: bool,
+    full_backtest_workers: int | None = None,
+    full_backtest_job_timeout_seconds: int | None = 2400,
 ) -> int:
     set_provider_trace_stderr_mode("warnings_only")
     config = load_config()
     scope = str(scope or "dashboard").strip().lower()
     if scope not in {"dashboard", "all"}:
         raise SystemExit("Unsupported finalize scope; expected 'dashboard' or 'all'.")
+    full_backtest_worker_count = (
+        max(1, int(full_backtest_workers))
+        if full_backtest_workers is not None
+        else None
+    )
+    full_backtest_job_timeout = (
+        max(1, int(full_backtest_job_timeout_seconds))
+        if full_backtest_job_timeout_seconds is not None
+        else None
+    )
     full_catalog_rows, corpus_index_info = _selection_corpus_rows(
         config,
         run_ids=run_ids,
@@ -10263,6 +10416,8 @@ def cmd_finalize_corpus(
         f"attempts (skipped_by_selection={skipped_by_selection}, "
         f"scope={selection_info.get('selection_scope')}, "
         f"runs={selection_info.get('run_count')}, workers={max(1, int(profile_drop_workers))}, "
+        f"full_backtest_workers={full_backtest_worker_count if full_backtest_worker_count is not None else 'auto'}, "
+        f"full_backtest_job_timeout={full_backtest_job_timeout if full_backtest_job_timeout is not None else 'default'}, "
         f"lookback={int(lookback_months)}mo, dry_run={'yes' if dry_run else 'no'})",
         as_json=as_json,
     )
@@ -10291,6 +10446,8 @@ def cmd_finalize_corpus(
         "selected_attempt_ids": selected_attempt_ids,
         "lookback_months": int(lookback_months),
         "profile_drop_workers": max(1, int(profile_drop_workers)),
+        "full_backtest_workers": full_backtest_worker_count,
+        "full_backtest_job_timeout_seconds": full_backtest_job_timeout,
         "profile_drop_timeout_seconds": max(1, int(profile_drop_timeout_seconds)),
         "force_rebuild": bool(force_rebuild),
         "require_presentation_metadata": bool(require_presentation_metadata),
@@ -10330,6 +10487,8 @@ def cmd_finalize_corpus(
                 profile_drop_workers=max(1, int(profile_drop_workers)),
                 profile_drop_timeout_seconds=max(1, int(profile_drop_timeout_seconds)),
                 force_rebuild=bool(force_rebuild),
+                full_backtest_workers=full_backtest_worker_count,
+                full_backtest_job_timeout_seconds=full_backtest_job_timeout,
                 require_presentation_metadata=bool(require_presentation_metadata),
                 as_json=True,
             )
@@ -10350,6 +10509,8 @@ def cmd_finalize_corpus(
             profile_drop_workers=max(1, int(profile_drop_workers)),
             profile_drop_timeout_seconds=max(1, int(profile_drop_timeout_seconds)),
             force_rebuild=bool(force_rebuild),
+            full_backtest_workers=full_backtest_worker_count,
+            full_backtest_job_timeout_seconds=full_backtest_job_timeout,
             require_presentation_metadata=bool(require_presentation_metadata),
             as_json=False,
         )
@@ -10728,6 +10889,8 @@ def main(argv: list[str] | None = None) -> int:
             profile_drop_workers=int(args.profile_drop_workers),
             profile_drop_timeout_seconds=int(args.profile_drop_timeout_seconds),
             force_rebuild=bool(args.force_rebuild),
+            full_backtest_workers=args.full_backtest_workers,
+            full_backtest_job_timeout_seconds=args.full_backtest_job_timeout_seconds,
             as_json=bool(args.json),
         )
     if args.command == "finalize-corpus":
@@ -10742,6 +10905,8 @@ def main(argv: list[str] | None = None) -> int:
             require_presentation_metadata=not bool(args.allow_presentation_fallback),
             dry_run=bool(args.dry_run),
             as_json=bool(args.json),
+            full_backtest_workers=args.full_backtest_workers,
+            full_backtest_job_timeout_seconds=args.full_backtest_job_timeout_seconds,
         )
     if args.command == "nuke-deep-caches":
         return cmd_nuke_deep_caches(as_json=bool(args.json))

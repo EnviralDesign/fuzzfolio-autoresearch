@@ -17,6 +17,7 @@ from autoresearch.play_hand import (
     _parameter_importance,
     _permutation_count,
     _play_hand_artifact_commands,
+    _repair_degenerate_profile_ranges,
     _refine_values,
     _reward_matrix_cli_args,
     _select_instrument_scout_records,
@@ -40,6 +41,31 @@ from autoresearch.play_hand import (
     resolve_sweep_budget,
 )
 from autoresearch.ledger import load_attempts, write_attempts
+
+
+def test_repair_degenerate_profile_ranges_expands_binary_defaults(tmp_path: Path) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(
+        """{
+  "profile": {
+    "indicators": [
+      {"config": {"ranges": {"buy": [1, 1], "sell": [0, 0]}}},
+      {"config": {"ranges": {"buy": [2, 1], "sell": [0.2, 0.4]}}}
+    ]
+  }
+}""",
+        encoding="utf-8",
+    )
+
+    assert _repair_degenerate_profile_ranges(profile_path) is True
+
+    payload = play_hand_mod._load_json(profile_path)
+    first_ranges = payload["profile"]["indicators"][0]["config"]["ranges"]
+    second_ranges = payload["profile"]["indicators"][1]["config"]["ranges"]
+    assert first_ranges["buy"] == [0.5, 1.0]
+    assert first_ranges["sell"] == [0.0, 0.5]
+    assert second_ranges["buy"] == [1.0, 2.0]
+    assert second_ranges["sell"] == [0.2, 0.4]
 
 
 def test_cmd_play_hand_authenticates_before_seed_prompt(monkeypatch, tmp_path: Path) -> None:

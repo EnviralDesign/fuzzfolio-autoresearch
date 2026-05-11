@@ -14,6 +14,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import AppConfig
+from .execution_costs import execution_cost_cli_args
 from .fuzzfolio import CliError, FuzzfolioCli
 from .ledger import (
     list_run_dirs,
@@ -366,8 +367,20 @@ def _sensitivity_path_for_attempt(attempt: dict[str, Any]) -> Path | None:
 
 
 FULL_BACKTEST_CURVE_FILENAME = "full-backtest-36mo-curve.json"
+FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME = (
+    "full-backtest-36mo-recommended-cell-path-detail.json"
+)
 FULL_BACKTEST_RESULT_FILENAME = "full-backtest-36mo-result.json"
 FULL_BACKTEST_TIMEOUT_SECONDS = 1800
+
+
+def _full_backtest_cli_timeout_seconds(job_timeout_seconds: int | None) -> int:
+    if job_timeout_seconds is None or int(job_timeout_seconds) <= 0:
+        return FULL_BACKTEST_TIMEOUT_SECONDS
+    # sensitivity-basket can wait once for the replay job and again for each
+    # requested cell-detail artifact. Keep the subprocess watchdog outside that
+    # envelope so the CLI reports the real replay/detail failure mode.
+    return max(FULL_BACKTEST_TIMEOUT_SECONDS, (int(job_timeout_seconds) * 3) + 300)
 
 
 def _full_backtest_curve_path(attempt: dict[str, Any]) -> Path | None:
@@ -406,6 +419,12 @@ def _copy_full_backtest_outputs(
     dest_curve = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
     dest_result = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
     shutil.copy2(curve_src, dest_curve)
+    recommended_src = sensitivity_output_dir / "recommended-cell-path-detail.json"
+    recommended_path: str | None = None
+    if recommended_src.exists():
+        dest_recommended = artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+        shutil.copy2(recommended_src, dest_recommended)
+        recommended_path = str(dest_recommended)
     result_path: str | None = None
     if result_src.exists():
         shutil.copy2(result_src, dest_result)
@@ -415,9 +434,35 @@ def _copy_full_backtest_outputs(
         "curve_path": str(dest_curve),
         "result_path": result_path,
     }
+    if recommended_path is not None:
+        payload["recommended_curve_path"] = recommended_path
     if recovery_mode:
         payload["recovery_mode"] = recovery_mode
     return payload
+
+
+def _without_cell_detail_artifacts_args(args: list[str]) -> list[str]:
+    stripped: list[str] = []
+    skip_next = False
+    for item in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if item == "--cell-detail-artifacts":
+            skip_next = True
+            continue
+        stripped.append(item)
+    return stripped
+
+
+def _cell_detail_artifacts_arg_rejected(result: Any) -> bool:
+    combined = f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}".lower()
+    return "cell-detail-artifacts" in combined and (
+        "unexpected" in combined
+        or "unknown" in combined
+        or "unrecognized" in combined
+        or "found argument" in combined
+    )
 
 
 def _has_full_backtest(attempt: dict[str, Any]) -> bool:
@@ -516,10 +561,13 @@ def _run_full_backtest_for_attempt(
             "--output-dir",
             str(sensitivity_output_dir),
             "--allow-timeframe-mismatch",
+            "--cell-detail-artifacts",
+            "both",
             "--quality-score-preset",
             _quality_score_preset_cli_value(config),
         ]
         args.extend(_reward_matrix_cli_args_from_attempt(attempt))
+        args.extend(execution_cost_cli_args(config))
         for instrument in instruments:
             args.extend(["--instrument", instrument])
 
@@ -527,16 +575,35 @@ def _run_full_backtest_for_attempt(
             f"[calculate-backtest] running sensitivity-basket: {' '.join(args)}",
             flush=True,
         )
+        cli_timeout_seconds = _full_backtest_cli_timeout_seconds(job_timeout_seconds)
         try:
             result = cli.run(
                 args,
                 check=False,
-                timeout_seconds=FULL_BACKTEST_TIMEOUT_SECONDS,
+                timeout_seconds=cli_timeout_seconds,
             )
             print(
                 f"[calculate-backtest] sensitivity-basket returned {result.returncode}",
                 flush=True,
             )
+            if result.returncode != 0 and _cell_detail_artifacts_arg_rejected(result):
+                shutil.rmtree(sensitivity_output_dir, ignore_errors=True)
+                sensitivity_output_dir.mkdir(parents=True, exist_ok=True)
+                args = _without_cell_detail_artifacts_args(args)
+                print(
+                    "[calculate-backtest] CLI does not support --cell-detail-artifacts; "
+                    f"retrying sensitivity-basket: {' '.join(args)}",
+                    flush=True,
+                )
+                result = cli.run(
+                    args,
+                    check=False,
+                    timeout_seconds=cli_timeout_seconds,
+                )
+                print(
+                    f"[calculate-backtest] sensitivity-basket returned {result.returncode}",
+                    flush=True,
+                )
             if result.returncode != 0:
                 raise RuntimeError(
                     f"sensitivity-basket failed (exit {result.returncode}):\n"
