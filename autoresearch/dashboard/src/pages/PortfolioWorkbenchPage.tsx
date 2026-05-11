@@ -894,6 +894,11 @@ function PortfolioPanel({
   const metrics = portfolio.metrics;
   const isJobRunning = job?.status === "running" || job?.status === "canceling";
   const [hoveredChart, setHoveredChart] = useState<PortfolioChartMode | null>(null);
+  const showUsdCharts = account.riskBasis === "current";
+  const equityDataKey = showUsdCharts ? "balance_usd" : "equity_r";
+  const drawdownDataKey = showUsdCharts ? "drawdown_usd" : "drawdown_r";
+  const chartUnitLabel = showUsdCharts ? "account USD" : "portfolio R";
+  const loadBasisLabel = showUsdCharts ? "current balance" : "starting balance";
   const tooltipFor = (mode: PortfolioChartMode) => (
     <PortfolioTooltip mode={mode} enabled={hoveredChart === mode} />
   );
@@ -1007,7 +1012,8 @@ function PortfolioPanel({
           Lot sizing floors to {formatNumber(account.lotStep, 2)} lot steps with a {formatNumber(account.minLot, 2)} minimum lot.
           {metrics.minLotForcedTrades ? ` ${formatInt(metrics.minLotForcedTrades)} trades were forced to minimum lot. ` : " "}
           {metrics.maxOpenTrades ? `Peak simultaneous open trades: ${formatInt(metrics.maxOpenTrades)}. ` : ""}
-          {metrics.maxUsedMarginUsd ? `Peak used margin: ${formatCurrency(metrics.maxUsedMarginUsd)} (${formatPercentDecimal(metrics.maxGrossMarginLoadPercent)} of starting balance). ` : ""}
+          {metrics.maxUsedMarginUsd ? `Peak used margin: ${formatCurrency(metrics.maxUsedMarginUsd)}. ` : ""}
+          {metrics.maxGrossMarginLoadPercent != null ? `Worst load versus ${loadBasisLabel}: ${formatPercentDecimal(metrics.maxGrossMarginLoadPercent)}. ` : ""}
           {metrics.maxDepositLoadPercent != null ? `Worst equity load: ${formatPercentDecimal(metrics.maxDepositLoadPercent)} at ${formatInt(metrics.openTradesAtMaxDepositLoad)} open / ${formatCurrency(metrics.usedMarginAtMaxDepositLoadUsd)}. ` : ""}
           Stop-out pressure uses current equity divided by used margin, so it can improve when a newly added strategy raises equity before the pressure peak.
           {metrics.marginLiquidated ? ` First stop-out ${metrics.firstLiquidationDate}.` : " No stop-out detected."}
@@ -1046,9 +1052,9 @@ function PortfolioPanel({
             secondary={metrics.marginLiquidated ? "stop-out" : metrics.blown ? "breached" : "floor"}
           />
           <PortfolioMetric
-            label="Gross load"
+            label="Basis load"
             primary={formatPercentDecimal(metrics.maxGrossMarginLoadPercent)}
-            secondary={`${formatCurrency(metrics.maxUsedMarginUsd)} peak margin`}
+            secondary={`vs ${loadBasisLabel}`}
           />
           <PortfolioMetric
             label="Equity load"
@@ -1080,7 +1086,9 @@ function PortfolioPanel({
           <div>
             <div className="text-sm font-semibold">36mo composite</div>
             <div className="text-xs text-muted-foreground">
-              {loadingSelectionCount ? `${loadingSelectionCount} curve(s) loading` : `${metrics.loadedCount} curve(s) loaded`}
+              {loadingSelectionCount
+                ? `${loadingSelectionCount} curve(s) loading`
+                : `${metrics.loadedCount} curve(s) loaded / ${chartUnitLabel}`}
             </div>
           </div>
         </div>
@@ -1097,13 +1105,18 @@ function PortfolioPanel({
               >
                 <CartesianGrid vertical={false} strokeDasharray="3 3" />
                 <XAxis dataKey="time" minTickGap={28} tickFormatter={formatTickDate} />
-                <YAxis width={58} tickFormatter={(value) => `${formatNumber(Number(value), 0)}R`} />
+                <YAxis
+                  width={58}
+                  tickFormatter={(value) => showUsdCharts
+                    ? formatCurrencyTick(Number(value))
+                    : `${formatNumber(Number(value), 0)}R`}
+                />
                 <ReferenceLine y={0} stroke="hsl(var(--border))" strokeDasharray="4 4" />
                 <ChartTooltip
                   cursor={chartCursor}
                   content={tooltipFor("equity")}
                 />
-                <Area type="monotone" dataKey="equity_r" stroke="var(--color-equity_r)" fill="var(--color-equity_r)" fillOpacity={0.16} strokeWidth={2} dot={false} activeDot={chartActiveDot} />
+                <Area type="monotone" dataKey={equityDataKey} stroke={`var(--color-${equityDataKey})`} fill={`var(--color-${equityDataKey})`} fillOpacity={0.16} strokeWidth={2} dot={false} activeDot={chartActiveDot} />
               </AreaChart>
             </ChartContainer>
             <ChartContainer config={drawdownChartConfig} className="h-40 w-full">
@@ -1117,18 +1130,23 @@ function PortfolioPanel({
               >
                 <CartesianGrid vertical={false} strokeDasharray="3 3" />
                 <XAxis dataKey="time" minTickGap={28} tickFormatter={formatTickDate} />
-                <YAxis width={58} tickFormatter={(value) => `${formatNumber(Number(value), 0)}R`} />
+                <YAxis
+                  width={58}
+                  tickFormatter={(value) => showUsdCharts
+                    ? formatCurrencyTick(Number(value))
+                    : `${formatNumber(Number(value), 0)}R`}
+                />
                 <ChartTooltip
                   cursor={chartCursor}
                   content={tooltipFor("drawdown")}
                 />
-                <Area type="monotone" dataKey="drawdown_r" stroke="var(--color-drawdown_r)" fill="var(--color-drawdown_r)" fillOpacity={0.25} strokeWidth={2} dot={false} activeDot={chartActiveDot} />
+                <Area type="monotone" dataKey={drawdownDataKey} stroke={`var(--color-${drawdownDataKey})`} fill={`var(--color-${drawdownDataKey})`} fillOpacity={0.25} strokeWidth={2} dot={false} activeDot={chartActiveDot} />
               </AreaChart>
             </ChartContainer>
             <div className="rounded-lg border border-border/60 bg-background/25 px-2 py-2">
               <div className="mb-1 flex items-center justify-between gap-3 px-1 text-[0.68rem] uppercase tracking-[0.14em] text-muted-foreground">
                 <span>Margin exposure</span>
-                <span>yellow raw load / red stop-out pressure</span>
+                <span>yellow load vs {loadBasisLabel} / red stop-out pressure</span>
               </div>
               <ChartContainer config={marginRiskChartConfig} className="h-24 w-full">
                 <ComposedChart
@@ -1353,6 +1371,8 @@ function SimilarityPanel({
   loadingSelectionCount: number;
 }) {
   const hasMatrix = similarity.cells.length > 1;
+  const matrixSize = similarity.cells.length;
+  const matrixGapPx = matrixSize > 14 ? 2 : matrixSize > 8 ? 3 : 4;
   return (
     <Panel className="p-4">
       <div className="mb-3 flex items-start justify-between gap-3">
@@ -1375,10 +1395,14 @@ function SimilarityPanel({
 
       {hasMatrix ? (
         <>
-          <div className="max-h-72 overflow-auto rounded-lg border border-border/60 bg-background/30 p-2">
+          <div className="aspect-square w-full rounded-lg border border-border/60 bg-background/30 p-2">
             <div
-              className="grid gap-1"
-              style={{ gridTemplateColumns: `repeat(${similarity.cells.length}, minmax(8px, 1fr))` }}
+              className="grid h-full w-full"
+              style={{
+                gridTemplateColumns: `repeat(${matrixSize}, minmax(0, 1fr))`,
+                gridTemplateRows: `repeat(${matrixSize}, minmax(0, 1fr))`,
+                gap: matrixGapPx,
+              }}
             >
               {similarity.cells.flatMap((row) =>
                 row.map((cell) => (
@@ -1616,8 +1640,9 @@ function buildPortfolioCurve(
       totalCostUsd = round(totalCostUsd + costDeltaUsd, 2);
     }
     const stopOutEquityUsd = round(usedMarginUsd * Math.max(0, account.stopOutLevelPercent) / 100, 2);
-    const grossMarginLoadPercent = startingBalanceUsd > 0
-      ? round((usedMarginUsd / startingBalanceUsd) * 100, 2)
+    const marginLoadBasisUsd = account.riskBasis === "current" ? balanceUsd : startingBalanceUsd;
+    const grossMarginLoadPercent = marginLoadBasisUsd > 0
+      ? round((usedMarginUsd / marginLoadBasisUsd) * 100, 2)
       : Number.POSITIVE_INFINITY;
     const depositLoadPercent = balanceUsd > 0 ? round((usedMarginUsd / balanceUsd) * 100, 2) : Number.POSITIVE_INFINITY;
     const marginLevelPercent = usedMarginUsd > 0 ? round((balanceUsd / usedMarginUsd) * 100, 2) : null;
@@ -2224,6 +2249,16 @@ function formatCurrency(value: number | null | undefined) {
     style: "currency",
     currency: "USD",
     maximumFractionDigits: value >= 1000 ? 0 : 2,
+  }).format(value);
+}
+
+function formatCurrencyTick(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value)) return "-";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    notation: "compact",
+    maximumFractionDigits: 1,
   }).format(value);
 }
 

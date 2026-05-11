@@ -7,8 +7,8 @@ from typing import Any
 
 DEFAULT_EXECUTION_COST_MODE = "research-conservative"
 DEFAULT_SPREAD_BPS = 2.0
-DEFAULT_SLIPPAGE_BPS = 0.5
-DEFAULT_COMMISSION_BPS = 0.1
+DEFAULT_SLIPPAGE_BPS = 1.0
+DEFAULT_COMMISSION_BPS = 0.5
 
 _VALID_MODES = {"none", "fixed-bps", "research-conservative"}
 

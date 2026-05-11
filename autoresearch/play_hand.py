@@ -3309,7 +3309,7 @@ def cmd_play_hand(
         "run_id": run_id,
         "runner": "play_hand_v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "canonical_score_lab_version": "score_lab_v2_5_2",
+        "canonical_score_lab_version": "score_lab_v2_5_3",
         "seed": seed,
         "instrument_source": instrument_deal["source"],
         "primary_instrument": instrument_deal["primary_instrument"],

@@ -2806,7 +2806,7 @@ def test_normalized_attempt_record_evidence_includes_signal_behavior(tmp_path) -
     score = AttemptScore(
         primary_score=67.2,
         composite_score=67.2,
-        score_basis="score_lab_v2_5_2:geometric_mean",
+        score_basis="score_lab_v2_5_3:geometric_mean",
         metrics={},
         best_summary=best_summary,
     )
