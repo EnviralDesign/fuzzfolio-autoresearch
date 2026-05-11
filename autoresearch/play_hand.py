@@ -63,14 +63,13 @@ EVOLUTIONARY_BUDGET_PRESETS: dict[str, tuple[int, int]] = {
 }
 PLAY_HAND_REWARD_STEP_R = 0.5
 PLAY_HAND_REWARD_COLUMN_LIMIT = 25
-PLAY_HAND_DEFAULT_MAX_REWARD_R = PLAY_HAND_REWARD_STEP_R * PLAY_HAND_REWARD_COLUMN_LIMIT
+PLAY_HAND_HARD_MAX_REWARD_R = PLAY_HAND_REWARD_STEP_R * PLAY_HAND_REWARD_COLUMN_LIMIT
+PLAY_HAND_DEFAULT_MAX_REWARD_R = 4.0
 PLAY_HAND_RUNNER = "play_hand_v1"
 
 
 def play_hand_reward_matrix(max_reward_r: float | None) -> dict[str, Any] | None:
-    if max_reward_r is None:
-        return None
-    requested = float(max_reward_r)
+    requested = PLAY_HAND_DEFAULT_MAX_REWARD_R if max_reward_r is None else float(max_reward_r)
     if not math.isfinite(requested) or requested <= 0:
         raise ValueError("--max-reward-r must be a positive finite number")
     columns = int(math.floor((requested / PLAY_HAND_REWARD_STEP_R) + 1e-9))
@@ -87,7 +86,9 @@ def play_hand_reward_matrix(max_reward_r: float | None) -> dict[str, Any] | None
         "reward_columns": columns,
         "effective_max_reward_r": effective_max,
         "default_max_reward_r": PLAY_HAND_DEFAULT_MAX_REWARD_R,
-        "is_active_cap": effective_max < PLAY_HAND_DEFAULT_MAX_REWARD_R,
+        "hard_max_reward_r": PLAY_HAND_HARD_MAX_REWARD_R,
+        "is_default_cap": max_reward_r is None,
+        "is_active_cap": effective_max < PLAY_HAND_HARD_MAX_REWARD_R,
     }
 
 
@@ -3333,7 +3334,7 @@ def cmd_play_hand(
         "sweep_budget_value": sweep_budget_value,
         "sweep_budget_source": budget.get("source"),
         "legacy_evolutionary_budget": evolutionary_budget,
-        "max_reward_r": max_reward_r,
+        "max_reward_r": reward_matrix.get("requested_max_reward_r") if reward_matrix else max_reward_r,
         "reward_matrix": reward_matrix,
         "reward_step_r": reward_matrix.get("reward_step_r") if reward_matrix else None,
         "reward_columns": reward_matrix.get("reward_columns") if reward_matrix else None,
@@ -3740,7 +3741,7 @@ def cmd_play_hand(
         "sweep_budget_value": sweep_budget_value,
         "sweep_budget_source": budget.get("source"),
         "max_sweep_permutations": max_sweep_permutations,
-        "max_reward_r": max_reward_r,
+        "max_reward_r": reward_matrix.get("requested_max_reward_r") if reward_matrix else max_reward_r,
         "reward_matrix": reward_matrix,
         "instrument_scout": scout_result,
         "canonical_attempt_id": final_attempt_id or None,

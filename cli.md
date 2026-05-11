@@ -44,7 +44,7 @@ Common arguments:
 - `--min-indicators`, `--max-indicators`: dealt indicator count bounds.
 - `--sweep-budget`: `low`, `medium`, or `high`; default high.
 - `--max-sweep-permutations`: exact legacy deterministic cap override.
-- `--max-reward-r`, `--max-r`: cap the searched reward/R cells.
+- `--max-reward-r`, `--max-r`: cap the searched reward/R cells. Default is `4`; pass `12.5` to opt into the full legacy 25-column grid.
 - `--coarse-mode`: `deterministic` or `evolutionary`.
 - `--no-instrument-scout`: skip late cross-instrument scouting.
 - `--no-final-artifacts`: skip canonical finalization at wrap-up.

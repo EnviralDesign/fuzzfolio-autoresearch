@@ -488,8 +488,8 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         type=float,
         default=None,
         help=(
-            "Optional cap for the reward/R search matrix used by play-hand sweeps and evaluations. "
-            "For example, --max-reward-r 4 limits searched reward cells to <=4R."
+            "Cap for the reward/R search matrix used by play-hand sweeps and evaluations. "
+            "Defaults to 4R; pass --max-reward-r 12.5 for the full legacy 25-column grid."
         ),
     )
     play_hand.add_argument(

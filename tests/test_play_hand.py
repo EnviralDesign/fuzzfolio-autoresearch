@@ -262,12 +262,28 @@ def test_play_hand_reward_matrix_caps_default_reward_grid() -> None:
     ]
 
 
-def test_play_hand_reward_matrix_keeps_default_ceiling_for_large_caps() -> None:
+def test_play_hand_reward_matrix_defaults_to_four_r() -> None:
+    matrix = play_hand_reward_matrix(None)
+
+    assert matrix is not None
+    assert matrix["requested_max_reward_r"] == 4.0
+    assert matrix["reward_columns"] == 8
+    assert matrix["effective_max_reward_r"] == 4.0
+    assert matrix["default_max_reward_r"] == 4.0
+    assert matrix["hard_max_reward_r"] == 12.5
+    assert matrix["is_default_cap"] is True
+    assert matrix["is_active_cap"] is True
+
+
+def test_play_hand_reward_matrix_keeps_hard_ceiling_for_large_caps() -> None:
     matrix = play_hand_reward_matrix(20)
 
     assert matrix is not None
     assert matrix["reward_columns"] == 25
     assert matrix["effective_max_reward_r"] == 12.5
+    assert matrix["default_max_reward_r"] == 4.0
+    assert matrix["hard_max_reward_r"] == 12.5
+    assert matrix["is_default_cap"] is False
     assert matrix["is_active_cap"] is False
 
 
