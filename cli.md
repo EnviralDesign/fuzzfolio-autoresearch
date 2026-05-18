@@ -50,6 +50,8 @@ Common arguments:
 - `--no-final-artifacts`: skip canonical finalization at wrap-up.
 - `--final-profile-drop-count`: positive values finalize the canonical run winner; `0` skips final profile-drop rendering.
 - `--final-profile-drop-workers`: final profile-drop worker count.
+- `--job-timeout-seconds`: deep-replay job wait budget for Play Hand evaluations. Default `2400`.
+- `--sweep-timeout-seconds`: sweep wait budget before Play Hand gives up on a sweep. Default `7200`.
 - `--dry-run`: write the run/plan without backend compute.
 - `--json`: print a JSON summary.
 

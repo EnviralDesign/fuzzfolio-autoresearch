@@ -446,6 +446,106 @@ def test_select_dashboard_preferred_attempt_rows_matches_reader_logic() -> None:
     assert info["score_selected_run_count"] == 1
 
 
+def test_select_dashboard_preferred_attempt_rows_skips_tombstoned_playhand_run() -> None:
+    rows = [
+        {
+            "run_id": "dead-playhand-run",
+            "attempt_id": "dead-playhand-run-attempt-00001",
+            "runner": "play_hand_v1",
+            "attempt_role": "instrument_scout",
+            "score_36m": 88.0,
+            "composite_score": 88.0,
+        },
+        {
+            "run_id": "dead-playhand-run",
+            "attempt_id": "dead-playhand-run-attempt-00011",
+            "runner": "play_hand_v1",
+            "attempt_role": "final",
+            "score_36m": 0.0,
+            "composite_score": 0.0,
+            "attempt_decision": "tombstoned",
+            "attempt_decision_reasons": ["final_36mo_scrutiny_failed"],
+        },
+        {
+            "run_id": "live-playhand-run",
+            "attempt_id": "live-playhand-run-attempt-00011",
+            "runner": "play_hand_v1",
+            "attempt_role": "final",
+            "score_36m": 61.0,
+            "composite_score": 61.0,
+            "is_canonical_playhand_attempt": True,
+        },
+    ]
+
+    selected, info = pf.select_dashboard_preferred_attempt_rows(rows)
+
+    assert [row["attempt_id"] for row in selected] == [
+        "live-playhand-run-attempt-00011"
+    ]
+    assert info["tombstoned_run_count"] == 1
+    assert info["tombstoned_dropped_count"] == 2
+
+
+def test_select_dashboard_preferred_attempt_rows_skips_incomplete_playhand_run() -> None:
+    rows = [
+        {
+            "run_id": "incomplete-playhand-run",
+            "attempt_id": "incomplete-playhand-run-attempt-00001",
+            "runner": "play_hand_v1",
+            "attempt_role": "baseline",
+            "score_36m": 93.0,
+            "composite_score": 93.0,
+        },
+        {
+            "run_id": "live-playhand-run",
+            "attempt_id": "live-playhand-run-attempt-00011",
+            "runner": "play_hand_v1",
+            "attempt_role": "final",
+            "score_36m": 61.0,
+            "composite_score": 61.0,
+            "is_canonical_playhand_attempt": True,
+        },
+    ]
+
+    selected, info = pf.select_dashboard_preferred_attempt_rows(rows)
+
+    assert [row["attempt_id"] for row in selected] == [
+        "live-playhand-run-attempt-00011"
+    ]
+    assert info["incomplete_playhand_run_count"] == 1
+    assert info["incomplete_playhand_dropped_count"] == 1
+
+
+def test_filter_play_hand_candidate_scope_all_skips_incomplete_playhand_run() -> None:
+    rows = [
+        {
+            "run_id": "incomplete-playhand-run",
+            "attempt_id": "incomplete-playhand-run-attempt-00001",
+            "runner": "play_hand_v1",
+            "attempt_role": "baseline",
+            "score_36m": 93.0,
+            "composite_score": 93.0,
+        },
+        {
+            "run_id": "completed-playhand-run",
+            "attempt_id": "completed-playhand-run-attempt-00011",
+            "runner": "play_hand_v1",
+            "attempt_role": "final",
+            "score_36m": 61.0,
+            "composite_score": 61.0,
+            "is_canonical_playhand_attempt": True,
+        },
+    ]
+
+    selected, info = pf.filter_play_hand_candidate_scope(rows, "all")
+
+    assert [row["attempt_id"] for row in selected] == [
+        "completed-playhand-run-attempt-00011"
+    ]
+    assert info["incomplete_playhand_run_count"] == 1
+    assert info["incomplete_playhand_dropped_count"] == 1
+
+
 def test_enrich_rows_for_account_computes_account_metrics(tmp_path: Path) -> None:
     result_path = tmp_path / "full-backtest-result.json"
     result_path.write_text(
@@ -1352,6 +1452,83 @@ def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(
     assert payload["selection"]["canonical_run_count"] == 1
     assert payload["selection"]["score_selected_run_count"] == 1
     assert payload["refresh_summary"]["attempt_count"] == 4
+
+
+def test_cmd_finalize_corpus_skips_tombstoned_runs(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=tmp_path / "runs",
+        fuzzfolio=SimpleNamespace(),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+    rows = [
+        {
+            "run_id": "dead-playhand-run",
+            "attempt_id": "dead-playhand-run-attempt-00001",
+            "runner": "play_hand_v1",
+            "attempt_role": "instrument_scout",
+            "score_36m": 88.0,
+            "composite_score": 88.0,
+        },
+        {
+            "run_id": "dead-playhand-run",
+            "attempt_id": "dead-playhand-run-attempt-00011",
+            "runner": "play_hand_v1",
+            "attempt_role": "final",
+            "score_36m": 0.0,
+            "composite_score": 0.0,
+            "attempt_decision": "tombstoned",
+            "attempt_decision_reasons": ["final_36mo_scrutiny_failed"],
+        },
+        {
+            "run_id": "live-playhand-run",
+            "attempt_id": "live-playhand-run-attempt-00011",
+            "runner": "play_hand_v1",
+            "attempt_role": "final",
+            "score_36m": 62.0,
+            "composite_score": 62.0,
+            "is_canonical_playhand_attempt": True,
+        },
+    ]
+    monkeypatch.setattr(
+        ar_main,
+        "_selection_corpus_rows",
+        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+    )
+    render_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        ar_main,
+        "cmd_render_corpus_profile_drops",
+        lambda **kwargs: render_calls.append(kwargs) or print("{}") or 0,
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_refresh_global_derived_corpus_state",
+        lambda _config: {"attempt_count": len(rows)},
+    )
+
+    exit_code = ar_main.cmd_finalize_corpus(
+        run_ids=None,
+        attempt_ids=None,
+        scope="dashboard",
+        lookback_months=36,
+        profile_drop_workers=2,
+        profile_drop_timeout_seconds=90,
+        force_rebuild=False,
+        require_presentation_metadata=True,
+        dry_run=False,
+        as_json=True,
+        full_backtest_workers=None,
+    )
+
+    assert exit_code == 0
+    assert render_calls[0]["attempt_ids"] == ["live-playhand-run-attempt-00011"]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["selected_count"] == 1
+    assert payload["selection"]["tombstoned_run_count"] == 1
+    assert payload["selection"]["tombstoned_dropped_count"] == 2
 
 
 def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(

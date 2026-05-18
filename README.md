@@ -68,6 +68,8 @@ uv run dashboard
 
 By default, Play Hand searches reward cells up to `4R`. Use `--max-reward-r 12.5` only when you explicitly want the full legacy high-R grid.
 
+Play Hand defaults are tuned for long unattended runs: deep-replay jobs can wait up to `2400` seconds and sweeps can wait up to `7200` seconds before the run gives up.
+
 From there you can build the portfolio either way:
 
 - In the dashboard, use Portfolio Workbench -> Auto Build. The dashboard writes a dashboard-owned config under `runs/derived/dashboard-portfolio-configs/`, starts a local `build-portfolio` job, shows status/logs, and can import the auto-selected result into the manual draft.

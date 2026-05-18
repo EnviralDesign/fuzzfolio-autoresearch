@@ -124,8 +124,10 @@ if __package__ in {None, ""}:
         build_sleeve_selection,
         enrich_rows_for_account,
         finalize_sleeve_selection,
+        filter_dashboard_visible_candidate_rows,
         filter_play_hand_candidate_scope,
         filter_selection_candidate_rows,
+        filter_tombstoned_candidate_rows,
         load_portfolio_build_specs,
         load_portfolio_spec,
         merge_portfolio_sleeves,
@@ -145,7 +147,11 @@ if __package__ in {None, ""}:
         build_attempt_score,
         load_sensitivity_snapshot,
     )
-    from autoresearch.play_hand import cmd_play_hand
+    from autoresearch.play_hand import (
+        PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
+        PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
+        cmd_play_hand,
+    )
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
@@ -228,8 +234,10 @@ else:
         build_sleeve_selection,
         enrich_rows_for_account,
         finalize_sleeve_selection,
+        filter_dashboard_visible_candidate_rows,
         filter_play_hand_candidate_scope,
         filter_selection_candidate_rows,
+        filter_tombstoned_candidate_rows,
         load_portfolio_build_specs,
         load_portfolio_spec,
         merge_portfolio_sleeves,
@@ -249,7 +257,11 @@ else:
         build_attempt_score,
         load_sensitivity_snapshot,
     )
-    from .play_hand import cmd_play_hand
+    from .play_hand import (
+        PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
+        PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
+        cmd_play_hand,
+    )
     from .typed_tools import CLI_OK_TOOLS
 
 
@@ -571,6 +583,24 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Concurrent profile-drop workers for the play-hand wrapup render. Default: 1.",
+    )
+    play_hand.add_argument(
+        "--job-timeout-seconds",
+        type=int,
+        default=PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
+        help=(
+            "Maximum seconds the Fuzzfolio CLI waits for each deep-replay job. "
+            f"Default: {PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS}."
+        ),
+    )
+    play_hand.add_argument(
+        "--sweep-timeout-seconds",
+        type=int,
+        default=PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
+        help=(
+            "Maximum seconds the Fuzzfolio CLI waits for a sweep to finish. "
+            f"Default: {PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS}."
+        ),
     )
     play_hand.add_argument(
         "--dry-run",
@@ -10120,7 +10150,7 @@ def cmd_render_corpus_profile_drops(
     }
 
     def select_rows(all_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        rows = list(all_rows)
+        rows, _tombstone_info = filter_tombstoned_candidate_rows(list(all_rows))
         if wanted_attempt_ids:
             rows = [
                 row
@@ -10325,6 +10355,9 @@ def _select_finalize_corpus_rows(
     scope: str,
     attempt_ids: list[str] | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    input_count = len(rows)
+    rows, tombstone_info = filter_tombstoned_candidate_rows(list(rows))
+    rows, incomplete_info = filter_dashboard_visible_candidate_rows(rows)
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
     }
@@ -10345,22 +10378,51 @@ def _select_finalize_corpus_rows(
         selected.sort(key=_full_backtest_priority_key)
         return selected, {
             "selection_scope": "attempt_id",
-            "input_count": len(rows),
+            "input_count": input_count,
             "output_count": len(selected),
             "run_count": len({str(row.get("run_id") or "").strip() for row in selected}),
+            "tombstoned_run_count": tombstone_info["tombstoned_run_count"],
+            "tombstoned_dropped_count": tombstone_info["tombstoned_dropped_count"],
+            "incomplete_playhand_run_count": incomplete_info[
+                "incomplete_playhand_run_count"
+            ],
+            "incomplete_playhand_dropped_count": incomplete_info[
+                "incomplete_playhand_dropped_count"
+            ],
         }
     if scope == "all":
         selected = list(rows)
         selected.sort(key=_full_backtest_priority_key)
         return selected, {
             "selection_scope": "all",
-            "input_count": len(rows),
+            "input_count": input_count,
             "output_count": len(selected),
             "run_count": len({str(row.get("run_id") or "").strip() for row in selected}),
+            "tombstoned_run_count": tombstone_info["tombstoned_run_count"],
+            "tombstoned_dropped_count": tombstone_info["tombstoned_dropped_count"],
+            "incomplete_playhand_run_count": incomplete_info[
+                "incomplete_playhand_run_count"
+            ],
+            "incomplete_playhand_dropped_count": incomplete_info[
+                "incomplete_playhand_dropped_count"
+            ],
         }
     selected, info = select_dashboard_preferred_attempt_rows(rows)
     selected.sort(key=_full_backtest_priority_key)
-    return selected, {"selection_scope": "dashboard", **info}
+    merged_info = {
+        "selection_scope": "dashboard",
+        **info,
+    }
+    merged_info["input_count"] = input_count
+    merged_info["tombstoned_run_count"] = tombstone_info["tombstoned_run_count"]
+    merged_info["tombstoned_dropped_count"] = tombstone_info["tombstoned_dropped_count"]
+    merged_info["incomplete_playhand_run_count"] = incomplete_info[
+        "incomplete_playhand_run_count"
+    ]
+    merged_info["incomplete_playhand_dropped_count"] = incomplete_info[
+        "incomplete_playhand_dropped_count"
+    ]
+    return selected, merged_info
 
 
 def cmd_finalize_corpus(
@@ -10415,7 +10477,10 @@ def cmd_finalize_corpus(
         f"[finalize-corpus] selected {len(selected_rows)}/{len(full_catalog_rows)} "
         f"attempts (skipped_by_selection={skipped_by_selection}, "
         f"scope={selection_info.get('selection_scope')}, "
-        f"runs={selection_info.get('run_count')}, workers={max(1, int(profile_drop_workers))}, "
+        f"runs={selection_info.get('run_count')}, "
+        f"tombstoned_runs={selection_info.get('tombstoned_run_count', 0)}, "
+        f"tombstoned_attempts={selection_info.get('tombstoned_dropped_count', 0)}, "
+        f"workers={max(1, int(profile_drop_workers))}, "
         f"full_backtest_workers={full_backtest_worker_count if full_backtest_worker_count is not None else 'auto'}, "
         f"full_backtest_job_timeout={full_backtest_job_timeout if full_backtest_job_timeout is not None else 'default'}, "
         f"lookback={int(lookback_months)}mo, dry_run={'yes' if dry_run else 'no'})",
@@ -10740,6 +10805,8 @@ def main(argv: list[str] | None = None) -> int:
             final_artifacts=not bool(args.no_final_artifacts),
             final_profile_drop_count=args.final_profile_drop_count,
             final_profile_drop_workers=args.final_profile_drop_workers,
+            job_timeout_seconds=args.job_timeout_seconds,
+            sweep_timeout_seconds=args.sweep_timeout_seconds,
             dry_run=bool(args.dry_run),
             as_json=bool(args.json),
         )

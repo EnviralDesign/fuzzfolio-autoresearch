@@ -19,6 +19,7 @@ from .ledger import list_run_dirs, load_run_metadata
 from .portfolio import (
     dashboard_attempt_score_sort_key,
     dashboard_run_attempt_sort_key,
+    filter_dashboard_visible_candidate_rows,
     is_dashboard_canonical_attempt,
     select_dashboard_preferred_attempt_rows,
 )
@@ -1115,7 +1116,19 @@ def _normalize_promotion_payload(config: AppConfig, payload: dict[str, Any] | No
 
 
 def _build_viewer_payload(config: AppConfig, catalog_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    visible_catalog_rows, visibility_info = filter_dashboard_visible_candidate_rows(
+        catalog_rows
+    )
     summary = _load_optional_json(config.attempt_catalog_summary_path) or {}
+    summary = dict(summary) if isinstance(summary, dict) else {}
+    summary["tombstoned_run_count"] = visibility_info["tombstoned_run_count"]
+    summary["tombstoned_attempt_count"] = visibility_info["tombstoned_dropped_count"]
+    summary["incomplete_playhand_run_count"] = visibility_info[
+        "incomplete_playhand_run_count"
+    ]
+    summary["incomplete_playhand_attempt_count"] = visibility_info[
+        "incomplete_playhand_dropped_count"
+    ]
     audit = _load_optional_json(config.full_backtest_audit_json_path) or {}
     latest_portfolio_path = _latest_portfolio_report_path(config)
     if latest_portfolio_path:
@@ -1133,7 +1146,7 @@ def _build_viewer_payload(config: AppConfig, catalog_rows: list[dict[str, Any]])
         config,
         _load_optional_json(config.promotion_board_json_path),
     )
-    runs = _build_run_summaries(config, catalog_rows)
+    runs = _build_run_summaries(config, visible_catalog_rows)
     charts = {
         "corpus_score_vs_trades": _normalize_chart_entry(config, str(config.corpus_tradeoff_plot_path)),
         "corpus_score_vs_trades_json": _normalize_chart_entry(
@@ -1163,8 +1176,8 @@ def _build_viewer_payload(config: AppConfig, catalog_rows: list[dict[str, Any]])
         "promotion": promotion,
         "runs": runs,
         "charts": charts,
-        "cadence_bands_all_scored": _cadence_band_rows(catalog_rows),
-        "cadence_bands_score_ge_40": _cadence_band_rows(catalog_rows, min_score=40.0),
+        "cadence_bands_all_scored": _cadence_band_rows(visible_catalog_rows),
+        "cadence_bands_score_ge_40": _cadence_band_rows(visible_catalog_rows, min_score=40.0),
     }
 
 
@@ -1376,7 +1389,10 @@ def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:
                         return self._send_json({"error": "job_not_found"}, status=404)
                     return self._send_json(job)
             if parsed.path == "/api/catalog":
-                rows = [_normalize_path_fields(state.config, row) for row in state.catalog_rows()]
+                visible_rows, _visibility_info = filter_dashboard_visible_candidate_rows(
+                    state.catalog_rows()
+                )
+                rows = [_normalize_path_fields(state.config, row) for row in visible_rows]
                 return self._send_json(
                     {
                         "generated_at": datetime.now(timezone.utc).isoformat(),

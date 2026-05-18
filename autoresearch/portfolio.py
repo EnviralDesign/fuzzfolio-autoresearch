@@ -128,6 +128,12 @@ DEFAULT_PORTFOLIO_SPEC: dict[str, Any] = {
 PLAY_HAND_RUNNER = "play_hand_v1"
 PROMOTED_CANDIDATE_SCOPE = "promoted"
 ALL_CANDIDATE_SCOPE = "all"
+TOMBSTONE_DECISIONS = {"tombstoned"}
+TOMBSTONE_REASON_TOKENS = {
+    "final_36mo_scrutiny_failed",
+    "missing_final_36mo_score",
+    "final_36mo_score_not_positive",
+}
 
 
 def normalize_candidate_scope(value: Any) -> str:
@@ -177,9 +183,166 @@ def _row_is_canonical_attempt(row: dict[str, Any]) -> bool:
 
 def _safe_float(value: Any) -> float | None:
     try:
+        if isinstance(value, bool):
+            return None
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    token = str(value or "").strip().lower()
+    return token in {"1", "true", "yes", "y", "on"}
+
+
+def _row_reason_tokens(row: dict[str, Any]) -> set[str]:
+    values = row.get("attempt_decision_reasons")
+    if values is None:
+        values = row.get("run_tombstone_reasons") or row.get("tombstone_reasons")
+    if isinstance(values, str):
+        tokens = re.split(r"[,;|]", values)
+    elif isinstance(values, list):
+        tokens = [str(value) for value in values]
+    else:
+        tokens = []
+    return {str(token).strip().lower() for token in tokens if str(token).strip()}
+
+
+def _row_is_final_scrutiny_attempt(row: dict[str, Any]) -> bool:
+    role = str(row.get("attempt_role") or row.get("play_hand_role") or "").strip().lower()
+    candidate_name = str(row.get("candidate_name") or "").strip().lower()
+    return role == "final" or candidate_name == "final_36mo"
+
+
+def _row_has_failed_final_scrutiny(row: dict[str, Any]) -> bool:
+    if not _row_is_play_hand(row) or not _row_is_final_scrutiny_attempt(row):
+        return False
+    score_36 = _safe_float(row.get("score_36m"))
+    composite = _safe_float(row.get("composite_score"))
+    score = score_36 if score_36 is not None else composite
+    return score is not None and score <= 0.0
+
+
+def is_tombstoned_attempt_row(row: dict[str, Any]) -> bool:
+    if _truthy(row.get("is_tombstoned")):
+        return True
+    if _truthy(row.get("run_tombstoned")) or _truthy(row.get("is_tombstoned_run")):
+        return True
+    if _truthy(row.get("attempt_tombstoned")) or _truthy(row.get("is_tombstoned_attempt")):
+        return True
+    decision = str(row.get("attempt_decision") or "").strip().lower()
+    if decision in TOMBSTONE_DECISIONS:
+        return True
+    if _row_reason_tokens(row).intersection(TOMBSTONE_REASON_TOKENS):
+        return True
+    return _row_has_failed_final_scrutiny(row)
+
+
+def _run_group_is_tombstoned(rows: list[dict[str, Any]]) -> bool:
+    return any(is_tombstoned_attempt_row(row) for row in rows)
+
+
+def filter_tombstoned_candidate_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    original_rows = list(rows)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    run_order: list[str] = []
+    orphan_index = 0
+    for row in original_rows:
+        run_id = str(row.get("run_id") or "").strip()
+        if run_id:
+            key = run_id
+        else:
+            orphan_index += 1
+            key = f"__orphan_{orphan_index}"
+        if key not in grouped:
+            grouped[key] = []
+            run_order.append(key)
+        grouped[key].append(row)
+
+    filtered: list[dict[str, Any]] = []
+    tombstoned_runs = 0
+    tombstoned_rows = 0
+    for key in run_order:
+        group = grouped[key]
+        if _run_group_is_tombstoned(group):
+            tombstoned_runs += 1
+            tombstoned_rows += len(group)
+            continue
+        filtered.extend(group)
+    return filtered, {
+        "input_count": len(original_rows),
+        "output_count": len(filtered),
+        "tombstoned_run_count": tombstoned_runs,
+        "tombstoned_dropped_count": tombstoned_rows,
+    }
+
+
+def _run_group_is_incomplete_playhand(rows: list[dict[str, Any]]) -> bool:
+    if not any(_row_is_play_hand(row) for row in rows):
+        return False
+    if any(_row_is_canonical_attempt(row) or _row_is_canonical_play_hand(row) for row in rows):
+        return False
+    return not any(_row_is_final_scrutiny_attempt(row) for row in rows)
+
+
+def filter_incomplete_playhand_candidate_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    original_rows = list(rows)
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    run_order: list[str] = []
+    orphan_index = 0
+    for row in original_rows:
+        run_id = str(row.get("run_id") or "").strip()
+        if run_id:
+            key = run_id
+        else:
+            orphan_index += 1
+            key = f"__orphan_{orphan_index}"
+        if key not in grouped:
+            grouped[key] = []
+            run_order.append(key)
+        grouped[key].append(row)
+
+    filtered: list[dict[str, Any]] = []
+    incomplete_runs = 0
+    incomplete_rows = 0
+    for key in run_order:
+        group = grouped[key]
+        if _run_group_is_incomplete_playhand(group):
+            incomplete_runs += 1
+            incomplete_rows += len(group)
+            continue
+        filtered.extend(group)
+    return filtered, {
+        "input_count": len(original_rows),
+        "output_count": len(filtered),
+        "incomplete_playhand_run_count": incomplete_runs,
+        "incomplete_playhand_dropped_count": incomplete_rows,
+    }
+
+
+def filter_dashboard_visible_candidate_rows(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    active_rows, tombstone_info = filter_tombstoned_candidate_rows(list(rows))
+    visible_rows, incomplete_info = filter_incomplete_playhand_candidate_rows(active_rows)
+    return visible_rows, {
+        "input_count": tombstone_info["input_count"],
+        "output_count": len(visible_rows),
+        "tombstoned_run_count": tombstone_info["tombstoned_run_count"],
+        "tombstoned_dropped_count": tombstone_info["tombstoned_dropped_count"],
+        "incomplete_playhand_run_count": incomplete_info[
+            "incomplete_playhand_run_count"
+        ],
+        "incomplete_playhand_dropped_count": incomplete_info[
+            "incomplete_playhand_dropped_count"
+        ],
+    }
 
 
 def dashboard_attempt_score_sort_key(
@@ -204,6 +367,8 @@ def is_dashboard_canonical_attempt(row: dict[str, Any]) -> bool:
 def select_dashboard_preferred_attempt_rows(
     rows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    original_count = len(rows)
+    rows, visible_info = filter_dashboard_visible_candidate_rows(rows)
     grouped: dict[str, list[dict[str, Any]]] = {}
     run_order: list[str] = []
     orphan_index = 0
@@ -224,8 +389,15 @@ def select_dashboard_preferred_attempt_rows(
     score_selected_run_count = 0
     for key in run_order:
         group = grouped[key]
+        is_playhand_group = any(_row_is_play_hand(row) for row in group)
         canonical_rows = [row for row in group if is_dashboard_canonical_attempt(row)]
-        candidates = canonical_rows or group
+        if not canonical_rows and is_playhand_group:
+            final_rows = [row for row in group if _row_is_final_scrutiny_attempt(row)]
+            if not final_rows:
+                continue
+            candidates = final_rows
+        else:
+            candidates = canonical_rows or group
         if not candidates:
             continue
         selected.append(sorted(candidates, key=dashboard_attempt_score_sort_key)[0])
@@ -235,11 +407,19 @@ def select_dashboard_preferred_attempt_rows(
             score_selected_run_count += 1
 
     return selected, {
-        "input_count": len(rows),
+        "input_count": original_count,
         "output_count": len(selected),
         "run_count": len(run_order),
         "canonical_run_count": canonical_run_count,
         "score_selected_run_count": score_selected_run_count,
+        "tombstoned_run_count": visible_info["tombstoned_run_count"],
+        "tombstoned_dropped_count": visible_info["tombstoned_dropped_count"],
+        "incomplete_playhand_run_count": visible_info[
+            "incomplete_playhand_run_count"
+        ],
+        "incomplete_playhand_dropped_count": visible_info[
+            "incomplete_playhand_dropped_count"
+        ],
     }
 
 
@@ -255,18 +435,27 @@ def filter_play_hand_candidate_scope(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     scope = normalize_candidate_scope(candidate_scope)
     original_rows = list(rows)
+    active_rows, visible_info = filter_dashboard_visible_candidate_rows(original_rows)
     if scope == ALL_CANDIDATE_SCOPE:
-        return original_rows, {
+        return active_rows, {
             "candidate_scope": scope,
             "input_count": len(original_rows),
-            "output_count": len(original_rows),
+            "output_count": len(active_rows),
             "dropped_count": 0,
             "playhand_runs_with_canonical": 0,
+            "tombstoned_run_count": visible_info["tombstoned_run_count"],
+            "tombstoned_dropped_count": visible_info["tombstoned_dropped_count"],
+            "incomplete_playhand_run_count": visible_info[
+                "incomplete_playhand_run_count"
+            ],
+            "incomplete_playhand_dropped_count": visible_info[
+                "incomplete_playhand_dropped_count"
+            ],
         }
 
     grouped: dict[str, list[dict[str, Any]]] = {}
     run_order: list[str] = []
-    for row in original_rows:
+    for row in active_rows:
         run_id = str(row.get("run_id") or "").strip()
         key = run_id or f"__row_{len(run_order)}"
         if key not in grouped:
@@ -279,18 +468,25 @@ def filter_play_hand_candidate_scope(
     dropped = 0
     for key in run_order:
         group = grouped[key]
+        is_playhand_group = any(_row_is_play_hand(row) for row in group)
         canonical_rows = [
             row for row in group if _row_is_canonical_attempt(row)
         ]
         if canonical_rows:
-            if any(_row_is_play_hand(row) for row in group):
+            if is_playhand_group:
                 playhand_runs_with_canonical += 1
-        elif any(_row_is_play_hand(row) for row in group):
+        elif is_playhand_group:
             canonical_rows = [
                 row for row in group if _row_is_canonical_play_hand(row)
             ]
             if canonical_rows:
                 playhand_runs_with_canonical += 1
+            else:
+                final_rows = [row for row in group if _row_is_final_scrutiny_attempt(row)]
+                if not final_rows:
+                    dropped += len(group)
+                    continue
+                canonical_rows = sorted(final_rows, key=dashboard_attempt_score_sort_key)[:1]
         else:
             filtered.extend(group)
             continue
@@ -315,6 +511,14 @@ def filter_play_hand_candidate_scope(
         "output_count": len(filtered),
         "dropped_count": dropped,
         "playhand_runs_with_canonical": playhand_runs_with_canonical,
+        "tombstoned_run_count": visible_info["tombstoned_run_count"],
+        "tombstoned_dropped_count": visible_info["tombstoned_dropped_count"],
+        "incomplete_playhand_run_count": visible_info[
+            "incomplete_playhand_run_count"
+        ],
+        "incomplete_playhand_dropped_count": visible_info[
+            "incomplete_playhand_dropped_count"
+        ],
     }
 
 DEFAULT_ACCOUNT_ASSET_MARGIN_WEIGHTS: dict[str, float] = {
@@ -896,10 +1100,11 @@ def filter_selection_candidate_rows(
     require_full_backtest_36: bool,
     field_filters: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int], float | None]:
-    filtered_rows = list(rows)
+    filtered_rows, tombstone_info = filter_tombstoned_candidate_rows(list(rows))
     if candidate_limit >= 0:
         filtered_rows = filtered_rows[:candidate_limit]
     filter_rejections = {
+        "tombstoned_run": int(tombstone_info["tombstoned_dropped_count"]),
         "missing_score_36m": 0,
         "score_below_min_score_36": 0,
         "missing_trades_per_month_36m": 0,

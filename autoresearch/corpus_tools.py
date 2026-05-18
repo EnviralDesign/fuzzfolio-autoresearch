@@ -677,6 +677,43 @@ def extract_attempt_catalog_row(
         attempt_decision_reasons = [raw_decision_reasons.strip()]
     else:
         attempt_decision_reasons = []
+    run_tombstoned = bool(
+        metadata.get("run_tombstoned")
+        or metadata.get("tombstoned")
+        or metadata.get("is_tombstoned_run")
+    )
+    attempt_tombstoned = bool(
+        attempt.get("attempt_tombstoned")
+        or attempt.get("is_tombstoned_attempt")
+        or attempt.get("is_tombstoned")
+    )
+    raw_tombstone_reasons = (
+        attempt.get("tombstone_reasons")
+        or attempt.get("run_tombstone_reasons")
+        or metadata.get("tombstone_reasons")
+        or metadata.get("run_tombstone_reasons")
+        or []
+    )
+    if isinstance(raw_tombstone_reasons, str):
+        tombstone_reasons = [raw_tombstone_reasons.strip()] if raw_tombstone_reasons.strip() else []
+    elif isinstance(raw_tombstone_reasons, list):
+        tombstone_reasons = [
+            str(reason).strip()
+            for reason in raw_tombstone_reasons
+            if str(reason).strip()
+        ]
+    else:
+        tombstone_reasons = []
+    tombstone_reason = (
+        str(
+            attempt.get("tombstone_reason")
+            or attempt.get("run_tombstone_reason")
+            or metadata.get("tombstone_reason")
+            or metadata.get("run_tombstone_reason")
+            or ""
+        ).strip()
+        or None
+    )
 
     return {
         "run_id": str(attempt.get("run_id") or ""),
@@ -699,6 +736,22 @@ def extract_attempt_catalog_row(
         "attempt_role": attempt_role,
         "attempt_decision": attempt_decision,
         "attempt_decision_reasons": attempt_decision_reasons,
+        "run_status": str(metadata.get("run_status") or "").strip() or None,
+        "run_tombstoned": run_tombstoned,
+        "attempt_tombstoned": attempt_tombstoned,
+        "is_tombstoned": run_tombstoned or attempt_tombstoned,
+        "tombstone_reason": tombstone_reason,
+        "tombstone_reasons": tombstone_reasons,
+        "final_scrutiny_passed": (
+            attempt.get("final_scrutiny_passed")
+            if attempt.get("final_scrutiny_passed") is not None
+            else metadata.get("final_scrutiny_passed")
+        ),
+        "final_scrutiny_score": _safe_float(
+            attempt.get("final_scrutiny_score")
+            if attempt.get("final_scrutiny_score") is not None
+            else metadata.get("final_scrutiny_score")
+        ),
         "strategy_family_id": (
             str(attempt.get("strategy_family_id") or metadata.get("strategy_family_id") or "").strip()
             or None

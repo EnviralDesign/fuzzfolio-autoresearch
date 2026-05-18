@@ -20,6 +20,8 @@ import {
   Filter,
   Fingerprint,
   Layers3,
+  Maximize2,
+  Network,
   Plus,
   Play,
   RotateCcw,
@@ -168,12 +170,8 @@ type SimilarityPair = {
   similarityScore: number;
   correlation: number | null;
   positiveCorrelation: number;
-  sharedActiveRatio: number;
-  instrumentOverlapRatio: number;
-  cadenceSimilarity: number;
-  drawdownSimilarity: number;
-  sameStrategyKey: boolean;
-  sameTimeframe: boolean;
+  activeOverlapRatio: number;
+  drawdownOverlapRatio: number;
   overlapDays: number;
 };
 
@@ -193,7 +191,39 @@ type PortfolioSimilarity = {
   averageSameness: number | null;
   maxSameness: number | null;
   maxPair: SimilarityPair | null;
+  pairs: SimilarityPair[];
   cells: SimilarityCell[][];
+};
+
+type PortfolioClusterMember = {
+  row: AttemptCatalogRow;
+  attemptId: string;
+  label: string;
+  score: number | null;
+  tradesPerMonth: number | null;
+  maxDrawdownR: number | null;
+};
+
+type PortfolioCluster = {
+  id: string;
+  label: string;
+  members: PortfolioClusterMember[];
+  x: number;
+  y: number;
+  size: number;
+  hue: number;
+  averageScore: number | null;
+  tradesPerMonth: number | null;
+  maxDrawdownR: number | null;
+  maxSameness: number | null;
+  pairCount: number;
+  strongestPair: SimilarityPair | null;
+};
+
+type ClusterThresholdStats = {
+  linkedPairCount: number;
+  nearestIncluded: number | null;
+  nearestExcluded: number | null;
 };
 
 type LotSizing = {
@@ -214,15 +244,22 @@ type SimilarityPrepared = {
   row: AttemptCatalogRow;
   attemptId: string;
   label: string;
-  curveSeries: Map<string, number>;
-  curveDates: Set<string>;
+  dailyChanges: Map<string, number>;
   activeDates: Set<string>;
+  drawdownDates: Set<string>;
   instruments: string[];
   instrumentSet: Set<string>;
   timeframe: string;
   strategyKey: string;
   tradesPerMonth: number | null;
   maxDrawdownR: number | null;
+};
+
+type AssetExposureRow = {
+  instrument: string;
+  tradesPerMonth: number;
+  share: number;
+  strategyCount: number;
 };
 
 const DEFAULT_ACCOUNT: AccountConfig = {
@@ -334,6 +371,10 @@ const chartActiveDot = {
   strokeWidth: 1,
 };
 
+const DEFAULT_CLUSTER_THRESHOLD = 0.25;
+const LOOSE_CLUSTER_THRESHOLD = 0.15;
+const STRICT_CLUSTER_THRESHOLD = 0.35;
+
 export function PortfolioWorkbenchPage() {
   const queryClient = useQueryClient();
   const { data: catalog, isLoading: catalogLoading, error: catalogError } = useCatalog();
@@ -350,6 +391,9 @@ export function PortfolioWorkbenchPage() {
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [account, setAccount] = useState<AccountConfig>(DEFAULT_ACCOUNT);
   const [preview, setPreview] = useState<AttemptCatalogRow | null>(null);
+  const [portfolioViewerOpen, setPortfolioViewerOpen] = useState(false);
+  const [clusterThreshold, setClusterThreshold] = useState(DEFAULT_CLUSTER_THRESHOLD);
+  const [clusterCollisionEnabled, setClusterCollisionEnabled] = useState(false);
   const [autoConfigText, setAutoConfigText] = useState("");
   const [autoConfigError, setAutoConfigError] = useState<string | null>(null);
   const lastAppliedLiveSelection = useRef<string | null>(null);
@@ -430,6 +474,11 @@ export function PortfolioWorkbenchPage() {
     [details, selectedIds.length, selectedRows],
   );
 
+  const clusters = useMemo(
+    () => buildPortfolioClusters(selectedRows, similarity, clusterThreshold, clusterCollisionEnabled),
+    [clusterCollisionEnabled, clusterThreshold, selectedRows, similarity],
+  );
+
   const preferredByRun = useMemo(() => buildDashboardPreferredAttemptMap(rows), [rows]);
 
   const filteredAttempts = useMemo(() => {
@@ -458,6 +507,7 @@ export function PortfolioWorkbenchPage() {
   const visibleAttempts = filteredAttempts.slice(0, 120);
   const loadedCount = detailQueries.filter((item) => item.data).length;
   const loadingSelectionCount = detailQueries.filter((item) => item.isLoading).length;
+  const multiMemberClusterCount = clusters.filter((cluster) => cluster.members.length > 1).length;
 
   useEffect(() => {
     if (!livePortfolio || hasHydratedLiveSelection.current) {
@@ -540,7 +590,7 @@ export function PortfolioWorkbenchPage() {
 
   return (
     <>
-      <div className="grid min-h-[calc(100vh-5.5rem)] gap-5 xl:grid-cols-[260px_minmax(0,1fr)_440px]">
+      <div className="grid min-h-[calc(100vh-5.5rem)] gap-5 xl:grid-cols-[260px_minmax(0,1fr)]">
         <aside className="space-y-4 xl:sticky xl:top-24 xl:h-[calc(100vh-7rem)] xl:overflow-y-auto">
           <Panel className="p-4">
             <div className="flex items-center justify-between gap-3">
@@ -608,7 +658,7 @@ export function PortfolioWorkbenchPage() {
         </aside>
 
         <main className="space-y-5">
-          <section className="grid gap-4 min-[1700px]:grid-cols-[minmax(0,1fr)_360px]">
+          <section className="grid items-start gap-4 min-[1700px]:grid-cols-[minmax(0,1fr)_460px]">
             <div className="space-y-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
@@ -632,10 +682,24 @@ export function PortfolioWorkbenchPage() {
                   : "Run portfolio automation, inspect the log, then import the selected basket."}
               </h1>
             </div>
-            <Panel className="grid grid-cols-3 gap-3 p-3">
-              <Metric label="Attempts" value={formatInt(filteredAttempts.length)} />
-              <Metric label="Selected" value={formatInt(selectedIds.length)} />
-              <Metric label="Loaded" value={`${formatInt(loadedCount)}/${formatInt(selectedIds.length)}`} />
+            <Panel className="flex flex-wrap items-center gap-2 self-start p-2 min-[1700px]:flex-nowrap">
+              <WorkbenchSummaryStat label="Attempts" value={formatInt(filteredAttempts.length)} />
+              <WorkbenchSummaryStat label="Selected" value={formatInt(selectedIds.length)} />
+              <WorkbenchSummaryStat label="Loaded" value={`${formatInt(loadedCount)}/${formatInt(selectedIds.length)}`} />
+              <Button
+                type="button"
+                variant="secondary"
+                className="h-10 min-w-40 flex-1 rounded-lg px-3 min-[1700px]:flex-none"
+                onClick={() => setPortfolioViewerOpen(true)}
+              >
+                <Maximize2 className="h-4 w-4" />
+                Portfolio viewer
+                {multiMemberClusterCount ? (
+                  <span className="rounded-md bg-primary-foreground/15 px-1.5 py-0.5 text-[0.68rem]">
+                    {formatInt(multiMemberClusterCount)}
+                  </span>
+                ) : null}
+              </Button>
             </Panel>
           </section>
 
@@ -720,7 +784,7 @@ export function PortfolioWorkbenchPage() {
             </div>
           </Panel>
 
-          <section className="grid gap-4 min-[1500px]:grid-cols-2 min-[1800px]:grid-cols-3">
+          <section className="grid gap-4 min-[1200px]:grid-cols-2 min-[1500px]:grid-cols-3">
             {visibleAttempts.map((attempt) => (
               <AttemptCard
                 key={attempt.attempt_id}
@@ -738,25 +802,32 @@ export function PortfolioWorkbenchPage() {
           ) : null}
         </main>
 
-        <aside className="space-y-5 xl:sticky xl:top-24 xl:h-[calc(100vh-7rem)] xl:overflow-y-auto">
-          <PortfolioPanel
-            account={account}
-            setAccount={setAccount}
-            selectedRows={selectedRows}
-            selectedIds={selectedIds}
-            persistSelectedIds={persistSelectedIds}
-            portfolio={portfolio}
-            similarity={similarity}
-            loadingSelectionCount={loadingSelectionCount}
-            isSavingLivePortfolio={livePortfolioMutation.isPending}
-            job={dashboardJob}
-            onExport={() => exportLivePortfolioMutation.mutate()}
-            onCancelJob={() => cancelJobMutation.mutate(dashboardJob?.id)}
-            isStartingExport={exportLivePortfolioMutation.isPending}
-            isCancelingJob={cancelJobMutation.isPending}
-          />
-        </aside>
       </div>
+
+      <PortfolioViewer
+        isOpen={portfolioViewerOpen}
+        onClose={() => setPortfolioViewerOpen(false)}
+        account={account}
+        setAccount={setAccount}
+        selectedRows={selectedRows}
+        selectedIds={selectedIds}
+        persistSelectedIds={persistSelectedIds}
+        portfolio={portfolio}
+        similarity={similarity}
+        clusters={clusters}
+        clusterThreshold={clusterThreshold}
+        setClusterThreshold={setClusterThreshold}
+        clusterCollisionEnabled={clusterCollisionEnabled}
+        setClusterCollisionEnabled={setClusterCollisionEnabled}
+        loadingSelectionCount={loadingSelectionCount}
+        isSavingLivePortfolio={livePortfolioMutation.isPending}
+        job={dashboardJob}
+        onExport={() => exportLivePortfolioMutation.mutate()}
+        onCancelJob={() => cancelJobMutation.mutate(dashboardJob?.id)}
+        isStartingExport={exportLivePortfolioMutation.isPending}
+        isCancelingJob={cancelJobMutation.isPending}
+        onPreview={setPreview}
+      />
 
       <ProfileDropModal
         isOpen={preview !== null}
@@ -902,6 +973,7 @@ function PortfolioPanel({
   const tooltipFor = (mode: PortfolioChartMode) => (
     <PortfolioTooltip mode={mode} enabled={hoveredChart === mode} />
   );
+  const assetExposure = useMemo(() => buildAssetExposureRows(selectedRows), [selectedRows]);
   return (
     <>
       <Panel className="p-4">
@@ -1078,6 +1150,8 @@ function PortfolioPanel({
           />
         </div>
       </Panel>
+
+      <AssetExposurePanel rows={assetExposure} />
 
       <SimilarityPanel similarity={similarity} loadingSelectionCount={loadingSelectionCount} />
 
@@ -1323,6 +1397,455 @@ function PortfolioPanel({
   );
 }
 
+function PortfolioViewer({
+  isOpen,
+  onClose,
+  account,
+  setAccount,
+  selectedRows,
+  selectedIds,
+  persistSelectedIds,
+  portfolio,
+  similarity,
+  clusters,
+  clusterThreshold,
+  setClusterThreshold,
+  clusterCollisionEnabled,
+  setClusterCollisionEnabled,
+  loadingSelectionCount,
+  isSavingLivePortfolio,
+  job,
+  onExport,
+  onCancelJob,
+  isStartingExport,
+  isCancelingJob,
+  onPreview,
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  account: AccountConfig;
+  setAccount: (value: AccountConfig) => void;
+  selectedRows: AttemptCatalogRow[];
+  selectedIds: string[];
+  persistSelectedIds: (value: string[]) => void;
+  portfolio: { points: PortfolioPoint[]; metrics: PortfolioMetrics };
+  similarity: PortfolioSimilarity;
+  clusters: PortfolioCluster[];
+  clusterThreshold: number;
+  setClusterThreshold: (value: number) => void;
+  clusterCollisionEnabled: boolean;
+  setClusterCollisionEnabled: (value: boolean) => void;
+  loadingSelectionCount: number;
+  isSavingLivePortfolio: boolean;
+  job?: DashboardJob;
+  onExport: () => void;
+  onCancelJob: () => void;
+  isStartingExport: boolean;
+  isCancelingJob: boolean;
+  onPreview: (attempt: AttemptCatalogRow) => void;
+}) {
+  const [activeClusterId, setActiveClusterId] = useState<string | null>(null);
+  const activeCluster = useMemo(
+    () => clusters.find((cluster) => cluster.id === activeClusterId) ?? null,
+    [activeClusterId, clusters],
+  );
+  const thresholdStats = useMemo(
+    () => summarizeClusterThreshold(similarity, clusterThreshold),
+    [clusterThreshold, similarity],
+  );
+  const multiMemberClusters = clusters.filter((cluster) => cluster.members.length > 1);
+  const singletonClusters = clusters.length - multiMemberClusters.length;
+
+  useEffect(() => {
+    if (!isOpen) return;
+
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (activeClusterId) {
+          setActiveClusterId(null);
+        } else {
+          onClose();
+        }
+      }
+    };
+
+    document.body.style.overflow = "hidden";
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [activeClusterId, isOpen, onClose]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    if (activeClusterId && clusters.some((cluster) => cluster.id === activeClusterId)) return;
+    setActiveClusterId(null);
+  }, [activeClusterId, clusters, isOpen]);
+
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 z-40 bg-background/95 backdrop-blur-xl">
+      <div className="mx-auto flex h-screen w-full max-w-[1920px] flex-col gap-4 px-4 py-4 md:px-6">
+        <header className="flex shrink-0 flex-wrap items-center justify-between gap-4 border-b border-border/60 pb-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-xs uppercase tracking-[0.18em] text-muted-foreground">
+              <Network className="h-3.5 w-3.5" />
+              Portfolio topology
+            </div>
+            <h2 className="mt-2 truncate text-2xl font-semibold tracking-tight md:text-4xl">
+              Cluster the live set, then prune inside the cluster.
+            </h2>
+          </div>
+          <div className="flex items-center gap-2">
+            <div className="hidden grid-cols-4 gap-2 lg:grid">
+              <TinyStat label="Selected" value={formatInt(selectedRows.length)} />
+              <TinyStat label="Loaded" value={`${formatInt(similarity.loadedCount)}/${formatInt(similarity.selectedCount)}`} />
+              <TinyStat label="Clusters" value={formatInt(clusters.length)} />
+              <TinyStat label="Multi" value={formatInt(multiMemberClusters.length)} />
+            </div>
+            <Button type="button" variant="outline" className="rounded-lg" onClick={onClose}>
+              <X className="h-4 w-4" />
+              Close
+            </Button>
+          </div>
+        </header>
+
+        <div className="grid min-h-0 flex-1 gap-4 xl:grid-cols-[minmax(0,1fr)_430px]">
+          <div className="flex min-h-0 flex-col gap-4 overflow-hidden">
+            <Panel className="shrink-0 p-4">
+              <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px] lg:items-center">
+                <div>
+                  <div className="flex items-center gap-2 text-sm font-semibold">
+                    <Fingerprint className="h-4 w-4 text-muted-foreground" />
+                    Similarity clustering
+                  </div>
+                  <div className="mt-1 text-sm text-muted-foreground">
+                    Connected strategies above the behavioral threshold become a cluster. Position is score versus trade cadence; exposure stays separate.
+                  </div>
+                  <label className="mt-3 inline-flex items-center gap-2 rounded-lg border border-border/50 bg-background/30 px-3 py-2 text-xs text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={clusterCollisionEnabled}
+                      onChange={(event) => setClusterCollisionEnabled(event.target.checked)}
+                      className="h-4 w-4 accent-primary"
+                    />
+                    Nudge overlapping markers
+                  </label>
+                </div>
+                <div className="rounded-lg border border-border/60 bg-background/35 p-3">
+                  <div className="mb-2 flex items-center justify-between gap-3 text-xs">
+                    <span className="uppercase tracking-[0.14em] text-muted-foreground">Cluster threshold</span>
+                    <span className="font-semibold tabular-nums">{formatPercent(clusterThreshold)}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={0.05}
+                    max={0.95}
+                    step={0.01}
+                    value={clusterThreshold}
+                    onChange={(event) => setClusterThreshold(toNumber(event.target.value, DEFAULT_CLUSTER_THRESHOLD))}
+                    className="w-full accent-primary"
+                    aria-label="Cluster similarity threshold"
+                  />
+                  <div className="mt-2 grid grid-cols-3 gap-1">
+                    <ThresholdPresetButton value={LOOSE_CLUSTER_THRESHOLD} current={clusterThreshold} onSelect={setClusterThreshold}>
+                      Loose
+                    </ThresholdPresetButton>
+                    <ThresholdPresetButton value={DEFAULT_CLUSTER_THRESHOLD} current={clusterThreshold} onSelect={setClusterThreshold}>
+                      Normal
+                    </ThresholdPresetButton>
+                    <ThresholdPresetButton value={STRICT_CLUSTER_THRESHOLD} current={clusterThreshold} onSelect={setClusterThreshold}>
+                      Strict
+                    </ThresholdPresetButton>
+                  </div>
+                  <div className="mt-3 rounded-md border border-border/45 bg-background/30 px-2.5 py-2 text-[0.68rem] leading-4 text-muted-foreground">
+                    <span className="font-medium tabular-nums text-foreground">
+                      {formatInt(thresholdStats.linkedPairCount)}
+                    </span>
+                    {" linked pair(s), "}
+                    <span className="font-medium tabular-nums text-foreground">{formatInt(clusters.length)}</span>
+                    {" clusters / "}
+                    <span className="font-medium tabular-nums text-foreground">{formatInt(multiMemberClusters.length)}</span>
+                    {" multi. "}
+                    {thresholdStats.nearestExcluded == null ? (
+                      "No just-below pairs."
+                    ) : (
+                      <>Next excluded pair is {formatPercent(thresholdStats.nearestExcluded)}.</>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </Panel>
+
+            <PortfolioClusterMap
+              clusters={clusters}
+              activeClusterId={activeCluster?.id ?? null}
+              onOpenCluster={setActiveClusterId}
+              loadingSelectionCount={loadingSelectionCount}
+            />
+          </div>
+
+          <aside className="min-h-0 overflow-y-auto pr-1">
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-2 lg:hidden">
+                <TinyStat label="Clusters" value={formatInt(clusters.length)} />
+                <TinyStat label="Singletons" value={formatInt(singletonClusters)} />
+              </div>
+              <PortfolioPanel
+                account={account}
+                setAccount={setAccount}
+                selectedRows={selectedRows}
+                selectedIds={selectedIds}
+                persistSelectedIds={persistSelectedIds}
+                portfolio={portfolio}
+                similarity={similarity}
+                loadingSelectionCount={loadingSelectionCount}
+                isSavingLivePortfolio={isSavingLivePortfolio}
+                job={job}
+                onExport={onExport}
+                onCancelJob={onCancelJob}
+                isStartingExport={isStartingExport}
+                isCancelingJob={isCancelingJob}
+              />
+            </div>
+          </aside>
+        </div>
+      </div>
+
+      <ClusterDetailModal
+        cluster={activeCluster}
+        selectedIds={selectedIds}
+        persistSelectedIds={persistSelectedIds}
+        onClose={() => setActiveClusterId(null)}
+        onPreview={onPreview}
+      />
+    </div>
+  );
+}
+
+function ThresholdPresetButton({
+  value,
+  current,
+  onSelect,
+  children,
+}: {
+  value: number;
+  current: number;
+  onSelect: (value: number) => void;
+  children: ReactNode;
+}) {
+  const active = Math.abs(value - current) < 0.005;
+  return (
+    <button
+      type="button"
+      onClick={() => onSelect(value)}
+      className={`h-8 rounded-md border px-2 text-xs font-medium transition ${
+        active
+          ? "border-amber-300/60 bg-amber-300/12 text-amber-100"
+          : "border-border/50 bg-background/25 text-muted-foreground hover:text-foreground"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function PortfolioClusterMap({
+  clusters,
+  activeClusterId,
+  onOpenCluster,
+  loadingSelectionCount,
+}: {
+  clusters: PortfolioCluster[];
+  activeClusterId: string | null;
+  onOpenCluster: (clusterId: string) => void;
+  loadingSelectionCount: number;
+}) {
+  return (
+    <Panel className="min-h-[360px] flex-1 overflow-hidden p-4 lg:min-h-0">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-semibold">Cluster map</div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            Higher score rises vertically. Faster cadence moves right.
+          </div>
+        </div>
+        <div className="text-right text-xs text-muted-foreground">
+          {loadingSelectionCount ? `${formatInt(loadingSelectionCount)} loading` : `${formatInt(clusters.length)} cluster(s)`}
+        </div>
+      </div>
+
+      {clusters.length ? (
+        <div
+          className="relative h-full min-h-[320px] overflow-visible rounded-lg border border-border/60 bg-background/35"
+          style={{
+            backgroundImage:
+              "linear-gradient(oklch(0.9 0.02 80 / 0.07) 1px, transparent 1px), linear-gradient(90deg, oklch(0.9 0.02 80 / 0.07) 1px, transparent 1px)",
+            backgroundSize: "72px 72px",
+          }}
+        >
+          <div className="pointer-events-none absolute left-4 top-4 text-[0.68rem] uppercase tracking-[0.14em] text-muted-foreground">
+            Score
+          </div>
+          <div className="pointer-events-none absolute bottom-4 right-4 text-[0.68rem] uppercase tracking-[0.14em] text-muted-foreground">
+            Cadence
+          </div>
+          <div className="pointer-events-none absolute bottom-8 left-8 right-8 border-t border-dashed border-border/55" />
+          <div className="pointer-events-none absolute bottom-8 top-8 left-8 border-l border-dashed border-border/55" />
+
+          {clusters.map((cluster) => {
+            const active = cluster.id === activeClusterId;
+            const singleton = cluster.members.length === 1;
+            const compactWidth = singleton ? 44 : Math.min(58, 44 + cluster.members.length * 5);
+            const compactHeight = singleton ? 38 : 42;
+            return (
+              <button
+                key={cluster.id}
+                type="button"
+                aria-label={`${cluster.label}, ${formatInt(cluster.members.length)} strategy cluster`}
+                aria-pressed={active}
+                onClick={() => onOpenCluster(cluster.id)}
+                className={`group absolute flex -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-xl border text-center transition-[border-color,box-shadow,transform] duration-200 ease-out hover:z-50 hover:scale-105 focus-visible:z-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50 ${
+                  active ? "z-30 ring-2 ring-primary/70" : "z-10"
+                }`}
+                style={{
+                  left: `${cluster.x}%`,
+                  top: `${cluster.y}%`,
+                  width: compactWidth,
+                  height: compactHeight,
+                  borderColor: `oklch(0.78 0.14 ${cluster.hue} / ${active ? 0.78 : 0.55})`,
+                  backgroundColor: `oklch(0.20 0.055 ${cluster.hue} / 0.96)`,
+                  boxShadow: active
+                    ? `0 0 0 1px oklch(0.78 0.14 ${cluster.hue} / 0.55), 0 18px 44px oklch(0 0 0 / 0.34)`
+                    : "0 8px 20px oklch(0 0 0 / 0.24)",
+                }}
+              >
+                <span className="pointer-events-none text-lg font-semibold tabular-nums tracking-tight text-foreground">
+                  {formatInt(cluster.members.length)}
+                </span>
+                <span
+                  className="pointer-events-none absolute left-1/2 top-1/2 z-20 grid w-32 -translate-x-1/2 -translate-y-1/2 scale-75 gap-1.5 rounded-xl border bg-popover/98 p-3 text-left opacity-0 shadow-2xl shadow-black/40 transition duration-200 ease-out group-hover:scale-100 group-hover:opacity-100 group-focus-visible:scale-100 group-focus-visible:opacity-100"
+                  style={{ borderColor: `oklch(0.78 0.14 ${cluster.hue} / 0.58)` }}
+                >
+                  <span className="flex items-center justify-between gap-2">
+                    <span className="text-[0.62rem] uppercase tracking-[0.12em] text-muted-foreground">
+                      {cluster.label}
+                    </span>
+                    <span className="text-xl font-semibold tabular-nums">{formatInt(cluster.members.length)}</span>
+                  </span>
+                  <span className="grid grid-cols-2 gap-x-3 gap-y-1 text-[0.68rem]">
+                    <span className="text-muted-foreground">Score</span>
+                    <span className="text-right font-medium tabular-nums">{formatNumber(cluster.averageScore, 1)}</span>
+                    <span className="text-muted-foreground">Cadence</span>
+                    <span className="text-right font-medium tabular-nums">{formatNumber(cluster.tradesPerMonth, 1)}</span>
+                    <span className="text-muted-foreground">Sameness</span>
+                    <span className="text-right font-medium tabular-nums">{formatPercent(cluster.maxSameness)}</span>
+                  </span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="flex h-full min-h-[320px] items-center justify-center rounded-lg border border-dashed border-border/70 bg-background/35 p-6 text-center text-sm text-muted-foreground">
+          Select strategies from the workbench to create the portfolio map.
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function ClusterDetailModal({
+  cluster,
+  selectedIds,
+  persistSelectedIds,
+  onClose,
+  onPreview,
+}: {
+  cluster: PortfolioCluster | null;
+  selectedIds: string[];
+  persistSelectedIds: (value: string[]) => void;
+  onClose: () => void;
+  onPreview: (attempt: AttemptCatalogRow) => void;
+}) {
+  if (!cluster) {
+    return null;
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/72 p-4 backdrop-blur-sm md:p-6">
+      <section className="mx-auto flex h-full max-w-[1840px] flex-col overflow-hidden rounded-lg border border-border/70 bg-background shadow-2xl shadow-black/45">
+        <header className="flex shrink-0 flex-wrap items-start justify-between gap-4 border-b border-border/60 px-4 py-4 md:px-6">
+          <div>
+            <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">Cluster drill-down</div>
+            <h3 className="mt-1 text-2xl font-semibold tracking-tight">
+              {cluster.label} / {formatInt(cluster.members.length)} member{cluster.members.length === 1 ? "" : "s"}
+            </h3>
+            <div className="mt-1 text-sm text-muted-foreground">
+              Avg score {formatNumber(cluster.averageScore, 1)} / cadence {formatNumber(cluster.tradesPerMonth, 1)} / max sameness {formatPercent(cluster.maxSameness)}
+            </div>
+            <ClusterLinkSummary pair={cluster.strongestPair} />
+          </div>
+          <div className="flex items-center gap-3">
+            <div className="hidden grid-cols-3 gap-2 text-right sm:grid">
+              <CompactMetric label="Pairs" value={formatInt(cluster.pairCount)} />
+              <CompactMetric label="DD" value={cluster.maxDrawdownR == null ? "-" : `${formatNumber(cluster.maxDrawdownR, 2)}R`} />
+              <CompactMetric label="Size" value={formatInt(cluster.members.length)} />
+            </div>
+            <Button type="button" variant="outline" className="rounded-lg" onClick={onClose}>
+              <X className="h-4 w-4" />
+              Close
+            </Button>
+          </div>
+        </header>
+        <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4 md:px-6">
+          <div className="grid gap-4 min-[900px]:grid-cols-2 min-[1400px]:grid-cols-3">
+            {cluster.members.map((member) => (
+              <AttemptCard
+                key={member.attemptId}
+                attempt={member.row}
+                selected
+                onToggle={() => persistSelectedIds(selectedIds.filter((id) => id !== member.attemptId))}
+                onPreview={() => onPreview(member.row)}
+              />
+            ))}
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ClusterLinkSummary({ pair }: { pair: SimilarityPair | null }) {
+  if (!pair) {
+    return null;
+  }
+
+  return (
+    <div className="mt-3 flex max-w-4xl flex-wrap items-center gap-2 rounded-lg border border-border/60 bg-background/35 px-3 py-2 text-xs">
+      <span className="shrink-0 uppercase tracking-[0.14em] text-muted-foreground">Strongest link</span>
+      <span className="min-w-0 flex-1 truncate font-medium" title={`${pair.leftLabel} / ${pair.rightLabel}`}>
+        {pair.leftLabel} / {pair.rightLabel}
+      </span>
+      <span className="rounded-md border border-border/50 bg-background/45 px-2 py-1 tabular-nums">
+        {formatPercent(pair.similarityScore)}
+      </span>
+      <span className="rounded-md border border-border/50 bg-background/45 px-2 py-1 tabular-nums">
+        Delta {pair.correlation == null ? "-" : formatNumber(pair.correlation, 2)}
+      </span>
+      <span className="rounded-md border border-border/50 bg-background/45 px-2 py-1 tabular-nums">
+        Active {formatPercent(pair.activeOverlapRatio)}
+      </span>
+      <span className="rounded-md border border-border/50 bg-background/45 px-2 py-1 tabular-nums">
+        DD {formatPercent(pair.drawdownOverlapRatio)}
+      </span>
+    </div>
+  );
+}
+
 function BrokerPresetMenu({ onSelect }: { onSelect: (preset: BrokerPreset) => void }) {
   const [open, setOpen] = useState(false);
 
@@ -1379,7 +1902,7 @@ function SimilarityPanel({
         <div>
           <div className="flex items-center gap-2 text-sm font-semibold">
             <Fingerprint className="h-4 w-4 text-muted-foreground" />
-            Diversity
+            Behavioral diversity
           </div>
           <div className="mt-1 text-xs text-muted-foreground">
             {loadingSelectionCount
@@ -1425,6 +1948,55 @@ function SimilarityPanel({
       ) : (
         <div className="rounded-lg border border-dashed border-border/70 bg-background/35 p-4 text-sm text-muted-foreground">
           Select at least two loaded strategies to see pairwise sameness.
+        </div>
+      )}
+    </Panel>
+  );
+}
+
+function AssetExposurePanel({ rows }: { rows: AssetExposureRow[] }) {
+  const totalTradesPerMonth = rows.reduce((sum, row) => sum + row.tradesPerMonth, 0);
+  return (
+    <Panel className="p-4">
+      <div className="mb-3 flex items-start justify-between gap-3">
+        <div>
+          <div className="flex items-center gap-2 text-sm font-semibold">
+            <Layers3 className="h-4 w-4 text-muted-foreground" />
+            Asset exposure
+          </div>
+          <div className="mt-1 text-xs text-muted-foreground">
+            Trades/mo split across listed instruments
+          </div>
+        </div>
+        <CompactMetric label="Total" value={formatNumber(totalTradesPerMonth, 1)} />
+      </div>
+
+      {rows.length ? (
+        <div className="space-y-2">
+          {rows.slice(0, 8).map((row) => (
+            <div key={row.instrument} className="rounded-lg border border-border/55 bg-background/32 p-2.5">
+              <div className="mb-2 flex items-center justify-between gap-3">
+                <div className="min-w-0 truncate text-sm font-medium">{row.instrument}</div>
+                <div className="shrink-0 text-xs font-semibold tabular-nums">
+                  {formatNumber(row.tradesPerMonth, 1)} / mo
+                </div>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-muted/35">
+                <div
+                  className="h-full rounded-full bg-amber-300/80"
+                  style={{ width: `${Math.max(3, row.share * 100)}%` }}
+                />
+              </div>
+              <div className="mt-2 flex items-center justify-between gap-3 text-[0.68rem] uppercase tracking-[0.12em] text-muted-foreground">
+                <span>{formatInt(row.strategyCount)} {row.strategyCount === 1 ? "strategy" : "strategies"}</span>
+                <span className="tabular-nums">{formatPercent(row.share)}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="rounded-lg border border-dashed border-border/70 bg-background/35 p-4 text-sm text-muted-foreground">
+          Select strategies with instruments to see exposure.
         </div>
       )}
     </Panel>
@@ -1478,11 +2050,9 @@ function SimilarityCellTooltip({ cell }: { cell: SimilarityCell }) {
       <div className="font-medium">{pair.leftLabel}</div>
       <div className="text-muted-foreground">vs {pair.rightLabel}</div>
       <TooltipMetric label="Sameness" value={formatPercent(pair.similarityScore)} />
-      <TooltipMetric label="Curve corr" value={pair.correlation == null ? "-" : formatNumber(pair.correlation, 2)} />
-      <TooltipMetric label="Active overlap" value={formatPercent(pair.sharedActiveRatio)} />
-      <TooltipMetric label="Instruments" value={formatPercent(pair.instrumentOverlapRatio)} />
-      <TooltipMetric label="Cadence" value={formatPercent(pair.cadenceSimilarity)} />
-      <TooltipMetric label="DD shape" value={formatPercent(pair.drawdownSimilarity)} />
+      <TooltipMetric label="Delta corr" value={pair.correlation == null ? "-" : formatNumber(pair.correlation, 2)} />
+      <TooltipMetric label="Active overlap" value={formatPercent(pair.activeOverlapRatio)} />
+      <TooltipMetric label="DD overlap" value={formatPercent(pair.drawdownOverlapRatio)} />
       <TooltipMetric label="Overlap days" value={formatInt(pair.overlapDays)} />
     </div>
   );
@@ -1739,6 +2309,7 @@ function buildPortfolioSimilarity(
 
   const loadedCount = prepared.length;
   const pairLookup = new Map<string, SimilarityPair>();
+  const pairs: SimilarityPair[] = [];
   const pairScores: number[] = [];
   let maxPair: SimilarityPair | null = null;
 
@@ -1748,6 +2319,7 @@ function buildPortfolioSimilarity(
       const right = prepared[rightIndex];
       const pair = scoreSimilarityPair(left, right);
       pairLookup.set(pairKey(left.attemptId, right.attemptId), pair);
+      pairs.push(pair);
       pairScores.push(pair.similarityScore);
       if (!maxPair || pair.similarityScore > maxPair.similarityScore) {
         maxPair = pair;
@@ -1777,13 +2349,240 @@ function buildPortfolioSimilarity(
     averageSameness: pairScores.length ? pairScores.reduce((sum, value) => sum + value, 0) / pairScores.length : null,
     maxSameness: maxPair?.similarityScore ?? null,
     maxPair,
+    pairs,
     cells,
   };
 }
 
+function buildPortfolioClusters(
+  selectedRows: AttemptCatalogRow[],
+  similarity: PortfolioSimilarity,
+  threshold: number,
+  nudgeOverlaps: boolean,
+): PortfolioCluster[] {
+  const members = selectedRows.map(clusterMemberFromRow);
+  if (!members.length) {
+    return [];
+  }
+
+  const memberByAttemptId = new Map(members.map((member) => [member.attemptId, member]));
+  const adjacency = new Map(members.map((member) => [member.attemptId, new Set<string>()]));
+  const pairLookup = new Map<string, SimilarityPair>();
+
+  similarity.pairs.forEach((pair) => {
+    pairLookup.set(pairKey(pair.leftAttemptId, pair.rightAttemptId), pair);
+    if (
+      pair.similarityScore >= threshold
+      && memberByAttemptId.has(pair.leftAttemptId)
+      && memberByAttemptId.has(pair.rightAttemptId)
+    ) {
+      adjacency.get(pair.leftAttemptId)?.add(pair.rightAttemptId);
+      adjacency.get(pair.rightAttemptId)?.add(pair.leftAttemptId);
+    }
+  });
+
+  const components: PortfolioClusterMember[][] = [];
+  const visited = new Set<string>();
+  members.forEach((member) => {
+    if (visited.has(member.attemptId)) return;
+    const queue = [member.attemptId];
+    const component: PortfolioClusterMember[] = [];
+    visited.add(member.attemptId);
+    while (queue.length) {
+      const attemptId = queue.shift();
+      if (!attemptId) continue;
+      const current = memberByAttemptId.get(attemptId);
+      if (current) {
+        component.push(current);
+      }
+      adjacency.get(attemptId)?.forEach((neighborId) => {
+        if (!visited.has(neighborId)) {
+          visited.add(neighborId);
+          queue.push(neighborId);
+        }
+      });
+    }
+    components.push(component);
+  });
+
+  const scoreValues = members.map((member) => member.score).filter((value): value is number => value != null);
+  const cadenceValues = members.map((member) => member.tradesPerMonth).filter((value): value is number => value != null);
+  const rawClusters = components
+    .map((component, index) => {
+      const pairScores: number[] = [];
+      const componentPairs: SimilarityPair[] = [];
+      const linkedPairs: SimilarityPair[] = [];
+      for (let leftIndex = 0; leftIndex < component.length; leftIndex += 1) {
+        for (let rightIndex = leftIndex + 1; rightIndex < component.length; rightIndex += 1) {
+          const left = component[leftIndex];
+          const right = component[rightIndex];
+          const pair = pairLookup.get(pairKey(left.attemptId, right.attemptId));
+          if (pair) {
+            componentPairs.push(pair);
+            pairScores.push(pair.similarityScore);
+            if (pair.similarityScore >= threshold) {
+              linkedPairs.push(pair);
+            }
+          }
+        }
+      }
+      const strongestPair = [...(linkedPairs.length ? linkedPairs : componentPairs)].sort(
+        (left, right) => right.similarityScore - left.similarityScore,
+      )[0] ?? null;
+      const averageScore = averageNullable(component.map((member) => member.score));
+      const tradesPerMonth = averageNullable(component.map((member) => member.tradesPerMonth));
+      const maxDrawdownValues = component
+        .map((member) => member.maxDrawdownR)
+        .filter((value): value is number => value != null);
+      return {
+        id: component.map((member) => member.attemptId).sort().join("|"),
+        label: "",
+        members: component.sort((left, right) => Number(right.score ?? -Infinity) - Number(left.score ?? -Infinity)),
+        x: metricPosition(tradesPerMonth, cadenceValues, true),
+        y: 100 - metricPosition(averageScore, scoreValues, false),
+        size: component.length === 1
+          ? 56
+          : Math.min(128, Math.max(78, 58 + Math.sqrt(component.length) * 30)),
+        hue: 78 + ((index * 43) % 250),
+        averageScore,
+        tradesPerMonth,
+        maxDrawdownR: maxDrawdownValues.length ? Math.max(...maxDrawdownValues) : null,
+        maxSameness: pairScores.length ? Math.max(...pairScores) : null,
+        pairCount: pairScores.length,
+        strongestPair,
+      } satisfies PortfolioCluster;
+    })
+    .sort((left, right) => {
+      const sizeDelta = right.members.length - left.members.length;
+      if (sizeDelta) return sizeDelta;
+      return Number(right.averageScore ?? -Infinity) - Number(left.averageScore ?? -Infinity);
+    })
+    .map((cluster, index) => ({
+      ...cluster,
+      label: `Cluster ${String(index + 1).padStart(2, "0")}`,
+      hue: 78 + ((index * 43) % 250),
+    }));
+
+  return nudgeOverlaps ? spreadClusterPositions(rawClusters) : rawClusters;
+}
+
+function summarizeClusterThreshold(
+  similarity: PortfolioSimilarity,
+  threshold: number,
+): ClusterThresholdStats {
+  const included = similarity.pairs
+    .map((pair) => pair.similarityScore)
+    .filter((score) => score >= threshold)
+    .sort((left, right) => left - right);
+  const excluded = similarity.pairs
+    .map((pair) => pair.similarityScore)
+    .filter((score) => score < threshold)
+    .sort((left, right) => right - left);
+  return {
+    linkedPairCount: included.length,
+    nearestIncluded: included[0] ?? null,
+    nearestExcluded: excluded[0] ?? null,
+  };
+}
+
+function clusterMemberFromRow(row: AttemptCatalogRow): PortfolioClusterMember {
+  return {
+    row,
+    attemptId: row.attempt_id,
+    label: compactAttemptLabel(row),
+    score: nullableNumber(row.score_36m),
+    tradesPerMonth: nullableNumber(row.trades_per_month_36m),
+    maxDrawdownR: nullableNumber(row.max_drawdown_r_36m),
+  };
+}
+
+function buildAssetExposureRows(rows: AttemptCatalogRow[]): AssetExposureRow[] {
+  const exposureByInstrument = new Map<string, { tradesPerMonth: number; attemptIds: Set<string> }>();
+  rows.forEach((row) => {
+    const instruments = normalizeTokens(row.instruments_36m ?? []);
+    if (!instruments.length) {
+      return;
+    }
+    const tradesPerMonth = Math.max(0, nullableNumber(row.trades_per_month_36m) ?? 0);
+    const contribution = tradesPerMonth / instruments.length;
+    instruments.forEach((instrument) => {
+      if (!exposureByInstrument.has(instrument)) {
+        exposureByInstrument.set(instrument, { tradesPerMonth: 0, attemptIds: new Set() });
+      }
+      const bucket = exposureByInstrument.get(instrument);
+      if (!bucket) return;
+      bucket.tradesPerMonth += contribution;
+      bucket.attemptIds.add(row.attempt_id);
+    });
+  });
+
+  const totalTradesPerMonth = [...exposureByInstrument.values()].reduce(
+    (sum, bucket) => sum + bucket.tradesPerMonth,
+    0,
+  );
+
+  return [...exposureByInstrument.entries()]
+    .map(([instrument, bucket]) => ({
+      instrument,
+      tradesPerMonth: bucket.tradesPerMonth,
+      share: totalTradesPerMonth > 0 ? bucket.tradesPerMonth / totalTradesPerMonth : 0,
+      strategyCount: bucket.attemptIds.size,
+    }))
+    .sort((left, right) => right.tradesPerMonth - left.tradesPerMonth || left.instrument.localeCompare(right.instrument));
+}
+
+function averageNullable(values: Array<number | null>) {
+  const finiteValues = values.filter((value): value is number => value != null && Number.isFinite(value));
+  if (!finiteValues.length) return null;
+  return finiteValues.reduce((sum, value) => sum + value, 0) / finiteValues.length;
+}
+
+function metricPosition(value: number | null, domain: number[], logScale: boolean) {
+  const finiteDomain = domain.filter((item) => Number.isFinite(item));
+  if (value == null || !Number.isFinite(value) || !finiteDomain.length) {
+    return 50;
+  }
+  const transform = (item: number) => (logScale ? Math.log1p(Math.max(0, item)) : item);
+  const transformedValue = transform(value);
+  const transformedDomain = finiteDomain.map(transform);
+  const minValue = Math.min(...transformedDomain);
+  const maxValue = Math.max(...transformedDomain);
+  if (Math.abs(maxValue - minValue) < 1e-9) {
+    return 50;
+  }
+  return 12 + ((transformedValue - minValue) / (maxValue - minValue)) * 76;
+}
+
+function spreadClusterPositions(clusters: PortfolioCluster[]) {
+  const placed: PortfolioCluster[] = [];
+  return clusters.map((cluster, index) => {
+    let x = cluster.x;
+    let y = cluster.y;
+    const clusterMinDistance = 11 + Math.min(12, Math.sqrt(cluster.members.length) * 4);
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const collision = placed.find((other) => {
+        const otherMinDistance = 9 + Math.min(10, Math.sqrt(other.members.length) * 3);
+        return percentDistance(x, y, other.x, other.y) < clusterMinDistance + otherMinDistance;
+      });
+      if (!collision) break;
+      const angle = ((index * 137.5 + attempt * 37) * Math.PI) / 180;
+      const push = 3.5 + attempt * 0.32;
+      x = Math.max(8, Math.min(92, x + Math.cos(angle) * push));
+      y = Math.max(8, Math.min(92, y + Math.sin(angle) * push));
+    }
+    const next = { ...cluster, x, y };
+    placed.push(next);
+    return next;
+  });
+}
+
+function percentDistance(leftX: number, leftY: number, rightX: number, rightY: number) {
+  return Math.sqrt((leftX - rightX) ** 2 + (leftY - rightY) ** 2);
+}
+
 function prepareSimilarityRow(row: AttemptCatalogRow, detail: AttemptDetail | undefined): SimilarityPrepared | null {
-  const curveSeries = loadRealizedCurveSeries(detail?.full_backtest_curve ?? null);
-  if (!curveSeries.size) {
+  const curveFeatures = buildBehavioralCurveFeatures(detail?.full_backtest_curve ?? null);
+  if (!curveFeatures.dailyChanges.size) {
     return null;
   }
   const instruments = normalizeTokens(row.instruments_36m ?? []);
@@ -1791,9 +2590,9 @@ function prepareSimilarityRow(row: AttemptCatalogRow, detail: AttemptDetail | un
     row,
     attemptId: row.attempt_id,
     label: compactAttemptLabel(row),
-    curveSeries,
-    curveDates: new Set(curveSeries.keys()),
-    activeDates: new Set([...curveSeries.entries()].filter(([, value]) => Math.abs(value) > 1e-9).map(([date]) => date)),
+    dailyChanges: curveFeatures.dailyChanges,
+    activeDates: curveFeatures.activeDates,
+    drawdownDates: curveFeatures.drawdownDates,
     instruments,
     instrumentSet: new Set(instruments),
     timeframe: String(row.timeframe_36m || "").trim().toUpperCase(),
@@ -1807,31 +2606,19 @@ function scoreSimilarityPair(
   left: SimilarityPrepared,
   right: SimilarityPrepared,
 ): SimilarityPair {
-  const commonDates = [...left.curveDates].filter((date) => right.curveDates.has(date)).sort();
-  const leftValues = commonDates.map((date) => left.curveSeries.get(date) ?? 0);
-  const rightValues = commonDates.map((date) => right.curveSeries.get(date) ?? 0);
-  const correlation = commonDates.length >= 30 ? pearsonCorrelation(leftValues, rightValues) : null;
+  const commonDates = [...left.dailyChanges.keys()].filter((date) => right.dailyChanges.has(date)).sort();
+  const leftValues = commonDates.map((date) => left.dailyChanges.get(date) ?? 0);
+  const rightValues = commonDates.map((date) => right.dailyChanges.get(date) ?? 0);
+  const correlation = commonDates.length >= 5 ? pearsonCorrelation(leftValues, rightValues) : null;
   const positiveCorrelation = Math.max(0, correlation ?? 0);
-  const activeUnion = new Set([...left.activeDates, ...right.activeDates]);
-  const sharedActiveCount = [...left.activeDates].filter((date) => right.activeDates.has(date)).length;
-  const sharedActiveRatio = activeUnion.size ? sharedActiveCount / activeUnion.size : 0;
-  const instrumentUnion = new Set([...left.instrumentSet, ...right.instrumentSet]);
-  const instrumentOverlapCount = [...left.instrumentSet].filter((token) => right.instrumentSet.has(token)).length;
-  const instrumentOverlapRatio = instrumentUnion.size ? instrumentOverlapCount / instrumentUnion.size : 0;
-  const cadenceSimilarity = ratioSimilarity(left.tradesPerMonth, right.tradesPerMonth);
-  const drawdownSimilarity = ratioSimilarity(left.maxDrawdownR, right.maxDrawdownR);
-  const sameTimeframe = Boolean(left.timeframe) && left.timeframe === right.timeframe;
-  const sameStrategyKey = Boolean(left.strategyKey) && left.strategyKey === right.strategyKey;
-  const similarityScore = commonDates.length < 30
+  const activeOverlapRatio = jaccardSimilarity(left.activeDates, right.activeDates);
+  const drawdownOverlapRatio = jaccardSimilarity(left.drawdownDates, right.drawdownDates);
+  const similarityScore = commonDates.length < 5
     ? 0
     : clamp01(
-        positiveCorrelation * 0.50
-        + sharedActiveRatio * 0.20
-        + instrumentOverlapRatio * 0.10
-        + cadenceSimilarity * 0.05
-        + drawdownSimilarity * 0.05
-        + (sameTimeframe ? 0.05 : 0)
-        + (sameStrategyKey ? 0.05 : 0),
+        positiveCorrelation * 0.60
+        + activeOverlapRatio * 0.25
+        + drawdownOverlapRatio * 0.15,
       );
 
   return {
@@ -1842,12 +2629,8 @@ function scoreSimilarityPair(
     similarityScore,
     correlation,
     positiveCorrelation,
-    sharedActiveRatio,
-    instrumentOverlapRatio,
-    cadenceSimilarity,
-    drawdownSimilarity,
-    sameStrategyKey,
-    sameTimeframe,
+    activeOverlapRatio,
+    drawdownOverlapRatio,
     overlapDays: commonDates.length,
   };
 }
@@ -2093,11 +2876,11 @@ function AutoBuildPanel({
   );
 }
 
-function Metric({ label, value }: { label: string; value: string }) {
+function WorkbenchSummaryStat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-lg border border-border/60 bg-background/35 p-3">
-      <div className="text-[0.68rem] uppercase tracking-[0.16em] text-muted-foreground">{label}</div>
-      <div className="mt-2 text-xl font-semibold tracking-tight">{value}</div>
+    <div className="min-w-20 rounded-lg border border-border/60 bg-background/35 px-3 py-2">
+      <div className="text-[0.62rem] uppercase tracking-[0.12em] text-muted-foreground">{label}</div>
+      <div className="mt-1 truncate text-lg font-semibold leading-none tabular-nums tracking-tight">{value}</div>
     </div>
   );
 }
@@ -2389,24 +3172,62 @@ function marginRequiredUsd(lots: number, account: AccountConfig) {
   return Math.max(0, lots) * Math.max(0, account.notionalUsdPerLot) / leverage;
 }
 
-function loadRealizedCurveSeries(payload: Record<string, unknown> | null): Map<string, number> {
+function buildBehavioralCurveFeatures(payload: Record<string, unknown> | null) {
   const rawPoints = (payload as { curve?: { points?: unknown[] }; points?: unknown[] } | null)?.curve?.points
     ?? (payload as { points?: unknown[] } | null)?.points
     ?? [];
-  const series = new Map<string, number>();
+
+  const dated = new Map<string, { value: number; realized: number | null; drawdown: number; closedTrades: number | null }>();
   rawPoints.forEach((raw) => {
     const point = raw as Record<string, unknown>;
-    const dateKey = String(point.date || "").trim();
+    const dateKey = curveDateKey(point);
     if (!dateKey) {
       return;
     }
-    const value = nullableNumber(point.realized_r);
+    const value = curveValue(point);
     if (value == null) {
       return;
     }
-    series.set(dateKey, value);
+    dated.set(dateKey, {
+      value,
+      realized: curveRealizedValue(point),
+      drawdown: nullableNumber(point.drawdown_r) ?? 0,
+      closedTrades: nullableInteger(point.closed_trade_count),
+    });
   });
-  return series;
+
+  const orderedDates = [...dated.keys()].sort();
+  const maxDrawdown = orderedDates.reduce((maxValue, date) => Math.max(maxValue, dated.get(date)?.drawdown ?? 0), 0);
+  const drawdownThreshold = Math.max(0.25, maxDrawdown * 0.25);
+  const dailyChanges = new Map<string, number>();
+  const activeDates = new Set<string>();
+  const drawdownDates = new Set<string>();
+  let previousValue: number | null = null;
+  let previousRealized: number | null = null;
+  let previousClosedTrades: number | null = null;
+
+  orderedDates.forEach((date) => {
+    const item = dated.get(date);
+    if (!item) return;
+    const delta = previousValue == null ? 0 : item.value - previousValue;
+    const realizedDelta = previousRealized == null || item.realized == null ? null : item.realized - previousRealized;
+    dailyChanges.set(date, delta);
+    if (
+      Math.abs(delta) > 1e-9
+      || (realizedDelta != null && Math.abs(realizedDelta) > 1e-9)
+      || (previousClosedTrades != null && item.closedTrades != null && item.closedTrades !== previousClosedTrades)
+    ) {
+      activeDates.add(date);
+    }
+    if (maxDrawdown > 0 && item.drawdown >= drawdownThreshold) {
+      drawdownDates.add(date);
+    }
+    previousValue = item.value;
+    previousRealized = item.realized;
+    previousClosedTrades = item.closedTrades;
+  });
+
+  return { dailyChanges, activeDates, drawdownDates };
 }
 
 function pearsonCorrelation(left: number[], right: number[]) {
@@ -2424,13 +3245,48 @@ function pearsonCorrelation(left: number[], right: number[]) {
   return covariance / Math.sqrt(leftVariance * rightVariance);
 }
 
-function ratioSimilarity(left: number | null, right: number | null) {
-  if (left == null || right == null || left < 0 || right < 0) {
+function jaccardSimilarity(left: Set<string>, right: Set<string>) {
+  const union = new Set([...left, ...right]);
+  if (!union.size) {
     return 0;
   }
-  const larger = Math.max(left, right, 0.1);
-  const smaller = Math.max(Math.min(left, right), 0.1);
-  return clamp01(smaller / larger);
+  const intersectionCount = [...left].filter((item) => right.has(item)).length;
+  return intersectionCount / union.size;
+}
+
+function curveDateKey(point: Record<string, unknown>) {
+  const rawDate = String(point.date || "").trim();
+  if (rawDate) {
+    return rawDate.slice(0, 10);
+  }
+  const timestamp = nullableNumber(point.time);
+  if (timestamp == null) {
+    return "";
+  }
+  return new Date(timestamp * 1000).toISOString().slice(0, 10);
+}
+
+function curveValue(point: Record<string, unknown>) {
+  return firstNullableNumber(point.equity_r, point.realized_r, point.cumulative_realized_r);
+}
+
+function curveRealizedValue(point: Record<string, unknown>) {
+  return firstNullableNumber(point.realized_r, point.cumulative_realized_r, point.equity_r);
+}
+
+function firstNullableNumber(...values: unknown[]) {
+  for (const value of values) {
+    const numeric = nullableNumber(value);
+    if (numeric != null) {
+      return numeric;
+    }
+  }
+  return null;
+}
+
+function nullableInteger(value: unknown) {
+  const numeric = nullableNumber(value);
+  return numeric == null ? null : Math.round(numeric);
 }
 
 function normalizeTokens(values: unknown[]) {

@@ -1,4 +1,6 @@
 import random
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +13,9 @@ from autoresearch.play_hand import (
     _best_sweep_parameters,
     _curve_features,
     _finalize_play_hand_attempt_metadata,
+    _evaluate_instrument_scout_records,
     _instrument_curve_similarity,
+    _instrument_scout_worker_count,
     _json_payload_from_stdout,
     _normalize_sweep_payload,
     _parameter_importance,
@@ -109,6 +113,8 @@ def test_cmd_play_hand_authenticates_before_seed_prompt(monkeypatch, tmp_path: P
             final_artifacts=False,
             final_profile_drop_count=0,
             final_profile_drop_workers=1,
+            job_timeout_seconds=2400,
+            sweep_timeout_seconds=7200,
             dry_run=False,
             as_json=True,
         )
@@ -245,6 +251,66 @@ def test_finalize_play_hand_attempt_metadata_marks_canonical_and_scout_decisions
     assert final_attempt["effective_max_reward_r"] == 4.0
 
 
+def test_finalize_play_hand_attempt_metadata_tombstones_failed_final_scrutiny(
+    tmp_path: Path,
+) -> None:
+    attempts_path = tmp_path / "attempts.jsonl"
+    write_attempts(
+        attempts_path,
+        [
+            {
+                "attempt_id": "run-1-attempt-00001",
+                "run_id": "run-1",
+                "candidate_name": "focused_top_3mo",
+            },
+            {
+                "attempt_id": "run-1-attempt-00002",
+                "run_id": "run-1",
+                "candidate_name": "final_36mo",
+            },
+        ],
+    )
+    ctx = PlayHandContext(
+        config=None,
+        cli=None,
+        run_id="run-1",
+        run_dir=tmp_path,
+        profiles_dir=tmp_path / "profiles",
+        evals_dir=tmp_path / "evals",
+        attempts_path=attempts_path,
+        events_path=tmp_path / "events.jsonl",
+        summary_path=tmp_path / "summary.json",
+    )
+
+    summary = _finalize_play_hand_attempt_metadata(
+        ctx,
+        final_attempt_id="run-1-attempt-00002",
+        scout_result=None,
+        selected_instruments=["XAUUSD"],
+        final_scrutiny_passed=False,
+        final_scrutiny_score=0.0,
+        tombstone_reason="final_36mo_score_not_positive",
+        tombstone_reasons=[
+            "final_36mo_scrutiny_failed",
+            "final_36mo_score_not_positive",
+        ],
+    )
+
+    attempts = {row["attempt_id"]: row for row in load_attempts(attempts_path)}
+    assert summary["run_tombstoned"] is True
+    assert summary["canonical_attempt_id"] is None
+    assert attempts["run-1-attempt-00001"]["run_tombstoned"] is True
+    final_attempt = attempts["run-1-attempt-00002"]
+    assert final_attempt["attempt_decision"] == "tombstoned"
+    assert final_attempt["attempt_tombstoned"] is True
+    assert final_attempt["is_canonical_attempt"] is False
+    assert final_attempt["canonical_attempt_id"] is None
+    assert final_attempt["attempt_decision_reasons"] == [
+        "final_36mo_scrutiny_failed",
+        "final_36mo_score_not_positive",
+    ]
+
+
 def test_play_hand_reward_matrix_caps_default_reward_grid() -> None:
     matrix = play_hand_reward_matrix(4.25)
 
@@ -290,6 +356,92 @@ def test_play_hand_reward_matrix_keeps_hard_ceiling_for_large_caps() -> None:
 def test_play_hand_reward_matrix_rejects_unrepresentable_caps() -> None:
     with pytest.raises(ValueError, match="at least 0.5"):
         play_hand_reward_matrix(0.25)
+
+
+def test_instrument_scout_worker_count_defaults_and_env(monkeypatch) -> None:
+    monkeypatch.delenv("AUTORESEARCH_PLAY_HAND_INSTRUMENT_SCOUT_WORKERS", raising=False)
+    assert _instrument_scout_worker_count(0) == 0
+    assert _instrument_scout_worker_count(1) == 1
+    assert _instrument_scout_worker_count(5) == 4
+
+    monkeypatch.setenv("AUTORESEARCH_PLAY_HAND_INSTRUMENT_SCOUT_WORKERS", "2")
+    assert _instrument_scout_worker_count(5) == 2
+
+    monkeypatch.setenv("AUTORESEARCH_PLAY_HAND_INSTRUMENT_SCOUT_WORKERS", "200")
+    assert _instrument_scout_worker_count(12) == 8
+
+    monkeypatch.setenv("AUTORESEARCH_PLAY_HAND_INSTRUMENT_SCOUT_WORKERS", "nope")
+    assert _instrument_scout_worker_count(5) == 4
+
+
+def test_evaluate_instrument_scout_records_parallelizes_evaluations(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def fake_evaluate_profile(*_args, instruments, **_kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.05)
+            instrument = instruments[0]
+            return {
+                "artifact_dir": str(tmp_path / instrument),
+                "attempt_id": f"attempt-{instrument}",
+                "score": float(len(instrument)),
+            }
+        finally:
+            with lock:
+                active -= 1
+
+    def fake_scout_record(instrument, evaluation):
+        return {
+            "instrument": instrument,
+            "attempt_id": evaluation["attempt_id"],
+            "score": evaluation["score"],
+        }
+
+    monkeypatch.setenv("AUTORESEARCH_PLAY_HAND_INSTRUMENT_SCOUT_WORKERS", "3")
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+    monkeypatch.setattr(play_hand_mod, "_instrument_scout_record", fake_scout_record)
+
+    ctx = PlayHandContext(
+        config=None,
+        cli=None,
+        run_id="run-1",
+        run_dir=tmp_path,
+        profiles_dir=tmp_path / "profiles",
+        evals_dir=tmp_path / "evals",
+        attempts_path=tmp_path / "attempts.jsonl",
+        events_path=tmp_path / "events.jsonl",
+        summary_path=tmp_path / "summary.json",
+    )
+
+    primary, candidates, worker_count = _evaluate_instrument_scout_records(
+        ctx,
+        stage=play_hand_mod.PlayHandStage(7, 9, "instrument_scout"),
+        profile_ref="profile-ref",
+        profile_path=tmp_path / "profile.json",
+        primary="XAUUSD",
+        candidates=["EURUSD", "USDJPY", "AUDUSD"],
+        timeframe="M5",
+        lookback_months=3,
+        reward_matrix=None,
+    )
+
+    assert worker_count == 3
+    assert max_active > 1
+    assert primary["instrument"] == "XAUUSD"
+    assert [record["instrument"] for record in candidates] == [
+        "EURUSD",
+        "USDJPY",
+        "AUDUSD",
+    ]
 
 
 def test_json_payload_from_stdout_accepts_trailing_json_payload() -> None:
