@@ -76,6 +76,28 @@ if __package__ in {None, ""}:
         result_matches_execution_cost_model,
     )
     from autoresearch.fuzzfolio import CliError, FuzzfolioCli
+    from autoresearch.forward_response_atlas import (
+        DEFAULT_FORWARD_HORIZONS,
+        DEFAULT_MIN_EVENTS as FORWARD_RESPONSE_DEFAULT_MIN_EVENTS,
+        DEFAULT_VOL_LOOKBACK as FORWARD_RESPONSE_DEFAULT_VOL_LOOKBACK,
+        build_forward_response_atlas,
+    )
+    from autoresearch.anchor_pair_atlas import (
+        DEFAULT_ANCHOR_PAIR_DIRNAME,
+        DEFAULT_ANCHOR_PAIR_TIMING_DIRNAME,
+        DEFAULT_EXECUTION_COST_MODE as ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE,
+        DEFAULT_LOOKBACK_MONTHS as ANCHOR_PAIR_DEFAULT_LOOKBACK_MONTHS,
+        DEFAULT_MAX_QUEUE_PAIRS as ANCHOR_PAIR_DEFAULT_MAX_QUEUE_PAIRS,
+        DEFAULT_PROBE_RUN_LIMIT as ANCHOR_PAIR_DEFAULT_PROBE_RUN_LIMIT,
+        DEFAULT_PROBE_TIMEOUT_SECONDS as ANCHOR_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS,
+        DEFAULT_QUALITY_SCORE_PRESET as ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET,
+        DEFAULT_TIMING_LOOKBACK_BARS as ANCHOR_PAIR_DEFAULT_TIMING_LOOKBACK_BARS,
+        build_anchor_pair_atlas,
+        build_anchor_pair_timing_atlas,
+        run_anchor_pair_probes,
+        run_anchor_pair_timing_probes,
+    )
+    from autoresearch.indicator_atlas import build_indicator_atlas
     from autoresearch.ledger import (
         append_attempt,
         attempts_path_for_run_dir,
@@ -147,6 +169,11 @@ if __package__ in {None, ""}:
         build_attempt_score,
         load_sensitivity_snapshot,
     )
+    from autoresearch.signal_atlas import (
+        DEFAULT_BAR_LIMIT as SIGNAL_ATLAS_DEFAULT_BAR_LIMIT,
+        DEFAULT_REPLAY_SOURCE as SIGNAL_ATLAS_DEFAULT_REPLAY_SOURCE,
+        build_signal_atlas,
+    )
     from autoresearch.play_hand import (
         PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
         PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
@@ -186,6 +213,28 @@ else:
         result_matches_execution_cost_model,
     )
     from .fuzzfolio import CliError, FuzzfolioCli
+    from .forward_response_atlas import (
+        DEFAULT_FORWARD_HORIZONS,
+        DEFAULT_MIN_EVENTS as FORWARD_RESPONSE_DEFAULT_MIN_EVENTS,
+        DEFAULT_VOL_LOOKBACK as FORWARD_RESPONSE_DEFAULT_VOL_LOOKBACK,
+        build_forward_response_atlas,
+    )
+    from .anchor_pair_atlas import (
+        DEFAULT_ANCHOR_PAIR_DIRNAME,
+        DEFAULT_ANCHOR_PAIR_TIMING_DIRNAME,
+        DEFAULT_EXECUTION_COST_MODE as ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE,
+        DEFAULT_LOOKBACK_MONTHS as ANCHOR_PAIR_DEFAULT_LOOKBACK_MONTHS,
+        DEFAULT_MAX_QUEUE_PAIRS as ANCHOR_PAIR_DEFAULT_MAX_QUEUE_PAIRS,
+        DEFAULT_PROBE_RUN_LIMIT as ANCHOR_PAIR_DEFAULT_PROBE_RUN_LIMIT,
+        DEFAULT_PROBE_TIMEOUT_SECONDS as ANCHOR_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS,
+        DEFAULT_QUALITY_SCORE_PRESET as ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET,
+        DEFAULT_TIMING_LOOKBACK_BARS as ANCHOR_PAIR_DEFAULT_TIMING_LOOKBACK_BARS,
+        build_anchor_pair_atlas,
+        build_anchor_pair_timing_atlas,
+        run_anchor_pair_probes,
+        run_anchor_pair_timing_probes,
+    )
+    from .indicator_atlas import build_indicator_atlas
     from .ledger import (
         append_attempt,
         attempts_path_for_run_dir,
@@ -256,6 +305,11 @@ else:
         CANONICAL_SCORE_LAB_VERSION,
         build_attempt_score,
         load_sensitivity_snapshot,
+    )
+    from .signal_atlas import (
+        DEFAULT_BAR_LIMIT as SIGNAL_ATLAS_DEFAULT_BAR_LIMIT,
+        DEFAULT_REPLAY_SOURCE as SIGNAL_ATLAS_DEFAULT_REPLAY_SOURCE,
+        build_signal_atlas,
     )
     from .play_hand import (
         PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
@@ -332,6 +386,13 @@ PUBLIC_CLI_COMMANDS = {
     "doctor",
     "test-providers",
     "play-hand",
+    "build-indicator-atlas",
+    "build-signal-atlas",
+    "build-forward-response-atlas",
+    "build-anchor-pair-atlas",
+    "run-anchor-pair-probes",
+    "build-anchor-pair-timing-atlas",
+    "run-anchor-pair-timing-probes",
     "run",
     "finalize-corpus",
     "build-portfolio",
@@ -608,6 +669,458 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Write a run folder and phase plan without calling backend compute.",
     )
     play_hand.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    indicator_atlas = subparsers.add_parser(
+        "build-indicator-atlas",
+        help="Build static indicator atlas, dependency, pair-matrix, and recipe-prior artifacts.",
+    )
+    indicator_atlas.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=None,
+        help=(
+            "Trading-Dashboard workspace root. Defaults to configured Fuzzfolio "
+            "workspace_root, AUTORESEARCH_FUZZFOLIO_WORKSPACE_ROOT, or C:\\repos\\Trading-Dashboard."
+        ),
+    )
+    indicator_atlas.add_argument(
+        "--catalog-path",
+        type=Path,
+        default=None,
+        help="Direct path to shared/constants/indicators.json. Overrides --workspace-root.",
+    )
+    indicator_atlas.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Output directory. Default: runs/derived/indicator-atlas.",
+    )
+    indicator_atlas.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    signal_atlas = subparsers.add_parser(
+        "build-signal-atlas",
+        help="Build Layer 1 signal-density and persistence metrics from replay simulations.",
+    )
+    signal_atlas.add_argument(
+        "--indicator",
+        action="append",
+        default=None,
+        help="Specific indicator id to profile. Can be repeated. Defaults to signalRole=trigger indicators.",
+    )
+    signal_atlas.add_argument(
+        "--signal-role",
+        default="trigger",
+        help="Catalog signalRole filter when --indicator is omitted. Default: trigger.",
+    )
+    signal_atlas.add_argument(
+        "--instrument",
+        action="append",
+        default=None,
+        help="Instrument panel member. Can be repeated. Default: EURUSD, GBPUSD, USDJPY, XAUUSD.",
+    )
+    signal_atlas.add_argument(
+        "--timeframe",
+        action="append",
+        default=None,
+        help="Timeframe panel member. Can be repeated. Default: M5 and M15.",
+    )
+    signal_atlas.add_argument(
+        "--bar-limit",
+        type=int,
+        default=SIGNAL_ATLAS_DEFAULT_BAR_LIMIT,
+        help=f"Bars per replay simulation, capped by Fuzzfolio at 5000. Default: {SIGNAL_ATLAS_DEFAULT_BAR_LIMIT}.",
+    )
+    signal_atlas.add_argument(
+        "--replay-source",
+        default=SIGNAL_ATLAS_DEFAULT_REPLAY_SOURCE,
+        help=(
+            "Signal Replay source passed to fuzzfolio-agent-cli. Default: "
+            f"{SIGNAL_ATLAS_DEFAULT_REPLAY_SOURCE}."
+        ),
+    )
+    signal_atlas.add_argument(
+        "--max-indicators",
+        type=int,
+        default=None,
+        help="Optional cap after priority sorting. Useful for smoke tests.",
+    )
+    signal_atlas.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard workspace root. Uses the same defaults as build-indicator-atlas.",
+    )
+    signal_atlas.add_argument(
+        "--catalog-path",
+        type=Path,
+        default=None,
+        help="Direct path to shared/constants/indicators.json. Overrides --workspace-root.",
+    )
+    signal_atlas.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Output directory. Default: runs/derived/signal-atlas.",
+    )
+    signal_atlas.add_argument(
+        "--refresh-static-atlas",
+        action="store_true",
+        help="Rebuild runs/derived/indicator-atlas before selecting indicators.",
+    )
+    signal_atlas.add_argument(
+        "--keep-profiles",
+        action="store_true",
+        help="Do not delete temporary cloud profiles after simulation.",
+    )
+    signal_atlas.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=None,
+        help="Optional per-CLI-call timeout.",
+    )
+    signal_atlas.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    forward_response_atlas = subparsers.add_parser(
+        "build-forward-response-atlas",
+        help="Build Layer 2 post-signal forward-response metrics from signal-atlas raw replay artifacts.",
+    )
+    forward_response_atlas.add_argument(
+        "--signal-atlas-dir",
+        type=Path,
+        default=None,
+        help="Input signal-atlas directory. Default: runs/derived/signal-atlas.",
+    )
+    forward_response_atlas.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help="Output directory. Default: runs/derived/forward-response-atlas.",
+    )
+    forward_response_atlas.add_argument(
+        "--horizon",
+        action="append",
+        type=int,
+        default=None,
+        help=(
+            "Forward horizon in bars. Can be repeated. Default: "
+            + ", ".join(str(value) for value in DEFAULT_FORWARD_HORIZONS)
+            + "."
+        ),
+    )
+    forward_response_atlas.add_argument(
+        "--vol-lookback",
+        type=int,
+        default=FORWARD_RESPONSE_DEFAULT_VOL_LOOKBACK,
+        help=f"Pre-event close-return volatility lookback in bars. Default: {FORWARD_RESPONSE_DEFAULT_VOL_LOOKBACK}.",
+    )
+    forward_response_atlas.add_argument(
+        "--min-events",
+        type=int,
+        default=FORWARD_RESPONSE_DEFAULT_MIN_EVENTS,
+        help=f"Minimum sample count before assigning a directional bucket. Default: {FORWARD_RESPONSE_DEFAULT_MIN_EVENTS}.",
+    )
+    forward_response_atlas.add_argument(
+        "--threshold",
+        type=float,
+        default=None,
+        help="Score threshold for treating a long/short score as active. Default: >0.",
+    )
+    forward_response_atlas.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    anchor_pair_atlas = subparsers.add_parser(
+        "build-anchor-pair-atlas",
+        help="Build Layer 3 anchor-trigger pair priors and runnable sensitivity probe artifacts.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--indicator-atlas-dir",
+        type=Path,
+        default=None,
+        help="Input indicator-atlas directory. Default: runs/derived/indicator-atlas.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--signal-atlas-dir",
+        type=Path,
+        default=None,
+        help="Input signal-atlas directory. Default: runs/derived/signal-atlas.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--forward-response-dir",
+        type=Path,
+        default=None,
+        help="Input forward-response-atlas directory. Default: runs/derived/forward-response-atlas.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=f"Output directory. Default: runs/derived/{DEFAULT_ANCHOR_PAIR_DIRNAME}.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard workspace root. Uses the same defaults as build-indicator-atlas.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--catalog-path",
+        type=Path,
+        default=None,
+        help="Direct path to shared/constants/indicators.json. Overrides --workspace-root.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--refresh-static-atlas",
+        action="store_true",
+        help="Rebuild runs/derived/indicator-atlas before constructing pairs.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--anchor",
+        action="append",
+        default=None,
+        help="Anchor indicator id to include. Can be repeated. Defaults to the atlas anchor set.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--trigger",
+        action="append",
+        default=None,
+        help="Trigger indicator id to include. Can be repeated. Defaults to all trigger indicators.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--instrument",
+        action="append",
+        default=None,
+        help="Instrument panel member. Can be repeated. Default: EURUSD, GBPUSD, USDJPY, XAUUSD.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--timeframe",
+        action="append",
+        default=None,
+        help="Probe timeframe. Can be repeated. Default: M5 and M15.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--max-triggers",
+        type=int,
+        default=None,
+        help="Optional cap on trigger candidates after prior sorting. Useful for smoke tests.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--max-pairs",
+        type=int,
+        default=ANCHOR_PAIR_DEFAULT_MAX_QUEUE_PAIRS,
+        help=f"Maximum queued anchor-pair probes. Default: {ANCHOR_PAIR_DEFAULT_MAX_QUEUE_PAIRS}.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--lookback-months",
+        type=int,
+        default=ANCHOR_PAIR_DEFAULT_LOOKBACK_MONTHS,
+        help=f"Sensitivity-basket lookback months embedded in the run manifest. Default: {ANCHOR_PAIR_DEFAULT_LOOKBACK_MONTHS}.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--quality-score-preset",
+        default=ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET,
+        help=f"Sensitivity-basket quality preset embedded in the run manifest. Default: {ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET}.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--execution-cost-mode",
+        default=ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE,
+        help=f"Sensitivity-basket execution-cost mode embedded in the run manifest. Default: {ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE}.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--no-profile-docs",
+        action="store_true",
+        help="Skip writing runnable pair profile JSON documents.",
+    )
+    anchor_pair_atlas.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    run_anchor_pair_probes = subparsers.add_parser(
+        "run-anchor-pair-probes",
+        help="Run and score queued Layer 3 anchor-pair sensitivity probes.",
+    )
+    run_anchor_pair_probes.add_argument(
+        "--atlas-dir",
+        type=Path,
+        default=None,
+        help=f"Anchor-pair atlas directory. Default: runs/derived/{DEFAULT_ANCHOR_PAIR_DIRNAME}.",
+    )
+    run_anchor_pair_probes.add_argument(
+        "--probe-id",
+        action="append",
+        default=None,
+        help="Specific queued probe id to run. Can be repeated.",
+    )
+    run_anchor_pair_probes.add_argument(
+        "--limit",
+        type=int,
+        default=ANCHOR_PAIR_DEFAULT_PROBE_RUN_LIMIT,
+        help=f"Number of queued probes to run when --probe-id is omitted. Default: {ANCHOR_PAIR_DEFAULT_PROBE_RUN_LIMIT}.",
+    )
+    run_anchor_pair_probes.add_argument(
+        "--all",
+        action="store_true",
+        help="Run all queued probes.",
+    )
+    run_anchor_pair_probes.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run probes even when sensitivity-response.json already exists.",
+    )
+    run_anchor_pair_probes.add_argument(
+        "--keep-profiles",
+        action="store_true",
+        help="Do not delete temporary cloud profiles after each probe.",
+    )
+    run_anchor_pair_probes.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=ANCHOR_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS,
+        help=f"Per sensitivity-basket timeout. Default: {ANCHOR_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS}.",
+    )
+    run_anchor_pair_probes.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    anchor_pair_timing_atlas = subparsers.add_parser(
+        "build-anchor-pair-timing-atlas",
+        help="Build Layer 3b timing-tolerance variants for queued anchor-pair probes.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--anchor-pair-atlas-dir",
+        type=Path,
+        default=None,
+        help=f"Input anchor-pair atlas directory. Default: runs/derived/{DEFAULT_ANCHOR_PAIR_DIRNAME}.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=f"Output directory. Default: runs/derived/{DEFAULT_ANCHOR_PAIR_TIMING_DIRNAME}.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard workspace root. Uses the same defaults as build-indicator-atlas.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--catalog-path",
+        type=Path,
+        default=None,
+        help="Direct path to shared/constants/indicators.json. Overrides --workspace-root.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--base-probe-id",
+        action="append",
+        default=None,
+        help="Specific Layer 3 base probe id to vary. Can be repeated.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--limit-base-pairs",
+        type=int,
+        default=None,
+        help="Optional cap on base Layer 3 probes. Default: all queued probes.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--lookback-bars",
+        type=int,
+        action="append",
+        default=None,
+        help=(
+            "Trigger lookbackBars value to test. Can be repeated. "
+            f"Default: {', '.join(str(value) for value in ANCHOR_PAIR_DEFAULT_TIMING_LOOKBACK_BARS)}."
+        ),
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--include-baseline",
+        action="store_true",
+        help="Also rerun variants whose lookbackBars value matches the catalog baseline.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--lookback-months",
+        type=int,
+        default=ANCHOR_PAIR_DEFAULT_LOOKBACK_MONTHS,
+        help=f"Sensitivity-basket lookback months embedded in the timing manifest. Default: {ANCHOR_PAIR_DEFAULT_LOOKBACK_MONTHS}.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--quality-score-preset",
+        default=ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET,
+        help=f"Sensitivity-basket quality preset embedded in the timing manifest. Default: {ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET}.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--execution-cost-mode",
+        default=ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE,
+        help=f"Sensitivity-basket execution-cost mode embedded in the timing manifest. Default: {ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE}.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--no-profile-docs",
+        action="store_true",
+        help="Skip writing runnable timing profile JSON documents.",
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    run_anchor_pair_timing_probes = subparsers.add_parser(
+        "run-anchor-pair-timing-probes",
+        help="Run and score queued Layer 3b timing-tolerance sensitivity probes.",
+    )
+    run_anchor_pair_timing_probes.add_argument(
+        "--atlas-dir",
+        type=Path,
+        default=None,
+        help=f"Anchor-pair timing atlas directory. Default: runs/derived/{DEFAULT_ANCHOR_PAIR_TIMING_DIRNAME}.",
+    )
+    run_anchor_pair_timing_probes.add_argument(
+        "--timing-probe-id",
+        action="append",
+        default=None,
+        help="Specific queued timing probe id to run. Can be repeated.",
+    )
+    run_anchor_pair_timing_probes.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Number of timing probes to run when --timing-probe-id is omitted. Default: all.",
+    )
+    run_anchor_pair_timing_probes.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run timing probes even when sensitivity-response.json already exists.",
+    )
+    run_anchor_pair_timing_probes.add_argument(
+        "--keep-profiles",
+        action="store_true",
+        help="Do not delete temporary cloud profiles after each timing probe.",
+    )
+    run_anchor_pair_timing_probes.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=ANCHOR_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS,
+        help=f"Per sensitivity-basket timeout. Default: {ANCHOR_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS}.",
+    )
+    run_anchor_pair_timing_probes.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON summary.",
@@ -10757,6 +11270,543 @@ def cmd_rescore_attempts() -> int:
     return 0
 
 
+def cmd_build_indicator_atlas(
+    *,
+    workspace_root: Path | None,
+    catalog_path: Path | None,
+    out_dir: Path | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    result = build_indicator_atlas(
+        config,
+        workspace_root=workspace_root,
+        catalog_path=catalog_path,
+        out_dir=out_dir,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    table = Table(title="Indicator Atlas", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Indicators", str(summary.get("indicator_count", 0)))
+    table.add_row(
+        "Generation eligible",
+        str(summary.get("generation_eligible_count", 0)),
+    )
+    table.add_row(
+        "Implementation mapped",
+        str(summary.get("implementation_mapped_count", 0)),
+    )
+    table.add_row(
+        "Missing implementations",
+        str(summary.get("missing_implementation_count", 0)),
+    )
+    console.print(table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Atlas JSON: {result.atlas_path}",
+                    f"Atlas CSV: {result.csv_path}",
+                    f"Dependencies: {result.dependencies_path}",
+                    f"Pair matrix: {result.pair_matrix_path}",
+                    f"Recipe priors: {result.recipe_priors_path}",
+                ]
+            ),
+            title="Indicator Atlas Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_build_signal_atlas(
+    *,
+    indicator_ids: list[str] | None,
+    signal_role: str | None,
+    instruments: list[str] | None,
+    timeframes: list[str] | None,
+    bar_limit: int,
+    max_indicators: int | None,
+    workspace_root: Path | None,
+    catalog_path: Path | None,
+    out_dir: Path | None,
+    refresh_static_atlas: bool,
+    keep_profiles: bool,
+    replay_source: str | None,
+    timeout_seconds: int | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+
+    def progress(payload: dict[str, Any]) -> None:
+        if as_json:
+            return
+        console.print(
+            "[signal-atlas] "
+            f"{payload.get('completed')}/{payload.get('total')} "
+            f"{payload.get('indicator_id')} {payload.get('instrument')} "
+            f"{payload.get('timeframe')} {payload.get('status')}"
+        )
+
+    result = build_signal_atlas(
+        config,
+        indicator_ids=indicator_ids,
+        signal_role=signal_role,
+        instruments=instruments,
+        timeframes=timeframes,
+        bar_limit=bar_limit,
+        max_indicators=max_indicators,
+        out_dir=out_dir,
+        workspace_root=workspace_root,
+        catalog_path=catalog_path,
+        refresh_static_atlas=refresh_static_atlas,
+        keep_profiles=keep_profiles,
+        replay_source=replay_source,
+        timeout_seconds=timeout_seconds,
+        progress_callback=progress,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    selection = summary.get("selection", {})
+    counts = summary.get("result_counts", {})
+    table = Table(title="Signal Atlas", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Indicators", str(selection.get("indicator_count", 0)))
+    table.add_row("Replay source", str(selection.get("replay_source") or ""))
+    table.add_row("Requested calls", str(selection.get("total_requested_calls", 0)))
+    table.add_row("Successful calls", str(counts.get("successful_calls", 0)))
+    table.add_row("Failed calls", str(counts.get("failed_calls", 0)))
+    table.add_row(
+        "Density buckets",
+        json.dumps(counts.get("density_bucket_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Signal atlas JSON: {result.atlas_path}",
+                    f"Signal atlas CSV: {result.csv_path}",
+                    f"Summary: {result.summary_path}",
+                    f"Issues: {result.issues_path}",
+                    f"Manifest: {result.request_manifest_path}",
+                ]
+            ),
+            title="Signal Atlas Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_build_forward_response_atlas(
+    *,
+    signal_atlas_dir: Path | None,
+    out_dir: Path | None,
+    horizons: list[int] | None,
+    vol_lookback: int,
+    min_events: int,
+    threshold: float | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    result = build_forward_response_atlas(
+        config,
+        signal_atlas_dir=signal_atlas_dir,
+        out_dir=out_dir,
+        horizons=horizons,
+        vol_lookback=vol_lookback,
+        min_events=min_events,
+        threshold=threshold if threshold is not None else 1e-9,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    selection = summary.get("selection", {})
+    counts = summary.get("result_counts", {})
+    table = Table(title="Forward Response Atlas", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Indicators", str(selection.get("indicator_count", 0)))
+    table.add_row("Cells", str(selection.get("cell_count", 0)))
+    table.add_row("Horizons", json.dumps(selection.get("horizons", []), ensure_ascii=True))
+    table.add_row("Event-horizon records", str(counts.get("event_horizon_records", 0)))
+    table.add_row("No-event cells", str(counts.get("no_event_cells", 0)))
+    table.add_row(
+        "Prior buckets",
+        json.dumps(counts.get("prior_bucket_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Forward response JSON: {result.atlas_path}",
+                    f"Cell CSV: {result.cell_csv_path}",
+                    f"Rollup CSV: {result.rollup_csv_path}",
+                    f"Priors CSV: {result.priors_csv_path}",
+                    f"Issues: {result.issues_path}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Forward Response Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_build_anchor_pair_atlas(
+    *,
+    indicator_atlas_dir: Path | None,
+    signal_atlas_dir: Path | None,
+    forward_response_dir: Path | None,
+    out_dir: Path | None,
+    workspace_root: Path | None,
+    catalog_path: Path | None,
+    refresh_static_atlas: bool,
+    anchor_ids: list[str] | None,
+    trigger_ids: list[str] | None,
+    instruments: list[str] | None,
+    timeframes: list[str] | None,
+    max_triggers: int | None,
+    max_pairs: int,
+    lookback_months: int,
+    quality_score_preset: str,
+    execution_cost_mode: str,
+    emit_profile_docs: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    result = build_anchor_pair_atlas(
+        config,
+        indicator_atlas_dir=indicator_atlas_dir,
+        signal_atlas_dir=signal_atlas_dir,
+        forward_response_dir=forward_response_dir,
+        out_dir=out_dir,
+        workspace_root=workspace_root,
+        catalog_path=catalog_path,
+        refresh_static_atlas=refresh_static_atlas,
+        anchor_ids=anchor_ids,
+        trigger_ids=trigger_ids,
+        instruments=instruments,
+        timeframes=timeframes,
+        max_triggers=max_triggers,
+        max_pairs=max_pairs,
+        lookback_months=lookback_months,
+        emit_profile_docs=emit_profile_docs,
+        quality_score_preset=quality_score_preset,
+        execution_cost_mode=execution_cost_mode,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    selection = summary.get("selection", {})
+    counts = summary.get("result_counts", {})
+    table = Table(title="Anchor Pair Atlas", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Pair matrix rows", str(counts.get("pair_matrix_rows", 0)))
+    table.add_row("Queued probes", str(counts.get("queue_rows", 0)))
+    table.add_row("Profile docs", str(counts.get("profile_docs", 0)))
+    table.add_row("Lookback months", str(selection.get("lookback_months", 0)))
+    table.add_row(
+        "Queue buckets",
+        json.dumps(counts.get("queue_bucket_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+    top_queue = summary.get("top_queue", [])
+    if top_queue:
+        top_table = Table(title="Top Anchor-Pair Probes", box=box.SIMPLE)
+        top_table.add_column("#", justify="right")
+        top_table.add_column("Anchor")
+        top_table.add_column("Trigger")
+        top_table.add_column("TF")
+        top_table.add_column("Score", justify="right")
+        top_table.add_column("Bucket")
+        for row in top_queue[:8]:
+            top_table.add_row(
+                str(row.get("queue_rank") or ""),
+                str(row.get("anchor_id") or ""),
+                str(row.get("trigger_id") or ""),
+                str(row.get("probe_timeframe") or ""),
+                str(row.get("pair_prior_score") or ""),
+                str(row.get("pair_prior_bucket") or ""),
+            )
+        console.print(top_table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Anchor pair JSON: {result.atlas_path}",
+                    f"Pair matrix CSV: {result.matrix_csv_path}",
+                    f"Queue CSV: {result.queue_csv_path}",
+                    f"Run manifest: {result.manifest_path}",
+                    f"Run script: {result.run_script_path}",
+                    f"Profiles: {result.profile_dir}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Anchor Pair Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_run_anchor_pair_probes(
+    *,
+    atlas_dir: Path | None,
+    probe_ids: list[str] | None,
+    limit: int | None,
+    force: bool,
+    keep_profiles: bool,
+    timeout_seconds: int | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+
+    def progress(payload: dict[str, Any]) -> None:
+        if as_json:
+            return
+        console.print(
+            "[anchor-pair-probes] "
+            f"{payload.get('completed')}/{payload.get('total')} "
+            f"{payload.get('probe_id')} {payload.get('status')}"
+        )
+
+    result = run_anchor_pair_probes(
+        config,
+        atlas_dir=atlas_dir,
+        probe_ids=probe_ids,
+        limit=limit,
+        force=force,
+        keep_profiles=keep_profiles,
+        timeout_seconds=timeout_seconds,
+        progress_callback=progress,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    counts = summary.get("result_counts", {})
+    table = Table(title="Anchor Pair Probe Results", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Selected", str(counts.get("selected", 0)))
+    table.add_row("Completed", str(counts.get("completed", 0)))
+    table.add_row("Scored", str(counts.get("scored", 0)))
+    table.add_row(
+        "Statuses",
+        json.dumps(counts.get("status_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+    top_scored = summary.get("top_scored", [])
+    if top_scored:
+        top_table = Table(title="Top Scored Pair Probes", box=box.SIMPLE)
+        top_table.add_column("Probe")
+        top_table.add_column("Anchor")
+        top_table.add_column("Trigger")
+        top_table.add_column("Score", justify="right")
+        top_table.add_column("Basis")
+        for row in top_scored[:8]:
+            top_table.add_row(
+                str(row.get("probe_id") or ""),
+                str(row.get("anchor_id") or ""),
+                str(row.get("trigger_id") or ""),
+                str(row.get("composite_score") or ""),
+                str(row.get("score_basis") or ""),
+            )
+        console.print(top_table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Results CSV: {result.results_csv_path}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Anchor Pair Probe Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_build_anchor_pair_timing_atlas(
+    *,
+    anchor_pair_atlas_dir: Path | None,
+    out_dir: Path | None,
+    workspace_root: Path | None,
+    catalog_path: Path | None,
+    base_probe_ids: list[str] | None,
+    limit_base_pairs: int | None,
+    lookback_bars: list[int] | None,
+    include_baseline_variants: bool,
+    lookback_months: int,
+    quality_score_preset: str,
+    execution_cost_mode: str,
+    emit_profile_docs: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    result = build_anchor_pair_timing_atlas(
+        config,
+        anchor_pair_atlas_dir=anchor_pair_atlas_dir,
+        out_dir=out_dir,
+        workspace_root=workspace_root,
+        catalog_path=catalog_path,
+        base_probe_ids=base_probe_ids,
+        limit_base_pairs=limit_base_pairs,
+        lookback_bars=lookback_bars,
+        include_baseline_variants=include_baseline_variants,
+        emit_profile_docs=emit_profile_docs,
+        lookback_months=lookback_months,
+        quality_score_preset=quality_score_preset,
+        execution_cost_mode=execution_cost_mode,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    counts = summary.get("result_counts", {})
+    selection = summary.get("selection", {})
+    table = Table(title="Anchor Pair Timing Atlas", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Base pairs considered", str(counts.get("base_pairs_considered", 0)))
+    table.add_row("Timing variants", str(counts.get("timing_variants", 0)))
+    table.add_row("Profile docs", str(counts.get("profile_docs", 0)))
+    table.add_row("Lookback bars", json.dumps(selection.get("lookback_bars", [])))
+    table.add_row(
+        "Variant counts",
+        json.dumps(counts.get("lookback_variant_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Timing JSON: {result.atlas_path}",
+                    f"Queue CSV: {result.queue_csv_path}",
+                    f"Run manifest: {result.manifest_path}",
+                    f"Run script: {result.run_script_path}",
+                    f"Profiles: {result.profile_dir}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Anchor Pair Timing Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_run_anchor_pair_timing_probes(
+    *,
+    atlas_dir: Path | None,
+    timing_probe_ids: list[str] | None,
+    limit: int | None,
+    force: bool,
+    keep_profiles: bool,
+    timeout_seconds: int | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+
+    def progress(payload: dict[str, Any]) -> None:
+        if as_json:
+            return
+        console.print(
+            "[anchor-pair-timing] "
+            f"{payload.get('completed')}/{payload.get('total')} "
+            f"{payload.get('probe_id')} {payload.get('status')}"
+        )
+
+    result = run_anchor_pair_timing_probes(
+        config,
+        atlas_dir=atlas_dir,
+        timing_probe_ids=timing_probe_ids,
+        limit=limit,
+        force=force,
+        keep_profiles=keep_profiles,
+        timeout_seconds=timeout_seconds,
+        progress_callback=progress,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    counts = summary.get("result_counts", {})
+    table = Table(title="Anchor Pair Timing Results", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Selected", str(counts.get("selected", 0)))
+    table.add_row("Completed", str(counts.get("completed", 0)))
+    table.add_row("Scored", str(counts.get("scored", 0)))
+    table.add_row("Positive deltas", str(counts.get("positive_delta", 0)))
+    table.add_row("Material improvements", str(counts.get("material_improved", 0)))
+    table.add_row("Rescued positives", str(counts.get("rescued_positive", 0)))
+    table.add_row(
+        "Buckets",
+        json.dumps(counts.get("timing_bucket_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+    improvements = summary.get("top_improvements", [])
+    if improvements:
+        top_table = Table(title="Top Timing Improvements", box=box.SIMPLE)
+        top_table.add_column("Timing Probe")
+        top_table.add_column("Base")
+        top_table.add_column("LB", justify="right")
+        top_table.add_column("Score", justify="right")
+        top_table.add_column("Delta", justify="right")
+        for row in improvements[:8]:
+            top_table.add_row(
+                str(row.get("timing_probe_id") or ""),
+                str(row.get("base_probe_id") or ""),
+                str(row.get("variant_lookback_bars") or ""),
+                str(row.get("composite_score") or ""),
+                str(row.get("score_delta") or ""),
+            )
+        console.print(top_table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Results CSV: {result.results_csv_path}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Anchor Pair Timing Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     direct_command = _command_from_invocation_name(sys.argv[0]) if argv is None else None
     if argv is None and direct_command is None:
@@ -10808,6 +11858,97 @@ def main(argv: list[str] | None = None) -> int:
             job_timeout_seconds=args.job_timeout_seconds,
             sweep_timeout_seconds=args.sweep_timeout_seconds,
             dry_run=bool(args.dry_run),
+            as_json=bool(args.json),
+        )
+    if args.command == "build-indicator-atlas":
+        return cmd_build_indicator_atlas(
+            workspace_root=args.workspace_root,
+            catalog_path=args.catalog_path,
+            out_dir=args.out_dir,
+            as_json=bool(args.json),
+        )
+    if args.command == "build-signal-atlas":
+        return cmd_build_signal_atlas(
+            indicator_ids=args.indicator,
+            signal_role=args.signal_role,
+            instruments=args.instrument,
+            timeframes=args.timeframe,
+            bar_limit=args.bar_limit,
+            max_indicators=args.max_indicators,
+            workspace_root=args.workspace_root,
+            catalog_path=args.catalog_path,
+            out_dir=args.out_dir,
+            refresh_static_atlas=bool(args.refresh_static_atlas),
+            keep_profiles=bool(args.keep_profiles),
+            replay_source=args.replay_source,
+            timeout_seconds=args.timeout_seconds,
+            as_json=bool(args.json),
+        )
+    if args.command == "build-forward-response-atlas":
+        return cmd_build_forward_response_atlas(
+            signal_atlas_dir=args.signal_atlas_dir,
+            out_dir=args.out_dir,
+            horizons=args.horizon,
+            vol_lookback=args.vol_lookback,
+            min_events=args.min_events,
+            threshold=args.threshold,
+            as_json=bool(args.json),
+        )
+    if args.command == "build-anchor-pair-atlas":
+        return cmd_build_anchor_pair_atlas(
+            indicator_atlas_dir=args.indicator_atlas_dir,
+            signal_atlas_dir=args.signal_atlas_dir,
+            forward_response_dir=args.forward_response_dir,
+            out_dir=args.out_dir,
+            workspace_root=args.workspace_root,
+            catalog_path=args.catalog_path,
+            refresh_static_atlas=bool(args.refresh_static_atlas),
+            anchor_ids=args.anchor,
+            trigger_ids=args.trigger,
+            instruments=args.instrument,
+            timeframes=args.timeframe,
+            max_triggers=args.max_triggers,
+            max_pairs=args.max_pairs,
+            lookback_months=args.lookback_months,
+            quality_score_preset=args.quality_score_preset,
+            execution_cost_mode=args.execution_cost_mode,
+            emit_profile_docs=not bool(args.no_profile_docs),
+            as_json=bool(args.json),
+        )
+    if args.command == "run-anchor-pair-probes":
+        return cmd_run_anchor_pair_probes(
+            atlas_dir=args.atlas_dir,
+            probe_ids=args.probe_id,
+            limit=None if bool(args.all) else args.limit,
+            force=bool(args.force),
+            keep_profiles=bool(args.keep_profiles),
+            timeout_seconds=args.timeout_seconds,
+            as_json=bool(args.json),
+        )
+    if args.command == "build-anchor-pair-timing-atlas":
+        return cmd_build_anchor_pair_timing_atlas(
+            anchor_pair_atlas_dir=args.anchor_pair_atlas_dir,
+            out_dir=args.out_dir,
+            workspace_root=args.workspace_root,
+            catalog_path=args.catalog_path,
+            base_probe_ids=args.base_probe_id,
+            limit_base_pairs=args.limit_base_pairs,
+            lookback_bars=args.lookback_bars,
+            include_baseline_variants=bool(args.include_baseline),
+            lookback_months=args.lookback_months,
+            quality_score_preset=args.quality_score_preset,
+            execution_cost_mode=args.execution_cost_mode,
+            emit_profile_docs=not bool(args.no_profile_docs),
+            as_json=bool(args.json),
+        )
+    if args.command == "run-anchor-pair-timing-probes":
+        return cmd_run_anchor_pair_timing_probes(
+            atlas_dir=args.atlas_dir,
+            timing_probe_ids=args.timing_probe_id,
+            limit=args.limit,
+            force=bool(args.force),
+            keep_profiles=bool(args.keep_profiles),
+            timeout_seconds=args.timeout_seconds,
             as_json=bool(args.json),
         )
     if args.command == "supervise":

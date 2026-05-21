@@ -55,6 +55,263 @@ Common arguments:
 - `--dry-run`: write the run/plan without backend compute.
 - `--json`: print a JSON summary.
 
+## build-indicator-atlas
+
+```powershell
+uv run build-indicator-atlas
+uv run build-indicator-atlas --json
+uv run build-indicator-atlas --workspace-root C:\repos\Trading-Dashboard
+```
+
+Builds the first static Indicator Atlas layer from the Fuzzfolio catalog and implementation factory. With no arguments it uses the configured Fuzzfolio workspace root, `AUTORESEARCH_FUZZFOLIO_WORKSPACE_ROOT`, or `C:\repos\Trading-Dashboard`.
+
+Outputs are written to `runs/derived/indicator-atlas/` by default:
+
+- `indicator-atlas.json` and `indicator-atlas.csv`: per-indicator role metadata, implementation mapping, parameter cardinality, sweepable parameters, and static prior buckets.
+- `indicator-dependencies.json`: base-indicator, implementation-class, TA function, namespace, role, and strategy groupings.
+- `indicator-pair-matrix.csv`: static anchor-trigger compatibility priors for the first Trigger Atlas probes.
+- `recipe-priors.json`: recipe-slot candidate priors and the 80/15/5 guided/wild sampling policy.
+
+Arguments:
+
+- `--workspace-root`: Trading-Dashboard workspace root.
+- `--catalog-path`: direct path to `shared/constants/indicators.json`; overrides `--workspace-root`.
+- `--out-dir`: output directory; default `runs/derived/indicator-atlas`.
+- `--json`: print machine-readable output.
+
+## build-signal-atlas
+
+```powershell
+uv run build-signal-atlas
+uv run build-signal-atlas --max-indicators 3 --bar-limit 500 --json
+uv run build-signal-atlas --indicator WICK_REJECTION --indicator BREAKOUT_FIRST_CLOSE
+```
+
+Builds Layer 1 signal behavior data from Signal Replay, not deep-replay P&L. The command creates temporary catalog-derived profiles, runs `replay simulate` for each selected indicator/timeframe/instrument cell, summarizes the long/short score series, and deletes the temporary profiles unless `--keep-profiles` is set.
+
+Default panel:
+
+- indicators: catalog `signalRole=trigger`
+- instruments: `EURUSD`, `GBPUSD`, `USDJPY`, `XAUUSD`
+- timeframes: `M5`, `M15`
+- bars per replay: `5000`
+- replay source: `system` so agent/operator atlas runs do not consume interactive Signal Replay usage
+
+Outputs are written to `runs/derived/signal-atlas/` by default:
+
+- `signal-atlas.json`: full row-level signal metrics and rollups.
+- `signal-atlas.csv`: compact per indicator/instrument/timeframe rows.
+- `signal-atlas-summary.json`: run summary and per-indicator rollups.
+- `signal-atlas-issues.csv`: flat, very sparse, saturated, one-sided, or failed cells.
+- `request-manifest.json`: temporary profile and raw replay artifact bookkeeping.
+
+Arguments:
+
+- `--indicator`: explicit indicator id; repeatable. Overrides `--signal-role` selection.
+- `--signal-role`: role filter when `--indicator` is omitted; default `trigger`.
+- `--instrument`: instrument panel member; repeatable.
+- `--timeframe`: timeframe panel member; repeatable.
+- `--bar-limit`: bars per replay simulation; default `5000`.
+- `--replay-source`: Signal Replay source passed through the Rust CLI; default `system`.
+- `--max-indicators`: cap selected indicators after static-prior sorting.
+- `--refresh-static-atlas`: rebuild the static atlas before selection.
+- `--keep-profiles`: keep temporary cloud profiles for manual inspection.
+- `--timeout-seconds`: per CLI call timeout.
+- `--json`: print machine-readable output.
+
+## build-forward-response-atlas
+
+```powershell
+uv run build-forward-response-atlas
+uv run build-forward-response-atlas --horizon 3 --horizon 12 --json
+```
+
+Builds Layer 2 forward-response data from existing `runs/derived/signal-atlas/raw/*.json` replay payloads. It does not call the Fuzzfolio backend. The command treats long/short event starts as trigger events and measures:
+
+- forward return after each configured horizon
+- max favorable excursion
+- max adverse excursion
+- MFE > MAE rate
+- volatility-normalized return using pre-event close-return volatility
+
+Default settings:
+
+- input: `runs/derived/signal-atlas/`
+- output: `runs/derived/forward-response-atlas/`
+- horizons: `1`, `3`, `6`, `12`, `24` bars
+- volatility lookback: `48` bars
+- minimum events for directional buckets: `30`
+
+Outputs:
+
+- `forward-response-atlas.json`: full Layer 2 artifact.
+- `forward-response-atlas.csv`: per indicator/instrument/timeframe/direction/horizon rows.
+- `forward-response-rollups.csv`: per indicator/direction/horizon rollups.
+- `forward-response-priors.csv`: one row per indicator with aggregate response, best conditional cell, strong-cell count, and prior bucket.
+- `forward-response-issues.csv`: no-event, low-sample, or negative-response review flags.
+
+Arguments:
+
+- `--signal-atlas-dir`: input signal-atlas directory.
+- `--out-dir`: output directory.
+- `--horizon`: forward horizon in bars; repeatable.
+- `--vol-lookback`: pre-event volatility lookback in bars.
+- `--min-events`: minimum sample count before assigning directional buckets.
+- `--threshold`: active-score threshold; default `>0`.
+- `--json`: print machine-readable output.
+
+## build-anchor-pair-atlas
+
+```powershell
+uv run build-anchor-pair-atlas
+uv run build-anchor-pair-atlas --max-pairs 12 --json
+uv run build-anchor-pair-atlas --anchor MA_SLOPE_TREND --trigger WICK_REJECTION
+```
+
+Builds Layer 3 anchor-trigger pair priors from the existing static, signal, and forward-response Atlas artifacts. This command does not run the backend probes itself; it writes the ranked queue, profile JSONs, a machine-readable run manifest, and a PowerShell script that creates the queued profiles with the robot auth profile and runs `sensitivity-basket`.
+
+Default settings:
+
+- input: `runs/derived/indicator-atlas/`, `runs/derived/signal-atlas/`, and `runs/derived/forward-response-atlas/`
+- output: `runs/derived/anchor-pair-atlas/`
+- anchors: the static atlas anchor set
+- triggers: all catalog `signalRole=trigger` indicators
+- instruments: `EURUSD`, `GBPUSD`, `USDJPY`, `XAUUSD`
+- probe timeframes: `M5`, `M15`
+- queued probes: `48`
+- sensitivity lookback embedded in the manifest: `3` months
+
+Outputs:
+
+- `anchor-pair-atlas.json`: full Layer 3 artifact.
+- `anchor-pair-matrix.csv`: all scored anchor-trigger-timeframe rows.
+- `anchor-pair-queue.csv`: prioritized probe queue.
+- `profiles/*.json`: temporary pair profile documents for queued probes.
+- `anchor-pair-run-manifest.json`: create-profile and sensitivity-basket arguments.
+- `run-anchor-pair-probes.ps1`: runnable backend batch script for the queued probes.
+- `anchor-pair-summary.json`: compact summary and top queued probes.
+
+Arguments:
+
+- `--indicator-atlas-dir`, `--signal-atlas-dir`, `--forward-response-dir`: input artifact directories.
+- `--out-dir`: output directory.
+- `--workspace-root`, `--catalog-path`: Trading-Dashboard catalog overrides.
+- `--refresh-static-atlas`: rebuild the static atlas first.
+- `--anchor`: anchor indicator id; repeatable.
+- `--trigger`: trigger indicator id; repeatable.
+- `--instrument`: instrument panel member; repeatable.
+- `--timeframe`: probe timeframe; repeatable.
+- `--max-triggers`: cap trigger candidates after prior sorting.
+- `--max-pairs`: cap queued probes.
+- `--lookback-months`: sensitivity-basket lookback months embedded in the run manifest.
+- `--quality-score-preset`: sensitivity quality preset embedded in the run manifest.
+- `--execution-cost-mode`: sensitivity execution-cost mode embedded in the run manifest.
+- `--no-profile-docs`: skip writing profile JSONs.
+- `--json`: print machine-readable output.
+
+## run-anchor-pair-probes
+
+```powershell
+uv run run-anchor-pair-probes
+uv run run-anchor-pair-probes --limit 1 --json
+uv run run-anchor-pair-probes --probe-id l3-001-rsi-mean-reversion-channel-reentry-m5
+uv run run-anchor-pair-probes --all
+```
+
+Runs queued Layer 3 pair probes from `runs/derived/anchor-pair-atlas/anchor-pair-atlas.json`. For each selected probe, the command creates the temporary pair profile with the configured robot auth profile, runs `sensitivity-basket`, scores the output with AutoResearch's normal sensitivity scorer, and deletes the temporary cloud profile unless `--keep-profiles` is set.
+
+Default settings:
+
+- input: `runs/derived/anchor-pair-atlas/`
+- selected probes: top `8` queued probes
+- per-probe timeout: `2400` seconds
+- existing `sensitivity-response.json` outputs are reused unless `--force` is set
+
+Outputs:
+
+- `anchor-pair-probe-results.csv`: one row per executed or reused probe with prior score, run status, composite score, and output directory.
+- `anchor-pair-probe-summary.json`: compact run summary and top scored probes.
+- per-probe sensitivity artifacts under `probe-results/<probe-id>/`.
+
+Arguments:
+
+- `--atlas-dir`: anchor-pair atlas directory.
+- `--probe-id`: queued probe id to run; repeatable.
+- `--limit`: number of queued probes to run when `--probe-id` is omitted.
+- `--all`: run the whole queue.
+- `--force`: rerun probes even if an output already exists.
+- `--keep-profiles`: keep temporary cloud profiles.
+- `--timeout-seconds`: per sensitivity-basket timeout.
+- `--json`: print machine-readable output.
+
+## build-anchor-pair-timing-atlas
+
+```powershell
+uv run build-anchor-pair-timing-atlas
+uv run build-anchor-pair-timing-atlas --lookback-bars 2 --lookback-bars 3 --json
+uv run build-anchor-pair-timing-atlas --base-probe-id l3-001-rsi-mean-reversion-channel-reentry-m5
+```
+
+Builds Layer 3b timing-tolerance variants from a completed Layer 3 anchor-pair run. The default pass reads `runs/derived/anchor-pair-atlas/`, uses the existing baseline scores from `anchor-pair-probe-results.csv`, and writes trigger-side `lookbackBars` variants for the whole queued set.
+
+Default settings:
+
+- input: `runs/derived/anchor-pair-atlas/`
+- output: `runs/derived/anchor-pair-timing-atlas/`
+- base probes: all queued Layer 3 probes with baseline results
+- trigger lookback bars: `1`, `2`, `3`, skipping the catalog baseline unless `--include-baseline` is set
+- sensitivity lookback embedded in the manifest: `3` months
+
+Outputs:
+
+- `anchor-pair-timing-atlas.json`: full Layer 3b artifact.
+- `anchor-pair-timing-queue.csv`: queued timing variants with baseline score fields.
+- `profiles/*.json`: temporary timing profile documents for queued probes.
+- `anchor-pair-timing-run-manifest.json`: create-profile and sensitivity-basket arguments.
+- `run-anchor-pair-timing-probes.ps1`: runnable backend batch script for the timing queue.
+- `anchor-pair-timing-build-summary.json`: compact build summary.
+
+Arguments:
+
+- `--anchor-pair-atlas-dir`: input anchor-pair atlas directory.
+- `--out-dir`: output directory.
+- `--workspace-root`, `--catalog-path`: Trading-Dashboard catalog overrides.
+- `--base-probe-id`: base Layer 3 probe id; repeatable.
+- `--limit-base-pairs`: cap base probes for a narrower run.
+- `--lookback-bars`: trigger `lookbackBars` value; repeatable.
+- `--include-baseline`: rerun variants whose `lookbackBars` value matches the catalog baseline.
+- `--lookback-months`: sensitivity-basket lookback months embedded in the run manifest.
+- `--quality-score-preset`: sensitivity quality preset embedded in the run manifest.
+- `--execution-cost-mode`: sensitivity execution-cost mode embedded in the run manifest.
+- `--no-profile-docs`: skip writing profile JSONs.
+- `--json`: print machine-readable output.
+
+## run-anchor-pair-timing-probes
+
+```powershell
+uv run run-anchor-pair-timing-probes
+uv run run-anchor-pair-timing-probes --limit 5
+uv run run-anchor-pair-timing-probes --timing-probe-id l3b-001-l3-001-rsi-mean-reversion-channel-reentry-m5-tr-lb2
+```
+
+Runs queued Layer 3b timing variants from `runs/derived/anchor-pair-timing-atlas/anchor-pair-timing-atlas.json`. Unlike the base Layer 3 runner, the no-arg default runs the whole timing queue because this layer is meant to produce a complete baseline-vs-timing comparison cache.
+
+Outputs:
+
+- `anchor-pair-timing-results.csv`: one row per timing variant with baseline metrics, variant metrics, deltas, and timing bucket.
+- `anchor-pair-timing-summary.json`: compact run summary, top scored variants, top improvements, rescued positives, and best variant by base probe.
+- per-probe sensitivity artifacts under `probe-results/<timing-probe-id>/`.
+
+Arguments:
+
+- `--atlas-dir`: anchor-pair timing atlas directory.
+- `--timing-probe-id`: queued timing probe id to run; repeatable.
+- `--limit`: number of timing probes to run when `--timing-probe-id` is omitted.
+- `--force`: rerun probes even if an output already exists.
+- `--keep-profiles`: keep temporary cloud profiles.
+- `--timeout-seconds`: per sensitivity-basket timeout.
+- `--json`: print machine-readable output.
+
 ## run
 
 ```powershell
