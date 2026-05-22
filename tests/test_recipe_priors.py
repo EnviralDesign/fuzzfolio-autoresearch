@@ -251,6 +251,23 @@ def test_build_recipe_prior_artifacts_emits_negative_priors_for_retention_failur
                 "discovery_evidence_score": "74",
                 "retention_ratio": "0",
                 "retention_bucket": "failed_retention",
+            },
+            {
+                "status": "ok",
+                "recipe_id": "discovered_recipe_001",
+                "recipe_confidence": "high_candidate",
+                "first_cluster_id": "cluster_a",
+                "second_cluster_id": "cluster_b",
+                "first_indicator_id": "FIRST_A",
+                "second_indicator_id": "SECOND_A",
+                "probe_timeframe": "M5",
+                "probe_id": "drv-retained",
+                "primary_score": "70",
+                "composite_score": "70",
+                "validation_priority_score": "70",
+                "discovery_evidence_score": "74",
+                "retention_ratio": "0.95",
+                "retention_bucket": "retained_strong",
             }
         ],
         max_slot_candidates=5,
@@ -259,6 +276,77 @@ def test_build_recipe_prior_artifacts_emits_negative_priors_for_retention_failur
 
     assert negative_pairs[0]["unordered_pair_id"] == "FIRST_A+SECOND_A"
     assert retention_failures[0]["negative_reason"] == "positive_discovery_collapsed"
-    assert negative_clusters[0]["failure_rate"] == 1.0
+    assert negative_pairs[0]["negative_scope"] == "hard_unordered"
+    assert negative_clusters[0]["tested_count"] == 2
+    assert negative_clusters[0]["retained_count"] == 1
+    assert negative_clusters[0]["failure_rate"] == 0.5
+    assert negative_clusters[0]["retained_rate"] == 0.5
     assert seed_plan["negative_pairs"][0]["probe_id"] == "drv-failed"
     assert summary["result_counts"]["negative_pair_rows"] == 1
+
+
+def test_build_recipe_prior_artifacts_uses_36m_result_over_12m_retention() -> None:
+    indicators = [
+        _indicator("FIRST_A", signal_role="setup", strategy_role="trend"),
+        _indicator("SECOND_A", signal_role="trigger", strategy_role="mean-reversion"),
+    ]
+
+    (
+        _payload,
+        _slot_rows,
+        pair_rows,
+        negative_pairs,
+        _negative_clusters,
+        _retention_failures,
+        seed_plan,
+        summary,
+    ) = build_recipe_prior_artifacts(
+        indicator_rows=indicators,
+        static_slot_scores={},
+        signal_rollups={},
+        forward_priors={},
+        pair_results=[],
+        timing_results=[],
+        discovery_validation_results=[
+            {
+                "status": "ok",
+                "recipe_id": "discovered_recipe_001",
+                "recipe_confidence": "high_candidate",
+                "first_indicator_id": "FIRST_A",
+                "second_indicator_id": "SECOND_A",
+                "probe_timeframe": "M5",
+                "probe_id": "drv-12m",
+                "lookback_months": "12",
+                "primary_score": "72",
+                "composite_score": "72",
+                "validation_priority_score": "70",
+                "discovery_evidence_score": "74",
+                "retention_ratio": "0.97",
+                "retention_bucket": "retained_strong",
+            },
+            {
+                "status": "ok",
+                "recipe_id": "discovered_recipe_001",
+                "recipe_confidence": "high_candidate",
+                "first_indicator_id": "FIRST_A",
+                "second_indicator_id": "SECOND_A",
+                "probe_timeframe": "M5",
+                "probe_id": "drs-36m",
+                "lookback_months": "36",
+                "primary_score": "0",
+                "composite_score": "0",
+                "validation_priority_score": "70",
+                "discovery_evidence_score": "74",
+                "retention_ratio": "0",
+                "retention_bucket": "failed_retention",
+            },
+        ],
+        max_slot_candidates=5,
+        max_pair_candidates=5,
+    )
+
+    assert "discovered_recipe_001" not in seed_plan["recipes"]
+    assert all(row.get("probe_id") != "drv-12m" for row in pair_rows)
+    assert negative_pairs[0]["probe_id"] == "drs-36m"
+    assert summary["discovered_recipe_validation"]["latest_pair_rows"] == 1
+    assert summary["result_counts"]["discovered_recipe_pair_rows"] == 0

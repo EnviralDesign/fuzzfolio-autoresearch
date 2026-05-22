@@ -182,7 +182,7 @@ uv run run-discovery-recipe-validation-probes --workers 32
 uv run build-discovery-recipe-scrutiny-atlas
 ```
 
-The validation builder expands high/promising discovered recipe templates into a capped concrete queue, defaulting to `12`-month sensitivity probes under `runs/derived/discovery-recipe-validation-atlas/`. The scrutiny builder then turns retained 12-month rows into a smaller `36`-month queue under `runs/derived/discovery-recipe-scrutiny-atlas/`; run it later with `uv run run-discovery-recipe-validation-probes --atlas-dir runs/derived/discovery-recipe-scrutiny-atlas --workers 32`. Re-run `uv run build-recipe-priors` after validation or scrutiny finishes; Play Hand reads the seed plan automatically, carries validated pair defaults into scaffolded profiles, and forces guided seed-plan deals to contain at least two indicators.
+The validation builder expands high/promising discovered recipe templates into a capped concrete queue, defaulting to `12`-month sensitivity probes under `runs/derived/discovery-recipe-validation-atlas/`. The scrutiny builder then turns retained 12-month rows into a smaller `36`-month queue under `runs/derived/discovery-recipe-scrutiny-atlas/` and copies the exact retained source profile documents when available; run it later with `uv run run-discovery-recipe-validation-probes --atlas-dir runs/derived/discovery-recipe-scrutiny-atlas --workers 32`. Re-run `uv run build-recipe-priors` after validation or scrutiny finishes; Play Hand reads the seed plan automatically, carries validated pair defaults into scaffolded profiles, forces guided seed-plan deals to contain at least two indicators, and hard-blocks only severe known pair collapses during slot/fill selection.
 
 From there you can build the portfolio either way:
 

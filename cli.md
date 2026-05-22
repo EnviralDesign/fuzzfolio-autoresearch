@@ -334,8 +334,8 @@ Outputs:
 - `recipe-priors.json`: full empirical recipe-prior artifact.
 - `slot-indicator-priors.csv`: one row per recipe/slot/indicator candidate with sampling weight and evidence fields.
 - `pair-priors.csv`: empirical anchor-trigger pair menu with score and timing policy.
-- `pair-negative-priors.csv`: exact failed pair/timeframe evidence used to avoid repeated collapses.
-- `cluster-expansion-negative-priors.csv`: failed cluster-expansion families.
+- `pair-negative-priors.csv`: exact failed pair/timeframe evidence; severe 3m-positive validation collapses become hard unordered avoid-pairs for Play Hand slot/fill selection.
+- `cluster-expansion-negative-priors.csv`: failed cluster-expansion families with tested, retained, failure, retained-rate, and soft-penalty fields for later downweighting.
 - `retention-failures.csv`: 3-month positives that collapsed during validation.
 - `play-hand-seed-plan.json`: compact weighted menu intended for Play Hand integration.
 - `recipe-priors-summary.json`: compact counts, top slot menus, and top pair priors.
@@ -553,7 +553,7 @@ uv run build-discovery-recipe-scrutiny-atlas --max-rows 6 --json
 uv run build-discovery-recipe-scrutiny-atlas --bucket retained_strong
 ```
 
-Builds the 36-month scrutiny queue for discovered recipes that already retained during the 12-month validation pass. It does not run backend jobs; it writes another validation-compatible atlas so the existing runner can execute it with `--atlas-dir`.
+Builds the 36-month scrutiny queue for discovered recipes that already retained during the 12-month validation pass. It does not run backend jobs; it writes another validation-compatible atlas so the existing runner can execute it with `--atlas-dir`. When the source validation profile exists, the builder copies that exact profile document and only rewrites the profile name/description, so scrutiny tests the retained 12-month profile rather than a freshly regenerated catalog-default profile.
 
 Default settings:
 
@@ -600,7 +600,7 @@ uv run run-discovery-recipe-validation-probes --atlas-dir runs/derived/discovery
 uv run build-recipe-priors
 ```
 
-`play-hand` reads `runs/derived/recipe-priors/play-hand-seed-plan.json` automatically when it exists. The discovered recipes are still priors, not hard filters: Play Hand keeps role-balanced fallback and policy exploration available. Guided seed-plan deals force at least two indicators, and retained discovered-pair deals carry the validated timeframe/lookback/range/TA-Lib defaults into the scaffolded profile before normal sweeps vary it.
+`play-hand` reads `runs/derived/recipe-priors/play-hand-seed-plan.json` automatically when it exists. The discovered recipes are still priors, not hard filters: Play Hand keeps role-balanced fallback and policy exploration available. Guided seed-plan deals force at least two indicators, retained discovered-pair deals carry the validated timeframe/lookback/range/TA-Lib defaults into the scaffolded profile before normal sweeps vary it, and severe known negative pairs are avoided during both slot-menu selection and role-balanced fill.
 
 ## run
 

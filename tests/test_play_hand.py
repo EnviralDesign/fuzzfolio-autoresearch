@@ -116,6 +116,55 @@ def test_deal_seed_plan_indicators_uses_validated_discovered_pair() -> None:
     assert deal["pair"]["retention_bucket"] == "retained_strong"
 
 
+def test_deal_seed_plan_indicators_applies_negative_guard_to_role_balanced_fill() -> None:
+    indicators = [
+        play_hand_mod.SeedIndicator("FIRST_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("SECOND_A", "trigger", "event", "entry"),
+        play_hand_mod.SeedIndicator("BAD_FILL", "trigger", "event", "entry"),
+        play_hand_mod.SeedIndicator("GOOD_FILL", "trigger", "event", "entry"),
+    ]
+    seed_plan = {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "negative_pairs": [
+            {
+                "first_indicator_id": "FIRST_A",
+                "second_indicator_id": "BAD_FILL",
+                "negative_reason": "positive_discovery_collapsed",
+                "negative_weight": 1.5,
+            }
+        ],
+        "recipes": {
+            "discovered_recipe_001": {
+                "source": "discovery_recipe_validation",
+                "pair_menu": [
+                    {
+                        "source": "discovery_recipe_validation",
+                        "anchor_id": "FIRST_A",
+                        "trigger_id": "SECOND_A",
+                        "pair_sampling_weight": 50,
+                        "pair_sampling_score": 75,
+                    }
+                ],
+                "slot_menus": {},
+            }
+        },
+    }
+
+    deal = deal_seed_plan_indicators(
+        indicators,
+        target_count=3,
+        seed_plan=seed_plan,
+        rng=random.Random(7),
+    )
+
+    assert [indicator.id for indicator in deal["indicators"]] == [
+        "FIRST_A",
+        "SECOND_A",
+        "GOOD_FILL",
+    ]
+    assert all(slot["indicator_id"] != "BAD_FILL" for slot in deal["selected_slots"])
+
+
 def test_apply_seed_pair_template_defaults_preserves_validated_pair_config() -> None:
     profile_payload = {
         "profile": {

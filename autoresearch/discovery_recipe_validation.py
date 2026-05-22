@@ -460,6 +460,7 @@ def _queue_fieldnames() -> list[str]:
         "source_retention_bucket",
         "source_validation_score",
         "source_retention_ratio",
+        "source_profile_path",
         "profile_path",
         "result_dir",
     ]
@@ -808,16 +809,25 @@ def build_discovery_recipe_scrutiny_atlas(
         row["profile_path"] = str(profile_path)
         row["result_dir"] = str(result_dir)
         if emit_profile_docs:
-            profile_doc = build_pair_profile_document(
-                catalog_by_id=catalog_by_id,
-                anchor_id=first_id,
-                trigger_id=second_id,
-                anchor_type="discovered_recipe_scrutiny",
-                probe_timeframe=probe_timeframe,
-                anchor_timeframe=anchor_timeframe,
-                instruments=_split_csv_tokens(row.get("instruments")),
-                probe_id=probe_id,
+            source_profile_path = (
+                source_dir
+                / "profiles"
+                / f"{_clean_token(row.get('source_validation_probe_id'))}.json"
             )
+            if source_profile_path.exists():
+                profile_doc = _as_dict(_load_json(source_profile_path))
+                row["source_profile_path"] = str(source_profile_path)
+            else:
+                profile_doc = build_pair_profile_document(
+                    catalog_by_id=catalog_by_id,
+                    anchor_id=first_id,
+                    trigger_id=second_id,
+                    anchor_type="discovered_recipe_scrutiny",
+                    probe_timeframe=probe_timeframe,
+                    anchor_timeframe=anchor_timeframe,
+                    instruments=_split_csv_tokens(row.get("instruments")),
+                    probe_id=probe_id,
+                )
             profile = _as_dict(profile_doc.get("profile"))
             profile["name"] = (
                 f"Discovery Recipe 36m Scrutiny {row.get('recipe_id')} "
@@ -828,6 +838,8 @@ def build_discovery_recipe_scrutiny_atlas(
                 "empirically discovered recipe pair. This is the high-prior gate "
                 "after 12-month retention."
             )
+            if instruments is not None:
+                profile["instruments"] = _split_csv_tokens(row.get("instruments"))
             _write_json(profile_path, profile_doc)
         sensitivity_args = _sensitivity_args_for_row(
             row,
@@ -856,13 +868,17 @@ def build_discovery_recipe_scrutiny_atlas(
                 "validation_priority_score": row.get("validation_priority_score"),
                 "source_validation_probe_id": row.get("source_validation_probe_id"),
                 "source_retention_bucket": row.get("source_retention_bucket"),
+                "source_profile_path": row.get("source_profile_path"),
             }
         )
 
     bucket_counts: dict[str, int] = {}
+    copied_profile_count = 0
     for row in filtered_rows:
         key = _clean_token(row.get("source_retention_bucket")) or "unknown"
         bucket_counts[key] = bucket_counts.get(key, 0) + 1
+        if _clean_token(row.get("source_profile_path")):
+            copied_profile_count += 1
     summary = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -886,6 +902,7 @@ def build_discovery_recipe_scrutiny_atlas(
             "source_validation_rows": len(source_rows),
             "queue_rows": len(filtered_rows),
             "profile_docs": len(probes) if emit_profile_docs else 0,
+            "copied_source_profile_docs": copied_profile_count,
             "source_retention_bucket_counts": dict(sorted(bucket_counts.items())),
         },
         "top_queue": filtered_rows[:15],

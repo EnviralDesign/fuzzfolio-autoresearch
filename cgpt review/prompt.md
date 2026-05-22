@@ -1,148 +1,154 @@
 # CGPT Review Packet
 
-Please review the latest Fuzzfolio AutoResearch state as a technical/design reviewer. This is the follow-up pass after your prior review. The goal is still to move from blind indicator generation toward evidence-guided, recipe-aware Play Hand generation without hard-filtering away odd but potentially useful combinations.
+Please review the latest Fuzzfolio AutoResearch state as a technical/design reviewer. This is the follow-up pass after your feedback about negative-pair fill bypasses, 36-month scrutiny profile drift, and cluster-negative rates.
 
-## What Changed In This Wave
+## Latest Commit Scope To Review
 
-The latest work implements the highest-leverage items from your previous recommendations:
+The latest work does four things:
 
-1. Recipe priors now carry validated pair template context into `play-hand-seed-plan.json`.
-   - Retained discovered validation rows include `recommended_profile_template`.
-   - The template preserves per-indicator `timeframe`, `lookbackBars`, `ranges`, `talibConfig`, `weight`, `isTrendFollowing`, `normalizationMode`, `useFormingBar`, and `scale`.
+1. **Fixes negative-pair avoidance in Play Hand fill.**
+   - `role_balanced_fill` now goes through the same `add_indicator()` path as slot-menu candidates.
+   - It keeps trying alternatives if a candidate would create a severe known negative pair.
+   - Only severe `positive_discovery_collapsed` rows with `negative_weight >= 1.5` become hard unordered avoid-pairs.
+   - Lower-severity negatives remain evidence artifacts for reporting or future soft downweighting.
 
-2. Play Hand now applies those validated pair defaults after scaffold/role-timeframe assignment and before normal defaults/sweeps.
-   - The intent is not to freeze the profile forever.
-   - The intent is to start from the exact two-indicator context that retained, then let the existing sweep machinery vary around it.
+2. **Makes 36-month scrutiny profiles copy the retained 12-month source profile.**
+   - `build-discovery-recipe-scrutiny-atlas` now copies the exact source validation profile when `source_validation_probe_id` is available.
+   - It only rewrites name/description, unless the user explicitly overrides instruments.
+   - The latest scrutiny atlas copied 13 of 13 source profiles.
 
-3. Guided seed-plan deals now force at least two indicators.
-   - If a seed plan exists, `cmd_play_hand` raises the effective min/max to at least `2`.
-   - Metadata now records both requested and effective min/max indicator counts.
+3. **Recomputes cluster-negative evidence over all validation rows.**
+   - `cluster-expansion-negative-priors.csv` now includes `tested_count`, `retained_count`, `retained_strong_count`, `partial_count`, failure bucket counts, `failure_rate`, `retained_rate`, median score, and a proposed `soft_penalty_multiplier`.
+   - The current code still does not actively downweight menus from cluster-level rates. It only emits a more truthful artifact.
 
-4. Recipe priors now emit negative evidence.
-   - `pair-negative-priors.csv`
-   - `cluster-expansion-negative-priors.csv`
-   - `retention-failures.csv`
-   - The seed plan includes the top negative pairs, and Play Hand avoids adding slot/fill indicators that form an exact known negative unordered pair with already selected indicators. Positive pair-menu picks are allowed through so validated retained pairs are not accidentally blocked.
-
-5. Promotion is more conservative before 36-month evidence exists.
-   - `new_positive_cluster_expansion` was demoted from medium-prior behavior to uncertain-prior behavior.
-   - Unknown signal/forward evidence is no longer treated as neutral `50`; it is scored as `42`.
-   - The seed plan uses `60/25/15` guided/uncertain/wild until 36-month retained evidence exists, then moves to `80/15/5`.
-
-6. A 36-month scrutiny queue builder was added.
-   - New command: `uv run build-discovery-recipe-scrutiny-atlas`
-   - It reads retained 12-month validation results and writes a validation-compatible 36-month queue under `runs/derived/discovery-recipe-scrutiny-atlas/`.
-   - The existing runner can execute it with:
+4. **Runs the 13-row 36-month scrutiny queue and rebuilds recipe priors.**
+   - Command run:
      `uv run run-discovery-recipe-validation-probes --atlas-dir runs/derived/discovery-recipe-scrutiny-atlas --workers 32`
+   - Then:
+     `uv run build-recipe-priors`
 
 ## Key Implementation Files
 
 Review these first in the repo root:
 
-- `autoresearch/recipe_priors.py`
 - `autoresearch/play_hand.py`
+- `autoresearch/recipe_priors.py`
 - `autoresearch/discovery_recipe_validation.py`
-- `autoresearch/__main__.py`
-- `tests/test_recipe_priors.py`
 - `tests/test_play_hand.py`
+- `tests/test_recipe_priors.py`
 - `tests/test_discovery_recipe_validation.py`
 - `README.md`
 - `cli.md`
-- `pyproject.toml`
 
 ## Important Cached Results In This Packet
 
-The folder contains selected cached artifacts copied from `runs/derived/`. I intentionally omitted bulky per-probe output/profile directories and huge raw artifacts where possible.
-
 Important included paths:
 
+- `recipe-priors/`
+- `discovery-recipe-scrutiny-atlas/`
+- `discovery-recipe-validation-atlas/`
+- `discovery-cluster-atlas/`
+- `discovery-pair-atlas/`
+- `anchor-pair-atlas/`
+- `anchor-pair-timing-atlas/`
 - `indicator-atlas/`
 - `signal-atlas/`
 - `forward-response-atlas/`
-- `anchor-pair-atlas/`
-- `anchor-pair-timing-atlas/`
-- `recipe-priors/`
-- `discovery-pair-atlas/`
-- `discovery-cluster-atlas/`
-- `discovery-recipe-validation-atlas/`
-- `discovery-recipe-scrutiny-atlas/`
-- `processes/processes.json`
 
-## Current Findings After This Wave
+## 36-Month Scrutiny Results
 
-Recipe-prior rebuild after the 12-month validation corpus:
+The 36-month queue had 13 rows:
 
-- Indicator rows: 87.
-- Slot-prior rows: 668.
-- Pair-prior rows: 64.
-- Discovered validation rows consumed: 64.
-- Retained discovered validation rows promoted: 16.
-- Discovered recipe priors created: 7.
-- Validated template rows carried into pair priors: 16.
-- Negative pair rows emitted: 48.
-- Cluster negative rows emitted: 16.
-- Retention-failure rows emitted: 10.
+- Completed: 13.
+- Statuses: 13 `ok`.
+- Retained: 4.
+- Partial retention: 3.
+- Failed retention: 6.
 
-Retention buckets from validation:
+Top 36-month retained rows:
 
-- 6 `retained_strong`
-- 7 `retained`
-- 2 `partial_retention`
-- 1 `new_positive_cluster_expansion`
-- 10 `failed_retention`
-- 37 `new_failed_cluster_expansion`
-- 1 `new_low_cluster_expansion`
+- `BBANDS_POSITION_TREND + MA_SPREAD_MEAN_REVERSION`: 68.3204, retained.
+- `WILLR_MEAN_REVERSION + RSI_CROSSBACK`: 66.0566, retained.
+- `RSI_CROSSBACK + WILLR_MEAN_REVERSION`: 66.0084, retained.
+- `MFI_TREND + OBV_MEAN_REVERSION`: 62.6214, retained.
 
-36-month scrutiny queue:
+Partial 36-month rows:
 
-- Source validation rows: 64.
-- Queued retained scrutiny rows: 13.
-- Source buckets: 6 `retained_strong`, 7 `retained`.
-- Output: `discovery-recipe-scrutiny-atlas/`
+- `OBV_MEAN_REVERSION + PLUS_DI_TREND`: 55.8862.
+- `CHANNEL_REENTRY + THRUST_BAR_SIGNAL`: 54.3905.
+- `THRUST_BAR_SIGNAL + CHANNEL_REENTRY`: 53.8936.
 
-Verification:
+Several 12-month retained rows collapsed to 0.0 at 36 months, including:
 
-- `uv run pytest tests/test_recipe_priors.py tests/test_discovery_recipe_validation.py tests/test_play_hand.py -q`
-- Result: 57 passed.
-- `uv run play-hand --dry-run --json --min-indicators 1 --max-indicators 1`
-- Result: forced effective deal count to 2 while recording requested min/max as 1/1.
+- `MACD_CROSSOVER + CHANNEL_REENTRY`
+- `CHANNEL_REENTRY + MACD_CROSSOVER`
+- `VQI_DIRECTIONAL_QUALITY + WILLR_MEAN_REVERSION`
+- `WILLR_MEAN_REVERSION + VQI_DIRECTIONAL_QUALITY`
+- `WAVETREND_CROSSOVER + CHANNEL_REENTRY`
+- `CHANNEL_REENTRY + WAVETREND_CROSSOVER`
+
+## Recipe Priors After 36-Month Rebuild
+
+After the 36-month run, `build-recipe-priors` now consumes both 12-month validation and 36-month scrutiny results.
+
+Important detail: promotion now uses the latest/highest-lookback row per exact recipe + ordered pair + timeframe. A 12-month retained row is no longer promoted if the same pair failed at 36 months.
+
+Current counts:
+
+- Source validation rows consumed: 77.
+- Latest exact pair rows after superseding: 64.
+- Promoted retained/partial/latest discovered rows: 10.
+- Discovered recipe count: 6.
+- Discovered pair-prior rows: 10.
+- Validated template rows carried: 10.
+- Negative pair rows: 54.
+- Cluster-negative rows: 16.
+- Retention-failure rows: 16.
+- Seed-plan maturity: `has_36m_retention`.
+- Sampling policy: `guided=0.80`, `uncertain=0.15`, `wild=0.05`.
+
+## Verification
+
+Commands run:
+
+```powershell
+uv run python -m py_compile autoresearch\recipe_priors.py autoresearch\play_hand.py autoresearch\discovery_recipe_validation.py autoresearch\__main__.py
+uv run pytest tests\test_recipe_priors.py tests\test_discovery_recipe_validation.py tests\test_play_hand.py -q
+uv run build-discovery-recipe-scrutiny-atlas --json
+uv run run-discovery-recipe-validation-probes --atlas-dir runs\derived\discovery-recipe-scrutiny-atlas --workers 32
+uv run build-recipe-priors --json
+```
+
+Targeted tests: 59 passed.
 
 ## Questions For This Review
 
-1. Is the template carry-forward implemented at the right level?
-   - Current approach carries exact pair profile defaults from validation into Play Hand scaffold.
-   - It does not yet carry reward matrix or instrument-panel context into Play Hand’s run configuration.
-   - Should instrument panel/reward context be carried too, or is that too constraining?
+1. Is the latest/highest-lookback superseding policy correct?
+   - Current behavior: if a 36m result exists for the same recipe + ordered pair + timeframe, it replaces the 12m row for promotion decisions.
+   - This means 12m retained rows that failed at 36m are not promoted, but they remain in negative evidence.
 
-2. Is the negative-pair behavior too blunt?
-   - Current Play Hand avoidance uses exact unordered pair keys from failed validation rows.
-   - It does not yet downweight broader cluster-family failures during recipe/slot menu construction except by artifact/reporting.
-   - Should cluster-level failure rates actively reduce slot or pair sampling weights now?
+2. Is hard negative-pair avoidance now scoped correctly?
+   - Current hard block: only `negative_reason == positive_discovery_collapsed` and `negative_weight >= 1.5`.
+   - Hard block is unordered across timeframes.
+   - Lower severity negatives are not currently blocking Play Hand.
 
-3. Is the conservative `60/25/15` pre-36m policy reasonable?
-   - The seed plan automatically moves to `80/15/5` only if a 36-month retained result is present in the consumed validation/scrutiny rows.
-   - Is that too cautious, not cautious enough, or about right?
+3. Should cluster-level soft penalties be applied now?
+   - The artifact now has real rates over all tested rows.
+   - Proposed fields exist, but no active slot/pair downweighting uses them yet.
 
-4. Should 36-month scrutiny results be folded back through the same `discovery-recipe-validation-results.csv` contract?
-   - Current scrutiny atlas intentionally writes validation-compatible artifacts so the existing runner works with `--atlas-dir`.
-   - `build-recipe-priors` now also looks for `runs/derived/discovery-recipe-scrutiny-atlas/discovery-recipe-validation-results.csv` when present.
+4. Does 4 retained out of 13 36-month scrutiny rows justify the mature `80/15/5` policy?
+   - The seed plan now marks `has_36m_retention`.
+   - We might still choose a middle policy, for example `70/20/10`, until more 36m retained families exist.
 
-5. What should the next branch be?
-   - A. Run the 13-row 36-month scrutiny queue now, then rebuild priors.
-   - B. Add cluster-level negative downweighting before the 36-month run.
-   - C. Add a human-readable recipe report/dashboard explaining promotions, failures, templates, and avoid-pairs.
-   - D. Carry instrument/reward context into Play Hand templates.
-   - E. Broaden discovery to additional instruments/timeframes only after the above learning loop is stronger.
+5. What is the next best branch?
+   - A. Add active cluster-level soft downweighting using the new true failure/retained rates.
+   - B. Add a recipe report/dashboard explaining promoted, partial, and failed discovered families.
+   - C. Add template instrument policy (`off`, `seed_pool`, `initial_basket`).
+   - D. Add reward-context metadata/policy.
+   - E. Broaden discovery to additional instruments/timeframes now that 36m gate exists.
 
-## My Current Opinion
+## Current Opinion
 
-This wave closes the biggest implementation gap from the first version: Play Hand no longer just receives indicator IDs from retained discovered recipes; it can now start from the validated two-indicator profile context. The system also starts learning from failures instead of merely ignoring them.
+The 36-month scrutiny did exactly what it was supposed to do: it kept a few families alive and exposed several 12-month survivors as fragile. The best retained discovered structures now look meaningfully stronger than before because they survived 3m discovery, 12m validation, and 36m scrutiny.
 
-The most likely next operational move is to run the 13-row 36-month scrutiny queue:
-
-```powershell
-uv run run-discovery-recipe-validation-probes --atlas-dir runs/derived/discovery-recipe-scrutiny-atlas --workers 32
-uv run build-recipe-priors
-```
-
-After that, I would review whether 36-month retained families should graduate to the mature `80/15/5` sampling policy and whether cluster-level negative evidence is strong enough to actively downweight broader slot menus.
+I would probably review the `80/15/5` promotion threshold next. The code mechanically graduates once any 36m retained result exists. That may be too binary. A more nuanced version could scale policy by number of retained 36m families and retained-rate.

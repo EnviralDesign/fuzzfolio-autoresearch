@@ -1,9 +1,9 @@
 {
   "schema_version": "discovery_recipe_validation_atlas_v1",
-  "generated_at": "2026-05-22T13:28:42.286575+00:00",
+  "generated_at": "2026-05-22T14:06:47.823678+00:00",
   "summary": {
     "schema_version": "discovery_recipe_validation_atlas_v1",
-    "generated_at": "2026-05-22T13:28:42.286575+00:00",
+    "generated_at": "2026-05-22T14:06:47.823678+00:00",
     "source": {
       "validation_atlas_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas",
       "validation_results_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\discovery-recipe-validation-results.csv",
@@ -32,6 +32,7 @@
       "source_validation_rows": 64,
       "queue_rows": 13,
       "profile_docs": 13,
+      "copied_source_profile_docs": 13,
       "source_retention_bucket_counts": {
         "retained": 7,
         "retained_strong": 6
@@ -74,7 +75,8 @@
         "probe_id": "drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5",
         "anchor_timeframe": "M5",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0022-r003-bbands-position-tr-ma-spread-mean-rev-m5.json"
       },
       {
         "recipe_id": "discovered_recipe_006",
@@ -112,7 +114,8 @@
         "probe_id": "drs-0002-r006-rsi-crossback-willr-mean-reversi-m5",
         "anchor_timeframe": "M5",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0002-r006-rsi-crossback-willr-mean-reversi-m5.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0002-r006-rsi-crossback-willr-mean-reversi-m5"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0002-r006-rsi-crossback-willr-mean-reversi-m5",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0017-r006-rsi-crossback-willr-mean-reversi-m5.json"
       },
       {
         "recipe_id": "discovered_recipe_006",
@@ -150,7 +153,8 @@
         "probe_id": "drs-0003-r006-willr-mean-reversi-rsi-crossback-m5",
         "anchor_timeframe": "M5",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0003-r006-willr-mean-reversi-rsi-crossback-m5.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0003-r006-willr-mean-reversi-rsi-crossback-m5"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0003-r006-willr-mean-reversi-rsi-crossback-m5",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0018-r006-willr-mean-reversi-rsi-crossback-m5.json"
       },
       {
         "recipe_id": "discovered_recipe_001",
@@ -188,7 +192,8 @@
         "probe_id": "drs-0004-r001-thrust-bar-signal-channel-reentry-m5",
         "anchor_timeframe": "M5",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0004-r001-thrust-bar-signal-channel-reentry-m5.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0004-r001-thrust-bar-signal-channel-reentry-m5"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0004-r001-thrust-bar-signal-channel-reentry-m5",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0009-r001-thrust-bar-signal-channel-reentry-m5.json"
       },
       {
         "recipe_id": "discovered_recipe_002",
@@ -226,7 +231,8 @@
         "probe_id": "drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
         "anchor_timeframe": "M5",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0005-r002-channel-reentry-thrust-bar-signal-m5.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0005-r002-channel-reentry-thrust-bar-signal-m5"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0010-r002-channel-reentry-thrust-bar-signal-m5.json"
       },
       {
         "recipe_id": "discovered_recipe_001",
@@ -264,7 +270,8 @@
         "probe_id": "drs-0006-r001-wavetrend-crossove-channel-reentry-m15",
         "anchor_timeframe": "M15",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0006-r001-wavetrend-crossove-channel-reentry-m15.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0006-r001-wavetrend-crossove-channel-reentry-m15"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0006-r001-wavetrend-crossove-channel-reentry-m15",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0012-r001-wavetrend-crossove-channel-reentry-m15.json"
       },
       {
         "recipe_id": "discovered_recipe_002",
@@ -302,7 +309,8 @@
         "probe_id": "drs-0007-r002-channel-reentry-wavetrend-crossove-m15",
         "anchor_timeframe": "M15",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0007-r002-channel-reentry-wavetrend-crossove-m15.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0007-r002-channel-reentry-wavetrend-crossove-m15"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0007-r002-channel-reentry-wavetrend-crossove-m15",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0013-r002-channel-reentry-wavetrend-crossove-m15.json"
       },
       {
         "recipe_id": "discovered_recipe_003",
@@ -340,7 +348,8 @@
         "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
         "anchor_timeframe": "M15",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0024-r003-mfi-trend-obv-mean-reversion-m15.json"
       },
       {
         "recipe_id": "discovered_recipe_005",
@@ -378,7 +387,8 @@
         "probe_id": "drs-0009-r005-obv-mean-reversion-plus-di-trend-m5",
         "anchor_timeframe": "M5",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0009-r005-obv-mean-reversion-plus-di-trend-m5.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0009-r005-obv-mean-reversion-plus-di-trend-m5"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0009-r005-obv-mean-reversion-plus-di-trend-m5",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0025-r005-obv-mean-reversion-plus-di-trend-m5.json"
       },
       {
         "recipe_id": "discovered_recipe_001",
@@ -416,7 +426,8 @@
         "probe_id": "drs-0010-r001-macd-crossover-channel-reentry-m5",
         "anchor_timeframe": "M5",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0010-r001-macd-crossover-channel-reentry-m5.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0010-r001-macd-crossover-channel-reentry-m5"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0010-r001-macd-crossover-channel-reentry-m5",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0005-r001-macd-crossover-channel-reentry-m5.json"
       },
       {
         "recipe_id": "discovered_recipe_002",
@@ -454,7 +465,8 @@
         "probe_id": "drs-0011-r002-channel-reentry-macd-crossover-m5",
         "anchor_timeframe": "M5",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0011-r002-channel-reentry-macd-crossover-m5.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0011-r002-channel-reentry-macd-crossover-m5"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0011-r002-channel-reentry-macd-crossover-m5",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0006-r002-channel-reentry-macd-crossover-m5.json"
       },
       {
         "recipe_id": "discovered_recipe_002",
@@ -492,7 +504,8 @@
         "probe_id": "drs-0012-r002-willr-mean-reversi-vqi-directional-qu-m5",
         "anchor_timeframe": "M5",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0012-r002-willr-mean-reversi-vqi-directional-qu-m5.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0012-r002-willr-mean-reversi-vqi-directional-qu-m5"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0012-r002-willr-mean-reversi-vqi-directional-qu-m5",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0015-r002-willr-mean-reversi-vqi-directional-qu-m5.json"
       },
       {
         "recipe_id": "discovered_recipe_008",
@@ -530,7 +543,8 @@
         "probe_id": "drs-0013-r008-vqi-directional-qu-willr-mean-reversi-m5",
         "anchor_timeframe": "M5",
         "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0013-r008-vqi-directional-qu-willr-mean-reversi-m5.json",
-        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0013-r008-vqi-directional-qu-willr-mean-reversi-m5"
+        "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0013-r008-vqi-directional-qu-willr-mean-reversi-m5",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0023-r008-vqi-directional-qu-willr-mean-reversi-m5.json"
       }
     ]
   },
@@ -571,7 +585,8 @@
       "probe_id": "drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5",
       "anchor_timeframe": "M5",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0022-r003-bbands-position-tr-ma-spread-mean-rev-m5.json"
     },
     {
       "recipe_id": "discovered_recipe_006",
@@ -609,7 +624,8 @@
       "probe_id": "drs-0002-r006-rsi-crossback-willr-mean-reversi-m5",
       "anchor_timeframe": "M5",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0002-r006-rsi-crossback-willr-mean-reversi-m5.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0002-r006-rsi-crossback-willr-mean-reversi-m5"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0002-r006-rsi-crossback-willr-mean-reversi-m5",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0017-r006-rsi-crossback-willr-mean-reversi-m5.json"
     },
     {
       "recipe_id": "discovered_recipe_006",
@@ -647,7 +663,8 @@
       "probe_id": "drs-0003-r006-willr-mean-reversi-rsi-crossback-m5",
       "anchor_timeframe": "M5",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0003-r006-willr-mean-reversi-rsi-crossback-m5.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0003-r006-willr-mean-reversi-rsi-crossback-m5"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0003-r006-willr-mean-reversi-rsi-crossback-m5",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0018-r006-willr-mean-reversi-rsi-crossback-m5.json"
     },
     {
       "recipe_id": "discovered_recipe_001",
@@ -685,7 +702,8 @@
       "probe_id": "drs-0004-r001-thrust-bar-signal-channel-reentry-m5",
       "anchor_timeframe": "M5",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0004-r001-thrust-bar-signal-channel-reentry-m5.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0004-r001-thrust-bar-signal-channel-reentry-m5"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0004-r001-thrust-bar-signal-channel-reentry-m5",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0009-r001-thrust-bar-signal-channel-reentry-m5.json"
     },
     {
       "recipe_id": "discovered_recipe_002",
@@ -723,7 +741,8 @@
       "probe_id": "drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
       "anchor_timeframe": "M5",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0005-r002-channel-reentry-thrust-bar-signal-m5.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0005-r002-channel-reentry-thrust-bar-signal-m5"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0010-r002-channel-reentry-thrust-bar-signal-m5.json"
     },
     {
       "recipe_id": "discovered_recipe_001",
@@ -761,7 +780,8 @@
       "probe_id": "drs-0006-r001-wavetrend-crossove-channel-reentry-m15",
       "anchor_timeframe": "M15",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0006-r001-wavetrend-crossove-channel-reentry-m15.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0006-r001-wavetrend-crossove-channel-reentry-m15"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0006-r001-wavetrend-crossove-channel-reentry-m15",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0012-r001-wavetrend-crossove-channel-reentry-m15.json"
     },
     {
       "recipe_id": "discovered_recipe_002",
@@ -799,7 +819,8 @@
       "probe_id": "drs-0007-r002-channel-reentry-wavetrend-crossove-m15",
       "anchor_timeframe": "M15",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0007-r002-channel-reentry-wavetrend-crossove-m15.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0007-r002-channel-reentry-wavetrend-crossove-m15"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0007-r002-channel-reentry-wavetrend-crossove-m15",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0013-r002-channel-reentry-wavetrend-crossove-m15.json"
     },
     {
       "recipe_id": "discovered_recipe_003",
@@ -837,7 +858,8 @@
       "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
       "anchor_timeframe": "M15",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0024-r003-mfi-trend-obv-mean-reversion-m15.json"
     },
     {
       "recipe_id": "discovered_recipe_005",
@@ -875,7 +897,8 @@
       "probe_id": "drs-0009-r005-obv-mean-reversion-plus-di-trend-m5",
       "anchor_timeframe": "M5",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0009-r005-obv-mean-reversion-plus-di-trend-m5.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0009-r005-obv-mean-reversion-plus-di-trend-m5"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0009-r005-obv-mean-reversion-plus-di-trend-m5",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0025-r005-obv-mean-reversion-plus-di-trend-m5.json"
     },
     {
       "recipe_id": "discovered_recipe_001",
@@ -913,7 +936,8 @@
       "probe_id": "drs-0010-r001-macd-crossover-channel-reentry-m5",
       "anchor_timeframe": "M5",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0010-r001-macd-crossover-channel-reentry-m5.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0010-r001-macd-crossover-channel-reentry-m5"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0010-r001-macd-crossover-channel-reentry-m5",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0005-r001-macd-crossover-channel-reentry-m5.json"
     },
     {
       "recipe_id": "discovered_recipe_002",
@@ -951,7 +975,8 @@
       "probe_id": "drs-0011-r002-channel-reentry-macd-crossover-m5",
       "anchor_timeframe": "M5",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0011-r002-channel-reentry-macd-crossover-m5.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0011-r002-channel-reentry-macd-crossover-m5"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0011-r002-channel-reentry-macd-crossover-m5",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0006-r002-channel-reentry-macd-crossover-m5.json"
     },
     {
       "recipe_id": "discovered_recipe_002",
@@ -989,7 +1014,8 @@
       "probe_id": "drs-0012-r002-willr-mean-reversi-vqi-directional-qu-m5",
       "anchor_timeframe": "M5",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0012-r002-willr-mean-reversi-vqi-directional-qu-m5.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0012-r002-willr-mean-reversi-vqi-directional-qu-m5"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0012-r002-willr-mean-reversi-vqi-directional-qu-m5",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0015-r002-willr-mean-reversi-vqi-directional-qu-m5.json"
     },
     {
       "recipe_id": "discovered_recipe_008",
@@ -1027,7 +1053,8 @@
       "probe_id": "drs-0013-r008-vqi-directional-qu-willr-mean-reversi-m5",
       "anchor_timeframe": "M5",
       "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0013-r008-vqi-directional-qu-willr-mean-reversi-m5.json",
-      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0013-r008-vqi-directional-qu-willr-mean-reversi-m5"
+      "result_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\probe-results\\drs-0013-r008-vqi-directional-qu-willr-mean-reversi-m5",
+      "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0023-r008-vqi-directional-qu-willr-mean-reversi-m5.json"
     }
   ],
   "run_manifest": {
@@ -1091,7 +1118,8 @@
         ],
         "validation_priority_score": 71.6842,
         "source_validation_probe_id": "drv-0022-r003-bbands-position-tr-ma-spread-mean-rev-m5",
-        "source_retention_bucket": "retained_strong"
+        "source_retention_bucket": "retained_strong",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0022-r003-bbands-position-tr-ma-spread-mean-rev-m5.json"
       },
       {
         "probe_id": "drs-0002-r006-rsi-crossback-willr-mean-reversi-m5",
@@ -1145,7 +1173,8 @@
         ],
         "validation_priority_score": 70.0158,
         "source_validation_probe_id": "drv-0017-r006-rsi-crossback-willr-mean-reversi-m5",
-        "source_retention_bucket": "retained_strong"
+        "source_retention_bucket": "retained_strong",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0017-r006-rsi-crossback-willr-mean-reversi-m5.json"
       },
       {
         "probe_id": "drs-0003-r006-willr-mean-reversi-rsi-crossback-m5",
@@ -1199,7 +1228,8 @@
         ],
         "validation_priority_score": 70.0158,
         "source_validation_probe_id": "drv-0018-r006-willr-mean-reversi-rsi-crossback-m5",
-        "source_retention_bucket": "retained_strong"
+        "source_retention_bucket": "retained_strong",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0018-r006-willr-mean-reversi-rsi-crossback-m5.json"
       },
       {
         "probe_id": "drs-0004-r001-thrust-bar-signal-channel-reentry-m5",
@@ -1253,7 +1283,8 @@
         ],
         "validation_priority_score": 69.3587,
         "source_validation_probe_id": "drv-0009-r001-thrust-bar-signal-channel-reentry-m5",
-        "source_retention_bucket": "retained_strong"
+        "source_retention_bucket": "retained_strong",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0009-r001-thrust-bar-signal-channel-reentry-m5.json"
       },
       {
         "probe_id": "drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
@@ -1307,7 +1338,8 @@
         ],
         "validation_priority_score": 69.2502,
         "source_validation_probe_id": "drv-0010-r002-channel-reentry-thrust-bar-signal-m5",
-        "source_retention_bucket": "retained_strong"
+        "source_retention_bucket": "retained_strong",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0010-r002-channel-reentry-thrust-bar-signal-m5.json"
       },
       {
         "probe_id": "drs-0006-r001-wavetrend-crossove-channel-reentry-m15",
@@ -1361,7 +1393,8 @@
         ],
         "validation_priority_score": 66.016,
         "source_validation_probe_id": "drv-0012-r001-wavetrend-crossove-channel-reentry-m15",
-        "source_retention_bucket": "retained"
+        "source_retention_bucket": "retained",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0012-r001-wavetrend-crossove-channel-reentry-m15.json"
       },
       {
         "probe_id": "drs-0007-r002-channel-reentry-wavetrend-crossove-m15",
@@ -1415,7 +1448,8 @@
         ],
         "validation_priority_score": 66.0124,
         "source_validation_probe_id": "drv-0013-r002-channel-reentry-wavetrend-crossove-m15",
-        "source_retention_bucket": "retained"
+        "source_retention_bucket": "retained",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0013-r002-channel-reentry-wavetrend-crossove-m15.json"
       },
       {
         "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
@@ -1469,7 +1503,8 @@
         ],
         "validation_priority_score": 65.9338,
         "source_validation_probe_id": "drv-0024-r003-mfi-trend-obv-mean-reversion-m15",
-        "source_retention_bucket": "retained_strong"
+        "source_retention_bucket": "retained_strong",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0024-r003-mfi-trend-obv-mean-reversion-m15.json"
       },
       {
         "probe_id": "drs-0009-r005-obv-mean-reversion-plus-di-trend-m5",
@@ -1523,7 +1558,8 @@
         ],
         "validation_priority_score": 63.8955,
         "source_validation_probe_id": "drv-0025-r005-obv-mean-reversion-plus-di-trend-m5",
-        "source_retention_bucket": "retained"
+        "source_retention_bucket": "retained",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0025-r005-obv-mean-reversion-plus-di-trend-m5.json"
       },
       {
         "probe_id": "drs-0010-r001-macd-crossover-channel-reentry-m5",
@@ -1577,7 +1613,8 @@
         ],
         "validation_priority_score": 60.9477,
         "source_validation_probe_id": "drv-0005-r001-macd-crossover-channel-reentry-m5",
-        "source_retention_bucket": "retained"
+        "source_retention_bucket": "retained",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0005-r001-macd-crossover-channel-reentry-m5.json"
       },
       {
         "probe_id": "drs-0011-r002-channel-reentry-macd-crossover-m5",
@@ -1631,7 +1668,8 @@
         ],
         "validation_priority_score": 60.9441,
         "source_validation_probe_id": "drv-0006-r002-channel-reentry-macd-crossover-m5",
-        "source_retention_bucket": "retained"
+        "source_retention_bucket": "retained",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0006-r002-channel-reentry-macd-crossover-m5.json"
       },
       {
         "probe_id": "drs-0012-r002-willr-mean-reversi-vqi-directional-qu-m5",
@@ -1685,7 +1723,8 @@
         ],
         "validation_priority_score": 60.6609,
         "source_validation_probe_id": "drv-0015-r002-willr-mean-reversi-vqi-directional-qu-m5",
-        "source_retention_bucket": "retained"
+        "source_retention_bucket": "retained",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0015-r002-willr-mean-reversi-vqi-directional-qu-m5.json"
       },
       {
         "probe_id": "drs-0013-r008-vqi-directional-qu-willr-mean-reversi-m5",
@@ -1739,7 +1778,8 @@
         ],
         "validation_priority_score": 60.3475,
         "source_validation_probe_id": "drv-0023-r008-vqi-directional-qu-willr-mean-reversi-m5",
-        "source_retention_bucket": "retained"
+        "source_retention_bucket": "retained",
+        "source_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-validation-atlas\\profiles\\drv-0023-r008-vqi-directional-qu-willr-mean-reversi-m5.json"
       }
     ]
   }

@@ -628,11 +628,11 @@ def build_discovered_recipe_prior_evidence(
     rows_by_id: dict[str, dict[str, Any]],
     profile_dir: Path | list[Path] | tuple[Path, ...] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    latest_rows = _latest_validation_rows_by_pair(validation_rows)
     retained_rows = [
         row
-        for row in validation_rows
-        if _clean_token(row.get("status")) in {"", "ok", "skipped_existing"}
-        and _clean_token(row.get("retention_bucket")) in DISCOVERY_RECIPE_INCLUDED_BUCKETS
+        for row in latest_rows
+        if _clean_token(row.get("retention_bucket")) in DISCOVERY_RECIPE_INCLUDED_BUCKETS
         and _float_value(row.get("primary_score"), _float_value(row.get("composite_score"))) > 0.0
     ]
     pair_priors: list[dict[str, Any]] = []
@@ -766,6 +766,7 @@ def build_discovered_recipe_prior_evidence(
 
     summary = {
         "source_rows": len(validation_rows),
+        "latest_pair_rows": len(latest_rows),
         "retained_rows": len(retained_rows),
         "retention_bucket_counts": _retention_bucket_counts(validation_rows),
         "included_retention_buckets": sorted(DISCOVERY_RECIPE_INCLUDED_BUCKETS),
@@ -784,6 +785,41 @@ def _unordered_pair_id(first_id: Any, second_id: Any) -> str:
     return "+".join(values)
 
 
+def _validation_pair_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
+    return (
+        _clean_token(row.get("recipe_id")),
+        _clean_upper(row.get("first_indicator_id")),
+        _clean_upper(row.get("second_indicator_id")),
+        _clean_upper(row.get("probe_timeframe")),
+    )
+
+
+def _latest_validation_rows_by_pair(validation_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for row in validation_rows:
+        status = _clean_token(row.get("status"))
+        if status not in {"", "ok", "skipped_existing"}:
+            continue
+        key = _validation_pair_key(row)
+        if not all(key):
+            continue
+        current = latest.get(key)
+        if current is None:
+            latest[key] = row
+            continue
+        row_rank = (
+            _int_value(row.get("lookback_months")),
+            _float_value(row.get("primary_score"), _float_value(row.get("composite_score"))),
+        )
+        current_rank = (
+            _int_value(current.get("lookback_months")),
+            _float_value(current.get("primary_score"), _float_value(current.get("composite_score"))),
+        )
+        if row_rank > current_rank:
+            latest[key] = row
+    return list(latest.values())
+
+
 def build_discovery_negative_priors(
     validation_rows: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -800,50 +836,9 @@ def build_discovery_negative_priors(
             _float_value(row.get("composite_score")),
         )
         discovery_score = _float_value(row.get("discovery_evidence_score"))
-        is_failure = bucket in DISCOVERY_RECIPE_NEGATIVE_BUCKETS or (
-            discovery_score >= 50.0 and validation_score <= 0.0
-        )
-        if not is_failure:
-            continue
         first_id = _clean_upper(row.get("first_indicator_id"))
         second_id = _clean_upper(row.get("second_indicator_id"))
         timeframe = _clean_upper(row.get("probe_timeframe"))
-        reason = (
-            "cluster_expansion_failed"
-            if bucket.startswith("new_")
-            else "retention_failed"
-        )
-        if discovery_score >= 50.0 and validation_score <= 0.0:
-            reason = "positive_discovery_collapsed"
-        negative_weight = 1.0
-        if discovery_score >= 65.0 and validation_score <= 0.0:
-            negative_weight = 1.5
-        elif bucket.startswith("new_"):
-            negative_weight = 0.75
-        pair_row = {
-            "source": "discovery_recipe_validation",
-            "recipe": row.get("recipe_id"),
-            "first_indicator_id": first_id,
-            "second_indicator_id": second_id,
-            "ordered_pair_id": f"{first_id}->{second_id}",
-            "unordered_pair_id": _unordered_pair_id(first_id, second_id),
-            "probe_timeframe": timeframe,
-            "probe_id": row.get("probe_id"),
-            "retention_bucket": bucket,
-            "validation_score": round(validation_score, 4),
-            "retention_ratio": row.get("retention_ratio"),
-            "discovery_evidence_score": row.get("discovery_evidence_score"),
-            "discovery_evidence_probe_id": row.get("discovery_evidence_probe_id"),
-            "signal_count": row.get("signal_count"),
-            "best_expectancy_r": row.get("best_expectancy_r"),
-            "best_trades": row.get("best_trades"),
-            "best_profit_factor": row.get("best_profit_factor"),
-            "negative_reason": reason,
-            "negative_weight": negative_weight,
-        }
-        pair_rows.append(pair_row)
-        if discovery_score >= 50.0:
-            retention_failures.append(pair_row)
         cluster_key = (
             _clean_token(row.get("recipe_id")),
             _clean_token(row.get("first_cluster_id")),
@@ -857,29 +852,121 @@ def build_discovery_negative_priors(
                 "first_cluster_id": cluster_key[1],
                 "second_cluster_id": cluster_key[2],
                 "probe_timeframe": cluster_key[3],
+                "tested_count": 0,
+                "retained_count": 0,
+                "retained_strong_count": 0,
+                "partial_count": 0,
+                "failed_retention_count": 0,
+                "new_failed_count": 0,
+                "new_low_count": 0,
                 "failed_count": 0,
                 "positive_count": 0,
                 "total_count": 0,
                 "worst_validation_score": None,
                 "best_validation_score": None,
+                "median_validation_score": None,
                 "example_probe_id": row.get("probe_id"),
+                "_scores": [],
             },
         )
-        cluster["failed_count"] = int(cluster.get("failed_count") or 0) + 1
+        cluster["tested_count"] = int(cluster.get("tested_count") or 0) + 1
         cluster["total_count"] = int(cluster.get("total_count") or 0) + 1
         if validation_score >= 50.0:
             cluster["positive_count"] = int(cluster.get("positive_count") or 0) + 1
+        if bucket == "retained_strong":
+            cluster["retained_strong_count"] = int(cluster.get("retained_strong_count") or 0) + 1
+            cluster["retained_count"] = int(cluster.get("retained_count") or 0) + 1
+        elif bucket == "retained":
+            cluster["retained_count"] = int(cluster.get("retained_count") or 0) + 1
+        elif bucket == "partial_retention":
+            cluster["partial_count"] = int(cluster.get("partial_count") or 0) + 1
+        elif bucket == "failed_retention":
+            cluster["failed_retention_count"] = int(cluster.get("failed_retention_count") or 0) + 1
+        elif bucket == "new_failed_cluster_expansion":
+            cluster["new_failed_count"] = int(cluster.get("new_failed_count") or 0) + 1
+        elif bucket == "new_low_cluster_expansion":
+            cluster["new_low_count"] = int(cluster.get("new_low_count") or 0) + 1
         worst = cluster.get("worst_validation_score")
         if worst is None or validation_score < _float_value(worst):
             cluster["worst_validation_score"] = round(validation_score, 4)
         best = cluster.get("best_validation_score")
         if best is None or validation_score > _float_value(best):
             cluster["best_validation_score"] = round(validation_score, 4)
+        scores = cluster.get("_scores")
+        if isinstance(scores, list):
+            scores.append(validation_score)
+
+        is_failure = bucket in DISCOVERY_RECIPE_NEGATIVE_BUCKETS or (
+            discovery_score >= 50.0 and validation_score <= 0.0
+        )
+        if not is_failure:
+            continue
+        cluster["failed_count"] = int(cluster.get("failed_count") or 0) + 1
+        reason = (
+            "cluster_expansion_failed"
+            if bucket.startswith("new_")
+            else "retention_failed"
+        )
+        if discovery_score >= 50.0 and validation_score <= 0.0:
+            reason = "positive_discovery_collapsed"
+        negative_weight = 1.0
+        if discovery_score >= 65.0 and validation_score <= 0.0:
+            negative_weight = 1.5
+        elif bucket.startswith("new_"):
+            negative_weight = 0.75
+        negative_scope = (
+            "hard_unordered"
+            if negative_weight >= 1.5 and reason == "positive_discovery_collapsed"
+            else "soft_exact_timeframe"
+        )
+        pair_row = {
+            "source": "discovery_recipe_validation",
+            "recipe": row.get("recipe_id"),
+            "first_indicator_id": first_id,
+            "second_indicator_id": second_id,
+            "ordered_pair_id": f"{first_id}->{second_id}",
+            "unordered_pair_id": _unordered_pair_id(first_id, second_id),
+            "probe_timeframe": timeframe,
+            "probe_id": row.get("probe_id"),
+            "lookback_months": row.get("lookback_months"),
+            "retention_bucket": bucket,
+            "validation_score": round(validation_score, 4),
+            "retention_ratio": row.get("retention_ratio"),
+            "discovery_evidence_score": row.get("discovery_evidence_score"),
+            "discovery_evidence_probe_id": row.get("discovery_evidence_probe_id"),
+            "signal_count": row.get("signal_count"),
+            "best_expectancy_r": row.get("best_expectancy_r"),
+            "best_trades": row.get("best_trades"),
+            "best_profit_factor": row.get("best_profit_factor"),
+            "negative_reason": reason,
+            "negative_scope": negative_scope,
+            "negative_weight": negative_weight,
+        }
+        pair_rows.append(pair_row)
+        if discovery_score >= 50.0:
+            retention_failures.append(pair_row)
     cluster_rows: list[dict[str, Any]] = []
     for row in cluster_groups.values():
-        total = max(1, int(row.get("total_count") or 0))
+        total = max(1, int(row.get("tested_count") or row.get("total_count") or 0))
         failed = int(row.get("failed_count") or 0)
+        if failed <= 0:
+            continue
+        scores = sorted(score for score in row.pop("_scores", []) if math.isfinite(score))
+        if scores:
+            midpoint = len(scores) // 2
+            if len(scores) % 2:
+                row["median_validation_score"] = round(scores[midpoint], 4)
+            else:
+                row["median_validation_score"] = round((scores[midpoint - 1] + scores[midpoint]) / 2.0, 4)
+        retained = int(row.get("retained_count") or 0)
         row["failure_rate"] = round(failed / float(total), 4)
+        row["retained_rate"] = round(retained / float(total), 4)
+        if total >= 6 and row["failure_rate"] >= 0.85:
+            row["soft_penalty_multiplier"] = 0.5
+        elif total >= 4 and row["failure_rate"] >= 0.75 and retained == 0:
+            row["soft_penalty_multiplier"] = 0.7
+        else:
+            row["soft_penalty_multiplier"] = 1.0
         row["negative_weight"] = round(min(2.0, 0.5 + row["failure_rate"]), 4)
         cluster_rows.append(row)
     pair_rows.sort(
@@ -1320,6 +1407,7 @@ def _pair_negative_fieldnames() -> list[str]:
         "unordered_pair_id",
         "probe_timeframe",
         "probe_id",
+        "lookback_months",
         "retention_bucket",
         "validation_score",
         "retention_ratio",
@@ -1330,6 +1418,7 @@ def _pair_negative_fieldnames() -> list[str]:
         "best_trades",
         "best_profit_factor",
         "negative_reason",
+        "negative_scope",
         "negative_weight",
     ]
 
@@ -1340,13 +1429,23 @@ def _cluster_negative_fieldnames() -> list[str]:
         "first_cluster_id",
         "second_cluster_id",
         "probe_timeframe",
+        "tested_count",
+        "retained_count",
+        "retained_strong_count",
+        "partial_count",
+        "failed_retention_count",
+        "new_failed_count",
+        "new_low_count",
         "failed_count",
         "positive_count",
         "total_count",
         "failure_rate",
+        "retained_rate",
         "worst_validation_score",
         "best_validation_score",
+        "median_validation_score",
         "example_probe_id",
+        "soft_penalty_multiplier",
         "negative_weight",
     ]
 

@@ -543,14 +543,17 @@ def _seed_plan_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def _seed_plan_negative_pair_keys(seed_plan: dict[str, Any] | None) -> set[tuple[str, str]]:
+def _seed_plan_hard_negative_pair_keys(seed_plan: dict[str, Any] | None) -> set[tuple[str, str]]:
     if not isinstance(seed_plan, dict):
         return set()
     keys: set[tuple[str, str]] = set()
     for row in seed_plan.get("negative_pairs") or []:
         if not isinstance(row, dict):
             continue
-        if _seed_plan_float(row.get("negative_weight")) <= 0.0:
+        if (
+            _seed_plan_float(row.get("negative_weight")) < 1.5
+            or str(row.get("negative_reason") or "") != "positive_discovery_collapsed"
+        ):
             continue
         first_id = _seed_plan_upper(row.get("first_indicator_id"))
         second_id = _seed_plan_upper(row.get("second_indicator_id"))
@@ -723,7 +726,7 @@ def deal_seed_plan_indicators(
     selected_ids: list[str] = []
     selected_slots: list[dict[str, Any]] = []
     selected_pair: dict[str, Any] | None = None
-    negative_pair_keys = _seed_plan_negative_pair_keys(seed_plan)
+    negative_pair_keys = _seed_plan_hard_negative_pair_keys(seed_plan)
 
     def add_indicator(
         indicator_id: Any,
@@ -811,19 +814,16 @@ def deal_seed_plan_indicators(
         remaining = [indicator for indicator in indicators if indicator.id.upper() not in selected_ids]
         for indicator in deal_role_balanced_indicators(
             remaining,
-            target_count=target_count - len(selected_ids),
+            target_count=len(remaining),
         ):
-            if indicator.id.upper() not in selected_ids:
-                selected_ids.append(indicator.id.upper())
-                selected_slots.append(
-                    {
-                        "slot": "role_balanced_fill",
-                        "indicator_id": indicator.id.upper(),
-                        "sampling_weight": None,
-                        "sampling_lane": None,
-                        "source": "role_balanced_fill",
-                    }
-                )
+            if len(selected_ids) >= target_count:
+                break
+            add_indicator(
+                indicator.id,
+                slot="role_balanced_fill",
+                evidence={"source": "role_balanced_fill"},
+                allow_negative_pair=False,
+            )
 
     selected = [by_id[indicator_id] for indicator_id in selected_ids if indicator_id in by_id]
     if not selected:
