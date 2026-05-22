@@ -1,0 +1,17 @@
+recipe,first_cluster_id,second_cluster_id,probe_timeframe,failed_count,positive_count,total_count,failure_rate,worst_validation_score,best_validation_score,example_probe_id,negative_weight
+discovered_recipe_007,first_cluster_02,second_cluster_04,M5,5,1,5,1.0,0.0,59.2623,drv-0048-r007-rsi-crossback-bbands-position-tr-m5,1.5
+discovered_recipe_003,first_cluster_03,second_cluster_02,M15,4,0,4,1.0,0.0,0.0,drv-0016-r003-bollinger-keltner-ma-spread-mean-rev-m15,1.5
+discovered_recipe_004,first_cluster_01,second_cluster_01,M5,4,0,4,1.0,0.0,42.452,drv-0020-r004-toby-crabel-narrow-wavetrend-crossove-m5,1.5
+discovered_recipe_004,first_cluster_01,second_cluster_01,M15,4,0,4,1.0,0.0,0.0,drv-0034-r004-macd-crossover-toby-crabel-narrow-m15,1.5
+discovered_recipe_005,first_cluster_02,second_cluster_03,M5,4,0,4,1.0,0.0,0.0,drv-0014-r005-obv-mean-reversion-bollinger-keltner-m5,1.5
+discovered_recipe_006,first_cluster_02,second_cluster_02,M15,4,0,4,1.0,0.0,0.0,drv-0044-r006-channel-reentry-rsi-crossback-m15,1.5
+discovered_recipe_008,first_cluster_04,second_cluster_02,M15,4,0,4,1.0,0.0,0.0,drv-0051-r008-vqi-directional-qu-rsi-crossback-m15,1.5
+discovered_recipe_005,first_cluster_02,second_cluster_03,M15,3,0,3,1.0,0.0,0.0,drv-0033-r005-rsi-crossback-bollinger-keltner-m15,1.5
+discovered_recipe_008,first_cluster_04,second_cluster_02,M5,3,0,3,1.0,0.0,0.0,drv-0053-r008-vqi-directional-qu-rsi-crossback-m5,1.5
+discovered_recipe_001,first_cluster_01,second_cluster_02,M5,2,0,2,1.0,0.0,0.0,drv-0001-r001-toby-crabel-narrow-rsi-crossback-m5,1.5
+discovered_recipe_001,first_cluster_01,second_cluster_02,M15,2,0,2,1.0,0.0,0.0,drv-0019-r001-market-mode-transi-ma-spread-mean-rev-m15,1.5
+discovered_recipe_002,first_cluster_02,second_cluster_01,M5,2,0,2,1.0,0.0,0.0,drv-0002-r002-rsi-crossback-toby-crabel-narrow-m5,1.5
+discovered_recipe_003,first_cluster_03,second_cluster_02,M5,2,0,2,1.0,0.0,0.0,drv-0011-r003-bollinger-keltner-obv-mean-reversion-m5,1.5
+discovered_recipe_006,first_cluster_02,second_cluster_02,M5,2,0,2,1.0,0.0,0.0,drv-0046-r006-channel-reentry-rsi-crossback-m5,1.5
+discovered_recipe_007,first_cluster_02,second_cluster_04,M15,2,0,2,1.0,0.0,0.0,drv-0052-r007-rsi-crossback-bbands-position-tr-m15,1.5
+discovered_recipe_002,first_cluster_02,second_cluster_01,M15,1,0,1,1.0,0.0,0.0,drv-0027-r002-rsi-crossback-toby-crabel-narrow-m15,1.5

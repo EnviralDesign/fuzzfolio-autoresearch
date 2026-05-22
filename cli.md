@@ -319,20 +319,24 @@ uv run build-recipe-priors
 uv run build-recipe-priors --max-slot-candidates 25 --json
 ```
 
-Builds empirical recipe and slot sampling weights from the completed Atlas layers. This is the bridge from blind random indicator selection toward recipe-aware weighted selection: high-evidence indicators get more sampling weight, uncertain indicators stay available, and wild-card exploration is preserved. When discovered recipe validation results are present, retained discovered recipe pairs are folded into the same Play Hand seed plan as additional weighted recipes.
+Builds empirical recipe and slot sampling weights from the completed Atlas layers. This is the bridge from blind random indicator selection toward recipe-aware weighted selection: high-evidence indicators get more sampling weight, uncertain indicators stay available, and wild-card exploration is preserved. When discovered recipe validation results are present, retained discovered recipe pairs are folded into the same Play Hand seed plan as additional weighted recipes, including the validated profile defaults that worked in the probe.
 
 Default settings:
 
-- input: `runs/derived/indicator-atlas/`, `runs/derived/signal-atlas/`, `runs/derived/forward-response-atlas/`, `runs/derived/anchor-pair-atlas/`, `runs/derived/anchor-pair-timing-atlas/`, and, when present, `runs/derived/discovery-recipe-validation-atlas/`
+- input: `runs/derived/indicator-atlas/`, `runs/derived/signal-atlas/`, `runs/derived/forward-response-atlas/`, `runs/derived/anchor-pair-atlas/`, `runs/derived/anchor-pair-timing-atlas/`, and, when present, `runs/derived/discovery-recipe-validation-atlas/` plus `runs/derived/discovery-recipe-scrutiny-atlas/`
 - output: `runs/derived/recipe-priors/`
 - max slot candidates per recipe slot: `40`
 - max empirical pair candidates: `80`
+- sampling policy: `60/25/15` guided/uncertain/wild until 36-month retained evidence exists, then `80/15/5`
 
 Outputs:
 
 - `recipe-priors.json`: full empirical recipe-prior artifact.
 - `slot-indicator-priors.csv`: one row per recipe/slot/indicator candidate with sampling weight and evidence fields.
 - `pair-priors.csv`: empirical anchor-trigger pair menu with score and timing policy.
+- `pair-negative-priors.csv`: exact failed pair/timeframe evidence used to avoid repeated collapses.
+- `cluster-expansion-negative-priors.csv`: failed cluster-expansion families.
+- `retention-failures.csv`: 3-month positives that collapsed during validation.
 - `play-hand-seed-plan.json`: compact weighted menu intended for Play Hand integration.
 - `recipe-priors-summary.json`: compact counts, top slot menus, and top pair priors.
 
@@ -541,13 +545,62 @@ Arguments:
 - `--workers`: number of validation probes to keep in flight concurrently.
 - `--json`: print machine-readable output.
 
+## build-discovery-recipe-scrutiny-atlas
+
+```powershell
+uv run build-discovery-recipe-scrutiny-atlas
+uv run build-discovery-recipe-scrutiny-atlas --max-rows 6 --json
+uv run build-discovery-recipe-scrutiny-atlas --bucket retained_strong
+```
+
+Builds the 36-month scrutiny queue for discovered recipes that already retained during the 12-month validation pass. It does not run backend jobs; it writes another validation-compatible atlas so the existing runner can execute it with `--atlas-dir`.
+
+Default settings:
+
+- input: `runs/derived/discovery-recipe-validation-atlas/discovery-recipe-validation-results.csv`
+- output: `runs/derived/discovery-recipe-scrutiny-atlas/`
+- included source buckets: `retained_strong`, `retained`
+- instruments: `EURUSD`, `GBPUSD`, `USDJPY`, `XAUUSD`
+- scrutiny lookback: `36` months
+
+Outputs:
+
+- `discovery-recipe-validation-atlas.json`: validation-compatible 36-month queue artifact.
+- `discovery-recipe-validation-queue.csv`: retained pair rows queued for scrutiny.
+- `discovery-recipe-validation-run-manifest.json`: create-profile and sensitivity-basket arguments.
+- `run-discovery-recipe-scrutiny-probes.ps1`: direct PowerShell runner.
+- `profiles/*.json`: temporary two-indicator scrutiny profiles.
+- `discovery-recipe-scrutiny-summary.json`: compact scrutiny queue summary.
+
+Arguments:
+
+- `--validation-atlas-dir`: input 12-month validation atlas directory.
+- `--out-dir`: output directory.
+- `--workspace-root`, `--catalog-path`: Trading-Dashboard catalog resolution overrides.
+- `--refresh-static-atlas`: rebuild the static indicator atlas before constructing profiles.
+- `--bucket`: 12-month retention bucket to promote; repeatable.
+- `--instrument`, `--timeframe`: override the panel or restrict retained rows; repeatable.
+- `--max-rows`: maximum retained validation rows to queue.
+- `--lookback-months`: scrutiny lookback months embedded in the run manifest.
+- `--job-timeout-seconds`: deep replay job wait timeout embedded in the run manifest.
+- `--quality-score-preset`, `--execution-cost-mode`: sensitivity-basket manifest settings.
+- `--no-profile-docs`: skip writing runnable profile JSON documents.
+- `--json`: print machine-readable output.
+
 After validation finishes, rebuild recipe priors to promote retained discovered structures into Play Hand's weighted seed plan:
 
 ```powershell
 uv run build-recipe-priors
 ```
 
-`play-hand` reads `runs/derived/recipe-priors/play-hand-seed-plan.json` automatically when it exists. The discovered recipes are still priors, not hard filters: Play Hand keeps role-balanced fallback and policy exploration available.
+To run the 36-month scrutiny queue, use the same runner against the scrutiny atlas:
+
+```powershell
+uv run run-discovery-recipe-validation-probes --atlas-dir runs/derived/discovery-recipe-scrutiny-atlas --workers 32
+uv run build-recipe-priors
+```
+
+`play-hand` reads `runs/derived/recipe-priors/play-hand-seed-plan.json` automatically when it exists. The discovered recipes are still priors, not hard filters: Play Hand keeps role-balanced fallback and policy exploration available. Guided seed-plan deals force at least two indicators, and retained discovered-pair deals carry the validated timeframe/lookback/range/TA-Lib defaults into the scaffolded profile before normal sweeps vary it.
 
 ## run
 

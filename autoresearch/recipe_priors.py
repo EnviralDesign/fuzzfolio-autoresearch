@@ -21,6 +21,7 @@ from .anchor_pair_atlas import (
 SCHEMA_VERSION = "empirical_recipe_priors_v1"
 DEFAULT_RECIPE_PRIORS_DIRNAME = "recipe-priors"
 DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME = "discovery-recipe-validation-atlas"
+DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME = "discovery-recipe-scrutiny-atlas"
 
 RECIPE_BY_ANCHOR_TYPE: dict[str, str] = {
     "trend": "trend_pullback_continuation",
@@ -44,7 +45,7 @@ DISCOVERY_RECIPE_INCLUDED_BUCKETS: dict[str, str] = {
     "retained": "high_prior",
     "partial_retention": "uncertain_prior",
     "new_strong_cluster_expansion": "medium_prior",
-    "new_positive_cluster_expansion": "medium_prior",
+    "new_positive_cluster_expansion": "uncertain_prior",
 }
 
 DISCOVERY_RECIPE_BUCKET_ADJUSTMENT: dict[str, float] = {
@@ -52,8 +53,26 @@ DISCOVERY_RECIPE_BUCKET_ADJUSTMENT: dict[str, float] = {
     "retained": 4.0,
     "partial_retention": -4.0,
     "new_strong_cluster_expansion": 3.0,
-    "new_positive_cluster_expansion": -2.0,
+    "new_positive_cluster_expansion": -6.0,
 }
+
+DISCOVERY_RECIPE_NEGATIVE_BUCKETS = {
+    "failed_retention",
+    "new_failed_cluster_expansion",
+    "new_low_cluster_expansion",
+}
+
+TEMPLATE_CONFIG_KEYS = (
+    "timeframe",
+    "lookbackBars",
+    "ranges",
+    "talibConfig",
+    "weight",
+    "isTrendFollowing",
+    "normalizationMode",
+    "useFormingBar",
+    "scale",
+)
 
 
 @dataclass(frozen=True)
@@ -61,6 +80,9 @@ class RecipePriorsBuildResult:
     priors_path: Path
     slot_csv_path: Path
     pair_csv_path: Path
+    pair_negative_csv_path: Path
+    cluster_negative_csv_path: Path
+    retention_failures_csv_path: Path
     seed_plan_path: Path
     summary_path: Path
     summary: dict[str, Any]
@@ -70,6 +92,9 @@ class RecipePriorsBuildResult:
             "recipe_priors_json": str(self.priors_path),
             "slot_indicator_priors_csv": str(self.slot_csv_path),
             "pair_priors_csv": str(self.pair_csv_path),
+            "pair_negative_priors_csv": str(self.pair_negative_csv_path),
+            "cluster_expansion_negative_priors_csv": str(self.cluster_negative_csv_path),
+            "retention_failures_csv": str(self.retention_failures_csv_path),
             "play_hand_seed_plan_json": str(self.seed_plan_path),
             "recipe_priors_summary_json": str(self.summary_path),
             "summary": self.summary,
@@ -238,7 +263,7 @@ def _fallback_static_slot_score(
 
 def _signal_score(signal_rollup: dict[str, Any] | None) -> tuple[float, str]:
     if not signal_rollup:
-        return 50.0, "unknown"
+        return 42.0, "unknown"
     bucket = _clean_token(signal_rollup.get("density_bucket")) or "unknown"
     score = DENSITY_SCORE.get(bucket, 50.0)
     balance_counts = _as_dict(signal_rollup.get("balance_bucket_counts"))
@@ -251,7 +276,7 @@ def _signal_score(signal_rollup: dict[str, Any] | None) -> tuple[float, str]:
 
 def _forward_score(forward_prior: dict[str, Any] | None) -> tuple[float, str]:
     if not forward_prior:
-        return 50.0, "unknown"
+        return 42.0, "unknown"
     return (
         round(_clamp(_float_value(forward_prior.get("forward_response_prior_score"), 50.0)), 2),
         _clean_token(forward_prior.get("forward_response_prior_bucket")) or "unknown",
@@ -515,10 +540,93 @@ def _discovery_slot_row(
     }
 
 
+def _load_recommended_profile_template(
+    profile_dir: Path | list[Path] | tuple[Path, ...] | None,
+    row: dict[str, Any],
+) -> dict[str, Any] | None:
+    if profile_dir is None:
+        return None
+    probe_id = _clean_token(row.get("probe_id"))
+    if not probe_id:
+        return None
+    profile_dirs = list(profile_dir) if isinstance(profile_dir, (list, tuple)) else [profile_dir]
+    profile_path: Path | None = None
+    for candidate_dir in profile_dirs:
+        candidate_path = candidate_dir / f"{probe_id}.json"
+        if candidate_path.exists():
+            profile_path = candidate_path
+            break
+    if profile_path is None and _clean_token(row.get("source_validation_probe_id")):
+        source_probe_id = _clean_token(row.get("source_validation_probe_id"))
+        for candidate_dir in profile_dirs:
+            candidate_path = candidate_dir / f"{source_probe_id}.json"
+            if candidate_path.exists():
+                profile_path = candidate_path
+                break
+    if profile_path is None:
+        return None
+    payload = _as_dict(_load_json(profile_path))
+    profile = _as_dict(payload.get("profile")) or payload
+    first_id = _clean_upper(row.get("first_indicator_id"))
+    second_id = _clean_upper(row.get("second_indicator_id"))
+    wanted = {value for value in (first_id, second_id) if value}
+    indicator_defaults: list[dict[str, Any]] = []
+    for item in _as_list(profile.get("indicators")):
+        if not isinstance(item, dict):
+            continue
+        meta = _as_dict(item.get("meta"))
+        indicator_id = _clean_upper(meta.get("id"))
+        if not indicator_id or indicator_id not in wanted:
+            continue
+        config = _as_dict(item.get("config"))
+        default_row = {
+            "indicator_id": indicator_id,
+            "instance_id": meta.get("instanceId"),
+        }
+        for key in TEMPLATE_CONFIG_KEYS:
+            if key in config:
+                default_row[key] = config.get(key)
+        indicator_defaults.append(default_row)
+    if not indicator_defaults:
+        return None
+    return {
+        "probe_id": probe_id,
+        "profile_path": str(profile_path),
+        "timeframe": _clean_upper(row.get("probe_timeframe")),
+        "lookback_months": _int_value(row.get("lookback_months")),
+        "instruments": [
+            _clean_upper(value)
+            for value in _as_list(profile.get("instruments"))
+            if _clean_upper(value)
+        ],
+        "indicator_defaults": indicator_defaults,
+    }
+
+
+def _profile_template_csv_bits(template: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(template, dict):
+        return {
+            "recommended_profile_template_path": None,
+            "recommended_template_timeframe": None,
+            "recommended_template_indicator_count": None,
+        }
+    indicators = [
+        row
+        for row in _as_list(template.get("indicator_defaults"))
+        if isinstance(row, dict)
+    ]
+    return {
+        "recommended_profile_template_path": template.get("profile_path"),
+        "recommended_template_timeframe": template.get("timeframe"),
+        "recommended_template_indicator_count": len(indicators),
+    }
+
+
 def build_discovered_recipe_prior_evidence(
     validation_rows: list[dict[str, Any]],
     *,
     rows_by_id: dict[str, dict[str, Any]],
+    profile_dir: Path | list[Path] | tuple[Path, ...] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     retained_rows = [
         row
@@ -559,6 +667,7 @@ def build_discovered_recipe_prior_evidence(
         recipe_score = _discovery_recipe_score(row)
         lane = DISCOVERY_RECIPE_INCLUDED_BUCKETS.get(bucket, pair_sampling_lane(recipe_score))
         pair_weight = sampling_weight(recipe_score, lane)
+        recommended_template = _load_recommended_profile_template(profile_dir, row)
         recipe_meta.setdefault(
             recipe_id,
             {
@@ -598,6 +707,8 @@ def build_discovered_recipe_prior_evidence(
                 "validation_score": round(validation_score, 4),
                 "retention_ratio": row.get("retention_ratio"),
                 "discovery_evidence_score": row.get("discovery_evidence_score"),
+                "recommended_profile_template": recommended_template,
+                **_profile_template_csv_bits(recommended_template),
             }
         )
         keep_slot(
@@ -658,11 +769,146 @@ def build_discovered_recipe_prior_evidence(
         "retained_rows": len(retained_rows),
         "retention_bucket_counts": _retention_bucket_counts(validation_rows),
         "included_retention_buckets": sorted(DISCOVERY_RECIPE_INCLUDED_BUCKETS),
+        "recommended_template_rows": sum(
+            1 for row in pair_priors if isinstance(row.get("recommended_profile_template"), dict)
+        ),
         "discovered_recipe_count": len(recipes),
         "discovered_pair_prior_rows": len(pair_priors),
         "discovered_slot_rows": len(slot_rows),
     }
     return recipes, slot_rows, pair_priors, summary
+
+
+def _unordered_pair_id(first_id: Any, second_id: Any) -> str:
+    values = sorted(value for value in (_clean_upper(first_id), _clean_upper(second_id)) if value)
+    return "+".join(values)
+
+
+def build_discovery_negative_priors(
+    validation_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    pair_rows: list[dict[str, Any]] = []
+    retention_failures: list[dict[str, Any]] = []
+    cluster_groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for row in validation_rows:
+        status = _clean_token(row.get("status"))
+        if status not in {"", "ok", "skipped_existing"}:
+            continue
+        bucket = _clean_token(row.get("retention_bucket"))
+        validation_score = _float_value(
+            row.get("primary_score"),
+            _float_value(row.get("composite_score")),
+        )
+        discovery_score = _float_value(row.get("discovery_evidence_score"))
+        is_failure = bucket in DISCOVERY_RECIPE_NEGATIVE_BUCKETS or (
+            discovery_score >= 50.0 and validation_score <= 0.0
+        )
+        if not is_failure:
+            continue
+        first_id = _clean_upper(row.get("first_indicator_id"))
+        second_id = _clean_upper(row.get("second_indicator_id"))
+        timeframe = _clean_upper(row.get("probe_timeframe"))
+        reason = (
+            "cluster_expansion_failed"
+            if bucket.startswith("new_")
+            else "retention_failed"
+        )
+        if discovery_score >= 50.0 and validation_score <= 0.0:
+            reason = "positive_discovery_collapsed"
+        negative_weight = 1.0
+        if discovery_score >= 65.0 and validation_score <= 0.0:
+            negative_weight = 1.5
+        elif bucket.startswith("new_"):
+            negative_weight = 0.75
+        pair_row = {
+            "source": "discovery_recipe_validation",
+            "recipe": row.get("recipe_id"),
+            "first_indicator_id": first_id,
+            "second_indicator_id": second_id,
+            "ordered_pair_id": f"{first_id}->{second_id}",
+            "unordered_pair_id": _unordered_pair_id(first_id, second_id),
+            "probe_timeframe": timeframe,
+            "probe_id": row.get("probe_id"),
+            "retention_bucket": bucket,
+            "validation_score": round(validation_score, 4),
+            "retention_ratio": row.get("retention_ratio"),
+            "discovery_evidence_score": row.get("discovery_evidence_score"),
+            "discovery_evidence_probe_id": row.get("discovery_evidence_probe_id"),
+            "signal_count": row.get("signal_count"),
+            "best_expectancy_r": row.get("best_expectancy_r"),
+            "best_trades": row.get("best_trades"),
+            "best_profit_factor": row.get("best_profit_factor"),
+            "negative_reason": reason,
+            "negative_weight": negative_weight,
+        }
+        pair_rows.append(pair_row)
+        if discovery_score >= 50.0:
+            retention_failures.append(pair_row)
+        cluster_key = (
+            _clean_token(row.get("recipe_id")),
+            _clean_token(row.get("first_cluster_id")),
+            _clean_token(row.get("second_cluster_id")),
+            timeframe,
+        )
+        cluster = cluster_groups.setdefault(
+            cluster_key,
+            {
+                "recipe": cluster_key[0],
+                "first_cluster_id": cluster_key[1],
+                "second_cluster_id": cluster_key[2],
+                "probe_timeframe": cluster_key[3],
+                "failed_count": 0,
+                "positive_count": 0,
+                "total_count": 0,
+                "worst_validation_score": None,
+                "best_validation_score": None,
+                "example_probe_id": row.get("probe_id"),
+            },
+        )
+        cluster["failed_count"] = int(cluster.get("failed_count") or 0) + 1
+        cluster["total_count"] = int(cluster.get("total_count") or 0) + 1
+        if validation_score >= 50.0:
+            cluster["positive_count"] = int(cluster.get("positive_count") or 0) + 1
+        worst = cluster.get("worst_validation_score")
+        if worst is None or validation_score < _float_value(worst):
+            cluster["worst_validation_score"] = round(validation_score, 4)
+        best = cluster.get("best_validation_score")
+        if best is None or validation_score > _float_value(best):
+            cluster["best_validation_score"] = round(validation_score, 4)
+    cluster_rows: list[dict[str, Any]] = []
+    for row in cluster_groups.values():
+        total = max(1, int(row.get("total_count") or 0))
+        failed = int(row.get("failed_count") or 0)
+        row["failure_rate"] = round(failed / float(total), 4)
+        row["negative_weight"] = round(min(2.0, 0.5 + row["failure_rate"]), 4)
+        cluster_rows.append(row)
+    pair_rows.sort(
+        key=lambda row: (
+            -_float_value(row.get("negative_weight")),
+            -_float_value(row.get("discovery_evidence_score")),
+            str(row.get("ordered_pair_id") or ""),
+        )
+    )
+    cluster_rows.sort(
+        key=lambda row: (
+            -_float_value(row.get("negative_weight")),
+            -_int_value(row.get("failed_count")),
+            str(row.get("recipe") or ""),
+        )
+    )
+    retention_failures.sort(
+        key=lambda row: (
+            -_float_value(row.get("discovery_evidence_score")),
+            str(row.get("ordered_pair_id") or ""),
+        )
+    )
+    summary = {
+        "negative_pair_rows": len(pair_rows),
+        "cluster_negative_rows": len(cluster_rows),
+        "retention_failure_rows": len(retention_failures),
+        "negative_retention_buckets": sorted(DISCOVERY_RECIPE_NEGATIVE_BUCKETS),
+    }
+    return pair_rows, cluster_rows, retention_failures, summary
 
 
 def score_slot_candidate(
@@ -759,9 +1005,19 @@ def build_recipe_prior_artifacts(
     pair_results: list[dict[str, Any]],
     timing_results: list[dict[str, Any]],
     discovery_validation_results: list[dict[str, Any]] | None = None,
+    discovery_validation_profile_dir: Path | list[Path] | tuple[Path, ...] | None = None,
     max_slot_candidates: int,
     max_pair_candidates: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any],
+]:
     rows_by_id = _row_by_id(indicator_rows)
     generation_rows = [
         row
@@ -778,7 +1034,14 @@ def build_recipe_prior_artifacts(
     ) = build_discovered_recipe_prior_evidence(
         discovery_validation_results or [],
         rows_by_id=rows_by_id,
+        profile_dir=discovery_validation_profile_dir,
     )
+    (
+        negative_pair_rows,
+        negative_cluster_rows,
+        retention_failure_rows,
+        negative_summary,
+    ) = build_discovery_negative_priors(discovery_validation_results or [])
 
     slot_rows: list[dict[str, Any]] = []
     recipes: dict[str, Any] = {}
@@ -852,16 +1115,34 @@ def build_recipe_prior_artifacts(
         reverse=True,
     )
     pair_priors = pair_priors[:max_pair_candidates]
+    any_36m_retained = any(
+        _int_value(row.get("lookback_months")) >= 36
+        and _clean_token(row.get("retention_bucket")) in {"retained", "retained_strong"}
+        for row in discovery_validation_results or []
+    )
+    sampling_policy = (
+        {
+            "guided_prior_fraction": 0.80,
+            "uncertain_prior_fraction": 0.15,
+            "wild_exploration_fraction": 0.05,
+            "maturity": "has_36m_retention",
+            "interpretation": "Weights bias random selection; they do not hard-filter the catalog.",
+        }
+        if any_36m_retained
+        else {
+            "guided_prior_fraction": 0.60,
+            "uncertain_prior_fraction": 0.25,
+            "wild_exploration_fraction": 0.15,
+            "maturity": "pre_36m_retention",
+            "interpretation": "Weights bias random selection; they do not hard-filter the catalog.",
+        }
+    )
 
     seed_plan = {
         "schema_version": "play_hand_seed_plan_v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "sampling_policy": {
-            "guided_prior_fraction": 0.80,
-            "uncertain_prior_fraction": 0.15,
-            "wild_exploration_fraction": 0.05,
-            "interpretation": "Weights bias random selection; they do not hard-filter the catalog.",
-        },
+        "sampling_policy": sampling_policy,
+        "negative_pairs": negative_pair_rows[:300],
         "recipes": {
             recipe_name: {
                 "source": recipe_payload.get("source", "curated_recipe_prior"),
@@ -920,8 +1201,13 @@ def build_recipe_prior_artifacts(
             "discovered_validation_retained_rows": discovered_summary["retained_rows"],
             "discovered_recipe_count": discovered_summary["discovered_recipe_count"],
             "discovered_recipe_pair_rows": discovered_summary["discovered_pair_prior_rows"],
+            "discovered_recipe_template_rows": discovered_summary["recommended_template_rows"],
+            "negative_pair_rows": negative_summary["negative_pair_rows"],
+            "cluster_negative_rows": negative_summary["cluster_negative_rows"],
+            "retention_failure_rows": negative_summary["retention_failure_rows"],
         },
         "discovered_recipe_validation": discovered_summary,
+        "negative_priors": negative_summary,
         "top_slots": {
             recipe_name: {
                 slot_name: recipe_payload["slots"][slot_name][:8]
@@ -941,9 +1227,21 @@ def build_recipe_prior_artifacts(
         "sampling_policy": seed_plan["sampling_policy"],
         "recipes": recipes,
         "pair_priors": pair_priors,
+        "negative_pair_priors": negative_pair_rows,
+        "cluster_expansion_negative_priors": negative_cluster_rows,
+        "retention_failures": retention_failure_rows,
         "summary": summary,
     }
-    return payload, slot_rows, pair_priors, seed_plan, summary
+    return (
+        payload,
+        slot_rows,
+        pair_priors,
+        negative_pair_rows,
+        negative_cluster_rows,
+        retention_failure_rows,
+        seed_plan,
+        summary,
+    )
 
 
 def _slot_fieldnames() -> list[str]:
@@ -1006,6 +1304,50 @@ def _pair_fieldnames() -> list[str]:
         "validation_score",
         "retention_ratio",
         "discovery_evidence_score",
+        "recommended_profile_template_path",
+        "recommended_template_timeframe",
+        "recommended_template_indicator_count",
+    ]
+
+
+def _pair_negative_fieldnames() -> list[str]:
+    return [
+        "source",
+        "recipe",
+        "first_indicator_id",
+        "second_indicator_id",
+        "ordered_pair_id",
+        "unordered_pair_id",
+        "probe_timeframe",
+        "probe_id",
+        "retention_bucket",
+        "validation_score",
+        "retention_ratio",
+        "discovery_evidence_score",
+        "discovery_evidence_probe_id",
+        "signal_count",
+        "best_expectancy_r",
+        "best_trades",
+        "best_profit_factor",
+        "negative_reason",
+        "negative_weight",
+    ]
+
+
+def _cluster_negative_fieldnames() -> list[str]:
+    return [
+        "recipe",
+        "first_cluster_id",
+        "second_cluster_id",
+        "probe_timeframe",
+        "failed_count",
+        "positive_count",
+        "total_count",
+        "failure_rate",
+        "worst_validation_score",
+        "best_validation_score",
+        "example_probe_id",
+        "negative_weight",
     ]
 
 
@@ -1052,6 +1394,7 @@ def build_recipe_priors(
         if discovery_recipe_validation_dir is not None
         else config.derived_root / DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME
     )
+    discovery_scrutiny_dir = config.derived_root / DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME
     target_dir = (
         out_dir.expanduser().resolve()
         if out_dir is not None
@@ -1073,13 +1416,27 @@ def build_recipe_priors(
     discovery_validation_results_path = (
         discovery_validation_dir / "discovery-recipe-validation-results.csv"
     )
+    discovery_scrutiny_results_path = (
+        discovery_scrutiny_dir / "discovery-recipe-validation-results.csv"
+    )
     discovery_validation_results = (
         _read_csv_rows(discovery_validation_results_path)
         if discovery_validation_results_path.exists()
         else []
     )
+    if discovery_scrutiny_results_path.exists():
+        discovery_validation_results.extend(_read_csv_rows(discovery_scrutiny_results_path))
 
-    payload, slot_rows, pair_rows, seed_plan, summary = build_recipe_prior_artifacts(
+    (
+        payload,
+        slot_rows,
+        pair_rows,
+        pair_negative_rows,
+        cluster_negative_rows,
+        retention_failure_rows,
+        seed_plan,
+        summary,
+    ) = build_recipe_prior_artifacts(
         indicator_rows=indicator_rows,
         static_slot_scores=_static_slot_scores(indicator_dir),
         signal_rollups=_signal_rollups(signal_dir),
@@ -1087,6 +1444,10 @@ def build_recipe_priors(
         pair_results=_read_csv_rows(pair_results_path),
         timing_results=_read_csv_rows(timing_results_path),
         discovery_validation_results=discovery_validation_results,
+        discovery_validation_profile_dir=[
+            discovery_validation_dir / "profiles",
+            discovery_scrutiny_dir / "profiles",
+        ],
         max_slot_candidates=max(1, int(max_slot_candidates)),
         max_pair_candidates=max(1, int(max_pair_candidates)),
     )
@@ -1101,24 +1462,38 @@ def build_recipe_priors(
             if discovery_validation_results_path.exists()
             else None
         ),
+        "discovery_recipe_scrutiny_results_path": (
+            str(discovery_scrutiny_results_path)
+            if discovery_scrutiny_results_path.exists()
+            else None
+        ),
     }
     payload["summary"] = summary
 
     priors_path = target_dir / "recipe-priors.json"
     slot_csv_path = target_dir / "slot-indicator-priors.csv"
     pair_csv_path = target_dir / "pair-priors.csv"
+    pair_negative_csv_path = target_dir / "pair-negative-priors.csv"
+    cluster_negative_csv_path = target_dir / "cluster-expansion-negative-priors.csv"
+    retention_failures_csv_path = target_dir / "retention-failures.csv"
     seed_plan_path = target_dir / "play-hand-seed-plan.json"
     summary_path = target_dir / "recipe-priors-summary.json"
 
     _write_json(priors_path, payload)
     _write_csv(slot_csv_path, slot_rows, _slot_fieldnames())
     _write_csv(pair_csv_path, pair_rows, _pair_fieldnames())
+    _write_csv(pair_negative_csv_path, pair_negative_rows, _pair_negative_fieldnames())
+    _write_csv(cluster_negative_csv_path, cluster_negative_rows, _cluster_negative_fieldnames())
+    _write_csv(retention_failures_csv_path, retention_failure_rows, _pair_negative_fieldnames())
     _write_json(seed_plan_path, seed_plan)
     _write_json(summary_path, summary)
     return RecipePriorsBuildResult(
         priors_path=priors_path,
         slot_csv_path=slot_csv_path,
         pair_csv_path=pair_csv_path,
+        pair_negative_csv_path=pair_negative_csv_path,
+        cluster_negative_csv_path=cluster_negative_csv_path,
+        retention_failures_csv_path=retention_failures_csv_path,
         seed_plan_path=seed_plan_path,
         summary_path=summary_path,
         summary=summary,

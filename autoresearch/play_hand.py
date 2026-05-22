@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -76,6 +77,17 @@ PLAY_HAND_FINAL_SCRUTINY_FAILED_REASON = "final_36mo_scrutiny_failed"
 PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS = 2400
 PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS = 7200
 PLAY_HAND_SEED_PLAN_PATH = Path("recipe-priors") / "play-hand-seed-plan.json"
+SEED_TEMPLATE_CONFIG_KEYS = (
+    "timeframe",
+    "lookbackBars",
+    "ranges",
+    "talibConfig",
+    "weight",
+    "isTrendFollowing",
+    "normalizationMode",
+    "useFormingBar",
+    "scale",
+)
 
 
 def _play_hand_eval_cli_timeout_seconds(job_timeout_seconds: int) -> int:
@@ -531,6 +543,22 @@ def _seed_plan_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _seed_plan_negative_pair_keys(seed_plan: dict[str, Any] | None) -> set[tuple[str, str]]:
+    if not isinstance(seed_plan, dict):
+        return set()
+    keys: set[tuple[str, str]] = set()
+    for row in seed_plan.get("negative_pairs") or []:
+        if not isinstance(row, dict):
+            continue
+        if _seed_plan_float(row.get("negative_weight")) <= 0.0:
+            continue
+        first_id = _seed_plan_upper(row.get("first_indicator_id"))
+        second_id = _seed_plan_upper(row.get("second_indicator_id"))
+        if first_id and second_id:
+            keys.add(tuple(sorted((first_id, second_id))))
+    return keys
+
+
 def _weighted_seed_plan_choice(
     items: list[Any],
     *,
@@ -695,11 +723,22 @@ def deal_seed_plan_indicators(
     selected_ids: list[str] = []
     selected_slots: list[dict[str, Any]] = []
     selected_pair: dict[str, Any] | None = None
+    negative_pair_keys = _seed_plan_negative_pair_keys(seed_plan)
 
-    def add_indicator(indicator_id: Any, *, slot: str, evidence: dict[str, Any] | None = None) -> bool:
+    def add_indicator(
+        indicator_id: Any,
+        *,
+        slot: str,
+        evidence: dict[str, Any] | None = None,
+        allow_negative_pair: bool = False,
+    ) -> bool:
         clean_id = _seed_plan_upper(indicator_id)
         if not clean_id or clean_id in selected_ids or clean_id not in by_id:
             return False
+        if not allow_negative_pair:
+            for selected_id in selected_ids:
+                if tuple(sorted((clean_id, selected_id))) in negative_pair_keys:
+                    return False
         selected_ids.append(clean_id)
         selected_slots.append(
             {
@@ -728,8 +767,18 @@ def deal_seed_plan_indicators(
         if isinstance(pair, dict):
             first_id = pair.get("anchor_id")
             second_id = pair.get("trigger_id")
-            added_first = add_indicator(first_id, slot="pair_first", evidence=pair)
-            added_second = add_indicator(second_id, slot="pair_second", evidence=pair)
+            added_first = add_indicator(
+                first_id,
+                slot="pair_first",
+                evidence=pair,
+                allow_negative_pair=True,
+            )
+            added_second = add_indicator(
+                second_id,
+                slot="pair_second",
+                evidence=pair,
+                allow_negative_pair=True,
+            )
             if added_first or added_second:
                 selected_pair = {
                     "probe_id": pair.get("probe_id"),
@@ -739,6 +788,7 @@ def deal_seed_plan_indicators(
                     "pair_sampling_score": pair.get("pair_sampling_score"),
                     "composite_score": pair.get("composite_score"),
                     "retention_bucket": pair.get("retention_bucket"),
+                    "recommended_profile_template": pair.get("recommended_profile_template"),
                     "source": pair.get("source"),
                 }
 
@@ -1344,6 +1394,59 @@ def apply_role_timeframe_defaults(
                 "pool": list(pool),
             }
         )
+    return changes
+
+
+def apply_seed_pair_template_defaults(
+    profile_payload: dict[str, Any],
+    pair_evidence: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    template = _seed_plan_dict(_seed_plan_dict(pair_evidence).get("recommended_profile_template"))
+    defaults = [
+        row
+        for row in template.get("indicator_defaults") or []
+        if isinstance(row, dict) and _seed_plan_upper(row.get("indicator_id"))
+    ]
+    if not defaults:
+        return []
+    by_id = {_seed_plan_upper(row.get("indicator_id")): row for row in defaults}
+    profile = _extract_profile(profile_payload)
+    changes: list[dict[str, Any]] = []
+    for index, item in enumerate(profile.get("indicators") or []):
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        indicator_id = _seed_plan_upper(meta.get("id"))
+        default_row = by_id.get(indicator_id)
+        if not default_row:
+            continue
+        config = item.setdefault("config", {})
+        if not isinstance(config, dict):
+            item["config"] = {}
+            config = item["config"]
+        applied: dict[str, Any] = {}
+        for key in SEED_TEMPLATE_CONFIG_KEYS:
+            if key not in default_row:
+                continue
+            previous = copy.deepcopy(config.get(key))
+            value = copy.deepcopy(default_row.get(key))
+            if previous == value:
+                continue
+            config[key] = value
+            applied[key] = {
+                "previous": previous,
+                "value": value,
+            }
+        if applied:
+            changes.append(
+                {
+                    "indicator_index": index,
+                    "indicator_id": indicator_id,
+                    "template_probe_id": template.get("probe_id"),
+                    "template_timeframe": template.get("timeframe"),
+                    "config": applied,
+                }
+            )
     return changes
 
 
@@ -3728,13 +3831,18 @@ def cmd_play_hand(
     rng = random.Random(seed)
     shuffled = list(hand)
     rng.shuffle(shuffled)
+    seed_plan, seed_plan_path = _load_play_hand_seed_plan(config)
+    effective_min_indicators = min_indicators
+    effective_max_indicators = max_indicators
+    if seed_plan is not None:
+        effective_min_indicators = max(effective_min_indicators, 2)
+        effective_max_indicators = max(effective_max_indicators, effective_min_indicators)
     dealt_count = deal_indicator_count(
         available_count=len(shuffled),
-        min_indicators=min_indicators,
-        max_indicators=max_indicators,
+        min_indicators=effective_min_indicators,
+        max_indicators=effective_max_indicators,
         rng=rng,
     )
-    seed_plan, seed_plan_path = _load_play_hand_seed_plan(config)
     indicator_deal = deal_seed_plan_indicators(
         shuffled,
         target_count=dealt_count,
@@ -3795,8 +3903,10 @@ def cmd_play_hand(
         "dealt_recipe_pair": indicator_deal.get("pair"),
         "dealt_recipe_slots": indicator_deal.get("selected_slots"),
         "dealt_indicator_count": len(dealt),
-        "min_indicators": min_indicators,
-        "max_indicators": max_indicators,
+        "min_indicators": effective_min_indicators,
+        "max_indicators": effective_max_indicators,
+        "requested_min_indicators": min_indicators,
+        "requested_max_indicators": max_indicators,
         "screen_months": screen_months,
         "scrutiny_months": scrutiny_months,
         "coarse_mode": coarse_mode,
@@ -3825,8 +3935,8 @@ def cmd_play_hand(
     write_run_metadata(run_dir, metadata)
     _render_dealt_hand(
         indicators=dealt,
-        min_indicators=min_indicators,
-        max_indicators=max_indicators,
+        min_indicators=effective_min_indicators,
+        max_indicators=effective_max_indicators,
         instrument_deal=instrument_deal,
         timeframe=timeframe,
         sweep_budget_label=sweep_budget_label,
@@ -3863,8 +3973,10 @@ def cmd_play_hand(
         dealt_recipe_pair=indicator_deal.get("pair"),
         dealt_recipe_slots=indicator_deal.get("selected_slots"),
         dealt_indicator_count=len(dealt),
-        min_indicators=min_indicators,
-        max_indicators=max_indicators,
+        min_indicators=effective_min_indicators,
+        max_indicators=effective_max_indicators,
+        requested_min_indicators=min_indicators,
+        requested_max_indicators=max_indicators,
         instrument_source=instrument_deal["source"],
         primary_instrument=instrument_deal["primary_instrument"],
         instrument_pool=instrument_deal["instrument_pool"],
@@ -3879,8 +3991,9 @@ def cmd_play_hand(
     profile_payload = _load_json(profile_path)
     metadata_changes = apply_seed_indicator_metadata(profile_payload, dealt_entries)
     timeframe_changes = apply_role_timeframe_defaults(profile_payload, rng=rng)
+    template_changes = apply_seed_pair_template_defaults(profile_payload, indicator_deal.get("pair"))
     default_changes = apply_play_hand_profile_defaults(profile_payload, rng=rng)
-    if metadata_changes or timeframe_changes or default_changes:
+    if metadata_changes or timeframe_changes or template_changes or default_changes:
         _write_json(profile_path, profile_payload)
     if metadata_changes:
         _append_event(
@@ -3902,6 +4015,23 @@ def cmd_play_hand(
         )
         metadata["indicator_timeframes"] = _profile_timeframes(profile_payload)
         metadata["timeframe_assignment"] = timeframe_changes
+        metadata["effective_timeframe"] = _lowest_profile_timeframe(
+            profile_payload,
+            timeframe,
+        )
+        metadata["timeframe"] = metadata["effective_timeframe"]
+        write_run_metadata(run_dir, metadata)
+    if template_changes:
+        _append_event(
+            ctx,
+            "scaffold",
+            "validated_template_applied",
+            stage=stages["scaffold"],
+            profile_path=str(profile_path),
+            changes=template_changes,
+        )
+        metadata["validated_template_defaults"] = template_changes
+        metadata["indicator_timeframes"] = _profile_timeframes(profile_payload)
         metadata["effective_timeframe"] = _lowest_profile_timeframe(
             profile_payload,
             timeframe,
@@ -4258,8 +4388,10 @@ def cmd_play_hand(
         "runner": "play_hand_v1",
         "dealt_indicator_ids": dealt,
         "dealt_indicator_count": len(dealt),
-        "min_indicators": min_indicators,
-        "max_indicators": max_indicators,
+        "min_indicators": effective_min_indicators,
+        "max_indicators": effective_max_indicators,
+        "requested_min_indicators": min_indicators,
+        "requested_max_indicators": max_indicators,
         "instrument_source": instrument_deal["source"],
         "primary_instrument": instrument_deal["primary_instrument"],
         "instrument_pool": instrument_deal["instrument_pool"],

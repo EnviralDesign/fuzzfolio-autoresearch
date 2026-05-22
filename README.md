@@ -148,7 +148,7 @@ Then build the empirical recipe-prior layer:
 uv run build-recipe-priors
 ```
 
-This consumes the static catalog atlas, signal atlas, forward-response atlas, Layer 3 pair results, Layer 3b timing results, and any retained discovered recipe validation rows. It writes weighted recipe-slot menus and a Play Hand seed plan under `runs/derived/recipe-priors/`. These weights bias future random selection; they do not remove lower-prior or wild-card indicators from exploration.
+This consumes the static catalog atlas, signal atlas, forward-response atlas, Layer 3 pair results, Layer 3b timing results, and any retained discovered recipe validation rows. It writes weighted recipe-slot menus, negative-pair evidence, validated two-indicator template defaults, and a Play Hand seed plan under `runs/derived/recipe-priors/`. These weights bias future random selection; they do not remove lower-prior or wild-card indicators from exploration. Until a discovered family has 36-month retention evidence, the seed plan uses a conservative `60/25/15` guided/uncertain/wild split instead of the mature `80/15/5` split.
 
 For a broader backend-heavy discovery pass, build the ordered-pair queue:
 
@@ -179,9 +179,10 @@ Then validate the strongest discovered templates over a longer window:
 ```powershell
 uv run build-discovery-recipe-validation-atlas
 uv run run-discovery-recipe-validation-probes --workers 32
+uv run build-discovery-recipe-scrutiny-atlas
 ```
 
-The builder expands high/promising discovered recipe templates into a capped concrete queue, defaulting to `12`-month sensitivity probes under `runs/derived/discovery-recipe-validation-atlas/`. This is the retention gate before feeding discovered recipes back into Play Hand. Re-run `uv run build-recipe-priors` after validation finishes; Play Hand reads the seed plan automatically. After that, `build-discovery-pair-atlas --full` is the natural longer nighttime expansion if we want a broader first-generation cluster corpus.
+The validation builder expands high/promising discovered recipe templates into a capped concrete queue, defaulting to `12`-month sensitivity probes under `runs/derived/discovery-recipe-validation-atlas/`. The scrutiny builder then turns retained 12-month rows into a smaller `36`-month queue under `runs/derived/discovery-recipe-scrutiny-atlas/`; run it later with `uv run run-discovery-recipe-validation-probes --atlas-dir runs/derived/discovery-recipe-scrutiny-atlas --workers 32`. Re-run `uv run build-recipe-priors` after validation or scrutiny finishes; Play Hand reads the seed plan automatically, carries validated pair defaults into scaffolded profiles, and forces guided seed-plan deals to contain at least two indicators.
 
 From there you can build the portfolio either way:
 

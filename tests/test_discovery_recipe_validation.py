@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from autoresearch.discovery_recipe_validation import (
     _retention_bucket,
+    build_retained_scrutiny_queue_rows,
     build_validation_queue_rows,
 )
 
@@ -89,3 +90,43 @@ def test_retention_bucket_classifies_validation_survival() -> None:
         64,
         has_discovery_evidence=False,
     ) == "new_positive_cluster_expansion"
+
+
+def test_build_retained_scrutiny_queue_rows_promotes_only_retained_rows() -> None:
+    rows = build_retained_scrutiny_queue_rows(
+        [
+            {
+                "status": "ok",
+                "probe_id": "drv-kept",
+                "recipe_id": "discovered_recipe_001",
+                "recipe_confidence": "high_candidate",
+                "first_cluster_id": "cluster_a",
+                "second_cluster_id": "cluster_b",
+                "first_indicator_id": "ANCHOR_A",
+                "second_indicator_id": "TRIGGER_X",
+                "probe_timeframe": "M5",
+                "primary_score": "72",
+                "validation_priority_score": "80",
+                "discovery_evidence_score": "74",
+                "retention_ratio": "0.97",
+                "retention_bucket": "retained_strong",
+            },
+            {
+                "status": "ok",
+                "probe_id": "drv-failed",
+                "recipe_id": "discovered_recipe_001",
+                "first_indicator_id": "ANCHOR_B",
+                "second_indicator_id": "TRIGGER_Y",
+                "probe_timeframe": "M5",
+                "primary_score": "0",
+                "retention_bucket": "failed_retention",
+            },
+        ],
+        instruments=["EURUSD"],
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["source_validation_probe_id"] == "drv-kept"
+    assert rows[0]["source_retention_bucket"] == "retained_strong"
+    assert str(rows[0]["probe_id"]).startswith("drs-0001-")
+    assert rows[0]["known_pair_status"] == "retained_discovered_recipe_36m_candidate"

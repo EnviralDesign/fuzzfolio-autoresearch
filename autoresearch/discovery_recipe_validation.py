@@ -21,6 +21,7 @@ from .anchor_pair_atlas import (
     _int_value,
     _load_json,
     _normalize_tokens,
+    _read_csv_rows,
     _replace_profile_id_arg,
     _result_row_from_score,
     _sensitivity_args_for_row,
@@ -46,11 +47,14 @@ from .signal_atlas import DEFAULT_INSTRUMENTS
 SCHEMA_VERSION = "discovery_recipe_validation_atlas_v1"
 RESULTS_SCHEMA_VERSION = "discovery_recipe_validation_results_v1"
 DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME = "discovery-recipe-validation-atlas"
+DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME = "discovery-recipe-scrutiny-atlas"
 DEFAULT_INCLUDED_CONFIDENCE = (
     "high_candidate",
     "promising_candidate",
 )
 DEFAULT_LOOKBACK_MONTHS = 12
+DEFAULT_SCRUTINY_LOOKBACK_MONTHS = 36
+DEFAULT_SCRUTINY_BUCKETS = ("retained_strong", "retained")
 DEFAULT_MAX_RECIPES = 8
 DEFAULT_MAX_PAIRS_PER_RECIPE = 8
 DEFAULT_FIRST_MEMBER_LIMIT = 6
@@ -324,6 +328,102 @@ def build_validation_queue_rows(
     return deduped
 
 
+def build_retained_scrutiny_queue_rows(
+    validation_result_rows: list[dict[str, Any]],
+    *,
+    included_buckets: list[str] | tuple[str, ...] = DEFAULT_SCRUTINY_BUCKETS,
+    max_rows: int | None = None,
+    timeframes: list[str] | None = None,
+    instruments: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    bucket_set = {_clean_token(value) for value in included_buckets if _clean_token(value)}
+    timeframe_set = set(_normalize_tokens(timeframes))
+    instrument_panel = _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS)
+    candidates: list[dict[str, Any]] = []
+    for source_row in validation_result_rows:
+        status = _clean_token(source_row.get("status"))
+        bucket = _clean_token(source_row.get("retention_bucket"))
+        validation_score = _float_value(
+            source_row.get("primary_score"),
+            _float_value(source_row.get("composite_score")),
+        )
+        timeframe = _clean_upper(source_row.get("probe_timeframe"))
+        if status not in {"", "ok", "skipped_existing"}:
+            continue
+        if bucket not in bucket_set:
+            continue
+        if validation_score <= 0.0:
+            continue
+        if timeframe_set and timeframe not in timeframe_set:
+            continue
+        priority_score = round(
+            (validation_score * 0.72)
+            + (_float_value(source_row.get("discovery_evidence_score")) * 0.16)
+            + (_float_value(source_row.get("validation_priority_score")) * 0.06),
+            4,
+        )
+        first_id = _clean_upper(source_row.get("first_indicator_id"))
+        second_id = _clean_upper(source_row.get("second_indicator_id"))
+        recipe_id = _clean_token(source_row.get("recipe_id"))
+        if not first_id or not second_id or not recipe_id:
+            continue
+        candidates.append(
+            {
+                "recipe_id": recipe_id,
+                "recipe_confidence": source_row.get("recipe_confidence"),
+                "recipe_name": source_row.get("recipe_id"),
+                "recipe_compatibility_score": source_row.get("validation_priority_score"),
+                "recipe_best_score": validation_score,
+                "recipe_positive_pair_count": 1,
+                "recipe_strong_pair_count": 1 if validation_score >= 70.0 else 0,
+                "first_cluster_id": source_row.get("first_cluster_id"),
+                "first_cluster_label": source_row.get("first_cluster_id"),
+                "second_cluster_id": source_row.get("second_cluster_id"),
+                "second_cluster_label": source_row.get("second_cluster_id"),
+                "first_indicator_id": first_id,
+                "second_indicator_id": second_id,
+                "anchor_id": first_id,
+                "trigger_id": second_id,
+                "anchor_type": "discovered_recipe_scrutiny",
+                "probe_timeframe": timeframe,
+                "instruments": ",".join(instrument_panel),
+                "validation_priority_score": priority_score,
+                "discovery_evidence_score": source_row.get("discovery_evidence_score"),
+                "discovery_evidence_probe_id": source_row.get("discovery_evidence_probe_id"),
+                "discovery_lane": source_row.get("discovery_lane"),
+                "pair_prior_score": priority_score,
+                "pair_prior_bucket": "recipe_scrutiny",
+                "local_discovery_score": priority_score,
+                "local_score_bucket": "scrutiny",
+                "known_pair_status": "retained_discovered_recipe_36m_candidate",
+                "source_validation_probe_id": source_row.get("probe_id"),
+                "source_retention_bucket": bucket,
+                "source_validation_score": validation_score,
+                "source_retention_ratio": source_row.get("retention_ratio"),
+            }
+        )
+    candidates.sort(
+        key=lambda row: (
+            -_float_value(row.get("validation_priority_score")),
+            str(row.get("recipe_id") or ""),
+            str(row.get("first_indicator_id") or ""),
+            str(row.get("second_indicator_id") or ""),
+        )
+    )
+    if max_rows is not None:
+        candidates = candidates[: max(0, int(max_rows))]
+    for index, row in enumerate(candidates, start=1):
+        row["queue_rank"] = index
+        row["probe_id"] = (
+            f"drs-{index:04d}-"
+            f"{_recipe_slug(row.get('recipe_id'))}-"
+            f"{_safe_slug(row.get('first_indicator_id'))}-"
+            f"{_safe_slug(row.get('second_indicator_id'))}-"
+            f"{_safe_slug(row.get('probe_timeframe'), max_length=4)}"
+        )
+    return candidates
+
+
 def _queue_fieldnames() -> list[str]:
     return [
         "queue_rank",
@@ -356,6 +456,10 @@ def _queue_fieldnames() -> list[str]:
         "local_discovery_score",
         "local_score_bucket",
         "known_pair_status",
+        "source_validation_probe_id",
+        "source_retention_bucket",
+        "source_validation_score",
+        "source_retention_ratio",
         "profile_path",
         "result_dir",
     ]
@@ -390,6 +494,10 @@ def _result_fieldnames() -> list[str]:
         "best_trades",
         "best_win_rate",
         "best_profit_factor",
+        "source_validation_probe_id",
+        "source_retention_bucket",
+        "source_validation_score",
+        "source_retention_ratio",
         "error",
     ]
 
@@ -615,6 +723,222 @@ def build_discovery_recipe_validation_atlas(
     )
 
 
+def build_discovery_recipe_scrutiny_atlas(
+    config: AppConfig,
+    *,
+    validation_atlas_dir: Path | None = None,
+    out_dir: Path | None = None,
+    workspace_root: Path | None = None,
+    catalog_path: Path | None = None,
+    refresh_static_atlas: bool = False,
+    included_buckets: list[str] | None = None,
+    instruments: list[str] | None = None,
+    timeframes: list[str] | None = None,
+    max_rows: int | None = None,
+    lookback_months: int = DEFAULT_SCRUTINY_LOOKBACK_MONTHS,
+    job_timeout_seconds: int | None = DEFAULT_JOB_TIMEOUT_SECONDS,
+    emit_profile_docs: bool = True,
+    quality_score_preset: str = DEFAULT_QUALITY_SCORE_PRESET,
+    execution_cost_mode: str = DEFAULT_EXECUTION_COST_MODE,
+) -> DiscoveryRecipeValidationAtlasBuildResult:
+    source_dir = (
+        validation_atlas_dir.expanduser().resolve()
+        if validation_atlas_dir is not None
+        else config.derived_root / DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME
+    )
+    target_dir = (
+        out_dir.expanduser().resolve()
+        if out_dir is not None
+        else config.derived_root / DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME
+    )
+    results_path = source_dir / "discovery-recipe-validation-results.csv"
+    if not results_path.exists():
+        raise FileNotFoundError(
+            f"Missing discovery recipe validation results at {results_path}. "
+            "Run `uv run run-discovery-recipe-validation-probes` first."
+        )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    profile_dir = target_dir / "profiles"
+    result_root = target_dir / "probe-results"
+    if emit_profile_docs:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+    result_root.mkdir(parents=True, exist_ok=True)
+
+    source_rows = [dict(row) for row in _read_csv_rows(results_path)]
+    included = included_buckets or list(DEFAULT_SCRUTINY_BUCKETS)
+    queue_rows = build_retained_scrutiny_queue_rows(
+        source_rows,
+        included_buckets=included,
+        max_rows=max_rows,
+        timeframes=timeframes,
+        instruments=instruments,
+    )
+    lookback_months = max(1, int(lookback_months or DEFAULT_SCRUTINY_LOOKBACK_MONTHS))
+    catalog_payload, resolved_workspace_root, resolved_catalog_path = load_indicator_catalog(
+        config=config,
+        workspace_root=workspace_root,
+        catalog_path=catalog_path,
+    )
+    if refresh_static_atlas:
+        build_indicator_atlas(
+            config,
+            workspace_root=workspace_root,
+            catalog_path=catalog_path,
+            out_dir=config.derived_root / "indicator-atlas",
+        )
+    catalog_by_id = _catalog_by_id(catalog_payload)
+
+    probes: list[dict[str, Any]] = []
+    exe, base_args = _fuzzfolio_base_args(config)
+    filtered_rows: list[dict[str, Any]] = []
+    for row in queue_rows:
+        first_id = _clean_upper(row.get("first_indicator_id"))
+        second_id = _clean_upper(row.get("second_indicator_id"))
+        if first_id not in catalog_by_id or second_id not in catalog_by_id:
+            continue
+        probe_id = _clean_token(row.get("probe_id"))
+        probe_timeframe = _clean_upper(row.get("probe_timeframe"))
+        anchor_timeframe = _anchor_timeframe(
+            catalog_by_id[first_id],
+            probe_timeframe=probe_timeframe,
+        )
+        profile_path = profile_dir / f"{probe_id}.json"
+        result_dir = result_root / probe_id
+        row["anchor_timeframe"] = anchor_timeframe
+        row["profile_path"] = str(profile_path)
+        row["result_dir"] = str(result_dir)
+        if emit_profile_docs:
+            profile_doc = build_pair_profile_document(
+                catalog_by_id=catalog_by_id,
+                anchor_id=first_id,
+                trigger_id=second_id,
+                anchor_type="discovered_recipe_scrutiny",
+                probe_timeframe=probe_timeframe,
+                anchor_timeframe=anchor_timeframe,
+                instruments=_split_csv_tokens(row.get("instruments")),
+                probe_id=probe_id,
+            )
+            profile = _as_dict(profile_doc.get("profile"))
+            profile["name"] = (
+                f"Discovery Recipe 36m Scrutiny {row.get('recipe_id')} "
+                f"{first_id}+{second_id} {probe_timeframe}"
+            )
+            profile["description"] = (
+                "Temporary AutoResearch 36-month scrutiny profile for a retained "
+                "empirically discovered recipe pair. This is the high-prior gate "
+                "after 12-month retention."
+            )
+            _write_json(profile_path, profile_doc)
+        sensitivity_args = _sensitivity_args_for_row(
+            row,
+            lookback_months=lookback_months,
+            quality_score_preset=quality_score_preset,
+            execution_cost_mode=execution_cost_mode,
+            result_dir=result_dir,
+        )
+        sensitivity_args = _with_job_timeout_args(sensitivity_args, job_timeout_seconds)
+        filtered_rows.append(row)
+        probes.append(
+            {
+                "probe_id": probe_id,
+                "queue_rank": row.get("queue_rank"),
+                "recipe_id": row.get("recipe_id"),
+                "recipe_confidence": row.get("recipe_confidence"),
+                "first_indicator_id": first_id,
+                "second_indicator_id": second_id,
+                "probe_timeframe": probe_timeframe,
+                "lookback_months": lookback_months,
+                "anchor_timeframe": anchor_timeframe,
+                "profile_path": str(profile_path),
+                "output_dir": str(result_dir),
+                "create_profile_args": ["profiles", "create", "--file", str(profile_path), "--pretty"],
+                "sensitivity_basket_args": sensitivity_args,
+                "validation_priority_score": row.get("validation_priority_score"),
+                "source_validation_probe_id": row.get("source_validation_probe_id"),
+                "source_retention_bucket": row.get("source_retention_bucket"),
+            }
+        )
+
+    bucket_counts: dict[str, int] = {}
+    for row in filtered_rows:
+        key = _clean_token(row.get("source_retention_bucket")) or "unknown"
+        bucket_counts[key] = bucket_counts.get(key, 0) + 1
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": {
+            "validation_atlas_dir": str(source_dir),
+            "validation_results_path": str(results_path),
+            "workspace_root": str(resolved_workspace_root) if resolved_workspace_root else None,
+            "catalog_path": str(resolved_catalog_path),
+        },
+        "selection": {
+            "included_buckets": included,
+            "instruments": _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS),
+            "timeframes": _normalize_tokens(timeframes),
+            "max_rows": max_rows,
+            "lookback_months": lookback_months,
+            "job_timeout_seconds": job_timeout_seconds,
+            "quality_score_preset": quality_score_preset,
+            "execution_cost_mode": execution_cost_mode,
+        },
+        "result_counts": {
+            "source_validation_rows": len(source_rows),
+            "queue_rows": len(filtered_rows),
+            "profile_docs": len(probes) if emit_profile_docs else 0,
+            "source_retention_bucket_counts": dict(sorted(bucket_counts.items())),
+        },
+        "top_queue": filtered_rows[:15],
+    }
+    atlas_payload = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": summary["generated_at"],
+        "summary": summary,
+        "queue_rows": filtered_rows,
+        "run_manifest": {
+            "fuzzfolio_exe": exe,
+            "fuzzfolio_base_args": base_args,
+            "probes": probes,
+        },
+    }
+
+    atlas_path = target_dir / "discovery-recipe-validation-atlas.json"
+    queue_csv_path = target_dir / "discovery-recipe-validation-queue.csv"
+    manifest_path = target_dir / "discovery-recipe-validation-run-manifest.json"
+    run_script_path = target_dir / "run-discovery-recipe-scrutiny-probes.ps1"
+    summary_path = target_dir / "discovery-recipe-scrutiny-summary.json"
+    _write_json(atlas_path, atlas_payload)
+    _write_csv(queue_csv_path, filtered_rows, _queue_fieldnames())
+    _write_json(
+        manifest_path,
+        {
+            "schema_version": "discovery_recipe_scrutiny_run_manifest_v1",
+            "generated_at": summary["generated_at"],
+            "fuzzfolio_exe": exe,
+            "fuzzfolio_base_args": base_args,
+            "probes": probes,
+        },
+    )
+    _write_run_script(
+        run_script_path,
+        exe=exe,
+        base_args=base_args,
+        probes=probes,
+        generated_by="uv run build-discovery-recipe-scrutiny-atlas",
+        description="Runs queued 36-month retained discovered recipe scrutiny sensitivity-basket probes.",
+    )
+    _write_json(summary_path, summary)
+    return DiscoveryRecipeValidationAtlasBuildResult(
+        atlas_path=atlas_path,
+        queue_csv_path=queue_csv_path,
+        manifest_path=manifest_path,
+        run_script_path=run_script_path,
+        profile_dir=profile_dir,
+        summary_path=summary_path,
+        summary=summary,
+    )
+
+
 def _retention_bucket(
     ratio: float | None,
     validation_score: float,
@@ -698,6 +1022,10 @@ def _result_row_from_validation_score(
         "best_trades": anchor_result.get("best_trades"),
         "best_win_rate": anchor_result.get("best_win_rate"),
         "best_profit_factor": anchor_result.get("best_profit_factor"),
+        "source_validation_probe_id": row.get("source_validation_probe_id"),
+        "source_retention_bucket": row.get("source_retention_bucket"),
+        "source_validation_score": row.get("source_validation_score"),
+        "source_retention_ratio": row.get("source_retention_ratio"),
         "error": error,
     }
 

@@ -31,6 +31,7 @@ from autoresearch.play_hand import (
     _sweep_progress_from_state,
     _top_sweep_score,
     apply_play_hand_profile_defaults,
+    apply_seed_pair_template_defaults,
     build_coarse_axes,
     build_focused_axes,
     build_lookback_axes,
@@ -113,6 +114,48 @@ def test_deal_seed_plan_indicators_uses_validated_discovered_pair() -> None:
     assert deal["recipe"] == "discovered_recipe_001"
     assert [indicator.id for indicator in deal["indicators"][:2]] == ["FIRST_A", "SECOND_A"]
     assert deal["pair"]["retention_bucket"] == "retained_strong"
+
+
+def test_apply_seed_pair_template_defaults_preserves_validated_pair_config() -> None:
+    profile_payload = {
+        "profile": {
+            "indicators": [
+                {
+                    "meta": {"id": "FIRST_A"},
+                    "config": {"timeframe": "M30", "lookbackBars": 3, "weight": 0.5},
+                },
+                {
+                    "meta": {"id": "SECOND_A"},
+                    "config": {"timeframe": "H1", "lookbackBars": 2},
+                },
+            ]
+        }
+    }
+    pair = {
+        "recommended_profile_template": {
+            "probe_id": "drv-test",
+            "timeframe": "M5",
+            "indicator_defaults": [
+                {
+                    "indicator_id": "FIRST_A",
+                    "timeframe": "M5",
+                    "lookbackBars": 1,
+                    "weight": 1.0,
+                    "ranges": {"buy": [0, 1], "sell": [0, 1]},
+                    "talibConfig": [{"name": "timeperiod", "value": 14}],
+                }
+            ],
+        }
+    }
+
+    changes = apply_seed_pair_template_defaults(profile_payload, pair)
+
+    config = profile_payload["profile"]["indicators"][0]["config"]
+    assert changes[0]["template_probe_id"] == "drv-test"
+    assert config["timeframe"] == "M5"
+    assert config["lookbackBars"] == 1
+    assert config["ranges"]["buy"] == [0, 1]
+    assert profile_payload["profile"]["indicators"][1]["config"]["timeframe"] == "H1"
 
 
 def test_cmd_play_hand_authenticates_before_seed_prompt(monkeypatch, tmp_path: Path) -> None:

@@ -122,6 +122,7 @@ if __package__ in {None, ""}:
         build_discovery_cluster_atlas,
     )
     from autoresearch.discovery_recipe_validation import (
+        DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME,
         DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME,
         DEFAULT_FIRST_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_FIRST_MEMBER_LIMIT,
         DEFAULT_INCLUDED_CONFIDENCE as DISCOVERY_VALIDATION_DEFAULT_INCLUDED_CONFIDENCE,
@@ -131,6 +132,9 @@ if __package__ in {None, ""}:
         DEFAULT_MAX_RECIPES as DISCOVERY_VALIDATION_DEFAULT_MAX_RECIPES,
         DEFAULT_PROBE_TIMEOUT_SECONDS as DISCOVERY_VALIDATION_DEFAULT_PROBE_TIMEOUT_SECONDS,
         DEFAULT_SECOND_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT,
+        DEFAULT_SCRUTINY_BUCKETS as DISCOVERY_SCRUTINY_DEFAULT_BUCKETS,
+        DEFAULT_SCRUTINY_LOOKBACK_MONTHS as DISCOVERY_SCRUTINY_DEFAULT_LOOKBACK_MONTHS,
+        build_discovery_recipe_scrutiny_atlas,
         build_discovery_recipe_validation_atlas,
         run_discovery_recipe_validation_probes,
     )
@@ -295,6 +299,7 @@ else:
         build_discovery_cluster_atlas,
     )
     from .discovery_recipe_validation import (
+        DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME,
         DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME,
         DEFAULT_FIRST_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_FIRST_MEMBER_LIMIT,
         DEFAULT_INCLUDED_CONFIDENCE as DISCOVERY_VALIDATION_DEFAULT_INCLUDED_CONFIDENCE,
@@ -304,6 +309,9 @@ else:
         DEFAULT_MAX_RECIPES as DISCOVERY_VALIDATION_DEFAULT_MAX_RECIPES,
         DEFAULT_PROBE_TIMEOUT_SECONDS as DISCOVERY_VALIDATION_DEFAULT_PROBE_TIMEOUT_SECONDS,
         DEFAULT_SECOND_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT,
+        DEFAULT_SCRUTINY_BUCKETS as DISCOVERY_SCRUTINY_DEFAULT_BUCKETS,
+        DEFAULT_SCRUTINY_LOOKBACK_MONTHS as DISCOVERY_SCRUTINY_DEFAULT_LOOKBACK_MONTHS,
+        build_discovery_recipe_scrutiny_atlas,
         build_discovery_recipe_validation_atlas,
         run_discovery_recipe_validation_probes,
     )
@@ -470,6 +478,7 @@ PUBLIC_CLI_COMMANDS = {
     "run-discovery-pair-probes",
     "build-discovery-cluster-atlas",
     "build-discovery-recipe-validation-atlas",
+    "build-discovery-recipe-scrutiny-atlas",
     "run-discovery-recipe-validation-probes",
     "run",
     "finalize-corpus",
@@ -1621,6 +1630,99 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Skip writing runnable validation profile JSON documents.",
     )
     discovery_recipe_validation.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    discovery_recipe_scrutiny = subparsers.add_parser(
+        "build-discovery-recipe-scrutiny-atlas",
+        help="Build a 36-month scrutiny queue from retained discovered recipe validation rows.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--validation-atlas-dir",
+        type=Path,
+        default=None,
+        help=f"Input 12-month validation atlas directory. Default: runs/derived/{DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME}.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=f"Output directory. Default: runs/derived/{DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME}.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard workspace root. Uses the same defaults as build-indicator-atlas.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--catalog-path",
+        type=Path,
+        default=None,
+        help="Direct path to shared/constants/indicators.json. Overrides --workspace-root.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--refresh-static-atlas",
+        action="store_true",
+        help="Rebuild runs/derived/indicator-atlas before constructing scrutiny profiles.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--bucket",
+        action="append",
+        default=None,
+        help=(
+            "12-month retention bucket to promote to 36-month scrutiny. Can be repeated. "
+            f"Default: {', '.join(DISCOVERY_SCRUTINY_DEFAULT_BUCKETS)}."
+        ),
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--instrument",
+        action="append",
+        default=None,
+        help="Instrument panel member. Can be repeated. Default: EURUSD, GBPUSD, USDJPY, XAUUSD.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--timeframe",
+        action="append",
+        default=None,
+        help="Restrict retained rows by timeframe. Can be repeated. Default: all retained timeframes.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Maximum retained validation rows to queue. Default: all retained rows.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--lookback-months",
+        type=int,
+        default=DISCOVERY_SCRUTINY_DEFAULT_LOOKBACK_MONTHS,
+        help=f"Sensitivity-basket scrutiny lookback months. Default: {DISCOVERY_SCRUTINY_DEFAULT_LOOKBACK_MONTHS}.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--job-timeout-seconds",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_JOB_TIMEOUT_SECONDS,
+        help=f"Deep replay job wait timeout embedded in the run manifest. Default: {DISCOVERY_VALIDATION_DEFAULT_JOB_TIMEOUT_SECONDS}.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--quality-score-preset",
+        default=ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET,
+        help=f"Sensitivity-basket quality preset embedded in the run manifest. Default: {ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET}.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--execution-cost-mode",
+        default=ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE,
+        help=f"Sensitivity-basket execution-cost mode embedded in the run manifest. Default: {ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE}.",
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--no-profile-docs",
+        action="store_true",
+        help="Skip writing runnable scrutiny profile JSON documents.",
+    )
+    discovery_recipe_scrutiny.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON summary.",
@@ -12848,6 +12950,106 @@ def cmd_build_discovery_recipe_validation_atlas(
     return 0
 
 
+def cmd_build_discovery_recipe_scrutiny_atlas(
+    *,
+    validation_atlas_dir: Path | None,
+    out_dir: Path | None,
+    workspace_root: Path | None,
+    catalog_path: Path | None,
+    refresh_static_atlas: bool,
+    included_buckets: list[str] | None,
+    instruments: list[str] | None,
+    timeframes: list[str] | None,
+    max_rows: int | None,
+    lookback_months: int,
+    job_timeout_seconds: int | None,
+    quality_score_preset: str,
+    execution_cost_mode: str,
+    emit_profile_docs: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    result = build_discovery_recipe_scrutiny_atlas(
+        config,
+        validation_atlas_dir=validation_atlas_dir,
+        out_dir=out_dir,
+        workspace_root=workspace_root,
+        catalog_path=catalog_path,
+        refresh_static_atlas=refresh_static_atlas,
+        included_buckets=included_buckets,
+        instruments=instruments,
+        timeframes=timeframes,
+        max_rows=max_rows,
+        lookback_months=lookback_months,
+        job_timeout_seconds=job_timeout_seconds,
+        quality_score_preset=quality_score_preset,
+        execution_cost_mode=execution_cost_mode,
+        emit_profile_docs=emit_profile_docs,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    counts = summary.get("result_counts", {})
+    selection = summary.get("selection", {})
+    table = Table(title="Discovery Recipe 36m Scrutiny Atlas", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Source validation rows", str(counts.get("source_validation_rows", 0)))
+    table.add_row("Queue rows", str(counts.get("queue_rows", 0)))
+    table.add_row("Profile docs", str(counts.get("profile_docs", 0)))
+    table.add_row("Lookback months", str(selection.get("lookback_months", 0)))
+    table.add_row(
+        "Source buckets",
+        json.dumps(counts.get("source_retention_bucket_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+
+    top_queue = summary.get("top_queue", [])
+    if top_queue:
+        queue_table = Table(title="Top 36m Scrutiny Queue", box=box.SIMPLE)
+        queue_table.add_column("Probe")
+        queue_table.add_column("Recipe")
+        queue_table.add_column("Bucket")
+        queue_table.add_column("First")
+        queue_table.add_column("Second")
+        queue_table.add_column("TF")
+        queue_table.add_column("Priority", justify="right")
+        queue_table.add_column("12m", justify="right")
+        for row in top_queue[:10]:
+            queue_table.add_row(
+                str(row.get("probe_id") or ""),
+                str(row.get("recipe_id") or ""),
+                str(row.get("source_retention_bucket") or ""),
+                str(row.get("first_indicator_id") or ""),
+                str(row.get("second_indicator_id") or ""),
+                str(row.get("probe_timeframe") or ""),
+                str(row.get("validation_priority_score") or ""),
+                str(row.get("source_validation_score") or ""),
+            )
+        console.print(queue_table)
+
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Scrutiny atlas JSON: {result.atlas_path}",
+                    f"Queue CSV: {result.queue_csv_path}",
+                    f"Run manifest: {result.manifest_path}",
+                    f"Run script: {result.run_script_path}",
+                    f"Profiles: {result.profile_dir}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Discovery Recipe Scrutiny Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
 def cmd_run_discovery_recipe_validation_probes(
     *,
     atlas_dir: Path | None,
@@ -13162,6 +13364,24 @@ def main(argv: list[str] | None = None) -> int:
             max_pairs_per_recipe=args.max_pairs_per_recipe,
             first_member_limit=args.first_member_limit,
             second_member_limit=args.second_member_limit,
+            lookback_months=args.lookback_months,
+            job_timeout_seconds=args.job_timeout_seconds,
+            quality_score_preset=args.quality_score_preset,
+            execution_cost_mode=args.execution_cost_mode,
+            emit_profile_docs=not bool(args.no_profile_docs),
+            as_json=bool(args.json),
+        )
+    if args.command == "build-discovery-recipe-scrutiny-atlas":
+        return cmd_build_discovery_recipe_scrutiny_atlas(
+            validation_atlas_dir=args.validation_atlas_dir,
+            out_dir=args.out_dir,
+            workspace_root=args.workspace_root,
+            catalog_path=args.catalog_path,
+            refresh_static_atlas=bool(args.refresh_static_atlas),
+            included_buckets=args.bucket,
+            instruments=args.instrument,
+            timeframes=args.timeframe,
+            max_rows=args.max_rows,
             lookback_months=args.lookback_months,
             job_timeout_seconds=args.job_timeout_seconds,
             quality_score_preset=args.quality_score_preset,

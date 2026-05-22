@@ -109,7 +109,16 @@ def test_build_recipe_prior_artifacts_emits_play_hand_seed_plan() -> None:
         _indicator("FILTER_A", signal_role="filter", strategy_role="filter"),
     ]
 
-    payload, slot_rows, pair_rows, seed_plan, summary = build_recipe_prior_artifacts(
+    (
+        payload,
+        slot_rows,
+        pair_rows,
+        _negative_pairs,
+        _negative_clusters,
+        _retention_failures,
+        seed_plan,
+        summary,
+    ) = build_recipe_prior_artifacts(
         indicator_rows=indicators,
         static_slot_scores={},
         signal_rollups={"TRIGGER_A": {"density_bucket": "usable"}},
@@ -154,7 +163,16 @@ def test_build_recipe_prior_artifacts_adds_validated_discovered_recipes() -> Non
         _indicator("SECOND_A", signal_role="trigger", strategy_role="mean-reversion"),
     ]
 
-    _payload, slot_rows, pair_rows, seed_plan, summary = build_recipe_prior_artifacts(
+    (
+        _payload,
+        slot_rows,
+        pair_rows,
+        negative_pairs,
+        _negative_clusters,
+        retention_failures,
+        seed_plan,
+        summary,
+    ) = build_recipe_prior_artifacts(
         indicator_rows=indicators,
         static_slot_scores={},
         signal_rollups={},
@@ -189,4 +207,58 @@ def test_build_recipe_prior_artifacts_adds_validated_discovered_recipes() -> Non
     assert recipe["slot_menus"]["trigger_or_response_cluster"][0]["indicator_id"] == "SECOND_A"
     assert any(row["source"] == "discovery_recipe_validation" for row in slot_rows)
     assert any(row["source"] == "discovery_recipe_validation" for row in pair_rows)
+    assert negative_pairs == []
+    assert retention_failures == []
     assert summary["result_counts"]["discovered_recipe_count"] == 1
+
+
+def test_build_recipe_prior_artifacts_emits_negative_priors_for_retention_failures() -> None:
+    indicators = [
+        _indicator("FIRST_A", signal_role="setup", strategy_role="trend"),
+        _indicator("SECOND_A", signal_role="trigger", strategy_role="mean-reversion"),
+    ]
+
+    (
+        _payload,
+        _slot_rows,
+        _pair_rows,
+        negative_pairs,
+        negative_clusters,
+        retention_failures,
+        seed_plan,
+        summary,
+    ) = build_recipe_prior_artifacts(
+        indicator_rows=indicators,
+        static_slot_scores={},
+        signal_rollups={},
+        forward_priors={},
+        pair_results=[],
+        timing_results=[],
+        discovery_validation_results=[
+            {
+                "status": "ok",
+                "recipe_id": "discovered_recipe_001",
+                "recipe_confidence": "high_candidate",
+                "first_cluster_id": "cluster_a",
+                "second_cluster_id": "cluster_b",
+                "first_indicator_id": "FIRST_A",
+                "second_indicator_id": "SECOND_A",
+                "probe_timeframe": "M5",
+                "probe_id": "drv-failed",
+                "primary_score": "0",
+                "composite_score": "0",
+                "validation_priority_score": "70",
+                "discovery_evidence_score": "74",
+                "retention_ratio": "0",
+                "retention_bucket": "failed_retention",
+            }
+        ],
+        max_slot_candidates=5,
+        max_pair_candidates=5,
+    )
+
+    assert negative_pairs[0]["unordered_pair_id"] == "FIRST_A+SECOND_A"
+    assert retention_failures[0]["negative_reason"] == "positive_discovery_collapsed"
+    assert negative_clusters[0]["failure_rate"] == 1.0
+    assert seed_plan["negative_pairs"][0]["probe_id"] == "drv-failed"
+    assert summary["result_counts"]["negative_pair_rows"] == 1
