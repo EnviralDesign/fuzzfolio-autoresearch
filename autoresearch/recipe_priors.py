@@ -1,0 +1,823 @@
+from __future__ import annotations
+
+import csv
+import json
+import math
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .config import AppConfig
+from .indicator_atlas import DEFAULT_ATLAS_DIRNAME, RECIPE_DEFINITIONS
+from .signal_atlas import DEFAULT_SIGNAL_ATLAS_DIRNAME
+from .forward_response_atlas import DEFAULT_FORWARD_RESPONSE_DIRNAME
+from .anchor_pair_atlas import (
+    DEFAULT_ANCHOR_PAIR_DIRNAME,
+    DEFAULT_ANCHOR_PAIR_TIMING_DIRNAME,
+)
+
+
+SCHEMA_VERSION = "empirical_recipe_priors_v1"
+DEFAULT_RECIPE_PRIORS_DIRNAME = "recipe-priors"
+
+RECIPE_BY_ANCHOR_TYPE: dict[str, str] = {
+    "trend": "trend_pullback_continuation",
+    "mean_reversion": "mean_reversion_reclaim",
+    "compression": "breakout_compression_release",
+    "profile_value": "profile_value_context",
+}
+
+DENSITY_SCORE: dict[str, float] = {
+    "usable": 88.0,
+    "sparse": 62.0,
+    "dense": 50.0,
+    "very_sparse": 35.0,
+    "saturated": 20.0,
+    "flat": 0.0,
+    "no_data": 0.0,
+}
+
+
+@dataclass(frozen=True)
+class RecipePriorsBuildResult:
+    priors_path: Path
+    slot_csv_path: Path
+    pair_csv_path: Path
+    seed_plan_path: Path
+    summary_path: Path
+    summary: dict[str, Any]
+
+    def as_summary(self) -> dict[str, Any]:
+        return {
+            "recipe_priors_json": str(self.priors_path),
+            "slot_indicator_priors_csv": str(self.slot_csv_path),
+            "pair_priors_csv": str(self.pair_csv_path),
+            "play_hand_seed_plan_json": str(self.seed_plan_path),
+            "recipe_priors_summary_json": str(self.summary_path),
+            "summary": self.summary,
+        }
+
+
+def _load_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+
+
+def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return [dict(row) for row in csv.DictReader(handle)]
+
+
+def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field) for field in fieldnames})
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _clean_token(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _clean_upper(value: Any) -> str:
+    return _clean_token(value).upper()
+
+
+def _float_value(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _int_value(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
+    return max(low, min(high, value))
+
+
+def _indicator_rows(indicator_atlas_dir: Path) -> list[dict[str, Any]]:
+    csv_path = indicator_atlas_dir / "indicator-atlas.csv"
+    if csv_path.exists():
+        return _read_csv_rows(csv_path)
+    atlas_path = indicator_atlas_dir / "indicator-atlas.json"
+    if not atlas_path.exists():
+        raise FileNotFoundError(
+            f"Missing indicator atlas at {indicator_atlas_dir}. Run `uv run build-indicator-atlas` first."
+        )
+    payload = _as_dict(_load_json(atlas_path))
+    return [row for row in _as_list(payload.get("indicators")) if isinstance(row, dict)]
+
+
+def _signal_rollups(signal_atlas_dir: Path) -> dict[str, dict[str, Any]]:
+    summary_path = signal_atlas_dir / "signal-atlas-summary.json"
+    if not summary_path.exists():
+        return {}
+    payload = _as_dict(_load_json(summary_path))
+    return {
+        _clean_upper(indicator_id): _as_dict(row)
+        for indicator_id, row in _as_dict(payload.get("indicator_rollups")).items()
+        if _clean_upper(indicator_id)
+    }
+
+
+def _forward_priors(forward_response_dir: Path) -> dict[str, dict[str, Any]]:
+    return {
+        _clean_upper(row.get("indicator_id")): row
+        for row in _read_csv_rows(forward_response_dir / "forward-response-priors.csv")
+        if _clean_upper(row.get("indicator_id"))
+    }
+
+
+def _static_slot_scores(indicator_atlas_dir: Path) -> dict[tuple[str, str, str], float]:
+    path = indicator_atlas_dir / "recipe-priors.json"
+    if not path.exists():
+        return {}
+    payload = _as_dict(_load_json(path))
+    scores: dict[tuple[str, str, str], float] = {}
+    recipes = _as_dict(payload.get("recipes"))
+    for recipe_name, recipe_payload in recipes.items():
+        slots = _as_dict(_as_dict(recipe_payload).get("slots"))
+        for slot_name, candidates in slots.items():
+            for item in _as_list(candidates):
+                if not isinstance(item, dict):
+                    continue
+                indicator_id = _clean_upper(item.get("id"))
+                if indicator_id:
+                    scores[(str(recipe_name), str(slot_name), indicator_id)] = _float_value(
+                        item.get("recipe_slot_prior")
+                    )
+    return scores
+
+
+def _row_by_id(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    return {
+        _clean_upper(row.get("id")): row
+        for row in rows
+        if _clean_upper(row.get("id"))
+    }
+
+
+def _slot_roles(recipe_name: str, slot_name: str) -> tuple[str, ...]:
+    definition = _as_dict(RECIPE_DEFINITIONS.get(recipe_name))
+    roles = _as_dict(definition.get("slots")).get(slot_name)
+    if isinstance(roles, tuple):
+        return roles
+    if isinstance(roles, list):
+        return tuple(str(role) for role in roles)
+    return ()
+
+
+def _fallback_static_slot_score(
+    indicator_row: dict[str, Any],
+    *,
+    recipe_name: str,
+    slot_name: str,
+) -> float:
+    signal_role = str(indicator_row.get("signal_role") or "").lower()
+    strategy_role = str(indicator_row.get("strategy_role") or "").lower()
+    definition = _as_dict(RECIPE_DEFINITIONS.get(recipe_name))
+    slot_roles = _slot_roles(recipe_name, slot_name)
+    score = _float_value(indicator_row.get("static_prior_score"), 45.0)
+    score += 22.0 if signal_role in slot_roles else -12.0
+    score += _float_value(_as_dict(definition.get("strategy_weights")).get(strategy_role))
+    if not _bool_value(indicator_row.get("generation_eligible")):
+        score -= 50.0
+    return round(_clamp(score), 2)
+
+
+def _signal_score(signal_rollup: dict[str, Any] | None) -> tuple[float, str]:
+    if not signal_rollup:
+        return 50.0, "unknown"
+    bucket = _clean_token(signal_rollup.get("density_bucket")) or "unknown"
+    score = DENSITY_SCORE.get(bucket, 50.0)
+    balance_counts = _as_dict(signal_rollup.get("balance_bucket_counts"))
+    if balance_counts.get("balanced"):
+        score += 6.0
+    if bucket in {"flat", "no_data"}:
+        score = 0.0
+    return round(_clamp(score), 2), bucket
+
+
+def _forward_score(forward_prior: dict[str, Any] | None) -> tuple[float, str]:
+    if not forward_prior:
+        return 50.0, "unknown"
+    return (
+        round(_clamp(_float_value(forward_prior.get("forward_response_prior_score"), 50.0)), 2),
+        _clean_token(forward_prior.get("forward_response_prior_bucket")) or "unknown",
+    )
+
+
+def _empty_stats() -> dict[str, Any]:
+    return {
+        "count": 0,
+        "positive_count": 0,
+        "zero_count": 0,
+        "best_score": None,
+        "avg_score": None,
+        "best_probe_id": None,
+        "best_timeframe": None,
+    }
+
+
+def _add_score_stat(stats: dict[str, Any], *, score: float, probe_id: str, timeframe: str) -> None:
+    count = int(stats.get("count") or 0)
+    total = _float_value(stats.get("_total_score"))
+    stats["count"] = count + 1
+    stats["_total_score"] = total + score
+    stats["avg_score"] = round((total + score) / float(count + 1), 4)
+    if score >= 50.0:
+        stats["positive_count"] = int(stats.get("positive_count") or 0) + 1
+    if score <= 0.0:
+        stats["zero_count"] = int(stats.get("zero_count") or 0) + 1
+    best_score = stats.get("best_score")
+    if best_score is None or score > _float_value(best_score):
+        stats["best_score"] = round(score, 4)
+        stats["best_probe_id"] = probe_id
+        stats["best_timeframe"] = timeframe
+
+
+def build_pair_evidence(
+    pair_rows: list[dict[str, Any]],
+) -> tuple[
+    dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    list[dict[str, Any]],
+]:
+    trigger_stats: dict[tuple[str, str], dict[str, Any]] = {}
+    anchor_stats: dict[tuple[str, str], dict[str, Any]] = {}
+    pair_priors: list[dict[str, Any]] = []
+    for row in pair_rows:
+        anchor_type = _clean_token(row.get("anchor_type"))
+        recipe_name = RECIPE_BY_ANCHOR_TYPE.get(anchor_type)
+        if not recipe_name:
+            continue
+        score = _float_value(row.get("composite_score"))
+        anchor_id = _clean_upper(row.get("anchor_id"))
+        trigger_id = _clean_upper(row.get("trigger_id"))
+        probe_id = _clean_token(row.get("probe_id"))
+        timeframe = _clean_upper(row.get("probe_timeframe"))
+        if trigger_id:
+            stats = trigger_stats.setdefault((recipe_name, trigger_id), _empty_stats())
+            _add_score_stat(stats, score=score, probe_id=probe_id, timeframe=timeframe)
+        if anchor_id:
+            stats = anchor_stats.setdefault((recipe_name, anchor_id), _empty_stats())
+            _add_score_stat(stats, score=score, probe_id=probe_id, timeframe=timeframe)
+        pair_priors.append(
+            {
+                "recipe": recipe_name,
+                "anchor_type": anchor_type,
+                "anchor_id": anchor_id,
+                "trigger_id": trigger_id,
+                "probe_timeframe": timeframe,
+                "probe_id": probe_id,
+                "pair_prior_score": row.get("pair_prior_score"),
+                "composite_score": score,
+                "signal_count": row.get("signal_count"),
+                "best_expectancy_r": row.get("best_expectancy_r"),
+                "best_trades": row.get("best_trades"),
+                "best_profit_factor": row.get("best_profit_factor"),
+            }
+        )
+    for stats in [*trigger_stats.values(), *anchor_stats.values()]:
+        stats.pop("_total_score", None)
+    return trigger_stats, anchor_stats, pair_priors
+
+
+def build_timing_evidence(
+    timing_rows: list[dict[str, Any]],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    evidence: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in timing_rows:
+        recipe_name = RECIPE_BY_ANCHOR_TYPE.get(_clean_token(row.get("anchor_type")))
+        trigger_id = _clean_upper(row.get("trigger_id"))
+        if not recipe_name or not trigger_id:
+            continue
+        item = evidence.setdefault(
+            (recipe_name, trigger_id),
+            {
+                "count": 0,
+                "positive_delta_count": 0,
+                "material_improved_count": 0,
+                "degraded_count": 0,
+                "lost_positive_count": 0,
+                "best_delta": None,
+                "best_variant_lookback_bars": None,
+                "best_timing_probe_id": None,
+            },
+        )
+        delta = _float_value(row.get("score_delta"))
+        item["count"] = int(item.get("count") or 0) + 1
+        if delta > 0:
+            item["positive_delta_count"] = int(item.get("positive_delta_count") or 0) + 1
+        if delta >= 5.0:
+            item["material_improved_count"] = int(item.get("material_improved_count") or 0) + 1
+        bucket = _clean_token(row.get("timing_bucket"))
+        if bucket == "degraded":
+            item["degraded_count"] = int(item.get("degraded_count") or 0) + 1
+        if bucket == "lost_positive":
+            item["lost_positive_count"] = int(item.get("lost_positive_count") or 0) + 1
+        best_delta = item.get("best_delta")
+        if best_delta is None or delta > _float_value(best_delta):
+            item["best_delta"] = round(delta, 4)
+            item["best_variant_lookback_bars"] = row.get("variant_lookback_bars")
+            item["best_timing_probe_id"] = row.get("timing_probe_id")
+    return evidence
+
+
+def timing_policy_for(evidence: dict[str, Any] | None) -> tuple[str, float, str | None]:
+    if not evidence:
+        return "catalog_default", 0.0, None
+    material = _int_value(evidence.get("material_improved_count"))
+    lost = _int_value(evidence.get("lost_positive_count"))
+    degraded = _int_value(evidence.get("degraded_count"))
+    best_delta = _float_value(evidence.get("best_delta"))
+    if material > 0 and lost == 0:
+        return "allow_variant", min(8.0, max(2.0, best_delta * 0.20)), _clean_token(
+            evidence.get("best_variant_lookback_bars")
+        )
+    if lost > 0 or degraded >= 2:
+        return "catalog_default_only", -8.0 if lost else -4.0, None
+    if best_delta > 0:
+        return "watch_variant", min(3.0, best_delta * 0.15), _clean_token(
+            evidence.get("best_variant_lookback_bars")
+        )
+    return "catalog_default", 0.0, None
+
+
+def sampling_lane(
+    score: float,
+    *,
+    empirical_count: int,
+    positive_pair_count: int = 0,
+    default_problem: bool = False,
+    has_behavior_evidence: bool = False,
+) -> str:
+    if default_problem:
+        return "blocked_default_problem"
+    if empirical_count > 0:
+        if positive_pair_count > 0 and score >= 60.0:
+            return "high_prior"
+        if score >= 50.0:
+            return "medium_prior"
+        if score >= 35.0:
+            return "uncertain_prior"
+        return "wild_exploration"
+    if has_behavior_evidence and score >= 78.0:
+        return "medium_prior"
+    if score >= 55.0:
+        return "uncertain_prior"
+    return "wild_exploration"
+
+
+def sampling_weight(score: float, lane: str) -> float:
+    if lane == "blocked_default_problem":
+        return 0.0
+    lane_multiplier = {
+        "high_prior": 1.35,
+        "medium_prior": 0.8,
+        "uncertain_prior": 0.24,
+        "wild_exploration": 0.08,
+    }.get(lane, 0.20)
+    return round(max(0.1, ((score / 100.0) ** 2) * 100.0 * lane_multiplier), 4)
+
+
+def pair_sampling_lane(score: float) -> str:
+    if score >= 65.0:
+        return "high_prior"
+    if score >= 60.0:
+        return "medium_prior"
+    if score >= 40.0:
+        return "uncertain_prior"
+    return "wild_exploration"
+
+
+def score_slot_candidate(
+    indicator_row: dict[str, Any],
+    *,
+    recipe_name: str,
+    slot_name: str,
+    static_slot_scores: dict[tuple[str, str, str], float],
+    signal_rollups: dict[str, dict[str, Any]],
+    forward_priors: dict[str, dict[str, Any]],
+    trigger_pair_stats: dict[tuple[str, str], dict[str, Any]],
+    anchor_pair_stats: dict[tuple[str, str], dict[str, Any]],
+    timing_evidence: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, Any]:
+    indicator_id = _clean_upper(indicator_row.get("id"))
+    signal_role = str(indicator_row.get("signal_role") or "").lower()
+    slot_roles = _slot_roles(recipe_name, slot_name)
+    static_score = static_slot_scores.get(
+        (recipe_name, slot_name, indicator_id),
+        _fallback_static_slot_score(
+            indicator_row,
+            recipe_name=recipe_name,
+            slot_name=slot_name,
+        ),
+    )
+    sig_score, density_bucket = _signal_score(signal_rollups.get(indicator_id))
+    fwd_score, forward_bucket = _forward_score(forward_priors.get(indicator_id))
+    if slot_name == "trigger":
+        empirical = trigger_pair_stats.get((recipe_name, indicator_id), _empty_stats())
+    else:
+        empirical = anchor_pair_stats.get((recipe_name, indicator_id), _empty_stats())
+    empirical_count = _int_value(empirical.get("count"))
+    best_pair_score = empirical.get("best_score")
+    pair_component = _float_value(best_pair_score, 50.0)
+    if empirical_count:
+        score = (static_score * 0.42) + (sig_score * 0.12) + (fwd_score * 0.14) + (pair_component * 0.32)
+    else:
+        score = (static_score * 0.66) + (sig_score * 0.16) + (fwd_score * 0.18)
+
+    slot_role_fit = "matched" if signal_role in slot_roles else "mismatch"
+    if slot_role_fit == "mismatch":
+        score -= 5.0 if empirical_count else 18.0
+
+    timing = timing_evidence.get((recipe_name, indicator_id)) if slot_name == "trigger" else None
+    timing_policy, timing_adjustment, recommended_lookback = timing_policy_for(timing)
+    score += timing_adjustment
+
+    default_problem = density_bucket in {"flat", "no_data"} or forward_bucket == "default_problem"
+    if default_problem and slot_name == "trigger":
+        score -= 40.0
+    score = round(_clamp(score), 4)
+    lane = sampling_lane(
+        score,
+        empirical_count=empirical_count,
+        positive_pair_count=_int_value(empirical.get("positive_count")),
+        default_problem=default_problem and slot_name == "trigger",
+        has_behavior_evidence=bool(signal_rollups.get(indicator_id) or forward_priors.get(indicator_id)),
+    )
+    return {
+        "recipe": recipe_name,
+        "slot": slot_name,
+        "indicator_id": indicator_id,
+        "signal_role": indicator_row.get("signal_role"),
+        "strategy_role": indicator_row.get("strategy_role"),
+        "namespace": indicator_row.get("namespace"),
+        "slot_role_fit": slot_role_fit,
+        "static_slot_score": round(static_score, 4),
+        "signal_density_score": sig_score,
+        "signal_density_bucket": density_bucket,
+        "forward_response_score": fwd_score,
+        "forward_response_bucket": forward_bucket,
+        "empirical_pair_count": empirical_count,
+        "positive_pair_count": empirical.get("positive_count"),
+        "best_pair_score": best_pair_score,
+        "avg_pair_score": empirical.get("avg_score"),
+        "best_pair_probe_id": empirical.get("best_probe_id"),
+        "best_pair_timeframe": empirical.get("best_timeframe"),
+        "timing_policy": timing_policy,
+        "timing_adjustment": round(timing_adjustment, 4),
+        "recommended_trigger_lookback_bars": recommended_lookback,
+        "recipe_slot_score": score,
+        "sampling_lane": lane,
+        "sampling_weight": sampling_weight(score, lane),
+    }
+
+
+def build_recipe_prior_artifacts(
+    *,
+    indicator_rows: list[dict[str, Any]],
+    static_slot_scores: dict[tuple[str, str, str], float],
+    signal_rollups: dict[str, dict[str, Any]],
+    forward_priors: dict[str, dict[str, Any]],
+    pair_results: list[dict[str, Any]],
+    timing_results: list[dict[str, Any]],
+    max_slot_candidates: int,
+    max_pair_candidates: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    rows_by_id = _row_by_id(indicator_rows)
+    generation_rows = [
+        row
+        for row in indicator_rows
+        if _bool_value(row.get("generation_eligible"))
+    ]
+    trigger_pair_stats, anchor_pair_stats, pair_priors = build_pair_evidence(pair_results)
+    timing = build_timing_evidence(timing_results)
+
+    slot_rows: list[dict[str, Any]] = []
+    recipes: dict[str, Any] = {}
+    for recipe_name, definition in RECIPE_DEFINITIONS.items():
+        recipe_slots: dict[str, Any] = {}
+        for slot_name in _as_dict(definition.get("slots")):
+            candidates = [
+                score_slot_candidate(
+                    row,
+                    recipe_name=recipe_name,
+                    slot_name=slot_name,
+                    static_slot_scores=static_slot_scores,
+                    signal_rollups=signal_rollups,
+                    forward_priors=forward_priors,
+                    trigger_pair_stats=trigger_pair_stats,
+                    anchor_pair_stats=anchor_pair_stats,
+                    timing_evidence=timing,
+                )
+                for row in generation_rows
+            ]
+            candidates.sort(
+                key=lambda row: (
+                    _float_value(row.get("sampling_weight")),
+                    _float_value(row.get("recipe_slot_score")),
+                    str(row.get("indicator_id") or ""),
+                ),
+                reverse=True,
+            )
+            selected = candidates[:max_slot_candidates]
+            slot_rows.extend(selected)
+            recipe_slots[slot_name] = selected
+        recipes[recipe_name] = {
+            "strategy_weights": definition.get("strategy_weights"),
+            "slots": recipe_slots,
+        }
+
+    for pair in pair_priors:
+        recipe_name = _clean_token(pair.get("recipe"))
+        trigger_id = _clean_upper(pair.get("trigger_id"))
+        trigger_timing = timing.get((recipe_name, trigger_id))
+        policy, adjustment, recommended_lookback = timing_policy_for(trigger_timing)
+        score = _float_value(pair.get("composite_score"))
+        prior = _float_value(pair.get("pair_prior_score"))
+        pair["timing_policy"] = policy
+        pair["timing_adjustment"] = round(adjustment, 4)
+        pair["recommended_trigger_lookback_bars"] = recommended_lookback
+        pair["pair_sampling_score"] = round(_clamp((score * 0.72) + (prior * 0.18) + adjustment), 4)
+        pair["pair_sampling_lane"] = (
+            "positive_pair"
+            if score >= 50.0
+            else "near_miss_pair"
+            if score >= 40.0 or adjustment > 4.0
+            else "low_pair"
+        )
+        pair["pair_sampling_weight"] = sampling_weight(
+            _float_value(pair.get("pair_sampling_score")),
+            pair_sampling_lane(_float_value(pair.get("pair_sampling_score"))),
+        )
+    pair_priors.sort(
+        key=lambda row: (
+            _float_value(row.get("pair_sampling_weight")),
+            _float_value(row.get("pair_sampling_score")),
+        ),
+        reverse=True,
+    )
+    pair_priors = pair_priors[:max_pair_candidates]
+
+    seed_plan = {
+        "schema_version": "play_hand_seed_plan_v1",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "sampling_policy": {
+            "guided_prior_fraction": 0.80,
+            "uncertain_prior_fraction": 0.15,
+            "wild_exploration_fraction": 0.05,
+            "interpretation": "Weights bias random selection; they do not hard-filter the catalog.",
+        },
+        "recipes": {
+            recipe_name: {
+                "slot_menus": {
+                    slot_name: [
+                        {
+                            "indicator_id": row["indicator_id"],
+                            "sampling_weight": row["sampling_weight"],
+                            "sampling_lane": row["sampling_lane"],
+                            "recipe_slot_score": row["recipe_slot_score"],
+                            "timing_policy": row["timing_policy"],
+                            "recommended_trigger_lookback_bars": row[
+                                "recommended_trigger_lookback_bars"
+                            ],
+                            "best_pair_score": row["best_pair_score"],
+                        }
+                        for row in recipe_payload["slots"][slot_name]
+                    ]
+                    for slot_name in recipe_payload["slots"]
+                },
+                "pair_menu": [
+                    row
+                    for row in pair_priors
+                    if row.get("recipe") == recipe_name
+                ][:25],
+                "recommended_templates": [
+                    {"name": "core_3", "slots": ["context", "setup", "trigger"]},
+                    {"name": "guarded_4", "slots": ["context", "setup", "trigger", "guard"]},
+                    {"name": "double_trigger_4", "slots": ["context", "setup", "trigger", "trigger"]},
+                ],
+            }
+            for recipe_name, recipe_payload in recipes.items()
+        },
+    }
+    lane_counts: dict[str, int] = {}
+    for row in slot_rows:
+        lane = _clean_token(row.get("sampling_lane")) or "unknown"
+        lane_counts[lane] = lane_counts.get(lane, 0) + 1
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "result_counts": {
+            "indicator_rows": len(indicator_rows),
+            "generation_eligible": len(generation_rows),
+            "slot_indicator_rows": len(slot_rows),
+            "pair_prior_rows": len(pair_priors),
+            "slot_sampling_lane_counts": dict(sorted(lane_counts.items())),
+        },
+        "top_slots": {
+            recipe_name: {
+                slot_name: recipe_payload["slots"][slot_name][:8]
+                for slot_name in recipe_payload["slots"]
+            }
+            for recipe_name, recipe_payload in recipes.items()
+        },
+        "top_pairs": pair_priors[:20],
+    }
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": summary["generated_at"],
+        "note": (
+            "Empirical recipe priors blend static catalog roles, signal density, forward response, "
+            "Layer 3 pair outcomes, and Layer 3b timing evidence. Weights bias sampling; they are not hard filters."
+        ),
+        "sampling_policy": seed_plan["sampling_policy"],
+        "recipes": recipes,
+        "pair_priors": pair_priors,
+        "summary": summary,
+    }
+    return payload, slot_rows, pair_priors, seed_plan, summary
+
+
+def _slot_fieldnames() -> list[str]:
+    return [
+        "recipe",
+        "slot",
+        "indicator_id",
+        "signal_role",
+        "strategy_role",
+        "namespace",
+        "slot_role_fit",
+        "static_slot_score",
+        "signal_density_score",
+        "signal_density_bucket",
+        "forward_response_score",
+        "forward_response_bucket",
+        "empirical_pair_count",
+        "positive_pair_count",
+        "best_pair_score",
+        "avg_pair_score",
+        "best_pair_probe_id",
+        "best_pair_timeframe",
+        "timing_policy",
+        "timing_adjustment",
+        "recommended_trigger_lookback_bars",
+        "recipe_slot_score",
+        "sampling_lane",
+        "sampling_weight",
+    ]
+
+
+def _pair_fieldnames() -> list[str]:
+    return [
+        "recipe",
+        "anchor_type",
+        "anchor_id",
+        "trigger_id",
+        "probe_timeframe",
+        "probe_id",
+        "pair_prior_score",
+        "composite_score",
+        "signal_count",
+        "best_expectancy_r",
+        "best_trades",
+        "best_profit_factor",
+        "timing_policy",
+        "timing_adjustment",
+        "recommended_trigger_lookback_bars",
+        "pair_sampling_score",
+        "pair_sampling_lane",
+        "pair_sampling_weight",
+    ]
+
+
+def build_recipe_priors(
+    config: AppConfig,
+    *,
+    indicator_atlas_dir: Path | None = None,
+    signal_atlas_dir: Path | None = None,
+    forward_response_dir: Path | None = None,
+    anchor_pair_dir: Path | None = None,
+    anchor_pair_timing_dir: Path | None = None,
+    out_dir: Path | None = None,
+    max_slot_candidates: int = 40,
+    max_pair_candidates: int = 80,
+) -> RecipePriorsBuildResult:
+    indicator_dir = (
+        indicator_atlas_dir.expanduser().resolve()
+        if indicator_atlas_dir is not None
+        else config.derived_root / DEFAULT_ATLAS_DIRNAME
+    )
+    signal_dir = (
+        signal_atlas_dir.expanduser().resolve()
+        if signal_atlas_dir is not None
+        else config.derived_root / DEFAULT_SIGNAL_ATLAS_DIRNAME
+    )
+    forward_dir = (
+        forward_response_dir.expanduser().resolve()
+        if forward_response_dir is not None
+        else config.derived_root / DEFAULT_FORWARD_RESPONSE_DIRNAME
+    )
+    pair_dir = (
+        anchor_pair_dir.expanduser().resolve()
+        if anchor_pair_dir is not None
+        else config.derived_root / DEFAULT_ANCHOR_PAIR_DIRNAME
+    )
+    timing_dir = (
+        anchor_pair_timing_dir.expanduser().resolve()
+        if anchor_pair_timing_dir is not None
+        else config.derived_root / DEFAULT_ANCHOR_PAIR_TIMING_DIRNAME
+    )
+    target_dir = (
+        out_dir.expanduser().resolve()
+        if out_dir is not None
+        else config.derived_root / DEFAULT_RECIPE_PRIORS_DIRNAME
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    indicator_rows = _indicator_rows(indicator_dir)
+    pair_results_path = pair_dir / "anchor-pair-probe-results.csv"
+    if not pair_results_path.exists():
+        raise FileNotFoundError(
+            f"Missing anchor pair results at {pair_results_path}. Run `uv run run-anchor-pair-probes --all` first."
+        )
+    timing_results_path = timing_dir / "anchor-pair-timing-results.csv"
+    if not timing_results_path.exists():
+        raise FileNotFoundError(
+            f"Missing anchor pair timing results at {timing_results_path}. Run `uv run run-anchor-pair-timing-probes` first."
+        )
+
+    payload, slot_rows, pair_rows, seed_plan, summary = build_recipe_prior_artifacts(
+        indicator_rows=indicator_rows,
+        static_slot_scores=_static_slot_scores(indicator_dir),
+        signal_rollups=_signal_rollups(signal_dir),
+        forward_priors=_forward_priors(forward_dir),
+        pair_results=_read_csv_rows(pair_results_path),
+        timing_results=_read_csv_rows(timing_results_path),
+        max_slot_candidates=max(1, int(max_slot_candidates)),
+        max_pair_candidates=max(1, int(max_pair_candidates)),
+    )
+    summary["source"] = {
+        "indicator_atlas_dir": str(indicator_dir),
+        "signal_atlas_dir": str(signal_dir),
+        "forward_response_dir": str(forward_dir),
+        "anchor_pair_results_path": str(pair_results_path),
+        "anchor_pair_timing_results_path": str(timing_results_path),
+    }
+    payload["summary"] = summary
+
+    priors_path = target_dir / "recipe-priors.json"
+    slot_csv_path = target_dir / "slot-indicator-priors.csv"
+    pair_csv_path = target_dir / "pair-priors.csv"
+    seed_plan_path = target_dir / "play-hand-seed-plan.json"
+    summary_path = target_dir / "recipe-priors-summary.json"
+
+    _write_json(priors_path, payload)
+    _write_csv(slot_csv_path, slot_rows, _slot_fieldnames())
+    _write_csv(pair_csv_path, pair_rows, _pair_fieldnames())
+    _write_json(seed_plan_path, seed_plan)
+    _write_json(summary_path, summary)
+    return RecipePriorsBuildResult(
+        priors_path=priors_path,
+        slot_csv_path=slot_csv_path,
+        pair_csv_path=pair_csv_path,
+        seed_plan_path=seed_plan_path,
+        summary_path=summary_path,
+        summary=summary,
+    )

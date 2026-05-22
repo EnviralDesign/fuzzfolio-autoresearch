@@ -52,6 +52,12 @@ Set `AUTORESEARCH_CODEX_HOME` only if you want a different dedicated home. Set `
 - `run-anchor-pair-probes` runs and scores the queued Layer 3 anchor-trigger sensitivity probes.
 - `build-anchor-pair-timing-atlas` builds Layer 3b trigger `lookbackBars` timing-tolerance variants from completed Layer 3 probes.
 - `run-anchor-pair-timing-probes` runs and scores the queued Layer 3b timing-tolerance probes.
+- `build-recipe-priors` builds empirical recipe/slot sampling weights and a Play Hand seed-plan artifact from all Atlas layers.
+- `build-discovery-pair-atlas` builds a broad ordered-pair discovery queue across generation-eligible indicators.
+- `run-discovery-pair-probes` runs and scores the queued broad discovery-pair backend probes.
+- `build-discovery-cluster-atlas` distills discovery-pair results into empirical indicator clusters and discovered recipe-template candidates.
+- `build-discovery-recipe-validation-atlas` builds a 12-month validation queue from the strongest discovered recipe templates.
+- `run-discovery-recipe-validation-probes` runs and scores the discovered recipe validation queue.
 - `run` runs the legacy Explorer controller and finalizes the best scored attempt when it exits.
 - `finalize-corpus` catches up canonical attempts across existing runs.
 - `build-portfolio` builds the automatic portfolio report from canonical candidates.
@@ -135,6 +141,47 @@ uv run run-anchor-pair-timing-probes
 ```
 
 Layer 3b keeps the same anchor and trigger pairings, then varies the trigger-side `lookbackBars` over `1`, `2`, and `3` while skipping the catalog baseline. It compares each timing variant against the original Layer 3 result and writes score, trade, signal-count, expectancy, and profit-factor deltas under `runs/derived/anchor-pair-timing-atlas/`. This is the first pass at finding pairs that looked weak only because the two signals were a few bars out of phase.
+
+Then build the empirical recipe-prior layer:
+
+```powershell
+uv run build-recipe-priors
+```
+
+This consumes the static catalog atlas, signal atlas, forward-response atlas, Layer 3 pair results, and Layer 3b timing results. It writes weighted recipe-slot menus and a Play Hand seed plan under `runs/derived/recipe-priors/`. These weights bias future random selection; they do not remove lower-prior or wild-card indicators from exploration.
+
+For a broader backend-heavy discovery pass, build the ordered-pair queue:
+
+```powershell
+uv run build-discovery-pair-atlas
+```
+
+This keeps the curated recipe priors, but adds an exploratory queue that considers every ordered pair of generation-eligible indicators on the default `M5`/`M15` panel. The default queue is a diversified `1536`-probe batch: about 25% proven-neighbor, 45% plausible-novel, 20% under-tested role-correct, and 10% wild exploration. Exact Layer 3 retests are marked in the matrix but not queued unless `--include-known-retests` is set. Use `--full` for the larger all-untested ordered-pair queue.
+
+Run the queued backend batch with:
+
+```powershell
+uv run run-discovery-pair-probes
+```
+
+With no arguments the runner attempts every queued discovery probe, deleting temporary cloud profiles after each run and writing scored results under `runs/derived/discovery-pair-atlas/`. Use `--workers 20` or higher when you want several discovery probes in flight at once so a larger backend worker pool stays busy. Use `--limit` only when you deliberately want a partial run.
+
+After the discovery probes finish, distill the empirical pair corpus:
+
+```powershell
+uv run build-discovery-cluster-atlas
+```
+
+This does not run more backend jobs. It looks across the completed discovery-pair scores, groups indicators that succeed with similar partners, builds a cluster-to-cluster compatibility matrix, and writes discovered recipe-template candidates under `runs/derived/discovery-cluster-atlas/`. These templates are exploratory evidence for the next Play Hand integration step; they still need 12-month and 36-month validation before being treated as durable recipes.
+
+Then validate the strongest discovered templates over a longer window:
+
+```powershell
+uv run build-discovery-recipe-validation-atlas
+uv run run-discovery-recipe-validation-probes --workers 32
+```
+
+The builder expands high/promising discovered recipe templates into a capped concrete queue, defaulting to `12`-month sensitivity probes under `runs/derived/discovery-recipe-validation-atlas/`. This is the retention gate before feeding discovered recipes back into Play Hand. After that, `build-discovery-pair-atlas --full` is the natural longer nighttime expansion if we want a broader first-generation cluster corpus.
 
 From there you can build the portfolio either way:
 

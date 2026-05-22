@@ -98,6 +98,42 @@ if __package__ in {None, ""}:
         run_anchor_pair_timing_probes,
     )
     from autoresearch.indicator_atlas import build_indicator_atlas
+    from autoresearch.recipe_priors import (
+        DEFAULT_RECIPE_PRIORS_DIRNAME,
+        build_recipe_priors,
+    )
+    from autoresearch.discovery_pair_atlas import (
+        DEFAULT_DISCOVERY_PAIR_DIRNAME,
+        DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS,
+        DEFAULT_MAX_QUEUE_PAIRS as DISCOVERY_PAIR_DEFAULT_MAX_QUEUE_PAIRS,
+        DEFAULT_PROBE_WORKERS as DISCOVERY_PAIR_DEFAULT_PROBE_WORKERS,
+        DEFAULT_PROBE_TIMEOUT_SECONDS as DISCOVERY_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS,
+        DEFAULT_RANDOM_SEED as DISCOVERY_PAIR_DEFAULT_RANDOM_SEED,
+        build_discovery_pair_atlas,
+        run_discovery_pair_probes,
+    )
+    from autoresearch.discovery_cluster_atlas import (
+        DEFAULT_DISCOVERY_CLUSTER_DIRNAME,
+        DEFAULT_MAX_RECIPES as DISCOVERY_CLUSTER_DEFAULT_MAX_RECIPES,
+        DEFAULT_MIN_POSITIVE_SCORE as DISCOVERY_CLUSTER_DEFAULT_MIN_POSITIVE_SCORE,
+        DEFAULT_MIN_SHARED_PARTNERS as DISCOVERY_CLUSTER_DEFAULT_MIN_SHARED_PARTNERS,
+        DEFAULT_MIN_SIMILARITY as DISCOVERY_CLUSTER_DEFAULT_MIN_SIMILARITY,
+        DEFAULT_STRONG_SCORE as DISCOVERY_CLUSTER_DEFAULT_STRONG_SCORE,
+        build_discovery_cluster_atlas,
+    )
+    from autoresearch.discovery_recipe_validation import (
+        DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME,
+        DEFAULT_FIRST_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_FIRST_MEMBER_LIMIT,
+        DEFAULT_INCLUDED_CONFIDENCE as DISCOVERY_VALIDATION_DEFAULT_INCLUDED_CONFIDENCE,
+        DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_VALIDATION_DEFAULT_JOB_TIMEOUT_SECONDS,
+        DEFAULT_LOOKBACK_MONTHS as DISCOVERY_VALIDATION_DEFAULT_LOOKBACK_MONTHS,
+        DEFAULT_MAX_PAIRS_PER_RECIPE as DISCOVERY_VALIDATION_DEFAULT_MAX_PAIRS_PER_RECIPE,
+        DEFAULT_MAX_RECIPES as DISCOVERY_VALIDATION_DEFAULT_MAX_RECIPES,
+        DEFAULT_PROBE_TIMEOUT_SECONDS as DISCOVERY_VALIDATION_DEFAULT_PROBE_TIMEOUT_SECONDS,
+        DEFAULT_SECOND_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT,
+        build_discovery_recipe_validation_atlas,
+        run_discovery_recipe_validation_probes,
+    )
     from autoresearch.ledger import (
         append_attempt,
         attempts_path_for_run_dir,
@@ -235,6 +271,42 @@ else:
         run_anchor_pair_timing_probes,
     )
     from .indicator_atlas import build_indicator_atlas
+    from .recipe_priors import (
+        DEFAULT_RECIPE_PRIORS_DIRNAME,
+        build_recipe_priors,
+    )
+    from .discovery_pair_atlas import (
+        DEFAULT_DISCOVERY_PAIR_DIRNAME,
+        DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS,
+        DEFAULT_MAX_QUEUE_PAIRS as DISCOVERY_PAIR_DEFAULT_MAX_QUEUE_PAIRS,
+        DEFAULT_PROBE_WORKERS as DISCOVERY_PAIR_DEFAULT_PROBE_WORKERS,
+        DEFAULT_PROBE_TIMEOUT_SECONDS as DISCOVERY_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS,
+        DEFAULT_RANDOM_SEED as DISCOVERY_PAIR_DEFAULT_RANDOM_SEED,
+        build_discovery_pair_atlas,
+        run_discovery_pair_probes,
+    )
+    from .discovery_cluster_atlas import (
+        DEFAULT_DISCOVERY_CLUSTER_DIRNAME,
+        DEFAULT_MAX_RECIPES as DISCOVERY_CLUSTER_DEFAULT_MAX_RECIPES,
+        DEFAULT_MIN_POSITIVE_SCORE as DISCOVERY_CLUSTER_DEFAULT_MIN_POSITIVE_SCORE,
+        DEFAULT_MIN_SHARED_PARTNERS as DISCOVERY_CLUSTER_DEFAULT_MIN_SHARED_PARTNERS,
+        DEFAULT_MIN_SIMILARITY as DISCOVERY_CLUSTER_DEFAULT_MIN_SIMILARITY,
+        DEFAULT_STRONG_SCORE as DISCOVERY_CLUSTER_DEFAULT_STRONG_SCORE,
+        build_discovery_cluster_atlas,
+    )
+    from .discovery_recipe_validation import (
+        DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME,
+        DEFAULT_FIRST_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_FIRST_MEMBER_LIMIT,
+        DEFAULT_INCLUDED_CONFIDENCE as DISCOVERY_VALIDATION_DEFAULT_INCLUDED_CONFIDENCE,
+        DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_VALIDATION_DEFAULT_JOB_TIMEOUT_SECONDS,
+        DEFAULT_LOOKBACK_MONTHS as DISCOVERY_VALIDATION_DEFAULT_LOOKBACK_MONTHS,
+        DEFAULT_MAX_PAIRS_PER_RECIPE as DISCOVERY_VALIDATION_DEFAULT_MAX_PAIRS_PER_RECIPE,
+        DEFAULT_MAX_RECIPES as DISCOVERY_VALIDATION_DEFAULT_MAX_RECIPES,
+        DEFAULT_PROBE_TIMEOUT_SECONDS as DISCOVERY_VALIDATION_DEFAULT_PROBE_TIMEOUT_SECONDS,
+        DEFAULT_SECOND_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT,
+        build_discovery_recipe_validation_atlas,
+        run_discovery_recipe_validation_probes,
+    )
     from .ledger import (
         append_attempt,
         attempts_path_for_run_dir,
@@ -393,6 +465,12 @@ PUBLIC_CLI_COMMANDS = {
     "run-anchor-pair-probes",
     "build-anchor-pair-timing-atlas",
     "run-anchor-pair-timing-probes",
+    "build-recipe-priors",
+    "build-discovery-pair-atlas",
+    "run-discovery-pair-probes",
+    "build-discovery-cluster-atlas",
+    "build-discovery-recipe-validation-atlas",
+    "run-discovery-recipe-validation-probes",
     "run",
     "finalize-corpus",
     "build-portfolio",
@@ -1121,6 +1199,475 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help=f"Per sensitivity-basket timeout. Default: {ANCHOR_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS}.",
     )
     run_anchor_pair_timing_probes.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    recipe_priors = subparsers.add_parser(
+        "build-recipe-priors",
+        help="Build empirical recipe and slot sampling priors from the completed Atlas layers.",
+    )
+    recipe_priors.add_argument(
+        "--indicator-atlas-dir",
+        type=Path,
+        default=None,
+        help="Input indicator-atlas directory. Default: runs/derived/indicator-atlas.",
+    )
+    recipe_priors.add_argument(
+        "--signal-atlas-dir",
+        type=Path,
+        default=None,
+        help="Input signal-atlas directory. Default: runs/derived/signal-atlas.",
+    )
+    recipe_priors.add_argument(
+        "--forward-response-dir",
+        type=Path,
+        default=None,
+        help="Input forward-response-atlas directory. Default: runs/derived/forward-response-atlas.",
+    )
+    recipe_priors.add_argument(
+        "--anchor-pair-dir",
+        type=Path,
+        default=None,
+        help="Input anchor-pair-atlas directory. Default: runs/derived/anchor-pair-atlas.",
+    )
+    recipe_priors.add_argument(
+        "--anchor-pair-timing-dir",
+        type=Path,
+        default=None,
+        help="Input anchor-pair-timing-atlas directory. Default: runs/derived/anchor-pair-timing-atlas.",
+    )
+    recipe_priors.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=f"Output directory. Default: runs/derived/{DEFAULT_RECIPE_PRIORS_DIRNAME}.",
+    )
+    recipe_priors.add_argument(
+        "--max-slot-candidates",
+        type=int,
+        default=40,
+        help="Maximum candidates kept per recipe slot. Default: 40.",
+    )
+    recipe_priors.add_argument(
+        "--max-pair-candidates",
+        type=int,
+        default=80,
+        help="Maximum empirical pair candidates kept. Default: 80.",
+    )
+    recipe_priors.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    discovery_pair_atlas = subparsers.add_parser(
+        "build-discovery-pair-atlas",
+        help="Build a broad ordered-pair discovery queue and runnable sensitivity probe artifacts.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--indicator-atlas-dir",
+        type=Path,
+        default=None,
+        help="Input indicator-atlas directory. Default: runs/derived/indicator-atlas.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--signal-atlas-dir",
+        type=Path,
+        default=None,
+        help="Input signal-atlas directory. Default: runs/derived/signal-atlas.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--forward-response-dir",
+        type=Path,
+        default=None,
+        help="Input forward-response-atlas directory. Default: runs/derived/forward-response-atlas.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--recipe-priors-dir",
+        type=Path,
+        default=None,
+        help="Input recipe-priors directory. Default: runs/derived/recipe-priors.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--anchor-pair-dir",
+        type=Path,
+        default=None,
+        help="Input anchor-pair-atlas directory for known pair evidence. Default: runs/derived/anchor-pair-atlas.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=f"Output directory. Default: runs/derived/{DEFAULT_DISCOVERY_PAIR_DIRNAME}.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard workspace root. Uses the same defaults as build-indicator-atlas.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--catalog-path",
+        type=Path,
+        default=None,
+        help="Direct path to shared/constants/indicators.json. Overrides --workspace-root.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--refresh-static-atlas",
+        action="store_true",
+        help="Rebuild runs/derived/indicator-atlas before constructing discovery pairs.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--first",
+        action="append",
+        default=None,
+        help="First indicator id to include. Can be repeated. Defaults to all generation-eligible indicators.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--second",
+        action="append",
+        default=None,
+        help="Second indicator id to include. Can be repeated. Defaults to all generation-eligible indicators.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--instrument",
+        action="append",
+        default=None,
+        help="Instrument panel member. Can be repeated. Default: EURUSD, GBPUSD, USDJPY, XAUUSD.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--timeframe",
+        action="append",
+        default=None,
+        help="Probe timeframe. Can be repeated. Default: M5 and M15.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--max-pairs",
+        type=int,
+        default=DISCOVERY_PAIR_DEFAULT_MAX_QUEUE_PAIRS,
+        help=f"Maximum queued discovery probes unless --full is used. Default: {DISCOVERY_PAIR_DEFAULT_MAX_QUEUE_PAIRS}.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--full",
+        action="store_true",
+        help="Queue every eligible ordered pair/timeframe instead of the diversified bounded batch.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--include-known-retests",
+        action="store_true",
+        help="Include exact pairs already tested by Layer 3 in the runnable queue.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--random-seed",
+        type=int,
+        default=DISCOVERY_PAIR_DEFAULT_RANDOM_SEED,
+        help=f"Seed for diversity lane ordering. Default: {DISCOVERY_PAIR_DEFAULT_RANDOM_SEED}.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--lookback-months",
+        type=int,
+        default=ANCHOR_PAIR_DEFAULT_LOOKBACK_MONTHS,
+        help=f"Sensitivity-basket lookback months embedded in the run manifest. Default: {ANCHOR_PAIR_DEFAULT_LOOKBACK_MONTHS}.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--job-timeout-seconds",
+        type=int,
+        default=DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS,
+        help=f"Deep replay job wait timeout embedded in the run manifest. Default: {DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS}.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--quality-score-preset",
+        default=ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET,
+        help=f"Sensitivity-basket quality preset embedded in the run manifest. Default: {ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET}.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--execution-cost-mode",
+        default=ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE,
+        help=f"Sensitivity-basket execution-cost mode embedded in the run manifest. Default: {ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE}.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--no-profile-docs",
+        action="store_true",
+        help="Skip writing runnable discovery pair profile JSON documents.",
+    )
+    discovery_pair_atlas.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    run_discovery_pair_probes = subparsers.add_parser(
+        "run-discovery-pair-probes",
+        help="Run and score queued broad discovery pair sensitivity probes.",
+    )
+    run_discovery_pair_probes.add_argument(
+        "--atlas-dir",
+        type=Path,
+        default=None,
+        help=f"Discovery-pair atlas directory. Default: runs/derived/{DEFAULT_DISCOVERY_PAIR_DIRNAME}.",
+    )
+    run_discovery_pair_probes.add_argument(
+        "--probe-id",
+        action="append",
+        default=None,
+        help="Specific queued discovery probe id to run. Can be repeated.",
+    )
+    run_discovery_pair_probes.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Number of queued probes to run when --probe-id is omitted. Default: all queued probes.",
+    )
+    run_discovery_pair_probes.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run probes even when sensitivity-response.json already exists.",
+    )
+    run_discovery_pair_probes.add_argument(
+        "--keep-profiles",
+        action="store_true",
+        help="Do not delete temporary cloud profiles after each probe.",
+    )
+    run_discovery_pair_probes.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DISCOVERY_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS,
+        help=f"Per sensitivity-basket timeout. Default: {DISCOVERY_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS}.",
+    )
+    run_discovery_pair_probes.add_argument(
+        "--job-timeout-seconds",
+        type=int,
+        default=DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS,
+        help=f"Deep replay job wait timeout passed to sensitivity-basket. Default: {DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS}.",
+    )
+    run_discovery_pair_probes.add_argument(
+        "--workers",
+        type=int,
+        default=DISCOVERY_PAIR_DEFAULT_PROBE_WORKERS,
+        help=f"Number of discovery probes to keep in flight concurrently. Default: {DISCOVERY_PAIR_DEFAULT_PROBE_WORKERS}.",
+    )
+    run_discovery_pair_probes.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    discovery_cluster_atlas = subparsers.add_parser(
+        "build-discovery-cluster-atlas",
+        help="Build empirical indicator clusters and discovered recipe templates from discovery-pair results.",
+    )
+    discovery_cluster_atlas.add_argument(
+        "--discovery-pair-dir",
+        type=Path,
+        default=None,
+        help=f"Input discovery-pair atlas directory. Default: runs/derived/{DEFAULT_DISCOVERY_PAIR_DIRNAME}.",
+    )
+    discovery_cluster_atlas.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=f"Output directory. Default: runs/derived/{DEFAULT_DISCOVERY_CLUSTER_DIRNAME}.",
+    )
+    discovery_cluster_atlas.add_argument(
+        "--min-positive-score",
+        type=float,
+        default=DISCOVERY_CLUSTER_DEFAULT_MIN_POSITIVE_SCORE,
+        help=f"Minimum backend score treated as a positive pair. Default: {DISCOVERY_CLUSTER_DEFAULT_MIN_POSITIVE_SCORE:g}.",
+    )
+    discovery_cluster_atlas.add_argument(
+        "--strong-score",
+        type=float,
+        default=DISCOVERY_CLUSTER_DEFAULT_STRONG_SCORE,
+        help=f"Score threshold for strong pair support. Default: {DISCOVERY_CLUSTER_DEFAULT_STRONG_SCORE:g}.",
+    )
+    discovery_cluster_atlas.add_argument(
+        "--min-similarity",
+        type=float,
+        default=DISCOVERY_CLUSTER_DEFAULT_MIN_SIMILARITY,
+        help=f"Minimum behavioral similarity for assigning indicators to a cluster. Default: {DISCOVERY_CLUSTER_DEFAULT_MIN_SIMILARITY:g}.",
+    )
+    discovery_cluster_atlas.add_argument(
+        "--min-shared-partners",
+        type=int,
+        default=DISCOVERY_CLUSTER_DEFAULT_MIN_SHARED_PARTNERS,
+        help=f"Minimum shared successful partners for cluster assignment. Default: {DISCOVERY_CLUSTER_DEFAULT_MIN_SHARED_PARTNERS}.",
+    )
+    discovery_cluster_atlas.add_argument(
+        "--max-recipes",
+        type=int,
+        default=DISCOVERY_CLUSTER_DEFAULT_MAX_RECIPES,
+        help=f"Maximum discovered recipe templates to emit. Default: {DISCOVERY_CLUSTER_DEFAULT_MAX_RECIPES}.",
+    )
+    discovery_cluster_atlas.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    discovery_recipe_validation = subparsers.add_parser(
+        "build-discovery-recipe-validation-atlas",
+        help="Build a 12-month validation queue from discovered cluster recipe templates.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--cluster-atlas-dir",
+        type=Path,
+        default=None,
+        help=f"Input discovery-cluster atlas directory. Default: runs/derived/{DEFAULT_DISCOVERY_CLUSTER_DIRNAME}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=f"Output directory. Default: runs/derived/{DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--workspace-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard workspace root. Uses the same defaults as build-indicator-atlas.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--catalog-path",
+        type=Path,
+        default=None,
+        help="Direct path to shared/constants/indicators.json. Overrides --workspace-root.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--refresh-static-atlas",
+        action="store_true",
+        help="Rebuild runs/derived/indicator-atlas before constructing validation profiles.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--confidence",
+        action="append",
+        default=None,
+        help=(
+            "Discovered recipe confidence bucket to validate. Can be repeated. "
+            f"Default: {', '.join(DISCOVERY_VALIDATION_DEFAULT_INCLUDED_CONFIDENCE)}."
+        ),
+    )
+    discovery_recipe_validation.add_argument(
+        "--instrument",
+        action="append",
+        default=None,
+        help="Instrument panel member. Can be repeated. Default: EURUSD, GBPUSD, USDJPY, XAUUSD.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--timeframe",
+        action="append",
+        default=None,
+        help="Validation timeframe. Can be repeated. Default: each recipe's top empirical timeframes.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--max-recipes",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_MAX_RECIPES,
+        help=f"Maximum discovered recipes to expand. Default: {DISCOVERY_VALIDATION_DEFAULT_MAX_RECIPES}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--max-pairs-per-recipe",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_MAX_PAIRS_PER_RECIPE,
+        help=f"Maximum concrete pairs queued per recipe. Default: {DISCOVERY_VALIDATION_DEFAULT_MAX_PAIRS_PER_RECIPE}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--first-member-limit",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_FIRST_MEMBER_LIMIT,
+        help=f"First-side cluster members considered per recipe. Default: {DISCOVERY_VALIDATION_DEFAULT_FIRST_MEMBER_LIMIT}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--second-member-limit",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT,
+        help=f"Second-side cluster members considered per recipe. Default: {DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--lookback-months",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_LOOKBACK_MONTHS,
+        help=f"Sensitivity-basket validation lookback months. Default: {DISCOVERY_VALIDATION_DEFAULT_LOOKBACK_MONTHS}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--job-timeout-seconds",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_JOB_TIMEOUT_SECONDS,
+        help=f"Deep replay job wait timeout embedded in the run manifest. Default: {DISCOVERY_VALIDATION_DEFAULT_JOB_TIMEOUT_SECONDS}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--quality-score-preset",
+        default=ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET,
+        help=f"Sensitivity-basket quality preset embedded in the run manifest. Default: {ANCHOR_PAIR_DEFAULT_QUALITY_SCORE_PRESET}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--execution-cost-mode",
+        default=ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE,
+        help=f"Sensitivity-basket execution-cost mode embedded in the run manifest. Default: {ANCHOR_PAIR_DEFAULT_EXECUTION_COST_MODE}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--no-profile-docs",
+        action="store_true",
+        help="Skip writing runnable validation profile JSON documents.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    run_discovery_recipe_validation = subparsers.add_parser(
+        "run-discovery-recipe-validation-probes",
+        help="Run and score queued 12-month discovered recipe validation probes.",
+    )
+    run_discovery_recipe_validation.add_argument(
+        "--atlas-dir",
+        type=Path,
+        default=None,
+        help=f"Discovery recipe validation atlas directory. Default: runs/derived/{DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME}.",
+    )
+    run_discovery_recipe_validation.add_argument(
+        "--probe-id",
+        action="append",
+        default=None,
+        help="Specific queued validation probe id to run. Can be repeated.",
+    )
+    run_discovery_recipe_validation.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Number of queued probes to run when --probe-id is omitted. Default: all queued probes.",
+    )
+    run_discovery_recipe_validation.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run probes even when sensitivity-response.json already exists.",
+    )
+    run_discovery_recipe_validation.add_argument(
+        "--keep-profiles",
+        action="store_true",
+        help="Do not delete temporary cloud profiles after each validation probe.",
+    )
+    run_discovery_recipe_validation.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_PROBE_TIMEOUT_SECONDS,
+        help=f"Per sensitivity-basket timeout. Default: {DISCOVERY_VALIDATION_DEFAULT_PROBE_TIMEOUT_SECONDS}.",
+    )
+    run_discovery_recipe_validation.add_argument(
+        "--job-timeout-seconds",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_JOB_TIMEOUT_SECONDS,
+        help=f"Deep replay job wait timeout passed to sensitivity-basket. Default: {DISCOVERY_VALIDATION_DEFAULT_JOB_TIMEOUT_SECONDS}.",
+    )
+    run_discovery_recipe_validation.add_argument(
+        "--workers",
+        type=int,
+        default=DISCOVERY_PAIR_DEFAULT_PROBE_WORKERS,
+        help=f"Number of validation probes to keep in flight concurrently. Default: {DISCOVERY_PAIR_DEFAULT_PROBE_WORKERS}.",
+    )
+    run_discovery_recipe_validation.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON summary.",
@@ -11340,6 +11887,7 @@ def cmd_build_signal_atlas(
     keep_profiles: bool,
     replay_source: str | None,
     timeout_seconds: int | None,
+    probe_workers: int,
     as_json: bool,
 ) -> int:
     config = load_config()
@@ -11600,6 +12148,7 @@ def cmd_run_anchor_pair_probes(
         force=force,
         keep_profiles=keep_profiles,
         timeout_seconds=timeout_seconds,
+        probe_workers=probe_workers,
         progress_callback=progress,
     )
     payload = result.as_summary()
@@ -11807,6 +12356,580 @@ def cmd_run_anchor_pair_timing_probes(
     return 0
 
 
+def cmd_build_recipe_priors(
+    *,
+    indicator_atlas_dir: Path | None,
+    signal_atlas_dir: Path | None,
+    forward_response_dir: Path | None,
+    anchor_pair_dir: Path | None,
+    anchor_pair_timing_dir: Path | None,
+    out_dir: Path | None,
+    max_slot_candidates: int,
+    max_pair_candidates: int,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    result = build_recipe_priors(
+        config,
+        indicator_atlas_dir=indicator_atlas_dir,
+        signal_atlas_dir=signal_atlas_dir,
+        forward_response_dir=forward_response_dir,
+        anchor_pair_dir=anchor_pair_dir,
+        anchor_pair_timing_dir=anchor_pair_timing_dir,
+        out_dir=out_dir,
+        max_slot_candidates=max_slot_candidates,
+        max_pair_candidates=max_pair_candidates,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    counts = summary.get("result_counts", {})
+    table = Table(title="Recipe Priors", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Indicators", str(counts.get("indicator_rows", 0)))
+    table.add_row("Generation eligible", str(counts.get("generation_eligible", 0)))
+    table.add_row("Slot rows", str(counts.get("slot_indicator_rows", 0)))
+    table.add_row("Pair rows", str(counts.get("pair_prior_rows", 0)))
+    table.add_row(
+        "Slot lanes",
+        json.dumps(counts.get("slot_sampling_lane_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+    top_pairs = summary.get("top_pairs", [])
+    if top_pairs:
+        pair_table = Table(title="Top Recipe Pair Priors", box=box.SIMPLE)
+        pair_table.add_column("Recipe")
+        pair_table.add_column("Anchor")
+        pair_table.add_column("Trigger")
+        pair_table.add_column("TF")
+        pair_table.add_column("Score", justify="right")
+        pair_table.add_column("Timing")
+        for row in top_pairs[:8]:
+            pair_table.add_row(
+                str(row.get("recipe") or ""),
+                str(row.get("anchor_id") or ""),
+                str(row.get("trigger_id") or ""),
+                str(row.get("probe_timeframe") or ""),
+                str(row.get("composite_score") or ""),
+                str(row.get("timing_policy") or ""),
+            )
+        console.print(pair_table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Recipe priors: {result.priors_path}",
+                    f"Slot CSV: {result.slot_csv_path}",
+                    f"Pair CSV: {result.pair_csv_path}",
+                    f"Play Hand seed plan: {result.seed_plan_path}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Recipe Prior Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_build_discovery_pair_atlas(
+    *,
+    indicator_atlas_dir: Path | None,
+    signal_atlas_dir: Path | None,
+    forward_response_dir: Path | None,
+    recipe_priors_dir: Path | None,
+    anchor_pair_dir: Path | None,
+    out_dir: Path | None,
+    workspace_root: Path | None,
+    catalog_path: Path | None,
+    refresh_static_atlas: bool,
+    first_ids: list[str] | None,
+    second_ids: list[str] | None,
+    instruments: list[str] | None,
+    timeframes: list[str] | None,
+    max_pairs: int,
+    full_queue: bool,
+    include_known_retests: bool,
+    random_seed: int,
+    lookback_months: int,
+    job_timeout_seconds: int | None,
+    quality_score_preset: str,
+    execution_cost_mode: str,
+    emit_profile_docs: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    result = build_discovery_pair_atlas(
+        config,
+        indicator_atlas_dir=indicator_atlas_dir,
+        signal_atlas_dir=signal_atlas_dir,
+        forward_response_dir=forward_response_dir,
+        recipe_priors_dir=recipe_priors_dir,
+        anchor_pair_dir=anchor_pair_dir,
+        out_dir=out_dir,
+        workspace_root=workspace_root,
+        catalog_path=catalog_path,
+        refresh_static_atlas=refresh_static_atlas,
+        first_ids=first_ids,
+        second_ids=second_ids,
+        instruments=instruments,
+        timeframes=timeframes,
+        max_pairs=max_pairs,
+        full_queue=full_queue,
+        include_known_retests=include_known_retests,
+        random_seed=random_seed,
+        lookback_months=lookback_months,
+        job_timeout_seconds=job_timeout_seconds,
+        quality_score_preset=quality_score_preset,
+        execution_cost_mode=execution_cost_mode,
+        emit_profile_docs=emit_profile_docs,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    counts = summary.get("result_counts", {})
+    selection = summary.get("selection", {})
+    table = Table(title="Discovery Pair Atlas", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Eligible indicators", str(counts.get("eligible_indicators", 0)))
+    table.add_row("Pair matrix rows", str(counts.get("pair_matrix_rows", 0)))
+    table.add_row("Queue rows", str(counts.get("queue_rows", 0)))
+    table.add_row("Profile docs", str(counts.get("profile_docs", 0)))
+    table.add_row("Full queue", str(selection.get("full_queue", False)))
+    table.add_row(
+        "Queue lanes",
+        json.dumps(counts.get("queue_lane_counts", {}), ensure_ascii=True),
+    )
+    table.add_row(
+        "Known statuses",
+        json.dumps(counts.get("known_pair_status_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+    top_queue = summary.get("top_queue", [])
+    if top_queue:
+        top_table = Table(title="Top Discovery Queue", box=box.SIMPLE)
+        top_table.add_column("Probe")
+        top_table.add_column("Lane")
+        top_table.add_column("First")
+        top_table.add_column("Second")
+        top_table.add_column("TF")
+        top_table.add_column("Score", justify="right")
+        for row in top_queue[:10]:
+            top_table.add_row(
+                str(row.get("probe_id") or ""),
+                str(row.get("lane") or ""),
+                str(row.get("first_indicator_id") or ""),
+                str(row.get("second_indicator_id") or ""),
+                str(row.get("probe_timeframe") or ""),
+                str(row.get("local_discovery_score") or ""),
+            )
+        console.print(top_table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Discovery pair JSON: {result.atlas_path}",
+                    f"Pair matrix CSV: {result.matrix_csv_path}",
+                    f"Queue CSV: {result.queue_csv_path}",
+                    f"Run manifest: {result.manifest_path}",
+                    f"Run script: {result.run_script_path}",
+                    f"Profiles: {result.profile_dir}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Discovery Pair Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_run_discovery_pair_probes(
+    *,
+    atlas_dir: Path | None,
+    probe_ids: list[str] | None,
+    limit: int | None,
+    force: bool,
+    keep_profiles: bool,
+    timeout_seconds: int | None,
+    job_timeout_seconds: int | None,
+    probe_workers: int,
+    as_json: bool,
+) -> int:
+    config = load_config()
+
+    def progress(payload: dict[str, Any]) -> None:
+        if as_json:
+            return
+        console.print(
+            "[discovery-pair-probes] "
+            f"{payload.get('completed')}/{payload.get('total')} "
+            f"{payload.get('probe_id')} {payload.get('status')}"
+        )
+
+    result = run_discovery_pair_probes(
+        config,
+        atlas_dir=atlas_dir,
+        probe_ids=probe_ids,
+        limit=limit,
+        force=force,
+        keep_profiles=keep_profiles,
+        timeout_seconds=timeout_seconds,
+        job_timeout_seconds=job_timeout_seconds,
+        probe_workers=probe_workers,
+        progress_callback=progress,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    counts = summary.get("result_counts", {})
+    table = Table(title="Discovery Pair Probe Results", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Selected", str(counts.get("selected", 0)))
+    table.add_row("Completed", str(counts.get("completed", 0)))
+    table.add_row("Scored", str(counts.get("scored", 0)))
+    table.add_row(
+        "Statuses",
+        json.dumps(counts.get("status_counts", {}), ensure_ascii=True),
+    )
+    table.add_row(
+        "Positive by lane",
+        json.dumps(counts.get("positive_by_lane", {}), ensure_ascii=True),
+    )
+    console.print(table)
+    top_scored = summary.get("top_scored", [])
+    if top_scored:
+        top_table = Table(title="Top Scored Discovery Pairs", box=box.SIMPLE)
+        top_table.add_column("Probe")
+        top_table.add_column("Lane")
+        top_table.add_column("First")
+        top_table.add_column("Second")
+        top_table.add_column("Score", justify="right")
+        top_table.add_column("Basis")
+        for row in top_scored[:10]:
+            top_table.add_row(
+                str(row.get("probe_id") or ""),
+                str(row.get("discovery_lane") or ""),
+                str(row.get("first_indicator_id") or ""),
+                str(row.get("second_indicator_id") or ""),
+                str(row.get("composite_score") or ""),
+                str(row.get("score_basis") or ""),
+            )
+        console.print(top_table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Results CSV: {result.results_csv_path}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Discovery Pair Probe Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_build_discovery_cluster_atlas(
+    *,
+    discovery_pair_dir: Path | None,
+    out_dir: Path | None,
+    min_positive_score: float,
+    strong_score: float,
+    min_similarity: float,
+    min_shared_partners: int,
+    max_recipes: int,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    result = build_discovery_cluster_atlas(
+        config,
+        discovery_pair_dir=discovery_pair_dir,
+        out_dir=out_dir,
+        min_positive_score=min_positive_score,
+        strong_score=strong_score,
+        min_similarity=min_similarity,
+        min_shared_partners=min_shared_partners,
+        max_recipes=max_recipes,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    counts = summary.get("result_counts", {})
+    table = Table(title="Discovery Cluster Atlas", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Scored pair rows", str(counts.get("scored_rows", 0)))
+    table.add_row("Positive rows", str(counts.get("positive_rows", 0)))
+    table.add_row("Strong rows", str(counts.get("strong_rows", 0)))
+    table.add_row("First-side clusters", str(counts.get("first_clusters", 0)))
+    table.add_row("Second-side clusters", str(counts.get("second_clusters", 0)))
+    table.add_row("Cluster pair rows", str(counts.get("cluster_pair_rows", 0)))
+    table.add_row("Discovered recipes", str(counts.get("discovered_recipes", 0)))
+    table.add_row(
+        "Positive lanes",
+        json.dumps(counts.get("positive_lane_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+
+    top_recipes = summary.get("top_discovered_recipes", [])
+    if top_recipes:
+        recipe_table = Table(title="Top Discovered Recipe Templates", box=box.SIMPLE)
+        recipe_table.add_column("Recipe")
+        recipe_table.add_column("Confidence")
+        recipe_table.add_column("Score", justify="right")
+        recipe_table.add_column("Best", justify="right")
+        recipe_table.add_column("Support", justify="right")
+        recipe_table.add_column("TF")
+        for row in top_recipes[:10]:
+            recipe_table.add_row(
+                str(row.get("recipe_id") or ""),
+                str(row.get("confidence") or ""),
+                str(row.get("compatibility_score") or ""),
+                str(row.get("best_score") or ""),
+                f"{row.get('positive_pair_count') or 0}/{row.get('strong_pair_count') or 0}",
+                str(row.get("top_timeframes") or ""),
+            )
+        console.print(recipe_table)
+
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Discovery cluster JSON: {result.atlas_path}",
+                    f"Indicator clusters CSV: {result.indicator_clusters_csv_path}",
+                    f"Indicator signatures CSV: {result.indicator_signatures_csv_path}",
+                    f"Cluster pair matrix CSV: {result.cluster_pair_matrix_csv_path}",
+                    f"Discovered recipes JSON: {result.discovered_recipes_path}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Discovery Cluster Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_build_discovery_recipe_validation_atlas(
+    *,
+    cluster_atlas_dir: Path | None,
+    out_dir: Path | None,
+    workspace_root: Path | None,
+    catalog_path: Path | None,
+    refresh_static_atlas: bool,
+    included_confidence: list[str] | None,
+    instruments: list[str] | None,
+    timeframes: list[str] | None,
+    max_recipes: int,
+    max_pairs_per_recipe: int,
+    first_member_limit: int,
+    second_member_limit: int,
+    lookback_months: int,
+    job_timeout_seconds: int | None,
+    quality_score_preset: str,
+    execution_cost_mode: str,
+    emit_profile_docs: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    result = build_discovery_recipe_validation_atlas(
+        config,
+        cluster_atlas_dir=cluster_atlas_dir,
+        out_dir=out_dir,
+        workspace_root=workspace_root,
+        catalog_path=catalog_path,
+        refresh_static_atlas=refresh_static_atlas,
+        included_confidence=included_confidence,
+        instruments=instruments,
+        timeframes=timeframes,
+        max_recipes=max_recipes,
+        max_pairs_per_recipe=max_pairs_per_recipe,
+        first_member_limit=first_member_limit,
+        second_member_limit=second_member_limit,
+        lookback_months=lookback_months,
+        job_timeout_seconds=job_timeout_seconds,
+        quality_score_preset=quality_score_preset,
+        execution_cost_mode=execution_cost_mode,
+        emit_profile_docs=emit_profile_docs,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    counts = summary.get("result_counts", {})
+    selection = summary.get("selection", {})
+    table = Table(title="Discovery Recipe Validation Atlas", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Available recipes", str(counts.get("available_recipes", 0)))
+    table.add_row("Queue rows", str(counts.get("queue_rows", 0)))
+    table.add_row("Profile docs", str(counts.get("profile_docs", 0)))
+    table.add_row("Lookback months", str(selection.get("lookback_months", 0)))
+    table.add_row(
+        "Confidence",
+        json.dumps(counts.get("queued_confidence_counts", {}), ensure_ascii=True),
+    )
+    table.add_row(
+        "Recipe counts",
+        json.dumps(counts.get("queued_recipe_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+
+    top_queue = summary.get("top_queue", [])
+    if top_queue:
+        queue_table = Table(title="Top Validation Queue", box=box.SIMPLE)
+        queue_table.add_column("Probe")
+        queue_table.add_column("Recipe")
+        queue_table.add_column("Conf")
+        queue_table.add_column("First")
+        queue_table.add_column("Second")
+        queue_table.add_column("TF")
+        queue_table.add_column("Priority", justify="right")
+        queue_table.add_column("3m", justify="right")
+        for row in top_queue[:10]:
+            queue_table.add_row(
+                str(row.get("probe_id") or ""),
+                str(row.get("recipe_id") or ""),
+                str(row.get("recipe_confidence") or ""),
+                str(row.get("first_indicator_id") or ""),
+                str(row.get("second_indicator_id") or ""),
+                str(row.get("probe_timeframe") or ""),
+                str(row.get("validation_priority_score") or ""),
+                str(row.get("discovery_evidence_score") or ""),
+            )
+        console.print(queue_table)
+
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Validation atlas JSON: {result.atlas_path}",
+                    f"Queue CSV: {result.queue_csv_path}",
+                    f"Run manifest: {result.manifest_path}",
+                    f"Run script: {result.run_script_path}",
+                    f"Profiles: {result.profile_dir}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Discovery Recipe Validation Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_run_discovery_recipe_validation_probes(
+    *,
+    atlas_dir: Path | None,
+    probe_ids: list[str] | None,
+    limit: int | None,
+    force: bool,
+    keep_profiles: bool,
+    timeout_seconds: int | None,
+    job_timeout_seconds: int | None,
+    probe_workers: int,
+    as_json: bool,
+) -> int:
+    config = load_config()
+
+    def progress(payload: dict[str, Any]) -> None:
+        if as_json:
+            return
+        console.print(
+            "[discovery-recipe-validation] "
+            f"{payload.get('completed')}/{payload.get('total')} "
+            f"{payload.get('probe_id')} {payload.get('status')}"
+        )
+
+    result = run_discovery_recipe_validation_probes(
+        config,
+        atlas_dir=atlas_dir,
+        probe_ids=probe_ids,
+        limit=limit,
+        force=force,
+        keep_profiles=keep_profiles,
+        timeout_seconds=timeout_seconds,
+        job_timeout_seconds=job_timeout_seconds,
+        probe_workers=probe_workers,
+        progress_callback=progress,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = payload["summary"]
+    counts = summary.get("result_counts", {})
+    table = Table(title="Discovery Recipe Validation Results", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Selected", str(counts.get("selected", 0)))
+    table.add_row("Completed", str(counts.get("completed", 0)))
+    table.add_row("Scored", str(counts.get("scored", 0)))
+    table.add_row("Retained", str(counts.get("retained", 0)))
+    table.add_row(
+        "Statuses",
+        json.dumps(counts.get("status_counts", {}), ensure_ascii=True),
+    )
+    table.add_row(
+        "Retention",
+        json.dumps(counts.get("retention_bucket_counts", {}), ensure_ascii=True),
+    )
+    console.print(table)
+
+    top_scored = summary.get("top_scored", [])
+    if top_scored:
+        top_table = Table(title="Top 12m Validation Scores", box=box.SIMPLE)
+        top_table.add_column("Probe")
+        top_table.add_column("Recipe")
+        top_table.add_column("First")
+        top_table.add_column("Second")
+        top_table.add_column("Score", justify="right")
+        top_table.add_column("Retention")
+        for row in top_scored[:10]:
+            top_table.add_row(
+                str(row.get("probe_id") or ""),
+                str(row.get("recipe_id") or ""),
+                str(row.get("first_indicator_id") or ""),
+                str(row.get("second_indicator_id") or ""),
+                str(row.get("composite_score") or ""),
+                str(row.get("retention_bucket") or ""),
+            )
+        console.print(top_table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Results CSV: {result.results_csv_path}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Discovery Recipe Validation Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     direct_command = _command_from_invocation_name(sys.argv[0]) if argv is None else None
     if argv is None and direct_command is None:
@@ -11923,6 +13046,7 @@ def main(argv: list[str] | None = None) -> int:
             force=bool(args.force),
             keep_profiles=bool(args.keep_profiles),
             timeout_seconds=args.timeout_seconds,
+            probe_workers=args.workers,
             as_json=bool(args.json),
         )
     if args.command == "build-anchor-pair-timing-atlas":
@@ -11949,6 +13073,100 @@ def main(argv: list[str] | None = None) -> int:
             force=bool(args.force),
             keep_profiles=bool(args.keep_profiles),
             timeout_seconds=args.timeout_seconds,
+            as_json=bool(args.json),
+        )
+    if args.command == "build-recipe-priors":
+        return cmd_build_recipe_priors(
+            indicator_atlas_dir=args.indicator_atlas_dir,
+            signal_atlas_dir=args.signal_atlas_dir,
+            forward_response_dir=args.forward_response_dir,
+            anchor_pair_dir=args.anchor_pair_dir,
+            anchor_pair_timing_dir=args.anchor_pair_timing_dir,
+            out_dir=args.out_dir,
+            max_slot_candidates=args.max_slot_candidates,
+            max_pair_candidates=args.max_pair_candidates,
+            as_json=bool(args.json),
+        )
+    if args.command == "build-discovery-pair-atlas":
+        return cmd_build_discovery_pair_atlas(
+            indicator_atlas_dir=args.indicator_atlas_dir,
+            signal_atlas_dir=args.signal_atlas_dir,
+            forward_response_dir=args.forward_response_dir,
+            recipe_priors_dir=args.recipe_priors_dir,
+            anchor_pair_dir=args.anchor_pair_dir,
+            out_dir=args.out_dir,
+            workspace_root=args.workspace_root,
+            catalog_path=args.catalog_path,
+            refresh_static_atlas=bool(args.refresh_static_atlas),
+            first_ids=args.first,
+            second_ids=args.second,
+            instruments=args.instrument,
+            timeframes=args.timeframe,
+            max_pairs=args.max_pairs,
+            full_queue=bool(args.full),
+            include_known_retests=bool(args.include_known_retests),
+            random_seed=args.random_seed,
+            lookback_months=args.lookback_months,
+            job_timeout_seconds=args.job_timeout_seconds,
+            quality_score_preset=args.quality_score_preset,
+            execution_cost_mode=args.execution_cost_mode,
+            emit_profile_docs=not bool(args.no_profile_docs),
+            as_json=bool(args.json),
+        )
+    if args.command == "run-discovery-pair-probes":
+        return cmd_run_discovery_pair_probes(
+            atlas_dir=args.atlas_dir,
+            probe_ids=args.probe_id,
+            limit=args.limit,
+            force=bool(args.force),
+            keep_profiles=bool(args.keep_profiles),
+            timeout_seconds=args.timeout_seconds,
+            job_timeout_seconds=args.job_timeout_seconds,
+            probe_workers=args.workers,
+            as_json=bool(args.json),
+        )
+    if args.command == "build-discovery-cluster-atlas":
+        return cmd_build_discovery_cluster_atlas(
+            discovery_pair_dir=args.discovery_pair_dir,
+            out_dir=args.out_dir,
+            min_positive_score=args.min_positive_score,
+            strong_score=args.strong_score,
+            min_similarity=args.min_similarity,
+            min_shared_partners=args.min_shared_partners,
+            max_recipes=args.max_recipes,
+            as_json=bool(args.json),
+        )
+    if args.command == "build-discovery-recipe-validation-atlas":
+        return cmd_build_discovery_recipe_validation_atlas(
+            cluster_atlas_dir=args.cluster_atlas_dir,
+            out_dir=args.out_dir,
+            workspace_root=args.workspace_root,
+            catalog_path=args.catalog_path,
+            refresh_static_atlas=bool(args.refresh_static_atlas),
+            included_confidence=args.confidence,
+            instruments=args.instrument,
+            timeframes=args.timeframe,
+            max_recipes=args.max_recipes,
+            max_pairs_per_recipe=args.max_pairs_per_recipe,
+            first_member_limit=args.first_member_limit,
+            second_member_limit=args.second_member_limit,
+            lookback_months=args.lookback_months,
+            job_timeout_seconds=args.job_timeout_seconds,
+            quality_score_preset=args.quality_score_preset,
+            execution_cost_mode=args.execution_cost_mode,
+            emit_profile_docs=not bool(args.no_profile_docs),
+            as_json=bool(args.json),
+        )
+    if args.command == "run-discovery-recipe-validation-probes":
+        return cmd_run_discovery_recipe_validation_probes(
+            atlas_dir=args.atlas_dir,
+            probe_ids=args.probe_id,
+            limit=args.limit,
+            force=bool(args.force),
+            keep_profiles=bool(args.keep_profiles),
+            timeout_seconds=args.timeout_seconds,
+            job_timeout_seconds=args.job_timeout_seconds,
+            probe_workers=args.workers,
             as_json=bool(args.json),
         )
     if args.command == "supervise":

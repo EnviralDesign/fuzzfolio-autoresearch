@@ -312,6 +312,234 @@ Arguments:
 - `--timeout-seconds`: per sensitivity-basket timeout.
 - `--json`: print machine-readable output.
 
+## build-recipe-priors
+
+```powershell
+uv run build-recipe-priors
+uv run build-recipe-priors --max-slot-candidates 25 --json
+```
+
+Builds empirical recipe and slot sampling weights from the completed Atlas layers. This is the bridge from blind random indicator selection toward recipe-aware weighted selection: high-evidence indicators get more sampling weight, uncertain indicators stay available, and wild-card exploration is preserved.
+
+Default settings:
+
+- input: `runs/derived/indicator-atlas/`, `runs/derived/signal-atlas/`, `runs/derived/forward-response-atlas/`, `runs/derived/anchor-pair-atlas/`, and `runs/derived/anchor-pair-timing-atlas/`
+- output: `runs/derived/recipe-priors/`
+- max slot candidates per recipe slot: `40`
+- max empirical pair candidates: `80`
+
+Outputs:
+
+- `recipe-priors.json`: full empirical recipe-prior artifact.
+- `slot-indicator-priors.csv`: one row per recipe/slot/indicator candidate with sampling weight and evidence fields.
+- `pair-priors.csv`: empirical anchor-trigger pair menu with score and timing policy.
+- `play-hand-seed-plan.json`: compact weighted menu intended for Play Hand integration.
+- `recipe-priors-summary.json`: compact counts, top slot menus, and top pair priors.
+
+Arguments:
+
+- `--indicator-atlas-dir`, `--signal-atlas-dir`, `--forward-response-dir`: input artifact directories.
+- `--anchor-pair-dir`, `--anchor-pair-timing-dir`: input Layer 3 artifact directories.
+- `--out-dir`: output directory.
+- `--max-slot-candidates`: maximum candidates kept per recipe slot.
+- `--max-pair-candidates`: maximum empirical pair rows kept.
+- `--json`: print machine-readable output.
+
+## build-discovery-pair-atlas
+
+```powershell
+uv run build-discovery-pair-atlas
+uv run build-discovery-pair-atlas --max-pairs 3000 --json
+uv run build-discovery-pair-atlas --full
+```
+
+Builds the broad ordered-pair discovery layer. Unlike `build-anchor-pair-atlas`, this is not limited to a small curated anchor set. It scores every ordered pair of generation-eligible indicators for the selected timeframes, marks exact Layer 3 retests, then writes a diversified backend queue.
+
+Default settings:
+
+- input: `runs/derived/indicator-atlas/`, `runs/derived/signal-atlas/`, `runs/derived/forward-response-atlas/`, `runs/derived/recipe-priors/`, and `runs/derived/anchor-pair-atlas/`
+- output: `runs/derived/discovery-pair-atlas/`
+- instruments: `EURUSD`, `GBPUSD`, `USDJPY`, `XAUUSD`
+- timeframes: `M5`, `M15`
+- max queued probes: `1536`
+- lane mix: 25% proven-neighbor, 45% plausible-novel, 20% under-tested role-correct, 10% wild diversity
+- exact known Layer 3 retests: excluded from the queue by default
+
+Outputs:
+
+- `discovery-pair-atlas.json`: full discovery-pair artifact with matrix rows, queue rows, and run manifest.
+- `discovery-pair-matrix.csv`: one row per ordered pair/timeframe candidate.
+- `discovery-pair-queue.csv`: selected backend queue.
+- `discovery-pair-run-manifest.json`: CLI command manifest.
+- `run-discovery-pair-probes.ps1`: direct PowerShell runner.
+- `profiles/*.json`: temporary two-indicator profile documents for queued probes.
+- `discovery-pair-summary.json`: compact counts and top queue rows.
+
+Arguments:
+
+- `--indicator-atlas-dir`, `--signal-atlas-dir`, `--forward-response-dir`: input artifact directories.
+- `--recipe-priors-dir`, `--anchor-pair-dir`: empirical prior and known-pair directories.
+- `--out-dir`: output directory.
+- `--workspace-root`, `--catalog-path`: Trading-Dashboard catalog resolution overrides.
+- `--refresh-static-atlas`: rebuild the static indicator atlas first.
+- `--first`, `--second`: restrict the ordered pair sides by indicator id; repeatable.
+- `--instrument`, `--timeframe`: override the panel; repeatable.
+- `--max-pairs`: bounded queue size when `--full` is not used.
+- `--full`: queue every eligible ordered pair/timeframe, excluding exact known retests unless requested.
+- `--include-known-retests`: allow exact Layer 3 pairs into the runnable queue.
+- `--random-seed`: deterministic diversity lane ordering.
+- `--lookback-months`, `--quality-score-preset`, `--execution-cost-mode`: sensitivity-basket manifest settings.
+- `--no-profile-docs`: skip writing runnable profile JSON documents.
+- `--json`: print machine-readable output.
+
+## run-discovery-pair-probes
+
+```powershell
+uv run run-discovery-pair-probes
+uv run run-discovery-pair-probes --limit 100
+uv run run-discovery-pair-probes --workers 32
+uv run run-discovery-pair-probes --probe-id dp-0001-rsi-mean-reversi-toby-crabel-narr-m5
+```
+
+Runs and scores the queued broad discovery-pair backend probes. With no arguments it runs every queued probe, so use `--limit` only for an intentional partial pass.
+
+Outputs:
+
+- `discovery-pair-probe-results.csv`: one row per completed or skipped probe with backend score, trade, signal, expectancy, and profit-factor fields.
+- `discovery-pair-probe-summary.json`: compact run summary, lane-level scoring counts, top scored pairs, and top scored pairs by lane.
+- per-probe sensitivity artifacts under `probe-results/<probe-id>/`.
+
+Arguments:
+
+- `--atlas-dir`: discovery-pair atlas directory.
+- `--probe-id`: queued probe id to run; repeatable.
+- `--limit`: number of queued probes to run when `--probe-id` is omitted; default is all.
+- `--force`: rerun probes even if an output already exists.
+- `--keep-profiles`: keep temporary cloud profiles.
+- `--timeout-seconds`: per sensitivity-basket timeout.
+- `--job-timeout-seconds`: deep replay job wait timeout passed to `sensitivity-basket`.
+- `--workers`: number of discovery probes to keep in flight concurrently.
+- `--json`: print machine-readable output.
+
+## build-discovery-cluster-atlas
+
+```powershell
+uv run build-discovery-cluster-atlas
+uv run build-discovery-cluster-atlas --min-positive-score 55 --max-recipes 50
+uv run build-discovery-cluster-atlas --json
+```
+
+Builds the offline clustering layer from completed discovery-pair backend results. The command groups indicators by empirical behavior: which partners they scored well with, which partner strategy roles worked, and which timeframes/lane types produced positives. It then builds a cluster-pair matrix and emits discovered recipe-template candidates.
+
+This command does not run Fuzzfolio backend jobs. It consumes the backend evidence already cached by `run-discovery-pair-probes`.
+
+Default settings:
+
+- input: `runs/derived/discovery-pair-atlas/`
+- output: `runs/derived/discovery-cluster-atlas/`
+- positive pair threshold: `50`
+- strong pair threshold: `70`
+- minimum cluster similarity: `0.22`
+- maximum discovered recipes: `32`
+
+Outputs:
+
+- `discovery-cluster-atlas.json`: full cluster artifact with first-side clusters, second-side clusters, cluster-pair rows, and recipes.
+- `indicator-clusters.csv`: compact cluster membership and evidence rollups.
+- `indicator-success-signatures.csv`: per-indicator success vectors.
+- `cluster-pair-matrix.csv`: empirical cluster-to-cluster compatibility rows.
+- `discovered-recipes.json`: recipe-template candidates for review and later Play Hand integration.
+- `discovery-cluster-summary.json`: compact counts and top recipes.
+
+Arguments:
+
+- `--discovery-pair-dir`: input discovery-pair atlas directory.
+- `--out-dir`: output directory.
+- `--min-positive-score`: score threshold for positive evidence.
+- `--strong-score`: score threshold for strong evidence.
+- `--min-similarity`: behavioral similarity needed to join an existing cluster.
+- `--min-shared-partners`: minimum shared successful partners needed for cluster assignment.
+- `--max-recipes`: maximum discovered recipe templates to emit.
+- `--json`: print machine-readable output.
+
+## build-discovery-recipe-validation-atlas
+
+```powershell
+uv run build-discovery-recipe-validation-atlas
+uv run build-discovery-recipe-validation-atlas --confidence high_candidate --max-pairs-per-recipe 12
+uv run build-discovery-recipe-validation-atlas --lookback-months 36 --max-recipes 3
+```
+
+Builds the validation bridge from discovered cluster recipes to longer backend evidence. The command reads `discovered-recipes.json`, keeps high/promising recipe templates by default, expands each template into a capped set of concrete indicator pairs, and writes runnable 12-month sensitivity profiles.
+
+This command does not run backend jobs. Use `run-discovery-recipe-validation-probes` after reviewing the queue.
+
+Default settings:
+
+- input: `runs/derived/discovery-cluster-atlas/`
+- output: `runs/derived/discovery-recipe-validation-atlas/`
+- included confidence buckets: `high_candidate`, `promising_candidate`
+- instruments: `EURUSD`, `GBPUSD`, `USDJPY`, `XAUUSD`
+- timeframes: each recipe's top empirical timeframes
+- max recipes: `8`
+- max pairs per recipe: `8`
+- validation lookback: `12` months
+
+Outputs:
+
+- `discovery-recipe-validation-atlas.json`: full validation queue artifact and run manifest.
+- `discovery-recipe-validation-queue.csv`: concrete recipe/pair/timeframe validation rows.
+- `discovery-recipe-validation-run-manifest.json`: create-profile and sensitivity-basket arguments.
+- `run-discovery-recipe-validation-probes.ps1`: direct PowerShell runner.
+- `profiles/*.json`: temporary two-indicator validation profiles.
+- `discovery-recipe-validation-summary.json`: compact queue summary.
+
+Arguments:
+
+- `--cluster-atlas-dir`: input discovery-cluster atlas directory.
+- `--out-dir`: output directory.
+- `--workspace-root`, `--catalog-path`: Trading-Dashboard catalog resolution overrides.
+- `--refresh-static-atlas`: rebuild the static indicator atlas before constructing profiles.
+- `--confidence`: discovered recipe confidence bucket to include; repeatable.
+- `--instrument`, `--timeframe`: override the panel; repeatable.
+- `--max-recipes`: maximum discovered recipes to expand.
+- `--max-pairs-per-recipe`: maximum concrete pairs queued per recipe.
+- `--first-member-limit`, `--second-member-limit`: cluster members considered before queue capping.
+- `--lookback-months`: validation lookback months embedded in the run manifest.
+- `--job-timeout-seconds`: deep replay job wait timeout embedded in the run manifest.
+- `--quality-score-preset`, `--execution-cost-mode`: sensitivity-basket manifest settings.
+- `--no-profile-docs`: skip writing runnable profile JSON documents.
+- `--json`: print machine-readable output.
+
+## run-discovery-recipe-validation-probes
+
+```powershell
+uv run run-discovery-recipe-validation-probes
+uv run run-discovery-recipe-validation-probes --workers 32
+uv run run-discovery-recipe-validation-probes --limit 5
+uv run run-discovery-recipe-validation-probes --probe-id drv-0001-r002-toby-crabel-narrow-rsi-crossback-m5
+```
+
+Runs and scores the queued discovered recipe validation probes. With no arguments it attempts every queued validation probe. The default queue is intentionally much smaller than the broad discovery-pair run, because this step is checking 12-month retention for discovered structures before they affect Play Hand.
+
+Outputs:
+
+- `discovery-recipe-validation-results.csv`: one row per completed or skipped validation probe.
+- `discovery-recipe-validation-results-summary.json`: compact status, retention, and top-score summary.
+- per-probe sensitivity artifacts under `probe-results/<probe-id>/`.
+
+Arguments:
+
+- `--atlas-dir`: discovery recipe validation atlas directory.
+- `--probe-id`: queued validation probe id to run; repeatable.
+- `--limit`: number of queued probes to run when `--probe-id` is omitted.
+- `--force`: rerun probes even if an output already exists.
+- `--keep-profiles`: keep temporary cloud profiles.
+- `--timeout-seconds`: per sensitivity-basket timeout.
+- `--job-timeout-seconds`: deep replay job wait timeout passed to `sensitivity-basket`.
+- `--workers`: number of validation probes to keep in flight concurrently.
+- `--json`: print machine-readable output.
+
 ## run
 
 ```powershell
