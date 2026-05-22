@@ -20,7 +20,7 @@ from rich.table import Table
 
 from .config import AppConfig, load_config
 from .execution_costs import execution_cost_cli_args
-from .fuzzfolio import FuzzfolioCli
+from .fuzzfolio import CliError, FuzzfolioCli
 from .ledger import (
     append_attempt,
     attempts_path_for_run_dir,
