@@ -1,0 +1,3679 @@
+{
+  "schema_version": "recipe_priors_v1",
+  "note": "These are static priors from catalog metadata, implementation mapping, and parameter-space size. They are not empirical P&L rankings.",
+  "sampling_policy": {
+    "high_medium_prior_fraction": 0.8,
+    "uncertain_prior_fraction": 0.15,
+    "wild_exploration_fraction": 0.05
+  },
+  "recipes": {
+    "trend_pullback_continuation": {
+      "strategy_weights": {
+        "trend": 20,
+        "confirm": 8,
+        "breakout": 4
+      },
+      "slots": {
+        "context": [
+          {
+            "id": "WEIS_WAVE_FORCE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SPREAD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADOSC_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "RANDOM_WALK_INDEX_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ATR_VOLATILITY_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADX",
+            "signal_role": "filter",
+            "strategy_role": null,
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADOSC_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WILLR_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ],
+        "setup": [
+          {
+            "id": "WILLR_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "WILLR_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "ULTOSC_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "TRENDFLEX_CONFIRM",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCH_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHRSI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHF_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "SPEARMAN_RANK_CORRELATION",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Statistics",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MFI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 79.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MFI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 79.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_DISTANCE_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MACD_HISTOGRAM_PIPS_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KELTNER_CHANNEL_BREAKOUT",
+            "signal_role": "setup",
+            "strategy_role": "breakout",
+            "namespace": "Channels",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KALMAN_VELOCITY_CONFIRM",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "EHLERS_FISHER_STATE_FILTER",
+            "signal_role": "setup",
+            "strategy_role": "filter",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "DONCHIAN_CHANNEL_BREAKOUT",
+            "signal_role": "setup",
+            "strategy_role": "breakout",
+            "namespace": "Channels",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CCI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CCI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "BBANDS_POSITION_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Volatility",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ],
+        "trigger": [
+          {
+            "id": "TOBY_CRABEL_NARROW_RANGE",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "THRUST_BAR_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCH_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "PRICE_RECLAIM_MA",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "PMO_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MACD_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KEY_REVERSAL_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 87.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "EHLERS_FISHER_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 87.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CANDLE_DIRECTION_INDEX",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 83.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CANDLESTICK_PATTERNS",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Patterns",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "WAVETREND_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "TTF_DSL_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "RSI_CROSSBACK",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MA_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MARKET_MODE_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "KST_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "NVO_VOLUME_IMPULSE",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Volume",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "BREAKOUT_FIRST_CLOSE",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "WILLR_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHRSI_CROSSBACK",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "RSI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ],
+        "guard": [
+          {
+            "id": "WEIS_WAVE_FORCE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SPREAD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADOSC_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "RANDOM_WALK_INDEX_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ATR_VOLATILITY_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADX",
+            "signal_role": "filter",
+            "strategy_role": null,
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADOSC_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WILLR_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ]
+      }
+    },
+    "mean_reversion_reclaim": {
+      "strategy_weights": {
+        "mean-reversion": 22,
+        "confirm": 6,
+        "filter": 4
+      },
+      "slots": {
+        "context": [
+          {
+            "id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "RANDOM_WALK_INDEX_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SPREAD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ATR_VOLATILITY_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADOSC_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WEIS_WAVE_FORCE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADX",
+            "signal_role": "filter",
+            "strategy_role": null,
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WILLR_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ],
+        "setup": [
+          {
+            "id": "WILLR_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "WILLR_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "ULTOSC_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "TRENDFLEX_CONFIRM",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCH_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHRSI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHF_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "SPEARMAN_RANK_CORRELATION",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Statistics",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "ROOFING_FILTER_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 61.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "MOM_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MFI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 79.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MFI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 79.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_DISTANCE_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KELTNER_CHANNEL_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Channels",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KALMAN_VELOCITY_CONFIRM",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "EHLERS_FISHER_STATE_FILTER",
+            "signal_role": "setup",
+            "strategy_role": "filter",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "DONCHIAN_CHANNEL_BREAKOUT",
+            "signal_role": "setup",
+            "strategy_role": "breakout",
+            "namespace": "Channels",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CCI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CCI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ],
+        "trigger": [
+          {
+            "id": "WICK_REJECTION",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Patterns",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "TOBY_CRABEL_NARROW_RANGE",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "THRUST_BAR_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCH_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHRSI_CROSSBACK",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "RSI_CROSSBACK",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "PRICE_RECLAIM_MA",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "PMO_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MACD_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KEY_REVERSAL_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 87.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "EHLERS_FISHER_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 87.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CHANNEL_REENTRY",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "CANDLE_DIRECTION_INDEX",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 83.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CANDLESTICK_PATTERNS",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Patterns",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MA_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "WAVETREND_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "TTF_DSL_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "MARKET_MODE_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "KST_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "NVO_VOLUME_IMPULSE",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Volume",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WILLR_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ],
+        "guard": [
+          {
+            "id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "RANDOM_WALK_INDEX_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SPREAD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ATR_VOLATILITY_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADOSC_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WEIS_WAVE_FORCE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADX",
+            "signal_role": "filter",
+            "strategy_role": null,
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WILLR_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ]
+      }
+    },
+    "breakout_compression_release": {
+      "strategy_weights": {
+        "breakout": 24,
+        "trend": 8,
+        "confirm": 5
+      },
+      "slots": {
+        "context": [
+          {
+            "id": "WEIS_WAVE_FORCE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADOSC_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "RANDOM_WALK_INDEX_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ATR_VOLATILITY_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADX",
+            "signal_role": "filter",
+            "strategy_role": null,
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SPREAD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "DONCHIAN_CHANNEL_BREAKOUT",
+            "signal_role": "setup",
+            "strategy_role": "breakout",
+            "namespace": "Channels",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "ADOSC_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SPREAD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 87.0,
+            "static_prior_bucket": "context_dependent"
+          }
+        ],
+        "setup": [
+          {
+            "id": "WILLR_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "WILLR_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "ULTOSC_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "TRENDFLEX_CONFIRM",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCH_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHRSI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHF_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "SPEARMAN_RANK_CORRELATION",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Statistics",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MFI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 79.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MFI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 79.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_DISTANCE_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MACD_HISTOGRAM_PIPS_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KELTNER_CHANNEL_BREAKOUT",
+            "signal_role": "setup",
+            "strategy_role": "breakout",
+            "namespace": "Channels",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KALMAN_VELOCITY_CONFIRM",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "EHLERS_FISHER_STATE_FILTER",
+            "signal_role": "setup",
+            "strategy_role": "filter",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "DONCHIAN_CHANNEL_BREAKOUT",
+            "signal_role": "setup",
+            "strategy_role": "breakout",
+            "namespace": "Channels",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CCI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CCI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "BBANDS_POSITION_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Volatility",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ],
+        "trigger": [
+          {
+            "id": "TOBY_CRABEL_NARROW_RANGE",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "THRUST_BAR_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCH_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "PRICE_RECLAIM_MA",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "PMO_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MACD_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KEY_REVERSAL_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 87.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "EHLERS_FISHER_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 87.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CANDLE_DIRECTION_INDEX",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 83.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CANDLESTICK_PATTERNS",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Patterns",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "BREAKOUT_FIRST_CLOSE",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_CROSSBACK",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MA_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "WAVETREND_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 94.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "TTF_DSL_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 94.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "MARKET_MODE_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 94.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "KST_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 94.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "DONCHIAN_CHANNEL_BREAKOUT",
+            "signal_role": "setup",
+            "strategy_role": "breakout",
+            "namespace": "Channels",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "NVO_VOLUME_IMPULSE",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Volume",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 92.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "STOCHRSI_CROSSBACK",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "CHANNEL_REENTRY",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "WICK_REJECTION",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Patterns",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 87.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "KELTNER_CHANNEL_BREAKOUT",
+            "signal_role": "setup",
+            "strategy_role": "breakout",
+            "namespace": "Channels",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 87.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ],
+        "guard": [
+          {
+            "id": "WEIS_WAVE_FORCE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADOSC_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "RANDOM_WALK_INDEX_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ATR_VOLATILITY_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADX",
+            "signal_role": "filter",
+            "strategy_role": null,
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SPREAD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "DONCHIAN_CHANNEL_BREAKOUT",
+            "signal_role": "setup",
+            "strategy_role": "breakout",
+            "namespace": "Channels",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "ADOSC_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SPREAD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 87.0,
+            "static_prior_bucket": "context_dependent"
+          }
+        ]
+      }
+    },
+    "profile_value_context": {
+      "strategy_weights": {
+        "filter": 14,
+        "mean-reversion": 10,
+        "confirm": 6
+      },
+      "slots": {
+        "context": [
+          {
+            "id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "RANDOM_WALK_INDEX_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ATR_VOLATILITY_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADOSC_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "VQI_DIRECTIONAL_QUALITY",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 63.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 63.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WEIS_WAVE_FORCE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SPREAD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADX",
+            "signal_role": "filter",
+            "strategy_role": null,
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "GARCH_VOLATILITY_REGIME",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 55.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ATR_STEP_TREND_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Trend",
+            "static_prior_score": 55.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "context_dependent"
+          }
+        ],
+        "setup": [
+          {
+            "id": "WILLR_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "WILLR_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "ULTOSC_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "TRENDFLEX_CONFIRM",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCH_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHRSI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHF_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "SPEARMAN_RANK_CORRELATION",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Statistics",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MOM_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MFI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 79.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MFI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 79.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_DISTANCE_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KELTNER_CHANNEL_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Channels",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KALMAN_VELOCITY_CONFIRM",
+            "signal_role": "setup",
+            "strategy_role": "confirm",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "EHLERS_FISHER_STATE_FILTER",
+            "signal_role": "setup",
+            "strategy_role": "filter",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "DONCHIAN_CHANNEL_BREAKOUT",
+            "signal_role": "setup",
+            "strategy_role": "breakout",
+            "namespace": "Channels",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CMO_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CCI_TREND",
+            "signal_role": "setup",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CCI_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "BBANDS_POSITION_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volatility",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ],
+        "trigger": [
+          {
+            "id": "TOBY_CRABEL_NARROW_RANGE",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "THRUST_BAR_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCH_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "RSI_CROSSBACK",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "PRICE_RECLAIM_MA",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "PMO_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "MACD_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "KEY_REVERSAL_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 87.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "EHLERS_FISHER_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 87.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CANDLE_DIRECTION_INDEX",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 83.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "CANDLESTICK_PATTERNS",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Patterns",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "STOCHRSI_CROSSBACK",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "CHANNEL_REENTRY",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "WICK_REJECTION",
+            "signal_role": "trigger",
+            "strategy_role": "mean-reversion",
+            "namespace": "Patterns",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": null,
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "high_static_prior"
+          },
+          {
+            "id": "WAVETREND_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "TTF_DSL_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "MARKET_MODE_TRANSITION",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "KST_CROSSOVER",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 95.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "NVO_VOLUME_IMPULSE",
+            "signal_role": "trigger",
+            "strategy_role": "confirm",
+            "namespace": "Volume",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "BREAKOUT_FIRST_CLOSE",
+            "signal_role": "trigger",
+            "strategy_role": "breakout",
+            "namespace": "Signals",
+            "static_prior_score": 67.0,
+            "recipe_slot_prior": 89.0,
+            "static_prior_bucket": "low_prior_broad_space"
+          },
+          {
+            "id": "EHLERS_FISHER_STATE_FILTER",
+            "signal_role": "setup",
+            "strategy_role": "filter",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 83.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WILLR_MEAN_REVERSION",
+            "signal_role": "setup",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 81.0,
+            "recipe_slot_prior": 79.0,
+            "static_prior_bucket": "high_static_prior"
+          }
+        ],
+        "guard": [
+          {
+            "id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "RANDOM_WALK_INDEX_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ATR_VOLATILITY_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADOSC_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Volume",
+            "static_prior_score": 69.0,
+            "recipe_slot_prior": 100.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "VQI_DIRECTIONAL_QUALITY",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 63.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "PLUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MINUS_DI_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 63.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "AROON_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Momentum",
+            "static_prior_score": 77.0,
+            "recipe_slot_prior": 99.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "WEIS_WAVE_FORCE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "OBV_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SPREAD_MEAN_REVERSION",
+            "signal_role": "context",
+            "strategy_role": "mean-reversion",
+            "namespace": "Trend",
+            "static_prior_score": 65.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "CHAIKIN_AD_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Volume",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ADX",
+            "signal_role": "filter",
+            "strategy_role": null,
+            "namespace": "Trend",
+            "static_prior_score": 75.0,
+            "recipe_slot_prior": 97.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "SAR_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "MA_SLOPE_TREND",
+            "signal_role": "context",
+            "strategy_role": "trend",
+            "namespace": "Trend",
+            "static_prior_score": 71.0,
+            "recipe_slot_prior": 93.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "GARCH_VOLATILITY_REGIME",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Volatility",
+            "static_prior_score": 55.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "context_dependent"
+          },
+          {
+            "id": "ATR_STEP_TREND_FILTER",
+            "signal_role": "filter",
+            "strategy_role": "filter",
+            "namespace": "Trend",
+            "static_prior_score": 55.0,
+            "recipe_slot_prior": 91.0,
+            "static_prior_bucket": "context_dependent"
+          }
+        ]
+      }
+    }
+  }
+}

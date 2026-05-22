@@ -1,0 +1,376 @@
+{
+  "schema_version": "signal_atlas_request_manifest_v1",
+  "profiles": [
+    {
+      "indicator_id": "EHLERS_FISHER_TRANSITION",
+      "timeframe": "M5",
+      "profile_id": "6a0f336c1436eb5e7c11",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ehlers_fisher_transition-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "EHLERS_FISHER_TRANSITION",
+      "timeframe": "M15",
+      "profile_id": "6a0f336f93731a78d982",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ehlers_fisher_transition-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "KEY_REVERSAL_SIGNAL",
+      "timeframe": "M5",
+      "profile_id": "6a0f33730dfb3e8be4ed",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\key_reversal_signal-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "KEY_REVERSAL_SIGNAL",
+      "timeframe": "M15",
+      "profile_id": "6a0f33767c422d2e49ea",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\key_reversal_signal-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CANDLE_DIRECTION_INDEX",
+      "timeframe": "M5",
+      "profile_id": "6a0f3379e532733f8413",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\candle_direction_index-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CANDLE_DIRECTION_INDEX",
+      "timeframe": "M15",
+      "profile_id": "6a0f337d890926862d09",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\candle_direction_index-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+      "timeframe": "M5",
+      "profile_id": "6a0f33811e69cefcdcc1",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\buffered_range_breakout_signal-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+      "timeframe": "M15",
+      "profile_id": "6a0f338494931cab4775",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\buffered_range_breakout_signal-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CANDLESTICK_PATTERNS",
+      "timeframe": "M5",
+      "profile_id": "6a0f33882ae5951ea63f",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\candlestick_patterns-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CANDLESTICK_PATTERNS",
+      "timeframe": "M15",
+      "profile_id": "6a0f338bab12d037c78e",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\candlestick_patterns-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MACD_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f338f1fc2f90f7e28",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\macd_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MACD_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f339301d8e759eec6",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\macd_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "STOCH_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f33969639b8de15f6",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\stoch_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "STOCH_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f339a37ecb5fb42ac",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\stoch_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "THRUST_BAR_SIGNAL",
+      "timeframe": "M5",
+      "profile_id": "6a0f339e04357c83ea3e",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\thrust_bar_signal-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "THRUST_BAR_SIGNAL",
+      "timeframe": "M15",
+      "profile_id": "6a0f33a1c33559b4e418",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\thrust_bar_signal-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "timeframe": "M5",
+      "profile_id": "6a0f33a54cf7cf261243",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\toby_crabel_narrow_range-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "timeframe": "M15",
+      "profile_id": "6a0f33a93f341f7bc4a1",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\toby_crabel_narrow_range-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+      "timeframe": "M5",
+      "profile_id": "6a0f33acbf6dbb62058d",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\bollinger_keltner_squeeze_release-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+      "timeframe": "M15",
+      "profile_id": "6a0f33b07147a3763f1b",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\bollinger_keltner_squeeze_release-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MA_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f33b45cd08b5fe000",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ma_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MA_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f33b8174c239dd278",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ma_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "PMO_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f33bea91d3c1004e8",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\pmo_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "PMO_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f33c3d36d1b3740aa",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\pmo_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "PRICE_RECLAIM_MA",
+      "timeframe": "M5",
+      "profile_id": "6a0f33c7d37f9081983a",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\price_reclaim_ma-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "PRICE_RECLAIM_MA",
+      "timeframe": "M15",
+      "profile_id": "6a0f33cb6902acd52ab5",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\price_reclaim_ma-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "RSI_CROSSBACK",
+      "timeframe": "M5",
+      "profile_id": "6a0f33cf32b5bc1dba6d",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\rsi_crossback-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "RSI_CROSSBACK",
+      "timeframe": "M15",
+      "profile_id": "6a0f33d2b46f7ab90aa3",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\rsi_crossback-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BREAKOUT_FIRST_CLOSE",
+      "timeframe": "M5",
+      "profile_id": "6a0f33d64b8d63e58405",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\breakout_first_close-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BREAKOUT_FIRST_CLOSE",
+      "timeframe": "M15",
+      "profile_id": "6a0f33da3a79bc37f7c4",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\breakout_first_close-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CHANNEL_REENTRY",
+      "timeframe": "M5",
+      "profile_id": "6a0f33ddd7bc58c4fba2",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\channel_reentry-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CHANNEL_REENTRY",
+      "timeframe": "M15",
+      "profile_id": "6a0f33e1c3d5d6d3a4ab",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\channel_reentry-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "KST_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f33e55c00a89c254f",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\kst_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "KST_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f33e90ba2e7792103",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\kst_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MARKET_MODE_TRANSITION",
+      "timeframe": "M5",
+      "profile_id": "6a0f33ece7e88346711d",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\market_mode_transition-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MARKET_MODE_TRANSITION",
+      "timeframe": "M15",
+      "profile_id": "6a0f33f080b7663f8fc0",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\market_mode_transition-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "STOCHRSI_CROSSBACK",
+      "timeframe": "M5",
+      "profile_id": "6a0f33f47c8aacd104ca",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\stochrsi_crossback-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "STOCHRSI_CROSSBACK",
+      "timeframe": "M15",
+      "profile_id": "6a0f33f8099e6f1110db",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\stochrsi_crossback-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "TTF_DSL_TRANSITION",
+      "timeframe": "M5",
+      "profile_id": "6a0f33fb7d8cc70d5c6f",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ttf_dsl_transition-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "TTF_DSL_TRANSITION",
+      "timeframe": "M15",
+      "profile_id": "6a0f33ff6414c32eecf8",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ttf_dsl_transition-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "WAVETREND_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f34030ad6d664e5af",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\wavetrend_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "WAVETREND_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f3406bd2821d70b75",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\wavetrend_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "NVO_VOLUME_IMPULSE",
+      "timeframe": "M5",
+      "profile_id": "6a0f340a76d287e1e8ff",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\nvo_volume_impulse-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "NVO_VOLUME_IMPULSE",
+      "timeframe": "M15",
+      "profile_id": "6a0f340e16445c94888e",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\nvo_volume_impulse-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "WICK_REJECTION",
+      "timeframe": "M5",
+      "profile_id": "6a0f3411ae014d95d857",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\wick_rejection-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "WICK_REJECTION",
+      "timeframe": "M15",
+      "profile_id": "6a0f3415341fb5fde2b8",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\wick_rejection-m15.json",
+      "created": true,
+      "deleted": true
+    }
+  ],
+  "replay_source": "system",
+  "raw_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\raw",
+  "profile_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles"
+}

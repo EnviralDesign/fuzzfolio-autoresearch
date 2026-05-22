@@ -1,0 +1,3404 @@
+{
+  "schema_version": "discovery_cluster_atlas_v1",
+  "recipes": [
+    {
+      "recipe_id": "discovered_recipe_001",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "high_candidate",
+      "name": "first:confirm->with:minus_di_mean_reversion + second:mean-reversion->with:toby_crabel_narrow_range",
+      "compatibility_score": 75.364,
+      "best_score": 78.3601,
+      "positive_pair_count": 295,
+      "strong_pair_count": 69,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_01",
+          "label": "first:confirm->with:minus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "THRUST_BAR_SIGNAL",
+            "MARKET_MODE_TRANSITION",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER",
+            "EHLERS_FISHER_TRANSITION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_02",
+          "label": "second:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-0252-toby-crabel-narrow-rsi-crossback-m5",
+          "first_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+          "second_indicator_id": "RSI_CROSSBACK",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 78.3601,
+          "best_trades": "34",
+          "best_expectancy_r": "0.6649",
+          "best_profit_factor": "3.5143"
+        },
+        {
+          "probe_id": "dp-8943-macd-crossover-channel-reentry-m5",
+          "first_indicator_id": "MACD_CROSSOVER",
+          "second_indicator_id": "CHANNEL_REENTRY",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 76.8543,
+          "best_trades": "42",
+          "best_expectancy_r": "0.6255",
+          "best_profit_factor": "3.2033"
+        },
+        {
+          "probe_id": "dp-5087-stochf-trend-cmo-mean-reversion-m5",
+          "first_indicator_id": "STOCHF_TREND",
+          "second_indicator_id": "CMO_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 76.6993,
+          "best_trades": "38",
+          "best_expectancy_r": "1.3768",
+          "best_profit_factor": "4.1987"
+        },
+        {
+          "probe_id": "dp-8937-thrust-bar-signal-channel-reentry-m5",
+          "first_indicator_id": "THRUST_BAR_SIGNAL",
+          "second_indicator_id": "CHANNEL_REENTRY",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 75.8283,
+          "best_trades": "35",
+          "best_expectancy_r": "0.627",
+          "best_profit_factor": "2.8166"
+        },
+        {
+          "probe_id": "dp-9670-market-mode-transi-ma-spread-mean-rev-m15",
+          "first_indicator_id": "MARKET_MODE_TRANSITION",
+          "second_indicator_id": "MA_SPREAD_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 75.5434,
+          "best_trades": "87",
+          "best_expectancy_r": "0.3042",
+          "best_profit_factor": "2.8418"
+        },
+        {
+          "probe_id": "dp-0076-toby-crabel-narrow-channel-reentry-m5",
+          "first_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+          "second_indicator_id": "CHANNEL_REENTRY",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 75.3942,
+          "best_trades": "46",
+          "best_expectancy_r": "0.3688",
+          "best_profit_factor": "1.8518"
+        },
+        {
+          "probe_id": "dp-8963-wavetrend-crossove-channel-reentry-m15",
+          "first_indicator_id": "WAVETREND_CROSSOVER",
+          "second_indicator_id": "CHANNEL_REENTRY",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 75.2125,
+          "best_trades": "25",
+          "best_expectancy_r": "0.5833",
+          "best_profit_factor": "2.9091"
+        },
+        {
+          "probe_id": "dp-10561-nvo-volume-impulse-mfi-mean-reversion-m15",
+          "first_indicator_id": "NVO_VOLUME_IMPULSE",
+          "second_indicator_id": "MFI_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 74.7918,
+          "best_trades": "16",
+          "best_expectancy_r": "1.7083",
+          "best_profit_factor": "4.9684"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_002",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "high_candidate",
+      "name": "first:mean-reversion->with:toby_crabel_narrow_range + second:confirm->with:plus_di_mean_reversion",
+      "compatibility_score": 75.2563,
+      "best_score": 78.3601,
+      "positive_pair_count": 345,
+      "strong_pair_count": 72,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_02",
+          "label": "first:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_01",
+          "label": "second:confirm->with:plus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "VQI_DIRECTIONAL_QUALITY",
+            "THRUST_BAR_SIGNAL",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "MARKET_MODE_TRANSITION",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-0152-rsi-crossback-toby-crabel-narrow-m5",
+          "first_indicator_id": "RSI_CROSSBACK",
+          "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 78.3601,
+          "best_trades": "34",
+          "best_expectancy_r": "0.6649",
+          "best_profit_factor": "3.5143"
+        },
+        {
+          "probe_id": "dp-8949-channel-reentry-macd-crossover-m5",
+          "first_indicator_id": "CHANNEL_REENTRY",
+          "second_indicator_id": "MACD_CROSSOVER",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 76.8543,
+          "best_trades": "42",
+          "best_expectancy_r": "0.6255",
+          "best_profit_factor": "3.2033"
+        },
+        {
+          "probe_id": "dp-5229-cmo-mean-reversion-stochf-trend-m5",
+          "first_indicator_id": "CMO_MEAN_REVERSION",
+          "second_indicator_id": "STOCHF_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 76.6993,
+          "best_trades": "38",
+          "best_expectancy_r": "1.3768",
+          "best_profit_factor": "4.1987"
+        },
+        {
+          "probe_id": "dp-13418-willr-mean-reversi-vqi-directional-qu-m5",
+          "first_indicator_id": "WILLR_MEAN_REVERSION",
+          "second_indicator_id": "VQI_DIRECTIONAL_QUALITY",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 76.5771,
+          "best_trades": "19",
+          "best_expectancy_r": "0.8705",
+          "best_profit_factor": "3.1005"
+        },
+        {
+          "probe_id": "dp-9018-channel-reentry-thrust-bar-signal-m5",
+          "first_indicator_id": "CHANNEL_REENTRY",
+          "second_indicator_id": "THRUST_BAR_SIGNAL",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 75.8283,
+          "best_trades": "35",
+          "best_expectancy_r": "0.627",
+          "best_profit_factor": "2.8166"
+        },
+        {
+          "probe_id": "dp-0106-channel-reentry-toby-crabel-narrow-m5",
+          "first_indicator_id": "CHANNEL_REENTRY",
+          "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 75.3942,
+          "best_trades": "46",
+          "best_expectancy_r": "0.3688",
+          "best_profit_factor": "1.8518"
+        },
+        {
+          "probe_id": "dp-8948-channel-reentry-wavetrend-crossove-m15",
+          "first_indicator_id": "CHANNEL_REENTRY",
+          "second_indicator_id": "WAVETREND_CROSSOVER",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 75.2125,
+          "best_trades": "25",
+          "best_expectancy_r": "0.5833",
+          "best_profit_factor": "2.9091"
+        },
+        {
+          "probe_id": "dp-2351-plus-di-mean-rever-market-mode-transi-m15",
+          "first_indicator_id": "PLUS_DI_MEAN_REVERSION",
+          "second_indicator_id": "MARKET_MODE_TRANSITION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 74.8644,
+          "best_trades": "43",
+          "best_expectancy_r": "0.5336",
+          "best_profit_factor": "2.0818"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_003",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "high_candidate",
+      "name": "first:trend->with:obv_mean_reversion + second:mean-reversion->with:toby_crabel_narrow_range",
+      "compatibility_score": 71.7369,
+      "best_score": 76.2815,
+      "positive_pair_count": 147,
+      "strong_pair_count": 15,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_03",
+          "label": "first:trend->with:obv_mean_reversion",
+          "recommended_indicators": [
+            "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "MINUS_DI_TREND",
+            "BBANDS_POSITION_TREND",
+            "DONCHIAN_CHANNEL_BREAKOUT",
+            "PLUS_DI_TREND",
+            "MFI_TREND",
+            "ULTOSC_TREND",
+            "STOCH_TREND",
+            "BREAKOUT_FIRST_CLOSE",
+            "CMO_TREND"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_02",
+          "label": "second:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-9980-bollinger-keltner-obv-mean-reversion-m5",
+          "first_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+          "second_indicator_id": "OBV_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 76.2815,
+          "best_trades": "59",
+          "best_expectancy_r": "0.3971",
+          "best_profit_factor": "2.8177"
+        },
+        {
+          "probe_id": "dp-5558-minus-di-trend-ma-distance-mean-r-m15",
+          "first_indicator_id": "MINUS_DI_TREND",
+          "second_indicator_id": "MA_DISTANCE_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 73.7761,
+          "best_trades": "80",
+          "best_expectancy_r": "0.5281",
+          "best_profit_factor": "1.9419"
+        },
+        {
+          "probe_id": "dp-12159-bbands-position-tr-adosc-mean-reversi-m15",
+          "first_indicator_id": "BBANDS_POSITION_TREND",
+          "second_indicator_id": "ADOSC_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 73.544,
+          "best_trades": "40",
+          "best_expectancy_r": "0.4563",
+          "best_profit_factor": "2.4064"
+        },
+        {
+          "probe_id": "dp-9978-bollinger-keltner-macd-histogram-pip-m5",
+          "first_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+          "second_indicator_id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 72.8469,
+          "best_trades": "97",
+          "best_expectancy_r": "0.5594",
+          "best_profit_factor": "1.7247"
+        },
+        {
+          "probe_id": "dp-6799-donchian-channel-b-macd-histogram-pip-m15",
+          "first_indicator_id": "DONCHIAN_CHANNEL_BREAKOUT",
+          "second_indicator_id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 72.6002,
+          "best_trades": "32",
+          "best_expectancy_r": "0.56",
+          "best_profit_factor": "2.0569"
+        },
+        {
+          "probe_id": "dp-12454-bbands-position-tr-ma-spread-mean-rev-m5",
+          "first_indicator_id": "BBANDS_POSITION_TREND",
+          "second_indicator_id": "MA_SPREAD_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 72.419,
+          "best_trades": "20",
+          "best_expectancy_r": "1.5167",
+          "best_profit_factor": "3.5175"
+        },
+        {
+          "probe_id": "dp-11787-bollinger-keltner-ma-spread-mean-rev-m15",
+          "first_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+          "second_indicator_id": "MA_SPREAD_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 71.8689,
+          "best_trades": "18",
+          "best_expectancy_r": "1.6473",
+          "best_profit_factor": "2.955"
+        },
+        {
+          "probe_id": "dp-11177-mfi-trend-obv-mean-reversion-m15",
+          "first_indicator_id": "MFI_TREND",
+          "second_indicator_id": "OBV_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 71.8478,
+          "best_trades": "21",
+          "best_expectancy_r": "0.9125",
+          "best_profit_factor": "4.3091"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_004",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "high_candidate",
+      "name": "first:confirm->with:minus_di_mean_reversion + second:confirm->with:plus_di_mean_reversion",
+      "compatibility_score": 67.5809,
+      "best_score": 75.147,
+      "positive_pair_count": 56,
+      "strong_pair_count": 9,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_01",
+          "label": "first:confirm->with:minus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "THRUST_BAR_SIGNAL",
+            "MARKET_MODE_TRANSITION",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER",
+            "EHLERS_FISHER_TRANSITION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_01",
+          "label": "second:confirm->with:plus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "VQI_DIRECTIONAL_QUALITY",
+            "THRUST_BAR_SIGNAL",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "MARKET_MODE_TRANSITION",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-2331-weis-wave-force-tr-market-mode-transi-m15",
+          "first_indicator_id": "WEIS_WAVE_FORCE_TREND",
+          "second_indicator_id": "MARKET_MODE_TRANSITION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 75.147,
+          "best_trades": "99",
+          "best_expectancy_r": "0.1429",
+          "best_profit_factor": "4.0709"
+        },
+        {
+          "probe_id": "dp-9266-market-mode-transi-weis-wave-force-tr-m15",
+          "first_indicator_id": "MARKET_MODE_TRANSITION",
+          "second_indicator_id": "WEIS_WAVE_FORCE_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 75.147,
+          "best_trades": "99",
+          "best_expectancy_r": "0.1429",
+          "best_profit_factor": "4.0709"
+        },
+        {
+          "probe_id": "dp-0426-trendflex-confirm-pmo-crossover-m15",
+          "first_indicator_id": "TRENDFLEX_CONFIRM",
+          "second_indicator_id": "PMO_CROSSOVER",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 74.303,
+          "best_trades": "113",
+          "best_expectancy_r": "0.553",
+          "best_profit_factor": "1.94"
+        },
+        {
+          "probe_id": "dp-1747-pmo-crossover-trendflex-confirm-m15",
+          "first_indicator_id": "PMO_CROSSOVER",
+          "second_indicator_id": "TRENDFLEX_CONFIRM",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 74.303,
+          "best_trades": "113",
+          "best_expectancy_r": "0.553",
+          "best_profit_factor": "1.94"
+        },
+        {
+          "probe_id": "dp-8967-buffered-range-bre-market-mode-transi-m15",
+          "first_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "second_indicator_id": "MARKET_MODE_TRANSITION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 71.561,
+          "best_trades": "40",
+          "best_expectancy_r": "0.3586",
+          "best_profit_factor": "2.1852"
+        },
+        {
+          "probe_id": "dp-0233-wavetrend-crossove-toby-crabel-narrow-m5",
+          "first_indicator_id": "WAVETREND_CROSSOVER",
+          "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 70.7945,
+          "best_trades": "202",
+          "best_expectancy_r": "0.2752",
+          "best_profit_factor": "1.6752"
+        },
+        {
+          "probe_id": "dp-0578-toby-crabel-narrow-wavetrend-crossove-m5",
+          "first_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+          "second_indicator_id": "WAVETREND_CROSSOVER",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 70.7945,
+          "best_trades": "202",
+          "best_expectancy_r": "0.2752",
+          "best_profit_factor": "1.6752"
+        },
+        {
+          "probe_id": "dp-8454-wavetrend-crossove-nvo-volume-impulse-m5",
+          "first_indicator_id": "WAVETREND_CROSSOVER",
+          "second_indicator_id": "NVO_VOLUME_IMPULSE",
+          "probe_timeframe": "M5",
+          "discovery_lane": "under_tested_role_correct",
+          "composite_score": 70.6595,
+          "best_trades": "55",
+          "best_expectancy_r": "0.3183",
+          "best_profit_factor": "1.7262"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_005",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "high_candidate",
+      "name": "first:mean-reversion->with:toby_crabel_narrow_range + second:breakout->with:obv_mean_reversion",
+      "compatibility_score": 67.5361,
+      "best_score": 76.2815,
+      "positive_pair_count": 57,
+      "strong_pair_count": 5,
+      "top_timeframes": "M5,M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_02",
+          "label": "first:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_03",
+          "label": "second:breakout->with:obv_mean_reversion",
+          "recommended_indicators": [
+            "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "TTF_DSL_TRANSITION",
+            "DONCHIAN_CHANNEL_BREAKOUT",
+            "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+            "PLUS_DI_TREND",
+            "MFI_TREND",
+            "BREAKOUT_FIRST_CLOSE"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-3083-obv-mean-reversion-bollinger-keltner-m5",
+          "first_indicator_id": "OBV_MEAN_REVERSION",
+          "second_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 76.2815,
+          "best_trades": "59",
+          "best_expectancy_r": "0.3971",
+          "best_profit_factor": "2.8177"
+        },
+        {
+          "probe_id": "dp-3560-macd-histogram-pip-bollinger-keltner-m5",
+          "first_indicator_id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+          "second_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 72.8469,
+          "best_trades": "97",
+          "best_expectancy_r": "0.5594",
+          "best_profit_factor": "1.7247"
+        },
+        {
+          "probe_id": "dp-6630-macd-histogram-pip-donchian-channel-b-m15",
+          "first_indicator_id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+          "second_indicator_id": "DONCHIAN_CHANNEL_BREAKOUT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 72.6002,
+          "best_trades": "32",
+          "best_expectancy_r": "0.56",
+          "best_profit_factor": "2.0569"
+        },
+        {
+          "probe_id": "dp-3033-mom-mean-reversion-buffered-range-bre-m15",
+          "first_indicator_id": "MOM_MEAN_REVERSION",
+          "second_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 71.9583,
+          "best_trades": "17",
+          "best_expectancy_r": "1.5732",
+          "best_profit_factor": "1.9452"
+        },
+        {
+          "probe_id": "dp-12278-obv-mean-reversion-plus-di-trend-m5",
+          "first_indicator_id": "OBV_MEAN_REVERSION",
+          "second_indicator_id": "PLUS_DI_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 71.4766,
+          "best_trades": "33",
+          "best_expectancy_r": "0.6728",
+          "best_profit_factor": "3.645"
+        },
+        {
+          "probe_id": "dp-1237-bbands-position-me-mfi-trend-m5",
+          "first_indicator_id": "BBANDS_POSITION_MEAN_REVERSION",
+          "second_indicator_id": "MFI_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 69.7949,
+          "best_trades": "9",
+          "best_expectancy_r": "2.125",
+          "best_profit_factor": "4.1538"
+        },
+        {
+          "probe_id": "dp-10802-ma-crossover-mfi-trend-m5",
+          "first_indicator_id": "MA_CROSSOVER",
+          "second_indicator_id": "MFI_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 69.5222,
+          "best_trades": "30",
+          "best_expectancy_r": "0.6088",
+          "best_profit_factor": "1.8873"
+        },
+        {
+          "probe_id": "dp-4131-macd-histogram-pip-bollinger-keltner-m15",
+          "first_indicator_id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+          "second_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 68.2368,
+          "best_trades": "58",
+          "best_expectancy_r": "0.3259",
+          "best_profit_factor": "1.584"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_006",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "high_candidate",
+      "name": "first:mean-reversion->with:toby_crabel_narrow_range + second:mean-reversion->with:toby_crabel_narrow_range",
+      "compatibility_score": 63.1692,
+      "best_score": 74.6439,
+      "positive_pair_count": 40,
+      "strong_pair_count": 5,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_02",
+          "label": "first:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_02",
+          "label": "second:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-0249-willr-mean-reversi-rsi-crossback-m5",
+          "first_indicator_id": "WILLR_MEAN_REVERSION",
+          "second_indicator_id": "RSI_CROSSBACK",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 74.6439,
+          "best_trades": "28",
+          "best_expectancy_r": "0.6151",
+          "best_profit_factor": "3.2281"
+        },
+        {
+          "probe_id": "dp-0921-rsi-crossback-willr-mean-reversi-m5",
+          "first_indicator_id": "RSI_CROSSBACK",
+          "second_indicator_id": "WILLR_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 74.6439,
+          "best_trades": "28",
+          "best_expectancy_r": "0.6151",
+          "best_profit_factor": "3.2281"
+        },
+        {
+          "probe_id": "dp-3838-roofing-filter-mea-ma-crossover-m5",
+          "first_indicator_id": "ROOFING_FILTER_MEAN_REVERSION",
+          "second_indicator_id": "MA_CROSSOVER",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 72.5921,
+          "best_trades": "15",
+          "best_expectancy_r": "0.5958",
+          "best_profit_factor": "2.5536"
+        },
+        {
+          "probe_id": "dp-11740-ma-crossover-roofing-filter-mea-m5",
+          "first_indicator_id": "MA_CROSSOVER",
+          "second_indicator_id": "ROOFING_FILTER_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 72.5921,
+          "best_trades": "15",
+          "best_expectancy_r": "0.5958",
+          "best_profit_factor": "2.5536"
+        },
+        {
+          "probe_id": "dp-0728-bbands-position-me-stochrsi-crossback-m15",
+          "first_indicator_id": "BBANDS_POSITION_MEAN_REVERSION",
+          "second_indicator_id": "STOCHRSI_CROSSBACK",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 72.1982,
+          "best_trades": "94",
+          "best_expectancy_r": "0.3395",
+          "best_profit_factor": "1.7192"
+        },
+        {
+          "probe_id": "dp-1222-rsi-crossback-bbands-position-me-m5",
+          "first_indicator_id": "RSI_CROSSBACK",
+          "second_indicator_id": "BBANDS_POSITION_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 69.4983,
+          "best_trades": "128",
+          "best_expectancy_r": "0.2681",
+          "best_profit_factor": "1.5094"
+        },
+        {
+          "probe_id": "dp-1820-rsi-crossback-bbands-position-me-m15",
+          "first_indicator_id": "RSI_CROSSBACK",
+          "second_indicator_id": "BBANDS_POSITION_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 64.5931,
+          "best_trades": "52",
+          "best_expectancy_r": "0.325",
+          "best_profit_factor": "1.576"
+        },
+        {
+          "probe_id": "dp-12688-minus-di-mean-reve-plus-di-mean-rever-m15",
+          "first_indicator_id": "MINUS_DI_MEAN_REVERSION",
+          "second_indicator_id": "PLUS_DI_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 61.0062,
+          "best_trades": "75",
+          "best_expectancy_r": "0.403",
+          "best_profit_factor": "1.8329"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_007",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "promising_candidate",
+      "name": "first:mean-reversion->with:toby_crabel_narrow_range + second:trend->with:ma_spread_mean_reversion",
+      "compatibility_score": 62.2637,
+      "best_score": 72.419,
+      "positive_pair_count": 62,
+      "strong_pair_count": 1,
+      "top_timeframes": "M5,M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_02",
+          "label": "first:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_04",
+          "label": "second:trend->with:ma_spread_mean_reversion",
+          "recommended_indicators": [
+            "BBANDS_POSITION_TREND",
+            "CMO_TREND",
+            "ULTOSC_TREND",
+            "CCI_TREND",
+            "WILLR_TREND",
+            "GARCH_VOLATILITY_REGIME"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-7408-ma-spread-mean-rev-bbands-position-tr-m5",
+          "first_indicator_id": "MA_SPREAD_MEAN_REVERSION",
+          "second_indicator_id": "BBANDS_POSITION_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 72.419,
+          "best_trades": "20",
+          "best_expectancy_r": "1.5167",
+          "best_profit_factor": "3.5175"
+        },
+        {
+          "probe_id": "dp-5748-ma-distance-mean-r-ultosc-trend-m5",
+          "first_indicator_id": "MA_DISTANCE_MEAN_REVERSION",
+          "second_indicator_id": "ULTOSC_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 67.1135,
+          "best_trades": "7",
+          "best_expectancy_r": "2.0833",
+          "best_profit_factor": "3.0"
+        },
+        {
+          "probe_id": "dp-5013-macd-histogram-pip-cci-trend-m5",
+          "first_indicator_id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+          "second_indicator_id": "CCI_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 66.8866,
+          "best_trades": "120",
+          "best_expectancy_r": "0.2924",
+          "best_profit_factor": "1.4438"
+        },
+        {
+          "probe_id": "dp-4919-aroon-mean-reversi-willr-trend-m5",
+          "first_indicator_id": "AROON_MEAN_REVERSION",
+          "second_indicator_id": "WILLR_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 65.7334,
+          "best_trades": "7",
+          "best_expectancy_r": "1.0906",
+          "best_profit_factor": "3.3798"
+        },
+        {
+          "probe_id": "dp-4819-mfi-mean-reversion-willr-trend-m5",
+          "first_indicator_id": "MFI_MEAN_REVERSION",
+          "second_indicator_id": "WILLR_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 65.6369,
+          "best_trades": "26",
+          "best_expectancy_r": "0.379",
+          "best_profit_factor": "3.3882"
+        },
+        {
+          "probe_id": "dp-6828-ma-spread-mean-rev-ultosc-trend-m5",
+          "first_indicator_id": "MA_SPREAD_MEAN_REVERSION",
+          "second_indicator_id": "ULTOSC_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 65.4756,
+          "best_trades": "51",
+          "best_expectancy_r": "0.4478",
+          "best_profit_factor": "1.7618"
+        },
+        {
+          "probe_id": "dp-6033-ma-spread-mean-rev-cci-trend-m5",
+          "first_indicator_id": "MA_SPREAD_MEAN_REVERSION",
+          "second_indicator_id": "CCI_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 65.1284,
+          "best_trades": "12",
+          "best_expectancy_r": "1.6691",
+          "best_profit_factor": "3.5098"
+        },
+        {
+          "probe_id": "dp-14381-chaikin-ad-mean-re-garch-volatility-r-m15",
+          "first_indicator_id": "CHAIKIN_AD_MEAN_REVERSION",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 63.6605,
+          "best_trades": "35",
+          "best_expectancy_r": "1.0774",
+          "best_profit_factor": "2.6425"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_008",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "promising_candidate",
+      "name": "first:filter->with:rsi_mean_reversion + second:mean-reversion->with:toby_crabel_narrow_range",
+      "compatibility_score": 61.6704,
+      "best_score": 76.5771,
+      "positive_pair_count": 41,
+      "strong_pair_count": 1,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_04",
+          "label": "first:filter->with:rsi_mean_reversion",
+          "recommended_indicators": [
+            "VQI_DIRECTIONAL_QUALITY",
+            "STOCHRSI_TREND",
+            "EHLERS_FISHER_STATE_FILTER",
+            "CHAIKIN_AD_TREND",
+            "ADOSC_TREND",
+            "MA_SPREAD_TREND",
+            "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+            "ATR_STEP_TREND_FILTER"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_02",
+          "label": "second:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-8011-vqi-directional-qu-willr-mean-reversi-m5",
+          "first_indicator_id": "VQI_DIRECTIONAL_QUALITY",
+          "second_indicator_id": "WILLR_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 76.5771,
+          "best_trades": "19",
+          "best_expectancy_r": "0.8705",
+          "best_profit_factor": "3.1005"
+        },
+        {
+          "probe_id": "dp-5834-stochrsi-trend-stoch-mean-reversi-m5",
+          "first_indicator_id": "STOCHRSI_TREND",
+          "second_indicator_id": "STOCH_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 69.9054,
+          "best_trades": "110",
+          "best_expectancy_r": "0.3714",
+          "best_profit_factor": "1.6439"
+        },
+        {
+          "probe_id": "dp-0964-stochrsi-trend-rsi-mean-reversion-m15",
+          "first_indicator_id": "STOCHRSI_TREND",
+          "second_indicator_id": "RSI_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 69.3159,
+          "best_trades": "132",
+          "best_expectancy_r": "0.4182",
+          "best_profit_factor": "1.6819"
+        },
+        {
+          "probe_id": "dp-7421-ehlers-fisher-stat-cci-mean-reversion-m15",
+          "first_indicator_id": "EHLERS_FISHER_STATE_FILTER",
+          "second_indicator_id": "CCI_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 68.4233,
+          "best_trades": "69",
+          "best_expectancy_r": "0.4154",
+          "best_profit_factor": "1.9254"
+        },
+        {
+          "probe_id": "dp-0950-chaikin-ad-trend-rsi-mean-reversion-m15",
+          "first_indicator_id": "CHAIKIN_AD_TREND",
+          "second_indicator_id": "RSI_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 68.3694,
+          "best_trades": "87",
+          "best_expectancy_r": "0.4815",
+          "best_profit_factor": "1.8046"
+        },
+        {
+          "probe_id": "dp-1088-adosc-trend-rsi-mean-reversion-m15",
+          "first_indicator_id": "ADOSC_TREND",
+          "second_indicator_id": "RSI_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 68.3694,
+          "best_trades": "87",
+          "best_expectancy_r": "0.4815",
+          "best_profit_factor": "1.8046"
+        },
+        {
+          "probe_id": "dp-12803-ma-spread-trend-minus-di-mean-reve-m15",
+          "first_indicator_id": "MA_SPREAD_TREND",
+          "second_indicator_id": "MINUS_DI_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 67.9584,
+          "best_trades": "23",
+          "best_expectancy_r": "1.4464",
+          "best_profit_factor": "2.8221"
+        },
+        {
+          "probe_id": "dp-0670-bollinger-keltner-rsi-crossback-m15",
+          "first_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+          "second_indicator_id": "RSI_CROSSBACK",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 67.8649,
+          "best_trades": "15",
+          "best_expectancy_r": "1.0042",
+          "best_profit_factor": "2.0606"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_009",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "promising_candidate",
+      "name": "first:confirm->with:minus_di_mean_reversion + second:breakout->with:obv_mean_reversion",
+      "compatibility_score": 57.373,
+      "best_score": 74.4479,
+      "positive_pair_count": 16,
+      "strong_pair_count": 2,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_01",
+          "label": "first:confirm->with:minus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "THRUST_BAR_SIGNAL",
+            "MARKET_MODE_TRANSITION",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER",
+            "EHLERS_FISHER_TRANSITION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_03",
+          "label": "second:breakout->with:obv_mean_reversion",
+          "recommended_indicators": [
+            "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "TTF_DSL_TRANSITION",
+            "DONCHIAN_CHANNEL_BREAKOUT",
+            "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+            "PLUS_DI_TREND",
+            "MFI_TREND",
+            "BREAKOUT_FIRST_CLOSE"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-9004-price-reclaim-ma-ttf-dsl-transition-m15",
+          "first_indicator_id": "PRICE_RECLAIM_MA",
+          "second_indicator_id": "TTF_DSL_TRANSITION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 74.4479,
+          "best_trades": "49",
+          "best_expectancy_r": "0.3507",
+          "best_profit_factor": "1.8428"
+        },
+        {
+          "probe_id": "dp-8990-market-mode-transi-buffered-range-bre-m15",
+          "first_indicator_id": "MARKET_MODE_TRANSITION",
+          "second_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 71.561,
+          "best_trades": "40",
+          "best_expectancy_r": "0.3586",
+          "best_profit_factor": "2.1852"
+        },
+        {
+          "probe_id": "dp-9203-key-reversal-signa-plus-di-trend-m15",
+          "first_indicator_id": "KEY_REVERSAL_SIGNAL",
+          "second_indicator_id": "PLUS_DI_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 67.483,
+          "best_trades": "30",
+          "best_expectancy_r": "0.4732",
+          "best_profit_factor": "1.8007"
+        },
+        {
+          "probe_id": "dp-2343-weis-wave-force-tr-ttf-dsl-transition-m15",
+          "first_indicator_id": "WEIS_WAVE_FORCE_TREND",
+          "second_indicator_id": "TTF_DSL_TRANSITION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 63.2349,
+          "best_trades": "88",
+          "best_expectancy_r": "0.2759",
+          "best_profit_factor": "1.4011"
+        },
+        {
+          "probe_id": "dp-8283-rolling-volume-pro-donchian-channel-b-m15",
+          "first_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "second_indicator_id": "DONCHIAN_CHANNEL_BREAKOUT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 62.5136,
+          "best_trades": "25",
+          "best_expectancy_r": "0.3211",
+          "best_profit_factor": "1.5836"
+        },
+        {
+          "probe_id": "dp-9244-buffered-range-bre-mfi-trend-m15",
+          "first_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "second_indicator_id": "MFI_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 58.0857,
+          "best_trades": "79",
+          "best_expectancy_r": "0.1773",
+          "best_profit_factor": "1.8404"
+        },
+        {
+          "probe_id": "dp-9361-thrust-bar-signal-mfi-trend-m15",
+          "first_indicator_id": "THRUST_BAR_SIGNAL",
+          "second_indicator_id": "MFI_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 58.0589,
+          "best_trades": "54",
+          "best_expectancy_r": "0.2656",
+          "best_profit_factor": "1.3593"
+        },
+        {
+          "probe_id": "dp-9017-nvo-volume-impulse-ttf-dsl-transition-m15",
+          "first_indicator_id": "NVO_VOLUME_IMPULSE",
+          "second_indicator_id": "TTF_DSL_TRANSITION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 55.9581,
+          "best_trades": "52",
+          "best_expectancy_r": "0.2585",
+          "best_profit_factor": "1.492"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_010",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "promising_candidate",
+      "name": "first:mean-reversion->with:toby_crabel_narrow_range + second:filter->with:cmo_mean_reversion",
+      "compatibility_score": 55.3872,
+      "best_score": 71.4887,
+      "positive_pair_count": 8,
+      "strong_pair_count": 2,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_02",
+          "label": "first:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_06",
+          "label": "second:filter->with:cmo_mean_reversion",
+          "recommended_indicators": [
+            "ATR_STEP_TREND_FILTER",
+            "STOCH_TREND"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-13779-cmo-mean-reversion-atr-step-trend-fil-m5",
+          "first_indicator_id": "CMO_MEAN_REVERSION",
+          "second_indicator_id": "ATR_STEP_TREND_FILTER",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 71.4887,
+          "best_trades": "24",
+          "best_expectancy_r": "0.7172",
+          "best_profit_factor": "2.1775"
+        },
+        {
+          "probe_id": "dp-5392-mfi-mean-reversion-stoch-trend-m15",
+          "first_indicator_id": "MFI_MEAN_REVERSION",
+          "second_indicator_id": "STOCH_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 70.1647,
+          "best_trades": "28",
+          "best_expectancy_r": "0.8953",
+          "best_profit_factor": "2.4719"
+        },
+        {
+          "probe_id": "dp-5549-minus-di-mean-reve-stoch-trend-m5",
+          "first_indicator_id": "MINUS_DI_MEAN_REVERSION",
+          "second_indicator_id": "STOCH_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 68.6808,
+          "best_trades": "40",
+          "best_expectancy_r": "1.0313",
+          "best_profit_factor": "3.2289"
+        },
+        {
+          "probe_id": "dp-5233-cmo-mean-reversion-stoch-trend-m5",
+          "first_indicator_id": "CMO_MEAN_REVERSION",
+          "second_indicator_id": "STOCH_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 68.3251,
+          "best_trades": "16",
+          "best_expectancy_r": "1.625",
+          "best_profit_factor": "2.7442"
+        },
+        {
+          "probe_id": "dp-5743-ma-distance-mean-r-stoch-trend-m15",
+          "first_indicator_id": "MA_DISTANCE_MEAN_REVERSION",
+          "second_indicator_id": "STOCH_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 65.8984,
+          "best_trades": "91",
+          "best_expectancy_r": "0.3388",
+          "best_profit_factor": "1.5137"
+        },
+        {
+          "probe_id": "dp-5232-cmo-mean-reversion-stoch-trend-m15",
+          "first_indicator_id": "CMO_MEAN_REVERSION",
+          "second_indicator_id": "STOCH_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 62.2293,
+          "best_trades": "12",
+          "best_expectancy_r": "1.9554",
+          "best_profit_factor": "2.3333"
+        },
+        {
+          "probe_id": "dp-5260-mom-mean-reversion-stoch-trend-m15",
+          "first_indicator_id": "MOM_MEAN_REVERSION",
+          "second_indicator_id": "STOCH_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 58.2596,
+          "best_trades": "40",
+          "best_expectancy_r": "0.4441",
+          "best_profit_factor": "2.2272"
+        },
+        {
+          "probe_id": "dp-6823-ma-spread-mean-rev-stoch-trend-m15",
+          "first_indicator_id": "MA_SPREAD_MEAN_REVERSION",
+          "second_indicator_id": "STOCH_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 53.5073,
+          "best_trades": "4",
+          "best_expectancy_r": "1.3864",
+          "best_profit_factor": "1.7449"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_011",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "needs_more_evidence",
+      "name": "first:mean-reversion->with:toby_crabel_narrow_range + second:trend->with:keltner_channel_mean_reversion",
+      "compatibility_score": 54.9473,
+      "best_score": 69.0885,
+      "positive_pair_count": 32,
+      "strong_pair_count": 0,
+      "top_timeframes": "M5,M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_02",
+          "label": "first:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_05",
+          "label": "second:trend->with:keltner_channel_mean_reversion",
+          "recommended_indicators": [
+            "MINUS_DI_TREND",
+            "MA_DISTANCE_TREND",
+            "KELTNER_CHANNEL_BREAKOUT",
+            "ADOSC_TREND",
+            "MA_SLOPE_TREND",
+            "RSI_TREND",
+            "RANDOM_WALK_INDEX_FILTER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-5701-keltner-channel-me-ma-distance-trend-m15",
+          "first_indicator_id": "KELTNER_CHANNEL_MEAN_REVERSION",
+          "second_indicator_id": "MA_DISTANCE_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 69.0885,
+          "best_trades": "20",
+          "best_expectancy_r": "0.8216",
+          "best_profit_factor": "2.2355"
+        },
+        {
+          "probe_id": "dp-12288-weis-wave-force-me-minus-di-trend-m5",
+          "first_indicator_id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+          "second_indicator_id": "MINUS_DI_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 68.2287,
+          "best_trades": "37",
+          "best_expectancy_r": "0.4261",
+          "best_profit_factor": "1.9394"
+        },
+        {
+          "probe_id": "dp-12986-ma-slope-mean-reve-adosc-trend-m5",
+          "first_indicator_id": "MA_SLOPE_MEAN_REVERSION",
+          "second_indicator_id": "ADOSC_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 66.8282,
+          "best_trades": "52",
+          "best_expectancy_r": "0.7273",
+          "best_profit_factor": "3.0001"
+        },
+        {
+          "probe_id": "dp-0995-rsi-crossback-adosc-trend-m5",
+          "first_indicator_id": "RSI_CROSSBACK",
+          "second_indicator_id": "ADOSC_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 66.4271,
+          "best_trades": "44",
+          "best_expectancy_r": "0.3091",
+          "best_profit_factor": "2.0172"
+        },
+        {
+          "probe_id": "dp-2015-keltner-channel-me-ma-slope-trend-m15",
+          "first_indicator_id": "KELTNER_CHANNEL_MEAN_REVERSION",
+          "second_indicator_id": "MA_SLOPE_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 66.087,
+          "best_trades": "9",
+          "best_expectancy_r": "2.0278",
+          "best_profit_factor": "3.3725"
+        },
+        {
+          "probe_id": "dp-12653-minus-di-mean-reve-adosc-trend-m5",
+          "first_indicator_id": "MINUS_DI_MEAN_REVERSION",
+          "second_indicator_id": "ADOSC_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 63.4284,
+          "best_trades": "183",
+          "best_expectancy_r": "0.9529",
+          "best_profit_factor": "2.8599"
+        },
+        {
+          "probe_id": "dp-9178-channel-reentry-keltner-channel-br-m5",
+          "first_indicator_id": "CHANNEL_REENTRY",
+          "second_indicator_id": "KELTNER_CHANNEL_BREAKOUT",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 63.3827,
+          "best_trades": "7",
+          "best_expectancy_r": "0.9833",
+          "best_profit_factor": "2.6591"
+        },
+        {
+          "probe_id": "dp-11226-keltner-channel-me-minus-di-trend-m5",
+          "first_indicator_id": "KELTNER_CHANNEL_MEAN_REVERSION",
+          "second_indicator_id": "MINUS_DI_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 63.3112,
+          "best_trades": "22",
+          "best_expectancy_r": "1.2139",
+          "best_profit_factor": "3.0165"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_012",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "needs_more_evidence",
+      "name": "first:trend->with:keltner_channel_mean_reversion + second:mean-reversion->with:toby_crabel_narrow_range",
+      "compatibility_score": 53.0259,
+      "best_score": 69.0885,
+      "positive_pair_count": 21,
+      "strong_pair_count": 0,
+      "top_timeframes": "M5,M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_06",
+          "label": "first:trend->with:keltner_channel_mean_reversion",
+          "recommended_indicators": [
+            "MA_DISTANCE_TREND",
+            "KELTNER_CHANNEL_BREAKOUT",
+            "SAR_TREND",
+            "MA_SLOPE_TREND"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_02",
+          "label": "second:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-5749-ma-distance-trend-keltner-channel-me-m15",
+          "first_indicator_id": "MA_DISTANCE_TREND",
+          "second_indicator_id": "KELTNER_CHANNEL_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 69.0885,
+          "best_trades": "20",
+          "best_expectancy_r": "0.8216",
+          "best_profit_factor": "2.2355"
+        },
+        {
+          "probe_id": "dp-6281-sar-trend-keltner-channel-me-m5",
+          "first_indicator_id": "SAR_TREND",
+          "second_indicator_id": "KELTNER_CHANNEL_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 67.6937,
+          "best_trades": "72",
+          "best_expectancy_r": "0.3753",
+          "best_profit_factor": "2.5004"
+        },
+        {
+          "probe_id": "dp-2268-sar-trend-channel-reentry-m5",
+          "first_indicator_id": "SAR_TREND",
+          "second_indicator_id": "CHANNEL_REENTRY",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 65.51,
+          "best_trades": "41",
+          "best_expectancy_r": "0.2979",
+          "best_profit_factor": "2.3999"
+        },
+        {
+          "probe_id": "dp-2309-keltner-channel-br-channel-reentry-m5",
+          "first_indicator_id": "KELTNER_CHANNEL_BREAKOUT",
+          "second_indicator_id": "CHANNEL_REENTRY",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 63.3827,
+          "best_trades": "7",
+          "best_expectancy_r": "0.9833",
+          "best_profit_factor": "2.6591"
+        },
+        {
+          "probe_id": "dp-2533-sar-trend-ma-crossover-m15",
+          "first_indicator_id": "SAR_TREND",
+          "second_indicator_id": "MA_CROSSOVER",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 62.7303,
+          "best_trades": "119",
+          "best_expectancy_r": "0.1384",
+          "best_profit_factor": "1.3768"
+        },
+        {
+          "probe_id": "dp-7280-keltner-channel-br-ma-distance-mean-r-m5",
+          "first_indicator_id": "KELTNER_CHANNEL_BREAKOUT",
+          "second_indicator_id": "MA_DISTANCE_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 62.614,
+          "best_trades": "38",
+          "best_expectancy_r": "0.4802",
+          "best_profit_factor": "2.0171"
+        },
+        {
+          "probe_id": "dp-12515-keltner-channel-br-sar-mean-reversion-m15",
+          "first_indicator_id": "KELTNER_CHANNEL_BREAKOUT",
+          "second_indicator_id": "SAR_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 62.1901,
+          "best_trades": "56",
+          "best_expectancy_r": "0.3874",
+          "best_profit_factor": "1.7136"
+        },
+        {
+          "probe_id": "dp-7279-keltner-channel-br-ma-distance-mean-r-m15",
+          "first_indicator_id": "KELTNER_CHANNEL_BREAKOUT",
+          "second_indicator_id": "MA_DISTANCE_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 60.4497,
+          "best_trades": "20",
+          "best_expectancy_r": "0.6667",
+          "best_profit_factor": "2.1462"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_013",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "promising_candidate",
+      "name": "first:confirm->with:weis_wave_force_trend + second:confirm->with:plus_di_mean_reversion",
+      "compatibility_score": 52.2865,
+      "best_score": 74.4479,
+      "positive_pair_count": 5,
+      "strong_pair_count": 1,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_05",
+          "label": "first:confirm->with:weis_wave_force_trend",
+          "recommended_indicators": [
+            "TTF_DSL_TRANSITION",
+            "STOCHRSI_CROSSBACK"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_01",
+          "label": "second:confirm->with:plus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "VQI_DIRECTIONAL_QUALITY",
+            "THRUST_BAR_SIGNAL",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "MARKET_MODE_TRANSITION",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-9030-ttf-dsl-transition-price-reclaim-ma-m15",
+          "first_indicator_id": "TTF_DSL_TRANSITION",
+          "second_indicator_id": "PRICE_RECLAIM_MA",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 74.4479,
+          "best_trades": "49",
+          "best_expectancy_r": "0.3507",
+          "best_profit_factor": "1.8428"
+        },
+        {
+          "probe_id": "dp-12358-stochrsi-crossback-weis-wave-force-tr-m15",
+          "first_indicator_id": "STOCHRSI_CROSSBACK",
+          "second_indicator_id": "WEIS_WAVE_FORCE_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 63.9327,
+          "best_trades": "39",
+          "best_expectancy_r": "0.3598",
+          "best_profit_factor": "1.6257"
+        },
+        {
+          "probe_id": "dp-9302-ttf-dsl-transition-weis-wave-force-tr-m15",
+          "first_indicator_id": "TTF_DSL_TRANSITION",
+          "second_indicator_id": "WEIS_WAVE_FORCE_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 63.2349,
+          "best_trades": "88",
+          "best_expectancy_r": "0.2759",
+          "best_profit_factor": "1.4011"
+        },
+        {
+          "probe_id": "dp-9101-ttf-dsl-transition-nvo-volume-impulse-m15",
+          "first_indicator_id": "TTF_DSL_TRANSITION",
+          "second_indicator_id": "NVO_VOLUME_IMPULSE",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 55.9581,
+          "best_trades": "52",
+          "best_expectancy_r": "0.2585",
+          "best_profit_factor": "1.492"
+        },
+        {
+          "probe_id": "dp-9027-ttf-dsl-transition-candle-direction-i-m5",
+          "first_indicator_id": "TTF_DSL_TRANSITION",
+          "second_indicator_id": "CANDLE_DIRECTION_INDEX",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 53.9739,
+          "best_trades": "42",
+          "best_expectancy_r": "0.126",
+          "best_profit_factor": "1.7505"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_014",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "needs_more_evidence",
+      "name": "first:confirm->with:minus_di_mean_reversion + second:trend->with:keltner_channel_mean_reversion",
+      "compatibility_score": 52.2702,
+      "best_score": 69.7841,
+      "positive_pair_count": 17,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_01",
+          "label": "first:confirm->with:minus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "THRUST_BAR_SIGNAL",
+            "MARKET_MODE_TRANSITION",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER",
+            "EHLERS_FISHER_TRANSITION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_05",
+          "label": "second:trend->with:keltner_channel_mean_reversion",
+          "recommended_indicators": [
+            "MINUS_DI_TREND",
+            "MA_DISTANCE_TREND",
+            "KELTNER_CHANNEL_BREAKOUT",
+            "ADOSC_TREND",
+            "MA_SLOPE_TREND",
+            "RSI_TREND",
+            "RANDOM_WALK_INDEX_FILTER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-9271-buffered-range-bre-minus-di-trend-m15",
+          "first_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "second_indicator_id": "MINUS_DI_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 69.7841,
+          "best_trades": "34",
+          "best_expectancy_r": "1.0341",
+          "best_profit_factor": "2.4232"
+        },
+        {
+          "probe_id": "dp-9471-wavetrend-crossove-keltner-channel-br-m15",
+          "first_indicator_id": "WAVETREND_CROSSOVER",
+          "second_indicator_id": "KELTNER_CHANNEL_BREAKOUT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 68.2359,
+          "best_trades": "11",
+          "best_expectancy_r": "1.7125",
+          "best_profit_factor": "4.7273"
+        },
+        {
+          "probe_id": "dp-10380-nvo-volume-impulse-minus-di-trend-m15",
+          "first_indicator_id": "NVO_VOLUME_IMPULSE",
+          "second_indicator_id": "MINUS_DI_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 68.0027,
+          "best_trades": "91",
+          "best_expectancy_r": "0.3254",
+          "best_profit_factor": "1.4689"
+        },
+        {
+          "probe_id": "dp-9225-buffered-range-bre-rsi-trend-m15",
+          "first_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "second_indicator_id": "RSI_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 65.5833,
+          "best_trades": "11",
+          "best_expectancy_r": "0.7351",
+          "best_profit_factor": "2.6757"
+        },
+        {
+          "probe_id": "dp-9411-wavetrend-crossove-ma-distance-trend-m15",
+          "first_indicator_id": "WAVETREND_CROSSOVER",
+          "second_indicator_id": "MA_DISTANCE_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 64.6081,
+          "best_trades": "16",
+          "best_expectancy_r": "0.5667",
+          "best_profit_factor": "3.3977"
+        },
+        {
+          "probe_id": "dp-0917-buffered-range-bre-ma-slope-trend-m15",
+          "first_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "second_indicator_id": "MA_SLOPE_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 62.7415,
+          "best_trades": "13",
+          "best_expectancy_r": "0.8643",
+          "best_profit_factor": "1.5758"
+        },
+        {
+          "probe_id": "dp-9565-wavetrend-crossove-adosc-trend-m15",
+          "first_indicator_id": "WAVETREND_CROSSOVER",
+          "second_indicator_id": "ADOSC_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 60.8135,
+          "best_trades": "64",
+          "best_expectancy_r": "0.3129",
+          "best_profit_factor": "1.5786"
+        },
+        {
+          "probe_id": "dp-0822-pmo-crossover-ma-slope-trend-m5",
+          "first_indicator_id": "PMO_CROSSOVER",
+          "second_indicator_id": "MA_SLOPE_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 60.5492,
+          "best_trades": "48",
+          "best_expectancy_r": "0.385",
+          "best_profit_factor": "1.817"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_015",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "needs_more_evidence",
+      "name": "first:trend->with:obv_mean_reversion + second:confirm->with:plus_di_mean_reversion",
+      "compatibility_score": 52.0877,
+      "best_score": 65.9064,
+      "positive_pair_count": 28,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_03",
+          "label": "first:trend->with:obv_mean_reversion",
+          "recommended_indicators": [
+            "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "MINUS_DI_TREND",
+            "BBANDS_POSITION_TREND",
+            "DONCHIAN_CHANNEL_BREAKOUT",
+            "PLUS_DI_TREND",
+            "MFI_TREND",
+            "ULTOSC_TREND",
+            "STOCH_TREND",
+            "BREAKOUT_FIRST_CLOSE",
+            "CMO_TREND"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_01",
+          "label": "second:confirm->with:plus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "VQI_DIRECTIONAL_QUALITY",
+            "THRUST_BAR_SIGNAL",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "MARKET_MODE_TRANSITION",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-3991-plus-di-trend-wick-rejection-m15",
+          "first_indicator_id": "PLUS_DI_TREND",
+          "second_indicator_id": "WICK_REJECTION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 65.9064,
+          "best_trades": "136",
+          "best_expectancy_r": "0.1733",
+          "best_profit_factor": "2.052"
+        },
+        {
+          "probe_id": "dp-14061-plus-di-trend-bollinger-keltner-m5",
+          "first_indicator_id": "PLUS_DI_TREND",
+          "second_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 65.2662,
+          "best_trades": "68",
+          "best_expectancy_r": "0.7871",
+          "best_profit_factor": "2.9253"
+        },
+        {
+          "probe_id": "dp-3730-stoch-trend-ehlers-fisher-tran-m15",
+          "first_indicator_id": "STOCH_TREND",
+          "second_indicator_id": "EHLERS_FISHER_TRANSITION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 63.956,
+          "best_trades": "36",
+          "best_expectancy_r": "0.3201",
+          "best_profit_factor": "1.6819"
+        },
+        {
+          "probe_id": "dp-4212-garch-volatility-r-key-reversal-signa-m5",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "KEY_REVERSAL_SIGNAL",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 60.2269,
+          "best_trades": "11",
+          "best_expectancy_r": "1.6713",
+          "best_profit_factor": "4.8548"
+        },
+        {
+          "probe_id": "dp-14184-garch-volatility-r-bollinger-keltner-m5",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 60.1107,
+          "best_trades": "16",
+          "best_expectancy_r": "1.3077",
+          "best_profit_factor": "3.1935"
+        },
+        {
+          "probe_id": "dp-4250-garch-volatility-r-wavetrend-crossove-m5",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "WAVETREND_CROSSOVER",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 59.7325,
+          "best_trades": "10",
+          "best_expectancy_r": "2.1",
+          "best_profit_factor": "10.5455"
+        },
+        {
+          "probe_id": "dp-4320-garch-volatility-r-price-reclaim-ma-m5",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "PRICE_RECLAIM_MA",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 59.2316,
+          "best_trades": "12",
+          "best_expectancy_r": "1.1364",
+          "best_profit_factor": "3.0408"
+        },
+        {
+          "probe_id": "dp-2919-mfi-trend-thrust-bar-signal-m15",
+          "first_indicator_id": "MFI_TREND",
+          "second_indicator_id": "THRUST_BAR_SIGNAL",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 58.0589,
+          "best_trades": "54",
+          "best_expectancy_r": "0.2656",
+          "best_profit_factor": "1.3593"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_016",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "promising_candidate",
+      "name": "first:confirm->with:weis_wave_force_trend + second:mean-reversion->with:toby_crabel_narrow_range",
+      "compatibility_score": 50.9858,
+      "best_score": 72.1982,
+      "positive_pair_count": 5,
+      "strong_pair_count": 1,
+      "top_timeframes": "M5,M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_05",
+          "label": "first:confirm->with:weis_wave_force_trend",
+          "recommended_indicators": [
+            "TTF_DSL_TRANSITION",
+            "STOCHRSI_CROSSBACK"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_02",
+          "label": "second:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-2123-stochrsi-crossback-bbands-position-me-m15",
+          "first_indicator_id": "STOCHRSI_CROSSBACK",
+          "second_indicator_id": "BBANDS_POSITION_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 72.1982,
+          "best_trades": "94",
+          "best_expectancy_r": "0.3395",
+          "best_profit_factor": "1.7192"
+        },
+        {
+          "probe_id": "dp-10370-ttf-dsl-transition-macd-histogram-pip-m5",
+          "first_indicator_id": "TTF_DSL_TRANSITION",
+          "second_indicator_id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 64.3922,
+          "best_trades": "36",
+          "best_expectancy_r": "0.3068",
+          "best_profit_factor": "2.1588"
+        },
+        {
+          "probe_id": "dp-10290-ttf-dsl-transition-aroon-mean-reversi-m5",
+          "first_indicator_id": "TTF_DSL_TRANSITION",
+          "second_indicator_id": "AROON_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 58.4484,
+          "best_trades": "57",
+          "best_expectancy_r": "0.2086",
+          "best_profit_factor": "1.2942"
+        },
+        {
+          "probe_id": "dp-2031-stochrsi-crossback-rsi-mean-reversion-m15",
+          "first_indicator_id": "STOCHRSI_CROSSBACK",
+          "second_indicator_id": "RSI_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 55.4342,
+          "best_trades": "135",
+          "best_expectancy_r": "0.1503",
+          "best_profit_factor": "1.214"
+        },
+        {
+          "probe_id": "dp-10709-stochrsi-crossback-stochf-mean-revers-m5",
+          "first_indicator_id": "STOCHRSI_CROSSBACK",
+          "second_indicator_id": "STOCHF_MEAN_REVERSION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 50.3681,
+          "best_trades": "12",
+          "best_expectancy_r": "0.8601",
+          "best_profit_factor": "1.3595"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_017",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "needs_more_evidence",
+      "name": "first:trend->with:obv_mean_reversion + second:filter->with:cmo_trend",
+      "compatibility_score": 50.7488,
+      "best_score": 67.7271,
+      "positive_pair_count": 7,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_03",
+          "label": "first:trend->with:obv_mean_reversion",
+          "recommended_indicators": [
+            "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "MINUS_DI_TREND",
+            "BBANDS_POSITION_TREND",
+            "DONCHIAN_CHANNEL_BREAKOUT",
+            "PLUS_DI_TREND",
+            "MFI_TREND",
+            "ULTOSC_TREND",
+            "STOCH_TREND",
+            "BREAKOUT_FIRST_CLOSE",
+            "CMO_TREND"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_07",
+          "label": "second:filter->with:cmo_trend",
+          "recommended_indicators": [
+            "ROLLING_VOLUME_PROFILE_CONTEXT"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-14123-cmo-trend-rolling-volume-pro-m15",
+          "first_indicator_id": "CMO_TREND",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 67.7271,
+          "best_trades": "79",
+          "best_expectancy_r": "0.4619",
+          "best_profit_factor": "1.8201"
+        },
+        {
+          "probe_id": "dp-14365-bbands-position-tr-rolling-volume-pro-m15",
+          "first_indicator_id": "BBANDS_POSITION_TREND",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 67.6965,
+          "best_trades": "75",
+          "best_expectancy_r": "0.4624",
+          "best_profit_factor": "1.7515"
+        },
+        {
+          "probe_id": "dp-14132-rsi-trend-rolling-volume-pro-m5",
+          "first_indicator_id": "RSI_TREND",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 66.1233,
+          "best_trades": "11",
+          "best_expectancy_r": "2.1845",
+          "best_profit_factor": "2.9526"
+        },
+        {
+          "probe_id": "dp-14125-donchian-channel-b-rolling-volume-pro-m15",
+          "first_indicator_id": "DONCHIAN_CHANNEL_BREAKOUT",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 62.5136,
+          "best_trades": "25",
+          "best_expectancy_r": "0.3211",
+          "best_profit_factor": "1.5836"
+        },
+        {
+          "probe_id": "dp-14119-cci-trend-rolling-volume-pro-m15",
+          "first_indicator_id": "CCI_TREND",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 60.3756,
+          "best_trades": "82",
+          "best_expectancy_r": "0.2637",
+          "best_profit_factor": "1.4946"
+        },
+        {
+          "probe_id": "dp-14549-garch-volatility-r-rolling-volume-pro-m15",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 57.2643,
+          "best_trades": "8",
+          "best_expectancy_r": "1.3438",
+          "best_profit_factor": "3.3243"
+        },
+        {
+          "probe_id": "dp-14550-garch-volatility-r-rolling-volume-pro-m5",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 54.0122,
+          "best_trades": "30",
+          "best_expectancy_r": "0.5083",
+          "best_profit_factor": "1.8472"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_018",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "promising_candidate",
+      "name": "first:trend->with:obv_mean_reversion + second:trend->with:keltner_channel_mean_reversion",
+      "compatibility_score": 49.7566,
+      "best_score": 72.1137,
+      "positive_pair_count": 3,
+      "strong_pair_count": 1,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_03",
+          "label": "first:trend->with:obv_mean_reversion",
+          "recommended_indicators": [
+            "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "MINUS_DI_TREND",
+            "BBANDS_POSITION_TREND",
+            "DONCHIAN_CHANNEL_BREAKOUT",
+            "PLUS_DI_TREND",
+            "MFI_TREND",
+            "ULTOSC_TREND",
+            "STOCH_TREND",
+            "BREAKOUT_FIRST_CLOSE",
+            "CMO_TREND"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_05",
+          "label": "second:trend->with:keltner_channel_mean_reversion",
+          "recommended_indicators": [
+            "MINUS_DI_TREND",
+            "MA_DISTANCE_TREND",
+            "KELTNER_CHANNEL_BREAKOUT",
+            "ADOSC_TREND",
+            "MA_SLOPE_TREND",
+            "RSI_TREND",
+            "RANDOM_WALK_INDEX_FILTER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-12700-plus-di-trend-minus-di-trend-m15",
+          "first_indicator_id": "PLUS_DI_TREND",
+          "second_indicator_id": "MINUS_DI_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 72.1137,
+          "best_trades": "115",
+          "best_expectancy_r": "0.3042",
+          "best_profit_factor": "3.5011"
+        },
+        {
+          "probe_id": "dp-12701-plus-di-trend-minus-di-trend-m5",
+          "first_indicator_id": "PLUS_DI_TREND",
+          "second_indicator_id": "MINUS_DI_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 61.8887,
+          "best_trades": "246",
+          "best_expectancy_r": "0.231",
+          "best_profit_factor": "2.2743"
+        },
+        {
+          "probe_id": "dp-14429-garch-volatility-r-adosc-trend-m15",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "ADOSC_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 56.5146,
+          "best_trades": "32",
+          "best_expectancy_r": "0.625",
+          "best_profit_factor": "1.8"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_019",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "needs_more_evidence",
+      "name": "first:confirm->with:minus_di_mean_reversion + second:trend->with:ma_spread_mean_reversion",
+      "compatibility_score": 49.2826,
+      "best_score": 67.7271,
+      "positive_pair_count": 11,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_01",
+          "label": "first:confirm->with:minus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "THRUST_BAR_SIGNAL",
+            "MARKET_MODE_TRANSITION",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER",
+            "EHLERS_FISHER_TRANSITION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_04",
+          "label": "second:trend->with:ma_spread_mean_reversion",
+          "recommended_indicators": [
+            "BBANDS_POSITION_TREND",
+            "CMO_TREND",
+            "ULTOSC_TREND",
+            "CCI_TREND",
+            "WILLR_TREND",
+            "GARCH_VOLATILITY_REGIME"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-8281-rolling-volume-pro-cmo-trend-m15",
+          "first_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "second_indicator_id": "CMO_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 67.7271,
+          "best_trades": "79",
+          "best_expectancy_r": "0.4619",
+          "best_profit_factor": "1.8201"
+        },
+        {
+          "probe_id": "dp-8353-rolling-volume-pro-bbands-position-tr-m15",
+          "first_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "second_indicator_id": "BBANDS_POSITION_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 67.6965,
+          "best_trades": "75",
+          "best_expectancy_r": "0.4624",
+          "best_profit_factor": "1.7515"
+        },
+        {
+          "probe_id": "dp-8277-rolling-volume-pro-cci-trend-m15",
+          "first_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "second_indicator_id": "CCI_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 60.3756,
+          "best_trades": "82",
+          "best_expectancy_r": "0.2637",
+          "best_profit_factor": "1.4946"
+        },
+        {
+          "probe_id": "dp-14030-trendflex-confirm-garch-volatility-r-m15",
+          "first_indicator_id": "TRENDFLEX_CONFIRM",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 58.3665,
+          "best_trades": "13",
+          "best_expectancy_r": "1.1154",
+          "best_profit_factor": "2.7373"
+        },
+        {
+          "probe_id": "dp-9323-buffered-range-bre-ultosc-trend-m15",
+          "first_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "second_indicator_id": "ULTOSC_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 57.0069,
+          "best_trades": "16",
+          "best_expectancy_r": "0.3583",
+          "best_profit_factor": "1.8148"
+        },
+        {
+          "probe_id": "dp-13363-kst-crossover-garch-volatility-r-m15",
+          "first_indicator_id": "KST_CROSSOVER",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 56.9969,
+          "best_trades": "5",
+          "best_expectancy_r": "1.45",
+          "best_profit_factor": "3.9"
+        },
+        {
+          "probe_id": "dp-2071-pmo-crossover-garch-volatility-r-m15",
+          "first_indicator_id": "PMO_CROSSOVER",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 56.3566,
+          "best_trades": "5",
+          "best_expectancy_r": "1.45",
+          "best_profit_factor": "3.9"
+        },
+        {
+          "probe_id": "dp-14393-obv-trend-garch-volatility-r-m15",
+          "first_indicator_id": "OBV_TREND",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 54.216,
+          "best_trades": "35",
+          "best_expectancy_r": "0.4643",
+          "best_profit_factor": "1.5652"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_020",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "needs_more_evidence",
+      "name": "first:trend->with:keltner_channel_mean_reversion + second:confirm->with:plus_di_mean_reversion",
+      "compatibility_score": 48.8236,
+      "best_score": 68.2359,
+      "positive_pair_count": 9,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_06",
+          "label": "first:trend->with:keltner_channel_mean_reversion",
+          "recommended_indicators": [
+            "MA_DISTANCE_TREND",
+            "KELTNER_CHANNEL_BREAKOUT",
+            "SAR_TREND",
+            "MA_SLOPE_TREND"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_01",
+          "label": "second:confirm->with:plus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "VQI_DIRECTIONAL_QUALITY",
+            "THRUST_BAR_SIGNAL",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "MARKET_MODE_TRANSITION",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-2715-keltner-channel-br-wavetrend-crossove-m15",
+          "first_indicator_id": "KELTNER_CHANNEL_BREAKOUT",
+          "second_indicator_id": "WAVETREND_CROSSOVER",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 68.2359,
+          "best_trades": "11",
+          "best_expectancy_r": "1.7125",
+          "best_profit_factor": "4.7273"
+        },
+        {
+          "probe_id": "dp-0100-ma-slope-trend-key-reversal-signa-m15",
+          "first_indicator_id": "MA_SLOPE_TREND",
+          "second_indicator_id": "KEY_REVERSAL_SIGNAL",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 66.9627,
+          "best_trades": "27",
+          "best_expectancy_r": "1.4476",
+          "best_profit_factor": "2.6098"
+        },
+        {
+          "probe_id": "dp-2680-ma-distance-trend-wavetrend-crossove-m15",
+          "first_indicator_id": "MA_DISTANCE_TREND",
+          "second_indicator_id": "WAVETREND_CROSSOVER",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 64.6081,
+          "best_trades": "16",
+          "best_expectancy_r": "0.5667",
+          "best_profit_factor": "3.3977"
+        },
+        {
+          "probe_id": "dp-2240-ma-slope-trend-bollinger-keltner-m15",
+          "first_indicator_id": "MA_SLOPE_TREND",
+          "second_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 57.8817,
+          "best_trades": "63",
+          "best_expectancy_r": "0.1654",
+          "best_profit_factor": "1.4795"
+        },
+        {
+          "probe_id": "dp-0122-ma-slope-trend-wavetrend-crossove-m15",
+          "first_indicator_id": "MA_SLOPE_TREND",
+          "second_indicator_id": "WAVETREND_CROSSOVER",
+          "probe_timeframe": "M15",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 56.2742,
+          "best_trades": "6",
+          "best_expectancy_r": "0.9097",
+          "best_profit_factor": "2.0476"
+        },
+        {
+          "probe_id": "dp-0127-ma-slope-trend-candle-direction-i-m5",
+          "first_indicator_id": "MA_SLOPE_TREND",
+          "second_indicator_id": "CANDLE_DIRECTION_INDEX",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 55.6819,
+          "best_trades": "62",
+          "best_expectancy_r": "0.1935",
+          "best_profit_factor": "1.3474"
+        },
+        {
+          "probe_id": "dp-0473-ma-slope-trend-thrust-bar-signal-m5",
+          "first_indicator_id": "MA_SLOPE_TREND",
+          "second_indicator_id": "THRUST_BAR_SIGNAL",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 54.4957,
+          "best_trades": "42",
+          "best_expectancy_r": "0.5325",
+          "best_profit_factor": "1.7179"
+        },
+        {
+          "probe_id": "dp-0200-ma-slope-trend-kst-crossover-m5",
+          "first_indicator_id": "MA_SLOPE_TREND",
+          "second_indicator_id": "KST_CROSSOVER",
+          "probe_timeframe": "M5",
+          "discovery_lane": "proven_neighbor",
+          "composite_score": 51.2348,
+          "best_trades": "76",
+          "best_expectancy_r": "0.2063",
+          "best_profit_factor": "1.3961"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_021",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "needs_more_evidence",
+      "name": "first:trend->with:obv_mean_reversion + second:breakout->with:obv_mean_reversion",
+      "compatibility_score": 48.1789,
+      "best_score": 65.5833,
+      "positive_pair_count": 10,
+      "strong_pair_count": 0,
+      "top_timeframes": "M5,M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_03",
+          "label": "first:trend->with:obv_mean_reversion",
+          "recommended_indicators": [
+            "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "MINUS_DI_TREND",
+            "BBANDS_POSITION_TREND",
+            "DONCHIAN_CHANNEL_BREAKOUT",
+            "PLUS_DI_TREND",
+            "MFI_TREND",
+            "ULTOSC_TREND",
+            "STOCH_TREND",
+            "BREAKOUT_FIRST_CLOSE",
+            "CMO_TREND"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_03",
+          "label": "second:breakout->with:obv_mean_reversion",
+          "recommended_indicators": [
+            "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "TTF_DSL_TRANSITION",
+            "DONCHIAN_CHANNEL_BREAKOUT",
+            "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+            "PLUS_DI_TREND",
+            "MFI_TREND",
+            "BREAKOUT_FIRST_CLOSE"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-2646-rsi-trend-buffered-range-bre-m15",
+          "first_indicator_id": "RSI_TREND",
+          "second_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 65.5833,
+          "best_trades": "11",
+          "best_expectancy_r": "0.7351",
+          "best_profit_factor": "2.6757"
+        },
+        {
+          "probe_id": "dp-12693-minus-di-trend-plus-di-trend-m5",
+          "first_indicator_id": "MINUS_DI_TREND",
+          "second_indicator_id": "PLUS_DI_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 61.8887,
+          "best_trades": "246",
+          "best_expectancy_r": "0.231",
+          "best_profit_factor": "2.2743"
+        },
+        {
+          "probe_id": "dp-4119-garch-volatility-r-ttf-dsl-transition-m5",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "TTF_DSL_TRANSITION",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 59.4507,
+          "best_trades": "9",
+          "best_expectancy_r": "1.8333",
+          "best_profit_factor": "5.7143"
+        },
+        {
+          "probe_id": "dp-2666-mfi-trend-buffered-range-bre-m15",
+          "first_indicator_id": "MFI_TREND",
+          "second_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 58.0857,
+          "best_trades": "79",
+          "best_expectancy_r": "0.1773",
+          "best_profit_factor": "1.8404"
+        },
+        {
+          "probe_id": "dp-2738-ultosc-trend-buffered-range-bre-m15",
+          "first_indicator_id": "ULTOSC_TREND",
+          "second_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 57.0069,
+          "best_trades": "16",
+          "best_expectancy_r": "0.3583",
+          "best_profit_factor": "1.8148"
+        },
+        {
+          "probe_id": "dp-4272-garch-volatility-r-buffered-range-bre-m5",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 56.029,
+          "best_trades": "9",
+          "best_expectancy_r": "1.0139",
+          "best_profit_factor": "2.5103"
+        },
+        {
+          "probe_id": "dp-2992-plus-di-trend-buffered-range-bre-m5",
+          "first_indicator_id": "PLUS_DI_TREND",
+          "second_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 55.5231,
+          "best_trades": "68",
+          "best_expectancy_r": "0.2471",
+          "best_profit_factor": "1.3295"
+        },
+        {
+          "probe_id": "dp-2991-minus-di-trend-buffered-range-bre-m5",
+          "first_indicator_id": "MINUS_DI_TREND",
+          "second_indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+          "probe_timeframe": "M5",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 55.2198,
+          "best_trades": "97",
+          "best_expectancy_r": "0.2231",
+          "best_profit_factor": "1.4568"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_022",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "sparse_watch",
+      "name": "first:confirm->with:weis_wave_force_trend + second:filter->with:cmo_mean_reversion",
+      "compatibility_score": 46.8753,
+      "best_score": 69.3561,
+      "positive_pair_count": 2,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_05",
+          "label": "first:confirm->with:weis_wave_force_trend",
+          "recommended_indicators": [
+            "TTF_DSL_TRANSITION",
+            "STOCHRSI_CROSSBACK"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_06",
+          "label": "second:filter->with:cmo_mean_reversion",
+          "recommended_indicators": [
+            "ATR_STEP_TREND_FILTER",
+            "STOCH_TREND"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-10501-stochrsi-crossback-stoch-trend-m5",
+          "first_indicator_id": "STOCHRSI_CROSSBACK",
+          "second_indicator_id": "STOCH_TREND",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 69.3561,
+          "best_trades": "47",
+          "best_expectancy_r": "0.3764",
+          "best_profit_factor": "1.7112"
+        },
+        {
+          "probe_id": "dp-12355-stochrsi-crossback-stoch-trend-m15",
+          "first_indicator_id": "STOCHRSI_CROSSBACK",
+          "second_indicator_id": "STOCH_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 53.4811,
+          "best_trades": "9",
+          "best_expectancy_r": "0.8542",
+          "best_profit_factor": "1.3651"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_023",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "sparse_watch",
+      "name": "first:mean-reversion->with:toby_crabel_narrow_range + second:filter->with:cmo_trend",
+      "compatibility_score": 46.6054,
+      "best_score": 67.0802,
+      "positive_pair_count": 4,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_02",
+          "label": "first:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_07",
+          "label": "second:filter->with:cmo_trend",
+          "recommended_indicators": [
+            "ROLLING_VOLUME_PROFILE_CONTEXT"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-14501-plus-di-mean-rever-rolling-volume-pro-m5",
+          "first_indicator_id": "PLUS_DI_MEAN_REVERSION",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 67.0802,
+          "best_trades": "46",
+          "best_expectancy_r": "0.6446",
+          "best_profit_factor": "1.9603"
+        },
+        {
+          "probe_id": "dp-14272-ultosc-mean-revers-rolling-volume-pro-m15",
+          "first_indicator_id": "ULTOSC_MEAN_REVERSION",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 63.4949,
+          "best_trades": "41",
+          "best_expectancy_r": "0.401",
+          "best_profit_factor": "1.9694"
+        },
+        {
+          "probe_id": "dp-14542-ma-slope-mean-reve-rolling-volume-pro-m5",
+          "first_indicator_id": "MA_SLOPE_MEAN_REVERSION",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 61.6785,
+          "best_trades": "13",
+          "best_expectancy_r": "0.4028",
+          "best_profit_factor": "1.6379"
+        },
+        {
+          "probe_id": "dp-14541-ma-slope-mean-reve-rolling-volume-pro-m15",
+          "first_indicator_id": "MA_SLOPE_MEAN_REVERSION",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 55.1102,
+          "best_trades": "32",
+          "best_expectancy_r": "0.3323",
+          "best_profit_factor": "1.4808"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_024",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "needs_more_evidence",
+      "name": "first:confirm->with:minus_di_mean_reversion + second:filter->with:cmo_trend",
+      "compatibility_score": 44.5338,
+      "best_score": 62.1521,
+      "positive_pair_count": 5,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_01",
+          "label": "first:confirm->with:minus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "THRUST_BAR_SIGNAL",
+            "MARKET_MODE_TRANSITION",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER",
+            "EHLERS_FISHER_TRANSITION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_07",
+          "label": "second:filter->with:cmo_trend",
+          "recommended_indicators": [
+            "ROLLING_VOLUME_PROFILE_CONTEXT"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-11309-thrust-bar-signal-rolling-volume-pro-m15",
+          "first_indicator_id": "THRUST_BAR_SIGNAL",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 62.1521,
+          "best_trades": "13",
+          "best_expectancy_r": "1.4444",
+          "best_profit_factor": "1.4238"
+        },
+        {
+          "probe_id": "dp-13248-candle-direction-i-rolling-volume-pro-m15",
+          "first_indicator_id": "CANDLE_DIRECTION_INDEX",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 58.9609,
+          "best_trades": "9",
+          "best_expectancy_r": "1.0875",
+          "best_profit_factor": "1.5758"
+        },
+        {
+          "probe_id": "dp-14529-roofing-filter-con-rolling-volume-pro-m15",
+          "first_indicator_id": "ROOFING_FILTER_CONFIRM",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 55.2154,
+          "best_trades": "222",
+          "best_expectancy_r": "0.1906",
+          "best_profit_factor": "1.3167"
+        },
+        {
+          "probe_id": "dp-13505-thrust-bar-signal-rolling-volume-pro-m5",
+          "first_indicator_id": "THRUST_BAR_SIGNAL",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 52.9354,
+          "best_trades": "36",
+          "best_expectancy_r": "0.1905",
+          "best_profit_factor": "1.416"
+        },
+        {
+          "probe_id": "dp-14527-weis-wave-force-tr-rolling-volume-pro-m15",
+          "first_indicator_id": "WEIS_WAVE_FORCE_TREND",
+          "second_indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 50.7071,
+          "best_trades": "97",
+          "best_expectancy_r": "0.2148",
+          "best_profit_factor": "1.3132"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_025",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "sparse_watch",
+      "name": "first:confirm->with:weis_wave_force_trend + second:breakout->with:obv_mean_reversion",
+      "compatibility_score": 44.4833,
+      "best_score": 66.5608,
+      "positive_pair_count": 2,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_05",
+          "label": "first:confirm->with:weis_wave_force_trend",
+          "recommended_indicators": [
+            "TTF_DSL_TRANSITION",
+            "STOCHRSI_CROSSBACK"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_03",
+          "label": "second:breakout->with:obv_mean_reversion",
+          "recommended_indicators": [
+            "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "TTF_DSL_TRANSITION",
+            "DONCHIAN_CHANNEL_BREAKOUT",
+            "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+            "PLUS_DI_TREND",
+            "MFI_TREND",
+            "BREAKOUT_FIRST_CLOSE"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-9256-ttf-dsl-transition-plus-di-trend-m15",
+          "first_indicator_id": "TTF_DSL_TRANSITION",
+          "second_indicator_id": "PLUS_DI_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 66.5608,
+          "best_trades": "66",
+          "best_expectancy_r": "0.4322",
+          "best_profit_factor": "1.5322"
+        },
+        {
+          "probe_id": "dp-12196-stochrsi-crossback-plus-di-trend-m15",
+          "first_indicator_id": "STOCHRSI_CROSSBACK",
+          "second_indicator_id": "PLUS_DI_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 58.8133,
+          "best_trades": "80",
+          "best_expectancy_r": "0.2933",
+          "best_profit_factor": "1.4307"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_026",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "sparse_watch",
+      "name": "first:filter->with:garch_volatility_regime + second:trend->with:ma_spread_mean_reversion",
+      "compatibility_score": 43.4868,
+      "best_score": 60.0878,
+      "positive_pair_count": 4,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_08",
+          "label": "first:filter->with:garch_volatility_regime",
+          "recommended_indicators": [
+            "RANDOM_WALK_INDEX_FILTER",
+            "ADX",
+            "ATR_VOLATILITY_FILTER"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_04",
+          "label": "second:trend->with:ma_spread_mean_reversion",
+          "recommended_indicators": [
+            "BBANDS_POSITION_TREND",
+            "CMO_TREND",
+            "ULTOSC_TREND",
+            "CCI_TREND",
+            "WILLR_TREND",
+            "GARCH_VOLATILITY_REGIME"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-13859-random-walk-index-garch-volatility-r-m15",
+          "first_indicator_id": "RANDOM_WALK_INDEX_FILTER",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 60.0878,
+          "best_trades": "28",
+          "best_expectancy_r": "0.756",
+          "best_profit_factor": "2.0304"
+        },
+        {
+          "probe_id": "dp-14535-adx-garch-volatility-r-m15",
+          "first_indicator_id": "ADX",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 59.2477,
+          "best_trades": "28",
+          "best_expectancy_r": "0.756",
+          "best_profit_factor": "2.0304"
+        },
+        {
+          "probe_id": "dp-13855-atr-volatility-fil-garch-volatility-r-m15",
+          "first_indicator_id": "ATR_VOLATILITY_FILTER",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 56.5915,
+          "best_trades": "86",
+          "best_expectancy_r": "0.436",
+          "best_profit_factor": "1.5263"
+        },
+        {
+          "probe_id": "dp-13860-random-walk-index-garch-volatility-r-m5",
+          "first_indicator_id": "RANDOM_WALK_INDEX_FILTER",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 54.3478,
+          "best_trades": "6",
+          "best_expectancy_r": "1.0577",
+          "best_profit_factor": "2.7742"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_027",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "sparse_watch",
+      "name": "first:confirm->with:minus_di_mean_reversion + second:filter->with:cmo_mean_reversion",
+      "compatibility_score": 41.468,
+      "best_score": 63.956,
+      "positive_pair_count": 1,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_01",
+          "label": "first:confirm->with:minus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "THRUST_BAR_SIGNAL",
+            "MARKET_MODE_TRANSITION",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER",
+            "EHLERS_FISHER_TRANSITION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_06",
+          "label": "second:filter->with:cmo_mean_reversion",
+          "recommended_indicators": [
+            "ATR_STEP_TREND_FILTER",
+            "STOCH_TREND"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-9833-ehlers-fisher-tran-stoch-trend-m15",
+          "first_indicator_id": "EHLERS_FISHER_TRANSITION",
+          "second_indicator_id": "STOCH_TREND",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 63.956,
+          "best_trades": "36",
+          "best_expectancy_r": "0.3201",
+          "best_profit_factor": "1.6819"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_028",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "sparse_watch",
+      "name": "first:trend->with:obv_mean_reversion + second:filter->with:garch_volatility_regime",
+      "compatibility_score": 40.297,
+      "best_score": 57.3247,
+      "positive_pair_count": 3,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15,M5",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_03",
+          "label": "first:trend->with:obv_mean_reversion",
+          "recommended_indicators": [
+            "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+            "MINUS_DI_TREND",
+            "BBANDS_POSITION_TREND",
+            "DONCHIAN_CHANNEL_BREAKOUT",
+            "PLUS_DI_TREND",
+            "MFI_TREND",
+            "ULTOSC_TREND",
+            "STOCH_TREND",
+            "BREAKOUT_FIRST_CLOSE",
+            "CMO_TREND"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_09",
+          "label": "second:filter->with:garch_volatility_regime",
+          "recommended_indicators": [
+            "ADX",
+            "ATR_VOLATILITY_FILTER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-14483-garch-volatility-r-adx-m15",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "ADX",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 57.3247,
+          "best_trades": "66",
+          "best_expectancy_r": "0.5682",
+          "best_profit_factor": "1.7143"
+        },
+        {
+          "probe_id": "dp-14484-garch-volatility-r-adx-m5",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "ADX",
+          "probe_timeframe": "M5",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 56.8782,
+          "best_trades": "56",
+          "best_expectancy_r": "0.5429",
+          "best_profit_factor": "1.8375"
+        },
+        {
+          "probe_id": "dp-13746-garch-volatility-r-atr-volatility-fil-m15",
+          "first_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "second_indicator_id": "ATR_VOLATILITY_FILTER",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 50.3029,
+          "best_trades": "100",
+          "best_expectancy_r": "0.3",
+          "best_profit_factor": "1.3478"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_029",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "sparse_watch",
+      "name": "first:mean-reversion->with:toby_crabel_narrow_range + second:unknown->with:stochf_mean_reversion",
+      "compatibility_score": 40.2433,
+      "best_score": 61.7839,
+      "positive_pair_count": 1,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_02",
+          "label": "first:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_08",
+          "label": "second:unknown->with:stochf_mean_reversion",
+          "recommended_indicators": [
+            "STOCH_CROSSOVER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-4490-stochf-mean-revers-stoch-crossover-m15",
+          "first_indicator_id": "STOCHF_MEAN_REVERSION",
+          "second_indicator_id": "STOCH_CROSSOVER",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 61.7839,
+          "best_trades": "95",
+          "best_expectancy_r": "0.2288",
+          "best_profit_factor": "1.3802"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_030",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "sparse_watch",
+      "name": "first:unknown->with:stochf_mean_reversion + second:mean-reversion->with:toby_crabel_narrow_range",
+      "compatibility_score": 40.2371,
+      "best_score": 61.7839,
+      "positive_pair_count": 1,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_07",
+          "label": "first:unknown->with:stochf_mean_reversion",
+          "recommended_indicators": [
+            "STOCH_CROSSOVER"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_02",
+          "label": "second:mean-reversion->with:toby_crabel_narrow_range",
+          "recommended_indicators": [
+            "RSI_CROSSBACK",
+            "CHANNEL_REENTRY",
+            "CMO_MEAN_REVERSION",
+            "WILLR_MEAN_REVERSION",
+            "OBV_MEAN_REVERSION",
+            "MA_SPREAD_MEAN_REVERSION",
+            "MFI_MEAN_REVERSION",
+            "ULTOSC_MEAN_REVERSION",
+            "BBANDS_POSITION_MEAN_REVERSION",
+            "PLUS_DI_MEAN_REVERSION"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-13528-stoch-crossover-stochf-mean-revers-m15",
+          "first_indicator_id": "STOCH_CROSSOVER",
+          "second_indicator_id": "STOCHF_MEAN_REVERSION",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 61.7839,
+          "best_trades": "95",
+          "best_expectancy_r": "0.2288",
+          "best_profit_factor": "1.3802"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_031",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "sparse_watch",
+      "name": "first:filter->with:rsi_mean_reversion + second:confirm->with:plus_di_mean_reversion",
+      "compatibility_score": 39.5023,
+      "best_score": 60.8107,
+      "positive_pair_count": 1,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_04",
+          "label": "first:filter->with:rsi_mean_reversion",
+          "recommended_indicators": [
+            "VQI_DIRECTIONAL_QUALITY",
+            "STOCHRSI_TREND",
+            "EHLERS_FISHER_STATE_FILTER",
+            "CHAIKIN_AD_TREND",
+            "ADOSC_TREND",
+            "MA_SPREAD_TREND",
+            "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+            "ATR_STEP_TREND_FILTER"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_01",
+          "label": "second:confirm->with:plus_di_mean_reversion",
+          "recommended_indicators": [
+            "TOBY_CRABEL_NARROW_RANGE",
+            "MACD_CROSSOVER",
+            "STOCHF_TREND",
+            "VQI_DIRECTIONAL_QUALITY",
+            "THRUST_BAR_SIGNAL",
+            "WAVETREND_CROSSOVER",
+            "WEIS_WAVE_FORCE_TREND",
+            "MARKET_MODE_TRANSITION",
+            "NVO_VOLUME_IMPULSE",
+            "KST_CROSSOVER"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-3583-bollinger-keltner-wavetrend-crossove-m15",
+          "first_indicator_id": "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+          "second_indicator_id": "WAVETREND_CROSSOVER",
+          "probe_timeframe": "M15",
+          "discovery_lane": "plausible_novel",
+          "composite_score": 60.8107,
+          "best_trades": "25",
+          "best_expectancy_r": "0.625",
+          "best_profit_factor": "3.1154"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    },
+    {
+      "recipe_id": "discovered_recipe_032",
+      "source": "discovery_pair_cluster_atlas",
+      "status": "needs_12m_validation",
+      "confidence": "sparse_watch",
+      "name": "first:filter->with:rsi_mean_reversion + second:trend->with:ma_spread_mean_reversion",
+      "compatibility_score": 38.0361,
+      "best_score": 55.6178,
+      "positive_pair_count": 2,
+      "strong_pair_count": 0,
+      "top_timeframes": "M15",
+      "slots": {
+        "context_or_setup_cluster": {
+          "cluster_id": "first_cluster_04",
+          "label": "first:filter->with:rsi_mean_reversion",
+          "recommended_indicators": [
+            "VQI_DIRECTIONAL_QUALITY",
+            "STOCHRSI_TREND",
+            "EHLERS_FISHER_STATE_FILTER",
+            "CHAIKIN_AD_TREND",
+            "ADOSC_TREND",
+            "MA_SPREAD_TREND",
+            "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+            "ATR_STEP_TREND_FILTER"
+          ]
+        },
+        "trigger_or_response_cluster": {
+          "cluster_id": "second_cluster_04",
+          "label": "second:trend->with:ma_spread_mean_reversion",
+          "recommended_indicators": [
+            "BBANDS_POSITION_TREND",
+            "CMO_TREND",
+            "ULTOSC_TREND",
+            "CCI_TREND",
+            "WILLR_TREND",
+            "GARCH_VOLATILITY_REGIME"
+          ]
+        }
+      },
+      "evidence_examples": [
+        {
+          "probe_id": "dp-14018-stochrsi-trend-garch-volatility-r-m15",
+          "first_indicator_id": "STOCHRSI_TREND",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 55.6178,
+          "best_trades": "27",
+          "best_expectancy_r": "0.6019",
+          "best_profit_factor": "1.7647"
+        },
+        {
+          "probe_id": "dp-14511-ma-spread-trend-garch-volatility-r-m15",
+          "first_indicator_id": "MA_SPREAD_TREND",
+          "second_indicator_id": "GARCH_VOLATILITY_REGIME",
+          "probe_timeframe": "M15",
+          "discovery_lane": "wild_diversity",
+          "composite_score": 53.3063,
+          "best_trades": "42",
+          "best_expectancy_r": "0.4167",
+          "best_profit_factor": "1.5"
+        }
+      ],
+      "operator_note": "Empirical two-indicator cluster relationship. Treat as a recipe template candidate, not a finished Play Hand recipe, until 12m validation confirms retention."
+    }
+  ]
+}

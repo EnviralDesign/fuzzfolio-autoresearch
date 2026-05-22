@@ -1,0 +1,203 @@
+{
+  "schema_version": "anchor_pair_atlas_v1",
+  "generated_at": "2026-05-21T17:36:16.006614+00:00",
+  "source": {
+    "indicator_atlas_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\indicator-atlas\\indicator-atlas.json",
+    "signal_atlas_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas",
+    "forward_response_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\forward-response-atlas",
+    "workspace_root": "C:\\repos\\Trading-Dashboard",
+    "catalog_path": "C:\\repos\\Trading-Dashboard\\shared\\constants\\indicators.json"
+  },
+  "selection": {
+    "anchors": [
+      {
+        "anchor_type": "trend",
+        "anchor_id": "MA_SLOPE_TREND"
+      },
+      {
+        "anchor_type": "trend",
+        "anchor_id": "ADX"
+      },
+      {
+        "anchor_type": "trend",
+        "anchor_id": "KALMAN_VELOCITY_CONFIRM"
+      },
+      {
+        "anchor_type": "mean_reversion",
+        "anchor_id": "RSI_MEAN_REVERSION"
+      },
+      {
+        "anchor_type": "mean_reversion",
+        "anchor_id": "BBANDS_POSITION_MEAN_REVERSION"
+      },
+      {
+        "anchor_type": "compression",
+        "anchor_id": "BOLLINGER_KELTNER_SQUEEZE_FILTER"
+      },
+      {
+        "anchor_type": "compression",
+        "anchor_id": "TOBY_CRABEL_NARROW_RANGE"
+      },
+      {
+        "anchor_type": "profile_value",
+        "anchor_id": "ROLLING_VOLUME_PROFILE_CONTEXT"
+      }
+    ],
+    "trigger_count": 23,
+    "instruments": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY",
+      "XAUUSD"
+    ],
+    "timeframes": [
+      "M5",
+      "M15"
+    ],
+    "max_pairs": 48,
+    "lookback_months": 3,
+    "quality_score_preset": "profile-drop",
+    "execution_cost_mode": "research-conservative"
+  },
+  "result_counts": {
+    "pair_matrix_rows": 366,
+    "queue_rows": 48,
+    "profile_docs": 48,
+    "pair_prior_bucket_counts": {
+      "blocked_default_problem": 16,
+      "probe_now": 298,
+      "probe_selectively": 52
+    },
+    "queue_bucket_counts": {
+      "probe_now": 48
+    },
+    "anchor_type_counts": {
+      "compression": 90,
+      "mean_reversion": 92,
+      "profile_value": 46,
+      "trend": 138
+    }
+  },
+  "top_queue": [
+    {
+      "queue_rank": 1,
+      "probe_id": "l3-001-rsi-mean-reversion-channel-reentry-m5",
+      "anchor_type": "mean_reversion",
+      "anchor_id": "RSI_MEAN_REVERSION",
+      "trigger_id": "CHANNEL_REENTRY",
+      "probe_timeframe": "M5",
+      "pair_prior_score": 89.34,
+      "pair_prior_bucket": "probe_now",
+      "forward_response_prior_bucket": "context_dependent_forward_response",
+      "best_forward_context": "USDJPY M5 long 1"
+    },
+    {
+      "queue_rank": 2,
+      "probe_id": "l3-002-toby-crabel-narrow-range-pmo-crossover-m5",
+      "anchor_type": "compression",
+      "anchor_id": "TOBY_CRABEL_NARROW_RANGE",
+      "trigger_id": "PMO_CROSSOVER",
+      "probe_timeframe": "M5",
+      "pair_prior_score": 88.97,
+      "pair_prior_bucket": "probe_now",
+      "forward_response_prior_bucket": "context_dependent_forward_response",
+      "best_forward_context": "EURUSD M5 short 24"
+    },
+    {
+      "queue_rank": 3,
+      "probe_id": "l3-003-bbands-position-mean-reversion-channel-reentry-m5",
+      "anchor_type": "mean_reversion",
+      "anchor_id": "BBANDS_POSITION_MEAN_REVERSION",
+      "trigger_id": "CHANNEL_REENTRY",
+      "probe_timeframe": "M5",
+      "pair_prior_score": 88.57,
+      "pair_prior_bucket": "probe_now",
+      "forward_response_prior_bucket": "context_dependent_forward_response",
+      "best_forward_context": "USDJPY M5 long 1"
+    },
+    {
+      "queue_rank": 4,
+      "probe_id": "l3-004-kalman-velocity-confirm-pmo-crossover-m5",
+      "anchor_type": "trend",
+      "anchor_id": "KALMAN_VELOCITY_CONFIRM",
+      "trigger_id": "PMO_CROSSOVER",
+      "probe_timeframe": "M5",
+      "pair_prior_score": 88.27,
+      "pair_prior_bucket": "probe_now",
+      "forward_response_prior_bucket": "context_dependent_forward_response",
+      "best_forward_context": "EURUSD M5 short 24"
+    },
+    {
+      "queue_rank": 5,
+      "probe_id": "l3-005-kalman-velocity-confirm-toby-crabel-narrow-range-m5",
+      "anchor_type": "trend",
+      "anchor_id": "KALMAN_VELOCITY_CONFIRM",
+      "trigger_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "pair_prior_score": 87.82,
+      "pair_prior_bucket": "probe_now",
+      "forward_response_prior_bucket": "context_dependent_forward_response",
+      "best_forward_context": "USDJPY M5 long 24"
+    },
+    {
+      "queue_rank": 6,
+      "probe_id": "l3-006-adx-pmo-crossover-m5",
+      "anchor_type": "trend",
+      "anchor_id": "ADX",
+      "trigger_id": "PMO_CROSSOVER",
+      "probe_timeframe": "M5",
+      "pair_prior_score": 86.99,
+      "pair_prior_bucket": "probe_now",
+      "forward_response_prior_bucket": "context_dependent_forward_response",
+      "best_forward_context": "EURUSD M5 short 24"
+    },
+    {
+      "queue_rank": 7,
+      "probe_id": "l3-007-toby-crabel-narrow-range-market-mode-transition-m15",
+      "anchor_type": "compression",
+      "anchor_id": "TOBY_CRABEL_NARROW_RANGE",
+      "trigger_id": "MARKET_MODE_TRANSITION",
+      "probe_timeframe": "M15",
+      "pair_prior_score": 86.9,
+      "pair_prior_bucket": "probe_now",
+      "forward_response_prior_bucket": "context_dependent_forward_response",
+      "best_forward_context": "USDJPY M15 long 6"
+    },
+    {
+      "queue_rank": 8,
+      "probe_id": "l3-008-ma-slope-trend-pmo-crossover-m5",
+      "anchor_type": "trend",
+      "anchor_id": "MA_SLOPE_TREND",
+      "trigger_id": "PMO_CROSSOVER",
+      "probe_timeframe": "M5",
+      "pair_prior_score": 86.73,
+      "pair_prior_bucket": "probe_now",
+      "forward_response_prior_bucket": "context_dependent_forward_response",
+      "best_forward_context": "EURUSD M5 short 24"
+    },
+    {
+      "queue_rank": 9,
+      "probe_id": "l3-009-bollinger-keltner-squeeze-filter-pmo-crossover-m5",
+      "anchor_type": "compression",
+      "anchor_id": "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+      "trigger_id": "PMO_CROSSOVER",
+      "probe_timeframe": "M5",
+      "pair_prior_score": 86.54,
+      "pair_prior_bucket": "probe_now",
+      "forward_response_prior_bucket": "context_dependent_forward_response",
+      "best_forward_context": "EURUSD M5 short 24"
+    },
+    {
+      "queue_rank": 10,
+      "probe_id": "l3-010-adx-toby-crabel-narrow-range-m5",
+      "anchor_type": "trend",
+      "anchor_id": "ADX",
+      "trigger_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "pair_prior_score": 86.54,
+      "pair_prior_bucket": "probe_now",
+      "forward_response_prior_bucket": "context_dependent_forward_response",
+      "best_forward_context": "USDJPY M5 long 24"
+    }
+  ]
+}

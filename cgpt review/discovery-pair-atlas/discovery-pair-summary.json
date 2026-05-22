@@ -1,0 +1,234 @@
+{
+  "schema_version": "discovery_pair_atlas_v1",
+  "generated_at": "2026-05-21T22:40:01.592483+00:00",
+  "source": {
+    "indicator_atlas_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\indicator-atlas",
+    "signal_atlas_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas",
+    "forward_response_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\forward-response-atlas",
+    "recipe_priors_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\recipe-priors",
+    "anchor_pair_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\anchor-pair-atlas",
+    "workspace_root": "C:\\repos\\Trading-Dashboard",
+    "catalog_path": "C:\\repos\\Trading-Dashboard\\shared\\constants\\indicators.json"
+  },
+  "selection": {
+    "first_ids": [],
+    "second_ids": [],
+    "instruments": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY",
+      "XAUUSD"
+    ],
+    "timeframes": [
+      "M5",
+      "M15"
+    ],
+    "max_pairs": null,
+    "full_queue": true,
+    "include_known_retests": false,
+    "random_seed": 20260521,
+    "lane_fractions": {
+      "proven_neighbor": 0.25,
+      "plausible_novel": 0.45,
+      "under_tested_role_correct": 0.2,
+      "wild_diversity": 0.1
+    },
+    "lookback_months": 3,
+    "job_timeout_seconds": 2400,
+    "quality_score_preset": "profile-drop",
+    "execution_cost_mode": "research-conservative"
+  },
+  "result_counts": {
+    "eligible_indicators": 87,
+    "pair_matrix_rows": 14964,
+    "queue_rows": 14916,
+    "profile_docs": 14916,
+    "discovery_lane_counts": {
+      "known_result": 48,
+      "plausible_novel": 6097,
+      "proven_neighbor": 2261,
+      "under_tested_role_correct": 572,
+      "wild_diversity": 5986
+    },
+    "queue_lane_counts": {
+      "plausible_novel": 6097,
+      "proven_neighbor": 2261,
+      "under_tested_role_correct": 572,
+      "wild_diversity": 5986
+    },
+    "known_pair_status_counts": {
+      "exact_known_low": 1,
+      "exact_known_positive": 6,
+      "exact_known_zero": 41,
+      "untested": 14916
+    },
+    "known_pair_evidence_rows": 48
+  },
+  "top_queue": [
+    {
+      "queue_rank": 1,
+      "probe_id": "dp-0001-aroon-trend-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "AROON_TREND",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 81.35,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 2,
+      "probe_id": "dp-0002-minus-di-trend-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "MINUS_DI_TREND",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 81.35,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 3,
+      "probe_id": "dp-0003-plus-di-trend-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "PLUS_DI_TREND",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 81.35,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 4,
+      "probe_id": "dp-0004-chaikin-ad-trend-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "CHAIKIN_AD_TREND",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 81.24,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 5,
+      "probe_id": "dp-0005-obv-trend-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "OBV_TREND",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 81.24,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 6,
+      "probe_id": "dp-0006-weis-wave-force-tr-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "WEIS_WAVE_FORCE_TREND",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 81.24,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 7,
+      "probe_id": "dp-0007-sar-trend-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "SAR_TREND",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 81.02,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 8,
+      "probe_id": "dp-0008-adosc-trend-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "ADOSC_TREND",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 80.91,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 9,
+      "probe_id": "dp-0009-aroon-mean-reversi-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "AROON_MEAN_REVERSION",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 80.79,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 10,
+      "probe_id": "dp-0010-minus-di-mean-reve-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "MINUS_DI_MEAN_REVERSION",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 80.79,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 11,
+      "probe_id": "dp-0011-plus-di-mean-rever-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "PLUS_DI_MEAN_REVERSION",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 80.79,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 12,
+      "probe_id": "dp-0012-ma-spread-trend-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "MA_SPREAD_TREND",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 80.7,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 13,
+      "probe_id": "dp-0013-chaikin-ad-mean-re-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "CHAIKIN_AD_MEAN_REVERSION",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 80.68,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 14,
+      "probe_id": "dp-0014-obv-mean-reversion-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "OBV_MEAN_REVERSION",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 80.68,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    },
+    {
+      "queue_rank": 15,
+      "probe_id": "dp-0015-weis-wave-force-me-toby-crabel-narrow-m5",
+      "lane": "proven_neighbor",
+      "first_indicator_id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "local_discovery_score": 80.68,
+      "known_pair_status": "untested",
+      "discovery_reason": "contains_indicator_or_reverse_order_with_positive_pair_evidence"
+    }
+  ]
+}

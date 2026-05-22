@@ -1,0 +1,530 @@
+{
+  "schema_version": "discovery_pair_findings_v1",
+  "generated_at": "2026-05-21T21:56:55.920063+00:00",
+  "source_results_csv": "runs\\derived\\discovery-pair-atlas\\discovery-pair-probe-results.csv",
+  "result_counts": {
+    "rows": 1536,
+    "scored": 1536,
+    "positive_ge_50": 177,
+    "positive_ge_60": 104,
+    "strong_ge_70": 39
+  },
+  "lanes": {
+    "plausible_novel": {
+      "count": 691,
+      "positive_ge_50": 90,
+      "strong_ge_70": 16,
+      "positive_rate_ge_50": 0.1302,
+      "top_score": 75.147
+    },
+    "proven_neighbor": {
+      "count": 384,
+      "positive_ge_50": 59,
+      "strong_ge_70": 20,
+      "positive_rate_ge_50": 0.1536,
+      "top_score": 78.3601
+    },
+    "under_tested_role_correct": {
+      "count": 307,
+      "positive_ge_50": 13,
+      "strong_ge_70": 1,
+      "positive_rate_ge_50": 0.0423,
+      "top_score": 70.6595
+    },
+    "wild_diversity": {
+      "count": 154,
+      "positive_ge_50": 15,
+      "strong_ge_70": 2,
+      "positive_rate_ge_50": 0.0974,
+      "top_score": 73.3098
+    }
+  },
+  "timeframes": {
+    "M15": {
+      "count": 752,
+      "positive_ge_50": 85,
+      "strong_ge_70": 20,
+      "positive_rate_ge_50": 0.113,
+      "top_score": 75.147
+    },
+    "M5": {
+      "count": 784,
+      "positive_ge_50": 92,
+      "strong_ge_70": 19,
+      "positive_rate_ge_50": 0.1173,
+      "top_score": 78.3601
+    }
+  },
+  "top_second_indicators_ge_70": [
+    [
+      "MARKET_MODE_TRANSITION",
+      6
+    ],
+    [
+      "RSI_CROSSBACK",
+      5
+    ],
+    [
+      "WAVETREND_CROSSOVER",
+      5
+    ],
+    [
+      "CHANNEL_REENTRY",
+      3
+    ],
+    [
+      "TOBY_CRABEL_NARROW_RANGE",
+      3
+    ],
+    [
+      "CANDLE_DIRECTION_INDEX",
+      3
+    ],
+    [
+      "PMO_CROSSOVER",
+      3
+    ],
+    [
+      "KST_CROSSOVER",
+      2
+    ],
+    [
+      "KEY_REVERSAL_SIGNAL",
+      2
+    ],
+    [
+      "EHLERS_FISHER_TRANSITION",
+      1
+    ],
+    [
+      "VQI_DIRECTIONAL_QUALITY",
+      1
+    ],
+    [
+      "MFI_MEAN_REVERSION",
+      1
+    ],
+    [
+      "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+      1
+    ],
+    [
+      "PRICE_RECLAIM_MA",
+      1
+    ],
+    [
+      "NVO_VOLUME_IMPULSE",
+      1
+    ],
+    [
+      "MA_CROSSOVER",
+      1
+    ]
+  ],
+  "top_first_indicators_ge_70": [
+    [
+      "TOBY_CRABEL_NARROW_RANGE",
+      5
+    ],
+    [
+      "PLUS_DI_MEAN_REVERSION",
+      3
+    ],
+    [
+      "RSI_MEAN_REVERSION",
+      3
+    ],
+    [
+      "STOCH_MEAN_REVERSION",
+      3
+    ],
+    [
+      "STOCHF_MEAN_REVERSION",
+      3
+    ],
+    [
+      "WILLR_MEAN_REVERSION",
+      2
+    ],
+    [
+      "OBV_TREND",
+      2
+    ],
+    [
+      "MOM_MEAN_REVERSION",
+      2
+    ],
+    [
+      "AROON_MEAN_REVERSION",
+      2
+    ],
+    [
+      "CHANNEL_REENTRY",
+      1
+    ],
+    [
+      "WEIS_WAVE_FORCE_TREND",
+      1
+    ],
+    [
+      "BBANDS_POSITION_MEAN_REVERSION",
+      1
+    ],
+    [
+      "CMO_MEAN_REVERSION",
+      1
+    ],
+    [
+      "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+      1
+    ],
+    [
+      "MINUS_DI_MEAN_REVERSION",
+      1
+    ],
+    [
+      "THRUST_BAR_SIGNAL",
+      1
+    ],
+    [
+      "WEIS_WAVE_FORCE_MEAN_REVERSION",
+      1
+    ],
+    [
+      "ULTOSC_MEAN_REVERSION",
+      1
+    ],
+    [
+      "KELTNER_CHANNEL_MEAN_REVERSION",
+      1
+    ],
+    [
+      "CANDLE_DIRECTION_INDEX",
+      1
+    ]
+  ],
+  "top_scored": [
+    {
+      "probe_id": "dp-0211-toby-crabel-narrow-rsi-crossback-m5",
+      "discovery_lane": "proven_neighbor",
+      "first_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "second_indicator_id": "RSI_CROSSBACK",
+      "probe_timeframe": "M5",
+      "composite_score": "78.3601",
+      "signal_count": "34.0",
+      "best_trades": "34",
+      "best_expectancy_r": "0.6649",
+      "best_profit_factor": "3.5143",
+      "local_discovery_score": "76.9",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0211-toby-crabel-narrow-rsi-crossback-m5"
+    },
+    {
+      "probe_id": "dp-0076-toby-crabel-narrow-channel-reentry-m5",
+      "discovery_lane": "proven_neighbor",
+      "first_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "second_indicator_id": "CHANNEL_REENTRY",
+      "probe_timeframe": "M5",
+      "composite_score": "75.3942",
+      "signal_count": "46.0",
+      "best_trades": "46",
+      "best_expectancy_r": "0.3688",
+      "best_profit_factor": "1.8518",
+      "local_discovery_score": "79.01",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0076-toby-crabel-narrow-channel-reentry-m5"
+    },
+    {
+      "probe_id": "dp-0106-channel-reentry-toby-crabel-narrow-m5",
+      "discovery_lane": "proven_neighbor",
+      "first_indicator_id": "CHANNEL_REENTRY",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "composite_score": "75.3942",
+      "signal_count": "46.0",
+      "best_trades": "46",
+      "best_expectancy_r": "0.3688",
+      "best_profit_factor": "1.8518",
+      "local_discovery_score": "78.53",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0106-channel-reentry-toby-crabel-narrow-m5"
+    },
+    {
+      "probe_id": "dp-0450-weis-wave-force-tr-market-mode-transi-m15",
+      "discovery_lane": "plausible_novel",
+      "first_indicator_id": "WEIS_WAVE_FORCE_TREND",
+      "second_indicator_id": "MARKET_MODE_TRANSITION",
+      "probe_timeframe": "M15",
+      "composite_score": "75.147",
+      "signal_count": "100.0",
+      "best_trades": "99",
+      "best_expectancy_r": "0.1429",
+      "best_profit_factor": "4.0709",
+      "local_discovery_score": "75.97",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0450-weis-wave-force-tr-market-mode-transi-m15"
+    },
+    {
+      "probe_id": "dp-0462-plus-di-mean-rever-market-mode-transi-m15",
+      "discovery_lane": "plausible_novel",
+      "first_indicator_id": "PLUS_DI_MEAN_REVERSION",
+      "second_indicator_id": "MARKET_MODE_TRANSITION",
+      "probe_timeframe": "M15",
+      "composite_score": "74.8644",
+      "signal_count": "46.0",
+      "best_trades": "43",
+      "best_expectancy_r": "0.5336",
+      "best_profit_factor": "2.0818",
+      "local_discovery_score": "75.52",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0462-plus-di-mean-rever-market-mode-transi-m15"
+    },
+    {
+      "probe_id": "dp-0209-willr-mean-reversi-rsi-crossback-m5",
+      "discovery_lane": "proven_neighbor",
+      "first_indicator_id": "WILLR_MEAN_REVERSION",
+      "second_indicator_id": "RSI_CROSSBACK",
+      "probe_timeframe": "M5",
+      "composite_score": "74.6439",
+      "signal_count": "28.0",
+      "best_trades": "28",
+      "best_expectancy_r": "0.6151",
+      "best_profit_factor": "3.2281",
+      "local_discovery_score": "76.92",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0209-willr-mean-reversi-rsi-crossback-m5"
+    },
+    {
+      "probe_id": "dp-0238-toby-crabel-narrow-channel-reentry-m15",
+      "discovery_lane": "proven_neighbor",
+      "first_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "second_indicator_id": "CHANNEL_REENTRY",
+      "probe_timeframe": "M15",
+      "composite_score": "74.542",
+      "signal_count": "18.0",
+      "best_trades": "18",
+      "best_expectancy_r": "1.1994",
+      "best_profit_factor": "4.6769",
+      "local_discovery_score": "76.51",
+      "validation_priority": "validate_12m_sparse",
+      "validation_note": "sparse_but_interesting",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0238-toby-crabel-narrow-channel-reentry-m15"
+    },
+    {
+      "probe_id": "dp-0370-bbands-position-me-ehlers-fisher-tran-m15",
+      "discovery_lane": "proven_neighbor",
+      "first_indicator_id": "BBANDS_POSITION_MEAN_REVERSION",
+      "second_indicator_id": "EHLERS_FISHER_TRANSITION",
+      "probe_timeframe": "M15",
+      "composite_score": "74.5233",
+      "signal_count": "33.0",
+      "best_trades": "31",
+      "best_expectancy_r": "0.8301",
+      "best_profit_factor": "5.138",
+      "local_discovery_score": "73.44",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0370-bbands-position-me-ehlers-fisher-tran-m15"
+    },
+    {
+      "probe_id": "dp-0850-cmo-mean-reversion-candle-direction-i-m5",
+      "discovery_lane": "plausible_novel",
+      "first_indicator_id": "CMO_MEAN_REVERSION",
+      "second_indicator_id": "CANDLE_DIRECTION_INDEX",
+      "probe_timeframe": "M5",
+      "composite_score": "74.3933",
+      "signal_count": "36.0",
+      "best_trades": "36",
+      "best_expectancy_r": "0.5951",
+      "best_profit_factor": "3.8704",
+      "local_discovery_score": "73.16",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0850-cmo-mean-reversion-candle-direction-i-m5"
+    },
+    {
+      "probe_id": "dp-0655-macd-histogram-pip-market-mode-transi-m15",
+      "discovery_lane": "plausible_novel",
+      "first_indicator_id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+      "second_indicator_id": "MARKET_MODE_TRANSITION",
+      "probe_timeframe": "M15",
+      "composite_score": "73.8841",
+      "signal_count": "60.0",
+      "best_trades": "54",
+      "best_expectancy_r": "0.8144",
+      "best_profit_factor": "2.3833",
+      "local_discovery_score": "73.97",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0655-macd-histogram-pip-market-mode-transi-m15"
+    },
+    {
+      "probe_id": "dp-0389-obv-trend-channel-reentry-m5",
+      "discovery_lane": "plausible_novel",
+      "first_indicator_id": "OBV_TREND",
+      "second_indicator_id": "CHANNEL_REENTRY",
+      "probe_timeframe": "M5",
+      "composite_score": "73.6155",
+      "signal_count": "43.0",
+      "best_trades": "41",
+      "best_expectancy_r": "0.8604",
+      "best_profit_factor": "3.073",
+      "local_discovery_score": "79.02",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0389-obv-trend-channel-reentry-m5"
+    },
+    {
+      "probe_id": "dp-0124-minus-di-mean-reve-toby-crabel-narrow-m15",
+      "discovery_lane": "proven_neighbor",
+      "first_indicator_id": "MINUS_DI_MEAN_REVERSION",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M15",
+      "composite_score": "73.5147",
+      "signal_count": "71.0",
+      "best_trades": "69",
+      "best_expectancy_r": "0.5797",
+      "best_profit_factor": "2.2232",
+      "local_discovery_score": "78.29",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0124-minus-di-mean-reve-toby-crabel-narrow-m15"
+    },
+    {
+      "probe_id": "dp-0094-willr-mean-reversi-pmo-crossover-m5",
+      "discovery_lane": "proven_neighbor",
+      "first_indicator_id": "WILLR_MEAN_REVERSION",
+      "second_indicator_id": "PMO_CROSSOVER",
+      "probe_timeframe": "M5",
+      "composite_score": "73.4169",
+      "signal_count": "39.0",
+      "best_trades": "39",
+      "best_expectancy_r": "0.6351",
+      "best_profit_factor": "1.8727",
+      "local_discovery_score": "78.72",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0094-willr-mean-reversi-pmo-crossover-m5"
+    },
+    {
+      "probe_id": "dp-0220-rsi-mean-reversion-kst-crossover-m5",
+      "discovery_lane": "proven_neighbor",
+      "first_indicator_id": "RSI_MEAN_REVERSION",
+      "second_indicator_id": "KST_CROSSOVER",
+      "probe_timeframe": "M5",
+      "composite_score": "73.3825",
+      "signal_count": "35.0",
+      "best_trades": "35",
+      "best_expectancy_r": "0.7765",
+      "best_profit_factor": "2.8296",
+      "local_discovery_score": "76.75",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0220-rsi-mean-reversion-kst-crossover-m5"
+    },
+    {
+      "probe_id": "dp-1495-stoch-mean-reversi-vqi-directional-qu-m15",
+      "discovery_lane": "wild_diversity",
+      "first_indicator_id": "STOCH_MEAN_REVERSION",
+      "second_indicator_id": "VQI_DIRECTIONAL_QUALITY",
+      "probe_timeframe": "M15",
+      "composite_score": "73.3098",
+      "signal_count": "14.0",
+      "best_trades": "12",
+      "best_expectancy_r": "1.3684",
+      "best_profit_factor": "4.2733",
+      "local_discovery_score": "54.39",
+      "validation_priority": "validate_12m_sparse",
+      "validation_note": "sparse_but_interesting",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-1495-stoch-mean-reversi-vqi-directional-qu-m15"
+    },
+    {
+      "probe_id": "dp-1428-thrust-bar-signal-mfi-mean-reversion-m5",
+      "discovery_lane": "wild_diversity",
+      "first_indicator_id": "THRUST_BAR_SIGNAL",
+      "second_indicator_id": "MFI_MEAN_REVERSION",
+      "probe_timeframe": "M5",
+      "composite_score": "73.0934",
+      "signal_count": "20.0",
+      "best_trades": "19",
+      "best_expectancy_r": "0.8393",
+      "best_profit_factor": "3.6415",
+      "local_discovery_score": "58.63",
+      "validation_priority": "validate_12m_sparse",
+      "validation_note": "sparse_but_interesting",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-1428-thrust-bar-signal-mfi-mean-reversion-m5"
+    },
+    {
+      "probe_id": "dp-0015-weis-wave-force-me-toby-crabel-narrow-m5",
+      "discovery_lane": "proven_neighbor",
+      "first_indicator_id": "WEIS_WAVE_FORCE_MEAN_REVERSION",
+      "second_indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "probe_timeframe": "M5",
+      "composite_score": "73.0248",
+      "signal_count": "30.0",
+      "best_trades": "29",
+      "best_expectancy_r": "0.6298",
+      "best_profit_factor": "2.1545",
+      "local_discovery_score": "80.68",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0015-weis-wave-force-me-toby-crabel-narrow-m5"
+    },
+    {
+      "probe_id": "dp-1035-mom-mean-reversion-kst-crossover-m5",
+      "discovery_lane": "plausible_novel",
+      "first_indicator_id": "MOM_MEAN_REVERSION",
+      "second_indicator_id": "KST_CROSSOVER",
+      "probe_timeframe": "M5",
+      "composite_score": "72.8514",
+      "signal_count": "70.0",
+      "best_trades": "70",
+      "best_expectancy_r": "0.5142",
+      "best_profit_factor": "2.4398",
+      "local_discovery_score": "72.34",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-1035-mom-mean-reversion-kst-crossover-m5"
+    },
+    {
+      "probe_id": "dp-0659-stoch-mean-reversi-market-mode-transi-m15",
+      "discovery_lane": "plausible_novel",
+      "first_indicator_id": "STOCH_MEAN_REVERSION",
+      "second_indicator_id": "MARKET_MODE_TRANSITION",
+      "probe_timeframe": "M15",
+      "composite_score": "72.7654",
+      "signal_count": "54.0",
+      "best_trades": "51",
+      "best_expectancy_r": "0.4809",
+      "best_profit_factor": "1.9267",
+      "local_discovery_score": "73.97",
+      "validation_priority": "validate_12m",
+      "validation_note": "normal_trade_count",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0659-stoch-mean-reversi-market-mode-transi-m15"
+    },
+    {
+      "probe_id": "dp-0660-ultosc-mean-revers-market-mode-transi-m15",
+      "discovery_lane": "plausible_novel",
+      "first_indicator_id": "ULTOSC_MEAN_REVERSION",
+      "second_indicator_id": "MARKET_MODE_TRANSITION",
+      "probe_timeframe": "M15",
+      "composite_score": "72.7083",
+      "signal_count": "17.0",
+      "best_trades": "17",
+      "best_expectancy_r": "0.9081",
+      "best_profit_factor": "2.5926",
+      "local_discovery_score": "73.97",
+      "validation_priority": "validate_12m_sparse",
+      "validation_note": "sparse_but_interesting",
+      "output_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-pair-atlas\\probe-results\\dp-0660-ultosc-mean-revers-market-mode-transi-m15"
+    }
+  ],
+  "shortlist_csv": "runs\\derived\\discovery-pair-atlas\\discovery-pair-validation-shortlist.csv",
+  "shortlist_count": 39
+}

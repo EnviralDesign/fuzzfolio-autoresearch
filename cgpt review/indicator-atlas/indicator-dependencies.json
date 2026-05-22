@@ -1,0 +1,1238 @@
+{
+  "schema_version": "indicator_dependencies_v1",
+  "groups": {
+    "by_base_indicator_id": {
+      "ADOSC": [
+        "ADOSC_MEAN_REVERSION",
+        "ADOSC_TREND"
+      ],
+      "AROON": [
+        "AROON_MEAN_REVERSION",
+        "AROON_TREND"
+      ],
+      "ATR": [
+        "ATR_VOLATILITY_FILTER"
+      ],
+      "ATR_STEP_TREND": [
+        "ATR_STEP_TREND_FILTER"
+      ],
+      "BBANDS_POSITION": [
+        "BBANDS_POSITION_MEAN_REVERSION",
+        "BBANDS_POSITION_TREND"
+      ],
+      "BOLLINGER_KELTNER_SQUEEZE": [
+        "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+        "BOLLINGER_KELTNER_SQUEEZE_RELEASE"
+      ],
+      "BUFFERED_RANGE_BREAKOUT": [
+        "BUFFERED_RANGE_BREAKOUT_SIGNAL"
+      ],
+      "CANDLE_DIRECTION_INDEX": [
+        "CANDLE_DIRECTION_INDEX"
+      ],
+      "CCI": [
+        "CCI_MEAN_REVERSION",
+        "CCI_TREND"
+      ],
+      "CHAIKIN_AD": [
+        "CHAIKIN_AD_MEAN_REVERSION",
+        "CHAIKIN_AD_TREND"
+      ],
+      "CHANNEL": [
+        "BREAKOUT_FIRST_CLOSE",
+        "CHANNEL_REENTRY"
+      ],
+      "CMO": [
+        "CMO_MEAN_REVERSION",
+        "CMO_TREND"
+      ],
+      "DONCHIAN_CHANNEL": [
+        "DONCHIAN_CHANNEL_BREAKOUT"
+      ],
+      "EHLERS_FISHER": [
+        "EHLERS_FISHER_STATE_FILTER",
+        "EHLERS_FISHER_TRANSITION"
+      ],
+      "GARCH": [
+        "GARCH_VOLATILITY_REGIME"
+      ],
+      "KALMAN_FILTER": [
+        "KALMAN_VELOCITY_CONFIRM"
+      ],
+      "KELTNER_CHANNEL": [
+        "KELTNER_CHANNEL_BREAKOUT",
+        "KELTNER_CHANNEL_MEAN_REVERSION"
+      ],
+      "KEY_REVERSAL": [
+        "KEY_REVERSAL_SIGNAL"
+      ],
+      "KST": [
+        "KST_CROSSOVER"
+      ],
+      "MA": [
+        "PRICE_RECLAIM_MA"
+      ],
+      "MACD_HISTOGRAM": [
+        "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+        "MACD_HISTOGRAM_PIPS_TREND"
+      ],
+      "MARKET_MODE": [
+        "MARKET_MODE_TRANSITION"
+      ],
+      "MA_DISTANCE": [
+        "MA_DISTANCE_MEAN_REVERSION",
+        "MA_DISTANCE_TREND"
+      ],
+      "MA_SLOPE": [
+        "MA_SLOPE_MEAN_REVERSION",
+        "MA_SLOPE_TREND"
+      ],
+      "MA_SPREAD": [
+        "MA_SPREAD_MEAN_REVERSION",
+        "MA_SPREAD_TREND"
+      ],
+      "MFI": [
+        "MFI_MEAN_REVERSION",
+        "MFI_TREND"
+      ],
+      "MINUS_DI": [
+        "MINUS_DI_MEAN_REVERSION",
+        "MINUS_DI_TREND"
+      ],
+      "MOM": [
+        "MOM_MEAN_REVERSION",
+        "MOM_TREND"
+      ],
+      "NVO": [
+        "NVO_VOLUME_IMPULSE"
+      ],
+      "OBV": [
+        "OBV_MEAN_REVERSION",
+        "OBV_TREND"
+      ],
+      "PLUS_DI": [
+        "PLUS_DI_MEAN_REVERSION",
+        "PLUS_DI_TREND"
+      ],
+      "PMO": [
+        "PMO_CROSSOVER"
+      ],
+      "PRICE_ACTION": [
+        "WICK_REJECTION"
+      ],
+      "RANDOM_WALK_INDEX": [
+        "RANDOM_WALK_INDEX_FILTER"
+      ],
+      "ROLLING_VOLUME_PROFILE": [
+        "ROLLING_VOLUME_PROFILE_CONTEXT"
+      ],
+      "ROOFING_FILTER": [
+        "ROOFING_FILTER_CONFIRM",
+        "ROOFING_FILTER_MEAN_REVERSION"
+      ],
+      "RSI": [
+        "RSI_CROSSBACK",
+        "RSI_MEAN_REVERSION",
+        "RSI_TREND"
+      ],
+      "SAR": [
+        "SAR_MEAN_REVERSION",
+        "SAR_TREND"
+      ],
+      "SPEARMAN_RANK": [
+        "SPEARMAN_RANK_CORRELATION"
+      ],
+      "STOCH": [
+        "STOCH_MEAN_REVERSION",
+        "STOCH_TREND"
+      ],
+      "STOCHF": [
+        "STOCHF_MEAN_REVERSION",
+        "STOCHF_TREND"
+      ],
+      "STOCHRSI": [
+        "STOCHRSI_CROSSBACK",
+        "STOCHRSI_MEAN_REVERSION",
+        "STOCHRSI_TREND"
+      ],
+      "THRUST_BAR": [
+        "THRUST_BAR_SIGNAL"
+      ],
+      "TOBY_CRABEL_NR": [
+        "TOBY_CRABEL_NARROW_RANGE"
+      ],
+      "TRENDFLEX": [
+        "TRENDFLEX_CONFIRM"
+      ],
+      "TREND_TRIGGER_FACTOR": [
+        "TTF_DSL_MAGNITUDE",
+        "TTF_DSL_TRANSITION"
+      ],
+      "ULTOSC": [
+        "ULTOSC_MEAN_REVERSION",
+        "ULTOSC_TREND"
+      ],
+      "VQI": [
+        "VQI_DIRECTIONAL_QUALITY"
+      ],
+      "WAVETREND": [
+        "WAVETREND_CROSSOVER"
+      ],
+      "WEIS_WAVE_FORCE": [
+        "WEIS_WAVE_FORCE_MEAN_REVERSION",
+        "WEIS_WAVE_FORCE_TREND"
+      ],
+      "WILLR": [
+        "WILLR_MEAN_REVERSION",
+        "WILLR_TREND"
+      ],
+      "__missing__": [
+        "ADX",
+        "CANDLESTICK_PATTERNS",
+        "MACD_CROSSOVER",
+        "MA_CROSSOVER",
+        "STOCH_CROSSOVER"
+      ]
+    },
+    "by_implementation_class": {
+      "ADOSCIndicator": [
+        "ADOSC_MEAN_REVERSION",
+        "ADOSC_TREND"
+      ],
+      "ADXIndicator": [
+        "ADX"
+      ],
+      "ATRIndicator": [
+        "ATR_VOLATILITY_FILTER"
+      ],
+      "ATRStepTrendFilterIndicator": [
+        "ATR_STEP_TREND_FILTER"
+      ],
+      "AroonIndicator": [
+        "AROON_MEAN_REVERSION",
+        "AROON_TREND"
+      ],
+      "BBandsPositionIndicator": [
+        "BBANDS_POSITION_MEAN_REVERSION",
+        "BBANDS_POSITION_TREND"
+      ],
+      "BollingerKeltnerSqueezeFilterIndicator": [
+        "BOLLINGER_KELTNER_SQUEEZE_FILTER"
+      ],
+      "BollingerKeltnerSqueezeReleaseIndicator": [
+        "BOLLINGER_KELTNER_SQUEEZE_RELEASE"
+      ],
+      "BreakoutFirstCloseIndicator": [
+        "BREAKOUT_FIRST_CLOSE"
+      ],
+      "BufferedRangeBreakoutIndicator": [
+        "BUFFERED_RANGE_BREAKOUT_SIGNAL"
+      ],
+      "CCIIndicator": [
+        "CCI_MEAN_REVERSION",
+        "CCI_TREND"
+      ],
+      "CMOIndicator": [
+        "CMO_MEAN_REVERSION",
+        "CMO_TREND"
+      ],
+      "CandleDirectionIndexIndicator": [
+        "CANDLE_DIRECTION_INDEX"
+      ],
+      "CandlestickPatternScannerIndicator": [
+        "CANDLESTICK_PATTERNS"
+      ],
+      "ChaikinADIndicator": [
+        "CHAIKIN_AD_MEAN_REVERSION",
+        "CHAIKIN_AD_TREND"
+      ],
+      "ChannelReentryIndicator": [
+        "CHANNEL_REENTRY"
+      ],
+      "DonchianChannelIndicator": [
+        "DONCHIAN_CHANNEL_BREAKOUT"
+      ],
+      "EhlersFisherStateFilterIndicator": [
+        "EHLERS_FISHER_STATE_FILTER"
+      ],
+      "EhlersFisherTransitionIndicator": [
+        "EHLERS_FISHER_TRANSITION"
+      ],
+      "GARCHVolatilityRegimeIndicator": [
+        "GARCH_VOLATILITY_REGIME"
+      ],
+      "KSTCrossoverIndicator": [
+        "KST_CROSSOVER"
+      ],
+      "KalmanVelocityIndicator": [
+        "KALMAN_VELOCITY_CONFIRM"
+      ],
+      "KeltnerChannelIndicator": [
+        "KELTNER_CHANNEL_BREAKOUT",
+        "KELTNER_CHANNEL_MEAN_REVERSION"
+      ],
+      "KeyReversalIndicator": [
+        "KEY_REVERSAL_SIGNAL"
+      ],
+      "MACDCrossoverIndicator": [
+        "MACD_CROSSOVER"
+      ],
+      "MACDHistogramIndicator": [
+        "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+        "MACD_HISTOGRAM_PIPS_TREND"
+      ],
+      "MACrossoverIndicator": [
+        "MA_CROSSOVER"
+      ],
+      "MADistanceIndicator": [
+        "MA_DISTANCE_MEAN_REVERSION",
+        "MA_DISTANCE_TREND"
+      ],
+      "MASlopeIndicator": [
+        "MA_SLOPE_MEAN_REVERSION",
+        "MA_SLOPE_TREND"
+      ],
+      "MASpreadIndicator": [
+        "MA_SPREAD_MEAN_REVERSION",
+        "MA_SPREAD_TREND"
+      ],
+      "MFIIndicator": [
+        "MFI_MEAN_REVERSION",
+        "MFI_TREND"
+      ],
+      "MOMIndicator": [
+        "MOM_MEAN_REVERSION",
+        "MOM_TREND"
+      ],
+      "MarketModeTransitionIndicator": [
+        "MARKET_MODE_TRANSITION"
+      ],
+      "MinusDIIndicator": [
+        "MINUS_DI_MEAN_REVERSION",
+        "MINUS_DI_TREND"
+      ],
+      "NormalizedVolumeImpulseIndicator": [
+        "NVO_VOLUME_IMPULSE"
+      ],
+      "OBVIndicator": [
+        "OBV_MEAN_REVERSION",
+        "OBV_TREND"
+      ],
+      "PMOCrossoverIndicator": [
+        "PMO_CROSSOVER"
+      ],
+      "PlusDIIndicator": [
+        "PLUS_DI_MEAN_REVERSION",
+        "PLUS_DI_TREND"
+      ],
+      "PriceReclaimMAIndicator": [
+        "PRICE_RECLAIM_MA"
+      ],
+      "RSICrossbackIndicator": [
+        "RSI_CROSSBACK"
+      ],
+      "RSIIndicator": [
+        "RSI_MEAN_REVERSION",
+        "RSI_TREND"
+      ],
+      "RandomWalkIndexIndicator": [
+        "RANDOM_WALK_INDEX_FILTER"
+      ],
+      "RollingVolumeProfileContextIndicator": [
+        "ROLLING_VOLUME_PROFILE_CONTEXT"
+      ],
+      "RoofingFilterIndicator": [
+        "ROOFING_FILTER_CONFIRM",
+        "ROOFING_FILTER_MEAN_REVERSION"
+      ],
+      "SARIndicator": [
+        "SAR_MEAN_REVERSION",
+        "SAR_TREND"
+      ],
+      "SpearmanRankCorrelationIndicator": [
+        "SPEARMAN_RANK_CORRELATION"
+      ],
+      "StochCrossoverIndicator": [
+        "STOCH_CROSSOVER"
+      ],
+      "StochIndicator": [
+        "STOCH_MEAN_REVERSION",
+        "STOCH_TREND"
+      ],
+      "StochRSICrossbackIndicator": [
+        "STOCHRSI_CROSSBACK"
+      ],
+      "StochRSIIndicator": [
+        "STOCHRSI_MEAN_REVERSION",
+        "STOCHRSI_TREND"
+      ],
+      "StochfIndicator": [
+        "STOCHF_MEAN_REVERSION",
+        "STOCHF_TREND"
+      ],
+      "TTFDSLMagnitudeIndicator": [
+        "TTF_DSL_MAGNITUDE"
+      ],
+      "TTFDSLTransitionIndicator": [
+        "TTF_DSL_TRANSITION"
+      ],
+      "ThrustBarIndicator": [
+        "THRUST_BAR_SIGNAL"
+      ],
+      "TobyCrabelNarrowRangeIndicator": [
+        "TOBY_CRABEL_NARROW_RANGE"
+      ],
+      "TrendFlexIndicator": [
+        "TRENDFLEX_CONFIRM"
+      ],
+      "ULTOscIndicator": [
+        "ULTOSC_MEAN_REVERSION",
+        "ULTOSC_TREND"
+      ],
+      "VQIIndicator": [
+        "VQI_DIRECTIONAL_QUALITY"
+      ],
+      "WILLRIndicator": [
+        "WILLR_MEAN_REVERSION",
+        "WILLR_TREND"
+      ],
+      "WaveTrendCrossoverIndicator": [
+        "WAVETREND_CROSSOVER"
+      ],
+      "WeisWaveForceIndicator": [
+        "WEIS_WAVE_FORCE_MEAN_REVERSION",
+        "WEIS_WAVE_FORCE_TREND"
+      ],
+      "WickRejectionIndicator": [
+        "WICK_REJECTION"
+      ]
+    },
+    "by_talib_function": {
+      "AD": [
+        "CHAIKIN_AD_MEAN_REVERSION",
+        "CHAIKIN_AD_TREND"
+      ],
+      "ADOSC": [
+        "ADOSC_MEAN_REVERSION",
+        "ADOSC_TREND"
+      ],
+      "ADX": [
+        "ADX"
+      ],
+      "AROONOSC": [
+        "AROON_MEAN_REVERSION",
+        "AROON_TREND"
+      ],
+      "ATR": [
+        "ATR_VOLATILITY_FILTER"
+      ],
+      "ATR_STEP_TREND": [
+        "ATR_STEP_TREND_FILTER"
+      ],
+      "BBANDS": [
+        "BBANDS_POSITION_MEAN_REVERSION",
+        "BBANDS_POSITION_TREND"
+      ],
+      "BOLLINGER_KELTNER_SQUEEZE": [
+        "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+        "BOLLINGER_KELTNER_SQUEEZE_RELEASE"
+      ],
+      "BREAKOUT_FIRST_CLOSE": [
+        "BREAKOUT_FIRST_CLOSE"
+      ],
+      "BUFFERED_RANGE_BREAKOUT": [
+        "BUFFERED_RANGE_BREAKOUT_SIGNAL"
+      ],
+      "CANDLE_DIRECTION_INDEX": [
+        "CANDLE_DIRECTION_INDEX"
+      ],
+      "CCI": [
+        "CCI_MEAN_REVERSION",
+        "CCI_TREND"
+      ],
+      "CDL*": [
+        "CANDLESTICK_PATTERNS"
+      ],
+      "CHANNEL_REENTRY": [
+        "CHANNEL_REENTRY"
+      ],
+      "CMO": [
+        "CMO_MEAN_REVERSION",
+        "CMO_TREND"
+      ],
+      "DONCHIAN": [
+        "DONCHIAN_CHANNEL_BREAKOUT"
+      ],
+      "EHLERS_FISHER": [
+        "EHLERS_FISHER_STATE_FILTER",
+        "EHLERS_FISHER_TRANSITION"
+      ],
+      "GARCH": [
+        "GARCH_VOLATILITY_REGIME"
+      ],
+      "KALMAN_FILTER": [
+        "KALMAN_VELOCITY_CONFIRM"
+      ],
+      "KELTNER": [
+        "KELTNER_CHANNEL_BREAKOUT",
+        "KELTNER_CHANNEL_MEAN_REVERSION"
+      ],
+      "KEY_REVERSAL": [
+        "KEY_REVERSAL_SIGNAL"
+      ],
+      "KST": [
+        "KST_CROSSOVER"
+      ],
+      "MA": [
+        "MA_CROSSOVER",
+        "MA_DISTANCE_MEAN_REVERSION",
+        "MA_DISTANCE_TREND",
+        "MA_SLOPE_MEAN_REVERSION",
+        "MA_SLOPE_TREND",
+        "MA_SPREAD_MEAN_REVERSION",
+        "MA_SPREAD_TREND"
+      ],
+      "MACD": [
+        "MACD_CROSSOVER",
+        "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+        "MACD_HISTOGRAM_PIPS_TREND"
+      ],
+      "MARKET_MODE": [
+        "MARKET_MODE_TRANSITION"
+      ],
+      "MFI": [
+        "MFI_MEAN_REVERSION",
+        "MFI_TREND"
+      ],
+      "MINUS_DI": [
+        "MINUS_DI_MEAN_REVERSION",
+        "MINUS_DI_TREND"
+      ],
+      "MOM": [
+        "MOM_MEAN_REVERSION",
+        "MOM_TREND"
+      ],
+      "NORMALIZED_VOLUME_IMPULSE": [
+        "NVO_VOLUME_IMPULSE"
+      ],
+      "OBV": [
+        "OBV_MEAN_REVERSION",
+        "OBV_TREND"
+      ],
+      "PLUS_DI": [
+        "PLUS_DI_MEAN_REVERSION",
+        "PLUS_DI_TREND"
+      ],
+      "PMO": [
+        "PMO_CROSSOVER"
+      ],
+      "PRICE_RECLAIM_MA": [
+        "PRICE_RECLAIM_MA"
+      ],
+      "RANDOM_WALK_INDEX": [
+        "RANDOM_WALK_INDEX_FILTER"
+      ],
+      "ROLLING_VOLUME_PROFILE": [
+        "ROLLING_VOLUME_PROFILE_CONTEXT"
+      ],
+      "ROOFING_FILTER": [
+        "ROOFING_FILTER_CONFIRM",
+        "ROOFING_FILTER_MEAN_REVERSION"
+      ],
+      "RSI": [
+        "RSI_MEAN_REVERSION",
+        "RSI_TREND"
+      ],
+      "RSI_CROSSBACK": [
+        "RSI_CROSSBACK"
+      ],
+      "SAR": [
+        "SAR_MEAN_REVERSION",
+        "SAR_TREND"
+      ],
+      "SPEARMAN_RANK": [
+        "SPEARMAN_RANK_CORRELATION"
+      ],
+      "STOCH": [
+        "STOCH_CROSSOVER",
+        "STOCH_MEAN_REVERSION",
+        "STOCH_TREND"
+      ],
+      "STOCHF": [
+        "STOCHF_MEAN_REVERSION",
+        "STOCHF_TREND"
+      ],
+      "STOCHRSI": [
+        "STOCHRSI_MEAN_REVERSION",
+        "STOCHRSI_TREND"
+      ],
+      "STOCHRSI_CROSSBACK": [
+        "STOCHRSI_CROSSBACK"
+      ],
+      "THRUST_BAR": [
+        "THRUST_BAR_SIGNAL"
+      ],
+      "TOBY_CRABEL_NR": [
+        "TOBY_CRABEL_NARROW_RANGE"
+      ],
+      "TRENDFLEX": [
+        "TRENDFLEX_CONFIRM"
+      ],
+      "TREND_TRIGGER_FACTOR": [
+        "TTF_DSL_MAGNITUDE",
+        "TTF_DSL_TRANSITION"
+      ],
+      "ULTOSC": [
+        "ULTOSC_MEAN_REVERSION",
+        "ULTOSC_TREND"
+      ],
+      "VQI": [
+        "VQI_DIRECTIONAL_QUALITY"
+      ],
+      "WAVETREND": [
+        "WAVETREND_CROSSOVER"
+      ],
+      "WEIS_WAVE_FORCE": [
+        "WEIS_WAVE_FORCE_MEAN_REVERSION",
+        "WEIS_WAVE_FORCE_TREND"
+      ],
+      "WICK_REJECTION": [
+        "WICK_REJECTION"
+      ],
+      "WILLR": [
+        "WILLR_MEAN_REVERSION",
+        "WILLR_TREND"
+      ]
+    },
+    "by_namespace": {
+      "Channels": [
+        "DONCHIAN_CHANNEL_BREAKOUT",
+        "KELTNER_CHANNEL_BREAKOUT",
+        "KELTNER_CHANNEL_MEAN_REVERSION"
+      ],
+      "Momentum": [
+        "AROON_MEAN_REVERSION",
+        "AROON_TREND",
+        "CCI_MEAN_REVERSION",
+        "CCI_TREND",
+        "CMO_MEAN_REVERSION",
+        "CMO_TREND",
+        "EHLERS_FISHER_STATE_FILTER",
+        "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+        "MACD_HISTOGRAM_PIPS_TREND",
+        "MOM_MEAN_REVERSION",
+        "MOM_TREND",
+        "ROOFING_FILTER_CONFIRM",
+        "ROOFING_FILTER_MEAN_REVERSION",
+        "RSI_MEAN_REVERSION",
+        "RSI_TREND",
+        "STOCHF_MEAN_REVERSION",
+        "STOCHF_TREND",
+        "STOCHRSI_MEAN_REVERSION",
+        "STOCHRSI_TREND",
+        "STOCH_MEAN_REVERSION",
+        "STOCH_TREND",
+        "ULTOSC_MEAN_REVERSION",
+        "ULTOSC_TREND",
+        "WILLR_MEAN_REVERSION",
+        "WILLR_TREND"
+      ],
+      "Patterns": [
+        "CANDLESTICK_PATTERNS",
+        "WICK_REJECTION"
+      ],
+      "Signals": [
+        "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+        "BREAKOUT_FIRST_CLOSE",
+        "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+        "CANDLE_DIRECTION_INDEX",
+        "CHANNEL_REENTRY",
+        "EHLERS_FISHER_TRANSITION",
+        "KEY_REVERSAL_SIGNAL",
+        "KST_CROSSOVER",
+        "MACD_CROSSOVER",
+        "MARKET_MODE_TRANSITION",
+        "MA_CROSSOVER",
+        "PMO_CROSSOVER",
+        "PRICE_RECLAIM_MA",
+        "RSI_CROSSBACK",
+        "STOCHRSI_CROSSBACK",
+        "STOCH_CROSSOVER",
+        "THRUST_BAR_SIGNAL",
+        "TOBY_CRABEL_NARROW_RANGE",
+        "TTF_DSL_TRANSITION",
+        "WAVETREND_CROSSOVER"
+      ],
+      "Statistics": [
+        "SPEARMAN_RANK_CORRELATION"
+      ],
+      "Trend": [
+        "ADX",
+        "ATR_STEP_TREND_FILTER",
+        "KALMAN_VELOCITY_CONFIRM",
+        "MA_DISTANCE_MEAN_REVERSION",
+        "MA_DISTANCE_TREND",
+        "MA_SLOPE_MEAN_REVERSION",
+        "MA_SLOPE_TREND",
+        "MA_SPREAD_MEAN_REVERSION",
+        "MA_SPREAD_TREND",
+        "MINUS_DI_MEAN_REVERSION",
+        "MINUS_DI_TREND",
+        "PLUS_DI_MEAN_REVERSION",
+        "PLUS_DI_TREND",
+        "RANDOM_WALK_INDEX_FILTER",
+        "SAR_MEAN_REVERSION",
+        "SAR_TREND",
+        "TRENDFLEX_CONFIRM",
+        "TTF_DSL_MAGNITUDE"
+      ],
+      "Volatility": [
+        "ATR_VOLATILITY_FILTER",
+        "BBANDS_POSITION_MEAN_REVERSION",
+        "BBANDS_POSITION_TREND",
+        "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+        "GARCH_VOLATILITY_REGIME",
+        "VQI_DIRECTIONAL_QUALITY"
+      ],
+      "Volume": [
+        "ADOSC_MEAN_REVERSION",
+        "ADOSC_TREND",
+        "CHAIKIN_AD_MEAN_REVERSION",
+        "CHAIKIN_AD_TREND",
+        "MFI_MEAN_REVERSION",
+        "MFI_TREND",
+        "NVO_VOLUME_IMPULSE",
+        "OBV_MEAN_REVERSION",
+        "OBV_TREND",
+        "ROLLING_VOLUME_PROFILE_CONTEXT",
+        "WEIS_WAVE_FORCE_MEAN_REVERSION",
+        "WEIS_WAVE_FORCE_TREND"
+      ]
+    },
+    "by_signal_role": {
+      "context": [
+        "ADOSC_MEAN_REVERSION",
+        "ADOSC_TREND",
+        "AROON_MEAN_REVERSION",
+        "AROON_TREND",
+        "CHAIKIN_AD_MEAN_REVERSION",
+        "CHAIKIN_AD_TREND",
+        "MA_SLOPE_MEAN_REVERSION",
+        "MA_SLOPE_TREND",
+        "MA_SPREAD_MEAN_REVERSION",
+        "MA_SPREAD_TREND",
+        "MINUS_DI_MEAN_REVERSION",
+        "MINUS_DI_TREND",
+        "OBV_MEAN_REVERSION",
+        "OBV_TREND",
+        "PLUS_DI_MEAN_REVERSION",
+        "PLUS_DI_TREND",
+        "SAR_MEAN_REVERSION",
+        "SAR_TREND",
+        "WEIS_WAVE_FORCE_MEAN_REVERSION",
+        "WEIS_WAVE_FORCE_TREND"
+      ],
+      "filter": [
+        "ADX",
+        "ATR_STEP_TREND_FILTER",
+        "ATR_VOLATILITY_FILTER",
+        "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+        "GARCH_VOLATILITY_REGIME",
+        "RANDOM_WALK_INDEX_FILTER",
+        "ROLLING_VOLUME_PROFILE_CONTEXT",
+        "VQI_DIRECTIONAL_QUALITY"
+      ],
+      "setup": [
+        "BBANDS_POSITION_MEAN_REVERSION",
+        "BBANDS_POSITION_TREND",
+        "CCI_MEAN_REVERSION",
+        "CCI_TREND",
+        "CMO_MEAN_REVERSION",
+        "CMO_TREND",
+        "DONCHIAN_CHANNEL_BREAKOUT",
+        "EHLERS_FISHER_STATE_FILTER",
+        "KALMAN_VELOCITY_CONFIRM",
+        "KELTNER_CHANNEL_BREAKOUT",
+        "KELTNER_CHANNEL_MEAN_REVERSION",
+        "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+        "MACD_HISTOGRAM_PIPS_TREND",
+        "MA_DISTANCE_MEAN_REVERSION",
+        "MA_DISTANCE_TREND",
+        "MFI_MEAN_REVERSION",
+        "MFI_TREND",
+        "MOM_MEAN_REVERSION",
+        "MOM_TREND",
+        "ROOFING_FILTER_CONFIRM",
+        "ROOFING_FILTER_MEAN_REVERSION",
+        "RSI_MEAN_REVERSION",
+        "RSI_TREND",
+        "SPEARMAN_RANK_CORRELATION",
+        "STOCHF_MEAN_REVERSION",
+        "STOCHF_TREND",
+        "STOCHRSI_MEAN_REVERSION",
+        "STOCHRSI_TREND",
+        "STOCH_MEAN_REVERSION",
+        "STOCH_TREND",
+        "TRENDFLEX_CONFIRM",
+        "TTF_DSL_MAGNITUDE",
+        "ULTOSC_MEAN_REVERSION",
+        "ULTOSC_TREND",
+        "WILLR_MEAN_REVERSION",
+        "WILLR_TREND"
+      ],
+      "trigger": [
+        "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+        "BREAKOUT_FIRST_CLOSE",
+        "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+        "CANDLESTICK_PATTERNS",
+        "CANDLE_DIRECTION_INDEX",
+        "CHANNEL_REENTRY",
+        "EHLERS_FISHER_TRANSITION",
+        "KEY_REVERSAL_SIGNAL",
+        "KST_CROSSOVER",
+        "MACD_CROSSOVER",
+        "MARKET_MODE_TRANSITION",
+        "MA_CROSSOVER",
+        "NVO_VOLUME_IMPULSE",
+        "PMO_CROSSOVER",
+        "PRICE_RECLAIM_MA",
+        "RSI_CROSSBACK",
+        "STOCHRSI_CROSSBACK",
+        "STOCH_CROSSOVER",
+        "THRUST_BAR_SIGNAL",
+        "TOBY_CRABEL_NARROW_RANGE",
+        "TTF_DSL_TRANSITION",
+        "WAVETREND_CROSSOVER",
+        "WICK_REJECTION"
+      ]
+    },
+    "by_strategy_role": {
+      "__missing__": [
+        "ADX",
+        "CANDLESTICK_PATTERNS",
+        "MACD_CROSSOVER",
+        "MA_CROSSOVER",
+        "STOCH_CROSSOVER"
+      ],
+      "breakout": [
+        "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+        "BREAKOUT_FIRST_CLOSE",
+        "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+        "DONCHIAN_CHANNEL_BREAKOUT",
+        "KELTNER_CHANNEL_BREAKOUT"
+      ],
+      "confirm": [
+        "CANDLE_DIRECTION_INDEX",
+        "EHLERS_FISHER_TRANSITION",
+        "KALMAN_VELOCITY_CONFIRM",
+        "KEY_REVERSAL_SIGNAL",
+        "KST_CROSSOVER",
+        "MARKET_MODE_TRANSITION",
+        "NVO_VOLUME_IMPULSE",
+        "PMO_CROSSOVER",
+        "PRICE_RECLAIM_MA",
+        "ROOFING_FILTER_CONFIRM",
+        "SPEARMAN_RANK_CORRELATION",
+        "THRUST_BAR_SIGNAL",
+        "TOBY_CRABEL_NARROW_RANGE",
+        "TRENDFLEX_CONFIRM",
+        "TTF_DSL_MAGNITUDE",
+        "TTF_DSL_TRANSITION",
+        "WAVETREND_CROSSOVER"
+      ],
+      "filter": [
+        "ATR_STEP_TREND_FILTER",
+        "ATR_VOLATILITY_FILTER",
+        "BOLLINGER_KELTNER_SQUEEZE_FILTER",
+        "EHLERS_FISHER_STATE_FILTER",
+        "GARCH_VOLATILITY_REGIME",
+        "RANDOM_WALK_INDEX_FILTER",
+        "ROLLING_VOLUME_PROFILE_CONTEXT",
+        "VQI_DIRECTIONAL_QUALITY"
+      ],
+      "mean-reversion": [
+        "ADOSC_MEAN_REVERSION",
+        "AROON_MEAN_REVERSION",
+        "BBANDS_POSITION_MEAN_REVERSION",
+        "CCI_MEAN_REVERSION",
+        "CHAIKIN_AD_MEAN_REVERSION",
+        "CHANNEL_REENTRY",
+        "CMO_MEAN_REVERSION",
+        "KELTNER_CHANNEL_MEAN_REVERSION",
+        "MACD_HISTOGRAM_PIPS_MEAN_REVERSION",
+        "MA_DISTANCE_MEAN_REVERSION",
+        "MA_SLOPE_MEAN_REVERSION",
+        "MA_SPREAD_MEAN_REVERSION",
+        "MFI_MEAN_REVERSION",
+        "MINUS_DI_MEAN_REVERSION",
+        "MOM_MEAN_REVERSION",
+        "OBV_MEAN_REVERSION",
+        "PLUS_DI_MEAN_REVERSION",
+        "ROOFING_FILTER_MEAN_REVERSION",
+        "RSI_CROSSBACK",
+        "RSI_MEAN_REVERSION",
+        "SAR_MEAN_REVERSION",
+        "STOCHF_MEAN_REVERSION",
+        "STOCHRSI_CROSSBACK",
+        "STOCHRSI_MEAN_REVERSION",
+        "STOCH_MEAN_REVERSION",
+        "ULTOSC_MEAN_REVERSION",
+        "WEIS_WAVE_FORCE_MEAN_REVERSION",
+        "WICK_REJECTION",
+        "WILLR_MEAN_REVERSION"
+      ],
+      "trend": [
+        "ADOSC_TREND",
+        "AROON_TREND",
+        "BBANDS_POSITION_TREND",
+        "CCI_TREND",
+        "CHAIKIN_AD_TREND",
+        "CMO_TREND",
+        "MACD_HISTOGRAM_PIPS_TREND",
+        "MA_DISTANCE_TREND",
+        "MA_SLOPE_TREND",
+        "MA_SPREAD_TREND",
+        "MFI_TREND",
+        "MINUS_DI_TREND",
+        "MOM_TREND",
+        "OBV_TREND",
+        "PLUS_DI_TREND",
+        "RSI_TREND",
+        "SAR_TREND",
+        "STOCHF_TREND",
+        "STOCHRSI_TREND",
+        "STOCH_TREND",
+        "ULTOSC_TREND",
+        "WEIS_WAVE_FORCE_TREND",
+        "WILLR_TREND"
+      ]
+    }
+  },
+  "missing_implementation_ids": [],
+  "variant_edges": [
+    {
+      "base_indicator_id": "ADOSC",
+      "indicator_id": "ADOSC_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "ADOSC",
+      "indicator_id": "ADOSC_TREND"
+    },
+    {
+      "base_indicator_id": "AROON",
+      "indicator_id": "AROON_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "AROON",
+      "indicator_id": "AROON_TREND"
+    },
+    {
+      "base_indicator_id": "ATR_STEP_TREND",
+      "indicator_id": "ATR_STEP_TREND_FILTER"
+    },
+    {
+      "base_indicator_id": "ATR",
+      "indicator_id": "ATR_VOLATILITY_FILTER"
+    },
+    {
+      "base_indicator_id": "BBANDS_POSITION",
+      "indicator_id": "BBANDS_POSITION_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "BBANDS_POSITION",
+      "indicator_id": "BBANDS_POSITION_TREND"
+    },
+    {
+      "base_indicator_id": "BOLLINGER_KELTNER_SQUEEZE",
+      "indicator_id": "BOLLINGER_KELTNER_SQUEEZE_FILTER"
+    },
+    {
+      "base_indicator_id": "BOLLINGER_KELTNER_SQUEEZE",
+      "indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE"
+    },
+    {
+      "base_indicator_id": "CHANNEL",
+      "indicator_id": "BREAKOUT_FIRST_CLOSE"
+    },
+    {
+      "base_indicator_id": "BUFFERED_RANGE_BREAKOUT",
+      "indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL"
+    },
+    {
+      "base_indicator_id": "CCI",
+      "indicator_id": "CCI_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "CCI",
+      "indicator_id": "CCI_TREND"
+    },
+    {
+      "base_indicator_id": "CHAIKIN_AD",
+      "indicator_id": "CHAIKIN_AD_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "CHAIKIN_AD",
+      "indicator_id": "CHAIKIN_AD_TREND"
+    },
+    {
+      "base_indicator_id": "CHANNEL",
+      "indicator_id": "CHANNEL_REENTRY"
+    },
+    {
+      "base_indicator_id": "CMO",
+      "indicator_id": "CMO_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "CMO",
+      "indicator_id": "CMO_TREND"
+    },
+    {
+      "base_indicator_id": "DONCHIAN_CHANNEL",
+      "indicator_id": "DONCHIAN_CHANNEL_BREAKOUT"
+    },
+    {
+      "base_indicator_id": "EHLERS_FISHER",
+      "indicator_id": "EHLERS_FISHER_STATE_FILTER"
+    },
+    {
+      "base_indicator_id": "EHLERS_FISHER",
+      "indicator_id": "EHLERS_FISHER_TRANSITION"
+    },
+    {
+      "base_indicator_id": "GARCH",
+      "indicator_id": "GARCH_VOLATILITY_REGIME"
+    },
+    {
+      "base_indicator_id": "KALMAN_FILTER",
+      "indicator_id": "KALMAN_VELOCITY_CONFIRM"
+    },
+    {
+      "base_indicator_id": "KELTNER_CHANNEL",
+      "indicator_id": "KELTNER_CHANNEL_BREAKOUT"
+    },
+    {
+      "base_indicator_id": "KELTNER_CHANNEL",
+      "indicator_id": "KELTNER_CHANNEL_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "KEY_REVERSAL",
+      "indicator_id": "KEY_REVERSAL_SIGNAL"
+    },
+    {
+      "base_indicator_id": "KST",
+      "indicator_id": "KST_CROSSOVER"
+    },
+    {
+      "base_indicator_id": "MACD_HISTOGRAM",
+      "indicator_id": "MACD_HISTOGRAM_PIPS_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "MACD_HISTOGRAM",
+      "indicator_id": "MACD_HISTOGRAM_PIPS_TREND"
+    },
+    {
+      "base_indicator_id": "MARKET_MODE",
+      "indicator_id": "MARKET_MODE_TRANSITION"
+    },
+    {
+      "base_indicator_id": "MA_DISTANCE",
+      "indicator_id": "MA_DISTANCE_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "MA_DISTANCE",
+      "indicator_id": "MA_DISTANCE_TREND"
+    },
+    {
+      "base_indicator_id": "MA_SLOPE",
+      "indicator_id": "MA_SLOPE_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "MA_SLOPE",
+      "indicator_id": "MA_SLOPE_TREND"
+    },
+    {
+      "base_indicator_id": "MA_SPREAD",
+      "indicator_id": "MA_SPREAD_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "MA_SPREAD",
+      "indicator_id": "MA_SPREAD_TREND"
+    },
+    {
+      "base_indicator_id": "MFI",
+      "indicator_id": "MFI_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "MFI",
+      "indicator_id": "MFI_TREND"
+    },
+    {
+      "base_indicator_id": "MINUS_DI",
+      "indicator_id": "MINUS_DI_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "MINUS_DI",
+      "indicator_id": "MINUS_DI_TREND"
+    },
+    {
+      "base_indicator_id": "MOM",
+      "indicator_id": "MOM_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "MOM",
+      "indicator_id": "MOM_TREND"
+    },
+    {
+      "base_indicator_id": "NVO",
+      "indicator_id": "NVO_VOLUME_IMPULSE"
+    },
+    {
+      "base_indicator_id": "OBV",
+      "indicator_id": "OBV_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "OBV",
+      "indicator_id": "OBV_TREND"
+    },
+    {
+      "base_indicator_id": "PLUS_DI",
+      "indicator_id": "PLUS_DI_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "PLUS_DI",
+      "indicator_id": "PLUS_DI_TREND"
+    },
+    {
+      "base_indicator_id": "PMO",
+      "indicator_id": "PMO_CROSSOVER"
+    },
+    {
+      "base_indicator_id": "MA",
+      "indicator_id": "PRICE_RECLAIM_MA"
+    },
+    {
+      "base_indicator_id": "RANDOM_WALK_INDEX",
+      "indicator_id": "RANDOM_WALK_INDEX_FILTER"
+    },
+    {
+      "base_indicator_id": "ROLLING_VOLUME_PROFILE",
+      "indicator_id": "ROLLING_VOLUME_PROFILE_CONTEXT"
+    },
+    {
+      "base_indicator_id": "ROOFING_FILTER",
+      "indicator_id": "ROOFING_FILTER_CONFIRM"
+    },
+    {
+      "base_indicator_id": "ROOFING_FILTER",
+      "indicator_id": "ROOFING_FILTER_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "RSI",
+      "indicator_id": "RSI_CROSSBACK"
+    },
+    {
+      "base_indicator_id": "RSI",
+      "indicator_id": "RSI_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "RSI",
+      "indicator_id": "RSI_TREND"
+    },
+    {
+      "base_indicator_id": "SAR",
+      "indicator_id": "SAR_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "SAR",
+      "indicator_id": "SAR_TREND"
+    },
+    {
+      "base_indicator_id": "SPEARMAN_RANK",
+      "indicator_id": "SPEARMAN_RANK_CORRELATION"
+    },
+    {
+      "base_indicator_id": "STOCHF",
+      "indicator_id": "STOCHF_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "STOCHF",
+      "indicator_id": "STOCHF_TREND"
+    },
+    {
+      "base_indicator_id": "STOCHRSI",
+      "indicator_id": "STOCHRSI_CROSSBACK"
+    },
+    {
+      "base_indicator_id": "STOCHRSI",
+      "indicator_id": "STOCHRSI_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "STOCHRSI",
+      "indicator_id": "STOCHRSI_TREND"
+    },
+    {
+      "base_indicator_id": "STOCH",
+      "indicator_id": "STOCH_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "STOCH",
+      "indicator_id": "STOCH_TREND"
+    },
+    {
+      "base_indicator_id": "THRUST_BAR",
+      "indicator_id": "THRUST_BAR_SIGNAL"
+    },
+    {
+      "base_indicator_id": "TOBY_CRABEL_NR",
+      "indicator_id": "TOBY_CRABEL_NARROW_RANGE"
+    },
+    {
+      "base_indicator_id": "TRENDFLEX",
+      "indicator_id": "TRENDFLEX_CONFIRM"
+    },
+    {
+      "base_indicator_id": "TREND_TRIGGER_FACTOR",
+      "indicator_id": "TTF_DSL_MAGNITUDE"
+    },
+    {
+      "base_indicator_id": "TREND_TRIGGER_FACTOR",
+      "indicator_id": "TTF_DSL_TRANSITION"
+    },
+    {
+      "base_indicator_id": "ULTOSC",
+      "indicator_id": "ULTOSC_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "ULTOSC",
+      "indicator_id": "ULTOSC_TREND"
+    },
+    {
+      "base_indicator_id": "VQI",
+      "indicator_id": "VQI_DIRECTIONAL_QUALITY"
+    },
+    {
+      "base_indicator_id": "WAVETREND",
+      "indicator_id": "WAVETREND_CROSSOVER"
+    },
+    {
+      "base_indicator_id": "WEIS_WAVE_FORCE",
+      "indicator_id": "WEIS_WAVE_FORCE_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "WEIS_WAVE_FORCE",
+      "indicator_id": "WEIS_WAVE_FORCE_TREND"
+    },
+    {
+      "base_indicator_id": "PRICE_ACTION",
+      "indicator_id": "WICK_REJECTION"
+    },
+    {
+      "base_indicator_id": "WILLR",
+      "indicator_id": "WILLR_MEAN_REVERSION"
+    },
+    {
+      "base_indicator_id": "WILLR",
+      "indicator_id": "WILLR_TREND"
+    }
+  ]
+}

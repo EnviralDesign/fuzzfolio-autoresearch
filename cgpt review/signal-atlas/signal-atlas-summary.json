@@ -1,0 +1,1020 @@
+{
+  "schema_version": "signal_atlas_v1",
+  "generated_at": "2026-05-21T16:34:35.421358+00:00",
+  "run_started_at": "2026-05-21T16:31:42.614857+00:00",
+  "source": {
+    "workspace_root": "C:\\repos\\Trading-Dashboard",
+    "catalog_path": "C:\\repos\\Trading-Dashboard\\shared\\constants\\indicators.json",
+    "static_atlas_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\indicator-atlas\\indicator-atlas.json",
+    "static_atlas_refreshed": false
+  },
+  "selection": {
+    "signal_role": "trigger",
+    "indicator_ids": [
+      "EHLERS_FISHER_TRANSITION",
+      "KEY_REVERSAL_SIGNAL",
+      "CANDLE_DIRECTION_INDEX",
+      "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+      "CANDLESTICK_PATTERNS",
+      "MACD_CROSSOVER",
+      "STOCH_CROSSOVER",
+      "THRUST_BAR_SIGNAL",
+      "TOBY_CRABEL_NARROW_RANGE",
+      "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+      "MA_CROSSOVER",
+      "PMO_CROSSOVER",
+      "PRICE_RECLAIM_MA",
+      "RSI_CROSSBACK",
+      "BREAKOUT_FIRST_CLOSE",
+      "CHANNEL_REENTRY",
+      "KST_CROSSOVER",
+      "MARKET_MODE_TRANSITION",
+      "STOCHRSI_CROSSBACK",
+      "TTF_DSL_TRANSITION",
+      "WAVETREND_CROSSOVER",
+      "NVO_VOLUME_IMPULSE",
+      "WICK_REJECTION"
+    ],
+    "indicator_count": 23,
+    "instruments": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY",
+      "XAUUSD"
+    ],
+    "timeframes": [
+      "M5",
+      "M15"
+    ],
+    "bar_limit": 5000,
+    "replay_source": "system",
+    "total_requested_calls": 184
+  },
+  "result_counts": {
+    "successful_calls": 184,
+    "failed_calls": 0,
+    "density_bucket_counts": {
+      "dense": 26,
+      "flat": 8,
+      "sparse": 1,
+      "usable": 149
+    },
+    "balance_bucket_counts": {
+      "balanced": 172,
+      "flat": 8,
+      "short_biased": 4
+    }
+  },
+  "indicator_rollups": {
+    "EHLERS_FISHER_TRANSITION": {
+      "indicator_id": "EHLERS_FISHER_TRANSITION",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 87.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 6726,
+      "either_active_bars": 8045,
+      "active_percent": 20.1125,
+      "long_active_bars": 4025,
+      "short_active_bars": 4020,
+      "long_share_of_active": 0.5003,
+      "density_bucket": "dense",
+      "density_bucket_counts": {
+        "dense": 5,
+        "usable": 3
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "KEY_REVERSAL_SIGNAL": {
+      "indicator_id": "KEY_REVERSAL_SIGNAL",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 87.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 3051,
+      "either_active_bars": 3076,
+      "active_percent": 7.69,
+      "long_active_bars": 1524,
+      "short_active_bars": 1552,
+      "long_share_of_active": 0.4954,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "CANDLE_DIRECTION_INDEX": {
+      "indicator_id": "CANDLE_DIRECTION_INDEX",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 83.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 1549,
+      "either_active_bars": 1866,
+      "active_percent": 4.665,
+      "long_active_bars": 1004,
+      "short_active_bars": 862,
+      "long_share_of_active": 0.538,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "BUFFERED_RANGE_BREAKOUT_SIGNAL": {
+      "indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+      "signal_role": "trigger",
+      "strategy_role": "breakout",
+      "static_prior_score": 81.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 2918,
+      "either_active_bars": 3055,
+      "active_percent": 7.6375,
+      "long_active_bars": 1529,
+      "short_active_bars": 1526,
+      "long_share_of_active": 0.5005,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "CANDLESTICK_PATTERNS": {
+      "indicator_id": "CANDLESTICK_PATTERNS",
+      "signal_role": "trigger",
+      "strategy_role": null,
+      "static_prior_score": 81.0,
+      "static_prior_bucket": "context_dependent",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 0,
+      "either_active_bars": 0,
+      "active_percent": 0.0,
+      "long_active_bars": 0,
+      "short_active_bars": 0,
+      "long_share_of_active": null,
+      "density_bucket": "flat",
+      "density_bucket_counts": {
+        "flat": 8
+      },
+      "balance_bucket_counts": {
+        "flat": 8
+      }
+    },
+    "MACD_CROSSOVER": {
+      "indicator_id": "MACD_CROSSOVER",
+      "signal_role": "trigger",
+      "strategy_role": null,
+      "static_prior_score": 81.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 2866,
+      "either_active_bars": 3129,
+      "active_percent": 7.8225,
+      "long_active_bars": 1565,
+      "short_active_bars": 1564,
+      "long_share_of_active": 0.5002,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "STOCH_CROSSOVER": {
+      "indicator_id": "STOCH_CROSSOVER",
+      "signal_role": "trigger",
+      "strategy_role": null,
+      "static_prior_score": 81.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 9323,
+      "either_active_bars": 10546,
+      "active_percent": 26.365,
+      "long_active_bars": 5274,
+      "short_active_bars": 5272,
+      "long_share_of_active": 0.5001,
+      "density_bucket": "dense",
+      "density_bucket_counts": {
+        "dense": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "THRUST_BAR_SIGNAL": {
+      "indicator_id": "THRUST_BAR_SIGNAL",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 81.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 440,
+      "either_active_bars": 473,
+      "active_percent": 1.1825,
+      "long_active_bars": 234,
+      "short_active_bars": 239,
+      "long_share_of_active": 0.4947,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "sparse": 1,
+        "usable": 7
+      },
+      "balance_bucket_counts": {
+        "balanced": 6,
+        "short_biased": 2
+      }
+    },
+    "TOBY_CRABEL_NARROW_RANGE": {
+      "indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 81.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 1173,
+      "either_active_bars": 3394,
+      "active_percent": 8.485,
+      "long_active_bars": 3394,
+      "short_active_bars": 3394,
+      "long_share_of_active": 0.5,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "BOLLINGER_KELTNER_SQUEEZE_RELEASE": {
+      "indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+      "signal_role": "trigger",
+      "strategy_role": "breakout",
+      "static_prior_score": 75.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 1131,
+      "either_active_bars": 2304,
+      "active_percent": 5.76,
+      "long_active_bars": 1160,
+      "short_active_bars": 1144,
+      "long_share_of_active": 0.5035,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "MA_CROSSOVER": {
+      "indicator_id": "MA_CROSSOVER",
+      "signal_role": "trigger",
+      "strategy_role": null,
+      "static_prior_score": 75.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 1731,
+      "either_active_bars": 1857,
+      "active_percent": 4.6425,
+      "long_active_bars": 931,
+      "short_active_bars": 926,
+      "long_share_of_active": 0.5013,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "PMO_CROSSOVER": {
+      "indicator_id": "PMO_CROSSOVER",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 75.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 2104,
+      "either_active_bars": 4642,
+      "active_percent": 11.605,
+      "long_active_bars": 2410,
+      "short_active_bars": 2412,
+      "long_share_of_active": 0.4998,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "PRICE_RECLAIM_MA": {
+      "indicator_id": "PRICE_RECLAIM_MA",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 75.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 3739,
+      "either_active_bars": 5308,
+      "active_percent": 13.27,
+      "long_active_bars": 2653,
+      "short_active_bars": 2655,
+      "long_share_of_active": 0.4998,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "RSI_CROSSBACK": {
+      "indicator_id": "RSI_CROSSBACK",
+      "signal_role": "trigger",
+      "strategy_role": "mean-reversion",
+      "static_prior_score": 75.0,
+      "static_prior_bucket": "high_static_prior",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 1095,
+      "either_active_bars": 1096,
+      "active_percent": 2.74,
+      "long_active_bars": 578,
+      "short_active_bars": 518,
+      "long_share_of_active": 0.5274,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "BREAKOUT_FIRST_CLOSE": {
+      "indicator_id": "BREAKOUT_FIRST_CLOSE",
+      "signal_role": "trigger",
+      "strategy_role": "breakout",
+      "static_prior_score": 67.0,
+      "static_prior_bucket": "low_prior_broad_space",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 2999,
+      "either_active_bars": 3002,
+      "active_percent": 7.505,
+      "long_active_bars": 1523,
+      "short_active_bars": 1479,
+      "long_share_of_active": 0.5073,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "CHANNEL_REENTRY": {
+      "indicator_id": "CHANNEL_REENTRY",
+      "signal_role": "trigger",
+      "strategy_role": "mean-reversion",
+      "static_prior_score": 67.0,
+      "static_prior_bucket": "low_prior_broad_space",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 2997,
+      "either_active_bars": 2997,
+      "active_percent": 7.4925,
+      "long_active_bars": 1479,
+      "short_active_bars": 1518,
+      "long_share_of_active": 0.4935,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "KST_CROSSOVER": {
+      "indicator_id": "KST_CROSSOVER",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 67.0,
+      "static_prior_bucket": "low_prior_broad_space",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 2075,
+      "either_active_bars": 4340,
+      "active_percent": 10.85,
+      "long_active_bars": 2206,
+      "short_active_bars": 2204,
+      "long_share_of_active": 0.5002,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "MARKET_MODE_TRANSITION": {
+      "indicator_id": "MARKET_MODE_TRANSITION",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 67.0,
+      "static_prior_bucket": "low_prior_broad_space",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 1487,
+      "either_active_bars": 2974,
+      "active_percent": 7.435,
+      "long_active_bars": 1436,
+      "short_active_bars": 1538,
+      "long_share_of_active": 0.4829,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "STOCHRSI_CROSSBACK": {
+      "indicator_id": "STOCHRSI_CROSSBACK",
+      "signal_role": "trigger",
+      "strategy_role": "mean-reversion",
+      "static_prior_score": 67.0,
+      "static_prior_bucket": "low_prior_broad_space",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 9687,
+      "either_active_bars": 11131,
+      "active_percent": 27.8275,
+      "long_active_bars": 5583,
+      "short_active_bars": 5548,
+      "long_share_of_active": 0.5016,
+      "density_bucket": "dense",
+      "density_bucket_counts": {
+        "dense": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "TTF_DSL_TRANSITION": {
+      "indicator_id": "TTF_DSL_TRANSITION",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 67.0,
+      "static_prior_bucket": "low_prior_broad_space",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 2107,
+      "either_active_bars": 2109,
+      "active_percent": 5.2725,
+      "long_active_bars": 1034,
+      "short_active_bars": 1075,
+      "long_share_of_active": 0.4903,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "WAVETREND_CROSSOVER": {
+      "indicator_id": "WAVETREND_CROSSOVER",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 67.0,
+      "static_prior_bucket": "low_prior_broad_space",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 796,
+      "either_active_bars": 1606,
+      "active_percent": 4.015,
+      "long_active_bars": 774,
+      "short_active_bars": 832,
+      "long_share_of_active": 0.4819,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 6,
+        "short_biased": 2
+      }
+    },
+    "NVO_VOLUME_IMPULSE": {
+      "indicator_id": "NVO_VOLUME_IMPULSE",
+      "signal_role": "trigger",
+      "strategy_role": "confirm",
+      "static_prior_score": 65.0,
+      "static_prior_bucket": "context_dependent",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 1377,
+      "either_active_bars": 1377,
+      "active_percent": 3.4425,
+      "long_active_bars": 683,
+      "short_active_bars": 694,
+      "long_share_of_active": 0.496,
+      "density_bucket": "usable",
+      "density_bucket_counts": {
+        "usable": 8
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    },
+    "WICK_REJECTION": {
+      "indicator_id": "WICK_REJECTION",
+      "signal_role": "trigger",
+      "strategy_role": "mean-reversion",
+      "static_prior_score": 65.0,
+      "static_prior_bucket": "context_dependent",
+      "status": "ok",
+      "runs": 8,
+      "successful_runs": 8,
+      "failed_runs": 0,
+      "bars": 40000,
+      "event_count": 6525,
+      "either_active_bars": 8188,
+      "active_percent": 20.47,
+      "long_active_bars": 4107,
+      "short_active_bars": 4081,
+      "long_share_of_active": 0.5016,
+      "density_bucket": "dense",
+      "density_bucket_counts": {
+        "dense": 5,
+        "usable": 3
+      },
+      "balance_bucket_counts": {
+        "balanced": 8
+      }
+    }
+  },
+  "profiles": [
+    {
+      "indicator_id": "EHLERS_FISHER_TRANSITION",
+      "timeframe": "M5",
+      "profile_id": "6a0f336c1436eb5e7c11",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ehlers_fisher_transition-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "EHLERS_FISHER_TRANSITION",
+      "timeframe": "M15",
+      "profile_id": "6a0f336f93731a78d982",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ehlers_fisher_transition-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "KEY_REVERSAL_SIGNAL",
+      "timeframe": "M5",
+      "profile_id": "6a0f33730dfb3e8be4ed",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\key_reversal_signal-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "KEY_REVERSAL_SIGNAL",
+      "timeframe": "M15",
+      "profile_id": "6a0f33767c422d2e49ea",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\key_reversal_signal-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CANDLE_DIRECTION_INDEX",
+      "timeframe": "M5",
+      "profile_id": "6a0f3379e532733f8413",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\candle_direction_index-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CANDLE_DIRECTION_INDEX",
+      "timeframe": "M15",
+      "profile_id": "6a0f337d890926862d09",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\candle_direction_index-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+      "timeframe": "M5",
+      "profile_id": "6a0f33811e69cefcdcc1",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\buffered_range_breakout_signal-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BUFFERED_RANGE_BREAKOUT_SIGNAL",
+      "timeframe": "M15",
+      "profile_id": "6a0f338494931cab4775",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\buffered_range_breakout_signal-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CANDLESTICK_PATTERNS",
+      "timeframe": "M5",
+      "profile_id": "6a0f33882ae5951ea63f",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\candlestick_patterns-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CANDLESTICK_PATTERNS",
+      "timeframe": "M15",
+      "profile_id": "6a0f338bab12d037c78e",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\candlestick_patterns-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MACD_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f338f1fc2f90f7e28",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\macd_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MACD_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f339301d8e759eec6",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\macd_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "STOCH_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f33969639b8de15f6",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\stoch_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "STOCH_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f339a37ecb5fb42ac",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\stoch_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "THRUST_BAR_SIGNAL",
+      "timeframe": "M5",
+      "profile_id": "6a0f339e04357c83ea3e",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\thrust_bar_signal-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "THRUST_BAR_SIGNAL",
+      "timeframe": "M15",
+      "profile_id": "6a0f33a1c33559b4e418",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\thrust_bar_signal-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "timeframe": "M5",
+      "profile_id": "6a0f33a54cf7cf261243",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\toby_crabel_narrow_range-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "TOBY_CRABEL_NARROW_RANGE",
+      "timeframe": "M15",
+      "profile_id": "6a0f33a93f341f7bc4a1",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\toby_crabel_narrow_range-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+      "timeframe": "M5",
+      "profile_id": "6a0f33acbf6dbb62058d",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\bollinger_keltner_squeeze_release-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BOLLINGER_KELTNER_SQUEEZE_RELEASE",
+      "timeframe": "M15",
+      "profile_id": "6a0f33b07147a3763f1b",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\bollinger_keltner_squeeze_release-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MA_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f33b45cd08b5fe000",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ma_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MA_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f33b8174c239dd278",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ma_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "PMO_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f33bea91d3c1004e8",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\pmo_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "PMO_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f33c3d36d1b3740aa",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\pmo_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "PRICE_RECLAIM_MA",
+      "timeframe": "M5",
+      "profile_id": "6a0f33c7d37f9081983a",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\price_reclaim_ma-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "PRICE_RECLAIM_MA",
+      "timeframe": "M15",
+      "profile_id": "6a0f33cb6902acd52ab5",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\price_reclaim_ma-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "RSI_CROSSBACK",
+      "timeframe": "M5",
+      "profile_id": "6a0f33cf32b5bc1dba6d",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\rsi_crossback-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "RSI_CROSSBACK",
+      "timeframe": "M15",
+      "profile_id": "6a0f33d2b46f7ab90aa3",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\rsi_crossback-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BREAKOUT_FIRST_CLOSE",
+      "timeframe": "M5",
+      "profile_id": "6a0f33d64b8d63e58405",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\breakout_first_close-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "BREAKOUT_FIRST_CLOSE",
+      "timeframe": "M15",
+      "profile_id": "6a0f33da3a79bc37f7c4",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\breakout_first_close-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CHANNEL_REENTRY",
+      "timeframe": "M5",
+      "profile_id": "6a0f33ddd7bc58c4fba2",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\channel_reentry-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "CHANNEL_REENTRY",
+      "timeframe": "M15",
+      "profile_id": "6a0f33e1c3d5d6d3a4ab",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\channel_reentry-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "KST_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f33e55c00a89c254f",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\kst_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "KST_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f33e90ba2e7792103",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\kst_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MARKET_MODE_TRANSITION",
+      "timeframe": "M5",
+      "profile_id": "6a0f33ece7e88346711d",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\market_mode_transition-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "MARKET_MODE_TRANSITION",
+      "timeframe": "M15",
+      "profile_id": "6a0f33f080b7663f8fc0",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\market_mode_transition-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "STOCHRSI_CROSSBACK",
+      "timeframe": "M5",
+      "profile_id": "6a0f33f47c8aacd104ca",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\stochrsi_crossback-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "STOCHRSI_CROSSBACK",
+      "timeframe": "M15",
+      "profile_id": "6a0f33f8099e6f1110db",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\stochrsi_crossback-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "TTF_DSL_TRANSITION",
+      "timeframe": "M5",
+      "profile_id": "6a0f33fb7d8cc70d5c6f",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ttf_dsl_transition-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "TTF_DSL_TRANSITION",
+      "timeframe": "M15",
+      "profile_id": "6a0f33ff6414c32eecf8",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\ttf_dsl_transition-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "WAVETREND_CROSSOVER",
+      "timeframe": "M5",
+      "profile_id": "6a0f34030ad6d664e5af",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\wavetrend_crossover-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "WAVETREND_CROSSOVER",
+      "timeframe": "M15",
+      "profile_id": "6a0f3406bd2821d70b75",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\wavetrend_crossover-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "NVO_VOLUME_IMPULSE",
+      "timeframe": "M5",
+      "profile_id": "6a0f340a76d287e1e8ff",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\nvo_volume_impulse-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "NVO_VOLUME_IMPULSE",
+      "timeframe": "M15",
+      "profile_id": "6a0f340e16445c94888e",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\nvo_volume_impulse-m15.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "WICK_REJECTION",
+      "timeframe": "M5",
+      "profile_id": "6a0f3411ae014d95d857",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\wick_rejection-m5.json",
+      "created": true,
+      "deleted": true
+    },
+    {
+      "indicator_id": "WICK_REJECTION",
+      "timeframe": "M15",
+      "profile_id": "6a0f3415341fb5fde2b8",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\signal-atlas\\profiles\\wick_rejection-m15.json",
+      "created": true,
+      "deleted": true
+    }
+  ]
+}

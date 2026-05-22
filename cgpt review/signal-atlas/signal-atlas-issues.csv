@@ -1,0 +1,9 @@
+indicator_id,issue,severity,detail,runs,active_percent,event_count
+CANDLESTICK_PATTERNS,density_flat,high,EURUSD M5,1,0.0,0
+CANDLESTICK_PATTERNS,density_flat,high,GBPUSD M5,1,0.0,0
+CANDLESTICK_PATTERNS,density_flat,high,USDJPY M5,1,0.0,0
+CANDLESTICK_PATTERNS,density_flat,high,XAUUSD M5,1,0.0,0
+CANDLESTICK_PATTERNS,density_flat,high,EURUSD M15,1,0.0,0
+CANDLESTICK_PATTERNS,density_flat,high,GBPUSD M15,1,0.0,0
+CANDLESTICK_PATTERNS,density_flat,high,USDJPY M15,1,0.0,0
+CANDLESTICK_PATTERNS,density_flat,high,XAUUSD M15,1,0.0,0

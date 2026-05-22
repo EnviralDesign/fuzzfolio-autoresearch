@@ -1,0 +1,11 @@
+indicator_id,issue,severity,detail,forward_response_prior_score,sample_count
+CHANNEL_REENTRY,context_dependent_forward_response,low,USDJPY M5 long 1,75.0,2996
+MA_CROSSOVER,context_dependent_forward_response,low,USDJPY M15 long 24,69.95,1857
+PMO_CROSSOVER,context_dependent_forward_response,low,EURUSD M5 short 24,69.81,2379
+TOBY_CRABEL_NARROW_RANGE,context_dependent_forward_response,low,USDJPY M5 long 24,66.16,2332
+MACD_CROSSOVER,context_dependent_forward_response,low,EURUSD M5 short 24,65.26,3127
+MARKET_MODE_TRANSITION,context_dependent_forward_response,low,USDJPY M15 long 6,65.16,1476
+WICK_REJECTION,context_dependent_forward_response,low,USDJPY M5 long 12,64.71,7308
+TTF_DSL_TRANSITION,context_dependent_forward_response,low,USDJPY M15 long 24,63.6,2104
+BREAKOUT_FIRST_CLOSE,negative_forward_response,medium,directional_headwind,42.43,3002
+CANDLESTICK_PATTERNS,no_forward_events,high,no_events,0.0,0
