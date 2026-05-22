@@ -1239,6 +1239,15 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Input anchor-pair-timing-atlas directory. Default: runs/derived/anchor-pair-timing-atlas.",
     )
     recipe_priors.add_argument(
+        "--discovery-recipe-validation-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Input discovery-recipe-validation-atlas directory. "
+            "Default: runs/derived/discovery-recipe-validation-atlas when present."
+        ),
+    )
+    recipe_priors.add_argument(
         "--out-dir",
         type=Path,
         default=None,
@@ -12363,6 +12372,7 @@ def cmd_build_recipe_priors(
     forward_response_dir: Path | None,
     anchor_pair_dir: Path | None,
     anchor_pair_timing_dir: Path | None,
+    discovery_recipe_validation_dir: Path | None,
     out_dir: Path | None,
     max_slot_candidates: int,
     max_pair_candidates: int,
@@ -12376,6 +12386,7 @@ def cmd_build_recipe_priors(
         forward_response_dir=forward_response_dir,
         anchor_pair_dir=anchor_pair_dir,
         anchor_pair_timing_dir=anchor_pair_timing_dir,
+        discovery_recipe_validation_dir=discovery_recipe_validation_dir,
         out_dir=out_dir,
         max_slot_candidates=max_slot_candidates,
         max_pair_candidates=max_pair_candidates,
@@ -13085,6 +13096,7 @@ def main(argv: list[str] | None = None) -> int:
             out_dir=args.out_dir,
             max_slot_candidates=args.max_slot_candidates,
             max_pair_candidates=args.max_pair_candidates,
+            discovery_recipe_validation_dir=args.discovery_recipe_validation_dir,
             as_json=bool(args.json),
         )
     if args.command == "build-discovery-pair-atlas":

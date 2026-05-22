@@ -319,11 +319,11 @@ uv run build-recipe-priors
 uv run build-recipe-priors --max-slot-candidates 25 --json
 ```
 
-Builds empirical recipe and slot sampling weights from the completed Atlas layers. This is the bridge from blind random indicator selection toward recipe-aware weighted selection: high-evidence indicators get more sampling weight, uncertain indicators stay available, and wild-card exploration is preserved.
+Builds empirical recipe and slot sampling weights from the completed Atlas layers. This is the bridge from blind random indicator selection toward recipe-aware weighted selection: high-evidence indicators get more sampling weight, uncertain indicators stay available, and wild-card exploration is preserved. When discovered recipe validation results are present, retained discovered recipe pairs are folded into the same Play Hand seed plan as additional weighted recipes.
 
 Default settings:
 
-- input: `runs/derived/indicator-atlas/`, `runs/derived/signal-atlas/`, `runs/derived/forward-response-atlas/`, `runs/derived/anchor-pair-atlas/`, and `runs/derived/anchor-pair-timing-atlas/`
+- input: `runs/derived/indicator-atlas/`, `runs/derived/signal-atlas/`, `runs/derived/forward-response-atlas/`, `runs/derived/anchor-pair-atlas/`, `runs/derived/anchor-pair-timing-atlas/`, and, when present, `runs/derived/discovery-recipe-validation-atlas/`
 - output: `runs/derived/recipe-priors/`
 - max slot candidates per recipe slot: `40`
 - max empirical pair candidates: `80`
@@ -340,6 +340,7 @@ Arguments:
 
 - `--indicator-atlas-dir`, `--signal-atlas-dir`, `--forward-response-dir`: input artifact directories.
 - `--anchor-pair-dir`, `--anchor-pair-timing-dir`: input Layer 3 artifact directories.
+- `--discovery-recipe-validation-dir`: optional validated discovered recipe input directory.
 - `--out-dir`: output directory.
 - `--max-slot-candidates`: maximum candidates kept per recipe slot.
 - `--max-pair-candidates`: maximum empirical pair rows kept.
@@ -539,6 +540,14 @@ Arguments:
 - `--job-timeout-seconds`: deep replay job wait timeout passed to `sensitivity-basket`.
 - `--workers`: number of validation probes to keep in flight concurrently.
 - `--json`: print machine-readable output.
+
+After validation finishes, rebuild recipe priors to promote retained discovered structures into Play Hand's weighted seed plan:
+
+```powershell
+uv run build-recipe-priors
+```
+
+`play-hand` reads `runs/derived/recipe-priors/play-hand-seed-plan.json` automatically when it exists. The discovered recipes are still priors, not hard filters: Play Hand keeps role-balanced fallback and policy exploration available.
 
 ## run
 

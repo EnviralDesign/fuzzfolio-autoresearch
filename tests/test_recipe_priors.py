@@ -146,3 +146,47 @@ def test_build_recipe_prior_artifacts_emits_play_hand_seed_plan() -> None:
     assert any(row["indicator_id"] == "TRIGGER_A" for row in slot_rows)
     assert trigger_menu[0]["indicator_id"] == "TRIGGER_A"
     assert trigger_menu[0]["timing_policy"] == "allow_variant"
+
+
+def test_build_recipe_prior_artifacts_adds_validated_discovered_recipes() -> None:
+    indicators = [
+        _indicator("FIRST_A", signal_role="setup", strategy_role="trend"),
+        _indicator("SECOND_A", signal_role="trigger", strategy_role="mean-reversion"),
+    ]
+
+    _payload, slot_rows, pair_rows, seed_plan, summary = build_recipe_prior_artifacts(
+        indicator_rows=indicators,
+        static_slot_scores={},
+        signal_rollups={},
+        forward_priors={},
+        pair_results=[],
+        timing_results=[],
+        discovery_validation_results=[
+            {
+                "status": "ok",
+                "recipe_id": "discovered_recipe_001",
+                "recipe_confidence": "high_candidate",
+                "first_indicator_id": "FIRST_A",
+                "second_indicator_id": "SECOND_A",
+                "probe_timeframe": "M5",
+                "probe_id": "drv-test",
+                "primary_score": "72",
+                "composite_score": "72",
+                "validation_priority_score": "70",
+                "discovery_evidence_score": "74",
+                "retention_ratio": "0.97",
+                "retention_bucket": "retained_strong",
+            }
+        ],
+        max_slot_candidates=5,
+        max_pair_candidates=5,
+    )
+
+    recipe = seed_plan["recipes"]["discovered_recipe_001"]
+    assert recipe["source"] == "discovery_recipe_validation"
+    assert recipe["pair_menu"][0]["retention_bucket"] == "retained_strong"
+    assert recipe["slot_menus"]["context_or_setup_cluster"][0]["indicator_id"] == "FIRST_A"
+    assert recipe["slot_menus"]["trigger_or_response_cluster"][0]["indicator_id"] == "SECOND_A"
+    assert any(row["source"] == "discovery_recipe_validation" for row in slot_rows)
+    assert any(row["source"] == "discovery_recipe_validation" for row in pair_rows)
+    assert summary["result_counts"]["discovered_recipe_count"] == 1

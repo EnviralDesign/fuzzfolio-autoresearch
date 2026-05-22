@@ -75,6 +75,7 @@ PLAY_HAND_FINAL_SCRUTINY_MIN_SCORE = 0.0
 PLAY_HAND_FINAL_SCRUTINY_FAILED_REASON = "final_36mo_scrutiny_failed"
 PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS = 2400
 PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS = 7200
+PLAY_HAND_SEED_PLAN_PATH = Path("recipe-priors") / "play-hand-seed-plan.json"
 
 
 def _play_hand_eval_cli_timeout_seconds(job_timeout_seconds: int) -> int:
@@ -510,6 +511,288 @@ def deal_role_balanced_indicators(
         if candidate not in selected:
             selected.append(candidate)
     return selected[:target_count]
+
+
+def _seed_plan_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _seed_plan_upper(value: Any) -> str:
+    return str(value or "").strip().upper()
+
+
+def _seed_plan_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _weighted_seed_plan_choice(
+    items: list[Any],
+    *,
+    rng: random.Random,
+    weight_fn: Any,
+) -> Any | None:
+    weighted: list[tuple[Any, float]] = []
+    total = 0.0
+    for item in items:
+        weight = max(0.0, _seed_plan_float(weight_fn(item)))
+        if weight <= 0.0:
+            continue
+        weighted.append((item, weight))
+        total += weight
+    if not weighted:
+        return None
+    threshold = rng.random() * total
+    running = 0.0
+    for item, weight in weighted:
+        running += weight
+        if running >= threshold:
+            return item
+    return weighted[-1][0]
+
+
+def _seed_plan_recipe_weight(recipe_payload: dict[str, Any]) -> float:
+    pair_menu = recipe_payload.get("pair_menu")
+    if isinstance(pair_menu, list) and pair_menu:
+        return sum(
+            max(
+                _seed_plan_float(row.get("pair_sampling_weight")),
+                _seed_plan_float(row.get("pair_sampling_score")) * 0.20,
+            )
+            for row in pair_menu
+            if isinstance(row, dict)
+        )
+    slot_menus = recipe_payload.get("slot_menus")
+    if not isinstance(slot_menus, dict):
+        return 0.0
+    total = 0.0
+    for rows in slot_menus.values():
+        if not isinstance(rows, list):
+            continue
+        total += sum(
+            _seed_plan_float(row.get("sampling_weight"))
+            for row in rows[:8]
+            if isinstance(row, dict)
+        )
+    return total
+
+
+def _load_play_hand_seed_plan(config: AppConfig) -> tuple[dict[str, Any] | None, Path | None]:
+    path = config.derived_root / PLAY_HAND_SEED_PLAN_PATH
+    if not path.exists():
+        return None, None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None, path
+    if not isinstance(payload, dict) or not isinstance(payload.get("recipes"), dict):
+        return None, path
+    return payload, path
+
+
+def _seed_plan_slots_in_order(slot_menus: dict[str, Any]) -> list[str]:
+    preferred = [
+        "context",
+        "setup",
+        "trigger",
+        "guard",
+        "filter",
+        "context_or_setup_cluster",
+        "trigger_or_response_cluster",
+    ]
+    names = [name for name in preferred if name in slot_menus]
+    names.extend(sorted(name for name in slot_menus if name not in set(names)))
+    return names
+
+
+def _fallback_indicator_deal(
+    indicators: list[SeedIndicator],
+    *,
+    target_count: int,
+    source: str,
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "source": source,
+        "reason": reason,
+        "indicators": deal_role_balanced_indicators(indicators, target_count=target_count),
+        "recipe": None,
+        "recipe_source": None,
+        "pair": None,
+        "selected_slots": [],
+    }
+
+
+def deal_seed_plan_indicators(
+    indicators: list[SeedIndicator],
+    *,
+    target_count: int,
+    seed_plan: dict[str, Any] | None,
+    rng: random.Random,
+) -> dict[str, Any]:
+    if target_count <= 0:
+        return _fallback_indicator_deal(
+            indicators,
+            target_count=target_count,
+            source="role_balanced",
+            reason="empty_target",
+        )
+    if not isinstance(seed_plan, dict):
+        return _fallback_indicator_deal(
+            indicators,
+            target_count=target_count,
+            source="role_balanced",
+            reason="missing_seed_plan",
+        )
+    by_id = {indicator.id.upper(): indicator for indicator in indicators}
+    if not by_id:
+        return _fallback_indicator_deal(
+            indicators,
+            target_count=target_count,
+            source="role_balanced",
+            reason="empty_seed_indicator_pool",
+        )
+    policy = seed_plan.get("sampling_policy") if isinstance(seed_plan.get("sampling_policy"), dict) else {}
+    guided_fraction = min(1.0, max(0.0, _seed_plan_float(policy.get("guided_prior_fraction"), 0.8)))
+    if rng.random() > guided_fraction:
+        return _fallback_indicator_deal(
+            indicators,
+            target_count=target_count,
+            source="role_balanced_policy_exploration",
+            reason="policy_exploration",
+        )
+    recipes = seed_plan.get("recipes")
+    if not isinstance(recipes, dict):
+        return _fallback_indicator_deal(
+            indicators,
+            target_count=target_count,
+            source="role_balanced",
+            reason="missing_recipes",
+        )
+    recipe_items = [
+        (str(name), payload)
+        for name, payload in recipes.items()
+        if isinstance(payload, dict) and _seed_plan_recipe_weight(payload) > 0.0
+    ]
+    selected_recipe = _weighted_seed_plan_choice(
+        recipe_items,
+        rng=rng,
+        weight_fn=lambda item: _seed_plan_recipe_weight(item[1]),
+    )
+    if selected_recipe is None:
+        return _fallback_indicator_deal(
+            indicators,
+            target_count=target_count,
+            source="role_balanced",
+            reason="no_weighted_recipe",
+        )
+    recipe_name, recipe_payload = selected_recipe
+    selected_ids: list[str] = []
+    selected_slots: list[dict[str, Any]] = []
+    selected_pair: dict[str, Any] | None = None
+
+    def add_indicator(indicator_id: Any, *, slot: str, evidence: dict[str, Any] | None = None) -> bool:
+        clean_id = _seed_plan_upper(indicator_id)
+        if not clean_id or clean_id in selected_ids or clean_id not in by_id:
+            return False
+        selected_ids.append(clean_id)
+        selected_slots.append(
+            {
+                "slot": slot,
+                "indicator_id": clean_id,
+                "sampling_weight": max(
+                    _seed_plan_float(_seed_plan_dict(evidence).get("sampling_weight")),
+                    _seed_plan_float(_seed_plan_dict(evidence).get("pair_sampling_weight")),
+                ),
+                "sampling_lane": _seed_plan_dict(evidence).get("sampling_lane"),
+                "source": _seed_plan_dict(evidence).get("source"),
+            }
+        )
+        return True
+
+    pair_menu = recipe_payload.get("pair_menu")
+    if target_count >= 2 and isinstance(pair_menu, list) and pair_menu:
+        pair = _weighted_seed_plan_choice(
+            [row for row in pair_menu if isinstance(row, dict)],
+            rng=rng,
+            weight_fn=lambda row: max(
+                _seed_plan_float(row.get("pair_sampling_weight")),
+                _seed_plan_float(row.get("pair_sampling_score")) * 0.20,
+            ),
+        )
+        if isinstance(pair, dict):
+            first_id = pair.get("anchor_id")
+            second_id = pair.get("trigger_id")
+            added_first = add_indicator(first_id, slot="pair_first", evidence=pair)
+            added_second = add_indicator(second_id, slot="pair_second", evidence=pair)
+            if added_first or added_second:
+                selected_pair = {
+                    "probe_id": pair.get("probe_id"),
+                    "first_indicator_id": _seed_plan_upper(first_id),
+                    "second_indicator_id": _seed_plan_upper(second_id),
+                    "probe_timeframe": pair.get("probe_timeframe"),
+                    "pair_sampling_score": pair.get("pair_sampling_score"),
+                    "composite_score": pair.get("composite_score"),
+                    "retention_bucket": pair.get("retention_bucket"),
+                    "source": pair.get("source"),
+                }
+
+    slot_menus = recipe_payload.get("slot_menus")
+    if isinstance(slot_menus, dict):
+        for slot_name in _seed_plan_slots_in_order(slot_menus):
+            if len(selected_ids) >= target_count:
+                break
+            rows = [row for row in list(slot_menus.get(slot_name) or []) if isinstance(row, dict)]
+            rows = [row for row in rows if _seed_plan_upper(row.get("indicator_id")) not in selected_ids]
+            candidate = _weighted_seed_plan_choice(
+                rows,
+                rng=rng,
+                weight_fn=lambda row: _seed_plan_float(row.get("sampling_weight")),
+            )
+            if isinstance(candidate, dict):
+                add_indicator(candidate.get("indicator_id"), slot=slot_name, evidence=candidate)
+
+    if len(selected_ids) < target_count:
+        remaining = [indicator for indicator in indicators if indicator.id.upper() not in selected_ids]
+        for indicator in deal_role_balanced_indicators(
+            remaining,
+            target_count=target_count - len(selected_ids),
+        ):
+            if indicator.id.upper() not in selected_ids:
+                selected_ids.append(indicator.id.upper())
+                selected_slots.append(
+                    {
+                        "slot": "role_balanced_fill",
+                        "indicator_id": indicator.id.upper(),
+                        "sampling_weight": None,
+                        "sampling_lane": None,
+                        "source": "role_balanced_fill",
+                    }
+                )
+
+    selected = [by_id[indicator_id] for indicator_id in selected_ids if indicator_id in by_id]
+    if not selected:
+        return _fallback_indicator_deal(
+            indicators,
+            target_count=target_count,
+            source="role_balanced",
+            reason="seed_plan_selected_no_available_indicators",
+        )
+    return {
+        "source": "play_hand_seed_plan",
+        "reason": "guided_recipe_weighted_selection",
+        "indicators": selected[:target_count],
+        "recipe": recipe_name,
+        "recipe_source": recipe_payload.get("source"),
+        "recipe_confidence": recipe_payload.get("recipe_confidence"),
+        "pair": selected_pair,
+        "selected_slots": selected_slots,
+    }
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -3451,7 +3734,22 @@ def cmd_play_hand(
         max_indicators=max_indicators,
         rng=rng,
     )
-    dealt_entries = deal_role_balanced_indicators(shuffled, target_count=dealt_count)
+    seed_plan, seed_plan_path = _load_play_hand_seed_plan(config)
+    indicator_deal = deal_seed_plan_indicators(
+        shuffled,
+        target_count=dealt_count,
+        seed_plan=seed_plan,
+        rng=rng,
+    )
+    dealt_entries = list(indicator_deal.get("indicators") or [])
+    if not dealt_entries:
+        indicator_deal = _fallback_indicator_deal(
+            shuffled,
+            target_count=dealt_count,
+            source="role_balanced",
+            reason="empty_guided_deal",
+        )
+        dealt_entries = list(indicator_deal.get("indicators") or [])
     dealt = [indicator.id for indicator in dealt_entries]
     instrument_deal = deal_instruments(
         instrument=instrument,
@@ -3487,6 +3785,15 @@ def cmd_play_hand(
         "dealt_indicator_metadata": [
             indicator.as_metadata() for indicator in dealt_entries
         ],
+        "dealt_indicator_source": indicator_deal.get("source"),
+        "dealt_indicator_source_reason": indicator_deal.get("reason"),
+        "play_hand_seed_plan_path": str(seed_plan_path) if seed_plan_path else None,
+        "play_hand_seed_plan_loaded": seed_plan is not None,
+        "dealt_recipe": indicator_deal.get("recipe"),
+        "dealt_recipe_source": indicator_deal.get("recipe_source"),
+        "dealt_recipe_confidence": indicator_deal.get("recipe_confidence"),
+        "dealt_recipe_pair": indicator_deal.get("pair"),
+        "dealt_recipe_slots": indicator_deal.get("selected_slots"),
         "dealt_indicator_count": len(dealt),
         "min_indicators": min_indicators,
         "max_indicators": max_indicators,
@@ -3548,6 +3855,13 @@ def cmd_play_hand(
         stage=stages["deal"],
         indicators=dealt,
         indicator_metadata=[indicator.as_metadata() for indicator in dealt_entries],
+        indicator_deal_source=indicator_deal.get("source"),
+        indicator_deal_reason=indicator_deal.get("reason"),
+        play_hand_seed_plan_path=str(seed_plan_path) if seed_plan_path else None,
+        dealt_recipe=indicator_deal.get("recipe"),
+        dealt_recipe_source=indicator_deal.get("recipe_source"),
+        dealt_recipe_pair=indicator_deal.get("pair"),
+        dealt_recipe_slots=indicator_deal.get("selected_slots"),
         dealt_indicator_count=len(dealt),
         min_indicators=min_indicators,
         max_indicators=max_indicators,

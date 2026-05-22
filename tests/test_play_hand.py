@@ -35,6 +35,7 @@ from autoresearch.play_hand import (
     build_focused_axes,
     build_lookback_axes,
     build_required_lookback_axes,
+    deal_seed_plan_indicators,
     deal_indicator_count,
     deal_instruments,
     evolutionary_budget_settings,
@@ -70,6 +71,48 @@ def test_repair_degenerate_profile_ranges_expands_binary_defaults(tmp_path: Path
     assert first_ranges["sell"] == [0.0, 0.5]
     assert second_ranges["buy"] == [1.0, 2.0]
     assert second_ranges["sell"] == [0.2, 0.4]
+
+
+def test_deal_seed_plan_indicators_uses_validated_discovered_pair() -> None:
+    indicators = [
+        play_hand_mod.SeedIndicator("FIRST_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("SECOND_A", "trigger", "event", "entry"),
+        play_hand_mod.SeedIndicator("FILL_A", "filter", "state", "higher-context"),
+    ]
+    seed_plan = {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {
+            "discovered_recipe_001": {
+                "source": "discovery_recipe_validation",
+                "recipe_confidence": "high_candidate",
+                "pair_menu": [
+                    {
+                        "source": "discovery_recipe_validation",
+                        "anchor_id": "FIRST_A",
+                        "trigger_id": "SECOND_A",
+                        "probe_id": "drv-test",
+                        "probe_timeframe": "M5",
+                        "pair_sampling_weight": 50,
+                        "pair_sampling_score": 75,
+                        "retention_bucket": "retained_strong",
+                    }
+                ],
+                "slot_menus": {},
+            }
+        },
+    }
+
+    deal = deal_seed_plan_indicators(
+        indicators,
+        target_count=3,
+        seed_plan=seed_plan,
+        rng=random.Random(7),
+    )
+
+    assert deal["source"] == "play_hand_seed_plan"
+    assert deal["recipe"] == "discovered_recipe_001"
+    assert [indicator.id for indicator in deal["indicators"][:2]] == ["FIRST_A", "SECOND_A"]
+    assert deal["pair"]["retention_bucket"] == "retained_strong"
 
 
 def test_cmd_play_hand_authenticates_before_seed_prompt(monkeypatch, tmp_path: Path) -> None:

@@ -52,7 +52,7 @@ Set `AUTORESEARCH_CODEX_HOME` only if you want a different dedicated home. Set `
 - `run-anchor-pair-probes` runs and scores the queued Layer 3 anchor-trigger sensitivity probes.
 - `build-anchor-pair-timing-atlas` builds Layer 3b trigger `lookbackBars` timing-tolerance variants from completed Layer 3 probes.
 - `run-anchor-pair-timing-probes` runs and scores the queued Layer 3b timing-tolerance probes.
-- `build-recipe-priors` builds empirical recipe/slot sampling weights and a Play Hand seed-plan artifact from all Atlas layers.
+- `build-recipe-priors` builds empirical recipe/slot sampling weights and a Play Hand seed-plan artifact from all Atlas layers, including retained discovered recipe validation results when present.
 - `build-discovery-pair-atlas` builds a broad ordered-pair discovery queue across generation-eligible indicators.
 - `run-discovery-pair-probes` runs and scores the queued broad discovery-pair backend probes.
 - `build-discovery-cluster-atlas` distills discovery-pair results into empirical indicator clusters and discovered recipe-template candidates.
@@ -148,7 +148,7 @@ Then build the empirical recipe-prior layer:
 uv run build-recipe-priors
 ```
 
-This consumes the static catalog atlas, signal atlas, forward-response atlas, Layer 3 pair results, and Layer 3b timing results. It writes weighted recipe-slot menus and a Play Hand seed plan under `runs/derived/recipe-priors/`. These weights bias future random selection; they do not remove lower-prior or wild-card indicators from exploration.
+This consumes the static catalog atlas, signal atlas, forward-response atlas, Layer 3 pair results, Layer 3b timing results, and any retained discovered recipe validation rows. It writes weighted recipe-slot menus and a Play Hand seed plan under `runs/derived/recipe-priors/`. These weights bias future random selection; they do not remove lower-prior or wild-card indicators from exploration.
 
 For a broader backend-heavy discovery pass, build the ordered-pair queue:
 
@@ -181,7 +181,7 @@ uv run build-discovery-recipe-validation-atlas
 uv run run-discovery-recipe-validation-probes --workers 32
 ```
 
-The builder expands high/promising discovered recipe templates into a capped concrete queue, defaulting to `12`-month sensitivity probes under `runs/derived/discovery-recipe-validation-atlas/`. This is the retention gate before feeding discovered recipes back into Play Hand. After that, `build-discovery-pair-atlas --full` is the natural longer nighttime expansion if we want a broader first-generation cluster corpus.
+The builder expands high/promising discovered recipe templates into a capped concrete queue, defaulting to `12`-month sensitivity probes under `runs/derived/discovery-recipe-validation-atlas/`. This is the retention gate before feeding discovered recipes back into Play Hand. Re-run `uv run build-recipe-priors` after validation finishes; Play Hand reads the seed plan automatically. After that, `build-discovery-pair-atlas --full` is the natural longer nighttime expansion if we want a broader first-generation cluster corpus.
 
 From there you can build the portfolio either way:
 
