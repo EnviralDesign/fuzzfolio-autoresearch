@@ -1,0 +1,81 @@
+{
+  "format": "fuzzfolio.scoring-profile",
+  "formatVersion": 1,
+  "profile": {
+    "name": "Discovery Recipe 36m Scrutiny discovered_recipe_003 MFI_TREND+OBV_MEAN_REVERSION M15 [exact template]",
+    "description": "Temporary AutoResearch 36-month scrutiny profile for a retained empirically discovered recipe pair. This is the high-prior gate after 12-month retention.",
+    "directionMode": "both",
+    "indicators": [
+      {
+        "meta": {
+          "id": "MFI_TREND",
+          "instanceId": "drv-0024-r003-mfi-trend-obv-mean-reversion-m15-anchor"
+        },
+        "config": {
+          "label": "MFI",
+          "isActive": true,
+          "isTrendFollowing": true,
+          "weight": 1.0,
+          "timeframe": "M15",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              60,
+              80
+            ],
+            "sell": [
+              20,
+              40
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 14
+            }
+          ],
+          "scale": 1,
+          "useFormingBar": false,
+          "normalizationMode": "none"
+        }
+      },
+      {
+        "meta": {
+          "id": "OBV_MEAN_REVERSION",
+          "instanceId": "drv-0024-r003-mfi-trend-obv-mean-reversion-m15-trigger"
+        },
+        "config": {
+          "label": "OBV",
+          "isActive": true,
+          "isTrendFollowing": false,
+          "weight": 1.0,
+          "timeframe": "M15",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              -1,
+              -0.2
+            ],
+            "sell": [
+              0.2,
+              1
+            ]
+          },
+          "talibConfig": [],
+          "scale": 1,
+          "useFormingBar": false,
+          "normalizationMode": "none"
+        }
+      }
+    ],
+    "instruments": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY",
+      "XAUUSD"
+    ],
+    "isActive": false,
+    "notificationThreshold": 80,
+    "version": "v1"
+  }
+}

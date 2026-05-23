@@ -1,0 +1,180 @@
+{
+  "format": "fuzzfolio.scoring-profile",
+  "formatVersion": 1,
+  "profile": {
+    "description": "Portable scoring profile scaffolded from live indicator templates.",
+    "directionMode": "both",
+    "indicators": [
+      {
+        "config": {
+          "isActive": true,
+          "isTrendFollowing": true,
+          "label": "BB Pos",
+          "lookbackBars": 3,
+          "normalizationMode": "none",
+          "ranges": {
+            "buy": [
+              0.8,
+              1.1
+            ],
+            "sell": [
+              -1.1,
+              -0.8
+            ]
+          },
+          "scale": 1.0,
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 22
+            },
+            {
+              "name": "nbdevup",
+              "value": 2
+            },
+            {
+              "name": "nbdevdn",
+              "value": 3
+            },
+            {
+              "name": "matype",
+              "value": 0
+            }
+          ],
+          "timeframe": "H1",
+          "useFormingBar": false,
+          "weight": 1.0
+        },
+        "meta": {
+          "id": "BBANDS_POSITION_TREND",
+          "instanceId": "scaffold-bbands-position-trend-1",
+          "preferredTimeframeRole": "mid-setup",
+          "signalPersistence": "state",
+          "signalRole": "setup",
+          "strategyRole": "trend"
+        }
+      },
+      {
+        "config": {
+          "isActive": true,
+          "isTrendFollowing": true,
+          "label": "MFI",
+          "lookbackBars": 5,
+          "normalizationMode": "none",
+          "ranges": {
+            "buy": [
+              60.0,
+              80.0
+            ],
+            "sell": [
+              20.0,
+              40.0
+            ]
+          },
+          "scale": 1.0,
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 14
+            }
+          ],
+          "timeframe": "M15",
+          "useFormingBar": false,
+          "weight": 1.0
+        },
+        "meta": {
+          "id": "MFI_TREND",
+          "instanceId": "scaffold-mfi-trend-2",
+          "preferredTimeframeRole": "mid-setup",
+          "signalPersistence": "state",
+          "signalRole": "setup",
+          "strategyRole": "trend"
+        }
+      },
+      {
+        "config": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "OBV",
+          "lookbackBars": 5,
+          "normalizationMode": "none",
+          "ranges": {
+            "buy": [
+              -1.0,
+              -0.2
+            ],
+            "sell": [
+              0.2,
+              1.0
+            ]
+          },
+          "scale": 1.0,
+          "talibConfig": [],
+          "timeframe": "M15",
+          "useFormingBar": false,
+          "weight": 1.0
+        },
+        "meta": {
+          "id": "OBV_MEAN_REVERSION",
+          "instanceId": "scaffold-obv-mean-reversion-3",
+          "preferredTimeframeRole": "higher-context",
+          "signalPersistence": "state",
+          "signalRole": "context",
+          "strategyRole": "mean-reversion"
+        }
+      },
+      {
+        "config": {
+          "isActive": true,
+          "isTrendFollowing": false,
+          "label": "MA Spread",
+          "lookbackBars": 3,
+          "normalizationMode": "none",
+          "ranges": {
+            "buy": [
+              -20.0,
+              -5.0
+            ],
+            "sell": [
+              5.0,
+              20.0
+            ]
+          },
+          "scale": 1.0,
+          "talibConfig": [
+            {
+              "name": "fastperiod",
+              "value": 6
+            },
+            {
+              "name": "slowperiod",
+              "value": 24
+            },
+            {
+              "name": "matype",
+              "value": 1
+            }
+          ],
+          "timeframe": "H1",
+          "useFormingBar": false,
+          "weight": 1.0
+        },
+        "meta": {
+          "id": "MA_SPREAD_MEAN_REVERSION",
+          "instanceId": "scaffold-ma-spread-mean-reversion-4",
+          "preferredTimeframeRole": "higher-context",
+          "signalPersistence": "state",
+          "signalRole": "context",
+          "strategyRole": "mean-reversion"
+        }
+      }
+    ],
+    "instruments": [
+      "EURUSD"
+    ],
+    "isActive": false,
+    "name": "Scaffold BBANDS_POSITION_TREND + MFI_TREND + OBV_MEAN_REVERSION + MA_SPREAD_MEAN_REVERSION [lookback_timing top] [coarse top] [focused top]",
+    "notificationThreshold": 80,
+    "version": "v1"
+  }
+}

@@ -3728,6 +3728,21 @@ def _copy_and_register_profile(
     return output_path, profile_ref
 
 
+def _seed_template_profile_path(template: dict[str, Any]) -> Path | None:
+    for key in ("profile_path", "source_profile_path", "recommended_profile_template_path"):
+        raw_path = str(template.get(key) or "").strip()
+        if not raw_path:
+            continue
+        candidate = Path(raw_path)
+        candidates = [candidate]
+        if not candidate.is_absolute():
+            candidates.append(Path.cwd() / candidate)
+        for path in candidates:
+            if path.exists() and path.is_file():
+                return path
+    return None
+
+
 def _materialize_and_register_best_sweep_candidate(
     ctx: PlayHandContext,
     *,
@@ -4245,6 +4260,12 @@ def cmd_play_hand(
     template_branch_instruments = (
         list(template_instrument_pool) if template_instrument_pool else list(instruments)
     )
+    exact_template_source_profile_path = _seed_template_profile_path(pair_template)
+    exact_template_source = (
+        "template_profile_path"
+        if exact_template_source_profile_path is not None
+        else "post_template_scaffold_fallback"
+    )
     profile_ref = _register_profile(ctx, profile_path)
     _append_event(
         ctx,
@@ -4258,18 +4279,23 @@ def cmd_play_hand(
     exact_template_profile_ref: str | None = None
     exact_template_timeframe: str | None = None
     if pair_template.get("indicator_defaults"):
+        exact_template_copy_source = exact_template_source_profile_path or profile_path
         exact_template_profile_path, exact_template_profile_ref = _copy_and_register_profile(
             ctx,
             stage=stages["scaffold"],
-            source_profile_path=profile_path,
+            source_profile_path=exact_template_copy_source,
             output_name="exact_template.json",
             phase="exact_template",
         )
-        exact_template_timeframe = evaluation_timeframe
+        exact_template_timeframe = str(
+            pair_template.get("timeframe") or evaluation_timeframe
+        ).strip().upper() or evaluation_timeframe
         metadata.update(
             {
                 "exact_template_profile_ref": exact_template_profile_ref,
                 "exact_template_profile_path": str(exact_template_profile_path.resolve()),
+                "exact_template_source": exact_template_source,
+                "exact_template_source_profile_path": str(exact_template_copy_source.resolve()),
                 "template_branch_instruments": template_branch_instruments,
                 "template_branch_source_probe_id": template_branch_source_probe_id,
             }
@@ -4563,6 +4589,21 @@ def cmd_play_hand(
         ),
         {},
     )
+    exact_template_branch_outcome = (
+        exact_template_branch.get("outcome")
+        if isinstance(exact_template_branch.get("outcome"), dict)
+        else {}
+    )
+    if selected_final_branch_name == "exact_template":
+        canonical_selection_reason = (
+            "rescued_by_exact_template"
+            if not mutated_outcome.get("passed") and exact_template_branch_outcome.get("passed")
+            else "exact_template_outscored_mutated"
+        )
+    elif final_scrutiny_passed:
+        canonical_selection_reason = "mutated_branch_selected"
+    else:
+        canonical_selection_reason = f"no_branch_passed_{selected_final_branch_name}_best_score"
     attempt_metadata_summary = _finalize_play_hand_attempt_metadata(
         ctx,
         final_attempt_id=final_attempt_id,
@@ -4593,7 +4634,14 @@ def cmd_play_hand(
             ),
             "selected_final_branch": selected_final_branch_name,
             "selected_final_phase": selected_final_phase,
+            "canonical_selection_reason": canonical_selection_reason,
             "final_branch_scores": final_branch_scores,
+            "exact_template_source": exact_template_source if exact_template_branch else None,
+            "exact_template_source_profile_path": (
+                str(exact_template_source_profile_path.resolve())
+                if exact_template_source_profile_path is not None
+                else None
+            ),
             "template_branch_instruments": template_branch_instruments,
             "template_branch_source_probe_id": template_branch_source_probe_id,
             "canonical_attempt_id": canonical_attempt_id,
@@ -4762,7 +4810,14 @@ def cmd_play_hand(
         ),
         "selected_final_branch": selected_final_branch_name,
         "selected_final_phase": selected_final_phase,
+        "canonical_selection_reason": canonical_selection_reason,
         "final_branch_scores": final_branch_scores,
+        "exact_template_source": exact_template_source if exact_template_branch else None,
+        "exact_template_source_profile_path": (
+            str(exact_template_source_profile_path.resolve())
+            if exact_template_source_profile_path is not None
+            else None
+        ),
         "template_branch_instruments": template_branch_instruments,
         "template_branch_source_probe_id": template_branch_source_probe_id,
         "canonical_attempt_id": canonical_attempt_id,

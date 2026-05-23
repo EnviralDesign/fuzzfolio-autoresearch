@@ -227,6 +227,30 @@ def test_seed_plan_indicator_metadata_reads_config_derived_root(tmp_path: Path) 
     assert metadata["RSI_CROSSBACK"]["signal_role"] == "trigger"
 
 
+def test_seed_template_profile_path_prefers_existing_profile_path(tmp_path: Path) -> None:
+    profile_path = tmp_path / "retained-template.json"
+    profile_path.write_text('{"profile":{"indicators":[]}}', encoding="utf-8")
+
+    resolved = play_hand_mod._seed_template_profile_path(
+        {
+            "profile_path": str(profile_path),
+            "source_profile_path": str(tmp_path / "fallback.json"),
+        }
+    )
+
+    assert resolved == profile_path
+
+
+def test_seed_template_profile_path_returns_none_for_missing_template(tmp_path: Path) -> None:
+    resolved = play_hand_mod._seed_template_profile_path(
+        {
+            "profile_path": str(tmp_path / "missing.json"),
+        }
+    )
+
+    assert resolved is None
+
+
 def test_select_final_scrutiny_branch_keeps_exact_template_when_it_passes() -> None:
     selected = play_hand_mod._select_final_scrutiny_branch(
         [

@@ -1,109 +1,104 @@
 # CGPT Review Packet
 
-Please review the latest Fuzzfolio AutoResearch state as a technical/design reviewer. This pass implements the narrow branch you recommended after reviewing commit `4c218bd`: preserve the exact retained validation template as a final comparison branch, lower default prior eagerness to `70/20/10` while 36-month evidence is still limited, and harden seed-plan metadata lookup.
+Please review the latest Fuzzfolio AutoResearch state as a technical/design reviewer. This is the follow-up patch after your review of `00f264d`, where you correctly pointed out that the "exact template" branch was copying the expanded post-template scaffold rather than the retained validation profile.
 
 ## Short Version
 
-The prior pass fixed the materialization bug: guided Play Hand can now select seed-plan indicators instead of being gated by the backend seed prompt.
+That concrete issue is fixed now.
 
-This pass fixes the next ambiguity:
+The exact-template branch now:
 
-> If a retained template materializes but the final Play Hand candidate fails, did the prior fail, or did Play Hand mutate/scout away from the retained template?
+1. reads `recommended_profile_template.profile_path`;
+2. copies/registers that retained validation profile as `exact_template.json` when the file exists;
+3. uses the validation basket from the template for `exact_template_36mo`;
+4. falls back to the post-template scaffold only if the retained profile file is missing;
+5. records `exact_template_source` and `exact_template_source_profile_path`.
 
-Play Hand now runs final 36-month scrutiny for both:
+The real seed 3 smoke confirms the distinction:
 
-1. the normal mutated/swept branch;
-2. the exact retained template branch, using the template validation basket when available.
-
-It selects the better passing branch, or the better-scoring branch if neither passes, and records branch-level metadata.
+- expanded mutated branch profile: 4 indicators;
+- exact template profile: 2 retained-template indicators;
+- both branches received real final 36-month attempt IDs;
+- both branches passed;
+- mutated branch scored higher and became canonical.
 
 ## New Fixes In This Pass
 
-1. **Exact-template final scrutiny branch**
-   - When a selected pair has `recommended_profile_template`, Play Hand copies/registers an `exact_template.json` profile immediately after template defaults are applied.
-   - Normal Play Hand continues through baseline, timing sweep, coarse sweep, focused sweep, and instrument scout as before.
-   - Final scrutiny now evaluates both `mutated_final_36mo` and `exact_template_36mo`.
-   - The exact branch uses `template_branch_instruments` from the retained template if available.
+1. **Exact-template source correction**
+   - Added a template source resolver for `profile_path`, `source_profile_path`, or `recommended_profile_template_path`.
+   - If the retained profile file exists, `exact_template.json` is copied from that source profile.
+   - Metadata records:
+     - `exact_template_source = template_profile_path`
+     - `exact_template_source_profile_path = <absolute retained profile path>`
+   - Fallback source is explicitly labeled `post_template_scaffold_fallback`.
 
-2. **Branch-aware final selection and metadata**
-   - New metadata fields include:
-     - `mutated_attempt_id`
-     - `mutated_score`
-     - `exact_template_attempt_id`
-     - `exact_template_score`
-     - `selected_final_branch`
-     - `selected_final_phase`
-     - `final_branch_scores`
-     - `template_branch_instruments`
-     - `template_branch_source_probe_id`
-   - The selected branch becomes the canonical final attempt when it passes.
+2. **Canonical selection reason**
+   - Metadata now records `canonical_selection_reason`.
+   - Possible examples:
+     - `rescued_by_exact_template`
+     - `exact_template_outscored_mutated`
+     - `mutated_branch_selected`
+     - `no_branch_passed_mutated_best_score`
 
-3. **Tiered 36-month maturity policy**
-   - The seed-plan policy is no longer binary.
-   - Current rebuilt policy is:
-
-   ```json
-   {
-     "guided_prior_fraction": 0.7,
-     "uncertain_prior_fraction": 0.2,
-     "wild_exploration_fraction": 0.1,
-     "maturity": "limited_36m_retention",
-     "retained_36m_family_count": 3,
-     "template_instrument_policy": "seed_pool"
-   }
-   ```
-
-   - `0` retained 36m families: `60/25/15`
-   - `1-3` distinct retained 36m families: `70/20/10`
-   - `4+` distinct retained 36m families: `80/15/5`
-   - Distinct families use unordered indicator pairs so opposite orderings do not inflate maturity.
-
-4. **Seed-plan metadata hardening**
-   - `_seed_plan_indicator_metadata()` now reads from `config.derived_root / "indicator-atlas"` instead of assuming `runs_root / "derived"`.
+3. **Tests**
+   - Added tests for template-profile source resolution.
+   - Existing branch selection tests remain in place.
 
 ## Key Files To Review
 
 - `autoresearch/play_hand.py`
-- `autoresearch/recipe_priors.py`
 - `tests/test_play_hand.py`
-- `tests/test_recipe_priors.py`
-- `cgpt review/exact-template-branch/dry-run-seed-3-summary.json`
-- `cgpt review/exact-template-branch/dry-run-seed-3-run-metadata.json`
-- `cgpt review/recipe-priors/play-hand-seed-plan.json`
-- `cgpt review/recipe-priors/recipe-priors-summary.json`
+- `cgpt review/exact-template-branch/notes.md`
+- `cgpt review/exact-template-branch/real-smoke-seed-3-summary.json`
+- `cgpt review/exact-template-branch/real-smoke-seed-3-run-metadata.json`
+- `cgpt review/exact-template-branch/real-smoke-seed-3-attempts.jsonl`
+- `cgpt review/exact-template-branch/real-smoke-seed-3-exact-template-profile.json`
+- `cgpt review/exact-template-branch/real-smoke-seed-3-mutated-final-profile.json`
 
-## Smoke Result
+## Real Smoke
 
-New packet folder:
-
-```text
-cgpt review/exact-template-branch/
-```
-
-Dry-run command:
+Command:
 
 ```powershell
-uv run play-hand --seed 3 --coarse-mode evolutionary --sweep-budget low --min-indicators 2 --max-indicators 4 --dry-run --json
+uv run play-hand --seed 3 --coarse-mode evolutionary --sweep-budget low --min-indicators 2 --max-indicators 4 --final-profile-drop-count 0 --json
 ```
 
-Important result:
+Run:
 
-- Dealt from `play_hand_seed_plan`.
+```text
+runs/20260523T023608430426Z-playhand-v1
+```
+
+Important results:
+
 - Dealt indicators:
   - `MFI_TREND`
   - `OBV_MEAN_REVERSION`
   - `BBANDS_POSITION_TREND`
   - `MA_SPREAD_MEAN_REVERSION`
-- Applied validated template defaults.
-- Registered `exact_template`.
-- Final branch scores include both:
-  - `mutated_final_36mo`
-  - `exact_template_36mo`
-- Exact-template branch used:
-  - `template_branch_source_probe_id`: `drs-0008-r003-mfi-trend-obv-mean-reversion-m15`
-  - `template_branch_instruments`: `EURUSD, GBPUSD, USDJPY, XAUUSD`
+- Exact retained template source:
+  - `runs/derived/discovery-recipe-scrutiny-atlas/profiles/drs-0008-r003-mfi-trend-obv-mean-reversion-m15.json`
+- Exact template profile indicators:
+  - `MFI_TREND`
+  - `OBV_MEAN_REVERSION`
+- Mutated final profile indicators:
+  - `BBANDS_POSITION_TREND`
+  - `MFI_TREND`
+  - `OBV_MEAN_REVERSION`
+  - `MA_SPREAD_MEAN_REVERSION`
+- `mutated_final_36mo`:
+  - attempt `20260523T023608430426Z-playhand-v1-attempt-00009`
+  - score `71.1089`
+  - instruments `EURUSD`, `USDJPY`
+- `exact_template_36mo`:
+  - attempt `20260523T023608430426Z-playhand-v1-attempt-00010`
+  - score `62.6208`
+  - instruments `EURUSD`, `GBPUSD`, `USDJPY`, `XAUUSD`
+- Selected branch:
+  - `mutated`
+  - `canonical_selection_reason = mutated_branch_selected`
 
-Because this was a dry run, both final scores are null and the mutated branch wins the tie by design. Unit tests cover the non-null branch selection behavior.
+Interpretation: the exact retained template itself still passed 36-month scrutiny, and in this run the expanded/mutated/scouted Play Hand branch improved on it.
 
 ## Verification
 
@@ -112,28 +107,34 @@ Commands run:
 ```powershell
 uv run python -m py_compile autoresearch\play_hand.py autoresearch\recipe_priors.py
 uv run pytest tests\test_play_hand.py tests\test_recipe_priors.py -q
-uv run build-recipe-priors
 uv run play-hand --seed 3 --coarse-mode evolutionary --sweep-budget low --min-indicators 2 --max-indicators 4 --dry-run --json
+uv run play-hand --seed 3 --coarse-mode evolutionary --sweep-budget low --min-indicators 2 --max-indicators 4 --final-profile-drop-count 0 --json
 uv run pytest -q
 ```
 
 Results:
 
-- Focused tests: `62 passed`
-- Full suite: `327 passed`
-- Rebuilt seed-plan maturity: `limited_36m_retention`, `70/20/10`, `retained_36m_family_count = 3`
+- Focused tests: `64 passed`
+- Full suite: `329 passed`
+- Dry run confirmed exact profile has 2 indicators while expanded scaffold has 4.
+- Real smoke confirmed two real final branch attempts and canonical selected-branch metadata.
 
 ## Questions For This Review
 
-1. Is the exact-template branch implemented at the right point in the flow: after template defaults, before baseline/sweeps, then final comparison against the mutated branch?
-2. Should the exact-template branch always use the template validation basket when available, even if the normal branch scouts down to one instrument?
-3. Should exact-template branch selection be allowed to become canonical exactly as implemented, or should it be recorded as a separate "rescued by template" status?
-4. Is `70/20/10` the right default now that the rebuilt seed plan has only three distinct retained 36-month families?
-5. Is the next best action now the clean controlled 50-seed Play Hand batch, or should we do one real low-budget backend smoke of the exact-template final branch first?
-6. After the clean batch, is the recipe performance report/dashboard still the next best branch?
+1. Does the corrected exact-template branch now answer the attribution question cleanly?
+2. Is `canonical_selection_reason` enough for the later report/dashboard, or should there be a separate top-level `rescued_by_exact_template` boolean?
+3. Should the clean controlled 50-seed batch be run now under the current `70/20/10` default?
+4. For that batch, should we keep `max_indicators=4`, or temporarily cap at `2-3` to reduce expanded-hand noise while measuring pair-template priors?
+5. After the clean batch, is the recipe performance report/dashboard still the next best branch?
 
 ## Current Opinion
 
-This pass removes the largest remaining attribution problem before the clean rerun. A failed run can now say whether the exact retained template itself failed, whether the mutated branch failed, or whether mutation improved the retained template.
+I think this removes the blocker before the clean batch. The next useful move is the controlled 50-seed run, then a recipe performance report that compares:
 
-My suggested next step is a clean controlled 50-seed batch under the current `70/20/10` default, then a recipe performance report that compares materialized pairs, exact-template outcomes, mutated outcomes, selected branches, and final promotions/tombstones.
+- pair/template materialization rate;
+- exact-template score;
+- mutated-branch score;
+- selected final branch;
+- canonical selection reason;
+- final promotion/tombstone status;
+- recipe and pair family.
