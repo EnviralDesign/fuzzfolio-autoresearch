@@ -1,0 +1,33 @@
+Traceback (most recent call last):
+  File "C:\repos\fuzzfolio-autoresearch\autoresearch\play_hand.py", line 3580, in _materialize_and_register_best_sweep_candidate
+    output_path, profile_ref = _materialize_and_register(
+  File "C:\repos\fuzzfolio-autoresearch\autoresearch\play_hand.py", line 3555, in _materialize_and_register
+    profile_ref = _register_profile(ctx, output_path)
+  File "C:\repos\fuzzfolio-autoresearch\autoresearch\play_hand.py", line 2268, in _register_profile
+    result = ctx.cli.run(["profiles", "create", "--file", str(profile_path), "--pretty"])
+  File "C:\repos\fuzzfolio-autoresearch\autoresearch\fuzzfolio.py", line 96, in run
+    raise CliError(self.format_result(result))
+autoresearch.fuzzfolio.CliError: Command failed: C:\Users\envir\.local\bin\fuzzfolio-agent-cli.EXE --base-url http://localhost:7946/api/dev --auth-profile robot profiles create --file C:\repos\fuzzfolio-autoresearch\runs\20260522T155145578426Z-playhand-v1\profiles\coarse_top.json --pretty
+cwd: C:\repos\fuzzfolio-autoresearch
+exit: 1
+stdout:
+
+
+stderr:
+Error: Request failed (422): {"status":"error","message":"Invalid value for TA-Lib parameter 'use_filter' on indicator 'KEY_REVERSAL_SIGNAL'","data":null,"errors":null}
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\envir\AppData\Roaming\uv\python\cpython-3.10-windows-x86_64-none\lib\runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "C:\Users\envir\AppData\Roaming\uv\python\cpython-3.10-windows-x86_64-none\lib\runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "C:\repos\fuzzfolio-autoresearch\.venv\Scripts\play-hand.exe\__main__.py", line 10, in <module>
+  File "C:\repos\fuzzfolio-autoresearch\autoresearch\__main__.py", line 13173, in main
+    return cmd_play_hand(
+  File "C:\repos\fuzzfolio-autoresearch\autoresearch\play_hand.py", line 4143, in cmd_play_hand
+    materialized = _materialize_and_register_best_sweep_candidate(
+  File "C:\repos\fuzzfolio-autoresearch\autoresearch\play_hand.py", line 3588, in _materialize_and_register_best_sweep_candidate
+    except CliError as exc:
+NameError: name 'CliError' is not defined. Did you mean: 'OSError'?

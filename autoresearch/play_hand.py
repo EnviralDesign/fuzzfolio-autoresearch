@@ -562,6 +562,26 @@ def _seed_plan_hard_negative_pair_keys(seed_plan: dict[str, Any] | None) -> set[
     return keys
 
 
+def _seed_plan_template_instrument_policy(seed_plan: dict[str, Any] | None) -> str:
+    if not isinstance(seed_plan, dict):
+        return "off"
+    policy = seed_plan.get("sampling_policy")
+    if not isinstance(policy, dict):
+        return "seed_pool"
+    value = str(policy.get("template_instrument_policy") or "seed_pool").strip().lower()
+    return value if value in {"off", "seed_pool"} else "seed_pool"
+
+
+def _seed_pair_template_instruments(pair: dict[str, Any] | None) -> list[str]:
+    if not isinstance(pair, dict):
+        return []
+    template = _seed_plan_dict(pair.get("recommended_profile_template"))
+    instruments = template.get("instruments")
+    if not isinstance(instruments, (list, tuple)):
+        return []
+    return _clean_tokens([str(item) for item in instruments])
+
+
 def _weighted_seed_plan_choice(
     items: list[Any],
     *,
@@ -659,31 +679,52 @@ def _fallback_indicator_deal(
     }
 
 
+def _merge_seed_indicator_candidates(
+    primary: list[SeedIndicator],
+    extra: list[SeedIndicator],
+) -> list[SeedIndicator]:
+    merged: list[SeedIndicator] = []
+    seen: set[str] = set()
+    for indicator in [*primary, *extra]:
+        indicator_id = str(indicator.id or "").strip().upper()
+        if not indicator_id or indicator_id in seen:
+            continue
+        seen.add(indicator_id)
+        merged.append(indicator)
+    return merged
+
+
 def deal_seed_plan_indicators(
     indicators: list[SeedIndicator],
     *,
     target_count: int,
     seed_plan: dict[str, Any] | None,
     rng: random.Random,
+    seed_plan_candidates: list[SeedIndicator] | None = None,
 ) -> dict[str, Any]:
+    fallback_indicators = list(indicators)
+    guided_indicators = _merge_seed_indicator_candidates(
+        indicators,
+        seed_plan_candidates or [],
+    )
     if target_count <= 0:
         return _fallback_indicator_deal(
-            indicators,
+            fallback_indicators,
             target_count=target_count,
             source="role_balanced",
             reason="empty_target",
         )
     if not isinstance(seed_plan, dict):
         return _fallback_indicator_deal(
-            indicators,
+            fallback_indicators,
             target_count=target_count,
             source="role_balanced",
             reason="missing_seed_plan",
         )
-    by_id = {indicator.id.upper(): indicator for indicator in indicators}
+    by_id = {indicator.id.upper(): indicator for indicator in guided_indicators}
     if not by_id:
         return _fallback_indicator_deal(
-            indicators,
+            fallback_indicators,
             target_count=target_count,
             source="role_balanced",
             reason="empty_seed_indicator_pool",
@@ -692,7 +733,7 @@ def deal_seed_plan_indicators(
     guided_fraction = min(1.0, max(0.0, _seed_plan_float(policy.get("guided_prior_fraction"), 0.8)))
     if rng.random() > guided_fraction:
         return _fallback_indicator_deal(
-            indicators,
+            fallback_indicators,
             target_count=target_count,
             source="role_balanced_policy_exploration",
             reason="policy_exploration",
@@ -700,7 +741,7 @@ def deal_seed_plan_indicators(
     recipes = seed_plan.get("recipes")
     if not isinstance(recipes, dict):
         return _fallback_indicator_deal(
-            indicators,
+            fallback_indicators,
             target_count=target_count,
             source="role_balanced",
             reason="missing_recipes",
@@ -717,7 +758,7 @@ def deal_seed_plan_indicators(
     )
     if selected_recipe is None:
         return _fallback_indicator_deal(
-            indicators,
+            fallback_indicators,
             target_count=target_count,
             source="role_balanced",
             reason="no_weighted_recipe",
@@ -811,7 +852,11 @@ def deal_seed_plan_indicators(
                 add_indicator(candidate.get("indicator_id"), slot=slot_name, evidence=candidate)
 
     if len(selected_ids) < target_count:
-        remaining = [indicator for indicator in indicators if indicator.id.upper() not in selected_ids]
+        remaining = [
+            indicator
+            for indicator in guided_indicators
+            if indicator.id.upper() not in selected_ids
+        ]
         for indicator in deal_role_balanced_indicators(
             remaining,
             target_count=len(remaining),
@@ -828,7 +873,7 @@ def deal_seed_plan_indicators(
     selected = [by_id[indicator_id] for indicator_id in selected_ids if indicator_id in by_id]
     if not selected:
         return _fallback_indicator_deal(
-            indicators,
+            fallback_indicators,
             target_count=target_count,
             source="role_balanced",
             reason="seed_plan_selected_no_available_indicators",
@@ -2260,6 +2305,75 @@ def _seed_hand(config: AppConfig, cli: FuzzfolioCli, run_dir: Path) -> list[Seed
             )
         )
     return hand
+
+
+def _append_seed_plan_indicator_id(ids: list[str], value: Any) -> None:
+    indicator_id = str(value or "").strip().upper()
+    if indicator_id and indicator_id not in ids:
+        ids.append(indicator_id)
+
+
+def _seed_plan_indicator_ids(seed_plan: dict[str, Any] | None) -> list[str]:
+    if not isinstance(seed_plan, dict):
+        return []
+    ids: list[str] = []
+    recipes = seed_plan.get("recipes")
+    if not isinstance(recipes, dict):
+        return ids
+    for recipe_payload in recipes.values():
+        if not isinstance(recipe_payload, dict):
+            continue
+        for pair in recipe_payload.get("pair_menu") or []:
+            if not isinstance(pair, dict):
+                continue
+            for key in (
+                "anchor_id",
+                "trigger_id",
+                "first_indicator_id",
+                "second_indicator_id",
+            ):
+                _append_seed_plan_indicator_id(ids, pair.get(key))
+            template = _seed_plan_dict(pair.get("recommended_profile_template"))
+            for default in template.get("indicator_defaults") or []:
+                if isinstance(default, dict):
+                    _append_seed_plan_indicator_id(ids, default.get("indicator_id"))
+        slot_menus = recipe_payload.get("slot_menus")
+        if isinstance(slot_menus, dict):
+            for rows in slot_menus.values():
+                for row in rows or []:
+                    if isinstance(row, dict):
+                        _append_seed_plan_indicator_id(ids, row.get("indicator_id"))
+    return ids
+
+
+def _seed_plan_indicator_metadata(config: AppConfig) -> dict[str, dict[str, Any]]:
+    atlas_path = config.runs_root / "derived" / "indicator-atlas" / "indicator-atlas.json"
+    payload = _load_json(atlas_path)
+    rows = payload.get("indicators")
+    metadata: dict[str, dict[str, Any]] = {}
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            indicator_id = str(row.get("id") or "").strip().upper()
+            if not indicator_id:
+                continue
+            metadata[indicator_id] = row
+    return metadata
+
+
+def _seed_plan_indicator_candidates(
+    config: AppConfig,
+    seed_plan: dict[str, Any] | None,
+) -> list[SeedIndicator]:
+    ids = _seed_plan_indicator_ids(seed_plan)
+    if not ids:
+        return []
+    metadata_by_id = _seed_plan_indicator_metadata(config)
+    return [
+        _seed_indicator_from_metadata(indicator_id, metadata_by_id.get(indicator_id))
+        for indicator_id in ids
+    ]
 
 
 def _register_profile(ctx: PlayHandContext, profile_path: Path) -> str:
@@ -3832,13 +3946,17 @@ def cmd_play_hand(
     shuffled = list(hand)
     rng.shuffle(shuffled)
     seed_plan, seed_plan_path = _load_play_hand_seed_plan(config)
+    seed_plan_candidates = _seed_plan_indicator_candidates(config, seed_plan)
+    guided_available_count = len(
+        _merge_seed_indicator_candidates(shuffled, seed_plan_candidates)
+    )
     effective_min_indicators = min_indicators
     effective_max_indicators = max_indicators
     if seed_plan is not None:
         effective_min_indicators = max(effective_min_indicators, 2)
         effective_max_indicators = max(effective_max_indicators, effective_min_indicators)
     dealt_count = deal_indicator_count(
-        available_count=len(shuffled),
+        available_count=max(len(shuffled), guided_available_count),
         min_indicators=effective_min_indicators,
         max_indicators=effective_max_indicators,
         rng=rng,
@@ -3848,6 +3966,7 @@ def cmd_play_hand(
         target_count=dealt_count,
         seed_plan=seed_plan,
         rng=rng,
+        seed_plan_candidates=seed_plan_candidates,
     )
     dealt_entries = list(indicator_deal.get("indicators") or [])
     if not dealt_entries:
@@ -3859,9 +3978,21 @@ def cmd_play_hand(
         )
         dealt_entries = list(indicator_deal.get("indicators") or [])
     dealt = [indicator.id for indicator in dealt_entries]
+    template_instrument_policy = _seed_plan_template_instrument_policy(seed_plan)
+    template_instrument_pool = _seed_pair_template_instruments(indicator_deal.get("pair"))
+    effective_instrument_pool = instrument_pool
+    template_instrument_pool_applied = False
+    if (
+        template_instrument_policy == "seed_pool"
+        and template_instrument_pool
+        and not _clean_tokens(instrument)
+        and not _clean_tokens(instrument_pool)
+    ):
+        effective_instrument_pool = template_instrument_pool
+        template_instrument_pool_applied = True
     instrument_deal = deal_instruments(
         instrument=instrument,
-        instrument_pool=instrument_pool,
+        instrument_pool=effective_instrument_pool,
         rng=rng,
     )
     instruments = list(instrument_deal["instruments"])
@@ -3897,6 +4028,9 @@ def cmd_play_hand(
         "dealt_indicator_source_reason": indicator_deal.get("reason"),
         "play_hand_seed_plan_path": str(seed_plan_path) if seed_plan_path else None,
         "play_hand_seed_plan_loaded": seed_plan is not None,
+        "template_instrument_policy": template_instrument_policy,
+        "template_instrument_pool": template_instrument_pool,
+        "template_instrument_pool_applied": template_instrument_pool_applied,
         "dealt_recipe": indicator_deal.get("recipe"),
         "dealt_recipe_source": indicator_deal.get("recipe_source"),
         "dealt_recipe_confidence": indicator_deal.get("recipe_confidence"),

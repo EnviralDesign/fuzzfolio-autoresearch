@@ -1,0 +1,46 @@
+{
+  "generated_at": "2026-05-23T00:03:15.232183+00:00",
+  "batch_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\playhand-prior-test\\20260522T143717Z-parallel",
+  "important_context": "This batch was intentionally stopped after discovering that pre-fix Play Hand only applied pair/template priors when the backend seed prompt already contained those indicators.",
+  "requested_seed_count": 50,
+  "completed_seed_count_before_stop": 37,
+  "failed_error_seed_count": 2,
+  "stopped_or_incomplete_seed_count": 2,
+  "not_started_seed_count": 9,
+  "run_status_counts": {
+    "promoted": 25,
+    "tombstoned": 12
+  },
+  "dealt_indicator_source_counts": {
+    "play_hand_seed_plan": 30,
+    "role_balanced_policy_exploration": 7
+  },
+  "dealt_recipe_source_counts": {
+    "curated_recipe_prior": 11,
+    "discovery_recipe_validation": 19,
+    "fallback_or_exploration": 7
+  },
+  "completed_with_dealt_pair_count": 2,
+  "completed_with_pair_template_count": 0,
+  "completed_with_template_instrument_pool_count": 0,
+  "completed_all_role_balanced_fill_count": 23,
+  "nonzero_error_seeds": [
+    7,
+    9
+  ],
+  "stopped_or_incomplete_seeds": [
+    39,
+    41
+  ],
+  "not_started_seeds": [
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48,
+    49,
+    50
+  ]
+}

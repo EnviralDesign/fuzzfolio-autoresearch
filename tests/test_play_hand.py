@@ -116,6 +116,100 @@ def test_deal_seed_plan_indicators_uses_validated_discovered_pair() -> None:
     assert deal["pair"]["retention_bucket"] == "retained_strong"
 
 
+def test_deal_seed_plan_indicators_can_use_seed_plan_candidate_pair() -> None:
+    indicators = [
+        play_hand_mod.SeedIndicator("FILL_A", "filter", "state", "higher-context"),
+        play_hand_mod.SeedIndicator("FILL_B", "trigger", "event", "entry"),
+    ]
+    seed_plan_candidates = [
+        play_hand_mod.SeedIndicator("FIRST_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("SECOND_A", "trigger", "event", "entry"),
+    ]
+    seed_plan = {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {
+            "discovered_recipe_001": {
+                "source": "discovery_recipe_validation",
+                "pair_menu": [
+                    {
+                        "source": "discovery_recipe_validation",
+                        "anchor_id": "FIRST_A",
+                        "trigger_id": "SECOND_A",
+                        "pair_sampling_weight": 50,
+                        "pair_sampling_score": 75,
+                        "retention_bucket": "retained",
+                    }
+                ],
+                "slot_menus": {},
+            }
+        },
+    }
+
+    deal = deal_seed_plan_indicators(
+        indicators,
+        target_count=2,
+        seed_plan=seed_plan,
+        rng=random.Random(7),
+        seed_plan_candidates=seed_plan_candidates,
+    )
+
+    assert [indicator.id for indicator in deal["indicators"]] == ["FIRST_A", "SECOND_A"]
+    assert deal["pair"]["retention_bucket"] == "retained"
+
+
+def test_deal_seed_plan_indicators_keeps_policy_exploration_on_seed_prompt_pool() -> None:
+    indicators = [
+        play_hand_mod.SeedIndicator("FILL_A", "filter", "state", "higher-context"),
+        play_hand_mod.SeedIndicator("FILL_B", "trigger", "event", "entry"),
+    ]
+    seed_plan_candidates = [
+        play_hand_mod.SeedIndicator("FIRST_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("SECOND_A", "trigger", "event", "entry"),
+    ]
+    seed_plan = {
+        "sampling_policy": {"guided_prior_fraction": 0.0},
+        "recipes": {
+            "discovered_recipe_001": {
+                "source": "discovery_recipe_validation",
+                "pair_menu": [
+                    {
+                        "anchor_id": "FIRST_A",
+                        "trigger_id": "SECOND_A",
+                        "pair_sampling_weight": 50,
+                    }
+                ],
+                "slot_menus": {},
+            }
+        },
+    }
+
+    deal = deal_seed_plan_indicators(
+        indicators,
+        target_count=2,
+        seed_plan=seed_plan,
+        rng=random.Random(7),
+        seed_plan_candidates=seed_plan_candidates,
+    )
+
+    assert deal["source"] == "role_balanced_policy_exploration"
+    assert {indicator.id for indicator in deal["indicators"]} == {"FILL_A", "FILL_B"}
+
+
+def test_seed_pair_template_instruments_reads_validated_template_pool() -> None:
+    pair = {
+        "recommended_profile_template": {
+            "instruments": ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD"]
+        }
+    }
+
+    assert play_hand_mod._seed_pair_template_instruments(pair) == [
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "XAUUSD",
+    ]
+
+
 def test_deal_seed_plan_indicators_applies_negative_guard_to_role_balanced_fill() -> None:
     indicators = [
         play_hand_mod.SeedIndicator("FIRST_A", "setup", "event", "mid-setup"),

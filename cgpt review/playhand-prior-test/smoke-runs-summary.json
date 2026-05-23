@@ -1,0 +1,175 @@
+[
+  {
+    "run_id": "20260522T233428294474Z-playhand-v1",
+    "exists": true,
+    "dry_run": true,
+    "seed": 2,
+    "dealt_indicator_source": "play_hand_seed_plan",
+    "dealt_indicator_ids": [
+      "BBANDS_POSITION_TREND",
+      "MA_SPREAD_MEAN_REVERSION"
+    ],
+    "dealt_recipe": "discovered_recipe_003",
+    "dealt_recipe_source": "discovery_recipe_validation",
+    "pair_probe_id": "drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5",
+    "pair_first_indicator_id": "BBANDS_POSITION_TREND",
+    "pair_second_indicator_id": "MA_SPREAD_MEAN_REVERSION",
+    "pair_retention_bucket": "retained",
+    "pair_template_present": true,
+    "template_instrument_policy": null,
+    "template_instrument_pool": null,
+    "template_instrument_pool_applied": null,
+    "instrument_pool": [
+      "EURUSD",
+      "GBPUSD",
+      "AUDUSD",
+      "USDCAD",
+      "NZDUSD",
+      "USDJPY",
+      "USDCHF",
+      "XAUUSD"
+    ],
+    "run_status": "tombstoned",
+    "final_scrutiny_score": null,
+    "notes": "Dry run after candidate-pool fix; showed validated pair/template can materialize without backend compute."
+  },
+  {
+    "run_id": "20260522T233453342600Z-playhand-v1",
+    "exists": true,
+    "dry_run": false,
+    "seed": 2,
+    "dealt_indicator_source": "role_balanced_policy_exploration",
+    "dealt_indicator_ids": [
+      "ADX",
+      "MACD_CROSSOVER"
+    ],
+    "dealt_recipe": null,
+    "dealt_recipe_source": null,
+    "pair_probe_id": null,
+    "pair_first_indicator_id": null,
+    "pair_second_indicator_id": null,
+    "pair_retention_bucket": null,
+    "pair_template_present": false,
+    "template_instrument_policy": null,
+    "template_instrument_pool": null,
+    "template_instrument_pool_applied": null,
+    "instrument_pool": [
+      "EURUSD",
+      "GBPUSD",
+      "AUDUSD",
+      "USDCAD",
+      "NZDUSD",
+      "USDJPY",
+      "USDCHF",
+      "XAUUSD"
+    ],
+    "run_status": "tombstoned",
+    "final_scrutiny_score": 0.0,
+    "notes": "Real low-budget smoke that landed in policy exploration, proving fallback exploration remained possible."
+  },
+  {
+    "run_id": "20260522T234331728320Z-playhand-v1",
+    "exists": true,
+    "dry_run": false,
+    "seed": 2,
+    "dealt_indicator_source": "role_balanced_policy_exploration",
+    "dealt_indicator_ids": [
+      "MA_SPREAD_MEAN_REVERSION",
+      "STOCHF_TREND",
+      "KEY_REVERSAL_SIGNAL",
+      "KST_CROSSOVER"
+    ],
+    "dealt_recipe": null,
+    "dealt_recipe_source": null,
+    "pair_probe_id": null,
+    "pair_first_indicator_id": null,
+    "pair_second_indicator_id": null,
+    "pair_retention_bucket": null,
+    "pair_template_present": false,
+    "template_instrument_policy": null,
+    "template_instrument_pool": null,
+    "template_instrument_pool_applied": null,
+    "instrument_pool": [
+      "EURUSD",
+      "GBPUSD",
+      "AUDUSD",
+      "USDCAD",
+      "NZDUSD",
+      "USDJPY",
+      "USDCHF",
+      "XAUUSD"
+    ],
+    "run_status": "tombstoned",
+    "final_scrutiny_score": 0.0,
+    "notes": "Second real low-budget smoke, also policy exploration due random lane."
+  },
+  {
+    "run_id": "20260522T235558735932Z-playhand-v1",
+    "exists": true,
+    "dry_run": false,
+    "seed": 2,
+    "dealt_indicator_source": "play_hand_seed_plan",
+    "dealt_indicator_ids": [
+      "BBANDS_POSITION_TREND",
+      "MA_SPREAD_MEAN_REVERSION"
+    ],
+    "dealt_recipe": "discovered_recipe_003",
+    "dealt_recipe_source": "discovery_recipe_validation",
+    "pair_probe_id": "drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5",
+    "pair_first_indicator_id": "BBANDS_POSITION_TREND",
+    "pair_second_indicator_id": "MA_SPREAD_MEAN_REVERSION",
+    "pair_retention_bucket": "retained",
+    "pair_template_present": true,
+    "template_instrument_policy": null,
+    "template_instrument_pool": null,
+    "template_instrument_pool_applied": null,
+    "instrument_pool": [
+      "EURUSD",
+      "GBPUSD",
+      "AUDUSD",
+      "USDCAD",
+      "NZDUSD",
+      "USDJPY",
+      "USDCHF",
+      "XAUUSD"
+    ],
+    "run_status": "tombstoned",
+    "final_scrutiny_score": 0.0,
+    "notes": "Forced-guided real backend smoke before seed_pool policy; pair/template materialized and backend ran, but final 36m failed after different instrument/timeframe path."
+  },
+  {
+    "run_id": "20260523T000154028924Z-playhand-v1",
+    "exists": true,
+    "dry_run": true,
+    "seed": 2,
+    "dealt_indicator_source": "play_hand_seed_plan",
+    "dealt_indicator_ids": [
+      "BBANDS_POSITION_TREND",
+      "MA_SPREAD_MEAN_REVERSION"
+    ],
+    "dealt_recipe": "discovered_recipe_003",
+    "dealt_recipe_source": "discovery_recipe_validation",
+    "pair_probe_id": "drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5",
+    "pair_first_indicator_id": "BBANDS_POSITION_TREND",
+    "pair_second_indicator_id": "MA_SPREAD_MEAN_REVERSION",
+    "pair_retention_bucket": "retained",
+    "pair_template_present": true,
+    "template_instrument_policy": "seed_pool",
+    "template_instrument_pool": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY",
+      "XAUUSD"
+    ],
+    "template_instrument_pool_applied": true,
+    "instrument_pool": [
+      "EURUSD",
+      "GBPUSD",
+      "USDJPY",
+      "XAUUSD"
+    ],
+    "run_status": "tombstoned",
+    "final_scrutiny_score": null,
+    "notes": "Dry run after seed_pool policy; pair/template materialized and validation instrument pool was applied."
+  }
+]

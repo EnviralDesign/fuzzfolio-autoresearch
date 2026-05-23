@@ -1213,6 +1213,7 @@ def build_recipe_prior_artifacts(
             "uncertain_prior_fraction": 0.15,
             "wild_exploration_fraction": 0.05,
             "maturity": "has_36m_retention",
+            "template_instrument_policy": "seed_pool",
             "interpretation": "Weights bias random selection; they do not hard-filter the catalog.",
         }
         if any_36m_retained
@@ -1221,6 +1222,7 @@ def build_recipe_prior_artifacts(
             "uncertain_prior_fraction": 0.25,
             "wild_exploration_fraction": 0.15,
             "maturity": "pre_36m_retention",
+            "template_instrument_policy": "seed_pool",
             "interpretation": "Weights bias random selection; they do not hard-filter the catalog.",
         }
     )
