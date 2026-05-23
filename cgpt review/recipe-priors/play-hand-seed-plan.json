@@ -1,11 +1,12 @@
 {
   "schema_version": "play_hand_seed_plan_v1",
-  "generated_at": "2026-05-23T00:01:45.415413+00:00",
+  "generated_at": "2026-05-23T01:25:02.997941+00:00",
   "sampling_policy": {
-    "guided_prior_fraction": 0.8,
-    "uncertain_prior_fraction": 0.15,
-    "wild_exploration_fraction": 0.05,
-    "maturity": "has_36m_retention",
+    "guided_prior_fraction": 0.7,
+    "uncertain_prior_fraction": 0.2,
+    "wild_exploration_fraction": 0.1,
+    "maturity": "limited_36m_retention",
+    "retained_36m_family_count": 3,
     "template_instrument_policy": "seed_pool",
     "interpretation": "Weights bias random selection; they do not hard-filter the catalog."
   },

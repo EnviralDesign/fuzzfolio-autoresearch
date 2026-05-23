@@ -350,3 +350,88 @@ def test_build_recipe_prior_artifacts_uses_36m_result_over_12m_retention() -> No
     assert negative_pairs[0]["probe_id"] == "drs-36m"
     assert summary["discovered_recipe_validation"]["latest_pair_rows"] == 1
     assert summary["result_counts"]["discovered_recipe_pair_rows"] == 0
+
+
+def test_build_recipe_prior_artifacts_tiers_sampling_policy_by_distinct_36m_families() -> None:
+    indicators = [
+        _indicator(f"FIRST_{index}", signal_role="setup", strategy_role="trend")
+        for index in range(1, 5)
+    ] + [
+        _indicator(f"SECOND_{index}", signal_role="trigger", strategy_role="mean-reversion")
+        for index in range(1, 5)
+    ]
+
+    def retained_row(index: int, *, first: str | None = None, second: str | None = None) -> dict[str, str]:
+        return {
+            "status": "ok",
+            "recipe_id": "discovered_recipe_001",
+            "recipe_confidence": "high_candidate",
+            "first_indicator_id": first or f"FIRST_{index}",
+            "second_indicator_id": second or f"SECOND_{index}",
+            "probe_timeframe": "M5",
+            "probe_id": f"drs-36m-{index}",
+            "lookback_months": "36",
+            "primary_score": "70",
+            "composite_score": "70",
+            "validation_priority_score": "70",
+            "discovery_evidence_score": "74",
+            "retention_ratio": "0.95",
+            "retention_bucket": "retained",
+        }
+
+    (
+        _payload,
+        _slot_rows,
+        _pair_rows,
+        _negative_pairs,
+        _negative_clusters,
+        _retention_failures,
+        limited_seed_plan,
+        _summary,
+    ) = build_recipe_prior_artifacts(
+        indicator_rows=indicators,
+        static_slot_scores={},
+        signal_rollups={},
+        forward_priors={},
+        pair_results=[],
+        timing_results=[],
+        discovery_validation_results=[
+            retained_row(1),
+            retained_row(11, first="SECOND_1", second="FIRST_1"),
+        ],
+        max_slot_candidates=10,
+        max_pair_candidates=10,
+    )
+
+    assert limited_seed_plan["sampling_policy"]["retained_36m_family_count"] == 1
+    assert limited_seed_plan["sampling_policy"]["guided_prior_fraction"] == 0.70
+    assert limited_seed_plan["sampling_policy"]["uncertain_prior_fraction"] == 0.20
+    assert limited_seed_plan["sampling_policy"]["wild_exploration_fraction"] == 0.10
+    assert limited_seed_plan["sampling_policy"]["maturity"] == "limited_36m_retention"
+
+    (
+        _payload,
+        _slot_rows,
+        _pair_rows,
+        _negative_pairs,
+        _negative_clusters,
+        _retention_failures,
+        broad_seed_plan,
+        _summary,
+    ) = build_recipe_prior_artifacts(
+        indicator_rows=indicators,
+        static_slot_scores={},
+        signal_rollups={},
+        forward_priors={},
+        pair_results=[],
+        timing_results=[],
+        discovery_validation_results=[retained_row(index) for index in range(1, 5)],
+        max_slot_candidates=10,
+        max_pair_candidates=10,
+    )
+
+    assert broad_seed_plan["sampling_policy"]["retained_36m_family_count"] == 4
+    assert broad_seed_plan["sampling_policy"]["guided_prior_fraction"] == 0.80
+    assert broad_seed_plan["sampling_policy"]["uncertain_prior_fraction"] == 0.15
+    assert broad_seed_plan["sampling_policy"]["wild_exploration_fraction"] == 0.05
+    assert broad_seed_plan["sampling_policy"]["maturity"] == "broad_36m_retention"

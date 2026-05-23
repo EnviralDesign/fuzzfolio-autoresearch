@@ -1,0 +1,442 @@
+{
+  "run_id": "20260523T012543042532Z-playhand-v1",
+  "runner": "play_hand_v1",
+  "created_at": "2026-05-23T01:25:43.048841+00:00",
+  "canonical_score_lab_version": "score_lab_v2_5_3",
+  "seed": 3,
+  "instrument_source": "dealt",
+  "primary_instrument": "EURUSD",
+  "instrument_pool": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "XAUUSD"
+  ],
+  "instruments": [
+    "EURUSD"
+  ],
+  "timeframe": "M15",
+  "requested_timeframe": "M5",
+  "effective_timeframe": "M15",
+  "dealt_indicator_ids": [
+    "MFI_TREND",
+    "OBV_MEAN_REVERSION",
+    "BBANDS_POSITION_TREND",
+    "MA_SPREAD_MEAN_REVERSION"
+  ],
+  "dealt_indicator_metadata": [
+    {
+      "id": "MFI_TREND",
+      "signalRole": "setup",
+      "signalPersistence": "state",
+      "preferredTimeframeRole": "mid-setup"
+    },
+    {
+      "id": "OBV_MEAN_REVERSION",
+      "signalRole": "context",
+      "signalPersistence": "state",
+      "preferredTimeframeRole": "higher-context"
+    },
+    {
+      "id": "BBANDS_POSITION_TREND",
+      "signalRole": "setup",
+      "signalPersistence": "state",
+      "preferredTimeframeRole": "mid-setup"
+    },
+    {
+      "id": "MA_SPREAD_MEAN_REVERSION",
+      "signalRole": "context",
+      "signalPersistence": "state",
+      "preferredTimeframeRole": "higher-context"
+    }
+  ],
+  "dealt_indicator_source": "play_hand_seed_plan",
+  "dealt_indicator_source_reason": "guided_recipe_weighted_selection",
+  "play_hand_seed_plan_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\recipe-priors\\play-hand-seed-plan.json",
+  "play_hand_seed_plan_loaded": true,
+  "template_instrument_policy": "seed_pool",
+  "template_instrument_pool": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "XAUUSD"
+  ],
+  "template_instrument_pool_applied": true,
+  "dealt_recipe": "discovered_recipe_003",
+  "dealt_recipe_source": "discovery_recipe_validation",
+  "dealt_recipe_confidence": "high_candidate",
+  "dealt_recipe_pair": {
+    "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+    "first_indicator_id": "MFI_TREND",
+    "second_indicator_id": "OBV_MEAN_REVERSION",
+    "probe_timeframe": "M15",
+    "pair_sampling_score": 64.7631,
+    "composite_score": 62.6214,
+    "retention_bucket": "retained",
+    "recommended_profile_template": {
+      "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+      "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15.json",
+      "timeframe": "M15",
+      "lookback_months": 36,
+      "instruments": [
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "XAUUSD"
+      ],
+      "indicator_defaults": [
+        {
+          "indicator_id": "MFI_TREND",
+          "instance_id": "drv-0024-r003-mfi-trend-obv-mean-reversion-m15-anchor",
+          "timeframe": "M15",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              60,
+              80
+            ],
+            "sell": [
+              20,
+              40
+            ]
+          },
+          "talibConfig": [
+            {
+              "name": "timeperiod",
+              "value": 14
+            }
+          ],
+          "weight": 1.0,
+          "isTrendFollowing": true,
+          "normalizationMode": "none",
+          "useFormingBar": false,
+          "scale": 1
+        },
+        {
+          "indicator_id": "OBV_MEAN_REVERSION",
+          "instance_id": "drv-0024-r003-mfi-trend-obv-mean-reversion-m15-trigger",
+          "timeframe": "M15",
+          "lookbackBars": 1,
+          "ranges": {
+            "buy": [
+              -1,
+              -0.2
+            ],
+            "sell": [
+              0.2,
+              1
+            ]
+          },
+          "talibConfig": [],
+          "weight": 1.0,
+          "isTrendFollowing": false,
+          "normalizationMode": "none",
+          "useFormingBar": false,
+          "scale": 1
+        }
+      ]
+    },
+    "source": "discovery_recipe_validation"
+  },
+  "dealt_recipe_slots": [
+    {
+      "slot": "pair_first",
+      "indicator_id": "MFI_TREND",
+      "sampling_weight": 56.6225,
+      "sampling_lane": null,
+      "source": "discovery_recipe_validation"
+    },
+    {
+      "slot": "pair_second",
+      "indicator_id": "OBV_MEAN_REVERSION",
+      "sampling_weight": 56.6225,
+      "sampling_lane": null,
+      "source": "discovery_recipe_validation"
+    },
+    {
+      "slot": "context_or_setup_cluster",
+      "indicator_id": "BBANDS_POSITION_TREND",
+      "sampling_weight": 65.3293,
+      "sampling_lane": "high_prior",
+      "source": "discovery_recipe_validation"
+    },
+    {
+      "slot": "trigger_or_response_cluster",
+      "indicator_id": "MA_SPREAD_MEAN_REVERSION",
+      "sampling_weight": 65.3293,
+      "sampling_lane": "high_prior",
+      "source": "discovery_recipe_validation"
+    }
+  ],
+  "dealt_indicator_count": 4,
+  "min_indicators": 2,
+  "max_indicators": 4,
+  "requested_min_indicators": 2,
+  "requested_max_indicators": 4,
+  "screen_months": 3,
+  "scrutiny_months": 36,
+  "coarse_mode": "evolutionary",
+  "sweep_budget": "low",
+  "sweep_budget_tier": "low",
+  "sweep_budget_value": 256,
+  "sweep_budget_source": "sweep_budget",
+  "legacy_evolutionary_budget": null,
+  "max_reward_r": 4.0,
+  "reward_matrix": {
+    "requested_max_reward_r": 4.0,
+    "reward_step_r": 0.5,
+    "reward_columns": 8,
+    "effective_max_reward_r": 4.0,
+    "default_max_reward_r": 4.0,
+    "hard_max_reward_r": 12.5,
+    "is_default_cap": true,
+    "is_active_cap": true
+  },
+  "reward_step_r": 0.5,
+  "reward_columns": 8,
+  "effective_max_reward_r": 4.0,
+  "instrument_scout": {
+    "version": "instrument_scout_v1",
+    "status": "dry_run",
+    "primary_instrument": "EURUSD",
+    "candidate_instruments": [
+      "USDJPY",
+      "GBPUSD",
+      "XAUUSD"
+    ],
+    "selected_instruments": [
+      "EURUSD"
+    ],
+    "lookback_months": 3
+  },
+  "instrument_scout_size": 5,
+  "instrument_scout_max_selected": 3,
+  "instrument_scout_months": 3,
+  "final_artifacts": true,
+  "final_profile_drop_count": 1,
+  "final_profile_drop_workers": 1,
+  "deep_replay_job_timeout_seconds": 2400,
+  "sweep_timeout_seconds": 7200,
+  "max_sweep_permutations": 256,
+  "dry_run": true,
+  "indicator_timeframes": [
+    "M15",
+    "H1"
+  ],
+  "timeframe_assignment": [
+    {
+      "indicator_index": 0,
+      "indicator_id": "MFI_TREND",
+      "role": "setup",
+      "previous_timeframe": "M5",
+      "timeframe": "H1",
+      "pool": [
+        "M5",
+        "M15",
+        "M30",
+        "H1"
+      ]
+    },
+    {
+      "indicator_index": 1,
+      "indicator_id": "OBV_MEAN_REVERSION",
+      "role": "context",
+      "previous_timeframe": "M5",
+      "timeframe": "D1",
+      "pool": [
+        "M30",
+        "H1",
+        "H4",
+        "D1"
+      ]
+    },
+    {
+      "indicator_index": 2,
+      "indicator_id": "BBANDS_POSITION_TREND",
+      "role": "setup",
+      "previous_timeframe": "M5",
+      "timeframe": "M15",
+      "pool": [
+        "M5",
+        "M15",
+        "M30",
+        "H1"
+      ]
+    },
+    {
+      "indicator_index": 3,
+      "indicator_id": "MA_SPREAD_MEAN_REVERSION",
+      "role": "context",
+      "previous_timeframe": "M5",
+      "timeframe": "H1",
+      "pool": [
+        "M30",
+        "H1",
+        "H4",
+        "D1"
+      ]
+    }
+  ],
+  "validated_template_defaults": [
+    {
+      "indicator_index": 0,
+      "indicator_id": "MFI_TREND",
+      "template_probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+      "template_timeframe": "M15",
+      "config": {
+        "timeframe": {
+          "previous": "H1",
+          "value": "M15"
+        },
+        "ranges": {
+          "previous": null,
+          "value": {
+            "buy": [
+              60,
+              80
+            ],
+            "sell": [
+              20,
+              40
+            ]
+          }
+        },
+        "isTrendFollowing": {
+          "previous": null,
+          "value": true
+        },
+        "normalizationMode": {
+          "previous": null,
+          "value": "none"
+        },
+        "useFormingBar": {
+          "previous": null,
+          "value": false
+        },
+        "scale": {
+          "previous": null,
+          "value": 1
+        }
+      }
+    },
+    {
+      "indicator_index": 1,
+      "indicator_id": "OBV_MEAN_REVERSION",
+      "template_probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+      "template_timeframe": "M15",
+      "config": {
+        "timeframe": {
+          "previous": "D1",
+          "value": "M15"
+        },
+        "ranges": {
+          "previous": null,
+          "value": {
+            "buy": [
+              -1,
+              -0.2
+            ],
+            "sell": [
+              0.2,
+              1
+            ]
+          }
+        },
+        "talibConfig": {
+          "previous": [
+            {
+              "name": "timeperiod",
+              "value": 14
+            }
+          ],
+          "value": []
+        },
+        "isTrendFollowing": {
+          "previous": null,
+          "value": false
+        },
+        "normalizationMode": {
+          "previous": null,
+          "value": "none"
+        },
+        "useFormingBar": {
+          "previous": null,
+          "value": false
+        },
+        "scale": {
+          "previous": null,
+          "value": 1
+        }
+      }
+    }
+  ],
+  "exact_template_profile_ref": "dry-exact_template",
+  "exact_template_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\20260523T012543042532Z-playhand-v1\\profiles\\exact_template.json",
+  "template_branch_instruments": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "XAUUSD"
+  ],
+  "template_branch_source_probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+  "run_status": "tombstoned",
+  "run_tombstoned": true,
+  "tombstone_reason": "missing_final_36mo_score",
+  "tombstone_reasons": [
+    "final_36mo_scrutiny_failed",
+    "missing_final_36mo_score"
+  ],
+  "final_attempt_id": null,
+  "final_scrutiny_passed": false,
+  "final_scrutiny_score": null,
+  "mutated_attempt_id": null,
+  "mutated_score": null,
+  "exact_template_attempt_id": null,
+  "exact_template_score": null,
+  "selected_final_branch": "mutated",
+  "selected_final_phase": "mutated_final_36mo",
+  "final_branch_scores": [
+    {
+      "branch": "mutated",
+      "phase": "mutated_final_36mo",
+      "attempt_id": null,
+      "score": null,
+      "passed": false,
+      "instruments": [
+        "EURUSD"
+      ],
+      "profile_ref": "dry-hand_base"
+    },
+    {
+      "branch": "exact_template",
+      "phase": "exact_template_36mo",
+      "attempt_id": null,
+      "score": null,
+      "passed": false,
+      "instruments": [
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "XAUUSD"
+      ],
+      "profile_ref": "dry-exact_template"
+    }
+  ],
+  "canonical_attempt_id": null,
+  "canonical_attempt_role": null,
+  "canonical_candidate_name": null,
+  "canonical_score": null,
+  "canonical_instruments": [
+    "EURUSD"
+  ],
+  "strategy_family_id": "20260523T012543042532Z-playhand-v1",
+  "attempt_metadata": {
+    "attempt_count": 0,
+    "updated_count": 0,
+    "canonical_attempt_id": null,
+    "run_tombstoned": true,
+    "tombstone_reason": "missing_final_36mo_score",
+    "final_scrutiny_passed": false,
+    "final_scrutiny_score": null
+  }
+}

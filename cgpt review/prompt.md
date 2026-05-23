@@ -1,104 +1,139 @@
 # CGPT Review Packet
 
-Please review the latest Fuzzfolio AutoResearch state as a technical/design reviewer. This is the follow-up pass after your recommendation to stop architecture looping and run a controlled Play Hand batch against the current 36-month recipe priors.
+Please review the latest Fuzzfolio AutoResearch state as a technical/design reviewer. This pass implements the narrow branch you recommended after reviewing commit `4c218bd`: preserve the exact retained validation template as a final comparison branch, lower default prior eagerness to `70/20/10` while 36-month evidence is still limited, and harden seed-plan metadata lookup.
 
 ## Short Version
 
-I started the controlled Play Hand batch, but stopped it after it exposed a more important integration issue:
+The prior pass fixed the materialization bug: guided Play Hand can now select seed-plan indicators instead of being gated by the backend seed prompt.
 
-Play Hand was loading the seed plan, selecting a recipe, and forcing at least two indicators, but it could only choose indicators that were already present in the backend seed prompt. That meant a discovered recipe could be selected while the exact retained pair/template could still be unavailable. In practice, most "guided" runs fell back to `role_balanced_fill`.
+This pass fixes the next ambiguity:
 
-So the partial batch is not a clean efficacy test. It is a useful diagnostic.
+> If a retained template materializes but the final Play Hand candidate fails, did the prior fail, or did Play Hand mutate/scout away from the retained template?
+
+Play Hand now runs final 36-month scrutiny for both:
+
+1. the normal mutated/swept branch;
+2. the exact retained template branch, using the template validation basket when available.
+
+It selects the better passing branch, or the better-scoring branch if neither passes, and records branch-level metadata.
 
 ## New Fixes In This Pass
 
-1. **Seed-plan candidate augmentation in Play Hand**
-   - Guided sampling now augments the selectable pool with indicators referenced by the seed plan.
-   - This includes pair-menu `anchor_id` / `trigger_id`, discovered pair IDs, slot-menu IDs, and indicator defaults inside carried templates.
-   - Policy exploration still uses the original backend seed prompt pool, preserving wild/random exploration.
+1. **Exact-template final scrutiny branch**
+   - When a selected pair has `recommended_profile_template`, Play Hand copies/registers an `exact_template.json` profile immediately after template defaults are applied.
+   - Normal Play Hand continues through baseline, timing sweep, coarse sweep, focused sweep, and instrument scout as before.
+   - Final scrutiny now evaluates both `mutated_final_36mo` and `exact_template_36mo`.
+   - The exact branch uses `template_branch_instruments` from the retained template if available.
 
-2. **Template instrument seed pool**
-   - `build-recipe-priors` now emits `template_instrument_policy: seed_pool`.
-   - When a validated pair/template is selected and the user has not pinned instruments or an instrument pool, Play Hand uses the template's validation instruments as the instrument pool.
-   - This does not force the exact basket. It just gives the validated pair a fair starting pool.
+2. **Branch-aware final selection and metadata**
+   - New metadata fields include:
+     - `mutated_attempt_id`
+     - `mutated_score`
+     - `exact_template_attempt_id`
+     - `exact_template_score`
+     - `selected_final_branch`
+     - `selected_final_phase`
+     - `final_branch_scores`
+     - `template_branch_instruments`
+     - `template_branch_source_probe_id`
+   - The selected branch becomes the canonical final attempt when it passes.
 
-3. **Review artifacts for the interrupted batch and smokes**
-   - New packet folder: `cgpt review/playhand-prior-test/`.
-   - It includes partial batch seed results, summary JSON, event tail, pre-fix crash logs, smoke summaries, and notes.
+3. **Tiered 36-month maturity policy**
+   - The seed-plan policy is no longer binary.
+   - Current rebuilt policy is:
+
+   ```json
+   {
+     "guided_prior_fraction": 0.7,
+     "uncertain_prior_fraction": 0.2,
+     "wild_exploration_fraction": 0.1,
+     "maturity": "limited_36m_retention",
+     "retained_36m_family_count": 3,
+     "template_instrument_policy": "seed_pool"
+   }
+   ```
+
+   - `0` retained 36m families: `60/25/15`
+   - `1-3` distinct retained 36m families: `70/20/10`
+   - `4+` distinct retained 36m families: `80/15/5`
+   - Distinct families use unordered indicator pairs so opposite orderings do not inflate maturity.
+
+4. **Seed-plan metadata hardening**
+   - `_seed_plan_indicator_metadata()` now reads from `config.derived_root / "indicator-atlas"` instead of assuming `runs_root / "derived"`.
 
 ## Key Files To Review
 
 - `autoresearch/play_hand.py`
 - `autoresearch/recipe_priors.py`
 - `tests/test_play_hand.py`
-- `cgpt review/playhand-prior-test/playhand-prior-test-notes.md`
-- `cgpt review/playhand-prior-test/partial-batch-summary.json`
-- `cgpt review/playhand-prior-test/partial-batch-seed-results.csv`
-- `cgpt review/playhand-prior-test/smoke-runs-summary.json`
+- `tests/test_recipe_priors.py`
+- `cgpt review/exact-template-branch/dry-run-seed-3-summary.json`
+- `cgpt review/exact-template-branch/dry-run-seed-3-run-metadata.json`
 - `cgpt review/recipe-priors/play-hand-seed-plan.json`
+- `cgpt review/recipe-priors/recipe-priors-summary.json`
 
-## Partial Batch Finding
+## Smoke Result
 
-The intended 50-seed controlled batch was stopped after 37 completed seeds.
+New packet folder:
 
-Partial pre-fix counts:
+```text
+cgpt review/exact-template-branch/
+```
 
-- Completed: 37/50.
-- Promoted: 25.
-- Tombstoned: 12.
-- `play_hand_seed_plan` source: 30.
-- `role_balanced_policy_exploration`: 7.
-- Completed runs with a concrete dealt pair: 2.
-- Completed runs with a carried pair template: 0.
-- Completed runs whose selected slots were only `role_balanced_fill`: 23.
-- Pre-fix crash seeds: 7 and 9, from the earlier missing `CliError` import that was already fixed.
+Dry-run command:
 
-Interpretation: these results should not be treated as the real prior efficacy test. The high promotion count is interesting, but the batch mostly tested recipe labels and role-balanced fill, not true pair/template-guided sampling.
+```powershell
+uv run play-hand --seed 3 --coarse-mode evolutionary --sweep-budget low --min-indicators 2 --max-indicators 4 --dry-run --json
+```
 
-## Smoke Results After Fix
+Important result:
 
-Commands/paths are summarized in `cgpt review/playhand-prior-test/smoke-runs-summary.json`.
+- Dealt from `play_hand_seed_plan`.
+- Dealt indicators:
+  - `MFI_TREND`
+  - `OBV_MEAN_REVERSION`
+  - `BBANDS_POSITION_TREND`
+  - `MA_SPREAD_MEAN_REVERSION`
+- Applied validated template defaults.
+- Registered `exact_template`.
+- Final branch scores include both:
+  - `mutated_final_36mo`
+  - `exact_template_36mo`
+- Exact-template branch used:
+  - `template_branch_source_probe_id`: `drs-0008-r003-mfi-trend-obv-mean-reversion-m15`
+  - `template_branch_instruments`: `EURUSD, GBPUSD, USDJPY, XAUUSD`
 
-Important smokes:
-
-- Dry run `20260523T000154028924Z-playhand-v1`
-  - Dealt `BBANDS_POSITION_TREND + MA_SPREAD_MEAN_REVERSION`.
-  - Applied the retained pair template.
-  - Applied `template_instrument_pool_applied: true`.
-  - Instrument pool became `EURUSD, GBPUSD, USDJPY, XAUUSD`.
-
-- Forced-guided real backend smoke `20260522T235558735932Z-playhand-v1`
-  - I temporarily set local ignored `guided_prior_fraction=1.0`, ran one low-budget backend smoke, then restored the seed plan.
-  - It scaffolded, replayed, swept, and ran 36-month scrutiny with the retained pair/template path.
-  - It still failed final 36-month scrutiny after sweeps/instrument selection, which raises the next design question: should exact templates be preserved as one branch rather than immediately being mutated away?
+Because this was a dry run, both final scores are null and the mutated branch wins the tie by design. Unit tests cover the non-null branch selection behavior.
 
 ## Verification
 
 Commands run:
 
 ```powershell
-uv run python -m py_compile autoresearch\play_hand.py autoresearch\recipe_priors.py autoresearch\__main__.py
+uv run python -m py_compile autoresearch\play_hand.py autoresearch\recipe_priors.py
 uv run pytest tests\test_play_hand.py tests\test_recipe_priors.py -q
+uv run build-recipe-priors
+uv run play-hand --seed 3 --coarse-mode evolutionary --sweep-budget low --min-indicators 2 --max-indicators 4 --dry-run --json
 uv run pytest -q
-uv run build-recipe-priors --json
-uv run play-hand --seed 2 --coarse-mode evolutionary --sweep-budget low --min-indicators 2 --max-indicators 2 --final-profile-drop-count 0 --json
-uv run play-hand --seed 2 --coarse-mode evolutionary --sweep-budget low --min-indicators 2 --max-indicators 4 --final-profile-drop-count 0 --json
-uv run play-hand --seed 2 --coarse-mode evolutionary --sweep-budget low --min-indicators 2 --max-indicators 4 --dry-run --json
 ```
 
-Full test suite: 323 passed.
+Results:
+
+- Focused tests: `62 passed`
+- Full suite: `327 passed`
+- Rebuilt seed-plan maturity: `limited_36m_retention`, `70/20/10`, `retained_36m_family_count = 3`
 
 ## Questions For This Review
 
-1. Is seed-plan candidate augmentation the right fix, or should guided Play Hand bypass the backend seed prompt entirely?
-2. Is `template_instrument_policy: seed_pool` the right default, or should retained templates use an `initial_basket` mode that starts with the full validation basket?
-3. Should a validated template be preserved as a fixed baseline branch during Play Hand sweeps, so the process can compare "exact retained template" versus "mutated local best"?
-4. Should the next clean measurement rerun the 50-seed controlled batch now, or first add that exact-template branch?
-5. Given that only a small number of 36-month retained pairs exist, should the sampling policy remain `80/15/5`, or drop to `70/20/10` for this rerun?
-6. After a clean rerun, is the next best branch still a recipe performance report/dashboard?
+1. Is the exact-template branch implemented at the right point in the flow: after template defaults, before baseline/sweeps, then final comparison against the mutated branch?
+2. Should the exact-template branch always use the template validation basket when available, even if the normal branch scouts down to one instrument?
+3. Should exact-template branch selection be allowed to become canonical exactly as implemented, or should it be recorded as a separate "rescued by template" status?
+4. Is `70/20/10` the right default now that the rebuilt seed plan has only three distinct retained 36-month families?
+5. Is the next best action now the clean controlled 50-seed Play Hand batch, or should we do one real low-budget backend smoke of the exact-template final branch first?
+6. After the clean batch, is the recipe performance report/dashboard still the next best branch?
 
 ## Current Opinion
 
-The right next step is no longer to interpret the partial batch as a signal-quality result. The partial batch found a real integration gap. The code now actually lets pair/template priors materialize, and the seed-pool policy gives them a more faithful instrument environment.
+This pass removes the largest remaining attribution problem before the clean rerun. A failed run can now say whether the exact retained template itself failed, whether the mutated branch failed, or whether mutation improved the retained template.
 
-My bias: rerun a clean controlled batch after this patch, then build the recipe performance report from that clean run. The remaining open design question is whether to add "exact template as fixed branch" before that rerun.
+My suggested next step is a clean controlled 50-seed batch under the current `70/20/10` default, then a recipe performance report that compares materialized pairs, exact-template outcomes, mutated outcomes, selected branches, and final promotions/tombstones.

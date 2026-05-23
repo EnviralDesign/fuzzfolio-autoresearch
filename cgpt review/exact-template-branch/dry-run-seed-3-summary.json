@@ -1,0 +1,177 @@
+{
+  "run_id": "20260523T012543042532Z-playhand-v1",
+  "run_dir": "C:\\repos\\fuzzfolio-autoresearch\\runs\\20260523T012543042532Z-playhand-v1",
+  "runner": "play_hand_v1",
+  "dealt_indicator_ids": [
+    "MFI_TREND",
+    "OBV_MEAN_REVERSION",
+    "BBANDS_POSITION_TREND",
+    "MA_SPREAD_MEAN_REVERSION"
+  ],
+  "dealt_indicator_count": 4,
+  "min_indicators": 2,
+  "max_indicators": 4,
+  "requested_min_indicators": 2,
+  "requested_max_indicators": 4,
+  "instrument_source": "dealt",
+  "primary_instrument": "EURUSD",
+  "instrument_pool": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "XAUUSD"
+  ],
+  "instruments": [
+    "EURUSD"
+  ],
+  "timeframe": "M15",
+  "requested_timeframe": "M5",
+  "indicator_timeframes": [
+    "M15",
+    "H1"
+  ],
+  "sweep_budget": "low",
+  "sweep_budget_value": 256,
+  "sweep_budget_source": "sweep_budget",
+  "max_sweep_permutations": 256,
+  "deep_replay_job_timeout_seconds": 2400,
+  "sweep_timeout_seconds": 7200,
+  "max_reward_r": 4.0,
+  "reward_matrix": {
+    "requested_max_reward_r": 4.0,
+    "reward_step_r": 0.5,
+    "reward_columns": 8,
+    "effective_max_reward_r": 4.0,
+    "default_max_reward_r": 4.0,
+    "hard_max_reward_r": 12.5,
+    "is_default_cap": true,
+    "is_active_cap": true
+  },
+  "instrument_scout": {
+    "version": "instrument_scout_v1",
+    "status": "dry_run",
+    "primary_instrument": "EURUSD",
+    "candidate_instruments": [
+      "USDJPY",
+      "GBPUSD",
+      "XAUUSD"
+    ],
+    "selected_instruments": [
+      "EURUSD"
+    ],
+    "lookback_months": 3
+  },
+  "run_status": "tombstoned",
+  "run_tombstoned": true,
+  "tombstone_reason": "missing_final_36mo_score",
+  "tombstone_reasons": [
+    "final_36mo_scrutiny_failed",
+    "missing_final_36mo_score"
+  ],
+  "final_attempt_id": null,
+  "final_scrutiny_passed": false,
+  "final_scrutiny_score": null,
+  "mutated_attempt_id": null,
+  "mutated_score": null,
+  "exact_template_attempt_id": null,
+  "exact_template_score": null,
+  "selected_final_branch": "mutated",
+  "selected_final_phase": "mutated_final_36mo",
+  "final_branch_scores": [
+    {
+      "branch": "mutated",
+      "phase": "mutated_final_36mo",
+      "attempt_id": null,
+      "score": null,
+      "passed": false,
+      "instruments": [
+        "EURUSD"
+      ],
+      "profile_ref": "dry-hand_base"
+    },
+    {
+      "branch": "exact_template",
+      "phase": "exact_template_36mo",
+      "attempt_id": null,
+      "score": null,
+      "passed": false,
+      "instruments": [
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "XAUUSD"
+      ],
+      "profile_ref": "dry-exact_template"
+    }
+  ],
+  "template_branch_instruments": [
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "XAUUSD"
+  ],
+  "template_branch_source_probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+  "canonical_attempt_id": null,
+  "canonical_attempt_role": null,
+  "canonical_candidate_name": null,
+  "strategy_family_id": "20260523T012543042532Z-playhand-v1",
+  "attempt_metadata": {
+    "attempt_count": 0,
+    "updated_count": 0,
+    "canonical_attempt_id": null,
+    "run_tombstoned": true,
+    "tombstone_reason": "missing_final_36mo_score",
+    "final_scrutiny_passed": false,
+    "final_scrutiny_score": null
+  },
+  "final_profile_ref": "dry-hand_base",
+  "final_profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\20260523T012543042532Z-playhand-v1\\profiles\\hand_base.json",
+  "final_score": null,
+  "events_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\20260523T012543042532Z-playhand-v1\\play-hand-events.jsonl",
+  "attempts_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\20260523T012543042532Z-playhand-v1\\attempts.jsonl",
+  "phase_rows": [
+    {
+      "phase": "baseline",
+      "status": "evaluated",
+      "score": null,
+      "detail": "dry-hand_base"
+    },
+    {
+      "phase": "instrument scout",
+      "status": "dry_run",
+      "score": null,
+      "detail": "EURUSD"
+    },
+    {
+      "phase": "mutated",
+      "status": "failed",
+      "score": null,
+      "detail": "36mo on EURUSD; branch=mutated; tombstoned=missing_final_36mo_score"
+    },
+    {
+      "phase": "exact template",
+      "status": "failed",
+      "score": null,
+      "detail": "36mo on EURUSD, GBPUSD, USDJPY, XAUUSD; branch=exact_template; tombstoned=missing_final_36mo_score"
+    },
+    {
+      "phase": "scrutiny",
+      "status": "failed",
+      "score": null,
+      "detail": "selected=mutated; 36mo on EURUSD; tombstoned=missing_final_36mo_score"
+    },
+    {
+      "phase": "artifacts",
+      "status": "skipped",
+      "score": null,
+      "detail": "run tombstoned: missing_final_36mo_score"
+    }
+  ],
+  "final_artifacts": {
+    "status": "skipped",
+    "reason": "missing_final_36mo_score",
+    "run_tombstoned": true,
+    "final_attempt_id": null,
+    "final_scrutiny_score": null
+  }
+}

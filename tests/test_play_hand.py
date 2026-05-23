@@ -210,6 +210,45 @@ def test_seed_pair_template_instruments_reads_validated_template_pool() -> None:
     ]
 
 
+def test_seed_plan_indicator_metadata_reads_config_derived_root(tmp_path: Path) -> None:
+    atlas_dir = tmp_path / "custom-derived" / "indicator-atlas"
+    atlas_dir.mkdir(parents=True)
+    (atlas_dir / "indicator-atlas.json").write_text(
+        """{"indicators":[{"id":"RSI_CROSSBACK","signal_role":"trigger"}]}""",
+        encoding="utf-8",
+    )
+    config = SimpleNamespace(
+        derived_root=tmp_path / "custom-derived",
+        runs_root=tmp_path / "wrong-runs-root",
+    )
+
+    metadata = play_hand_mod._seed_plan_indicator_metadata(config)
+
+    assert metadata["RSI_CROSSBACK"]["signal_role"] == "trigger"
+
+
+def test_select_final_scrutiny_branch_keeps_exact_template_when_it_passes() -> None:
+    selected = play_hand_mod._select_final_scrutiny_branch(
+        [
+            {"branch": "mutated", "outcome": {"passed": False, "score": 0.0}},
+            {"branch": "exact_template", "outcome": {"passed": True, "score": 61.5}},
+        ]
+    )
+
+    assert selected["branch"] == "exact_template"
+
+
+def test_select_final_scrutiny_branch_prefers_higher_mutated_score() -> None:
+    selected = play_hand_mod._select_final_scrutiny_branch(
+        [
+            {"branch": "mutated", "outcome": {"passed": True, "score": 70.0}},
+            {"branch": "exact_template", "outcome": {"passed": True, "score": 61.5}},
+        ]
+    )
+
+    assert selected["branch"] == "mutated"
+
+
 def test_deal_seed_plan_indicators_applies_negative_guard_to_role_balanced_fill() -> None:
     indicators = [
         play_hand_mod.SeedIndicator("FIRST_A", "setup", "event", "mid-setup"),

@@ -1202,30 +1202,54 @@ def build_recipe_prior_artifacts(
         reverse=True,
     )
     pair_priors = pair_priors[:max_pair_candidates]
-    any_36m_retained = any(
-        _int_value(row.get("lookback_months")) >= 36
-        and _clean_token(row.get("retention_bucket")) in {"retained", "retained_strong"}
-        for row in discovery_validation_results or []
-    )
-    sampling_policy = (
-        {
+    retained_36m_families: set[tuple[str, str, tuple[str, str]]] = set()
+    for row in discovery_validation_results or []:
+        if _int_value(row.get("lookback_months")) < 36:
+            continue
+        if _clean_token(row.get("retention_bucket")) not in {"retained", "retained_strong"}:
+            continue
+        first_id = _clean_token(row.get("first_indicator_id"))
+        second_id = _clean_token(row.get("second_indicator_id"))
+        if not first_id or not second_id:
+            continue
+        retained_36m_families.add(
+            (
+                _clean_token(row.get("recipe_id")),
+                _clean_token(row.get("probe_timeframe")),
+                tuple(sorted((first_id, second_id))),
+            )
+        )
+    retained_36m_family_count = len(retained_36m_families)
+    if retained_36m_family_count >= 4:
+        sampling_policy = {
             "guided_prior_fraction": 0.80,
             "uncertain_prior_fraction": 0.15,
             "wild_exploration_fraction": 0.05,
-            "maturity": "has_36m_retention",
+            "maturity": "broad_36m_retention",
+            "retained_36m_family_count": retained_36m_family_count,
             "template_instrument_policy": "seed_pool",
             "interpretation": "Weights bias random selection; they do not hard-filter the catalog.",
         }
-        if any_36m_retained
-        else {
+    elif retained_36m_family_count > 0:
+        sampling_policy = {
+            "guided_prior_fraction": 0.70,
+            "uncertain_prior_fraction": 0.20,
+            "wild_exploration_fraction": 0.10,
+            "maturity": "limited_36m_retention",
+            "retained_36m_family_count": retained_36m_family_count,
+            "template_instrument_policy": "seed_pool",
+            "interpretation": "Weights bias random selection; they do not hard-filter the catalog.",
+        }
+    else:
+        sampling_policy = {
             "guided_prior_fraction": 0.60,
             "uncertain_prior_fraction": 0.25,
             "wild_exploration_fraction": 0.15,
             "maturity": "pre_36m_retention",
+            "retained_36m_family_count": retained_36m_family_count,
             "template_instrument_policy": "seed_pool",
             "interpretation": "Weights bias random selection; they do not hard-filter the catalog.",
         }
-    )
 
     seed_plan = {
         "schema_version": "play_hand_seed_plan_v1",

@@ -6,6 +6,7 @@ import math
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -2347,7 +2348,7 @@ def _seed_plan_indicator_ids(seed_plan: dict[str, Any] | None) -> list[str]:
 
 
 def _seed_plan_indicator_metadata(config: AppConfig) -> dict[str, dict[str, Any]]:
-    atlas_path = config.runs_root / "derived" / "indicator-atlas" / "indicator-atlas.json"
+    atlas_path = config.derived_root / "indicator-atlas" / "indicator-atlas.json"
     payload = _load_json(atlas_path)
     rows = payload.get("indicators")
     metadata: dict[str, dict[str, Any]] = {}
@@ -2641,6 +2642,23 @@ def _final_scrutiny_outcome(scrutiny: dict[str, Any]) -> dict[str, Any]:
         "reason": None,
         "reasons": [],
     }
+
+
+def _select_final_scrutiny_branch(branches: list[dict[str, Any]]) -> dict[str, Any] | None:
+    candidates = [branch for branch in branches if isinstance(branch, dict)]
+    if not candidates:
+        return None
+
+    def rank(branch: dict[str, Any]) -> tuple[int, float, int]:
+        outcome = branch.get("outcome") if isinstance(branch.get("outcome"), dict) else {}
+        score = _as_float(outcome.get("score"))
+        score_value = score if score is not None else float("-inf")
+        passed = 1 if outcome.get("passed") else 0
+        # Keep the normal mutated branch as the tie-breaker when evidence is equal.
+        branch_bias = 1 if str(branch.get("branch") or "") == "mutated" else 0
+        return passed, score_value, branch_bias
+
+    return max(candidates, key=rank)
 
 
 def _as_int(value: Any) -> int | None:
@@ -3680,6 +3698,36 @@ def _materialize_and_register(
     return output_path, profile_ref
 
 
+def _copy_and_register_profile(
+    ctx: PlayHandContext,
+    *,
+    stage: PlayHandStage,
+    source_profile_path: Path,
+    output_name: str,
+    phase: str,
+) -> tuple[Path, str]:
+    output_path = ctx.profiles_dir / output_name
+    payload = _load_json(source_profile_path)
+    profile = _extract_profile(payload)
+    if profile:
+        original_name = str(profile.get("name") or source_profile_path.stem)
+        profile["name"] = f"{original_name} [exact template]".strip()
+        profile["isActive"] = False
+        _write_json(output_path, payload)
+    else:
+        shutil.copyfile(source_profile_path, output_path)
+    profile_ref = _register_profile(ctx, output_path)
+    _append_event(
+        ctx,
+        phase,
+        "registered",
+        stage=stage,
+        profile_path=str(output_path),
+        profile_ref=profile_ref,
+    )
+    return output_path, profile_ref
+
+
 def _materialize_and_register_best_sweep_candidate(
     ctx: PlayHandContext,
     *,
@@ -4182,6 +4230,21 @@ def cmd_play_hand(
             changes=default_changes,
         )
     evaluation_timeframe = _lowest_profile_timeframe(profile_payload, timeframe)
+    pair_evidence = _seed_plan_dict(indicator_deal.get("pair"))
+    pair_template = _seed_plan_dict(pair_evidence.get("recommended_profile_template"))
+    template_branch_source_probe_id = (
+        str(
+            pair_template.get("probe_id")
+            or pair_template.get("source_probe_id")
+            or pair_evidence.get("probe_id")
+            or pair_evidence.get("source_probe_id")
+            or ""
+        ).strip()
+        or None
+    )
+    template_branch_instruments = (
+        list(template_instrument_pool) if template_instrument_pool else list(instruments)
+    )
     profile_ref = _register_profile(ctx, profile_path)
     _append_event(
         ctx,
@@ -4191,6 +4254,27 @@ def cmd_play_hand(
         profile_path=str(profile_path),
         profile_ref=profile_ref,
     )
+    exact_template_profile_path: Path | None = None
+    exact_template_profile_ref: str | None = None
+    exact_template_timeframe: str | None = None
+    if pair_template.get("indicator_defaults"):
+        exact_template_profile_path, exact_template_profile_ref = _copy_and_register_profile(
+            ctx,
+            stage=stages["scaffold"],
+            source_profile_path=profile_path,
+            output_name="exact_template.json",
+            phase="exact_template",
+        )
+        exact_template_timeframe = evaluation_timeframe
+        metadata.update(
+            {
+                "exact_template_profile_ref": exact_template_profile_ref,
+                "exact_template_profile_path": str(exact_template_profile_path.resolve()),
+                "template_branch_instruments": template_branch_instruments,
+                "template_branch_source_probe_id": template_branch_source_probe_id,
+            }
+        )
+        write_run_metadata(run_dir, metadata)
 
     baseline = _evaluate_profile(
         ctx,
@@ -4383,10 +4467,10 @@ def cmd_play_hand(
         }
     )
 
-    scrutiny = _evaluate_profile(
+    mutated_scrutiny = _evaluate_profile(
         ctx,
         stage=stages["scrutiny"],
-        phase="final_36mo",
+        phase="mutated_final_36mo",
         profile_ref=current_profile_ref,
         profile_path=current_profile_path,
         instruments=instruments,
@@ -4394,15 +4478,96 @@ def cmd_play_hand(
         lookback_months=scrutiny_months,
         reward_matrix=reward_matrix,
     )
-    final_attempt_id = str(scrutiny.get("attempt_id") or "").strip()
-    final_scrutiny = _final_scrutiny_outcome(scrutiny)
+    mutated_outcome = _final_scrutiny_outcome(mutated_scrutiny)
+    final_branch_candidates: list[dict[str, Any]] = [
+        {
+            "branch": "mutated",
+            "phase": "mutated_final_36mo",
+            "scrutiny": mutated_scrutiny,
+            "outcome": mutated_outcome,
+            "attempt_id": str(mutated_scrutiny.get("attempt_id") or "").strip(),
+            "profile_ref": current_profile_ref,
+            "profile_path": current_profile_path,
+            "instruments": list(instruments),
+            "timeframe": current_evaluation_timeframe,
+        }
+    ]
+    if exact_template_profile_path is not None and exact_template_profile_ref:
+        exact_template_scrutiny = _evaluate_profile(
+            ctx,
+            stage=stages["scrutiny"],
+            phase="exact_template_36mo",
+            profile_ref=exact_template_profile_ref,
+            profile_path=exact_template_profile_path,
+            instruments=template_branch_instruments,
+            timeframe=exact_template_timeframe or evaluation_timeframe,
+            lookback_months=scrutiny_months,
+            reward_matrix=reward_matrix,
+        )
+        exact_template_outcome = _final_scrutiny_outcome(exact_template_scrutiny)
+        final_branch_candidates.append(
+            {
+                "branch": "exact_template",
+                "phase": "exact_template_36mo",
+                "scrutiny": exact_template_scrutiny,
+                "outcome": exact_template_outcome,
+                "attempt_id": str(exact_template_scrutiny.get("attempt_id") or "").strip(),
+                "profile_ref": exact_template_profile_ref,
+                "profile_path": exact_template_profile_path,
+                "instruments": list(template_branch_instruments),
+                "timeframe": exact_template_timeframe or evaluation_timeframe,
+            }
+        )
+    selected_final_branch = _select_final_scrutiny_branch(final_branch_candidates) or final_branch_candidates[0]
+    scrutiny = selected_final_branch["scrutiny"]
+    final_scrutiny = selected_final_branch["outcome"]
+    final_attempt_id = str(selected_final_branch.get("attempt_id") or "").strip()
     final_scrutiny_passed = bool(final_scrutiny.get("passed"))
     canonical_attempt_id = final_attempt_id if final_scrutiny_passed else None
+    selected_final_branch_name = str(selected_final_branch.get("branch") or "mutated")
+    selected_final_phase = str(selected_final_branch.get("phase") or "final_36mo")
+    selected_final_instruments = _clean_tokens(selected_final_branch.get("instruments") or instruments)
+    selected_final_timeframe = str(selected_final_branch.get("timeframe") or current_evaluation_timeframe)
+    selected_final_profile_ref = str(selected_final_branch.get("profile_ref") or current_profile_ref)
+    selected_profile_path_value = selected_final_branch.get("profile_path")
+    selected_final_profile_path = (
+        selected_profile_path_value
+        if isinstance(selected_profile_path_value, Path)
+        else Path(str(selected_profile_path_value or current_profile_path))
+    )
+    final_branch_scores = [
+        {
+            "branch": str(branch.get("branch") or ""),
+            "phase": str(branch.get("phase") or ""),
+            "attempt_id": str(branch.get("attempt_id") or "") or None,
+            "score": (
+                branch.get("outcome", {}).get("score")
+                if isinstance(branch.get("outcome"), dict)
+                else None
+            ),
+            "passed": bool(
+                branch.get("outcome", {}).get("passed")
+                if isinstance(branch.get("outcome"), dict)
+                else False
+            ),
+            "instruments": list(branch.get("instruments") or []),
+            "profile_ref": branch.get("profile_ref"),
+        }
+        for branch in final_branch_candidates
+    ]
+    exact_template_branch = next(
+        (
+            branch
+            for branch in final_branch_candidates
+            if str(branch.get("branch") or "") == "exact_template"
+        ),
+        {},
+    )
     attempt_metadata_summary = _finalize_play_hand_attempt_metadata(
         ctx,
         final_attempt_id=final_attempt_id,
         scout_result=scout_result,
-        selected_instruments=instruments,
+        selected_instruments=selected_final_instruments,
         reward_matrix=reward_matrix,
         final_scrutiny_passed=final_scrutiny_passed,
         final_scrutiny_score=final_scrutiny.get("score"),
@@ -4418,11 +4583,24 @@ def cmd_play_hand(
             "final_attempt_id": final_attempt_id or None,
             "final_scrutiny_passed": final_scrutiny_passed,
             "final_scrutiny_score": final_scrutiny.get("score"),
+            "mutated_attempt_id": str(mutated_scrutiny.get("attempt_id") or "") or None,
+            "mutated_score": mutated_outcome.get("score"),
+            "exact_template_attempt_id": str(exact_template_branch.get("attempt_id") or "") or None,
+            "exact_template_score": (
+                exact_template_branch.get("outcome", {}).get("score")
+                if isinstance(exact_template_branch.get("outcome"), dict)
+                else None
+            ),
+            "selected_final_branch": selected_final_branch_name,
+            "selected_final_phase": selected_final_phase,
+            "final_branch_scores": final_branch_scores,
+            "template_branch_instruments": template_branch_instruments,
+            "template_branch_source_probe_id": template_branch_source_probe_id,
             "canonical_attempt_id": canonical_attempt_id,
             "canonical_attempt_role": "final" if final_scrutiny_passed else None,
-            "canonical_candidate_name": "final_36mo" if final_scrutiny_passed else None,
+            "canonical_candidate_name": selected_final_phase if final_scrutiny_passed else None,
             "canonical_score": scrutiny.get("score") if final_scrutiny_passed else None,
-            "canonical_instruments": instruments,
+            "canonical_instruments": selected_final_instruments,
             "strategy_family_id": run_id,
             "attempt_metadata": attempt_metadata_summary,
         }
@@ -4435,8 +4613,33 @@ def cmd_play_hand(
         stage=stages["scrutiny"],
         **attempt_metadata_summary,
     )
+    for branch in final_branch_candidates:
+        branch_outcome = branch.get("outcome") if isinstance(branch.get("outcome"), dict) else {}
+        branch_name = str(branch.get("branch") or "")
+        branch_status = "evaluated" if branch_outcome.get("passed") else "failed"
+        branch_detail = (
+            f"{scrutiny_months}mo on {', '.join(branch.get('instruments') or [])}; "
+            f"branch={branch_name}"
+        )
+        if not branch_outcome.get("passed"):
+            branch_detail += f"; tombstoned={branch_outcome.get('reason') or 'failed'}"
+        phase_rows.append(
+            {
+                "phase": branch_name.replace("_", " ") or "scrutiny",
+                "status": branch_status,
+                "score": (
+                    branch.get("scrutiny", {}).get("score")
+                    if isinstance(branch.get("scrutiny"), dict)
+                    else None
+                ),
+                "detail": branch_detail,
+            }
+        )
     scrutiny_status = "evaluated" if final_scrutiny_passed else "failed"
-    scrutiny_detail = f"{scrutiny_months}mo on {', '.join(instruments)}"
+    scrutiny_detail = (
+        f"selected={selected_final_branch_name}; "
+        f"{scrutiny_months}mo on {', '.join(selected_final_instruments)}"
+    )
     if not final_scrutiny_passed:
         scrutiny_detail += f"; tombstoned={final_scrutiny.get('reason') or 'failed'}"
     phase_rows.append(
@@ -4529,10 +4732,10 @@ def cmd_play_hand(
         "instrument_source": instrument_deal["source"],
         "primary_instrument": instrument_deal["primary_instrument"],
         "instrument_pool": instrument_deal["instrument_pool"],
-        "instruments": instruments,
-        "timeframe": current_evaluation_timeframe,
+        "instruments": selected_final_instruments,
+        "timeframe": selected_final_timeframe,
         "requested_timeframe": timeframe,
-        "indicator_timeframes": _profile_timeframes(_load_json(current_profile_path)),
+        "indicator_timeframes": _profile_timeframes(_load_json(selected_final_profile_path)),
         "sweep_budget": sweep_budget_label,
         "sweep_budget_value": sweep_budget_value,
         "sweep_budget_source": budget.get("source"),
@@ -4549,13 +4752,26 @@ def cmd_play_hand(
         "final_attempt_id": final_attempt_id or None,
         "final_scrutiny_passed": final_scrutiny_passed,
         "final_scrutiny_score": final_scrutiny.get("score"),
+        "mutated_attempt_id": str(mutated_scrutiny.get("attempt_id") or "") or None,
+        "mutated_score": mutated_outcome.get("score"),
+        "exact_template_attempt_id": str(exact_template_branch.get("attempt_id") or "") or None,
+        "exact_template_score": (
+            exact_template_branch.get("outcome", {}).get("score")
+            if isinstance(exact_template_branch.get("outcome"), dict)
+            else None
+        ),
+        "selected_final_branch": selected_final_branch_name,
+        "selected_final_phase": selected_final_phase,
+        "final_branch_scores": final_branch_scores,
+        "template_branch_instruments": template_branch_instruments,
+        "template_branch_source_probe_id": template_branch_source_probe_id,
         "canonical_attempt_id": canonical_attempt_id,
         "canonical_attempt_role": "final" if final_scrutiny_passed else None,
-        "canonical_candidate_name": "final_36mo" if final_scrutiny_passed else None,
+        "canonical_candidate_name": selected_final_phase if final_scrutiny_passed else None,
         "strategy_family_id": run_id,
         "attempt_metadata": attempt_metadata_summary,
-        "final_profile_ref": current_profile_ref,
-        "final_profile_path": str(current_profile_path.resolve()),
+        "final_profile_ref": selected_final_profile_ref,
+        "final_profile_path": str(selected_final_profile_path.resolve()),
         "final_score": scrutiny.get("score"),
         "events_path": str(ctx.events_path.resolve()),
         "attempts_path": str(ctx.attempts_path.resolve()),

@@ -1,12 +1,13 @@
 {
   "schema_version": "empirical_recipe_priors_v1",
-  "generated_at": "2026-05-23T00:01:45.416414+00:00",
+  "generated_at": "2026-05-23T01:25:02.998943+00:00",
   "note": "Empirical recipe priors blend static catalog roles, signal density, forward response, Layer 3 pair outcomes, and Layer 3b timing evidence. Weights bias sampling; they are not hard filters.",
   "sampling_policy": {
-    "guided_prior_fraction": 0.8,
-    "uncertain_prior_fraction": 0.15,
-    "wild_exploration_fraction": 0.05,
-    "maturity": "has_36m_retention",
+    "guided_prior_fraction": 0.7,
+    "uncertain_prior_fraction": 0.2,
+    "wild_exploration_fraction": 0.1,
+    "maturity": "limited_36m_retention",
+    "retained_36m_family_count": 3,
     "template_instrument_policy": "seed_pool",
     "interpretation": "Weights bias random selection; they do not hard-filter the catalog."
   },
@@ -22166,7 +22167,7 @@
   ],
   "summary": {
     "schema_version": "empirical_recipe_priors_v1",
-    "generated_at": "2026-05-23T00:01:45.416414+00:00",
+    "generated_at": "2026-05-23T01:25:02.998943+00:00",
     "result_counts": {
       "indicator_rows": 87,
       "generation_eligible": 87,
