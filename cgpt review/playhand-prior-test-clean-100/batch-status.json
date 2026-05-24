@@ -1,0 +1,15 @@
+﻿{
+    "updated_at":  "2026-05-24T17:17:48.3829003Z",
+    "pid":  52484,
+    "finished_at":  "2026-05-24T17:17:48.3829003Z",
+    "seed_end":  150,
+    "command_template":  "uv run play-hand --seed \u003cseed\u003e --coarse-mode evolutionary --sweep-budget high --min-indicators 2 --max-indicators 4 --final-profile-drop-count 0 --json",
+    "skipped":  0,
+    "started_at":  "2026-05-23T17:08:38.8114831Z",
+    "status":  "completed",
+    "completed":  100,
+    "current_seed":  null,
+    "total":  100,
+    "seed_start":  51,
+    "failed":  0
+}
