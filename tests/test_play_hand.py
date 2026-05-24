@@ -319,6 +319,62 @@ def test_deal_seed_plan_indicators_applies_negative_guard_to_role_balanced_fill(
         "SECOND_A",
         "GOOD_FILL",
     ]
+
+
+def test_deal_seed_plan_indicators_template_locked_caps_to_pair_only() -> None:
+    indicators = [
+        play_hand_mod.SeedIndicator("RSI_CROSSBACK", "setup", "event", "entry"),
+        play_hand_mod.SeedIndicator("WILLR_MEAN_REVERSION", "trigger", "event", "entry"),
+        play_hand_mod.SeedIndicator("SLOT_ADDON", "filter", "state", "higher-context"),
+        play_hand_mod.SeedIndicator("RANDOM_FILL", "filter", "state", "higher-context"),
+    ]
+    seed_plan = {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {
+            "discovered_recipe_006": {
+                "source": "discovery_recipe_validation",
+                "pair_menu": [
+                    {
+                        "source": "discovery_recipe_validation",
+                        "anchor_id": "RSI_CROSSBACK",
+                        "trigger_id": "WILLR_MEAN_REVERSION",
+                        "probe_id": "drs-0002-r006-rsi-crossback-willr-mean-reversi-m5",
+                        "pair_sampling_weight": 50,
+                        "pair_sampling_score": 75,
+                        "playhand_family_id": "drs-0002-r006-rsi-crossback-willr-mean-reversi-m5",
+                        "playhand_family_policy": "template_locked",
+                        "playhand_recommended_max_indicators": 2,
+                        "playhand_role_balanced_fill_limit": 0,
+                        "playhand_mutation_pressure": "low",
+                    }
+                ],
+                "slot_menus": {
+                    "guard": [
+                        {
+                            "indicator_id": "SLOT_ADDON",
+                            "sampling_weight": 100,
+                            "source": "slot",
+                        }
+                    ]
+                },
+            }
+        },
+    }
+
+    deal = deal_seed_plan_indicators(
+        indicators,
+        target_count=4,
+        seed_plan=seed_plan,
+        rng=random.Random(7),
+    )
+
+    assert [indicator.id for indicator in deal["indicators"]] == [
+        "RSI_CROSSBACK",
+        "WILLR_MEAN_REVERSION",
+    ]
+    assert deal["policy_target_count"] == 2
+    assert deal["pair"]["playhand_family_policy"] == "template_locked"
+    assert all(slot["slot"] != "role_balanced_fill" for slot in deal["selected_slots"])
     assert all(slot["indicator_id"] != "BAD_FILL" for slot in deal["selected_slots"])
 
 

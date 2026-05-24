@@ -102,6 +102,10 @@ if __package__ in {None, ""}:
         DEFAULT_RECIPE_PRIORS_DIRNAME,
         build_recipe_priors,
     )
+    from autoresearch.playhand_outcome_priors import (
+        DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME,
+        build_playhand_outcome_priors,
+    )
     from autoresearch.discovery_pair_atlas import (
         DEFAULT_DISCOVERY_PAIR_DIRNAME,
         DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS,
@@ -278,6 +282,10 @@ else:
     from .recipe_priors import (
         DEFAULT_RECIPE_PRIORS_DIRNAME,
         build_recipe_priors,
+    )
+    from .playhand_outcome_priors import (
+        DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME,
+        build_playhand_outcome_priors,
     )
     from .discovery_pair_atlas import (
         DEFAULT_DISCOVERY_PAIR_DIRNAME,
@@ -473,6 +481,7 @@ PUBLIC_CLI_COMMANDS = {
     "run-anchor-pair-probes",
     "build-anchor-pair-timing-atlas",
     "run-anchor-pair-timing-probes",
+    "build-playhand-outcome-priors",
     "build-recipe-priors",
     "build-discovery-pair-atlas",
     "run-discovery-pair-probes",
@@ -1257,6 +1266,15 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     recipe_priors.add_argument(
+        "--playhand-outcome-priors-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Input Play Hand outcome-priors directory. "
+            "Default: runs/derived/playhand-outcome-priors when present."
+        ),
+    )
+    recipe_priors.add_argument(
         "--out-dir",
         type=Path,
         default=None,
@@ -1275,6 +1293,32 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Maximum empirical pair candidates kept. Default: 80.",
     )
     recipe_priors.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    outcome_priors = subparsers.add_parser(
+        "build-playhand-outcome-priors",
+        help="Build pair-family and recipe outcome policy priors from Play Hand batch reports.",
+    )
+    outcome_priors.add_argument(
+        "--report-dir",
+        type=Path,
+        action="append",
+        default=None,
+        help=(
+            "Input recipe-performance report directory. May be repeated. "
+            "Default: discovered cgpt review/playhand-prior-test-clean-* and runs/derived equivalents."
+        ),
+    )
+    outcome_priors.add_argument(
+        "--out-dir",
+        type=Path,
+        default=None,
+        help=f"Output directory. Default: runs/derived/{DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME}.",
+    )
+    outcome_priors.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON summary.",
@@ -12475,6 +12519,7 @@ def cmd_build_recipe_priors(
     anchor_pair_dir: Path | None,
     anchor_pair_timing_dir: Path | None,
     discovery_recipe_validation_dir: Path | None,
+    playhand_outcome_priors_dir: Path | None,
     out_dir: Path | None,
     max_slot_candidates: int,
     max_pair_candidates: int,
@@ -12489,6 +12534,7 @@ def cmd_build_recipe_priors(
         anchor_pair_dir=anchor_pair_dir,
         anchor_pair_timing_dir=anchor_pair_timing_dir,
         discovery_recipe_validation_dir=discovery_recipe_validation_dir,
+        playhand_outcome_priors_dir=playhand_outcome_priors_dir,
         out_dir=out_dir,
         max_slot_candidates=max_slot_candidates,
         max_pair_candidates=max_pair_candidates,
@@ -12543,6 +12589,50 @@ def cmd_build_recipe_priors(
                 ]
             ),
             title="Recipe Prior Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
+def cmd_build_playhand_outcome_priors(
+    *,
+    report_dirs: list[Path] | None,
+    out_dir: Path | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    result = build_playhand_outcome_priors(
+        config,
+        report_dirs=report_dirs,
+        out_dir=out_dir,
+    )
+    payload = result.as_summary()
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    counts = result.summary.get("result_counts", {})
+    table = Table(title="Play Hand Outcome Priors", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Pair families", str(counts.get("pair_family_rows", 0)))
+    table.add_row("Recipes", str(counts.get("recipe_rows", 0)))
+    table.add_row("Template locked families", str(counts.get("template_locked_pair_families", 0)))
+    table.add_row("Template guarded families", str(counts.get("template_guarded_pair_families", 0)))
+    table.add_row("Mutation friendly families", str(counts.get("mutation_friendly_pair_families", 0)))
+    console.print(table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Outcome priors: {result.priors_path}",
+                    f"Pair family CSV: {result.pair_csv_path}",
+                    f"Recipe CSV: {result.recipe_csv_path}",
+                    f"Summary: {result.summary_path}",
+                ]
+            ),
+            title="Play Hand Outcome Prior Artifacts",
             border_style="green",
         )
     )
@@ -13299,6 +13389,13 @@ def main(argv: list[str] | None = None) -> int:
             max_slot_candidates=args.max_slot_candidates,
             max_pair_candidates=args.max_pair_candidates,
             discovery_recipe_validation_dir=args.discovery_recipe_validation_dir,
+            playhand_outcome_priors_dir=args.playhand_outcome_priors_dir,
+            as_json=bool(args.json),
+        )
+    if args.command == "build-playhand-outcome-priors":
+        return cmd_build_playhand_outcome_priors(
+            report_dirs=args.report_dir,
+            out_dir=args.out_dir,
             as_json=bool(args.json),
         )
     if args.command == "build-discovery-pair-atlas":

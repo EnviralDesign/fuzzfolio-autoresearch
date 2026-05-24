@@ -1,0 +1,178 @@
+{
+  "generated_at": "2026-05-24T19:28:47.9937601Z",
+  "tests": "uv run pytest tests/test_playhand_outcome_priors.py tests/test_recipe_priors.py tests/test_play_hand.py tests/test_provider_trace.py -q => 91 passed",
+  "commands": [
+    "uv run build-playhand-outcome-priors --json",
+    "uv run build-recipe-priors --json"
+  ],
+  "sampling_policy": {
+    "guided_prior_fraction": 0.7,
+    "uncertain_prior_fraction": 0.2,
+    "wild_exploration_fraction": 0.1,
+    "maturity": "limited_36m_retention",
+    "retained_36m_family_count": 3,
+    "template_instrument_policy": "seed_pool",
+    "interpretation": "Weights bias random selection; they do not hard-filter the catalog."
+  },
+  "target_drs_0002": {
+    "probe_id": "drs-0002-r006-rsi-crossback-willr-mean-reversi-m5",
+    "playhand_family_policy": "template_locked",
+    "playhand_recommended_max_indicators": 2,
+    "playhand_role_balanced_fill_limit": 0,
+    "playhand_family_cap_share": 0.15,
+    "pair_sampling_weight": 50.2302,
+    "pair_sampling_weight_uncapped": 71.6706,
+    "pair_sampling_weight_capped": 50.2302
+  },
+  "outcome_prior_counts": {
+    "pair_family_rows": 33,
+    "recipe_rows": 10,
+    "template_locked_pair_families": 2,
+    "template_guarded_pair_families": 2,
+    "mutation_friendly_pair_families": 0
+  },
+  "template_locked_families": [
+    {
+      "family_id": "drs-0002-r006-rsi-crossback-willr-mean-reversi-m5",
+      "count": "18",
+      "promoted": "18",
+      "promotion_rate": "1.0",
+      "exact_rescue_rate": "0.5556",
+      "exact_selected_rate": "0.8333",
+      "avg_mutation_delta": "-44.3961",
+      "recommended_max_indicators": "2",
+      "role_balanced_fill_limit": "0",
+      "family_cap_share": "0.15"
+    },
+    {
+      "family_id": "drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5",
+      "count": "10",
+      "promoted": "10",
+      "promotion_rate": "1.0",
+      "exact_rescue_rate": "0.6",
+      "exact_selected_rate": "0.8",
+      "avg_mutation_delta": "-26.2874",
+      "recommended_max_indicators": "2",
+      "role_balanced_fill_limit": "0",
+      "family_cap_share": "0.15"
+    }
+  ],
+  "template_guarded_families": [
+    {
+      "family_id": "drs-0003-r006-willr-mean-reversi-rsi-crossback-m5",
+      "count": "18",
+      "promoted": "18",
+      "promotion_rate": "1.0",
+      "exact_rescue_rate": "0.3333",
+      "exact_selected_rate": "0.6667",
+      "avg_mutation_delta": "-22.285",
+      "recommended_max_indicators": "4",
+      "role_balanced_fill_limit": "1",
+      "family_cap_share": "0.15"
+    },
+    {
+      "family_id": "drs-0004-r001-thrust-bar-signal-channel-reentry-m5",
+      "count": "4",
+      "promoted": "4",
+      "promotion_rate": "1.0",
+      "exact_rescue_rate": "0.25",
+      "exact_selected_rate": "1.0",
+      "avg_mutation_delta": "-2.2208",
+      "recommended_max_indicators": "4",
+      "role_balanced_fill_limit": "1",
+      "family_cap_share": "0.15"
+    }
+  ],
+  "recipe_policies": [
+    {
+      "recipe": "discovered_recipe_006",
+      "count": "36",
+      "promoted": "36",
+      "promotion_rate": "1.0",
+      "recipe_policy": "template_locked",
+      "recipe_sampling_weight_multiplier": "1.1",
+      "recipe_cap_share": "0.3"
+    },
+    {
+      "recipe": "discovered_recipe_003",
+      "count": "23",
+      "promoted": "23",
+      "promotion_rate": "1.0",
+      "recipe_policy": "template_guarded",
+      "recipe_sampling_weight_multiplier": "1.05",
+      "recipe_cap_share": "0.3"
+    },
+    {
+      "recipe": "mean_reversion_reclaim",
+      "count": "19",
+      "promoted": "12",
+      "promotion_rate": "0.6316",
+      "recipe_policy": "unstable",
+      "recipe_sampling_weight_multiplier": "1.0",
+      "recipe_cap_share": "0.2"
+    },
+    {
+      "recipe": "trend_pullback_continuation",
+      "count": "9",
+      "promoted": "3",
+      "promotion_rate": "0.3333",
+      "recipe_policy": "unstable",
+      "recipe_sampling_weight_multiplier": "0.6",
+      "recipe_cap_share": "0.12"
+    },
+    {
+      "recipe": "breakout_compression_release",
+      "count": "8",
+      "promoted": "4",
+      "promotion_rate": "0.5",
+      "recipe_policy": "unstable",
+      "recipe_sampling_weight_multiplier": "0.85",
+      "recipe_cap_share": "0.18"
+    },
+    {
+      "recipe": "discovered_recipe_001",
+      "count": "5",
+      "promoted": "4",
+      "promotion_rate": "0.8",
+      "recipe_policy": "template_guarded",
+      "recipe_sampling_weight_multiplier": "1.0",
+      "recipe_cap_share": "0.25"
+    },
+    {
+      "recipe": "discovered_recipe_002",
+      "count": "4",
+      "promoted": "4",
+      "promotion_rate": "1.0",
+      "recipe_policy": "unstable",
+      "recipe_sampling_weight_multiplier": "1.05",
+      "recipe_cap_share": "0.3"
+    },
+    {
+      "recipe": "profile_value_context",
+      "count": "4",
+      "promoted": "2",
+      "promotion_rate": "0.5",
+      "recipe_policy": "unstable",
+      "recipe_sampling_weight_multiplier": "0.85",
+      "recipe_cap_share": "0.18"
+    },
+    {
+      "recipe": "discovered_recipe_007",
+      "count": "1",
+      "promoted": "1",
+      "promotion_rate": "1.0",
+      "recipe_policy": "under_sampled",
+      "recipe_sampling_weight_multiplier": "1.05",
+      "recipe_cap_share": "0.3"
+    },
+    {
+      "recipe": "discovered_recipe_005",
+      "count": "1",
+      "promoted": "1",
+      "promotion_rate": "1.0",
+      "recipe_policy": "under_sampled",
+      "recipe_sampling_weight_multiplier": "1.05",
+      "recipe_cap_share": "0.3"
+    }
+  ]
+}

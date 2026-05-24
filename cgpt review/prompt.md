@@ -1,190 +1,153 @@
 # CGPT Review Packet
 
-Please review the latest Fuzzfolio AutoResearch state as a technical/design reviewer. This packet covers the completed clean 100-seed Play Hand confirmation batch and compares it against the earlier clean 50-seed batch.
+Please review the latest Fuzzfolio AutoResearch state as a technical/design reviewer. This packet now covers the family-aware Play Hand policy implementation requested after the clean-100 confirmation batch.
 
-## What Changed Since Your Last Review
+## Start Here
 
-The clean 100-seed confirmation batch has finished and the report builder was tightened per your requests:
+New packet:
 
-- The final packet only uses `batch_status.completed == 100`.
-- `mutation_delta` is only computed when both exact-template and mutated branch scores exist.
-- Blank, unknown, and policy-exploration rows are excluded from pair/template-family concentration metrics.
-- Unique promoted pair/template families exclude blank/unknown families.
-- Clean-50 and clean-100 family labels are computed independently before comparison.
-- Report outputs now include family classification rules, data hygiene notes, mutation-delta metrics, source hit rates, family concentration, and clean-50 vs clean-100 comparison artifacts.
+- `cgpt review/family-policy-v1/acceptance-check.json`
+- `cgpt review/family-policy-v1/playhand-outcome-priors.json`
+- `cgpt review/family-policy-v1/pair-family-outcome-priors.csv`
+- `cgpt review/family-policy-v1/recipe-outcome-priors.csv`
+- `cgpt review/family-policy-v1/play-hand-seed-plan-excerpt.json`
+- `cgpt review/family-policy-v1/playhand-outcome-priors-summary.json`
+- `cgpt review/family-policy-v1/recipe-priors-summary.json`
 
-Command template:
-
-```powershell
-uv run play-hand --seed <seed> --coarse-mode evolutionary --sweep-budget high --min-indicators 2 --max-indicators 4 --final-profile-drop-count 0 --json
-```
-
-Batch directory:
-
-```text
-runs/derived/playhand-prior-test-clean-100
-```
-
-Review packet directory:
-
-```text
-cgpt review/playhand-prior-test-clean-100
-```
-
-## New Report Artifacts
-
-Please start with:
+Previous clean batch packet remains available:
 
 - `cgpt review/playhand-prior-test-clean-100/recipe-performance-report.md`
 - `cgpt review/playhand-prior-test-clean-100/recipe-performance-comparison-clean50-vs-clean100.md`
 - `cgpt review/playhand-prior-test-clean-100/recipe-performance-dashboard.html`
-- `cgpt review/playhand-prior-test-clean-100/recipe-performance-report.json`
-- `cgpt review/playhand-prior-test-clean-100/recipe-performance-comparison-clean50-vs-clean100.json`
 - `cgpt review/playhand-prior-test-clean-100/recipe-performance-runs.csv`
-- `cgpt review/playhand-prior-test-clean-100/recipe-performance-recipes.csv`
 - `cgpt review/playhand-prior-test-clean-100/recipe-performance-pairs.csv`
+- `cgpt review/playhand-prior-test-clean-100/recipe-performance-recipes.csv`
 
-Source batch artifacts copied for audit:
+## What Changed
 
-- `cgpt review/playhand-prior-test-clean-100/batch-status.json`
-- `cgpt review/playhand-prior-test-clean-100/batch-run.log`
-- `cgpt review/playhand-prior-test-clean-100/run-clean-100.ps1`
+I added a Play Hand outcome-prior layer that backprops clean-50 and clean-100 report outcomes into recipe priors and Play Hand seed-plan behavior.
 
-Reusable report builder:
+New CLI:
 
-- `scripts/build_playhand_prior_batch_report.py`
-
-## Headline Clean-100 Results
-
-The batch completed without execution failures:
-
-- 100/100 runs completed.
-- 73 promoted.
-- 27 tombstoned.
-- 0 failed.
-- 73% promotion rate.
-- Median final scrutiny score: 62.6199.
-- Best final scrutiny score: 79.8725.
-
-Guided prior materialization stayed healthy:
-
-- 72 runs used `play_hand_seed_plan`.
-- 28 runs used `role_balanced_policy_exploration`.
-- 46 runs materialized exact retained-template branches.
-- 0 retained templates failed to materialize.
-
-Exact-template branch attribution stayed important:
-
-- 69 selected the mutated branch.
-- 31 selected the exact-template branch.
-- 20 were `rescued_by_exact_template`.
-- 11 were `exact_template_outscored_mutated`.
-- 14 were `mutated_branch_selected` while a comparable exact template was present.
-
-Case counts:
-
-```text
-policy_exploration: 28
-no_template_curated_recipe: 26
-template_materialized_exact_passed_mutated_passed: 24
-template_materialized_exact_passed_mutated_failed: 20
-template_materialized_both_failed: 1
-template_materialized_exact_failed_mutated_passed: 1
+```powershell
+uv run build-playhand-outcome-priors --json
 ```
 
-Source hit rates:
+It reads report artifacts from `cgpt review/playhand-prior-test-clean-*` and emits:
 
 ```text
-discovered_recipe_hit_rate: 45/46 = 97.83%
-curated_recipe_hit_rate: 13/26 = 50.00%
-policy_exploration_hit_rate: 15/28 = 53.57%
+runs/derived/playhand-outcome-priors/playhand-outcome-priors.json
+runs/derived/playhand-outcome-priors/pair-family-outcome-priors.csv
+runs/derived/playhand-outcome-priors/recipe-outcome-priors.csv
+runs/derived/playhand-outcome-priors/playhand-outcome-priors-summary.json
 ```
 
-## Clean-50 vs Clean-100
+Then `uv run build-recipe-priors --json` consumes those outcome priors automatically and injects family policies into `runs/derived/recipe-priors/play-hand-seed-plan.json`.
 
-The comparison artifact shows the core clean-50 signal mostly held:
+## Implemented Policy
+
+Pair/template families are classified as:
 
 ```text
-promotion_rate: 72% -> 73%
-template_materialization_rate: 48% -> 46%
-exact_rescue_rate: 29.17% -> 43.48%
-mutation_improvement_rate: 33.33% -> 30.43%
-policy_exploration_hit_rate: 33.33% -> 53.57%
-discovered_recipe_hit_rate: 100% -> 97.83%
-curated_recipe_hit_rate: 57.14% -> 50.00%
-top_family_concentration_share: 12% -> 15%
-unique_promoted_pair_families: 13 -> 16
-median_final_score: 63.013 -> 62.6199
-best_final_score: 75.1727 -> 79.8725
+under_sampled: count < 3
+template_locked: exact_rescue_rate >= 0.40
+mutation_friendly: mutated_win_rate >= 0.60 and avg_mutation_delta > 3
+template_guarded: exact_selected_rate >= 0.40
+unstable: otherwise
 ```
 
-The main change from clean-50 is not collapse. It is a clearer split between discovered templates, exact-template rescue behavior, and policy exploration still producing occasional wins.
+Current combined clean-50 + clean-100 outcome summary:
 
-## Family-Level Read
+```text
+pair_family_rows: 33
+recipe_rows: 10
+template_locked_pair_families: 2
+template_guarded_pair_families: 2
+mutation_friendly_pair_families: 0
+```
 
-Current top discovered/template families:
+The important acceptance row landed:
 
-- `drs-0002-r006-rsi-crossback-willr-mean-reversi-m5`: 15/15 promoted, classified `template_locked`, 10 exact rescues, avg mutation delta -44.3961.
-- `drs-0003-r006-willr-mean-reversi-rsi-crossback-m5`: 12/12 promoted, classified `template_guarded`, 4 exact rescues, avg mutation delta -22.285.
-- `drs-0008-r003-mfi-trend-obv-mean-reversion-m15`: 7/7 promoted, classified `template_guarded`, 2 exact rescues, avg mutation delta -18.328.
-- `drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5`: 6/6 promoted, classified `template_guarded`, 2 exact rescues, avg mutation delta -26.2874.
-- `l3-035-rsi-mean-reversion-toby-crabel-narrow-range-m5`: 5/7 promoted, classified `unstable`.
+```text
+drs-0002-r006-rsi-crossback-willr-mean-reversi-m5
+  family_policy: template_locked
+  count: 18
+  promoted: 18
+  exact_rescue_rate: 0.5556
+  exact_selected_rate: 0.8333
+  avg_mutation_delta: -44.3961
+  recommended_max_indicators: 2
+  role_balanced_fill_limit: 0
+  family_cap_share: 0.15
+```
 
-Recipe-level highlights:
+The rebuilt seed plan preserves global sampling at:
 
-- `discovered_recipe_006`: 27/27 promoted, classified `template_locked`.
-- `discovered_recipe_003`: 13/13 promoted, classified `template_guarded`.
-- `discovered_recipe_002`: 3/3 promoted, but still thin.
-- `mean_reversion_reclaim`: 7/11 promoted.
-- `breakout_compression_release`: 3/4 promoted.
-- `trend_pullback_continuation`: 1/7 promoted.
-- `profile_value_context`: 2/4 promoted.
+```text
+guided_prior_fraction: 0.70
+uncertain_prior_fraction: 0.20
+wild_exploration_fraction: 0.10
+```
 
-## My Current Read
+## Play Hand Behavior Change
 
-This looks like confirmation that the prior/template loop is useful:
+When a selected seed-plan pair carries `playhand_family_policy`:
 
-- The clean-50 promotion rate held on clean-100.
-- Discovered recipe validation remained much stronger than curated recipe priors.
-- Exact-template preservation was not optional; 20 clean-100 runs were rescued by exact template.
-- Mutation still helps sometimes, but the family-level data is leaning more template-protective than mutation-friendly for the best retained families.
-- Family concentration increased only modestly after excluding unknown/policy rows, and unique promoted pair families increased from 13 to 16.
-- Policy exploration is still worth preserving because it promoted 15/28 in clean-100.
+- `template_locked` caps the guided deal to the retained pair and blocks role-balanced fill by default.
+- `template_guarded` still preserves the exact template branch and allows limited expansion.
+- `mutation_friendly` would allow more expansion, but no family currently qualifies under the combined clean-50 + clean-100 rule.
+- Policy exploration still uses the backend seed prompt pool, not seed-plan candidates.
 
-My tentative conclusion is: keep global `70/20/10`, add family caps and family mutation policies, and do not broaden discovery until Play Hand can feed these family outcomes back into priors cleanly.
+This is intentionally family-aware rather than a global move from `70/20/10` to `80/15/5`.
 
-## Questions For This Review
+## Files Changed
 
-1. Does clean-100 confirm the clean-50 signal strongly enough to move from measurement/reporting into family-aware Play Hand policy?
-2. Should `drs-0002` be treated as `template_locked` immediately, given 15/15 promoted and 10 exact rescues?
-3. Should `drs-0003`, `drs-0008`, and `drs-0001` be `template_guarded` rather than mutation-friendly, given negative average mutation deltas?
-4. Should `trend_pullback_continuation` and weak curated anchor-pair menus be demoted now, or only capped pending more data?
-5. Is global `70/20/10` still right, or should we keep global policy stable and only adjust inside guided sampling?
-6. What family caps would you use now: max share per exact pair/template family and max share per discovered recipe?
-7. Should the next implementation branch be:
-   - family-aware mutation policy (`template_locked`, `template_guarded`, `mutation_friendly`);
-   - family concentration caps;
-   - outcome backprop from Play Hand reports into recipe priors;
-   - pair-plus / conditional third-indicator testing;
-   - or another confirmation batch?
-8. Is it time to start using these Play Hand batch results as negative evidence against weak curated recipes and mutation-heavy expansions?
+Core implementation:
+
+- `autoresearch/playhand_outcome_priors.py`
+- `autoresearch/recipe_priors.py`
+- `autoresearch/play_hand.py`
+- `autoresearch/__main__.py`
+- `pyproject.toml`
+
+Tests:
+
+- `tests/test_playhand_outcome_priors.py`
+- `tests/test_recipe_priors.py`
+- `tests/test_play_hand.py`
+- `tests/test_provider_trace.py`
 
 ## Verification
 
 Commands run:
 
 ```powershell
-uv run python scripts\build_playhand_prior_batch_report.py --batch-dir runs\derived\playhand-prior-test-clean-100 --review-dir "cgpt review\playhand-prior-test-clean-100"
-uv run python scripts\build_playhand_prior_batch_report.py --batch-dir runs\derived\playhand-prior-test-clean-50 --out-dir runs\derived\report-smoke-clean50
-uv run python scripts\build_playhand_prior_batch_report.py --batch-dir runs\derived\playhand-prior-test-clean-100 --out-dir runs\derived\report-smoke-clean100
-uv run python -m py_compile scripts\build_playhand_prior_batch_report.py
+uv run python -m py_compile autoresearch\playhand_outcome_priors.py autoresearch\recipe_priors.py autoresearch\play_hand.py autoresearch\__main__.py
+uv run pytest tests/test_playhand_outcome_priors.py tests/test_recipe_priors.py tests/test_play_hand.py tests/test_provider_trace.py -q
+uv run build-playhand-outcome-priors --json
+uv run build-recipe-priors --json
 ```
 
-The final clean-100 status is:
+Test result:
 
 ```text
-completed: 100
-failed: 0
-status: completed
-finished_at: 2026-05-24T17:17:48.3829003Z
+91 passed
 ```
+
+Seed-plan acceptance check:
+
+```text
+drs-0002 family_policy: template_locked
+recommended_max_indicators: 2
+role_balanced_fill_limit: 0
+global sampling: 70/20/10
+```
+
+## Questions For Pro
+
+1. Does this satisfy the requested family-aware policy branch before `clean-50-family-policy-v1`?
+2. Are the classification thresholds right for v1, especially `template_locked = exact_rescue_rate >= 0.40` and `mutation_friendly = mutated_win_rate >= 0.60 plus avg_delta > 3`?
+3. Should `drs-0008 MFI_TREND + OBV_MEAN_REVERSION` remain `unstable` under combined clean-50 + clean-100 because the average mutation delta is negative, or should it be manually treated as `template_guarded` because prior discussion considered it mutation-friendly?
+4. Should unstable retained families be downweighted to `0.65`, or is that too punitive while the sample is still small?
+5. Are the starting caps right: `0.15` per exact pair/template family and `0.30` per discovered recipe?
+6. If this looks good, should the next command be a clean `50` seed confirmation batch named `playhand-prior-test-clean-50-family-policy-v1`?

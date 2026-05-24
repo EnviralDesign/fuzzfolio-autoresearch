@@ -609,6 +609,9 @@ def _weighted_seed_plan_choice(
 
 
 def _seed_plan_recipe_weight(recipe_payload: dict[str, Any]) -> float:
+    explicit_weight = _seed_plan_float(recipe_payload.get("recipe_sampling_weight"))
+    if explicit_weight > 0.0:
+        return explicit_weight
     pair_menu = recipe_payload.get("pair_menu")
     if isinstance(pair_menu, list) and pair_menu:
         return sum(
@@ -632,6 +635,31 @@ def _seed_plan_recipe_weight(recipe_payload: dict[str, Any]) -> float:
             if isinstance(row, dict)
         )
     return total
+
+
+def _seed_pair_family_policy(pair: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(pair, dict):
+        return {}
+    policy = _seed_plan_dict(pair)
+    family_policy = str(policy.get("playhand_family_policy") or "").strip()
+    if not family_policy:
+        return {}
+    return {
+        "family_id": policy.get("playhand_family_id") or policy.get("probe_id"),
+        "family_policy": family_policy,
+        "family_policy_source": policy.get("playhand_family_policy_source"),
+        "family_cap_share": policy.get("playhand_family_cap_share"),
+        "recommended_max_indicators": policy.get("playhand_recommended_max_indicators"),
+        "role_balanced_fill_limit": policy.get("playhand_role_balanced_fill_limit"),
+        "mutation_pressure": policy.get("playhand_mutation_pressure"),
+        "sampling_weight_multiplier": policy.get("playhand_sampling_weight_multiplier"),
+        "exact_branch_required": policy.get("playhand_exact_branch_required"),
+        "exact_rescue_rate": policy.get("playhand_exact_rescue_rate"),
+        "mutated_win_rate": policy.get("playhand_mutated_win_rate"),
+        "avg_mutation_delta": policy.get("playhand_avg_mutation_delta"),
+        "promotion_rate": policy.get("playhand_promotion_rate"),
+        "observation_count": policy.get("playhand_observation_count"),
+    }
 
 
 def _load_play_hand_seed_plan(config: AppConfig) -> tuple[dict[str, Any] | None, Path | None]:
@@ -768,6 +796,9 @@ def deal_seed_plan_indicators(
     selected_ids: list[str] = []
     selected_slots: list[dict[str, Any]] = []
     selected_pair: dict[str, Any] | None = None
+    selected_family_policy: dict[str, Any] = {}
+    policy_target_count = target_count
+    role_balanced_fill_limit: int | None = None
     negative_pair_keys = _seed_plan_hard_negative_pair_keys(seed_plan)
 
     def add_indicator(
@@ -810,6 +841,10 @@ def deal_seed_plan_indicators(
             ),
         )
         if isinstance(pair, dict):
+            candidate_family_policy = _seed_pair_family_policy(pair)
+            recommended_max = int(
+                _seed_plan_float(candidate_family_policy.get("recommended_max_indicators"))
+            )
             first_id = pair.get("anchor_id")
             second_id = pair.get("trigger_id")
             added_first = add_indicator(
@@ -825,6 +860,12 @@ def deal_seed_plan_indicators(
                 allow_negative_pair=True,
             )
             if added_first or added_second:
+                selected_family_policy = candidate_family_policy
+                if recommended_max >= 2:
+                    policy_target_count = min(policy_target_count, recommended_max)
+                fill_limit_value = selected_family_policy.get("role_balanced_fill_limit")
+                if fill_limit_value not in {None, ""}:
+                    role_balanced_fill_limit = max(0, int(_seed_plan_float(fill_limit_value)))
                 selected_pair = {
                     "probe_id": pair.get("probe_id"),
                     "first_indicator_id": _seed_plan_upper(first_id),
@@ -835,12 +876,25 @@ def deal_seed_plan_indicators(
                     "retention_bucket": pair.get("retention_bucket"),
                     "recommended_profile_template": pair.get("recommended_profile_template"),
                     "source": pair.get("source"),
+                    "playhand_family_policy": selected_family_policy.get("family_policy"),
+                    "playhand_family_id": selected_family_policy.get("family_id"),
+                    "playhand_family_policy_source": selected_family_policy.get("family_policy_source"),
+                    "playhand_recommended_max_indicators": selected_family_policy.get("recommended_max_indicators"),
+                    "playhand_role_balanced_fill_limit": selected_family_policy.get("role_balanced_fill_limit"),
+                    "playhand_mutation_pressure": selected_family_policy.get("mutation_pressure"),
+                    "playhand_sampling_weight_multiplier": selected_family_policy.get("sampling_weight_multiplier"),
+                    "playhand_exact_branch_required": selected_family_policy.get("exact_branch_required"),
+                    "playhand_exact_rescue_rate": selected_family_policy.get("exact_rescue_rate"),
+                    "playhand_mutated_win_rate": selected_family_policy.get("mutated_win_rate"),
+                    "playhand_avg_mutation_delta": selected_family_policy.get("avg_mutation_delta"),
+                    "playhand_promotion_rate": selected_family_policy.get("promotion_rate"),
+                    "playhand_observation_count": selected_family_policy.get("observation_count"),
                 }
 
     slot_menus = recipe_payload.get("slot_menus")
     if isinstance(slot_menus, dict):
         for slot_name in _seed_plan_slots_in_order(slot_menus):
-            if len(selected_ids) >= target_count:
+            if len(selected_ids) >= policy_target_count:
                 break
             rows = [row for row in list(slot_menus.get(slot_name) or []) if isinstance(row, dict)]
             rows = [row for row in rows if _seed_plan_upper(row.get("indicator_id")) not in selected_ids]
@@ -853,6 +907,7 @@ def deal_seed_plan_indicators(
                 add_indicator(candidate.get("indicator_id"), slot=slot_name, evidence=candidate)
 
     if len(selected_ids) < target_count:
+        role_balanced_added = 0
         remaining = [
             indicator
             for indicator in guided_indicators
@@ -862,14 +917,20 @@ def deal_seed_plan_indicators(
             remaining,
             target_count=len(remaining),
         ):
-            if len(selected_ids) >= target_count:
+            if len(selected_ids) >= policy_target_count:
                 break
-            add_indicator(
+            if (
+                role_balanced_fill_limit is not None
+                and role_balanced_added >= role_balanced_fill_limit
+            ):
+                break
+            if add_indicator(
                 indicator.id,
                 slot="role_balanced_fill",
                 evidence={"source": "role_balanced_fill"},
                 allow_negative_pair=False,
-            )
+            ):
+                role_balanced_added += 1
 
     selected = [by_id[indicator_id] for indicator_id in selected_ids if indicator_id in by_id]
     if not selected:
@@ -887,6 +948,8 @@ def deal_seed_plan_indicators(
         "recipe_source": recipe_payload.get("source"),
         "recipe_confidence": recipe_payload.get("recipe_confidence"),
         "pair": selected_pair,
+        "family_policy": selected_family_policy,
+        "policy_target_count": policy_target_count,
         "selected_slots": selected_slots,
     }
 
@@ -4098,6 +4161,8 @@ def cmd_play_hand(
         "dealt_recipe_source": indicator_deal.get("recipe_source"),
         "dealt_recipe_confidence": indicator_deal.get("recipe_confidence"),
         "dealt_recipe_pair": indicator_deal.get("pair"),
+        "dealt_pair_family_policy": indicator_deal.get("family_policy"),
+        "dealt_policy_target_count": indicator_deal.get("policy_target_count"),
         "dealt_recipe_slots": indicator_deal.get("selected_slots"),
         "dealt_indicator_count": len(dealt),
         "min_indicators": effective_min_indicators,
@@ -4168,6 +4233,8 @@ def cmd_play_hand(
         dealt_recipe=indicator_deal.get("recipe"),
         dealt_recipe_source=indicator_deal.get("recipe_source"),
         dealt_recipe_pair=indicator_deal.get("pair"),
+        dealt_pair_family_policy=indicator_deal.get("family_policy"),
+        dealt_policy_target_count=indicator_deal.get("policy_target_count"),
         dealt_recipe_slots=indicator_deal.get("selected_slots"),
         dealt_indicator_count=len(dealt),
         min_indicators=effective_min_indicators,

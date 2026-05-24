@@ -212,6 +212,91 @@ def test_build_recipe_prior_artifacts_adds_validated_discovered_recipes() -> Non
     assert summary["result_counts"]["discovered_recipe_count"] == 1
 
 
+def test_build_recipe_prior_artifacts_injects_playhand_outcome_policy() -> None:
+    indicators = [
+        _indicator("RSI_CROSSBACK", signal_role="setup", strategy_role="mean-reversion"),
+        _indicator("WILLR_MEAN_REVERSION", signal_role="trigger", strategy_role="mean-reversion"),
+    ]
+
+    (
+        _payload,
+        _slot_rows,
+        pair_rows,
+        _negative_pairs,
+        _negative_clusters,
+        _retention_failures,
+        seed_plan,
+        summary,
+    ) = build_recipe_prior_artifacts(
+        indicator_rows=indicators,
+        static_slot_scores={},
+        signal_rollups={},
+        forward_priors={},
+        pair_results=[],
+        timing_results=[],
+        discovery_validation_results=[
+            {
+                "status": "ok",
+                "recipe_id": "discovered_recipe_006",
+                "recipe_confidence": "high_candidate",
+                "first_indicator_id": "RSI_CROSSBACK",
+                "second_indicator_id": "WILLR_MEAN_REVERSION",
+                "probe_timeframe": "M5",
+                "probe_id": "drs-0002-r006-rsi-crossback-willr-mean-reversi-m5",
+                "primary_score": "70",
+                "composite_score": "70",
+                "validation_priority_score": "70",
+                "discovery_evidence_score": "74",
+                "retention_ratio": "0.95",
+                "retention_bucket": "retained",
+            }
+        ],
+        playhand_outcome_priors={
+            "pair_families": {
+                "drs-0002-r006-rsi-crossback-willr-mean-reversi-m5": {
+                    "family_policy": "template_locked",
+                    "source_batches": "playhand-prior-test-clean-100",
+                    "family_cap_share": 0.15,
+                    "recommended_max_indicators": 2,
+                    "role_balanced_fill_limit": 0,
+                    "mutation_pressure": "low",
+                    "sampling_weight_multiplier": 1.15,
+                    "exact_branch_required": True,
+                    "exact_rescue_rate": 0.6667,
+                    "mutated_win_rate": 0.1333,
+                    "avg_mutation_delta": -44.3961,
+                    "promotion_rate": 1.0,
+                    "count": 15,
+                }
+            },
+            "recipes": {
+                "discovered_recipe_006": {
+                    "recipe_policy": "template_locked",
+                    "recipe_sampling_weight_multiplier": 1.10,
+                    "recipe_cap_share": 0.30,
+                    "promotion_rate": 1.0,
+                    "count": 27,
+                    "source_batches": "playhand-prior-test-clean-100",
+                }
+            },
+        },
+        max_slot_candidates=5,
+        max_pair_candidates=5,
+    )
+
+    pair = seed_plan["recipes"]["discovered_recipe_006"]["pair_menu"][0]
+    recipe = seed_plan["recipes"]["discovered_recipe_006"]
+    assert pair_rows[0]["playhand_family_policy"] == "template_locked"
+    assert pair["playhand_recommended_max_indicators"] == 2
+    assert pair["playhand_role_balanced_fill_limit"] == 0
+    assert pair["playhand_exact_branch_required"] is True
+    assert pair["playhand_family_cap_share"] == 0.15
+    assert pair["pair_sampling_weight"] == pair["pair_sampling_weight_uncapped"]
+    assert recipe["playhand_recipe_policy"] == "template_locked"
+    assert recipe["recipe_sampling_weight"] > 0
+    assert summary["result_counts"]["outcome_prior_pair_rows_annotated"] == 1
+
+
 def test_build_recipe_prior_artifacts_emits_negative_priors_for_retention_failures() -> None:
     indicators = [
         _indicator("FIRST_A", signal_role="setup", strategy_role="trend"),

@@ -1,0 +1,27 @@
+{
+  "schema_version": "playhand_outcome_priors_v1",
+  "generated_at": "2026-05-24T19:28:04.741372+00:00",
+  "source_report_dirs": [
+    "C:\\repos\\fuzzfolio-autoresearch\\cgpt review\\playhand-prior-test-clean-100",
+    "C:\\repos\\fuzzfolio-autoresearch\\cgpt review\\playhand-prior-test-clean-50"
+  ],
+  "result_counts": {
+    "pair_family_rows": 33,
+    "recipe_rows": 10,
+    "template_locked_pair_families": 2,
+    "template_guarded_pair_families": 2,
+    "mutation_friendly_pair_families": 0
+  },
+  "classification_rules": [
+    "under_sampled: count < 3",
+    "template_locked: exact_rescue_rate >= 0.40",
+    "mutation_friendly: mutated_win_rate >= 0.60 and avg_mutation_delta > 3",
+    "template_guarded: exact_selected_rate >= 0.40",
+    "unstable: otherwise"
+  ],
+  "policy_defaults": {
+    "max_exact_pair_template_family_share": 0.15,
+    "max_discovered_recipe_share": 0.3,
+    "global_sampling_policy": "preserve existing 70/20/10 when present"
+  }
+}

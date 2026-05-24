@@ -16,12 +16,14 @@ from .anchor_pair_atlas import (
     DEFAULT_ANCHOR_PAIR_DIRNAME,
     DEFAULT_ANCHOR_PAIR_TIMING_DIRNAME,
 )
+from .playhand_outcome_priors import DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME
 
 
 SCHEMA_VERSION = "empirical_recipe_priors_v1"
 DEFAULT_RECIPE_PRIORS_DIRNAME = "recipe-priors"
 DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME = "discovery-recipe-validation-atlas"
 DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME = "discovery-recipe-scrutiny-atlas"
+DEFAULT_PLAYHAND_OUTCOME_PRIORS_FILENAME = "playhand-outcome-priors.json"
 
 RECIPE_BY_ANCHOR_TYPE: dict[str, str] = {
     "trend": "trend_pullback_continuation",
@@ -622,6 +624,180 @@ def _profile_template_csv_bits(template: dict[str, Any] | None) -> dict[str, Any
     }
 
 
+def _playhand_pair_family_id(row: dict[str, Any]) -> str:
+    return _clean_token(row.get("probe_id"))
+
+
+def _playhand_outcome_maps(
+    payload: dict[str, Any] | None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return {}, {}, {}
+    pair_families = payload.get("pair_families")
+    recipes = payload.get("recipes")
+    return (
+        {
+            _clean_token(key): value
+            for key, value in (pair_families or {}).items()
+            if _clean_token(key) and isinstance(value, dict)
+        }
+        if isinstance(pair_families, dict)
+        else {},
+        {
+            _clean_token(key): value
+            for key, value in (recipes or {}).items()
+            if _clean_token(key) and isinstance(value, dict)
+        }
+        if isinstance(recipes, dict)
+        else {},
+        payload.get("summary") if isinstance(payload.get("summary"), dict) else {},
+    )
+
+
+def _copy_policy_fields(
+    target: dict[str, Any],
+    source: dict[str, Any],
+    mapping: dict[str, str],
+) -> None:
+    for source_key, target_key in mapping.items():
+        if source_key in source and source.get(source_key) not in {"", None}:
+            target[target_key] = source.get(source_key)
+
+
+def apply_playhand_outcome_pair_policy(
+    pair_rows: list[dict[str, Any]],
+    *,
+    outcome_priors: dict[str, Any] | None,
+) -> dict[str, Any]:
+    pair_outcomes, _recipe_outcomes, summary = _playhand_outcome_maps(outcome_priors)
+    annotated = 0
+    for row in pair_rows:
+        family_id = _playhand_pair_family_id(row)
+        outcome = pair_outcomes.get(family_id)
+        if not outcome:
+            continue
+        annotated += 1
+        original_weight = _float_value(row.get("pair_sampling_weight"))
+        multiplier = max(0.0, _float_value(outcome.get("sampling_weight_multiplier"), 1.0))
+        row["playhand_family_id"] = family_id
+        _copy_policy_fields(
+            row,
+            outcome,
+            {
+                "family_policy": "playhand_family_policy",
+                "source_batches": "playhand_family_policy_source",
+                "family_cap_share": "playhand_family_cap_share",
+                "recommended_max_indicators": "playhand_recommended_max_indicators",
+                "role_balanced_fill_limit": "playhand_role_balanced_fill_limit",
+                "mutation_pressure": "playhand_mutation_pressure",
+                "sampling_weight_multiplier": "playhand_sampling_weight_multiplier",
+                "exact_branch_required": "playhand_exact_branch_required",
+                "exact_rescue_rate": "playhand_exact_rescue_rate",
+                "mutated_win_rate": "playhand_mutated_win_rate",
+                "avg_mutation_delta": "playhand_avg_mutation_delta",
+                "promotion_rate": "playhand_promotion_rate",
+                "count": "playhand_observation_count",
+            },
+        )
+        row["pair_sampling_weight_uncapped"] = round(original_weight * multiplier, 4)
+        row["pair_sampling_weight"] = row["pair_sampling_weight_uncapped"]
+    _cap_weight_share(pair_rows, weight_key="pair_sampling_weight", cap_key="playhand_family_cap_share")
+    for row in pair_rows:
+        if "pair_sampling_weight_uncapped" in row:
+            row["pair_sampling_weight_capped"] = row.get("pair_sampling_weight")
+    return {
+        "outcome_prior_pair_family_rows": len(pair_outcomes),
+        "outcome_prior_pair_rows_annotated": annotated,
+        "outcome_prior_summary": summary,
+    }
+
+
+def _cap_weight_share(rows: list[dict[str, Any]], *, weight_key: str, cap_key: str) -> None:
+    total = sum(max(0.0, _float_value(row.get(weight_key))) for row in rows)
+    if total <= 0.0:
+        return
+    for row in rows:
+        cap = _float_value(row.get(cap_key))
+        weight = max(0.0, _float_value(row.get(weight_key)))
+        if cap <= 0.0 or cap >= 1.0 or weight <= 0.0:
+            continue
+        other_weight = max(0.0, total - weight)
+        if other_weight <= 0.0:
+            continue
+        max_weight = (cap / (1.0 - cap)) * other_weight
+        if weight > max_weight:
+            row[weight_key] = round(max_weight, 4)
+
+
+def _recipe_seed_weight(recipe_payload: dict[str, Any], pair_rows: list[dict[str, Any]]) -> float:
+    total = 0.0
+    recipe_name = _clean_token(recipe_payload.get("recipe_name"))
+    if recipe_name:
+        total += sum(
+            max(
+                _float_value(row.get("pair_sampling_weight")),
+                _float_value(row.get("pair_sampling_score")) * 0.20,
+            )
+            for row in pair_rows
+            if _clean_token(row.get("recipe")) == recipe_name
+        )
+    slots = recipe_payload.get("slots")
+    if isinstance(slots, dict):
+        for rows in slots.values():
+            for row in list(rows or [])[:8]:
+                if isinstance(row, dict):
+                    total += _float_value(row.get("sampling_weight"))
+    return total
+
+
+def build_recipe_seed_weights(
+    recipes: dict[str, Any],
+    pair_rows: list[dict[str, Any]],
+    *,
+    outcome_priors: dict[str, Any] | None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    _pair_outcomes, recipe_outcomes, _summary = _playhand_outcome_maps(outcome_priors)
+    weights: dict[str, dict[str, Any]] = {}
+    for recipe_name, recipe_payload in recipes.items():
+        payload = dict(recipe_payload) if isinstance(recipe_payload, dict) else {}
+        payload["recipe_name"] = recipe_name
+        base = _recipe_seed_weight(payload, pair_rows)
+        outcome = recipe_outcomes.get(recipe_name, {})
+        multiplier = max(0.0, _float_value(outcome.get("recipe_sampling_weight_multiplier"), 1.0))
+        row = {
+            "recipe_sampling_weight_base": round(base, 4),
+            "recipe_sampling_weight_uncapped": round(base * multiplier, 4),
+            "recipe_sampling_weight": round(base * multiplier, 4),
+        }
+        if outcome:
+            _copy_policy_fields(
+                row,
+                outcome,
+                {
+                    "recipe_policy": "playhand_recipe_policy",
+                    "recipe_sampling_weight_multiplier": "playhand_recipe_sampling_weight_multiplier",
+                    "recipe_cap_share": "playhand_recipe_cap_share",
+                    "promotion_rate": "playhand_recipe_promotion_rate",
+                    "count": "playhand_recipe_observation_count",
+                    "source_batches": "playhand_recipe_policy_source",
+                },
+            )
+        weights[recipe_name] = row
+    _cap_weight_share(
+        list(weights.values()),
+        weight_key="recipe_sampling_weight",
+        cap_key="playhand_recipe_cap_share",
+    )
+    for row in weights.values():
+        row["recipe_sampling_weight_capped"] = row.get("recipe_sampling_weight")
+    return weights, {
+        "outcome_prior_recipe_rows": len(recipe_outcomes),
+        "outcome_prior_recipe_rows_annotated": sum(
+            1 for recipe_name in recipes if recipe_name in recipe_outcomes
+        ),
+    }
+
+
 def build_discovered_recipe_prior_evidence(
     validation_rows: list[dict[str, Any]],
     *,
@@ -1093,8 +1269,9 @@ def build_recipe_prior_artifacts(
     timing_results: list[dict[str, Any]],
     discovery_validation_results: list[dict[str, Any]] | None = None,
     discovery_validation_profile_dir: Path | list[Path] | tuple[Path, ...] | None = None,
-    max_slot_candidates: int,
-    max_pair_candidates: int,
+    playhand_outcome_priors: dict[str, Any] | None = None,
+    max_slot_candidates: int = 40,
+    max_pair_candidates: int = 80,
 ) -> tuple[
     dict[str, Any],
     list[dict[str, Any]],
@@ -1194,6 +1371,10 @@ def build_recipe_prior_artifacts(
             _float_value(pair.get("pair_sampling_score")),
             pair_sampling_lane(_float_value(pair.get("pair_sampling_score"))),
         )
+    outcome_pair_summary = apply_playhand_outcome_pair_policy(
+        pair_priors,
+        outcome_priors=playhand_outcome_priors,
+    )
     pair_priors.sort(
         key=lambda row: (
             _float_value(row.get("pair_sampling_weight")),
@@ -1251,10 +1432,19 @@ def build_recipe_prior_artifacts(
             "interpretation": "Weights bias random selection; they do not hard-filter the catalog.",
         }
 
+    recipe_seed_weights, outcome_recipe_summary = build_recipe_seed_weights(
+        recipes,
+        pair_priors,
+        outcome_priors=playhand_outcome_priors,
+    )
     seed_plan = {
         "schema_version": "play_hand_seed_plan_v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "sampling_policy": sampling_policy,
+        "playhand_outcome_prior_summary": {
+            **outcome_pair_summary,
+            **outcome_recipe_summary,
+        },
         "negative_pairs": negative_pair_rows[:300],
         "recipes": {
             recipe_name: {
@@ -1262,6 +1452,7 @@ def build_recipe_prior_artifacts(
                 "recipe_confidence": recipe_payload.get("recipe_confidence"),
                 "first_cluster_id": recipe_payload.get("first_cluster_id"),
                 "second_cluster_id": recipe_payload.get("second_cluster_id"),
+                **recipe_seed_weights.get(recipe_name, {}),
                 "slot_menus": {
                     slot_name: [
                         {
@@ -1318,9 +1509,15 @@ def build_recipe_prior_artifacts(
             "negative_pair_rows": negative_summary["negative_pair_rows"],
             "cluster_negative_rows": negative_summary["cluster_negative_rows"],
             "retention_failure_rows": negative_summary["retention_failure_rows"],
+            **outcome_pair_summary,
+            **outcome_recipe_summary,
         },
         "discovered_recipe_validation": discovered_summary,
         "negative_priors": negative_summary,
+        "playhand_outcome_priors": {
+            **outcome_pair_summary,
+            **outcome_recipe_summary,
+        },
         "top_slots": {
             recipe_name: {
                 slot_name: recipe_payload["slots"][slot_name][:8]
@@ -1420,6 +1617,22 @@ def _pair_fieldnames() -> list[str]:
         "recommended_profile_template_path",
         "recommended_template_timeframe",
         "recommended_template_indicator_count",
+        "playhand_family_id",
+        "playhand_family_policy",
+        "playhand_family_policy_source",
+        "playhand_family_cap_share",
+        "playhand_recommended_max_indicators",
+        "playhand_role_balanced_fill_limit",
+        "playhand_mutation_pressure",
+        "playhand_sampling_weight_multiplier",
+        "playhand_exact_branch_required",
+        "playhand_exact_rescue_rate",
+        "playhand_mutated_win_rate",
+        "playhand_avg_mutation_delta",
+        "playhand_promotion_rate",
+        "playhand_observation_count",
+        "pair_sampling_weight_uncapped",
+        "pair_sampling_weight_capped",
     ]
 
 
@@ -1485,6 +1698,7 @@ def build_recipe_priors(
     anchor_pair_dir: Path | None = None,
     anchor_pair_timing_dir: Path | None = None,
     discovery_recipe_validation_dir: Path | None = None,
+    playhand_outcome_priors_dir: Path | None = None,
     out_dir: Path | None = None,
     max_slot_candidates: int = 40,
     max_pair_candidates: int = 80,
@@ -1519,6 +1733,11 @@ def build_recipe_priors(
         if discovery_recipe_validation_dir is not None
         else config.derived_root / DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME
     )
+    outcome_priors_dir = (
+        playhand_outcome_priors_dir.expanduser().resolve()
+        if playhand_outcome_priors_dir is not None
+        else config.derived_root / DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME
+    )
     discovery_scrutiny_dir = config.derived_root / DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME
     target_dir = (
         out_dir.expanduser().resolve()
@@ -1551,6 +1770,12 @@ def build_recipe_priors(
     )
     if discovery_scrutiny_results_path.exists():
         discovery_validation_results.extend(_read_csv_rows(discovery_scrutiny_results_path))
+    playhand_outcome_priors_path = outcome_priors_dir / DEFAULT_PLAYHAND_OUTCOME_PRIORS_FILENAME
+    playhand_outcome_priors = (
+        _load_json(playhand_outcome_priors_path)
+        if playhand_outcome_priors_path.exists()
+        else None
+    )
 
     (
         payload,
@@ -1573,6 +1798,7 @@ def build_recipe_priors(
             discovery_validation_dir / "profiles",
             discovery_scrutiny_dir / "profiles",
         ],
+        playhand_outcome_priors=playhand_outcome_priors,
         max_slot_candidates=max(1, int(max_slot_candidates)),
         max_pair_candidates=max(1, int(max_pair_candidates)),
     )
@@ -1590,6 +1816,11 @@ def build_recipe_priors(
         "discovery_recipe_scrutiny_results_path": (
             str(discovery_scrutiny_results_path)
             if discovery_scrutiny_results_path.exists()
+            else None
+        ),
+        "playhand_outcome_priors_path": (
+            str(playhand_outcome_priors_path)
+            if playhand_outcome_priors_path.exists()
             else None
         ),
     }
