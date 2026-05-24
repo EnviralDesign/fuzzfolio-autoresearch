@@ -185,7 +185,11 @@ def _family_id(row: dict[str, Any]) -> str:
     )
 
 
-def _policy_for_pair_classification(classification: str) -> dict[str, Any]:
+def _policy_for_pair_classification(
+    classification: str,
+    *,
+    promotion_rate: float | None = None,
+) -> dict[str, Any]:
     if classification == "template_locked":
         return {
             "family_policy": "template_locked",
@@ -217,6 +221,16 @@ def _policy_for_pair_classification(classification: str) -> dict[str, Any]:
             "family_cap_share": 0.15,
         }
     if classification == "unstable":
+        if (promotion_rate or 0.0) >= 0.70:
+            return {
+                "family_policy": "unstable",
+                "exact_branch_required": True,
+                "recommended_max_indicators": 3,
+                "role_balanced_fill_limit": 1,
+                "mutation_pressure": "low",
+                "sampling_weight_multiplier": 0.85,
+                "family_cap_share": 0.12,
+            }
         return {
             "family_policy": "unstable",
             "exact_branch_required": True,
@@ -240,6 +254,8 @@ def _policy_for_pair_classification(classification: str) -> dict[str, Any]:
 def _classify(
     *,
     count: int,
+    promotion_rate: float | None,
+    comparable_template_runs: int,
     exact_rescue_rate: float | None,
     exact_selected_rate: float | None,
     mutated_win_rate: float | None,
@@ -252,6 +268,14 @@ def _classify(
     if (mutated_win_rate or 0.0) >= 0.60 and (avg_mutation_delta or 0.0) > 3.0:
         return "mutation_friendly"
     if (exact_selected_rate or 0.0) >= 0.40:
+        return "template_guarded"
+    if (
+        count >= 5
+        and (promotion_rate or 0.0) >= 0.90
+        and comparable_template_runs >= 5
+        and avg_mutation_delta is not None
+        and avg_mutation_delta <= -5.0
+    ):
         return "template_guarded"
     return "unstable"
 
@@ -313,8 +337,11 @@ def _aggregate_group(rows: list[dict[str, Any]], *, key_field: str) -> dict[str,
     exact_rescue_rate = _safe_rate(exact_rescues, count)
     exact_selected_rate = _safe_rate(exact_selected, count)
     mutated_win_rate = _safe_rate(mutated_wins, comparable)
+    promotion_rate = _safe_rate(promoted, count)
     classification = _classify(
         count=count,
+        promotion_rate=promotion_rate,
+        comparable_template_runs=comparable,
         exact_rescue_rate=exact_rescue_rate,
         exact_selected_rate=exact_selected_rate,
         mutated_win_rate=mutated_win_rate,
@@ -326,7 +353,7 @@ def _aggregate_group(rows: list[dict[str, Any]], *, key_field: str) -> dict[str,
         "count": count,
         "promoted": promoted,
         "tombstoned": tombstoned,
-        "promotion_rate": _safe_rate(promoted, count),
+        "promotion_rate": promotion_rate,
         "exact_selected": exact_selected,
         "mutated_selected": mutated_selected,
         "exact_rescues": exact_rescues,
@@ -397,7 +424,12 @@ def build_playhand_outcome_prior_artifacts(
                 "dealt_pair_source": _clean(exemplar.get("dealt_pair_source")),
             }
         )
-        row.update(_policy_for_pair_classification(str(row.get("family_classification") or "")))
+        row.update(
+            _policy_for_pair_classification(
+                str(row.get("family_classification") or ""),
+                promotion_rate=_safe_float(row.get("promotion_rate"), 0.0),
+            )
+        )
         pair_rows_out.append(row)
 
     recipe_rows_out: list[dict[str, Any]] = []
@@ -452,8 +484,12 @@ def build_playhand_outcome_prior_artifacts(
             "under_sampled: count < 3",
             "template_locked: exact_rescue_rate >= 0.40",
             "mutation_friendly: mutated_win_rate >= 0.60 and avg_mutation_delta > 3",
-            "template_guarded: exact_selected_rate >= 0.40",
-            "unstable: otherwise",
+            (
+                "template_guarded: exact_selected_rate >= 0.40, or count >= 5 "
+                "with promotion_rate >= 0.90, comparable_template_runs >= 5, "
+                "and avg_mutation_delta <= -5"
+            ),
+            "unstable: otherwise; productive unstable families use softened sampling policy",
         ],
         "policy_defaults": {
             "max_exact_pair_template_family_share": 0.15,

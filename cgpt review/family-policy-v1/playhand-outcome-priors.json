@@ -1,6 +1,6 @@
 {
   "schema_version": "playhand_outcome_priors_v1",
-  "generated_at": "2026-05-24T19:28:04.741372+00:00",
+  "generated_at": "2026-05-24T20:34:02.215574+00:00",
   "note": "Play Hand outcome priors are a second-layer policy overlay derived from clean batch outcomes. They do not overwrite empirical validation scores.",
   "pair_families": {
     "drs-0003-r006-willr-mean-reversi-rsi-crossback-m5": {
@@ -91,19 +91,19 @@
       "avg_positive_score": 65.7305,
       "best_score": 74.447,
       "best_seed": "3",
-      "family_classification": "unstable",
+      "family_classification": "template_guarded",
       "source_batches": "playhand-prior-test-clean-100,playhand-prior-test-clean-50",
       "dealt_pair_probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
       "template_branch_source_probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
       "dealt_recipe": "discovered_recipe_003",
       "dealt_pair_source": "discovery_recipe_validation",
-      "family_policy": "unstable",
+      "family_policy": "template_guarded",
       "exact_branch_required": true,
-      "recommended_max_indicators": 3,
-      "role_balanced_fill_limit": 0,
-      "mutation_pressure": "low",
-      "sampling_weight_multiplier": 0.65,
-      "family_cap_share": 0.08
+      "recommended_max_indicators": 4,
+      "role_balanced_fill_limit": 1,
+      "mutation_pressure": "normal",
+      "sampling_weight_multiplier": 1.05,
+      "family_cap_share": 0.15
     },
     "drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5": {
       "family_id": "drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5",
@@ -168,10 +168,10 @@
       "family_policy": "unstable",
       "exact_branch_required": true,
       "recommended_max_indicators": 3,
-      "role_balanced_fill_limit": 0,
+      "role_balanced_fill_limit": 1,
       "mutation_pressure": "low",
-      "sampling_weight_multiplier": 0.65,
-      "family_cap_share": 0.08
+      "sampling_weight_multiplier": 0.85,
+      "family_cap_share": 0.12
     },
     "drs-0004-r001-thrust-bar-signal-channel-reentry-m5": {
       "family_id": "drs-0004-r001-thrust-bar-signal-channel-reentry-m5",
@@ -236,10 +236,10 @@
       "family_policy": "unstable",
       "exact_branch_required": true,
       "recommended_max_indicators": 3,
-      "role_balanced_fill_limit": 0,
+      "role_balanced_fill_limit": 1,
       "mutation_pressure": "low",
-      "sampling_weight_multiplier": 0.65,
-      "family_cap_share": 0.08
+      "sampling_weight_multiplier": 0.85,
+      "family_cap_share": 0.12
     },
     "drs-0005-r002-channel-reentry-thrust-bar-signal-m5": {
       "family_id": "drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
@@ -270,10 +270,10 @@
       "family_policy": "unstable",
       "exact_branch_required": true,
       "recommended_max_indicators": 3,
-      "role_balanced_fill_limit": 0,
+      "role_balanced_fill_limit": 1,
       "mutation_pressure": "low",
-      "sampling_weight_multiplier": 0.65,
-      "family_cap_share": 0.08
+      "sampling_weight_multiplier": 0.85,
+      "family_cap_share": 0.12
     },
     "l3-042-bbands-position-mean-reversion-rsi-crossback-m15": {
       "family_id": "l3-042-bbands-position-mean-reversion-rsi-crossback-m15",
@@ -1400,7 +1400,7 @@
   },
   "summary": {
     "schema_version": "playhand_outcome_priors_v1",
-    "generated_at": "2026-05-24T19:28:04.741372+00:00",
+    "generated_at": "2026-05-24T20:34:02.215574+00:00",
     "source_report_dirs": [
       "C:\\repos\\fuzzfolio-autoresearch\\cgpt review\\playhand-prior-test-clean-100",
       "C:\\repos\\fuzzfolio-autoresearch\\cgpt review\\playhand-prior-test-clean-50"
@@ -1409,15 +1409,15 @@
       "pair_family_rows": 33,
       "recipe_rows": 10,
       "template_locked_pair_families": 2,
-      "template_guarded_pair_families": 2,
+      "template_guarded_pair_families": 3,
       "mutation_friendly_pair_families": 0
     },
     "classification_rules": [
       "under_sampled: count < 3",
       "template_locked: exact_rescue_rate >= 0.40",
       "mutation_friendly: mutated_win_rate >= 0.60 and avg_mutation_delta > 3",
-      "template_guarded: exact_selected_rate >= 0.40",
-      "unstable: otherwise"
+      "template_guarded: exact_selected_rate >= 0.40, or count >= 5 with promotion_rate >= 0.90, comparable_template_runs >= 5, and avg_mutation_delta <= -5",
+      "unstable: otherwise; productive unstable families use softened sampling policy"
     ],
     "policy_defaults": {
       "max_exact_pair_template_family_share": 0.15,

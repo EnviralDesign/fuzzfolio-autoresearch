@@ -1,6 +1,6 @@
 {
   "schema_version": "empirical_recipe_priors_v1",
-  "generated_at": "2026-05-24T19:28:05.651987+00:00",
+  "generated_at": "2026-05-24T20:34:13.382097+00:00",
   "result_counts": {
     "indicator_rows": 87,
     "generation_eligible": 87,
@@ -24,7 +24,7 @@
     "outcome_prior_pair_rows_annotated": 33,
     "outcome_prior_summary": {
       "schema_version": "playhand_outcome_priors_v1",
-      "generated_at": "2026-05-24T19:28:04.741372+00:00",
+      "generated_at": "2026-05-24T20:34:02.215574+00:00",
       "source_report_dirs": [
         "C:\\repos\\fuzzfolio-autoresearch\\cgpt review\\playhand-prior-test-clean-100",
         "C:\\repos\\fuzzfolio-autoresearch\\cgpt review\\playhand-prior-test-clean-50"
@@ -33,15 +33,15 @@
         "pair_family_rows": 33,
         "recipe_rows": 10,
         "template_locked_pair_families": 2,
-        "template_guarded_pair_families": 2,
+        "template_guarded_pair_families": 3,
         "mutation_friendly_pair_families": 0
       },
       "classification_rules": [
         "under_sampled: count < 3",
         "template_locked: exact_rescue_rate >= 0.40",
         "mutation_friendly: mutated_win_rate >= 0.60 and avg_mutation_delta > 3",
-        "template_guarded: exact_selected_rate >= 0.40",
-        "unstable: otherwise"
+        "template_guarded: exact_selected_rate >= 0.40, or count >= 5 with promotion_rate >= 0.90, comparable_template_runs >= 5, and avg_mutation_delta <= -5",
+        "unstable: otherwise; productive unstable families use softened sampling policy"
       ],
       "policy_defaults": {
         "max_exact_pair_template_family_share": 0.15,
@@ -92,7 +92,7 @@
     "outcome_prior_pair_rows_annotated": 33,
     "outcome_prior_summary": {
       "schema_version": "playhand_outcome_priors_v1",
-      "generated_at": "2026-05-24T19:28:04.741372+00:00",
+      "generated_at": "2026-05-24T20:34:02.215574+00:00",
       "source_report_dirs": [
         "C:\\repos\\fuzzfolio-autoresearch\\cgpt review\\playhand-prior-test-clean-100",
         "C:\\repos\\fuzzfolio-autoresearch\\cgpt review\\playhand-prior-test-clean-50"
@@ -101,15 +101,15 @@
         "pair_family_rows": 33,
         "recipe_rows": 10,
         "template_locked_pair_families": 2,
-        "template_guarded_pair_families": 2,
+        "template_guarded_pair_families": 3,
         "mutation_friendly_pair_families": 0
       },
       "classification_rules": [
         "under_sampled: count < 3",
         "template_locked: exact_rescue_rate >= 0.40",
         "mutation_friendly: mutated_win_rate >= 0.60 and avg_mutation_delta > 3",
-        "template_guarded: exact_selected_rate >= 0.40",
-        "unstable: otherwise"
+        "template_guarded: exact_selected_rate >= 0.40, or count >= 5 with promotion_rate >= 0.90, comparable_template_runs >= 5, and avg_mutation_delta <= -5",
+        "unstable: otherwise; productive unstable families use softened sampling policy"
       ],
       "policy_defaults": {
         "max_exact_pair_template_family_share": 0.15,
@@ -4277,6 +4277,114 @@
   "top_pairs": [
     {
       "source": "discovery_recipe_validation",
+      "recipe": "discovered_recipe_003",
+      "anchor_type": "discovered_recipe_validation",
+      "anchor_id": "MFI_TREND",
+      "trigger_id": "OBV_MEAN_REVERSION",
+      "probe_timeframe": "M15",
+      "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+      "pair_prior_score": 65.9338,
+      "composite_score": 62.6214,
+      "signal_count": "415.0",
+      "best_expectancy_r": "0.2429",
+      "best_trades": "415",
+      "best_profit_factor": "1.3163",
+      "timing_policy": "catalog_default",
+      "timing_adjustment": 0.0,
+      "recommended_trigger_lookback_bars": null,
+      "pair_sampling_score": 64.7631,
+      "pair_sampling_lane": "positive_pair",
+      "pair_sampling_weight": 58.7662,
+      "recipe_confidence": "high_candidate",
+      "retention_bucket": "retained",
+      "validation_score": 62.6214,
+      "retention_ratio": "0.8716",
+      "discovery_evidence_score": "71.8478",
+      "recommended_profile_template": {
+        "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+        "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15.json",
+        "timeframe": "M15",
+        "lookback_months": 36,
+        "instruments": [
+          "EURUSD",
+          "GBPUSD",
+          "USDJPY",
+          "XAUUSD"
+        ],
+        "indicator_defaults": [
+          {
+            "indicator_id": "MFI_TREND",
+            "instance_id": "drv-0024-r003-mfi-trend-obv-mean-reversion-m15-anchor",
+            "timeframe": "M15",
+            "lookbackBars": 1,
+            "ranges": {
+              "buy": [
+                60,
+                80
+              ],
+              "sell": [
+                20,
+                40
+              ]
+            },
+            "talibConfig": [
+              {
+                "name": "timeperiod",
+                "value": 14
+              }
+            ],
+            "weight": 1.0,
+            "isTrendFollowing": true,
+            "normalizationMode": "none",
+            "useFormingBar": false,
+            "scale": 1
+          },
+          {
+            "indicator_id": "OBV_MEAN_REVERSION",
+            "instance_id": "drv-0024-r003-mfi-trend-obv-mean-reversion-m15-trigger",
+            "timeframe": "M15",
+            "lookbackBars": 1,
+            "ranges": {
+              "buy": [
+                -1,
+                -0.2
+              ],
+              "sell": [
+                0.2,
+                1
+              ]
+            },
+            "talibConfig": [],
+            "weight": 1.0,
+            "isTrendFollowing": false,
+            "normalizationMode": "none",
+            "useFormingBar": false,
+            "scale": 1
+          }
+        ]
+      },
+      "recommended_profile_template_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15.json",
+      "recommended_template_timeframe": "M15",
+      "recommended_template_indicator_count": 2,
+      "playhand_family_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+      "playhand_family_policy": "template_guarded",
+      "playhand_family_policy_source": "playhand-prior-test-clean-100,playhand-prior-test-clean-50",
+      "playhand_family_cap_share": 0.15,
+      "playhand_recommended_max_indicators": 4,
+      "playhand_role_balanced_fill_limit": 1,
+      "playhand_mutation_pressure": "normal",
+      "playhand_sampling_weight_multiplier": 1.05,
+      "playhand_exact_branch_required": true,
+      "playhand_exact_rescue_rate": 0.1538,
+      "playhand_mutated_win_rate": 0.4286,
+      "playhand_avg_mutation_delta": -18.328,
+      "playhand_promotion_rate": 1.0,
+      "playhand_observation_count": 13,
+      "pair_sampling_weight_uncapped": 59.4536,
+      "pair_sampling_weight_capped": 58.7662
+    },
+    {
+      "source": "discovery_recipe_validation",
       "recipe": "discovered_recipe_006",
       "anchor_type": "discovered_recipe_validation",
       "anchor_id": "WILLR_MEAN_REVERSION",
@@ -4294,7 +4402,7 @@
       "recommended_trigger_lookback_bars": null,
       "pair_sampling_score": 67.9822,
       "pair_sampling_lane": "positive_pair",
-      "pair_sampling_weight": 51.3172,
+      "pair_sampling_weight": 57.6973,
       "recipe_confidence": "high_candidate",
       "retention_bucket": "retained",
       "validation_score": 66.0566,
@@ -4394,7 +4502,7 @@
       "playhand_promotion_rate": 1.0,
       "playhand_observation_count": 18,
       "pair_sampling_weight_uncapped": 65.5109,
-      "pair_sampling_weight_capped": 51.3172
+      "pair_sampling_weight_capped": 57.6973
     },
     {
       "source": "discovery_recipe_validation",
@@ -4415,7 +4523,7 @@
       "recommended_trigger_lookback_bars": null,
       "pair_sampling_score": 67.9446,
       "pair_sampling_lane": "positive_pair",
-      "pair_sampling_weight": 50.2302,
+      "pair_sampling_weight": 56.6102,
       "recipe_confidence": "high_candidate",
       "retention_bucket": "retained",
       "validation_score": 66.0084,
@@ -4515,7 +4623,7 @@
       "playhand_promotion_rate": 1.0,
       "playhand_observation_count": 18,
       "pair_sampling_weight_uncapped": 71.6706,
-      "pair_sampling_weight_capped": 50.2302
+      "pair_sampling_weight_capped": 56.6102
     },
     {
       "source": "discovery_recipe_validation",
@@ -4536,7 +4644,7 @@
       "recommended_trigger_lookback_bars": null,
       "pair_sampling_score": 69.5644,
       "pair_sampling_lane": "positive_pair",
-      "pair_sampling_weight": 49.62,
+      "pair_sampling_weight": 56.0,
       "recipe_confidence": "high_candidate",
       "retention_bucket": "retained",
       "validation_score": 68.3204,
@@ -4648,115 +4756,7 @@
       "playhand_promotion_rate": 1.0,
       "playhand_observation_count": 10,
       "pair_sampling_weight_uncapped": 75.1287,
-      "pair_sampling_weight_capped": 49.62
-    },
-    {
-      "source": "discovery_recipe_validation",
-      "recipe": "discovered_recipe_003",
-      "anchor_type": "discovered_recipe_validation",
-      "anchor_id": "MFI_TREND",
-      "trigger_id": "OBV_MEAN_REVERSION",
-      "probe_timeframe": "M15",
-      "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
-      "pair_prior_score": 65.9338,
-      "composite_score": 62.6214,
-      "signal_count": "415.0",
-      "best_expectancy_r": "0.2429",
-      "best_trades": "415",
-      "best_profit_factor": "1.3163",
-      "timing_policy": "catalog_default",
-      "timing_adjustment": 0.0,
-      "recommended_trigger_lookback_bars": null,
-      "pair_sampling_score": 64.7631,
-      "pair_sampling_lane": "positive_pair",
-      "pair_sampling_weight": 27.783,
-      "recipe_confidence": "high_candidate",
-      "retention_bucket": "retained",
-      "validation_score": 62.6214,
-      "retention_ratio": "0.8716",
-      "discovery_evidence_score": "71.8478",
-      "recommended_profile_template": {
-        "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
-        "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15.json",
-        "timeframe": "M15",
-        "lookback_months": 36,
-        "instruments": [
-          "EURUSD",
-          "GBPUSD",
-          "USDJPY",
-          "XAUUSD"
-        ],
-        "indicator_defaults": [
-          {
-            "indicator_id": "MFI_TREND",
-            "instance_id": "drv-0024-r003-mfi-trend-obv-mean-reversion-m15-anchor",
-            "timeframe": "M15",
-            "lookbackBars": 1,
-            "ranges": {
-              "buy": [
-                60,
-                80
-              ],
-              "sell": [
-                20,
-                40
-              ]
-            },
-            "talibConfig": [
-              {
-                "name": "timeperiod",
-                "value": 14
-              }
-            ],
-            "weight": 1.0,
-            "isTrendFollowing": true,
-            "normalizationMode": "none",
-            "useFormingBar": false,
-            "scale": 1
-          },
-          {
-            "indicator_id": "OBV_MEAN_REVERSION",
-            "instance_id": "drv-0024-r003-mfi-trend-obv-mean-reversion-m15-trigger",
-            "timeframe": "M15",
-            "lookbackBars": 1,
-            "ranges": {
-              "buy": [
-                -1,
-                -0.2
-              ],
-              "sell": [
-                0.2,
-                1
-              ]
-            },
-            "talibConfig": [],
-            "weight": 1.0,
-            "isTrendFollowing": false,
-            "normalizationMode": "none",
-            "useFormingBar": false,
-            "scale": 1
-          }
-        ]
-      },
-      "recommended_profile_template_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0008-r003-mfi-trend-obv-mean-reversion-m15.json",
-      "recommended_template_timeframe": "M15",
-      "recommended_template_indicator_count": 2,
-      "playhand_family_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
-      "playhand_family_policy": "unstable",
-      "playhand_family_policy_source": "playhand-prior-test-clean-100,playhand-prior-test-clean-50",
-      "playhand_family_cap_share": 0.08,
-      "playhand_recommended_max_indicators": 3,
-      "playhand_role_balanced_fill_limit": 0,
-      "playhand_mutation_pressure": "low",
-      "playhand_sampling_weight_multiplier": 0.65,
-      "playhand_exact_branch_required": true,
-      "playhand_exact_rescue_rate": 0.1538,
-      "playhand_mutated_win_rate": 0.4286,
-      "playhand_avg_mutation_delta": -18.328,
-      "playhand_promotion_rate": 1.0,
-      "playhand_observation_count": 13,
-      "pair_sampling_weight_uncapped": 36.8046,
-      "pair_sampling_weight_capped": 27.783
+      "pair_sampling_weight_capped": 56.0
     },
     {
       "source": "anchor_pair_atlas",
@@ -4777,21 +4777,21 @@
       "recommended_trigger_lookback_bars": null,
       "pair_sampling_score": 67.2747,
       "pair_sampling_lane": "positive_pair",
-      "pair_sampling_weight": 27.5299,
+      "pair_sampling_weight": 46.4356,
       "playhand_family_id": "l3-035-rsi-mean-reversion-toby-crabel-narrow-range-m5",
       "playhand_family_policy": "unstable",
       "playhand_family_policy_source": "playhand-prior-test-clean-100,playhand-prior-test-clean-50",
-      "playhand_family_cap_share": 0.08,
+      "playhand_family_cap_share": 0.12,
       "playhand_recommended_max_indicators": 3,
-      "playhand_role_balanced_fill_limit": 0,
+      "playhand_role_balanced_fill_limit": 1,
       "playhand_mutation_pressure": "low",
-      "playhand_sampling_weight_multiplier": 0.65,
+      "playhand_sampling_weight_multiplier": 0.85,
       "playhand_exact_branch_required": true,
       "playhand_exact_rescue_rate": 0.0,
       "playhand_promotion_rate": 0.7778,
       "playhand_observation_count": 9,
-      "pair_sampling_weight_uncapped": 39.7147,
-      "pair_sampling_weight_capped": 27.5299
+      "pair_sampling_weight_uncapped": 51.9346,
+      "pair_sampling_weight_capped": 46.4356
     },
     {
       "source": "anchor_pair_atlas",
@@ -5105,6 +5105,143 @@
       "playhand_observation_count": 1,
       "pair_sampling_weight_uncapped": 5.3819,
       "pair_sampling_weight_capped": 5.3819
+    },
+    {
+      "source": "discovery_recipe_validation",
+      "recipe": "discovered_recipe_002",
+      "anchor_type": "discovered_recipe_validation",
+      "anchor_id": "CHANNEL_REENTRY",
+      "trigger_id": "THRUST_BAR_SIGNAL",
+      "probe_timeframe": "M5",
+      "probe_id": "drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
+      "pair_prior_score": 69.2502,
+      "composite_score": 54.3905,
+      "signal_count": "545.0",
+      "best_expectancy_r": "0.1224",
+      "best_trades": "539",
+      "best_profit_factor": "1.1503",
+      "timing_policy": "catalog_default",
+      "timing_adjustment": 0.0,
+      "recommended_trigger_lookback_bars": null,
+      "pair_sampling_score": 50.9865,
+      "pair_sampling_lane": "near_miss_pair",
+      "pair_sampling_weight": 5.3032,
+      "recipe_confidence": "high_candidate",
+      "retention_bucket": "partial_retention",
+      "validation_score": 54.3905,
+      "retention_ratio": "0.7173",
+      "discovery_evidence_score": "75.8283",
+      "recommended_profile_template": {
+        "probe_id": "drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
+        "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0005-r002-channel-reentry-thrust-bar-signal-m5.json",
+        "timeframe": "M5",
+        "lookback_months": 36,
+        "instruments": [
+          "EURUSD",
+          "GBPUSD",
+          "USDJPY",
+          "XAUUSD"
+        ],
+        "indicator_defaults": [
+          {
+            "indicator_id": "CHANNEL_REENTRY",
+            "instance_id": "drv-0010-r002-channel-reentry-thrust-bar-signal-m5-anchor",
+            "timeframe": "M5",
+            "lookbackBars": 1,
+            "ranges": {
+              "buy": [
+                0,
+                1
+              ],
+              "sell": [
+                0,
+                1
+              ]
+            },
+            "talibConfig": [
+              {
+                "name": "channel_type",
+                "value": "donchian"
+              },
+              {
+                "name": "timeperiod",
+                "value": 20
+              },
+              {
+                "name": "matype",
+                "value": 0
+              },
+              {
+                "name": "nbdevup",
+                "value": 2
+              },
+              {
+                "name": "nbdevdn",
+                "value": 2
+              },
+              {
+                "name": "price_type",
+                "value": "typical"
+              }
+            ],
+            "weight": 1.0,
+            "isTrendFollowing": false,
+            "normalizationMode": "none",
+            "useFormingBar": false,
+            "scale": 1
+          },
+          {
+            "indicator_id": "THRUST_BAR_SIGNAL",
+            "instance_id": "drv-0010-r002-channel-reentry-thrust-bar-signal-m5-trigger",
+            "timeframe": "M5",
+            "lookbackBars": 1,
+            "ranges": {
+              "buy": [
+                0,
+                1
+              ],
+              "sell": [
+                0,
+                1
+              ]
+            },
+            "talibConfig": [
+              {
+                "name": "atr_period",
+                "value": 14
+              },
+              {
+                "name": "multiplier",
+                "value": 2
+              }
+            ],
+            "weight": 1.0,
+            "isTrendFollowing": null,
+            "normalizationMode": "none",
+            "useFormingBar": false,
+            "scale": 1
+          }
+        ]
+      },
+      "recommended_profile_template_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0005-r002-channel-reentry-thrust-bar-signal-m5.json",
+      "recommended_template_timeframe": "M5",
+      "recommended_template_indicator_count": 2,
+      "playhand_family_id": "drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
+      "playhand_family_policy": "unstable",
+      "playhand_family_policy_source": "playhand-prior-test-clean-100,playhand-prior-test-clean-50",
+      "playhand_family_cap_share": 0.12,
+      "playhand_recommended_max_indicators": 3,
+      "playhand_role_balanced_fill_limit": 1,
+      "playhand_mutation_pressure": "low",
+      "playhand_sampling_weight_multiplier": 0.85,
+      "playhand_exact_branch_required": true,
+      "playhand_exact_rescue_rate": 0.3333,
+      "playhand_mutated_win_rate": 0.5,
+      "playhand_avg_mutation_delta": -26.3822,
+      "playhand_promotion_rate": 1.0,
+      "playhand_observation_count": 3,
+      "pair_sampling_weight_uncapped": 5.3032,
+      "pair_sampling_weight_capped": 5.3032
     },
     {
       "source": "discovery_recipe_validation",
@@ -5632,143 +5769,6 @@
       "playhand_observation_count": 3,
       "pair_sampling_weight_uncapped": 4.0905,
       "pair_sampling_weight_capped": 4.0905
-    },
-    {
-      "source": "discovery_recipe_validation",
-      "recipe": "discovered_recipe_002",
-      "anchor_type": "discovered_recipe_validation",
-      "anchor_id": "CHANNEL_REENTRY",
-      "trigger_id": "THRUST_BAR_SIGNAL",
-      "probe_timeframe": "M5",
-      "probe_id": "drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
-      "pair_prior_score": 69.2502,
-      "composite_score": 54.3905,
-      "signal_count": "545.0",
-      "best_expectancy_r": "0.1224",
-      "best_trades": "539",
-      "best_profit_factor": "1.1503",
-      "timing_policy": "catalog_default",
-      "timing_adjustment": 0.0,
-      "recommended_trigger_lookback_bars": null,
-      "pair_sampling_score": 50.9865,
-      "pair_sampling_lane": "near_miss_pair",
-      "pair_sampling_weight": 4.0554,
-      "recipe_confidence": "high_candidate",
-      "retention_bucket": "partial_retention",
-      "validation_score": 54.3905,
-      "retention_ratio": "0.7173",
-      "discovery_evidence_score": "75.8283",
-      "recommended_profile_template": {
-        "probe_id": "drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
-        "profile_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0005-r002-channel-reentry-thrust-bar-signal-m5.json",
-        "timeframe": "M5",
-        "lookback_months": 36,
-        "instruments": [
-          "EURUSD",
-          "GBPUSD",
-          "USDJPY",
-          "XAUUSD"
-        ],
-        "indicator_defaults": [
-          {
-            "indicator_id": "CHANNEL_REENTRY",
-            "instance_id": "drv-0010-r002-channel-reentry-thrust-bar-signal-m5-anchor",
-            "timeframe": "M5",
-            "lookbackBars": 1,
-            "ranges": {
-              "buy": [
-                0,
-                1
-              ],
-              "sell": [
-                0,
-                1
-              ]
-            },
-            "talibConfig": [
-              {
-                "name": "channel_type",
-                "value": "donchian"
-              },
-              {
-                "name": "timeperiod",
-                "value": 20
-              },
-              {
-                "name": "matype",
-                "value": 0
-              },
-              {
-                "name": "nbdevup",
-                "value": 2
-              },
-              {
-                "name": "nbdevdn",
-                "value": 2
-              },
-              {
-                "name": "price_type",
-                "value": "typical"
-              }
-            ],
-            "weight": 1.0,
-            "isTrendFollowing": false,
-            "normalizationMode": "none",
-            "useFormingBar": false,
-            "scale": 1
-          },
-          {
-            "indicator_id": "THRUST_BAR_SIGNAL",
-            "instance_id": "drv-0010-r002-channel-reentry-thrust-bar-signal-m5-trigger",
-            "timeframe": "M5",
-            "lookbackBars": 1,
-            "ranges": {
-              "buy": [
-                0,
-                1
-              ],
-              "sell": [
-                0,
-                1
-              ]
-            },
-            "talibConfig": [
-              {
-                "name": "atr_period",
-                "value": 14
-              },
-              {
-                "name": "multiplier",
-                "value": 2
-              }
-            ],
-            "weight": 1.0,
-            "isTrendFollowing": null,
-            "normalizationMode": "none",
-            "useFormingBar": false,
-            "scale": 1
-          }
-        ]
-      },
-      "recommended_profile_template_path": "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\discovery-recipe-scrutiny-atlas\\profiles\\drs-0005-r002-channel-reentry-thrust-bar-signal-m5.json",
-      "recommended_template_timeframe": "M5",
-      "recommended_template_indicator_count": 2,
-      "playhand_family_id": "drs-0005-r002-channel-reentry-thrust-bar-signal-m5",
-      "playhand_family_policy": "unstable",
-      "playhand_family_policy_source": "playhand-prior-test-clean-100,playhand-prior-test-clean-50",
-      "playhand_family_cap_share": 0.08,
-      "playhand_recommended_max_indicators": 3,
-      "playhand_role_balanced_fill_limit": 0,
-      "playhand_mutation_pressure": "low",
-      "playhand_sampling_weight_multiplier": 0.65,
-      "playhand_exact_branch_required": true,
-      "playhand_exact_rescue_rate": 0.3333,
-      "playhand_mutated_win_rate": 0.5,
-      "playhand_avg_mutation_delta": -26.3822,
-      "playhand_promotion_rate": 1.0,
-      "playhand_observation_count": 3,
-      "pair_sampling_weight_uncapped": 4.0554,
-      "pair_sampling_weight_capped": 4.0554
     },
     {
       "source": "anchor_pair_atlas",

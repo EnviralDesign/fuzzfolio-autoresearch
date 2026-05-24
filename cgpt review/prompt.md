@@ -1,6 +1,6 @@
 # CGPT Review Packet
 
-Please review the latest Fuzzfolio AutoResearch state as a technical/design reviewer. This packet now covers the family-aware Play Hand policy implementation requested after the clean-100 confirmation batch.
+Please review the latest Fuzzfolio AutoResearch state as a technical/design reviewer. This packet now covers the patched family-aware Play Hand policy implementation requested after the clean-100 confirmation batch and your follow-up review.
 
 ## Start Here
 
@@ -44,16 +44,25 @@ runs/derived/playhand-outcome-priors/playhand-outcome-priors-summary.json
 
 Then `uv run build-recipe-priors --json` consumes those outcome priors automatically and injects family policies into `runs/derived/recipe-priors/play-hand-seed-plan.json`.
 
-## Implemented Policy
+## Follow-Up Patch
 
-Pair/template families are classified as:
+After your review of `6d575d3`, I made the two concrete fixes you requested before `clean-50-family-policy-v1`:
+
+- Play Hand already consumed `recipe_sampling_weight`; I added a direct regression test proving explicit recipe weights override huge pair-menu fallback weights during recipe selection.
+- High-performing negative-delta families now classify as `template_guarded` even when `exact_selected_rate` is just below `0.40`.
+- Productive `unstable` families now get softened handling instead of the harsh `0.65` multiplier.
+
+Updated pair/template classification:
 
 ```text
 under_sampled: count < 3
 template_locked: exact_rescue_rate >= 0.40
 mutation_friendly: mutated_win_rate >= 0.60 and avg_mutation_delta > 3
-template_guarded: exact_selected_rate >= 0.40
-unstable: otherwise
+template_guarded:
+  exact_selected_rate >= 0.40
+  OR count >= 5 AND promotion_rate >= 0.90 AND comparable_template_runs >= 5 AND avg_mutation_delta <= -5
+unstable:
+  otherwise; productive unstable families use softened sampling policy
 ```
 
 Current combined clean-50 + clean-100 outcome summary:
@@ -62,7 +71,7 @@ Current combined clean-50 + clean-100 outcome summary:
 pair_family_rows: 33
 recipe_rows: 10
 template_locked_pair_families: 2
-template_guarded_pair_families: 2
+template_guarded_pair_families: 3
 mutation_friendly_pair_families: 0
 ```
 
@@ -79,6 +88,31 @@ drs-0002-r006-rsi-crossback-willr-mean-reversi-m5
   recommended_max_indicators: 2
   role_balanced_fill_limit: 0
   family_cap_share: 0.15
+```
+
+The edge-case row from your review also changed as requested:
+
+```text
+drs-0008-r003-mfi-trend-obv-mean-reversion-m15
+  family_policy: template_guarded
+  count: 13
+  promoted: 13
+  exact_selected_rate: 0.3846
+  avg_mutation_delta: -18.328
+  sampling_weight_multiplier: 1.05
+  role_balanced_fill_limit: 1
+  family_cap_share: 0.15
+```
+
+The productive unstable example is softened:
+
+```text
+l3-035-rsi-mean-reversion-toby-crabel-narrow-range-m5
+  family_policy: unstable
+  promotion_rate: 0.7778
+  sampling_weight_multiplier: 0.85
+  role_balanced_fill_limit: 1
+  family_cap_share: 0.12
 ```
 
 The rebuilt seed plan preserves global sampling at:
@@ -131,7 +165,7 @@ uv run build-recipe-priors --json
 Test result:
 
 ```text
-91 passed
+94 passed
 ```
 
 Seed-plan acceptance check:
@@ -145,9 +179,7 @@ global sampling: 70/20/10
 
 ## Questions For Pro
 
-1. Does this satisfy the requested family-aware policy branch before `clean-50-family-policy-v1`?
-2. Are the classification thresholds right for v1, especially `template_locked = exact_rescue_rate >= 0.40` and `mutation_friendly = mutated_win_rate >= 0.60 plus avg_delta > 3`?
-3. Should `drs-0008 MFI_TREND + OBV_MEAN_REVERSION` remain `unstable` under combined clean-50 + clean-100 because the average mutation delta is negative, or should it be manually treated as `template_guarded` because prior discussion considered it mutation-friendly?
-4. Should unstable retained families be downweighted to `0.65`, or is that too punitive while the sample is still small?
-5. Are the starting caps right: `0.15` per exact pair/template family and `0.30` per discovered recipe?
-6. If this looks good, should the next command be a clean `50` seed confirmation batch named `playhand-prior-test-clean-50-family-policy-v1`?
+1. Does this patched version now satisfy your conditional go for `clean-50-family-policy-v1`?
+2. Is the high-performing negative-delta `template_guarded` clause too broad, or acceptable for v1?
+3. Is the productive-unstable softening acceptable: multiplier `0.85`, cap `0.12`, fill limit `1`?
+4. Should I proceed immediately with `playhand-prior-test-clean-50-family-policy-v1` using seeds `151..200`, `min_indicators=2`, `max_indicators=4`, evolutionary high budget, and `final-profile-drop-count=0`?

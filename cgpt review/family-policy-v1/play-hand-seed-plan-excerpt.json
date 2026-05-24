@@ -13,7 +13,7 @@
     "outcome_prior_pair_rows_annotated": 33,
     "outcome_prior_summary": {
       "schema_version": "playhand_outcome_priors_v1",
-      "generated_at": "2026-05-24T14:28:04.741372-05:00",
+      "generated_at": "2026-05-24T15:34:02.215574-05:00",
       "source_report_dirs": [
         "C:\\repos\\fuzzfolio-autoresearch\\cgpt review\\playhand-prior-test-clean-100",
         "C:\\repos\\fuzzfolio-autoresearch\\cgpt review\\playhand-prior-test-clean-50"
@@ -22,15 +22,15 @@
         "pair_family_rows": 33,
         "recipe_rows": 10,
         "template_locked_pair_families": 2,
-        "template_guarded_pair_families": 2,
+        "template_guarded_pair_families": 3,
         "mutation_friendly_pair_families": 0
       },
       "classification_rules": [
         "under_sampled: count < 3",
         "template_locked: exact_rescue_rate >= 0.40",
         "mutation_friendly: mutated_win_rate >= 0.60 and avg_mutation_delta > 3",
-        "template_guarded: exact_selected_rate >= 0.40",
-        "unstable: otherwise"
+        "template_guarded: exact_selected_rate >= 0.40, or count >= 5 with promotion_rate >= 0.90, comparable_template_runs >= 5, and avg_mutation_delta <= -5",
+        "unstable: otherwise; productive unstable families use softened sampling policy"
       ],
       "policy_defaults": {
         "max_exact_pair_template_family_share": 0.15,
@@ -43,7 +43,7 @@
   },
   "discovered_recipe_006": {
     "source": "discovery_recipe_validation",
-    "recipe_sampling_weight": 386.0721,
+    "recipe_sampling_weight": 400.1082,
     "playhand_recipe_policy": "template_locked",
     "pair_menu": [
       {
@@ -51,9 +51,9 @@
         "anchor_id": "WILLR_MEAN_REVERSION",
         "trigger_id": "RSI_CROSSBACK",
         "probe_timeframe": "M5",
-        "pair_sampling_weight": 51.3172,
+        "pair_sampling_weight": 57.6973,
         "pair_sampling_weight_uncapped": 65.5109,
-        "pair_sampling_weight_capped": 51.3172,
+        "pair_sampling_weight_capped": 57.6973,
         "playhand_family_policy": "template_guarded",
         "playhand_family_cap_share": 0.15,
         "playhand_recommended_max_indicators": 4,
@@ -68,9 +68,9 @@
         "anchor_id": "RSI_CROSSBACK",
         "trigger_id": "WILLR_MEAN_REVERSION",
         "probe_timeframe": "M5",
-        "pair_sampling_weight": 50.2302,
+        "pair_sampling_weight": 56.6102,
         "pair_sampling_weight_uncapped": 71.6706,
-        "pair_sampling_weight_capped": 50.2302,
+        "pair_sampling_weight_capped": 56.6102,
         "playhand_family_policy": "template_locked",
         "playhand_family_cap_share": 0.15,
         "playhand_recommended_max_indicators": 2,
@@ -84,17 +84,34 @@
   },
   "discovered_recipe_003": {
     "source": "discovery_recipe_validation",
-    "recipe_sampling_weight": 337.3719,
+    "recipe_sampling_weight": 376.6033,
     "playhand_recipe_policy": "template_guarded",
     "pair_menu": [
+      {
+        "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+        "anchor_id": "MFI_TREND",
+        "trigger_id": "OBV_MEAN_REVERSION",
+        "probe_timeframe": "M15",
+        "pair_sampling_weight": 58.7662,
+        "pair_sampling_weight_uncapped": 59.4536,
+        "pair_sampling_weight_capped": 58.7662,
+        "playhand_family_policy": "template_guarded",
+        "playhand_family_cap_share": 0.15,
+        "playhand_recommended_max_indicators": 4,
+        "playhand_role_balanced_fill_limit": 1,
+        "playhand_mutation_pressure": "normal",
+        "playhand_exact_rescue_rate": 0.1538,
+        "playhand_avg_mutation_delta": -18.328,
+        "playhand_observation_count": 13
+      },
       {
         "probe_id": "drs-0001-r003-bbands-position-tr-ma-spread-mean-rev-m5",
         "anchor_id": "BBANDS_POSITION_TREND",
         "trigger_id": "MA_SPREAD_MEAN_REVERSION",
         "probe_timeframe": "M5",
-        "pair_sampling_weight": 49.62,
+        "pair_sampling_weight": 56.0,
         "pair_sampling_weight_uncapped": 75.1287,
-        "pair_sampling_weight_capped": 49.62,
+        "pair_sampling_weight_capped": 56.0,
         "playhand_family_policy": "template_locked",
         "playhand_family_cap_share": 0.15,
         "playhand_recommended_max_indicators": 2,
@@ -103,23 +120,6 @@
         "playhand_exact_rescue_rate": 0.6,
         "playhand_avg_mutation_delta": -26.2874,
         "playhand_observation_count": 10
-      },
-      {
-        "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
-        "anchor_id": "MFI_TREND",
-        "trigger_id": "OBV_MEAN_REVERSION",
-        "probe_timeframe": "M15",
-        "pair_sampling_weight": 27.783,
-        "pair_sampling_weight_uncapped": 36.8046,
-        "pair_sampling_weight_capped": 27.783,
-        "playhand_family_policy": "unstable",
-        "playhand_family_cap_share": 0.08,
-        "playhand_recommended_max_indicators": 3,
-        "playhand_role_balanced_fill_limit": 0,
-        "playhand_mutation_pressure": "low",
-        "playhand_exact_rescue_rate": 0.1538,
-        "playhand_avg_mutation_delta": -18.328,
-        "playhand_observation_count": 13
       }
     ]
   }

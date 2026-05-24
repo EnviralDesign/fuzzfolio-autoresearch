@@ -195,6 +195,52 @@ def test_deal_seed_plan_indicators_keeps_policy_exploration_on_seed_prompt_pool(
     assert {indicator.id for indicator in deal["indicators"]} == {"FILL_A", "FILL_B"}
 
 
+def test_deal_seed_plan_indicators_uses_explicit_recipe_sampling_weight() -> None:
+    indicators = [
+        play_hand_mod.SeedIndicator("WEAK_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("WEAK_B", "trigger", "event", "entry"),
+        play_hand_mod.SeedIndicator("STRONG_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("STRONG_B", "trigger", "event", "entry"),
+    ]
+    seed_plan = {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {
+            "huge_pair_menu_but_capped": {
+                "recipe_sampling_weight": 1,
+                "pair_menu": [
+                    {
+                        "anchor_id": "WEAK_A",
+                        "trigger_id": "WEAK_B",
+                        "pair_sampling_weight": 10000,
+                    }
+                ],
+                "slot_menus": {},
+            },
+            "small_pair_menu_but_boosted": {
+                "recipe_sampling_weight": 100,
+                "pair_menu": [
+                    {
+                        "anchor_id": "STRONG_A",
+                        "trigger_id": "STRONG_B",
+                        "pair_sampling_weight": 1,
+                    }
+                ],
+                "slot_menus": {},
+            },
+        },
+    }
+
+    deal = deal_seed_plan_indicators(
+        indicators,
+        target_count=2,
+        seed_plan=seed_plan,
+        rng=random.Random(0),
+    )
+
+    assert deal["recipe"] == "small_pair_menu_but_boosted"
+    assert [indicator.id for indicator in deal["indicators"]] == ["STRONG_A", "STRONG_B"]
+
+
 def test_seed_pair_template_instruments_reads_validated_template_pool() -> None:
     pair = {
         "recommended_profile_template": {

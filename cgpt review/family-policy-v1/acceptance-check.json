@@ -1,9 +1,14 @@
 {
-  "generated_at": "2026-05-24T19:28:47.9937601Z",
-  "tests": "uv run pytest tests/test_playhand_outcome_priors.py tests/test_recipe_priors.py tests/test_play_hand.py tests/test_provider_trace.py -q => 91 passed",
+  "generated_at": "2026-05-24T20:35:02.9507299Z",
+  "tests": "uv run pytest tests/test_playhand_outcome_priors.py tests/test_recipe_priors.py tests/test_play_hand.py tests/test_provider_trace.py -q => 94 passed",
   "commands": [
     "uv run build-playhand-outcome-priors --json",
     "uv run build-recipe-priors --json"
+  ],
+  "pro_followup_fixes": [
+    "Play Hand already consumed recipe_sampling_weight; added direct explicit-weight recipe selection test.",
+    "High-performing negative-delta families classify as template_guarded even when exact_selected_rate is slightly below 0.40.",
+    "Productive unstable families get softened policy: multiplier 0.85, cap 0.12, role_balanced_fill_limit 1."
   ],
   "sampling_policy": {
     "guided_prior_fraction": 0.7,
@@ -20,15 +25,30 @@
     "playhand_recommended_max_indicators": 2,
     "playhand_role_balanced_fill_limit": 0,
     "playhand_family_cap_share": 0.15,
-    "pair_sampling_weight": 50.2302,
+    "pair_sampling_weight": 56.6102,
     "pair_sampling_weight_uncapped": 71.6706,
-    "pair_sampling_weight_capped": 50.2302
+    "pair_sampling_weight_capped": 56.6102
+  },
+  "target_drs_0008": {
+    "probe_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+    "playhand_family_policy": "template_guarded",
+    "playhand_sampling_weight_multiplier": 1.05,
+    "playhand_role_balanced_fill_limit": 1,
+    "playhand_family_cap_share": 0.15
+  },
+  "productive_unstable_example_l3_035": {
+    "family_id": "l3-035-rsi-mean-reversion-toby-crabel-narrow-range-m5",
+    "promotion_rate": "0.7778",
+    "family_policy": "unstable",
+    "sampling_weight_multiplier": "0.85",
+    "role_balanced_fill_limit": "1",
+    "family_cap_share": "0.12"
   },
   "outcome_prior_counts": {
     "pair_family_rows": 33,
     "recipe_rows": 10,
     "template_locked_pair_families": 2,
-    "template_guarded_pair_families": 2,
+    "template_guarded_pair_families": 3,
     "mutation_friendly_pair_families": 0
   },
   "template_locked_families": [
@@ -66,6 +86,18 @@
       "exact_rescue_rate": "0.3333",
       "exact_selected_rate": "0.6667",
       "avg_mutation_delta": "-22.285",
+      "recommended_max_indicators": "4",
+      "role_balanced_fill_limit": "1",
+      "family_cap_share": "0.15"
+    },
+    {
+      "family_id": "drs-0008-r003-mfi-trend-obv-mean-reversion-m15",
+      "count": "13",
+      "promoted": "13",
+      "promotion_rate": "1.0",
+      "exact_rescue_rate": "0.1538",
+      "exact_selected_rate": "0.3846",
+      "avg_mutation_delta": "-18.328",
       "recommended_max_indicators": "4",
       "role_balanced_fill_limit": "1",
       "family_cap_share": "0.15"

@@ -41,3 +41,64 @@ unknown,unknown,28,15,13,0.5357,0,28,0,0,0,0,0.0,0.0,,,,unstable,31.9939,59.722,
     assert pair_rows[0]["family_id"] == "drs-0002-r006-rsi-crossback-willr-mean-reversi-m5"
     assert len(recipe_rows) == 1
     assert recipe_rows[0]["recipe"] == "discovered_recipe_006"
+
+
+def test_build_playhand_outcome_priors_guards_high_performing_negative_delta_family(
+    tmp_path: Path,
+) -> None:
+    report_dir = tmp_path / "playhand-prior-test-clean-100"
+    _write_csv(
+        report_dir / "recipe-performance-pairs.csv",
+        """
+template_branch_source_probe_id,dealt_pair_probe_id,dealt_recipe,dealt_pair_source,count,promoted,tombstoned,promotion_rate,exact_selected,mutated_selected,exact_rescues,exact_outscored_mutated,comparable_template_runs,mutated_wins_over_exact,exact_rescue_rate,exact_selected_rate,mutated_win_rate,avg_mutation_delta,median_mutation_delta,family_classification,avg_score,avg_positive_score,best_score,best_seed
+drs-0008-r003-mfi-trend-obv-mean-reversion-m15,drs-0008-r003-mfi-trend-obv-mean-reversion-m15,discovered_recipe_003,discovery_recipe_validation,13,13,0,1.0,5,8,2,4,13,7,0.1538,0.3846,0.5385,-18.328,-20.0,unstable,66.0,66.0,74.0,88
+""",
+    )
+    _write_csv(
+        report_dir / "recipe-performance-recipes.csv",
+        """
+dealt_recipe,dealt_recipe_source,count,promoted,tombstoned,promotion_rate,exact_selected,mutated_selected,exact_rescues,exact_outscored_mutated,comparable_template_runs,mutated_wins_over_exact,exact_rescue_rate,exact_selected_rate,mutated_win_rate,avg_mutation_delta,median_mutation_delta,family_classification,avg_score,avg_positive_score,best_score,best_seed
+discovered_recipe_003,discovery_recipe_validation,13,13,0,1.0,5,8,2,4,13,7,0.1538,0.3846,0.5385,-18.328,-20.0,unstable,66.0,66.0,74.0,88
+""",
+    )
+
+    payload, pair_rows, _recipe_rows, summary = build_playhand_outcome_prior_artifacts(
+        report_dirs=[report_dir]
+    )
+
+    row = payload["pair_families"]["drs-0008-r003-mfi-trend-obv-mean-reversion-m15"]
+    assert row["family_policy"] == "template_guarded"
+    assert row["role_balanced_fill_limit"] == 1
+    assert row["sampling_weight_multiplier"] == 1.05
+    assert pair_rows[0]["family_classification"] == "template_guarded"
+    assert summary["result_counts"]["template_guarded_pair_families"] == 1
+
+
+def test_build_playhand_outcome_priors_softens_productive_unstable_family(
+    tmp_path: Path,
+) -> None:
+    report_dir = tmp_path / "playhand-prior-test-clean-100"
+    _write_csv(
+        report_dir / "recipe-performance-pairs.csv",
+        """
+template_branch_source_probe_id,dealt_pair_probe_id,dealt_recipe,dealt_pair_source,count,promoted,tombstoned,promotion_rate,exact_selected,mutated_selected,exact_rescues,exact_outscored_mutated,comparable_template_runs,mutated_wins_over_exact,exact_rescue_rate,exact_selected_rate,mutated_win_rate,avg_mutation_delta,median_mutation_delta,family_classification,avg_score,avg_positive_score,best_score,best_seed
+l3-035-rsi-mean-reversion-toby-crabel-narrow-range-m5,l3-035-rsi-mean-reversion-toby-crabel-narrow-range-m5,mean_reversion_reclaim,anchor_pair_atlas,9,7,2,0.7778,0,9,0,0,0,0,0.0,0.0,,0.0,0.0,unstable,55.0,62.0,73.0,35
+""",
+    )
+    _write_csv(
+        report_dir / "recipe-performance-recipes.csv",
+        """
+dealt_recipe,dealt_recipe_source,count,promoted,tombstoned,promotion_rate,exact_selected,mutated_selected,exact_rescues,exact_outscored_mutated,comparable_template_runs,mutated_wins_over_exact,exact_rescue_rate,exact_selected_rate,mutated_win_rate,avg_mutation_delta,median_mutation_delta,family_classification,avg_score,avg_positive_score,best_score,best_seed
+mean_reversion_reclaim,curated_recipe_prior,9,7,2,0.7778,0,9,0,0,0,0,0.0,0.0,,0.0,0.0,unstable,55.0,62.0,73.0,35
+""",
+    )
+
+    payload, _pair_rows, _recipe_rows, _summary = build_playhand_outcome_prior_artifacts(
+        report_dirs=[report_dir]
+    )
+
+    row = payload["pair_families"]["l3-035-rsi-mean-reversion-toby-crabel-narrow-range-m5"]
+    assert row["family_policy"] == "unstable"
+    assert row["sampling_weight_multiplier"] == 0.85
+    assert row["family_cap_share"] == 0.12
+    assert row["role_balanced_fill_limit"] == 1
