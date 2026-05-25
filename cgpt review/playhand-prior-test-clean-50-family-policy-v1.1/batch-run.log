@@ -1,0 +1,103 @@
+﻿[2026-05-25T11:51:43.6498741Z] Starting clean 50-seed Play Hand family-policy v1.1 source-mix confirmation batch
+Command template: uv run play-hand --seed <seed> --coarse-mode evolutionary --sweep-budget high --min-indicators 2 --max-indicators 4 --final-profile-drop-count 0 --json
+[2026-05-25T11:51:43.6853002Z] Starting seed 201
+[2026-05-25T12:11:24.5102795Z] Seed 201 completed run=20260525T115144432451Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T12:11:24.5779171Z] Starting seed 202
+[2026-05-25T12:24:45.8427213Z] Seed 202 completed run=20260525T121125494675Z-playhand-v1 status=promoted score=62.6286 branch=exact_template
+[2026-05-25T12:24:45.8668848Z] Starting seed 203
+[2026-05-25T12:30:02.5589196Z] Seed 203 completed run=20260525T122446577857Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T12:30:02.5931294Z] Starting seed 204
+[2026-05-25T12:49:11.2485194Z] Seed 204 completed run=20260525T123003355182Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T12:49:11.2722938Z] Starting seed 205
+[2026-05-25T13:02:42.6769297Z] Seed 205 completed run=20260525T124912007212Z-playhand-v1 status=promoted score=65.034 branch=mutated
+[2026-05-25T13:02:42.6973249Z] Starting seed 206
+[2026-05-25T13:07:07.7094043Z] Seed 206 completed run=20260525T130243437475Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T13:07:07.7305568Z] Starting seed 207
+[2026-05-25T13:12:38.9095723Z] Seed 207 completed run=20260525T130708509590Z-playhand-v1 status=promoted score=62.6158 branch=exact_template
+[2026-05-25T13:12:38.9323626Z] Starting seed 208
+[2026-05-25T13:23:34.6642256Z] Seed 208 completed run=20260525T131239640313Z-playhand-v1 status=promoted score=61.6931 branch=exact_template
+[2026-05-25T13:23:34.6883225Z] Starting seed 209
+[2026-05-25T13:31:12.3677914Z] Seed 209 completed run=20260525T132335427342Z-playhand-v1 status=promoted score=72.2181 branch=exact_template
+[2026-05-25T13:31:12.3894223Z] Starting seed 210
+[2026-05-25T13:38:03.8536514Z] Seed 210 completed run=20260525T133113122523Z-playhand-v1 status=promoted score=70.9361 branch=mutated
+[2026-05-25T13:38:03.8800551Z] Starting seed 211
+[2026-05-25T13:52:28.6808122Z] Seed 211 completed run=20260525T133804623375Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T13:52:28.7053748Z] Starting seed 212
+[2026-05-25T14:06:15.3674911Z] Seed 212 completed run=20260525T135229450102Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T14:06:15.3921901Z] Starting seed 213
+[2026-05-25T14:14:45.1322024Z] Seed 213 completed run=20260525T140616228477Z-playhand-v1 status=promoted score=61.6267 branch=exact_template
+[2026-05-25T14:14:45.1569367Z] Starting seed 214
+[2026-05-25T14:22:06.1565215Z] Seed 214 completed run=20260525T141445941003Z-playhand-v1 status=promoted score=59.5044 branch=mutated
+[2026-05-25T14:22:06.1815456Z] Starting seed 215
+[2026-05-25T14:27:14.1600587Z] Seed 215 completed run=20260525T142207000320Z-playhand-v1 status=promoted score=73.1268 branch=mutated
+[2026-05-25T14:27:14.1842354Z] Starting seed 216
+[2026-05-25T14:33:27.8885117Z] Seed 216 completed run=20260525T142714932549Z-playhand-v1 status=promoted score=72.2181 branch=exact_template
+[2026-05-25T14:33:27.9128006Z] Starting seed 217
+[2026-05-25T14:49:05.3645857Z] Seed 217 completed run=20260525T143328669393Z-playhand-v1 status=promoted score=63.9168 branch=mutated
+[2026-05-25T14:49:05.3869191Z] Starting seed 218
+[2026-05-25T15:06:56.4922924Z] Seed 218 completed run=20260525T144906137950Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T15:06:56.5183360Z] Starting seed 219
+[2026-05-25T15:14:38.5697689Z] Seed 219 completed run=20260525T150657304228Z-playhand-v1 status=promoted score=62.6286 branch=exact_template
+[2026-05-25T15:14:38.5932034Z] Starting seed 220
+[2026-05-25T15:40:44.8147992Z] Seed 220 completed run=20260525T151439309336Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T15:40:44.8376478Z] Starting seed 221
+[2026-05-25T15:54:04.5213533Z] Seed 221 completed run=20260525T154045596417Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T15:54:04.5460230Z] Starting seed 222
+[2026-05-25T16:02:01.2927642Z] Seed 222 completed run=20260525T155405343974Z-playhand-v1 status=promoted score=61.6931 branch=exact_template
+[2026-05-25T16:02:01.3149675Z] Starting seed 223
+[2026-05-25T16:19:12.4630809Z] Seed 223 completed run=20260525T160202013849Z-playhand-v1 status=promoted score=57.7182 branch=mutated
+[2026-05-25T16:19:12.4806528Z] Starting seed 224
+[2026-05-25T16:25:15.3262504Z] Seed 224 completed run=20260525T161913286477Z-playhand-v1 status=promoted score=72.8843 branch=mutated
+[2026-05-25T16:25:15.3513474Z] Starting seed 225
+[2026-05-25T16:55:33.5337206Z] Seed 225 completed run=20260525T162516144284Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T16:55:33.5592741Z] Starting seed 226
+[2026-05-25T17:10:14.2007485Z] Seed 226 completed run=20260525T165534345803Z-playhand-v1 status=promoted score=40.6791 branch=mutated
+[2026-05-25T17:10:14.2240012Z] Starting seed 227
+[2026-05-25T17:20:31.0488740Z] Seed 227 completed run=20260525T171014970531Z-playhand-v1 status=promoted score=57.7347 branch=mutated
+[2026-05-25T17:20:31.0720047Z] Starting seed 228
+[2026-05-25T17:38:49.7983790Z] Seed 228 completed run=20260525T172031832870Z-playhand-v1 status=promoted score=68.0531 branch=mutated
+[2026-05-25T17:38:49.8225741Z] Starting seed 229
+[2026-05-25T17:53:09.1336992Z] Seed 229 completed run=20260525T173850554496Z-playhand-v1 status=promoted score=72.8068 branch=mutated
+[2026-05-25T17:53:09.1572519Z] Starting seed 230
+[2026-05-25T18:01:14.5679950Z] Seed 230 completed run=20260525T175309915726Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T18:01:14.5925386Z] Starting seed 231
+[2026-05-25T18:10:34.7262692Z] Seed 231 completed run=20260525T180115382568Z-playhand-v1 status=promoted score=73.0629 branch=mutated
+[2026-05-25T18:10:34.7474687Z] Starting seed 232
+[2026-05-25T18:18:05.1398606Z] Seed 232 completed run=20260525T181035457562Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T18:18:05.1621528Z] Starting seed 233
+[2026-05-25T18:27:53.2485861Z] Seed 233 completed run=20260525T181805892915Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T18:27:53.2765312Z] Starting seed 234
+[2026-05-25T18:44:25.8116416Z] Seed 234 completed run=20260525T182754041273Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T18:44:25.8345923Z] Starting seed 235
+[2026-05-25T18:50:58.0031622Z] Seed 235 completed run=20260525T184426547202Z-playhand-v1 status=promoted score=68.326 branch=exact_template
+[2026-05-25T18:50:58.0256131Z] Starting seed 236
+[2026-05-25T18:59:41.5758958Z] Seed 236 completed run=20260525T185058778965Z-playhand-v1 status=promoted score=61.6929 branch=exact_template
+[2026-05-25T18:59:41.5996302Z] Starting seed 237
+[2026-05-25T19:08:30.3596754Z] Seed 237 completed run=20260525T185942325334Z-playhand-v1 status=promoted score=61.6929 branch=exact_template
+[2026-05-25T19:08:30.3827487Z] Starting seed 238
+[2026-05-25T19:36:02.4752725Z] Seed 238 completed run=20260525T190831133270Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T19:36:02.5013991Z] Starting seed 239
+[2026-05-25T19:44:45.7158372Z] Seed 239 completed run=20260525T193603264229Z-playhand-v1 status=promoted score=62.6156 branch=exact_template
+[2026-05-25T19:44:45.7415092Z] Starting seed 240
+[2026-05-25T20:02:05.0895373Z] Seed 240 completed run=20260525T194446546455Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T20:02:05.1142445Z] Starting seed 241
+[2026-05-25T20:09:22.1450046Z] Seed 241 completed run=20260525T200205830953Z-playhand-v1 status=promoted score=56.8888 branch=mutated
+[2026-05-25T20:09:22.1690789Z] Starting seed 242
+[2026-05-25T20:15:27.4159399Z] Seed 242 completed run=20260525T200922943875Z-playhand-v1 status=promoted score=68.326 branch=exact_template
+[2026-05-25T20:15:27.4379821Z] Starting seed 243
+[2026-05-25T20:21:31.7051685Z] Seed 243 completed run=20260525T201528179186Z-playhand-v1 status=promoted score=72.2179 branch=exact_template
+[2026-05-25T20:21:31.7287170Z] Starting seed 244
+[2026-05-25T20:31:04.4817980Z] Seed 244 completed run=20260525T202132470397Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T20:31:04.5038597Z] Starting seed 245
+[2026-05-25T20:39:30.0095146Z] Seed 245 completed run=20260525T203105228690Z-playhand-v1 status=tombstoned score=0.0 branch=mutated
+[2026-05-25T20:39:30.0321717Z] Starting seed 246
+[2026-05-25T20:45:45.5227423Z] Seed 246 completed run=20260525T203930829446Z-playhand-v1 status=promoted score=73.303 branch=mutated
+[2026-05-25T20:45:45.5460062Z] Starting seed 247
+[2026-05-25T20:53:48.0439333Z] Seed 247 completed run=20260525T204546275807Z-playhand-v1 status=promoted score=68.326 branch=exact_template
+[2026-05-25T20:53:48.0659586Z] Starting seed 248
+[2026-05-25T21:07:40.1477673Z] Seed 248 completed run=20260525T205348820482Z-playhand-v1 status=promoted score=61.6929 branch=exact_template
+[2026-05-25T21:07:40.1736852Z] Starting seed 249
+[2026-05-25T21:22:39.1857693Z] Seed 249 completed run=20260525T210740946671Z-playhand-v1 status=promoted score=47.7092 branch=mutated
+[2026-05-25T21:22:39.2071458Z] Starting seed 250
+[2026-05-25T21:35:09.7346042Z] Seed 250 completed run=20260525T212239951949Z-playhand-v1 status=promoted score=69.8456 branch=mutated
+[2026-05-25T21:35:09.7488213Z] Finished clean 50-seed Play Hand family-policy v1.1 source-mix confirmation batch completed=50 failed=0 skipped=0
