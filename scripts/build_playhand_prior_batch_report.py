@@ -233,6 +233,22 @@ def load_rows(batch_dir: Path) -> list[dict[str, Any]]:
             ),
             "dealt_recipe_source": dealt_recipe_source,
             "dealt_recipe_confidence": metadata.get("dealt_recipe_confidence"),
+            "guided_recipe_source_mix_expected": json_compact(
+                metadata.get("guided_recipe_source_mix_expected")
+                or deal_event.get("guided_recipe_source_mix_expected")
+            ),
+            "guided_recipe_source_bucket": clean_text(
+                metadata.get("guided_recipe_source_bucket")
+                or deal_event.get("guided_recipe_source_bucket")
+            ),
+            "guided_recipe_source_bucket_matched": safe_bool(
+                metadata.get("guided_recipe_source_bucket_matched")
+                or deal_event.get("guided_recipe_source_bucket_matched")
+            ),
+            "guided_recipe_source_bucket_fallback": safe_bool(
+                metadata.get("guided_recipe_source_bucket_fallback")
+                or deal_event.get("guided_recipe_source_bucket_fallback")
+            ),
             "dealt_pair_probe_id": clean_text(pair.get("probe_id")),
             "dealt_pair_source": clean_text(pair.get("source")),
             "first_indicator_id": clean_text(pair.get("first_indicator_id")),
@@ -289,6 +305,53 @@ def load_rows(batch_dir: Path) -> list[dict[str, Any]]:
 def count_by(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
     counter: Counter[str] = Counter(clean_text(row.get(key)) or "unknown" for row in rows)
     return dict(sorted(counter.items(), key=lambda item: (-item[1], item[0])))
+
+
+def first_json_object(rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    for row in rows:
+        raw = row.get(key)
+        if isinstance(raw, dict):
+            return raw
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
+def source_mix_observed(rows: list[dict[str, Any]]) -> dict[str, float]:
+    guided_rows = [
+        row for row in rows if row.get("dealt_indicator_source") == "play_hand_seed_plan"
+    ]
+    counts = count_by(guided_rows, "dealt_recipe_source")
+    total = sum(counts.values())
+    if not total:
+        return {}
+    return {
+        source: round(count / total, 4)
+        for source, count in sorted(counts.items())
+    }
+
+
+def source_rate(
+    rows: list[dict[str, Any]],
+    *,
+    numerator_fn: Any,
+) -> dict[str, float | None]:
+    output: dict[str, float | None] = {}
+    sources = sorted({clean_text(row.get("dealt_recipe_source")) or "unknown" for row in rows})
+    for source in sources:
+        selected = [
+            row
+            for row in rows
+            if (clean_text(row.get("dealt_recipe_source")) or "unknown") == source
+        ]
+        output[source] = safe_rate(len([row for row in selected if numerator_fn(row)]), len(selected))
+    return output
 
 
 def numeric_values(rows: list[dict[str, Any]], key: str) -> list[float]:
@@ -464,6 +527,26 @@ def build_summary(rows: list[dict[str, Any]], batch_status: dict[str, Any]) -> d
         "schema_version": "playhand_prior_batch_report_v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "batch_status": batch_status,
+        "guided_recipe_source_mix_expected": first_json_object(
+            rows, "guided_recipe_source_mix_expected"
+        ),
+        "guided_recipe_source_mix_observed": source_mix_observed(rows),
+        "guided_recipe_runs_by_source": count_by(
+            [
+                row
+                for row in rows
+                if row.get("dealt_indicator_source") == "play_hand_seed_plan"
+            ],
+            "dealt_recipe_source",
+        ),
+        "template_materialization_rate_by_source": source_rate(
+            rows,
+            numerator_fn=lambda row: bool(row.get("pair_template_materialized")),
+        ),
+        "promotion_rate_by_source": source_rate(
+            rows,
+            numerator_fn=lambda row: row.get("run_status") == "promoted",
+        ),
         "result_counts": {
             "runs": len(rows),
             "completed": int(batch_status.get("completed") or len(rows)),
@@ -573,6 +656,14 @@ def make_markdown(
         f"- Exact-template impact: {counts['exact_template_rescues']} rescues, {counts['exact_template_outscored_mutated']} exact-template outscored mutated, {counts['mutated_improved_over_exact_template']} mutated improved over an exact template.",
         f"- Source hit rates: discovered {pct(counts.get('discovered_recipe_hit_rate'))}, curated {pct(counts.get('curated_recipe_hit_rate'))}, policy exploration {pct(counts.get('policy_exploration_hit_rate'))}.",
         f"- Family concentration: top family share {pct(counts.get('top_family_concentration_share'))}; unique promoted pair/template families {counts.get('unique_promoted_pair_families')}.",
+        "",
+        "## Guided Source Mix",
+        "",
+        f"- Expected guided recipe source mix: `{json_compact(summary.get('guided_recipe_source_mix_expected'))}`",
+        f"- Observed guided recipe source mix: `{json_compact(summary.get('guided_recipe_source_mix_observed'))}`",
+        f"- Guided recipe runs by source: `{json_compact(summary.get('guided_recipe_runs_by_source'))}`",
+        f"- Template materialization rate by source: `{json_compact(summary.get('template_materialization_rate_by_source'))}`",
+        f"- Promotion rate by source: `{json_compact(summary.get('promotion_rate_by_source'))}`",
         "",
         "## Case Counts",
         "",
@@ -865,6 +956,15 @@ def metric_bundle(report: dict[str, Any]) -> dict[str, Any]:
             "curated_recipe_hit_rate",
             hit_rate(rows, "dealt_recipe_source", "curated_recipe_prior"),
         ),
+        "discovered_recipe_exposure": safe_rate(
+            len([row for row in rows if row.get("dealt_recipe_source") == "discovery_recipe_validation"]),
+            len(rows),
+        ),
+        "curated_recipe_exposure": safe_rate(
+            len([row for row in rows if row.get("dealt_recipe_source") == "curated_recipe_prior"]),
+            len(rows),
+        ),
+        "policy_exploration_exposure": safe_rate(len(policy_exploration), len(rows)),
         "top_family_concentration_share": result_counts.get(
             "top_family_concentration_share", safe_rate(top_family_count, len(rows))
         ),
@@ -916,6 +1016,15 @@ def build_comparison(
             if current_float is not None and previous_float is not None
             else None
         )
+    exposure_deltas = {
+        "discovered_recipe_exposure_delta": metric_deltas.get(
+            "discovered_recipe_exposure"
+        ),
+        "curated_recipe_exposure_delta": metric_deltas.get("curated_recipe_exposure"),
+        "policy_exploration_exposure_delta": metric_deltas.get(
+            "policy_exploration_exposure"
+        ),
+    }
     previous_families = family_rows(previous_report)
     current_families = family_rows(current_report)
     family_comparison: list[dict[str, Any]] = []
@@ -959,6 +1068,7 @@ def build_comparison(
         "previous_metrics": previous_metrics,
         "current_metrics": current_metrics,
         "metric_deltas": metric_deltas,
+        "exposure_deltas": exposure_deltas,
         "family_comparison": family_comparison,
         "family_classification_changes": [
             row for row in family_comparison if row.get("classification_changed")
@@ -978,6 +1088,9 @@ def make_comparison_markdown(comparison: dict[str, Any]) -> str:
         "exact_rescue_rate",
         "mutation_improvement_rate",
         "policy_exploration_hit_rate",
+        "discovered_recipe_exposure",
+        "curated_recipe_exposure",
+        "policy_exploration_exposure",
         "discovered_recipe_hit_rate",
         "curated_recipe_hit_rate",
         "top_family_concentration_share",
@@ -1017,6 +1130,17 @@ def make_comparison_markdown(comparison: dict[str, Any]) -> str:
         lines.append(
             f"| `{key}` | {previous_metrics.get(key)} | {current_metrics.get(key)} | {metric_deltas.get(key)} |"
         )
+    lines.extend(
+        [
+            "",
+            "## Exposure Deltas",
+            "",
+            "| Metric | Delta |",
+            "|---|---:|",
+        ]
+    )
+    for key, value in (comparison.get("exposure_deltas") or {}).items():
+        lines.append(f"| `{key}` | {value} |")
     lines.extend(
         [
             "",

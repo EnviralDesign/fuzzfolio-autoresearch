@@ -637,6 +637,19 @@ def _seed_plan_recipe_weight(recipe_payload: dict[str, Any]) -> float:
     return total
 
 
+def _seed_plan_guided_recipe_source_mix(policy: dict[str, Any]) -> dict[str, float]:
+    raw_mix = policy.get("guided_recipe_source_mix")
+    if not isinstance(raw_mix, dict):
+        return {}
+    mix: dict[str, float] = {}
+    for source, weight in raw_mix.items():
+        source_name = str(source or "").strip()
+        source_weight = _seed_plan_float(weight)
+        if source_name and source_weight > 0.0:
+            mix[source_name] = source_weight
+    return mix
+
+
 def _seed_pair_family_policy(pair: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(pair, dict):
         return {}
@@ -780,8 +793,31 @@ def deal_seed_plan_indicators(
         for name, payload in recipes.items()
         if isinstance(payload, dict) and _seed_plan_recipe_weight(payload) > 0.0
     ]
+    recipe_source_mix = _seed_plan_guided_recipe_source_mix(policy)
+    recipe_source_bucket: str | None = None
+    recipe_source_bucket_matched = False
+    recipe_source_bucket_fallback = False
+    recipe_candidates = recipe_items
+    if recipe_source_mix:
+        selected_source = _weighted_seed_plan_choice(
+            list(recipe_source_mix.items()),
+            rng=rng,
+            weight_fn=lambda item: item[1],
+        )
+        if selected_source is not None:
+            recipe_source_bucket = str(selected_source[0])
+            source_candidates = [
+                item
+                for item in recipe_items
+                if str(item[1].get("source") or "").strip() == recipe_source_bucket
+            ]
+            if source_candidates:
+                recipe_candidates = source_candidates
+                recipe_source_bucket_matched = True
+            else:
+                recipe_source_bucket_fallback = True
     selected_recipe = _weighted_seed_plan_choice(
-        recipe_items,
+        recipe_candidates,
         rng=rng,
         weight_fn=lambda item: _seed_plan_recipe_weight(item[1]),
     )
@@ -947,6 +983,10 @@ def deal_seed_plan_indicators(
         "recipe": recipe_name,
         "recipe_source": recipe_payload.get("source"),
         "recipe_confidence": recipe_payload.get("recipe_confidence"),
+        "guided_recipe_source_mix_expected": recipe_source_mix,
+        "guided_recipe_source_bucket": recipe_source_bucket,
+        "guided_recipe_source_bucket_matched": recipe_source_bucket_matched,
+        "guided_recipe_source_bucket_fallback": recipe_source_bucket_fallback,
         "pair": selected_pair,
         "family_policy": selected_family_policy,
         "policy_target_count": policy_target_count,
@@ -4160,6 +4200,16 @@ def cmd_play_hand(
         "dealt_recipe": indicator_deal.get("recipe"),
         "dealt_recipe_source": indicator_deal.get("recipe_source"),
         "dealt_recipe_confidence": indicator_deal.get("recipe_confidence"),
+        "guided_recipe_source_mix_expected": indicator_deal.get(
+            "guided_recipe_source_mix_expected"
+        ),
+        "guided_recipe_source_bucket": indicator_deal.get("guided_recipe_source_bucket"),
+        "guided_recipe_source_bucket_matched": indicator_deal.get(
+            "guided_recipe_source_bucket_matched"
+        ),
+        "guided_recipe_source_bucket_fallback": indicator_deal.get(
+            "guided_recipe_source_bucket_fallback"
+        ),
         "dealt_recipe_pair": indicator_deal.get("pair"),
         "dealt_pair_family_policy": indicator_deal.get("family_policy"),
         "dealt_policy_target_count": indicator_deal.get("policy_target_count"),
@@ -4232,6 +4282,16 @@ def cmd_play_hand(
         play_hand_seed_plan_path=str(seed_plan_path) if seed_plan_path else None,
         dealt_recipe=indicator_deal.get("recipe"),
         dealt_recipe_source=indicator_deal.get("recipe_source"),
+        guided_recipe_source_mix_expected=indicator_deal.get(
+            "guided_recipe_source_mix_expected"
+        ),
+        guided_recipe_source_bucket=indicator_deal.get("guided_recipe_source_bucket"),
+        guided_recipe_source_bucket_matched=indicator_deal.get(
+            "guided_recipe_source_bucket_matched"
+        ),
+        guided_recipe_source_bucket_fallback=indicator_deal.get(
+            "guided_recipe_source_bucket_fallback"
+        ),
         dealt_recipe_pair=indicator_deal.get("pair"),
         dealt_pair_family_policy=indicator_deal.get("family_policy"),
         dealt_policy_target_count=indicator_deal.get("policy_target_count"),
@@ -4859,6 +4919,25 @@ def cmd_play_hand(
         "sweep_timeout_seconds": sweep_timeout_seconds,
         "max_reward_r": reward_matrix.get("requested_max_reward_r") if reward_matrix else max_reward_r,
         "reward_matrix": reward_matrix,
+        "dealt_indicator_source": indicator_deal.get("source"),
+        "dealt_indicator_source_reason": indicator_deal.get("reason"),
+        "dealt_recipe": indicator_deal.get("recipe"),
+        "dealt_recipe_source": indicator_deal.get("recipe_source"),
+        "dealt_recipe_confidence": indicator_deal.get("recipe_confidence"),
+        "guided_recipe_source_mix_expected": indicator_deal.get(
+            "guided_recipe_source_mix_expected"
+        ),
+        "guided_recipe_source_bucket": indicator_deal.get("guided_recipe_source_bucket"),
+        "guided_recipe_source_bucket_matched": indicator_deal.get(
+            "guided_recipe_source_bucket_matched"
+        ),
+        "guided_recipe_source_bucket_fallback": indicator_deal.get(
+            "guided_recipe_source_bucket_fallback"
+        ),
+        "dealt_recipe_pair": indicator_deal.get("pair"),
+        "dealt_pair_family_policy": indicator_deal.get("family_policy"),
+        "dealt_policy_target_count": indicator_deal.get("policy_target_count"),
+        "dealt_recipe_slots": indicator_deal.get("selected_slots"),
         "instrument_scout": scout_result,
         "run_status": "promoted" if final_scrutiny_passed else "tombstoned",
         "run_tombstoned": not final_scrutiny_passed,

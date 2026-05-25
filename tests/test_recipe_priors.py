@@ -492,6 +492,10 @@ def test_build_recipe_prior_artifacts_tiers_sampling_policy_by_distinct_36m_fami
     assert limited_seed_plan["sampling_policy"]["guided_prior_fraction"] == 0.70
     assert limited_seed_plan["sampling_policy"]["uncertain_prior_fraction"] == 0.20
     assert limited_seed_plan["sampling_policy"]["wild_exploration_fraction"] == 0.10
+    assert limited_seed_plan["sampling_policy"]["guided_recipe_source_mix"] == {
+        "discovery_recipe_validation": 0.60,
+        "curated_recipe_prior": 0.40,
+    }
     assert limited_seed_plan["sampling_policy"]["maturity"] == "limited_36m_retention"
 
     (
@@ -519,4 +523,8 @@ def test_build_recipe_prior_artifacts_tiers_sampling_policy_by_distinct_36m_fami
     assert broad_seed_plan["sampling_policy"]["guided_prior_fraction"] == 0.80
     assert broad_seed_plan["sampling_policy"]["uncertain_prior_fraction"] == 0.15
     assert broad_seed_plan["sampling_policy"]["wild_exploration_fraction"] == 0.05
+    assert broad_seed_plan["sampling_policy"]["guided_recipe_source_mix"] == {
+        "discovery_recipe_validation": 0.60,
+        "curated_recipe_prior": 0.40,
+    }
     assert broad_seed_plan["sampling_policy"]["maturity"] == "broad_36m_retention"

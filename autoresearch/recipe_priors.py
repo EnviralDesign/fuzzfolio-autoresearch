@@ -1406,6 +1406,10 @@ def build_recipe_prior_artifacts(
             "guided_prior_fraction": 0.80,
             "uncertain_prior_fraction": 0.15,
             "wild_exploration_fraction": 0.05,
+            "guided_recipe_source_mix": {
+                "discovery_recipe_validation": 0.60,
+                "curated_recipe_prior": 0.40,
+            },
             "maturity": "broad_36m_retention",
             "retained_36m_family_count": retained_36m_family_count,
             "template_instrument_policy": "seed_pool",
@@ -1416,6 +1420,10 @@ def build_recipe_prior_artifacts(
             "guided_prior_fraction": 0.70,
             "uncertain_prior_fraction": 0.20,
             "wild_exploration_fraction": 0.10,
+            "guided_recipe_source_mix": {
+                "discovery_recipe_validation": 0.60,
+                "curated_recipe_prior": 0.40,
+            },
             "maturity": "limited_36m_retention",
             "retained_36m_family_count": retained_36m_family_count,
             "template_instrument_policy": "seed_pool",
@@ -1426,6 +1434,10 @@ def build_recipe_prior_artifacts(
             "guided_prior_fraction": 0.60,
             "uncertain_prior_fraction": 0.25,
             "wild_exploration_fraction": 0.15,
+            "guided_recipe_source_mix": {
+                "discovery_recipe_validation": 0.60,
+                "curated_recipe_prior": 0.40,
+            },
             "maturity": "pre_36m_retention",
             "retained_36m_family_count": retained_36m_family_count,
             "template_instrument_policy": "seed_pool",

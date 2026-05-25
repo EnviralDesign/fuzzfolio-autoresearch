@@ -241,6 +241,64 @@ def test_deal_seed_plan_indicators_uses_explicit_recipe_sampling_weight() -> Non
     assert [indicator.id for indicator in deal["indicators"]] == ["STRONG_A", "STRONG_B"]
 
 
+def test_deal_seed_plan_indicators_selects_guided_recipe_source_bucket() -> None:
+    indicators = [
+        play_hand_mod.SeedIndicator("CURATED_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("CURATED_B", "trigger", "event", "entry"),
+        play_hand_mod.SeedIndicator("DISC_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("DISC_B", "trigger", "event", "entry"),
+    ]
+    seed_plan = {
+        "sampling_policy": {
+            "guided_prior_fraction": 1.0,
+            "guided_recipe_source_mix": {
+                "discovery_recipe_validation": 1.0,
+                "curated_recipe_prior": 0.0,
+            },
+        },
+        "recipes": {
+            "curated_high_weight": {
+                "source": "curated_recipe_prior",
+                "recipe_sampling_weight": 10000,
+                "pair_menu": [
+                    {
+                        "anchor_id": "CURATED_A",
+                        "trigger_id": "CURATED_B",
+                        "pair_sampling_weight": 10000,
+                    }
+                ],
+                "slot_menus": {},
+            },
+            "discovered_low_weight": {
+                "source": "discovery_recipe_validation",
+                "recipe_sampling_weight": 1,
+                "pair_menu": [
+                    {
+                        "anchor_id": "DISC_A",
+                        "trigger_id": "DISC_B",
+                        "pair_sampling_weight": 1,
+                    }
+                ],
+                "slot_menus": {},
+            },
+        },
+    }
+
+    deal = deal_seed_plan_indicators(
+        indicators,
+        target_count=2,
+        seed_plan=seed_plan,
+        rng=random.Random(0),
+    )
+
+    assert deal["recipe"] == "discovered_low_weight"
+    assert deal["recipe_source"] == "discovery_recipe_validation"
+    assert deal["guided_recipe_source_bucket"] == "discovery_recipe_validation"
+    assert deal["guided_recipe_source_bucket_matched"] is True
+    assert deal["guided_recipe_source_bucket_fallback"] is False
+    assert [indicator.id for indicator in deal["indicators"]] == ["DISC_A", "DISC_B"]
+
+
 def test_seed_pair_template_instruments_reads_validated_template_pool() -> None:
     pair = {
         "recommended_profile_template": {
