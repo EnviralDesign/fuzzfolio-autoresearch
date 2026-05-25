@@ -1,0 +1,13 @@
+{
+  "generated_at": "2026-05-25T22:47:08.9806398Z",
+  "accepted_report_dirs": [
+    "cgpt review/playhand-prior-test-clean-50",
+    "cgpt review/playhand-prior-test-clean-100",
+    "cgpt review/playhand-prior-test-clean-50-family-policy-v1.1"
+  ],
+  "excluded_report_dirs": [
+    "cgpt review/playhand-prior-test-clean-50-family-policy-v1"
+  ],
+  "build_command": "uv run build-playhand-outcome-priors --report-dir \"cgpt review\\playhand-prior-test-clean-50\" --report-dir \"cgpt review\\playhand-prior-test-clean-100\" --report-dir \"cgpt review\\playhand-prior-test-clean-50-family-policy-v1.1\" --json",
+  "pro_decision": "Accept v1.1 for outcome-prior backprop; exclude family-policy-v1; rebuild outcome priors from accepted reports only; rebuild recipe priors; resume normal overnight Play Hand."
+}
