@@ -1,0 +1,9 @@
+dealt_recipe,dealt_recipe_source,count,promoted,tombstoned,promotion_rate,exact_selected,mutated_selected,exact_rescues,exact_outscored_mutated,comparable_template_runs,mutated_wins_over_exact,exact_rescue_rate,exact_selected_rate,mutated_win_rate,avg_mutation_delta,median_mutation_delta,family_classification,avg_score,avg_positive_score,best_score,best_seed
+unknown,unknown,17,9,8,0.5294,0,17,0,0,0,0,0.0,0.0,,,,unstable,32.4465,61.2879,71.8764,167
+discovered_recipe_006,discovery_recipe_validation,7,7,0,1.0,5,2,3,2,7,2,0.4286,0.7143,0.2857,-28.3694,-24.4743,template_locked,64.6468,64.6468,72.3354,183
+breakout_compression_release,curated_recipe_prior,5,3,2,0.6,0,5,0,0,0,0,0.0,0.0,,,,unstable,34.3245,57.2075,71.3214,199
+discovered_recipe_003,discovery_recipe_validation,2,2,0,1.0,1,1,1,0,2,1,0.5,0.5,0.5,-27.504,-27.504,under_sampled,72.0331,72.0331,75.8434,174
+profile_value_context,curated_recipe_prior,7,2,5,0.2857,0,7,0,0,0,0,0.0,0.0,,,,unstable,17.4303,61.0062,68.865,197
+mean_reversion_reclaim,curated_recipe_prior,3,2,1,0.6667,0,3,0,0,0,0,0.0,0.0,,,,unstable,32.2568,48.3852,52.2944,182
+trend_pullback_continuation,curated_recipe_prior,8,1,7,0.125,0,8,0,0,0,0,0.0,0.0,,,,unstable,7.5189,60.1512,60.1512,190
+discovered_recipe_005,discovery_recipe_validation,1,1,0,1.0,1,0,0,1,1,0,0.0,1.0,0.0,-0.825,-0.825,under_sampled,55.8845,55.8845,55.8845,154
