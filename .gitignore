@@ -48,3 +48,4 @@ wheels/
 /runs_archive
 /.tmp
 /codex-home
+/.playwright-cli

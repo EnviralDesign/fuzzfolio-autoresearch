@@ -11,6 +11,7 @@ from .scoring import CANONICAL_SCORE_LAB_VERSION, build_attempt_score
 
 SCRUTINY_CACHE_DIRNAME = "scrutiny-cache"
 FULL_BACKTEST_CURVE_FILENAME = "full-backtest-36mo-curve.json"
+FULL_BACKTEST_CALENDAR_CURVE_FILENAME = "full-backtest-36mo-calendar-curve.json"
 FULL_BACKTEST_RESULT_FILENAME = "full-backtest-36mo-result.json"
 
 
@@ -368,12 +369,16 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
             "cell_match": None,
             "result_path": None,
             "curve_path": None,
+            "calendar_curve_path": None,
+            "calendar_curve_exists": False,
         }
 
     result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
     curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
+    calendar_curve_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
     result_exists = result_path.exists()
     curve_exists = curve_path.exists()
+    calendar_curve_exists = calendar_curve_path.exists()
     issues: list[str] = []
 
     if not result_exists and not curve_exists:
@@ -387,6 +392,8 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
             "cell_match": None,
             "result_path": str(result_path),
             "curve_path": str(curve_path),
+            "calendar_curve_path": str(calendar_curve_path),
+            "calendar_curve_exists": calendar_curve_exists,
         }
     if not result_exists:
         issues.append("missing_result_file")
@@ -471,6 +478,8 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
         "cell_match": cell_match,
         "result_path": str(result_path),
         "curve_path": str(curve_path),
+        "calendar_curve_path": str(calendar_curve_path),
+        "calendar_curve_exists": calendar_curve_exists,
     }
 
 
@@ -841,6 +850,12 @@ def extract_attempt_catalog_row(
         "has_full_backtest_curve_36m": bool(full_backtest_validation.get("curve_exists")),
         "full_backtest_result_path_36m": full_backtest_validation.get("result_path"),
         "full_backtest_curve_path_36m": full_backtest_validation.get("curve_path"),
+        "full_backtest_calendar_curve_path_36m": full_backtest_validation.get(
+            "calendar_curve_path"
+        ),
+        "has_full_backtest_calendar_curve_36m": bool(
+            full_backtest_validation.get("calendar_curve_exists")
+        ),
         "full_backtest_validation_status_36m": full_backtest_validation.get("status"),
         "full_backtest_validation_issue_count_36m": len(
             list(full_backtest_validation.get("issues") or [])
@@ -1097,6 +1112,9 @@ def build_full_backtest_audit(
             "trades_per_month_36m": row.get("trades_per_month_36m"),
             "full_backtest_result_path_36m": row.get("full_backtest_result_path_36m"),
             "full_backtest_curve_path_36m": row.get("full_backtest_curve_path_36m"),
+            "full_backtest_calendar_curve_path_36m": row.get(
+                "full_backtest_calendar_curve_path_36m"
+            ),
         }
 
     return {

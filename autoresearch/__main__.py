@@ -64,6 +64,7 @@ if __package__ in {None, ""}:
     )
     from autoresearch.dashboard import (
         FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
+        FULL_BACKTEST_CALENDAR_CURVE_FILENAME,
         _has_full_backtest,
         _reward_matrix_cli_args_from_attempt,
         _reward_matrix_from_attempt,
@@ -245,6 +246,7 @@ else:
     from .controller import ResearchController, RunPolicy, set_runtime_trace_stderr_mode
     from .dashboard import (
         FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
+        FULL_BACKTEST_CALENDAR_CURVE_FILENAME,
         _has_full_backtest,
         _reward_matrix_cli_args_from_attempt,
         _reward_matrix_from_attempt,
@@ -492,6 +494,8 @@ PUBLIC_CLI_COMMANDS = {
     "run",
     "finalize-corpus",
     "build-portfolio",
+    "export-portfolio-bundle",
+    "render-portfolio-profile-drops",
     "dashboard",
     "record-attempt",
     "nuke-deep-caches",
@@ -2439,6 +2443,12 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Override the portfolio config worker count for profile-drop packaging/rendering.",
     )
     portfolio_report.add_argument(
+        "--profile-drop-exit-policy-cell",
+        choices=("recommended", "best", "artifact"),
+        default=None,
+        help="Override the portfolio config TP/SL cell embedded in profile-drop imports.",
+    )
+    portfolio_report.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
@@ -2474,6 +2484,12 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--force-rebuild",
         action="store_true",
         help="Re-render portfolio profile drops even when cached artifacts already exist.",
+    )
+    render_portfolio_profile_drops.add_argument(
+        "--profile-drop-exit-policy-cell",
+        choices=("recommended", "best", "artifact"),
+        default=None,
+        help="Override the report spec TP/SL cell embedded in profile-drop imports.",
     )
     render_portfolio_profile_drops.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
@@ -4949,9 +4965,13 @@ def _run_full_backtest_with_retry(
         ):
             source_result_path = Path(result_path_raw)
             source_curve_path = Path(curve_path_raw)
+            source_calendar_path = (
+                source_curve_path.parent / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
+            )
             if (
                 source_result_path.exists()
                 and source_curve_path.exists()
+                and source_calendar_path.exists()
                 and _result_has_canonical_score_lab(source_result_path)
                 and _result_matches_attempt_reward_matrix(source_result_path, attempt)
                 and result_matches_execution_cost_model(source_result_path, config)
@@ -4965,6 +4985,9 @@ def _run_full_backtest_with_retry(
                     "result_path": str(dest_result),
                     "seed_source": source_name,
                 }
+                dest_calendar = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
+                shutil.copy2(source_calendar_path, dest_calendar)
+                result["calendar_curve_path"] = str(dest_calendar)
                 source_recommended_path = (
                     source_curve_path.parent / "recommended-cell-path-detail.json"
                 )
@@ -6147,22 +6170,60 @@ def _load_profile_document_for_existing_bundle(profile_path: Path | None) -> dic
     return None
 
 
-def _apply_recommended_exit_policy_to_profile_document(
-    profile_document: dict[str, Any],
-    recommended_cell: dict[str, Any] | None,
+def _normalize_profile_drop_exit_policy_cell(value: str | None) -> str:
+    normalized = str(value or "recommended").strip().lower().replace("-", "_")
+    if normalized in {"recommended", "best", "artifact"}:
+        return normalized
+    return "recommended"
+
+
+def _select_profile_drop_exit_policy_cell(
     *,
-    basis: str,
+    policy: str,
+    recommended_cell: dict[str, Any] | None,
+    recommended_basis: str | None,
+    best_cell: dict[str, Any] | None,
+    artifact_cell: dict[str, Any] | None,
+    artifact_basis: str | None,
+) -> tuple[dict[str, Any], str] | None:
+    normalized = _normalize_profile_drop_exit_policy_cell(policy)
+    if normalized == "best" and isinstance(best_cell, dict):
+        return best_cell, "best_cell"
+    if normalized == "artifact" and isinstance(artifact_cell, dict):
+        return artifact_cell, str(artifact_basis or "artifact_cell")
+    if isinstance(recommended_cell, dict):
+        return recommended_cell, str(recommended_basis or "recommended_cell")
+    if isinstance(best_cell, dict):
+        return best_cell, "best_cell"
+    if isinstance(artifact_cell, dict):
+        return artifact_cell, str(artifact_basis or "artifact_cell")
+    return None
+
+
+def _apply_exit_policy_to_profile_document(
+    profile_document: dict[str, Any],
+    selected_cell_source: dict[str, Any] | None,
+    *,
+    selected_basis: str,
+    policy: str,
+    recommendation_cell_source: dict[str, Any] | None,
+    recommendation_basis: str | None,
     job_id: str,
     lookback_months: int,
     market_data_source: str,
     timeframe: str,
     computed_at: str,
 ) -> dict[str, Any]:
-    if not isinstance(recommended_cell, dict):
+    if not isinstance(selected_cell_source, dict):
         return profile_document
-    selected_cell = _build_exit_policy_cell_payload(recommended_cell)
+    selected_cell = _build_exit_policy_cell_payload(selected_cell_source)
     if selected_cell is None:
         return profile_document
+    recommendation_cell = (
+        _build_exit_policy_cell_payload(recommendation_cell_source)
+        if isinstance(recommendation_cell_source, dict)
+        else None
+    ) or selected_cell
 
     patched = copy.deepcopy(profile_document)
     profile = patched.setdefault("profile", {})
@@ -6175,9 +6236,11 @@ def _apply_recommended_exit_policy_to_profile_document(
         execution_config = profile["executionConfig"]
     execution_config["exitPolicy"] = {
         "selectedCell": selected_cell,
+        "selectedCellBasis": str(selected_basis or "best_cell"),
+        "executionCellPolicy": _normalize_profile_drop_exit_policy_cell(policy),
         "recommendation": {
-            "cell": selected_cell,
-            "basis": str(basis or "best_cell"),
+            "cell": recommendation_cell,
+            "basis": str(recommendation_basis or selected_basis or "best_cell"),
             "lookbackMonths": int(lookback_months),
             "marketDataSource": str(market_data_source or "lake_bars"),
             "timeframe": str(timeframe or ""),
@@ -6519,33 +6582,59 @@ def _validate_profile_drop_bundle_recommended_detail(
 ) -> None:
     analysis = _profile_drop_package_analysis(response_payload)
     recommended_cell = analysis.get("recommended_cell") if analysis else None
-    if not isinstance(recommended_cell, dict):
-        return
-
-    detail_path = bundle_dir / "recommended-cell-path-detail.json"
-    if not detail_path.exists():
-        raise RuntimeError(
-            "Packaged profile-drop bundle is missing recommended-cell-path-detail.json "
-            f"for the selected recommended cell: {bundle_dir}"
-        )
-    detail_payload = _load_json_if_exists(detail_path)
-    detail_cell = detail_payload.get("cell") if isinstance(detail_payload, dict) else None
-    if not _cells_match_by_stop_reward(detail_cell, recommended_cell):
-        raise RuntimeError(
-            "Packaged profile-drop bundle recommended-cell-path-detail.json does not "
-            f"match the selected recommended cell: {detail_path}"
-        )
+    if isinstance(recommended_cell, dict):
+        detail_path = bundle_dir / "recommended-cell-path-detail.json"
+        if not detail_path.exists():
+            raise RuntimeError(
+                "Packaged profile-drop bundle is missing recommended-cell-path-detail.json "
+                f"for the recommended cell: {bundle_dir}"
+            )
+        detail_payload = _load_json_if_exists(detail_path)
+        detail_cell = detail_payload.get("cell") if isinstance(detail_payload, dict) else None
+        if not _cells_match_by_stop_reward(detail_cell, recommended_cell):
+            raise RuntimeError(
+                "Packaged profile-drop bundle recommended-cell-path-detail.json does not "
+                f"match the recommended cell: {detail_path}"
+            )
 
     selected_cell = _nested_get(
         profile_document_payload,
         ["profile", "executionConfig", "exitPolicy", "selectedCell"],
     )
-    if isinstance(selected_cell, dict) and not _cells_match_by_stop_reward(
-        detail_cell, selected_cell
+    if not isinstance(selected_cell, dict):
+        return
+    selected_basis = str(
+        _nested_get(
+            profile_document_payload,
+            ["profile", "executionConfig", "exitPolicy", "selectedCellBasis"],
+        )
+        or ""
+    ).strip()
+    selected_detail_name = (
+        "best-cell-path-detail.json"
+        if selected_basis == "best_cell"
+        else (
+            "recommended-cell-path-detail.json"
+            if selected_basis in {"robust_cell", "recommended_cell"}
+            else None
+        )
+    )
+    selected_detail_cell = None
+    if selected_detail_name:
+        selected_detail_path = bundle_dir / selected_detail_name
+        if selected_detail_path.exists():
+            selected_detail_payload = _load_json_if_exists(selected_detail_path)
+            selected_detail_cell = (
+                selected_detail_payload.get("cell")
+                if isinstance(selected_detail_payload, dict)
+                else None
+            )
+    if selected_detail_cell is not None and not _cells_match_by_stop_reward(
+        selected_detail_cell, selected_cell
     ):
         raise RuntimeError(
-            "Packaged profile-drop bundle recommended-cell-path-detail.json does not "
-            f"match the profile exitPolicy selectedCell: {detail_path}"
+            "Packaged profile-drop bundle selected cell detail does not match "
+            f"profile exitPolicy selectedCell: {bundle_dir / selected_detail_name}"
         )
 
 
@@ -6638,6 +6727,7 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
     profile_ref: str,
     attempt_token: str,
     layout_mode: str,
+    exit_policy_cell: str = "recommended",
     timeout_seconds: int = 1800,
 ) -> Path | None:
     sources = _existing_profile_drop_artifact_sources(
@@ -6695,10 +6785,35 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
         source_result_path=response_path,
         source_detail_path=detail_path,
     )
-    profile_document = _apply_recommended_exit_policy_to_profile_document(
+    analysis = _profile_drop_package_analysis(bundle_response)
+    detail_cell = detail_payload.get("cell") if isinstance(detail_payload, dict) else None
+    best_cell = analysis.get("best_cell") if isinstance(analysis, dict) else None
+    artifact_basis = "artifact_cell"
+    if _cells_match_by_stop_reward(best_cell, detail_cell) and isinstance(best_cell, dict):
+        artifact_basis = "best_cell"
+    elif _cells_match_by_stop_reward(recommended_cell, detail_cell) and isinstance(
+        recommended_cell, dict
+    ):
+        artifact_basis = str(recommended_basis or "recommended_cell")
+    selected_exit_policy = _select_profile_drop_exit_policy_cell(
+        policy=exit_policy_cell,
+        recommended_cell=recommended_cell,
+        recommended_basis=recommended_basis,
+        best_cell=best_cell if isinstance(best_cell, dict) else None,
+        artifact_cell=detail_cell if isinstance(detail_cell, dict) else None,
+        artifact_basis=artifact_basis,
+    )
+    if selected_exit_policy is not None:
+        selected_cell, selected_basis = selected_exit_policy
+    else:
+        selected_cell, selected_basis = None, ""
+    profile_document = _apply_exit_policy_to_profile_document(
         profile_document,
-        recommended_cell,
-        basis=recommended_basis,
+        selected_cell,
+        selected_basis=selected_basis,
+        policy=exit_policy_cell,
+        recommendation_cell_source=recommended_cell,
+        recommendation_basis=recommended_basis,
         job_id=str(analysis_metadata.get("deep_replay_job_id") or profile_ref),
         lookback_months=int(lookback_months),
         market_data_source=str(analysis_metadata.get("market_data_source") or "lake_bars"),
@@ -6720,7 +6835,6 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
     package_output_root.mkdir(parents=True, exist_ok=True)
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
-    analysis = _profile_drop_package_analysis(bundle_response)
     detail_cell = detail_payload.get("cell") if isinstance(detail_payload, dict) else None
     best_cell = analysis.get("best_cell") if isinstance(analysis, dict) else None
     recommended_detail_file_cell = (
@@ -6833,6 +6947,10 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
         },
         "analysis": analysis_metadata,
     }
+    run_metadata["analysis"]["exit_policy_cell"] = _normalize_profile_drop_exit_policy_cell(
+        exit_policy_cell
+    )
+    run_metadata["analysis"]["exit_policy_cell_basis"] = selected_basis or None
 
     _write_json_file(bundle_dir / "profile-document.json", profile_document)
     _write_json_file(bundle_dir / "sensitivity-request.json", sensitivity_request)
@@ -7194,6 +7312,12 @@ def _try_seed_attempt_scrutiny_cache(
             cache_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(full_result_path, cache_dir / "sensitivity-response.json")
             shutil.copy2(full_curve_path, cache_dir / "best-cell-path-detail.json")
+            full_calendar_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
+            if full_calendar_path.exists():
+                shutil.copy2(
+                    full_calendar_path,
+                    cache_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME,
+                )
             full_recommended_path = (
                 artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
             )
@@ -7763,7 +7887,10 @@ def cmd_calculate_full_backtests(
             return True
         curve_path = artifact_dir / "full-backtest-36mo-curve.json"
         result_path = artifact_dir / "full-backtest-36mo-result.json"
+        calendar_curve_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
         if not curve_path.exists() or not result_path.exists():
+            return True
+        if not calendar_curve_path.exists():
             return True
         if not _result_has_canonical_score_lab(result_path):
             return True
@@ -8128,6 +8255,7 @@ def _render_profile_drop_for_attempt(
     lookback_months: int,
     force_rebuild: bool,
     timeout_seconds: int,
+    exit_policy_cell: str,
     emit: Callable[[str], None] | None,
     layout_mode: str = "derived",
     require_presentation_metadata: bool = False,
@@ -8178,6 +8306,7 @@ def _render_profile_drop_for_attempt(
         "instruments": list(package_inputs["instruments"]),
         "lookback_months": int(lookback_months),
         "quality_score_preset": str(config.research.quality_score_preset),
+        "exit_policy_cell": _normalize_profile_drop_exit_policy_cell(exit_policy_cell),
         "score_lab_version": CANONICAL_SCORE_LAB_VERSION,
         **execution_cost_manifest_payload(config),
     }
@@ -8276,6 +8405,7 @@ def _render_profile_drop_for_attempt(
         profile_ref=profile_ref,
         attempt_token=attempt_token,
         layout_mode=layout_mode,
+        exit_policy_cell=exit_policy_cell,
         timeout_seconds=int(timeout_seconds),
     )
     if bundle_dir is not None:
@@ -8311,6 +8441,8 @@ def _render_profile_drop_for_attempt(
             "--allow-timeframe-mismatch",
             "--quality-score-preset",
             str(config.research.quality_score_preset),
+            "--exit-policy-cell",
+            _normalize_profile_drop_exit_policy_cell(exit_policy_cell),
         ]
         package_args.extend(_reward_matrix_cli_args_from_attempt(attempt))
         package_args.extend(execution_cost_cli_args(config))
@@ -8507,6 +8639,7 @@ def _render_profile_drop_rows(
     timeout_seconds: int,
     force_rebuild: bool,
     profile_drop_workers: int,
+    exit_policy_cell: str = "recommended",
     as_json: bool,
     progress_label: str,
     layout_mode: str = "derived",
@@ -8619,7 +8752,8 @@ def _render_profile_drop_rows(
         f"missing_ledger={failed_count} skipped={skipped_count} "
         f"cached=0 rendered=0 failed={failed_count} "
         f"workers={worker_count} lookback={int(lookback_months)}mo "
-        f"force_rebuild={'yes' if force_rebuild else 'no'}",
+        f"force_rebuild={'yes' if force_rebuild else 'no'} "
+        f"exit_policy_cell={_normalize_profile_drop_exit_policy_cell(exit_policy_cell)}",
         as_json=as_json,
         use_progress=use_progress,
     )
@@ -8657,6 +8791,7 @@ def _render_profile_drop_rows(
                     lookback_months=int(lookback_months),
                     force_rebuild=force_rebuild,
                     timeout_seconds=int(timeout_seconds),
+                    exit_policy_cell=exit_policy_cell,
                     emit=None,
                     layout_mode=layout_mode,
                     require_presentation_metadata=require_presentation_metadata,
@@ -9199,6 +9334,7 @@ def cmd_build_shortlist_report(
             timeout_seconds=int(profile_drop_timeout_seconds),
             force_rebuild=force_rebuild_profile_drops,
             profile_drop_workers=int(profile_drop_workers),
+            exit_policy_cell="recommended",
             as_json=as_json,
             progress_label="shortlist profile drops",
         )
@@ -9248,6 +9384,7 @@ def cmd_build_portfolio(
     generate_profile_drops: bool | None,
     export_bundle: bool | None,
     profile_drop_workers: int | None,
+    profile_drop_exit_policy_cell: str | None,
     as_json: bool,
 ) -> int:
     config = load_config()
@@ -9273,6 +9410,10 @@ def cmd_build_portfolio(
             portfolio_spec["export_bundle"] = bool(export_bundle)
         if profile_drop_workers is not None:
             portfolio_spec["profile_drop_workers"] = max(1, int(profile_drop_workers))
+        if profile_drop_exit_policy_cell is not None:
+            portfolio_spec["profile_drop_exit_policy_cell"] = (
+                _normalize_profile_drop_exit_policy_cell(profile_drop_exit_policy_cell)
+            )
         if candidate_scope is not None:
             portfolio_spec["candidate_scope"] = candidate_scope
 
@@ -9601,6 +9742,9 @@ def cmd_build_portfolio(
                 timeout_seconds=int(variant_spec.get("profile_drop_timeout_seconds", 1800)),
                 force_rebuild=False,
                 profile_drop_workers=int(variant_spec.get("profile_drop_workers", 4)),
+                exit_policy_cell=_normalize_profile_drop_exit_policy_cell(
+                    str(variant_spec.get("profile_drop_exit_policy_cell") or "recommended")
+                ),
                 as_json=as_json,
                 progress_label=f"portfolio profile drops:{portfolio_name}",
                 require_presentation_metadata=True,
@@ -11175,6 +11319,7 @@ def _export_portfolio_bundle(
         "generated_at": datetime.now().astimezone().isoformat(),
         "portfolio_name": portfolio_name,
         "bundle_root": str(bundle_root),
+        "manifest_path": str(bundle_root / "portfolio-export-manifest.json"),
         "report_path": str(report_path),
         "report_markdown_path": str(report_markdown_path) if report_markdown_path.exists() else None,
         "bundle_markdown_path": str(bundle_markdown_path) if exported_markdown else None,
@@ -11187,6 +11332,7 @@ def _export_portfolio_bundle(
         "missing_drop_manifest_attempts": missing_drop_manifest_attempts,
         "selected_rows": manifest_rows,
     }
+    write_json(bundle_root / "portfolio-export-manifest.json", summary)
     return summary
 
 
@@ -11231,6 +11377,7 @@ def cmd_render_portfolio_profile_drops(
     *,
     portfolio_report: str | None,
     profile_drop_workers: int | None,
+    profile_drop_exit_policy_cell: str | None,
     force_rebuild: bool,
     as_json: bool,
 ) -> int:
@@ -11257,6 +11404,11 @@ def cmd_render_portfolio_profile_drops(
     )
     lookback_months = int(portfolio_spec.get("profile_drop_lookback_months", 36))
     timeout_seconds = int(portfolio_spec.get("profile_drop_timeout_seconds", 1800))
+    exit_policy_cell = _normalize_profile_drop_exit_policy_cell(
+        profile_drop_exit_policy_cell
+        or str(portfolio_spec.get("profile_drop_exit_policy_cell") or "recommended")
+    )
+    portfolio_spec["profile_drop_exit_policy_cell"] = exit_policy_cell
     worker_count = (
         max(1, int(profile_drop_workers))
         if profile_drop_workers is not None
@@ -11272,12 +11424,14 @@ def cmd_render_portfolio_profile_drops(
         timeout_seconds=timeout_seconds,
         force_rebuild=bool(force_rebuild),
         profile_drop_workers=worker_count,
+        exit_policy_cell=exit_policy_cell,
         as_json=as_json,
         progress_label="portfolio profile drops",
         require_presentation_metadata=True,
     )
 
     payload["generated_at"] = datetime.now().astimezone().isoformat()
+    payload["portfolio_spec"] = portfolio_spec
     payload["profile_drop_phase"] = "complete"
     payload["profile_drops"] = profile_drop_results
     write_json(report_path, payload)
@@ -11300,6 +11454,7 @@ def cmd_render_portfolio_profile_drops(
             1 for row in profile_drop_results if row.get("status") == "failed"
         ),
         "profile_drop_workers": worker_count,
+        "profile_drop_exit_policy_cell": exit_policy_cell,
         "force_rebuild": bool(force_rebuild),
         "profile_drop_root": str(profile_drop_root),
     }
@@ -11493,6 +11648,7 @@ def cmd_render_corpus_profile_drops(
         timeout_seconds=timeout_seconds,
         force_rebuild=bool(force_rebuild),
         profile_drop_workers=worker_count,
+        exit_policy_cell="recommended",
         as_json=as_json,
         progress_label="corpus profile drops",
         layout_mode="attempt_local",
@@ -13619,6 +13775,7 @@ def main(argv: list[str] | None = None) -> int:
             generate_profile_drops=args.generate_profile_drops,
             export_bundle=args.export_bundle,
             profile_drop_workers=args.profile_drop_workers,
+            profile_drop_exit_policy_cell=args.profile_drop_exit_policy_cell,
             as_json=bool(args.json),
         )
     if args.command == "export-portfolio-bundle":
@@ -13630,6 +13787,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_render_portfolio_profile_drops(
             portfolio_report=args.portfolio_report,
             profile_drop_workers=args.profile_drop_workers,
+            profile_drop_exit_policy_cell=args.profile_drop_exit_policy_cell,
             force_rebuild=bool(args.force_rebuild),
             as_json=bool(args.json),
         )

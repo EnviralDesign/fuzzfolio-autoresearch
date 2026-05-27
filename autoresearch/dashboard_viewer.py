@@ -36,6 +36,7 @@ _PROFILE_DROP_EXIT_POLICY_CACHE: dict[
 LIVE_PORTFOLIO_CACHE_FILENAME = "dashboard-live-portfolio.json"
 DASHBOARD_JOB_ROOTNAME = "dashboard-jobs"
 DASHBOARD_PORTFOLIO_CONFIG_ROOTNAME = "dashboard-portfolio-configs"
+FULL_BACKTEST_CALENDAR_CURVE_FILENAME = "full-backtest-36mo-calendar-curve.json"
 LOCAL_JOB_CLIENTS = {"127.0.0.1", "::1", "localhost"}
 
 
@@ -728,6 +729,7 @@ def _normalize_path_fields(config: AppConfig, row: dict[str, Any]) -> dict[str, 
         "scrutiny_curve_path_36m",
         "full_backtest_result_path_36m",
         "full_backtest_curve_path_36m",
+        "full_backtest_calendar_curve_path_36m",
     ]:
         value = normalized.get(key)
         if isinstance(value, str) and value.strip():
@@ -1261,16 +1263,26 @@ def _attempt_detail_payload(
         return None
     result_payload = None
     curve_payload = None
+    calendar_curve_payload = None
     result_path = row.get("full_backtest_result_path_36m")
     curve_path = row.get("full_backtest_curve_path_36m")
+    calendar_curve_path = row.get("full_backtest_calendar_curve_path_36m")
     if isinstance(result_path, str) and result_path.strip():
         result_payload = _load_optional_json(Path(result_path))
+    if isinstance(calendar_curve_path, str) and calendar_curve_path.strip():
+        calendar_curve_payload = _load_optional_json(Path(calendar_curve_path))
     if isinstance(curve_path, str) and curve_path.strip():
-        curve_payload = _load_optional_json(Path(curve_path))
+        resolved_curve_path = Path(curve_path)
+        curve_payload = _load_optional_json(resolved_curve_path)
+        if calendar_curve_payload is None:
+            calendar_curve_payload = _load_optional_json(
+                resolved_curve_path.parent / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
+            )
     return {
         "attempt": row,
         "full_backtest_result": result_payload,
         "full_backtest_curve": curve_payload,
+        "full_backtest_calendar_curve": calendar_curve_payload,
     }
 
 

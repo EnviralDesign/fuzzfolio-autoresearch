@@ -12,7 +12,10 @@ import {
 } from "recharts";
 import {
   Bot,
+  CalendarDays,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   Check,
   Clock3,
   Download,
@@ -121,6 +124,39 @@ type PortfolioPoint = {
   realized_r: number;
   closed_trade_count: number;
   open_trade_count: number;
+};
+
+type PortfolioCalendarDay = {
+  date: string;
+  dayOfMonth: number;
+  monthKey: string;
+  inMonth: boolean;
+  hasData: boolean;
+  pnlR: number;
+  pnlUsd: number | null;
+  realizedR: number;
+  closedTrades: number;
+  peakDrawdownR: number | null;
+  peakDrawdownUsd: number | null;
+  peakOpenTrades: number;
+  endEquityR: number | null;
+  endBalanceUsd: number | null;
+};
+
+type PortfolioCalendarMonth = {
+  monthKey: string;
+  label: string;
+  days: PortfolioCalendarDay[];
+  monthPnlR: number;
+  monthPnlUsd: number | null;
+  activeDays: number;
+  positiveDays: number;
+  negativeDays: number;
+  flatDays: number;
+  peakDrawdownR: number | null;
+  peakDrawdownUsd: number | null;
+  bestDay: PortfolioCalendarDay | null;
+  worstDay: PortfolioCalendarDay | null;
 };
 
 type PortfolioMetrics = {
@@ -468,6 +504,10 @@ export function PortfolioWorkbenchPage() {
     () => buildPortfolioCurve(details, account, selectedIds.length),
     [account, details, selectedIds.length],
   );
+  const calendarPortfolio = useMemo(
+    () => buildPortfolioCurve(details, account, selectedIds.length, "calendar"),
+    [account, details, selectedIds.length],
+  );
 
   const similarity = useMemo(
     () => buildPortfolioSimilarity(details, selectedRows, selectedIds.length),
@@ -513,12 +553,16 @@ export function PortfolioWorkbenchPage() {
     if (!livePortfolio || hasHydratedLiveSelection.current) {
       return;
     }
+    const rawIncomingIds = livePortfolio.selected_attempt_ids ?? [];
+    if (rawIncomingIds.length && !rows.length) {
+      return;
+    }
     hasHydratedLiveSelection.current = true;
-    const incomingIds = livePortfolio.selected_attempt_ids ?? [];
+    const incomingIds = normalizeSelectedAttemptIds(rawIncomingIds, rows);
     const incomingKey = stableSelectionKey(incomingIds);
     lastAppliedLiveSelection.current = incomingKey;
     setSelectedIds(incomingIds);
-  }, [livePortfolio]);
+  }, [livePortfolio, rows]);
 
   useEffect(() => {
     let canceled = false;
@@ -539,7 +583,7 @@ export function PortfolioWorkbenchPage() {
   }, []);
 
   const persistSelectedIds = (nextIds: string[]) => {
-    const normalizedIds = normalizeSelectedIds(nextIds);
+    const normalizedIds = normalizeSelectedAttemptIds(nextIds, rows);
     setSelectedIds(normalizedIds);
     lastAppliedLiveSelection.current = stableSelectionKey(normalizedIds);
     livePortfolioMutation.mutate(normalizedIds);
@@ -642,7 +686,7 @@ export function PortfolioWorkbenchPage() {
                   }`}
                 >
                   <div className="flex items-center justify-between gap-3">
-                    <span className="truncate text-sm font-medium">{compactRunId(run.run_id)}</span>
+                    <span className="truncate text-sm font-medium">{workbenchRunLabel(run)}</span>
                     <span className="text-xs">{formatInt(run.attempt_count)}</span>
                   </div>
                   <div className="mt-1 flex items-center justify-between gap-3 text-xs">
@@ -813,6 +857,7 @@ export function PortfolioWorkbenchPage() {
         selectedIds={selectedIds}
         persistSelectedIds={persistSelectedIds}
         portfolio={portfolio}
+        calendarPortfolio={calendarPortfolio}
         similarity={similarity}
         clusters={clusters}
         clusterThreshold={clusterThreshold}
@@ -938,6 +983,7 @@ function PortfolioPanel({
   selectedIds,
   persistSelectedIds,
   portfolio,
+  calendarPortfolio,
   similarity,
   loadingSelectionCount,
   isSavingLivePortfolio,
@@ -953,6 +999,7 @@ function PortfolioPanel({
   selectedIds: string[];
   persistSelectedIds: (value: string[]) => void;
   portfolio: { points: PortfolioPoint[]; metrics: PortfolioMetrics };
+  calendarPortfolio: { points: PortfolioPoint[]; metrics: PortfolioMetrics };
   similarity: PortfolioSimilarity;
   loadingSelectionCount: number;
   isSavingLivePortfolio: boolean;
@@ -974,6 +1021,18 @@ function PortfolioPanel({
     <PortfolioTooltip mode={mode} enabled={hoveredChart === mode} />
   );
   const assetExposure = useMemo(() => buildAssetExposureRows(selectedRows), [selectedRows]);
+  const calendarMonths = useMemo(
+    () => buildPortfolioCalendarMonths(calendarPortfolio.points, account.balanceUsd),
+    [account.balanceUsd, calendarPortfolio.points],
+  );
+  const [calendarMonthKey, setCalendarMonthKey] = useState<string | null>(null);
+  const requestedCalendarIndex = calendarMonthKey
+    ? calendarMonths.findIndex((month) => month.monthKey === calendarMonthKey)
+    : -1;
+  const calendarMonthIndex = requestedCalendarIndex >= 0
+    ? requestedCalendarIndex
+    : calendarMonths.length - 1;
+  const activeCalendarMonth = calendarMonthIndex >= 0 ? calendarMonths[calendarMonthIndex] : null;
   return (
     <>
       <Panel className="p-4">
@@ -1299,6 +1358,22 @@ function PortfolioPanel({
                 </span>
               </div>
             </div>
+            <PortfolioCalendarPanel
+              month={activeCalendarMonth}
+              monthIndex={calendarMonthIndex}
+              monthCount={calendarMonths.length}
+              loadedCount={calendarPortfolio.metrics.loadedCount}
+              selectedCount={calendarPortfolio.metrics.selectedCount}
+              showUsd={showUsdCharts}
+              onPrevious={() => {
+                const previous = calendarMonths[calendarMonthIndex - 1];
+                if (previous) setCalendarMonthKey(previous.monthKey);
+              }}
+              onNext={() => {
+                const next = calendarMonths[calendarMonthIndex + 1];
+                if (next) setCalendarMonthKey(next.monthKey);
+              }}
+            />
           </div>
         ) : (
           <div className="flex min-h-72 items-center justify-center rounded-lg border border-dashed border-border/70 bg-background/35 p-6 text-center text-sm text-muted-foreground">
@@ -1406,6 +1481,7 @@ function PortfolioViewer({
   selectedIds,
   persistSelectedIds,
   portfolio,
+  calendarPortfolio,
   similarity,
   clusters,
   clusterThreshold,
@@ -1429,6 +1505,7 @@ function PortfolioViewer({
   selectedIds: string[];
   persistSelectedIds: (value: string[]) => void;
   portfolio: { points: PortfolioPoint[]; metrics: PortfolioMetrics };
+  calendarPortfolio: { points: PortfolioPoint[]; metrics: PortfolioMetrics };
   similarity: PortfolioSimilarity;
   clusters: PortfolioCluster[];
   clusterThreshold: number;
@@ -1601,6 +1678,7 @@ function PortfolioViewer({
                 selectedIds={selectedIds}
                 persistSelectedIds={persistSelectedIds}
                 portfolio={portfolio}
+                calendarPortfolio={calendarPortfolio}
                 similarity={similarity}
                 loadingSelectionCount={loadingSelectionCount}
                 isSavingLivePortfolio={isSavingLivePortfolio}
@@ -2062,6 +2140,7 @@ function buildPortfolioCurve(
   details: AttemptDetail[],
   account: AccountConfig,
   selectedCount: number,
+  source: "display" | "calendar" = "display",
 ): { points: PortfolioPoint[]; metrics: PortfolioMetrics } {
   const startingBalanceUsd = Math.max(0, account.balanceUsd);
   const riskPercent = Math.max(0, account.riskPerRPercent) / 100;
@@ -2072,8 +2151,9 @@ function buildPortfolioCurve(
   );
   const series: NormalizedSeries[] = details
     .map((detail) => {
-      const points = normalizeCurvePoints(detail.full_backtest_curve);
-      const sampling = curveSamplingInfo(detail.full_backtest_curve, points.length);
+      const curvePayload = selectPortfolioCurvePayload(detail, source);
+      const points = normalizeCurvePoints(curvePayload);
+      const sampling = curveSamplingInfo(curvePayload, points.length);
       return {
         points,
         sizing: buildLotSizing(detail.attempt, account),
@@ -2295,6 +2375,125 @@ function buildPortfolioCurve(
   metrics.firstLiquidationDate = firstLiquidationDate;
   metrics.blown = marginLiquidated || points.some((point) => point.balance_usd <= 0);
   return { points, metrics };
+}
+
+function buildPortfolioCalendarMonths(
+  points: PortfolioPoint[],
+  startingBalanceUsd: number,
+): PortfolioCalendarMonth[] {
+  const sortedPoints = [...points]
+    .map((point) => ({ ...point, date: normalizeDateKey(point.date) ?? dateKeyFromTimestamp(point.time) }))
+    .filter((point) => point.date)
+    .sort((left, right) => left.time - right.time);
+  if (!sortedPoints.length) {
+    return [];
+  }
+
+  const pointsByDate = new Map<string, PortfolioPoint[]>();
+  sortedPoints.forEach((point) => {
+    const date = point.date;
+    const bucket = pointsByDate.get(date) ?? [];
+    bucket.push(point);
+    pointsByDate.set(date, bucket);
+  });
+
+  const orderedDates = [...pointsByDate.keys()].sort();
+  const firstDateMs = parseDateKeyUtcMs(orderedDates[0]);
+  const lastDateMs = parseDateKeyUtcMs(orderedDates[orderedDates.length - 1]);
+  if (firstDateMs == null || lastDateMs == null) {
+    return [];
+  }
+
+  const dayByDate = new Map<string, PortfolioCalendarDay>();
+  let previousPoint: PortfolioPoint | null = null;
+  for (let dayMs = firstDateMs; dayMs <= lastDateMs; dayMs += DAY_MS) {
+    const date = dateKeyFromUtcMs(dayMs);
+    const dayPoints = pointsByDate.get(date) ?? [];
+    if (!dayPoints.length) {
+      dayByDate.set(date, emptyPortfolioCalendarDay(date, false));
+      continue;
+    }
+
+    const endPoint = dayPoints[dayPoints.length - 1];
+    const baselineEquityR = previousPoint?.equity_r ?? 0;
+    const baselineRealizedR = previousPoint?.realized_r ?? 0;
+    const baselineBalanceUsd = previousPoint?.balance_usd ?? startingBalanceUsd;
+    const baselineClosedTrades = previousPoint?.closed_trade_count ?? 0;
+    const peakDrawdownR = maxNullable(dayPoints.map((point) => point.drawdown_r));
+    const peakDrawdownUsd = maxNullable(dayPoints.map((point) => point.drawdown_usd));
+    dayByDate.set(date, {
+      date,
+      dayOfMonth: utcDayOfMonth(dayMs),
+      monthKey: monthKeyFromUtcMs(dayMs),
+      inMonth: false,
+      hasData: true,
+      pnlR: round(endPoint.equity_r - baselineEquityR, 6),
+      pnlUsd: round(endPoint.balance_usd - baselineBalanceUsd, 2),
+      realizedR: round(endPoint.realized_r - baselineRealizedR, 6),
+      closedTrades: Math.max(0, endPoint.closed_trade_count - baselineClosedTrades),
+      peakDrawdownR,
+      peakDrawdownUsd,
+      peakOpenTrades: Math.max(0, ...dayPoints.map((point) => point.open_trade_count)),
+      endEquityR: endPoint.equity_r,
+      endBalanceUsd: endPoint.balance_usd,
+    });
+    previousPoint = endPoint;
+  }
+
+  const months: PortfolioCalendarMonth[] = [];
+  const firstMonthMs = startOfUtcMonth(firstDateMs);
+  const lastMonthMs = startOfUtcMonth(lastDateMs);
+  for (let monthMs = firstMonthMs; monthMs <= lastMonthMs; monthMs = addUtcMonths(monthMs, 1)) {
+    const monthKey = monthKeyFromUtcMs(monthMs);
+    const monthStartMs = startOfUtcMonth(monthMs);
+    const monthEndMs = endOfUtcMonth(monthMs);
+    const gridStartMs = startOfUtcWeekMonday(monthStartMs);
+    const gridEndMs = endOfUtcWeekSunday(monthEndMs);
+    const days: PortfolioCalendarDay[] = [];
+    for (let dayMs = gridStartMs; dayMs <= gridEndMs; dayMs += DAY_MS) {
+      const date = dateKeyFromUtcMs(dayMs);
+      const inMonth = monthKeyFromUtcMs(dayMs) === monthKey;
+      const existing = dayByDate.get(date) ?? emptyPortfolioCalendarDay(date, inMonth);
+      days.push({
+        ...existing,
+        dayOfMonth: utcDayOfMonth(dayMs),
+        monthKey: monthKeyFromUtcMs(dayMs),
+        inMonth,
+      });
+    }
+
+    const monthDays = days.filter((day) => day.inMonth);
+    const activeDays = monthDays.filter((day) => day.hasData);
+    const monthPnlR = round(activeDays.reduce((sum, day) => sum + day.pnlR, 0), 6);
+    const monthPnlUsd = activeDays.some((day) => day.pnlUsd != null)
+      ? round(activeDays.reduce((sum, day) => sum + (day.pnlUsd ?? 0), 0), 2)
+      : null;
+    const bestDay = activeDays.reduce<PortfolioCalendarDay | null>(
+      (best, day) => (!best || day.pnlR > best.pnlR ? day : best),
+      null,
+    );
+    const worstDay = activeDays.reduce<PortfolioCalendarDay | null>(
+      (worst, day) => (!worst || day.pnlR < worst.pnlR ? day : worst),
+      null,
+    );
+    months.push({
+      monthKey,
+      label: formatCalendarMonth(monthMs),
+      days,
+      monthPnlR,
+      monthPnlUsd,
+      activeDays: activeDays.length,
+      positiveDays: activeDays.filter((day) => day.pnlR > 0.005).length,
+      negativeDays: activeDays.filter((day) => day.pnlR < -0.005).length,
+      flatDays: activeDays.filter((day) => Math.abs(day.pnlR) <= 0.005).length,
+      peakDrawdownR: maxNullable(activeDays.map((day) => day.peakDrawdownR)),
+      peakDrawdownUsd: maxNullable(activeDays.map((day) => day.peakDrawdownUsd)),
+      bestDay,
+      worstDay,
+    });
+  }
+
+  return months;
 }
 
 function buildPortfolioSimilarity(
@@ -2685,6 +2884,207 @@ function PortfolioTooltip({
   );
 }
 
+const CALENDAR_WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function PortfolioCalendarPanel({
+  month,
+  monthIndex,
+  monthCount,
+  loadedCount,
+  selectedCount,
+  showUsd,
+  onPrevious,
+  onNext,
+}: {
+  month: PortfolioCalendarMonth | null;
+  monthIndex: number;
+  monthCount: number;
+  loadedCount: number;
+  selectedCount: number;
+  showUsd: boolean;
+  onPrevious: () => void;
+  onNext: () => void;
+}) {
+  if (!month) {
+    return (
+      <div className="rounded-lg border border-amber-300/25 bg-amber-300/8 p-3">
+        <div className="flex items-center gap-2 text-[0.68rem] uppercase tracking-[0.14em] text-amber-100/80">
+          <CalendarDays className="h-3.5 w-3.5" />
+          Daily calendar
+        </div>
+        <div className="mt-2 text-sm font-semibold text-amber-50">Source daily curves unavailable</div>
+        <div className="mt-1 text-xs leading-5 text-amber-100/70">
+          Loaded {formatInt(loadedCount)} of {formatInt(selectedCount)} selected strategy curve(s) with unsampled daily source data.
+          The calendar does not use compact chart previews, so it will stay empty until full daily calendar artifacts are generated.
+        </div>
+      </div>
+    );
+  }
+  const peakDrawdown = month.peakDrawdownR ?? 0;
+  const monthTone = calendarPnlTone(month.monthPnlR);
+
+  return (
+    <div className="rounded-lg border border-border/60 bg-background/25 p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 text-[0.68rem] uppercase tracking-[0.14em] text-muted-foreground">
+            <CalendarDays className="h-3.5 w-3.5" />
+            Daily calendar
+          </div>
+          <div className="mt-1 text-lg font-semibold tracking-tight">{month.label}</div>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={onPrevious}
+            disabled={monthIndex <= 0}
+            className="grid h-8 w-8 place-items-center rounded-md border border-border/60 bg-background/35 text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35"
+            aria-label="Previous calendar month"
+          >
+            <ChevronLeft className="h-4 w-4" />
+          </button>
+          <div className="min-w-11 text-center text-[0.68rem] tabular-nums text-muted-foreground">
+            {monthIndex + 1}/{monthCount}
+          </div>
+          <button
+            type="button"
+            onClick={onNext}
+            disabled={monthIndex >= monthCount - 1}
+            className="grid h-8 w-8 place-items-center rounded-md border border-border/60 bg-background/35 text-muted-foreground transition hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35"
+            aria-label="Next calendar month"
+          >
+            <ChevronRight className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+
+      <div className="mt-3 grid grid-cols-3 gap-2">
+        <div className="rounded-md border border-border/45 bg-background/35 px-2.5 py-2">
+          <div className="text-[0.62rem] uppercase tracking-[0.14em] text-muted-foreground">Month P/L</div>
+          <div className={`mt-1 text-sm font-semibold tabular-nums ${monthTone}`}>
+            {showUsd && month.monthPnlUsd != null ? formatSignedCurrency(month.monthPnlUsd) : formatSignedR(month.monthPnlR)}
+          </div>
+          <div className="mt-0.5 truncate text-[0.68rem] text-muted-foreground">
+            {showUsd ? formatSignedR(month.monthPnlR) : formatSignedCompactCurrency(month.monthPnlUsd)}
+          </div>
+        </div>
+        <div className="rounded-md border border-border/45 bg-background/35 px-2.5 py-2">
+          <div className="text-[0.62rem] uppercase tracking-[0.14em] text-muted-foreground">Day mix</div>
+          <div className="mt-1 text-sm font-semibold tabular-nums">
+            {formatInt(month.positiveDays)}W / {formatInt(month.negativeDays)}L
+          </div>
+          <div className="mt-0.5 text-[0.68rem] text-muted-foreground">
+            {formatInt(month.flatDays)} flat / {formatInt(month.activeDays)} active
+          </div>
+        </div>
+        <div className="rounded-md border border-border/45 bg-background/35 px-2.5 py-2">
+          <div className="text-[0.62rem] uppercase tracking-[0.14em] text-muted-foreground">Worst DD</div>
+          <div className="mt-1 text-sm font-semibold tabular-nums text-rose-100">
+            {month.peakDrawdownR == null ? "-" : `${formatNumber(month.peakDrawdownR, 2)}R`}
+          </div>
+          <div className="mt-0.5 truncate text-[0.68rem] text-muted-foreground">
+            {formatCurrency(month.peakDrawdownUsd)}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-3 grid grid-cols-7 gap-1.5 text-[0.62rem] uppercase tracking-[0.12em] text-muted-foreground">
+        {CALENDAR_WEEKDAYS.map((weekday) => (
+          <div key={weekday} className="px-1 text-center">{weekday}</div>
+        ))}
+      </div>
+      <div className="mt-1.5 grid grid-cols-7 gap-1.5">
+        {month.days.map((day) => (
+          <PortfolioCalendarDayCell key={day.date} day={day} peakDrawdown={peakDrawdown} />
+        ))}
+      </div>
+      <div className="mt-3 grid gap-1 border-t border-border/45 pt-2 text-[0.68rem] leading-4 text-muted-foreground">
+        <div>Best {month.bestDay ? `${month.bestDay.date} ${formatSignedR(month.bestDay.pnlR)} / ${formatSignedCompactCurrency(month.bestDay.pnlUsd)}` : "-"}</div>
+        <div>Worst {month.worstDay ? `${month.worstDay.date} ${formatSignedR(month.worstDay.pnlR)} / ${formatSignedCompactCurrency(month.worstDay.pnlUsd)}` : "-"}</div>
+      </div>
+    </div>
+  );
+}
+
+function PortfolioCalendarDayCell({
+  day,
+  peakDrawdown,
+}: {
+  day: PortfolioCalendarDay;
+  peakDrawdown: number;
+}) {
+  const toneClass = calendarDayClass(day);
+  const pnlTone = calendarPnlTone(day.pnlR);
+  const drawdownWidth = day.peakDrawdownR != null && peakDrawdown > 0
+    ? `${Math.max(4, Math.min(100, (day.peakDrawdownR / peakDrawdown) * 100))}%`
+    : "0%";
+  const title = [
+    day.date,
+    `P/L ${formatSignedR(day.pnlR)} / ${formatSignedCompactCurrency(day.pnlUsd)}`,
+    `Peak DD ${day.peakDrawdownR == null ? "-" : `${formatNumber(day.peakDrawdownR, 2)}R`} / ${formatCurrency(day.peakDrawdownUsd)}`,
+    `${formatInt(day.closedTrades)} closed / ${formatInt(day.peakOpenTrades)} peak open`,
+  ].join("\n");
+
+  return (
+    <div
+      title={title}
+      className={`flex min-h-[4.65rem] flex-col rounded-md border px-1.5 py-1.5 transition ${toneClass}`}
+    >
+      <div className="flex items-start justify-between gap-1">
+        <span className={`font-semibold tabular-nums ${day.inMonth ? "text-foreground" : "text-muted-foreground/55"}`}>
+          {day.dayOfMonth}
+        </span>
+        {day.closedTrades > 0 ? (
+          <span className="tabular-nums text-[0.58rem] font-semibold text-muted-foreground">
+            {formatInt(day.closedTrades)}t
+          </span>
+        ) : null}
+      </div>
+      <div className={`mt-1 text-[0.72rem] font-semibold tabular-nums ${day.hasData ? pnlTone : "text-muted-foreground/60"}`}>
+        {day.hasData ? formatSignedDailyR(day.pnlR) : "0.00R"}
+      </div>
+      <div className="truncate text-[0.58rem] tabular-nums text-muted-foreground">
+        {day.hasData ? formatSignedCompactCurrency(day.pnlUsd) : "-"}
+      </div>
+      <div className="mt-auto">
+        <div className="mb-0.5 flex items-center justify-between gap-1 text-[0.54rem] uppercase tracking-[0.08em] text-muted-foreground/80">
+          <span>DD</span>
+          <span className="tabular-nums">
+            {day.peakDrawdownR == null ? "-" : `${formatNumber(day.peakDrawdownR, 1)}R`}
+          </span>
+        </div>
+        <div className="h-1 overflow-hidden rounded-full bg-border/35">
+          <div className="h-full rounded-full bg-rose-300/65" style={{ width: drawdownWidth }} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function calendarDayClass(day: PortfolioCalendarDay) {
+  if (!day.inMonth) {
+    return "border-border/25 bg-background/10 text-muted-foreground/50";
+  }
+  if (!day.hasData) {
+    return "border-border/35 bg-background/20 text-muted-foreground";
+  }
+  if (day.pnlR > 0.005) {
+    return "border-emerald-300/45 bg-emerald-400/10";
+  }
+  if (day.pnlR < -0.005) {
+    return "border-rose-400/45 bg-rose-400/10";
+  }
+  return "border-border/45 bg-background/30";
+}
+
+function calendarPnlTone(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value) || Math.abs(value) <= 0.005) {
+    return "text-muted-foreground";
+  }
+  return value > 0 ? "text-emerald-200" : "text-rose-200";
+}
+
 function TooltipMetric({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between gap-4">
@@ -2692,6 +3092,44 @@ function TooltipMetric({ label, value }: { label: string; value: string }) {
       <span className="text-right font-medium tabular-nums text-foreground">{value}</span>
     </div>
   );
+}
+
+function selectPortfolioCurvePayload(detail: AttemptDetail, source: "display" | "calendar") {
+  if (source === "display") {
+    return detail.full_backtest_curve;
+  }
+  if (isUnsampledDailyCurve(detail.full_backtest_calendar_curve)) {
+    return detail.full_backtest_calendar_curve ?? null;
+  }
+  if (isUnsampledDailyCurve(detail.full_backtest_curve)) {
+    return detail.full_backtest_curve;
+  }
+  return null;
+}
+
+function isUnsampledDailyCurve(payload: Record<string, unknown> | null | undefined) {
+  const curve = (payload as { curve?: Record<string, unknown> } | null)?.curve;
+  const points = curve?.points;
+  if (!curve || !Array.isArray(points) || !points.length) {
+    return false;
+  }
+  const period = String(curve.period_granularity || "").trim().toLowerCase();
+  const pointCount = nullableNumber(curve.point_count);
+  const returnedPointCount = nullableNumber(curve.returned_point_count);
+  const downsampled = Boolean(curve.downsampled);
+  if (period && period !== "day") {
+    return false;
+  }
+  if (downsampled) {
+    return false;
+  }
+  if (pointCount != null && returnedPointCount != null && returnedPointCount < pointCount) {
+    return false;
+  }
+  if (pointCount != null && points.length < pointCount) {
+    return false;
+  }
+  return true;
 }
 
 function curveSamplingInfo(
@@ -3035,6 +3473,24 @@ function formatCurrency(value: number | null | undefined) {
   }).format(value);
 }
 
+function formatSignedCurrency(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value)) return "-";
+  const sign = value >= 0 ? "+" : "-";
+  return `${sign}${formatCurrency(Math.abs(value))}`;
+}
+
+function formatSignedCompactCurrency(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value)) return "-";
+  const sign = value >= 0 ? "+" : "-";
+  const abs = Math.abs(value);
+  return `${sign}${new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    notation: abs >= 1000 ? "compact" : "standard",
+    maximumFractionDigits: abs >= 1000 ? 1 : 0,
+  }).format(abs)}`;
+}
+
 function formatCurrencyTick(value: number | null | undefined) {
   if (value == null || Number.isNaN(value)) return "-";
   return new Intl.NumberFormat("en-US", {
@@ -3048,6 +3504,12 @@ function formatCurrencyTick(value: number | null | undefined) {
 function formatSignedR(value: number | null | undefined) {
   if (value == null || Number.isNaN(value)) return "-";
   return `${value >= 0 ? "+" : "-"}${formatNumber(Math.abs(value), 2)}R`;
+}
+
+function formatSignedDailyR(value: number | null | undefined) {
+  if (value == null || Number.isNaN(value)) return "-";
+  if (Math.abs(value) <= 0.005) return "0.00R";
+  return formatSignedR(value);
 }
 
 function formatRewardMultiple(value: number | null | undefined) {
@@ -3113,6 +3575,54 @@ function normalizeSelectedIds(value: string[]) {
     normalized.push(attemptId);
   });
   return normalized;
+}
+
+function normalizeSelectedAttemptIds(value: string[], rows: AttemptCatalogRow[]) {
+  const normalized = normalizeSelectedIds(value);
+  if (!normalized.length || !rows.length) {
+    return normalized;
+  }
+  const rowsByAttemptId = new Map(
+    rows
+      .map((row) => [String(row.attempt_id || "").trim(), row] as const)
+      .filter(([attemptId]) => attemptId),
+  );
+  const preferredByRun = new Map<string, AttemptCatalogRow>();
+  normalized.forEach((attemptId) => {
+    const row = rowsByAttemptId.get(attemptId);
+    const runId = String(row?.run_id || "").trim();
+    if (!row || !runId) {
+      return;
+    }
+    const previous = preferredByRun.get(runId);
+    if (!previous || compareSelectedAttemptPreference(row, previous) < 0) {
+      preferredByRun.set(runId, row);
+    }
+  });
+  return normalized.filter((attemptId) => {
+    const row = rowsByAttemptId.get(attemptId);
+    const runId = String(row?.run_id || "").trim();
+    if (!row || !runId) {
+      return true;
+    }
+    return String(preferredByRun.get(runId)?.attempt_id || "").trim() === attemptId;
+  });
+}
+
+function compareSelectedAttemptPreference(left: AttemptCatalogRow, right: AttemptCatalogRow) {
+  const leftCanonical = isCanonicalPlayHandAttempt(left);
+  const rightCanonical = isCanonicalPlayHandAttempt(right);
+  if (leftCanonical !== rightCanonical) return leftCanonical ? -1 : 1;
+  const leftFinal = isFinalPlayHandAttempt(left);
+  const rightFinal = isFinalPlayHandAttempt(right);
+  if (leftFinal !== rightFinal) return leftFinal ? -1 : 1;
+  return compareDashboardAttemptScore(left, right);
+}
+
+function isFinalPlayHandAttempt(row: AttemptCatalogRow) {
+  const role = String(row.attempt_role || row.play_hand_role || "").trim().toLowerCase();
+  const name = String(row.candidate_name || "").trim().toLowerCase();
+  return role === "final" || name.endsWith("_final_36mo") || name === "final_36mo";
 }
 
 function stableSelectionKey(value: string[]) {
@@ -3330,6 +3840,107 @@ function sortRuns(runs: RunSummary[], mode: RunSortMode) {
     }
     return recentDelta || runScore(b) - runScore(a) || a.run_id.localeCompare(b.run_id);
   });
+}
+
+function workbenchRunLabel(run: RunSummary) {
+  const runId = String(run.run_id || "").trim();
+  const compact = compactRunId(runId);
+  const timestamp = runId.match(/^(\d{8}T\d{6})/);
+  if (!timestamp) return compact;
+  const raw = timestamp[1];
+  return `${raw.slice(4, 8)} ${raw.slice(9)} · ${compact}`;
+}
+
+function emptyPortfolioCalendarDay(date: string, inMonth: boolean): PortfolioCalendarDay {
+  const dateMs = parseDateKeyUtcMs(date) ?? 0;
+  return {
+    date,
+    dayOfMonth: utcDayOfMonth(dateMs),
+    monthKey: monthKeyFromUtcMs(dateMs),
+    inMonth,
+    hasData: false,
+    pnlR: 0,
+    pnlUsd: null,
+    realizedR: 0,
+    closedTrades: 0,
+    peakDrawdownR: null,
+    peakDrawdownUsd: null,
+    peakOpenTrades: 0,
+    endEquityR: null,
+    endBalanceUsd: null,
+  };
+}
+
+function maxNullable(values: Array<number | null | undefined>) {
+  const numeric = values.filter((value): value is number => value != null && Number.isFinite(value));
+  return numeric.length ? Math.max(...numeric) : null;
+}
+
+function normalizeDateKey(value: unknown) {
+  const raw = String(value || "").trim();
+  const match = raw.match(/^\d{4}-\d{2}-\d{2}/);
+  if (match) return match[0];
+  const parsed = Date.parse(raw);
+  return Number.isFinite(parsed) ? dateKeyFromUtcMs(parsed) : null;
+}
+
+function dateKeyFromTimestamp(value: unknown) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? dateKeyFromUtcMs(numeric * 1000) : "";
+}
+
+function parseDateKeyUtcMs(date: string | undefined) {
+  if (!date) return null;
+  const match = date.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  return Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+function dateKeyFromUtcMs(value: number) {
+  return new Date(value).toISOString().slice(0, 10);
+}
+
+function monthKeyFromUtcMs(value: number) {
+  return dateKeyFromUtcMs(value).slice(0, 7);
+}
+
+function utcDayOfMonth(value: number) {
+  return new Date(value).getUTCDate();
+}
+
+function startOfUtcMonth(value: number) {
+  const date = new Date(value);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1);
+}
+
+function endOfUtcMonth(value: number) {
+  const date = new Date(value);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0);
+}
+
+function addUtcMonths(value: number, months: number) {
+  const date = new Date(value);
+  return Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + months, 1);
+}
+
+function startOfUtcWeekMonday(value: number) {
+  const date = new Date(value);
+  const mondayOffset = (date.getUTCDay() + 6) % 7;
+  return value - mondayOffset * DAY_MS;
+}
+
+function endOfUtcWeekSunday(value: number) {
+  const date = new Date(value);
+  const sundayOffset = (7 - ((date.getUTCDay() + 6) % 7) - 1);
+  return value + sundayOffset * DAY_MS;
+}
+
+function formatCalendarMonth(value: number) {
+  return new Intl.DateTimeFormat("en-US", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  }).format(new Date(value));
 }
 
 function runTimestamp(run: RunSummary) {

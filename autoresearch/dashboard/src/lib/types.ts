@@ -265,6 +265,7 @@ export type AttemptDetail = {
   attempt: AttemptCatalogRow;
   full_backtest_result: Record<string, unknown> | null;
   full_backtest_curve: Record<string, unknown> | null;
+  full_backtest_calendar_curve?: Record<string, unknown> | null;
 };
 
 export type LivePortfolio = {

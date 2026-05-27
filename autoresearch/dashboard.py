@@ -367,6 +367,7 @@ def _sensitivity_path_for_attempt(attempt: dict[str, Any]) -> Path | None:
 
 
 FULL_BACKTEST_CURVE_FILENAME = "full-backtest-36mo-curve.json"
+FULL_BACKTEST_CALENDAR_CURVE_FILENAME = "full-backtest-36mo-calendar-curve.json"
 FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME = (
     "full-backtest-36mo-recommended-cell-path-detail.json"
 )
@@ -399,10 +400,101 @@ def _full_backtest_result_path(attempt: dict[str, Any]) -> Path | None:
     return path if path.exists() else None
 
 
+def _is_unsampled_daily_curve_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    curve = payload.get("curve")
+    if not isinstance(curve, dict):
+        return False
+    points = curve.get("points")
+    if not isinstance(points, list) or not points:
+        return False
+    period = str(curve.get("period_granularity") or "").strip().lower()
+    if period and period != "day":
+        return False
+    if bool(curve.get("downsampled")):
+        return False
+    try:
+        point_count = int(curve.get("point_count") or len(points))
+    except (TypeError, ValueError):
+        point_count = len(points)
+    try:
+        returned_point_count = int(curve.get("returned_point_count") or len(points))
+    except (TypeError, ValueError):
+        returned_point_count = len(points)
+    return returned_point_count >= point_count and len(points) >= point_count
+
+
+def _fetch_full_backtest_calendar_curve(
+    cli: FuzzfolioCli,
+    sensitivity_output_dir: Path,
+    *,
+    timeout_seconds: int,
+) -> Path | None:
+    detail_path = sensitivity_output_dir / "best-cell-path-detail.json"
+    job_path = sensitivity_output_dir / "deep-replay-job.json"
+    detail_payload = _load_optional_json(detail_path)
+    job_payload = _load_optional_json(job_path)
+    if not isinstance(detail_payload, dict):
+        return None
+    cell = detail_payload.get("cell")
+    if not isinstance(cell, dict):
+        return None
+    job_id = str(detail_payload.get("job_id") or "").strip()
+    if not job_id and isinstance(job_payload, dict):
+        job_id = str(job_payload.get("job_id") or "").strip()
+    if not job_id:
+        return None
+    stop_loss = cell.get("stop_loss_percent")
+    reward = cell.get("reward_multiple")
+    if not isinstance(stop_loss, (int, float)) or not isinstance(reward, (int, float)):
+        return None
+
+    scope = str(detail_payload.get("scope") or "aggregate").strip().lower() or "aggregate"
+    instrument = str(detail_payload.get("instrument") or "").strip().upper()
+    output_path = sensitivity_output_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
+    args = [
+        "deep-replay",
+        "cell-detail",
+        "--job-id",
+        job_id,
+        "--scope",
+        scope,
+        "--stop-loss-percent",
+        f"{float(stop_loss):g}",
+        "--reward-multiple",
+        f"{float(reward):g}",
+        "--max-points",
+        "5000",
+        "--out",
+        str(output_path),
+    ]
+    if scope == "instrument" and instrument:
+        args.extend(["--instrument", instrument])
+
+    try:
+        cli.run(args, timeout_seconds=max(60, int(timeout_seconds)))
+    except Exception as exc:
+        print(
+            f"[calculate-backtest] source daily calendar curve unavailable: {exc}",
+            flush=True,
+        )
+        return None
+    payload = _load_optional_json(output_path)
+    if not _is_unsampled_daily_curve_payload(payload):
+        print(
+            "[calculate-backtest] source daily calendar curve was not an unsampled daily curve",
+            flush=True,
+        )
+        return None
+    return output_path
+
+
 def _copy_full_backtest_outputs(
     artifact_dir: Path,
     sensitivity_output_dir: Path,
     *,
+    calendar_curve_src: Path | None = None,
     recovery_mode: str | None = None,
 ) -> dict[str, Any]:
     curve_src = sensitivity_output_dir / "best-cell-path-detail.json"
@@ -419,6 +511,11 @@ def _copy_full_backtest_outputs(
     dest_curve = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
     dest_result = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
     shutil.copy2(curve_src, dest_curve)
+    calendar_curve_path: str | None = None
+    if calendar_curve_src is not None and calendar_curve_src.exists():
+        dest_calendar_curve = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
+        shutil.copy2(calendar_curve_src, dest_calendar_curve)
+        calendar_curve_path = str(dest_calendar_curve)
     recommended_src = sensitivity_output_dir / "recommended-cell-path-detail.json"
     recommended_path: str | None = None
     if recommended_src.exists():
@@ -434,6 +531,8 @@ def _copy_full_backtest_outputs(
         "curve_path": str(dest_curve),
         "result_path": result_path,
     }
+    if calendar_curve_path is not None:
+        payload["calendar_curve_path"] = calendar_curve_path
     if recommended_path is not None:
         payload["recommended_curve_path"] = recommended_path
     if recovery_mode:
@@ -625,7 +724,16 @@ def _run_full_backtest_for_attempt(
                 )
             raise RuntimeError(message) from exc
 
-        return _copy_full_backtest_outputs(artifact_dir, sensitivity_output_dir)
+        calendar_curve_src = _fetch_full_backtest_calendar_curve(
+            cli,
+            sensitivity_output_dir,
+            timeout_seconds=cli_timeout_seconds,
+        )
+        return _copy_full_backtest_outputs(
+            artifact_dir,
+            sensitivity_output_dir,
+            calendar_curve_src=calendar_curve_src,
+        )
 
 
 def _latest_run_log_state(run_dir: Path) -> tuple[int | None, str | None]:
