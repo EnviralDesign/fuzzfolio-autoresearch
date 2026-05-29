@@ -5793,6 +5793,37 @@ def _discover_bundle_dir(package_output_root: Path) -> Path:
     return sorted(bundle_dirs, key=lambda path: path.stat().st_mtime, reverse=True)[0]
 
 
+_CLI_SUBCOMMAND_HELP_CACHE: dict[tuple[str, str], str] = {}
+
+
+def _cli_subcommand_supports_option(
+    cli: FuzzfolioCli,
+    subcommand: str,
+    option: str,
+) -> bool:
+    try:
+        executable = cli.resolve_executable()
+    except Exception:
+        return False
+    cache_key = (str(executable), str(subcommand))
+    help_text = _CLI_SUBCOMMAND_HELP_CACHE.get(cache_key)
+    if help_text is None:
+        try:
+            result = cli.run(
+                [subcommand, "--help"],
+                check=False,
+                timeout_seconds=30,
+            )
+        except Exception:
+            help_text = ""
+        else:
+            help_text = "\n".join(
+                part for part in [result.stdout, result.stderr] if part
+            )
+        _CLI_SUBCOMMAND_HELP_CACHE[cache_key] = help_text
+    return option in help_text
+
+
 def _write_json_file(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -8441,9 +8472,19 @@ def _render_profile_drop_for_attempt(
             "--allow-timeframe-mismatch",
             "--quality-score-preset",
             str(config.research.quality_score_preset),
-            "--exit-policy-cell",
-            _normalize_profile_drop_exit_policy_cell(exit_policy_cell),
         ]
+        if _cli_subcommand_supports_option(cli, "package", "--exit-policy-cell"):
+            package_args.extend(
+                [
+                    "--exit-policy-cell",
+                    _normalize_profile_drop_exit_policy_cell(exit_policy_cell),
+                ]
+            )
+        elif emit and _normalize_profile_drop_exit_policy_cell(exit_policy_cell) != "recommended":
+            emit(
+                "  active fuzzfolio-agent-cli package does not expose "
+                f"--exit-policy-cell; using package default exit policy for {attempt_id}"
+            )
         package_args.extend(_reward_matrix_cli_args_from_attempt(attempt))
         package_args.extend(execution_cost_cli_args(config))
         for instrument in package_inputs["instruments"]:
