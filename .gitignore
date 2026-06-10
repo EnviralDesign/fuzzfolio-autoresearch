@@ -49,3 +49,4 @@ wheels/
 /.tmp
 /codex-home
 /.playwright-cli
+/.codex-remote-attachments
