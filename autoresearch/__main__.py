@@ -807,6 +807,28 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     play_hand.add_argument(
+        "--screen-anchor-mode",
+        choices=["now", "random"],
+        default="now",
+        help=(
+            "Anchor mode for the discovery screen phases (baseline, sweeps, focused, "
+            "instrument scout). 'random' anchors the screen window at a uniformly "
+            "random as-of date in the recent past to de-bias selection away from the "
+            "current regime; the 36-month final scrutiny always stays anchored at now. "
+            "Env AUTORESEARCH_SCREEN_ANCHOR_MODE overrides. Default: now."
+        ),
+    )
+    play_hand.add_argument(
+        "--screen-anchor-max-offset-months",
+        type=int,
+        default=24,
+        help=(
+            "Maximum months in the past the random screen anchor may land. "
+            "Clamped so the anchored screen window stays inside the rolling "
+            "market-data lake. Default: 24."
+        ),
+    )
+    play_hand.add_argument(
         "--dry-run",
         action="store_true",
         help="Write a run folder and phase plan without calling backend compute.",
@@ -14034,6 +14056,8 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=bool(args.dry_run),
             as_json=bool(args.json),
             calendar_gate=args.calendar_gate,
+            screen_anchor_mode=args.screen_anchor_mode,
+            screen_anchor_max_offset_months=args.screen_anchor_max_offset_months,
         )
     if args.command == "build-indicator-atlas":
         return cmd_build_indicator_atlas(

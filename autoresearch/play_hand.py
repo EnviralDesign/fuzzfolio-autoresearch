@@ -12,7 +12,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +80,15 @@ PLAY_HAND_CALENDAR_GATE_FAILED_REASON = "calendar_gate_failed"
 PLAY_HAND_CALENDAR_GATE_ENV = "AUTORESEARCH_CALENDAR_GATE"
 PLAY_HAND_CALENDAR_GATE_MODES = ("off", "report", "enforce")
 PLAY_HAND_CALENDAR_GATE_DEFAULT_MODE = "report"
+PLAY_HAND_SCREEN_ANCHOR_ENV = "AUTORESEARCH_SCREEN_ANCHOR_MODE"
+PLAY_HAND_SCREEN_ANCHOR_MODES = ("now", "random")
+PLAY_HAND_SCREEN_ANCHOR_DEFAULT_MODE = "now"
+PLAY_HAND_SCREEN_ANCHOR_DEFAULT_MAX_OFFSET_MONTHS = 24
+# The market-data lake holds a rolling ~36-month window. Keep the anchored
+# screen window plus indicator warmup comfortably inside it so historical
+# evaluations never run out of bars at the old edge.
+PLAY_HAND_SCREEN_ANCHOR_OFFSET_BUDGET_MONTHS = 30
+AVERAGE_DAYS_PER_MONTH = 30.4375
 PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS = 2400
 PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS = 7200
 PLAY_HAND_SEED_PLAN_PATH = Path("recipe-priors") / "play-hand-seed-plan.json"
@@ -2605,6 +2614,7 @@ def _evaluate_profile(
     timeframe: str,
     lookback_months: int,
     reward_matrix: dict[str, Any] | None = None,
+    as_of_date: str | None = None,
 ) -> dict[str, Any]:
     out_dir = (ctx.evals_dir / f"eval_{phase}_{_utc_stamp()}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2634,6 +2644,8 @@ def _evaluate_profile(
         "--lookback-months",
         str(int(lookback_months)),
     ]
+    if as_of_date:
+        args.extend(["--as-of-date", str(as_of_date)])
     args.extend(_reward_matrix_cli_args(reward_matrix))
     args.extend(execution_cost_cli_args(ctx.config))
     for instrument in instruments:
@@ -2712,6 +2724,7 @@ def _evaluate_profile(
             score=record.composite_score,
             score_basis=record.score_basis,
             reward_matrix=reward_matrix,
+            as_of_date=as_of_date,
         )
     return {
         "artifact_dir": str(out_dir),
@@ -2767,6 +2780,56 @@ def _resolve_calendar_gate_mode(cli_value: str | None) -> str:
     if token in PLAY_HAND_CALENDAR_GATE_MODES:
         return token
     return PLAY_HAND_CALENDAR_GATE_DEFAULT_MODE
+
+
+def _resolve_screen_anchor_mode(cli_value: str | None) -> str:
+    env_value = str(os.environ.get(PLAY_HAND_SCREEN_ANCHOR_ENV) or "").strip().lower()
+    if env_value in PLAY_HAND_SCREEN_ANCHOR_MODES:
+        return env_value
+    token = str(cli_value or "").strip().lower()
+    if token in PLAY_HAND_SCREEN_ANCHOR_MODES:
+        return token
+    return PLAY_HAND_SCREEN_ANCHOR_DEFAULT_MODE
+
+
+def sample_screen_anchor(
+    *,
+    mode: str,
+    screen_months: int,
+    max_offset_months: int = PLAY_HAND_SCREEN_ANCHOR_DEFAULT_MAX_OFFSET_MONTHS,
+    seed: int | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Sample the screen-phase evaluation anchor.
+
+    In ``random`` mode the discovery screen is anchored at a uniformly random
+    point in the recent past instead of always at "now", so the corpus stops
+    selecting exclusively for strategies fit to the current regime. The
+    36-month scrutiny stays anchored at now regardless of this anchor.
+    """
+    current = now or datetime.now(timezone.utc)
+    requested_max = max(0, int(max_offset_months))
+    effective_max = min(
+        requested_max,
+        max(0, PLAY_HAND_SCREEN_ANCHOR_OFFSET_BUDGET_MONTHS - int(screen_months)),
+    )
+    anchor: dict[str, Any] = {
+        "mode": mode,
+        "as_of_date": None,
+        "offset_days": 0,
+        "requested_max_offset_months": requested_max,
+        "effective_max_offset_months": effective_max,
+    }
+    if mode != "random" or effective_max <= 0:
+        return anchor
+    # Dedicated stream keyed off the run seed so the anchor is reproducible
+    # without perturbing the existing indicator/instrument deal sequence.
+    rng = random.Random(f"play-hand-screen-anchor:{seed}") if seed is not None else random.Random()
+    offset_days = int(round(rng.uniform(0.0, effective_max * AVERAGE_DAYS_PER_MONTH)))
+    anchor["offset_days"] = offset_days
+    if offset_days > 0:
+        anchor["as_of_date"] = (current - timedelta(days=offset_days)).date().isoformat()
+    return anchor
 
 
 def _branch_calendar_gate(branch: dict[str, Any], *, mode: str) -> dict[str, Any]:
@@ -3161,6 +3224,7 @@ def _evaluate_instrument_scout_records(
     timeframe: str,
     lookback_months: int,
     reward_matrix: dict[str, Any] | None,
+    as_of_date: str | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
     instruments = [primary, *candidates]
     worker_count = _instrument_scout_worker_count(len(instruments))
@@ -3176,6 +3240,7 @@ def _evaluate_instrument_scout_records(
             timeframe=timeframe,
             lookback_months=lookback_months,
             reward_matrix=reward_matrix,
+            as_of_date=as_of_date,
         )
         return instrument, _instrument_scout_record(instrument, evaluation)
 
@@ -3210,6 +3275,7 @@ def _run_instrument_scout(
     scout_size: int,
     max_selected: int,
     reward_matrix: dict[str, Any] | None = None,
+    as_of_date: str | None = None,
 ) -> dict[str, Any]:
     primary = str((instruments or [instrument_deal.get("primary_instrument")])[0] or "").strip().upper()
     pool = _clean_tokens(instrument_deal.get("instrument_pool") or [])
@@ -3298,6 +3364,7 @@ def _run_instrument_scout(
         timeframe=timeframe,
         lookback_months=lookback_months,
         reward_matrix=reward_matrix,
+        as_of_date=as_of_date,
     )
 
     result = _select_instrument_scout_records(
@@ -3463,6 +3530,7 @@ def _run_sweep(
     sweep_budget: str,
     max_permutations: int,
     reward_matrix: dict[str, Any] | None = None,
+    as_of_date: str | None = None,
 ) -> dict[str, Any]:
     original_axes = list(axes)
     sweep_reward_matrix = reward_matrix
@@ -3602,6 +3670,8 @@ def _run_sweep(
         "--mode",
         mode,
     ]
+    if as_of_date:
+        args.extend(["--as-of-date", str(as_of_date)])
     args.extend(["--timeout-seconds", str(sweep_timeout_seconds)])
     args.extend(_reward_matrix_cli_args(sweep_reward_matrix))
     args.extend(execution_cost_cli_args(ctx.config))
@@ -4122,6 +4192,8 @@ def cmd_play_hand(
     dry_run: bool,
     as_json: bool,
     calendar_gate: str | None = None,
+    screen_anchor_mode: str | None = None,
+    screen_anchor_max_offset_months: int = PLAY_HAND_SCREEN_ANCHOR_DEFAULT_MAX_OFFSET_MONTHS,
 ) -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
@@ -4223,6 +4295,13 @@ def cmd_play_hand(
     max_sweep_permutations = sweep_budget_value
     reward_matrix = play_hand_reward_matrix(max_reward_r)
     calendar_gate_mode = _resolve_calendar_gate_mode(calendar_gate)
+    screen_anchor = sample_screen_anchor(
+        mode=_resolve_screen_anchor_mode(screen_anchor_mode),
+        screen_months=screen_months,
+        max_offset_months=screen_anchor_max_offset_months,
+        seed=seed,
+    )
+    screen_as_of_date = screen_anchor.get("as_of_date")
 
     metadata = {
         "run_id": run_id,
@@ -4272,6 +4351,8 @@ def cmd_play_hand(
         "requested_max_indicators": max_indicators,
         "screen_months": screen_months,
         "scrutiny_months": scrutiny_months,
+        "screen_anchor": screen_anchor,
+        "screen_as_of_date": screen_as_of_date,
         "coarse_mode": coarse_mode,
         "sweep_budget": sweep_budget_label,
         "sweep_budget_tier": budget.get("tier"),
@@ -4297,6 +4378,11 @@ def cmd_play_hand(
         "dry_run": dry_run,
     }
     write_run_metadata(run_dir, metadata)
+    if screen_as_of_date:
+        console.print(
+            f"[bold]screen anchor[/]: random as-of [cyan]{screen_as_of_date}[/] "
+            f"(offset {screen_anchor.get('offset_days')}d; scrutiny stays now-anchored)"
+        )
     _render_dealt_hand(
         indicators=dealt,
         min_indicators=effective_min_indicators,
@@ -4491,6 +4577,7 @@ def cmd_play_hand(
         timeframe=evaluation_timeframe,
         lookback_months=screen_months,
         reward_matrix=reward_matrix,
+        as_of_date=screen_as_of_date,
     )
     phase_rows.append({"phase": "baseline", "status": "evaluated", "score": baseline.get("score"), "detail": profile_ref})
 
@@ -4514,6 +4601,7 @@ def cmd_play_hand(
             sweep_budget=sweep_budget_label,
             max_permutations=max_sweep_permutations,
             reward_matrix=reward_matrix,
+            as_of_date=screen_as_of_date,
         )
         last_sweep_payload = sweep["result"]
         last_sweep_axes = list(sweep.get("axes") or lookback_axes)
@@ -4540,6 +4628,7 @@ def cmd_play_hand(
                 timeframe=current_evaluation_timeframe,
                 lookback_months=screen_months,
                 reward_matrix=reward_matrix,
+                as_of_date=screen_as_of_date,
             )
             phase_rows.append({"phase": "lookback", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(lookback_axes)})
     else:
@@ -4560,6 +4649,7 @@ def cmd_play_hand(
             sweep_budget=sweep_budget_label,
             max_permutations=max_sweep_permutations,
             reward_matrix=reward_matrix,
+            as_of_date=screen_as_of_date,
         )
         last_sweep_payload = sweep["result"]
         last_sweep_axes = list(sweep.get("axes") or coarse_axes)
@@ -4586,6 +4676,7 @@ def cmd_play_hand(
                 timeframe=current_evaluation_timeframe,
                 lookback_months=screen_months,
                 reward_matrix=reward_matrix,
+                as_of_date=screen_as_of_date,
             )
             phase_rows.append({"phase": "coarse", "status": "top evaluated", "score": result.get("score"), "detail": f"{len(coarse_axes)} axes"})
     else:
@@ -4609,6 +4700,7 @@ def cmd_play_hand(
             sweep_budget=sweep_budget_label,
             max_permutations=max_sweep_permutations,
             reward_matrix=reward_matrix,
+            as_of_date=screen_as_of_date,
         )
         materialized = _materialize_and_register_best_sweep_candidate(
             ctx,
@@ -4633,6 +4725,7 @@ def cmd_play_hand(
                 timeframe=current_evaluation_timeframe,
                 lookback_months=screen_months,
                 reward_matrix=reward_matrix,
+                as_of_date=screen_as_of_date,
             )
             phase_rows.append({"phase": "focused", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(focused_axes)})
     else:
@@ -4652,6 +4745,7 @@ def cmd_play_hand(
         scout_size=int(instrument_scout_size),
         max_selected=int(instrument_scout_max_selected),
         reward_matrix=reward_matrix,
+        as_of_date=screen_as_of_date,
     )
     scout_selected = _clean_tokens(list(scout_result.get("selected_instruments") or []))
     if scout_selected:
