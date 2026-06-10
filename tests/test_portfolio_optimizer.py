@@ -1,6 +1,9 @@
 import json
 from pathlib import Path
 
+import pytest
+
+from autoresearch import portfolio_optimizer as portfolio_optimizer_module
 from autoresearch.portfolio_optimizer import (
     PortfolioOptimizerSpec,
     PortfolioSearch,
@@ -176,6 +179,214 @@ def test_pareto_front_keeps_nondominated_archived_portfolios(tmp_path: Path) -> 
 
     assert [item["archive_label"] for item in front] == ["good"]
     assert front[0]["metrics"]["neg_months"] == 0
+
+
+def _equity_from_returns(returns: list[float]) -> list[float]:
+    equity: list[float] = []
+    total = 0.0
+    for value in returns:
+        total += value
+        equity.append(total)
+    return equity
+
+
+def test_zero_diversification_weights_keep_legacy_selection(tmp_path: Path) -> None:
+    rows = [
+        _row(tmp_path, "smooth-a", "EURUSD", [1, 2, 3, 4], score=65),
+        _row(tmp_path, "smooth-b", "XAUUSD", [0.5, 1.5, 2.5, 3.5], score=65),
+        _row(tmp_path, "lumpy", "USDJPY", [8, 1, 9, 2], score=95),
+    ]
+    base_kwargs = dict(
+        portfolio_size=2,
+        candidate_limit=3,
+        objective_names=("stability",),
+        random_starts=0,
+        max_swaps=4,
+        max_per_family=1,
+        min_fx_share=0,
+        max_metal_share=2,
+        max_index_share=2,
+        max_instrument_share=1,
+    )
+    legacy_spec = PortfolioOptimizerSpec(**base_kwargs)
+    zero_specs = [
+        PortfolioOptimizerSpec(
+            **base_kwargs,
+            correlation_penalty_weight=0.0,
+            diversification_mode="penalty",
+            portfolio_sharpe_weight=0.0,
+        ),
+        PortfolioOptimizerSpec(
+            **base_kwargs,
+            correlation_penalty_weight=0.0,
+            diversification_mode="marginal_sharpe",
+            portfolio_sharpe_weight=0.0,
+        ),
+    ]
+    legacy_candidates, _ = build_optimizer_candidates(rows, legacy_spec)
+    legacy_variants = PortfolioSearch(legacy_candidates, legacy_spec).optimize()
+
+    for spec in zero_specs:
+        candidates, _ = build_optimizer_candidates(rows, spec)
+        variants = PortfolioSearch(candidates, spec).optimize()
+        assert (
+            variants["stability"]["selected_attempt_ids"]
+            == legacy_variants["stability"]["selected_attempt_ids"]
+        )
+        assert (
+            variants["stability"]["objective_score"]
+            == legacy_variants["stability"]["objective_score"]
+        )
+        assert variants["stability"]["diversification"]["correlation_penalty"] == 0.0
+        assert variants["stability"]["diversification"]["portfolio_sharpe_term"] == 0.0
+
+
+def test_penalty_mode_prefers_uncorrelated_candidate_over_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        portfolio_optimizer_module,
+        "DEFAULT_OBJECTIVES",
+        {"return": {"final_r": 1.0, "maxdd_r": -2.0}},
+    )
+    clone_returns = [2.0, -0.5, 2.0, -0.5, 2.0, -0.5]
+    uncorr_returns = [-0.2, 0.6, -0.2, 0.6, -0.2, 0.6]
+    rows = [
+        _row(tmp_path, "clone-a", "EURUSD", _equity_from_returns(clone_returns), score=90),
+        _row(tmp_path, "clone-b", "GBPUSD", _equity_from_returns(clone_returns), score=89),
+        _row(tmp_path, "uncorr-c", "USDJPY", _equity_from_returns(uncorr_returns), score=60),
+    ]
+    base_kwargs = dict(
+        portfolio_size=2,
+        candidate_limit=3,
+        objective_names=("return",),
+        random_starts=0,
+        max_swaps=0,
+        min_fx_share=0,
+    )
+
+    legacy_spec = PortfolioOptimizerSpec(**base_kwargs)
+    legacy_candidates, _ = build_optimizer_candidates(rows, legacy_spec)
+    legacy_variants = PortfolioSearch(legacy_candidates, legacy_spec).optimize()
+    assert set(legacy_variants["return"]["selected_attempt_ids"]) == {"clone-a", "clone-b"}
+
+    penalty_spec = PortfolioOptimizerSpec(
+        **base_kwargs,
+        correlation_penalty_weight=10.0,
+        diversification_mode="penalty",
+    )
+    penalty_candidates, _ = build_optimizer_candidates(rows, penalty_spec)
+    penalty_variants = PortfolioSearch(penalty_candidates, penalty_spec).optimize()
+    selected = set(penalty_variants["return"]["selected_attempt_ids"])
+    assert "uncorr-c" in selected
+    assert selected != {"clone-a", "clone-b"}
+    diversification = penalty_variants["return"]["diversification"]
+    assert diversification["correlation_penalty"] == pytest.approx(0.0, abs=1e-9)
+    assert penalty_variants["return"]["metrics"]["avg_positive_pair_corr"] == pytest.approx(
+        0.0, abs=1e-9
+    )
+
+
+def test_marginal_sharpe_mode_prefers_anticorrelated_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        portfolio_optimizer_module,
+        "DEFAULT_OBJECTIVES",
+        {"return": {"final_r": 1.0, "maxdd_r": -2.0}},
+    )
+    seed_returns = [2.0, -0.5, 2.0, -0.5, 2.0, -0.5]
+    correlated_returns = [1.5, -0.3, 1.5, -0.3, 1.5, -0.3]
+    anti_returns = [-0.2, 0.6, -0.2, 0.6, -0.2, 0.6]
+    rows = [
+        _row(tmp_path, "seed", "EURUSD", _equity_from_returns(seed_returns), score=90),
+        _row(
+            tmp_path,
+            "corr-high-r",
+            "GBPUSD",
+            _equity_from_returns(correlated_returns),
+            score=80,
+        ),
+        _row(tmp_path, "anti-low-r", "USDJPY", _equity_from_returns(anti_returns), score=60),
+    ]
+    base_kwargs = dict(
+        portfolio_size=2,
+        candidate_limit=3,
+        objective_names=("return",),
+        random_starts=0,
+        max_swaps=0,
+        min_fx_share=0,
+    )
+
+    legacy_spec = PortfolioOptimizerSpec(**base_kwargs)
+    legacy_candidates, _ = build_optimizer_candidates(rows, legacy_spec)
+    legacy_variants = PortfolioSearch(legacy_candidates, legacy_spec).optimize()
+    assert set(legacy_variants["return"]["selected_attempt_ids"]) == {"seed", "corr-high-r"}
+
+    sharpe_spec = PortfolioOptimizerSpec(
+        **base_kwargs,
+        diversification_mode="marginal_sharpe",
+        portfolio_sharpe_weight=5.0,
+    )
+    sharpe_candidates, _ = build_optimizer_candidates(rows, sharpe_spec)
+    sharpe_variants = PortfolioSearch(sharpe_candidates, sharpe_spec).optimize()
+    assert set(sharpe_variants["return"]["selected_attempt_ids"]) == {"seed", "anti-low-r"}
+    diversification = sharpe_variants["return"]["diversification"]
+    assert diversification["portfolio_sharpe"] == pytest.approx(0.95 / 0.85, rel=1e-9)
+    assert diversification["portfolio_sharpe_term"] == pytest.approx(
+        5.0 * (0.95 / 0.85), rel=1e-9
+    )
+
+
+def test_correlation_objective_avoids_disk_io_and_reuses_pair_matrix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = [
+        _row(tmp_path, "smooth-a", "EURUSD", [1, 2, 3, 4], score=65),
+        _row(tmp_path, "smooth-b", "XAUUSD", [0.5, 1.5, 2.5, 3.5], score=65),
+        _row(tmp_path, "lumpy", "USDJPY", [8, 1, 9, 2], score=95),
+    ]
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=2,
+        candidate_limit=3,
+        objective_names=("stability",),
+        random_starts=0,
+        max_swaps=4,
+        min_fx_share=0,
+        max_metal_share=2,
+        max_index_share=2,
+        max_instrument_share=1,
+        correlation_penalty_weight=5.0,
+        diversification_mode="marginal_sharpe",
+        portfolio_sharpe_weight=2.0,
+    )
+    candidates, _ = build_optimizer_candidates(rows, spec)
+
+    io_calls = {"count": 0}
+    real_reader = portfolio_optimizer_module.read_json_if_exists
+
+    def counting_reader(path):
+        io_calls["count"] += 1
+        return real_reader(path)
+
+    pearson_calls = {"count": 0}
+    real_pearson = portfolio_optimizer_module.pearson_corr
+
+    def counting_pearson(first, second):
+        pearson_calls["count"] += 1
+        return real_pearson(first, second)
+
+    monkeypatch.setattr(
+        portfolio_optimizer_module, "read_json_if_exists", counting_reader
+    )
+    monkeypatch.setattr(portfolio_optimizer_module, "pearson_corr", counting_pearson)
+
+    search = PortfolioSearch(candidates, spec)
+    search.optimize()
+
+    assert io_calls["count"] == 0
+    max_pairs = len(candidates) * (len(candidates) - 1) // 2
+    assert 0 < pearson_calls["count"] <= max_pairs
 
 
 def test_optimizer_metrics_include_account_realistic_lot_floor(tmp_path: Path) -> None:

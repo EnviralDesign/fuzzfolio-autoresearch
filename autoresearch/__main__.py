@@ -2696,6 +2696,24 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Soft maximum monthly cadence for portfolio constraint penalties. Use -1 to disable. Default: 260.",
     )
     optimize_portfolio.add_argument(
+        "--correlation-penalty-weight",
+        type=float,
+        default=0.0,
+        help="Objective penalty per unit of average positive pairwise daily-return correlation across the selection. 0 keeps legacy behavior. Default: 0.",
+    )
+    optimize_portfolio.add_argument(
+        "--diversification-mode",
+        choices=("penalty", "marginal_sharpe"),
+        default="penalty",
+        help="Correlation-aware objective mode: 'penalty' only subtracts correlated overlap; 'marginal_sharpe' additionally rewards portfolio daily Sharpe. Default: penalty.",
+    )
+    optimize_portfolio.add_argument(
+        "--portfolio-sharpe-weight",
+        type=float,
+        default=0.0,
+        help="Objective weight on portfolio daily Sharpe (mean/std of combined daily R) in marginal_sharpe mode. 0 keeps legacy behavior. Default: 0.",
+    )
+    optimize_portfolio.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
@@ -10249,6 +10267,9 @@ def cmd_optimize_portfolio(
     max_peak_open_positions: float,
     target_trades_per_month: float,
     max_trades_per_month: float,
+    correlation_penalty_weight: float,
+    diversification_mode: str,
+    portfolio_sharpe_weight: float,
     as_json: bool,
 ) -> int:
     config = load_config()
@@ -10324,6 +10345,9 @@ def cmd_optimize_portfolio(
         max_peak_open_positions=float(max_peak_open_positions),
         target_trades_per_month=float(target_trades_per_month),
         max_trades_per_month=float(max_trades_per_month),
+        correlation_penalty_weight=float(correlation_penalty_weight),
+        diversification_mode=str(diversification_mode or "penalty"),
+        portfolio_sharpe_weight=float(portfolio_sharpe_weight),
         baseline_attempt_ids=tuple(dict.fromkeys(baseline_ids)),
         account=baseline_account,
     )
@@ -14426,6 +14450,9 @@ def main(argv: list[str] | None = None) -> int:
             max_peak_open_positions=float(args.max_peak_open_positions),
             target_trades_per_month=float(args.target_trades_per_month),
             max_trades_per_month=float(args.max_trades_per_month),
+            correlation_penalty_weight=float(args.correlation_penalty_weight),
+            diversification_mode=str(args.diversification_mode),
+            portfolio_sharpe_weight=float(args.portfolio_sharpe_weight),
             as_json=bool(args.json),
         )
     if args.command == "export-portfolio-bundle":

@@ -327,6 +327,9 @@ class PortfolioOptimizerSpec:
     max_peak_open_positions: float = 28.0
     target_trades_per_month: float = 160.0
     max_trades_per_month: float = 260.0
+    correlation_penalty_weight: float = 0.0
+    diversification_mode: str = "penalty"
+    portfolio_sharpe_weight: float = 0.0
     baseline_attempt_ids: tuple[str, ...] = ()
     account: dict[str, Any] = field(default_factory=dict, compare=False)
 
@@ -574,6 +577,12 @@ class PortfolioSearch:
         self._metrics_cache: dict[tuple[tuple[str, ...], bool], dict[str, Any]] = {}
         self._score_cache: dict[tuple[str, tuple[str, ...]], float] = {}
         self._archive: dict[tuple[str, ...], dict[str, Any]] = {}
+        self._pair_corr_cache: dict[tuple[str, str], float] = {}
+        self._positive_corr_cache: dict[tuple[str, ...], float] = {}
+        self._sharpe_cache: dict[tuple[str, ...], float] = {}
+        self._sum_stats_cache: dict[tuple[str, ...], tuple[list[float], float, float]] = {}
+        self._candidate_sum: dict[str, float] = {}
+        self._candidate_sumsq: dict[str, float] = {}
         self.dates = sorted({date for candidate in candidates for date in candidate.dates})
         self.date_index = {date: index for index, date in enumerate(self.dates)}
         for candidate in self.candidates:
@@ -593,6 +602,10 @@ class PortfolioSearch:
             candidate.vector = vector
             candidate.open_vector = open_vector
             candidate.closed_vector = closed_vector
+            self._candidate_sum[candidate.attempt_id] = sum(vector)
+            self._candidate_sumsq[candidate.attempt_id] = sum(
+                value * value for value in vector
+            )
 
     def progress(self, event: str, **fields: Any) -> None:
         if self.progress_callback is None:
@@ -624,6 +637,104 @@ class PortfolioSearch:
                 open_counts[index] += candidate.open_vector[index]
                 closed_counts[index] += candidate.closed_vector[index]
         return daily, open_counts, closed_counts
+
+    def pair_corr(self, left_id: str, right_id: str) -> float:
+        """Pairwise daily-return correlation, computed at most once per pair per run."""
+        if left_id == right_id:
+            return 1.0
+        key = (left_id, right_id) if left_id < right_id else (right_id, left_id)
+        cached = self._pair_corr_cache.get(key)
+        if cached is None:
+            cached = pearson_corr(self.by_id[key[0]].vector, self.by_id[key[1]].vector)
+            self._pair_corr_cache[key] = cached
+        return cached
+
+    def avg_positive_pair_corr(self, selected_ids: list[str] | tuple[str, ...]) -> float:
+        """Mean of max(0, corr) across all selected pairs from the precomputed pair cache."""
+        ids = list(dict.fromkeys(
+            attempt_id for attempt_id in selected_ids if attempt_id in self.by_id
+        ))
+        key = tuple(sorted(ids))
+        cached = self._positive_corr_cache.get(key)
+        if cached is not None:
+            return cached
+        total = 0.0
+        pairs = 0
+        for left_index, left_id in enumerate(ids):
+            for right_id in ids[left_index + 1 :]:
+                total += max(0.0, self.pair_corr(left_id, right_id))
+                pairs += 1
+        value = total / pairs if pairs else 0.0
+        self._positive_corr_cache[key] = value
+        return value
+
+    def _selection_sum_stats(self, key: tuple[str, ...]) -> tuple[float, float]:
+        """Return (total, sum of squares) of the summed daily-return vector for `key`.
+
+        Base selections (the current greedy/swap working set) are cached with their
+        full summed vector; candidate trials that extend a cached base by one member
+        are evaluated incrementally in O(days) without materializing a new vector.
+        """
+        cached = self._sum_stats_cache.get(key)
+        if cached is not None:
+            return cached[1], cached[2]
+        for index in range(len(key)):
+            base_key = key[:index] + key[index + 1 :]
+            base = self._sum_stats_cache.get(base_key)
+            if base is None:
+                continue
+            base_vector, base_total, base_sumsq = base
+            added = self.by_id[key[index]].vector
+            cross = 0.0
+            for base_value, added_value in zip(base_vector, added):
+                cross += base_value * added_value
+            total = base_total + self._candidate_sum[key[index]]
+            sumsq = base_sumsq + 2.0 * cross + self._candidate_sumsq[key[index]]
+            return total, sumsq
+        vector = [0.0] * len(self.dates)
+        for attempt_id in key:
+            for index, value in enumerate(self.by_id[attempt_id].vector):
+                vector[index] += value
+        total = sum(vector)
+        sumsq = sum(value * value for value in vector)
+        self._sum_stats_cache[key] = (vector, total, sumsq)
+        return total, sumsq
+
+    def portfolio_sharpe(self, selected_ids: list[str] | tuple[str, ...]) -> float:
+        """Daily portfolio Sharpe: mean(daily R) / population std(daily R)."""
+        ids = list(dict.fromkeys(
+            attempt_id for attempt_id in selected_ids if attempt_id in self.by_id
+        ))
+        key = tuple(sorted(ids))
+        cached = self._sharpe_cache.get(key)
+        if cached is not None:
+            return cached
+        day_count = len(self.dates)
+        if not key or day_count < 2:
+            value = 0.0
+        else:
+            total, sumsq = self._selection_sum_stats(key)
+            mean = total / day_count
+            variance = max(0.0, (sumsq / day_count) - (mean * mean))
+            std = math.sqrt(variance)
+            value = mean / std if std > 1e-12 else 0.0
+        self._sharpe_cache[key] = value
+        return value
+
+    def _diversification_adjustment(self, selected_ids: list[str]) -> float:
+        adjustment = 0.0
+        if self.spec.correlation_penalty_weight > 0.0:
+            adjustment -= self.spec.correlation_penalty_weight * self.avg_positive_pair_corr(
+                selected_ids
+            )
+        if (
+            str(self.spec.diversification_mode or "penalty").lower() == "marginal_sharpe"
+            and self.spec.portfolio_sharpe_weight > 0.0
+        ):
+            adjustment += self.spec.portfolio_sharpe_weight * self.portfolio_sharpe(
+                selected_ids
+            )
+        return adjustment
 
     def exposure_counts(self, selected_ids: list[str]) -> tuple[Counter[str], Counter[str], Counter[str]]:
         instrument_counts: Counter[str] = Counter()
@@ -1019,13 +1130,14 @@ class PortfolioSearch:
             )
         if include_correlation:
             correlations: list[float] = []
-            for left_index, left_id in enumerate(selected_ids):
-                for right_id in selected_ids[left_index + 1 :]:
-                    correlations.append(
-                        pearson_corr(self.by_id[left_id].vector, self.by_id[right_id].vector)
-                    )
+            unique_ids = list(dict.fromkeys(selected_ids))
+            for left_index, left_id in enumerate(unique_ids):
+                for right_id in unique_ids[left_index + 1 :]:
+                    correlations.append(self.pair_corr(left_id, right_id))
             result["avg_pair_corr"] = statistics.mean(correlations) if correlations else 0.0
             result["max_pair_corr"] = max(correlations) if correlations else 0.0
+            result["avg_positive_pair_corr"] = self.avg_positive_pair_corr(selected_ids)
+            result["portfolio_sharpe"] = self.portfolio_sharpe(selected_ids)
         self._metrics_cache[cache_key] = result
         return result
 
@@ -1076,6 +1188,7 @@ class PortfolioSearch:
             float(metrics["trades_per_month"]) - self.spec.target_trades_per_month,
         )
         score += weights.get("constraint_violation", 0.0) * violation_size
+        score += self._diversification_adjustment(selected_ids)
         self._score_cache[score_key] = score
         return score
 
@@ -1426,12 +1539,30 @@ class PortfolioSearch:
                     objective_score=score,
                     best_objective_score=best_score,
                 )
+            best_avg_positive_corr = self.avg_positive_pair_corr(best_ids)
+            best_portfolio_sharpe = self.portfolio_sharpe(best_ids)
+            diversification_mode = str(self.spec.diversification_mode or "penalty").lower()
             variants[objective_name] = {
                 "objective_name": objective_name,
                 "objective_score": best_score,
                 "start": best_start,
                 "selected_attempt_ids": best_ids,
                 "swaps": best_swaps,
+                "diversification": {
+                    "mode": diversification_mode,
+                    "correlation_penalty_weight": self.spec.correlation_penalty_weight,
+                    "portfolio_sharpe_weight": self.spec.portfolio_sharpe_weight,
+                    "avg_positive_pair_corr": best_avg_positive_corr,
+                    "correlation_penalty": (
+                        self.spec.correlation_penalty_weight * best_avg_positive_corr
+                    ),
+                    "portfolio_sharpe": best_portfolio_sharpe,
+                    "portfolio_sharpe_term": (
+                        self.spec.portfolio_sharpe_weight * best_portfolio_sharpe
+                        if diversification_mode == "marginal_sharpe"
+                        else 0.0
+                    ),
+                },
                 "metrics": self.metrics(best_ids, include_correlation=True),
                 "selected": [
                     self.candidate_row(attempt_id, rank=index + 1)
@@ -1537,6 +1668,9 @@ def write_optimizer_report(
             "max_peak_open_positions": spec.max_peak_open_positions,
             "target_trades_per_month": spec.target_trades_per_month,
             "max_trades_per_month": spec.max_trades_per_month,
+            "correlation_penalty_weight": spec.correlation_penalty_weight,
+            "diversification_mode": spec.diversification_mode,
+            "portfolio_sharpe_weight": spec.portfolio_sharpe_weight,
             "account": spec.account,
         },
         "source": source_info,
@@ -1599,6 +1733,8 @@ def write_optimizer_report(
             "max_single_trade_hold_hours",
             "avg_pair_corr",
             "max_pair_corr",
+            "avg_positive_pair_corr",
+            "portfolio_sharpe",
             "account_initial_final_balance",
             "account_initial_return_pct",
             "account_initial_maxdd_usd",
@@ -1826,6 +1962,8 @@ def _comparison_row(kind: str, name: Any, metrics: dict[str, Any]) -> dict[str, 
         "max_single_trade_hold_hours": metrics.get("max_single_trade_hold_hours"),
         "avg_pair_corr": metrics.get("avg_pair_corr"),
         "max_pair_corr": metrics.get("max_pair_corr"),
+        "avg_positive_pair_corr": metrics.get("avg_positive_pair_corr"),
+        "portfolio_sharpe": metrics.get("portfolio_sharpe"),
         "account_initial_final_balance": account_initial.get("final_balance"),
         "account_initial_return_pct": account_initial.get("final_return_pct"),
         "account_initial_maxdd_usd": account_initial.get("max_drawdown_usd"),
