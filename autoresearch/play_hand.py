@@ -19,6 +19,7 @@ from typing import Any
 from rich.console import Console
 from rich.table import Table
 
+from .calendar_robustness import compute_calendar_robustness, evaluate_calendar_gate
 from .config import AppConfig, load_config
 from .execution_costs import execution_cost_cli_args
 from .fuzzfolio import CliError, FuzzfolioCli
@@ -75,6 +76,10 @@ PLAY_HAND_DEFAULT_MAX_REWARD_R = 4.0
 PLAY_HAND_RUNNER = "play_hand_v1"
 PLAY_HAND_FINAL_SCRUTINY_MIN_SCORE = 0.0
 PLAY_HAND_FINAL_SCRUTINY_FAILED_REASON = "final_36mo_scrutiny_failed"
+PLAY_HAND_CALENDAR_GATE_FAILED_REASON = "calendar_gate_failed"
+PLAY_HAND_CALENDAR_GATE_ENV = "AUTORESEARCH_CALENDAR_GATE"
+PLAY_HAND_CALENDAR_GATE_MODES = ("off", "report", "enforce")
+PLAY_HAND_CALENDAR_GATE_DEFAULT_MODE = "report"
 PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS = 2400
 PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS = 7200
 PLAY_HAND_SEED_PLAN_PATH = Path("recipe-priors") / "play-hand-seed-plan.json"
@@ -1099,9 +1104,12 @@ def _finalize_play_hand_attempt_metadata(
     final_scrutiny_score: float | None = None,
     tombstone_reason: str | None = None,
     tombstone_reasons: list[str] | None = None,
+    run_promoted: bool | None = None,
+    calendar_gate: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    canonical_attempt_id = final_attempt_id if final_scrutiny_passed else None
-    tombstoned = not bool(final_scrutiny_passed)
+    promoted = bool(final_scrutiny_passed) if run_promoted is None else bool(run_promoted)
+    canonical_attempt_id = final_attempt_id if promoted else None
+    tombstoned = not promoted
     tombstone_reason = str(tombstone_reason or "").strip() or None
     tombstone_reasons = [
         str(reason).strip()
@@ -1118,6 +1126,7 @@ def _finalize_play_hand_attempt_metadata(
             "tombstone_reason": tombstone_reason,
             "final_scrutiny_passed": bool(final_scrutiny_passed),
             "final_scrutiny_score": final_scrutiny_score,
+            "calendar_gate": dict(calendar_gate) if isinstance(calendar_gate, dict) else None,
         }
     scout_updates = _attempt_decision_updates_from_scout(scout_result)
     selected = _clean_tokens(selected_instruments)
@@ -1138,8 +1147,10 @@ def _finalize_play_hand_attempt_metadata(
         is_canonical = bool(canonical_attempt_id and attempt_id == canonical_attempt_id)
         if is_final_attempt:
             role = "final"
-            decision = "canonical" if final_scrutiny_passed else "tombstoned"
+            decision = "canonical" if promoted else "tombstoned"
         prior = dict(attempt)
+        if is_final_attempt and isinstance(calendar_gate, dict):
+            attempt["calendar_gate"] = dict(calendar_gate)
         attempt["runner"] = PLAY_HAND_RUNNER
         attempt["attempt_role"] = role
         attempt["play_hand_role"] = role
@@ -1213,6 +1224,7 @@ def _finalize_play_hand_attempt_metadata(
         "tombstone_reasons": tombstone_reasons,
         "final_scrutiny_passed": bool(final_scrutiny_passed),
         "final_scrutiny_score": final_scrutiny_score,
+        "calendar_gate": dict(calendar_gate) if isinstance(calendar_gate, dict) else None,
     }
 
 
@@ -2747,19 +2759,56 @@ def _final_scrutiny_outcome(scrutiny: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _select_final_scrutiny_branch(branches: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _resolve_calendar_gate_mode(cli_value: str | None) -> str:
+    env_value = str(os.environ.get(PLAY_HAND_CALENDAR_GATE_ENV) or "").strip().lower()
+    if env_value in PLAY_HAND_CALENDAR_GATE_MODES:
+        return env_value
+    token = str(cli_value or "").strip().lower()
+    if token in PLAY_HAND_CALENDAR_GATE_MODES:
+        return token
+    return PLAY_HAND_CALENDAR_GATE_DEFAULT_MODE
+
+
+def _branch_calendar_gate(branch: dict[str, Any], *, mode: str) -> dict[str, Any]:
+    scrutiny = branch.get("scrutiny") if isinstance(branch.get("scrutiny"), dict) else {}
+    artifact_dir = str(scrutiny.get("artifact_dir") or "").strip()
+    points = _curve_points_from_artifact(Path(artifact_dir)) if artifact_dir else []
+    robustness = compute_calendar_robustness(points)
+    decision = evaluate_calendar_gate(robustness)
+    return {
+        "mode": mode,
+        "passed": bool(decision.passed),
+        "reasons": list(decision.reasons),
+        "metrics": dict(decision.metrics),
+        "artifact_dir": artifact_dir or None,
+    }
+
+
+def _select_final_scrutiny_branch(
+    branches: list[dict[str, Any]],
+    *,
+    enforce_calendar_gate: bool = False,
+) -> dict[str, Any] | None:
     candidates = [branch for branch in branches if isinstance(branch, dict)]
     if not candidates:
         return None
 
-    def rank(branch: dict[str, Any]) -> tuple[int, float, int]:
+    def rank(branch: dict[str, Any]) -> tuple[int, int, float, int]:
         outcome = branch.get("outcome") if isinstance(branch.get("outcome"), dict) else {}
         score = _as_float(outcome.get("score"))
         score_value = score if score is not None else float("-inf")
         passed = 1 if outcome.get("passed") else 0
+        gate = (
+            branch.get("calendar_gate")
+            if isinstance(branch.get("calendar_gate"), dict)
+            else None
+        )
+        gate_passed = 1 if (not enforce_calendar_gate or gate is None or gate.get("passed")) else 0
         # Keep the normal mutated branch as the tie-breaker when evidence is equal.
         branch_bias = 1 if str(branch.get("branch") or "") == "mutated" else 0
-        return passed, score_value, branch_bias
+        # In enforce mode a branch passing both score and gate outranks a branch
+        # passing score alone; otherwise the legacy ordering is preserved exactly.
+        return passed * gate_passed, passed, score_value, branch_bias
 
     return max(candidates, key=rank)
 
@@ -4072,6 +4121,7 @@ def cmd_play_hand(
     sweep_timeout_seconds: int,
     dry_run: bool,
     as_json: bool,
+    calendar_gate: str | None = None,
 ) -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
@@ -4172,6 +4222,7 @@ def cmd_play_hand(
     sweep_budget_value = int(budget["value"])
     max_sweep_permutations = sweep_budget_value
     reward_matrix = play_hand_reward_matrix(max_reward_r)
+    calendar_gate_mode = _resolve_calendar_gate_mode(calendar_gate)
 
     metadata = {
         "run_id": run_id,
@@ -4242,6 +4293,7 @@ def cmd_play_hand(
         "deep_replay_job_timeout_seconds": job_timeout_seconds,
         "sweep_timeout_seconds": sweep_timeout_seconds,
         "max_sweep_permutations": max_sweep_permutations,
+        "calendar_gate_mode": calendar_gate_mode,
         "dry_run": dry_run,
     }
     write_run_metadata(run_dir, metadata)
@@ -4671,12 +4723,46 @@ def cmd_play_hand(
                 "timeframe": exact_template_timeframe or evaluation_timeframe,
             }
         )
-    selected_final_branch = _select_final_scrutiny_branch(final_branch_candidates) or final_branch_candidates[0]
+    if calendar_gate_mode != "off":
+        for branch in final_branch_candidates:
+            branch["calendar_gate"] = _branch_calendar_gate(branch, mode=calendar_gate_mode)
+    selected_final_branch = (
+        _select_final_scrutiny_branch(
+            final_branch_candidates,
+            enforce_calendar_gate=calendar_gate_mode == "enforce",
+        )
+        or final_branch_candidates[0]
+    )
     scrutiny = selected_final_branch["scrutiny"]
     final_scrutiny = selected_final_branch["outcome"]
     final_attempt_id = str(selected_final_branch.get("attempt_id") or "").strip()
     final_scrutiny_passed = bool(final_scrutiny.get("passed"))
-    canonical_attempt_id = final_attempt_id if final_scrutiny_passed else None
+    selected_calendar_gate = (
+        selected_final_branch.get("calendar_gate")
+        if isinstance(selected_final_branch.get("calendar_gate"), dict)
+        else None
+    )
+    calendar_gate_failed = bool(
+        selected_calendar_gate is not None and not selected_calendar_gate.get("passed")
+    )
+    calendar_gate_blocked = bool(
+        calendar_gate_mode == "enforce" and final_scrutiny_passed and calendar_gate_failed
+    )
+    run_promoted = final_scrutiny_passed and not calendar_gate_blocked
+    if calendar_gate_blocked:
+        run_tombstone_reason: str | None = PLAY_HAND_CALENDAR_GATE_FAILED_REASON
+        run_tombstone_reasons = [
+            PLAY_HAND_CALENDAR_GATE_FAILED_REASON,
+            *[
+                str(reason)
+                for reason in list((selected_calendar_gate or {}).get("reasons") or [])
+                if str(reason).strip()
+            ],
+        ]
+    else:
+        run_tombstone_reason = final_scrutiny.get("reason")
+        run_tombstone_reasons = list(final_scrutiny.get("reasons") or [])
+    canonical_attempt_id = final_attempt_id if run_promoted else None
     selected_final_branch_name = str(selected_final_branch.get("branch") or "mutated")
     selected_final_phase = str(selected_final_branch.get("phase") or "final_36mo")
     selected_final_instruments = _clean_tokens(selected_final_branch.get("instruments") or instruments)
@@ -4731,6 +4817,29 @@ def cmd_play_hand(
         canonical_selection_reason = "mutated_branch_selected"
     else:
         canonical_selection_reason = f"no_branch_passed_{selected_final_branch_name}_best_score"
+    if calendar_gate_mode != "off":
+        _append_event(
+            ctx,
+            "calendar_gate",
+            "evaluated",
+            stage=stages["scrutiny"],
+            mode=calendar_gate_mode,
+            selected_branch=selected_final_branch_name,
+            attempt_id=final_attempt_id or None,
+            gate_passed=not calendar_gate_failed,
+            gate_reasons=list((selected_calendar_gate or {}).get("reasons") or []),
+            gate_metrics=dict((selected_calendar_gate or {}).get("metrics") or {}),
+            would_block_promotion=bool(final_scrutiny_passed and calendar_gate_failed),
+            promotion_blocked=calendar_gate_blocked,
+            branch_gates=[
+                {
+                    "branch": str(branch.get("branch") or ""),
+                    "passed": bool((branch.get("calendar_gate") or {}).get("passed", True)),
+                    "reasons": list((branch.get("calendar_gate") or {}).get("reasons") or []),
+                }
+                for branch in final_branch_candidates
+            ],
+        )
     attempt_metadata_summary = _finalize_play_hand_attempt_metadata(
         ctx,
         final_attempt_id=final_attempt_id,
@@ -4739,15 +4848,17 @@ def cmd_play_hand(
         reward_matrix=reward_matrix,
         final_scrutiny_passed=final_scrutiny_passed,
         final_scrutiny_score=final_scrutiny.get("score"),
-        tombstone_reason=final_scrutiny.get("reason"),
-        tombstone_reasons=list(final_scrutiny.get("reasons") or []),
+        tombstone_reason=run_tombstone_reason,
+        tombstone_reasons=run_tombstone_reasons,
+        run_promoted=run_promoted,
+        calendar_gate=selected_calendar_gate,
     )
     metadata.update(
         {
-            "run_status": "promoted" if final_scrutiny_passed else "tombstoned",
-            "run_tombstoned": not final_scrutiny_passed,
-            "tombstone_reason": final_scrutiny.get("reason"),
-            "tombstone_reasons": list(final_scrutiny.get("reasons") or []),
+            "run_status": "promoted" if run_promoted else "tombstoned",
+            "run_tombstoned": not run_promoted,
+            "tombstone_reason": run_tombstone_reason,
+            "tombstone_reasons": run_tombstone_reasons,
             "final_attempt_id": final_attempt_id or None,
             "final_scrutiny_passed": final_scrutiny_passed,
             "final_scrutiny_score": final_scrutiny.get("score"),
@@ -4772,10 +4883,12 @@ def cmd_play_hand(
             "template_branch_instruments": template_branch_instruments,
             "template_branch_source_probe_id": template_branch_source_probe_id,
             "canonical_attempt_id": canonical_attempt_id,
-            "canonical_attempt_role": "final" if final_scrutiny_passed else None,
-            "canonical_candidate_name": selected_final_phase if final_scrutiny_passed else None,
-            "canonical_score": scrutiny.get("score") if final_scrutiny_passed else None,
+            "canonical_attempt_role": "final" if run_promoted else None,
+            "canonical_candidate_name": selected_final_phase if run_promoted else None,
+            "canonical_score": scrutiny.get("score") if run_promoted else None,
             "canonical_instruments": selected_final_instruments,
+            "calendar_gate_mode": calendar_gate_mode,
+            "calendar_gate": selected_calendar_gate,
             "strategy_family_id": run_id,
             "attempt_metadata": attempt_metadata_summary,
         }
@@ -4810,13 +4923,15 @@ def cmd_play_hand(
                 "detail": branch_detail,
             }
         )
-    scrutiny_status = "evaluated" if final_scrutiny_passed else "failed"
+    scrutiny_status = "evaluated" if run_promoted else "failed"
     scrutiny_detail = (
         f"selected={selected_final_branch_name}; "
         f"{scrutiny_months}mo on {', '.join(selected_final_instruments)}"
     )
-    if not final_scrutiny_passed:
-        scrutiny_detail += f"; tombstoned={final_scrutiny.get('reason') or 'failed'}"
+    if not run_promoted:
+        scrutiny_detail += f"; tombstoned={run_tombstone_reason or 'failed'}"
+    elif calendar_gate_mode == "report" and calendar_gate_failed:
+        scrutiny_detail += "; calendar_gate=would_fail"
     phase_rows.append(
         {
             "phase": "scrutiny",
@@ -4827,10 +4942,10 @@ def cmd_play_hand(
     )
 
     final_artifact_summary: dict[str, Any]
-    if final_artifacts and not final_scrutiny_passed:
+    if final_artifacts and not run_promoted:
         final_artifact_summary = {
             "status": "skipped",
-            "reason": final_scrutiny.get("reason") or PLAY_HAND_FINAL_SCRUTINY_FAILED_REASON,
+            "reason": run_tombstone_reason or PLAY_HAND_FINAL_SCRUTINY_FAILED_REASON,
             "run_tombstoned": True,
             "final_attempt_id": final_attempt_id or None,
             "final_scrutiny_score": final_scrutiny.get("score"),
@@ -4939,10 +5054,10 @@ def cmd_play_hand(
         "dealt_policy_target_count": indicator_deal.get("policy_target_count"),
         "dealt_recipe_slots": indicator_deal.get("selected_slots"),
         "instrument_scout": scout_result,
-        "run_status": "promoted" if final_scrutiny_passed else "tombstoned",
-        "run_tombstoned": not final_scrutiny_passed,
-        "tombstone_reason": final_scrutiny.get("reason"),
-        "tombstone_reasons": list(final_scrutiny.get("reasons") or []),
+        "run_status": "promoted" if run_promoted else "tombstoned",
+        "run_tombstoned": not run_promoted,
+        "tombstone_reason": run_tombstone_reason,
+        "tombstone_reasons": run_tombstone_reasons,
         "final_attempt_id": final_attempt_id or None,
         "final_scrutiny_passed": final_scrutiny_passed,
         "final_scrutiny_score": final_scrutiny.get("score"),
@@ -4967,8 +5082,10 @@ def cmd_play_hand(
         "template_branch_instruments": template_branch_instruments,
         "template_branch_source_probe_id": template_branch_source_probe_id,
         "canonical_attempt_id": canonical_attempt_id,
-        "canonical_attempt_role": "final" if final_scrutiny_passed else None,
-        "canonical_candidate_name": selected_final_phase if final_scrutiny_passed else None,
+        "canonical_attempt_role": "final" if run_promoted else None,
+        "canonical_candidate_name": selected_final_phase if run_promoted else None,
+        "calendar_gate_mode": calendar_gate_mode,
+        "calendar_gate": selected_calendar_gate,
         "strategy_family_id": run_id,
         "attempt_metadata": attempt_metadata_summary,
         "final_profile_ref": selected_final_profile_ref,

@@ -796,6 +796,17 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     play_hand.add_argument(
+        "--calendar-gate",
+        choices=["off", "report", "enforce"],
+        default="report",
+        help=(
+            "Calendar robustness gate for the final scrutiny promotion. 'report' logs "
+            "gate metrics without changing promotion; 'enforce' tombstones runs whose "
+            "selected final branch concentrates profit in one era. "
+            "Env AUTORESEARCH_CALENDAR_GATE overrides. Default: report."
+        ),
+    )
+    play_hand.add_argument(
         "--dry-run",
         action="store_true",
         help="Write a run folder and phase plan without calling backend compute.",
@@ -14022,6 +14033,7 @@ def main(argv: list[str] | None = None) -> int:
             sweep_timeout_seconds=args.sweep_timeout_seconds,
             dry_run=bool(args.dry_run),
             as_json=bool(args.json),
+            calendar_gate=args.calendar_gate,
         )
     if args.command == "build-indicator-atlas":
         return cmd_build_indicator_atlas(
