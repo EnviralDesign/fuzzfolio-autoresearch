@@ -1312,6 +1312,7 @@ def test_cmd_build_portfolio_continues_when_catch_up_reports_failures(
         generate_profile_drops=None,
         export_bundle=None,
         profile_drop_workers=None,
+        profile_drop_exit_policy_cell=None,
         as_json=True,
     )
 
@@ -1328,6 +1329,126 @@ def test_cmd_build_portfolio_continues_when_catch_up_reports_failures(
     payload = json.loads(capsys.readouterr().out)
     assert payload["catch_up_exit_code"] == 1
     assert payload["catch_up_status"] == "partial_failure"
+    assert payload["selected_union_count"] == 1
+
+
+def test_cmd_build_portfolio_honors_config_selected_attempt_ids(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    derived_root = tmp_path / "runs" / "derived"
+    derived_root.mkdir(parents=True, exist_ok=True)
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        derived_root=derived_root,
+        attempt_catalog_summary_path=derived_root / "attempt-catalog-summary.json",
+        full_backtest_failures_json_path=derived_root / "full-backtest-failures.json",
+        fuzzfolio=SimpleNamespace(),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+    portfolio_spec = {
+        "portfolio_name": "optimizer-config",
+        "catch_up_full_backtests": False,
+        "generate_profile_drops": False,
+        "export_bundle": False,
+        "candidate_scope": "all",
+        "selected_attempt_ids": ["attempt-b"],
+        "sleeves": [{"name": "optimizer", "shortlist_size": 10, "candidate_limit": -1}],
+    }
+    monkeypatch.setattr(
+        ar_main,
+        "load_portfolio_build_specs",
+        lambda _path: ([portfolio_spec], False),
+    )
+    rows = [
+        {
+            "attempt_id": "attempt-a",
+            "run_id": "run-a",
+            "candidate_name": "alpha",
+            "profile_ref": "profile-a",
+            "score_36m": 91.0,
+            "composite_score": 91.0,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+        {
+            "attempt_id": "attempt-b",
+            "run_id": "run-b",
+            "candidate_name": "bravo",
+            "profile_ref": "profile-b",
+            "score_36m": 72.0,
+            "composite_score": 72.0,
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+    ]
+    monkeypatch.setattr(
+        ar_main,
+        "_selection_corpus_rows",
+        lambda *_args, **_kwargs: (rows, {"source": "materialized", "row_count": 2}),
+    )
+
+    def fake_build_sleeve_prefilter(filtered_rows, sleeve_spec):
+        assert [row["attempt_id"] for row in filtered_rows] == ["attempt-b"]
+        return {
+            "name": sleeve_spec.get("name"),
+            "spec": sleeve_spec,
+            "qualified_rows": list(filtered_rows),
+            "candidate_rows": list(filtered_rows),
+            "prefilter_limit": 1,
+            "prefilter_excluded_count": 0,
+            "filter_rejections": {},
+        }
+
+    monkeypatch.setattr(ar_main, "build_sleeve_prefilter", fake_build_sleeve_prefilter)
+    monkeypatch.setattr(ar_main, "build_candidate_similarity_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        ar_main,
+        "finalize_sleeve_selection",
+        lambda sleeve, similarity_payload=None: {
+            **sleeve,
+            "selected_rows": list(sleeve.get("candidate_rows") or []),
+            "board": {"alternates": []},
+        },
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "merge_portfolio_sleeves",
+        lambda items: {
+            "candidate_rows": list(items[0].get("candidate_rows") or []),
+            "selected_rows": list(items[0].get("selected_rows") or []),
+            "selected_overlap_count": 0,
+        },
+    )
+    monkeypatch.setattr(ar_main, "subset_similarity_payload", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ar_main, "render_attempt_tradeoff_scatter_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ar_main, "render_attempt_tradeoff_overlay_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ar_main, "render_attempt_drawdown_scatter_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ar_main, "render_similarity_scatter_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ar_main, "render_similarity_heatmap_artifacts", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ar_main, "_build_selection_basket_summary", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(ar_main, "_build_selection_basket_curve", lambda *_args, **_kwargs: {})
+
+    exit_code = ar_main.cmd_build_portfolio(
+        run_ids=None,
+        attempt_ids=None,
+        portfolio_config=None,
+        catch_up_full_backtests=None,
+        catch_up_force_rebuild=None,
+        catch_up_require_scrutiny_36=None,
+        generate_profile_drops=None,
+        export_bundle=None,
+        profile_drop_workers=None,
+        profile_drop_exit_policy_cell=None,
+        as_json=True,
+    )
+
+    assert exit_code == 0
+    report_path = derived_root / "portfolio-report" / "optimizer-config" / "portfolio-report.json"
+    report_payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report_payload["candidate_scope"]["candidate_scope"] == "config_selected_attempts"
+    assert report_payload["candidate_scope"]["matched_attempt_count"] == 1
+    assert [row["attempt_id"] for row in report_payload["selected"]] == ["attempt-b"]
+    payload = json.loads(capsys.readouterr().out)
     assert payload["selected_union_count"] == 1
 
 

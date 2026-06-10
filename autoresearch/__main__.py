@@ -200,6 +200,21 @@ if __package__ in {None, ""}:
         merge_portfolio_sleeves,
         select_dashboard_preferred_attempt_rows,
     )
+    from autoresearch.portfolio_optimizer import (
+        DEFAULT_OBJECTIVES,
+        PortfolioOptimizerSpec,
+        PortfolioSearch,
+        baseline_metrics_from_ids,
+        build_optimizer_candidates,
+        load_baseline_account,
+        load_baseline_attempt_ids,
+        write_optimizer_report,
+    )
+    from autoresearch.portfolio_risk_sizing import (
+        RiskSizingSpec,
+        build_risk_sizing_schedule,
+        write_risk_sizing_report,
+    )
     from autoresearch.provider import (
         ChatMessage,
         ProviderError,
@@ -382,6 +397,21 @@ else:
         merge_portfolio_sleeves,
         select_dashboard_preferred_attempt_rows,
     )
+    from .portfolio_optimizer import (
+        DEFAULT_OBJECTIVES,
+        PortfolioOptimizerSpec,
+        PortfolioSearch,
+        baseline_metrics_from_ids,
+        build_optimizer_candidates,
+        load_baseline_account,
+        load_baseline_attempt_ids,
+        write_optimizer_report,
+    )
+    from .portfolio_risk_sizing import (
+        RiskSizingSpec,
+        build_risk_sizing_schedule,
+        write_risk_sizing_report,
+    )
     from .provider import (
         ChatMessage,
         ProviderError,
@@ -494,7 +524,9 @@ PUBLIC_CLI_COMMANDS = {
     "run",
     "finalize-corpus",
     "build-portfolio",
+    "optimize-portfolio",
     "export-portfolio-bundle",
+    "build-portfolio-risk-sizing",
     "render-portfolio-profile-drops",
     "dashboard",
     "record-attempt",
@@ -2452,6 +2484,188 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
+    optimize_portfolio = subparsers.add_parser(
+        "optimize-portfolio",
+        help="Search source-calendar portfolios directly for return/stability/hold-time tradeoffs.",
+    )
+    optimize_portfolio.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only consider attempts from the named run id. Can be repeated.",
+    )
+    optimize_portfolio.add_argument(
+        "--attempt-id",
+        action="append",
+        default=None,
+        help="Only consider the named attempt id as a candidate. Can be repeated.",
+    )
+    optimize_portfolio.add_argument(
+        "--portfolio-name",
+        default="portfolio-optimizer",
+        help="Name for the optimization packet under runs/derived/portfolio-optimization.",
+    )
+    optimize_portfolio.add_argument(
+        "--portfolio-size",
+        type=int,
+        default=20,
+        help="Number of strategies in each optimized portfolio. Default: 20.",
+    )
+    optimize_portfolio.add_argument(
+        "--candidate-scope",
+        choices=["promoted", "all"],
+        default="promoted",
+        help="Candidate scope before optimizer hygiene filters. Default: promoted.",
+    )
+    optimize_portfolio.add_argument(
+        "--candidate-limit",
+        type=int,
+        default=120,
+        help="Maximum post-filter candidates to search by individual score/final R. Default: 120.",
+    )
+    optimize_portfolio.add_argument(
+        "--swap-candidate-limit",
+        type=int,
+        default=80,
+        help="Maximum top-ranked candidates considered as swap additions. Use -1 for all. Default: 80.",
+    )
+    optimize_portfolio.add_argument(
+        "--min-score",
+        type=float,
+        default=45.0,
+        help="Minimum 36mo/final score for optimizer candidates. Default: 45.",
+    )
+    optimize_portfolio.add_argument(
+        "--allowed-asset-class",
+        action="append",
+        default=None,
+        help="Allowed asset class token. Can be repeated. Default: fx, metal, index.",
+    )
+    optimize_portfolio.add_argument(
+        "--allowed-instrument",
+        action="append",
+        default=None,
+        help="Allowed instrument symbol or comma-separated symbols. Can be repeated.",
+    )
+    optimize_portfolio.add_argument(
+        "--blocked-instrument",
+        action="append",
+        default=None,
+        help="Blocked instrument symbol or comma-separated symbols. Can be repeated.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-avg-hold-hours",
+        type=float,
+        default=48.0,
+        help="Reject candidates with average hold above this. Default: 48.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-p90-hold-hours",
+        type=float,
+        default=144.0,
+        help="Reject candidates with p90 hold above this. Default: 144.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-single-hold-hours",
+        type=float,
+        default=336.0,
+        help="Reject candidates with max hold above this. Default: 336.",
+    )
+    optimize_portfolio.add_argument(
+        "--objective",
+        action="append",
+        choices=tuple(DEFAULT_OBJECTIVES) if "DEFAULT_OBJECTIVES" in globals() else None,
+        default=None,
+        help="Objective to optimize. Can be repeated. Default: return, balanced, stability.",
+    )
+    optimize_portfolio.add_argument(
+        "--baseline-portfolio-report",
+        action="append",
+        default=None,
+        help="Portfolio report JSON to compare against and use as a seed. Can be repeated.",
+    )
+    optimize_portfolio.add_argument(
+        "--baseline-attempt-id",
+        action="append",
+        default=None,
+        help="Extra baseline/seed attempt id. Can be repeated.",
+    )
+    optimize_portfolio.add_argument(
+        "--random-starts",
+        type=int,
+        default=3,
+        help="Random seed portfolios per objective. Default: 3.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-swaps",
+        type=int,
+        default=10,
+        help="Maximum improving swaps per start. Default: 10.",
+    )
+    optimize_portfolio.add_argument(
+        "--random-seed",
+        type=int,
+        default=17,
+        help="Deterministic random seed for reproducible optimization. Default: 17.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-per-family",
+        type=int,
+        default=1,
+        help="Soft cap per normalized strategy family. Default: 1.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-instrument-share",
+        type=float,
+        default=4.0,
+        help="Soft cap for fractional exposure to one instrument. Default: 4.",
+    )
+    optimize_portfolio.add_argument(
+        "--min-fx-share",
+        type=float,
+        default=7.0,
+        help="Soft minimum fractional FX exposure. Default: 7.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-metal-share",
+        type=float,
+        default=8.0,
+        help="Soft maximum fractional metals exposure. Default: 8.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-index-share",
+        type=float,
+        default=6.0,
+        help="Soft maximum fractional index exposure. Default: 6.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-avg-open-positions",
+        type=float,
+        default=7.0,
+        help="Soft maximum average open-position pressure for the whole portfolio. Default: 7.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-peak-open-positions",
+        type=float,
+        default=28.0,
+        help="Soft maximum peak open-position pressure for the whole portfolio. Default: 28.",
+    )
+    optimize_portfolio.add_argument(
+        "--target-trades-per-month",
+        type=float,
+        default=160.0,
+        help="Target monthly cadence before objective penalties begin. Default: 160.",
+    )
+    optimize_portfolio.add_argument(
+        "--max-trades-per-month",
+        type=float,
+        default=260.0,
+        help="Soft maximum monthly cadence for portfolio constraint penalties. Use -1 to disable. Default: 260.",
+    )
+    optimize_portfolio.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
     export_portfolio_bundle = subparsers.add_parser(
         "export-portfolio-bundle",
         help="Export the latest portfolio selection into a dated derived bundle with profile JSONs and rendered drops.",
@@ -2462,6 +2676,47 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Path to a portfolio-report.json. Defaults to the latest derived portfolio report.",
     )
     export_portfolio_bundle.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    build_portfolio_risk_sizing = subparsers.add_parser(
+        "build-portfolio-risk-sizing",
+        help="Build per-strategy risk sizing from a portfolio report/export bundle.",
+    )
+    build_portfolio_risk_sizing.add_argument(
+        "--portfolio-report",
+        required=True,
+        help="Path to a portfolio-report.json produced by build-portfolio.",
+    )
+    build_portfolio_risk_sizing.add_argument(
+        "--export-bundle",
+        default=None,
+        help="Portfolio export bundle root. Defaults to the report's export_bundle.bundle_root.",
+    )
+    build_portfolio_risk_sizing.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory for risk-sizing artifacts. Defaults under runs/derived/fuzzfolio-risk-sizing.",
+    )
+    build_portfolio_risk_sizing.add_argument(
+        "--min-risk-pct",
+        type=float,
+        default=0.25,
+        help="Minimum per-strategy risk percent. Default: 0.25.",
+    )
+    build_portfolio_risk_sizing.add_argument(
+        "--max-risk-pct",
+        type=float,
+        default=5.0,
+        help="Maximum per-strategy risk percent. Default: 5.",
+    )
+    build_portfolio_risk_sizing.add_argument(
+        "--default-cap-pct",
+        type=float,
+        default=2.5,
+        help="Default cap before hygiene-specific caps. Default: 2.5.",
+    )
+    build_portfolio_risk_sizing.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
@@ -5497,6 +5752,19 @@ def _normalize_tokens(values: list[Any]) -> list[str]:
         seen.add(token)
         normalized.append(token)
     return normalized
+
+
+def _normalize_cli_tokens(values: list[Any] | None) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw in values or []:
+        for part in str(raw or "").split(","):
+            token = part.strip().upper()
+            if not token or token in seen:
+                continue
+            seen.add(token)
+            normalized.append(token)
+    return tuple(normalized)
 
 
 def _attempt_request_payload(attempt: dict[str, Any]) -> dict[str, Any]:
@@ -9546,7 +9814,45 @@ def cmd_build_portfolio(
     ) -> dict[str, Any]:
         portfolio_name = str(variant_spec.get("portfolio_name") or "default-portfolio").strip()
         variant_scope_info = dict(base_scope_info)
-        if not wanted_attempt_ids:
+        variant_wanted_attempt_ids = {
+            str(token).strip()
+            for token in (
+                variant_spec.get("selected_attempt_ids")
+                or variant_spec.get("attempt_ids")
+                or []
+            )
+            if str(token).strip()
+        }
+        if variant_wanted_attempt_ids and not wanted_attempt_ids:
+            input_count = len(variant_rows)
+            matched_attempt_ids = {
+                str(row.get("attempt_id") or "").strip()
+                for row in variant_rows
+                if str(row.get("attempt_id") or "").strip() in variant_wanted_attempt_ids
+            }
+            variant_rows = [
+                row
+                for row in variant_rows
+                if str(row.get("attempt_id") or "").strip() in variant_wanted_attempt_ids
+            ]
+            missing_attempt_ids = sorted(variant_wanted_attempt_ids - matched_attempt_ids)
+            if missing_attempt_ids:
+                _phase_emit(
+                    f"[portfolio:{portfolio_name}] selected_attempt_ids missing from corpus: "
+                    + ", ".join(missing_attempt_ids),
+                    as_json=as_json,
+                )
+            variant_scope_info = {
+                "candidate_scope": "config_selected_attempts",
+                "input_count": input_count,
+                "output_count": len(variant_rows),
+                "dropped_count": max(0, input_count - len(variant_rows)),
+                "requested_attempt_count": len(variant_wanted_attempt_ids),
+                "matched_attempt_count": len(matched_attempt_ids),
+                "missing_attempt_ids": missing_attempt_ids,
+                "playhand_runs_with_canonical": 0,
+            }
+        elif not wanted_attempt_ids:
             variant_rows, variant_scope_info = filter_play_hand_candidate_scope(
                 variant_rows,
                 variant_spec.get("candidate_scope", "promoted"),
@@ -9876,6 +10182,240 @@ def cmd_build_portfolio(
             "portfolios": summaries,
         }
     print(json.dumps(output_payload, ensure_ascii=True, indent=2))
+    return 0
+
+
+def cmd_optimize_portfolio(
+    *,
+    run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    portfolio_name: str,
+    portfolio_size: int,
+    candidate_scope: str,
+    candidate_limit: int,
+    swap_candidate_limit: int,
+    min_score: float,
+    allowed_asset_classes: list[str] | None,
+    allowed_instruments: list[str] | None,
+    blocked_instruments: list[str] | None,
+    max_avg_hold_hours: float,
+    max_p90_hold_hours: float,
+    max_single_hold_hours: float,
+    objective_names: list[str] | None,
+    baseline_portfolio_reports: list[str] | None,
+    baseline_attempt_ids: list[str] | None,
+    random_starts: int,
+    max_swaps: int,
+    random_seed: int,
+    max_per_family: int,
+    max_instrument_share: float,
+    min_fx_share: float,
+    max_metal_share: float,
+    max_index_share: float,
+    max_avg_open_positions: float,
+    max_peak_open_positions: float,
+    target_trades_per_month: float,
+    max_trades_per_month: float,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    full_rows, corpus_info = _selection_corpus_rows(
+        config,
+        run_ids=run_ids,
+        label="portfolio-optimizer",
+        as_json=as_json,
+    )
+    wanted_attempt_ids = {
+        token.strip() for token in (attempt_ids or []) if str(token).strip()
+    }
+    rows = list(full_rows)
+    if wanted_attempt_ids:
+        rows = [
+            row for row in rows if str(row.get("attempt_id") or "").strip() in wanted_attempt_ids
+        ]
+        scope_info = {
+            "candidate_scope": "explicit_attempts",
+            "input_count": len(full_rows),
+            "output_count": len(rows),
+            "dropped_count": len(full_rows) - len(rows),
+            "playhand_runs_with_canonical": 0,
+        }
+    else:
+        rows, scope_info = filter_play_hand_candidate_scope(rows, candidate_scope)
+
+    baseline_ids: list[str] = []
+    baselines_raw: list[tuple[str, list[str]]] = []
+    baseline_account: dict[str, Any] = {}
+    for raw_path in baseline_portfolio_reports or []:
+        path = Path(raw_path).resolve()
+        ids = load_baseline_attempt_ids(path)
+        baselines_raw.append((path.stem if path.name != "portfolio-report.json" else path.parent.name, ids))
+        baseline_ids.extend(ids)
+        if not baseline_account:
+            baseline_account = load_baseline_account(path)
+    extra_baseline_ids = [
+        token.strip() for token in (baseline_attempt_ids or []) if str(token).strip()
+    ]
+    if extra_baseline_ids:
+        baselines_raw.append(("baseline-attempt-ids", extra_baseline_ids))
+        baseline_ids.extend(extra_baseline_ids)
+
+    spec = PortfolioOptimizerSpec(
+        portfolio_name=str(portfolio_name or "portfolio-optimizer").strip()
+        or "portfolio-optimizer",
+        portfolio_size=max(1, int(portfolio_size)),
+        candidate_scope=str(candidate_scope or "promoted"),
+        min_score=float(min_score),
+        allowed_asset_classes=tuple(
+            token.strip().lower()
+            for token in (allowed_asset_classes or ["fx", "metal", "index"])
+            if str(token).strip()
+        ),
+        allowed_instruments=_normalize_cli_tokens(allowed_instruments),
+        blocked_instruments=_normalize_cli_tokens(blocked_instruments),
+        max_avg_hold_hours=float(max_avg_hold_hours),
+        max_p90_hold_hours=float(max_p90_hold_hours),
+        max_single_hold_hours=float(max_single_hold_hours),
+        candidate_limit=int(candidate_limit),
+        swap_candidate_limit=int(swap_candidate_limit),
+        objective_names=tuple(objective_names or ["return", "balanced", "stability"]),
+        max_swaps=max(0, int(max_swaps)),
+        random_starts=max(0, int(random_starts)),
+        random_seed=int(random_seed),
+        max_per_family=max(1, int(max_per_family)),
+        max_instrument_share=float(max_instrument_share),
+        min_fx_share=float(min_fx_share),
+        max_metal_share=float(max_metal_share),
+        max_index_share=float(max_index_share),
+        max_avg_open_positions=float(max_avg_open_positions),
+        max_peak_open_positions=float(max_peak_open_positions),
+        target_trades_per_month=float(target_trades_per_month),
+        max_trades_per_month=float(max_trades_per_month),
+        baseline_attempt_ids=tuple(dict.fromkeys(baseline_ids)),
+        account=baseline_account,
+    )
+    report_root = config.derived_root / "portfolio-optimization" / _slug_token(
+        spec.portfolio_name
+    )
+    report_root.mkdir(parents=True, exist_ok=True)
+    progress_path = report_root / "portfolio-optimizer-progress.jsonl"
+    progress_path.write_text("", encoding="utf-8")
+
+    def optimizer_progress(event: dict[str, Any]) -> None:
+        payload = {
+            "generated_at": datetime.now().astimezone().isoformat(),
+            **event,
+        }
+        line = json.dumps(payload, ensure_ascii=True)
+        with progress_path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+        print(line, file=sys.stderr, flush=True)
+
+    candidates, rejections = build_optimizer_candidates(rows, spec)
+    if not candidates:
+        raise SystemExit("No optimizer candidates survived the source-calendar filters.")
+    optimizer_progress(
+        {
+            "event": "candidate_filter_done",
+            "candidate_count": len(candidates),
+            "rejections": rejections,
+            "scoped_row_count": len(rows),
+        }
+    )
+    search = PortfolioSearch(candidates, spec, progress_callback=optimizer_progress)
+    baselines = [
+        baseline_metrics_from_ids(search, name, ids)
+        for name, ids in baselines_raw
+    ]
+    variants = search.optimize()
+    pareto_front = search.pareto_front(limit=50)
+    summary = write_optimizer_report(
+        report_root=report_root,
+        spec=spec,
+        candidates=candidates,
+        rejections=rejections,
+        variants=variants,
+        baselines=baselines,
+        pareto_front=pareto_front,
+        source_info={
+            **corpus_info,
+            "scope": scope_info,
+            "scoped_row_count": len(rows),
+        },
+    )
+    output_payload = {
+        **summary,
+        "candidate_scope": scope_info,
+        "progress_jsonl": str(progress_path),
+        "variants": {
+            name: {
+                "objective_score": variant.get("objective_score"),
+                "selected_attempt_ids": variant.get("selected_attempt_ids"),
+                "metrics": variant.get("metrics"),
+            }
+            for name, variant in variants.items()
+        },
+        "baselines": baselines,
+        "pareto_front": pareto_front,
+    }
+    print(json.dumps(output_payload, ensure_ascii=True, indent=2))
+    return 0
+
+
+def cmd_build_portfolio_risk_sizing(
+    *,
+    portfolio_report: str,
+    export_bundle: str | None,
+    output_dir: str | None,
+    min_risk_pct: float,
+    max_risk_pct: float,
+    default_cap_pct: float,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    report_path = Path(portfolio_report).resolve()
+    bundle_path = Path(export_bundle).resolve() if export_bundle else None
+    if output_dir:
+        root = Path(output_dir).resolve()
+    else:
+        name = report_path.parent.name if report_path.name == "portfolio-report.json" else report_path.stem
+        root = config.derived_root / "fuzzfolio-risk-sizing" / _slug_token(name)
+    spec = RiskSizingSpec(
+        min_risk_pct=float(min_risk_pct),
+        max_risk_pct=float(max_risk_pct),
+        default_cap_pct=float(default_cap_pct),
+    )
+    schedule = build_risk_sizing_schedule(
+        portfolio_report_path=report_path,
+        export_bundle_path=bundle_path,
+        spec=spec,
+    )
+    summary = write_risk_sizing_report(
+        schedule=schedule,
+        output_dir=root,
+        portfolio_report_path=report_path,
+        export_bundle_path=bundle_path,
+    )
+    payload = {
+        **summary,
+        "schedule": schedule,
+    }
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+    else:
+        console.print(
+            Panel.fit(
+                "\n".join(
+                    [
+                        f"Strategies: {summary.get('schedule_count')}",
+                        f"Risk range: {summary.get('min_risk_percent')}% - {summary.get('max_risk_percent')}%",
+                        f"Average risk: {round(float(summary.get('avg_risk_percent') or 0.0), 4)}%",
+                        f"Artifacts: {summary.get('output_dir')}",
+                    ]
+                ),
+                title="Portfolio Risk Sizing",
+            )
+        )
     return 0
 
 
@@ -13819,9 +14359,52 @@ def main(argv: list[str] | None = None) -> int:
             profile_drop_exit_policy_cell=args.profile_drop_exit_policy_cell,
             as_json=bool(args.json),
         )
+    if args.command == "optimize-portfolio":
+        return cmd_optimize_portfolio(
+            run_ids=args.run_id,
+            attempt_ids=args.attempt_id,
+            portfolio_name=args.portfolio_name,
+            portfolio_size=int(args.portfolio_size),
+            candidate_scope=args.candidate_scope,
+            candidate_limit=int(args.candidate_limit),
+            swap_candidate_limit=int(args.swap_candidate_limit),
+            min_score=float(args.min_score),
+            allowed_asset_classes=args.allowed_asset_class,
+            allowed_instruments=args.allowed_instrument,
+            blocked_instruments=args.blocked_instrument,
+            max_avg_hold_hours=float(args.max_avg_hold_hours),
+            max_p90_hold_hours=float(args.max_p90_hold_hours),
+            max_single_hold_hours=float(args.max_single_hold_hours),
+            objective_names=args.objective,
+            baseline_portfolio_reports=args.baseline_portfolio_report,
+            baseline_attempt_ids=args.baseline_attempt_id,
+            random_starts=int(args.random_starts),
+            max_swaps=int(args.max_swaps),
+            random_seed=int(args.random_seed),
+            max_per_family=int(args.max_per_family),
+            max_instrument_share=float(args.max_instrument_share),
+            min_fx_share=float(args.min_fx_share),
+            max_metal_share=float(args.max_metal_share),
+            max_index_share=float(args.max_index_share),
+            max_avg_open_positions=float(args.max_avg_open_positions),
+            max_peak_open_positions=float(args.max_peak_open_positions),
+            target_trades_per_month=float(args.target_trades_per_month),
+            max_trades_per_month=float(args.max_trades_per_month),
+            as_json=bool(args.json),
+        )
     if args.command == "export-portfolio-bundle":
         return cmd_export_portfolio_bundle(
             portfolio_report=args.portfolio_report,
+            as_json=bool(args.json),
+        )
+    if args.command == "build-portfolio-risk-sizing":
+        return cmd_build_portfolio_risk_sizing(
+            portfolio_report=args.portfolio_report,
+            export_bundle=args.export_bundle,
+            output_dir=args.output_dir,
+            min_risk_pct=float(args.min_risk_pct),
+            max_risk_pct=float(args.max_risk_pct),
+            default_cap_pct=float(args.default_cap_pct),
             as_json=bool(args.json),
         )
     if args.command == "render-portfolio-profile-drops":
