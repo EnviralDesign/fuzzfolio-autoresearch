@@ -724,6 +724,17 @@ def test_build_coarse_halving_decision_thresholds() -> None:
     assert near_incumbent["expanded"] is True
     assert "probe_score_met_expand_threshold" in near_incumbent["reasons"]
 
+    rejected_probe_against_strong_incumbent = play_hand_mod.build_coarse_halving_decision(
+        mode="enforce",
+        total_budget=1024,
+        probe_budget=128,
+        incumbent_score=75.0,
+        probe_score=56.0,
+    )
+    assert rejected_probe_against_strong_incumbent["expanded"] is False
+    assert rejected_probe_against_strong_incumbent["decision"] == "skip_expansion"
+    assert "probe_not_near_strong_incumbent" in rejected_probe_against_strong_incumbent["reasons"]
+
     weak_near_incumbent = play_hand_mod.build_coarse_halving_decision(
         mode="enforce",
         total_budget=1024,

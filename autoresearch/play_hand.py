@@ -3182,7 +3182,11 @@ def build_coarse_halving_decision(
     elif probe is None:
         decision = "skip_expansion"
         reasons.append("missing_probe_score")
-    elif probe >= COARSE_HALVING_EXPAND_SCORE:
+    elif probe >= COARSE_HALVING_EXPAND_SCORE and (
+        incumbent is None
+        or incumbent < 60.0
+        or probe >= incumbent - COARSE_HALVING_NEAR_INCUMBENT_TOLERANCE
+    ):
         expanded = True
         decision = "expand"
         reasons.append("probe_score_met_expand_threshold")
@@ -5707,6 +5711,7 @@ def cmd_play_hand(
             probe_score = _top_sweep_score(last_sweep_payload)
             probe_candidate_path: Path | None = None
             probe_candidate_ref: str | None = None
+            probe_acceptance: dict[str, Any] | None = None
             materialized = _materialize_and_register_best_sweep_candidate(
                 ctx,
                 stage=stages["coarse"],
@@ -5733,7 +5738,7 @@ def cmd_play_hand(
                     as_of_date=screen_as_of_date,
                 )
                 probe_score = _as_float(result.get("score"))
-                _apply_stage_candidate(
+                probe_acceptance = _apply_stage_candidate(
                     stage_key="coarse_probe",
                     phase="coarse_probe",
                     candidate_profile_path=probe_candidate_path,
@@ -5752,8 +5757,15 @@ def cmd_play_hand(
             )
             _record_coarse_halving_decision(halving_decision)
             if halving_decision["expanded"]:
-                expand_source_profile_path = probe_candidate_path or current_profile_path
-                expand_source_profile_ref = probe_candidate_ref or current_profile_ref
+                probe_was_accepted = bool(
+                    probe_acceptance and probe_acceptance.get("accepted")
+                )
+                expand_source_profile_path = (
+                    probe_candidate_path if probe_was_accepted else current_profile_path
+                )
+                expand_source_profile_ref = (
+                    probe_candidate_ref if probe_was_accepted else current_profile_ref
+                )
                 expand_source_payload = _load_json(expand_source_profile_path)
                 sweep = _run_sweep(
                     ctx,

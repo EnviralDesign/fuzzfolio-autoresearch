@@ -24,7 +24,7 @@ def test_build_play_hand_health_marks_tombstoned_calendar_report_failure() -> No
         "calendar_gate": {
             "passed": False,
             "reasons": ["calendar_segments_insufficient"],
-            "metrics": {"positive_segment_count": 2, "min_positive_segments": 3},
+            "metrics": {"segments_positive": 2, "min_segments_positive": 3},
         },
         "play_hand_phase_scores": {
             "baseline": 63.5626,
@@ -43,8 +43,27 @@ def test_build_play_hand_health_marks_tombstoned_calendar_report_failure() -> No
     assert health["status"] == "tombstoned"
     assert health["scores"]["selected_final_score"] == 0.0
     assert health["calendar"]["passed"] is False
+    assert health["calendar"]["segments_positive"] == 2
+    assert health["calendar"]["min_segments_positive"] == 3
     assert "calendar_gate_failed_report_only" in health["reasons"]
     assert health["early_exit_inputs"]["lookback_delta_vs_baseline"] == pytest.approx(-17.0263)
+
+
+def test_build_play_hand_health_accepts_legacy_calendar_metric_names() -> None:
+    health = build_play_hand_health(
+        run_metadata={
+            "runner": "play_hand_v1",
+            "calendar_gate": {
+                "passed": True,
+                "metrics": {"positive_segment_count": 4, "min_positive_segments": 3},
+            },
+        },
+        attempts=[],
+        computed_at="2026-06-14T00:00:00+00:00",
+    )
+
+    assert health["calendar"]["segments_positive"] == 4
+    assert health["calendar"]["min_segments_positive"] == 3
 
 
 def test_build_play_hand_health_marks_canonical_retained() -> None:

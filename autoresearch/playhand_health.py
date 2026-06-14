@@ -149,13 +149,23 @@ def _calendar_evidence(run_metadata: dict[str, Any], catalog_row: dict[str, Any]
     metrics = gate.get("metrics") if isinstance(gate.get("metrics"), dict) else {}
     available = bool(gate) or bool(catalog_row.get("has_full_backtest_calendar_curve_36m"))
     passed = _as_bool(gate.get("passed"))
+    segments_positive = (
+        metrics.get("segments_positive")
+        if metrics.get("segments_positive") is not None
+        else metrics.get("positive_segment_count")
+    )
+    min_segments_positive = (
+        metrics.get("min_segments_positive")
+        if metrics.get("min_segments_positive") is not None
+        else metrics.get("min_positive_segments")
+    )
     return {
         "available": available,
         "mode": run_metadata.get("calendar_gate_mode"),
         "passed": passed,
         "reasons": _clean_strings(gate.get("reasons")),
-        "segments_positive": metrics.get("positive_segment_count"),
-        "min_segments_positive": metrics.get("min_positive_segments"),
+        "segments_positive": segments_positive,
+        "min_segments_positive": min_segments_positive,
         "status": (
             "passed"
             if passed is True
