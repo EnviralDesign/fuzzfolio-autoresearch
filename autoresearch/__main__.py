@@ -107,6 +107,11 @@ if __package__ in {None, ""}:
         DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME,
         build_playhand_outcome_priors,
     )
+    from autoresearch.playhand_efficiency import (
+        DEFAULT_PLAYHAND_EFFICIENCY_DIRNAME,
+        build_playhand_efficiency_report,
+        write_playhand_efficiency_report,
+    )
     from autoresearch.playhand_health import heal_play_hand_run_metadata
     from autoresearch.discovery_pair_atlas import (
         DEFAULT_DISCOVERY_PAIR_DIRNAME,
@@ -305,6 +310,11 @@ else:
     from .playhand_outcome_priors import (
         DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME,
         build_playhand_outcome_priors,
+    )
+    from .playhand_efficiency import (
+        DEFAULT_PLAYHAND_EFFICIENCY_DIRNAME,
+        build_playhand_efficiency_report,
+        write_playhand_efficiency_report,
     )
     from .playhand_health import heal_play_hand_run_metadata
     from .discovery_pair_atlas import (
@@ -518,6 +528,7 @@ PUBLIC_CLI_COMMANDS = {
     "build-anchor-pair-timing-atlas",
     "run-anchor-pair-timing-probes",
     "build-playhand-outcome-priors",
+    "playhand-efficiency-report",
     "build-recipe-priors",
     "build-discovery-pair-atlas",
     "run-discovery-pair-probes",
@@ -1445,6 +1456,40 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Print machine-readable JSON summary.",
+    )
+
+    efficiency_report = subparsers.add_parser(
+        "playhand-efficiency-report",
+        help="Summarize PlayHand compute-saving mechanisms across recent runs.",
+    )
+    efficiency_report.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only include the named PlayHand run id. Can be repeated.",
+    )
+    efficiency_report.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum recent PlayHand runs to include. Default: 200.",
+    )
+    efficiency_report.add_argument(
+        "--all-runs",
+        action="store_true",
+        help="Analyze all PlayHand runs instead of the recent --limit window.",
+    )
+    efficiency_report.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for JSON/Markdown/CSV artifacts. "
+            f"Default: runs/derived/{DEFAULT_PLAYHAND_EFFICIENCY_DIRNAME}."
+        ),
+    )
+    efficiency_report.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
     )
 
     discovery_pair_atlas = subparsers.add_parser(
@@ -13533,6 +13578,86 @@ def cmd_build_playhand_outcome_priors(
     return 0
 
 
+def cmd_build_playhand_efficiency_report(
+    *,
+    run_ids: list[str] | None,
+    limit: int,
+    all_runs: bool,
+    output_dir: Path | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    resolved_limit = None if all_runs else max(0, int(limit))
+    report = build_playhand_efficiency_report(
+        config.runs_root,
+        limit=resolved_limit,
+        run_ids=run_ids,
+    )
+    target_dir = output_dir or config.derived_root / DEFAULT_PLAYHAND_EFFICIENCY_DIRNAME
+    paths = write_playhand_efficiency_report(report, target_dir)
+    payload = {
+        **paths,
+        "summary": report.get("summary", {}),
+    }
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = report.get("summary", {})
+    coarse = summary.get("coarse_halving", {})
+    early = summary.get("early_exit", {})
+    family = summary.get("family_policy", {})
+    saved = early.get("estimated_saved", {}) if isinstance(early, dict) else {}
+    table = Table(title="PlayHand Efficiency Report", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Runs analyzed", str(summary.get("run_count", 0)))
+    table.add_row("Completed runs", str(summary.get("completed_count", 0)))
+    table.add_row(
+        "Coarse saved evals",
+        str(coarse.get("total_estimated_saved_evaluations", 0)),
+    )
+    table.add_row(
+        "Coarse skipped expansions",
+        str(coarse.get("skipped_expansion_runs", 0)),
+    )
+    table.add_row(
+        "Early terminal tombstones",
+        str(early.get("enforced_terminal_tombstones", 0)),
+    )
+    table.add_row(
+        "Early scout skips",
+        str(early.get("enforced_scout_skips", 0)),
+    )
+    table.add_row(
+        "Early coarse perms avoided",
+        str(saved.get("coarse_permutations_avoided", 0)),
+    )
+    table.add_row(
+        "Deep replay jobs avoided",
+        str(saved.get("deep_replay_jobs_avoided", 0)),
+    )
+    table.add_row(
+        "Family exact-only skips",
+        str(family.get("exact_only_skip_runs", 0)),
+    )
+    console.print(table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Report JSON: {paths['playhand_efficiency_report_json']}",
+                    f"Report Markdown: {paths['playhand_efficiency_report_markdown']}",
+                    f"Run CSV: {paths['playhand_efficiency_runs_csv']}",
+                ]
+            ),
+            title="PlayHand Efficiency Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
 def cmd_build_discovery_pair_atlas(
     *,
     indicator_atlas_dir: Path | None,
@@ -14298,6 +14423,14 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_build_playhand_outcome_priors(
             report_dirs=args.report_dir,
             out_dir=args.out_dir,
+            as_json=bool(args.json),
+        )
+    if args.command == "playhand-efficiency-report":
+        return cmd_build_playhand_efficiency_report(
+            run_ids=args.run_id,
+            limit=args.limit,
+            all_runs=bool(args.all_runs),
+            output_dir=args.output_dir,
             as_json=bool(args.json),
         )
     if args.command == "build-discovery-pair-atlas":
