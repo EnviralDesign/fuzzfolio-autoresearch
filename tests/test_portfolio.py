@@ -1479,6 +1479,7 @@ def test_build_parser_includes_finalize_corpus_defaults() -> None:
     assert play_args.coarse_halving_mode == "off"
     assert play_args.coarse_probe_budget == 128
     assert play_args.family_policy_mode == "off"
+    assert play_args.resource_trace is False
     enforced_args = parser.parse_args(
         [
             "play-hand",
@@ -1490,12 +1491,14 @@ def test_build_parser_includes_finalize_corpus_defaults() -> None:
             "64",
             "--family-policy-mode",
             "enforce",
+            "--resource-trace",
         ]
     )
     assert enforced_args.early_exit_mode == "enforce"
     assert enforced_args.coarse_halving_mode == "enforce"
     assert enforced_args.coarse_probe_budget == 64
     assert enforced_args.family_policy_mode == "enforce"
+    assert enforced_args.resource_trace is True
 
 
 def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(

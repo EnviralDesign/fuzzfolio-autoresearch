@@ -1,5 +1,6 @@
 import json
 import random
+import sys
 import threading
 import time
 from pathlib import Path
@@ -751,9 +752,88 @@ def _play_hand_cmd_defaults(**overrides):
         "coarse_halving_mode": "off",
         "family_policy_mode": "off",
         "coarse_probe_budget": 128,
+        "resource_trace": False,
     }
     params.update(overrides)
     return params
+
+
+def test_resource_trace_records_rollup_and_parallel_group(tmp_path: Path) -> None:
+    ctx = PlayHandContext(
+        config=None,
+        cli=None,
+        run_id="run-trace",
+        run_dir=tmp_path,
+        profiles_dir=tmp_path / "profiles",
+        evals_dir=tmp_path / "evals",
+        attempts_path=tmp_path / "attempts.jsonl",
+        events_path=tmp_path / "events.jsonl",
+        summary_path=tmp_path / "summary.json",
+        resource_trace_enabled=True,
+        resource_trace_path=tmp_path / "play-hand-resource-trace.jsonl",
+        resource_trace_started_at="2026-06-14T00:00:00+00:00",
+        resource_trace_base_perf=time.perf_counter(),
+    )
+    stage = play_hand_mod.PlayHandStage(1, 2, "trace_test")
+
+    with play_hand_mod._resource_span(
+        ctx,
+        phase="startup",
+        operation="single_step",
+        execution_kind="single_sync",
+        parallel_capability="none",
+        stage=stage,
+    ):
+        time.sleep(0.001)
+
+    with play_hand_mod._resource_span(
+        ctx,
+        phase="instrument_scout",
+        operation="parallel_group",
+        execution_kind="local_parallel",
+        parallel_capability="local_threads",
+        stage=stage,
+        worker_count=2,
+    ) as group:
+        with play_hand_mod._resource_span(
+            ctx,
+            phase="instrument_scout",
+            operation="parallel_worker_eval",
+            execution_kind="remote_worker_blocking",
+            parallel_capability="fuzzfolio_worker_pool",
+            rollup_role="parallel_worker",
+            parent_span_id=group.span_id,
+            stage=stage,
+        ):
+            time.sleep(0.001)
+
+    metadata: dict[str, object] = {}
+    summary = play_hand_mod._finalize_resource_trace(ctx, metadata)
+
+    assert summary is not None
+    assert metadata["resource_trace"] == summary
+    assert summary["enabled"] is True
+    assert summary["span_count"] == 3
+    assert summary["critical_path_span_count"] == 2
+    assert summary["single_sync_seconds"] > 0
+    assert summary["local_parallel_seconds"] > 0
+    assert summary["parallel_capable_seconds"] >= summary["local_parallel_seconds"]
+    assert summary["by_execution_kind_seconds"]["single_sync"] > 0
+    assert summary["trace_jsonl"] == str(
+        (tmp_path / "play-hand-resource-trace.jsonl").resolve()
+    )
+
+    trace_lines = [
+        json.loads(line)
+        for line in (tmp_path / "play-hand-resource-trace.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert len(trace_lines) == 3
+    assert any(line["rollup_role"] == "parallel_worker" for line in trace_lines)
+    assert summary["parallel_groups"][0]["worker_count"] == 2
+    assert summary["parallel_groups"][0]["child_span_count"] == 1
+    assert summary["parallel_groups"][0]["estimated_worker_utilization"] is not None
 
 
 def test_coarse_halving_budget_plan_splits_remaining_budget() -> None:
@@ -2279,7 +2359,9 @@ def test_play_hand_artifact_commands_heal_full_backtests_and_top_drop() -> None:
 
     assert len(commands) == 1
     drop_command = commands[0]
-    assert drop_command[:2] == ["uv", "run"]
+    assert drop_command[0] == sys.executable
+    assert drop_command[1] == "-c"
+    assert "main(sys.argv[1:])" in drop_command[2]
     for expected in (
         "finalize-corpus",
         "--run-id",

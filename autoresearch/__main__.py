@@ -244,6 +244,7 @@ if __package__ in {None, ""}:
         PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
         PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
         PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
+        PLAY_HAND_RESOURCE_TRACE_ENV,
         cmd_play_hand,
     )
     from autoresearch.typed_tools import CLI_OK_TOOLS
@@ -448,6 +449,7 @@ else:
         PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
         PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
         PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
+        PLAY_HAND_RESOURCE_TRACE_ENV,
         cmd_play_hand,
     )
     from .typed_tools import CLI_OK_TOOLS
@@ -891,6 +893,14 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
             "first decisions without changing mutation flow; 'enforce' makes "
             "template-locked families exact-only and uses template-guarded exact "
             "screens as mutation benchmarks. Default: off."
+        ),
+    )
+    play_hand.add_argument(
+        "--resource-trace",
+        action="store_true",
+        help=(
+            "Write opt-in PlayHand resource-utilization spans and summary rollups. "
+            f"Env {PLAY_HAND_RESOURCE_TRACE_ENV} can also enable or disable it."
         ),
     )
     play_hand.add_argument(
@@ -14312,6 +14322,7 @@ def main(argv: list[str] | None = None) -> int:
             coarse_probe_budget=args.coarse_probe_budget,
             screen_anchor_max_offset_months=args.screen_anchor_max_offset_months,
             keep_cloud_profiles=bool(args.keep_cloud_profiles),
+            resource_trace=bool(args.resource_trace),
         )
     if args.command == "build-indicator-atlas":
         return cmd_build_indicator_atlas(

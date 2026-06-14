@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -108,6 +109,8 @@ PLAY_HAND_FAMILY_POLICY_EXECUTION_VERSION = "family_policy_execution_v1"
 PLAY_HAND_FAMILY_POLICY_MODES = ("off", "report", "enforce")
 PLAY_HAND_FAMILY_POLICY_DEFAULT_MODE = "off"
 PLAY_HAND_FAMILY_POLICY_ACTIVE_POLICIES = ("template_locked", "template_guarded")
+PLAY_HAND_RESOURCE_TRACE_VERSION = "play_hand_resource_trace_v1"
+PLAY_HAND_RESOURCE_TRACE_ENV = "AUTORESEARCH_PLAY_HAND_RESOURCE_TRACE"
 STAGE_ACCEPTANCE_DROP_TOLERANCE = 5.0
 COARSE_HALVING_EXPAND_SCORE = 55.0
 COARSE_HALVING_MIN_NEAR_INCUMBENT_SCORE = 50.0
@@ -343,6 +346,13 @@ class PlayHandContext:
     sweep_timeout_seconds: int = PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS
     registered_profile_refs: list[str] = field(default_factory=list)
     io_lock: Any = field(default_factory=threading.RLock, repr=False)
+    resource_trace_enabled: bool = False
+    resource_trace_path: Path | None = None
+    resource_trace_started_at: str | None = None
+    resource_trace_base_perf: float = 0.0
+    resource_trace_spans: list[dict[str, Any]] = field(default_factory=list)
+    resource_trace_next_id: int = 0
+    resource_trace_local: Any = field(default_factory=threading.local, repr=False)
 
 
 @dataclass(frozen=True)
@@ -1055,6 +1065,297 @@ def _append_event(ctx: PlayHandContext, phase: str, status: str, **payload: Any)
         detail = f" score={score:.4f}" if isinstance(score, (int, float)) else ""
         prefix = f"{stage.prefix} " if isinstance(stage, PlayHandStage) else ""
         console.print(f"{prefix}[cyan]{phase}[/] [bold]{status}[/]{detail}")
+
+
+def _resolve_resource_trace_mode(enabled: bool) -> bool:
+    raw = os.environ.get(PLAY_HAND_RESOURCE_TRACE_ENV)
+    if raw is None or str(raw).strip() == "":
+        return bool(enabled)
+    token = str(raw).strip().lower()
+    if token in {"1", "true", "yes", "on", "trace", "enabled"}:
+        return True
+    if token in {"0", "false", "no", "off", "disabled"}:
+        return False
+    return bool(enabled)
+
+
+def _resource_trace_paths(ctx: PlayHandContext) -> dict[str, Any]:
+    return {
+        "trace_jsonl": str(ctx.resource_trace_path.resolve())
+        if ctx.resource_trace_path is not None
+        else None,
+    }
+
+
+class _NoopResourceSpan:
+    span_id: int | None = None
+
+    def update(self, **_payload: Any) -> None:
+        return None
+
+    def __enter__(self) -> "_NoopResourceSpan":
+        return self
+
+    def __exit__(self, *_exc_info: Any) -> bool:
+        return False
+
+
+class _ResourceSpan:
+    def __init__(
+        self,
+        ctx: PlayHandContext,
+        *,
+        phase: str,
+        operation: str,
+        execution_kind: str,
+        parallel_capability: str,
+        rollup_role: str,
+        stage: PlayHandStage | None = None,
+        parent_span_id: int | None = None,
+        **payload: Any,
+    ) -> None:
+        self.ctx = ctx
+        self.phase = phase
+        self.operation = operation
+        self.execution_kind = execution_kind
+        self.parallel_capability = parallel_capability
+        self.rollup_role = rollup_role
+        self.stage = stage
+        self.parent_span_id = parent_span_id
+        self.payload = dict(payload)
+        self.span_id: int | None = None
+        self._previous_parent: int | None = None
+        self._start_perf = 0.0
+        self._start_ts = ""
+
+    def update(self, **payload: Any) -> None:
+        self.payload.update(payload)
+
+    def __enter__(self) -> "_ResourceSpan":
+        with self.ctx.io_lock:
+            self.ctx.resource_trace_next_id += 1
+            self.span_id = self.ctx.resource_trace_next_id
+        self._start_perf = time.perf_counter()
+        self._start_ts = datetime.now(timezone.utc).isoformat()
+        self._previous_parent = getattr(
+            self.ctx.resource_trace_local,
+            "current_span_id",
+            None,
+        )
+        self.ctx.resource_trace_local.current_span_id = self.span_id
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, _tb: Any) -> bool:
+        end_perf = time.perf_counter()
+        end_ts = datetime.now(timezone.utc).isoformat()
+        parent = self.parent_span_id
+        if parent is None:
+            parent = self._previous_parent
+        if self._previous_parent is None:
+            try:
+                delattr(self.ctx.resource_trace_local, "current_span_id")
+            except AttributeError:
+                pass
+        else:
+            self.ctx.resource_trace_local.current_span_id = self._previous_parent
+        span = {
+            "schema_version": PLAY_HAND_RESOURCE_TRACE_VERSION,
+            "span_id": self.span_id,
+            "parent_span_id": parent,
+            "run_id": self.ctx.run_id,
+            "phase": self.phase,
+            "operation": self.operation,
+            "execution_kind": self.execution_kind,
+            "parallel_capability": self.parallel_capability,
+            "rollup_role": self.rollup_role,
+            "blocking_playhand": self.rollup_role == "critical_path",
+            "start_ts": self._start_ts,
+            "end_ts": end_ts,
+            "start_offset_seconds": round(
+                self._start_perf - self.ctx.resource_trace_base_perf,
+                6,
+            ),
+            "end_offset_seconds": round(
+                end_perf - self.ctx.resource_trace_base_perf,
+                6,
+            ),
+            "duration_seconds": round(end_perf - self._start_perf, 6),
+            "status": "error" if exc_type else "completed",
+            **(self.stage.event_payload() if isinstance(self.stage, PlayHandStage) else {}),
+            **self.payload,
+        }
+        if exc is not None:
+            span["error"] = str(exc)[:2000]
+        with self.ctx.io_lock:
+            self.ctx.resource_trace_spans.append(span)
+            if self.ctx.resource_trace_path is not None:
+                self.ctx.resource_trace_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.ctx.resource_trace_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(span, ensure_ascii=True) + "\n")
+        return False
+
+
+def _resource_span(
+    ctx: PlayHandContext,
+    *,
+    phase: str,
+    operation: str,
+    execution_kind: str,
+    parallel_capability: str,
+    rollup_role: str = "critical_path",
+    stage: PlayHandStage | None = None,
+    parent_span_id: int | None = None,
+    **payload: Any,
+) -> _ResourceSpan | _NoopResourceSpan:
+    if not getattr(ctx, "resource_trace_enabled", False):
+        return _NoopResourceSpan()
+    return _ResourceSpan(
+        ctx,
+        phase=phase,
+        operation=operation,
+        execution_kind=execution_kind,
+        parallel_capability=parallel_capability,
+        rollup_role=rollup_role,
+        stage=stage,
+        parent_span_id=parent_span_id,
+        **payload,
+    )
+
+
+def _resource_trace_summary(ctx: PlayHandContext) -> dict[str, Any] | None:
+    if not ctx.resource_trace_enabled:
+        return None
+    spans = list(ctx.resource_trace_spans)
+    critical_spans = [
+        span for span in spans if span.get("rollup_role") == "critical_path"
+    ]
+    kind_seconds: dict[str, float] = {}
+    operation_seconds: dict[str, float] = {}
+    for span in critical_spans:
+        duration = float(span.get("duration_seconds") or 0.0)
+        kind = str(span.get("execution_kind") or "unknown")
+        operation = str(span.get("operation") or span.get("phase") or "unknown")
+        kind_seconds[kind] = kind_seconds.get(kind, 0.0) + duration
+        operation_seconds[operation] = operation_seconds.get(operation, 0.0) + duration
+
+    critical_seconds = sum(kind_seconds.values())
+    wall_seconds = None
+    if critical_spans:
+        wall_seconds = max(float(span.get("end_offset_seconds") or 0.0) for span in critical_spans)
+        wall_seconds -= min(float(span.get("start_offset_seconds") or 0.0) for span in critical_spans)
+        wall_seconds = round(max(0.0, wall_seconds), 6)
+
+    parallel_groups: list[dict[str, Any]] = []
+    for span in critical_spans:
+        if span.get("execution_kind") != "local_parallel":
+            continue
+        span_id = span.get("span_id")
+        worker_count = max(1, int(span.get("worker_count") or 1))
+        duration = float(span.get("duration_seconds") or 0.0)
+        child_spans = [item for item in spans if item.get("parent_span_id") == span_id]
+        child_busy_seconds = sum(float(item.get("duration_seconds") or 0.0) for item in child_spans)
+        capacity_seconds = duration * worker_count
+        parallel_groups.append(
+            {
+                "span_id": span_id,
+                "phase": span.get("phase"),
+                "operation": span.get("operation"),
+                "worker_count": worker_count,
+                "duration_seconds": round(duration, 6),
+                "child_span_count": len(child_spans),
+                "child_busy_seconds": round(child_busy_seconds, 6),
+                "capacity_seconds": round(capacity_seconds, 6),
+                "estimated_worker_utilization": (
+                    round(child_busy_seconds / capacity_seconds, 4)
+                    if capacity_seconds > 0
+                    else None
+                ),
+            }
+        )
+
+    def pct(value: float) -> float | None:
+        if critical_seconds <= 0:
+            return None
+        return round(value / critical_seconds, 4)
+
+    def wall_pct(value: float) -> float | None:
+        if wall_seconds is None or wall_seconds <= 0:
+            return None
+        return round(value / wall_seconds, 4)
+
+    uninstrumented_gap_seconds = None
+    if wall_seconds is not None:
+        uninstrumented_gap_seconds = round(
+            max(0.0, wall_seconds - critical_seconds),
+            6,
+        )
+
+    single_sync_seconds = kind_seconds.get("single_sync", 0.0)
+    remote_worker_seconds = kind_seconds.get("remote_worker_blocking", 0.0)
+    child_process_seconds = kind_seconds.get("child_process_blocking", 0.0)
+    local_parallel_seconds = kind_seconds.get("local_parallel", 0.0)
+    return {
+        "version": PLAY_HAND_RESOURCE_TRACE_VERSION,
+        "enabled": True,
+        "started_at": ctx.resource_trace_started_at,
+        **_resource_trace_paths(ctx),
+        "span_count": len(spans),
+        "critical_path_span_count": len(critical_spans),
+        "critical_path_instrumented_seconds": round(critical_seconds, 6),
+        "critical_path_wall_seconds": wall_seconds,
+        "critical_path_coverage_share_of_wall": wall_pct(critical_seconds),
+        "uninstrumented_gap_seconds": uninstrumented_gap_seconds,
+        "uninstrumented_gap_share_of_wall": wall_pct(uninstrumented_gap_seconds or 0.0)
+        if uninstrumented_gap_seconds is not None
+        else None,
+        "by_execution_kind_seconds": {
+            key: round(value, 6) for key, value in sorted(kind_seconds.items())
+        },
+        "by_execution_kind_share": {
+            key: pct(value) for key, value in sorted(kind_seconds.items())
+        },
+        "single_sync_seconds": round(single_sync_seconds, 6),
+        "single_sync_share": pct(single_sync_seconds),
+        "single_sync_share_of_wall": wall_pct(single_sync_seconds),
+        "parallel_capable_seconds": round(
+            remote_worker_seconds + child_process_seconds + local_parallel_seconds,
+            6,
+        ),
+        "parallel_capable_share": pct(
+            remote_worker_seconds + child_process_seconds + local_parallel_seconds
+        ),
+        "parallel_capable_share_of_wall": wall_pct(
+            remote_worker_seconds + child_process_seconds + local_parallel_seconds
+        ),
+        "playhand_blocked_on_external_workers_seconds": round(
+            remote_worker_seconds + child_process_seconds,
+            6,
+        ),
+        "playhand_blocked_on_external_workers_share_of_wall": wall_pct(
+            remote_worker_seconds + child_process_seconds
+        ),
+        "local_parallel_seconds": round(local_parallel_seconds, 6),
+        "local_parallel_share_of_wall": wall_pct(local_parallel_seconds),
+        "top_operations": [
+            {"operation": key, "seconds": round(value, 6), "share": pct(value)}
+            for key, value in sorted(
+                operation_seconds.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:12]
+        ],
+        "parallel_groups": parallel_groups,
+    }
+
+
+def _finalize_resource_trace(
+    ctx: PlayHandContext,
+    metadata: dict[str, Any],
+) -> dict[str, Any] | None:
+    summary = _resource_trace_summary(ctx)
+    if summary is not None:
+        metadata["resource_trace"] = summary
+    return summary
 
 
 def _play_hand_role_for_phase(phase: str) -> str:
@@ -2578,25 +2879,35 @@ def _cleanup_registered_profiles(
 
     deleted: list[str] = []
     failures: list[dict[str, Any]] = []
-    for profile_ref in profile_refs:
-        try:
-            result = ctx.cli.run(
-                ["profiles", "delete", "--profile-ref", profile_ref, "--pretty"],
-                check=False,
-            )
-            if result.returncode == 0:
-                deleted.append(profile_ref)
-            else:
-                failures.append(
-                    {
-                        "profile_ref": profile_ref,
-                        "returncode": result.returncode,
-                        "stderr": result.stderr.strip()[:800],
-                        "stdout": result.stdout.strip()[:800],
-                    }
+    with _resource_span(
+        ctx,
+        phase="cloud_profile_cleanup",
+        operation="delete_registered_profiles",
+        execution_kind="single_sync",
+        parallel_capability="none",
+        stage=stage,
+        profile_count=len(profile_refs),
+        reason=reason,
+    ):
+        for profile_ref in profile_refs:
+            try:
+                result = ctx.cli.run(
+                    ["profiles", "delete", "--profile-ref", profile_ref, "--pretty"],
+                    check=False,
                 )
-        except Exception as exc:
-            failures.append({"profile_ref": profile_ref, "error": str(exc)[:800]})
+                if result.returncode == 0:
+                    deleted.append(profile_ref)
+                else:
+                    failures.append(
+                        {
+                            "profile_ref": profile_ref,
+                            "returncode": result.returncode,
+                            "stderr": result.stderr.strip()[:800],
+                            "stdout": result.stdout.strip()[:800],
+                        }
+                    )
+            except Exception as exc:
+                failures.append({"profile_ref": profile_ref, "error": str(exc)[:800]})
 
     summary.update(
         {
@@ -2725,6 +3036,8 @@ def _evaluate_profile(
     lookback_months: int,
     reward_matrix: dict[str, Any] | None = None,
     as_of_date: str | None = None,
+    resource_trace_role: str = "critical_path",
+    resource_trace_parent_span_id: int | None = None,
 ) -> dict[str, Any]:
     out_dir = (ctx.evals_dir / f"eval_{phase}_{_utc_stamp()}").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2761,14 +3074,30 @@ def _evaluate_profile(
     for instrument in instruments:
         args.extend(["--instrument", instrument])
     args.append("--pretty")
-    ctx.cli.run(
-        args,
-        timeout_seconds=_play_hand_eval_cli_timeout_seconds(job_timeout_seconds),
-    )
-    compare_payload = ctx.cli.score_artifact(out_dir)
-    snapshot_path = out_dir / "sensitivity-response.json"
-    snapshot = load_sensitivity_snapshot(out_dir) if snapshot_path.exists() else None
-    attempt_score = build_attempt_score(compare_payload, snapshot)
+    with _resource_span(
+        ctx,
+        phase=phase,
+        operation="sensitivity_basket_evaluation",
+        execution_kind="remote_worker_blocking",
+        parallel_capability="fuzzfolio_worker_pool",
+        rollup_role=resource_trace_role,
+        parent_span_id=resource_trace_parent_span_id,
+        stage=stage,
+        instrument_count=len(instruments),
+        instruments=list(instruments),
+        timeframe=timeframe,
+        lookback_months=int(lookback_months),
+        job_timeout_seconds=job_timeout_seconds,
+        as_of_date=as_of_date,
+    ):
+        ctx.cli.run(
+            args,
+            timeout_seconds=_play_hand_eval_cli_timeout_seconds(job_timeout_seconds),
+        )
+        compare_payload = ctx.cli.score_artifact(out_dir)
+        snapshot_path = out_dir / "sensitivity-response.json"
+        snapshot = load_sensitivity_snapshot(out_dir) if snapshot_path.exists() else None
+        attempt_score = build_attempt_score(compare_payload, snapshot)
     play_hand_role = _play_hand_role_for_phase(phase)
     play_hand_decision = _play_hand_default_decision(play_hand_role)
     with ctx.io_lock:
@@ -3913,7 +4242,11 @@ def _evaluate_instrument_scout_records(
     instruments = [primary, *candidates]
     worker_count = _instrument_scout_worker_count(len(instruments))
 
-    def evaluate(instrument: str) -> tuple[str, dict[str, Any]]:
+    def evaluate(
+        instrument: str,
+        *,
+        parent_span_id: int | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         evaluation = _evaluate_profile(
             ctx,
             stage=stage,
@@ -3925,21 +4258,46 @@ def _evaluate_instrument_scout_records(
             lookback_months=lookback_months,
             reward_matrix=reward_matrix,
             as_of_date=as_of_date,
+            resource_trace_role="parallel_worker",
+            resource_trace_parent_span_id=parent_span_id,
         )
         return instrument, _instrument_scout_record(instrument, evaluation)
 
-    if worker_count <= 1:
-        records = dict(evaluate(instrument) for instrument in instruments)
-    else:
-        records: dict[str, dict[str, Any]] = {}
-        with ThreadPoolExecutor(
-            max_workers=worker_count,
-            thread_name_prefix="playhand-scout",
-        ) as executor:
-            futures = {executor.submit(evaluate, instrument): instrument for instrument in instruments}
-            for future in as_completed(futures):
-                instrument, record = future.result()
-                records[instrument] = record
+    with _resource_span(
+        ctx,
+        phase="instrument_scout",
+        operation="instrument_scout_evaluate_instruments",
+        execution_kind="local_parallel" if worker_count > 1 else "single_sync",
+        parallel_capability="local_threads" if worker_count > 1 else "none",
+        stage=stage,
+        worker_count=worker_count,
+        instrument_count=len(instruments),
+        primary_instrument=primary,
+        candidate_instruments=list(candidates),
+        lookback_months=int(lookback_months),
+    ) as trace_span:
+        if worker_count <= 1:
+            records = dict(
+                evaluate(instrument, parent_span_id=trace_span.span_id)
+                for instrument in instruments
+            )
+        else:
+            records: dict[str, dict[str, Any]] = {}
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="playhand-scout",
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        evaluate,
+                        instrument,
+                        parent_span_id=trace_span.span_id,
+                    ): instrument
+                    for instrument in instruments
+                }
+                for future in as_completed(futures):
+                    instrument, record = future.result()
+                    records[instrument] = record
 
     return records[primary], [records[instrument] for instrument in candidates], worker_count
 
@@ -4428,14 +4786,35 @@ def _run_sweep(
             f"{progress_text} elapsed={elapsed_text}"
         )
 
-    result = ctx.cli.run_with_heartbeat(
-        args,
-        timeout_seconds=_play_hand_sweep_cli_timeout_seconds(sweep_timeout_seconds),
-        heartbeat_seconds=30,
-        heartbeat_snapshot=heartbeat,
-    )
-    payload = result.parsed_json if isinstance(result.parsed_json, dict) else _load_json(out_dir / "sweep-results.json")
-    _normalize_sweep_payload(payload, requested_axes=axes, definition_path=out_dir / "sweep-definition.json")
+    with _resource_span(
+        ctx,
+        phase=phase,
+        operation="sweep_run",
+        execution_kind="remote_worker_blocking",
+        parallel_capability="fuzzfolio_sweep_worker_pool",
+        stage=stage,
+        mode=mode,
+        axis_count=len(axes),
+        permutation_count=selected_permutations,
+        search_space_permutations=selected_permutations,
+        evaluation_budget=evaluation_budget,
+        planned_work_count=planned_work_count,
+        planned_work_label=planned_work_label,
+        sweep_budget=sweep_budget,
+        as_of_date=as_of_date,
+    ) as trace_span:
+        result = ctx.cli.run_with_heartbeat(
+            args,
+            timeout_seconds=_play_hand_sweep_cli_timeout_seconds(sweep_timeout_seconds),
+            heartbeat_seconds=30,
+            heartbeat_snapshot=heartbeat,
+        )
+        payload = result.parsed_json if isinstance(result.parsed_json, dict) else _load_json(out_dir / "sweep-results.json")
+        _normalize_sweep_payload(payload, requested_axes=axes, definition_path=out_dir / "sweep-definition.json")
+        trace_span.update(
+            sweep_id=live_sweep_id or _sweep_id_from_stderr(result.stderr),
+            top_score=_top_sweep_score(payload),
+        )
     _append_event(
         ctx,
         phase,
@@ -4584,13 +4963,23 @@ def _materialize_and_register(
     candidate_rank: int = 1,
 ) -> tuple[Path, str]:
     output_path = ctx.profiles_dir / f"{phase}_top.json"
-    materialize_profile_variant(
-        source_profile_path,
-        output_path,
-        parameters,
-        name_suffix=f"[{phase} top]",
-    )
-    profile_ref = _register_profile(ctx, output_path)
+    with _resource_span(
+        ctx,
+        phase=phase,
+        operation="materialize_and_register_profile",
+        execution_kind="single_sync",
+        parallel_capability="none",
+        stage=stage,
+        candidate_rank=candidate_rank,
+        parameter_count=len(parameters),
+    ):
+        materialize_profile_variant(
+            source_profile_path,
+            output_path,
+            parameters,
+            name_suffix=f"[{phase} top]",
+        )
+        profile_ref = _register_profile(ctx, output_path)
     _append_event(
         ctx,
         phase,
@@ -4613,16 +5002,25 @@ def _copy_and_register_profile(
     phase: str,
 ) -> tuple[Path, str]:
     output_path = ctx.profiles_dir / output_name
-    payload = _load_json(source_profile_path)
-    profile = _extract_profile(payload)
-    if profile:
-        original_name = str(profile.get("name") or source_profile_path.stem)
-        profile["name"] = f"{original_name} [exact template]".strip()
-        profile["isActive"] = False
-        _write_json(output_path, payload)
-    else:
-        shutil.copyfile(source_profile_path, output_path)
-    profile_ref = _register_profile(ctx, output_path)
+    with _resource_span(
+        ctx,
+        phase=phase,
+        operation="copy_and_register_profile",
+        execution_kind="single_sync",
+        parallel_capability="none",
+        stage=stage,
+        output_name=output_name,
+    ):
+        payload = _load_json(source_profile_path)
+        profile = _extract_profile(payload)
+        if profile:
+            original_name = str(profile.get("name") or source_profile_path.stem)
+            profile["name"] = f"{original_name} [exact template]".strip()
+            profile["isActive"] = False
+            _write_json(output_path, payload)
+        else:
+            shutil.copyfile(source_profile_path, output_path)
+        profile_ref = _register_profile(ctx, output_path)
     _append_event(
         ctx,
         phase,
@@ -4708,8 +5106,11 @@ def _play_hand_artifact_commands(
     if drop_count <= 0:
         return []
     command = [
-        "uv",
-        "run",
+        sys.executable,
+        "-c",
+        "from autoresearch.__main__ import main; "
+        "import sys; "
+        "raise SystemExit(main(sys.argv[1:]))",
         "finalize-corpus",
         "--run-id",
         run_id,
@@ -4808,9 +5209,21 @@ def _finalize_run_artifacts(
     try:
         if commands:
             console.print(f"{stage.prefix} [cyan]final_artifacts[/] [bold]finalize corpus[/]")
-            full_backtests = _run_child_public_command(
-                commands[0], cwd=ctx.config.repo_root
-            )
+            with _resource_span(
+                ctx,
+                phase="final_artifacts",
+                operation="finalize_corpus_child_process",
+                execution_kind="child_process_blocking",
+                parallel_capability="child_process_workers",
+                stage=stage,
+                profile_drop_count=max(0, int(profile_drop_count)),
+                profile_drop_workers=max(1, int(profile_drop_workers)),
+                final_attempt_id=final_attempt_id,
+                command=" ".join(commands[0]),
+            ):
+                full_backtests = _run_child_public_command(
+                    commands[0], cwd=ctx.config.repo_root
+                )
             _append_event(
                 ctx,
                 "final_artifacts",
@@ -4883,6 +5296,7 @@ def cmd_play_hand(
     coarse_probe_budget: int | None = PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
     screen_anchor_max_offset_months: int = PLAY_HAND_SCREEN_ANCHOR_DEFAULT_MAX_OFFSET_MONTHS,
     keep_cloud_profiles: bool = False,
+    resource_trace: bool = False,
 ) -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
@@ -4892,6 +5306,7 @@ def cmd_play_hand(
     run_dir = config.runs_root / run_id
     profiles_dir = run_dir / "profiles"
     evals_dir = run_dir / "evals"
+    resource_trace_enabled = _resolve_resource_trace_mode(resource_trace)
     ctx = PlayHandContext(
         config=config,
         cli=cli,
@@ -4905,74 +5320,98 @@ def cmd_play_hand(
         dry_run=dry_run,
         job_timeout_seconds=job_timeout_seconds,
         sweep_timeout_seconds=sweep_timeout_seconds,
+        resource_trace_enabled=resource_trace_enabled,
+        resource_trace_path=(
+            run_dir / "play-hand-resource-trace.jsonl"
+            if resource_trace_enabled
+            else None
+        ),
+        resource_trace_started_at=datetime.now(timezone.utc).isoformat()
+        if resource_trace_enabled
+        else None,
+        resource_trace_base_perf=time.perf_counter(),
     )
     profiles_dir.mkdir(parents=True, exist_ok=True)
     evals_dir.mkdir(parents=True, exist_ok=True)
 
     if not dry_run:
-        cli.ensure_login()
+        with _resource_span(
+            ctx,
+            phase="startup",
+            operation="ensure_login",
+            execution_kind="single_sync",
+            parallel_capability="none",
+        ):
+            cli.ensure_login()
 
-    hand = _seed_hand(config, cli, run_dir) if not dry_run else [
-        SeedIndicator("RSI_CROSSBACK", "trigger", "event-with-lookback", "entry"),
-        SeedIndicator("STOCH_CROSSOVER", "trigger", "event-with-lookback", "entry"),
-        SeedIndicator("MA_SLOPE_TREND", "context", "state", "higher-context"),
-        SeedIndicator("ADX", "filter", "state", "higher-context"),
-        SeedIndicator("WICK_REJECTION", "trigger", "event-with-lookback", "entry"),
-    ]
-    rng = random.Random(seed)
-    shuffled = list(hand)
-    rng.shuffle(shuffled)
-    seed_plan, seed_plan_path = _load_play_hand_seed_plan(config)
-    seed_plan_candidates = _seed_plan_indicator_candidates(config, seed_plan)
-    guided_available_count = len(
-        _merge_seed_indicator_candidates(shuffled, seed_plan_candidates)
-    )
-    effective_min_indicators = min_indicators
-    effective_max_indicators = max_indicators
-    if seed_plan is not None:
-        effective_min_indicators = max(effective_min_indicators, 2)
-        effective_max_indicators = max(effective_max_indicators, effective_min_indicators)
-    dealt_count = deal_indicator_count(
-        available_count=max(len(shuffled), guided_available_count),
-        min_indicators=effective_min_indicators,
-        max_indicators=effective_max_indicators,
-        rng=rng,
-    )
-    indicator_deal = deal_seed_plan_indicators(
-        shuffled,
-        target_count=dealt_count,
-        seed_plan=seed_plan,
-        rng=rng,
-        seed_plan_candidates=seed_plan_candidates,
-    )
-    dealt_entries = list(indicator_deal.get("indicators") or [])
-    if not dealt_entries:
-        indicator_deal = _fallback_indicator_deal(
+    with _resource_span(
+        ctx,
+        phase="deal",
+        operation="seed_and_deal_hand",
+        execution_kind="single_sync",
+        parallel_capability="none",
+    ):
+        hand = _seed_hand(config, cli, run_dir) if not dry_run else [
+            SeedIndicator("RSI_CROSSBACK", "trigger", "event-with-lookback", "entry"),
+            SeedIndicator("STOCH_CROSSOVER", "trigger", "event-with-lookback", "entry"),
+            SeedIndicator("MA_SLOPE_TREND", "context", "state", "higher-context"),
+            SeedIndicator("ADX", "filter", "state", "higher-context"),
+            SeedIndicator("WICK_REJECTION", "trigger", "event-with-lookback", "entry"),
+        ]
+        rng = random.Random(seed)
+        shuffled = list(hand)
+        rng.shuffle(shuffled)
+        seed_plan, seed_plan_path = _load_play_hand_seed_plan(config)
+        seed_plan_candidates = _seed_plan_indicator_candidates(config, seed_plan)
+        guided_available_count = len(
+            _merge_seed_indicator_candidates(shuffled, seed_plan_candidates)
+        )
+        effective_min_indicators = min_indicators
+        effective_max_indicators = max_indicators
+        if seed_plan is not None:
+            effective_min_indicators = max(effective_min_indicators, 2)
+            effective_max_indicators = max(effective_max_indicators, effective_min_indicators)
+        dealt_count = deal_indicator_count(
+            available_count=max(len(shuffled), guided_available_count),
+            min_indicators=effective_min_indicators,
+            max_indicators=effective_max_indicators,
+            rng=rng,
+        )
+        indicator_deal = deal_seed_plan_indicators(
             shuffled,
             target_count=dealt_count,
-            source="role_balanced",
-            reason="empty_guided_deal",
+            seed_plan=seed_plan,
+            rng=rng,
+            seed_plan_candidates=seed_plan_candidates,
         )
         dealt_entries = list(indicator_deal.get("indicators") or [])
-    dealt = [indicator.id for indicator in dealt_entries]
-    template_instrument_policy = _seed_plan_template_instrument_policy(seed_plan)
-    template_instrument_pool = _seed_pair_template_instruments(indicator_deal.get("pair"))
-    effective_instrument_pool = instrument_pool
-    template_instrument_pool_applied = False
-    if (
-        template_instrument_policy == "seed_pool"
-        and template_instrument_pool
-        and not _clean_tokens(instrument)
-        and not _clean_tokens(instrument_pool)
-    ):
-        effective_instrument_pool = template_instrument_pool
-        template_instrument_pool_applied = True
-    instrument_deal = deal_instruments(
-        instrument=instrument,
-        instrument_pool=effective_instrument_pool,
-        rng=rng,
-    )
-    instruments = list(instrument_deal["instruments"])
+        if not dealt_entries:
+            indicator_deal = _fallback_indicator_deal(
+                shuffled,
+                target_count=dealt_count,
+                source="role_balanced",
+                reason="empty_guided_deal",
+            )
+            dealt_entries = list(indicator_deal.get("indicators") or [])
+        dealt = [indicator.id for indicator in dealt_entries]
+        template_instrument_policy = _seed_plan_template_instrument_policy(seed_plan)
+        template_instrument_pool = _seed_pair_template_instruments(indicator_deal.get("pair"))
+        effective_instrument_pool = instrument_pool
+        template_instrument_pool_applied = False
+        if (
+            template_instrument_policy == "seed_pool"
+            and template_instrument_pool
+            and not _clean_tokens(instrument)
+            and not _clean_tokens(instrument_pool)
+        ):
+            effective_instrument_pool = template_instrument_pool
+            template_instrument_pool_applied = True
+        instrument_deal = deal_instruments(
+            instrument=instrument,
+            instrument_pool=effective_instrument_pool,
+            rng=rng,
+        )
+        instruments = list(instrument_deal["instruments"])
     timeframe = str(timeframe or "M5").strip().upper() or "M5"
     budget = resolve_sweep_budget(
         sweep_budget=sweep_budget,
@@ -5089,6 +5528,11 @@ def cmd_play_hand(
             family_policy=resolved_family_policy,
             exact_template_available=False,
         ),
+        "resource_trace": {
+            "version": PLAY_HAND_RESOURCE_TRACE_VERSION,
+            "enabled": resource_trace_enabled,
+            **_resource_trace_paths(ctx),
+        },
         "stage_acceptance_drop_tolerance": STAGE_ACCEPTANCE_DROP_TOLERANCE,
         "stage_acceptance_decisions": [],
         "play_hand_phase_scores": {},
@@ -5298,6 +5742,7 @@ def cmd_play_hand(
             attempts=load_attempts(ctx.attempts_path),
         )
         metadata["play_hand_health"] = play_hand_health
+        resource_trace_summary = _finalize_resource_trace(ctx, metadata)
         write_run_metadata(run_dir, metadata)
         summary = {
             "run_id": run_id,
@@ -5367,6 +5812,7 @@ def cmd_play_hand(
             "stage_acceptance_decisions": metadata.get("stage_acceptance_decisions"),
             "final_artifacts": final_artifact_summary,
             "cloud_profile_cleanup": cloud_profile_cleanup,
+            "resource_trace": resource_trace_summary,
         }
         _write_json(ctx.summary_path, summary)
         if as_json:
@@ -5487,7 +5933,17 @@ def cmd_play_hand(
     )
 
     phase_rows: list[dict[str, Any]] = []
-    profile_path = _scaffold_profile(ctx, dealt, instruments, timeframe, "hand_base")
+    with _resource_span(
+        ctx,
+        phase="scaffold",
+        operation="scaffold_base_profile",
+        execution_kind="single_sync",
+        parallel_capability="none",
+        stage=stages["scaffold"],
+        indicator_count=len(dealt),
+        instrument_count=len(instruments),
+    ):
+        profile_path = _scaffold_profile(ctx, dealt, instruments, timeframe, "hand_base")
     profile_payload = _load_json(profile_path)
     metadata_changes = apply_seed_indicator_metadata(profile_payload, dealt_entries)
     timeframe_changes = apply_role_timeframe_defaults(profile_payload, rng=rng)
@@ -5569,7 +6025,15 @@ def cmd_play_hand(
         if exact_template_source_profile_path is not None
         else "post_template_scaffold_fallback"
     )
-    profile_ref = _register_profile(ctx, profile_path)
+    with _resource_span(
+        ctx,
+        phase="scaffold",
+        operation="register_base_profile",
+        execution_kind="single_sync",
+        parallel_capability="none",
+        stage=stages["scaffold"],
+    ):
+        profile_ref = _register_profile(ctx, profile_path)
     _append_event(
         ctx,
         "scaffold",
@@ -6863,6 +7327,7 @@ def cmd_play_hand(
         attempts=load_attempts(ctx.attempts_path),
     )
     metadata["play_hand_health"] = play_hand_health
+    resource_trace_summary = _finalize_resource_trace(ctx, metadata)
     write_run_metadata(run_dir, metadata)
 
     summary = {
@@ -6962,6 +7427,7 @@ def cmd_play_hand(
         "stage_acceptance_decisions": metadata.get("stage_acceptance_decisions"),
         "final_artifacts": final_artifact_summary,
         "cloud_profile_cleanup": cloud_profile_cleanup,
+        "resource_trace": resource_trace_summary,
     }
     _write_json(ctx.summary_path, summary)
     if as_json:
