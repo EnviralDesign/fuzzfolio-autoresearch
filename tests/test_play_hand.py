@@ -12,6 +12,7 @@ import autoresearch.play_hand as play_hand_mod
 from autoresearch.play_hand import (
     PlayHandContext,
     _best_sweep_parameters,
+    build_early_exit_decision,
     _cleanup_registered_profiles,
     _curve_features,
     _finalize_play_hand_attempt_metadata,
@@ -49,6 +50,54 @@ from autoresearch.play_hand import (
     resolve_sweep_budget,
 )
 from autoresearch.ledger import load_attempts, write_attempts
+
+
+def _family_policy_seed_plan(policy: str) -> dict[str, object]:
+    return {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {
+            "discovered_recipe_006": {
+                "source": "discovery_recipe_validation",
+                "pair_menu": [
+                    {
+                        "source": "discovery_recipe_validation",
+                        "anchor_id": "RSI_CROSSBACK",
+                        "trigger_id": "STOCH_CROSSOVER",
+                        "probe_id": f"probe-{policy}",
+                        "pair_sampling_weight": 100,
+                        "pair_sampling_score": 80,
+                        "playhand_family_id": f"family-{policy}",
+                        "playhand_family_policy": policy,
+                        "playhand_exact_branch_required": policy == "template_locked",
+                        "playhand_recommended_max_indicators": 2,
+                        "playhand_role_balanced_fill_limit": 0
+                        if policy == "template_locked"
+                        else 1,
+                        "playhand_mutation_pressure": "low"
+                        if policy == "template_locked"
+                        else "guarded",
+                        "recommended_profile_template": {
+                            "probe_id": f"probe-{policy}",
+                            "timeframe": "M5",
+                            "indicator_defaults": [
+                                {
+                                    "indicator_id": "RSI_CROSSBACK",
+                                    "timeframe": "M5",
+                                    "lookbackBars": 7,
+                                },
+                                {
+                                    "indicator_id": "STOCH_CROSSOVER",
+                                    "timeframe": "M5",
+                                    "lookbackBars": 5,
+                                },
+                            ],
+                        },
+                    }
+                ],
+                "slot_menus": {},
+            }
+        },
+    }
 
 
 def test_repair_degenerate_profile_ranges_expands_binary_defaults(tmp_path: Path) -> None:
@@ -484,6 +533,36 @@ def test_deal_seed_plan_indicators_template_locked_caps_to_pair_only() -> None:
     assert all(slot["indicator_id"] != "BAD_FILL" for slot in deal["selected_slots"])
 
 
+def test_resolve_playhand_family_policy_normalizes_template_locked() -> None:
+    policy = play_hand_mod.resolve_playhand_family_policy(
+        {
+            "family_policy": {
+                "family_id": "family-1",
+                "family_policy": "template_locked",
+                "exact_branch_required": "true",
+                "recommended_max_indicators": 2,
+                "role_balanced_fill_limit": 0,
+                "mutation_pressure": "low",
+            }
+        }
+    )
+
+    assert policy["family_id"] == "family-1"
+    assert policy["family_policy"] == "template_locked"
+    assert policy["exact_branch_required"] is True
+    assert policy["recommended_max_indicators"] == 2
+    assert policy["role_balanced_fill_limit"] == 0
+    assert policy["source"] == "indicator_deal.family_policy"
+
+
+def test_resolve_playhand_family_policy_handles_missing_policy() -> None:
+    policy = play_hand_mod.resolve_playhand_family_policy({"pair": None})
+
+    assert policy["family_policy"] == "none"
+    assert policy["exact_branch_required"] is False
+    assert policy["source"] == "indicator_deal.pair"
+
+
 def test_apply_seed_pair_template_defaults_preserves_validated_pair_config() -> None:
     profile_payload = {
         "profile": {
@@ -526,6 +605,161 @@ def test_apply_seed_pair_template_defaults_preserves_validated_pair_config() -> 
     assert profile_payload["profile"]["indicators"][1]["config"]["timeframe"] == "H1"
 
 
+def test_build_early_exit_decision_reports_lookback_drop() -> None:
+    decision = build_early_exit_decision(
+        checkpoint="after_lookback_top",
+        mode="report",
+        evidence={
+            "source": {
+                "dealt_indicator_source": "role_balanced_policy_exploration",
+                "family_policy": None,
+            },
+            "scores": {
+                "baseline_3mo": 63.5626,
+                "lookback_top_3mo": 46.5363,
+                "coarse_top_3mo": None,
+                "focused_top_3mo": None,
+            },
+            "early_exit_inputs": {
+                "safe_for_report_mode": True,
+                "guided_or_role_balanced": "role_balanced_policy_exploration"
+            },
+        },
+    )
+
+    assert decision["version"] == play_hand_mod.PLAY_HAND_EARLY_EXIT_VERSION
+    assert decision["mode"] == "report"
+    assert decision["would_exit"] is True
+    assert decision["would_exit_research"] is False
+    assert decision["would_exit_compute_expansion"] is True
+    assert any(
+        reason.startswith("lookback_score_below_baseline_by_")
+        for reason in decision["reasons"]
+    )
+    assert decision["rules_fired"]
+    assert decision["deltas"]["lookback_delta_vs_baseline"] is None
+    assert decision["saved_if_enforced"]["would_skip_coarse"] is True
+    assert decision["saved_if_enforced"]["would_skip_final_36mo"] is False
+
+
+def test_build_early_exit_decision_degrades_without_health_context() -> None:
+    decision = build_early_exit_decision(
+        checkpoint="after_baseline",
+        mode="report",
+        evidence={
+            "source": {},
+            "scores": {"baseline_3mo": 0.0},
+            "early_exit_inputs": {},
+        },
+    )
+
+    assert decision["would_exit"] is False
+    assert decision["would_exit_research"] is False
+    assert decision["would_exit_compute_expansion"] is False
+    assert decision["rules_fired"] == ["insufficient_health_context"]
+    assert "insufficient_health_context" in decision["reasons"]
+
+
+def test_coarse_halving_budget_plan_splits_remaining_budget() -> None:
+    plan = play_hand_mod.build_coarse_halving_budget_plan(
+        mode="enforce",
+        total_budget=1024,
+        probe_budget=128,
+    )
+
+    assert plan["split"] is True
+    assert plan["probe_budget"] == 128
+    assert plan["expand_budget"] == 896
+
+    unsplit = play_hand_mod.build_coarse_halving_budget_plan(
+        mode="enforce",
+        total_budget=64,
+        probe_budget=128,
+    )
+
+    assert unsplit["split"] is False
+    assert unsplit["probe_budget"] == 64
+    assert unsplit["expand_budget"] == 0
+
+
+def test_build_coarse_halving_decision_thresholds() -> None:
+    missing = play_hand_mod.build_coarse_halving_decision(
+        mode="enforce",
+        total_budget=1024,
+        probe_budget=128,
+        incumbent_score=63.0,
+        probe_score=None,
+    )
+    assert missing["expanded"] is False
+    assert missing["decision"] == "skip_expansion"
+    assert missing["estimated_saved_evaluations"] == 896
+
+    zero = play_hand_mod.build_coarse_halving_decision(
+        mode="enforce",
+        total_budget=1024,
+        probe_budget=128,
+        incumbent_score=63.0,
+        probe_score=0.0,
+    )
+    assert zero["expanded"] is False
+    assert zero["decision"] == "skip_expansion"
+
+    strong_probe = play_hand_mod.build_coarse_halving_decision(
+        mode="enforce",
+        total_budget=1024,
+        probe_budget=128,
+        incumbent_score=42.0,
+        probe_score=55.0,
+    )
+    assert strong_probe["expanded"] is True
+    assert "probe_score_met_expand_threshold" in strong_probe["reasons"]
+
+    near_incumbent = play_hand_mod.build_coarse_halving_decision(
+        mode="enforce",
+        total_budget=1024,
+        probe_budget=128,
+        incumbent_score=63.0,
+        probe_score=58.0,
+    )
+    assert near_incumbent["expanded"] is True
+    assert "probe_score_met_expand_threshold" in near_incumbent["reasons"]
+
+    weak_near_incumbent = play_hand_mod.build_coarse_halving_decision(
+        mode="enforce",
+        total_budget=1024,
+        probe_budget=128,
+        incumbent_score=63.0,
+        probe_score=49.0,
+    )
+    assert weak_near_incumbent["expanded"] is False
+    assert "probe_score_below_expand_threshold" in weak_near_incumbent["reasons"]
+
+
+def test_stage_acceptance_rejects_material_drop_and_accepts_near_or_better() -> None:
+    rejected = play_hand_mod.build_stage_acceptance_decision(
+        stage="lookback",
+        incumbent_score=63.0,
+        candidate_score=46.0,
+    )
+    near = play_hand_mod.build_stage_acceptance_decision(
+        stage="lookback",
+        incumbent_score=63.0,
+        candidate_score=58.0,
+    )
+    better = play_hand_mod.build_stage_acceptance_decision(
+        stage="lookback",
+        incumbent_score=63.0,
+        candidate_score=64.0,
+    )
+
+    assert rejected["accepted"] is False
+    assert rejected["reason"] == "candidate_below_incumbent_tolerance"
+    assert near["accepted"] is True
+    assert near["reason"] == "candidate_within_incumbent_tolerance"
+    assert better["accepted"] is True
+    assert better["reason"] == "candidate_improved_incumbent"
+
+
 def test_cmd_play_hand_authenticates_before_seed_prompt(monkeypatch, tmp_path: Path) -> None:
     events: list[str] = []
 
@@ -540,7 +774,11 @@ def test_cmd_play_hand_authenticates_before_seed_prompt(monkeypatch, tmp_path: P
     monkeypatch.setattr(
         play_hand_mod,
         "load_config",
-        lambda: SimpleNamespace(runs_root=tmp_path, fuzzfolio=SimpleNamespace()),
+        lambda: SimpleNamespace(
+            runs_root=tmp_path,
+            derived_root=tmp_path / "derived",
+            fuzzfolio=SimpleNamespace(),
+        ),
     )
     monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
     monkeypatch.setattr(play_hand_mod, "_seed_hand", fake_seed_hand)
@@ -574,6 +812,883 @@ def test_cmd_play_hand_authenticates_before_seed_prompt(monkeypatch, tmp_path: P
         )
 
     assert events == ["ensure_login", "seed_hand"]
+
+
+def test_cmd_play_hand_coarse_halving_no_expand_skips_expensive_stages(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    sweep_calls: list[dict[str, object]] = []
+    eval_calls: list[dict[str, object]] = []
+
+    class FakeCli:
+        pass
+
+    def fake_run_sweep(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_payload,
+        instruments,
+        axes,
+        mode,
+        sweep_budget,
+        max_permutations,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        if phase in {"coarse_expand", "focused"}:
+            raise AssertionError(f"{phase} should be skipped")
+        sweep_calls.append(
+            {
+                "phase": phase,
+                "mode": mode,
+                "sweep_budget": sweep_budget,
+                "max_permutations": max_permutations,
+            }
+        )
+        top_score = 46.0 if phase == "coarse_probe" else 50.0
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "axes": list(axes),
+            "result": {
+                "ranked_permutations": [
+                    {"parameters": {"fake": phase}, "fitness_value": top_score}
+                ],
+                "parameter_importance": [
+                    {"axis": "indicator[0].talib.timeperiod", "importance": 1.0}
+                ],
+            },
+        }
+
+    def fake_materialize(ctx, *, stage, source_profile_path, sweep_payload, phase):
+        output_path = ctx.profiles_dir / f"{phase}_top.json"
+        output_path.write_text(
+            source_profile_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return output_path, f"dry-{phase}_top", {"fake": phase}
+
+    def fake_evaluate_profile(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_path,
+        instruments,
+        timeframe,
+        lookback_months,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        eval_calls.append(
+            {
+                "phase": phase,
+                "profile_ref": profile_ref,
+                "lookback_months": lookback_months,
+            }
+        )
+        scores = {
+            "baseline_3mo": 63.5626,
+            "lookback_timing_top_3mo": 46.5363,
+            "coarse_probe_top_3mo": 46.2,
+            "mutated_final_36mo": 12.0,
+        }
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "attempt_id": f"attempt-{phase}",
+            "score": scores[phase],
+            "profile_ref": profile_ref,
+            "profile_path": str(profile_path),
+        }
+
+    def fake_instrument_scout(*_args, **_kwargs):
+        raise AssertionError("instrument scout should be skipped")
+
+    monkeypatch.setattr(
+        play_hand_mod,
+        "load_config",
+        lambda: SimpleNamespace(
+            runs_root=tmp_path,
+            fuzzfolio=SimpleNamespace(),
+        ),
+    )
+    monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
+    monkeypatch.setattr(play_hand_mod, "_load_play_hand_seed_plan", lambda _config: (None, None))
+    monkeypatch.setattr(play_hand_mod, "build_timing_axes", lambda _payload: ["timing=1,2"])
+    monkeypatch.setattr(
+        play_hand_mod,
+        "build_coarse_axes",
+        lambda _payload: ["indicator[0].talib.timeperiod=5,14"],
+    )
+    monkeypatch.setattr(
+        play_hand_mod,
+        "build_focused_axes",
+        lambda *_args, **_kwargs: ["focused=1,2"],
+    )
+    monkeypatch.setattr(play_hand_mod, "_run_sweep", fake_run_sweep)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_materialize_and_register_best_sweep_candidate",
+        fake_materialize,
+    )
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+    monkeypatch.setattr(play_hand_mod, "_run_instrument_scout", fake_instrument_scout)
+
+    exit_code = play_hand_mod.cmd_play_hand(
+        instrument=["EURUSD"],
+        instrument_pool=None,
+        timeframe="M5",
+        sweep_budget="high",
+        max_sweep_permutations=None,
+        max_reward_r=None,
+        min_indicators=2,
+        max_indicators=2,
+        seed=1,
+        screen_months=3,
+        scrutiny_months=36,
+        coarse_mode="evolutionary",
+        evolutionary_budget=None,
+        instrument_scout=True,
+        instrument_scout_size=5,
+        instrument_scout_max_selected=3,
+        instrument_scout_months=None,
+        final_artifacts=False,
+        final_profile_drop_count=0,
+        final_profile_drop_workers=1,
+        job_timeout_seconds=2400,
+        sweep_timeout_seconds=7200,
+        dry_run=True,
+        as_json=True,
+        calendar_gate="off",
+        early_exit_mode="report",
+        coarse_halving_mode="enforce",
+        coarse_probe_budget=128,
+    )
+
+    assert exit_code == 0
+    assert [call["phase"] for call in sweep_calls] == ["lookback_timing", "coarse_probe"]
+    coarse_probe_call = sweep_calls[1]
+    assert coarse_probe_call["sweep_budget"] == "128"
+    assert coarse_probe_call["max_permutations"] == 128
+    assert [call["phase"] for call in eval_calls] == [
+        "baseline_3mo",
+        "lookback_timing_top_3mo",
+        "coarse_probe_top_3mo",
+        "mutated_final_36mo",
+    ]
+    assert eval_calls[-1]["profile_ref"] == "dry-hand_base"
+
+    run_dirs = list(tmp_path.glob("*-playhand-v1"))
+    assert len(run_dirs) == 1
+    metadata = json.loads((run_dirs[0] / "run-metadata.json").read_text(encoding="utf-8"))
+    halving = metadata["coarse_halving"]
+    assert halving["version"] == play_hand_mod.PLAY_HAND_COARSE_HALVING_VERSION
+    assert halving["mode"] == "enforce"
+    assert halving["decision"] == "skip_expansion"
+    assert halving["expanded"] is False
+    assert halving["estimated_saved_evaluations"] == 896
+    assert halving["skipped_stages"] == ["coarse_expand", "focused", "instrument_scout"]
+    assert metadata["instrument_scout"]["status"] == "skipped"
+    assert metadata["instrument_scout"]["reason"] == "coarse_halving_skip_expansion"
+    assert metadata["play_hand_phase_scores"]["coarse_probe_top_3mo"] == 46.2
+    assert metadata["play_hand_phase_scores"]["coarse_top_3mo"] == 63.5626
+    assert metadata["stage_incumbent"]["profile_ref"] == "dry-hand_base"
+    assert [item["accepted"] for item in metadata["stage_acceptance_decisions"]] == [
+        False,
+        False,
+    ]
+    assert "play_hand_health" in metadata
+
+
+def test_cmd_play_hand_coarse_halving_expand_runs_remaining_work(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    sweep_calls: list[dict[str, object]] = []
+    eval_calls: list[dict[str, object]] = []
+    scout_calls: list[dict[str, object]] = []
+
+    class FakeCli:
+        pass
+
+    def fake_run_sweep(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_payload,
+        instruments,
+        axes,
+        mode,
+        sweep_budget,
+        max_permutations,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        sweep_calls.append(
+            {
+                "phase": phase,
+                "mode": mode,
+                "sweep_budget": sweep_budget,
+                "max_permutations": max_permutations,
+            }
+        )
+        top_scores = {
+            "lookback_timing": 60.5,
+            "coarse_probe": 56.0,
+            "coarse_expand": 66.0,
+            "focused": 67.0,
+        }
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "axes": list(axes),
+            "result": {
+                "ranked_permutations": [
+                    {"parameters": {"fake": phase}, "fitness_value": top_scores[phase]}
+                ],
+                "parameter_importance": [
+                    {"axis": "indicator[0].talib.timeperiod", "importance": 1.0}
+                ],
+            },
+        }
+
+    def fake_materialize(ctx, *, stage, source_profile_path, sweep_payload, phase):
+        output_path = ctx.profiles_dir / f"{phase}_top.json"
+        output_path.write_text(
+            source_profile_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return output_path, f"dry-{phase}_top", {"fake": phase}
+
+    def fake_evaluate_profile(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_path,
+        instruments,
+        timeframe,
+        lookback_months,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        eval_calls.append({"phase": phase, "profile_ref": profile_ref})
+        scores = {
+            "baseline_3mo": 60.0,
+            "lookback_timing_top_3mo": 60.5,
+            "coarse_probe_top_3mo": 56.0,
+            "coarse_expand_top_3mo": 66.0,
+            "focused_top_3mo": 67.0,
+            "mutated_final_36mo": 15.0,
+        }
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "attempt_id": f"attempt-{phase}",
+            "score": scores[phase],
+            "profile_ref": profile_ref,
+            "profile_path": str(profile_path),
+        }
+
+    def fake_instrument_scout(
+        ctx,
+        *,
+        stage,
+        profile_ref,
+        profile_path,
+        instrument_deal,
+        instruments,
+        timeframe,
+        lookback_months,
+        rng,
+        enabled,
+        scout_size,
+        max_selected,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        scout_calls.append({"profile_ref": profile_ref, "enabled": enabled})
+        return {
+            "version": "instrument_scout_v1",
+            "status": "completed",
+            "selected_instruments": list(instruments),
+            "accepted": [],
+            "rejected": [],
+        }
+
+    monkeypatch.setattr(
+        play_hand_mod,
+        "load_config",
+        lambda: SimpleNamespace(
+            runs_root=tmp_path,
+            fuzzfolio=SimpleNamespace(),
+        ),
+    )
+    monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
+    monkeypatch.setattr(play_hand_mod, "_load_play_hand_seed_plan", lambda _config: (None, None))
+    monkeypatch.setattr(play_hand_mod, "build_timing_axes", lambda _payload: ["timing=1,2"])
+    monkeypatch.setattr(
+        play_hand_mod,
+        "build_coarse_axes",
+        lambda _payload: ["indicator[0].talib.timeperiod=5,14"],
+    )
+    monkeypatch.setattr(
+        play_hand_mod,
+        "build_focused_axes",
+        lambda *_args, **_kwargs: ["indicator[0].talib.timeperiod=8,14"],
+    )
+    monkeypatch.setattr(play_hand_mod, "_run_sweep", fake_run_sweep)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_materialize_and_register_best_sweep_candidate",
+        fake_materialize,
+    )
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+    monkeypatch.setattr(play_hand_mod, "_run_instrument_scout", fake_instrument_scout)
+
+    exit_code = play_hand_mod.cmd_play_hand(
+        instrument=["EURUSD"],
+        instrument_pool=None,
+        timeframe="M5",
+        sweep_budget="high",
+        max_sweep_permutations=None,
+        max_reward_r=None,
+        min_indicators=2,
+        max_indicators=2,
+        seed=2,
+        screen_months=3,
+        scrutiny_months=36,
+        coarse_mode="evolutionary",
+        evolutionary_budget=None,
+        instrument_scout=True,
+        instrument_scout_size=5,
+        instrument_scout_max_selected=3,
+        instrument_scout_months=None,
+        final_artifacts=False,
+        final_profile_drop_count=0,
+        final_profile_drop_workers=1,
+        job_timeout_seconds=2400,
+        sweep_timeout_seconds=7200,
+        dry_run=True,
+        as_json=True,
+        calendar_gate="off",
+        early_exit_mode="report",
+        coarse_halving_mode="enforce",
+        coarse_probe_budget=128,
+    )
+
+    assert exit_code == 0
+    assert [call["phase"] for call in sweep_calls] == [
+        "lookback_timing",
+        "coarse_probe",
+        "coarse_expand",
+        "focused",
+    ]
+    assert sweep_calls[1]["sweep_budget"] == "128"
+    assert sweep_calls[1]["max_permutations"] == 128
+    assert sweep_calls[2]["sweep_budget"] == "896"
+    assert sweep_calls[2]["max_permutations"] == 896
+    assert [call["phase"] for call in eval_calls] == [
+        "baseline_3mo",
+        "lookback_timing_top_3mo",
+        "coarse_probe_top_3mo",
+        "coarse_expand_top_3mo",
+        "focused_top_3mo",
+        "mutated_final_36mo",
+    ]
+    assert eval_calls[-1]["profile_ref"] == "dry-focused_top"
+    assert scout_calls == [{"profile_ref": "dry-focused_top", "enabled": True}]
+
+    run_dirs = list(tmp_path.glob("*-playhand-v1"))
+    assert len(run_dirs) == 1
+    metadata = json.loads((run_dirs[0] / "run-metadata.json").read_text(encoding="utf-8"))
+    halving = metadata["coarse_halving"]
+    assert halving["decision"] == "expand"
+    assert halving["expanded"] is True
+    assert halving["expand_budget"] == 896
+    assert halving["estimated_saved_evaluations"] == 0
+    assert metadata["play_hand_phase_scores"]["coarse_probe_top_3mo"] == 56.0
+    assert metadata["play_hand_phase_scores"]["coarse_expand_top_3mo"] == 66.0
+    assert metadata["play_hand_phase_scores"]["focused_top_3mo"] == 67.0
+    assert metadata["stage_incumbent"]["profile_ref"] == "dry-focused_top"
+    assert all(item["accepted"] for item in metadata["stage_acceptance_decisions"])
+
+
+def test_cmd_play_hand_family_policy_template_locked_enforce_skips_mutation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    eval_calls: list[str] = []
+
+    class FakeCli:
+        pass
+
+    def fake_evaluate_profile(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_path,
+        instruments,
+        timeframe,
+        lookback_months,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        eval_calls.append(phase)
+        scores = {
+            "baseline_3mo": 48.0,
+            "exact_template_screen_3mo": 62.0,
+            "exact_template_36mo": 64.0,
+        }
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "attempt_id": f"attempt-{phase}",
+            "score": scores[phase],
+            "profile_ref": profile_ref,
+            "profile_path": str(profile_path),
+        }
+
+    def fail_sweep(*_args, **_kwargs):
+        raise AssertionError("mutation sweeps should be skipped")
+
+    def fail_scout(*_args, **_kwargs):
+        raise AssertionError("instrument scout should be skipped")
+
+    monkeypatch.setattr(
+        play_hand_mod,
+        "load_config",
+        lambda: SimpleNamespace(
+            runs_root=tmp_path,
+            derived_root=tmp_path / "derived",
+            fuzzfolio=SimpleNamespace(),
+        ),
+    )
+    monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_load_play_hand_seed_plan",
+        lambda _config: (_family_policy_seed_plan("template_locked"), tmp_path / "seed.json"),
+    )
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+    monkeypatch.setattr(play_hand_mod, "_run_sweep", fail_sweep)
+    monkeypatch.setattr(play_hand_mod, "_run_instrument_scout", fail_scout)
+
+    exit_code = play_hand_mod.cmd_play_hand(
+        instrument=["EURUSD"],
+        instrument_pool=None,
+        timeframe="M5",
+        sweep_budget="high",
+        max_sweep_permutations=None,
+        max_reward_r=None,
+        min_indicators=2,
+        max_indicators=2,
+        seed=3,
+        screen_months=3,
+        scrutiny_months=36,
+        coarse_mode="evolutionary",
+        evolutionary_budget=None,
+        instrument_scout=True,
+        instrument_scout_size=5,
+        instrument_scout_max_selected=3,
+        instrument_scout_months=None,
+        final_artifacts=False,
+        final_profile_drop_count=0,
+        final_profile_drop_workers=1,
+        job_timeout_seconds=2400,
+        sweep_timeout_seconds=7200,
+        dry_run=True,
+        as_json=True,
+        calendar_gate="off",
+        family_policy_mode="enforce",
+    )
+
+    assert exit_code == 0
+    assert eval_calls == [
+        "baseline_3mo",
+        "exact_template_screen_3mo",
+        "exact_template_36mo",
+    ]
+    run_dirs = list(tmp_path.glob("*-playhand-v1"))
+    metadata = json.loads((run_dirs[0] / "run-metadata.json").read_text(encoding="utf-8"))
+    policy = metadata["family_policy_execution"]
+    assert policy["version"] == play_hand_mod.PLAY_HAND_FAMILY_POLICY_EXECUTION_VERSION
+    assert policy["mode"] == "enforce"
+    assert policy["family_policy"] == "template_locked"
+    assert policy["decision"] == "template_locked_exact_only"
+    assert policy["mutation_allowed"] is False
+    assert policy["exact_template_used_as_incumbent"] is True
+    assert policy["skipped_stages"] == [
+        "lookback_timing",
+        "coarse_probe",
+        "coarse_expand",
+        "focused",
+        "instrument_scout",
+        "mutated_final_36mo",
+    ]
+    assert metadata["instrument_scout"]["reason"] == "family_policy_template_locked_exact_only"
+    assert metadata["mutated_attempt_id"] is None
+    assert metadata["selected_final_branch"] == "exact_template"
+    assert metadata["canonical_selection_reason"] == "template_locked_exact_only"
+    assert metadata["exact_template_score"] == 64.0
+
+
+def test_cmd_play_hand_family_policy_template_guarded_enforce_benchmarks_exact(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    sweep_calls: list[str] = []
+    eval_calls: list[str] = []
+
+    class FakeCli:
+        pass
+
+    def fake_run_sweep(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_payload,
+        instruments,
+        axes,
+        mode,
+        sweep_budget,
+        max_permutations,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        sweep_calls.append(phase)
+        score = 56.0 if phase == "coarse_probe" else 66.0
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "axes": list(axes),
+            "result": {
+                "ranked_permutations": [
+                    {"parameters": {"fake": phase}, "fitness_value": score}
+                ],
+                "parameter_importance": [
+                    {"axis": "indicator[0].talib.timeperiod", "importance": 1.0}
+                ],
+            },
+        }
+
+    def fake_materialize(ctx, *, stage, source_profile_path, sweep_payload, phase):
+        output_path = ctx.profiles_dir / f"{phase}_top.json"
+        output_path.write_text(
+            source_profile_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return output_path, f"dry-{phase}_top", {"fake": phase}
+
+    def fake_evaluate_profile(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_path,
+        instruments,
+        timeframe,
+        lookback_months,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        eval_calls.append(phase)
+        scores = {
+            "baseline_3mo": 58.0,
+            "exact_template_screen_3mo": 62.0,
+            "lookback_timing_top_3mo": 62.5,
+            "coarse_probe_top_3mo": 64.0,
+            "coarse_expand_top_3mo": 66.0,
+            "focused_top_3mo": 67.0,
+            "mutated_final_36mo": 70.0,
+            "exact_template_36mo": 62.0,
+        }
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "attempt_id": f"attempt-{phase}",
+            "score": scores[phase],
+            "profile_ref": profile_ref,
+            "profile_path": str(profile_path),
+        }
+
+    def fake_instrument_scout(*_args, **_kwargs):
+        return {
+            "version": "instrument_scout_v1",
+            "status": "completed",
+            "selected_instruments": ["EURUSD"],
+            "accepted": [],
+            "rejected": [],
+        }
+
+    monkeypatch.setattr(
+        play_hand_mod,
+        "load_config",
+        lambda: SimpleNamespace(
+            runs_root=tmp_path,
+            derived_root=tmp_path / "derived",
+            fuzzfolio=SimpleNamespace(),
+        ),
+    )
+    monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_load_play_hand_seed_plan",
+        lambda _config: (_family_policy_seed_plan("template_guarded"), tmp_path / "seed.json"),
+    )
+    monkeypatch.setattr(play_hand_mod, "build_timing_axes", lambda _payload: ["timing=1,2"])
+    monkeypatch.setattr(
+        play_hand_mod,
+        "build_coarse_axes",
+        lambda _payload: ["indicator[0].talib.timeperiod=5,14"],
+    )
+    monkeypatch.setattr(
+        play_hand_mod,
+        "build_focused_axes",
+        lambda *_args, **_kwargs: ["indicator[0].talib.timeperiod=8,14"],
+    )
+    monkeypatch.setattr(play_hand_mod, "_run_sweep", fake_run_sweep)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_materialize_and_register_best_sweep_candidate",
+        fake_materialize,
+    )
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+    monkeypatch.setattr(play_hand_mod, "_run_instrument_scout", fake_instrument_scout)
+
+    exit_code = play_hand_mod.cmd_play_hand(
+        instrument=["EURUSD"],
+        instrument_pool=None,
+        timeframe="M5",
+        sweep_budget="high",
+        max_sweep_permutations=None,
+        max_reward_r=None,
+        min_indicators=2,
+        max_indicators=2,
+        seed=4,
+        screen_months=3,
+        scrutiny_months=36,
+        coarse_mode="evolutionary",
+        evolutionary_budget=None,
+        instrument_scout=True,
+        instrument_scout_size=5,
+        instrument_scout_max_selected=3,
+        instrument_scout_months=None,
+        final_artifacts=False,
+        final_profile_drop_count=0,
+        final_profile_drop_workers=1,
+        job_timeout_seconds=2400,
+        sweep_timeout_seconds=7200,
+        dry_run=True,
+        as_json=True,
+        calendar_gate="off",
+        coarse_halving_mode="enforce",
+        family_policy_mode="enforce",
+    )
+
+    assert exit_code == 0
+    assert eval_calls == [
+        "baseline_3mo",
+        "exact_template_screen_3mo",
+        "lookback_timing_top_3mo",
+        "coarse_probe_top_3mo",
+        "coarse_expand_top_3mo",
+        "focused_top_3mo",
+        "mutated_final_36mo",
+        "exact_template_36mo",
+    ]
+    assert sweep_calls == [
+        "lookback_timing",
+        "coarse_probe",
+        "coarse_expand",
+        "focused",
+    ]
+    run_dirs = list(tmp_path.glob("*-playhand-v1"))
+    metadata = json.loads((run_dirs[0] / "run-metadata.json").read_text(encoding="utf-8"))
+    policy = metadata["family_policy_execution"]
+    assert policy["decision"] == "template_guarded_exact_benchmark_mutation_allowed"
+    assert policy["mutation_allowed"] is True
+    assert policy["exact_template_used_as_incumbent"] is True
+    assert metadata["stage_acceptance_decisions"][0]["stage"] == "exact_template_screen"
+    assert metadata["stage_acceptance_decisions"][0]["accepted"] is True
+    assert metadata["selected_final_branch"] == "mutated"
+    assert {row["branch"] for row in metadata["final_branch_scores"]} == {
+        "mutated",
+        "exact_template",
+    }
+
+
+def test_cmd_play_hand_family_policy_report_keeps_mutation_flow(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    sweep_calls: list[str] = []
+    eval_calls: list[str] = []
+
+    class FakeCli:
+        pass
+
+    def fake_run_sweep(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_payload,
+        instruments,
+        axes,
+        mode,
+        sweep_budget,
+        max_permutations,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        sweep_calls.append(phase)
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "axes": list(axes),
+            "result": {
+                "ranked_permutations": [
+                    {"parameters": {"fake": phase}, "fitness_value": 66.0}
+                ],
+                "parameter_importance": [],
+            },
+        }
+
+    def fake_materialize(ctx, *, stage, source_profile_path, sweep_payload, phase):
+        output_path = ctx.profiles_dir / f"{phase}_top.json"
+        output_path.write_text(
+            source_profile_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return output_path, f"dry-{phase}_top", {"fake": phase}
+
+    def fake_evaluate_profile(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_path,
+        instruments,
+        timeframe,
+        lookback_months,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        eval_calls.append(phase)
+        scores = {
+            "baseline_3mo": 50.0,
+            "exact_template_screen_3mo": 62.0,
+            "lookback_timing_top_3mo": 55.0,
+            "coarse_top_3mo": 58.0,
+            "mutated_final_36mo": 60.0,
+            "exact_template_36mo": 62.0,
+        }
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "attempt_id": f"attempt-{phase}",
+            "score": scores[phase],
+            "profile_ref": profile_ref,
+            "profile_path": str(profile_path),
+        }
+
+    monkeypatch.setattr(
+        play_hand_mod,
+        "load_config",
+        lambda: SimpleNamespace(
+            runs_root=tmp_path,
+            derived_root=tmp_path / "derived",
+            fuzzfolio=SimpleNamespace(),
+        ),
+    )
+    monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_load_play_hand_seed_plan",
+        lambda _config: (_family_policy_seed_plan("template_locked"), tmp_path / "seed.json"),
+    )
+    monkeypatch.setattr(play_hand_mod, "build_timing_axes", lambda _payload: ["timing=1,2"])
+    monkeypatch.setattr(
+        play_hand_mod,
+        "build_coarse_axes",
+        lambda _payload: ["indicator[0].talib.timeperiod=5,14"],
+    )
+    monkeypatch.setattr(play_hand_mod, "build_focused_axes", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(play_hand_mod, "_run_sweep", fake_run_sweep)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_materialize_and_register_best_sweep_candidate",
+        fake_materialize,
+    )
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_run_instrument_scout",
+        lambda *_args, **_kwargs: {
+            "version": "instrument_scout_v1",
+            "status": "disabled",
+            "selected_instruments": ["EURUSD"],
+            "accepted": [],
+            "rejected": [],
+        },
+    )
+
+    exit_code = play_hand_mod.cmd_play_hand(
+        instrument=["EURUSD"],
+        instrument_pool=None,
+        timeframe="M5",
+        sweep_budget="low",
+        max_sweep_permutations=None,
+        max_reward_r=None,
+        min_indicators=2,
+        max_indicators=2,
+        seed=5,
+        screen_months=3,
+        scrutiny_months=36,
+        coarse_mode="grid",
+        evolutionary_budget=None,
+        instrument_scout=False,
+        instrument_scout_size=0,
+        instrument_scout_max_selected=0,
+        instrument_scout_months=None,
+        final_artifacts=False,
+        final_profile_drop_count=0,
+        final_profile_drop_workers=1,
+        job_timeout_seconds=2400,
+        sweep_timeout_seconds=7200,
+        dry_run=True,
+        as_json=True,
+        calendar_gate="off",
+        family_policy_mode="report",
+    )
+
+    assert exit_code == 0
+    assert "exact_template_screen_3mo" in eval_calls
+    assert "mutated_final_36mo" in eval_calls
+    assert sweep_calls == ["lookback_timing", "coarse"]
+    run_dirs = list(tmp_path.glob("*-playhand-v1"))
+    metadata = json.loads((run_dirs[0] / "run-metadata.json").read_text(encoding="utf-8"))
+    policy = metadata["family_policy_execution"]
+    assert policy["mode"] == "report"
+    assert policy["decision"] == "would_template_locked_exact_only"
+    assert policy["mutation_allowed"] is True
+    assert policy["would_skip_stages"] == [
+        "lookback_timing",
+        "coarse_probe",
+        "coarse_expand",
+        "focused",
+        "instrument_scout",
+        "mutated_final_36mo",
+    ]
+    assert metadata["mutated_attempt_id"] == "attempt-mutated_final_36mo"
 
 
 def test_cleanup_registered_profiles_deletes_unique_cloud_refs(tmp_path: Path) -> None:

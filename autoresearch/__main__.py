@@ -107,6 +107,7 @@ if __package__ in {None, ""}:
         DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME,
         build_playhand_outcome_priors,
     )
+    from autoresearch.playhand_health import heal_play_hand_run_metadata
     from autoresearch.discovery_pair_atlas import (
         DEFAULT_DISCOVERY_PAIR_DIRNAME,
         DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS,
@@ -235,6 +236,7 @@ if __package__ in {None, ""}:
         build_signal_atlas,
     )
     from autoresearch.play_hand import (
+        PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
         PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
         PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
         cmd_play_hand,
@@ -304,6 +306,7 @@ else:
         DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME,
         build_playhand_outcome_priors,
     )
+    from .playhand_health import heal_play_hand_run_metadata
     from .discovery_pair_atlas import (
         DEFAULT_DISCOVERY_PAIR_DIRNAME,
         DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS,
@@ -432,6 +435,7 @@ else:
         build_signal_atlas,
     )
     from .play_hand import (
+        PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
         PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
         PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
         cmd_play_hand,
@@ -834,6 +838,47 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
             "Maximum months in the past the random screen anchor may land. "
             "Clamped so the anchored screen window stays inside the rolling "
             "market-data lake. Default: 24."
+        ),
+    )
+    play_hand.add_argument(
+        "--early-exit-mode",
+        choices=["off", "report"],
+        default="off",
+        help=(
+            "Report-only early-exit diagnostics for PlayHand checkpoints. "
+            "'report' writes would-exit decisions to run metadata and events "
+            "without changing control flow. Env AUTORESEARCH_EARLY_EXIT_MODE overrides. "
+            "Default: off."
+        ),
+    )
+    play_hand.add_argument(
+        "--coarse-halving-mode",
+        choices=["off", "enforce"],
+        default="off",
+        help=(
+            "Conservative PlayHand coarse-stage successive halving. "
+            "'enforce' probes evolutionary coarse search first and skips expansion, "
+            "focused refinement, and instrument scout when the probe is weak. Default: off."
+        ),
+    )
+    play_hand.add_argument(
+        "--coarse-probe-budget",
+        type=int,
+        default=PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
+        help=(
+            "Evolutionary evaluation budget for the coarse halving probe. "
+            f"Default: {PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET}."
+        ),
+    )
+    play_hand.add_argument(
+        "--family-policy-mode",
+        choices=["off", "report", "enforce"],
+        default="off",
+        help=(
+            "Opt-in PlayHand family-policy execution. 'report' records exact-template "
+            "first decisions without changing mutation flow; 'enforce' makes "
+            "template-locked families exact-only and uses template-guarded exact "
+            "screens as mutation benchmarks. Default: off."
         ),
     )
     play_hand.add_argument(
@@ -12597,10 +12642,56 @@ def cmd_finalize_corpus(
             as_json=False,
         )
 
+    play_hand_health_results: list[dict[str, Any]] = []
+    play_hand_run_ids = sorted(
+        {
+            str(row.get("run_id") or "").strip()
+            for row in selected_rows
+            if str(row.get("run_id") or "").strip()
+            and (
+                str(row.get("runner") or "").strip() == "play_hand_v1"
+                or bool(row.get("is_canonical_playhand_attempt"))
+                or (
+                    bool(row.get("canonical_attempt_id"))
+                    and "playhand" in str(row.get("run_id") or "").lower()
+                )
+            )
+        }
+    )
+    for run_id in play_hand_run_ids:
+        run_dir = config.runs_root / run_id
+        if not run_dir.exists():
+            play_hand_health_results.append(
+                {
+                    "run_id": run_id,
+                    "updated": False,
+                    "error": "run_dir_missing",
+                }
+            )
+            continue
+        try:
+            play_hand_health_results.append(
+                heal_play_hand_run_metadata(run_dir, force=bool(force_rebuild))
+            )
+        except Exception as exc:
+            play_hand_health_results.append(
+                {
+                    "run_id": run_id,
+                    "updated": False,
+                    "error": str(exc),
+                }
+            )
+
     refresh_summary = _refresh_global_derived_corpus_state(config)
     summary["status"] = "complete" if render_exit_code == 0 else "partial_failure"
     summary["render_exit_code"] = render_exit_code
     summary["render_summary"] = render_summary
+    summary["play_hand_health"] = {
+        "selected_play_hand_runs": len(play_hand_run_ids),
+        "updated": sum(1 for item in play_hand_health_results if item.get("updated")),
+        "errors": [item for item in play_hand_health_results if item.get("error")],
+        "results": play_hand_health_results,
+    }
     summary["refresh_summary"] = refresh_summary
     if as_json:
         print(json.dumps(summary, ensure_ascii=True, indent=2))
@@ -14089,6 +14180,10 @@ def main(argv: list[str] | None = None) -> int:
             as_json=bool(args.json),
             calendar_gate=args.calendar_gate,
             screen_anchor_mode=args.screen_anchor_mode,
+            early_exit_mode=args.early_exit_mode,
+            coarse_halving_mode=args.coarse_halving_mode,
+            family_policy_mode=args.family_policy_mode,
+            coarse_probe_budget=args.coarse_probe_budget,
             screen_anchor_max_offset_months=args.screen_anchor_max_offset_months,
             keep_cloud_profiles=bool(args.keep_cloud_profiles),
         )

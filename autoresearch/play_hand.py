@@ -32,6 +32,7 @@ from .ledger import (
     write_attempts,
     write_run_metadata,
 )
+from .playhand_health import build_play_hand_evidence, build_play_hand_health
 from .plotting import render_progress_artifacts
 from .scoring import build_attempt_score, load_sensitivity_snapshot
 
@@ -92,6 +93,22 @@ PLAY_HAND_SCREEN_ANCHOR_OFFSET_BUDGET_MONTHS = 30
 AVERAGE_DAYS_PER_MONTH = 30.4375
 PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS = 2400
 PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS = 7200
+PLAY_HAND_EARLY_EXIT_ENV = "AUTORESEARCH_EARLY_EXIT_MODE"
+PLAY_HAND_EARLY_EXIT_MODES = ("off", "report")
+PLAY_HAND_EARLY_EXIT_DEFAULT_MODE = "off"
+PLAY_HAND_EARLY_EXIT_VERSION = "early_exit_policy_v1"
+PLAY_HAND_COARSE_HALVING_VERSION = "coarse_halving_v1"
+PLAY_HAND_COARSE_HALVING_MODES = ("off", "enforce")
+PLAY_HAND_COARSE_HALVING_DEFAULT_MODE = "off"
+PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET = 128
+PLAY_HAND_FAMILY_POLICY_EXECUTION_VERSION = "family_policy_execution_v1"
+PLAY_HAND_FAMILY_POLICY_MODES = ("off", "report", "enforce")
+PLAY_HAND_FAMILY_POLICY_DEFAULT_MODE = "off"
+PLAY_HAND_FAMILY_POLICY_ACTIVE_POLICIES = ("template_locked", "template_guarded")
+STAGE_ACCEPTANCE_DROP_TOLERANCE = 5.0
+COARSE_HALVING_EXPAND_SCORE = 55.0
+COARSE_HALVING_MIN_NEAR_INCUMBENT_SCORE = 50.0
+COARSE_HALVING_NEAR_INCUMBENT_TOLERANCE = 5.0
 PLAY_HAND_SEED_PLAN_PATH = Path("recipe-priors") / "play-hand-seed-plan.json"
 SEED_TEMPLATE_CONFIG_KEYS = (
     "timeframe",
@@ -1041,9 +1058,11 @@ def _play_hand_role_for_phase(phase: str) -> str:
     token = str(phase or "").strip().lower()
     if token == "baseline_3mo":
         return "baseline"
+    if token == "exact_template_screen_3mo":
+        return "exact_template_screen"
     if token == "lookback_timing_top_3mo":
         return "lookback_top"
-    if token == "coarse_top_3mo":
+    if token in {"coarse_top_3mo", "coarse_probe_top_3mo", "coarse_expand_top_3mo"}:
         return "coarse_top"
     if token == "focused_top_3mo":
         return "focused_top"
@@ -2880,6 +2899,468 @@ def _resolve_screen_anchor_mode(cli_value: str | None) -> str:
     return PLAY_HAND_SCREEN_ANCHOR_DEFAULT_MODE
 
 
+def _resolve_early_exit_mode(cli_value: str | None) -> str:
+    env_value = str(os.environ.get(PLAY_HAND_EARLY_EXIT_ENV) or "").strip().lower()
+    if env_value in PLAY_HAND_EARLY_EXIT_MODES:
+        return env_value
+    token = str(cli_value or "").strip().lower()
+    if token in PLAY_HAND_EARLY_EXIT_MODES:
+        return token
+    return PLAY_HAND_EARLY_EXIT_DEFAULT_MODE
+
+
+def _resolve_coarse_halving_mode(cli_value: str | None) -> str:
+    token = str(cli_value or "").strip().lower()
+    if token in PLAY_HAND_COARSE_HALVING_MODES:
+        return token
+    return PLAY_HAND_COARSE_HALVING_DEFAULT_MODE
+
+
+def _resolve_coarse_probe_budget(value: int | None) -> int:
+    try:
+        parsed = int(value) if value is not None else PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET
+    except (TypeError, ValueError):
+        parsed = PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET
+    return max(1, parsed)
+
+
+def _resolve_family_policy_mode(cli_value: str | None) -> str:
+    token = str(cli_value or "").strip().lower()
+    if token in PLAY_HAND_FAMILY_POLICY_MODES:
+        return token
+    return PLAY_HAND_FAMILY_POLICY_DEFAULT_MODE
+
+
+def _coerce_play_hand_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    token = str(value).strip().lower()
+    if token in {"1", "true", "yes", "y", "on"}:
+        return True
+    if token in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def resolve_playhand_family_policy(
+    indicator_deal: dict[str, Any] | None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    deal = indicator_deal if isinstance(indicator_deal, dict) else {}
+    meta = metadata if isinstance(metadata, dict) else {}
+    raw_policy = deal.get("family_policy")
+    source = "indicator_deal.family_policy"
+    if not isinstance(raw_policy, dict):
+        raw_policy = meta.get("dealt_pair_family_policy")
+        source = "metadata.dealt_pair_family_policy"
+    if not isinstance(raw_policy, dict):
+        raw_policy = _seed_pair_family_policy(deal.get("pair"))
+        source = "indicator_deal.pair"
+    if not isinstance(raw_policy, dict):
+        raw_policy = {}
+        source = "none"
+
+    family_policy = str(raw_policy.get("family_policy") or "").strip().lower()
+    allowed = {
+        "template_locked",
+        "template_guarded",
+        "mutation_friendly",
+        "unstable",
+        "under_sampled",
+    }
+    if family_policy not in allowed:
+        family_policy = "none"
+
+    exact_required = _coerce_play_hand_bool(raw_policy.get("exact_branch_required"))
+    return {
+        "family_id": raw_policy.get("family_id"),
+        "family_policy": family_policy,
+        "family_policy_source": raw_policy.get("family_policy_source"),
+        "family_cap_share": raw_policy.get("family_cap_share"),
+        "recommended_max_indicators": raw_policy.get("recommended_max_indicators"),
+        "role_balanced_fill_limit": raw_policy.get("role_balanced_fill_limit"),
+        "mutation_pressure": raw_policy.get("mutation_pressure"),
+        "sampling_weight_multiplier": raw_policy.get("sampling_weight_multiplier"),
+        "exact_branch_required": bool(exact_required) if exact_required is not None else False,
+        "exact_rescue_rate": raw_policy.get("exact_rescue_rate"),
+        "mutated_win_rate": raw_policy.get("mutated_win_rate"),
+        "avg_mutation_delta": raw_policy.get("avg_mutation_delta"),
+        "promotion_rate": raw_policy.get("promotion_rate"),
+        "observation_count": raw_policy.get("observation_count"),
+        "source": source,
+    }
+
+
+def build_family_policy_execution_state(
+    *,
+    mode: str,
+    family_policy: dict[str, Any],
+    exact_template_available: bool,
+) -> dict[str, Any]:
+    policy = dict(family_policy)
+    family = str(policy.get("family_policy") or "none")
+    reasons: list[str] = []
+    if mode == "off":
+        decision = "disabled"
+        reasons.append("family_policy_mode_off")
+    elif not exact_template_available:
+        decision = "not_applicable"
+        reasons.append("no_exact_template")
+    elif family == "none":
+        decision = "not_applicable"
+        reasons.append("no_family_policy")
+    elif family in {"unstable", "under_sampled"}:
+        decision = "metadata_only"
+        reasons.append(f"family_policy_{family}")
+    elif family == "mutation_friendly":
+        decision = "mutation_friendly_no_extra_restriction"
+        reasons.append("family_policy_mutation_friendly")
+    elif family == "template_locked":
+        decision = (
+            "template_locked_exact_only"
+            if mode == "enforce"
+            else "would_template_locked_exact_only"
+        )
+        reasons.append("family_policy_template_locked")
+    elif family == "template_guarded":
+        decision = (
+            "template_guarded_exact_benchmark_mutation_allowed"
+            if mode == "enforce"
+            else "would_template_guarded_exact_benchmark_mutation_allowed"
+        )
+        reasons.append("family_policy_template_guarded")
+    else:
+        decision = "not_applicable"
+        reasons.append("unrecognized_family_policy")
+
+    locked_skip_stages = [
+        "lookback_timing",
+        "coarse_probe",
+        "coarse_expand",
+        "focused",
+        "instrument_scout",
+        "mutated_final_36mo",
+    ]
+    mutation_allowed = not (mode == "enforce" and family == "template_locked" and exact_template_available)
+    skipped_stages = locked_skip_stages if not mutation_allowed else []
+    would_skip_stages = (
+        locked_skip_stages
+        if mode == "report" and family == "template_locked" and exact_template_available
+        else []
+    )
+    if policy.get("exact_branch_required"):
+        reasons.append("exact_branch_required")
+    if str(policy.get("role_balanced_fill_limit") or "").strip() == "0":
+        reasons.append("role_balanced_fill_limit_zero")
+
+    return {
+        "version": PLAY_HAND_FAMILY_POLICY_EXECUTION_VERSION,
+        "mode": mode,
+        **policy,
+        "exact_template_available": bool(exact_template_available),
+        "decision": decision,
+        "mutation_allowed": mutation_allowed,
+        "skipped_stages": skipped_stages,
+        "would_skip_stages": would_skip_stages,
+        "reasons": reasons,
+        "would_reduce_mutation_pressure": bool(mode == "report" and family in {"unstable", "under_sampled"}),
+        "would_require_extra_screen": bool(mode == "report" and family in {"unstable", "under_sampled"}),
+    }
+
+
+def build_coarse_halving_budget_plan(
+    *,
+    mode: str,
+    total_budget: int,
+    probe_budget: int,
+) -> dict[str, Any]:
+    total = max(1, int(total_budget))
+    probe = max(1, int(probe_budget))
+    if mode != "enforce":
+        return {
+            "version": PLAY_HAND_COARSE_HALVING_VERSION,
+            "mode": mode,
+            "total_budget": total,
+            "probe_budget": min(probe, total),
+            "expand_budget": 0,
+            "split": False,
+            "reason": "halving_disabled",
+        }
+    if total <= probe:
+        return {
+            "version": PLAY_HAND_COARSE_HALVING_VERSION,
+            "mode": mode,
+            "total_budget": total,
+            "probe_budget": total,
+            "expand_budget": 0,
+            "split": False,
+            "reason": "budget_not_above_probe",
+        }
+    return {
+        "version": PLAY_HAND_COARSE_HALVING_VERSION,
+        "mode": mode,
+        "total_budget": total,
+        "probe_budget": probe,
+        "expand_budget": max(0, total - probe),
+        "split": True,
+        "reason": None,
+    }
+
+
+def should_accept_stage_candidate(
+    *,
+    incumbent_score: Any,
+    candidate_score: Any,
+    tolerance: float = STAGE_ACCEPTANCE_DROP_TOLERANCE,
+) -> bool:
+    candidate = _as_float(candidate_score)
+    if candidate is None:
+        return False
+    incumbent = _as_float(incumbent_score)
+    if incumbent is None:
+        return True
+    return candidate >= incumbent - float(tolerance)
+
+
+def build_stage_acceptance_decision(
+    *,
+    stage: str,
+    incumbent_score: Any,
+    candidate_score: Any,
+    tolerance: float = STAGE_ACCEPTANCE_DROP_TOLERANCE,
+) -> dict[str, Any]:
+    incumbent = _as_float(incumbent_score)
+    candidate = _as_float(candidate_score)
+    accepted = should_accept_stage_candidate(
+        incumbent_score=incumbent,
+        candidate_score=candidate,
+        tolerance=tolerance,
+    )
+    if candidate is None:
+        reason = "missing_candidate_score"
+    elif incumbent is None:
+        reason = "missing_incumbent_score"
+    elif accepted and candidate >= incumbent:
+        reason = "candidate_improved_incumbent"
+    elif accepted:
+        reason = "candidate_within_incumbent_tolerance"
+    else:
+        reason = "candidate_below_incumbent_tolerance"
+    return {
+        "stage": str(stage),
+        "accepted": accepted,
+        "reason": reason,
+        "incumbent_score": incumbent,
+        "candidate_score": candidate,
+        "tolerance": float(tolerance),
+    }
+
+
+def build_coarse_halving_decision(
+    *,
+    mode: str,
+    total_budget: int,
+    probe_budget: int,
+    incumbent_score: Any,
+    probe_score: Any,
+) -> dict[str, Any]:
+    plan = build_coarse_halving_budget_plan(
+        mode=mode,
+        total_budget=total_budget,
+        probe_budget=probe_budget,
+    )
+    incumbent = _as_float(incumbent_score)
+    probe = _as_float(probe_score)
+    reasons: list[str] = []
+    expanded = False
+    if not plan["split"]:
+        expanded = True
+        decision = "use_original_coarse"
+        reasons.append(str(plan.get("reason") or "not_split"))
+    elif probe is None:
+        decision = "skip_expansion"
+        reasons.append("missing_probe_score")
+    elif probe >= COARSE_HALVING_EXPAND_SCORE:
+        expanded = True
+        decision = "expand"
+        reasons.append("probe_score_met_expand_threshold")
+    elif (
+        incumbent is not None
+        and incumbent >= 60.0
+        and probe >= COARSE_HALVING_MIN_NEAR_INCUMBENT_SCORE
+        and probe >= incumbent - COARSE_HALVING_NEAR_INCUMBENT_TOLERANCE
+    ):
+        expanded = True
+        decision = "expand"
+        reasons.append("probe_score_near_strong_incumbent")
+    else:
+        decision = "skip_expansion"
+        reasons.append("probe_score_below_expand_threshold")
+        if incumbent is not None and incumbent >= 60.0:
+            reasons.append("probe_not_near_strong_incumbent")
+
+    expand_budget = int(plan["expand_budget"])
+    estimated_saved = 0 if expanded else expand_budget
+    skipped_stages: list[str] = []
+    if not expanded:
+        skipped_stages = ["coarse_expand", "focused", "instrument_scout"]
+    return {
+        "version": PLAY_HAND_COARSE_HALVING_VERSION,
+        "mode": mode,
+        "probe_budget": int(plan["probe_budget"]),
+        "expand_budget": expand_budget,
+        "total_budget": int(plan["total_budget"]),
+        "expanded": expanded,
+        "decision": decision,
+        "reasons": reasons,
+        "incumbent_score": incumbent,
+        "probe_score": probe,
+        "estimated_saved_evaluations": estimated_saved,
+        "skipped_stages": skipped_stages,
+    }
+
+
+def _early_exit_saved_if_enforced(checkpoint: str) -> dict[str, bool]:
+    order = [
+        "after_baseline",
+        "after_lookback_top",
+        "after_coarse_top",
+        "after_focused_top",
+        "before_instrument_scout",
+        "before_final_scrutiny",
+    ]
+    index = order.index(checkpoint) if checkpoint in order else len(order)
+    return {
+        "would_skip_lookback": index <= order.index("after_baseline"),
+        "would_skip_coarse": index <= order.index("after_lookback_top"),
+        "would_skip_focused": index <= order.index("after_coarse_top"),
+        "would_skip_instrument_scout": index <= order.index("after_focused_top"),
+        "would_skip_final_36mo": False,
+    }
+
+
+def build_early_exit_decision(
+    *,
+    checkpoint: str,
+    evidence: dict[str, Any],
+    mode: str,
+) -> dict[str, Any]:
+    scores = evidence.get("scores") if isinstance(evidence.get("scores"), dict) else {}
+    inputs = (
+        evidence.get("early_exit_inputs")
+        if isinstance(evidence.get("early_exit_inputs"), dict)
+        else {}
+    )
+    source = evidence.get("source") if isinstance(evidence.get("source"), dict) else {}
+    baseline = _as_float(scores.get("baseline_3mo"))
+    lookback = _as_float(scores.get("lookback_top_3mo"))
+    coarse = _as_float(scores.get("coarse_top_3mo"))
+    focused = _as_float(scores.get("focused_top_3mo"))
+    candidate = focused if focused is not None else coarse if coarse is not None else lookback
+    if candidate is None:
+        candidate = baseline
+    deltas = {
+        "lookback_delta_vs_baseline": _as_float(
+            inputs.get("lookback_delta_vs_baseline")
+        ),
+        "coarse_delta_vs_baseline": _as_float(
+            inputs.get("coarse_delta_vs_baseline")
+        ),
+        "focused_delta_vs_baseline": _as_float(
+            inputs.get("focused_delta_vs_baseline")
+        ),
+        "final_delta_vs_focused": _as_float(inputs.get("final_delta_vs_focused")),
+    }
+    reasons: list[str] = []
+    rules_fired: list[str] = []
+    would_exit = False
+
+    def _fire(rule: str) -> None:
+        reasons.append(rule)
+        rules_fired.append(rule)
+
+    if not bool(inputs.get("safe_for_report_mode", False)):
+        _fire("insufficient_health_context")
+        would_exit = False
+    elif checkpoint == "after_baseline":
+        if baseline is None:
+            would_exit = True
+            _fire("missing_baseline_score")
+        elif baseline <= 0.0:
+            would_exit = True
+            _fire("baseline_score_not_positive")
+
+    elif checkpoint == "after_lookback_top":
+        if lookback is None:
+            would_exit = True
+            _fire("missing_lookback_top_score")
+        elif baseline is not None and lookback < baseline - 15.0 and lookback < 55.0:
+            would_exit = True
+            _fire(f"lookback_score_below_baseline_by_{baseline - lookback:.2f}")
+    elif checkpoint == "after_coarse_top":
+        if coarse is None:
+            would_exit = True
+            _fire("missing_coarse_top_score")
+        elif coarse < 45.0:
+            would_exit = True
+            _fire("coarse_top_score_below_45")
+        elif baseline is not None and coarse < baseline - 10.0:
+            would_exit = True
+            _fire(f"coarse_top_score_below_baseline_by_{baseline - coarse:.2f}")
+    elif checkpoint == "after_focused_top":
+        if focused is None:
+            would_exit = True
+            _fire("missing_focused_top_score")
+        elif focused < 50.0 and (coarse is None or focused <= coarse + 2.0):
+            would_exit = True
+            _fire("focused_top_below_50_without_material_improvement")
+    elif checkpoint == "before_instrument_scout":
+        if candidate is None:
+            would_exit = True
+            _fire("missing_scout_candidate_score")
+        elif candidate < 45.0:
+            would_exit = True
+            _fire("candidate_below_scout_floor")
+    elif checkpoint == "before_final_scrutiny":
+        reasons.append("final_scrutiny_retained_for_learning")
+
+    if source.get("family_policy"):
+        reasons.append(f"family_policy:{source['family_policy']}")
+    guided_source = str(inputs.get("guided_or_role_balanced") or "").strip()
+    if guided_source:
+        reasons.append(f"source:{guided_source}")
+
+    return {
+        "version": PLAY_HAND_EARLY_EXIT_VERSION,
+        "mode": mode,
+        "checkpoint": checkpoint,
+        "would_exit": bool(would_exit),
+        "would_exit_research": False,
+        "would_exit_compute_expansion": bool(would_exit),
+        "reasons": reasons,
+        "rules_fired": rules_fired,
+        "source": {
+            "dealt_indicator_source": source.get("dealt_indicator_source"),
+            "dealt_recipe": source.get("dealt_recipe"),
+            "template_branch_source_probe_id": source.get(
+                "template_branch_source_probe_id"
+            ),
+            "family_policy": source.get("family_policy"),
+        },
+        "scores": {
+            "baseline_3mo": baseline,
+            "lookback_top_3mo": lookback,
+            "coarse_top_3mo": coarse,
+            "focused_top_3mo": focused,
+            "candidate_score": candidate,
+        },
+        "deltas": deltas,
+        "saved_if_enforced": _early_exit_saved_if_enforced(checkpoint),
+    }
+
+
 def sample_screen_anchor(
     *,
     mode: str,
@@ -4281,6 +4762,10 @@ def cmd_play_hand(
     as_json: bool,
     calendar_gate: str | None = None,
     screen_anchor_mode: str | None = None,
+    early_exit_mode: str | None = None,
+    coarse_halving_mode: str | None = None,
+    family_policy_mode: str | None = None,
+    coarse_probe_budget: int | None = PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
     screen_anchor_max_offset_months: int = PLAY_HAND_SCREEN_ANCHOR_DEFAULT_MAX_OFFSET_MONTHS,
     keep_cloud_profiles: bool = False,
 ) -> int:
@@ -4384,6 +4869,10 @@ def cmd_play_hand(
     max_sweep_permutations = sweep_budget_value
     reward_matrix = play_hand_reward_matrix(max_reward_r)
     calendar_gate_mode = _resolve_calendar_gate_mode(calendar_gate)
+    early_exit_mode = _resolve_early_exit_mode(early_exit_mode)
+    coarse_halving_mode = _resolve_coarse_halving_mode(coarse_halving_mode)
+    family_policy_mode = _resolve_family_policy_mode(family_policy_mode)
+    coarse_probe_budget = _resolve_coarse_probe_budget(coarse_probe_budget)
     screen_anchor = sample_screen_anchor(
         mode=_resolve_screen_anchor_mode(screen_anchor_mode),
         screen_months=screen_months,
@@ -4391,6 +4880,7 @@ def cmd_play_hand(
         seed=seed,
     )
     screen_as_of_date = screen_anchor.get("as_of_date")
+    resolved_family_policy = resolve_playhand_family_policy(indicator_deal)
 
     metadata = {
         "run_id": run_id,
@@ -4464,6 +4954,29 @@ def cmd_play_hand(
         "sweep_timeout_seconds": sweep_timeout_seconds,
         "max_sweep_permutations": max_sweep_permutations,
         "calendar_gate_mode": calendar_gate_mode,
+        "early_exit_mode": early_exit_mode,
+        "early_exit_policy": {
+            "version": PLAY_HAND_EARLY_EXIT_VERSION,
+            "mode": early_exit_mode,
+            "decisions": [],
+        },
+        "coarse_halving_mode": coarse_halving_mode,
+        "coarse_probe_budget": coarse_probe_budget,
+        "coarse_halving": {
+            "version": PLAY_HAND_COARSE_HALVING_VERSION,
+            "mode": coarse_halving_mode,
+            "probe_budget": coarse_probe_budget,
+            "decisions": [],
+        },
+        "family_policy_mode": family_policy_mode,
+        "family_policy_execution": build_family_policy_execution_state(
+            mode=family_policy_mode,
+            family_policy=resolved_family_policy,
+            exact_template_available=False,
+        ),
+        "stage_acceptance_drop_tolerance": STAGE_ACCEPTANCE_DROP_TOLERANCE,
+        "stage_acceptance_decisions": [],
+        "play_hand_phase_scores": {},
         "dry_run": dry_run,
         "keep_cloud_profiles": keep_cloud_profiles,
     }
@@ -4498,6 +5011,100 @@ def cmd_play_hand(
         "scrutiny": PlayHandStage(8, stage_total, "Final scrutiny"),
         "artifacts": PlayHandStage(9, stage_total, "Finalize artifacts"),
     }
+
+    def _record_phase_score(phase_key: str, score: Any) -> None:
+        phase_scores = metadata.setdefault("play_hand_phase_scores", {})
+        if not isinstance(phase_scores, dict):
+            phase_scores = {}
+            metadata["play_hand_phase_scores"] = phase_scores
+        phase_scores[phase_key] = _as_float(score)
+        write_run_metadata(run_dir, metadata)
+
+    def _report_early_exit(checkpoint: str, stage_key: str) -> dict[str, Any] | None:
+        if early_exit_mode != "report":
+            return None
+        attempts = load_attempts(ctx.attempts_path)
+        evidence = build_play_hand_evidence(run_metadata=metadata, attempts=attempts)
+        decision = build_early_exit_decision(
+            checkpoint=checkpoint,
+            evidence=evidence,
+            mode=early_exit_mode,
+        )
+        policy = metadata.setdefault(
+            "early_exit_policy",
+            {
+                "version": PLAY_HAND_EARLY_EXIT_VERSION,
+                "mode": early_exit_mode,
+                "decisions": [],
+            },
+        )
+        if not isinstance(policy, dict):
+            policy = {
+                "version": PLAY_HAND_EARLY_EXIT_VERSION,
+                "mode": early_exit_mode,
+                "decisions": [],
+            }
+            metadata["early_exit_policy"] = policy
+        decisions = policy.setdefault("decisions", [])
+        if not isinstance(decisions, list):
+            decisions = []
+            policy["decisions"] = decisions
+        decisions.append(decision)
+        write_run_metadata(run_dir, metadata)
+        _append_event(
+            ctx,
+            "early_exit",
+            "reported",
+            stage=stages.get(stage_key),
+            **decision,
+        )
+        return decision
+
+    def _record_family_policy_execution(
+        status: str,
+        *,
+        stage_key: str = "scaffold",
+        **updates: Any,
+    ) -> dict[str, Any]:
+        state = metadata.setdefault(
+            "family_policy_execution",
+            build_family_policy_execution_state(
+                mode=family_policy_mode,
+                family_policy=resolved_family_policy,
+                exact_template_available=bool(updates.get("exact_template_available")),
+            ),
+        )
+        if not isinstance(state, dict):
+            state = build_family_policy_execution_state(
+                mode=family_policy_mode,
+                family_policy=resolved_family_policy,
+                exact_template_available=bool(updates.get("exact_template_available")),
+            )
+            metadata["family_policy_execution"] = state
+        state.update(updates)
+        decisions = state.setdefault("decisions", [])
+        if not isinstance(decisions, list):
+            decisions = []
+            state["decisions"] = decisions
+        decisions.append(
+            {
+                "status": status,
+                "decision": state.get("decision"),
+                "mutation_allowed": state.get("mutation_allowed"),
+                "skipped_stages": list(state.get("skipped_stages") or []),
+                "reasons": list(state.get("reasons") or []),
+            }
+        )
+        write_run_metadata(run_dir, metadata)
+        _append_event(
+            ctx,
+            "family_policy_execution",
+            status,
+            stage=stages.get(stage_key),
+            **state,
+        )
+        return state
+
     cleanup_state = {"ran": False}
 
     def _run_play_hand_cloud_cleanup(reason: str = "process_exit") -> dict[str, Any]:
@@ -4681,6 +5288,29 @@ def cmd_play_hand(
             }
         )
         write_run_metadata(run_dir, metadata)
+    family_policy_execution = build_family_policy_execution_state(
+        mode=family_policy_mode,
+        family_policy=resolved_family_policy,
+        exact_template_available=exact_template_profile_path is not None
+        and exact_template_profile_ref is not None,
+    )
+    metadata["family_policy_execution"] = family_policy_execution
+    _record_family_policy_execution(
+        "resolved",
+        exact_template_available=family_policy_execution["exact_template_available"],
+        decision=family_policy_execution["decision"],
+        mutation_allowed=family_policy_execution["mutation_allowed"],
+        skipped_stages=family_policy_execution["skipped_stages"],
+        reasons=family_policy_execution["reasons"],
+        would_reduce_mutation_pressure=family_policy_execution.get(
+            "would_reduce_mutation_pressure",
+            False,
+        ),
+        would_require_extra_screen=family_policy_execution.get(
+            "would_require_extra_screen",
+            False,
+        ),
+    )
 
     baseline = _evaluate_profile(
         ctx,
@@ -4695,15 +5325,268 @@ def cmd_play_hand(
         as_of_date=screen_as_of_date,
     )
     phase_rows.append({"phase": "baseline", "status": "evaluated", "score": baseline.get("score"), "detail": profile_ref})
+    _record_phase_score("baseline", baseline.get("score"))
+    _report_early_exit("after_baseline", "baseline")
 
     current_profile_path = profile_path
     current_profile_ref = profile_ref
     current_evaluation_timeframe = evaluation_timeframe
     last_sweep_payload: dict[str, Any] | None = None
     last_sweep_axes: list[str] = []
+    skip_mutation_pipeline = False
+    skip_focused_and_scout = False
+    family_policy_name = str(resolved_family_policy.get("family_policy") or "none")
+    stage_acceptance_enabled = coarse_halving_mode == "enforce" or (
+        family_policy_mode == "enforce"
+        and family_policy_name == "template_guarded"
+    )
+    incumbent: dict[str, Any] = {
+        "profile_path": current_profile_path,
+        "profile_ref": current_profile_ref,
+        "evaluation_timeframe": current_evaluation_timeframe,
+        "score": _as_float(baseline.get("score")),
+        "phase": "baseline_3mo",
+    }
+
+    def _public_incumbent(snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
+        source = snapshot or incumbent
+        path = source.get("profile_path")
+        return {
+            "profile_path": str(path.resolve() if isinstance(path, Path) else path),
+            "profile_ref": source.get("profile_ref"),
+            "evaluation_timeframe": source.get("evaluation_timeframe"),
+            "score": _as_float(source.get("score")),
+            "phase": source.get("phase"),
+        }
+
+    metadata["stage_incumbent"] = _public_incumbent()
+    write_run_metadata(run_dir, metadata)
+
+    def _apply_stage_candidate(
+        *,
+        stage_key: str,
+        phase: str,
+        candidate_profile_path: Path,
+        candidate_profile_ref: str,
+        candidate_timeframe: str,
+        candidate_score: Any,
+        detail: str,
+        phase_score_key: str,
+    ) -> dict[str, Any]:
+        nonlocal current_profile_path
+        nonlocal current_profile_ref
+        nonlocal current_evaluation_timeframe
+        nonlocal incumbent
+
+        decision = build_stage_acceptance_decision(
+            stage=stage_key,
+            incumbent_score=incumbent.get("score"),
+            candidate_score=candidate_score,
+        )
+        decision.update(
+            {
+                "phase": phase,
+                "candidate_profile_path": str(candidate_profile_path.resolve()),
+                "candidate_profile_ref": candidate_profile_ref,
+                "candidate_evaluation_timeframe": candidate_timeframe,
+                "incumbent_profile_path": _public_incumbent().get("profile_path"),
+                "incumbent_profile_ref": incumbent.get("profile_ref"),
+                "incumbent_phase": incumbent.get("phase"),
+            }
+        )
+        decisions = metadata.setdefault("stage_acceptance_decisions", [])
+        if not isinstance(decisions, list):
+            decisions = []
+            metadata["stage_acceptance_decisions"] = decisions
+        decisions.append(decision)
+        if decision["accepted"]:
+            incumbent = {
+                "profile_path": candidate_profile_path,
+                "profile_ref": candidate_profile_ref,
+                "evaluation_timeframe": candidate_timeframe,
+                "score": _as_float(candidate_score),
+                "phase": phase_score_key,
+            }
+            current_profile_path = candidate_profile_path
+            current_profile_ref = candidate_profile_ref
+            current_evaluation_timeframe = candidate_timeframe
+        else:
+            current_profile_path = incumbent["profile_path"]
+            current_profile_ref = str(incumbent.get("profile_ref") or "")
+            current_evaluation_timeframe = str(
+                incumbent.get("evaluation_timeframe") or evaluation_timeframe
+            )
+        metadata["stage_incumbent"] = _public_incumbent()
+        write_run_metadata(run_dir, metadata)
+        event_decision = dict(decision)
+        event_decision["acceptance_stage"] = event_decision.pop("stage", stage_key)
+        event_decision["candidate_phase"] = event_decision.pop("phase", phase)
+        _append_event(
+            ctx,
+            "stage_acceptance",
+            "accepted" if decision["accepted"] else "rejected",
+            stage=stages.get(stage_key),
+            **event_decision,
+        )
+        phase_rows.append(
+            {
+                "phase": stage_key.replace("_", " "),
+                "status": "top evaluated" if decision["accepted"] else "top rejected",
+                "score": candidate_score,
+                "detail": detail,
+            }
+        )
+        _record_phase_score(phase_score_key, candidate_score)
+        return decision
+
+    def _record_coarse_halving_decision(decision: dict[str, Any]) -> None:
+        policy = metadata.setdefault(
+            "coarse_halving",
+            {
+                "version": PLAY_HAND_COARSE_HALVING_VERSION,
+                "mode": coarse_halving_mode,
+                "probe_budget": coarse_probe_budget,
+                "decisions": [],
+            },
+        )
+        if not isinstance(policy, dict):
+            policy = {
+                "version": PLAY_HAND_COARSE_HALVING_VERSION,
+                "mode": coarse_halving_mode,
+                "probe_budget": coarse_probe_budget,
+                "decisions": [],
+            }
+            metadata["coarse_halving"] = policy
+        decisions = policy.setdefault("decisions", [])
+        if not isinstance(decisions, list):
+            decisions = []
+            policy["decisions"] = decisions
+        decisions.append(dict(decision))
+        policy.update({key: value for key, value in decision.items() if key != "decisions"})
+        write_run_metadata(run_dir, metadata)
+        _append_event(
+            ctx,
+            "coarse_halving",
+            str(decision.get("decision") or "reported"),
+            stage=stages["coarse"],
+            **decision,
+        )
+
+    exact_template_screen: dict[str, Any] | None = None
 
     lookback_axes = build_timing_axes(profile_payload)
-    if lookback_axes:
+    should_screen_exact_template = (
+        family_policy_mode in {"report", "enforce"}
+        and family_policy_name in PLAY_HAND_FAMILY_POLICY_ACTIVE_POLICIES
+        and exact_template_profile_path is not None
+        and bool(exact_template_profile_ref)
+    )
+    if should_screen_exact_template:
+        exact_template_screen = _evaluate_profile(
+            ctx,
+            stage=stages["baseline"],
+            phase="exact_template_screen_3mo",
+            profile_ref=str(exact_template_profile_ref),
+            profile_path=exact_template_profile_path,
+            instruments=template_branch_instruments,
+            timeframe=exact_template_timeframe or evaluation_timeframe,
+            lookback_months=screen_months,
+            reward_matrix=reward_matrix,
+            as_of_date=screen_as_of_date,
+        )
+        exact_template_screen_summary = {
+            "attempt_id": str(exact_template_screen.get("attempt_id") or "") or None,
+            "score": _as_float(exact_template_screen.get("score")),
+            "profile_ref": exact_template_profile_ref,
+            "profile_path": str(exact_template_profile_path.resolve()),
+            "instruments": list(template_branch_instruments),
+            "timeframe": exact_template_timeframe or evaluation_timeframe,
+        }
+        phase_rows.append(
+            {
+                "phase": "exact template screen",
+                "status": "evaluated",
+                "score": exact_template_screen.get("score"),
+                "detail": family_policy_name,
+            }
+        )
+        _record_phase_score("exact_template_screen_3mo", exact_template_screen.get("score"))
+        exact_used_as_incumbent = False
+        if family_policy_mode == "enforce" and family_policy_name == "template_locked":
+            skip_mutation_pipeline = True
+            current_profile_path = exact_template_profile_path
+            current_profile_ref = str(exact_template_profile_ref)
+            current_evaluation_timeframe = exact_template_timeframe or evaluation_timeframe
+            incumbent = {
+                "profile_path": current_profile_path,
+                "profile_ref": current_profile_ref,
+                "evaluation_timeframe": current_evaluation_timeframe,
+                "score": _as_float(exact_template_screen.get("score")),
+                "phase": "exact_template_screen_3mo",
+            }
+            metadata["stage_incumbent"] = _public_incumbent()
+            write_run_metadata(run_dir, metadata)
+            exact_used_as_incumbent = True
+        elif family_policy_mode == "enforce" and family_policy_name == "template_guarded":
+            acceptance = _apply_stage_candidate(
+                stage_key="exact_template_screen",
+                phase="exact_template_screen",
+                candidate_profile_path=exact_template_profile_path,
+                candidate_profile_ref=str(exact_template_profile_ref),
+                candidate_timeframe=exact_template_timeframe or evaluation_timeframe,
+                candidate_score=exact_template_screen.get("score"),
+                detail="family policy exact benchmark",
+                phase_score_key="exact_template_screen_3mo",
+            )
+            exact_used_as_incumbent = bool(acceptance.get("accepted"))
+        _record_family_policy_execution(
+            "enforced" if family_policy_mode == "enforce" else "reported",
+            stage_key="baseline",
+            exact_template_screen=exact_template_screen_summary,
+            exact_template_used_as_incumbent=exact_used_as_incumbent,
+            decision=(
+                "template_locked_exact_only"
+                if family_policy_mode == "enforce" and family_policy_name == "template_locked"
+                else (
+                    "template_guarded_exact_benchmark_mutation_allowed"
+                    if family_policy_mode == "enforce" and family_policy_name == "template_guarded"
+                    else metadata["family_policy_execution"].get("decision")
+                )
+            ),
+            mutation_allowed=not skip_mutation_pipeline,
+            skipped_stages=(
+                [
+                    "lookback_timing",
+                    "coarse_probe",
+                    "coarse_expand",
+                    "focused",
+                    "instrument_scout",
+                    "mutated_final_36mo",
+                ]
+                if skip_mutation_pipeline
+                else []
+            ),
+        )
+
+    lookback_axes = [] if skip_mutation_pipeline else lookback_axes
+    if skip_mutation_pipeline:
+        _append_event(
+            ctx,
+            "lookback_timing",
+            "skipped",
+            stage=stages["lookback"],
+            reason="family_policy_template_locked_exact_only",
+        )
+        phase_rows.append(
+            {
+                "phase": "lookback",
+                "status": "skipped",
+                "score": None,
+                "detail": "family policy template-locked exact-only",
+            }
+        )
+        _report_early_exit("after_lookback_top", "lookback")
+    elif lookback_axes:
         sweep = _run_sweep(
             ctx,
             stage=stages["lookback"],
@@ -4720,89 +5603,355 @@ def cmd_play_hand(
         )
         last_sweep_payload = sweep["result"]
         last_sweep_axes = list(sweep.get("axes") or lookback_axes)
+        source_profile_path = current_profile_path
         materialized = _materialize_and_register_best_sweep_candidate(
             ctx,
             stage=stages["lookback"],
-            source_profile_path=current_profile_path,
+            source_profile_path=source_profile_path,
             sweep_payload=last_sweep_payload,
             phase="lookback_timing",
         )
         if materialized:
-            current_profile_path, current_profile_ref, _params = materialized
-            current_evaluation_timeframe = _lowest_profile_timeframe(
-                _load_json(current_profile_path),
+            candidate_profile_path, candidate_profile_ref, _params = materialized
+            candidate_timeframe = _lowest_profile_timeframe(
+                _load_json(candidate_profile_path),
                 timeframe,
             )
+            if not stage_acceptance_enabled:
+                current_profile_path = candidate_profile_path
+                current_profile_ref = candidate_profile_ref
+                current_evaluation_timeframe = candidate_timeframe
             result = _evaluate_profile(
                 ctx,
                 stage=stages["lookback"],
                 phase="lookback_timing_top_3mo",
-                profile_ref=current_profile_ref,
-                profile_path=current_profile_path,
+                profile_ref=candidate_profile_ref,
+                profile_path=candidate_profile_path,
                 instruments=instruments,
-                timeframe=current_evaluation_timeframe,
+                timeframe=candidate_timeframe,
                 lookback_months=screen_months,
                 reward_matrix=reward_matrix,
                 as_of_date=screen_as_of_date,
             )
-            phase_rows.append({"phase": "lookback", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(lookback_axes)})
+            if stage_acceptance_enabled:
+                _apply_stage_candidate(
+                    stage_key="lookback",
+                    phase="lookback_timing",
+                    candidate_profile_path=candidate_profile_path,
+                    candidate_profile_ref=candidate_profile_ref,
+                    candidate_timeframe=candidate_timeframe,
+                    candidate_score=result.get("score"),
+                    detail=", ".join(lookback_axes),
+                    phase_score_key="lookback_top_3mo",
+                )
+            else:
+                phase_rows.append({"phase": "lookback", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(lookback_axes)})
+                _record_phase_score("lookback_top_3mo", result.get("score"))
+            _report_early_exit("after_lookback_top", "lookback")
     else:
         _append_event(ctx, "lookback_timing", "skipped", stage=stages["lookback"], reason="no active indicators available")
+        _report_early_exit("after_lookback_top", "lookback")
 
     current_profile_payload = _load_json(current_profile_path)
     coarse_axes = build_coarse_axes(current_profile_payload)
-    if coarse_axes:
-        sweep = _run_sweep(
+    if skip_mutation_pipeline:
+        _append_event(
             ctx,
+            "coarse",
+            "skipped",
             stage=stages["coarse"],
-            phase="coarse",
-            profile_ref=current_profile_ref,
-            profile_payload=current_profile_payload,
-            instruments=instruments,
-            axes=coarse_axes,
-            mode=coarse_mode,
-            sweep_budget=sweep_budget_label,
-            max_permutations=max_sweep_permutations,
-            reward_matrix=reward_matrix,
-            as_of_date=screen_as_of_date,
+            reason="family_policy_template_locked_exact_only",
         )
-        last_sweep_payload = sweep["result"]
-        last_sweep_axes = list(sweep.get("axes") or coarse_axes)
-        materialized = _materialize_and_register_best_sweep_candidate(
-            ctx,
-            stage=stages["coarse"],
-            source_profile_path=current_profile_path,
-            sweep_payload=last_sweep_payload,
-            phase="coarse",
+        phase_rows.append(
+            {
+                "phase": "coarse",
+                "status": "skipped",
+                "score": None,
+                "detail": "family policy template-locked exact-only",
+            }
         )
-        if materialized:
-            current_profile_path, current_profile_ref, _params = materialized
-            current_evaluation_timeframe = _lowest_profile_timeframe(
-                _load_json(current_profile_path),
-                timeframe,
-            )
-            result = _evaluate_profile(
+        _record_phase_score("coarse_top_3mo", incumbent.get("score"))
+        _report_early_exit("after_coarse_top", "coarse")
+    elif coarse_axes:
+        coarse_halving_plan = build_coarse_halving_budget_plan(
+            mode=coarse_halving_mode,
+            total_budget=max_sweep_permutations,
+            probe_budget=coarse_probe_budget,
+        )
+        use_coarse_halving = (
+            coarse_mode == "evolutionary"
+            and coarse_halving_mode == "enforce"
+            and bool(coarse_halving_plan.get("split"))
+        )
+        if use_coarse_halving:
+            probe_budget = int(coarse_halving_plan["probe_budget"])
+            expand_budget = int(coarse_halving_plan["expand_budget"])
+            pre_probe_incumbent_score = incumbent.get("score")
+            probe_source_profile_path = current_profile_path
+            sweep = _run_sweep(
                 ctx,
                 stage=stages["coarse"],
-                phase="coarse_top_3mo",
+                phase="coarse_probe",
                 profile_ref=current_profile_ref,
-                profile_path=current_profile_path,
+                profile_payload=current_profile_payload,
                 instruments=instruments,
-                timeframe=current_evaluation_timeframe,
-                lookback_months=screen_months,
+                axes=coarse_axes,
+                mode=coarse_mode,
+                sweep_budget=str(probe_budget),
+                max_permutations=probe_budget,
                 reward_matrix=reward_matrix,
                 as_of_date=screen_as_of_date,
             )
-            phase_rows.append({"phase": "coarse", "status": "top evaluated", "score": result.get("score"), "detail": f"{len(coarse_axes)} axes"})
+            last_sweep_payload = sweep["result"]
+            last_sweep_axes = list(sweep.get("axes") or coarse_axes)
+            probe_score = _top_sweep_score(last_sweep_payload)
+            probe_candidate_path: Path | None = None
+            probe_candidate_ref: str | None = None
+            materialized = _materialize_and_register_best_sweep_candidate(
+                ctx,
+                stage=stages["coarse"],
+                source_profile_path=probe_source_profile_path,
+                sweep_payload=last_sweep_payload,
+                phase="coarse_probe",
+            )
+            if materialized:
+                probe_candidate_path, probe_candidate_ref, _params = materialized
+                probe_timeframe = _lowest_profile_timeframe(
+                    _load_json(probe_candidate_path),
+                    timeframe,
+                )
+                result = _evaluate_profile(
+                    ctx,
+                    stage=stages["coarse"],
+                    phase="coarse_probe_top_3mo",
+                    profile_ref=probe_candidate_ref,
+                    profile_path=probe_candidate_path,
+                    instruments=instruments,
+                    timeframe=probe_timeframe,
+                    lookback_months=screen_months,
+                    reward_matrix=reward_matrix,
+                    as_of_date=screen_as_of_date,
+                )
+                probe_score = _as_float(result.get("score"))
+                _apply_stage_candidate(
+                    stage_key="coarse_probe",
+                    phase="coarse_probe",
+                    candidate_profile_path=probe_candidate_path,
+                    candidate_profile_ref=probe_candidate_ref,
+                    candidate_timeframe=probe_timeframe,
+                    candidate_score=result.get("score"),
+                    detail=f"probe {probe_budget}/{max_sweep_permutations} evals",
+                    phase_score_key="coarse_probe_top_3mo",
+                )
+            halving_decision = build_coarse_halving_decision(
+                mode=coarse_halving_mode,
+                total_budget=max_sweep_permutations,
+                probe_budget=coarse_probe_budget,
+                incumbent_score=pre_probe_incumbent_score,
+                probe_score=probe_score,
+            )
+            _record_coarse_halving_decision(halving_decision)
+            if halving_decision["expanded"]:
+                expand_source_profile_path = probe_candidate_path or current_profile_path
+                expand_source_profile_ref = probe_candidate_ref or current_profile_ref
+                expand_source_payload = _load_json(expand_source_profile_path)
+                sweep = _run_sweep(
+                    ctx,
+                    stage=stages["coarse"],
+                    phase="coarse_expand",
+                    profile_ref=expand_source_profile_ref,
+                    profile_payload=expand_source_payload,
+                    instruments=instruments,
+                    axes=coarse_axes,
+                    mode=coarse_mode,
+                    sweep_budget=str(expand_budget),
+                    max_permutations=expand_budget,
+                    reward_matrix=reward_matrix,
+                    as_of_date=screen_as_of_date,
+                )
+                last_sweep_payload = sweep["result"]
+                last_sweep_axes = list(sweep.get("axes") or coarse_axes)
+                materialized = _materialize_and_register_best_sweep_candidate(
+                    ctx,
+                    stage=stages["coarse"],
+                    source_profile_path=expand_source_profile_path,
+                    sweep_payload=last_sweep_payload,
+                    phase="coarse_expand",
+                )
+                if materialized:
+                    candidate_profile_path, candidate_profile_ref, _params = materialized
+                    candidate_timeframe = _lowest_profile_timeframe(
+                        _load_json(candidate_profile_path),
+                        timeframe,
+                    )
+                    result = _evaluate_profile(
+                        ctx,
+                        stage=stages["coarse"],
+                        phase="coarse_expand_top_3mo",
+                        profile_ref=candidate_profile_ref,
+                        profile_path=candidate_profile_path,
+                        instruments=instruments,
+                        timeframe=candidate_timeframe,
+                        lookback_months=screen_months,
+                        reward_matrix=reward_matrix,
+                        as_of_date=screen_as_of_date,
+                    )
+                    _apply_stage_candidate(
+                        stage_key="coarse_expand",
+                        phase="coarse_expand",
+                        candidate_profile_path=candidate_profile_path,
+                        candidate_profile_ref=candidate_profile_ref,
+                        candidate_timeframe=candidate_timeframe,
+                        candidate_score=result.get("score"),
+                        detail=f"expand {expand_budget} evals",
+                        phase_score_key="coarse_expand_top_3mo",
+                    )
+            else:
+                skip_focused_and_scout = True
+                phase_rows.append(
+                    {
+                        "phase": "coarse expand",
+                        "status": "skipped",
+                        "score": None,
+                        "detail": "coarse halving skipped expansion",
+                    }
+                )
+            _record_phase_score("coarse_top_3mo", incumbent.get("score"))
+            _report_early_exit("after_coarse_top", "coarse")
+        else:
+            if coarse_halving_mode == "enforce":
+                if coarse_mode != "evolutionary":
+                    _record_coarse_halving_decision(
+                        {
+                            "version": PLAY_HAND_COARSE_HALVING_VERSION,
+                            "mode": coarse_halving_mode,
+                            "probe_budget": coarse_probe_budget,
+                            "expand_budget": 0,
+                            "total_budget": max_sweep_permutations,
+                            "expanded": True,
+                            "decision": "use_original_coarse",
+                            "reasons": ["coarse_mode_not_evolutionary"],
+                            "incumbent_score": _as_float(incumbent.get("score")),
+                            "probe_score": None,
+                            "estimated_saved_evaluations": 0,
+                            "skipped_stages": [],
+                        }
+                    )
+                else:
+                    _record_coarse_halving_decision(
+                        build_coarse_halving_decision(
+                            mode=coarse_halving_mode,
+                            total_budget=max_sweep_permutations,
+                            probe_budget=coarse_probe_budget,
+                            incumbent_score=incumbent.get("score"),
+                            probe_score=None,
+                        )
+                    )
+            sweep = _run_sweep(
+                ctx,
+                stage=stages["coarse"],
+                phase="coarse",
+                profile_ref=current_profile_ref,
+                profile_payload=current_profile_payload,
+                instruments=instruments,
+                axes=coarse_axes,
+                mode=coarse_mode,
+                sweep_budget=sweep_budget_label,
+                max_permutations=max_sweep_permutations,
+                reward_matrix=reward_matrix,
+                as_of_date=screen_as_of_date,
+            )
+            last_sweep_payload = sweep["result"]
+            last_sweep_axes = list(sweep.get("axes") or coarse_axes)
+            source_profile_path = current_profile_path
+            materialized = _materialize_and_register_best_sweep_candidate(
+                ctx,
+                stage=stages["coarse"],
+                source_profile_path=source_profile_path,
+                sweep_payload=last_sweep_payload,
+                phase="coarse",
+            )
+            if materialized:
+                candidate_profile_path, candidate_profile_ref, _params = materialized
+                candidate_timeframe = _lowest_profile_timeframe(
+                    _load_json(candidate_profile_path),
+                    timeframe,
+                )
+                if not stage_acceptance_enabled:
+                    current_profile_path = candidate_profile_path
+                    current_profile_ref = candidate_profile_ref
+                    current_evaluation_timeframe = candidate_timeframe
+                result = _evaluate_profile(
+                    ctx,
+                    stage=stages["coarse"],
+                    phase="coarse_top_3mo",
+                    profile_ref=candidate_profile_ref,
+                    profile_path=candidate_profile_path,
+                    instruments=instruments,
+                    timeframe=candidate_timeframe,
+                    lookback_months=screen_months,
+                    reward_matrix=reward_matrix,
+                    as_of_date=screen_as_of_date,
+                )
+                if stage_acceptance_enabled:
+                    _apply_stage_candidate(
+                        stage_key="coarse",
+                        phase="coarse",
+                        candidate_profile_path=candidate_profile_path,
+                        candidate_profile_ref=candidate_profile_ref,
+                        candidate_timeframe=candidate_timeframe,
+                        candidate_score=result.get("score"),
+                        detail=f"{len(coarse_axes)} axes",
+                        phase_score_key="coarse_top_3mo",
+                    )
+                else:
+                    phase_rows.append({"phase": "coarse", "status": "top evaluated", "score": result.get("score"), "detail": f"{len(coarse_axes)} axes"})
+                    _record_phase_score("coarse_top_3mo", result.get("score"))
+                _report_early_exit("after_coarse_top", "coarse")
     else:
         _append_event(ctx, "coarse", "skipped", stage=stages["coarse"], reason="no numeric talib axes found")
+        _report_early_exit("after_coarse_top", "coarse")
 
     focused_axes = (
         build_focused_axes(_parameter_importance(last_sweep_payload or {}), last_sweep_axes)
-        if last_sweep_payload
+        if last_sweep_payload and not skip_focused_and_scout and not skip_mutation_pipeline
         else []
     )
-    if focused_axes:
+    if skip_mutation_pipeline:
+        _append_event(
+            ctx,
+            "focused",
+            "skipped",
+            stage=stages["focused"],
+            reason="family_policy_template_locked_exact_only",
+        )
+        phase_rows.append(
+            {
+                "phase": "focused",
+                "status": "skipped",
+                "score": None,
+                "detail": "family policy template-locked exact-only",
+            }
+        )
+        _report_early_exit("after_focused_top", "focused")
+    elif skip_focused_and_scout:
+        _append_event(
+            ctx,
+            "focused",
+            "skipped",
+            stage=stages["focused"],
+            reason="coarse_halving_skip_expansion",
+        )
+        phase_rows.append(
+            {
+                "phase": "focused",
+                "status": "skipped",
+                "score": None,
+                "detail": "coarse halving skipped focused refinement",
+            }
+        )
+        _report_early_exit("after_focused_top", "focused")
+    elif focused_axes:
         sweep = _run_sweep(
             ctx,
             stage=stages["focused"],
@@ -4825,43 +5974,102 @@ def cmd_play_hand(
             phase="focused",
         )
         if materialized:
-            current_profile_path, current_profile_ref, _params = materialized
-            current_evaluation_timeframe = _lowest_profile_timeframe(
-                _load_json(current_profile_path),
+            candidate_profile_path, candidate_profile_ref, _params = materialized
+            candidate_timeframe = _lowest_profile_timeframe(
+                _load_json(candidate_profile_path),
                 timeframe,
             )
+            if not stage_acceptance_enabled:
+                current_profile_path = candidate_profile_path
+                current_profile_ref = candidate_profile_ref
+                current_evaluation_timeframe = candidate_timeframe
             result = _evaluate_profile(
                 ctx,
                 stage=stages["focused"],
                 phase="focused_top_3mo",
-                profile_ref=current_profile_ref,
-                profile_path=current_profile_path,
+                profile_ref=candidate_profile_ref,
+                profile_path=candidate_profile_path,
                 instruments=instruments,
-                timeframe=current_evaluation_timeframe,
+                timeframe=candidate_timeframe,
                 lookback_months=screen_months,
                 reward_matrix=reward_matrix,
                 as_of_date=screen_as_of_date,
             )
-            phase_rows.append({"phase": "focused", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(focused_axes)})
+            if stage_acceptance_enabled:
+                _apply_stage_candidate(
+                    stage_key="focused",
+                    phase="focused",
+                    candidate_profile_path=candidate_profile_path,
+                    candidate_profile_ref=candidate_profile_ref,
+                    candidate_timeframe=candidate_timeframe,
+                    candidate_score=result.get("score"),
+                    detail=", ".join(focused_axes),
+                    phase_score_key="focused_top_3mo",
+                )
+            else:
+                phase_rows.append({"phase": "focused", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(focused_axes)})
+                _record_phase_score("focused_top_3mo", result.get("score"))
+            _report_early_exit("after_focused_top", "focused")
     else:
         _append_event(ctx, "focused", "skipped", stage=stages["focused"], reason="no high-impact axes available from previous sweep")
+        _report_early_exit("after_focused_top", "focused")
 
-    scout_result = _run_instrument_scout(
-        ctx,
-        stage=stages["instrument_scout"],
-        profile_ref=current_profile_ref,
-        profile_path=current_profile_path,
-        instrument_deal=instrument_deal,
-        instruments=instruments,
-        timeframe=current_evaluation_timeframe,
-        lookback_months=int(instrument_scout_months or screen_months),
-        rng=rng,
-        enabled=bool(instrument_scout),
-        scout_size=int(instrument_scout_size),
-        max_selected=int(instrument_scout_max_selected),
-        reward_matrix=reward_matrix,
-        as_of_date=screen_as_of_date,
-    )
+    _report_early_exit("before_instrument_scout", "instrument_scout")
+    if skip_mutation_pipeline:
+        scout_result = {
+            "version": "instrument_scout_v1",
+            "status": "skipped",
+            "reason": "family_policy_template_locked_exact_only",
+            "selected_instruments": list(instruments),
+            "primary_instrument": instrument_deal["primary_instrument"],
+            "accepted": [],
+            "rejected": [],
+        }
+        metadata["instrument_scout"] = scout_result
+        write_run_metadata(run_dir, metadata)
+        _append_event(
+            ctx,
+            "instrument_scout",
+            "skipped",
+            stage=stages["instrument_scout"],
+            reason="family_policy_template_locked_exact_only",
+        )
+    elif skip_focused_and_scout:
+        scout_result = {
+            "version": "instrument_scout_v1",
+            "status": "skipped",
+            "reason": "coarse_halving_skip_expansion",
+            "selected_instruments": list(instruments),
+            "primary_instrument": instrument_deal["primary_instrument"],
+            "accepted": [],
+            "rejected": [],
+        }
+        metadata["instrument_scout"] = scout_result
+        write_run_metadata(run_dir, metadata)
+        _append_event(
+            ctx,
+            "instrument_scout",
+            "skipped",
+            stage=stages["instrument_scout"],
+            reason="coarse_halving_skip_expansion",
+        )
+    else:
+        scout_result = _run_instrument_scout(
+            ctx,
+            stage=stages["instrument_scout"],
+            profile_ref=current_profile_ref,
+            profile_path=current_profile_path,
+            instrument_deal=instrument_deal,
+            instruments=instruments,
+            timeframe=current_evaluation_timeframe,
+            lookback_months=int(instrument_scout_months or screen_months),
+            rng=rng,
+            enabled=bool(instrument_scout),
+            scout_size=int(instrument_scout_size),
+            max_selected=int(instrument_scout_max_selected),
+            reward_matrix=reward_matrix,
+            as_of_date=screen_as_of_date,
+        )
     scout_selected = _clean_tokens(list(scout_result.get("selected_instruments") or []))
     if scout_selected:
         instruments = scout_selected
@@ -4881,20 +6089,46 @@ def cmd_play_hand(
         }
     )
 
-    mutated_scrutiny = _evaluate_profile(
-        ctx,
-        stage=stages["scrutiny"],
-        phase="mutated_final_36mo",
-        profile_ref=current_profile_ref,
-        profile_path=current_profile_path,
-        instruments=instruments,
-        timeframe=current_evaluation_timeframe,
-        lookback_months=scrutiny_months,
-        reward_matrix=reward_matrix,
-    )
-    mutated_outcome = _final_scrutiny_outcome(mutated_scrutiny)
-    final_branch_candidates: list[dict[str, Any]] = [
-        {
+    _report_early_exit("before_final_scrutiny", "scrutiny")
+    mutated_scrutiny: dict[str, Any] | None = None
+    mutated_outcome: dict[str, Any] = {
+        "passed": False,
+        "score": None,
+        "reason": "mutated_branch_skipped",
+        "reasons": ["family_policy_template_locked_exact_only"],
+    }
+    final_branch_candidates: list[dict[str, Any]] = []
+    if skip_mutation_pipeline:
+        _append_event(
+            ctx,
+            "mutated_final_36mo",
+            "skipped",
+            stage=stages["scrutiny"],
+            reason="family_policy_template_locked_exact_only",
+        )
+        phase_rows.append(
+            {
+                "phase": "mutated final",
+                "status": "skipped",
+                "score": None,
+                "detail": "family policy template-locked exact-only",
+            }
+        )
+    else:
+        mutated_scrutiny = _evaluate_profile(
+            ctx,
+            stage=stages["scrutiny"],
+            phase="mutated_final_36mo",
+            profile_ref=current_profile_ref,
+            profile_path=current_profile_path,
+            instruments=instruments,
+            timeframe=current_evaluation_timeframe,
+            lookback_months=scrutiny_months,
+            reward_matrix=reward_matrix,
+        )
+        mutated_outcome = _final_scrutiny_outcome(mutated_scrutiny)
+        final_branch_candidates.append(
+            {
             "branch": "mutated",
             "phase": "mutated_final_36mo",
             "scrutiny": mutated_scrutiny,
@@ -4904,8 +6138,8 @@ def cmd_play_hand(
             "profile_path": current_profile_path,
             "instruments": list(instruments),
             "timeframe": current_evaluation_timeframe,
-        }
-    ]
+            }
+        )
     if exact_template_profile_path is not None and exact_template_profile_ref:
         exact_template_scrutiny = _evaluate_profile(
             ctx,
@@ -4932,6 +6166,8 @@ def cmd_play_hand(
                 "timeframe": exact_template_timeframe or evaluation_timeframe,
             }
         )
+    if not final_branch_candidates:
+        raise RuntimeError("PlayHand final scrutiny has no branch candidates")
     if calendar_gate_mode != "off":
         for branch in final_branch_candidates:
             branch["calendar_gate"] = _branch_calendar_gate(branch, mode=calendar_gate_mode)
@@ -5016,7 +6252,9 @@ def cmd_play_hand(
         if isinstance(exact_template_branch.get("outcome"), dict)
         else {}
     )
-    if selected_final_branch_name == "exact_template":
+    if selected_final_branch_name == "exact_template" and skip_mutation_pipeline:
+        canonical_selection_reason = "template_locked_exact_only"
+    elif selected_final_branch_name == "exact_template":
         canonical_selection_reason = (
             "rescued_by_exact_template"
             if not mutated_outcome.get("passed") and exact_template_branch_outcome.get("passed")
@@ -5071,7 +6309,11 @@ def cmd_play_hand(
             "final_attempt_id": final_attempt_id or None,
             "final_scrutiny_passed": final_scrutiny_passed,
             "final_scrutiny_score": final_scrutiny.get("score"),
-            "mutated_attempt_id": str(mutated_scrutiny.get("attempt_id") or "") or None,
+            "mutated_attempt_id": (
+                str(mutated_scrutiny.get("attempt_id") or "") or None
+                if isinstance(mutated_scrutiny, dict)
+                else None
+            ),
             "mutated_score": mutated_outcome.get("score"),
             "exact_template_attempt_id": str(exact_template_branch.get("attempt_id") or "") or None,
             "exact_template_score": (
@@ -5100,6 +6342,7 @@ def cmd_play_hand(
             "calendar_gate": selected_calendar_gate,
             "strategy_family_id": run_id,
             "attempt_metadata": attempt_metadata_summary,
+            "family_policy_execution": metadata.get("family_policy_execution"),
         }
     )
     write_run_metadata(run_dir, metadata)
@@ -5225,6 +6468,16 @@ def cmd_play_hand(
         except ValueError:
             pass
 
+    metadata["phase_rows"] = phase_rows
+    metadata["final_artifacts"] = final_artifact_summary
+    metadata["cloud_profile_cleanup"] = cloud_profile_cleanup
+    play_hand_health = build_play_hand_health(
+        run_metadata=metadata,
+        attempts=load_attempts(ctx.attempts_path),
+    )
+    metadata["play_hand_health"] = play_hand_health
+    write_run_metadata(run_dir, metadata)
+
     summary = {
         "run_id": run_id,
         "run_dir": str(run_dir.resolve()),
@@ -5277,7 +6530,11 @@ def cmd_play_hand(
         "final_attempt_id": final_attempt_id or None,
         "final_scrutiny_passed": final_scrutiny_passed,
         "final_scrutiny_score": final_scrutiny.get("score"),
-        "mutated_attempt_id": str(mutated_scrutiny.get("attempt_id") or "") or None,
+        "mutated_attempt_id": (
+            str(mutated_scrutiny.get("attempt_id") or "") or None
+            if isinstance(mutated_scrutiny, dict)
+            else None
+        ),
         "mutated_score": mutated_outcome.get("score"),
         "exact_template_attempt_id": str(exact_template_branch.get("attempt_id") or "") or None,
         "exact_template_score": (
@@ -5310,6 +6567,12 @@ def cmd_play_hand(
         "events_path": str(ctx.events_path.resolve()),
         "attempts_path": str(ctx.attempts_path.resolve()),
         "phase_rows": phase_rows,
+        "play_hand_health": play_hand_health,
+        "early_exit_policy": metadata.get("early_exit_policy"),
+        "coarse_halving": metadata.get("coarse_halving"),
+        "family_policy_execution": metadata.get("family_policy_execution"),
+        "stage_incumbent": metadata.get("stage_incumbent"),
+        "stage_acceptance_decisions": metadata.get("stage_acceptance_decisions"),
         "final_artifacts": final_artifact_summary,
         "cloud_profile_cleanup": cloud_profile_cleanup,
     }
