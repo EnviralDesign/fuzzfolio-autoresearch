@@ -1482,6 +1482,8 @@ def test_build_parser_includes_finalize_corpus_defaults() -> None:
     enforced_args = parser.parse_args(
         [
             "play-hand",
+            "--early-exit-mode",
+            "enforce",
             "--coarse-halving-mode",
             "enforce",
             "--coarse-probe-budget",
@@ -1490,6 +1492,7 @@ def test_build_parser_includes_finalize_corpus_defaults() -> None:
             "enforce",
         ]
     )
+    assert enforced_args.early_exit_mode == "enforce"
     assert enforced_args.coarse_halving_mode == "enforce"
     assert enforced_args.coarse_probe_budget == 64
     assert enforced_args.family_policy_mode == "enforce"

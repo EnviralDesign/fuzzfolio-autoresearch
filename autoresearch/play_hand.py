@@ -94,9 +94,12 @@ AVERAGE_DAYS_PER_MONTH = 30.4375
 PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS = 2400
 PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS = 7200
 PLAY_HAND_EARLY_EXIT_ENV = "AUTORESEARCH_EARLY_EXIT_MODE"
-PLAY_HAND_EARLY_EXIT_MODES = ("off", "report")
+PLAY_HAND_EARLY_EXIT_MODES = ("off", "report", "enforce")
 PLAY_HAND_EARLY_EXIT_DEFAULT_MODE = "off"
 PLAY_HAND_EARLY_EXIT_VERSION = "early_exit_policy_v1"
+PLAY_HAND_EARLY_EXIT_TOMBSTONE_REASON = "early_exit_policy_enforced"
+PLAY_HAND_EARLY_EXIT_DEPLOYABLE_FLOOR = 55.0
+PLAY_HAND_EARLY_EXIT_SCOUT_FLOOR = 45.0
 PLAY_HAND_COARSE_HALVING_VERSION = "coarse_halving_v1"
 PLAY_HAND_COARSE_HALVING_MODES = ("off", "enforce")
 PLAY_HAND_COARSE_HALVING_DEFAULT_MODE = "off"
@@ -3280,10 +3283,22 @@ def build_early_exit_decision(
     reasons: list[str] = []
     rules_fired: list[str] = []
     would_exit = False
+    enforce_action = "continue"
+    enforce_reasons: list[str] = []
+    skipped_stages: list[str] = []
 
     def _fire(rule: str) -> None:
         reasons.append(rule)
         rules_fired.append(rule)
+
+    def _enforce(action: str, rule: str, stages: list[str]) -> None:
+        nonlocal enforce_action
+        nonlocal skipped_stages
+        if enforce_action != "continue":
+            return
+        enforce_action = action
+        enforce_reasons.append(rule)
+        skipped_stages = list(stages)
 
     if not bool(inputs.get("safe_for_report_mode", False)):
         _fire("insufficient_health_context")
@@ -3336,6 +3351,96 @@ def build_early_exit_decision(
     if guided_source:
         reasons.append(f"source:{guided_source}")
 
+    safe_context = bool(inputs.get("safe_for_report_mode", False))
+    if mode == "enforce" and safe_context:
+        if checkpoint == "after_baseline":
+            if baseline is None:
+                _enforce(
+                    "early_exit_tombstone",
+                    "missing_baseline_score",
+                    [
+                        "lookback_timing",
+                        "coarse_probe",
+                        "coarse_expand",
+                        "focused",
+                        "instrument_scout",
+                        "mutated_final_36mo",
+                        "exact_template_36mo",
+                    ],
+                )
+            elif baseline <= 0.0:
+                _enforce(
+                    "early_exit_tombstone",
+                    "baseline_score_not_positive",
+                    [
+                        "lookback_timing",
+                        "coarse_probe",
+                        "coarse_expand",
+                        "focused",
+                        "instrument_scout",
+                        "mutated_final_36mo",
+                        "exact_template_36mo",
+                    ],
+                )
+        elif checkpoint == "after_lookback_top" and (
+            baseline is not None and baseline < PLAY_HAND_EARLY_EXIT_DEPLOYABLE_FLOOR
+        ):
+            if lookback is None:
+                _enforce(
+                    "early_exit_tombstone",
+                    "missing_lookback_top_score_with_weak_baseline",
+                    [
+                        "coarse_probe",
+                        "coarse_expand",
+                        "focused",
+                        "instrument_scout",
+                        "mutated_final_36mo",
+                        "exact_template_36mo",
+                    ],
+                )
+            elif lookback <= 0.0:
+                _enforce(
+                    "early_exit_tombstone",
+                    "lookback_score_not_positive_with_weak_baseline",
+                    [
+                        "coarse_probe",
+                        "coarse_expand",
+                        "focused",
+                        "instrument_scout",
+                        "mutated_final_36mo",
+                        "exact_template_36mo",
+                    ],
+                )
+            elif (
+                lookback < baseline - 15.0
+                and lookback < PLAY_HAND_EARLY_EXIT_SCOUT_FLOOR
+            ):
+                _enforce(
+                    "early_exit_tombstone",
+                    f"lookback_score_below_weak_baseline_by_{baseline - lookback:.2f}",
+                    [
+                        "coarse_probe",
+                        "coarse_expand",
+                        "focused",
+                        "instrument_scout",
+                        "mutated_final_36mo",
+                        "exact_template_36mo",
+                    ],
+                )
+        elif checkpoint == "before_instrument_scout":
+            if candidate is None:
+                _enforce(
+                    "skip_instrument_scout",
+                    "missing_scout_candidate_score",
+                    ["instrument_scout"],
+                )
+            elif candidate < PLAY_HAND_EARLY_EXIT_SCOUT_FLOOR:
+                _enforce(
+                    "skip_instrument_scout",
+                    "candidate_below_scout_floor",
+                    ["instrument_scout"],
+                )
+
     return {
         "version": PLAY_HAND_EARLY_EXIT_VERSION,
         "mode": mode,
@@ -3345,6 +3450,12 @@ def build_early_exit_decision(
         "would_exit_compute_expansion": bool(would_exit),
         "reasons": reasons,
         "rules_fired": rules_fired,
+        "enforced": enforce_action != "continue",
+        "enforce_action": enforce_action,
+        "terminal": enforce_action == "early_exit_tombstone",
+        "skip_instrument_scout": enforce_action == "skip_instrument_scout",
+        "enforce_reasons": enforce_reasons,
+        "skipped_stages": skipped_stages,
         "source": {
             "dealt_indicator_source": source.get("dealt_indicator_source"),
             "dealt_recipe": source.get("dealt_recipe"),
@@ -5025,7 +5136,7 @@ def cmd_play_hand(
         write_run_metadata(run_dir, metadata)
 
     def _report_early_exit(checkpoint: str, stage_key: str) -> dict[str, Any] | None:
-        if early_exit_mode != "report":
+        if early_exit_mode not in {"report", "enforce"}:
             return None
         attempts = load_attempts(ctx.attempts_path)
         evidence = build_play_hand_evidence(run_metadata=metadata, attempts=attempts)
@@ -5055,14 +5166,193 @@ def cmd_play_hand(
             policy["decisions"] = decisions
         decisions.append(decision)
         write_run_metadata(run_dir, metadata)
+        if early_exit_mode == "enforce":
+            event_status = "enforced" if decision.get("enforced") else "continued"
+        else:
+            event_status = "reported"
         _append_event(
             ctx,
             "early_exit",
-            "reported",
+            event_status,
             stage=stages.get(stage_key),
             **decision,
         )
         return decision
+
+    def _complete_early_exit_tombstone(
+        *,
+        decision: dict[str, Any],
+        stage_key: str,
+        selected_profile_path: Path,
+        selected_profile_ref: str,
+        selected_timeframe: str,
+        selected_instruments: list[str],
+    ) -> int:
+        reason = PLAY_HAND_EARLY_EXIT_TOMBSTONE_REASON
+        decision_reasons = [
+            str(item)
+            for item in list(decision.get("enforce_reasons") or decision.get("rules_fired") or [])
+            if str(item).strip()
+        ]
+        tombstone_reasons = sorted({item for item in [reason, *decision_reasons] if item})
+        metadata.update(
+            {
+                "run_status": "tombstoned",
+                "run_tombstoned": True,
+                "tombstone_reason": reason,
+                "tombstone_reasons": tombstone_reasons,
+                "final_attempt_id": None,
+                "final_scrutiny_passed": False,
+                "final_scrutiny_score": None,
+                "mutated_attempt_id": None,
+                "mutated_score": None,
+                "selected_final_branch": "early_exit",
+                "selected_final_phase": str(decision.get("checkpoint") or "early_exit"),
+                "canonical_selection_reason": reason,
+                "canonical_attempt_id": None,
+                "canonical_attempt_role": None,
+                "canonical_candidate_name": None,
+                "canonical_score": None,
+                "canonical_instruments": list(selected_instruments),
+                "final_profile_ref": selected_profile_ref,
+                "final_profile_path": str(selected_profile_path.resolve()),
+                "final_score": None,
+                "early_exit_policy": metadata.get("early_exit_policy"),
+            }
+        )
+        _append_event(
+            ctx,
+            "early_exit",
+            "tombstoned",
+            stage=stages.get(stage_key),
+            reason=reason,
+            tombstone_reasons=tombstone_reasons,
+            checkpoint=decision.get("checkpoint"),
+            skipped_stages=list(decision.get("skipped_stages") or []),
+        )
+        phase_rows.append(
+            {
+                "phase": "early exit",
+                "status": "tombstoned",
+                "score": None,
+                "detail": ", ".join(tombstone_reasons),
+            }
+        )
+        final_artifact_summary = {
+            "status": "skipped",
+            "reason": reason,
+            "run_tombstoned": True,
+            "final_attempt_id": None,
+            "final_scrutiny_score": None,
+        }
+        _append_event(
+            ctx,
+            "final_artifacts",
+            "skipped",
+            stage=stages["artifacts"],
+            reason=reason,
+            run_tombstoned=True,
+            final_attempt_id=None,
+        )
+        phase_rows.append(
+            {
+                "phase": "artifacts",
+                "status": "skipped",
+                "score": None,
+                "detail": f"run tombstoned: {reason}",
+            }
+        )
+        cloud_profile_cleanup = _run_play_hand_cloud_cleanup("early_exit")
+        if cleanup_registered_with_atexit:
+            try:
+                atexit.unregister(_run_play_hand_cloud_cleanup)
+            except ValueError:
+                pass
+        metadata["phase_rows"] = phase_rows
+        metadata["final_artifacts"] = final_artifact_summary
+        metadata["cloud_profile_cleanup"] = cloud_profile_cleanup
+        play_hand_health = build_play_hand_health(
+            run_metadata=metadata,
+            attempts=load_attempts(ctx.attempts_path),
+        )
+        metadata["play_hand_health"] = play_hand_health
+        write_run_metadata(run_dir, metadata)
+        summary = {
+            "run_id": run_id,
+            "run_dir": str(run_dir.resolve()),
+            "runner": "play_hand_v1",
+            "dealt_indicator_ids": dealt,
+            "dealt_indicator_count": len(dealt),
+            "min_indicators": effective_min_indicators,
+            "max_indicators": effective_max_indicators,
+            "instrument_source": instrument_deal["source"],
+            "primary_instrument": instrument_deal["primary_instrument"],
+            "instrument_pool": instrument_deal["instrument_pool"],
+            "instruments": list(selected_instruments),
+            "timeframe": selected_timeframe,
+            "requested_timeframe": timeframe,
+            "indicator_timeframes": _profile_timeframes(_load_json(selected_profile_path)),
+            "sweep_budget": sweep_budget_label,
+            "sweep_budget_value": sweep_budget_value,
+            "sweep_budget_source": budget.get("source"),
+            "max_sweep_permutations": max_sweep_permutations,
+            "deep_replay_job_timeout_seconds": job_timeout_seconds,
+            "sweep_timeout_seconds": sweep_timeout_seconds,
+            "max_reward_r": reward_matrix.get("requested_max_reward_r") if reward_matrix else max_reward_r,
+            "reward_matrix": reward_matrix,
+            "dealt_indicator_source": indicator_deal.get("source"),
+            "dealt_indicator_source_reason": indicator_deal.get("reason"),
+            "dealt_recipe": indicator_deal.get("recipe"),
+            "dealt_recipe_source": indicator_deal.get("recipe_source"),
+            "dealt_recipe_confidence": indicator_deal.get("recipe_confidence"),
+            "dealt_pair_family_policy": indicator_deal.get("family_policy"),
+            "instrument_scout": {
+                "version": "instrument_scout_v1",
+                "status": "skipped",
+                "reason": reason,
+                "selected_instruments": list(selected_instruments),
+                "accepted": [],
+                "rejected": [],
+            },
+            "run_status": "tombstoned",
+            "run_tombstoned": True,
+            "tombstone_reason": reason,
+            "tombstone_reasons": tombstone_reasons,
+            "final_attempt_id": None,
+            "final_scrutiny_passed": False,
+            "final_scrutiny_score": None,
+            "mutated_attempt_id": None,
+            "mutated_score": None,
+            "selected_final_branch": "early_exit",
+            "selected_final_phase": str(decision.get("checkpoint") or "early_exit"),
+            "canonical_selection_reason": reason,
+            "canonical_attempt_id": None,
+            "calendar_gate_mode": calendar_gate_mode,
+            "calendar_gate": None,
+            "strategy_family_id": run_id,
+            "attempt_metadata": {"status": "skipped", "reason": reason},
+            "final_profile_ref": selected_profile_ref,
+            "final_profile_path": str(selected_profile_path.resolve()),
+            "final_score": None,
+            "events_path": str(ctx.events_path.resolve()),
+            "attempts_path": str(ctx.attempts_path.resolve()),
+            "phase_rows": phase_rows,
+            "play_hand_health": play_hand_health,
+            "early_exit_policy": metadata.get("early_exit_policy"),
+            "coarse_halving": metadata.get("coarse_halving"),
+            "family_policy_execution": metadata.get("family_policy_execution"),
+            "stage_incumbent": metadata.get("stage_incumbent"),
+            "stage_acceptance_decisions": metadata.get("stage_acceptance_decisions"),
+            "final_artifacts": final_artifact_summary,
+            "cloud_profile_cleanup": cloud_profile_cleanup,
+        }
+        _write_json(ctx.summary_path, summary)
+        if as_json:
+            print(json.dumps(summary, ensure_ascii=True, indent=2))
+        else:
+            _render_phase_table(phase_rows)
+            console.print(f"Run dir: {run_dir}")
+        return 0
 
     def _record_family_policy_execution(
         status: str,
@@ -5315,6 +5605,7 @@ def cmd_play_hand(
             False,
         ),
     )
+    family_policy_name = str(resolved_family_policy.get("family_policy") or "none")
 
     baseline = _evaluate_profile(
         ctx,
@@ -5330,7 +5621,25 @@ def cmd_play_hand(
     )
     phase_rows.append({"phase": "baseline", "status": "evaluated", "score": baseline.get("score"), "detail": profile_ref})
     _record_phase_score("baseline", baseline.get("score"))
-    _report_early_exit("after_baseline", "baseline")
+    baseline_early_exit = _report_early_exit("after_baseline", "baseline")
+    exact_template_screen_available = bool(
+        family_policy_name in PLAY_HAND_FAMILY_POLICY_ACTIVE_POLICIES
+        and exact_template_profile_path is not None
+        and exact_template_profile_ref
+    )
+    if (
+        baseline_early_exit
+        and baseline_early_exit.get("terminal")
+        and not exact_template_screen_available
+    ):
+        return _complete_early_exit_tombstone(
+            decision=baseline_early_exit,
+            stage_key="baseline",
+            selected_profile_path=profile_path,
+            selected_profile_ref=profile_ref,
+            selected_timeframe=evaluation_timeframe,
+            selected_instruments=list(instruments),
+        )
 
     current_profile_path = profile_path
     current_profile_ref = profile_ref
@@ -5339,7 +5648,6 @@ def cmd_play_hand(
     last_sweep_axes: list[str] = []
     skip_mutation_pipeline = False
     skip_focused_and_scout = False
-    family_policy_name = str(resolved_family_policy.get("family_policy") or "none")
     stage_acceptance_enabled = coarse_halving_mode == "enforce" or (
         family_policy_mode == "enforce"
         and family_policy_name == "template_guarded"
@@ -5651,10 +5959,28 @@ def cmd_play_hand(
             else:
                 phase_rows.append({"phase": "lookback", "status": "top evaluated", "score": result.get("score"), "detail": ", ".join(lookback_axes)})
                 _record_phase_score("lookback_top_3mo", result.get("score"))
-            _report_early_exit("after_lookback_top", "lookback")
+            lookback_early_exit = _report_early_exit("after_lookback_top", "lookback")
+            if lookback_early_exit and lookback_early_exit.get("terminal"):
+                return _complete_early_exit_tombstone(
+                    decision=lookback_early_exit,
+                    stage_key="lookback",
+                    selected_profile_path=current_profile_path,
+                    selected_profile_ref=current_profile_ref,
+                    selected_timeframe=current_evaluation_timeframe,
+                    selected_instruments=list(instruments),
+                )
     else:
         _append_event(ctx, "lookback_timing", "skipped", stage=stages["lookback"], reason="no active indicators available")
-        _report_early_exit("after_lookback_top", "lookback")
+        lookback_early_exit = _report_early_exit("after_lookback_top", "lookback")
+        if lookback_early_exit and lookback_early_exit.get("terminal"):
+            return _complete_early_exit_tombstone(
+                decision=lookback_early_exit,
+                stage_key="lookback",
+                selected_profile_path=current_profile_path,
+                selected_profile_ref=current_profile_ref,
+                selected_timeframe=current_evaluation_timeframe,
+                selected_instruments=list(instruments),
+            )
 
     current_profile_payload = _load_json(current_profile_path)
     coarse_axes = build_coarse_axes(current_profile_payload)
@@ -6026,7 +6352,10 @@ def cmd_play_hand(
         _append_event(ctx, "focused", "skipped", stage=stages["focused"], reason="no high-impact axes available from previous sweep")
         _report_early_exit("after_focused_top", "focused")
 
-    _report_early_exit("before_instrument_scout", "instrument_scout")
+    scout_early_exit = _report_early_exit("before_instrument_scout", "instrument_scout")
+    skip_scout_for_early_exit = bool(
+        scout_early_exit and scout_early_exit.get("skip_instrument_scout")
+    )
     if skip_mutation_pipeline:
         scout_result = {
             "version": "instrument_scout_v1",
@@ -6064,6 +6393,28 @@ def cmd_play_hand(
             "skipped",
             stage=stages["instrument_scout"],
             reason="coarse_halving_skip_expansion",
+        )
+    elif skip_scout_for_early_exit:
+        scout_result = {
+            "version": "instrument_scout_v1",
+            "status": "skipped",
+            "reason": "early_exit_policy_skip_instrument_scout",
+            "selected_instruments": list(instruments),
+            "primary_instrument": instrument_deal["primary_instrument"],
+            "accepted": [],
+            "rejected": [],
+            "early_exit_decision": scout_early_exit,
+        }
+        metadata["instrument_scout"] = scout_result
+        write_run_metadata(run_dir, metadata)
+        _append_event(
+            ctx,
+            "instrument_scout",
+            "skipped",
+            stage=stages["instrument_scout"],
+            reason="early_exit_policy_skip_instrument_scout",
+            early_exit_checkpoint=(scout_early_exit or {}).get("checkpoint"),
+            early_exit_reasons=list((scout_early_exit or {}).get("enforce_reasons") or []),
         )
     else:
         scout_result = _run_instrument_scout(

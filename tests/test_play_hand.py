@@ -660,6 +660,102 @@ def test_build_early_exit_decision_degrades_without_health_context() -> None:
     assert "insufficient_health_context" in decision["reasons"]
 
 
+def test_build_early_exit_decision_enforce_actions() -> None:
+    baseline = build_early_exit_decision(
+        checkpoint="after_baseline",
+        mode="enforce",
+        evidence={
+            "source": {},
+            "scores": {"baseline_3mo": 0.0},
+            "early_exit_inputs": {"safe_for_report_mode": True},
+        },
+    )
+    assert baseline["enforced"] is True
+    assert baseline["terminal"] is True
+    assert baseline["enforce_action"] == "early_exit_tombstone"
+    assert "baseline_score_not_positive" in baseline["enforce_reasons"]
+    assert "lookback_timing" in baseline["skipped_stages"]
+    assert "mutated_final_36mo" in baseline["skipped_stages"]
+
+    lookback = build_early_exit_decision(
+        checkpoint="after_lookback_top",
+        mode="enforce",
+        evidence={
+            "source": {},
+            "scores": {"baseline_3mo": 50.0, "lookback_top_3mo": 0.0},
+            "early_exit_inputs": {"safe_for_report_mode": True},
+        },
+    )
+    assert lookback["enforced"] is True
+    assert lookback["terminal"] is True
+    assert lookback["enforce_action"] == "early_exit_tombstone"
+    assert "lookback_score_not_positive_with_weak_baseline" in lookback["enforce_reasons"]
+
+    scout = build_early_exit_decision(
+        checkpoint="before_instrument_scout",
+        mode="enforce",
+        evidence={
+            "source": {},
+            "scores": {"baseline_3mo": 50.0, "lookback_top_3mo": 44.0},
+            "early_exit_inputs": {"safe_for_report_mode": True},
+        },
+    )
+    assert scout["enforced"] is True
+    assert scout["terminal"] is False
+    assert scout["skip_instrument_scout"] is True
+    assert scout["enforce_action"] == "skip_instrument_scout"
+    assert scout["skipped_stages"] == ["instrument_scout"]
+
+    continuation = build_early_exit_decision(
+        checkpoint="after_baseline",
+        mode="enforce",
+        evidence={
+            "source": {},
+            "scores": {"baseline_3mo": 60.0},
+            "early_exit_inputs": {"safe_for_report_mode": True},
+        },
+    )
+    assert continuation["enforced"] is False
+    assert continuation["terminal"] is False
+    assert continuation["enforce_action"] == "continue"
+
+
+def _play_hand_cmd_defaults(**overrides):
+    params = {
+        "instrument": ["EURUSD"],
+        "instrument_pool": None,
+        "timeframe": "M5",
+        "sweep_budget": "high",
+        "max_sweep_permutations": None,
+        "max_reward_r": None,
+        "min_indicators": 2,
+        "max_indicators": 2,
+        "seed": 1,
+        "screen_months": 3,
+        "scrutiny_months": 36,
+        "coarse_mode": "evolutionary",
+        "evolutionary_budget": None,
+        "instrument_scout": True,
+        "instrument_scout_size": 5,
+        "instrument_scout_max_selected": 3,
+        "instrument_scout_months": None,
+        "final_artifacts": False,
+        "final_profile_drop_count": 0,
+        "final_profile_drop_workers": 1,
+        "job_timeout_seconds": 2400,
+        "sweep_timeout_seconds": 7200,
+        "dry_run": True,
+        "as_json": True,
+        "calendar_gate": "off",
+        "early_exit_mode": "enforce",
+        "coarse_halving_mode": "off",
+        "family_policy_mode": "off",
+        "coarse_probe_budget": 128,
+    }
+    params.update(overrides)
+    return params
+
+
 def test_coarse_halving_budget_plan_splits_remaining_budget() -> None:
     plan = play_hand_mod.build_coarse_halving_budget_plan(
         mode="enforce",
@@ -823,6 +919,306 @@ def test_cmd_play_hand_authenticates_before_seed_prompt(monkeypatch, tmp_path: P
         )
 
     assert events == ["ensure_login", "seed_hand"]
+
+
+def test_cmd_play_hand_early_exit_enforce_tombstones_after_baseline(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    eval_calls: list[str] = []
+
+    class FakeCli:
+        pass
+
+    def fake_evaluate_profile(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_path,
+        instruments,
+        timeframe,
+        lookback_months,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        eval_calls.append(phase)
+        if phase != "baseline_3mo":
+            raise AssertionError(f"{phase} should be skipped by early exit")
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "attempt_id": f"attempt-{phase}",
+            "score": 0.0,
+            "profile_ref": profile_ref,
+            "profile_path": str(profile_path),
+        }
+
+    monkeypatch.setattr(
+        play_hand_mod,
+        "load_config",
+        lambda: SimpleNamespace(runs_root=tmp_path, fuzzfolio=SimpleNamespace()),
+    )
+    monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
+    monkeypatch.setattr(play_hand_mod, "_load_play_hand_seed_plan", lambda _config: (None, None))
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "build_timing_axes",
+        lambda _payload: (_ for _ in ()).throw(AssertionError("lookback should be skipped")),
+    )
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_run_sweep",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("sweeps should be skipped")),
+    )
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_run_instrument_scout",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scout should be skipped")),
+    )
+
+    exit_code = play_hand_mod.cmd_play_hand(**_play_hand_cmd_defaults(final_artifacts=True))
+
+    assert exit_code == 0
+    assert eval_calls == ["baseline_3mo"]
+    run_dirs = list(tmp_path.glob("*-playhand-v1"))
+    assert len(run_dirs) == 1
+    metadata = json.loads((run_dirs[0] / "run-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["run_status"] == "tombstoned"
+    assert metadata["tombstone_reason"] == play_hand_mod.PLAY_HAND_EARLY_EXIT_TOMBSTONE_REASON
+    assert metadata["selected_final_branch"] == "early_exit"
+    assert metadata["final_artifacts"]["status"] == "skipped"
+    decision = metadata["early_exit_policy"]["decisions"][-1]
+    assert decision["checkpoint"] == "after_baseline"
+    assert decision["enforced"] is True
+    assert decision["terminal"] is True
+    assert "baseline_score_not_positive" in decision["enforce_reasons"]
+    assert metadata["play_hand_health"]["status"] == "tombstoned"
+
+
+def test_cmd_play_hand_early_exit_enforce_tombstones_after_weak_lookback(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    eval_calls: list[str] = []
+
+    class FakeCli:
+        pass
+
+    def fake_run_sweep(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_payload,
+        instruments,
+        axes,
+        mode,
+        sweep_budget,
+        max_permutations,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        if phase != "lookback_timing":
+            raise AssertionError(f"{phase} should be skipped by early exit")
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "axes": list(axes),
+            "result": {
+                "ranked_permutations": [
+                    {"parameters": {"fake": phase}, "fitness_value": 0.0}
+                ],
+                "parameter_importance": [],
+            },
+        }
+
+    def fake_materialize(ctx, *, stage, source_profile_path, sweep_payload, phase):
+        output_path = ctx.profiles_dir / f"{phase}_top.json"
+        output_path.write_text(
+            source_profile_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return output_path, f"dry-{phase}_top", {"fake": phase}
+
+    def fake_evaluate_profile(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_path,
+        instruments,
+        timeframe,
+        lookback_months,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        eval_calls.append(phase)
+        scores = {
+            "baseline_3mo": 50.0,
+            "lookback_timing_top_3mo": 0.0,
+        }
+        if phase not in scores:
+            raise AssertionError(f"{phase} should be skipped by early exit")
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "attempt_id": f"attempt-{phase}",
+            "score": scores[phase],
+            "profile_ref": profile_ref,
+            "profile_path": str(profile_path),
+        }
+
+    monkeypatch.setattr(
+        play_hand_mod,
+        "load_config",
+        lambda: SimpleNamespace(runs_root=tmp_path, fuzzfolio=SimpleNamespace()),
+    )
+    monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
+    monkeypatch.setattr(play_hand_mod, "_load_play_hand_seed_plan", lambda _config: (None, None))
+    monkeypatch.setattr(play_hand_mod, "build_timing_axes", lambda _payload: ["timing=1,2"])
+    monkeypatch.setattr(
+        play_hand_mod,
+        "build_coarse_axes",
+        lambda _payload: (_ for _ in ()).throw(AssertionError("coarse should be skipped")),
+    )
+    monkeypatch.setattr(play_hand_mod, "_run_sweep", fake_run_sweep)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_materialize_and_register_best_sweep_candidate",
+        fake_materialize,
+    )
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+
+    exit_code = play_hand_mod.cmd_play_hand(**_play_hand_cmd_defaults(seed=2))
+
+    assert exit_code == 0
+    assert eval_calls == ["baseline_3mo", "lookback_timing_top_3mo"]
+    run_dirs = list(tmp_path.glob("*-playhand-v1"))
+    assert len(run_dirs) == 1
+    metadata = json.loads((run_dirs[0] / "run-metadata.json").read_text(encoding="utf-8"))
+    decision = metadata["early_exit_policy"]["decisions"][-1]
+    assert decision["checkpoint"] == "after_lookback_top"
+    assert decision["enforced"] is True
+    assert decision["terminal"] is True
+    assert "lookback_score_not_positive_with_weak_baseline" in decision["enforce_reasons"]
+    assert "coarse_probe" in decision["skipped_stages"]
+    assert metadata["run_status"] == "tombstoned"
+
+
+def test_cmd_play_hand_early_exit_enforce_skips_scout_but_keeps_final_scrutiny(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    eval_calls: list[str] = []
+
+    class FakeCli:
+        pass
+
+    def fake_run_sweep(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_payload,
+        instruments,
+        axes,
+        mode,
+        sweep_budget,
+        max_permutations,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "axes": list(axes),
+            "result": {
+                "ranked_permutations": [
+                    {"parameters": {"fake": phase}, "fitness_value": 44.0}
+                ],
+                "parameter_importance": [],
+            },
+        }
+
+    def fake_materialize(ctx, *, stage, source_profile_path, sweep_payload, phase):
+        output_path = ctx.profiles_dir / f"{phase}_top.json"
+        output_path.write_text(
+            source_profile_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return output_path, f"dry-{phase}_top", {"fake": phase}
+
+    def fake_evaluate_profile(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_path,
+        instruments,
+        timeframe,
+        lookback_months,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        eval_calls.append(phase)
+        scores = {
+            "baseline_3mo": 50.0,
+            "lookback_timing_top_3mo": 44.0,
+            "mutated_final_36mo": 60.0,
+        }
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "attempt_id": f"attempt-{phase}",
+            "score": scores[phase],
+            "profile_ref": profile_ref,
+            "profile_path": str(profile_path),
+        }
+
+    monkeypatch.setattr(
+        play_hand_mod,
+        "load_config",
+        lambda: SimpleNamespace(runs_root=tmp_path, fuzzfolio=SimpleNamespace()),
+    )
+    monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
+    monkeypatch.setattr(play_hand_mod, "_load_play_hand_seed_plan", lambda _config: (None, None))
+    monkeypatch.setattr(play_hand_mod, "build_timing_axes", lambda _payload: ["timing=1,2"])
+    monkeypatch.setattr(play_hand_mod, "build_coarse_axes", lambda _payload: [])
+    monkeypatch.setattr(play_hand_mod, "build_focused_axes", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(play_hand_mod, "_run_sweep", fake_run_sweep)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_materialize_and_register_best_sweep_candidate",
+        fake_materialize,
+    )
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_run_instrument_scout",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scout should be skipped")),
+    )
+
+    exit_code = play_hand_mod.cmd_play_hand(**_play_hand_cmd_defaults(seed=3))
+
+    assert exit_code == 0
+    assert "mutated_final_36mo" in eval_calls
+    run_dirs = list(tmp_path.glob("*-playhand-v1"))
+    assert len(run_dirs) == 1
+    metadata = json.loads((run_dirs[0] / "run-metadata.json").read_text(encoding="utf-8"))
+    decision = [
+        item
+        for item in metadata["early_exit_policy"]["decisions"]
+        if item["checkpoint"] == "before_instrument_scout"
+    ][0]
+    assert decision["enforced"] is True
+    assert decision["skip_instrument_scout"] is True
+    assert decision["terminal"] is False
+    assert metadata["instrument_scout"]["status"] == "skipped"
+    assert metadata["instrument_scout"]["reason"] == "early_exit_policy_skip_instrument_scout"
+    assert metadata["run_status"] == "promoted"
+    assert metadata["final_scrutiny_score"] == 60.0
 
 
 def test_cmd_play_hand_coarse_halving_no_expand_skips_expensive_stages(

@@ -842,13 +842,14 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     )
     play_hand.add_argument(
         "--early-exit-mode",
-        choices=["off", "report"],
+        choices=["off", "report", "enforce"],
         default="off",
         help=(
-            "Report-only early-exit diagnostics for PlayHand checkpoints. "
+            "Early-exit diagnostics/enforcement for PlayHand checkpoints. "
             "'report' writes would-exit decisions to run metadata and events "
-            "without changing control flow. Env AUTORESEARCH_EARLY_EXIT_MODE overrides. "
-            "Default: off."
+            "without changing control flow; 'enforce' applies conservative "
+            "loser-stop and scout-skip rules. Env AUTORESEARCH_EARLY_EXIT_MODE "
+            "overrides. Default: off."
         ),
     )
     play_hand.add_argument(
