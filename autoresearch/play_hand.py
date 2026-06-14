@@ -5808,7 +5808,7 @@ def cmd_play_hand(
 
     exact_template_screen: dict[str, Any] | None = None
 
-    lookback_axes = build_timing_axes(profile_payload)
+    lookback_axes: list[str] = []
     should_screen_exact_template = (
         family_policy_mode in {"report", "enforce"}
         and family_policy_name in PLAY_HAND_FAMILY_POLICY_ACTIVE_POLICIES
@@ -5902,7 +5902,9 @@ def cmd_play_hand(
             ),
         )
 
-    lookback_axes = [] if skip_mutation_pipeline else lookback_axes
+    lookback_axes = (
+        [] if skip_mutation_pipeline else build_timing_axes(_load_json(current_profile_path))
+    )
     if skip_mutation_pipeline:
         _append_event(
             ctx,

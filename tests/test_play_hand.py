@@ -1958,6 +1958,7 @@ def test_cmd_play_hand_early_exit_enforce_suppresses_terminal_when_exact_templat
     ):
         if phase != "lookback_timing":
             raise AssertionError(f"{phase} should be the only mutation sweep")
+        assert all("indicator[2]" not in str(axis) for axis in axes)
         return {
             "artifact_dir": str(ctx.evals_dir / phase),
             "axes": list(axes),
@@ -2040,6 +2041,8 @@ def test_cmd_play_hand_early_exit_enforce_suppresses_terminal_when_exact_templat
     exit_code = play_hand_mod.cmd_play_hand(
         **_play_hand_cmd_defaults(
             seed=5,
+            min_indicators=3,
+            max_indicators=3,
             early_exit_mode="enforce",
             family_policy_mode="enforce",
             instrument_scout=True,
