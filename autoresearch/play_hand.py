@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import copy
 import json
 import math
@@ -320,6 +321,7 @@ class PlayHandContext:
     dry_run: bool = False
     job_timeout_seconds: int = PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS
     sweep_timeout_seconds: int = PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS
+    registered_profile_refs: list[str] = field(default_factory=list)
     io_lock: Any = field(default_factory=threading.RLock, repr=False)
 
 
@@ -2510,7 +2512,93 @@ def _register_profile(ctx: PlayHandContext, profile_path: Path) -> str:
     profile_ref = str(data.get("id") or "").strip()
     if not profile_ref:
         raise RuntimeError(f"profiles create did not return an id for {profile_path}")
+    ctx.registered_profile_refs.append(profile_ref)
     return profile_ref
+
+
+def _cleanup_registered_profiles(
+    ctx: PlayHandContext,
+    *,
+    keep_cloud_profiles: bool,
+    reason: str,
+    stage: PlayHandStage | None = None,
+) -> dict[str, Any]:
+    profile_refs = list(
+        dict.fromkeys(
+            profile_ref
+            for profile_ref in ctx.registered_profile_refs
+            if str(profile_ref or "").strip()
+        )
+    )
+    summary: dict[str, Any] = {
+        "status": "skipped",
+        "reason": reason,
+        "keep_cloud_profiles": bool(keep_cloud_profiles),
+        "attempted_count": 0,
+        "deleted_count": 0,
+        "failed_count": 0,
+    }
+    if not profile_refs:
+        summary["skip_reason"] = "no_registered_profiles"
+        return summary
+    if keep_cloud_profiles:
+        summary["skip_reason"] = "keep_cloud_profiles"
+        summary["attempted_count"] = len(profile_refs)
+        _append_event(
+            ctx,
+            "cloud_profile_cleanup",
+            "skipped",
+            stage=stage,
+            reason=summary["skip_reason"],
+            profile_refs=profile_refs,
+        )
+        return summary
+
+    deleted: list[str] = []
+    failures: list[dict[str, Any]] = []
+    for profile_ref in profile_refs:
+        try:
+            result = ctx.cli.run(
+                ["profiles", "delete", "--profile-ref", profile_ref, "--pretty"],
+                check=False,
+            )
+            if result.returncode == 0:
+                deleted.append(profile_ref)
+            else:
+                failures.append(
+                    {
+                        "profile_ref": profile_ref,
+                        "returncode": result.returncode,
+                        "stderr": result.stderr.strip()[:800],
+                        "stdout": result.stdout.strip()[:800],
+                    }
+                )
+        except Exception as exc:
+            failures.append({"profile_ref": profile_ref, "error": str(exc)[:800]})
+
+    summary.update(
+        {
+            "status": "completed" if not failures else "partial",
+            "attempted_count": len(profile_refs),
+            "deleted_count": len(deleted),
+            "failed_count": len(failures),
+            "deleted_profile_refs": deleted,
+        }
+    )
+    if failures:
+        summary["failures"] = failures
+    _append_event(
+        ctx,
+        "cloud_profile_cleanup",
+        summary["status"],
+        stage=stage,
+        reason=reason,
+        attempted_count=summary["attempted_count"],
+        deleted_count=summary["deleted_count"],
+        failed_count=summary["failed_count"],
+        failures=failures[:5],
+    )
+    return summary
 
 
 def _scaffold_profile(
@@ -4194,6 +4282,7 @@ def cmd_play_hand(
     calendar_gate: str | None = None,
     screen_anchor_mode: str | None = None,
     screen_anchor_max_offset_months: int = PLAY_HAND_SCREEN_ANCHOR_DEFAULT_MAX_OFFSET_MONTHS,
+    keep_cloud_profiles: bool = False,
 ) -> int:
     config = load_config()
     cli = FuzzfolioCli(config.fuzzfolio)
@@ -4376,6 +4465,7 @@ def cmd_play_hand(
         "max_sweep_permutations": max_sweep_permutations,
         "calendar_gate_mode": calendar_gate_mode,
         "dry_run": dry_run,
+        "keep_cloud_profiles": keep_cloud_profiles,
     }
     write_run_metadata(run_dir, metadata)
     if screen_as_of_date:
@@ -4408,6 +4498,31 @@ def cmd_play_hand(
         "scrutiny": PlayHandStage(8, stage_total, "Final scrutiny"),
         "artifacts": PlayHandStage(9, stage_total, "Finalize artifacts"),
     }
+    cleanup_state = {"ran": False}
+
+    def _run_play_hand_cloud_cleanup(reason: str = "process_exit") -> dict[str, Any]:
+        if cleanup_state["ran"]:
+            return {
+                "status": "skipped",
+                "reason": reason,
+                "skip_reason": "already_ran",
+                "keep_cloud_profiles": bool(keep_cloud_profiles),
+                "attempted_count": 0,
+                "deleted_count": 0,
+                "failed_count": 0,
+            }
+        cleanup_state["ran"] = True
+        return _cleanup_registered_profiles(
+            ctx,
+            keep_cloud_profiles=keep_cloud_profiles,
+            reason=reason,
+            stage=stages["artifacts"],
+        )
+
+    cleanup_registered_with_atexit = not dry_run and not keep_cloud_profiles
+    if cleanup_registered_with_atexit:
+        atexit.register(_run_play_hand_cloud_cleanup)
+
     _append_event(
         ctx,
         "deal",
@@ -5103,6 +5218,13 @@ def cmd_play_hand(
         }
         _append_event(ctx, "final_artifacts", "skipped", stage=stages["artifacts"], reason="disabled")
 
+    cloud_profile_cleanup = _run_play_hand_cloud_cleanup("completed")
+    if cleanup_registered_with_atexit:
+        try:
+            atexit.unregister(_run_play_hand_cloud_cleanup)
+        except ValueError:
+            pass
+
     summary = {
         "run_id": run_id,
         "run_dir": str(run_dir.resolve()),
@@ -5189,6 +5311,7 @@ def cmd_play_hand(
         "attempts_path": str(ctx.attempts_path.resolve()),
         "phase_rows": phase_rows,
         "final_artifacts": final_artifact_summary,
+        "cloud_profile_cleanup": cloud_profile_cleanup,
     }
     _write_json(ctx.summary_path, summary)
     if as_json:

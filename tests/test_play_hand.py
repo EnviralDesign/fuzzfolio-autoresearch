@@ -1,3 +1,4 @@
+import json
 import random
 import threading
 import time
@@ -11,6 +12,7 @@ import autoresearch.play_hand as play_hand_mod
 from autoresearch.play_hand import (
     PlayHandContext,
     _best_sweep_parameters,
+    _cleanup_registered_profiles,
     _curve_features,
     _finalize_play_hand_attempt_metadata,
     _evaluate_instrument_scout_records,
@@ -572,6 +574,41 @@ def test_cmd_play_hand_authenticates_before_seed_prompt(monkeypatch, tmp_path: P
         )
 
     assert events == ["ensure_login", "seed_hand"]
+
+
+def test_cleanup_registered_profiles_deletes_unique_cloud_refs(tmp_path: Path) -> None:
+    deleted: list[str] = []
+
+    class FakeCli:
+        def run(self, args, *, check=True):
+            assert args[:3] == ["profiles", "delete", "--profile-ref"]
+            deleted.append(args[3])
+            return SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+    ctx = SimpleNamespace(
+        cli=FakeCli(),
+        registered_profile_refs=["prof-a", "prof-b", "prof-a"],
+        run_id="run-1",
+        events_path=tmp_path / "events.jsonl",
+        io_lock=threading.RLock(),
+    )
+
+    summary = _cleanup_registered_profiles(
+        ctx,
+        keep_cloud_profiles=False,
+        reason="completed",
+    )
+
+    assert deleted == ["prof-a", "prof-b"]
+    assert summary["status"] == "completed"
+    assert summary["attempted_count"] == 2
+    assert summary["deleted_count"] == 2
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert events[-1]["phase"] == "cloud_profile_cleanup"
+    assert events[-1]["deleted_count"] == 2
 
 
 def test_play_hand_artifact_commands_heal_full_backtests_and_top_drop() -> None:

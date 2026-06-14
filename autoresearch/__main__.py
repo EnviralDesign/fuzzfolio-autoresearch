@@ -766,6 +766,14 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     play_hand.add_argument(
+        "--keep-cloud-profiles",
+        action="store_true",
+        help=(
+            "Do not delete temporary scoring profiles registered during the play-hand run. "
+            "By default play-hand cleans them up after final artifacts finish."
+        ),
+    )
+    play_hand.add_argument(
         "--final-profile-drop-count",
         type=int,
         default=1,
@@ -14082,6 +14090,7 @@ def main(argv: list[str] | None = None) -> int:
             calendar_gate=args.calendar_gate,
             screen_anchor_mode=args.screen_anchor_mode,
             screen_anchor_max_offset_months=args.screen_anchor_max_offset_months,
+            keep_cloud_profiles=bool(args.keep_cloud_profiles),
         )
     if args.command == "build-indicator-atlas":
         return cmd_build_indicator_atlas(
