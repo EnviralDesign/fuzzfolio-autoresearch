@@ -1932,6 +1932,140 @@ def test_cmd_play_hand_family_policy_template_guarded_enforce_benchmarks_exact(
     }
 
 
+def test_cmd_play_hand_early_exit_enforce_suppresses_terminal_when_exact_template_available(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    eval_calls: list[str] = []
+
+    class FakeCli:
+        pass
+
+    def fake_run_sweep(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_payload,
+        instruments,
+        axes,
+        mode,
+        sweep_budget,
+        max_permutations,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        if phase != "lookback_timing":
+            raise AssertionError(f"{phase} should be the only mutation sweep")
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "axes": list(axes),
+            "result": {
+                "ranked_permutations": [
+                    {"parameters": {"fake": phase}, "fitness_value": 0.0}
+                ],
+                "parameter_importance": [],
+            },
+        }
+
+    def fake_materialize(ctx, *, stage, source_profile_path, sweep_payload, phase):
+        output_path = ctx.profiles_dir / f"{phase}_top.json"
+        output_path.write_text(
+            source_profile_path.read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return output_path, f"dry-{phase}_top", {"fake": phase}
+
+    def fake_evaluate_profile(
+        ctx,
+        *,
+        stage,
+        phase,
+        profile_ref,
+        profile_path,
+        instruments,
+        timeframe,
+        lookback_months,
+        reward_matrix=None,
+        as_of_date=None,
+    ):
+        eval_calls.append(phase)
+        scores = {
+            "baseline_3mo": 0.0,
+            "exact_template_screen_3mo": 65.0,
+            "lookback_timing_top_3mo": 0.0,
+            "mutated_final_36mo": 20.0,
+            "exact_template_36mo": 66.0,
+        }
+        return {
+            "artifact_dir": str(ctx.evals_dir / phase),
+            "attempt_id": f"attempt-{phase}",
+            "score": scores[phase],
+            "profile_ref": profile_ref,
+            "profile_path": str(profile_path),
+        }
+
+    monkeypatch.setattr(
+        play_hand_mod,
+        "load_config",
+        lambda: SimpleNamespace(
+            runs_root=tmp_path,
+            derived_root=tmp_path / "derived",
+            fuzzfolio=SimpleNamespace(),
+        ),
+    )
+    monkeypatch.setattr(play_hand_mod, "FuzzfolioCli", lambda _config: FakeCli())
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_load_play_hand_seed_plan",
+        lambda _config: (_family_policy_seed_plan("template_guarded"), tmp_path / "seed.json"),
+    )
+    monkeypatch.setattr(play_hand_mod, "build_timing_axes", lambda _payload: ["timing=1,2"])
+    monkeypatch.setattr(play_hand_mod, "build_coarse_axes", lambda _payload: [])
+    monkeypatch.setattr(play_hand_mod, "build_focused_axes", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(play_hand_mod, "_run_sweep", fake_run_sweep)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_materialize_and_register_best_sweep_candidate",
+        fake_materialize,
+    )
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+    monkeypatch.setattr(
+        play_hand_mod,
+        "_run_instrument_scout",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scout should be skipped")),
+    )
+
+    exit_code = play_hand_mod.cmd_play_hand(
+        **_play_hand_cmd_defaults(
+            seed=5,
+            early_exit_mode="enforce",
+            family_policy_mode="enforce",
+            instrument_scout=True,
+        )
+    )
+
+    assert exit_code == 0
+    assert "exact_template_36mo" in eval_calls
+    run_dirs = list(tmp_path.glob("*-playhand-v1"))
+    assert len(run_dirs) == 1
+    metadata = json.loads((run_dirs[0] / "run-metadata.json").read_text(encoding="utf-8"))
+    decisions = {
+        item["checkpoint"]: item
+        for item in metadata["early_exit_policy"]["decisions"]
+    }
+    assert decisions["after_baseline"]["enforcement_suppressed"] is True
+    assert decisions["after_baseline"]["enforced"] is False
+    assert decisions["after_baseline"]["terminal"] is False
+    assert decisions["after_lookback_top"]["enforcement_suppressed"] is True
+    assert decisions["after_lookback_top"]["enforced"] is False
+    assert decisions["after_lookback_top"]["terminal"] is False
+    assert metadata["run_status"] == "promoted"
+    assert metadata["selected_final_branch"] == "exact_template"
+    assert metadata["exact_template_score"] == 66.0
+
+
 def test_cmd_play_hand_family_policy_report_keeps_mutation_flow(
     monkeypatch,
     tmp_path: Path,

@@ -5145,6 +5145,28 @@ def cmd_play_hand(
             evidence=evidence,
             mode=early_exit_mode,
         )
+        exact_template_available = bool(
+            family_policy_name in PLAY_HAND_FAMILY_POLICY_ACTIVE_POLICIES
+            and exact_template_profile_path is not None
+            and exact_template_profile_ref
+        )
+        if early_exit_mode == "enforce" and decision.get("terminal") and exact_template_available:
+            decision = dict(decision)
+            reasons = list(decision.get("reasons") or [])
+            reasons.append("enforcement_suppressed:exact_template_branch_available")
+            decision.update(
+                {
+                    "enforced": False,
+                    "terminal": False,
+                    "enforce_action": "continue",
+                    "skip_instrument_scout": False,
+                    "enforcement_suppressed": True,
+                    "suppression_reason": "exact_template_branch_available",
+                    "enforce_reasons": [],
+                    "skipped_stages": [],
+                    "reasons": reasons,
+                }
+            )
         policy = metadata.setdefault(
             "early_exit_policy",
             {
