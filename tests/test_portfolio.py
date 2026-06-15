@@ -1474,6 +1474,31 @@ def test_build_parser_includes_finalize_corpus_defaults() -> None:
     assert args.dry_run is False
     assert args.run_id is None
     assert args.attempt_id is None
+    play_args = parser.parse_args(["play-hand"])
+    assert play_args.early_exit_mode == "off"
+    assert play_args.coarse_halving_mode == "off"
+    assert play_args.coarse_probe_budget == 128
+    assert play_args.family_policy_mode == "off"
+    assert play_args.resource_trace is False
+    enforced_args = parser.parse_args(
+        [
+            "play-hand",
+            "--early-exit-mode",
+            "enforce",
+            "--coarse-halving-mode",
+            "enforce",
+            "--coarse-probe-budget",
+            "64",
+            "--family-policy-mode",
+            "enforce",
+            "--resource-trace",
+        ]
+    )
+    assert enforced_args.early_exit_mode == "enforce"
+    assert enforced_args.coarse_halving_mode == "enforce"
+    assert enforced_args.coarse_probe_budget == 64
+    assert enforced_args.family_policy_mode == "enforce"
+    assert enforced_args.resource_trace is True
 
 
 def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(
@@ -1650,6 +1675,97 @@ def test_cmd_finalize_corpus_skips_tombstoned_runs(
     assert payload["selected_count"] == 1
     assert payload["selection"]["tombstoned_run_count"] == 1
     assert payload["selection"]["tombstoned_dropped_count"] == 2
+
+
+def test_cmd_finalize_corpus_heals_selected_playhand_run_health(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    runs_root = tmp_path / "runs"
+    run_dir = runs_root / "playhand-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run-metadata.json").write_text(
+        json.dumps(
+            {
+                "run_id": "playhand-run",
+                "runner": "play_hand_v1",
+                "canonical_attempt_id": "playhand-run-attempt-00002",
+                "final_attempt_id": "playhand-run-attempt-00002",
+                "final_scrutiny_score": 61.0,
+                "final_scrutiny_passed": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "attempts.jsonl").write_text(
+        json.dumps(
+            {
+                "attempt_id": "playhand-run-attempt-00002",
+                "run_id": "playhand-run",
+                "runner": "play_hand_v1",
+                "candidate_name": "final_36mo",
+                "is_canonical_playhand_attempt": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=runs_root,
+        fuzzfolio=SimpleNamespace(),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+    rows = [
+        {
+            "run_id": "playhand-run",
+            "attempt_id": "playhand-run-attempt-00002",
+            "runner": "play_hand_v1",
+            "score_36m": 61.0,
+            "composite_score": 61.0,
+            "canonical_attempt_id": "playhand-run-attempt-00002",
+            "is_canonical_playhand_attempt": True,
+        }
+    ]
+    monkeypatch.setattr(
+        ar_main,
+        "_selection_corpus_rows",
+        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "cmd_render_corpus_profile_drops",
+        lambda **_kwargs: print("{}") or 0,
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_refresh_global_derived_corpus_state",
+        lambda _config: {"attempt_count": len(rows)},
+    )
+
+    exit_code = ar_main.cmd_finalize_corpus(
+        run_ids=None,
+        attempt_ids=None,
+        scope="dashboard",
+        lookback_months=36,
+        profile_drop_workers=2,
+        profile_drop_timeout_seconds=90,
+        force_rebuild=False,
+        require_presentation_metadata=True,
+        dry_run=False,
+        as_json=True,
+        full_backtest_workers=None,
+    )
+
+    assert exit_code == 0
+    metadata = json.loads((run_dir / "run-metadata.json").read_text(encoding="utf-8"))
+    assert metadata["play_hand_health"]["version"] == "play_hand_health_v1"
+    assert metadata["play_hand_health"]["status"] in {
+        "canonical_retained",
+        "missing_artifacts",
+    }
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["play_hand_health"]["selected_play_hand_runs"] == 1
+    assert payload["play_hand_health"]["updated"] == 1
 
 
 def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(

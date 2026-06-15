@@ -107,6 +107,12 @@ if __package__ in {None, ""}:
         DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME,
         build_playhand_outcome_priors,
     )
+    from autoresearch.playhand_efficiency import (
+        DEFAULT_PLAYHAND_EFFICIENCY_DIRNAME,
+        build_playhand_efficiency_report,
+        write_playhand_efficiency_report,
+    )
+    from autoresearch.playhand_health import heal_play_hand_run_metadata
     from autoresearch.discovery_pair_atlas import (
         DEFAULT_DISCOVERY_PAIR_DIRNAME,
         DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS,
@@ -235,8 +241,10 @@ if __package__ in {None, ""}:
         build_signal_atlas,
     )
     from autoresearch.play_hand import (
+        PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
         PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
         PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
+        PLAY_HAND_RESOURCE_TRACE_ENV,
         cmd_play_hand,
     )
     from autoresearch.typed_tools import CLI_OK_TOOLS
@@ -304,6 +312,12 @@ else:
         DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME,
         build_playhand_outcome_priors,
     )
+    from .playhand_efficiency import (
+        DEFAULT_PLAYHAND_EFFICIENCY_DIRNAME,
+        build_playhand_efficiency_report,
+        write_playhand_efficiency_report,
+    )
+    from .playhand_health import heal_play_hand_run_metadata
     from .discovery_pair_atlas import (
         DEFAULT_DISCOVERY_PAIR_DIRNAME,
         DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS,
@@ -432,8 +446,10 @@ else:
         build_signal_atlas,
     )
     from .play_hand import (
+        PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
         PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
         PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
+        PLAY_HAND_RESOURCE_TRACE_ENV,
         cmd_play_hand,
     )
     from .typed_tools import CLI_OK_TOOLS
@@ -514,6 +530,7 @@ PUBLIC_CLI_COMMANDS = {
     "build-anchor-pair-timing-atlas",
     "run-anchor-pair-timing-probes",
     "build-playhand-outcome-priors",
+    "playhand-efficiency-report",
     "build-recipe-priors",
     "build-discovery-pair-atlas",
     "run-discovery-pair-probes",
@@ -834,6 +851,56 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
             "Maximum months in the past the random screen anchor may land. "
             "Clamped so the anchored screen window stays inside the rolling "
             "market-data lake. Default: 24."
+        ),
+    )
+    play_hand.add_argument(
+        "--early-exit-mode",
+        choices=["off", "report", "enforce"],
+        default="off",
+        help=(
+            "Early-exit diagnostics/enforcement for PlayHand checkpoints. "
+            "'report' writes would-exit decisions to run metadata and events "
+            "without changing control flow; 'enforce' applies conservative "
+            "loser-stop and scout-skip rules. Env AUTORESEARCH_EARLY_EXIT_MODE "
+            "overrides. Default: off."
+        ),
+    )
+    play_hand.add_argument(
+        "--coarse-halving-mode",
+        choices=["off", "enforce"],
+        default="off",
+        help=(
+            "Conservative PlayHand coarse-stage successive halving. "
+            "'enforce' probes evolutionary coarse search first and skips expansion, "
+            "focused refinement, and instrument scout when the probe is weak. Default: off."
+        ),
+    )
+    play_hand.add_argument(
+        "--coarse-probe-budget",
+        type=int,
+        default=PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
+        help=(
+            "Evolutionary evaluation budget for the coarse halving probe. "
+            f"Default: {PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET}."
+        ),
+    )
+    play_hand.add_argument(
+        "--family-policy-mode",
+        choices=["off", "report", "enforce"],
+        default="off",
+        help=(
+            "Opt-in PlayHand family-policy execution. 'report' records exact-template "
+            "first decisions without changing mutation flow; 'enforce' makes "
+            "template-locked families exact-only and uses template-guarded exact "
+            "screens as mutation benchmarks. Default: off."
+        ),
+    )
+    play_hand.add_argument(
+        "--resource-trace",
+        action="store_true",
+        help=(
+            "Write opt-in PlayHand resource-utilization spans and summary rollups. "
+            f"Env {PLAY_HAND_RESOURCE_TRACE_ENV} can also enable or disable it."
         ),
     )
     play_hand.add_argument(
@@ -1399,6 +1466,40 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--json",
         action="store_true",
         help="Print machine-readable JSON summary.",
+    )
+
+    efficiency_report = subparsers.add_parser(
+        "playhand-efficiency-report",
+        help="Summarize PlayHand compute-saving mechanisms across recent runs.",
+    )
+    efficiency_report.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only include the named PlayHand run id. Can be repeated.",
+    )
+    efficiency_report.add_argument(
+        "--limit",
+        type=int,
+        default=200,
+        help="Maximum recent PlayHand runs to include. Default: 200.",
+    )
+    efficiency_report.add_argument(
+        "--all-runs",
+        action="store_true",
+        help="Analyze all PlayHand runs instead of the recent --limit window.",
+    )
+    efficiency_report.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for JSON/Markdown/CSV artifacts. "
+            f"Default: runs/derived/{DEFAULT_PLAYHAND_EFFICIENCY_DIRNAME}."
+        ),
+    )
+    efficiency_report.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
     )
 
     discovery_pair_atlas = subparsers.add_parser(
@@ -12597,10 +12698,56 @@ def cmd_finalize_corpus(
             as_json=False,
         )
 
+    play_hand_health_results: list[dict[str, Any]] = []
+    play_hand_run_ids = sorted(
+        {
+            str(row.get("run_id") or "").strip()
+            for row in selected_rows
+            if str(row.get("run_id") or "").strip()
+            and (
+                str(row.get("runner") or "").strip() == "play_hand_v1"
+                or bool(row.get("is_canonical_playhand_attempt"))
+                or (
+                    bool(row.get("canonical_attempt_id"))
+                    and "playhand" in str(row.get("run_id") or "").lower()
+                )
+            )
+        }
+    )
+    for run_id in play_hand_run_ids:
+        run_dir = config.runs_root / run_id
+        if not run_dir.exists():
+            play_hand_health_results.append(
+                {
+                    "run_id": run_id,
+                    "updated": False,
+                    "error": "run_dir_missing",
+                }
+            )
+            continue
+        try:
+            play_hand_health_results.append(
+                heal_play_hand_run_metadata(run_dir, force=bool(force_rebuild))
+            )
+        except Exception as exc:
+            play_hand_health_results.append(
+                {
+                    "run_id": run_id,
+                    "updated": False,
+                    "error": str(exc),
+                }
+            )
+
     refresh_summary = _refresh_global_derived_corpus_state(config)
     summary["status"] = "complete" if render_exit_code == 0 else "partial_failure"
     summary["render_exit_code"] = render_exit_code
     summary["render_summary"] = render_summary
+    summary["play_hand_health"] = {
+        "selected_play_hand_runs": len(play_hand_run_ids),
+        "updated": sum(1 for item in play_hand_health_results if item.get("updated")),
+        "errors": [item for item in play_hand_health_results if item.get("error")],
+        "results": play_hand_health_results,
+    }
     summary["refresh_summary"] = refresh_summary
     if as_json:
         print(json.dumps(summary, ensure_ascii=True, indent=2))
@@ -13441,6 +13588,86 @@ def cmd_build_playhand_outcome_priors(
     return 0
 
 
+def cmd_build_playhand_efficiency_report(
+    *,
+    run_ids: list[str] | None,
+    limit: int,
+    all_runs: bool,
+    output_dir: Path | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    resolved_limit = None if all_runs else max(0, int(limit))
+    report = build_playhand_efficiency_report(
+        config.runs_root,
+        limit=resolved_limit,
+        run_ids=run_ids,
+    )
+    target_dir = output_dir or config.derived_root / DEFAULT_PLAYHAND_EFFICIENCY_DIRNAME
+    paths = write_playhand_efficiency_report(report, target_dir)
+    payload = {
+        **paths,
+        "summary": report.get("summary", {}),
+    }
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
+
+    summary = report.get("summary", {})
+    coarse = summary.get("coarse_halving", {})
+    early = summary.get("early_exit", {})
+    family = summary.get("family_policy", {})
+    saved = early.get("estimated_saved", {}) if isinstance(early, dict) else {}
+    table = Table(title="PlayHand Efficiency Report", box=box.SIMPLE_HEAVY)
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    table.add_row("Runs analyzed", str(summary.get("run_count", 0)))
+    table.add_row("Completed runs", str(summary.get("completed_count", 0)))
+    table.add_row(
+        "Coarse saved evals",
+        str(coarse.get("total_estimated_saved_evaluations", 0)),
+    )
+    table.add_row(
+        "Coarse skipped expansions",
+        str(coarse.get("skipped_expansion_runs", 0)),
+    )
+    table.add_row(
+        "Early terminal tombstones",
+        str(early.get("enforced_terminal_tombstones", 0)),
+    )
+    table.add_row(
+        "Early scout skips",
+        str(early.get("enforced_scout_skips", 0)),
+    )
+    table.add_row(
+        "Early coarse perms avoided",
+        str(saved.get("coarse_permutations_avoided", 0)),
+    )
+    table.add_row(
+        "Deep replay jobs avoided",
+        str(saved.get("deep_replay_jobs_avoided", 0)),
+    )
+    table.add_row(
+        "Family exact-only skips",
+        str(family.get("exact_only_skip_runs", 0)),
+    )
+    console.print(table)
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Report JSON: {paths['playhand_efficiency_report_json']}",
+                    f"Report Markdown: {paths['playhand_efficiency_report_markdown']}",
+                    f"Run CSV: {paths['playhand_efficiency_runs_csv']}",
+                ]
+            ),
+            title="PlayHand Efficiency Artifacts",
+            border_style="green",
+        )
+    )
+    return 0
+
+
 def cmd_build_discovery_pair_atlas(
     *,
     indicator_atlas_dir: Path | None,
@@ -14089,8 +14316,13 @@ def main(argv: list[str] | None = None) -> int:
             as_json=bool(args.json),
             calendar_gate=args.calendar_gate,
             screen_anchor_mode=args.screen_anchor_mode,
+            early_exit_mode=args.early_exit_mode,
+            coarse_halving_mode=args.coarse_halving_mode,
+            family_policy_mode=args.family_policy_mode,
+            coarse_probe_budget=args.coarse_probe_budget,
             screen_anchor_max_offset_months=args.screen_anchor_max_offset_months,
             keep_cloud_profiles=bool(args.keep_cloud_profiles),
+            resource_trace=bool(args.resource_trace),
         )
     if args.command == "build-indicator-atlas":
         return cmd_build_indicator_atlas(
@@ -14202,6 +14434,14 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_build_playhand_outcome_priors(
             report_dirs=args.report_dir,
             out_dir=args.out_dir,
+            as_json=bool(args.json),
+        )
+    if args.command == "playhand-efficiency-report":
+        return cmd_build_playhand_efficiency_report(
+            run_ids=args.run_id,
+            limit=args.limit,
+            all_runs=bool(args.all_runs),
+            output_dir=args.output_dir,
             as_json=bool(args.json),
         )
     if args.command == "build-discovery-pair-atlas":
