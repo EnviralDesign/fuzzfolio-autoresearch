@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import copy
+import inspect
 import json
 import math
 import os
@@ -3209,6 +3210,104 @@ def _final_scrutiny_outcome(scrutiny: dict[str, Any]) -> dict[str, Any]:
         "reason": None,
         "reasons": [],
     }
+
+
+def _evaluate_profile_trace_kwargs(
+    *,
+    resource_trace_role: str,
+    resource_trace_parent_span_id: int | None,
+) -> dict[str, Any]:
+    try:
+        parameters = inspect.signature(_evaluate_profile).parameters
+    except (TypeError, ValueError):
+        return {
+            "resource_trace_role": resource_trace_role,
+            "resource_trace_parent_span_id": resource_trace_parent_span_id,
+        }
+    if "resource_trace_role" not in parameters:
+        return {}
+    return {
+        "resource_trace_role": resource_trace_role,
+        "resource_trace_parent_span_id": resource_trace_parent_span_id,
+    }
+
+
+def _evaluate_final_scrutiny_branch_candidates(
+    ctx: PlayHandContext,
+    *,
+    stage: PlayHandStage,
+    branch_specs: list[dict[str, Any]],
+    scrutiny_months: int,
+    reward_matrix: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    branch_count = len(branch_specs)
+    if branch_count <= 0:
+        return []
+
+    def evaluate_branch(
+        spec: dict[str, Any],
+        *,
+        parent_span_id: int | None = None,
+    ) -> dict[str, Any]:
+        trace_kwargs = _evaluate_profile_trace_kwargs(
+            resource_trace_role="parallel_worker" if branch_count > 1 else "critical_path",
+            resource_trace_parent_span_id=parent_span_id,
+        )
+        scrutiny = _evaluate_profile(
+            ctx,
+            stage=stage,
+            phase=str(spec["phase"]),
+            profile_ref=str(spec["profile_ref"]),
+            profile_path=Path(spec["profile_path"]),
+            instruments=list(spec["instruments"]),
+            timeframe=str(spec["timeframe"]),
+            lookback_months=scrutiny_months,
+            reward_matrix=reward_matrix,
+            **trace_kwargs,
+        )
+        return {
+            "branch": str(spec["branch"]),
+            "phase": str(spec["phase"]),
+            "scrutiny": scrutiny,
+            "outcome": _final_scrutiny_outcome(scrutiny),
+            "attempt_id": str(scrutiny.get("attempt_id") or "").strip(),
+            "profile_ref": str(spec["profile_ref"]),
+            "profile_path": Path(spec["profile_path"]),
+            "instruments": list(spec["instruments"]),
+            "timeframe": str(spec["timeframe"]),
+        }
+
+    with _resource_span(
+        ctx,
+        phase="final_scrutiny",
+        operation="final_scrutiny_evaluate_branches",
+        execution_kind="local_parallel" if branch_count > 1 else "single_sync",
+        parallel_capability="local_threads" if branch_count > 1 else "none",
+        stage=stage,
+        branch_count=branch_count,
+        worker_count=branch_count,
+        branches=[str(spec.get("branch") or "") for spec in branch_specs],
+        lookback_months=int(scrutiny_months),
+    ) as trace_span:
+        if branch_count == 1:
+            return [evaluate_branch(branch_specs[0], parent_span_id=trace_span.span_id)]
+
+        ordered: list[dict[str, Any] | None] = [None] * branch_count
+        with ThreadPoolExecutor(
+            max_workers=branch_count,
+            thread_name_prefix="playhand-final",
+        ) as executor:
+            futures = {
+                executor.submit(
+                    evaluate_branch,
+                    spec,
+                    parent_span_id=trace_span.span_id,
+                ): index
+                for index, spec in enumerate(branch_specs)
+            }
+            for future in as_completed(futures):
+                ordered[futures[future]] = future.result()
+        return [item for item in ordered if item is not None]
 
 
 def _resolve_calendar_gate_mode(cli_value: str | None) -> str:
@@ -6949,6 +7048,7 @@ def cmd_play_hand(
         "reasons": ["family_policy_template_locked_exact_only"],
     }
     final_branch_candidates: list[dict[str, Any]] = []
+    final_branch_specs: list[dict[str, Any]] = []
     if skip_mutation_pipeline:
         _append_event(
             ctx,
@@ -6966,57 +7066,45 @@ def cmd_play_hand(
             }
         )
     else:
-        mutated_scrutiny = _evaluate_profile(
-            ctx,
-            stage=stages["scrutiny"],
-            phase="mutated_final_36mo",
-            profile_ref=current_profile_ref,
-            profile_path=current_profile_path,
-            instruments=instruments,
-            timeframe=current_evaluation_timeframe,
-            lookback_months=scrutiny_months,
-            reward_matrix=reward_matrix,
-        )
-        mutated_outcome = _final_scrutiny_outcome(mutated_scrutiny)
-        final_branch_candidates.append(
+        final_branch_specs.append(
             {
-            "branch": "mutated",
-            "phase": "mutated_final_36mo",
-            "scrutiny": mutated_scrutiny,
-            "outcome": mutated_outcome,
-            "attempt_id": str(mutated_scrutiny.get("attempt_id") or "").strip(),
-            "profile_ref": current_profile_ref,
-            "profile_path": current_profile_path,
-            "instruments": list(instruments),
-            "timeframe": current_evaluation_timeframe,
+                "branch": "mutated",
+                "phase": "mutated_final_36mo",
+                "profile_ref": current_profile_ref,
+                "profile_path": current_profile_path,
+                "instruments": list(instruments),
+                "timeframe": current_evaluation_timeframe,
             }
         )
     if exact_template_profile_path is not None and exact_template_profile_ref:
-        exact_template_scrutiny = _evaluate_profile(
-            ctx,
-            stage=stages["scrutiny"],
-            phase="exact_template_36mo",
-            profile_ref=exact_template_profile_ref,
-            profile_path=exact_template_profile_path,
-            instruments=template_branch_instruments,
-            timeframe=exact_template_timeframe or evaluation_timeframe,
-            lookback_months=scrutiny_months,
-            reward_matrix=reward_matrix,
-        )
-        exact_template_outcome = _final_scrutiny_outcome(exact_template_scrutiny)
-        final_branch_candidates.append(
+        final_branch_specs.append(
             {
                 "branch": "exact_template",
                 "phase": "exact_template_36mo",
-                "scrutiny": exact_template_scrutiny,
-                "outcome": exact_template_outcome,
-                "attempt_id": str(exact_template_scrutiny.get("attempt_id") or "").strip(),
                 "profile_ref": exact_template_profile_ref,
                 "profile_path": exact_template_profile_path,
                 "instruments": list(template_branch_instruments),
                 "timeframe": exact_template_timeframe or evaluation_timeframe,
             }
         )
+    final_branch_candidates.extend(
+        _evaluate_final_scrutiny_branch_candidates(
+            ctx,
+            stage=stages["scrutiny"],
+            branch_specs=final_branch_specs,
+            scrutiny_months=scrutiny_months,
+            reward_matrix=reward_matrix,
+        )
+    )
+    for branch in final_branch_candidates:
+        if str(branch.get("branch") or "") == "mutated":
+            candidate_scrutiny = branch.get("scrutiny")
+            if isinstance(candidate_scrutiny, dict):
+                mutated_scrutiny = candidate_scrutiny
+            candidate_outcome = branch.get("outcome")
+            if isinstance(candidate_outcome, dict):
+                mutated_outcome = candidate_outcome
+            break
     if not final_branch_candidates:
         raise RuntimeError("PlayHand final scrutiny has no branch candidates")
     if calendar_gate_mode != "off":

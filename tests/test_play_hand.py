@@ -18,6 +18,7 @@ from autoresearch.play_hand import (
     _curve_features,
     _finalize_play_hand_attempt_metadata,
     _evaluate_instrument_scout_records,
+    _evaluate_final_scrutiny_branch_candidates,
     _instrument_curve_similarity,
     _instrument_scout_worker_count,
     _json_payload_from_stdout,
@@ -2672,6 +2673,109 @@ def test_evaluate_instrument_scout_records_parallelizes_evaluations(
         "USDJPY",
         "AUDUSD",
     ]
+
+
+def test_evaluate_final_scrutiny_branch_candidates_parallelizes_and_preserves_order(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    active = 0
+    max_active = 0
+    trace_roles: list[tuple[str, str, int | None]] = []
+    lock = threading.Lock()
+
+    def fake_evaluate_profile(
+        *_args,
+        phase,
+        profile_ref,
+        profile_path,
+        instruments,
+        timeframe,
+        lookback_months,
+        reward_matrix=None,
+        as_of_date=None,
+        resource_trace_role="critical_path",
+        resource_trace_parent_span_id=None,
+        **_kwargs,
+    ):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.05)
+            trace_roles.append((phase, resource_trace_role, resource_trace_parent_span_id))
+            return {
+                "artifact_dir": str(tmp_path / phase),
+                "attempt_id": f"attempt-{phase}",
+                "score": 60.0 if phase == "mutated_final_36mo" else 66.0,
+                "profile_ref": profile_ref,
+                "profile_path": str(profile_path),
+                "instruments": list(instruments),
+                "timeframe": timeframe,
+                "lookback_months": lookback_months,
+                "reward_matrix": reward_matrix,
+                "as_of_date": as_of_date,
+            }
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(play_hand_mod, "_evaluate_profile", fake_evaluate_profile)
+
+    ctx = PlayHandContext(
+        config=None,
+        cli=None,
+        run_id="run-1",
+        run_dir=tmp_path,
+        profiles_dir=tmp_path / "profiles",
+        evals_dir=tmp_path / "evals",
+        attempts_path=tmp_path / "attempts.jsonl",
+        events_path=tmp_path / "events.jsonl",
+        summary_path=tmp_path / "summary.json",
+        resource_trace_enabled=True,
+        resource_trace_path=tmp_path / "trace.jsonl",
+        resource_trace_started_at="2026-06-15T00:00:00+00:00",
+        resource_trace_base_perf=time.perf_counter(),
+    )
+
+    candidates = _evaluate_final_scrutiny_branch_candidates(
+        ctx,
+        stage=play_hand_mod.PlayHandStage(8, 9, "Final scrutiny"),
+        branch_specs=[
+            {
+                "branch": "mutated",
+                "phase": "mutated_final_36mo",
+                "profile_ref": "mutated-ref",
+                "profile_path": tmp_path / "mutated.json",
+                "instruments": ["EURUSD"],
+                "timeframe": "M15",
+            },
+            {
+                "branch": "exact_template",
+                "phase": "exact_template_36mo",
+                "profile_ref": "exact-ref",
+                "profile_path": tmp_path / "exact.json",
+                "instruments": ["EURUSD", "GBPUSD"],
+                "timeframe": "M15",
+            },
+        ],
+        scrutiny_months=36,
+        reward_matrix=None,
+    )
+
+    assert max_active > 1
+    assert [candidate["branch"] for candidate in candidates] == [
+        "mutated",
+        "exact_template",
+    ]
+    assert [candidate["outcome"]["score"] for candidate in candidates] == [60.0, 66.0]
+    assert {phase for phase, role, _parent in trace_roles} == {
+        "mutated_final_36mo",
+        "exact_template_36mo",
+    }
+    assert {role for _phase, role, _parent in trace_roles} == {"parallel_worker"}
+    assert all(parent is not None for _phase, _role, parent in trace_roles)
 
 
 def test_json_payload_from_stdout_accepts_trailing_json_payload() -> None:
