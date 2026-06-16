@@ -95,7 +95,7 @@ def test_cleanup_incomplete_playhand_runs_dry_run_matches_only_in_progress_runs(
     exit_code = ar_main.cmd_cleanup_incomplete_playhand_runs(
         run_ids=None,
         older_than_minutes=None,
-        execute=False,
+        dry_run=True,
         preview=20,
         as_json=True,
     )
@@ -127,7 +127,7 @@ def test_cleanup_incomplete_playhand_runs_executes_with_age_filter_and_run_id_ta
                 "runner": "play_hand_v1",
             }
         ],
-        last_modified_seconds_ago=120,
+        last_modified_seconds_ago=180,
     )
     _build_run(
         runs_root,
@@ -152,7 +152,7 @@ def test_cleanup_incomplete_playhand_runs_executes_with_age_filter_and_run_id_ta
     exit_code = ar_main.cmd_cleanup_incomplete_playhand_runs(
         run_ids=["run-old", "run-fresh"],
         older_than_minutes=2.0,
-        execute=False,
+        dry_run=True,
         preview=20,
         as_json=True,
     )
@@ -165,7 +165,7 @@ def test_cleanup_incomplete_playhand_runs_executes_with_age_filter_and_run_id_ta
     exit_code = ar_main.cmd_cleanup_incomplete_playhand_runs(
         run_ids=["run-old", "run-fresh"],
         older_than_minutes=2.0,
-        execute=True,
+        dry_run=False,
         preview=20,
         as_json=True,
     )
@@ -196,7 +196,7 @@ def test_cleanup_incomplete_playhand_runs_rejects_unknown_run_ids(
         ar_main.cmd_cleanup_incomplete_playhand_runs(
             run_ids=["definitely-missing"],
             older_than_minutes=None,
-            execute=False,
+            dry_run=True,
             preview=20,
             as_json=True,
         )

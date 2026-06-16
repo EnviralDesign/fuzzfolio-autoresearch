@@ -107,11 +107,11 @@ def test_direct_script_invocation_infers_public_command() -> None:
         ["--json"], invoked_as="playhand-efficiency-report"
     ) == ["playhand-efficiency-report", "--json"]
     assert _argv_for_invocation(
-        ["--yes", "--json", "run-a", "run-b"],
+        ["--dry-run", "--json", "run-a", "run-b"],
         invoked_as="cleanup-incomplete-playhand-runs",
     ) == [
         "cleanup-incomplete-playhand-runs",
-        "--yes",
+        "--dry-run",
         "--json",
         "run-a",
         "run-b",

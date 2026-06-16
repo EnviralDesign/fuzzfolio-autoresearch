@@ -2357,11 +2357,10 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     cleanup_cmd.add_argument(
-        "--yes",
+        "--dry-run",
         action="store_true",
         help=(
-            "Actually delete the matched run directories. Without this flag the command "
-            "performs a dry run and only reports what it would delete."
+            "Preview matched runs without deleting run directories."
         ),
     )
     cleanup_cmd.add_argument(
@@ -4018,7 +4017,7 @@ def cmd_cleanup_incomplete_playhand_runs(
     *,
     run_ids: list[str] | None,
     older_than_minutes: float | None,
-    execute: bool,
+    dry_run: bool,
     preview: int,
     as_json: bool,
 ) -> int:
@@ -4085,13 +4084,14 @@ def cmd_cleanup_incomplete_playhand_runs(
         "run_ids_filter": run_ids or [],
         "total_runs": len(target_runs),
         "matched_runs": len(matched),
-        "dry_run": not execute,
+        "dry_run": dry_run,
         "preview": inspected,
     }
 
-    if not execute:
+    if dry_run:
         payload["message"] = (
-            "Dry run only. Re-run with --yes to delete the matched incomplete PlayHand runs."
+            "Dry run only. Re-run without --dry-run to delete the matched incomplete "
+            "PlayHand runs."
         )
         if as_json:
             print(json.dumps(payload, ensure_ascii=True, indent=2))
@@ -15183,7 +15183,7 @@ def main(argv: list[str] | None = None) -> int:
                 if args.older_than_minutes is not None
                 else None
             ),
-            execute=bool(args.yes),
+            dry_run=bool(args.dry_run),
             preview=int(args.preview),
             as_json=bool(args.json),
         )
