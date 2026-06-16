@@ -558,6 +558,7 @@ PUBLIC_CLI_COMMANDS = {
     "export-portfolio-bundle",
     "build-portfolio-risk-sizing",
     "render-portfolio-profile-drops",
+    "cleanup-incomplete-playhand-runs",
     "dashboard",
     "record-attempt",
     "nuke-deep-caches",
@@ -2331,6 +2332,47 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     prune_runs.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
+    cleanup_cmd = subparsers.add_parser(
+        "cleanup-incomplete-playhand-runs",
+        help=(
+            "Delete in-progress PlayHand runs that were interrupted or crashed before "
+            "finalization."
+        ),
+    )
+    cleanup_cmd.add_argument(
+        "run_id",
+        nargs="*",
+        help=(
+            "Optional run IDs to target. When omitted, all incomplete PlayHand runs are "
+            "considered."
+        ),
+    )
+    cleanup_cmd.add_argument(
+        "--older-than-minutes",
+        type=float,
+        default=None,
+        help=(
+            "Only delete runs with no file updates in at least this many minutes. "
+            "Useful to avoid touching very recent work."
+        ),
+    )
+    cleanup_cmd.add_argument(
+        "--yes",
+        action="store_true",
+        help=(
+            "Actually delete the matched run directories. Without this flag the command "
+            "performs a dry run and only reports what it would delete."
+        ),
+    )
+    cleanup_cmd.add_argument(
+        "--preview",
+        type=int,
+        default=20,
+        help="How many matched runs to include in the preview output.",
+    )
+    cleanup_cmd.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
     stop_all = subparsers.add_parser(
         "stop-all-runs",
         help="Clear local queued Fuzzfolio research work and optionally stop local autoresearch processes.",
@@ -3914,6 +3956,142 @@ def cmd_prune_runs(
     if not execute:
         payload["message"] = (
             "Dry run only. Re-run with --yes to delete the matched low-signal runs."
+        )
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0
+        _print_json_payload(payload)
+        return 0
+
+    deleted: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for item in matched:
+        run_dir = Path(str(item["run_dir"]))
+        try:
+            shutil.rmtree(run_dir)
+            deleted.append(item)
+        except OSError as exc:
+            blocked.append(
+                {
+                    "run_id": item["run_id"],
+                    "run_dir": item["run_dir"],
+                    "error": str(exc),
+                }
+            )
+
+    payload["deleted_runs"] = len(deleted)
+    payload["blocked_runs"] = len(blocked)
+    payload["deleted_preview"] = deleted[: max(0, preview)]
+    if blocked:
+        payload["blocked_preview"] = blocked[: max(0, preview)]
+
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0 if not blocked else 1
+    _print_json_payload(payload)
+    return 0 if not blocked else 1
+
+
+def _is_run_dir_stale(
+    run_dir: Path,
+    *,
+    older_than_minutes: float | None,
+    now: datetime,
+) -> bool:
+    if older_than_minutes is None:
+        return True
+    if older_than_minutes <= 0:
+        return True
+    try:
+        mtime = datetime.fromtimestamp(
+            run_dir.stat().st_mtime, tz=timezone.utc
+        )
+    except OSError:
+        return True
+    age = now - mtime
+    if age.total_seconds() < 0:
+        return True
+    return age.total_seconds() >= (older_than_minutes * 60.0)
+
+
+def cmd_cleanup_incomplete_playhand_runs(
+    *,
+    run_ids: list[str] | None,
+    older_than_minutes: float | None,
+    execute: bool,
+    preview: int,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    target_runs = _matching_run_dirs(config, run_ids)
+    now = datetime.now(timezone.utc)
+    matched: list[dict[str, Any]] = []
+    inspected: list[dict[str, Any]] = []
+
+    for run_dir in target_runs:
+        try:
+            try:
+                last_modified_at = datetime.fromtimestamp(
+                    run_dir.stat().st_mtime, tz=timezone.utc
+                )
+            except OSError:
+                last_modified_at = datetime.now(timezone.utc)
+
+            if not _is_run_dir_stale(
+                run_dir,
+                older_than_minutes=older_than_minutes,
+                now=now,
+            ):
+                continue
+
+            health_result = heal_play_hand_run_metadata(run_dir, force=True)
+            health = health_result.get("play_hand_health") or {}
+            status = str(health.get("status") or "").strip()
+            run_metadata = load_run_metadata(run_dir)
+            if status != "in_progress":
+                continue
+            item = {
+                "run_id": run_dir.name,
+                "run_dir": str(run_dir),
+                "health_status": status,
+                "updated_metadata": bool(health_result.get("updated")),
+                "matched_at": now.isoformat(),
+                "last_modified_at": last_modified_at.isoformat(),
+                "run_status": run_metadata.get("run_status"),
+                "runner": run_metadata.get("runner"),
+                "created_at": run_metadata.get("created_at"),
+                "started_at": run_metadata.get("started_at"),
+                "completed_at": run_metadata.get("completed_at"),
+            }
+            matched.append(item)
+            if len(inspected) < max(0, preview):
+                inspected.append(item)
+        except OSError as exc:
+            inspected.append(
+                {
+                    "run_id": run_dir.name,
+                    "run_dir": str(run_dir),
+                    "health_status": "unreadable",
+                    "error": str(exc),
+                    "updated_metadata": False,
+                    "matched_at": now.isoformat(),
+                }
+            )
+
+    payload: dict[str, Any] = {
+        "command": "cleanup-incomplete-playhand-runs",
+        "runs_root": str(config.runs_root),
+        "older_than_minutes": older_than_minutes,
+        "run_ids_filter": run_ids or [],
+        "total_runs": len(target_runs),
+        "matched_runs": len(matched),
+        "dry_run": not execute,
+        "preview": inspected,
+    }
+
+    if not execute:
+        payload["message"] = (
+            "Dry run only. Re-run with --yes to delete the matched incomplete PlayHand runs."
         )
         if as_json:
             print(json.dumps(payload, ensure_ascii=True, indent=2))
@@ -14993,6 +15171,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "prune-runs":
         return cmd_prune_runs(
             min_mapped_points=int(args.min_mapped_points),
+            execute=bool(args.yes),
+            preview=int(args.preview),
+            as_json=bool(args.json),
+        )
+    if args.command == "cleanup-incomplete-playhand-runs":
+        return cmd_cleanup_incomplete_playhand_runs(
+            run_ids=args.run_id,
+            older_than_minutes=(
+                float(args.older_than_minutes)
+                if args.older_than_minutes is not None
+                else None
+            ),
             execute=bool(args.yes),
             preview=int(args.preview),
             as_json=bool(args.json),

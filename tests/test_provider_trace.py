@@ -106,6 +106,16 @@ def test_direct_script_invocation_infers_public_command() -> None:
     assert _argv_for_invocation(
         ["--json"], invoked_as="playhand-efficiency-report"
     ) == ["playhand-efficiency-report", "--json"]
+    assert _argv_for_invocation(
+        ["--yes", "--json", "run-a", "run-b"],
+        invoked_as="cleanup-incomplete-playhand-runs",
+    ) == [
+        "cleanup-incomplete-playhand-runs",
+        "--yes",
+        "--json",
+        "run-a",
+        "run-b",
+    ]
 
 
 def test_request_snapshot_pretty_prints_assistant_actions_and_tool_results(tmp_path: Path) -> None:
