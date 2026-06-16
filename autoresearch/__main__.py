@@ -247,6 +247,12 @@ if __package__ in {None, ""}:
         PLAY_HAND_RESOURCE_TRACE_ENV,
         cmd_play_hand,
     )
+    from autoresearch.play_hand_massive import (
+        DEFAULT_BASELINE_FLOOR as PLAY_HAND_MASSIVE_DEFAULT_BASELINE_FLOOR,
+        DEFAULT_MASSIVE_ACTIVE_LANES,
+        DEFAULT_MASSIVE_LANES,
+        cmd_play_hand_massive,
+    )
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
@@ -452,6 +458,12 @@ else:
         PLAY_HAND_RESOURCE_TRACE_ENV,
         cmd_play_hand,
     )
+    from .play_hand_massive import (
+        DEFAULT_BASELINE_FLOOR as PLAY_HAND_MASSIVE_DEFAULT_BASELINE_FLOOR,
+        DEFAULT_MASSIVE_ACTIVE_LANES,
+        DEFAULT_MASSIVE_LANES,
+        cmd_play_hand_massive,
+    )
     from .typed_tools import CLI_OK_TOOLS
 
 
@@ -522,6 +534,7 @@ PUBLIC_CLI_COMMANDS = {
     "doctor",
     "test-providers",
     "play-hand",
+    "play-hand-massive",
     "build-indicator-atlas",
     "build-signal-atlas",
     "build-forward-response-atlas",
@@ -909,6 +922,192 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Write a run folder and phase plan without calling backend compute.",
     )
     play_hand.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
+    play_hand_massive = subparsers.add_parser(
+        "play-hand-massive",
+        help="Run a backlog-oriented multi-lane PlayHand campaign.",
+    )
+    play_hand_massive.add_argument(
+        "--lanes",
+        type=int,
+        default=DEFAULT_MASSIVE_LANES,
+        help=f"Total independent campaign lanes to run. Default: {DEFAULT_MASSIVE_LANES}.",
+    )
+    play_hand_massive.add_argument(
+        "--active-lanes",
+        type=int,
+        default=DEFAULT_MASSIVE_ACTIVE_LANES,
+        help=(
+            "Maximum lanes to run concurrently. "
+            f"Default: {DEFAULT_MASSIVE_ACTIVE_LANES}."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--instrument",
+        action="append",
+        default=None,
+        help="Pinned instrument to evaluate. Can be repeated.",
+    )
+    play_hand_massive.add_argument(
+        "--instrument-pool",
+        action="append",
+        default=None,
+        help="Instrument pool to shuffle from when --instrument is omitted. Can be repeated.",
+    )
+    play_hand_massive.add_argument(
+        "--timeframe",
+        default="M5",
+        help="Timeframe to scaffold and evaluate. Default: M5.",
+    )
+    play_hand_massive.add_argument(
+        "--min-indicators",
+        type=int,
+        default=1,
+        help="Minimum shuffled seed indicators per lane. Default: 1.",
+    )
+    play_hand_massive.add_argument(
+        "--max-indicators",
+        type=int,
+        default=4,
+        help="Maximum shuffled seed indicators per lane. Default: 4.",
+    )
+    play_hand_massive.add_argument(
+        "--sweep-budget",
+        choices=["low", "medium", "high"],
+        default="high",
+        help="Per-lane sweep budget tier. Default: high.",
+    )
+    play_hand_massive.add_argument(
+        "--max-sweep-permutations",
+        type=int,
+        default=None,
+        help="Custom per-lane sweep work cap. Overrides --sweep-budget when provided.",
+    )
+    play_hand_massive.add_argument(
+        "--max-reward-r",
+        "--max-r",
+        dest="max_reward_r",
+        type=float,
+        default=None,
+        help="Cap for the reward/R search matrix. Defaults to the PlayHand cap.",
+    )
+    play_hand_massive.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Optional deterministic campaign seed.",
+    )
+    play_hand_massive.add_argument(
+        "--screen-months",
+        type=int,
+        default=3,
+        help="Short-horizon screening window. Default: 3.",
+    )
+    play_hand_massive.add_argument(
+        "--coarse-mode",
+        choices=["deterministic", "evolutionary"],
+        default="evolutionary",
+        help="Mode for each lane's coarse parameter sweep. Default: evolutionary.",
+    )
+    play_hand_massive.add_argument(
+        "--focused",
+        action="store_true",
+        help="Also run a focused sweep after each lane's coarse top candidate.",
+    )
+    play_hand_massive.add_argument(
+        "--baseline-floor",
+        type=float,
+        default=PLAY_HAND_MASSIVE_DEFAULT_BASELINE_FLOOR,
+        help=(
+            "Skip lane expansion below this baseline score. "
+            "Use a negative value to effectively disable. Default: "
+            f"{PLAY_HAND_MASSIVE_DEFAULT_BASELINE_FLOOR:g}."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--job-timeout-seconds",
+        type=int,
+        default=PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
+        help=(
+            "Maximum seconds the Fuzzfolio CLI waits for each deep-replay job. "
+            f"Default: {PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS}."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--sweep-timeout-seconds",
+        type=int,
+        default=PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
+        help=(
+            "Maximum seconds the Fuzzfolio CLI waits for a sweep to finish. "
+            f"Default: {PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS}."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--keep-cloud-profiles",
+        action="store_true",
+        help="Do not delete temporary scoring profiles registered during the campaign.",
+    )
+    play_hand_massive.add_argument(
+        "--adaptive-lanes",
+        action="store_true",
+        help=(
+            "Adjust newly admitted lanes from worker-gateway pool telemetry. "
+            "Falls back to --active-lanes when telemetry is unavailable."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--min-active-lanes",
+        type=int,
+        default=1,
+        help="Minimum lane window when --adaptive-lanes is enabled. Default: 1.",
+    )
+    play_hand_massive.add_argument(
+        "--target-worker-slots-per-lane",
+        type=int,
+        default=8,
+        help=(
+            "Adaptive scheduling ratio: registered worker slots divided by this value "
+            "sets the desired active lane window. Default: 8."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--gateway-url",
+        default=None,
+        help=(
+            "Optional worker-gateway base URL for adaptive telemetry. "
+            "Can also come from FUZZFOLIO_WORKER_GATEWAY_URL."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--gateway-token",
+        default=None,
+        help=(
+            "Optional worker-gateway bearer token for adaptive telemetry. "
+            "Prefer FUZZFOLIO_WORKER_GATEWAY_TOKEN or WORKER_GATEWAY_API_TOKEN."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--gateway-pool",
+        action="append",
+        default=None,
+        help="Optional worker pool name to include in adaptive telemetry. Can be repeated.",
+    )
+    play_hand_massive.add_argument(
+        "--telemetry-interval-seconds",
+        type=int,
+        default=30,
+        help="Seconds between adaptive worker-gateway telemetry polls. Default: 30.",
+    )
+    play_hand_massive.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write a run folder and lane plan without calling backend compute.",
+    )
+    play_hand_massive.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON summary.",
@@ -14323,6 +14522,36 @@ def main(argv: list[str] | None = None) -> int:
             screen_anchor_max_offset_months=args.screen_anchor_max_offset_months,
             keep_cloud_profiles=bool(args.keep_cloud_profiles),
             resource_trace=bool(args.resource_trace),
+        )
+    if args.command == "play-hand-massive":
+        return cmd_play_hand_massive(
+            lanes=args.lanes,
+            active_lanes=args.active_lanes,
+            instrument=args.instrument,
+            instrument_pool=args.instrument_pool,
+            timeframe=args.timeframe,
+            sweep_budget=args.sweep_budget,
+            max_sweep_permutations=args.max_sweep_permutations,
+            max_reward_r=args.max_reward_r,
+            min_indicators=args.min_indicators,
+            max_indicators=args.max_indicators,
+            seed=args.seed,
+            screen_months=args.screen_months,
+            coarse_mode=args.coarse_mode,
+            focused=bool(args.focused),
+            baseline_floor=args.baseline_floor,
+            job_timeout_seconds=args.job_timeout_seconds,
+            sweep_timeout_seconds=args.sweep_timeout_seconds,
+            keep_cloud_profiles=bool(args.keep_cloud_profiles),
+            adaptive_lanes=bool(args.adaptive_lanes),
+            min_active_lanes=args.min_active_lanes,
+            target_worker_slots_per_lane=args.target_worker_slots_per_lane,
+            gateway_url=args.gateway_url,
+            gateway_token=args.gateway_token,
+            gateway_pool=args.gateway_pool,
+            telemetry_interval_seconds=args.telemetry_interval_seconds,
+            dry_run=bool(args.dry_run),
+            as_json=bool(args.json),
         )
     if args.command == "build-indicator-atlas":
         return cmd_build_indicator_atlas(
