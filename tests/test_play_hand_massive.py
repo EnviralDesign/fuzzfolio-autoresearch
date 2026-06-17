@@ -58,13 +58,98 @@ def test_adaptive_lane_window_uses_worker_slots_with_safe_fallbacks() -> None:
 
     assert massive._desired_active_lanes(runtime, {"ok": True, "slots": 32}) == 4
     assert massive._desired_active_lanes(runtime, {"ok": True, "slots": 1}) == 2
-    assert massive._desired_active_lanes(runtime, {"ok": True, "slots": 0}) == 2
-    assert massive._desired_active_lanes(runtime, {"ok": False}) == 12
+    assert massive._desired_active_lanes(runtime, {"ok": True, "slots": 0}) == 0
+    assert massive._desired_active_lanes(runtime, {"ok": False}) == 2
+
+    gateway_runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=20,
+            active_lanes=12,
+            adaptive_lanes=True,
+            min_active_lanes=2,
+            target_worker_slots_per_lane=8,
+            gateway_url="https://example.com/api/worker-gateway",
+        )
+    )
+    assert massive._desired_active_lanes(gateway_runtime, {"ok": False}) == 0
+
+    fail_open = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=20,
+            active_lanes=12,
+            adaptive_lanes=True,
+            adaptive_fail_open=True,
+            gateway_url="https://example.com/api/worker-gateway",
+        )
+    )
+    assert massive._desired_active_lanes(fail_open, {"ok": False}) == 12
 
     fixed = massive.normalize_massive_runtime_config(
-        massive.MassiveRuntimeConfig(lanes=20, active_lanes=7)
+        massive.MassiveRuntimeConfig(lanes=20, active_lanes=7, adaptive_lanes=False)
     )
     assert massive._desired_active_lanes(fixed, {"ok": True, "slots": 64}) == 7
+
+
+def test_run_campaign_lane_executor_blocks_on_backend_down(monkeypatch) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=3,
+            active_lanes=2,
+            adaptive_lanes=False,
+            staged_campaign=False,
+        )
+    )
+    config = SimpleNamespace(
+        runs_root=Path("."),
+        derived_root=Path("."),
+        fuzzfolio=SimpleNamespace(base_url="http://localhost:7946/api/dev"),
+    )
+    ctx = SimpleNamespace(
+        config=config,
+        run_dir=Path("."),
+        run_id="campaign-test",
+    )
+    ctx.run_dir = Path(".")
+    metadata: dict = {}
+
+    monkeypatch.setattr(
+        massive,
+        "_poll_local_backend_health",
+        lambda *_args, **_kwargs: {"ok": False, "reason": "backend_health_failed"},
+    )
+    monkeypatch.setattr(massive, "write_run_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        massive,
+        "_append_event",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        massive,
+        "_run_lane",
+        lambda *_args, **_kwargs: massive.MassiveLaneResult(
+            lane_id="lane_001",
+            status="completed",
+            started_at="2026-06-17T00:00:00+00:00",
+        ),
+    )
+
+    results, state = massive._run_campaign_lane_executor(
+        ctx=ctx,
+        runtime=runtime,
+        config=config,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "low", "value": 64},
+        sweep_budget_label="low",
+        sweep_budget_value=64,
+        reward_matrix=None,
+        metadata=metadata,
+        lane_indexes=[1, 2, 3],
+    )
+
+    assert state["consecutive_backend_health_failures"] >= 1
+    assert any(result.status == "not_started_backend_down" for result in results)
 
 
 def test_cmd_play_hand_massive_dry_run_writes_first_class_lane_runs(
@@ -74,7 +159,7 @@ def test_cmd_play_hand_massive_dry_run_writes_first_class_lane_runs(
     config = SimpleNamespace(
         runs_root=tmp_path / "runs",
         derived_root=tmp_path / "runs" / "derived",
-        fuzzfolio=SimpleNamespace(),
+        fuzzfolio=SimpleNamespace(base_url="http://localhost:7946/api/dev"),
         research=SimpleNamespace(
             quality_score_preset="profile-drop",
             plot_lower_is_better=False,
@@ -118,6 +203,8 @@ def test_cmd_play_hand_massive_dry_run_writes_first_class_lane_runs(
         min_indicators=2,
         max_indicators=2,
         seed=42,
+        staged_campaign=False,
+        adaptive_lanes=False,
         dry_run=True,
         as_json=False,
     )

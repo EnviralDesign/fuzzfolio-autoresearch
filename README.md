@@ -83,6 +83,18 @@ By default, Play Hand searches reward cells up to `4R`. Use `--max-reward-r 12.5
 
 Play Hand defaults are tuned for long unattended runs: deep-replay jobs can wait up to `2400` seconds and sweeps can wait up to `7200` seconds before the run gives up.
 
+### Play Hand Massive
+
+For multi-lane backlog campaigns, start the Fuzzfolio backend without Uvicorn reload. In the Fuzzfolio process manager, use **Backend Research / No Reload** (`uv run start`) or **Backend Research Gateway** for worker-gateway-heavy runs. Do not use **Backend Dev** (`uv run dev`) for Massive; reload mode is for interactive work only.
+
+Safe starting point:
+
+```powershell
+uv run play-hand-massive --active-lanes 2 --sweep-budget low --target-worker-slots-per-lane 32 --adaptive-lanes
+```
+
+Scale lane concurrency only after worker-gateway claim latency stays stable. Massive fails closed when gateway telemetry or local backend health (`/healthz`) is bad, marks unstarted lanes as `not_started_*`, and stages baseline screening before expand sweeps.
+
 ### Indicator Atlas
 
 Before spending backend compute, build the static indicator priors:

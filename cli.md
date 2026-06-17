@@ -55,6 +55,34 @@ Common arguments:
 - `--dry-run`: write the run/plan without backend compute.
 - `--json`: print a JSON summary.
 
+## play-hand-massive
+
+```powershell
+uv run play-hand-massive
+uv run play-hand-massive --active-lanes 2 --sweep-budget low --target-worker-slots-per-lane 32 --adaptive-lanes
+uv run play-hand-massive --dry-run --json
+```
+
+Runs a backlog-oriented multi-lane Play Hand campaign. Requires a no-reload Fuzzfolio backend (**Backend Research / No Reload** or **Backend Research Gateway** in the Fuzzfolio process manager). Do not use **Backend Dev** for Massive runs.
+
+Defaults are conservative: `--active-lanes 2`, `--sweep-budget low`, `--target-worker-slots-per-lane 32`, `--adaptive-lanes` enabled. Adaptive mode fails closed when worker-gateway telemetry is unavailable unless `--adaptive-fail-open` is passed.
+
+Common arguments:
+
+- `--lanes`: total independent lanes. Default `12`.
+- `--active-lanes`: max concurrent lanes during expand sweeps. Default `2`.
+- `--sweep-budget`: `low`, `medium`, or `high`. Default `low`.
+- `--adaptive-lanes` / `--no-adaptive-lanes`: gateway-aware lane window. Default enabled.
+- `--adaptive-fail-open`: legacy fail-open adaptive behavior when gateway polls fail.
+- `--staged-campaign` / `--no-staged-campaign`: baseline screen all lanes at low concurrency before expand sweeps. Default enabled.
+- `--scaffold-active-lanes`: concurrency cap during baseline screening. Default `2`.
+- `--remote-token-budget-multiplier`: remote permutation budget = healthy worker slots × multiplier. Default `2`.
+- `--gateway-url`, `--gateway-token`, `--gateway-pool`: adaptive telemetry against the worker gateway.
+- `--dry-run`: write campaign/lane folders without backend compute.
+- `--json`: print machine-readable summary.
+
+When infrastructure fails mid-campaign, unstarted lanes are reported as `not_started_backend_down` or `not_started_gateway_unhealthy` rather than failed strategy lanes.
+
 ## build-indicator-atlas
 
 ```powershell

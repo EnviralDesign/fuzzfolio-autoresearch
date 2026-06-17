@@ -253,6 +253,8 @@ if __package__ in {None, ""}:
         DEFAULT_BASELINE_FLOOR as PLAY_HAND_MASSIVE_DEFAULT_BASELINE_FLOOR,
         DEFAULT_MASSIVE_ACTIVE_LANES,
         DEFAULT_MASSIVE_LANES,
+        DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
+        DEFAULT_SCAFFOLD_ACTIVE_LANES,
         cmd_play_hand_massive,
     )
     from autoresearch.typed_tools import CLI_OK_TOOLS
@@ -465,6 +467,8 @@ else:
         DEFAULT_BASELINE_FLOOR as PLAY_HAND_MASSIVE_DEFAULT_BASELINE_FLOOR,
         DEFAULT_MASSIVE_ACTIVE_LANES,
         DEFAULT_MASSIVE_LANES,
+        DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
+        DEFAULT_SCAFFOLD_ACTIVE_LANES,
         cmd_play_hand_massive,
     )
     from .typed_tools import CLI_OK_TOOLS
@@ -982,8 +986,8 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     play_hand_massive.add_argument(
         "--sweep-budget",
         choices=["low", "medium", "high"],
-        default="high",
-        help="Per-lane sweep budget tier. Default: high.",
+        default="low",
+        help="Per-lane sweep budget tier. Default: low.",
     )
     play_hand_massive.add_argument(
         "--max-sweep-permutations",
@@ -1057,11 +1061,17 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     )
     play_hand_massive.add_argument(
         "--adaptive-lanes",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Adjust newly admitted lanes from worker-gateway pool telemetry. "
-            "Falls back to --active-lanes when telemetry is unavailable."
+            "Fails closed when telemetry is unavailable unless --adaptive-fail-open."
         ),
+    )
+    play_hand_massive.add_argument(
+        "--adaptive-fail-open",
+        action="store_true",
+        help="Restore legacy adaptive behavior that keeps submitting lanes when gateway telemetry fails.",
     )
     play_hand_massive.add_argument(
         "--min-active-lanes",
@@ -1072,10 +1082,37 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     play_hand_massive.add_argument(
         "--target-worker-slots-per-lane",
         type=int,
-        default=8,
+        default=32,
         help=(
             "Adaptive scheduling ratio: registered worker slots divided by this value "
-            "sets the desired active lane window. Default: 8."
+            "sets the desired active lane window. Default: 32."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--scaffold-active-lanes",
+        type=int,
+        default=DEFAULT_SCAFFOLD_ACTIVE_LANES,
+        help=(
+            "Maximum concurrent lanes during staged baseline screening. "
+            f"Default: {DEFAULT_SCAFFOLD_ACTIVE_LANES}."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--staged-campaign",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run baseline screening at low concurrency before expanding survivors into sweeps. "
+            "Default: enabled."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--remote-token-budget-multiplier",
+        type=float,
+        default=DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
+        help=(
+            "Remote permutation budget is healthy worker slots times this multiplier. "
+            f"Default: {DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER:g}."
         ),
     )
     play_hand_massive.add_argument(
@@ -14949,8 +14986,12 @@ def main(argv: list[str] | None = None) -> int:
             sweep_timeout_seconds=args.sweep_timeout_seconds,
             keep_cloud_profiles=bool(args.keep_cloud_profiles),
             adaptive_lanes=bool(args.adaptive_lanes),
+            adaptive_fail_open=bool(args.adaptive_fail_open),
             min_active_lanes=args.min_active_lanes,
             target_worker_slots_per_lane=args.target_worker_slots_per_lane,
+            scaffold_active_lanes=args.scaffold_active_lanes,
+            staged_campaign=bool(args.staged_campaign),
+            remote_token_budget_multiplier=args.remote_token_budget_multiplier,
             gateway_url=args.gateway_url,
             gateway_token=args.gateway_token,
             gateway_pool=args.gateway_pool,

@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 from rich.console import Console
@@ -72,8 +73,12 @@ PLAY_HAND_MASSIVE_SCHEMA_VERSION = "play_hand_massive_campaign_v1"
 PLAY_HAND_MASSIVE_LANE_SCHEMA_VERSION = "play_hand_massive_lane_v1"
 PLAY_HAND_MASSIVE_CAMPAIGNS_DIR = "play-hand-massive-campaigns"
 DEFAULT_MASSIVE_LANES = 12
-DEFAULT_MASSIVE_ACTIVE_LANES = 6
+DEFAULT_MASSIVE_ACTIVE_LANES = 2
+DEFAULT_SCAFFOLD_ACTIVE_LANES = 2
+DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER = 2.0
 DEFAULT_BASELINE_FLOOR = 0.0
+CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD = 2
+CAMPAIGN_BACKEND_DOWN_THRESHOLD = 1
 
 
 @dataclass(frozen=True)
@@ -83,7 +88,7 @@ class MassiveRuntimeConfig:
     timeframe: str = "M5"
     instrument: list[str] | None = None
     instrument_pool: list[str] | None = None
-    sweep_budget: str | None = "high"
+    sweep_budget: str | None = "low"
     max_sweep_permutations: int | None = None
     max_reward_r: float | None = None
     min_indicators: int = 1
@@ -96,9 +101,14 @@ class MassiveRuntimeConfig:
     job_timeout_seconds: int = PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS
     sweep_timeout_seconds: int = PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS
     keep_cloud_profiles: bool = False
-    adaptive_lanes: bool = False
+    adaptive_lanes: bool = True
+    adaptive_fail_open: bool = False
     min_active_lanes: int = 1
-    target_worker_slots_per_lane: int = 8
+    target_worker_slots_per_lane: int = 32
+    scaffold_active_lanes: int = DEFAULT_SCAFFOLD_ACTIVE_LANES
+    staged_campaign: bool = True
+    remote_token_budget_multiplier: float = DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER
+    backend_health_timeout_seconds: int = 5
     gateway_url: str | None = None
     gateway_token: str | None = None
     gateway_pool: list[str] | None = None
@@ -159,6 +169,9 @@ def normalize_massive_runtime_config(config: MassiveRuntimeConfig) -> MassiveRun
     sweep_timeout_seconds = max(1, int(config.sweep_timeout_seconds))
     min_active_lanes = max(1, min(int(config.min_active_lanes), active_lanes))
     target_worker_slots_per_lane = max(1, int(config.target_worker_slots_per_lane))
+    scaffold_active_lanes = max(1, min(int(config.scaffold_active_lanes), active_lanes))
+    remote_token_budget_multiplier = max(0.1, float(config.remote_token_budget_multiplier))
+    backend_health_timeout_seconds = max(1, int(config.backend_health_timeout_seconds))
     telemetry_interval_seconds = max(1, int(config.telemetry_interval_seconds))
     baseline_floor = (
         None
@@ -185,8 +198,13 @@ def normalize_massive_runtime_config(config: MassiveRuntimeConfig) -> MassiveRun
         sweep_timeout_seconds=sweep_timeout_seconds,
         keep_cloud_profiles=bool(config.keep_cloud_profiles),
         adaptive_lanes=bool(config.adaptive_lanes),
+        adaptive_fail_open=bool(config.adaptive_fail_open),
         min_active_lanes=min_active_lanes,
         target_worker_slots_per_lane=target_worker_slots_per_lane,
+        scaffold_active_lanes=scaffold_active_lanes,
+        staged_campaign=bool(config.staged_campaign),
+        remote_token_budget_multiplier=remote_token_budget_multiplier,
+        backend_health_timeout_seconds=backend_health_timeout_seconds,
         gateway_url=str(config.gateway_url).strip() if config.gateway_url else None,
         gateway_token=str(config.gateway_token).strip() if config.gateway_token else None,
         gateway_pool=[
@@ -253,6 +271,62 @@ def _gateway_url(runtime: MassiveRuntimeConfig) -> str | None:
         if url:
             return url.rstrip("/")
     return None
+
+
+def _backend_root_url(config: AppConfig) -> str:
+    base = str(config.fuzzfolio.base_url or "").strip().rstrip("/")
+    if not base:
+        return "http://localhost:7946"
+    for suffix in ("/api/dev", "/api"):
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
+    parsed = urlparse(base)
+    if parsed.scheme and parsed.netloc:
+        return f"{parsed.scheme}://{parsed.netloc}"
+    return "http://localhost:7946"
+
+
+def _poll_local_backend_health(
+    config: AppConfig,
+    *,
+    timeout_seconds: int = 5,
+) -> dict[str, Any]:
+    url = f"{_backend_root_url(config)}/healthz"
+    try:
+        response = requests.get(url, timeout=timeout_seconds)
+        response.raise_for_status()
+        return {
+            "ok": True,
+            "url": url,
+            "status_code": response.status_code,
+        }
+    except (requests.RequestException, ValueError) as exc:
+        return {
+            "ok": False,
+            "url": url,
+            "reason": "backend_health_failed",
+            "error": str(exc)[:500],
+        }
+
+
+def _estimate_lane_remote_permutations(max_sweep_permutations: int) -> int:
+    cap = max(1, int(max_sweep_permutations))
+    return cap * 2
+
+
+def _remote_token_budget(
+    snapshot: dict[str, Any] | None,
+    runtime: MassiveRuntimeConfig,
+) -> int | None:
+    if not snapshot or not snapshot.get("ok"):
+        return None
+    try:
+        slots = int(snapshot.get("slots") or 0)
+    except (TypeError, ValueError):
+        slots = 0
+    if slots <= 0:
+        return 0
+    return int(math.ceil(slots * float(runtime.remote_token_budget_multiplier)))
 
 
 def _poll_worker_pool_snapshot(runtime: MassiveRuntimeConfig) -> dict[str, Any]:
@@ -324,14 +398,16 @@ def _desired_active_lanes(
     if not runtime.adaptive_lanes:
         return runtime.active_lanes
     if not snapshot or not snapshot.get("ok"):
-        return runtime.active_lanes
+        if runtime.adaptive_fail_open:
+            return runtime.active_lanes
+        return 0 if _gateway_url(runtime) else runtime.min_active_lanes
     slots = 0
     try:
         slots = int(snapshot.get("slots") or 0)
     except (TypeError, ValueError):
         slots = 0
     if slots <= 0:
-        return runtime.min_active_lanes
+        return 0
     desired = int(math.ceil(slots / float(runtime.target_worker_slots_per_lane)))
     return max(runtime.min_active_lanes, min(runtime.active_lanes, desired))
 
@@ -684,10 +760,13 @@ def _run_lane(
     sweep_budget_label: str,
     max_sweep_permutations: int,
     reward_matrix: dict[str, Any] | None,
+    stop_after_baseline: bool = False,
+    existing_lane_run_id: str | None = None,
+    existing_lane_run_dir: Path | None = None,
 ) -> MassiveLaneResult:
     lane_id = f"lane_{lane_index:03d}"
-    lane_run_id = _lane_run_id(lane_index)
-    lane_run_dir = campaign_ctx.config.runs_root / lane_run_id
+    lane_run_id = existing_lane_run_id or _lane_run_id(lane_index)
+    lane_run_dir = existing_lane_run_dir or (campaign_ctx.config.runs_root / lane_run_id)
     lane_ctx = _new_play_hand_context(
         config=campaign_ctx.config,
         cli=campaign_ctx.cli,
@@ -738,77 +817,124 @@ def _run_lane(
         lane_run_dir=str(lane_run_dir.resolve()),
     )
     try:
-        deal = _deal_lane(
-            config=lane_ctx.config,
-            runtime=runtime,
-            seed_indicators=seed_indicators,
-            seed_plan=seed_plan,
-            rng=lane_rng,
-        )
-        result.indicators = list(deal["dealt"])
-        result.instruments = list(deal["instruments"])
-        _append_event(
-            lane_ctx,
-            lane_id,
-            "dealt",
-            stage=stages["scaffold"],
-            indicators=result.indicators,
-            instruments=result.instruments,
-            indicator_deal_source=deal["indicator_deal"].get("source"),
-            dealt_recipe=deal["indicator_deal"].get("recipe"),
-        )
-        profile_path, profile_ref, profile_payload, evaluation_timeframe = _scaffold_lane_profile(
-            lane_ctx,
-            lane_id=lane_id,
-            deal=deal,
-            runtime=runtime,
-            rng=lane_rng,
-            stage=stages["scaffold"],
-        )
-        baseline = _run_profile_evaluation(
-            lane_ctx,
-            runtime=runtime,
-            stage=stages["baseline"],
-            lane_id=lane_id,
-            lane_stage="baseline_3mo",
-            profile_ref=profile_ref,
-            profile_path=profile_path,
-            instruments=result.instruments,
-            timeframe=evaluation_timeframe,
-            reward_matrix=reward_matrix,
-        )
-        result.baseline_score = _score(baseline.get("score"))
-        _retag_attempt(
-            lane_ctx,
-            attempt_id=baseline.get("attempt_id"),
-            lane_id=lane_id,
-            lane_stage="baseline_3mo",
-            campaign_id=campaign_ctx.run_id,
-        )
-        _remember_best(
-            result,
-            score=result.baseline_score,
-            attempt_id=baseline.get("attempt_id"),
-            profile_path=profile_path,
-            profile_ref=profile_ref,
-        )
-        if not should_expand_lane(
-            baseline_score=result.baseline_score,
-            baseline_floor=runtime.baseline_floor,
-            dry_run=runtime.dry_run,
-        ):
-            result.status = "skipped"
-            result.skipped_reason = "baseline_below_floor"
+        if existing_lane_run_dir is not None:
+            lane_metadata = load_run_metadata(lane_run_dir)
+            result.indicators = list(lane_metadata.get("indicators") or result.indicators)
+            result.instruments = list(lane_metadata.get("instruments") or result.instruments)
+            result.baseline_score = _score(lane_metadata.get("baseline_score"))
+            profile_path = Path(str(lane_metadata.get("profile_path") or lane_run_dir / "profiles"))
+            profile_ref = str(lane_metadata.get("profile_ref") or "")
+            profile_payload = _load_json(profile_path) if profile_path.exists() else {}
+            evaluation_timeframe = str(
+                lane_metadata.get("evaluation_timeframe") or runtime.timeframe
+            )
+            if not profile_ref:
+                raise RuntimeError("expand lane missing profile_ref in lane metadata")
+        else:
+            deal = _deal_lane(
+                config=lane_ctx.config,
+                runtime=runtime,
+                seed_indicators=seed_indicators,
+                seed_plan=seed_plan,
+                rng=lane_rng,
+            )
+            result.indicators = list(deal["dealt"])
+            result.instruments = list(deal["instruments"])
             _append_event(
                 lane_ctx,
                 lane_id,
-                "skipped",
+                "dealt",
+                stage=stages["scaffold"],
+                indicators=result.indicators,
+                instruments=result.instruments,
+                indicator_deal_source=deal["indicator_deal"].get("source"),
+                dealt_recipe=deal["indicator_deal"].get("recipe"),
+            )
+            profile_path, profile_ref, profile_payload, evaluation_timeframe = _scaffold_lane_profile(
+                lane_ctx,
+                lane_id=lane_id,
+                deal=deal,
+                runtime=runtime,
+                rng=lane_rng,
+                stage=stages["scaffold"],
+            )
+            baseline = _run_profile_evaluation(
+                lane_ctx,
+                runtime=runtime,
                 stage=stages["baseline"],
-                reason=result.skipped_reason,
+                lane_id=lane_id,
+                lane_stage="baseline_3mo",
+                profile_ref=profile_ref,
+                profile_path=profile_path,
+                instruments=result.instruments,
+                timeframe=evaluation_timeframe,
+                reward_matrix=reward_matrix,
+            )
+            result.baseline_score = _score(baseline.get("score"))
+            _retag_attempt(
+                lane_ctx,
+                attempt_id=baseline.get("attempt_id"),
+                lane_id=lane_id,
+                lane_stage="baseline_3mo",
+                campaign_id=campaign_ctx.run_id,
+            )
+            _remember_best(
+                result,
+                score=result.baseline_score,
+                attempt_id=baseline.get("attempt_id"),
+                profile_path=profile_path,
+                profile_ref=profile_ref,
+            )
+            _write_lane_metadata(
+                lane_ctx,
+                campaign_id=campaign_ctx.run_id,
+                campaign_dir=campaign_ctx.run_dir,
+                lane_id=lane_id,
+                lane_index=lane_index,
+                runtime=runtime,
+                sweep_budget_label=sweep_budget_label,
+                sweep_budget_value=max_sweep_permutations,
+                budget=budget,
+                reward_matrix=reward_matrix,
+                seed_plan_path=seed_plan_path,
+                seed_plan_loaded=seed_plan is not None,
+                status="running",
+                extra={
+                    "indicators": result.indicators,
+                    "instruments": result.instruments,
+                    "baseline_score": result.baseline_score,
+                    "profile_path": str(profile_path),
+                    "profile_ref": profile_ref,
+                    "evaluation_timeframe": evaluation_timeframe,
+                },
+            )
+            if not should_expand_lane(
                 baseline_score=result.baseline_score,
                 baseline_floor=runtime.baseline_floor,
-            )
-            return result
+                dry_run=runtime.dry_run,
+            ):
+                result.status = "skipped"
+                result.skipped_reason = "baseline_below_floor"
+                _append_event(
+                    lane_ctx,
+                    lane_id,
+                    "skipped",
+                    stage=stages["baseline"],
+                    reason=result.skipped_reason,
+                    baseline_score=result.baseline_score,
+                    baseline_floor=runtime.baseline_floor,
+                )
+                return result
+            if stop_after_baseline:
+                result.status = "baseline_screened"
+                _append_event(
+                    lane_ctx,
+                    lane_id,
+                    "baseline_screened",
+                    stage=stages["baseline"],
+                    baseline_score=result.baseline_score,
+                )
+                return result
 
         current_profile_path = profile_path
         current_profile_ref = profile_ref
@@ -1111,6 +1237,277 @@ def _render_campaign_table(results: list[MassiveLaneResult]) -> None:
     console.print(table)
 
 
+def _mark_unstarted_lanes(
+    *,
+    pending_lane_indexes: list[int],
+    reason: str,
+    started_at: str,
+) -> list[MassiveLaneResult]:
+    results: list[MassiveLaneResult] = []
+    for lane_index in pending_lane_indexes:
+        lane_id = f"lane_{lane_index:03d}"
+        results.append(
+            MassiveLaneResult(
+                lane_id=lane_id,
+                status=reason,
+                started_at=started_at,
+                skipped_reason=reason,
+            )
+        )
+    return results
+
+
+def _run_campaign_lane_executor(
+    *,
+    ctx: PlayHandContext,
+    runtime: MassiveRuntimeConfig,
+    config: AppConfig,
+    seed_indicators: list[SeedIndicator],
+    seed_plan: dict[str, Any] | None,
+    seed_plan_path: Path | None,
+    budget: dict[str, Any],
+    sweep_budget_label: str,
+    sweep_budget_value: int,
+    reward_matrix: dict[str, Any] | None,
+    metadata: dict[str, Any],
+    lane_indexes: list[int],
+    stop_after_baseline: bool = False,
+    expand_from: dict[int, MassiveLaneResult] | None = None,
+    max_active_override: int | None = None,
+) -> tuple[list[MassiveLaneResult], dict[str, Any]]:
+    results: list[MassiveLaneResult] = []
+    pending_lane_indexes = list(lane_indexes)
+    in_flight: dict[concurrent.futures.Future[MassiveLaneResult], int] = {}
+    last_snapshot: dict[str, Any] | None = None
+    last_backend_health: dict[str, Any] | None = None
+    desired_active_lanes = runtime.active_lanes
+    next_telemetry_at = 0.0
+    consecutive_bad_gateway_polls = 0
+    consecutive_backend_health_failures = 0
+    pause_until = 0.0
+    pause_reason: str | None = None
+    in_flight_remote_permutations = 0
+    lane_remote_cost = _estimate_lane_remote_permutations(sweep_budget_value)
+    expand_from = expand_from or {}
+    executor_cap = max_active_override or runtime.active_lanes
+
+    def refresh_lane_window(force: bool = False) -> int:
+        nonlocal last_snapshot, last_backend_health, desired_active_lanes, next_telemetry_at
+        nonlocal consecutive_bad_gateway_polls, consecutive_backend_health_failures
+        nonlocal pause_until, pause_reason
+        now = time.monotonic()
+        if force or now >= next_telemetry_at:
+            if not runtime.dry_run:
+                last_backend_health = _poll_local_backend_health(
+                    config,
+                    timeout_seconds=runtime.backend_health_timeout_seconds,
+                )
+                if last_backend_health.get("ok"):
+                    consecutive_backend_health_failures = 0
+                else:
+                    consecutive_backend_health_failures += 1
+                    if consecutive_backend_health_failures >= CAMPAIGN_BACKEND_DOWN_THRESHOLD:
+                        pause_reason = "backend_down"
+                        pause_until = now + runtime.telemetry_interval_seconds
+            elif last_backend_health is None:
+                last_backend_health = {"ok": True, "reason": "dry_run_skipped"}
+
+            if runtime.adaptive_lanes:
+                last_snapshot = _poll_worker_pool_snapshot(runtime)
+                desired_active_lanes = _desired_active_lanes(runtime, last_snapshot)
+                if last_snapshot.get("ok"):
+                    consecutive_bad_gateway_polls = 0
+                elif _gateway_url(runtime):
+                    consecutive_bad_gateway_polls += 1
+                    if consecutive_bad_gateway_polls >= CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD:
+                        pause_reason = "gateway_unhealthy"
+                        pause_until = now + runtime.telemetry_interval_seconds
+            else:
+                desired_active_lanes = runtime.active_lanes
+
+            next_telemetry_at = now + runtime.telemetry_interval_seconds
+            _append_event(
+                ctx,
+                "campaign",
+                "lane_window",
+                desired_active_lanes=desired_active_lanes,
+                running_lanes=len(in_flight),
+                pending_lanes=len(pending_lane_indexes),
+                worker_pool_snapshot=last_snapshot,
+                backend_health=last_backend_health,
+                pause_reason=pause_reason,
+                pause_until=round(pause_until, 3) if pause_until else None,
+                in_flight_remote_permutations=in_flight_remote_permutations,
+            )
+            metadata["last_worker_pool_snapshot"] = last_snapshot
+            metadata["last_backend_health"] = last_backend_health
+            metadata["desired_active_lanes"] = desired_active_lanes
+            metadata["campaign_pause_reason"] = pause_reason
+            metadata["in_flight_remote_permutations"] = in_flight_remote_permutations
+            write_run_metadata(ctx.run_dir, metadata)
+        return desired_active_lanes
+
+    def submission_allowed() -> bool:
+        if runtime.dry_run:
+            return True
+        if time.monotonic() < pause_until:
+            return False
+        if consecutive_backend_health_failures >= CAMPAIGN_BACKEND_DOWN_THRESHOLD:
+            return False
+        if (
+            runtime.adaptive_lanes
+            and _gateway_url(runtime)
+            and consecutive_bad_gateway_polls >= CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD
+        ):
+            return False
+        return True
+
+    def lane_submission_reason() -> str | None:
+        if consecutive_backend_health_failures >= CAMPAIGN_BACKEND_DOWN_THRESHOLD:
+            return "not_started_backend_down"
+        if (
+            runtime.adaptive_lanes
+            and _gateway_url(runtime)
+            and consecutive_bad_gateway_polls >= CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD
+        ):
+            return "not_started_gateway_unhealthy"
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=executor_cap) as executor:
+        refresh_lane_window(force=True)
+        while pending_lane_indexes or in_flight:
+            desired = refresh_lane_window()
+            effective_desired = min(desired, executor_cap)
+            if not stop_after_baseline and not expand_from:
+                token_budget = _remote_token_budget(last_snapshot, runtime)
+            else:
+                token_budget = None
+
+            while pending_lane_indexes and len(in_flight) < effective_desired:
+                if not submission_allowed():
+                    blocked_reason = lane_submission_reason()
+                    if blocked_reason:
+                        blocked_indexes = list(pending_lane_indexes)
+                        pending_lane_indexes.clear()
+                        results.extend(
+                            _mark_unstarted_lanes(
+                                pending_lane_indexes=blocked_indexes,
+                                reason=blocked_reason,
+                                started_at=_now_iso(),
+                            )
+                        )
+                        metadata["blocked_lane_count"] = len(blocked_indexes)
+                        metadata["blocked_lane_reason"] = blocked_reason
+                        write_run_metadata(ctx.run_dir, metadata)
+                    break
+
+                if (
+                    token_budget is not None
+                    and in_flight_remote_permutations + lane_remote_cost > token_budget
+                ):
+                    break
+
+                lane_index = pending_lane_indexes.pop(0)
+                prior = expand_from.get(lane_index)
+                future = executor.submit(
+                    _run_lane,
+                    ctx,
+                    runtime=runtime,
+                    lane_index=lane_index,
+                    seed_indicators=seed_indicators,
+                    seed_plan=seed_plan,
+                    seed_plan_path=seed_plan_path,
+                    budget=budget,
+                    sweep_budget_label=sweep_budget_label,
+                    max_sweep_permutations=sweep_budget_value,
+                    reward_matrix=reward_matrix,
+                    stop_after_baseline=stop_after_baseline,
+                    existing_lane_run_id=prior.run_id if prior else None,
+                    existing_lane_run_dir=Path(prior.run_dir) if prior and prior.run_dir else None,
+                )
+                in_flight[future] = lane_index
+                if token_budget is not None:
+                    in_flight_remote_permutations += lane_remote_cost
+                _append_event(
+                    ctx,
+                    "campaign",
+                    "lane_submitted",
+                    lane_index=lane_index,
+                    running_lanes=len(in_flight),
+                    desired_active_lanes=effective_desired,
+                    pending_lanes=len(pending_lane_indexes),
+                    stop_after_baseline=stop_after_baseline,
+                    expand_lane=prior is not None,
+                )
+
+            if not in_flight and pending_lane_indexes and not submission_allowed():
+                blocked_reason = lane_submission_reason() or "not_started_backend_down"
+                blocked_indexes = list(pending_lane_indexes)
+                pending_lane_indexes.clear()
+                results.extend(
+                    _mark_unstarted_lanes(
+                        pending_lane_indexes=blocked_indexes,
+                        reason=blocked_reason,
+                        started_at=_now_iso(),
+                    )
+                )
+                metadata["blocked_lane_count"] = len(blocked_indexes)
+                metadata["blocked_lane_reason"] = blocked_reason
+                write_run_metadata(ctx.run_dir, metadata)
+                break
+
+            if not in_flight:
+                if pending_lane_indexes and token_budget is not None:
+                    time.sleep(1.0)
+                    continue
+                if not pending_lane_indexes:
+                    break
+                time.sleep(1.0)
+                continue
+
+            done, _pending = concurrent.futures.wait(
+                set(in_flight),
+                timeout=1.0,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                lane_index = in_flight.pop(future, None)
+                lane_result = future.result()
+                results.append(lane_result)
+                if token_budget is not None and lane_index is not None:
+                    in_flight_remote_permutations = max(
+                        0,
+                        in_flight_remote_permutations - lane_remote_cost,
+                    )
+                completed = len(results)
+                _append_event(
+                    ctx,
+                    "campaign",
+                    "lane_finished",
+                    completed_lanes=completed,
+                    total_lanes=len(lane_indexes),
+                    active_lanes=runtime.active_lanes,
+                    desired_active_lanes=desired_active_lanes,
+                    running_lanes=len(in_flight),
+                    pending_lanes=len(pending_lane_indexes),
+                    lane_result=lane_result.as_dict(),
+                )
+                metadata["completed_lanes"] = completed
+                metadata["lane_results"] = [result.as_dict() for result in results]
+                metadata["desired_active_lanes"] = desired_active_lanes
+                metadata["in_flight_remote_permutations"] = in_flight_remote_permutations
+                write_run_metadata(ctx.run_dir, metadata)
+
+    campaign_state = {
+        "last_snapshot": last_snapshot,
+        "last_backend_health": last_backend_health,
+        "pause_reason": pause_reason,
+        "consecutive_bad_gateway_polls": consecutive_bad_gateway_polls,
+        "consecutive_backend_health_failures": consecutive_backend_health_failures,
+    }
+    return results, campaign_state
+
+
 def _run_campaign_lanes(
     *,
     ctx: PlayHandContext,
@@ -1124,98 +1521,77 @@ def _run_campaign_lanes(
     reward_matrix: dict[str, Any] | None,
     metadata: dict[str, Any],
 ) -> list[MassiveLaneResult]:
-    results: list[MassiveLaneResult] = []
-    pending_lane_indexes = list(range(1, runtime.lanes + 1))
-    in_flight: dict[concurrent.futures.Future[MassiveLaneResult], int] = {}
-    last_snapshot: dict[str, Any] | None = None
-    desired_active_lanes = runtime.active_lanes
-    next_telemetry_at = 0.0
+    config = ctx.config
+    lane_indexes = list(range(1, runtime.lanes + 1))
+    if runtime.staged_campaign and not runtime.dry_run:
+        scaffold_cap = max(1, min(runtime.scaffold_active_lanes, runtime.active_lanes))
+        baseline_results, baseline_state = _run_campaign_lane_executor(
+            ctx=ctx,
+            runtime=runtime,
+            config=config,
+            seed_indicators=seed_indicators,
+            seed_plan=seed_plan,
+            seed_plan_path=seed_plan_path,
+            budget=budget,
+            sweep_budget_label=sweep_budget_label,
+            sweep_budget_value=sweep_budget_value,
+            reward_matrix=reward_matrix,
+            metadata=metadata,
+            lane_indexes=lane_indexes,
+            stop_after_baseline=True,
+            max_active_override=scaffold_cap,
+        )
+        metadata["campaign_stage"] = "baseline_screened"
+        metadata["baseline_stage_state"] = baseline_state
+        survivors = {
+            int(result.lane_id.split("_")[-1]): result
+            for result in baseline_results
+            if result.status == "baseline_screened" and result.run_dir
+        }
+        metadata["baseline_survivor_count"] = len(survivors)
+        write_run_metadata(ctx.run_dir, metadata)
+        if not survivors:
+            return baseline_results
+        expand_results, expand_state = _run_campaign_lane_executor(
+            ctx=ctx,
+            runtime=runtime,
+            config=config,
+            seed_indicators=seed_indicators,
+            seed_plan=seed_plan,
+            seed_plan_path=seed_plan_path,
+            budget=budget,
+            sweep_budget_label=sweep_budget_label,
+            sweep_budget_value=sweep_budget_value,
+            reward_matrix=reward_matrix,
+            metadata=metadata,
+            lane_indexes=sorted(survivors),
+            expand_from=survivors,
+            max_active_override=runtime.active_lanes,
+        )
+        metadata["campaign_stage"] = "expanded"
+        metadata["expand_stage_state"] = expand_state
+        write_run_metadata(ctx.run_dir, metadata)
+        expand_by_lane = {result.lane_id: result for result in expand_results}
+        merged: list[MassiveLaneResult] = []
+        for baseline in baseline_results:
+            expanded = expand_by_lane.get(baseline.lane_id)
+            merged.append(expanded or baseline)
+        return merged
 
-    def refresh_lane_window(force: bool = False) -> int:
-        nonlocal last_snapshot, desired_active_lanes, next_telemetry_at
-        if not runtime.adaptive_lanes:
-            desired_active_lanes = runtime.active_lanes
-            return desired_active_lanes
-        now = time.monotonic()
-        if force or now >= next_telemetry_at:
-            last_snapshot = _poll_worker_pool_snapshot(runtime)
-            desired_active_lanes = _desired_active_lanes(runtime, last_snapshot)
-            next_telemetry_at = now + runtime.telemetry_interval_seconds
-            _append_event(
-                ctx,
-                "campaign",
-                "lane_window",
-                desired_active_lanes=desired_active_lanes,
-                running_lanes=len(in_flight),
-                pending_lanes=len(pending_lane_indexes),
-                worker_pool_snapshot=last_snapshot,
-            )
-            metadata["last_worker_pool_snapshot"] = last_snapshot
-            metadata["desired_active_lanes"] = desired_active_lanes
-            write_run_metadata(ctx.run_dir, metadata)
-        return desired_active_lanes
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=runtime.active_lanes) as executor:
-        refresh_lane_window(force=True)
-        while pending_lane_indexes or in_flight:
-            desired = refresh_lane_window()
-            while pending_lane_indexes and len(in_flight) < desired:
-                lane_index = pending_lane_indexes.pop(0)
-                future = executor.submit(
-                    _run_lane,
-                    ctx,
-                    runtime=runtime,
-                    lane_index=lane_index,
-                    seed_indicators=seed_indicators,
-                    seed_plan=seed_plan,
-                    seed_plan_path=seed_plan_path,
-                    budget=budget,
-                    sweep_budget_label=sweep_budget_label,
-                    max_sweep_permutations=sweep_budget_value,
-                    reward_matrix=reward_matrix,
-                )
-                in_flight[future] = lane_index
-                _append_event(
-                    ctx,
-                    "campaign",
-                    "lane_submitted",
-                    lane_index=lane_index,
-                    running_lanes=len(in_flight),
-                    desired_active_lanes=desired,
-                    pending_lanes=len(pending_lane_indexes),
-                )
-            if not in_flight:
-                time.sleep(1.0)
-                continue
-            done, _pending = concurrent.futures.wait(
-                set(in_flight),
-                timeout=1.0,
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-            for future in done:
-                in_flight.pop(future, None)
-                lane_result = future.result()
-                results.append(lane_result)
-                completed = len(results)
-                _append_event(
-                    ctx,
-                    "campaign",
-                    "lane_finished",
-                    completed_lanes=completed,
-                    total_lanes=runtime.lanes,
-                    active_lanes=runtime.active_lanes,
-                    desired_active_lanes=desired_active_lanes,
-                    running_lanes=len(in_flight),
-                    pending_lanes=len(pending_lane_indexes),
-                    lane_result=lane_result.as_dict(),
-                )
-                metadata["completed_lanes"] = completed
-                metadata["lane_run_ids"] = [
-                    result.run_id for result in results if result.run_id
-                ]
-                metadata["lane_results"] = [result.as_dict() for result in results]
-                metadata["desired_active_lanes"] = desired_active_lanes
-                write_run_metadata(ctx.run_dir, metadata)
+    results, _state = _run_campaign_lane_executor(
+        ctx=ctx,
+        runtime=runtime,
+        config=config,
+        seed_indicators=seed_indicators,
+        seed_plan=seed_plan,
+        seed_plan_path=seed_plan_path,
+        budget=budget,
+        sweep_budget_label=sweep_budget_label,
+        sweep_budget_value=sweep_budget_value,
+        reward_matrix=reward_matrix,
+        metadata=metadata,
+        lane_indexes=lane_indexes,
+    )
     return results
 
 
@@ -1226,7 +1602,7 @@ def cmd_play_hand_massive(
     instrument: list[str] | None = None,
     instrument_pool: list[str] | None = None,
     timeframe: str = "M5",
-    sweep_budget: str | None = "high",
+    sweep_budget: str | None = "low",
     max_sweep_permutations: int | None = None,
     max_reward_r: float | None = None,
     min_indicators: int = 1,
@@ -1239,9 +1615,14 @@ def cmd_play_hand_massive(
     job_timeout_seconds: int = PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
     sweep_timeout_seconds: int = PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
     keep_cloud_profiles: bool = False,
-    adaptive_lanes: bool = False,
+    adaptive_lanes: bool = True,
+    adaptive_fail_open: bool = False,
     min_active_lanes: int = 1,
-    target_worker_slots_per_lane: int = 8,
+    target_worker_slots_per_lane: int = 32,
+    scaffold_active_lanes: int = DEFAULT_SCAFFOLD_ACTIVE_LANES,
+    staged_campaign: bool = True,
+    remote_token_budget_multiplier: float = DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
+    backend_health_timeout_seconds: int = 5,
     gateway_url: str | None = None,
     gateway_token: str | None = None,
     gateway_pool: list[str] | None = None,
@@ -1270,8 +1651,13 @@ def cmd_play_hand_massive(
             sweep_timeout_seconds=sweep_timeout_seconds,
             keep_cloud_profiles=keep_cloud_profiles,
             adaptive_lanes=adaptive_lanes,
+            adaptive_fail_open=adaptive_fail_open,
             min_active_lanes=min_active_lanes,
             target_worker_slots_per_lane=target_worker_slots_per_lane,
+            scaffold_active_lanes=scaffold_active_lanes,
+            staged_campaign=staged_campaign,
+            remote_token_budget_multiplier=remote_token_budget_multiplier,
+            backend_health_timeout_seconds=backend_health_timeout_seconds,
             gateway_url=gateway_url,
             gateway_token=gateway_token,
             gateway_pool=gateway_pool,
@@ -1342,8 +1728,13 @@ def cmd_play_hand_massive(
         "deep_replay_job_timeout_seconds": runtime.job_timeout_seconds,
         "sweep_timeout_seconds": runtime.sweep_timeout_seconds,
         "adaptive_lanes": runtime.adaptive_lanes,
+        "adaptive_fail_open": runtime.adaptive_fail_open,
         "min_active_lanes": runtime.min_active_lanes,
         "target_worker_slots_per_lane": runtime.target_worker_slots_per_lane,
+        "scaffold_active_lanes": runtime.scaffold_active_lanes,
+        "staged_campaign": runtime.staged_campaign,
+        "remote_token_budget_multiplier": runtime.remote_token_budget_multiplier,
+        "backend_health_timeout_seconds": runtime.backend_health_timeout_seconds,
         "gateway_url": _gateway_url(runtime),
         "gateway_pool": runtime.gateway_pool,
         "telemetry_interval_seconds": runtime.telemetry_interval_seconds,
@@ -1389,6 +1780,11 @@ def cmd_play_hand_massive(
     elapsed_seconds = round(time.perf_counter() - started_perf, 3)
     completed_results = [result for result in results if result.status == "completed"]
     failed_results = [result for result in results if result.status == "failed"]
+    infrastructure_blocked = [
+        result
+        for result in results
+        if result.status.startswith("not_started_")
+    ]
     best_result = max(
         (result for result in results if result.best_score is not None),
         key=lambda result: float(result.best_score or float("-inf")),
@@ -1406,13 +1802,20 @@ def cmd_play_hand_massive(
         "last_worker_pool_snapshot": metadata.get("last_worker_pool_snapshot"),
         "completed_lanes": len(completed_results),
         "failed_lanes": len(failed_results),
+        "infrastructure_blocked_lanes": len(infrastructure_blocked),
+        "campaign_pause_reason": metadata.get("campaign_pause_reason"),
+        "last_backend_health": metadata.get("last_backend_health"),
         "best_lane": best_result.as_dict() if best_result is not None else None,
         "cloud_profile_cleanup": cleanup,
         "lane_results": [result.as_dict() for result in sorted(results, key=lambda item: item.lane_id)],
     }
     metadata.update(
         {
-            "run_status": "completed" if not failed_results else "partial",
+            "run_status": (
+                "completed"
+                if completed_results and not failed_results
+                else ("infrastructure_blocked" if infrastructure_blocked and not completed_results else "partial")
+            ),
             "completed_at": _now_iso(),
             "elapsed_seconds": elapsed_seconds,
             "completed_lanes": len(completed_results),
@@ -1441,12 +1844,16 @@ __all__ = [
     "DEFAULT_BASELINE_FLOOR",
     "DEFAULT_MASSIVE_ACTIVE_LANES",
     "DEFAULT_MASSIVE_LANES",
+    "DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER",
+    "DEFAULT_SCAFFOLD_ACTIVE_LANES",
     "PLAY_HAND_MASSIVE_CAMPAIGNS_DIR",
     "PLAY_HAND_MASSIVE_LANE_SCHEMA_VERSION",
     "PLAY_HAND_MASSIVE_RUNNER",
     "MassiveRuntimeConfig",
     "cmd_play_hand_massive",
     "_desired_active_lanes",
+    "_poll_local_backend_health",
+    "_run_campaign_lane_executor",
     "lane_seed",
     "normalize_massive_runtime_config",
     "should_expand_lane",
