@@ -408,6 +408,48 @@ def _poll_worker_pool_snapshot(runtime: MassiveRuntimeConfig) -> dict[str, Any]:
     }
 
 
+def _poll_worker_gateway_pressure(runtime: MassiveRuntimeConfig) -> dict[str, Any]:
+    url = _gateway_url(runtime)
+    token = _gateway_token(runtime)
+    if not url:
+        return {"ok": False, "reason": "gateway_url_missing"}
+    if not token:
+        return {"ok": False, "reason": "gateway_token_missing", "gateway_url": url}
+    try:
+        response = requests.get(
+            f"{url}/pressure",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        return {
+            "ok": False,
+            "reason": "gateway_pressure_poll_failed",
+            "gateway_url": url,
+            "error": str(exc)[:500],
+        }
+    if not isinstance(payload, dict):
+        return {"ok": False, "reason": "gateway_pressure_invalid_payload", "gateway_url": url}
+    return {
+        "ok": True,
+        "gateway_url": url,
+        "status": str(payload.get("status") or "ok"),
+        "eligible_worker_count": payload.get("eligible_worker_count"),
+        "active_leases": payload.get("active_leases"),
+        "pending_by_queue": payload.get("pending_by_queue"),
+        "server_time": payload.get("server_time"),
+    }
+
+
+def _gateway_pressure_should_pause(snapshot: dict[str, Any] | None) -> bool:
+    if not snapshot or not snapshot.get("ok"):
+        return False
+    status = str(snapshot.get("status") or "").strip().lower()
+    return status in {"saturated", "degraded"}
+
+
 def _desired_active_lanes(
     runtime: MassiveRuntimeConfig,
     snapshot: dict[str, Any] | None,
@@ -1296,6 +1338,7 @@ def _run_campaign_lane_executor(
     pending_lane_indexes = list(lane_indexes)
     in_flight: dict[concurrent.futures.Future[MassiveLaneResult], int] = {}
     last_snapshot: dict[str, Any] | None = None
+    last_gateway_pressure: dict[str, Any] | None = None
     last_backend_health: dict[str, Any] | None = None
     desired_active_lanes = runtime.active_lanes
     next_telemetry_at = 0.0
@@ -1310,7 +1353,7 @@ def _run_campaign_lane_executor(
     executor_cap = max_active_override or runtime.active_lanes
 
     def refresh_lane_window(force: bool = False) -> int:
-        nonlocal last_snapshot, last_backend_health, desired_active_lanes, next_telemetry_at
+        nonlocal last_snapshot, last_gateway_pressure, last_backend_health, desired_active_lanes, next_telemetry_at
         nonlocal consecutive_bad_gateway_polls, consecutive_backend_health_failures
         nonlocal pause_until, pause_reason, no_worker_since
         now = time.monotonic()
@@ -1332,6 +1375,11 @@ def _run_campaign_lane_executor(
 
             if runtime.adaptive_lanes:
                 last_snapshot = _poll_worker_pool_snapshot(runtime)
+                if _gateway_url(runtime):
+                    last_gateway_pressure = _poll_worker_gateway_pressure(runtime)
+                    if _gateway_pressure_should_pause(last_gateway_pressure):
+                        pause_reason = "gateway_pressure"
+                        pause_until = now + runtime.telemetry_interval_seconds
                 desired_active_lanes = _desired_active_lanes(runtime, last_snapshot)
                 if last_snapshot.get("ok"):
                     consecutive_bad_gateway_polls = 0
@@ -1370,12 +1418,14 @@ def _run_campaign_lane_executor(
                 running_lanes=len(in_flight),
                 pending_lanes=len(pending_lane_indexes),
                 worker_pool_snapshot=last_snapshot,
+                gateway_pressure=last_gateway_pressure,
                 backend_health=last_backend_health,
                 pause_reason=pause_reason,
                 pause_until=round(pause_until, 3) if pause_until else None,
                 in_flight_remote_permutations=in_flight_remote_permutations,
             )
             metadata["last_worker_pool_snapshot"] = last_snapshot
+            metadata["last_gateway_pressure"] = last_gateway_pressure
             metadata["last_backend_health"] = last_backend_health
             metadata["desired_active_lanes"] = desired_active_lanes
             metadata["campaign_pause_reason"] = pause_reason
@@ -1398,6 +1448,8 @@ def _run_campaign_lane_executor(
             return False
         if pause_reason == "no_workers":
             return False
+        if pause_reason == "gateway_pressure":
+            return False
         return True
 
     def lane_submission_reason() -> str | None:
@@ -1405,6 +1457,8 @@ def _run_campaign_lane_executor(
             return "not_started_backend_down"
         if pause_reason == "no_workers":
             return "not_started_no_workers"
+        if pause_reason == "gateway_pressure":
+            return "not_started_gateway_pressure"
         if (
             runtime.adaptive_lanes
             and _gateway_url(runtime)

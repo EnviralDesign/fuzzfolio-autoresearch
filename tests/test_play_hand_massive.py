@@ -105,6 +105,13 @@ def test_effective_remote_token_budget_floors_to_one_lane_cost() -> None:
     assert massive._effective_remote_token_budget(snapshot, runtime, lane_cost) == 512
 
 
+def test_gateway_pressure_should_pause_on_saturated_or_degraded() -> None:
+    assert massive._gateway_pressure_should_pause({"ok": True, "status": "saturated"})
+    assert massive._gateway_pressure_should_pause({"ok": True, "status": "degraded"})
+    assert not massive._gateway_pressure_should_pause({"ok": True, "status": "ok"})
+    assert not massive._gateway_pressure_should_pause({"ok": False, "status": "saturated"})
+
+
 def test_run_campaign_lane_executor_blocks_on_backend_down(monkeypatch) -> None:
     runtime = massive.normalize_massive_runtime_config(
         massive.MassiveRuntimeConfig(
