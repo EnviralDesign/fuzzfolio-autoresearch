@@ -373,3 +373,290 @@ def test_cmd_play_hand_massive_dry_run_writes_first_class_lane_runs(
         assert attempt["generated_by_runner"] == massive.PLAY_HAND_MASSIVE_RUNNER
         assert attempt["is_canonical_attempt"] is True
         assert attempt["is_canonical_playhand_attempt"] is True
+
+
+def _campaign_test_context() -> tuple[SimpleNamespace, SimpleNamespace, dict]:
+    config = SimpleNamespace(
+        runs_root=Path("."),
+        derived_root=Path("."),
+        fuzzfolio=SimpleNamespace(base_url="http://localhost:7946/api/dev"),
+    )
+    ctx = SimpleNamespace(config=config, run_dir=Path("."), run_id="campaign-test")
+    ctx.run_dir = Path(".")
+    return config, ctx, {}
+
+
+def test_baseline_window_ignores_sweep_slot_ratio() -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=24,
+            active_lanes=4,
+            scaffold_active_lanes=4,
+            target_worker_slots_per_lane=75,
+        )
+    )
+    assert massive._baseline_window(runtime) == 4
+
+
+def test_expand_window_floors_to_one_when_expand_ready_and_workers_exist() -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=24,
+            active_lanes=4,
+            adaptive_lanes=True,
+            min_active_lanes=1,
+            target_worker_slots_per_lane=75,
+            gateway_url="https://example.com/api/worker-gateway",
+        )
+    )
+    snapshot = {"ok": True, "slots": 7}
+    assert massive._expand_window(runtime, snapshot, has_expand_ready=False) == 1
+    assert massive._expand_window(runtime, snapshot, has_expand_ready=True) == 1
+
+    two_worker = {"ok": True, "slots": 2}
+    assert massive._expand_window(runtime, two_worker, has_expand_ready=True) == 1
+
+
+def test_expand_window_scales_for_large_pools() -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=24,
+            active_lanes=8,
+            adaptive_lanes=True,
+            min_active_lanes=1,
+            target_worker_slots_per_lane=64,
+            gateway_url="https://example.com/api/worker-gateway",
+        )
+    )
+    snapshot = {"ok": True, "slots": 200}
+    assert massive._expand_window(runtime, snapshot, has_expand_ready=True) == 4
+
+
+def test_rolling_staged_submits_expand_before_all_baselines_finish(monkeypatch) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=6,
+            active_lanes=4,
+            scaffold_active_lanes=4,
+            adaptive_lanes=True,
+            staged_campaign=True,
+            target_worker_slots_per_lane=75,
+            gateway_url="https://example.com/api/worker-gateway",
+            telemetry_interval_seconds=3600,
+        )
+    )
+    config, ctx, metadata = _campaign_test_context()
+    submissions: list[tuple[int, str]] = []
+    baseline_started = __import__("threading").Event()
+    expand_started = __import__("threading").Event()
+
+    def fake_run_lane(*_args, **kwargs):
+        lane_index = kwargs["lane_index"]
+        if kwargs.get("stop_after_baseline"):
+            submissions.append((lane_index, "baseline"))
+            if lane_index == 1:
+                baseline_started.set()
+            if lane_index >= 4:
+                baseline_started.wait(timeout=2)
+            return massive.MassiveLaneResult(
+                lane_id=f"lane_{lane_index:03d}",
+                status="baseline_screened",
+                started_at="2026-06-17T00:00:00+00:00",
+                run_id=f"run-{lane_index}",
+                run_dir=str(Path(f"lane-{lane_index}")),
+            )
+        submissions.append((lane_index, "expand"))
+        expand_started.set()
+        return massive.MassiveLaneResult(
+            lane_id=f"lane_{lane_index:03d}",
+            status="completed",
+            started_at="2026-06-17T00:00:00+00:00",
+            run_id=f"run-{lane_index}",
+            run_dir=str(Path(f"lane-{lane_index}")),
+        )
+
+    monkeypatch.setattr(massive, "_run_lane", fake_run_lane)
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_pool_snapshot",
+        lambda _runtime: {"ok": True, "slots": 7, "pool_count": 1, "worker_count": 7},
+    )
+    monkeypatch.setattr(
+        massive,
+        "_poll_local_backend_health",
+        lambda *_args, **_kwargs: {"ok": True, "url": "http://localhost:7946/healthz"},
+    )
+    monkeypatch.setattr(massive, "write_run_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(massive, "_append_event", lambda *_args, **_kwargs: None)
+
+    results, _state = massive._run_rolling_staged_campaign_executor(
+        ctx=ctx,
+        runtime=runtime,
+        config=config,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "high", "value": 1024},
+        sweep_budget_label="high",
+        sweep_budget_value=1024,
+        reward_matrix=None,
+        metadata=metadata,
+        lane_indexes=[1, 2, 3, 4, 5, 6],
+    )
+
+    expand_indices = [lane for lane, phase in submissions if phase == "expand"]
+    baseline_indices = [lane for lane, phase in submissions if phase == "baseline"]
+    assert expand_indices
+    assert min(expand_indices) == 1
+    assert max(baseline_indices) > min(expand_indices)
+    assert len(results) == 6
+
+
+def test_rolling_staged_baseline_concurrency_reaches_scaffold_cap(monkeypatch) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=8,
+            active_lanes=4,
+            scaffold_active_lanes=4,
+            adaptive_lanes=True,
+            target_worker_slots_per_lane=75,
+            gateway_url="https://example.com/api/worker-gateway",
+            telemetry_interval_seconds=3600,
+        )
+    )
+    config, ctx, metadata = _campaign_test_context()
+    lock = __import__("threading").Lock()
+    baseline_inflight = 0
+    max_baseline_inflight = 0
+
+    def fake_run_lane(*_args, **kwargs):
+        nonlocal baseline_inflight, max_baseline_inflight
+        if not kwargs.get("stop_after_baseline"):
+            time.sleep(0.01)
+            lane_index = kwargs["lane_index"]
+            return massive.MassiveLaneResult(
+                lane_id=f"lane_{lane_index:03d}",
+                status="completed",
+                started_at="2026-06-17T00:00:00+00:00",
+                run_id=f"run-{lane_index}",
+                run_dir=str(Path(f"lane-{lane_index}")),
+            )
+        with lock:
+            baseline_inflight += 1
+            max_baseline_inflight = max(max_baseline_inflight, baseline_inflight)
+        time.sleep(0.05)
+        with lock:
+            baseline_inflight -= 1
+        lane_index = kwargs["lane_index"]
+        return massive.MassiveLaneResult(
+            lane_id=f"lane_{lane_index:03d}",
+            status="baseline_screened",
+            started_at="2026-06-17T00:00:00+00:00",
+            run_id=f"run-{lane_index}",
+            run_dir=str(Path(f"lane-{lane_index}")),
+        )
+
+    monkeypatch.setattr(massive, "_run_lane", fake_run_lane)
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_pool_snapshot",
+        lambda _runtime: {"ok": True, "slots": 7, "pool_count": 1, "worker_count": 7},
+    )
+    monkeypatch.setattr(
+        massive,
+        "_poll_local_backend_health",
+        lambda *_args, **_kwargs: {"ok": True, "url": "http://localhost:7946/healthz"},
+    )
+    monkeypatch.setattr(massive, "write_run_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(massive, "_append_event", lambda *_args, **_kwargs: None)
+
+    massive._run_rolling_staged_campaign_executor(
+        ctx=ctx,
+        runtime=runtime,
+        config=config,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "high", "value": 1024},
+        sweep_budget_label="high",
+        sweep_budget_value=1024,
+        reward_matrix=None,
+        metadata=metadata,
+        lane_indexes=list(range(1, 9)),
+    )
+
+    assert max_baseline_inflight >= 4
+
+
+def test_rolling_staged_pauses_on_gateway_pressure_without_mass_not_started(monkeypatch) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=3,
+            active_lanes=2,
+            scaffold_active_lanes=2,
+            adaptive_lanes=True,
+            staged_campaign=True,
+            gateway_url="https://example.com/api/worker-gateway",
+            telemetry_interval_seconds=3600,
+        )
+    )
+    config, ctx, metadata = _campaign_test_context()
+    pressure_calls = {"count": 0}
+
+    def fake_run_lane(*_args, **kwargs):
+        lane_index = kwargs["lane_index"]
+        time.sleep(0.05)
+        if kwargs.get("stop_after_baseline"):
+            return massive.MassiveLaneResult(
+                lane_id=f"lane_{lane_index:03d}",
+                status="baseline_screened",
+                started_at="2026-06-17T00:00:00+00:00",
+                run_id=f"run-{lane_index}",
+                run_dir=str(Path(f"lane-{lane_index}")),
+            )
+        return massive.MassiveLaneResult(
+            lane_id=f"lane_{lane_index:03d}",
+            status="completed",
+            started_at="2026-06-17T00:00:00+00:00",
+            run_id=f"run-{lane_index}",
+            run_dir=str(Path(f"lane-{lane_index}")),
+        )
+
+    def fake_pressure(_runtime):
+        pressure_calls["count"] += 1
+        if pressure_calls["count"] >= 2:
+            return {"ok": True, "status": "saturated"}
+        return {"ok": True, "status": "ok"}
+
+    monkeypatch.setattr(massive, "_run_lane", fake_run_lane)
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_pool_snapshot",
+        lambda _runtime: {"ok": True, "slots": 7, "pool_count": 1, "worker_count": 7},
+    )
+    monkeypatch.setattr(massive, "_poll_worker_gateway_pressure", fake_pressure)
+    monkeypatch.setattr(
+        massive,
+        "_poll_local_backend_health",
+        lambda *_args, **_kwargs: {"ok": True, "url": "http://localhost:7946/healthz"},
+    )
+    monkeypatch.setattr(massive, "write_run_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(massive, "_append_event", lambda *_args, **_kwargs: None)
+
+    results, state = massive._run_rolling_staged_campaign_executor(
+        ctx=ctx,
+        runtime=runtime,
+        config=config,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "high", "value": 1024},
+        sweep_budget_label="high",
+        sweep_budget_value=1024,
+        reward_matrix=None,
+        metadata=metadata,
+        lane_indexes=[1, 2, 3],
+    )
+
+    assert not any(result.status == "not_started_gateway_pressure" for result in results)
+    assert state["pause_reason"] in {None, "gateway_pressure"}

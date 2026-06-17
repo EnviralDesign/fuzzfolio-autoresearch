@@ -74,8 +74,9 @@ Common arguments:
 - `--sweep-budget`: `low`, `medium`, or `high`. Default `low`.
 - `--adaptive-lanes` / `--no-adaptive-lanes`: gateway-aware lane window. Default enabled.
 - `--adaptive-fail-open`: legacy fail-open adaptive behavior when gateway polls fail.
-- `--staged-campaign` / `--no-staged-campaign`: baseline screen all lanes at low concurrency before expand sweeps. Default enabled.
-- `--scaffold-active-lanes`: concurrency cap during baseline screening. Default `2`.
+- `--staged-campaign` / `--no-staged-campaign`: rolling staged pipeline — baseline/scaffold lanes and expansion/sweep lanes run concurrently; each lane enters sweeps as soon as it passes baseline. Default enabled.
+- `--scaffold-active-lanes`: concurrency cap for baseline/scaffold work only (not reduced by `--target-worker-slots-per-lane`). Default `2`.
+- `--target-worker-slots-per-lane`: adaptive cap for expansion/sweep lane concurrency only. Worker count affects throughput, not whether sweeps start.
 - `--remote-token-budget-multiplier`: remote permutation budget = healthy worker slots × multiplier. Default `2`.
 - `--gateway-url`, `--gateway-token`, `--gateway-pool`: adaptive telemetry against the worker gateway.
 - `--dry-run`: write campaign/lane folders without backend compute.

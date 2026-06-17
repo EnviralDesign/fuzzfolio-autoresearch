@@ -471,6 +471,78 @@ def _desired_active_lanes(
     return max(runtime.min_active_lanes, min(runtime.active_lanes, desired))
 
 
+def _eligible_worker_slots(snapshot: dict[str, Any] | None) -> int:
+    if not snapshot or not snapshot.get("ok"):
+        return 0
+    try:
+        return max(int(snapshot.get("slots") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _baseline_window(runtime: MassiveRuntimeConfig) -> int:
+    """Baseline/scaffold concurrency is independent of sweep slot ratio."""
+    return max(1, min(runtime.scaffold_active_lanes, runtime.active_lanes))
+
+
+def _expand_window(
+    runtime: MassiveRuntimeConfig,
+    snapshot: dict[str, Any] | None,
+    *,
+    has_expand_ready: bool,
+) -> int:
+    """Expansion/sweep lane concurrency derived from worker slots per sweep lane."""
+    if not runtime.adaptive_lanes:
+        window = runtime.active_lanes
+    else:
+        window = _desired_active_lanes(runtime, snapshot)
+    window = min(window, runtime.active_lanes)
+    slots = _eligible_worker_slots(snapshot)
+    if has_expand_ready and (slots > 0 or not _gateway_url(runtime)):
+        window = max(1, window)
+    return window
+
+
+def _is_terminal_submission_block(
+    *,
+    pause_reason: str | None,
+    consecutive_backend_health_failures: int,
+    consecutive_bad_gateway_polls: int,
+    runtime: MassiveRuntimeConfig,
+) -> bool:
+    if consecutive_backend_health_failures >= CAMPAIGN_BACKEND_DOWN_THRESHOLD:
+        return True
+    if pause_reason == "no_workers":
+        return True
+    if pause_reason == "gateway_pressure":
+        return False
+    if (
+        runtime.adaptive_lanes
+        and _gateway_url(runtime)
+        and consecutive_bad_gateway_polls >= CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD
+    ):
+        return True
+    return False
+
+
+def _expansion_submission_allowed(
+    *,
+    runtime: MassiveRuntimeConfig,
+    snapshot: dict[str, Any] | None,
+    expand_in_flight_count: int,
+    expand_ready_count: int,
+    in_flight_remote_permutations: int,
+    lane_remote_cost: int,
+    token_budget: int | None,
+) -> bool:
+    slots = _eligible_worker_slots(snapshot)
+    if expand_ready_count > 0 and slots > 0 and expand_in_flight_count == 0:
+        return True
+    if token_budget is None:
+        return True
+    return in_flight_remote_permutations + lane_remote_cost <= token_budget
+
+
 def _derived_campaign_root(config: AppConfig) -> Path:
     derived_root = getattr(config, "derived_root", None)
     if isinstance(derived_root, Path):
@@ -1484,7 +1556,12 @@ def _run_campaign_lane_executor(
             while pending_lane_indexes and len(in_flight) < effective_desired:
                 if not submission_allowed():
                     blocked_reason = lane_submission_reason()
-                    if blocked_reason:
+                    if blocked_reason and _is_terminal_submission_block(
+                        pause_reason=pause_reason,
+                        consecutive_backend_health_failures=consecutive_backend_health_failures,
+                        consecutive_bad_gateway_polls=consecutive_bad_gateway_polls,
+                        runtime=runtime,
+                    ):
                         blocked_indexes = list(pending_lane_indexes)
                         pending_lane_indexes.clear()
                         results.extend(
@@ -1539,20 +1616,29 @@ def _run_campaign_lane_executor(
                 )
 
             if not in_flight and pending_lane_indexes and not submission_allowed():
-                blocked_reason = lane_submission_reason() or "not_started_backend_down"
-                blocked_indexes = list(pending_lane_indexes)
-                pending_lane_indexes.clear()
-                results.extend(
-                    _mark_unstarted_lanes(
-                        pending_lane_indexes=blocked_indexes,
-                        reason=blocked_reason,
-                        started_at=_now_iso(),
+                blocked_reason = lane_submission_reason()
+                if blocked_reason and _is_terminal_submission_block(
+                    pause_reason=pause_reason,
+                    consecutive_backend_health_failures=consecutive_backend_health_failures,
+                    consecutive_bad_gateway_polls=consecutive_bad_gateway_polls,
+                    runtime=runtime,
+                ):
+                    blocked_indexes = list(pending_lane_indexes)
+                    pending_lane_indexes.clear()
+                    results.extend(
+                        _mark_unstarted_lanes(
+                            pending_lane_indexes=blocked_indexes,
+                            reason=blocked_reason,
+                            started_at=_now_iso(),
+                        )
                     )
-                )
-                metadata["blocked_lane_count"] = len(blocked_indexes)
-                metadata["blocked_lane_reason"] = blocked_reason
-                write_run_metadata(ctx.run_dir, metadata)
-                break
+                    metadata["blocked_lane_count"] = len(blocked_indexes)
+                    metadata["blocked_lane_reason"] = blocked_reason
+                    write_run_metadata(ctx.run_dir, metadata)
+                    break
+                if pending_lane_indexes:
+                    time.sleep(1.0)
+                    continue
 
             if not in_flight:
                 if pending_lane_indexes and token_budget is not None:
@@ -1606,6 +1692,380 @@ def _run_campaign_lane_executor(
     return results, campaign_state
 
 
+def _run_rolling_staged_campaign_executor(
+    *,
+    ctx: PlayHandContext,
+    runtime: MassiveRuntimeConfig,
+    config: AppConfig,
+    seed_indicators: list[SeedIndicator],
+    seed_plan: dict[str, Any] | None,
+    seed_plan_path: Path | None,
+    budget: dict[str, Any],
+    sweep_budget_label: str,
+    sweep_budget_value: int,
+    reward_matrix: dict[str, Any] | None,
+    metadata: dict[str, Any],
+    lane_indexes: list[int],
+) -> tuple[list[MassiveLaneResult], dict[str, Any]]:
+    unstarted_baseline = list(lane_indexes)
+    expand_ready: list[tuple[int, MassiveLaneResult]] = []
+    baseline_in_flight: dict[concurrent.futures.Future[MassiveLaneResult], int] = {}
+    expand_in_flight: dict[concurrent.futures.Future[MassiveLaneResult], int] = {}
+    terminal_by_lane: dict[int, MassiveLaneResult] = {}
+    baseline_by_lane: dict[int, MassiveLaneResult] = {}
+
+    last_snapshot: dict[str, Any] | None = None
+    last_gateway_pressure: dict[str, Any] | None = None
+    last_backend_health: dict[str, Any] | None = None
+    next_telemetry_at = 0.0
+    consecutive_bad_gateway_polls = 0
+    consecutive_backend_health_failures = 0
+    pause_until = 0.0
+    pause_reason: str | None = None
+    in_flight_remote_permutations = 0
+    lane_remote_cost = _estimate_lane_remote_permutations(sweep_budget_value)
+    no_worker_since: float | None = None
+    baseline_window = _baseline_window(runtime)
+    expand_window = 0
+    executor_cap = max(
+        1,
+        min(runtime.scaffold_active_lanes + runtime.active_lanes, len(lane_indexes) * 2),
+    )
+
+    def refresh_lane_window(force: bool = False) -> tuple[int, int]:
+        nonlocal last_snapshot, last_gateway_pressure, last_backend_health, next_telemetry_at
+        nonlocal consecutive_bad_gateway_polls, consecutive_backend_health_failures
+        nonlocal pause_until, pause_reason, no_worker_since, baseline_window, expand_window
+        now = time.monotonic()
+        if force or now >= next_telemetry_at:
+            if not runtime.dry_run:
+                last_backend_health = _poll_local_backend_health(
+                    config,
+                    timeout_seconds=runtime.backend_health_timeout_seconds,
+                )
+                if last_backend_health.get("ok"):
+                    consecutive_backend_health_failures = 0
+                else:
+                    consecutive_backend_health_failures += 1
+                    if consecutive_backend_health_failures >= CAMPAIGN_BACKEND_DOWN_THRESHOLD:
+                        pause_reason = "backend_down"
+                        pause_until = now + runtime.telemetry_interval_seconds
+            elif last_backend_health is None:
+                last_backend_health = {"ok": True, "reason": "dry_run_skipped"}
+
+            if runtime.adaptive_lanes:
+                last_snapshot = _poll_worker_pool_snapshot(runtime)
+                if _gateway_url(runtime):
+                    last_gateway_pressure = _poll_worker_gateway_pressure(runtime)
+                    if _gateway_pressure_should_pause(last_gateway_pressure):
+                        pause_reason = "gateway_pressure"
+                        pause_until = now + runtime.telemetry_interval_seconds
+                if last_snapshot.get("ok"):
+                    consecutive_bad_gateway_polls = 0
+                    slots = _eligible_worker_slots(last_snapshot)
+                    if (
+                        slots <= 0
+                        and _gateway_url(runtime)
+                        and runtime.max_no_worker_wait_seconds > 0
+                    ):
+                        if no_worker_since is None:
+                            no_worker_since = now
+                        elif now - no_worker_since >= runtime.max_no_worker_wait_seconds:
+                            pause_reason = "no_workers"
+                            pause_until = now + runtime.telemetry_interval_seconds
+                    else:
+                        no_worker_since = None
+                elif _gateway_url(runtime):
+                    consecutive_bad_gateway_polls += 1
+                    no_worker_since = None
+                    if consecutive_bad_gateway_polls >= CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD:
+                        pause_reason = "gateway_unhealthy"
+                        pause_until = now + runtime.telemetry_interval_seconds
+            else:
+                no_worker_since = None
+
+            baseline_window = _baseline_window(runtime)
+            expand_window = _expand_window(
+                runtime,
+                last_snapshot,
+                has_expand_ready=bool(expand_ready),
+            )
+            next_telemetry_at = now + runtime.telemetry_interval_seconds
+            _append_event(
+                ctx,
+                "campaign",
+                "lane_window",
+                scheduler="rolling_staged",
+                baseline_window=baseline_window,
+                expand_window=expand_window,
+                baseline_inflight=len(baseline_in_flight),
+                expand_inflight=len(expand_in_flight),
+                expand_ready=len(expand_ready),
+                pending_baseline=len(unstarted_baseline),
+                worker_pool_snapshot=last_snapshot,
+                gateway_pressure=last_gateway_pressure,
+                backend_health=last_backend_health,
+                pause_reason=pause_reason,
+                pause_until=round(pause_until, 3) if pause_until else None,
+                in_flight_remote_permutations=in_flight_remote_permutations,
+            )
+            metadata["last_worker_pool_snapshot"] = last_snapshot
+            metadata["last_gateway_pressure"] = last_gateway_pressure
+            metadata["last_backend_health"] = last_backend_health
+            metadata["baseline_window"] = baseline_window
+            metadata["expand_window"] = expand_window
+            metadata["campaign_pause_reason"] = pause_reason
+            metadata["in_flight_remote_permutations"] = in_flight_remote_permutations
+            metadata["campaign_stage"] = "rolling_staged"
+            write_run_metadata(ctx.run_dir, metadata)
+        return baseline_window, expand_window
+
+    def submission_allowed() -> bool:
+        if runtime.dry_run:
+            return True
+        if time.monotonic() < pause_until:
+            return False
+        if consecutive_backend_health_failures >= CAMPAIGN_BACKEND_DOWN_THRESHOLD:
+            return False
+        if (
+            runtime.adaptive_lanes
+            and _gateway_url(runtime)
+            and consecutive_bad_gateway_polls >= CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD
+        ):
+            return False
+        if pause_reason == "no_workers":
+            return False
+        if pause_reason == "gateway_pressure":
+            return False
+        return True
+
+    def lane_submission_reason() -> str | None:
+        if consecutive_backend_health_failures >= CAMPAIGN_BACKEND_DOWN_THRESHOLD:
+            return "not_started_backend_down"
+        if pause_reason == "no_workers":
+            return "not_started_no_workers"
+        if pause_reason == "gateway_pressure":
+            return "not_started_gateway_pressure"
+        if (
+            runtime.adaptive_lanes
+            and _gateway_url(runtime)
+            and consecutive_bad_gateway_polls >= CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD
+        ):
+            return "not_started_gateway_unhealthy"
+        return None
+
+    def mark_terminal_unstarted(reason: str) -> None:
+        started_at = _now_iso()
+        for lane_index in unstarted_baseline:
+            terminal_by_lane[lane_index] = MassiveLaneResult(
+                lane_id=f"lane_{lane_index:03d}",
+                status=reason,
+                started_at=started_at,
+                skipped_reason=reason,
+            )
+        unstarted_baseline.clear()
+        for lane_index, prior in expand_ready:
+            terminal_by_lane[lane_index] = MassiveLaneResult(
+                lane_id=prior.lane_id,
+                status=reason,
+                started_at=prior.started_at,
+                skipped_reason=reason,
+                run_id=prior.run_id,
+                run_dir=prior.run_dir,
+                baseline_score=prior.baseline_score,
+            )
+        expand_ready.clear()
+
+    token_budget = _effective_remote_token_budget(
+        last_snapshot,
+        runtime,
+        lane_remote_cost,
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=executor_cap) as executor:
+        refresh_lane_window(force=True)
+        while unstarted_baseline or baseline_in_flight or expand_ready or expand_in_flight:
+            baseline_window, expand_window = refresh_lane_window()
+            token_budget = _effective_remote_token_budget(
+                last_snapshot,
+                runtime,
+                lane_remote_cost,
+            )
+
+            if submission_allowed():
+                while unstarted_baseline and len(baseline_in_flight) < baseline_window:
+                    lane_index = unstarted_baseline.pop(0)
+                    future = executor.submit(
+                        _run_lane,
+                        ctx,
+                        runtime=runtime,
+                        lane_index=lane_index,
+                        seed_indicators=seed_indicators,
+                        seed_plan=seed_plan,
+                        seed_plan_path=seed_plan_path,
+                        budget=budget,
+                        sweep_budget_label=sweep_budget_label,
+                        max_sweep_permutations=sweep_budget_value,
+                        reward_matrix=reward_matrix,
+                        stop_after_baseline=True,
+                    )
+                    baseline_in_flight[future] = lane_index
+                    _append_event(
+                        ctx,
+                        "campaign",
+                        "lane_submitted",
+                        lane_index=lane_index,
+                        lane_phase="baseline",
+                        running_baseline=len(baseline_in_flight),
+                        running_expand=len(expand_in_flight),
+                        baseline_window=baseline_window,
+                        expand_window=expand_window,
+                    )
+
+                while expand_ready and len(expand_in_flight) < expand_window:
+                    if not _expansion_submission_allowed(
+                        runtime=runtime,
+                        snapshot=last_snapshot,
+                        expand_in_flight_count=len(expand_in_flight),
+                        expand_ready_count=len(expand_ready),
+                        in_flight_remote_permutations=in_flight_remote_permutations,
+                        lane_remote_cost=lane_remote_cost,
+                        token_budget=token_budget,
+                    ):
+                        break
+                    lane_index, prior = expand_ready.pop(0)
+                    future = executor.submit(
+                        _run_lane,
+                        ctx,
+                        runtime=runtime,
+                        lane_index=lane_index,
+                        seed_indicators=seed_indicators,
+                        seed_plan=seed_plan,
+                        seed_plan_path=seed_plan_path,
+                        budget=budget,
+                        sweep_budget_label=sweep_budget_label,
+                        max_sweep_permutations=sweep_budget_value,
+                        reward_matrix=reward_matrix,
+                        stop_after_baseline=False,
+                        existing_lane_run_id=prior.run_id,
+                        existing_lane_run_dir=Path(prior.run_dir) if prior.run_dir else None,
+                    )
+                    expand_in_flight[future] = lane_index
+                    in_flight_remote_permutations += lane_remote_cost
+                    _append_event(
+                        ctx,
+                        "campaign",
+                        "lane_submitted",
+                        lane_index=lane_index,
+                        lane_phase="expand",
+                        running_baseline=len(baseline_in_flight),
+                        running_expand=len(expand_in_flight),
+                        baseline_window=baseline_window,
+                        expand_window=expand_window,
+                    )
+            elif _is_terminal_submission_block(
+                pause_reason=pause_reason,
+                consecutive_backend_health_failures=consecutive_backend_health_failures,
+                consecutive_bad_gateway_polls=consecutive_bad_gateway_polls,
+                runtime=runtime,
+            ):
+                blocked_reason = lane_submission_reason() or "not_started_backend_down"
+                if not baseline_in_flight and not expand_in_flight:
+                    mark_terminal_unstarted(blocked_reason)
+                    metadata["blocked_lane_count"] = len(terminal_by_lane)
+                    metadata["blocked_lane_reason"] = blocked_reason
+                    write_run_metadata(ctx.run_dir, metadata)
+                    break
+
+            if not baseline_in_flight and not expand_in_flight:
+                if unstarted_baseline or expand_ready:
+                    time.sleep(1.0)
+                    continue
+                break
+
+            all_in_flight = set(baseline_in_flight) | set(expand_in_flight)
+            done, _pending = concurrent.futures.wait(
+                all_in_flight,
+                timeout=1.0,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                if future in baseline_in_flight:
+                    lane_index = baseline_in_flight.pop(future)
+                    lane_result = future.result()
+                    if (
+                        lane_result.status == "baseline_screened"
+                        and lane_result.run_dir
+                    ):
+                        baseline_by_lane[lane_index] = lane_result
+                        expand_ready.append((lane_index, lane_result))
+                        _append_event(
+                            ctx,
+                            "campaign",
+                            "lane_expand_ready",
+                            lane_index=lane_index,
+                            baseline_score=lane_result.baseline_score,
+                            expand_ready=len(expand_ready),
+                            pending_baseline=len(unstarted_baseline),
+                        )
+                    else:
+                        terminal_by_lane[lane_index] = lane_result
+                    _append_event(
+                        ctx,
+                        "campaign",
+                        "lane_finished",
+                        lane_phase="baseline",
+                        lane_index=lane_index,
+                        lane_result=lane_result.as_dict(),
+                        pending_baseline=len(unstarted_baseline),
+                        expand_ready=len(expand_ready),
+                    )
+                elif future in expand_in_flight:
+                    lane_index = expand_in_flight.pop(future)
+                    lane_result = future.result()
+                    terminal_by_lane[lane_index] = lane_result
+                    in_flight_remote_permutations = max(
+                        0,
+                        in_flight_remote_permutations - lane_remote_cost,
+                    )
+                    _append_event(
+                        ctx,
+                        "campaign",
+                        "lane_finished",
+                        lane_phase="expand",
+                        lane_index=lane_index,
+                        lane_result=lane_result.as_dict(),
+                        running_expand=len(expand_in_flight),
+                    )
+
+            metadata["baseline_survivor_count"] = len(baseline_by_lane)
+            metadata["expand_ready_count"] = len(expand_ready)
+            metadata["lane_results"] = [
+                terminal_by_lane.get(index, baseline_by_lane.get(index)).as_dict()
+                for index in lane_indexes
+                if index in terminal_by_lane or index in baseline_by_lane
+            ]
+            write_run_metadata(ctx.run_dir, metadata)
+
+    results: list[MassiveLaneResult] = []
+    for lane_index in lane_indexes:
+        if lane_index in terminal_by_lane:
+            results.append(terminal_by_lane[lane_index])
+        elif lane_index in baseline_by_lane:
+            results.append(baseline_by_lane[lane_index])
+
+    campaign_state = {
+        "last_snapshot": last_snapshot,
+        "last_backend_health": last_backend_health,
+        "pause_reason": pause_reason,
+        "consecutive_bad_gateway_polls": consecutive_bad_gateway_polls,
+        "consecutive_backend_health_failures": consecutive_backend_health_failures,
+        "baseline_window": baseline_window,
+        "expand_window": expand_window,
+    }
+    return results, campaign_state
+
+
 def _run_campaign_lanes(
     *,
     ctx: PlayHandContext,
@@ -1622,8 +2082,7 @@ def _run_campaign_lanes(
     config = ctx.config
     lane_indexes = list(range(1, runtime.lanes + 1))
     if runtime.staged_campaign and not runtime.dry_run:
-        scaffold_cap = max(1, min(runtime.scaffold_active_lanes, runtime.active_lanes))
-        baseline_results, baseline_state = _run_campaign_lane_executor(
+        results, rolling_state = _run_rolling_staged_campaign_executor(
             ctx=ctx,
             runtime=runtime,
             config=config,
@@ -1636,45 +2095,11 @@ def _run_campaign_lanes(
             reward_matrix=reward_matrix,
             metadata=metadata,
             lane_indexes=lane_indexes,
-            stop_after_baseline=True,
-            max_active_override=scaffold_cap,
         )
-        metadata["campaign_stage"] = "baseline_screened"
-        metadata["baseline_stage_state"] = baseline_state
-        survivors = {
-            int(result.lane_id.split("_")[-1]): result
-            for result in baseline_results
-            if result.status == "baseline_screened" and result.run_dir
-        }
-        metadata["baseline_survivor_count"] = len(survivors)
+        metadata["campaign_stage"] = "rolling_staged_complete"
+        metadata["rolling_stage_state"] = rolling_state
         write_run_metadata(ctx.run_dir, metadata)
-        if not survivors:
-            return baseline_results
-        expand_results, expand_state = _run_campaign_lane_executor(
-            ctx=ctx,
-            runtime=runtime,
-            config=config,
-            seed_indicators=seed_indicators,
-            seed_plan=seed_plan,
-            seed_plan_path=seed_plan_path,
-            budget=budget,
-            sweep_budget_label=sweep_budget_label,
-            sweep_budget_value=sweep_budget_value,
-            reward_matrix=reward_matrix,
-            metadata=metadata,
-            lane_indexes=sorted(survivors),
-            expand_from=survivors,
-            max_active_override=runtime.active_lanes,
-        )
-        metadata["campaign_stage"] = "expanded"
-        metadata["expand_stage_state"] = expand_state
-        write_run_metadata(ctx.run_dir, metadata)
-        expand_by_lane = {result.lane_id: result for result in expand_results}
-        merged: list[MassiveLaneResult] = []
-        for baseline in baseline_results:
-            expanded = expand_by_lane.get(baseline.lane_id)
-            merged.append(expanded or baseline)
-        return merged
+        return results
 
     results, _state = _run_campaign_lane_executor(
         ctx=ctx,
@@ -1953,6 +2378,10 @@ __all__ = [
     "MassiveRuntimeConfig",
     "cmd_play_hand_massive",
     "_desired_active_lanes",
+    "_baseline_window",
+    "_expand_window",
+    "_eligible_worker_slots",
+    "_run_rolling_staged_campaign_executor",
     "_poll_local_backend_health",
     "_effective_remote_token_budget",
     "_remote_token_budget",
