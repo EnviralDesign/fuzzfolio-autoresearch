@@ -604,50 +604,53 @@ def _write_lane_metadata(
     extra: dict[str, Any] | None = None,
 ) -> None:
     existing = load_run_metadata(ctx.run_dir)
-    metadata: dict[str, Any] = {
-        "schema_version": PLAY_HAND_MASSIVE_LANE_SCHEMA_VERSION,
-        "runner": PLAY_HAND_RUNNER,
-        "generated_by_runner": PLAY_HAND_MASSIVE_RUNNER,
-        "run_kind": "play_hand_massive_lane",
-        "run_id": ctx.run_id,
-        "run_status": status,
-        "created_at": existing.get("created_at") or _now_iso(),
-        "massive_campaign_id": campaign_id,
-        "parent_campaign_id": campaign_id,
-        "campaign_dir": str(campaign_dir.resolve()),
-        "massive_lane_id": lane_id,
-        "massive_lane_index": lane_index,
-        "lanes": runtime.lanes,
-        "active_lanes": runtime.active_lanes,
-        "timeframe": runtime.timeframe,
-        "instrument": runtime.instrument,
-        "instrument_pool": runtime.instrument_pool or list(DEFAULT_INSTRUMENT_POOL),
-        "screen_months": runtime.screen_months,
-        "coarse_mode": runtime.coarse_mode,
-        "focused": runtime.run_focused,
-        "baseline_floor": runtime.baseline_floor,
-        "sweep_budget": sweep_budget_label,
-        "sweep_budget_value": sweep_budget_value,
-        "sweep_budget_source": budget.get("source"),
-        "max_sweep_permutations": sweep_budget_value,
-        "reward_matrix": reward_matrix,
-        "deep_replay_job_timeout_seconds": runtime.job_timeout_seconds,
-        "sweep_timeout_seconds": runtime.sweep_timeout_seconds,
-        "adaptive_lanes": runtime.adaptive_lanes,
-        "min_active_lanes": runtime.min_active_lanes,
-        "target_worker_slots_per_lane": runtime.target_worker_slots_per_lane,
-        "gateway_url": _gateway_url(runtime),
-        "gateway_pool": runtime.gateway_pool,
-        "telemetry_interval_seconds": runtime.telemetry_interval_seconds,
-        "seed": runtime.seed,
-        "play_hand_seed_plan_path": str(seed_plan_path) if seed_plan_path else None,
-        "play_hand_seed_plan_loaded": seed_plan_loaded,
-        "dry_run": runtime.dry_run,
-        "design_note": (
-            "First-class PlayHand Massive lane: screened candidate run managed by "
-            "a campaign controller; catch-up/final artifacts run outside this loop."
-        ),
-    }
+    metadata: dict[str, Any] = dict(existing)
+    metadata.update(
+        {
+            "schema_version": PLAY_HAND_MASSIVE_LANE_SCHEMA_VERSION,
+            "runner": PLAY_HAND_RUNNER,
+            "generated_by_runner": PLAY_HAND_MASSIVE_RUNNER,
+            "run_kind": "play_hand_massive_lane",
+            "run_id": ctx.run_id,
+            "run_status": status,
+            "created_at": existing.get("created_at") or _now_iso(),
+            "massive_campaign_id": campaign_id,
+            "parent_campaign_id": campaign_id,
+            "campaign_dir": str(campaign_dir.resolve()),
+            "massive_lane_id": lane_id,
+            "massive_lane_index": lane_index,
+            "lanes": runtime.lanes,
+            "active_lanes": runtime.active_lanes,
+            "timeframe": runtime.timeframe,
+            "instrument": runtime.instrument,
+            "instrument_pool": runtime.instrument_pool or list(DEFAULT_INSTRUMENT_POOL),
+            "screen_months": runtime.screen_months,
+            "coarse_mode": runtime.coarse_mode,
+            "focused": runtime.run_focused,
+            "baseline_floor": runtime.baseline_floor,
+            "sweep_budget": sweep_budget_label,
+            "sweep_budget_value": sweep_budget_value,
+            "sweep_budget_source": budget.get("source"),
+            "max_sweep_permutations": sweep_budget_value,
+            "reward_matrix": reward_matrix,
+            "deep_replay_job_timeout_seconds": runtime.job_timeout_seconds,
+            "sweep_timeout_seconds": runtime.sweep_timeout_seconds,
+            "adaptive_lanes": runtime.adaptive_lanes,
+            "min_active_lanes": runtime.min_active_lanes,
+            "target_worker_slots_per_lane": runtime.target_worker_slots_per_lane,
+            "gateway_url": _gateway_url(runtime),
+            "gateway_pool": runtime.gateway_pool,
+            "telemetry_interval_seconds": runtime.telemetry_interval_seconds,
+            "seed": runtime.seed,
+            "play_hand_seed_plan_path": str(seed_plan_path) if seed_plan_path else None,
+            "play_hand_seed_plan_loaded": seed_plan_loaded,
+            "dry_run": runtime.dry_run,
+            "design_note": (
+                "First-class PlayHand Massive lane: screened candidate run managed by "
+                "a campaign controller; catch-up/final artifacts run outside this loop."
+            ),
+        }
+    )
     if extra:
         metadata.update(extra)
     write_run_metadata(ctx.run_dir, metadata)
@@ -879,6 +882,31 @@ def _remember_best(
         result.best_profile_ref = profile_ref
 
 
+def _deferred_lane_cleanup_summary(
+    ctx: PlayHandContext,
+    *,
+    keep_cloud_profiles: bool,
+    reason: str,
+) -> dict[str, Any]:
+    profile_refs = list(
+        dict.fromkeys(
+            profile_ref
+            for profile_ref in ctx.registered_profile_refs
+            if str(profile_ref or "").strip()
+        )
+    )
+    return {
+        "status": "skipped",
+        "reason": reason,
+        "keep_cloud_profiles": bool(keep_cloud_profiles),
+        "attempted_count": len(profile_refs),
+        "deleted_count": 0,
+        "failed_count": 0,
+        "skip_reason": "pending_lane_expansion",
+        "profile_refs": profile_refs,
+    }
+
+
 def _run_lane(
     campaign_ctx: PlayHandContext,
     *,
@@ -917,6 +945,7 @@ def _run_lane(
         run_id=lane_run_id,
         run_dir=str(lane_run_dir.resolve()),
     )
+    terminal_event_written = False
     lane_rng = random.Random(lane_seed(runtime.seed, lane_index))
     stages = {
         "scaffold": PlayHandStage(1, 4, "Massive lane scaffold"),
@@ -961,6 +990,12 @@ def _run_lane(
             )
             if not profile_ref:
                 raise RuntimeError("expand lane missing profile_ref in lane metadata")
+            if (
+                not runtime.dry_run
+                and profile_ref
+                and profile_ref not in lane_ctx.registered_profile_refs
+            ):
+                lane_ctx.registered_profile_refs.append(profile_ref)
         else:
             deal = _deal_lane(
                 config=lane_ctx.config,
@@ -1055,6 +1090,7 @@ def _run_lane(
                     baseline_score=result.baseline_score,
                     baseline_floor=runtime.baseline_floor,
                 )
+                terminal_event_written = True
                 return result
             if stop_after_baseline:
                 result.status = "baseline_screened"
@@ -1065,6 +1101,7 @@ def _run_lane(
                     stage=stages["baseline"],
                     baseline_score=result.baseline_score,
                 )
+                terminal_event_written = True
                 return result
 
         current_profile_path = profile_path
@@ -1102,6 +1139,7 @@ def _run_lane(
             result.status = "completed"
             result.skipped_reason = "no_coarse_axes"
             _append_event(lane_ctx, lane_id, "completed", stage=stages["coarse"], reason="no_coarse_axes")
+            terminal_event_written = True
             return result
         coarse_sweep = _run_sweep(
             lane_ctx,
@@ -1219,6 +1257,7 @@ def _run_lane(
         result.status = "failed"
         result.error = str(exc)[:2000]
         _append_event(lane_ctx, lane_id, "failed", error=result.error)
+        terminal_event_written = True
         return result
     finally:
         result.completed_at = _now_iso()
@@ -1228,11 +1267,18 @@ def _run_lane(
             campaign_id=campaign_ctx.run_id,
             reward_matrix=reward_matrix,
         )
-        cleanup = _cleanup_registered_profiles(
-            lane_ctx,
-            keep_cloud_profiles=runtime.keep_cloud_profiles,
-            reason="play_hand_massive_lane_completed",
-        )
+        if stop_after_baseline and result.status == "baseline_screened":
+            cleanup = _deferred_lane_cleanup_summary(
+                lane_ctx,
+                keep_cloud_profiles=runtime.keep_cloud_profiles,
+                reason="play_hand_massive_lane_completed",
+            )
+        else:
+            cleanup = _cleanup_registered_profiles(
+                lane_ctx,
+                keep_cloud_profiles=runtime.keep_cloud_profiles,
+                reason="play_hand_massive_lane_completed",
+            )
         canonical_attempt_id = attempt_metadata.get("canonical_attempt_id")
         lane_run_status = (
             "screened"
@@ -1278,16 +1324,8 @@ def _run_lane(
                 "cloud_profile_cleanup": cleanup,
             },
         )
-        _append_event(lane_ctx, lane_id, result.status, result=result.as_dict())
-        _append_event(
-            campaign_ctx,
-            lane_id,
-            result.status,
-            lane_run_id=lane_ctx.run_id,
-            canonical_attempt_id=canonical_attempt_id,
-            best_score=result.best_score,
-            result=result.as_dict(),
-        )
+        if not terminal_event_written:
+            _append_event(lane_ctx, lane_id, result.status, result=result.as_dict())
 
 
 def _materialize_best(

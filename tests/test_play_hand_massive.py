@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import autoresearch.play_hand_massive as massive
 from autoresearch.ledger import load_all_run_attempts, load_attempts, write_attempts
+from autoresearch.ledger import load_run_metadata, write_run_metadata
 from autoresearch.portfolio import select_dashboard_preferred_attempt_rows
 
 
@@ -660,3 +661,213 @@ def test_rolling_staged_pauses_on_gateway_pressure_without_mass_not_started(monk
 
     assert not any(result.status == "not_started_gateway_pressure" for result in results)
     assert state["pause_reason"] in {None, "gateway_pressure"}
+
+
+def test_run_lane_expansion_preserves_baseline_profile_metadata(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(dry_run=True)
+    )
+    config = SimpleNamespace(
+        runs_root=tmp_path / "runs",
+        derived_root=tmp_path / "runs" / "derived",
+        fuzzfolio=SimpleNamespace(base_url="http://localhost:7946/api/dev"),
+    )
+    campaign_dir = config.derived_root / "campaign"
+    campaign_ctx = massive._new_play_hand_context(
+        config=config,
+        cli=SimpleNamespace(),
+        run_id="campaign-test",
+        run_dir=campaign_dir,
+        event_name="events.jsonl",
+        summary_name="summary.json",
+        runtime=runtime,
+    )
+    campaign_ctx.profiles_dir.mkdir(parents=True, exist_ok=True)
+    campaign_ctx.evals_dir.mkdir(parents=True, exist_ok=True)
+
+    lane_dir = config.runs_root / "lane-1"
+    profile_path = lane_dir / "profiles" / "baseline.json"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(json.dumps({"indicators": []}), encoding="utf-8")
+    write_run_metadata(
+        lane_dir,
+        {
+            "runner": "play_hand_v1",
+            "run_id": "lane-1",
+            "run_status": "screened",
+            "indicators": ["RSI_CROSSBACK"],
+            "instruments": ["EURUSD"],
+            "baseline_score": 12.5,
+            "profile_path": str(profile_path),
+            "profile_ref": "cloud-profile-baseline",
+            "evaluation_timeframe": "M5",
+        },
+    )
+
+    monkeypatch.setattr(massive, "build_timing_axes", lambda _payload: [])
+    monkeypatch.setattr(massive, "build_coarse_axes", lambda _payload: [])
+
+    result = massive._run_lane(
+        campaign_ctx,
+        runtime=runtime,
+        lane_index=1,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "low", "value": 64},
+        sweep_budget_label="low",
+        max_sweep_permutations=64,
+        reward_matrix=None,
+        existing_lane_run_id="lane-1",
+        existing_lane_run_dir=lane_dir,
+    )
+
+    assert result.status == "completed"
+    assert result.error is None
+    metadata = load_run_metadata(lane_dir)
+    assert metadata["profile_ref"] == "cloud-profile-baseline"
+    assert metadata["profile_path"] == str(profile_path)
+
+
+def test_staged_baseline_defers_cloud_profile_cleanup(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(dry_run=False)
+    )
+    config = SimpleNamespace(
+        runs_root=tmp_path / "runs",
+        derived_root=tmp_path / "runs" / "derived",
+        fuzzfolio=SimpleNamespace(base_url="http://localhost:7946/api/dev"),
+    )
+    campaign_ctx = massive._new_play_hand_context(
+        config=config,
+        cli=SimpleNamespace(),
+        run_id="campaign-test",
+        run_dir=config.derived_root / "campaign",
+        event_name="events.jsonl",
+        summary_name="summary.json",
+        runtime=runtime,
+    )
+    campaign_ctx.profiles_dir.mkdir(parents=True, exist_ok=True)
+    campaign_ctx.evals_dir.mkdir(parents=True, exist_ok=True)
+
+    def fake_scaffold(ctx, **_kwargs):
+        profile_path = ctx.profiles_dir / "lane.json"
+        profile_path.parent.mkdir(parents=True, exist_ok=True)
+        profile_path.write_text(json.dumps({"indicators": []}), encoding="utf-8")
+        ctx.registered_profile_refs.append("cloud-profile-baseline")
+        return profile_path, "cloud-profile-baseline", {"indicators": []}, "M5"
+
+    cleanup_calls: list[str] = []
+    monkeypatch.setattr(
+        massive,
+        "_deal_lane",
+        lambda **_kwargs: {"dealt": ["RSI_CROSSBACK"], "instruments": ["EURUSD"], "indicator_deal": {}},
+    )
+    monkeypatch.setattr(massive, "_scaffold_lane_profile", fake_scaffold)
+    monkeypatch.setattr(
+        massive,
+        "_run_profile_evaluation",
+        lambda *_args, **_kwargs: {"attempt_id": None, "score": 10.0},
+    )
+    monkeypatch.setattr(
+        massive,
+        "_cleanup_registered_profiles",
+        lambda *_args, **_kwargs: cleanup_calls.append("cleanup") or {},
+    )
+
+    result = massive._run_lane(
+        campaign_ctx,
+        runtime=runtime,
+        lane_index=1,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "low", "value": 64},
+        sweep_budget_label="low",
+        max_sweep_permutations=64,
+        reward_matrix=None,
+        stop_after_baseline=True,
+    )
+
+    assert result.status == "baseline_screened"
+    assert cleanup_calls == []
+    metadata = load_run_metadata(Path(result.run_dir or ""))
+    assert metadata["cloud_profile_cleanup"]["skip_reason"] == "pending_lane_expansion"
+    assert metadata["profile_ref"] == "cloud-profile-baseline"
+
+
+def test_expansion_reclaims_baseline_profile_for_cleanup(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(dry_run=False)
+    )
+    config = SimpleNamespace(
+        runs_root=tmp_path / "runs",
+        derived_root=tmp_path / "runs" / "derived",
+        fuzzfolio=SimpleNamespace(base_url="http://localhost:7946/api/dev"),
+    )
+    campaign_ctx = massive._new_play_hand_context(
+        config=config,
+        cli=SimpleNamespace(),
+        run_id="campaign-test",
+        run_dir=config.derived_root / "campaign",
+        event_name="events.jsonl",
+        summary_name="summary.json",
+        runtime=runtime,
+    )
+    campaign_ctx.profiles_dir.mkdir(parents=True, exist_ok=True)
+    campaign_ctx.evals_dir.mkdir(parents=True, exist_ok=True)
+    lane_dir = config.runs_root / "lane-1"
+    profile_path = lane_dir / "profiles" / "baseline.json"
+    profile_path.parent.mkdir(parents=True, exist_ok=True)
+    profile_path.write_text(json.dumps({"indicators": []}), encoding="utf-8")
+    write_run_metadata(
+        lane_dir,
+        {
+            "runner": "play_hand_v1",
+            "run_id": "lane-1",
+            "run_status": "screened",
+            "indicators": ["RSI_CROSSBACK"],
+            "instruments": ["EURUSD"],
+            "baseline_score": 12.5,
+            "profile_path": str(profile_path),
+            "profile_ref": "cloud-profile-baseline",
+            "evaluation_timeframe": "M5",
+        },
+    )
+
+    cleaned_refs: list[list[str]] = []
+
+    def fake_cleanup(ctx, **_kwargs):
+        cleaned_refs.append(list(ctx.registered_profile_refs))
+        return {"status": "completed", "deleted_profile_refs": list(ctx.registered_profile_refs)}
+
+    monkeypatch.setattr(massive, "build_timing_axes", lambda _payload: [])
+    monkeypatch.setattr(massive, "build_coarse_axes", lambda _payload: [])
+    monkeypatch.setattr(massive, "_cleanup_registered_profiles", fake_cleanup)
+
+    result = massive._run_lane(
+        campaign_ctx,
+        runtime=runtime,
+        lane_index=1,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "low", "value": 64},
+        sweep_budget_label="low",
+        max_sweep_permutations=64,
+        reward_matrix=None,
+        existing_lane_run_id="lane-1",
+        existing_lane_run_dir=lane_dir,
+    )
+
+    assert result.status == "completed"
+    assert cleaned_refs == [["cloud-profile-baseline"]]
