@@ -50,3 +50,4 @@ wheels/
 /codex-home
 /.playwright-cli
 /.codex-remote-attachments
+/diagnostics
