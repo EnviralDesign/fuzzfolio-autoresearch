@@ -18,6 +18,7 @@ from autoresearch.provider import (
     _CodexAppServerSession,
     _parse_codex_usage_limit_delay_seconds,
     create_provider,
+    is_immediate_provider_fallback_error,
     _write_provider_request_snapshot,
     provider_trace_scope,
 )
@@ -686,6 +687,64 @@ def test_codex_provider_waits_and_retries_once_on_usage_limit(monkeypatch) -> No
 
     assert result == {"mode": "runtime_shape", "reasoning": "ok", "actions": []}
     assert sleep_calls == [123]
+
+
+def test_codex_provider_skips_usage_limit_wait_when_disabled(monkeypatch) -> None:
+    class FakeSession:
+        def __init__(self, config: ProviderProfileConfig):
+            self.config = config
+
+        def default_turn_summary_enabled(self) -> bool:
+            return False
+
+        def start_turn(self, prompt: str, *, include_summary: bool | None = None) -> str:
+            return "turn-1"
+
+        def collect_turn_text(self, turn_id: str) -> str:
+            raise ProviderError(
+                "Codex app-server turn failed with status 'failed': "
+                "You've hit your usage limit for GPT-5.3-Codex-Spark. "
+                "Switch to another model now, or try again at 4:10 PM."
+            )
+
+        def close(self) -> None:
+            return None
+
+    sleep_calls: list[float] = []
+
+    monkeypatch.setattr(provider_module, "_CodexAppServerSession", FakeSession)
+    monkeypatch.setattr(provider_module.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(
+        provider_module,
+        "_parse_codex_usage_limit_delay_seconds",
+        lambda text, now=None: 123,
+    )
+
+    provider = CodexAppServerProvider(
+        ProviderProfileConfig(
+            provider_type="codex",
+            command="codex",
+            model="gpt-5.3-codex-spark",
+            codex_usage_limit_wait=False,
+        )
+    )
+
+    with pytest.raises(ProviderError, match="usage limit"):
+        provider.complete_json([ChatMessage(role="user", content="hello")])
+
+    assert sleep_calls == []
+
+
+def test_is_immediate_provider_fallback_error_detects_codex_usage_limit() -> None:
+    exc = ProviderError(
+        "You've hit your usage limit for GPT-5.3-Codex-Spark. Try again at 4:10 PM."
+    )
+    assert is_immediate_provider_fallback_error(exc) is True
+
+
+def test_is_immediate_provider_fallback_error_detects_hard_quota() -> None:
+    exc = ProviderError("insufficient_quota: out of credits")
+    assert is_immediate_provider_fallback_error(exc) is True
 
 
 def test_codex_provider_retries_blocked_tool_disabled_payload(monkeypatch) -> None:

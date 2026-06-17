@@ -684,6 +684,14 @@ def _parse_codex_usage_limit_delay_seconds(
     return DEFAULT_CODEX_USAGE_LIMIT_FALLBACK_SECONDS
 
 
+def is_immediate_provider_fallback_error(exc: ProviderError) -> bool:
+    """Return True when the caller should try the next provider instead of waiting."""
+    text = str(exc)
+    if _parse_codex_usage_limit_delay_seconds(text) is not None:
+        return True
+    return _looks_like_hard_quota(text)
+
+
 def _is_malformed_success_error(error: ProviderError) -> bool:
     lowered = str(error).lower()
     return (
@@ -1634,6 +1642,21 @@ class CodexAppServerProvider:
                 self._reset_session()
                 delay_seconds = self._codex_usage_limit_delay_seconds(exc)
                 if delay_seconds is None or usage_limit_retries >= DEFAULT_CODEX_USAGE_LIMIT_RETRIES:
+                    raise
+                if not self.config.codex_usage_limit_wait:
+                    _trace_provider_event(
+                        "codex_usage_limit_immediate_fail",
+                        model=self.config.model,
+                        delay_seconds=delay_seconds,
+                        retry_index=usage_limit_retries + 1,
+                    )
+                    _append_provider_capture(
+                        "codex_usage_limit_immediate_fail",
+                        payload_kind="provider_backoff",
+                        delay_seconds=delay_seconds,
+                        retry_index=usage_limit_retries + 1,
+                        error=str(exc),
+                    )
                     raise
                 usage_limit_retries += 1
                 _trace_provider_event(

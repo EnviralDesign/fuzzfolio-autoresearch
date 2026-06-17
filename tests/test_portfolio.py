@@ -8,6 +8,8 @@ import pytest
 
 from autoresearch import __main__ as ar_main
 from autoresearch import portfolio as pf
+from autoresearch.config import ProviderProfileConfig
+from autoresearch.provider import ProviderError
 
 
 def _write_minimal_png(path: Path) -> None:
@@ -2419,7 +2421,9 @@ def test_generate_presentation_metadata_repairs_invalid_writer_copy(
 
     monkeypatch.setattr(ar_main, "create_provider", lambda _profile: RepairingProvider())
     config = SimpleNamespace(
-        providers={"writer": SimpleNamespace(type="codex")},
+        providers={
+            "writer": ProviderProfileConfig(provider_type="codex", model="gpt-5.4-mini")
+        },
         research=SimpleNamespace(presentation_metadata_provider_profile="writer"),
     )
     metadata_path = tmp_path / "presentation.json"
@@ -2449,6 +2453,91 @@ def test_generate_presentation_metadata_repairs_invalid_writer_copy(
     assert len(calls) == 2
     assert "Validation failures" in calls[1][-1].content
     assert result["display_name"] == "Gold Pullback"
+    assert metadata_path.exists() is True
+
+
+def test_generate_presentation_metadata_falls_back_on_codex_usage_limit(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    created_profiles: list[str] = []
+
+    class UsageLimitProvider:
+        def complete_json(self, messages):
+            raise ProviderError(
+                "You've hit your usage limit for GPT-5.3-Codex-Spark. Try again at 4:10 PM."
+            )
+
+        def close(self):
+            return None
+
+    class FallbackProvider:
+        def complete_json(self, messages):
+            return {
+                "display_name": "Gold Pullback",
+                "tagline": "Trend context with pullback entries.",
+                "short_description": "Trades XAUUSD pullbacks when trend and trigger agree.",
+                "long_description": (
+                    "Reads the broader gold trend first, then waits for a brief pullback and a clear "
+                    "M15 trigger. It trades only when context and timing agree."
+                ),
+            }
+
+        def close(self):
+            return None
+
+    def fake_create_provider(profile):
+        created_profiles.append(str(profile.model))
+        if str(profile.provider_type).lower() == "codex":
+            return UsageLimitProvider()
+        return FallbackProvider()
+
+    monkeypatch.setattr(ar_main, "create_provider", fake_create_provider)
+    config = SimpleNamespace(
+        providers={
+            "codex-sample": ProviderProfileConfig(
+                provider_type="codex",
+                model="gpt-5.4-mini",
+                codex_usage_limit_wait=True,
+            ),
+            "openrouter-presentation": ProviderProfileConfig(
+                provider_type="openrouter",
+                model="google/gemini-2.5-flash",
+                codex_usage_limit_wait=True,
+            ),
+        },
+        research=SimpleNamespace(
+            presentation_metadata_provider_profile="codex-sample",
+            presentation_metadata_fallback_provider_profile="openrouter-presentation",
+        ),
+    )
+    metadata_path = tmp_path / "presentation.json"
+
+    result = ar_main._generate_presentation_metadata(
+        config=config,
+        run_dir=tmp_path / "run-a",
+        row={"attempt_id": "attempt-a", "candidate_name": "candidate"},
+        attempt={"attempt_id": "attempt-a", "candidate_name": "candidate"},
+        package_inputs={"timeframe": "M15", "instruments": ["XAUUSD"]},
+        lookback_months=36,
+        profile_ref="profile-a",
+        profile_document_payload={
+            "profile": {
+                "name": "candidate",
+                "description": "Portable scoring profile scaffolded from live indicator templates.",
+                "directionMode": "both",
+                "indicators": [],
+            }
+        },
+        presentation_signature="sig-a",
+        metadata_artifact_path=metadata_path,
+        emit=lambda message: print(message),
+    )
+
+    captured = capsys.readouterr()
+    assert result is not None
+    assert result["writer_profile"] == "openrouter-presentation"
+    assert created_profiles == ["gpt-5.4-mini", "google/gemini-2.5-flash"]
+    assert "falling back to openrouter-presentation" in captured.out
     assert metadata_path.exists() is True
 
 

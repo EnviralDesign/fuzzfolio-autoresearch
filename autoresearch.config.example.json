@@ -128,6 +128,14 @@
       "temperature": 0.2,
       "max_tokens": 8192,
       "timeout_seconds": 180
+    },
+    "openrouter-presentation": {
+      "type": "openrouter",
+      "api_key_ref": "openrouter_main",
+      "model": "openai/gpt-5.4-mini",
+      "temperature": 0.2,
+      "max_tokens": 2048,
+      "timeout_seconds": 120
     }
   },
   "fuzzfolio": {
@@ -144,7 +152,8 @@
     "plot_lower_is_better": false,
     "compact_trigger_tokens": 12000,
     "compact_target_tokens": 9000,
-    "presentation_metadata_provider_profile": "codex-sample",
+    "presentation_metadata_provider_profile": "openrouter-presentation",
+    "presentation_metadata_fallback_provider_profile": "codex-sample",
     "recent_step_window_steps": 6,
     "finish_min_attempts": 4,
     "run_wrap_up_steps": 3,

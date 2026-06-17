@@ -37,6 +37,7 @@ class ProviderProfileConfig:
     compact_target_tokens: int | None = None
     rate_limit_backoff_seconds: list[int] | None = None
     rate_limit_max_retries: int | None = None
+    codex_usage_limit_wait: bool = True
 
 
 @dataclass
@@ -71,6 +72,7 @@ class ResearchConfig:
     compact_target_tokens: int = 9000
     recent_step_window_steps: int = 6
     presentation_metadata_provider_profile: str | None = None
+    presentation_metadata_fallback_provider_profile: str | None = None
     finish_min_attempts: int = 4
     run_wrap_up_steps: int = 3
     phase_early_ratio: float = 0.35
@@ -503,6 +505,12 @@ def _load_provider_profiles(
                     if profile_cfg.get("rate_limit_max_retries") is not None
                     else None
                 ),
+                codex_usage_limit_wait=bool(
+                    profile_cfg.get(
+                        "codex_usage_limit_wait",
+                        ProviderProfileConfig.codex_usage_limit_wait,
+                    )
+                ),
             )
 
         explorer_profile = _env_or_value(
@@ -691,6 +699,15 @@ def load_config(repo_root: Path | None = None) -> AppConfig:
                 research_cfg.get(
                     "presentation_metadata_provider_profile",
                     ResearchConfig.presentation_metadata_provider_profile or "",
+                )
+            ).strip()
+            or None
+        ),
+        presentation_metadata_fallback_provider_profile=(
+            str(
+                research_cfg.get(
+                    "presentation_metadata_fallback_provider_profile",
+                    ResearchConfig.presentation_metadata_fallback_provider_profile or "",
                 )
             ).strip()
             or None

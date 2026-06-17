@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from dataclasses import replace
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import redirect_stdout
 import io
@@ -228,6 +229,7 @@ if __package__ in {None, ""}:
         codex_isolated_login_hint,
         codex_source_home_for_provider,
         create_provider,
+        is_immediate_provider_fallback_error,
         set_provider_trace_stderr_mode,
     )
     from autoresearch.scoring import (
@@ -439,6 +441,7 @@ else:
         codex_isolated_login_hint,
         codex_source_home_for_provider,
         create_provider,
+        is_immediate_provider_fallback_error,
         set_provider_trace_stderr_mode,
     )
     from .scoring import (
@@ -3655,9 +3658,17 @@ def cmd_doctor() -> int:
     presentation_profile_name = str(
         config.research.presentation_metadata_provider_profile or ""
     ).strip()
+    presentation_fallback_profile_name = str(
+        config.research.presentation_metadata_fallback_provider_profile or ""
+    ).strip()
     presentation_profile = (
         config.providers.get(presentation_profile_name)
         if presentation_profile_name
+        else None
+    )
+    presentation_fallback_profile = (
+        config.providers.get(presentation_fallback_profile_name)
+        if presentation_fallback_profile_name
         else None
     )
     presentation_runtime = (
@@ -3687,8 +3698,16 @@ def cmd_doctor() -> int:
             config.llm.explorer_profile
         ),
         "presentation_metadata_provider_profile": presentation_profile_name or None,
+        "presentation_metadata_fallback_provider_profile": (
+            presentation_fallback_profile_name or None
+        ),
         "presentation_metadata_provider_type": (
             presentation_profile.provider_type if presentation_profile is not None else None
+        ),
+        "presentation_metadata_fallback_provider_type": (
+            presentation_fallback_profile.provider_type
+            if presentation_fallback_profile is not None
+            else None
         ),
         "presentation_metadata_codex_home": (
             presentation_runtime.get("codex_home")
@@ -6801,6 +6820,39 @@ def _presentation_writer_profile_name(config) -> str | None:
     return value or None
 
 
+def _presentation_metadata_fallback_profile_name(config) -> str | None:
+    value = str(
+        getattr(
+            config.research,
+            "presentation_metadata_fallback_provider_profile",
+            None,
+        )
+        or ""
+    ).strip()
+    return value or None
+
+
+def _presentation_metadata_provider_profile_names(config) -> list[str]:
+    primary = _presentation_writer_profile_name(config)
+    if not primary:
+        return []
+    names = [primary]
+    fallback = _presentation_metadata_fallback_profile_name(config)
+    if fallback and fallback not in names:
+        names.append(fallback)
+    return names
+
+
+def _provider_profile_for_presentation_chain(
+    profile,
+    *,
+    is_primary: bool,
+):
+    if is_primary and str(profile.provider_type or "").strip().lower() == "codex":
+        return replace(profile, codex_usage_limit_wait=False)
+    return profile
+
+
 def _profile_drop_source_profile_snapshot_path(
     attempt_root: Path, lookback_months: int
 ) -> Path:
@@ -7807,6 +7859,52 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
     return bundle_dir
 
 
+def _complete_presentation_metadata_with_provider(
+    *,
+    provider,
+    messages: list[ChatMessage],
+    attempt: dict[str, Any],
+    emit: Callable[[str], None] | None,
+) -> dict[str, str] | None:
+    raw_payload: Any = None
+    metadata: dict[str, str] | None = None
+    validation_reasons: list[str] = []
+    request_messages = messages
+    max_attempts = 3
+    for repair_index in range(max_attempts):
+        raw_payload = provider.complete_json(request_messages)
+        metadata, validation_reasons = validate_generated_metadata_with_reasons(
+            raw_payload
+        )
+        if metadata is not None:
+            if repair_index > 0 and emit:
+                emit(
+                    f"  presentation metadata repaired for {attempt.get('attempt_id')} "
+                    f"after {repair_index} retry"
+                )
+            return metadata
+        if repair_index >= max_attempts - 1:
+            break
+        request_messages = build_writer_repair_messages(
+            original_messages=messages,
+            previous_payload=raw_payload,
+            rejection_reasons=validation_reasons,
+        )
+        if emit:
+            reason_text = "; ".join(validation_reasons[:3]) or "invalid copy"
+            emit(
+                f"  presentation metadata repair requested for {attempt.get('attempt_id')}: "
+                f"{_short_text(reason_text, limit=180)}"
+            )
+    if emit:
+        reason_text = "; ".join(validation_reasons[:4]) or "invalid copy"
+        emit(
+            f"  presentation metadata invalid for {attempt.get('attempt_id')}: "
+            f"{_short_text(reason_text, limit=220)}"
+        )
+    return None
+
+
 def _generate_presentation_metadata(
     *,
     config,
@@ -7821,16 +7919,10 @@ def _generate_presentation_metadata(
     metadata_artifact_path: Path,
     emit: Callable[[str], None] | None,
 ) -> dict[str, Any] | None:
-    writer_profile_name = _presentation_writer_profile_name(config)
-    if not writer_profile_name:
+    profile_names = _presentation_metadata_provider_profile_names(config)
+    if not profile_names:
         return None
-    provider_profile = config.providers.get(writer_profile_name)
-    if provider_profile is None:
-        raise RuntimeError(
-            "Configured presentation metadata provider profile "
-            f"{writer_profile_name!r} does not exist."
-        )
-    provider = create_provider(provider_profile)
+
     messages = build_writer_messages(
         profile_document_payload=profile_document_payload,
         package_inputs=package_inputs,
@@ -7838,111 +7930,147 @@ def _generate_presentation_metadata(
         row=row,
         attempt=attempt,
     )
-    raw_payload: Any = None
-    metadata: dict[str, str] | None = None
-    validation_reasons: list[str] = []
-    request_messages = messages
-    max_attempts = 3
-    try:
-        for repair_index in range(max_attempts):
+    last_error: ProviderError | None = None
+    for index, profile_name in enumerate(profile_names):
+        provider_profile = config.providers.get(profile_name)
+        if provider_profile is None:
+            if index == 0:
+                raise RuntimeError(
+                    "Configured presentation metadata provider profile "
+                    f"{profile_name!r} does not exist."
+                )
+            if emit:
+                emit(
+                    f"  presentation metadata fallback profile {profile_name!r} "
+                    "is missing; skipping"
+                )
+            continue
+
+        chain_profile = _provider_profile_for_presentation_chain(
+            provider_profile,
+            is_primary=(index == 0),
+        )
+        provider = create_provider(chain_profile)
+        try:
             try:
-                raw_payload = provider.complete_json(request_messages)
+                metadata = _complete_presentation_metadata_with_provider(
+                    provider=provider,
+                    messages=messages,
+                    attempt=attempt,
+                    emit=emit,
+                )
             except ProviderError as exc:
+                last_error = exc
+                if (
+                    index < len(profile_names) - 1
+                    and is_immediate_provider_fallback_error(exc)
+                ):
+                    if emit:
+                        emit(
+                            f"  presentation metadata provider {profile_name} "
+                            f"unavailable ({_short_text(str(exc), limit=180)}); "
+                            f"falling back to {profile_names[index + 1]}"
+                        )
+                    continue
                 if emit:
                     emit(
-                        f"  presentation metadata writer failed for {attempt.get('attempt_id')}: {exc}"
+                        f"  presentation metadata writer failed for "
+                        f"{attempt.get('attempt_id')}: {exc}"
                     )
                 return None
-            metadata, validation_reasons = validate_generated_metadata_with_reasons(
-                raw_payload
-            )
-            if metadata is not None:
-                if repair_index > 0 and emit:
-                    emit(
-                        f"  presentation metadata repaired for {attempt.get('attempt_id')} "
-                        f"after {repair_index} retry"
-                    )
-                break
-            if repair_index >= max_attempts - 1:
-                break
-            request_messages = build_writer_repair_messages(
-                original_messages=messages,
-                previous_payload=raw_payload,
-                rejection_reasons=validation_reasons,
-            )
-            if emit:
-                reason_text = "; ".join(validation_reasons[:3]) or "invalid copy"
-                emit(
-                    f"  presentation metadata repair requested for {attempt.get('attempt_id')}: "
-                    f"{_short_text(reason_text, limit=180)}"
-                )
-    finally:
-        close = getattr(provider, "close", None)
-        if callable(close):
-            close()
-    if metadata is None:
-        if emit:
-            reason_text = "; ".join(validation_reasons[:4]) or "invalid copy"
-            emit(
-                f"  presentation metadata invalid for {attempt.get('attempt_id')}: "
-                f"{_short_text(reason_text, limit=220)}"
-            )
-        return None
-    artifact_payload = build_metadata_artifact(
-        run_id=run_dir.name,
-        attempt_id=str(row.get("attempt_id") or attempt.get("attempt_id") or ""),
-        candidate_name=str(row.get("candidate_name") or attempt.get("candidate_name") or ""),
-        profile_ref=profile_ref,
-        writer_profile=writer_profile_name,
-        presentation_signature=presentation_signature,
-        metadata=metadata,
-    )
-    _write_json_file(metadata_artifact_path, artifact_payload)
-    if emit:
-        emit(
-            f"  presentation metadata generated for {attempt.get('attempt_id')} via {writer_profile_name}"
+            if metadata is None:
+                return None
+        finally:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
+
+        artifact_payload = build_metadata_artifact(
+            run_id=run_dir.name,
+            attempt_id=str(row.get("attempt_id") or attempt.get("attempt_id") or ""),
+            candidate_name=str(
+                row.get("candidate_name") or attempt.get("candidate_name") or ""
+            ),
+            profile_ref=profile_ref,
+            writer_profile=profile_name,
+            presentation_signature=presentation_signature,
+            metadata=metadata,
         )
-    return artifact_payload
+        _write_json_file(metadata_artifact_path, artifact_payload)
+        if emit:
+            emit(
+                f"  presentation metadata generated for {attempt.get('attempt_id')} "
+                f"via {profile_name}"
+            )
+        return artifact_payload
+
+    if emit and last_error is not None:
+        emit(
+            f"  presentation metadata writer failed for {attempt.get('attempt_id')}: "
+            f"{last_error}"
+        )
+    return None
 
 
 def _preflight_presentation_metadata_provider(config) -> None:
-    writer_profile_name = _presentation_writer_profile_name(config)
-    if not writer_profile_name:
+    profile_names = _presentation_metadata_provider_profile_names(config)
+    if not profile_names:
         return
-    provider_profile = getattr(config, "providers", {}).get(writer_profile_name)
-    if provider_profile is None:
-        raise RuntimeError(
-            "Configured presentation metadata provider profile "
-            f"{writer_profile_name!r} does not exist."
+
+    ping_messages = [
+        ChatMessage(
+            role="system",
+            content="Return exactly one JSON object. No markdown.",
+        ),
+        ChatMessage(
+            role="user",
+            content='Return {"status":"ok"} now.',
+        ),
+    ]
+    last_error: ProviderError | None = None
+    for index, profile_name in enumerate(profile_names):
+        provider_profile = getattr(config, "providers", {}).get(profile_name)
+        if provider_profile is None:
+            if index == 0:
+                raise RuntimeError(
+                    "Configured presentation metadata provider profile "
+                    f"{profile_name!r} does not exist."
+                )
+            continue
+        chain_profile = _provider_profile_for_presentation_chain(
+            provider_profile,
+            is_primary=(index == 0),
         )
-    provider = create_provider(provider_profile)
-    try:
-        payload = provider.complete_json(
-            [
-                ChatMessage(
-                    role="system",
-                    content="Return exactly one JSON object. No markdown.",
-                ),
-                ChatMessage(
-                    role="user",
-                    content='Return {"status":"ok"} now.',
-                ),
-            ]
-        )
-    except ProviderError as exc:
+        provider = create_provider(chain_profile)
+        try:
+            payload = provider.complete_json(ping_messages)
+        except ProviderError as exc:
+            last_error = exc
+            if (
+                index < len(profile_names) - 1
+                and is_immediate_provider_fallback_error(exc)
+            ):
+                continue
+            raise RuntimeError(
+                "Presentation metadata provider preflight failed for "
+                f"{profile_name!r}: {exc}"
+            ) from exc
+        finally:
+            close = getattr(provider, "close", None)
+            if callable(close):
+                close()
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                "Presentation metadata provider preflight failed for "
+                f"{profile_name!r}: provider did not return a JSON object."
+            )
+        return
+
+    if last_error is not None:
         raise RuntimeError(
-            "Presentation metadata provider preflight failed for "
-            f"{writer_profile_name!r}: {exc}"
-        ) from exc
-    finally:
-        close = getattr(provider, "close", None)
-        if callable(close):
-            close()
-    if not isinstance(payload, dict):
-        raise RuntimeError(
-            "Presentation metadata provider preflight failed for "
-            f"{writer_profile_name!r}: provider did not return a JSON object."
-        )
+            "Presentation metadata provider preflight failed for all configured "
+            f"profiles ({', '.join(profile_names)}): {last_error}"
+        ) from last_error
 
 
 def _validation_cache_dir(config, run_id: str, lookback_months: int) -> Path:
