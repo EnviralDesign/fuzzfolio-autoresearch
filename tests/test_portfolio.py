@@ -1600,6 +1600,55 @@ def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(
     assert payload["selection"]["canonical_run_count"] == 1
     assert payload["selection"]["score_selected_run_count"] == 1
     assert payload["refresh_summary"]["attempt_count"] == 4
+    assert payload["passing_summary"]["passing_count_before"] == 0
+    assert payload["passing_summary"]["passing_count"] == 0
+    assert payload["passing_summary"]["newly_passing_count"] == 0
+
+
+def test_finalize_corpus_passing_delta_helpers(tmp_path: Path) -> None:
+    def _write_passing_artifact(root: Path) -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        _write_minimal_png(root / "profile-drop-36mo.png")
+        (root / "profile-drop-36mo.manifest.json").write_text("{}", encoding="utf-8")
+
+    passing_artifact = tmp_path / "passing"
+    newly_passing_artifact = tmp_path / "newly-passing"
+    pending_artifact = tmp_path / "pending"
+    _write_passing_artifact(passing_artifact)
+    _write_passing_artifact(newly_passing_artifact)
+    pending_artifact.mkdir()
+
+    before_rows = [
+        {
+            "attempt_id": "attempt-passing",
+            "artifact_dir": str(passing_artifact),
+            "full_backtest_validation_status_36m": "valid",
+        },
+        {
+            "attempt_id": "attempt-pending",
+            "artifact_dir": str(pending_artifact),
+            "full_backtest_validation_status_36m": "invalid",
+        },
+    ]
+    after_rows = [
+        dict(before_rows[0]),
+        {
+            "attempt_id": "attempt-newly-passing",
+            "artifact_dir": str(newly_passing_artifact),
+            "full_backtest_validation_status_36m": "valid",
+        },
+    ]
+
+    delta = ar_main._build_finalize_corpus_passing_delta(
+        before_rows=before_rows,
+        after_rows=after_rows,
+        lookback_months=36,
+    )
+
+    assert delta["passing_count_before"] == 1
+    assert delta["passing_count"] == 2
+    assert delta["newly_passing_count"] == 1
+    assert delta["newly_passing_attempt_ids"] == ["attempt-newly-passing"]
 
 
 def test_cmd_finalize_corpus_skips_tombstoned_runs(

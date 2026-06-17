@@ -12972,6 +12972,66 @@ def cmd_render_corpus_profile_drops(
     return 0 if summary["status"] == "complete" else 1
 
 
+def _row_has_passing_finalize_corpus_state(
+    row: dict[str, Any],
+    *,
+    lookback_months: int = 36,
+) -> bool:
+    if (
+        str(row.get(f"full_backtest_validation_status_{int(lookback_months)}m") or "")
+        != "valid"
+    ):
+        return False
+    artifact_dir_raw = str(row.get("artifact_dir") or "").strip()
+    if not artifact_dir_raw:
+        return False
+    artifact_dir = Path(artifact_dir_raw)
+    manifest_path = artifact_dir / f"profile-drop-{int(lookback_months)}mo.manifest.json"
+    png_path = artifact_dir / f"profile-drop-{int(lookback_months)}mo.png"
+    return manifest_path.exists() and png_path.exists()
+
+
+def _finalize_corpus_passing_summary(
+    rows: list[dict[str, Any]],
+    *,
+    lookback_months: int = 36,
+) -> dict[str, Any]:
+    passing_attempt_ids = [
+        str(row.get("attempt_id") or "").strip()
+        for row in rows
+        if str(row.get("attempt_id") or "").strip()
+        and _row_has_passing_finalize_corpus_state(row, lookback_months=lookback_months)
+    ]
+    return {
+        "selected_count": len(rows),
+        "passing_count": len(passing_attempt_ids),
+        "passing_attempt_ids": passing_attempt_ids,
+    }
+
+
+def _build_finalize_corpus_passing_delta(
+    *,
+    before_rows: list[dict[str, Any]],
+    after_rows: list[dict[str, Any]],
+    lookback_months: int,
+) -> dict[str, Any]:
+    before = _finalize_corpus_passing_summary(
+        before_rows, lookback_months=int(lookback_months)
+    )
+    after = _finalize_corpus_passing_summary(
+        after_rows, lookback_months=int(lookback_months)
+    )
+    before_ids = set(before["passing_attempt_ids"])
+    after_ids = set(after["passing_attempt_ids"])
+    newly_passing_attempt_ids = sorted(after_ids - before_ids)
+    return {
+        **after,
+        "passing_count_before": int(before["passing_count"]),
+        "newly_passing_count": len(newly_passing_attempt_ids),
+        "newly_passing_attempt_ids": newly_passing_attempt_ids,
+    }
+
+
 def _select_finalize_corpus_rows(
     rows: list[dict[str, Any]],
     *,
@@ -13096,6 +13156,10 @@ def cmd_finalize_corpus(
         if str(row.get("attempt_id") or "").strip()
     ]
     skipped_by_selection = max(0, len(full_catalog_rows) - len(selected_rows))
+    passing_before_summary = _finalize_corpus_passing_summary(
+        selected_rows,
+        lookback_months=int(lookback_months),
+    )
     _job_status_emit(
         f"[finalize-corpus] selected {len(selected_rows)}/{len(full_catalog_rows)} "
         f"attempts (skipped_by_selection={skipped_by_selection}, "
@@ -13244,9 +13308,34 @@ def cmd_finalize_corpus(
             )
 
     refresh_summary = _refresh_global_derived_corpus_state(config)
+    refreshed_catalog_rows, _ = _selection_corpus_rows(
+        config,
+        run_ids=run_ids,
+        label="finalize-corpus-passing-refresh",
+        as_json=as_json,
+        materialize_full_corpus=False,
+    )
+    refreshed_by_attempt_id = {
+        str(row.get("attempt_id") or "").strip(): row
+        for row in refreshed_catalog_rows
+        if str(row.get("attempt_id") or "").strip()
+    }
+    refreshed_selected_rows = [
+        dict(refreshed_by_attempt_id.get(attempt_id) or before_row)
+        for attempt_id, before_row in (
+            (str(row.get("attempt_id") or "").strip(), row) for row in selected_rows
+        )
+        if attempt_id
+    ]
+    passing_delta = _build_finalize_corpus_passing_delta(
+        before_rows=selected_rows,
+        after_rows=refreshed_selected_rows,
+        lookback_months=int(lookback_months),
+    )
     summary["status"] = "complete" if render_exit_code == 0 else "partial_failure"
     summary["render_exit_code"] = render_exit_code
     summary["render_summary"] = render_summary
+    summary["passing_summary"] = passing_delta
     summary["play_hand_health"] = {
         "selected_play_hand_runs": len(play_hand_run_ids),
         "updated": sum(1 for item in play_hand_health_results if item.get("updated")),
@@ -13254,6 +13343,13 @@ def cmd_finalize_corpus(
         "results": play_hand_health_results,
     }
     summary["refresh_summary"] = refresh_summary
+    _job_status_emit(
+        f"[finalize-corpus] passing strategies: +{passing_delta['newly_passing_count']} "
+        f"new this run ({passing_delta['passing_count']}/"
+        f"{passing_delta['selected_count']} selected now passing, "
+        f"was {passing_delta['passing_count_before']} before catch-up)",
+        as_json=as_json,
+    )
     if as_json:
         print(json.dumps(summary, ensure_ascii=True, indent=2))
     else:
@@ -13262,6 +13358,9 @@ def cmd_finalize_corpus(
                 "\n".join(
                     [
                         f"Selected attempts: {summary['selected_count']}",
+                        f"Passing strategies: {passing_delta['passing_count']}/{passing_delta['selected_count']}",
+                        f"New passing this run: +{passing_delta['newly_passing_count']} "
+                        f"(was {passing_delta['passing_count_before']} before catch-up)",
                         f"Scope: {selection_info.get('selection_scope')}",
                         f"Render exit code: {render_exit_code}",
                         f"Refreshed catalog rows: {refresh_summary.get('attempt_count')}",
