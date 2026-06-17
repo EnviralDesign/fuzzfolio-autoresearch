@@ -255,6 +255,7 @@ if __package__ in {None, ""}:
         DEFAULT_MASSIVE_LANES,
         DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
         DEFAULT_SCAFFOLD_ACTIVE_LANES,
+        DEFAULT_MAX_NO_WORKER_WAIT_SECONDS,
         cmd_play_hand_massive,
     )
     from autoresearch.typed_tools import CLI_OK_TOOLS
@@ -469,6 +470,7 @@ else:
         DEFAULT_MASSIVE_LANES,
         DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
         DEFAULT_SCAFFOLD_ACTIVE_LANES,
+        DEFAULT_MAX_NO_WORKER_WAIT_SECONDS,
         cmd_play_hand_massive,
     )
     from .typed_tools import CLI_OK_TOOLS
@@ -1113,6 +1115,16 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help=(
             "Remote permutation budget is healthy worker slots times this multiplier. "
             f"Default: {DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER:g}."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--max-no-worker-wait-seconds",
+        type=int,
+        default=DEFAULT_MAX_NO_WORKER_WAIT_SECONDS,
+        help=(
+            "When gateway telemetry is healthy but worker slots stay at zero, stop "
+            f"after this many seconds. Default: {DEFAULT_MAX_NO_WORKER_WAIT_SECONDS}. "
+            "Use 0 to wait indefinitely."
         ),
     )
     play_hand_massive.add_argument(
@@ -14992,6 +15004,7 @@ def main(argv: list[str] | None = None) -> int:
             scaffold_active_lanes=args.scaffold_active_lanes,
             staged_campaign=bool(args.staged_campaign),
             remote_token_budget_multiplier=args.remote_token_budget_multiplier,
+            max_no_worker_wait_seconds=args.max_no_worker_wait_seconds,
             gateway_url=args.gateway_url,
             gateway_token=args.gateway_token,
             gateway_pool=args.gateway_pool,

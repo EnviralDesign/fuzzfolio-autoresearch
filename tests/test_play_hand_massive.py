@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -150,6 +151,93 @@ def test_run_campaign_lane_executor_blocks_on_backend_down(monkeypatch) -> None:
 
     assert state["consecutive_backend_health_failures"] >= 1
     assert any(result.status == "not_started_backend_down" for result in results)
+
+
+def test_staged_expand_applies_remote_token_budget(monkeypatch) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=3,
+            active_lanes=3,
+            adaptive_lanes=True,
+            staged_campaign=True,
+            gateway_url="https://example.com/api/worker-gateway",
+            gateway_token="secret",
+            remote_token_budget_multiplier=2.0,
+            telemetry_interval_seconds=1,
+        )
+    )
+    config = SimpleNamespace(
+        runs_root=Path("."),
+        derived_root=Path("."),
+        fuzzfolio=SimpleNamespace(base_url="http://localhost:7946/api/dev"),
+    )
+    ctx = SimpleNamespace(config=config, run_dir=Path("."), run_id="campaign-test")
+    ctx.run_dir = Path(".")
+    metadata: dict = {}
+    max_concurrent = 0
+    current = 0
+    lock = __import__("threading").Lock()
+
+    def fake_run_lane(*_args, **kwargs):
+        nonlocal max_concurrent, current
+        with lock:
+            current += 1
+            max_concurrent = max(max_concurrent, current)
+        time.sleep(0.05)
+        with lock:
+            current -= 1
+        lane_index = kwargs["lane_index"]
+        return massive.MassiveLaneResult(
+            lane_id=f"lane_{lane_index:03d}",
+            status="completed",
+            started_at="2026-06-17T00:00:00+00:00",
+            run_id=f"run-{lane_index}",
+            run_dir=str(Path(f"lane-{lane_index}")),
+        )
+
+    monkeypatch.setattr(massive, "_run_lane", fake_run_lane)
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_pool_snapshot",
+        lambda _runtime: {"ok": True, "slots": 64, "pool_count": 1, "worker_count": 1},
+    )
+    monkeypatch.setattr(
+        massive,
+        "_poll_local_backend_health",
+        lambda *_args, **_kwargs: {"ok": True, "url": "http://localhost:7946/healthz"},
+    )
+    monkeypatch.setattr(massive, "write_run_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(massive, "_append_event", lambda *_args, **_kwargs: None)
+
+    survivors = {
+        index: massive.MassiveLaneResult(
+            lane_id=f"lane_{index:03d}",
+            status="baseline_screened",
+            started_at="2026-06-17T00:00:00+00:00",
+            run_id=f"run-{index}",
+            run_dir=str(Path(f"lane-{index}")),
+        )
+        for index in (1, 2, 3)
+    }
+
+    results, _state = massive._run_campaign_lane_executor(
+        ctx=ctx,
+        runtime=runtime,
+        config=config,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "low", "value": 64},
+        sweep_budget_label="low",
+        sweep_budget_value=64,
+        reward_matrix=None,
+        metadata=metadata,
+        lane_indexes=[1, 2, 3],
+        expand_from=survivors,
+    )
+
+    assert len(results) == 3
+    assert max_concurrent == 1
 
 
 def test_cmd_play_hand_massive_dry_run_writes_first_class_lane_runs(

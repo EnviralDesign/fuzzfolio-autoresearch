@@ -76,6 +76,7 @@ DEFAULT_MASSIVE_LANES = 12
 DEFAULT_MASSIVE_ACTIVE_LANES = 2
 DEFAULT_SCAFFOLD_ACTIVE_LANES = 2
 DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER = 2.0
+DEFAULT_MAX_NO_WORKER_WAIT_SECONDS = 300
 DEFAULT_BASELINE_FLOOR = 0.0
 CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD = 2
 CAMPAIGN_BACKEND_DOWN_THRESHOLD = 1
@@ -108,6 +109,7 @@ class MassiveRuntimeConfig:
     scaffold_active_lanes: int = DEFAULT_SCAFFOLD_ACTIVE_LANES
     staged_campaign: bool = True
     remote_token_budget_multiplier: float = DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER
+    max_no_worker_wait_seconds: int = DEFAULT_MAX_NO_WORKER_WAIT_SECONDS
     backend_health_timeout_seconds: int = 5
     gateway_url: str | None = None
     gateway_token: str | None = None
@@ -171,6 +173,7 @@ def normalize_massive_runtime_config(config: MassiveRuntimeConfig) -> MassiveRun
     target_worker_slots_per_lane = max(1, int(config.target_worker_slots_per_lane))
     scaffold_active_lanes = max(1, min(int(config.scaffold_active_lanes), active_lanes))
     remote_token_budget_multiplier = max(0.1, float(config.remote_token_budget_multiplier))
+    max_no_worker_wait_seconds = max(0, int(config.max_no_worker_wait_seconds))
     backend_health_timeout_seconds = max(1, int(config.backend_health_timeout_seconds))
     telemetry_interval_seconds = max(1, int(config.telemetry_interval_seconds))
     baseline_floor = (
@@ -204,6 +207,7 @@ def normalize_massive_runtime_config(config: MassiveRuntimeConfig) -> MassiveRun
         scaffold_active_lanes=scaffold_active_lanes,
         staged_campaign=bool(config.staged_campaign),
         remote_token_budget_multiplier=remote_token_budget_multiplier,
+        max_no_worker_wait_seconds=max_no_worker_wait_seconds,
         backend_health_timeout_seconds=backend_health_timeout_seconds,
         gateway_url=str(config.gateway_url).strip() if config.gateway_url else None,
         gateway_token=str(config.gateway_token).strip() if config.gateway_token else None,
@@ -1288,13 +1292,14 @@ def _run_campaign_lane_executor(
     pause_reason: str | None = None
     in_flight_remote_permutations = 0
     lane_remote_cost = _estimate_lane_remote_permutations(sweep_budget_value)
+    no_worker_since: float | None = None
     expand_from = expand_from or {}
     executor_cap = max_active_override or runtime.active_lanes
 
     def refresh_lane_window(force: bool = False) -> int:
         nonlocal last_snapshot, last_backend_health, desired_active_lanes, next_telemetry_at
         nonlocal consecutive_bad_gateway_polls, consecutive_backend_health_failures
-        nonlocal pause_until, pause_reason
+        nonlocal pause_until, pause_reason, no_worker_since
         now = time.monotonic()
         if force or now >= next_telemetry_at:
             if not runtime.dry_run:
@@ -1317,13 +1322,31 @@ def _run_campaign_lane_executor(
                 desired_active_lanes = _desired_active_lanes(runtime, last_snapshot)
                 if last_snapshot.get("ok"):
                     consecutive_bad_gateway_polls = 0
+                    try:
+                        slots = int(last_snapshot.get("slots") or 0)
+                    except (TypeError, ValueError):
+                        slots = 0
+                    if (
+                        slots <= 0
+                        and _gateway_url(runtime)
+                        and runtime.max_no_worker_wait_seconds > 0
+                    ):
+                        if no_worker_since is None:
+                            no_worker_since = now
+                        elif now - no_worker_since >= runtime.max_no_worker_wait_seconds:
+                            pause_reason = "no_workers"
+                            pause_until = now + runtime.telemetry_interval_seconds
+                    else:
+                        no_worker_since = None
                 elif _gateway_url(runtime):
                     consecutive_bad_gateway_polls += 1
+                    no_worker_since = None
                     if consecutive_bad_gateway_polls >= CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD:
                         pause_reason = "gateway_unhealthy"
                         pause_until = now + runtime.telemetry_interval_seconds
             else:
                 desired_active_lanes = runtime.active_lanes
+                no_worker_since = None
 
             next_telemetry_at = now + runtime.telemetry_interval_seconds
             _append_event(
@@ -1360,11 +1383,15 @@ def _run_campaign_lane_executor(
             and consecutive_bad_gateway_polls >= CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD
         ):
             return False
+        if pause_reason == "no_workers":
+            return False
         return True
 
     def lane_submission_reason() -> str | None:
         if consecutive_backend_health_failures >= CAMPAIGN_BACKEND_DOWN_THRESHOLD:
             return "not_started_backend_down"
+        if pause_reason == "no_workers":
+            return "not_started_no_workers"
         if (
             runtime.adaptive_lanes
             and _gateway_url(runtime)
@@ -1378,7 +1405,7 @@ def _run_campaign_lane_executor(
         while pending_lane_indexes or in_flight:
             desired = refresh_lane_window()
             effective_desired = min(desired, executor_cap)
-            if not stop_after_baseline and not expand_from:
+            if not stop_after_baseline:
                 token_budget = _remote_token_budget(last_snapshot, runtime)
             else:
                 token_budget = None
@@ -1622,6 +1649,7 @@ def cmd_play_hand_massive(
     scaffold_active_lanes: int = DEFAULT_SCAFFOLD_ACTIVE_LANES,
     staged_campaign: bool = True,
     remote_token_budget_multiplier: float = DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
+    max_no_worker_wait_seconds: int = DEFAULT_MAX_NO_WORKER_WAIT_SECONDS,
     backend_health_timeout_seconds: int = 5,
     gateway_url: str | None = None,
     gateway_token: str | None = None,
@@ -1657,6 +1685,7 @@ def cmd_play_hand_massive(
             scaffold_active_lanes=scaffold_active_lanes,
             staged_campaign=staged_campaign,
             remote_token_budget_multiplier=remote_token_budget_multiplier,
+            max_no_worker_wait_seconds=max_no_worker_wait_seconds,
             backend_health_timeout_seconds=backend_health_timeout_seconds,
             gateway_url=gateway_url,
             gateway_token=gateway_token,
@@ -1734,6 +1763,7 @@ def cmd_play_hand_massive(
         "scaffold_active_lanes": runtime.scaffold_active_lanes,
         "staged_campaign": runtime.staged_campaign,
         "remote_token_budget_multiplier": runtime.remote_token_budget_multiplier,
+        "max_no_worker_wait_seconds": runtime.max_no_worker_wait_seconds,
         "backend_health_timeout_seconds": runtime.backend_health_timeout_seconds,
         "gateway_url": _gateway_url(runtime),
         "gateway_pool": runtime.gateway_pool,
