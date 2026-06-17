@@ -91,6 +91,20 @@ def test_adaptive_lane_window_uses_worker_slots_with_safe_fallbacks() -> None:
     assert massive._desired_active_lanes(fixed, {"ok": True, "slots": 64}) == 7
 
 
+def test_effective_remote_token_budget_floors_to_one_lane_cost() -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            remote_token_budget_multiplier=2.0,
+            gateway_url="https://example.com/api/worker-gateway",
+        )
+    )
+    snapshot = {"ok": True, "slots": 64}
+    lane_cost = 512
+
+    assert massive._remote_token_budget(snapshot, runtime) == 128
+    assert massive._effective_remote_token_budget(snapshot, runtime, lane_cost) == 512
+
+
 def test_run_campaign_lane_executor_blocks_on_backend_down(monkeypatch) -> None:
     runtime = massive.normalize_massive_runtime_config(
         massive.MassiveRuntimeConfig(

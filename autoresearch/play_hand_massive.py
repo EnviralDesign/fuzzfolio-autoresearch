@@ -333,6 +333,19 @@ def _remote_token_budget(
     return int(math.ceil(slots * float(runtime.remote_token_budget_multiplier)))
 
 
+def _effective_remote_token_budget(
+    snapshot: dict[str, Any] | None,
+    runtime: MassiveRuntimeConfig,
+    lane_remote_cost: int,
+) -> int | None:
+    token_budget = _remote_token_budget(snapshot, runtime)
+    if token_budget is None:
+        return None
+    if token_budget <= 0:
+        return 0
+    return max(token_budget, max(1, int(lane_remote_cost)))
+
+
 def _poll_worker_pool_snapshot(runtime: MassiveRuntimeConfig) -> dict[str, Any]:
     url = _gateway_url(runtime)
     token = _gateway_token(runtime)
@@ -1406,7 +1419,11 @@ def _run_campaign_lane_executor(
             desired = refresh_lane_window()
             effective_desired = min(desired, executor_cap)
             if not stop_after_baseline:
-                token_budget = _remote_token_budget(last_snapshot, runtime)
+                token_budget = _effective_remote_token_budget(
+                    last_snapshot,
+                    runtime,
+                    lane_remote_cost,
+                )
             else:
                 token_budget = None
 
@@ -1883,6 +1900,8 @@ __all__ = [
     "cmd_play_hand_massive",
     "_desired_active_lanes",
     "_poll_local_backend_health",
+    "_effective_remote_token_budget",
+    "_remote_token_budget",
     "_run_campaign_lane_executor",
     "lane_seed",
     "normalize_massive_runtime_config",
