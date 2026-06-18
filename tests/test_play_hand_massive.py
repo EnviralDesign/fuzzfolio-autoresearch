@@ -92,6 +92,62 @@ def test_adaptive_lane_window_uses_worker_slots_with_safe_fallbacks() -> None:
     assert massive._desired_active_lanes(fixed, {"ok": True, "slots": 64}) == 7
 
 
+def test_adaptive_lane_window_uses_pressure_to_expand_and_contract() -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=20,
+            active_lanes=12,
+            adaptive_lanes=True,
+            min_active_lanes=1,
+            target_worker_slots_per_lane=32,
+            gateway_url="https://example.com/api/worker-gateway",
+        )
+    )
+    snapshot = {"ok": True, "slots": 64}
+
+    assert massive._desired_active_lanes(
+        runtime,
+        snapshot,
+        {"ok": True, "active_leases": 8, "pending_by_queue": {"deep_replay_jobs": 8}},
+    ) == 4
+    assert massive._desired_active_lanes(
+        runtime,
+        snapshot,
+        {"ok": True, "active_leases": 256, "pending_by_queue": {"deep_replay_jobs": 32}},
+    ) == 1
+
+
+def test_adaptive_sweep_shard_size_scales_with_worker_slots_and_pressure() -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            gateway_url="https://example.com/api/worker-gateway",
+            min_sweep_shard_size=4,
+            max_sweep_shard_size=16,
+            target_shards_per_worker_slot=3.0,
+        )
+    )
+    snapshot = {"ok": True, "slots": 55}
+
+    assert massive._adaptive_sweep_shard_size(
+        runtime,
+        snapshot,
+        None,
+        max_permutations=960,
+    ) == 6
+    assert massive._adaptive_sweep_shard_size(
+        runtime,
+        snapshot,
+        {"ok": True, "active_leases": 4, "pending_by_queue": {"deep_replay_jobs": 8}},
+        max_permutations=960,
+    ) == 4
+    assert massive._adaptive_sweep_shard_size(
+        runtime,
+        snapshot,
+        {"ok": True, "active_leases": 220, "pending_by_queue": {"deep_replay_jobs": 20}},
+        max_permutations=960,
+    ) == 8
+
+
 def test_effective_remote_token_budget_floors_to_one_lane_cost() -> None:
     runtime = massive.normalize_massive_runtime_config(
         massive.MassiveRuntimeConfig(
@@ -431,6 +487,81 @@ def test_expand_window_scales_for_large_pools() -> None:
     )
     snapshot = {"ok": True, "slots": 200}
     assert massive._expand_window(runtime, snapshot, has_expand_ready=True) == 4
+
+
+def test_rolling_staged_passes_adaptive_shard_size_to_expansion(monkeypatch) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=1,
+            active_lanes=1,
+            scaffold_active_lanes=1,
+            adaptive_lanes=True,
+            staged_campaign=True,
+            min_sweep_shard_size=4,
+            max_sweep_shard_size=16,
+            target_shards_per_worker_slot=3.0,
+            gateway_url="https://example.com/api/worker-gateway",
+            telemetry_interval_seconds=3600,
+        )
+    )
+    config, ctx, metadata = _campaign_test_context()
+    expansion_shards: list[int | None] = []
+
+    def fake_run_lane(*_args, **kwargs):
+        lane_index = kwargs["lane_index"]
+        if kwargs.get("stop_after_baseline"):
+            return massive.MassiveLaneResult(
+                lane_id=f"lane_{lane_index:03d}",
+                status="baseline_screened",
+                started_at="2026-06-17T00:00:00+00:00",
+                run_id=f"run-{lane_index}",
+                run_dir=str(Path(f"lane-{lane_index}")),
+            )
+        expansion_shards.append(kwargs.get("sweep_shard_size"))
+        return massive.MassiveLaneResult(
+            lane_id=f"lane_{lane_index:03d}",
+            status="completed",
+            started_at="2026-06-17T00:00:00+00:00",
+            run_id=f"run-{lane_index}",
+            run_dir=str(Path(f"lane-{lane_index}")),
+        )
+
+    monkeypatch.setattr(massive, "_run_lane", fake_run_lane)
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_pool_snapshot",
+        lambda _runtime: {"ok": True, "slots": 55, "pool_count": 1, "worker_count": 55},
+    )
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_gateway_pressure",
+        lambda _runtime: {"ok": True, "status": "ok", "active_leases": 4, "pending_by_queue": {"deep_replay_jobs": 8}},
+    )
+    monkeypatch.setattr(
+        massive,
+        "_poll_local_backend_health",
+        lambda *_args, **_kwargs: {"ok": True, "url": "http://localhost:7946/healthz"},
+    )
+    monkeypatch.setattr(massive, "write_run_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(massive, "_append_event", lambda *_args, **_kwargs: None)
+
+    results, _state = massive._run_rolling_staged_campaign_executor(
+        ctx=ctx,
+        runtime=runtime,
+        config=config,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "high", "value": 960},
+        sweep_budget_label="high",
+        sweep_budget_value=960,
+        reward_matrix=None,
+        metadata=metadata,
+        lane_indexes=[1],
+    )
+
+    assert [result.status for result in results] == ["completed"]
+    assert expansion_shards == [4]
 
 
 def test_rolling_staged_submits_expand_before_all_baselines_finish(monkeypatch) -> None:

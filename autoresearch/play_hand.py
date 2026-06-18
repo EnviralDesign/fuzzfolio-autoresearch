@@ -176,6 +176,7 @@ def _reward_matrix_cli_args(reward_matrix: dict[str, Any] | None) -> list[str]:
 
 
 _SWEEP_REWARD_MATRIX_SUPPORT: bool | None = None
+_SWEEP_SHARD_SIZE_SUPPORT: bool | None = None
 
 
 def _sweep_reward_matrix_supported(cli: FuzzfolioCli) -> bool:
@@ -198,6 +199,24 @@ def _sweep_reward_matrix_supported(cli: FuzzfolioCli) -> bool:
         and "--reward-columns" in text
     )
     return _SWEEP_REWARD_MATRIX_SUPPORT
+
+
+def _sweep_shard_size_supported(cli: FuzzfolioCli) -> bool:
+    global _SWEEP_SHARD_SIZE_SUPPORT
+    if _SWEEP_SHARD_SIZE_SUPPORT is not None:
+        return _SWEEP_SHARD_SIZE_SUPPORT
+    try:
+        result = cli.run(
+            ["sweep", "run", "--help"],
+            check=False,
+            timeout_seconds=10,
+        )
+    except Exception:
+        _SWEEP_SHARD_SIZE_SUPPORT = False
+        return False
+    text = f"{result.stdout}\n{result.stderr}"
+    _SWEEP_SHARD_SIZE_SUPPORT = result.returncode == 0 and "--shard-size" in text
+    return _SWEEP_SHARD_SIZE_SUPPORT
 
 
 def resolve_sweep_budget(
@@ -4672,6 +4691,7 @@ def _run_sweep(
     max_permutations: int,
     reward_matrix: dict[str, Any] | None = None,
     as_of_date: str | None = None,
+    shard_size: int | None = None,
 ) -> dict[str, Any]:
     original_axes = list(axes)
     sweep_reward_matrix = reward_matrix
@@ -4689,6 +4709,17 @@ def _run_sweep(
             f"{stage.prefix} [cyan]{phase}[/] [yellow]reward cap not applied to sweep[/] "
             "(active fuzzfolio-agent-cli needs rebuild)"
         )
+    sweep_shard_size = None if shard_size is None else max(1, int(shard_size))
+    if sweep_shard_size and not ctx.dry_run and not _sweep_shard_size_supported(ctx.cli):
+        _append_event(
+            ctx,
+            phase,
+            "shard_size_not_supported",
+            stage=stage,
+            shard_size=sweep_shard_size,
+            reason="active fuzzfolio-agent-cli sweep run does not expose --shard-size",
+        )
+        sweep_shard_size = None
     evolutionary_settings = (
         evolutionary_budget_settings(sweep_budget, evaluation_budget=max_permutations)
         if mode == "evolutionary"
@@ -4815,6 +4846,8 @@ def _run_sweep(
         args.extend(["--as-of-date", str(as_of_date)])
     args.extend(["--timeout-seconds", str(sweep_timeout_seconds)])
     args.extend(_reward_matrix_cli_args(sweep_reward_matrix))
+    if sweep_shard_size is not None:
+        args.extend(["--shard-size", str(sweep_shard_size)])
     args.extend(execution_cost_cli_args(ctx.config))
     if evolutionary_settings is not None:
         args.extend(
@@ -4875,6 +4908,7 @@ def _run_sweep(
                         "progress_best_fitness": progress.get("best_fitness") if isinstance(progress, dict) else None,
                         "progress_text": progress_text,
                         "reward_matrix": sweep_reward_matrix,
+                        "shard_size": sweep_shard_size,
                     },
                     ensure_ascii=True,
                 )
@@ -4901,6 +4935,7 @@ def _run_sweep(
         planned_work_label=planned_work_label,
         sweep_budget=sweep_budget,
         as_of_date=as_of_date,
+        shard_size=sweep_shard_size,
     ) as trace_span:
         result = ctx.cli.run_with_heartbeat(
             args,
@@ -4936,6 +4971,7 @@ def _run_sweep(
         allow_large_sweep=selected_permutations > SWEEP_PERMUTATION_HARD_LIMIT,
         top_score=_top_sweep_score(payload),
         reward_matrix=sweep_reward_matrix,
+        shard_size=sweep_shard_size,
     )
     return {"artifact_dir": str(out_dir), "result": payload, "axes": axes}
 

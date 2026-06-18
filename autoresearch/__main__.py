@@ -253,6 +253,9 @@ if __package__ in {None, ""}:
         DEFAULT_BASELINE_FLOOR as PLAY_HAND_MASSIVE_DEFAULT_BASELINE_FLOOR,
         DEFAULT_MASSIVE_ACTIVE_LANES,
         DEFAULT_MASSIVE_LANES,
+        DEFAULT_MASSIVE_MAX_SWEEP_SHARD_SIZE,
+        DEFAULT_MASSIVE_MIN_SWEEP_SHARD_SIZE,
+        DEFAULT_MASSIVE_TARGET_SHARDS_PER_WORKER_SLOT,
         DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
         DEFAULT_SCAFFOLD_ACTIVE_LANES,
         DEFAULT_MAX_NO_WORKER_WAIT_SECONDS,
@@ -468,6 +471,9 @@ else:
         DEFAULT_BASELINE_FLOOR as PLAY_HAND_MASSIVE_DEFAULT_BASELINE_FLOOR,
         DEFAULT_MASSIVE_ACTIVE_LANES,
         DEFAULT_MASSIVE_LANES,
+        DEFAULT_MASSIVE_MAX_SWEEP_SHARD_SIZE,
+        DEFAULT_MASSIVE_MIN_SWEEP_SHARD_SIZE,
+        DEFAULT_MASSIVE_TARGET_SHARDS_PER_WORKER_SLOT,
         DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
         DEFAULT_SCAFFOLD_ACTIVE_LANES,
         DEFAULT_MAX_NO_WORKER_WAIT_SECONDS,
@@ -1097,6 +1103,42 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help=(
             "Maximum concurrent lanes during staged baseline screening. "
             f"Default: {DEFAULT_SCAFFOLD_ACTIVE_LANES}."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--adaptive-shard-size",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Adjust deterministic sweep shard size from worker-gateway capacity. "
+            "Default: enabled."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--min-sweep-shard-size",
+        type=int,
+        default=DEFAULT_MASSIVE_MIN_SWEEP_SHARD_SIZE,
+        help=(
+            "Smallest adaptive deterministic sweep shard. "
+            f"Default: {DEFAULT_MASSIVE_MIN_SWEEP_SHARD_SIZE}."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--max-sweep-shard-size",
+        type=int,
+        default=DEFAULT_MASSIVE_MAX_SWEEP_SHARD_SIZE,
+        help=(
+            "Largest adaptive deterministic sweep shard. "
+            f"Default: {DEFAULT_MASSIVE_MAX_SWEEP_SHARD_SIZE}."
+        ),
+    )
+    play_hand_massive.add_argument(
+        "--target-shards-per-worker-slot",
+        type=float,
+        default=DEFAULT_MASSIVE_TARGET_SHARDS_PER_WORKER_SLOT,
+        help=(
+            "Adaptive shard target: desired queued shards per eligible worker slot. "
+            f"Default: {DEFAULT_MASSIVE_TARGET_SHARDS_PER_WORKER_SLOT:g}."
         ),
     )
     play_hand_massive.add_argument(
@@ -15002,6 +15044,10 @@ def main(argv: list[str] | None = None) -> int:
             min_active_lanes=args.min_active_lanes,
             target_worker_slots_per_lane=args.target_worker_slots_per_lane,
             scaffold_active_lanes=args.scaffold_active_lanes,
+            adaptive_shard_size=bool(args.adaptive_shard_size),
+            min_sweep_shard_size=args.min_sweep_shard_size,
+            max_sweep_shard_size=args.max_sweep_shard_size,
+            target_shards_per_worker_slot=args.target_shards_per_worker_slot,
             staged_campaign=bool(args.staged_campaign),
             remote_token_budget_multiplier=args.remote_token_budget_multiplier,
             max_no_worker_wait_seconds=args.max_no_worker_wait_seconds,

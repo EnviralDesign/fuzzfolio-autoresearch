@@ -76,6 +76,9 @@ DEFAULT_MASSIVE_LANES = 12
 DEFAULT_MASSIVE_ACTIVE_LANES = 2
 DEFAULT_SCAFFOLD_ACTIVE_LANES = 2
 DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER = 2.0
+DEFAULT_MASSIVE_MIN_SWEEP_SHARD_SIZE = 4
+DEFAULT_MASSIVE_MAX_SWEEP_SHARD_SIZE = 16
+DEFAULT_MASSIVE_TARGET_SHARDS_PER_WORKER_SLOT = 3.0
 DEFAULT_MAX_NO_WORKER_WAIT_SECONDS = 300
 DEFAULT_BASELINE_FLOOR = 0.0
 CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD = 2
@@ -107,6 +110,10 @@ class MassiveRuntimeConfig:
     min_active_lanes: int = 1
     target_worker_slots_per_lane: int = 32
     scaffold_active_lanes: int = DEFAULT_SCAFFOLD_ACTIVE_LANES
+    adaptive_shard_size: bool = True
+    min_sweep_shard_size: int = DEFAULT_MASSIVE_MIN_SWEEP_SHARD_SIZE
+    max_sweep_shard_size: int = DEFAULT_MASSIVE_MAX_SWEEP_SHARD_SIZE
+    target_shards_per_worker_slot: float = DEFAULT_MASSIVE_TARGET_SHARDS_PER_WORKER_SLOT
     staged_campaign: bool = True
     remote_token_budget_multiplier: float = DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER
     max_no_worker_wait_seconds: int = DEFAULT_MAX_NO_WORKER_WAIT_SECONDS
@@ -172,6 +179,9 @@ def normalize_massive_runtime_config(config: MassiveRuntimeConfig) -> MassiveRun
     min_active_lanes = max(1, min(int(config.min_active_lanes), active_lanes))
     target_worker_slots_per_lane = max(1, int(config.target_worker_slots_per_lane))
     scaffold_active_lanes = max(1, min(int(config.scaffold_active_lanes), active_lanes))
+    min_sweep_shard_size = max(1, int(config.min_sweep_shard_size))
+    max_sweep_shard_size = max(min_sweep_shard_size, int(config.max_sweep_shard_size))
+    target_shards_per_worker_slot = max(0.25, float(config.target_shards_per_worker_slot))
     remote_token_budget_multiplier = max(0.1, float(config.remote_token_budget_multiplier))
     max_no_worker_wait_seconds = max(0, int(config.max_no_worker_wait_seconds))
     backend_health_timeout_seconds = max(1, int(config.backend_health_timeout_seconds))
@@ -205,6 +215,10 @@ def normalize_massive_runtime_config(config: MassiveRuntimeConfig) -> MassiveRun
         min_active_lanes=min_active_lanes,
         target_worker_slots_per_lane=target_worker_slots_per_lane,
         scaffold_active_lanes=scaffold_active_lanes,
+        adaptive_shard_size=bool(config.adaptive_shard_size),
+        min_sweep_shard_size=min_sweep_shard_size,
+        max_sweep_shard_size=max_sweep_shard_size,
+        target_shards_per_worker_slot=target_shards_per_worker_slot,
         staged_campaign=bool(config.staged_campaign),
         remote_token_budget_multiplier=remote_token_budget_multiplier,
         max_no_worker_wait_seconds=max_no_worker_wait_seconds,
@@ -450,9 +464,34 @@ def _gateway_pressure_should_pause(snapshot: dict[str, Any] | None) -> bool:
     return status in {"saturated", "degraded"}
 
 
+def _gateway_pending_work(snapshot: dict[str, Any] | None) -> int:
+    if not snapshot or not snapshot.get("ok"):
+        return 0
+    pending_by_queue = snapshot.get("pending_by_queue")
+    if not isinstance(pending_by_queue, dict):
+        return 0
+    total = 0
+    for value in pending_by_queue.values():
+        try:
+            total += max(int(value or 0), 0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _gateway_active_leases(snapshot: dict[str, Any] | None) -> int:
+    if not snapshot or not snapshot.get("ok"):
+        return 0
+    try:
+        return max(int(snapshot.get("active_leases") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _desired_active_lanes(
     runtime: MassiveRuntimeConfig,
     snapshot: dict[str, Any] | None,
+    pressure: dict[str, Any] | None = None,
 ) -> int:
     if not runtime.adaptive_lanes:
         return runtime.active_lanes
@@ -468,6 +507,13 @@ def _desired_active_lanes(
     if slots <= 0:
         return 0
     desired = int(math.ceil(slots / float(runtime.target_worker_slots_per_lane)))
+    if pressure and pressure.get("ok"):
+        queued_or_running = _gateway_active_leases(pressure) + _gateway_pending_work(pressure)
+        if queued_or_running < slots:
+            warm_target = max(float(runtime.target_worker_slots_per_lane) / 2.0, 1.0)
+            desired = max(desired, int(math.ceil(slots / warm_target)))
+        elif queued_or_running > slots * 3:
+            desired = max(runtime.min_active_lanes, desired - 1)
     return max(runtime.min_active_lanes, min(runtime.active_lanes, desired))
 
 
@@ -490,17 +536,46 @@ def _expand_window(
     snapshot: dict[str, Any] | None,
     *,
     has_expand_ready: bool,
+    pressure: dict[str, Any] | None = None,
 ) -> int:
     """Expansion/sweep lane concurrency derived from worker slots per sweep lane."""
     if not runtime.adaptive_lanes:
         window = runtime.active_lanes
     else:
-        window = _desired_active_lanes(runtime, snapshot)
+        window = _desired_active_lanes(runtime, snapshot, pressure)
     window = min(window, runtime.active_lanes)
     slots = _eligible_worker_slots(snapshot)
     if has_expand_ready and (slots > 0 or not _gateway_url(runtime)):
         window = max(1, window)
     return window
+
+
+def _adaptive_sweep_shard_size(
+    runtime: MassiveRuntimeConfig,
+    snapshot: dict[str, Any] | None,
+    pressure: dict[str, Any] | None,
+    *,
+    max_permutations: int,
+) -> int | None:
+    if not runtime.adaptive_shard_size:
+        return None
+    permutation_cap = max(1, int(max_permutations))
+    min_size = max(1, int(runtime.min_sweep_shard_size))
+    max_size = max(min_size, int(runtime.max_sweep_shard_size))
+    slots = _eligible_worker_slots(snapshot)
+    if slots <= 0:
+        return max_size
+
+    target_shards_per_slot = float(runtime.target_shards_per_worker_slot)
+    if pressure and pressure.get("ok"):
+        queued_or_running = _gateway_active_leases(pressure) + _gateway_pending_work(pressure)
+        if queued_or_running < slots:
+            target_shards_per_slot *= 1.5
+        elif queued_or_running > slots * 3:
+            target_shards_per_slot *= 0.75
+    target_shards = max(1, int(math.ceil(slots * target_shards_per_slot)))
+    shard_size = int(math.ceil(permutation_cap / float(target_shards)))
+    return max(min_size, min(max_size, shard_size))
 
 
 def _is_terminal_submission_block(
@@ -638,6 +713,10 @@ def _write_lane_metadata(
             "adaptive_lanes": runtime.adaptive_lanes,
             "min_active_lanes": runtime.min_active_lanes,
             "target_worker_slots_per_lane": runtime.target_worker_slots_per_lane,
+            "adaptive_shard_size": runtime.adaptive_shard_size,
+            "min_sweep_shard_size": runtime.min_sweep_shard_size,
+            "max_sweep_shard_size": runtime.max_sweep_shard_size,
+            "target_shards_per_worker_slot": runtime.target_shards_per_worker_slot,
             "gateway_url": _gateway_url(runtime),
             "gateway_pool": runtime.gateway_pool,
             "telemetry_interval_seconds": runtime.telemetry_interval_seconds,
@@ -922,6 +1001,7 @@ def _run_lane(
     stop_after_baseline: bool = False,
     existing_lane_run_id: str | None = None,
     existing_lane_run_dir: Path | None = None,
+    sweep_shard_size: int | None = None,
 ) -> MassiveLaneResult:
     lane_id = f"lane_{lane_index:03d}"
     lane_run_id = existing_lane_run_id or _lane_run_id(lane_index)
@@ -967,7 +1047,7 @@ def _run_lane(
         seed_plan_path=seed_plan_path,
         seed_plan_loaded=seed_plan is not None,
         status="running",
-        extra={"started_at": started_at},
+        extra={"started_at": started_at, "sweep_shard_size": sweep_shard_size},
     )
     _append_event(
         campaign_ctx,
@@ -1072,6 +1152,7 @@ def _run_lane(
                     "profile_path": str(profile_path),
                     "profile_ref": profile_ref,
                     "evaluation_timeframe": evaluation_timeframe,
+                    "sweep_shard_size": sweep_shard_size,
                 },
             )
             if not should_expand_lane(
@@ -1122,6 +1203,7 @@ def _run_lane(
                 sweep_budget=sweep_budget_label,
                 max_permutations=max_sweep_permutations,
                 reward_matrix=reward_matrix,
+                shard_size=sweep_shard_size,
             )
             timing_materialized = _materialize_best(
                 lane_ctx,
@@ -1153,6 +1235,7 @@ def _run_lane(
             sweep_budget=sweep_budget_label,
             max_permutations=max_sweep_permutations,
             reward_matrix=reward_matrix,
+            shard_size=sweep_shard_size,
         )
         coarse_top_score = _top_sweep_score(coarse_sweep["result"])
         coarse_materialized = _materialize_best(
@@ -1213,6 +1296,7 @@ def _run_lane(
                     sweep_budget=sweep_budget_label,
                     max_permutations=max_sweep_permutations,
                     reward_matrix=reward_matrix,
+                    shard_size=sweep_shard_size,
                 )
                 focused_materialized = _materialize_best(
                     lane_ctx,
@@ -1310,6 +1394,7 @@ def _run_lane(
                 "strategy_family_id": lane_ctx.run_id,
                 "attempt_metadata": attempt_metadata,
                 "cloud_profile_cleanup": cleanup,
+                "sweep_shard_size": sweep_shard_size,
             },
         )
         _write_json(
@@ -1490,7 +1575,11 @@ def _run_campaign_lane_executor(
                     if _gateway_pressure_should_pause(last_gateway_pressure):
                         pause_reason = "gateway_pressure"
                         pause_until = now + runtime.telemetry_interval_seconds
-                desired_active_lanes = _desired_active_lanes(runtime, last_snapshot)
+                desired_active_lanes = _desired_active_lanes(
+                    runtime,
+                    last_snapshot,
+                    last_gateway_pressure,
+                )
                 if last_snapshot.get("ok"):
                     consecutive_bad_gateway_polls = 0
                     try:
@@ -1520,6 +1609,12 @@ def _run_campaign_lane_executor(
                 no_worker_since = None
 
             next_telemetry_at = now + runtime.telemetry_interval_seconds
+            sweep_shard_size_recommendation = _adaptive_sweep_shard_size(
+                runtime,
+                last_snapshot,
+                last_gateway_pressure,
+                max_permutations=sweep_budget_value,
+            )
             _append_event(
                 ctx,
                 "campaign",
@@ -1533,6 +1628,7 @@ def _run_campaign_lane_executor(
                 pause_reason=pause_reason,
                 pause_until=round(pause_until, 3) if pause_until else None,
                 in_flight_remote_permutations=in_flight_remote_permutations,
+                sweep_shard_size_recommendation=sweep_shard_size_recommendation,
             )
             metadata["last_worker_pool_snapshot"] = last_snapshot
             metadata["last_gateway_pressure"] = last_gateway_pressure
@@ -1540,6 +1636,7 @@ def _run_campaign_lane_executor(
             metadata["desired_active_lanes"] = desired_active_lanes
             metadata["campaign_pause_reason"] = pause_reason
             metadata["in_flight_remote_permutations"] = in_flight_remote_permutations
+            metadata["sweep_shard_size_recommendation"] = sweep_shard_size_recommendation
             write_run_metadata(ctx.run_dir, metadata)
         return desired_active_lanes
 
@@ -1622,6 +1719,16 @@ def _run_campaign_lane_executor(
 
                 lane_index = pending_lane_indexes.pop(0)
                 prior = expand_from.get(lane_index)
+                sweep_shard_size = (
+                    None
+                    if stop_after_baseline
+                    else _adaptive_sweep_shard_size(
+                        runtime,
+                        last_snapshot,
+                        last_gateway_pressure,
+                        max_permutations=sweep_budget_value,
+                    )
+                )
                 future = executor.submit(
                     _run_lane,
                     ctx,
@@ -1637,6 +1744,7 @@ def _run_campaign_lane_executor(
                     stop_after_baseline=stop_after_baseline,
                     existing_lane_run_id=prior.run_id if prior else None,
                     existing_lane_run_dir=Path(prior.run_dir) if prior and prior.run_dir else None,
+                    sweep_shard_size=sweep_shard_size,
                 )
                 in_flight[future] = lane_index
                 if token_budget is not None:
@@ -1651,6 +1759,7 @@ def _run_campaign_lane_executor(
                     pending_lanes=len(pending_lane_indexes),
                     stop_after_baseline=stop_after_baseline,
                     expand_lane=prior is not None,
+                    sweep_shard_size=sweep_shard_size,
                 )
 
             if not in_flight and pending_lane_indexes and not submission_allowed():
@@ -1850,8 +1959,15 @@ def _run_rolling_staged_campaign_executor(
                 runtime,
                 last_snapshot,
                 has_expand_ready=bool(expand_ready),
+                pressure=last_gateway_pressure,
             )
             next_telemetry_at = now + runtime.telemetry_interval_seconds
+            sweep_shard_size_recommendation = _adaptive_sweep_shard_size(
+                runtime,
+                last_snapshot,
+                last_gateway_pressure,
+                max_permutations=sweep_budget_value,
+            )
             _append_event(
                 ctx,
                 "campaign",
@@ -1869,6 +1985,7 @@ def _run_rolling_staged_campaign_executor(
                 pause_reason=pause_reason,
                 pause_until=round(pause_until, 3) if pause_until else None,
                 in_flight_remote_permutations=in_flight_remote_permutations,
+                sweep_shard_size_recommendation=sweep_shard_size_recommendation,
             )
             metadata["last_worker_pool_snapshot"] = last_snapshot
             metadata["last_gateway_pressure"] = last_gateway_pressure
@@ -1877,6 +1994,7 @@ def _run_rolling_staged_campaign_executor(
             metadata["expand_window"] = expand_window
             metadata["campaign_pause_reason"] = pause_reason
             metadata["in_flight_remote_permutations"] = in_flight_remote_permutations
+            metadata["sweep_shard_size_recommendation"] = sweep_shard_size_recommendation
             metadata["campaign_stage"] = "rolling_staged"
             write_run_metadata(ctx.run_dir, metadata)
         return baseline_window, expand_window
@@ -1995,6 +2113,12 @@ def _run_rolling_staged_campaign_executor(
                     ):
                         break
                     lane_index, prior = expand_ready.pop(0)
+                    sweep_shard_size = _adaptive_sweep_shard_size(
+                        runtime,
+                        last_snapshot,
+                        last_gateway_pressure,
+                        max_permutations=sweep_budget_value,
+                    )
                     future = executor.submit(
                         _run_lane,
                         ctx,
@@ -2010,6 +2134,7 @@ def _run_rolling_staged_campaign_executor(
                         stop_after_baseline=False,
                         existing_lane_run_id=prior.run_id,
                         existing_lane_run_dir=Path(prior.run_dir) if prior.run_dir else None,
+                        sweep_shard_size=sweep_shard_size,
                     )
                     expand_in_flight[future] = lane_index
                     in_flight_remote_permutations += lane_remote_cost
@@ -2023,6 +2148,7 @@ def _run_rolling_staged_campaign_executor(
                         running_expand=len(expand_in_flight),
                         baseline_window=baseline_window,
                         expand_window=expand_window,
+                        sweep_shard_size=sweep_shard_size,
                     )
             elif _is_terminal_submission_block(
                 pause_reason=pause_reason,
@@ -2204,6 +2330,10 @@ def cmd_play_hand_massive(
     min_active_lanes: int = 1,
     target_worker_slots_per_lane: int = 32,
     scaffold_active_lanes: int = DEFAULT_SCAFFOLD_ACTIVE_LANES,
+    adaptive_shard_size: bool = True,
+    min_sweep_shard_size: int = DEFAULT_MASSIVE_MIN_SWEEP_SHARD_SIZE,
+    max_sweep_shard_size: int = DEFAULT_MASSIVE_MAX_SWEEP_SHARD_SIZE,
+    target_shards_per_worker_slot: float = DEFAULT_MASSIVE_TARGET_SHARDS_PER_WORKER_SLOT,
     staged_campaign: bool = True,
     remote_token_budget_multiplier: float = DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
     max_no_worker_wait_seconds: int = DEFAULT_MAX_NO_WORKER_WAIT_SECONDS,
@@ -2240,6 +2370,10 @@ def cmd_play_hand_massive(
             min_active_lanes=min_active_lanes,
             target_worker_slots_per_lane=target_worker_slots_per_lane,
             scaffold_active_lanes=scaffold_active_lanes,
+            adaptive_shard_size=adaptive_shard_size,
+            min_sweep_shard_size=min_sweep_shard_size,
+            max_sweep_shard_size=max_sweep_shard_size,
+            target_shards_per_worker_slot=target_shards_per_worker_slot,
             staged_campaign=staged_campaign,
             remote_token_budget_multiplier=remote_token_budget_multiplier,
             max_no_worker_wait_seconds=max_no_worker_wait_seconds,
@@ -2318,6 +2452,10 @@ def cmd_play_hand_massive(
         "min_active_lanes": runtime.min_active_lanes,
         "target_worker_slots_per_lane": runtime.target_worker_slots_per_lane,
         "scaffold_active_lanes": runtime.scaffold_active_lanes,
+        "adaptive_shard_size": runtime.adaptive_shard_size,
+        "min_sweep_shard_size": runtime.min_sweep_shard_size,
+        "max_sweep_shard_size": runtime.max_sweep_shard_size,
+        "target_shards_per_worker_slot": runtime.target_shards_per_worker_slot,
         "staged_campaign": runtime.staged_campaign,
         "remote_token_budget_multiplier": runtime.remote_token_budget_multiplier,
         "max_no_worker_wait_seconds": runtime.max_no_worker_wait_seconds,
@@ -2343,6 +2481,9 @@ def cmd_play_hand_massive(
         active_lanes=runtime.active_lanes,
         sweep_budget=sweep_budget_label,
         sweep_budget_value=sweep_budget_value,
+        adaptive_shard_size=runtime.adaptive_shard_size,
+        min_sweep_shard_size=runtime.min_sweep_shard_size,
+        max_sweep_shard_size=runtime.max_sweep_shard_size,
     )
 
     started_perf = time.perf_counter()
@@ -2431,6 +2572,9 @@ __all__ = [
     "DEFAULT_BASELINE_FLOOR",
     "DEFAULT_MASSIVE_ACTIVE_LANES",
     "DEFAULT_MASSIVE_LANES",
+    "DEFAULT_MASSIVE_MAX_SWEEP_SHARD_SIZE",
+    "DEFAULT_MASSIVE_MIN_SWEEP_SHARD_SIZE",
+    "DEFAULT_MASSIVE_TARGET_SHARDS_PER_WORKER_SLOT",
     "DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER",
     "DEFAULT_SCAFFOLD_ACTIVE_LANES",
     "PLAY_HAND_MASSIVE_CAMPAIGNS_DIR",
@@ -2439,6 +2583,7 @@ __all__ = [
     "MassiveRuntimeConfig",
     "cmd_play_hand_massive",
     "_desired_active_lanes",
+    "_adaptive_sweep_shard_size",
     "_baseline_window",
     "_expand_window",
     "_eligible_worker_slots",
