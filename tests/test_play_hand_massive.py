@@ -453,16 +453,42 @@ def _campaign_test_context() -> tuple[SimpleNamespace, SimpleNamespace, dict]:
     return config, ctx, {}
 
 
-def test_baseline_window_ignores_sweep_slot_ratio() -> None:
+def test_baseline_window_adapts_to_worker_slots_and_pressure() -> None:
     runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=128,
+            active_lanes=64,
+            scaffold_active_lanes=32,
+            target_worker_slots_per_lane=16,
+            gateway_url="https://example.com/api/worker-gateway",
+        )
+    )
+    assert massive._baseline_window(runtime) == 1
+
+    snapshot = {"ok": True, "slots": 174}
+    low_pressure = {
+        "ok": True,
+        "active_leases": 20,
+        "pending_by_queue": {"deep_replay_jobs": 8},
+    }
+    high_pressure = {
+        "ok": True,
+        "active_leases": 400,
+        "pending_by_queue": {"deep_replay_jobs": 50},
+    }
+    assert massive._baseline_window(runtime, snapshot, low_pressure) == 11
+    assert massive._baseline_window(runtime, snapshot, high_pressure) == 3
+
+    fixed = massive.normalize_massive_runtime_config(
         massive.MassiveRuntimeConfig(
             lanes=24,
             active_lanes=4,
             scaffold_active_lanes=4,
+            adaptive_lanes=False,
             target_worker_slots_per_lane=75,
         )
     )
-    assert massive._baseline_window(runtime) == 4
+    assert massive._baseline_window(fixed, {"ok": True, "slots": 1}) == 4
 
 
 def test_expand_window_floors_to_one_when_expand_ready_and_workers_exist() -> None:
@@ -647,7 +673,12 @@ def test_rolling_staged_submits_expand_before_all_baselines_finish(monkeypatch) 
     monkeypatch.setattr(
         massive,
         "_poll_worker_pool_snapshot",
-        lambda _runtime: {"ok": True, "slots": 7, "pool_count": 1, "worker_count": 7},
+        lambda _runtime: {"ok": True, "slots": 300, "pool_count": 1, "worker_count": 300},
+    )
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_gateway_pressure",
+        lambda _runtime: {"ok": True, "active_leases": 0, "pending_by_queue": {}},
     )
     monkeypatch.setattr(
         massive,
@@ -728,7 +759,12 @@ def test_rolling_staged_baseline_concurrency_reaches_scaffold_cap(monkeypatch) -
     monkeypatch.setattr(
         massive,
         "_poll_worker_pool_snapshot",
-        lambda _runtime: {"ok": True, "slots": 7, "pool_count": 1, "worker_count": 7},
+        lambda _runtime: {"ok": True, "slots": 300, "pool_count": 1, "worker_count": 300},
+    )
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_gateway_pressure",
+        lambda _runtime: {"ok": True, "active_leases": 0, "pending_by_queue": {}},
     )
     monkeypatch.setattr(
         massive,

@@ -530,9 +530,33 @@ def _eligible_worker_slots(snapshot: dict[str, Any] | None) -> int:
         return 0
 
 
-def _baseline_window(runtime: MassiveRuntimeConfig) -> int:
-    """Baseline/scaffold concurrency is independent of sweep slot ratio."""
-    return max(1, min(runtime.scaffold_active_lanes, runtime.active_lanes))
+def _baseline_window(
+    runtime: MassiveRuntimeConfig,
+    snapshot: dict[str, Any] | None = None,
+    pressure: dict[str, Any] | None = None,
+) -> int:
+    """Baseline/scaffold concurrency follows the live gateway capacity envelope."""
+    cap = max(1, min(runtime.scaffold_active_lanes, runtime.active_lanes))
+    if not runtime.adaptive_lanes:
+        return cap
+
+    slots = _eligible_worker_slots(snapshot)
+    if slots <= 0:
+        if _gateway_url(runtime):
+            return max(0, min(cap, runtime.min_active_lanes))
+        return max(1, min(cap, runtime.min_active_lanes))
+
+    target_slots = max(float(runtime.target_worker_slots_per_lane), 1.0)
+    divisor = target_slots * 2.0
+    if pressure and pressure.get("ok"):
+        queued_or_running = _gateway_active_leases(pressure) + _gateway_pending_work(pressure)
+        if queued_or_running < slots:
+            divisor = target_slots
+        elif queued_or_running > slots * 2:
+            divisor = target_slots * 4.0
+
+    desired = int(math.ceil(slots / divisor))
+    return max(1, min(cap, desired))
 
 
 def _expand_window(
@@ -1958,7 +1982,11 @@ def _run_rolling_staged_campaign_executor(
                     pause_reason = None
                     pause_until = 0.0
 
-            baseline_window = _baseline_window(runtime)
+            baseline_window = _baseline_window(
+                runtime,
+                last_snapshot,
+                last_gateway_pressure,
+            )
             expand_window = _expand_window(
                 runtime,
                 last_snapshot,
