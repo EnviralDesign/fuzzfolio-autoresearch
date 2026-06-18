@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import math
 import random
 import re
+import shutil
 import statistics
+import subprocess
+import sys
+import sysconfig
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1578,6 +1584,224 @@ class PortfolioSearch:
             )
         self.progress("optimize_done", variant_count=len(variants))
         return variants
+
+
+def optimizer_candidate_payload(candidate: OptimizerCandidate) -> dict[str, Any]:
+    return {
+        "attempt_id": candidate.attempt_id,
+        "candidate_name": candidate.row.get("candidate_name"),
+        "run_id": candidate.row.get("run_id"),
+        "created_at": candidate.created_at,
+        "instruments": candidate.instruments,
+        "family": candidate.family,
+        "score": candidate.score,
+        "avg_hold_hours": candidate.avg_hold_hours,
+        "p90_hold_hours": candidate.p90_hold_hours,
+        "max_hold_hours": candidate.max_hold_hours,
+        "path_quality": candidate.path_quality,
+        "stop_loss_percent": candidate.stop_loss_percent,
+        "trade_count": candidate.trade_count,
+        "trades_per_month": candidate.trades_per_month,
+        "dates": candidate.dates,
+        "daily_r": candidate.daily_r,
+        "open_counts": candidate.open_counts,
+        "closed_counts": candidate.closed_counts,
+    }
+
+
+def _optimizer_spec_payload(spec: PortfolioOptimizerSpec) -> dict[str, Any]:
+    return {
+        "portfolio_name": spec.portfolio_name,
+        "portfolio_size": spec.portfolio_size,
+        "candidate_limit": spec.candidate_limit,
+        "swap_candidate_limit": spec.swap_candidate_limit,
+        "objective_names": list(spec.objective_names),
+        "max_swaps": spec.max_swaps,
+        "random_starts": spec.random_starts,
+        "random_seed": spec.random_seed,
+        "max_per_family": spec.max_per_family,
+        "max_instrument_share": spec.max_instrument_share,
+        "min_fx_share": spec.min_fx_share,
+        "max_metal_share": spec.max_metal_share,
+        "max_index_share": spec.max_index_share,
+        "max_avg_open_positions": spec.max_avg_open_positions,
+        "max_peak_open_positions": spec.max_peak_open_positions,
+        "target_trades_per_month": spec.target_trades_per_month,
+        "max_trades_per_month": spec.max_trades_per_month,
+        "correlation_penalty_weight": spec.correlation_penalty_weight,
+        "diversification_mode": spec.diversification_mode,
+        "portfolio_sharpe_weight": spec.portfolio_sharpe_weight,
+        "baseline_attempt_ids": list(spec.baseline_attempt_ids),
+        "account": spec.account,
+    }
+
+
+def _rust_optimizer_input_payload(
+    candidates: list[OptimizerCandidate],
+    spec: PortfolioOptimizerSpec,
+) -> dict[str, Any]:
+    return {
+        "spec": _optimizer_spec_payload(spec),
+        "candidates": [optimizer_candidate_payload(candidate) for candidate in candidates],
+        "objectives": DEFAULT_OBJECTIVES,
+    }
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _rust_optimizer_manifest() -> Path:
+    return _repo_root() / "rust" / "portfolio-optimizer" / "Cargo.toml"
+
+
+def _rust_optimizer_cdylib_path(*, release: bool = True) -> Path:
+    profile = "release" if release else "debug"
+    target_root = _repo_root() / "rust" / "portfolio-optimizer" / "target" / profile
+    if sys.platform.startswith("win"):
+        return target_root / "portfolio_optimizer_rs.dll"
+    if sys.platform == "darwin":
+        return target_root / "libportfolio_optimizer_rs.dylib"
+    return target_root / "libportfolio_optimizer_rs.so"
+
+
+def _ensure_rust_optimizer_extension(*, release: bool = True) -> Path:
+    manifest = _rust_optimizer_manifest()
+    if not manifest.exists():
+        raise RuntimeError(f"Rust optimizer manifest not found: {manifest}")
+    command = [
+        "cargo",
+        "build",
+        "--quiet",
+        "--manifest-path",
+        str(manifest),
+        "--features",
+        "python-extension",
+        "--lib",
+    ]
+    if release:
+        command.insert(2, "--release")
+    completed = subprocess.run(
+        command,
+        cwd=_repo_root(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "failed to build Rust optimizer PyO3 extension: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}"
+        )
+    cdylib_path = _rust_optimizer_cdylib_path(release=release)
+    if not cdylib_path.exists():
+        raise RuntimeError(f"Rust optimizer extension build did not produce {cdylib_path}")
+    return cdylib_path
+
+
+def _load_rust_optimizer_module(*, release: bool = True) -> Any:
+    cdylib_path = _ensure_rust_optimizer_extension(release=release)
+    extension_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".pyd"
+    extension_root = _repo_root() / ".tmp" / "portfolio_optimizer_pyo3"
+    extension_root.mkdir(parents=True, exist_ok=True)
+    module_dir = Path(tempfile.mkdtemp(prefix="runtime-", dir=extension_root))
+    module_path = module_dir / f"portfolio_optimizer_rs{extension_suffix}"
+    shutil.copy2(cdylib_path, module_path)
+    spec = importlib.util.spec_from_file_location("portfolio_optimizer_rs", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to create import spec for {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    previous_module = sys.modules.pop("portfolio_optimizer_rs", None)
+    try:
+        sys.modules["portfolio_optimizer_rs"] = module
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop("portfolio_optimizer_rs", None)
+        if previous_module is not None:
+            sys.modules["portfolio_optimizer_rs"] = previous_module
+        raise
+    return module
+
+
+def _hydrate_rust_variants(
+    variants: dict[str, dict[str, Any]],
+    search: PortfolioSearch,
+) -> dict[str, dict[str, Any]]:
+    hydrated: dict[str, dict[str, Any]] = {}
+    for name, variant in variants.items():
+        selected_ids = [
+            str(item)
+            for item in variant.get("selected_attempt_ids", [])
+            if str(item) in search.by_id
+        ]
+        hydrated[name] = {
+            **variant,
+            "selected_attempt_ids": selected_ids,
+            "selected": [
+                search.candidate_row(attempt_id, rank=index + 1)
+                for index, attempt_id in enumerate(selected_ids)
+            ],
+        }
+    return hydrated
+
+
+def _run_pyo3_optimizer(
+    candidates: list[OptimizerCandidate],
+    spec: PortfolioOptimizerSpec,
+    search: PortfolioSearch,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    module = _load_rust_optimizer_module(release=True)
+    payload = _rust_optimizer_input_payload(candidates, spec)
+    output_json = module.optimize_json(json.dumps(payload, ensure_ascii=True))
+    output = json.loads(output_json)
+    variants = output.get("variants") or {}
+    pareto_front = output.get("pareto_front") or []
+    if not isinstance(variants, dict) or not isinstance(pareto_front, list):
+        raise RuntimeError("Rust optimizer returned an unexpected payload shape.")
+    return _hydrate_rust_variants(variants, search), pareto_front
+
+
+def run_optimizer_backend(
+    candidates: list[OptimizerCandidate],
+    spec: PortfolioOptimizerSpec,
+    *,
+    backend: str = "python",
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[PortfolioSearch, dict[str, dict[str, Any]], list[dict[str, Any]], str]:
+    requested_backend = str(backend or "python").lower()
+    if requested_backend not in {"python", "pyo3", "auto"}:
+        raise ValueError(f"Unsupported optimizer backend: {backend}")
+    search = PortfolioSearch(candidates, spec, progress_callback=progress_callback)
+    if requested_backend == "python":
+        variants = search.optimize()
+        return search, variants, search.pareto_front(limit=50), "python"
+    try:
+        if progress_callback is not None:
+            progress_callback({"event": "rust_optimizer_start", "backend": "pyo3"})
+        variants, pareto_front = _run_pyo3_optimizer(candidates, spec, search)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "event": "rust_optimizer_done",
+                    "backend": "pyo3",
+                    "variant_count": len(variants),
+                    "pareto_front_count": len(pareto_front),
+                }
+            )
+        return search, variants, pareto_front, "pyo3"
+    except Exception as exc:
+        if requested_backend != "auto":
+            raise
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "event": "rust_optimizer_fallback",
+                    "backend": "python",
+                    "reason": str(exc),
+                }
+            )
+        variants = search.optimize()
+        return search, variants, search.pareto_front(limit=50), "python"
 
 
 def load_baseline_attempt_ids(report_path: Path) -> list[str]:

@@ -8,6 +8,7 @@ from autoresearch.portfolio_optimizer import (
     PortfolioOptimizerSpec,
     PortfolioSearch,
     build_optimizer_candidates,
+    run_optimizer_backend,
 )
 
 
@@ -145,6 +146,78 @@ def test_optimizer_selects_portfolio_from_source_calendar_curves(tmp_path: Path)
     metrics = variants["stability"]["metrics"]
     assert metrics["constraint_violations"] == {}
     assert metrics["max_daily_loss_streak"] == 0
+
+
+def test_optimizer_backend_dispatch_preserves_python_default(tmp_path: Path) -> None:
+    rows = [
+        _row(tmp_path, "smooth-a", "EURUSD", [1, 2, 3, 4], score=65),
+        _row(tmp_path, "smooth-b", "XAUUSD", [0.5, 1.5, 2.5, 3.5], score=65),
+        _row(tmp_path, "lumpy", "USDJPY", [8, 1, 9, 2], score=95),
+    ]
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=2,
+        candidate_limit=3,
+        objective_names=("stability",),
+        random_starts=0,
+        max_swaps=4,
+        max_per_family=1,
+        min_fx_share=0,
+        max_metal_share=2,
+        max_index_share=2,
+        max_instrument_share=1,
+    )
+    candidates, _ = build_optimizer_candidates(rows, spec)
+
+    search, variants, pareto_front, used_backend = run_optimizer_backend(
+        candidates,
+        spec,
+    )
+
+    assert used_backend == "python"
+    assert isinstance(search, PortfolioSearch)
+    assert set(variants["stability"]["selected_attempt_ids"]) == {"smooth-a", "smooth-b"}
+    assert pareto_front
+
+
+def test_optimizer_backend_auto_falls_back_to_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        _row(tmp_path, "smooth-a", "EURUSD", [1, 2, 3, 4], score=65),
+        _row(tmp_path, "smooth-b", "XAUUSD", [0.5, 1.5, 2.5, 3.5], score=65),
+        _row(tmp_path, "lumpy", "USDJPY", [8, 1, 9, 2], score=95),
+    ]
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=2,
+        candidate_limit=3,
+        objective_names=("stability",),
+        random_starts=0,
+        max_swaps=4,
+        max_per_family=1,
+        min_fx_share=0,
+        max_metal_share=2,
+        max_index_share=2,
+        max_instrument_share=1,
+    )
+    candidates, _ = build_optimizer_candidates(rows, spec)
+    events: list[dict] = []
+
+    def broken_pyo3(*args, **kwargs):
+        raise RuntimeError("extension unavailable")
+
+    monkeypatch.setattr(portfolio_optimizer_module, "_run_pyo3_optimizer", broken_pyo3)
+
+    _, variants, _, used_backend = run_optimizer_backend(
+        candidates,
+        spec,
+        backend="auto",
+        progress_callback=events.append,
+    )
+
+    assert used_backend == "python"
+    assert set(variants["stability"]["selected_attempt_ids"]) == {"smooth-a", "smooth-b"}
+    assert any(event.get("event") == "rust_optimizer_fallback" for event in events)
 
 
 def test_pareto_front_keeps_nondominated_archived_portfolios(tmp_path: Path) -> None:

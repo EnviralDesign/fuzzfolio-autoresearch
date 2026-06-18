@@ -215,6 +215,7 @@ if __package__ in {None, ""}:
         build_optimizer_candidates,
         load_baseline_account,
         load_baseline_attempt_ids,
+        run_optimizer_backend,
         write_optimizer_report,
     )
     from autoresearch.portfolio_risk_sizing import (
@@ -433,6 +434,7 @@ else:
         build_optimizer_candidates,
         load_baseline_account,
         load_baseline_attempt_ids,
+        run_optimizer_backend,
         write_optimizer_report,
     )
     from .portfolio_risk_sizing import (
@@ -3172,6 +3174,12 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help="Objective weight on portfolio daily Sharpe (mean/std of combined daily R) in marginal_sharpe mode. 0 keeps legacy behavior. Default: 0.",
+    )
+    optimize_portfolio.add_argument(
+        "--optimizer-backend",
+        choices=("python", "pyo3", "auto"),
+        default="python",
+        help="Search backend for dense portfolio optimization. Default: python.",
     )
     optimize_portfolio.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
@@ -10992,6 +11000,7 @@ def cmd_optimize_portfolio(
     correlation_penalty_weight: float,
     diversification_mode: str,
     portfolio_sharpe_weight: float,
+    optimizer_backend: str,
     as_json: bool,
 ) -> int:
     config = load_config()
@@ -11101,13 +11110,16 @@ def cmd_optimize_portfolio(
             "scoped_row_count": len(rows),
         }
     )
-    search = PortfolioSearch(candidates, spec, progress_callback=optimizer_progress)
+    search, variants, pareto_front, used_optimizer_backend = run_optimizer_backend(
+        candidates,
+        spec,
+        backend=optimizer_backend,
+        progress_callback=optimizer_progress,
+    )
     baselines = [
         baseline_metrics_from_ids(search, name, ids)
         for name, ids in baselines_raw
     ]
-    variants = search.optimize()
-    pareto_front = search.pareto_front(limit=50)
     summary = write_optimizer_report(
         report_root=report_root,
         spec=spec,
@@ -11120,11 +11132,15 @@ def cmd_optimize_portfolio(
             **corpus_info,
             "scope": scope_info,
             "scoped_row_count": len(rows),
+            "optimizer_backend": used_optimizer_backend,
+            "requested_optimizer_backend": optimizer_backend,
         },
     )
     output_payload = {
         **summary,
         "candidate_scope": scope_info,
+        "optimizer_backend": used_optimizer_backend,
+        "requested_optimizer_backend": optimizer_backend,
         "progress_jsonl": str(progress_path),
         "variants": {
             name: {
@@ -15456,6 +15472,7 @@ def main(argv: list[str] | None = None) -> int:
             correlation_penalty_weight=float(args.correlation_penalty_weight),
             diversification_mode=str(args.diversification_mode),
             portfolio_sharpe_weight=float(args.portfolio_sharpe_weight),
+            optimizer_backend=str(args.optimizer_backend),
             as_json=bool(args.json),
         )
     if args.command == "export-portfolio-bundle":
