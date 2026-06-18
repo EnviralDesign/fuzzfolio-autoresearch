@@ -1822,6 +1822,29 @@ def _run_rolling_staged_campaign_executor(
             else:
                 no_worker_since = None
 
+            if pause_reason and not (pause_until and now < pause_until):
+                pause_recovered = False
+                if pause_reason == "gateway_pressure":
+                    pause_recovered = not _gateway_pressure_should_pause(last_gateway_pressure)
+                elif pause_reason == "no_workers":
+                    pause_recovered = (
+                        _eligible_worker_slots(last_snapshot) > 0
+                        or not _gateway_url(runtime)
+                    )
+                elif pause_reason == "gateway_unhealthy":
+                    pause_recovered = (
+                        consecutive_bad_gateway_polls
+                        < CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD
+                    )
+                elif pause_reason == "backend_down":
+                    pause_recovered = (
+                        consecutive_backend_health_failures
+                        < CAMPAIGN_BACKEND_DOWN_THRESHOLD
+                    )
+                if pause_recovered:
+                    pause_reason = None
+                    pause_until = 0.0
+
             baseline_window = _baseline_window(runtime)
             expand_window = _expand_window(
                 runtime,

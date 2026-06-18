@@ -663,6 +663,92 @@ def test_rolling_staged_pauses_on_gateway_pressure_without_mass_not_started(monk
     assert state["pause_reason"] in {None, "gateway_pressure"}
 
 
+def test_rolling_staged_recovers_from_gateway_pressure_pause(monkeypatch) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=2,
+            active_lanes=1,
+            scaffold_active_lanes=1,
+            adaptive_lanes=True,
+            staged_campaign=True,
+            gateway_url="https://example.com/api/worker-gateway",
+            telemetry_interval_seconds=1,
+        )
+    )
+    config, ctx, metadata = _campaign_test_context()
+    submissions: list[tuple[int, str]] = []
+    pressure_calls = {"count": 0}
+    lane_window_events = {"count": 0}
+
+    def fake_run_lane(*_args, **kwargs):
+        lane_index = kwargs["lane_index"]
+        if kwargs.get("stop_after_baseline"):
+            submissions.append((lane_index, "baseline"))
+            return massive.MassiveLaneResult(
+                lane_id=f"lane_{lane_index:03d}",
+                status="baseline_screened",
+                started_at="2026-06-17T00:00:00+00:00",
+                run_id=f"run-{lane_index}",
+                run_dir=str(Path(f"lane-{lane_index}")),
+            )
+        submissions.append((lane_index, "expand"))
+        return massive.MassiveLaneResult(
+            lane_id=f"lane_{lane_index:03d}",
+            status="completed",
+            started_at="2026-06-17T00:00:00+00:00",
+            run_id=f"run-{lane_index}",
+            run_dir=str(Path(f"lane-{lane_index}")),
+        )
+
+    def fake_pressure(_runtime):
+        pressure_calls["count"] += 1
+        if pressure_calls["count"] == 1:
+            return {"ok": True, "status": "saturated"}
+        return {"ok": True, "status": "ok"}
+
+    def fake_append_event(_ctx, _phase, status, **_payload):
+        if status == "lane_window":
+            lane_window_events["count"] += 1
+            if lane_window_events["count"] > 4:
+                raise AssertionError("scheduler did not recover from gateway_pressure")
+
+    monkeypatch.setattr(massive, "_run_lane", fake_run_lane)
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_pool_snapshot",
+        lambda _runtime: {"ok": True, "slots": 10, "pool_count": 1, "worker_count": 10},
+    )
+    monkeypatch.setattr(massive, "_poll_worker_gateway_pressure", fake_pressure)
+    monkeypatch.setattr(
+        massive,
+        "_poll_local_backend_health",
+        lambda *_args, **_kwargs: {"ok": True, "url": "http://localhost:7946/healthz"},
+    )
+    monkeypatch.setattr(massive, "write_run_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(massive, "_append_event", fake_append_event)
+
+    results, state = massive._run_rolling_staged_campaign_executor(
+        ctx=ctx,
+        runtime=runtime,
+        config=config,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "high", "value": 1024},
+        sweep_budget_label="high",
+        sweep_budget_value=1024,
+        reward_matrix=None,
+        metadata=metadata,
+        lane_indexes=[1, 2],
+    )
+
+    assert pressure_calls["count"] >= 2
+    assert (1, "baseline") in submissions
+    assert (1, "expand") in submissions
+    assert [result.status for result in results] == ["completed", "completed"]
+    assert state["pause_reason"] is None
+
+
 def test_run_lane_expansion_preserves_baseline_profile_metadata(
     monkeypatch,
     tmp_path: Path,
