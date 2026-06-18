@@ -45,6 +45,16 @@ def test_should_expand_lane_keeps_dry_run_open() -> None:
         baseline_floor=10.0,
         dry_run=False,
     )
+    assert not massive.should_expand_lane(
+        baseline_score=0.0,
+        baseline_floor=0.0,
+        dry_run=False,
+    )
+    assert massive.should_expand_lane(
+        baseline_score=0.0001,
+        baseline_floor=0.0,
+        dry_run=False,
+    )
 
 
 def test_adaptive_lane_window_uses_worker_slots_with_safe_fallbacks() -> None:

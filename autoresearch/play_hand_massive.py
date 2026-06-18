@@ -250,7 +250,11 @@ def should_expand_lane(
 ) -> bool:
     if dry_run or baseline_floor is None or baseline_score is None:
         return True
-    return float(baseline_score) >= float(baseline_floor)
+    score = float(baseline_score)
+    floor = float(baseline_floor)
+    if floor == 0.0:
+        return score > 0.0
+    return score >= floor
 
 
 def _now_iso() -> str:
