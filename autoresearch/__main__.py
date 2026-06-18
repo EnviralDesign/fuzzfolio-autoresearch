@@ -1198,6 +1198,23 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Seconds between adaptive worker-gateway telemetry polls. Default: 30.",
     )
     play_hand_massive.add_argument(
+        "--repeat",
+        action="store_true",
+        help="Run campaigns back-to-back inside one long-lived process.",
+    )
+    play_hand_massive.add_argument(
+        "--repeat-delay-seconds",
+        type=float,
+        default=5.0,
+        help="Seconds to wait between repeated campaigns. Default: 5.",
+    )
+    play_hand_massive.add_argument(
+        "--repeat-max-campaigns",
+        type=int,
+        default=None,
+        help="Optional cap for repeat mode. Omit to repeat until stopped.",
+    )
+    play_hand_massive.add_argument(
         "--dry-run",
         action="store_true",
         help="Write a run folder and lane plan without calling backend compute.",
@@ -15057,6 +15074,9 @@ def main(argv: list[str] | None = None) -> int:
             telemetry_interval_seconds=args.telemetry_interval_seconds,
             dry_run=bool(args.dry_run),
             as_json=bool(args.json),
+            repeat=bool(args.repeat),
+            repeat_delay_seconds=args.repeat_delay_seconds,
+            repeat_max_campaigns=args.repeat_max_campaigns,
         )
     if args.command == "build-indicator-atlas":
         return cmd_build_indicator_atlas(

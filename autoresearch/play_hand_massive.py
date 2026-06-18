@@ -2309,7 +2309,7 @@ def _run_campaign_lanes(
     return results
 
 
-def cmd_play_hand_massive(
+def _cmd_play_hand_massive_once(
     *,
     lanes: int = DEFAULT_MASSIVE_LANES,
     active_lanes: int = DEFAULT_MASSIVE_ACTIVE_LANES,
@@ -2570,6 +2570,107 @@ def cmd_play_hand_massive(
         _render_campaign_table(results)
         console.print(f"[bold]Campaign dir[/]: {run_dir}")
     return 0 if completed_results else 1
+
+
+def cmd_play_hand_massive(
+    *,
+    lanes: int = DEFAULT_MASSIVE_LANES,
+    active_lanes: int = DEFAULT_MASSIVE_ACTIVE_LANES,
+    instrument: list[str] | None = None,
+    instrument_pool: list[str] | None = None,
+    timeframe: str = "M5",
+    sweep_budget: str = "low",
+    max_sweep_permutations: int | None = None,
+    max_reward_r: float | None = None,
+    min_indicators: int = 1,
+    max_indicators: int = 4,
+    seed: int | None = None,
+    screen_months: int = 3,
+    coarse_mode: str = "evolutionary",
+    focused: bool = False,
+    baseline_floor: float | None = DEFAULT_BASELINE_FLOOR,
+    job_timeout_seconds: int = PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
+    sweep_timeout_seconds: int = PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
+    keep_cloud_profiles: bool = False,
+    adaptive_lanes: bool = True,
+    adaptive_fail_open: bool = False,
+    min_active_lanes: int = 1,
+    target_worker_slots_per_lane: int = 32,
+    scaffold_active_lanes: int = DEFAULT_SCAFFOLD_ACTIVE_LANES,
+    adaptive_shard_size: bool = True,
+    min_sweep_shard_size: int = DEFAULT_MASSIVE_MIN_SWEEP_SHARD_SIZE,
+    max_sweep_shard_size: int = DEFAULT_MASSIVE_MAX_SWEEP_SHARD_SIZE,
+    target_shards_per_worker_slot: float = DEFAULT_MASSIVE_TARGET_SHARDS_PER_WORKER_SLOT,
+    staged_campaign: bool = True,
+    remote_token_budget_multiplier: float = DEFAULT_REMOTE_TOKEN_BUDGET_MULTIPLIER,
+    max_no_worker_wait_seconds: int = DEFAULT_MAX_NO_WORKER_WAIT_SECONDS,
+    backend_health_timeout_seconds: int = 5,
+    gateway_url: str | None = None,
+    gateway_token: str | None = None,
+    gateway_pool: list[str] | None = None,
+    telemetry_interval_seconds: int = 30,
+    dry_run: bool = False,
+    as_json: bool = False,
+    repeat: bool = False,
+    repeat_delay_seconds: float = 5.0,
+    repeat_max_campaigns: int | None = None,
+) -> int:
+    campaign_kwargs = {
+        "lanes": lanes,
+        "active_lanes": active_lanes,
+        "instrument": instrument,
+        "instrument_pool": instrument_pool,
+        "timeframe": timeframe,
+        "sweep_budget": sweep_budget,
+        "max_sweep_permutations": max_sweep_permutations,
+        "max_reward_r": max_reward_r,
+        "min_indicators": min_indicators,
+        "max_indicators": max_indicators,
+        "seed": seed,
+        "screen_months": screen_months,
+        "coarse_mode": coarse_mode,
+        "focused": focused,
+        "baseline_floor": baseline_floor,
+        "job_timeout_seconds": job_timeout_seconds,
+        "sweep_timeout_seconds": sweep_timeout_seconds,
+        "keep_cloud_profiles": keep_cloud_profiles,
+        "adaptive_lanes": adaptive_lanes,
+        "adaptive_fail_open": adaptive_fail_open,
+        "min_active_lanes": min_active_lanes,
+        "target_worker_slots_per_lane": target_worker_slots_per_lane,
+        "scaffold_active_lanes": scaffold_active_lanes,
+        "adaptive_shard_size": adaptive_shard_size,
+        "min_sweep_shard_size": min_sweep_shard_size,
+        "max_sweep_shard_size": max_sweep_shard_size,
+        "target_shards_per_worker_slot": target_shards_per_worker_slot,
+        "staged_campaign": staged_campaign,
+        "remote_token_budget_multiplier": remote_token_budget_multiplier,
+        "max_no_worker_wait_seconds": max_no_worker_wait_seconds,
+        "backend_health_timeout_seconds": backend_health_timeout_seconds,
+        "gateway_url": gateway_url,
+        "gateway_token": gateway_token,
+        "gateway_pool": gateway_pool,
+        "telemetry_interval_seconds": telemetry_interval_seconds,
+        "dry_run": dry_run,
+        "as_json": as_json,
+    }
+    if not repeat:
+        return _cmd_play_hand_massive_once(**campaign_kwargs)
+
+    delay_seconds = max(float(repeat_delay_seconds), 0.0)
+    max_campaigns = None if repeat_max_campaigns is None else max(int(repeat_max_campaigns), 1)
+    campaign_index = 0
+    last_exit_code = 0
+    while max_campaigns is None or campaign_index < max_campaigns:
+        campaign_index += 1
+        print(f"campaign repeat_start index={campaign_index}", flush=True)
+        last_exit_code = _cmd_play_hand_massive_once(**campaign_kwargs)
+        print(f"campaign repeat_finished index={campaign_index} exit={last_exit_code}", flush=True)
+        if max_campaigns is not None and campaign_index >= max_campaigns:
+            break
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+    return last_exit_code
 
 
 __all__ = [

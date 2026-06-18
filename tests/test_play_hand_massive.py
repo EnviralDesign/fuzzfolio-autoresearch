@@ -499,6 +499,32 @@ def test_expand_window_scales_for_large_pools() -> None:
     assert massive._expand_window(runtime, snapshot, has_expand_ready=True) == 4
 
 
+def test_cmd_play_hand_massive_repeat_runs_bounded_campaigns(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+    sleeps: list[float] = []
+
+    def fake_run_once(**kwargs):
+        calls.append(dict(kwargs))
+        return 1 if len(calls) == 1 else 0
+
+    monkeypatch.setattr(massive, "_cmd_play_hand_massive_once", fake_run_once)
+    monkeypatch.setattr(massive.time, "sleep", lambda seconds: sleeps.append(float(seconds)))
+
+    result = massive.cmd_play_hand_massive(
+        lanes=2,
+        repeat=True,
+        repeat_delay_seconds=0.25,
+        repeat_max_campaigns=2,
+        dry_run=True,
+    )
+
+    assert result == 0
+    assert len(calls) == 2
+    assert sleeps == [0.25]
+    assert all(call["lanes"] == 2 for call in calls)
+    assert all(call["dry_run"] is True for call in calls)
+
+
 def test_rolling_staged_passes_adaptive_shard_size_to_expansion(monkeypatch) -> None:
     runtime = massive.normalize_massive_runtime_config(
         massive.MassiveRuntimeConfig(
