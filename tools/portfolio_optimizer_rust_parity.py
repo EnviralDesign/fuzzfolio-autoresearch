@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
+import shutil
 import statistics
 import subprocess
 import sys
+import sysconfig
 import tempfile
 import time
 from dataclasses import asdict
@@ -208,12 +211,64 @@ def rust_binary_path(*, release: bool) -> Path:
     return RUST_TARGET / profile / f"portfolio-optimizer-rs{suffix}"
 
 
+def rust_cdylib_path(*, release: bool) -> Path:
+    profile = "release" if release else "debug"
+    if sys.platform.startswith("win"):
+        return RUST_TARGET / profile / "portfolio_optimizer_rs.dll"
+    if sys.platform == "darwin":
+        return RUST_TARGET / profile / "libportfolio_optimizer_rs.dylib"
+    return RUST_TARGET / profile / "libportfolio_optimizer_rs.so"
+
+
 def ensure_rust_binary(*, release: bool) -> Path:
     command = ["cargo", "build", "--quiet", "--manifest-path", str(RUST_MANIFEST)]
     if release:
         command.insert(2, "--release")
     subprocess.run(command, cwd=REPO_ROOT, check=True)
     return rust_binary_path(release=release)
+
+
+def ensure_pyo3_extension(*, release: bool) -> Path:
+    command = [
+        "cargo",
+        "build",
+        "--quiet",
+        "--manifest-path",
+        str(RUST_MANIFEST),
+        "--features",
+        "python-extension",
+        "--lib",
+    ]
+    if release:
+        command.insert(2, "--release")
+    subprocess.run(command, cwd=REPO_ROOT, check=True)
+    return rust_cdylib_path(release=release)
+
+
+def load_pyo3_module(*, release: bool):
+    cdylib_path = ensure_pyo3_extension(release=release)
+    extension_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".pyd"
+    extension_root = REPO_ROOT / ".tmp" / "portfolio_optimizer_pyo3"
+    extension_root.mkdir(parents=True, exist_ok=True)
+    module_dir = Path(tempfile.mkdtemp(prefix="load-", dir=extension_root))
+    module_path = module_dir / f"portfolio_optimizer_rs{extension_suffix}"
+    shutil.copy2(cdylib_path, module_path)
+    spec = importlib.util.spec_from_file_location("portfolio_optimizer_rs", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to create import spec for {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.pop("portfolio_optimizer_rs", None)
+    try:
+        sys.modules["portfolio_optimizer_rs"] = module
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop("portfolio_optimizer_rs", None)
+        if previous is not None:
+            sys.modules["portfolio_optimizer_rs"] = previous
+        raise
+    module._portfolio_optimizer_rs_module_path = str(module_path)
+    module._portfolio_optimizer_rs_previous = previous
+    return module
 
 
 def rust_dense_optimize(
@@ -238,6 +293,14 @@ def rust_dense_optimize(
         )
         elapsed = time.perf_counter() - start
     return json.loads(completed.stdout), elapsed
+
+
+def pyo3_dense_optimize(payload: dict[str, Any], module: Any) -> tuple[dict[str, Any], float]:
+    input_json = json.dumps(payload)
+    start = time.perf_counter()
+    output_json = module.optimize_json(input_json)
+    elapsed = time.perf_counter() - start
+    return json.loads(output_json), elapsed
 
 
 def assert_json_close(label: str, left: Any, right: Any, *, tolerance: float = TOLERANCE) -> None:
@@ -315,22 +378,32 @@ def run_case(
     *,
     objectives: dict[str, dict[str, float]] | None = None,
     release: bool = False,
-) -> tuple[float, float, int]:
+    pyo3_module: Any | None = None,
+) -> tuple[float, float, float | None, int]:
     candidates = build_candidates(rows, spec, objectives=objectives)
     python_output, python_elapsed = python_dense_optimize(candidates, spec, objectives=objectives)
-    rust_output, rust_elapsed = rust_dense_optimize(
-        rust_input_payload(candidates, spec, objectives=objectives),
-        release=release,
-    )
+    payload = rust_input_payload(candidates, spec, objectives=objectives)
+    rust_output, rust_elapsed = rust_dense_optimize(payload, release=release)
     compare_outputs(case, python_output, rust_output)
+    pyo3_elapsed: float | None = None
+    if pyo3_module is not None:
+        pyo3_output, pyo3_elapsed = pyo3_dense_optimize(payload, pyo3_module)
+        compare_outputs(f"{case}.pyo3", python_output, pyo3_output)
+    pyo3_text = f", pyo3={pyo3_elapsed:.4f}s" if pyo3_elapsed is not None else ""
     print(
         f"{case} parity ok "
-        f"(candidates={len(candidates)}, python={python_elapsed:.4f}s, rust_cli={rust_elapsed:.4f}s)"
+        f"(candidates={len(candidates)}, python={python_elapsed:.4f}s, "
+        f"rust_cli={rust_elapsed:.4f}s{pyo3_text})"
     )
-    return python_elapsed, rust_elapsed, len(candidates)
+    return python_elapsed, rust_elapsed, pyo3_elapsed, len(candidates)
 
 
-def run_selection_case(tmp_path: Path, *, release: bool) -> tuple[float, float, int]:
+def run_selection_case(
+    tmp_path: Path,
+    *,
+    release: bool,
+    pyo3_module: Any | None,
+) -> tuple[float, float, float | None, int]:
     rows = [
         row(tmp_path, "smooth-a", "EURUSD", [1, 2, 3, 4], score=65),
         row(tmp_path, "smooth-b", "XAUUSD", [0.5, 1.5, 2.5, 3.5], score=65),
@@ -348,10 +421,15 @@ def run_selection_case(tmp_path: Path, *, release: bool) -> tuple[float, float, 
         max_index_share=2,
         max_instrument_share=1,
     )
-    return run_case("selection", rows, spec, release=release)
+    return run_case("selection", rows, spec, release=release, pyo3_module=pyo3_module)
 
 
-def run_zero_diversification_case(tmp_path: Path, *, release: bool) -> list[tuple[float, float, int]]:
+def run_zero_diversification_case(
+    tmp_path: Path,
+    *,
+    release: bool,
+    pyo3_module: Any | None,
+) -> list[tuple[float, float, float | None, int]]:
     rows = [
         row(tmp_path, "smooth-a", "EURUSD", [1, 2, 3, 4], score=65),
         row(tmp_path, "smooth-b", "XAUUSD", [0.5, 1.5, 2.5, 3.5], score=65),
@@ -386,11 +464,24 @@ def run_zero_diversification_case(tmp_path: Path, *, release: bool) -> list[tupl
     ]
     return [
         run_case(f"zero-diversification-{index}", rows, spec, release=release)
+        if pyo3_module is None
+        else run_case(
+            f"zero-diversification-{index}",
+            rows,
+            spec,
+            release=release,
+            pyo3_module=pyo3_module,
+        )
         for index, spec in enumerate(specs)
     ]
 
 
-def run_penalty_case(tmp_path: Path, *, release: bool) -> tuple[float, float, int]:
+def run_penalty_case(
+    tmp_path: Path,
+    *,
+    release: bool,
+    pyo3_module: Any | None,
+) -> tuple[float, float, float | None, int]:
     objectives = {"return": {"final_r": 1.0, "maxdd_r": -2.0}}
     clone_returns = [2.0, -0.5, 2.0, -0.5, 2.0, -0.5]
     uncorr_returns = [-0.2, 0.6, -0.2, 0.6, -0.2, 0.6]
@@ -409,10 +500,22 @@ def run_penalty_case(tmp_path: Path, *, release: bool) -> tuple[float, float, in
         correlation_penalty_weight=10.0,
         diversification_mode="penalty",
     )
-    return run_case("penalty-diversification", rows, spec, objectives=objectives, release=release)
+    return run_case(
+        "penalty-diversification",
+        rows,
+        spec,
+        objectives=objectives,
+        release=release,
+        pyo3_module=pyo3_module,
+    )
 
 
-def run_sharpe_case(tmp_path: Path, *, release: bool) -> tuple[float, float, int]:
+def run_sharpe_case(
+    tmp_path: Path,
+    *,
+    release: bool,
+    pyo3_module: Any | None,
+) -> tuple[float, float, float | None, int]:
     objectives = {"return": {"final_r": 1.0, "maxdd_r": -2.0}}
     seed_returns = [2.0, -0.5, 2.0, -0.5, 2.0, -0.5]
     correlated_returns = [1.5, -0.3, 1.5, -0.3, 1.5, -0.3]
@@ -432,10 +535,22 @@ def run_sharpe_case(tmp_path: Path, *, release: bool) -> tuple[float, float, int
         diversification_mode="marginal_sharpe",
         portfolio_sharpe_weight=5.0,
     )
-    return run_case("marginal-sharpe", rows, spec, objectives=objectives, release=release)
+    return run_case(
+        "marginal-sharpe",
+        rows,
+        spec,
+        objectives=objectives,
+        release=release,
+        pyo3_module=pyo3_module,
+    )
 
 
-def run_account_case(tmp_path: Path, *, release: bool) -> list[tuple[float, float, int]]:
+def run_account_case(
+    tmp_path: Path,
+    *,
+    release: bool,
+    pyo3_module: Any | None,
+) -> list[tuple[float, float, float | None, int]]:
     objectives = {"return": {"final_r": 1.0}}
     rows = [row(tmp_path, "tiny-risk", "EURUSD", [1, 0.5, 1.5], score=70)]
     lot_floor_spec = PortfolioOptimizerSpec(
@@ -462,6 +577,7 @@ def run_account_case(tmp_path: Path, *, release: bool) -> list[tuple[float, floa
             lot_floor_spec,
             objectives=objectives,
             release=release,
+            pyo3_module=pyo3_module,
         )
     ]
     rows = [row(tmp_path, "compound", "EURUSD", [1, 2], score=70)]
@@ -488,12 +604,18 @@ def run_account_case(tmp_path: Path, *, release: bool) -> list[tuple[float, floa
             compound_spec,
             objectives=objectives,
             release=release,
+            pyo3_module=pyo3_module,
         )
     )
     return timings
 
 
-def run_baseline_case(tmp_path: Path, *, release: bool) -> tuple[float, float, int]:
+def run_baseline_case(
+    tmp_path: Path,
+    *,
+    release: bool,
+    pyo3_module: Any | None,
+) -> tuple[float, float, float | None, int]:
     rows = []
     instruments = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "XAUUSD", "US500"]
     for index in range(10):
@@ -520,10 +642,21 @@ def run_baseline_case(tmp_path: Path, *, release: bool) -> tuple[float, float, i
         max_index_share=2,
         max_instrument_share=2,
     )
-    return run_case("baseline-preservation", rows, spec, release=release)
+    return run_case(
+        "baseline-preservation",
+        rows,
+        spec,
+        release=release,
+        pyo3_module=pyo3_module,
+    )
 
 
-def run_random_start_case(tmp_path: Path, *, release: bool) -> tuple[float, float, int]:
+def run_random_start_case(
+    tmp_path: Path,
+    *,
+    release: bool,
+    pyo3_module: Any | None,
+) -> tuple[float, float, float | None, int]:
     rows = []
     instruments = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD", "XAUUSD", "US500", "SP500"]
     for index in range(32):
@@ -555,20 +688,36 @@ def run_random_start_case(tmp_path: Path, *, release: bool) -> tuple[float, floa
         diversification_mode="marginal_sharpe",
         portfolio_sharpe_weight=1.5,
     )
-    return run_case("random-starts-broad", rows, spec, release=release)
+    return run_case(
+        "random-starts-broad",
+        rows,
+        spec,
+        release=release,
+        pyo3_module=pyo3_module,
+    )
 
 
-def run_synthetic_parity(*, release: bool) -> list[tuple[float, float, int]]:
-    timings: list[tuple[float, float, int]] = []
+def run_synthetic_parity(
+    *,
+    release: bool,
+    pyo3_module: Any | None,
+) -> list[tuple[float, float, float | None, int]]:
+    timings: list[tuple[float, float, float | None, int]] = []
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp)
-        timings.append(run_selection_case(tmp_path, release=release))
-        timings.extend(run_zero_diversification_case(tmp_path, release=release))
-        timings.append(run_penalty_case(tmp_path, release=release))
-        timings.append(run_sharpe_case(tmp_path, release=release))
-        timings.extend(run_account_case(tmp_path, release=release))
-        timings.append(run_baseline_case(tmp_path, release=release))
-        timings.append(run_random_start_case(tmp_path, release=release))
+        timings.append(run_selection_case(tmp_path, release=release, pyo3_module=pyo3_module))
+        timings.extend(
+            run_zero_diversification_case(
+                tmp_path,
+                release=release,
+                pyo3_module=pyo3_module,
+            )
+        )
+        timings.append(run_penalty_case(tmp_path, release=release, pyo3_module=pyo3_module))
+        timings.append(run_sharpe_case(tmp_path, release=release, pyo3_module=pyo3_module))
+        timings.extend(run_account_case(tmp_path, release=release, pyo3_module=pyo3_module))
+        timings.append(run_baseline_case(tmp_path, release=release, pyo3_module=pyo3_module))
+        timings.append(run_random_start_case(tmp_path, release=release, pyo3_module=pyo3_module))
     return timings
 
 
@@ -622,7 +771,8 @@ def run_real_corpus_parity(
     random_starts: int,
     max_swaps: int,
     release: bool,
-) -> tuple[float, float, int]:
+    pyo3_module: Any | None,
+) -> tuple[float, float, float | None, int]:
     candidates, spec = real_corpus_candidates(
         candidate_limit=candidate_limit,
         portfolio_size=portfolio_size,
@@ -630,16 +780,20 @@ def run_real_corpus_parity(
         max_swaps=max_swaps,
     )
     python_output, python_elapsed = python_dense_optimize(candidates, spec)
-    rust_output, rust_elapsed = rust_dense_optimize(
-        rust_input_payload(candidates, spec),
-        release=release,
-    )
+    payload = rust_input_payload(candidates, spec)
+    rust_output, rust_elapsed = rust_dense_optimize(payload, release=release)
     compare_outputs("real-corpus", python_output, rust_output)
+    pyo3_elapsed: float | None = None
+    if pyo3_module is not None:
+        pyo3_output, pyo3_elapsed = pyo3_dense_optimize(payload, pyo3_module)
+        compare_outputs("real-corpus.pyo3", python_output, pyo3_output)
+    pyo3_text = f", pyo3={pyo3_elapsed:.4f}s" if pyo3_elapsed is not None else ""
     print(
         f"real-corpus parity ok "
-        f"(candidates={len(candidates)}, python={python_elapsed:.4f}s, rust_cli={rust_elapsed:.4f}s)"
+        f"(candidates={len(candidates)}, python={python_elapsed:.4f}s, "
+        f"rust_cli={rust_elapsed:.4f}s{pyo3_text})"
     )
-    return python_elapsed, rust_elapsed, len(candidates)
+    return python_elapsed, rust_elapsed, pyo3_elapsed, len(candidates)
 
 
 def benchmark_dense(
@@ -647,14 +801,17 @@ def benchmark_dense(
     candidates: list[Any],
     spec: PortfolioOptimizerSpec,
     repeat: int,
+    include_pyo3: bool,
 ) -> None:
     binary = ensure_rust_binary(release=True)
+    pyo3_module = load_pyo3_module(release=True) if include_pyo3 else None
     payload = rust_input_payload(candidates, spec)
     with tempfile.TemporaryDirectory() as tmp:
         input_path = Path(tmp) / "optimizer-input.json"
         input_path.write_text(json.dumps(payload), encoding="utf-8")
         python_times = []
         rust_times = []
+        pyo3_times = []
         reference_python, _ = python_dense_optimize(candidates, spec)
         for _ in range(repeat):
             _, elapsed = python_dense_optimize(candidates, spec)
@@ -673,8 +830,14 @@ def benchmark_dense(
             rust_output = json.loads(completed.stdout)
             compare_outputs("benchmark", reference_python, rust_output)
             rust_times.append(rust_elapsed)
+        if pyo3_module is not None:
+            for _ in range(repeat):
+                pyo3_output, pyo3_elapsed = pyo3_dense_optimize(payload, pyo3_module)
+                compare_outputs("benchmark.pyo3", reference_python, pyo3_output)
+                pyo3_times.append(pyo3_elapsed)
     python_median = statistics.median(python_times)
     rust_median = statistics.median(rust_times)
+    pyo3_median = statistics.median(pyo3_times) if pyo3_times else None
     speedup = python_median / rust_median if rust_median > 0 else float("inf")
     print(
         "benchmark dense packet: "
@@ -682,11 +845,15 @@ def benchmark_dense(
         f"objectives={','.join(spec.objective_names)}, random_starts={spec.random_starts}, "
         f"max_swaps={spec.max_swaps}"
     )
-    print(
+    line = (
         f"python median={python_median:.4f}s over {repeat} runs; "
         f"rust release CLI median={rust_median:.4f}s over {repeat} runs; "
-        f"speedup={speedup:.2f}x"
+        f"CLI speedup={speedup:.2f}x"
     )
+    if pyo3_median is not None:
+        pyo3_speedup = python_median / pyo3_median if pyo3_median > 0 else float("inf")
+        line += f"; PyO3 median={pyo3_median:.4f}s; PyO3 speedup={pyo3_speedup:.2f}x"
+    print(line)
 
 
 def synthetic_benchmark_packet(tmp_path: Path, *, candidate_limit: int, portfolio_size: int) -> tuple[list[Any], PortfolioOptimizerSpec]:
@@ -739,6 +906,7 @@ def main() -> int:
     parser.add_argument("--release", action="store_true", help="Use a release Rust binary for parity timing.")
     parser.add_argument("--real-corpus", action="store_true", help="Also compare against the local materialized corpus.")
     parser.add_argument("--benchmark", action="store_true", help="Run an apples-to-apples dense packet benchmark.")
+    parser.add_argument("--pyo3", action="store_true", help="Also build/import the PyO3 extension and compare it.")
     parser.add_argument("--skip-parity", action="store_true", help="Skip parity cases and run only the requested benchmark.")
     parser.add_argument("--candidate-limit", type=int, default=80)
     parser.add_argument("--portfolio-size", type=int, default=12)
@@ -749,10 +917,14 @@ def main() -> int:
 
     if args.release or args.benchmark:
         ensure_rust_binary(release=True)
+    pyo3_module = load_pyo3_module(release=bool(args.release)) if args.pyo3 else None
 
-    timings: list[tuple[float, float, int]] = []
+    timings: list[tuple[float, float, float | None, int]] = []
     if not args.skip_parity:
-        timings = run_synthetic_parity(release=bool(args.release))
+        timings = run_synthetic_parity(
+            release=bool(args.release),
+            pyo3_module=pyo3_module,
+        )
         if args.real_corpus:
             timings.append(
                 run_real_corpus_parity(
@@ -761,14 +933,17 @@ def main() -> int:
                     random_starts=int(args.random_starts),
                     max_swaps=int(args.max_swaps),
                     release=bool(args.release),
+                    pyo3_module=pyo3_module,
                 )
             )
     if timings:
         python_total = sum(item[0] for item in timings)
         rust_total = sum(item[1] for item in timings)
+        pyo3_times = [item[2] for item in timings if item[2] is not None]
+        pyo3_text = f", pyo3={sum(pyo3_times):.4f}s" if pyo3_times else ""
         print(
             f"parity timing subtotal: python={python_total:.4f}s, "
-            f"rust_cli={rust_total:.4f}s, cases={len(timings)}"
+            f"rust_cli={rust_total:.4f}s{pyo3_text}, cases={len(timings)}"
         )
 
     if args.benchmark:
@@ -786,9 +961,19 @@ def main() -> int:
                     candidate_limit=int(args.candidate_limit),
                     portfolio_size=int(args.portfolio_size),
                 )
-                benchmark_dense(candidates=candidates, spec=spec, repeat=max(1, int(args.repeat)))
+                benchmark_dense(
+                    candidates=candidates,
+                    spec=spec,
+                    repeat=max(1, int(args.repeat)),
+                    include_pyo3=bool(args.pyo3),
+                )
                 return 0
-        benchmark_dense(candidates=candidates, spec=spec, repeat=max(1, int(args.repeat)))
+        benchmark_dense(
+            candidates=candidates,
+            spec=spec,
+            repeat=max(1, int(args.repeat)),
+            include_pyo3=bool(args.pyo3),
+        )
     return 0
 
 

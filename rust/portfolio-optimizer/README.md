@@ -16,6 +16,7 @@ Run:
 ```powershell
 cargo test --manifest-path rust/portfolio-optimizer/Cargo.toml
 cargo run --manifest-path rust/portfolio-optimizer/Cargo.toml -- --input path\to\fixture.json
+cargo build --manifest-path rust/portfolio-optimizer/Cargo.toml --features python-extension --lib
 ```
 
 ## Parity Status
@@ -43,14 +44,18 @@ Known boundary:
 - Rust currently consumes already-normalized dense candidates. That is the
   intended backend boundary for a future `backend = python | rust | auto`
   integration.
+- The PyO3 extension exposes the same dense JSON contract through
+  `portfolio_optimizer_rs.optimize_json(...)`. It is an in-process call path,
+  but still serializes the full packet and result as JSON.
 
 Latest local checks on this branch:
 
 ```powershell
 cargo test --manifest-path rust/portfolio-optimizer/Cargo.toml
 uv run python tools\portfolio_optimizer_rust_parity.py
+uv run python tools\portfolio_optimizer_rust_parity.py --pyo3
 uv run python tools\portfolio_optimizer_rust_parity.py --release --real-corpus --candidate-limit 80 --portfolio-size 12 --random-starts 1 --max-swaps 2
-uv run python tools\portfolio_optimizer_rust_parity.py --release --real-corpus --benchmark --skip-parity --candidate-limit 40 --portfolio-size 8 --random-starts 1 --max-swaps 2 --repeat 3
+uv run python tools\portfolio_optimizer_rust_parity.py --release --real-corpus --benchmark --skip-parity --pyo3 --candidate-limit 40 --portfolio-size 8 --random-starts 1 --max-swaps 2 --repeat 3
 uv run pytest tests\test_portfolio_optimizer.py -q
 ```
 
@@ -62,3 +67,8 @@ Observed local performance:
 - 80 real candidates, 12-strategy basket, 3 objectives, 1 random start,
   2 swaps: Python `116.8211s`, Rust release CLI `13.7708s`,
   about `8.48x` faster on that parity run.
+- After adding PyO3, 40 real candidates, 8-strategy basket, 3 objectives,
+  1 random start, 2 swaps: Python median `31.1229s`, Rust release CLI median
+  `2.8722s`, PyO3 median `3.0901s`. That was `10.84x` CLI speedup and
+  `10.07x` PyO3 speedup in the local run. PyO3 is not materially faster than
+  CLI yet because this first bridge still serializes JSON in and out.

@@ -2,6 +2,8 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use chrono::{Datelike, NaiveDate};
+#[cfg(feature = "python-extension")]
+use pyo3::{exceptions::PyValueError, prelude::*};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -301,6 +303,27 @@ pub fn optimize_input(input: OptimizerInput) -> OptimizerOutput {
         variants,
         pareto_front,
     }
+}
+
+pub fn optimize_json(input_json: &str) -> Result<String, String> {
+    let input: OptimizerInput = serde_json::from_str(input_json)
+        .map_err(|error| format!("invalid optimizer input JSON: {error}"))?;
+    let output = optimize_input(input);
+    serde_json::to_string(&output)
+        .map_err(|error| format!("failed to serialize optimizer output: {error}"))
+}
+
+#[cfg(feature = "python-extension")]
+#[pyfunction(name = "optimize_json")]
+fn optimize_json_py(input_json: &str) -> PyResult<String> {
+    optimize_json(input_json).map_err(PyValueError::new_err)
+}
+
+#[cfg(feature = "python-extension")]
+#[pymodule]
+fn portfolio_optimizer_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(optimize_json_py, m)?)?;
+    Ok(())
 }
 
 fn default_objectives() -> BTreeMap<String, BTreeMap<String, f64>> {
