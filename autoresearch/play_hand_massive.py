@@ -82,7 +82,7 @@ DEFAULT_MASSIVE_TARGET_SHARDS_PER_WORKER_SLOT = 3.0
 DEFAULT_MAX_NO_WORKER_WAIT_SECONDS = 300
 DEFAULT_BASELINE_FLOOR = 0.0
 CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD = 2
-CAMPAIGN_BACKEND_DOWN_THRESHOLD = 1
+CAMPAIGN_BACKEND_DOWN_THRESHOLD = 3
 
 
 @dataclass(frozen=True)
@@ -492,6 +492,16 @@ def _gateway_active_leases(snapshot: dict[str, Any] | None) -> int:
         return 0
 
 
+def _gateway_work_in_system(snapshot: dict[str, Any] | None) -> int:
+    """Approximate gateway-side work without double-counting active stream leases."""
+    return max(_gateway_active_leases(snapshot), _gateway_pending_work(snapshot))
+
+
+def _underfed_target_worker_slots_per_lane(runtime: MassiveRuntimeConfig) -> float:
+    target = max(float(runtime.target_worker_slots_per_lane), 1.0)
+    return max(1.0, min(4.0, target / 8.0))
+
+
 def _desired_active_lanes(
     runtime: MassiveRuntimeConfig,
     snapshot: dict[str, Any] | None,
@@ -512,11 +522,11 @@ def _desired_active_lanes(
         return 0
     desired = int(math.ceil(slots / float(runtime.target_worker_slots_per_lane)))
     if pressure and pressure.get("ok"):
-        queued_or_running = _gateway_active_leases(pressure) + _gateway_pending_work(pressure)
-        if queued_or_running < slots:
-            warm_target = max(float(runtime.target_worker_slots_per_lane) / 2.0, 1.0)
+        work_in_system = _gateway_work_in_system(pressure)
+        if work_in_system < slots:
+            warm_target = _underfed_target_worker_slots_per_lane(runtime)
             desired = max(desired, int(math.ceil(slots / warm_target)))
-        elif queued_or_running > slots * 3:
+        elif work_in_system > slots * 3:
             desired = max(runtime.min_active_lanes, desired - 1)
     return max(runtime.min_active_lanes, min(runtime.active_lanes, desired))
 
@@ -535,7 +545,7 @@ def _baseline_window(
     snapshot: dict[str, Any] | None = None,
     pressure: dict[str, Any] | None = None,
 ) -> int:
-    """Baseline/scaffold concurrency follows the live gateway capacity envelope."""
+    """Baseline/scaffold concurrency follows live capacity as one-slot probe work."""
     cap = max(1, min(runtime.scaffold_active_lanes, runtime.active_lanes))
     if not runtime.adaptive_lanes:
         return cap
@@ -546,16 +556,16 @@ def _baseline_window(
             return max(0, min(cap, runtime.min_active_lanes))
         return max(1, min(cap, runtime.min_active_lanes))
 
-    target_slots = max(float(runtime.target_worker_slots_per_lane), 1.0)
-    divisor = target_slots * 2.0
     if pressure and pressure.get("ok"):
-        queued_or_running = _gateway_active_leases(pressure) + _gateway_pending_work(pressure)
-        if queued_or_running < slots:
-            divisor = target_slots
-        elif queued_or_running > slots * 2:
-            divisor = target_slots * 4.0
+        work_in_system = _gateway_work_in_system(pressure)
+        if work_in_system < slots:
+            return cap
+        elif work_in_system > slots * 2:
+            target_slots = max(float(runtime.target_worker_slots_per_lane), 1.0)
+            desired = int(math.ceil(slots / (target_slots * 4.0)))
+            return max(1, min(cap, desired))
 
-    desired = int(math.ceil(slots / divisor))
+    desired = slots
     return max(1, min(cap, desired))
 
 
@@ -596,10 +606,10 @@ def _adaptive_sweep_shard_size(
 
     target_shards_per_slot = float(runtime.target_shards_per_worker_slot)
     if pressure and pressure.get("ok"):
-        queued_or_running = _gateway_active_leases(pressure) + _gateway_pending_work(pressure)
-        if queued_or_running < slots:
+        work_in_system = _gateway_work_in_system(pressure)
+        if work_in_system < slots:
             target_shards_per_slot *= 1.5
-        elif queued_or_running > slots * 3:
+        elif work_in_system > slots * 3:
             target_shards_per_slot *= 0.75
     target_shards = max(1, int(math.ceil(slots * target_shards_per_slot)))
     shard_size = int(math.ceil(permutation_cap / float(target_shards)))

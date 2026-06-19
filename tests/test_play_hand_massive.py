@@ -119,12 +119,21 @@ def test_adaptive_lane_window_uses_pressure_to_expand_and_contract() -> None:
         runtime,
         snapshot,
         {"ok": True, "active_leases": 8, "pending_by_queue": {"deep_replay_jobs": 8}},
-    ) == 4
+    ) == 12
     assert massive._desired_active_lanes(
         runtime,
         snapshot,
         {"ok": True, "active_leases": 256, "pending_by_queue": {"deep_replay_jobs": 32}},
     ) == 1
+
+
+def test_gateway_work_in_system_does_not_double_count_pending_leases() -> None:
+    assert massive._gateway_work_in_system(
+        {"ok": True, "active_leases": 48, "pending_by_queue": {"deep_replay_jobs": 48}}
+    ) == 48
+    assert massive._gateway_work_in_system(
+        {"ok": True, "active_leases": 24, "pending_by_queue": {"deep_replay_jobs": 80}}
+    ) == 80
 
 
 def test_adaptive_sweep_shard_size_scales_with_worker_slots_and_pressure() -> None:
@@ -179,7 +188,7 @@ def test_gateway_pressure_should_pause_on_saturated_or_degraded() -> None:
     assert not massive._gateway_pressure_should_pause({"ok": False, "status": "saturated"})
 
 
-def test_run_campaign_lane_executor_blocks_on_backend_down(monkeypatch) -> None:
+def test_backend_down_block_requires_repeated_health_failures(monkeypatch) -> None:
     runtime = massive.normalize_massive_runtime_config(
         massive.MassiveRuntimeConfig(
             lanes=3,
@@ -237,8 +246,20 @@ def test_run_campaign_lane_executor_blocks_on_backend_down(monkeypatch) -> None:
         lane_indexes=[1, 2, 3],
     )
 
-    assert state["consecutive_backend_health_failures"] >= 1
-    assert any(result.status == "not_started_backend_down" for result in results)
+    assert state["consecutive_backend_health_failures"] == 1
+    assert not any(result.status == "not_started_backend_down" for result in results)
+    assert not massive._is_terminal_submission_block(
+        pause_reason="backend_down",
+        consecutive_backend_health_failures=massive.CAMPAIGN_BACKEND_DOWN_THRESHOLD - 1,
+        consecutive_bad_gateway_polls=0,
+        runtime=runtime,
+    )
+    assert massive._is_terminal_submission_block(
+        pause_reason="backend_down",
+        consecutive_backend_health_failures=massive.CAMPAIGN_BACKEND_DOWN_THRESHOLD,
+        consecutive_bad_gateway_polls=0,
+        runtime=runtime,
+    )
 
 
 def test_staged_expand_applies_remote_token_budget(monkeypatch) -> None:
@@ -476,7 +497,7 @@ def test_baseline_window_adapts_to_worker_slots_and_pressure() -> None:
         "active_leases": 400,
         "pending_by_queue": {"deep_replay_jobs": 50},
     }
-    assert massive._baseline_window(runtime, snapshot, low_pressure) == 11
+    assert massive._baseline_window(runtime, snapshot, low_pressure) == 32
     assert massive._baseline_window(runtime, snapshot, high_pressure) == 3
 
     fixed = massive.normalize_massive_runtime_config(
@@ -523,6 +544,27 @@ def test_expand_window_scales_for_large_pools() -> None:
     )
     snapshot = {"ok": True, "slots": 200}
     assert massive._expand_window(runtime, snapshot, has_expand_ready=True) == 4
+
+
+def test_expand_window_opens_wider_when_large_pool_is_underfed() -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=128,
+            active_lanes=64,
+            adaptive_lanes=True,
+            min_active_lanes=1,
+            target_worker_slots_per_lane=16,
+            gateway_url="https://example.com/api/worker-gateway",
+        )
+    )
+    snapshot = {"ok": True, "slots": 101}
+    pressure = {
+        "ok": True,
+        "active_leases": 63,
+        "pending_by_queue": {"QUEUE:sweep_shard_jobs": 71},
+    }
+
+    assert massive._expand_window(runtime, snapshot, has_expand_ready=True, pressure=pressure) == 51
 
 
 def test_cmd_play_hand_massive_repeat_runs_bounded_campaigns(monkeypatch) -> None:
