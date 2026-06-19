@@ -83,6 +83,7 @@ DEFAULT_MAX_NO_WORKER_WAIT_SECONDS = 300
 DEFAULT_BASELINE_FLOOR = 0.0
 CAMPAIGN_GATEWAY_UNHEALTHY_THRESHOLD = 2
 CAMPAIGN_BACKEND_DOWN_THRESHOLD = 3
+BASELINE_UNDERFED_SLOT_MULTIPLIER = 2.0
 
 
 @dataclass(frozen=True)
@@ -559,7 +560,8 @@ def _baseline_window(
     if pressure and pressure.get("ok"):
         work_in_system = _gateway_work_in_system(pressure)
         if work_in_system < slots:
-            return cap
+            warmup_window = int(math.ceil(slots * BASELINE_UNDERFED_SLOT_MULTIPLIER))
+            return max(1, min(cap, warmup_window))
         elif work_in_system > slots * 2:
             target_slots = max(float(runtime.target_worker_slots_per_lane), 1.0)
             desired = int(math.ceil(slots / (target_slots * 4.0)))
@@ -636,6 +638,25 @@ def _is_terminal_submission_block(
     ):
         return True
     return False
+
+
+def _lane_result_indicates_backend_down(lane_result: MassiveLaneResult) -> bool:
+    if lane_result.status != "failed":
+        return False
+    error = str(lane_result.error or "").lower()
+    if not error:
+        return False
+    backend_failure_markers = (
+        "http request failed",
+        "http login request failed",
+        "error sending request",
+        "tcp connect error",
+        "connection refused",
+        "actively refused",
+        "failed to connect",
+        "connecterror",
+    )
+    return any(marker in error for marker in backend_failure_markers)
 
 
 def _expansion_submission_allowed(
@@ -1712,6 +1733,18 @@ def _run_campaign_lane_executor(
             return "not_started_gateway_unhealthy"
         return None
 
+    def note_lane_result(lane_result: MassiveLaneResult) -> None:
+        nonlocal consecutive_backend_health_failures, pause_reason, pause_until, next_telemetry_at
+        if not _lane_result_indicates_backend_down(lane_result):
+            return
+        consecutive_backend_health_failures = max(
+            consecutive_backend_health_failures,
+            CAMPAIGN_BACKEND_DOWN_THRESHOLD,
+        )
+        pause_reason = "backend_down"
+        pause_until = time.monotonic() + runtime.telemetry_interval_seconds
+        next_telemetry_at = 0.0
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=executor_cap) as executor:
         refresh_lane_window(force=True)
         while pending_lane_indexes or in_flight:
@@ -1842,6 +1875,7 @@ def _run_campaign_lane_executor(
             for future in done:
                 lane_index = in_flight.pop(future, None)
                 lane_result = future.result()
+                note_lane_result(lane_result)
                 results.append(lane_result)
                 if token_budget is not None and lane_index is not None:
                     in_flight_remote_permutations = max(
@@ -2097,6 +2131,18 @@ def _run_rolling_staged_campaign_executor(
             )
         expand_ready.clear()
 
+    def note_lane_result(lane_result: MassiveLaneResult) -> None:
+        nonlocal consecutive_backend_health_failures, pause_reason, pause_until, next_telemetry_at
+        if not _lane_result_indicates_backend_down(lane_result):
+            return
+        consecutive_backend_health_failures = max(
+            consecutive_backend_health_failures,
+            CAMPAIGN_BACKEND_DOWN_THRESHOLD,
+        )
+        pause_reason = "backend_down"
+        pause_until = time.monotonic() + runtime.telemetry_interval_seconds
+        next_telemetry_at = 0.0
+
     token_budget = _effective_remote_token_budget(
         last_snapshot,
         runtime,
@@ -2222,6 +2268,7 @@ def _run_rolling_staged_campaign_executor(
                 if future in baseline_in_flight:
                     lane_index = baseline_in_flight.pop(future)
                     lane_result = future.result()
+                    note_lane_result(lane_result)
                     if (
                         lane_result.status == "baseline_screened"
                         and lane_result.run_dir
@@ -2252,6 +2299,7 @@ def _run_rolling_staged_campaign_executor(
                 elif future in expand_in_flight:
                     lane_index = expand_in_flight.pop(future)
                     lane_result = future.result()
+                    note_lane_result(lane_result)
                     terminal_by_lane[lane_index] = lane_result
                     in_flight_remote_permutations = max(
                         0,

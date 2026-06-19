@@ -262,6 +262,29 @@ def test_backend_down_block_requires_repeated_health_failures(monkeypatch) -> No
     )
 
 
+def test_lane_transport_failure_trips_backend_down_circuit() -> None:
+    assert massive._lane_result_indicates_backend_down(
+        massive.MassiveLaneResult(
+            lane_id="lane_001",
+            status="failed",
+            started_at="2026-06-17T00:00:00+00:00",
+            error=(
+                "Error: HTTP request failed\n"
+                "Caused by: tcp connect error: No connection could be made because "
+                "the target machine actively refused it."
+            ),
+        )
+    )
+    assert not massive._lane_result_indicates_backend_down(
+        massive.MassiveLaneResult(
+            lane_id="lane_002",
+            status="failed",
+            started_at="2026-06-17T00:00:00+00:00",
+            error="baseline score did not clear the floor",
+        )
+    )
+
+
 def test_staged_expand_applies_remote_token_budget(monkeypatch) -> None:
     runtime = massive.normalize_massive_runtime_config(
         massive.MassiveRuntimeConfig(
@@ -497,7 +520,13 @@ def test_baseline_window_adapts_to_worker_slots_and_pressure() -> None:
         "active_leases": 400,
         "pending_by_queue": {"deep_replay_jobs": 50},
     }
+    small_underfed_pressure = {
+        "ok": True,
+        "active_leases": 1,
+        "pending_by_queue": {"deep_replay_jobs": 2},
+    }
     assert massive._baseline_window(runtime, snapshot, low_pressure) == 32
+    assert massive._baseline_window(runtime, {"ok": True, "slots": 8}, small_underfed_pressure) == 16
     assert massive._baseline_window(runtime, snapshot, high_pressure) == 3
 
     fixed = massive.normalize_massive_runtime_config(
@@ -992,6 +1021,82 @@ def test_rolling_staged_recovers_from_gateway_pressure_pause(monkeypatch) -> Non
     assert (1, "expand") in submissions
     assert [result.status for result in results] == ["completed", "completed"]
     assert state["pause_reason"] is None
+
+
+def test_rolling_staged_backend_transport_failure_stops_new_submissions(monkeypatch) -> None:
+    runtime = massive.normalize_massive_runtime_config(
+        massive.MassiveRuntimeConfig(
+            lanes=4,
+            active_lanes=2,
+            scaffold_active_lanes=2,
+            adaptive_lanes=True,
+            staged_campaign=True,
+            gateway_url="https://example.com/api/worker-gateway",
+            telemetry_interval_seconds=1,
+        )
+    )
+    config, ctx, metadata = _campaign_test_context()
+    submitted: list[int] = []
+    health_calls = {"count": 0}
+
+    def fake_run_lane(*_args, **kwargs):
+        lane_index = kwargs["lane_index"]
+        submitted.append(lane_index)
+        return massive.MassiveLaneResult(
+            lane_id=f"lane_{lane_index:03d}",
+            status="failed",
+            started_at="2026-06-17T00:00:00+00:00",
+            error=(
+                "Error: HTTP request failed\n"
+                "Caused by: tcp connect error: No connection could be made because "
+                "the target machine actively refused it."
+            ),
+        )
+
+    def fake_health(*_args, **_kwargs):
+        health_calls["count"] += 1
+        if health_calls["count"] == 1:
+            return {"ok": True, "url": "http://localhost:7946/healthz"}
+        return {"ok": False, "reason": "backend_health_failed"}
+
+    monkeypatch.setattr(massive, "_run_lane", fake_run_lane)
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_pool_snapshot",
+        lambda _runtime: {"ok": True, "slots": 8, "pool_count": 1, "worker_count": 8},
+    )
+    monkeypatch.setattr(
+        massive,
+        "_poll_worker_gateway_pressure",
+        lambda _runtime: {"ok": True, "status": "ok", "active_leases": 0, "pending_by_queue": {}},
+    )
+    monkeypatch.setattr(massive, "_poll_local_backend_health", fake_health)
+    monkeypatch.setattr(massive, "write_run_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(massive, "_append_event", lambda *_args, **_kwargs: None)
+
+    results, state = massive._run_rolling_staged_campaign_executor(
+        ctx=ctx,
+        runtime=runtime,
+        config=config,
+        seed_indicators=[],
+        seed_plan=None,
+        seed_plan_path=None,
+        budget={"label": "high", "value": 1024},
+        sweep_budget_label="high",
+        sweep_budget_value=1024,
+        reward_matrix=None,
+        metadata=metadata,
+        lane_indexes=[1, 2, 3, 4],
+    )
+
+    assert sorted(submitted) == [1, 2]
+    assert [result.status for result in results] == [
+        "failed",
+        "failed",
+        "not_started_backend_down",
+        "not_started_backend_down",
+    ]
+    assert state["pause_reason"] == "backend_down"
 
 
 def test_run_lane_expansion_preserves_baseline_profile_metadata(
