@@ -5,9 +5,12 @@ description = "Autonomous Fuzzfolio research loop"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "httpx>=0.28.1",
     "matplotlib>=3.10.8",
     "requests>=2.32.0",
     "rich>=13.9.4",
+    "uvicorn[standard]>=0.40.0",
+    "websockets>=16.0",
 ]
 
 [dependency-groups]
@@ -22,6 +25,16 @@ doctor = "autoresearch.__main__:main"
 test-providers = "autoresearch.__main__:main"
 play-hand = "autoresearch.__main__:main"
 play-hand-massive = "autoresearch.__main__:main"
+play-hand-lab = "autoresearch.__main__:main"
+play-hand-lab-gateway = "autoresearch.__main__:main"
+play-hand-lab-http-sim = "autoresearch.__main__:main"
+play-hand-lab-sim = "autoresearch.__main__:main"
+play-hand-lab-ws-sim = "autoresearch.__main__:main"
+play-hand-massive-v2 = "autoresearch.__main__:main"
+play-hand-massive-v2-gateway = "autoresearch.__main__:main"
+play-hand-massive-v2-http-sim = "autoresearch.__main__:main"
+play-hand-massive-v2-sim = "autoresearch.__main__:main"
+play-hand-massive-v2-ws-sim = "autoresearch.__main__:main"
 build-indicator-atlas = "autoresearch.__main__:main"
 build-signal-atlas = "autoresearch.__main__:main"
 build-forward-response-atlas = "autoresearch.__main__:main"

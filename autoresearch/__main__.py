@@ -262,6 +262,7 @@ if __package__ in {None, ""}:
         DEFAULT_MAX_NO_WORKER_WAIT_SECONDS,
         cmd_play_hand_massive,
     )
+    from autoresearch.play_hand_lab_cli import add_play_hand_lab_subparsers, dispatch_play_hand_lab_command
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
@@ -481,6 +482,7 @@ else:
         DEFAULT_MAX_NO_WORKER_WAIT_SECONDS,
         cmd_play_hand_massive,
     )
+    from .play_hand_lab_cli import add_play_hand_lab_subparsers, dispatch_play_hand_lab_command
     from .typed_tools import CLI_OK_TOOLS
 
 
@@ -552,6 +554,16 @@ PUBLIC_CLI_COMMANDS = {
     "test-providers",
     "play-hand",
     "play-hand-massive",
+    "play-hand-lab",
+    "play-hand-lab-gateway",
+    "play-hand-lab-http-sim",
+    "play-hand-lab-sim",
+    "play-hand-lab-ws-sim",
+    "play-hand-massive-v2",
+    "play-hand-massive-v2-gateway",
+    "play-hand-massive-v2-http-sim",
+    "play-hand-massive-v2-sim",
+    "play-hand-massive-v2-ws-sim",
     "build-indicator-atlas",
     "build-signal-atlas",
     "build-forward-response-atlas",
@@ -1226,6 +1238,8 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         action="store_true",
         help="Print machine-readable JSON summary.",
     )
+
+    add_play_hand_lab_subparsers(subparsers)
 
     indicator_atlas = subparsers.add_parser(
         "build-indicator-atlas",
@@ -15094,6 +15108,9 @@ def main(argv: list[str] | None = None) -> int:
             repeat_delay_seconds=args.repeat_delay_seconds,
             repeat_max_campaigns=args.repeat_max_campaigns,
         )
+    play_hand_lab_exit = dispatch_play_hand_lab_command(args, console=console)
+    if play_hand_lab_exit is not None:
+        return play_hand_lab_exit
     if args.command == "build-indicator-atlas":
         return cmd_build_indicator_atlas(
             workspace_root=args.workspace_root,

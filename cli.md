@@ -55,7 +55,31 @@ Common arguments:
 - `--dry-run`: write the run/plan without backend compute.
 - `--json`: print a JSON summary.
 
-## play-hand-massive
+## play-hand-massive-v2
+
+```powershell
+uv run play-hand-massive-v2-gateway
+uv run play-hand-massive-v2 --task-mode deep_replay --lanes 16 --tasks-per-lane 1 --json
+uv run play-hand-massive-v2-sim --workers 1000 --json
+uv run play-hand-massive-v2-ws-sim --workers 1000 --json
+```
+
+Runs first-class Play Hand Massive v2 work through the in-memory lab gateway. This is the preferred scalable path for author research: no Redis/Appwrite/backend hot path and no shards.
+
+The `play-hand-lab*` command names remain supported aliases while the v2 naming settles.
+
+Common arguments:
+
+- `--gateway-url`, `--gateway-token`: lab gateway connection details.
+- `--task-mode`: `deep_replay` or `fake_compute`.
+- `--lanes`: independent Play Hand lanes.
+- `--tasks-per-lane`: replay tasks queued for each lane.
+- `--instrument-pool`: comma-separated or repeatable instruments to deal across lanes.
+- `--min-indicators`, `--max-indicators`: generated profile width.
+- `--dry-run`: write campaign/lane folders without enqueuing work.
+- `--json`: print machine-readable summary.
+
+## play-hand-massive legacy
 
 ```powershell
 uv run play-hand-massive
@@ -63,7 +87,7 @@ uv run play-hand-massive --active-lanes 2 --sweep-budget low --target-worker-slo
 uv run play-hand-massive --dry-run --json
 ```
 
-Runs a backlog-oriented multi-lane Play Hand campaign. Requires a no-reload Fuzzfolio backend (**Backend Research / No Reload** or **Backend Research Gateway** in the Fuzzfolio process manager). Do not use **Backend Dev** for Massive runs.
+Runs the v1 backlog-oriented multi-lane Play Hand campaign through the FuzzFolio worker gateway. This path is legacy and should not be used for high-scale author research runs.
 
 Defaults are conservative: `--active-lanes 2`, `--sweep-budget low`, `--target-worker-slots-per-lane 32`, `--adaptive-lanes` enabled. Adaptive mode fails closed when worker-gateway telemetry is unavailable unless `--adaptive-fail-open` is passed.
 
