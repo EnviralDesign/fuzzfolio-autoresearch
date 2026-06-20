@@ -478,6 +478,7 @@ Observed and fixed during validation:
 - Cumulative gateway metrics could contaminate later campaign summaries. Summaries now report campaign-scoped task counts and metric deltas while preserving raw gateway counters for diagnostics.
 - Deep-replay `--tasks-per-lane` values above `1` duplicated the same generated profile. The coordinator now rejects that configuration and requires scaling through `--lanes`.
 - The coordinator acked results one lease at a time. It now batches successful result acks per read batch.
+- Deep-replay worker completions with unscoreable artifacts could produce green campaigns with `lab_scoring_failed` attempts. Unscoreable deep-replay results now fail the task and campaign.
 - The gateway now rejects non-loopback startup without a token, and HTTP/WebSocket failure payloads parse string booleans such as `"false"` as false.
 - Lab WebSocket workers now send tokens only in the Authorization header, not in the URL query string.
 - `fake_compute` task durations are finite and capped by `FUZZFOLIO_LAB_FAKE_COMPUTE_MAX_SECONDS` so load tests cannot accidentally monopolize workers indefinitely.

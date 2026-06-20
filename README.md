@@ -89,6 +89,8 @@ Play Hand Massive v2 is the lab gateway path: in-memory queue, in-memory worker 
 
 When the gateway binds outside loopback, set `FUZZFOLIO_LAB_GATEWAY_TOKEN` or pass `--token`; unauthenticated non-loopback gateway startup is rejected. Deep-replay v2 runs require `--tasks-per-lane 1`; scale by increasing `--lanes` so each worker task maps to a distinct generated profile.
 
+Deep-replay worker completions must also be scoreable. If the coordinator cannot score a returned artifact, it records the attempt as failed and the campaign exits failed instead of treating an unusable artifact as a screened result.
+
 Safe starting point:
 
 ```powershell

@@ -976,7 +976,7 @@ def _record_lab_result(
             "lab_lane_id": lane.lane_id,
             "worker_id": lab_result.get("worker_id"),
             "worker_lease_id": lab_result.get("lease_id"),
-            "run_status": "screened",
+            "run_status": "failed" if score_warning else "screened",
         }
     )
     if score_warning:
@@ -1011,6 +1011,7 @@ def _record_lab_result(
         "artifact_dir": str(artifact_dir),
         "score": record.composite_score,
         "score_basis": record.score_basis,
+        "status": "failed" if score_warning else "success",
     }
 
 
@@ -1526,7 +1527,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                         lab_result=lab_result,
                         reward_matrix=reward_matrix,
                     )
-                    lane.completed_task_ids.add(task_id)
+                    if recorded.get("status") == "failed":
+                        lane.failed_task_ids.add(task_id)
+                    else:
+                        lane.completed_task_ids.add(task_id)
                 recorded_result_count += 1
                 _add_recorded_result_sample(recorded_results, recorded)
                 recorded_successfully = True

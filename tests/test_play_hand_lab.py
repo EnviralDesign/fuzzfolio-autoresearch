@@ -503,6 +503,131 @@ def test_play_hand_lab_records_terminal_worker_failure(
     assert attempts[0]["score_basis"] == "lab_worker_failed"
 
 
+def test_play_hand_lab_scoring_warning_fails_deep_replay_task(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    fake_config = _test_config(tmp_path)
+
+    class FakeCli:
+        def __init__(self, _config):
+            self.config = _config
+
+    class FakeGateway:
+        def __init__(self, *, base_url: str, token: str | None = None):
+            self.base_url = base_url
+            self.token = token
+            self.tasks: list[dict] = []
+            self.results: list[dict] = []
+
+        def health(self) -> dict:
+            return {"ok": True}
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            self.tasks = list(tasks)
+            task = self.tasks[0]
+            self.results = [
+                {
+                    "task_id": task["task_id"],
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "success",
+                    "worker_id": "fake-worker",
+                    "lease_id": "lease-1",
+                    "result": {
+                        "job_id": task["task_id"],
+                        "status": "success",
+                        "result": {"matrix": {"ok": True}},
+                    },
+                }
+            ]
+            return {"enqueued": len(tasks)}
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            return self.results[:limit]
+
+        def ack_results(self, lease_ids: list[str]) -> int:
+            requested = set(lease_ids)
+            before = len(self.results)
+            self.results = [
+                result for result in self.results if result.get("lease_id") not in requested
+            ]
+            return before - len(self.results)
+
+        def snapshot(self) -> dict:
+            return {
+                "ok": True,
+                "completed_tasks": len(self.tasks),
+                "failed_tasks": 0,
+                "queued_tasks": 0,
+                "metrics": {},
+            }
+
+    def fake_prepare_lane_profile(lane_ctx, *, runtime, lane, seed_plan, deal, rng) -> None:
+        profile_path = lane_ctx.profiles_dir / "profile.json"
+        profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+        lane.profile_path = profile_path
+        lane.profile_payload = _profile_payload()["profile"]
+        lane.profile_ref = f"lab-inline:{lane.run_id}:{lane.lane_id}"
+        lane.instruments = ["EURUSD"]
+        lane.timeframe = "M5"
+        lane.indicator_ids = ["RSI"]
+
+    def fake_score_lab_artifact(*, cli, artifact_dir, strict):
+        return (
+            lab.AttemptScore(
+                primary_score=None,
+                composite_score=None,
+                score_basis="lab_scoring_failed",
+                metrics={},
+                best_summary={"error": "simulated scoring failure"},
+            ),
+            {"error": "simulated scoring failure", "error_type": "RuntimeError"},
+        )
+
+    monkeypatch.setattr(lab, "load_config", lambda: fake_config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", FakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", FakeGateway)
+    monkeypatch.setattr(lab, "_seed_indicators", lambda **_kwargs: (["RSI"], None, None))
+    monkeypatch.setattr(lab, "_deal_lane", lambda **_kwargs: object())
+    monkeypatch.setattr(lab, "_prepare_lane_profile", fake_prepare_lane_profile)
+    monkeypatch.setattr(lab, "_score_lab_artifact", fake_score_lab_artifact)
+
+    exit_code = lab.cmd_play_hand_lab(
+        lab.PlayHandLabRuntimeConfig(
+            gateway_url="http://127.0.0.1:8799",
+            task_mode="deep_replay",
+            lanes=1,
+            tasks_per_lane=1,
+            poll_interval_seconds=0.01,
+            max_wait_seconds=2.0,
+            worker_contract_hash="sha256:" + "a" * 64,
+        )
+    )
+
+    assert exit_code == 2
+    campaign_dir = next(
+        (fake_config.runs_root / "derived" / lab.PLAY_HAND_LAB_CAMPAIGNS_DIR).glob(
+            "*-playhand-lab-campaign-v1"
+        )
+    )
+    lane_dir = next(fake_config.runs_root.glob("*-playhand-lab-lane-*-v1"))
+    summary = json.loads(
+        (campaign_dir / "play-hand-lab-campaign-summary.json").read_text(encoding="utf-8")
+    )
+    attempts = [
+        json.loads(line)
+        for line in (lane_dir / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert summary["status"] == "failed"
+    assert summary["completed_tasks"] == 0
+    assert summary["failed_tasks"] == 1
+    assert attempts[0]["run_status"] == "failed"
+    assert attempts[0]["score_basis"] == "lab_scoring_failed"
+    assert attempts[0]["lab_scoring_warning"]["error"] == "simulated scoring failure"
+
+
 def test_play_hand_lab_ack_failure_does_not_turn_success_into_failed_attempt(
     tmp_path: Path,
     monkeypatch,
