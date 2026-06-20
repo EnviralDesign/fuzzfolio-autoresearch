@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import random
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -48,6 +50,149 @@ def _test_config(tmp_path: Path) -> SimpleNamespace:
         fuzzfolio=SimpleNamespace(workspace_root=None),
         research=SimpleNamespace(plot_lower_is_better=False),
     )
+
+
+def _campaign_ctx(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        run_id="campaign-1",
+        run_dir=tmp_path,
+        events_path=tmp_path / "events.jsonl",
+        io_lock=threading.RLock(),
+    )
+
+
+class _IndicatorIndexCli:
+    def __init__(self, ids: list[str]):
+        self.ids = ids
+
+    def run(self, args, **_kwargs):
+        assert args == ["indicators", "--mode", "index"]
+        return SimpleNamespace(parsed_json={"data": {"ids": self.ids}})
+
+
+def test_seed_indicators_filter_unscaffoldable_seed_plan_ids(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    seed_plan = {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {
+            "pair": {
+                "recipe_sampling_weight": 1.0,
+                "pair_menu": [
+                    {
+                        "anchor_id": "RSI",
+                        "trigger_id": "SPEARMAN_RANK_CORRELATION",
+                        "pair_sampling_weight": 1.0,
+                    }
+                ],
+                "slot_menus": {
+                    "trigger": [
+                        {"indicator_id": "TTF_DSL_TRANSITION", "sampling_weight": 1.0},
+                        {"indicator_id": "ADX", "sampling_weight": 1.0},
+                    ]
+                },
+            }
+        },
+    }
+    config = _test_config(tmp_path)
+    monkeypatch.setattr(
+        lab,
+        "_load_play_hand_seed_plan",
+        lambda _config: (seed_plan, tmp_path / "seed-plan.json"),
+    )
+
+    indicators, loaded_seed_plan, _seed_plan_path = lab._seed_indicators(
+        config=config,
+        cli=_IndicatorIndexCli(["RSI", "ADX"]),
+        campaign_ctx=_campaign_ctx(tmp_path),
+        runtime=lab.PlayHandLabRuntimeConfig(min_indicators=2, max_indicators=2),
+    )
+
+    assert [indicator.id for indicator in indicators] == ["RSI", "ADX"]
+    deal = lab._deal_lane(
+        config=config,
+        runtime=lab.PlayHandLabRuntimeConfig(
+            min_indicators=2,
+            max_indicators=2,
+            instrument=["EURUSD"],
+        ),
+        seed_indicators=indicators,
+        seed_plan=loaded_seed_plan,
+        rng=random.Random(4),
+    )
+
+    assert set(deal["dealt"]) <= {"RSI", "ADX"}
+    assert "SPEARMAN_RANK_CORRELATION" not in deal["dealt"]
+    assert "TTF_DSL_TRANSITION" not in deal["dealt"]
+
+
+def test_seed_indicators_reject_unscaffoldable_pinned_ids(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="not scaffoldable"):
+        lab._seed_indicators(
+            config=_test_config(tmp_path),
+            cli=_IndicatorIndexCli(["RSI", "ADX"]),
+            campaign_ctx=_campaign_ctx(tmp_path),
+            runtime=lab.PlayHandLabRuntimeConfig(
+                indicator=["RSI", "SPEARMAN_RANK_CORRELATION"],
+                min_indicators=2,
+                max_indicators=2,
+            ),
+        )
+
+
+def test_deep_replay_dry_run_uses_real_scaffold_for_profile_validation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    ctx = SimpleNamespace(
+        config=_test_config(tmp_path),
+        dry_run=True,
+        profiles_dir=tmp_path / "profiles",
+        events_path=tmp_path / "events.jsonl",
+        run_id="lane-run",
+        io_lock=threading.RLock(),
+    )
+    ctx.profiles_dir.mkdir()
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="lane-run",
+        run_dir=tmp_path / "lane-run",
+    )
+
+    def fake_scaffold_profile(scaffold_ctx, indicator_ids, instruments, timeframe, candidate_name):
+        assert scaffold_ctx.dry_run is False
+        assert indicator_ids == ["RSI"]
+        assert instruments == ["EURUSD"]
+        assert timeframe == "M5"
+        profile_path = ctx.profiles_dir / f"{candidate_name}.json"
+        profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+        return profile_path
+
+    monkeypatch.setattr(lab, "_scaffold_profile", fake_scaffold_profile)
+    monkeypatch.setattr(
+        lab,
+        "_worker_ready_profile_snapshot",
+        lambda profile_payload, **_kwargs: profile_payload,
+    )
+
+    lab._prepare_lane_profile(
+        ctx,
+        runtime=lab.PlayHandLabRuntimeConfig(task_mode="deep_replay", dry_run=True),
+        lane=lane,
+        seed_plan=None,
+        deal={
+            "dealt": ["RSI"],
+            "dealt_entries": [lab.SeedIndicator("RSI")],
+            "indicator_deal": {},
+            "instruments": ["EURUSD"],
+        },
+        rng=random.Random(1),
+    )
+
+    assert lane.profile_path == ctx.profiles_dir / "lane_000_base.json"
+    assert lane.indicator_ids == ["RSI"]
 
 
 def test_deep_replay_tasks_are_self_contained_and_contract_pinned(tmp_path: Path) -> None:

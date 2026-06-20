@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import random
@@ -272,6 +273,70 @@ def _clean_symbols(values: list[str] | tuple[str, ...] | None) -> list[str] | No
             cleaned.append(token)
             seen.add(token)
     return cleaned or None
+
+
+def _extract_scaffoldable_indicator_ids(payload: Any) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    data = payload.get("data")
+    candidates: Any = None
+    if isinstance(data, dict):
+        candidates = data.get("ids") or data.get("indicators")
+    elif isinstance(data, list):
+        candidates = data
+    if candidates is None:
+        candidates = payload.get("ids") or payload.get("indicators")
+    if not isinstance(candidates, list):
+        return set()
+    ids: set[str] = set()
+    for item in candidates:
+        raw = item.get("id") if isinstance(item, dict) else item
+        indicator_id = str(raw or "").strip().upper()
+        if indicator_id:
+            ids.add(indicator_id)
+    return ids
+
+
+def _load_scaffoldable_indicator_ids(cli: FuzzfolioCli) -> set[str]:
+    result = cli.run(["indicators", "--mode", "index"])
+    ids = _extract_scaffoldable_indicator_ids(result.parsed_json)
+    if not ids:
+        raise RuntimeError("FuzzFolio indicator index did not return scaffoldable indicator ids.")
+    return ids
+
+
+def _coerce_seed_indicator(value: Any) -> SeedIndicator | None:
+    if isinstance(value, SeedIndicator):
+        indicator = value
+    else:
+        indicator = SeedIndicator(id=str(value or ""))
+    indicator_id = str(indicator.id or "").strip().upper()
+    if not indicator_id:
+        return None
+    return replace(indicator, id=indicator_id)
+
+
+def _filter_scaffoldable_seed_indicators(
+    indicators: list[SeedIndicator] | list[Any],
+    *,
+    scaffoldable_indicator_ids: set[str],
+) -> tuple[list[SeedIndicator], list[str]]:
+    valid: list[SeedIndicator] = []
+    invalid: list[str] = []
+    seen: set[str] = set()
+    for raw_indicator in indicators:
+        indicator = _coerce_seed_indicator(raw_indicator)
+        if indicator is None:
+            continue
+        indicator_id = indicator.id.upper()
+        if indicator_id in seen:
+            continue
+        seen.add(indicator_id)
+        if indicator_id not in scaffoldable_indicator_ids:
+            invalid.append(indicator_id)
+            continue
+        valid.append(indicator)
+    return valid, invalid
 
 
 def _runtime_event_payload(runtime: PlayHandLabRuntimeConfig) -> dict[str, Any]:
@@ -557,11 +622,59 @@ def _seed_indicators(
 ) -> tuple[list[SeedIndicator], dict[str, Any] | None, Path | None]:
     seed_plan, seed_plan_path = _load_play_hand_seed_plan(config)
     pinned = [SeedIndicator(id=item) for item in runtime.indicator or []]
+    scaffoldable_indicator_ids: set[str] | None = None
+    if runtime.profile_path is None:
+        scaffoldable_indicator_ids = _load_scaffoldable_indicator_ids(cli)
+
+    def scaffoldable_pool(
+        indicators: list[SeedIndicator] | list[Any],
+        *,
+        source: str,
+        require_all: bool = False,
+    ) -> tuple[list[SeedIndicator], list[str]]:
+        if scaffoldable_indicator_ids is None:
+            return [indicator for item in indicators if (indicator := _coerce_seed_indicator(item))], []
+        valid, invalid = _filter_scaffoldable_seed_indicators(
+            indicators,
+            scaffoldable_indicator_ids=scaffoldable_indicator_ids,
+        )
+        if invalid:
+            _append_event(
+                campaign_ctx,
+                "seed_indicators",
+                "filtered_unscaffoldable",
+                source=source,
+                invalid_indicators=invalid[:50],
+                invalid_count=len(invalid),
+                valid_count=len(valid),
+            )
+        if require_all and invalid:
+            raise ValueError(
+                "Pinned PlayHand indicators are not scaffoldable by the current FuzzFolio CLI: "
+                + ", ".join(invalid[:10])
+            )
+        return valid, invalid
+
     if pinned:
-        return pinned, seed_plan, seed_plan_path
+        valid, _invalid = scaffoldable_pool(pinned, source="pinned", require_all=True)
+        if len(valid) < runtime.min_indicators:
+            raise RuntimeError(
+                "Pinned PlayHand indicator pool is smaller than --min-indicators after validation: "
+                f"{len(valid)} < {runtime.min_indicators}."
+            )
+        return valid, seed_plan, seed_plan_path
     seed_plan_candidates = _seed_plan_indicator_candidates(config, seed_plan)
     if seed_plan_candidates:
-        return seed_plan_candidates, seed_plan, seed_plan_path
+        valid, _invalid = scaffoldable_pool(seed_plan_candidates, source="seed_plan")
+        if len(valid) >= runtime.min_indicators:
+            return valid, seed_plan, seed_plan_path
+        _append_event(
+            campaign_ctx,
+            "seed_indicators",
+            "seed_plan_pool_too_small",
+            valid_count=len(valid),
+            min_indicators=runtime.min_indicators,
+        )
     try:
         seeded = _seed_hand(config, cli, campaign_ctx.run_dir)
     except Exception as exc:
@@ -573,7 +686,19 @@ def _seed_indicators(
             fallback_indicators=["RSI", "MACD", "SMA"],
         )
         seeded = [SeedIndicator("RSI"), SeedIndicator("MACD"), SeedIndicator("SMA")]
-    return seeded or [SeedIndicator("RSI")], seed_plan, seed_plan_path
+    valid, _invalid = scaffoldable_pool(seeded or [], source="seed_prompt")
+    if len(valid) >= runtime.min_indicators:
+        return valid, seed_plan, seed_plan_path
+    fallback, _fallback_invalid = scaffoldable_pool(
+        [SeedIndicator("RSI"), SeedIndicator("MACD"), SeedIndicator("SMA")],
+        source="fallback",
+    )
+    if len(fallback) >= runtime.min_indicators:
+        return fallback, seed_plan, seed_plan_path
+    raise RuntimeError(
+        "PlayHand Massive v2 could not build a scaffoldable indicator pool large enough "
+        f"for --min-indicators {runtime.min_indicators}; valid fallback count={len(fallback)}."
+    )
 
 
 def _deal_lane(
@@ -584,9 +709,15 @@ def _deal_lane(
     seed_plan: dict[str, Any] | None,
     rng: random.Random,
 ) -> dict[str, Any]:
+    seed_indicators = [indicator for item in seed_indicators if (indicator := _coerce_seed_indicator(item))]
     shuffled = list(seed_indicators)
     rng.shuffle(shuffled)
-    seed_plan_candidates = _seed_plan_indicator_candidates(config, seed_plan)
+    allowed_seed_ids = {indicator.id.upper() for indicator in seed_indicators}
+    seed_plan_candidates = [
+        candidate
+        for candidate in _seed_plan_indicator_candidates(config, seed_plan)
+        if candidate.id.upper() in allowed_seed_ids
+    ]
     guided_available_count = len(_merge_seed_indicator_candidates(shuffled, seed_plan_candidates))
     dealt_count = deal_indicator_count(
         available_count=max(len(shuffled), guided_available_count),
@@ -663,8 +794,15 @@ def _prepare_lane_profile(
         profile = _inner_profile_payload(profile_payload)
         lane.instruments = [str(item).strip().upper() for item in profile.get("instruments") or deal["instruments"]]
     else:
+        scaffold_ctx = ctx
+        if runtime.task_mode == "deep_replay" and getattr(ctx, "dry_run", False):
+            try:
+                scaffold_ctx = replace(ctx, dry_run=False)
+            except TypeError:
+                scaffold_ctx = copy.copy(ctx)
+                scaffold_ctx.dry_run = False
         lane.profile_path = _scaffold_profile(
-            ctx,
+            scaffold_ctx,
             list(deal["dealt"]),
             list(deal["instruments"]),
             runtime.timeframe,
@@ -1336,12 +1474,28 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         )
         raise
 
-    seed_indicators, seed_plan, seed_plan_path = _seed_indicators(
-        config=config,
-        cli=cli,
-        campaign_ctx=campaign_ctx,
-        runtime=runtime,
-    )
+    try:
+        seed_indicators, seed_plan, seed_plan_path = _seed_indicators(
+            config=config,
+            cli=cli,
+            campaign_ctx=campaign_ctx,
+            runtime=runtime,
+        )
+    except Exception as exc:
+        _append_event(
+            campaign_ctx,
+            "seed_indicators",
+            "failed",
+            error=str(exc)[:1000],
+        )
+        _write_campaign_metadata(
+            campaign_ctx,
+            runtime=runtime,
+            status="failed",
+            started_at=started_at,
+            extra={"failed_reason": "seed_indicator_preflight_failed", "error": str(exc)[:1000]},
+        )
+        raise
     reward_matrix = play_hand_reward_matrix(runtime.max_reward_r)
     lanes: list[LabLaneState] = []
     for lane_index in range(runtime.lanes):
