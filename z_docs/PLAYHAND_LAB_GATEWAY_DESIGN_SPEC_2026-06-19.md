@@ -50,12 +50,12 @@ Trading-Dashboard owns:
 
 AutoResearch procman owns local launch entries:
 
-- `play hand lab - gateway`
-- `play hand lab - cloudflared tunnel`
-- `play hand lab - coordinator fake smoke`
-- `play hand lab - coordinator deep replay`
+- `play hand massive v2 - lab gateway`
+- `play hand massive v2`
 
-The procman gateway/coordinator entries dot-source `scripts/play-hand-lab-procman-env.ps1`. If `FUZZFOLIO_LAB_GATEWAY_TOKEN` is not already present in the procman server environment, the helper creates or reads a per-user token file at `%LOCALAPPDATA%\FuzzfolioAutoResearch\play-hand-lab-gateway-token.txt`.
+The procman gateway/coordinator entries use native `uv run ...` commands. If `FUZZFOLIO_LAB_GATEWAY_TOKEN` is not already present, non-loopback gateway startup creates or reads a per-user token file at `%LOCALAPPDATA%\FuzzfolioAutoResearch\play-hand-lab-gateway-token.txt`; the coordinator reads the same token file when present.
+
+Instrument pool presets are named in AutoResearch and derived from `Trading-Dashboard/shared/constants/market_data/dukascopy/instruments.json`, which is FuzzFolio's trimmed source-of-truth catalog for deep backfill tooling. Omit `--instrument-pool-preset` for the existing Play Hand default and seed-template narrowing; use repeatable presets such as `--instrument-pool-preset fx --instrument-pool-preset metals`, or `--instrument-pool-preset all` for the full trimmed catalog.
 
 ## Non-Goals
 

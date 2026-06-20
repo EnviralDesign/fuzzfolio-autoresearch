@@ -601,11 +601,26 @@ def test_lab_gateway_asgi_rejects_oversized_body() -> None:
     assert sent[0]["status"] == 413
 
 
-def test_lab_gateway_cli_rejects_non_loopback_bind_without_token(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_lab_gateway_cli_uses_token_file_for_non_loopback_bind(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.delenv("FUZZFOLIO_LAB_GATEWAY_TOKEN", raising=False)
+    token_file = tmp_path / "gateway-token.txt"
+    monkeypatch.setenv("FUZZFOLIO_LAB_GATEWAY_TOKEN_FILE", str(token_file))
+    served = {}
 
-    with pytest.raises(RuntimeError, match="requires --token"):
-        cmd_play_hand_lab_gateway(host="0.0.0.0", port=8799)
+    def fake_serve_lab_gateway(**kwargs) -> None:
+        served.update(kwargs)
+
+    monkeypatch.setattr("autoresearch.play_hand_lab_gateway.serve_lab_gateway", fake_serve_lab_gateway)
+
+    assert cmd_play_hand_lab_gateway(host="0.0.0.0", port=8799) == 0
+
+    token = token_file.read_text(encoding="ascii").strip()
+    assert token
+    assert served["host"] == "0.0.0.0"
+    assert served["port"] == 8799
+    assert served["token"] == token
 
 
 def test_saturation_simulation_keeps_100_virtual_workers_busy() -> None:
@@ -726,9 +741,21 @@ def test_build_parser_accepts_play_hand_lab_sim_defaults() -> None:
 def test_build_parser_accepts_play_hand_massive_v2_aliases() -> None:
     parser = build_parser()
 
-    args = parser.parse_args(["play-hand-massive-v2", "--lanes", "12", "--json"])
+    args = parser.parse_args(
+        [
+            "play-hand-massive-v2",
+            "--lanes",
+            "12",
+            "--instrument-pool-preset",
+            "fx",
+            "--instrument-pool-set",
+            "metals,crypto",
+            "--json",
+        ]
+    )
     assert args.command == "play-hand-massive-v2"
     assert args.lanes == 12
+    assert args.instrument_pool_preset == ["fx", "metals,crypto"]
     assert args.json is True
 
     args = parser.parse_args(["play-hand-massive-v2-gateway", "--port", "8799"])

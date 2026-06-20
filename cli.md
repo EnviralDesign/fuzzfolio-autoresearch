@@ -71,10 +71,12 @@ The `play-hand-lab*` command names remain supported aliases while the v2 naming 
 Common arguments:
 
 - `--gateway-url`, `--gateway-token`: lab gateway connection details.
+- `--token`: gateway bearer token. Non-loopback gateway binds auto-create/read `FUZZFOLIO_LAB_GATEWAY_TOKEN_FILE` when neither `--token` nor `FUZZFOLIO_LAB_GATEWAY_TOKEN` is set.
 - `--task-mode`: `deep_replay` or `fake_compute`.
 - `--lanes`: independent Play Hand lanes.
 - `--tasks-per-lane`: replay tasks queued for each lane.
-- `--instrument-pool`: comma-separated or repeatable instruments to deal across lanes.
+- `--instrument-pool-preset`: named pool preset to deal across lanes. Repeat or comma-separate values such as `fx,metals`, `crypto`, or `all`.
+- `--instrument-pool`: explicit comma-separated or repeatable instruments to add to the resolved pool.
 - `--min-indicators`, `--max-indicators`: generated profile width.
 - `--dry-run`: write campaign/lane folders without enqueuing work.
 - `--json`: print machine-readable summary.

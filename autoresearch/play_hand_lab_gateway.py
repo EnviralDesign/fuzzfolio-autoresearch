@@ -24,6 +24,8 @@ import requests
 import httpx
 from websockets.asyncio.client import connect as websocket_connect
 
+from .play_hand_lab_auth import load_lab_gateway_token
+
 
 TaskStatus = Literal["queued", "leased", "completed", "failed"]
 ClaimStatus = Literal["leased", "no_work"]
@@ -1305,9 +1307,12 @@ def cmd_play_hand_lab_gateway(
     token: str | None = None,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
 ) -> int:
-    token = token or os.environ.get("FUZZFOLIO_LAB_GATEWAY_TOKEN")
+    token = token or load_lab_gateway_token(create=not _is_loopback_host(host))
     if not token and not _is_loopback_host(host):
-        raise RuntimeError("PlayHand Lab gateway requires --token or FUZZFOLIO_LAB_GATEWAY_TOKEN for non-loopback binds.")
+        raise RuntimeError(
+            "PlayHand Lab gateway requires --token, FUZZFOLIO_LAB_GATEWAY_TOKEN, "
+            "or a writable FUZZFOLIO_LAB_GATEWAY_TOKEN_FILE for non-loopback binds."
+        )
     serve_lab_gateway(host=host, port=port, token=token, max_body_bytes=max_body_bytes)
     return 0
 

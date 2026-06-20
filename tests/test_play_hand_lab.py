@@ -61,6 +61,41 @@ def _campaign_ctx(tmp_path: Path) -> SimpleNamespace:
     )
 
 
+def test_normalize_runtime_loads_existing_gateway_token_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("FUZZFOLIO_LAB_GATEWAY_TOKEN", raising=False)
+    token_file = tmp_path / "gateway-token.txt"
+    token_file.write_text("shared-token", encoding="ascii")
+    monkeypatch.setenv("FUZZFOLIO_LAB_GATEWAY_TOKEN_FILE", str(token_file))
+
+    runtime = lab._normalize_runtime(lab.PlayHandLabRuntimeConfig())
+
+    assert runtime.gateway_token == "shared-token"
+
+
+def test_normalize_runtime_resolves_instrument_pool_presets() -> None:
+    runtime = lab._normalize_runtime(
+        lab.PlayHandLabRuntimeConfig(
+            instrument_pool_preset=["fx-major", "metals"],
+            instrument_pool=["US500"],
+        )
+    )
+
+    assert runtime.instrument_pool_preset == ["fx-major", "metals"]
+    assert runtime.instrument_pool == [
+        "AUDUSD",
+        "EURUSD",
+        "GBPUSD",
+        "USDCAD",
+        "USDCHF",
+        "USDJPY",
+        "XAGUSD",
+        "XAUUSD",
+        "US500",
+    ]
+
+
 class _IndicatorIndexCli:
     def __init__(self, ids: list[str]):
         self.ids = ids

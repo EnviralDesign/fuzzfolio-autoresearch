@@ -52,6 +52,81 @@ DEFAULT_INSTRUMENT_POOL = (
     "XAUUSD",
 )
 
+FX_MAJOR_INSTRUMENT_POOL = (
+    "AUDUSD",
+    "EURUSD",
+    "GBPUSD",
+    "USDCAD",
+    "USDCHF",
+    "USDJPY",
+)
+FX_MINOR_INSTRUMENT_POOL = (
+    "AUDCAD",
+    "AUDCHF",
+    "AUDJPY",
+    "AUDNZD",
+    "CADCHF",
+    "CADJPY",
+    "CHFJPY",
+    "EURAUD",
+    "EURCAD",
+    "EURCHF",
+    "EURGBP",
+    "EURJPY",
+    "EURNZD",
+    "GBPAUD",
+    "GBPCAD",
+    "GBPCHF",
+    "GBPJPY",
+    "GBPNZD",
+    "NZDCAD",
+    "NZDCHF",
+    "NZDJPY",
+    "NZDUSD",
+    "USDSGD",
+)
+METALS_INSTRUMENT_POOL = ("XAGUSD", "XAUUSD")
+ENERGIES_INSTRUMENT_POOL = ("XBRUSD", "XTIUSD")
+INDICES_INSTRUMENT_POOL = (
+    "DE40",
+    "HK50",
+    "JP225",
+    "RUSS2000",
+    "UK100",
+    "US30",
+    "US500",
+    "USTECH",
+)
+CRYPTO_INSTRUMENT_POOL = ("BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD")
+ALL_INSTRUMENT_POOL = (
+    *FX_MAJOR_INSTRUMENT_POOL,
+    *FX_MINOR_INSTRUMENT_POOL,
+    *METALS_INSTRUMENT_POOL,
+    *ENERGIES_INSTRUMENT_POOL,
+    *INDICES_INSTRUMENT_POOL,
+    *CRYPTO_INSTRUMENT_POOL,
+)
+PLAY_HAND_INSTRUMENT_POOL_PRESETS: dict[str, tuple[str, ...]] = {
+    "default": DEFAULT_INSTRUMENT_POOL,
+    "core": DEFAULT_INSTRUMENT_POOL,
+    "majors-gold": DEFAULT_INSTRUMENT_POOL,
+    "fx-major": FX_MAJOR_INSTRUMENT_POOL,
+    "fx-majors": FX_MAJOR_INSTRUMENT_POOL,
+    "majors": FX_MAJOR_INSTRUMENT_POOL,
+    "fx-minor": FX_MINOR_INSTRUMENT_POOL,
+    "fx-minors": FX_MINOR_INSTRUMENT_POOL,
+    "minors": FX_MINOR_INSTRUMENT_POOL,
+    "fx": (*FX_MAJOR_INSTRUMENT_POOL, *FX_MINOR_INSTRUMENT_POOL),
+    "metals": METALS_INSTRUMENT_POOL,
+    "energies": ENERGIES_INSTRUMENT_POOL,
+    "indices": INDICES_INSTRUMENT_POOL,
+    "crypto": CRYPTO_INSTRUMENT_POOL,
+    "commodities": (*METALS_INSTRUMENT_POOL, *ENERGIES_INSTRUMENT_POOL),
+    "cfds": (*METALS_INSTRUMENT_POOL, *ENERGIES_INSTRUMENT_POOL, *INDICES_INSTRUMENT_POOL),
+    "all": ALL_INSTRUMENT_POOL,
+}
+INSTRUMENT_POOL_PRESET_NAMES = tuple(sorted(PLAY_HAND_INSTRUMENT_POOL_PRESETS))
+
 SWEEP_PERMUTATION_HARD_LIMIT = 256
 PLAY_HAND_SWEEP_PERMUTATION_LIMIT = 1024
 SWEEP_BUDGET_PRESETS: dict[str, int] = {
@@ -462,12 +537,62 @@ def _clean_tokens(values: list[str] | tuple[str, ...] | None) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
     for item in values or []:
-        token = str(item).strip().upper()
-        if not token or token in seen:
-            continue
-        cleaned.append(token)
-        seen.add(token)
+        for part in str(item).split(","):
+            token = part.strip().upper()
+            if not token or token in seen:
+                continue
+            cleaned.append(token)
+            seen.add(token)
     return cleaned
+
+
+def _clean_instrument_pool_preset_names(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in values or []:
+        for part in str(item).split(","):
+            name = part.strip().lower().replace("_", "-")
+            if not name or name in seen:
+                continue
+            cleaned.append(name)
+            seen.add(name)
+    return cleaned
+
+
+def resolve_instrument_pool_presets(
+    *,
+    presets: list[str] | tuple[str, ...] | None,
+    instrument_pool: list[str] | tuple[str, ...] | None,
+) -> list[str] | None:
+    resolved: list[str] = []
+    seen: set[str] = set()
+    unknown: list[str] = []
+
+    for preset in _clean_instrument_pool_preset_names(presets):
+        pool = PLAY_HAND_INSTRUMENT_POOL_PRESETS.get(preset)
+        if pool is None:
+            unknown.append(preset)
+            continue
+        for instrument in pool:
+            token = str(instrument).strip().upper()
+            if token and token not in seen:
+                resolved.append(token)
+                seen.add(token)
+
+    if unknown:
+        available = ", ".join(INSTRUMENT_POOL_PRESET_NAMES)
+        raise ValueError(
+            "Unknown instrument pool preset(s): "
+            + ", ".join(unknown)
+            + f". Available presets: {available}."
+        )
+
+    for instrument in _clean_tokens(instrument_pool):
+        if instrument not in seen:
+            resolved.append(instrument)
+            seen.add(instrument)
+
+    return resolved or None
 
 
 def _normalize_role(value: Any) -> str | None:

@@ -14,6 +14,7 @@ from typing import Any, Literal
 import requests
 from rich.console import Console
 
+from .play_hand_lab_auth import load_lab_gateway_token
 from .config import AppConfig, load_config
 from .fuzzfolio import CliError, FuzzfolioCli
 from .ledger import (
@@ -51,6 +52,7 @@ from .play_hand import (
     deal_instruments,
     deal_seed_plan_indicators,
     play_hand_reward_matrix,
+    resolve_instrument_pool_presets,
 )
 from .plotting import render_progress_artifacts
 from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapshot
@@ -80,6 +82,7 @@ class PlayHandLabRuntimeConfig:
     timeframe: str = "M5"
     instrument: list[str] | None = None
     instrument_pool: list[str] | None = None
+    instrument_pool_preset: list[str] | None = None
     indicator: list[str] | None = None
     profile_path: Path | None = None
     min_indicators: int = 1
@@ -196,7 +199,7 @@ def _now_iso() -> str:
 
 def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeConfig:
     gateway_url = str(runtime.gateway_url or os.environ.get("FUZZFOLIO_LAB_GATEWAY_URL") or DEFAULT_LAB_GATEWAY_URL)
-    token = runtime.gateway_token or os.environ.get("FUZZFOLIO_LAB_GATEWAY_TOKEN")
+    token = runtime.gateway_token or load_lab_gateway_token(create=False)
     contract_hash = (
         runtime.worker_contract_hash
         or os.environ.get("FUZZFOLIO_REPLAY_WORKER_CONTRACT_HASH")
@@ -230,7 +233,11 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         tasks_per_lane=tasks_per_lane,
         timeframe=str(runtime.timeframe or "M5").strip().upper() or "M5",
         instrument=_clean_symbols(runtime.instrument),
-        instrument_pool=_clean_symbols(runtime.instrument_pool),
+        instrument_pool=resolve_instrument_pool_presets(
+            presets=runtime.instrument_pool_preset,
+            instrument_pool=runtime.instrument_pool,
+        ),
+        instrument_pool_preset=_clean_pool_names(runtime.instrument_pool_preset),
         indicator=_clean_symbols(runtime.indicator),
         profile_path=runtime.profile_path,
         min_indicators=min_indicators,
@@ -272,6 +279,18 @@ def _clean_symbols(values: list[str] | tuple[str, ...] | None) -> list[str] | No
                 continue
             cleaned.append(token)
             seen.add(token)
+    return cleaned or None
+
+
+def _clean_pool_names(values: list[str] | tuple[str, ...] | None) -> list[str] | None:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        for part in str(value or "").split(","):
+            token = part.strip().lower().replace("_", "-")
+            if token and token not in seen:
+                cleaned.append(token)
+                seen.add(token)
     return cleaned or None
 
 
@@ -540,6 +559,7 @@ def _write_campaign_metadata(
             "lookback_months": runtime.lookback_months,
             "bar_limit": runtime.bar_limit,
             "instrument": runtime.instrument,
+            "instrument_pool_preset": runtime.instrument_pool_preset,
             "instrument_pool": runtime.instrument_pool or list(DEFAULT_INSTRUMENT_POOL),
             "indicator": runtime.indicator,
             "profile_path": str(runtime.profile_path.resolve()) if runtime.profile_path else None,

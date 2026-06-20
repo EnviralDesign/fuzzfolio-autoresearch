@@ -7,6 +7,7 @@ from typing import Any
 
 from rich.console import Console
 
+from .play_hand import INSTRUMENT_POOL_PRESET_NAMES
 from .play_hand_lab import (
     DEFAULT_LAB_GATEWAY_URL,
     PlayHandLabRuntimeConfig,
@@ -81,7 +82,17 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         "--instrument-pool",
         action="append",
         default=None,
-        help="Instrument-pool symbol or comma-separated symbols. Repeatable.",
+        help="Explicit instrument-pool symbol or comma-separated symbols. Repeatable.",
+    )
+    play_hand_lab.add_argument(
+        "--instrument-pool-preset",
+        "--instrument-pool-set",
+        action="append",
+        default=None,
+        help=(
+            "Named instrument-pool preset. Repeatable or comma-separated. "
+            "Available: " + ", ".join(INSTRUMENT_POOL_PRESET_NAMES) + "."
+        ),
     )
     play_hand_lab.add_argument(
         "--indicator",
@@ -342,6 +353,7 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 tasks_per_lane=args.tasks_per_lane,
                 timeframe=args.timeframe,
                 instrument=args.instrument,
+                instrument_pool_preset=args.instrument_pool_preset,
                 instrument_pool=args.instrument_pool,
                 indicator=args.indicator,
                 profile_path=args.profile_path,

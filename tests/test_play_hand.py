@@ -11,6 +11,10 @@ import pytest
 import autoresearch.play_hand as play_hand_mod
 
 from autoresearch.play_hand import (
+    ALL_INSTRUMENT_POOL,
+    CRYPTO_INSTRUMENT_POOL,
+    FX_MAJOR_INSTRUMENT_POOL,
+    METALS_INSTRUMENT_POOL,
     PlayHandContext,
     _best_sweep_parameters,
     build_early_exit_decision,
@@ -49,6 +53,7 @@ from autoresearch.play_hand import (
     materialize_profile_variant,
     plan_sweep_axes,
     play_hand_reward_matrix,
+    resolve_instrument_pool_presets,
     resolve_sweep_budget,
 )
 from autoresearch.ledger import load_attempts, write_attempts
@@ -2899,6 +2904,32 @@ def test_deal_instruments_shuffles_from_pool_when_unpinned() -> None:
     assert dealt["primary_instrument"] in {"EURUSD", "GBPUSD", "XAUUSD"}
     assert dealt["instruments"] == [dealt["primary_instrument"]]
     assert dealt["instrument_pool"] == ["EURUSD", "GBPUSD", "XAUUSD"]
+
+
+def test_resolve_instrument_pool_preset_all_matches_catalog_trimmed_set() -> None:
+    pool = resolve_instrument_pool_presets(presets=["all"], instrument_pool=None)
+
+    assert pool == list(ALL_INSTRUMENT_POOL)
+    assert len(pool or []) == 45
+
+
+def test_resolve_instrument_pool_presets_union_multiple_sets_and_explicit_symbols() -> None:
+    pool = resolve_instrument_pool_presets(
+        presets=["fx-major,metals", "crypto"],
+        instrument_pool=["EURUSD", "US500"],
+    )
+
+    assert pool == [
+        *FX_MAJOR_INSTRUMENT_POOL,
+        *METALS_INSTRUMENT_POOL,
+        *CRYPTO_INSTRUMENT_POOL,
+        "US500",
+    ]
+
+
+def test_resolve_instrument_pool_presets_rejects_unknown_name() -> None:
+    with pytest.raises(ValueError, match="Unknown instrument pool preset"):
+        resolve_instrument_pool_presets(presets=["everything"], instrument_pool=None)
 
 
 def _scout_record(instrument: str, score: float, equity_values: list[float]) -> dict:
