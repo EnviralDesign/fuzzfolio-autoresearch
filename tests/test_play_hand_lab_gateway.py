@@ -744,8 +744,12 @@ def test_build_parser_accepts_play_hand_massive_v2_aliases() -> None:
     args = parser.parse_args(
         [
             "play-hand-massive-v2",
-            "--lanes",
+            "--target-runs",
             "12",
+            "--active-runs",
+            "3",
+            "--mode",
+            "finite",
             "--instrument-pool-preset",
             "fx",
             "--instrument-pool-set",
@@ -754,9 +758,14 @@ def test_build_parser_accepts_play_hand_massive_v2_aliases() -> None:
         ]
     )
     assert args.command == "play-hand-massive-v2"
-    assert args.lanes == 12
+    assert args.target_runs == 12
+    assert args.active_runs == 3
+    assert args.mode == "finite"
     assert args.instrument_pool_preset == ["fx", "metals,crypto"]
     assert args.json is True
+
+    args = parser.parse_args(["play-hand-massive-v2", "--lanes", "12"])
+    assert args.target_runs == 12
 
     args = parser.parse_args(["play-hand-massive-v2-gateway", "--port", "8799"])
     assert args.command == "play-hand-massive-v2-gateway"

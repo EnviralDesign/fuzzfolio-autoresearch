@@ -87,7 +87,7 @@ Play Hand defaults are tuned for long unattended runs: deep-replay jobs can wait
 
 Play Hand Massive v2 is the lab gateway path: in-memory queue, in-memory worker registry, no Redis/Appwrite/backend hot path, and no shards. In the AutoResearch process manager, start **play hand massive v2 - lab gateway** before starting a v2 coordinator.
 
-When the gateway binds outside loopback, it uses `--token`, `FUZZFOLIO_LAB_GATEWAY_TOKEN`, or the per-user `FUZZFOLIO_LAB_GATEWAY_TOKEN_FILE` fallback. Deep-replay v2 runs require `--tasks-per-lane 1`; scale by increasing `--lanes` so each worker task maps to a distinct generated profile.
+When the gateway binds outside loopback, it uses `--token`, `FUZZFOLIO_LAB_GATEWAY_TOKEN`, or the per-user `FUZZFOLIO_LAB_GATEWAY_TOKEN_FILE` fallback. Deep-replay v2 runs require `--tasks-per-lane 1`; scale finite campaigns with `--target-runs` and keep worker pressure bounded with `--active-runs`. The legacy `--lanes` flag remains as an alias for `--target-runs`.
 
 When `--instrument-pool-preset` is omitted, v2 uses the existing Play Hand default pool and still allows seed-template instrument narrowing. Named presets can be repeated or comma-separated: `core/default`, `fx`, `fx-major`, `fx-minor`, `metals`, `energies`, `indices`, `crypto`, `commodities`, `cfds`, and `all`. The `all` preset tracks the trimmed FuzzFolio Dukascopy constants set: all FX plus selected metals, energies, indices, and crypto.
 
@@ -96,8 +96,10 @@ Deep-replay worker completions must also be scoreable. If the coordinator cannot
 Safe starting point:
 
 ```powershell
-uv run play-hand-massive-v2 --task-mode deep_replay --lanes 16 --tasks-per-lane 1 --json
+uv run play-hand-massive-v2 --mode finite --task-mode deep_replay --target-runs 128 --active-runs 32 --tasks-per-lane 1 --json
 ```
+
+Use `--mode continuous --active-runs N` for a run-until-stopped campaign. Continuous mode keeps replacing completed runs until the process is stopped; interrupted lane folders are expected and can be cleaned with the incomplete-run cleanup tool.
 
 The old `play-hand-massive` command is v1 legacy and still uses the FuzzFolio worker gateway. It should not be used for high-scale research runs; keep it only for compatibility while v2 finishes taking over the operational surface.
 

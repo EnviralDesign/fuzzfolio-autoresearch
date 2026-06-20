@@ -96,6 +96,32 @@ def test_normalize_runtime_resolves_instrument_pool_presets() -> None:
     ]
 
 
+def test_normalize_runtime_uses_target_and_active_runs() -> None:
+    runtime = lab._normalize_runtime(
+        lab.PlayHandLabRuntimeConfig(
+            campaign_mode="finite",
+            target_runs=512,
+            active_runs=64,
+            lanes=4,
+        )
+    )
+
+    assert runtime.campaign_mode == "finite"
+    assert runtime.target_runs == 512
+    assert runtime.active_runs == 64
+    assert runtime.lanes == 512
+
+
+def test_normalize_runtime_continuous_has_no_target_by_default() -> None:
+    runtime = lab._normalize_runtime(
+        lab.PlayHandLabRuntimeConfig(campaign_mode="continuous")
+    )
+
+    assert runtime.campaign_mode == "continuous"
+    assert runtime.target_runs is None
+    assert runtime.active_runs == lab.DEFAULT_LAB_ACTIVE_RUNS
+
+
 class _IndicatorIndexCli:
     def __init__(self, ids: list[str]):
         self.ids = ids
@@ -475,6 +501,118 @@ def test_play_hand_lab_fake_compute_writes_lane_attempts(
         assert len(attempts) == 2
         assert {attempt["generated_by_runner"] for attempt in attempts} == {lab.PLAY_HAND_LAB_RUNNER}
         assert {attempt["attempt_role"] for attempt in attempts} == {"lab_smoke"}
+
+
+def test_play_hand_lab_rolls_finite_runs_with_active_run_limit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    fake_config = _test_config(tmp_path)
+
+    class FakeCli:
+        def __init__(self, _config):
+            self.config = _config
+
+    class FakeGateway:
+        enqueue_batches: list[int] = []
+
+        def __init__(self, *, base_url: str, token: str | None = None):
+            self.base_url = base_url
+            self.token = token
+            self.tasks: list[dict] = []
+            self.results: list[dict] = []
+
+        def health(self) -> dict:
+            return {"ok": True}
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            self.enqueue_batches.append(len(tasks))
+            start = len(self.tasks)
+            self.tasks.extend(tasks)
+            self.results.extend(
+                {
+                    "task_id": task["task_id"],
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "success",
+                    "worker_id": "fake-worker",
+                    "lease_id": f"lease-{start + index}",
+                    "result": {
+                        "job_id": task["task_id"],
+                        "status": "success",
+                        "result": {
+                            "task_id": task["task_id"],
+                            "task_kind": "fake_compute",
+                            "work_seconds": task["payload"]["work_seconds"],
+                        },
+                    },
+                }
+                for index, task in enumerate(tasks)
+            )
+            return {"enqueued": len(tasks)}
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            return self.results[:1]
+
+        def ack_results(self, lease_ids: list[str]) -> int:
+            requested = set(lease_ids)
+            before = len(self.results)
+            self.results = [
+                result for result in self.results if result.get("lease_id") not in requested
+            ]
+            return before - len(self.results)
+
+        def snapshot(self) -> dict:
+            return {
+                "ok": True,
+                "completed_tasks": len(self.tasks) - len(self.results),
+                "queued_tasks": len(self.results),
+                "metrics": {},
+            }
+
+    FakeGateway.enqueue_batches = []
+    monkeypatch.setattr(lab, "load_config", lambda: fake_config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", FakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", FakeGateway)
+
+    exit_code = lab.cmd_play_hand_lab(
+        lab.PlayHandLabRuntimeConfig(
+            gateway_url="http://127.0.0.1:8799",
+            task_mode="fake_compute",
+            target_runs=5,
+            active_runs=2,
+            tasks_per_lane=1,
+            indicator=["RSI"],
+            profile_path=profile_path,
+            fake_work_seconds=0.0,
+            poll_interval_seconds=0.01,
+            max_wait_seconds=2.0,
+        )
+    )
+
+    assert exit_code == 0
+    assert FakeGateway.enqueue_batches[0] == 2
+    assert max(FakeGateway.enqueue_batches) <= 2
+    assert sum(FakeGateway.enqueue_batches) == 5
+
+    campaign_dir = next(
+        (fake_config.runs_root / "derived" / lab.PLAY_HAND_LAB_CAMPAIGNS_DIR).glob(
+            "*-playhand-lab-campaign-v1"
+        )
+    )
+    summary = json.loads(
+        (campaign_dir / "play-hand-lab-campaign-summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert summary["campaign_mode"] == "finite"
+    assert summary["target_runs"] == 5
+    assert summary["active_runs"] == 2
+    assert summary["lane_count"] == 5
+    assert summary["total_tasks"] == 5
+    assert summary["completed_tasks"] == 5
 
 
 def test_play_hand_lab_refreshes_gateway_snapshot_after_final_result(

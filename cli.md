@@ -59,7 +59,8 @@ Common arguments:
 
 ```powershell
 uv run play-hand-massive-v2-gateway
-uv run play-hand-massive-v2 --task-mode deep_replay --lanes 16 --tasks-per-lane 1 --json
+uv run play-hand-massive-v2 --mode finite --task-mode deep_replay --target-runs 128 --active-runs 32 --tasks-per-lane 1 --json
+uv run play-hand-massive-v2 --mode continuous --task-mode deep_replay --active-runs 64 --tasks-per-lane 1 --json
 uv run play-hand-massive-v2-sim --workers 1000 --json
 uv run play-hand-massive-v2-ws-sim --workers 1000 --json
 ```
@@ -72,8 +73,10 @@ Common arguments:
 
 - `--gateway-url`, `--gateway-token`: lab gateway connection details.
 - `--token`: gateway bearer token. Non-loopback gateway binds auto-create/read `FUZZFOLIO_LAB_GATEWAY_TOKEN_FILE` when neither `--token` nor `FUZZFOLIO_LAB_GATEWAY_TOKEN` is set.
+- `--mode`: `finite` drains and exits after `--target-runs`; `continuous` replaces completed runs until stopped.
 - `--task-mode`: `deep_replay` or `fake_compute`.
-- `--lanes`: independent Play Hand lanes.
+- `--target-runs`: total candidate run folders to create in finite mode. `--lanes` remains a compatibility alias.
+- `--active-runs`: candidate runs kept in flight at once.
 - `--tasks-per-lane`: replay tasks queued for each lane.
 - `--instrument-pool-preset`: named pool preset to deal across lanes. Repeat or comma-separate values such as `fx,metals`, `crypto`, or `all`.
 - `--instrument-pool`: explicit comma-separated or repeatable instruments to add to the resolved pool.

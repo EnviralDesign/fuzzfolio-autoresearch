@@ -64,7 +64,26 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         default="deep_replay",
         help="Task kind to enqueue. Default: deep_replay.",
     )
-    play_hand_lab.add_argument("--lanes", type=int, default=4, help="Independent PlayHand lanes. Default: 4.")
+    play_hand_lab.add_argument(
+        "--mode",
+        choices=["finite", "continuous"],
+        default="finite",
+        help="Campaign mode. finite exits after --target-runs drain; continuous replaces completed runs until stopped.",
+    )
+    play_hand_lab.add_argument(
+        "--target-runs",
+        "--lanes",
+        dest="target_runs",
+        type=int,
+        default=None,
+        help="Total candidate run folders to create in finite mode. --lanes is a compatibility alias. Default: 4.",
+    )
+    play_hand_lab.add_argument(
+        "--active-runs",
+        type=int,
+        default=None,
+        help="Candidate runs to keep in flight at once. Defaults to min(target-runs, 64).",
+    )
     play_hand_lab.add_argument(
         "--tasks-per-lane",
         type=int,
@@ -348,8 +367,11 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
             PlayHandLabRuntimeConfig(
                 gateway_url=args.gateway_url,
                 gateway_token=args.gateway_token,
+                campaign_mode=args.mode,
                 task_mode=args.task_mode,
-                lanes=args.lanes,
+                target_runs=args.target_runs,
+                active_runs=args.active_runs,
+                lanes=args.target_runs or 4,
                 tasks_per_lane=args.tasks_per_lane,
                 timeframe=args.timeframe,
                 instrument=args.instrument,
