@@ -1,8 +1,10 @@
 import asyncio
+import json
 import threading
 
 import pytest
 import requests
+from websockets.asyncio.client import connect as websocket_connect
 from autoresearch.__main__ import build_parser
 from autoresearch.play_hand_lab_gateway import (
     LabGatewayConfig,
@@ -12,6 +14,7 @@ from autoresearch.play_hand_lab_gateway import (
     WebSocketSaturationSimulationConfig,
     build_lab_gateway_http_server,
     cmd_play_hand_lab_gateway,
+    _start_uvicorn_gateway_thread,
     run_http_saturation_simulation_sync,
     run_saturation_simulation,
     HttpSaturationSimulationConfig,
@@ -99,6 +102,32 @@ def test_lab_gateway_failed_result_payload_sets_top_level_failed_status() -> Non
     assert snapshot["completed_tasks"] == 0
     assert snapshot["failed_tasks"] == 1
     assert results[0]["status"] == "failed"
+
+
+def test_lab_gateway_sweep_claim_exposes_resolved_profile_snapshot() -> None:
+    profile_snapshot = {"name": "base", "indicators": [{"id": "RSI"}]}
+    gateway = PlayHandLabGateway()
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            task_kind="sweep_shard",
+            payload={
+                "shard_id": "shard-1",
+                "base_profile_snapshot": profile_snapshot,
+                "required_capabilities": ["deep_replay", "sweep_shard"],
+            },
+            required_worker_capabilities={"deep_replay", "sweep_shard"},
+        )
+    )
+    gateway.register_worker("worker-1", capabilities=["deep_replay", "sweep_shard"])
+
+    claim = gateway.claim("worker-1", capabilities=["deep_replay", "sweep_shard"])
+
+    assert claim["status"] == "leased"
+    assert claim["task"]["payload"]["base_profile_snapshot"] == profile_snapshot
+    assert claim["task"]["resolved_profile_snapshot"] == profile_snapshot
 
 
 def test_lab_gateway_requeues_retryable_failure_until_cap() -> None:
@@ -674,6 +703,42 @@ def test_websocket_saturation_simulation_measures_persistent_worker_path() -> No
     assert result["snapshot"]["completed_tasks"] >= 24
     assert result["claim_latency_p95_ms"] > 0
     assert result["completion_latency_p95_ms"] > 0
+
+
+def test_lab_gateway_websocket_rejects_query_token_auth() -> None:
+    gateway = PlayHandLabGateway()
+    server, thread, base_url = _start_uvicorn_gateway_thread(gateway, token="secret")
+    ws_url = base_url.replace("http://", "ws://", 1) + "/ws"
+
+    async def run_probe() -> None:
+        with pytest.raises(Exception):
+            async with websocket_connect(f"{ws_url}?token=secret", open_timeout=5, ping_interval=None):
+                pass
+
+        async with websocket_connect(
+            ws_url,
+            additional_headers={"Authorization": "Bearer secret"},
+            open_timeout=5,
+            ping_interval=None,
+        ) as websocket:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "register",
+                        "worker_id": "worker-1",
+                        "pool": "ws-test",
+                        "slots": 1,
+                    }
+                )
+            )
+            response = json.loads(await websocket.recv())
+            assert response["status"] == "registered"
+
+    try:
+        asyncio.run(run_probe())
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
 
 
 def test_build_parser_accepts_play_hand_lab_sim_defaults() -> None:

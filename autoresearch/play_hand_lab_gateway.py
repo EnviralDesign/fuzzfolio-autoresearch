@@ -186,9 +186,19 @@ class LabLease:
     progress: dict[str, Any] | None = None
 
     def to_payload(self, task: LabTask) -> dict[str, Any]:
+        task_payload = task.to_payload()
+        raw_task_payload = task_payload.get("payload")
+        if isinstance(raw_task_payload, dict):
+            resolved_profile = raw_task_payload.get("resolved_profile_snapshot")
+            if not isinstance(resolved_profile, dict):
+                resolved_profile = raw_task_payload.get("inline_profile_snapshot")
+            if not isinstance(resolved_profile, dict):
+                resolved_profile = raw_task_payload.get("base_profile_snapshot")
+            if isinstance(resolved_profile, dict):
+                task_payload["resolved_profile_snapshot"] = dict(resolved_profile)
         return {
             "lease_id": self.lease_id,
-            "task": task.to_payload(),
+            "task": task_payload,
             "task_id": self.task_id,
             "lane_id": task.lane_id,
             "attempt_id": task.attempt_id,
@@ -1066,16 +1076,14 @@ class LabGatewayAsgiApp:
 
     async def _handle_websocket(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         path = str(scope.get("path") or "/").rstrip("/") or "/"
-        query = parse_qs(bytes(scope.get("query_string") or b"").decode("utf-8"))
         headers = {
             bytes(key).decode("latin-1").lower(): bytes(value).decode("latin-1")
             for key, value in scope.get("headers", [])
         }
-        query_token = query.get("token", [None])[0]
         if path != "/ws":
             await send({"type": "websocket.close", "code": 1008})
             return
-        if not self._authorized(headers.get("authorization"), query_token=query_token):
+        if not self._authorized(headers.get("authorization")):
             await send({"type": "websocket.close", "code": 1008})
             return
         await send({"type": "websocket.accept"})
@@ -1175,12 +1183,10 @@ class LabGatewayAsgiApp:
             return result
         return {"type": "error", "error": f"unsupported_message_type:{message_type}"}
 
-    def _authorized(self, authorization: str | None, *, query_token: str | None = None) -> bool:
+    def _authorized(self, authorization: str | None) -> bool:
         if not self.token:
             return True
-        return hmac.compare_digest(str(authorization or ""), f"Bearer {self.token}") or hmac.compare_digest(
-            str(query_token or ""), self.token
-        )
+        return hmac.compare_digest(str(authorization or ""), f"Bearer {self.token}")
 
     async def _read_json(self, receive: Any) -> dict[str, Any]:
         chunks: list[bytes] = []
@@ -1563,7 +1569,7 @@ async def run_websocket_saturation_simulation(config: WebSocketSaturationSimulat
         )
     )
     server, server_thread, base_url = _start_uvicorn_gateway_thread(gateway, token=config.token)
-    ws_url = base_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1) + f"/ws?token={config.token}"
+    ws_url = base_url.replace("http://", "ws://", 1).replace("https://", "wss://", 1) + "/ws"
     headers = {"Authorization": f"Bearer {config.token}"}
     stop = asyncio.Event()
     completed_lock = asyncio.Lock()

@@ -122,6 +122,80 @@ def test_normalize_runtime_continuous_has_no_target_by_default() -> None:
     assert runtime.active_runs == lab.DEFAULT_LAB_ACTIVE_RUNS
 
 
+def test_expand_sweep_params_enforces_permutation_budget() -> None:
+    axes = [
+        {"target": "profile_field", "param_key": "alpha", "values": list(range(100))},
+        {"target": "profile_field", "param_key": "beta", "values": list(range(100))},
+    ]
+
+    params = lab._expand_sweep_params(axes, max_permutations=8)
+
+    assert len(params) == 8
+    assert params[0] == {"alpha": 0, "beta": 0}
+    assert params[-1] == {"alpha": 99, "beta": 99}
+
+
+def test_make_sweep_shard_tasks_honors_permutation_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_payload = {"indicators": [{"meta": {"instanceId": "indicator-1"}}]}
+    axis_texts = [
+        "indicator[0].talib.fast=1,2,3,4,5,6,7,8,9,10",
+        "indicator[0].talib.slow=10,20,30,40,50,60,70,80,90,100",
+        "indicator[0].config.threshold=0.1,0.2,0.3,0.4,0.5",
+    ]
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="run-1",
+        run_dir=tmp_path,
+        profile_path=tmp_path / "base.json",
+        profile_payload=profile_payload,
+        profile_ref="lab-inline:run-1:lane_000",
+        instruments=["EURUSD"],
+        timeframe="M5",
+    )
+
+    axis_plan = SimpleNamespace(
+        axes=axis_texts,
+        selected_permutations=500,
+        event_payload=lambda: {
+            "selected_axes": axis_texts,
+            "selected_permutations": 500,
+            "max_permutations": 16,
+            "search_mode": "evolutionary",
+        },
+    )
+    monkeypatch.setattr(lab, "plan_sweep_axes", lambda *args, **kwargs: axis_plan)
+
+    tasks = lab._make_sweep_shard_tasks(
+        lane,
+        phase="coarse_probe",
+        runtime=lab.PlayHandLabRuntimeConfig(
+            max_sweep_permutations=16,
+            sweep_shard_size=4,
+            worker_contract_hash="sha256:" + "a" * 64,
+        ),
+        reward_matrix=None,
+        worker_contract_hash="sha256:" + "a" * 64,
+        profile_payload=profile_payload,
+        profile_path=tmp_path / "base.json",
+        profile_ref="lab-inline:run-1:lane_000",
+        instruments=["EURUSD"],
+        lookback_months=3,
+        axis_texts=axis_texts,
+        mode="evolutionary",
+    )
+
+    assert len(tasks) == 4
+    assert sum(int(task["payload"]["permutation_count"]) for task in tasks) == 16
+    assert max(len(task["payload"]["params_by_index"]) for task in tasks) == 4
+    first_spec = lane.task_specs[tasks[0]["task_id"]]
+    assert first_spec["permutation_budget_applied"] is True
+    assert first_spec["expanded_permutation_count"] == 16
+
+
 class _IndicatorIndexCli:
     def __init__(self, ids: list[str]):
         self.ids = ids
@@ -1239,3 +1313,290 @@ def test_play_hand_lab_fails_fast_when_gateway_result_read_dies(
     assert summary["status"] == "gateway_unreachable"
     assert summary["recorded_result_count"] == 0
     assert any(event["phase"] == "gateway" and event["status"] == "result_read_failed" for event in events)
+
+
+def test_play_hand_lab_pipeline_early_exits_after_bad_baseline(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    fake_config = _test_config(tmp_path)
+
+    class FakeCli:
+        def __init__(self, _config):
+            self.config = _config
+
+    class FakeGateway:
+        def __init__(self, *, base_url: str, token: str | None = None):
+            self.base_url = base_url
+            self.token = token
+            self.tasks: list[dict] = []
+            self.results: list[dict] = []
+
+        def health(self) -> dict:
+            return {"ok": True}
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            start = len(self.tasks)
+            self.tasks.extend(tasks)
+            for index, task in enumerate(tasks):
+                self.results.append(
+                    {
+                        "task_id": task["task_id"],
+                        "lane_id": task["lane_id"],
+                        "attempt_id": task["attempt_id"],
+                        "status": "success",
+                        "worker_id": "fake-worker",
+                        "lease_id": f"lease-{start + index}",
+                        "result": {
+                            "job_id": task["task_id"],
+                            "status": "success",
+                            "result": {"aggregate": {"score_lab": {"score": -1.0}}},
+                        },
+                    }
+                )
+            return {"enqueued": len(tasks)}
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            return self.results[:limit]
+
+        def ack_results(self, lease_ids: list[str]) -> int:
+            requested = set(lease_ids)
+            before = len(self.results)
+            self.results = [result for result in self.results if result.get("lease_id") not in requested]
+            return before - len(self.results)
+
+        def snapshot(self) -> dict:
+            return {
+                "ok": True,
+                "completed_tasks": len(self.tasks) - len(self.results),
+                "queued_tasks": len(self.results),
+                "metrics": {},
+            }
+
+    def fake_score_lab_artifact(*, cli, artifact_dir, strict):
+        return (
+            lab.AttemptScore(
+                primary_score=-1.0,
+                composite_score=-1.0,
+                score_basis="test",
+                metrics={"score_lab": -1.0},
+                best_summary={"score_lab": {"score": -1.0}},
+            ),
+            None,
+        )
+
+    monkeypatch.setattr(lab, "load_config", lambda: fake_config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", FakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", FakeGateway)
+    monkeypatch.setattr(lab, "_worker_ready_profile_snapshot", lambda profile, **_kwargs: profile)
+    monkeypatch.setattr(lab, "_score_lab_artifact", fake_score_lab_artifact)
+
+    exit_code = lab.cmd_play_hand_lab(
+        lab.PlayHandLabRuntimeConfig(
+            gateway_url="http://127.0.0.1:8799",
+            task_mode="deep_replay",
+            pipeline_mode="play_hand",
+            target_runs=1,
+            active_runs=1,
+            profile_path=profile_path,
+            poll_interval_seconds=0.01,
+            max_wait_seconds=2.0,
+            worker_contract_hash="sha256:" + "a" * 64,
+        )
+    )
+
+    assert exit_code == 0
+    lane_dir = next(fake_config.runs_root.glob("*-playhand-lab-lane-*-v1"))
+    metadata = json.loads((lane_dir / "run-metadata.json").read_text(encoding="utf-8"))
+    attempts = [
+        json.loads(line)
+        for line in (lane_dir / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert metadata["run_status"] == "tombstoned"
+    assert metadata["tombstone_reason"] == lab.PLAY_HAND_EARLY_EXIT_TOMBSTONE_REASON
+    assert metadata["completed_task_count"] == 1
+    assert metadata["play_hand_phase_scores"]["baseline"] == -1.0
+    assert len(attempts) == 1
+
+
+def test_play_hand_lab_pipeline_promotes_good_lane_with_sweep_shards(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    fake_config = _test_config(tmp_path)
+
+    class FakeCli:
+        def __init__(self, _config):
+            self.config = _config
+
+    class FakeGateway:
+        enqueue_batches: list[list[str]] = []
+
+        def __init__(self, *, base_url: str, token: str | None = None):
+            self.base_url = base_url
+            self.token = token
+            self.tasks: list[dict] = []
+            self.results: list[dict] = []
+
+        def health(self) -> dict:
+            return {"ok": True}
+
+        def _score_for_task(self, task: dict, offset: int = 0) -> float:
+            task_id = str(task["task_id"])
+            if "baseline_3mo" in task_id:
+                return 60.0
+            if "lookback_timing" in task_id:
+                return 62.0 + offset
+            if "coarse_probe" in task_id:
+                return 66.0 + offset
+            if "coarse_expand" in task_id:
+                return 68.0 + offset
+            if "focused" in task_id:
+                return 70.0 + offset
+            if "instrument_scout" in task_id:
+                return 58.0 + offset
+            if "final_36mo" in task_id:
+                return 72.0
+            return 55.0
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            self.enqueue_batches.append([str(task.get("task_kind")) for task in tasks])
+            start = len(self.tasks)
+            self.tasks.extend(tasks)
+            for index, task in enumerate(tasks):
+                task_kind = str(task.get("task_kind"))
+                if task_kind == "sweep_shard":
+                    params_by_index = dict((task.get("payload") or {}).get("params_by_index") or {})
+                    permutation_results = []
+                    for raw_index, params in params_by_index.items():
+                        permutation_index = int(raw_index)
+                        score = self._score_for_task(task, offset=permutation_index % 3)
+                        permutation_results.append(
+                            {
+                                "permutation_index": permutation_index,
+                                "child_job_id": f"{task['task_id']}-{permutation_index}",
+                                "status": "success",
+                                "parameters": dict(params),
+                                "result": {"aggregate": {"score_lab": {"score": score}}},
+                                "completed_at": "2026-06-20T00:00:00Z",
+                            }
+                        )
+                    worker_result = {
+                        "job_id": task["task_id"],
+                        "status": "success",
+                        "result": {
+                            "shard_id": (task.get("payload") or {}).get("shard_id"),
+                            "sweep_id": (task.get("payload") or {}).get("sweep_id"),
+                            "status": "success",
+                            "started_at": "2026-06-20T00:00:00Z",
+                            "completed_at": "2026-06-20T00:00:01Z",
+                            "permutation_results": permutation_results,
+                            "failed_permutations": [],
+                            "worker_attribution": {},
+                        },
+                    }
+                else:
+                    score = self._score_for_task(task)
+                    worker_result = {
+                        "job_id": task["task_id"],
+                        "status": "success",
+                        "result": {"aggregate": {"score_lab": {"score": score}}},
+                    }
+                self.results.append(
+                    {
+                        "task_id": task["task_id"],
+                        "lane_id": task["lane_id"],
+                        "attempt_id": task["attempt_id"],
+                        "status": "success",
+                        "worker_id": "fake-worker",
+                        "lease_id": f"lease-{start + index}",
+                        "result": worker_result,
+                    }
+                )
+            return {"enqueued": len(tasks)}
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            return self.results[:limit]
+
+        def ack_results(self, lease_ids: list[str]) -> int:
+            requested = set(lease_ids)
+            before = len(self.results)
+            self.results = [result for result in self.results if result.get("lease_id") not in requested]
+            return before - len(self.results)
+
+        def snapshot(self) -> dict:
+            return {
+                "ok": True,
+                "completed_tasks": len(self.tasks) - len(self.results),
+                "queued_tasks": len(self.results),
+                "metrics": {},
+            }
+
+    def fake_score_lab_artifact(*, cli, artifact_dir, strict):
+        path = str(artifact_dir)
+        score = 60.0
+        if "instrument_scout" in path:
+            score = 58.0
+        if "final_36mo" in path:
+            score = 72.0
+        return (
+            lab.AttemptScore(
+                primary_score=score,
+                composite_score=score,
+                score_basis="test",
+                metrics={"score_lab": score},
+                best_summary={"score_lab": {"score": score}},
+            ),
+            None,
+        )
+
+    FakeGateway.enqueue_batches = []
+    monkeypatch.setattr(lab, "load_config", lambda: fake_config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", FakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", FakeGateway)
+    monkeypatch.setattr(lab, "_worker_ready_profile_snapshot", lambda profile, **_kwargs: profile)
+    monkeypatch.setattr(lab, "_score_lab_artifact", fake_score_lab_artifact)
+
+    exit_code = lab.cmd_play_hand_lab(
+        lab.PlayHandLabRuntimeConfig(
+            gateway_url="http://127.0.0.1:8799",
+            task_mode="deep_replay",
+            pipeline_mode="play_hand",
+            target_runs=1,
+            active_runs=1,
+            profile_path=profile_path,
+            max_sweep_permutations=4,
+            coarse_probe_budget=2,
+            sweep_shard_size=2,
+            instrument_scout_size=1,
+            instrument_scout_max_selected=1,
+            poll_interval_seconds=0.01,
+            max_wait_seconds=5.0,
+            worker_contract_hash="sha256:" + "a" * 64,
+        )
+    )
+
+    assert exit_code == 0
+    assert any("sweep_shard" in batch for batch in FakeGateway.enqueue_batches)
+
+    lane_dir = next(fake_config.runs_root.glob("*-playhand-lab-lane-*-v1"))
+    metadata = json.loads((lane_dir / "run-metadata.json").read_text(encoding="utf-8"))
+    attempts = [
+        json.loads(line)
+        for line in (lane_dir / "attempts.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert metadata["run_status"] == "promoted"
+    assert metadata["final_scrutiny_passed"] is True
+    assert metadata["final_scrutiny_score"] == 72.0
+    assert metadata["completed_task_count"] > 1
+    assert "coarse_halving" in metadata
+    assert {"baseline", "lookback_top_3mo", "coarse_top_3mo", "final_36mo"} <= set(
+        metadata["play_hand_phase_scores"]
+    )
+    assert any(attempt["lab_task_kind"] == "sweep_shard" for attempt in attempts)

@@ -65,6 +65,12 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         help="Task kind to enqueue. Default: deep_replay.",
     )
     play_hand_lab.add_argument(
+        "--pipeline-mode",
+        choices=["screen", "play_hand"],
+        default="play_hand",
+        help="Lane lifecycle. play_hand runs staged baseline/sweep/scout/final; screen runs one replay.",
+    )
+    play_hand_lab.add_argument(
         "--mode",
         choices=["finite", "continuous"],
         default="finite",
@@ -155,6 +161,60 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         type=float,
         default=None,
         help="Optional max reward R for the replay reward matrix.",
+    )
+    play_hand_lab.add_argument(
+        "--sweep-budget",
+        choices=["low", "medium", "high"],
+        default="high",
+        help="PlayHand sweep budget preset. Default: high.",
+    )
+    play_hand_lab.add_argument(
+        "--max-sweep-permutations",
+        type=int,
+        default=None,
+        help="Override PlayHand sweep permutation budget.",
+    )
+    play_hand_lab.add_argument(
+        "--sweep-shard-size",
+        type=int,
+        default=8,
+        help="Permutations per lab sweep-shard task. Default: 8.",
+    )
+    play_hand_lab.add_argument(
+        "--early-exit-mode",
+        choices=["off", "report", "enforce"],
+        default="enforce",
+        help="PlayHand early-exit policy. Default: enforce.",
+    )
+    play_hand_lab.add_argument(
+        "--coarse-halving-mode",
+        choices=["off", "enforce"],
+        default="enforce",
+        help="Run a coarse probe before full expansion. Default: enforce.",
+    )
+    play_hand_lab.add_argument(
+        "--coarse-probe-budget",
+        type=int,
+        default=128,
+        help="Permutation budget for the coarse probe. Default: 128.",
+    )
+    play_hand_lab.add_argument(
+        "--scrutiny-months",
+        type=int,
+        default=36,
+        help="Final scrutiny lookback months. Default: 36.",
+    )
+    play_hand_lab.add_argument(
+        "--instrument-scout-size",
+        type=int,
+        default=5,
+        help="Additional instruments to scout before final scrutiny. Default: 5.",
+    )
+    play_hand_lab.add_argument(
+        "--instrument-scout-max-selected",
+        type=int,
+        default=3,
+        help="Maximum instruments selected by scout. Default: 3.",
     )
     play_hand_lab.add_argument(
         "--fake-work-seconds",
@@ -369,6 +429,7 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 gateway_token=args.gateway_token,
                 campaign_mode=args.mode,
                 task_mode=args.task_mode,
+                pipeline_mode=args.pipeline_mode,
                 target_runs=args.target_runs,
                 active_runs=args.active_runs,
                 lanes=args.target_runs or 4,
@@ -385,6 +446,15 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 lookback_months=args.lookback_months,
                 bar_limit=args.bar_limit,
                 max_reward_r=args.max_reward_r,
+                sweep_budget=args.sweep_budget,
+                max_sweep_permutations=args.max_sweep_permutations,
+                sweep_shard_size=args.sweep_shard_size,
+                early_exit_mode=args.early_exit_mode,
+                coarse_halving_mode=args.coarse_halving_mode,
+                coarse_probe_budget=args.coarse_probe_budget,
+                scrutiny_months=args.scrutiny_months,
+                instrument_scout_size=args.instrument_scout_size,
+                instrument_scout_max_selected=args.instrument_scout_max_selected,
                 fake_work_seconds=args.fake_work_seconds,
                 deadline_seconds=args.deadline_seconds,
                 max_attempts=args.max_attempts,
