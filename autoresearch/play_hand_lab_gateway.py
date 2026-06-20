@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
+import ipaddress
 import json
 import math
 import os
@@ -43,6 +44,33 @@ def _string_list(value: Any) -> list[str]:
     if isinstance(value, (list, tuple, set)):
         return [str(item) for item in value if str(item)]
     return []
+
+
+def _parse_bool(value: Any, *, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = str(host or "").strip().lower()
+    if normalized in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    if normalized in {"", "0.0.0.0", "::", "*", "+"}:
+        return False
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
 
 
 def _worker_contract_fields(payload: dict[str, Any]) -> tuple[str | None, list[str]]:
@@ -830,7 +858,7 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
                     worker_id,
                     lease_id,
                     error=str(payload.get("error") or "worker_failed"),
-                    retryable=bool(payload.get("retryable", True)),
+                    retryable=_parse_bool(payload.get("retryable"), default=True),
                 )
                 status = HTTPStatus.NOT_FOUND if result.get("status") == "lease_lost" else HTTPStatus.OK
                 self._write_json(result, status=status)
@@ -1019,7 +1047,7 @@ class LabGatewayAsgiApp:
                         worker_id,
                         lease_id,
                         error=str(payload.get("error") or "worker_failed"),
-                        retryable=bool(payload.get("retryable", True)),
+                        retryable=_parse_bool(payload.get("retryable"), default=True),
                     )
                     status = 404 if result.get("status") == "lease_lost" else 200
                     await self._send_json(send, result, status=status)
@@ -1139,7 +1167,7 @@ class LabGatewayAsgiApp:
                 worker_id,
                 lease_id,
                 error=str(payload.get("error") or "worker_failed"),
-                retryable=bool(payload.get("retryable", True)),
+                retryable=_parse_bool(payload.get("retryable"), default=True),
             )
             result["type"] = "fail"
             return result
@@ -1278,6 +1306,8 @@ def cmd_play_hand_lab_gateway(
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
 ) -> int:
     token = token or os.environ.get("FUZZFOLIO_LAB_GATEWAY_TOKEN")
+    if not token and not _is_loopback_host(host):
+        raise RuntimeError("PlayHand Lab gateway requires --token or FUZZFOLIO_LAB_GATEWAY_TOKEN for non-loopback binds.")
     serve_lab_gateway(host=host, port=port, token=token, max_body_bytes=max_body_bytes)
     return 0
 

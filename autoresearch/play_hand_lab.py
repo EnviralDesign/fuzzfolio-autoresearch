@@ -215,6 +215,8 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         raise ValueError("--task-mode must be fake_compute or deep_replay")
     lanes = max(int(runtime.lanes), 1)
     tasks_per_lane = max(int(runtime.tasks_per_lane), 1)
+    if task_mode == "deep_replay" and tasks_per_lane != 1:
+        raise ValueError("Deep-replay lab mode requires --tasks-per-lane 1; increase --lanes for more work.")
     min_indicators = max(int(runtime.min_indicators), 1)
     max_indicators = max(int(runtime.max_indicators), min_indicators)
     lookback_months = max(int(runtime.lookback_months), 1)
@@ -1181,6 +1183,54 @@ def _add_recorded_result_sample(recorded_results: list[dict[str, Any]], recorded
         recorded_results.append(recorded)
 
 
+def _snapshot_metrics(snapshot: dict[str, Any] | None) -> dict[str, int]:
+    if not isinstance(snapshot, dict):
+        return {}
+    metrics = snapshot.get("metrics")
+    if not isinstance(metrics, dict):
+        return {}
+    output: dict[str, int] = {}
+    for key, value in metrics.items():
+        try:
+            output[str(key)] = int(value or 0)
+        except (TypeError, ValueError):
+            continue
+    return output
+
+
+def _metric_delta(snapshot: dict[str, Any] | None, baseline: dict[str, int], key: str) -> int:
+    metrics = _snapshot_metrics(snapshot)
+    return max(int(metrics.get(key, 0)) - int(baseline.get(key, 0)), 0)
+
+
+def _campaign_gateway_snapshot(
+    snapshot: dict[str, Any] | None,
+    *,
+    metric_baseline: dict[str, int],
+    lanes: list[LabLaneState],
+) -> dict[str, Any] | None:
+    if not isinstance(snapshot, dict):
+        return None
+    scoped = dict(snapshot)
+    raw_metrics = _snapshot_metrics(snapshot)
+    scoped["raw_metrics"] = dict(raw_metrics)
+    scoped["metrics"] = {
+        key: max(int(value) - int(metric_baseline.get(key, 0)), 0)
+        for key, value in raw_metrics.items()
+    }
+    for key in ("queued_tasks", "active_leases", "completed_tasks", "failed_tasks", "live_tasks", "result_backlog"):
+        if key in snapshot:
+            scoped[f"raw_{key}"] = snapshot.get(key)
+    total_tasks = sum(len(lane.task_ids) for lane in lanes)
+    completed_tasks = sum(len(lane.completed_task_ids) for lane in lanes)
+    failed_tasks = sum(len(lane.failed_task_ids) for lane in lanes)
+    scoped["total_tasks"] = total_tasks
+    scoped["completed_tasks"] = completed_tasks
+    scoped["failed_tasks"] = failed_tasks
+    scoped["live_tasks"] = max(total_tasks - completed_tasks - failed_tasks, 0)
+    return scoped
+
+
 def _write_summary(
     campaign_ctx: PlayHandContext,
     lanes: list[LabLaneState],
@@ -1382,6 +1432,12 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             print(json.dumps(summary, ensure_ascii=True, sort_keys=True))
         return 0
 
+    gateway_metric_baseline: dict[str, int] = {}
+    try:
+        gateway_metric_baseline = _snapshot_metrics(gateway.snapshot())
+    except requests.RequestException as exc:
+        _append_event(campaign_ctx, "gateway", "baseline_snapshot_failed", error=str(exc)[:500])
+
     enqueue_result = gateway.enqueue_tasks(tasks)
     _append_event(campaign_ctx, "gateway", "tasks_enqueued", enqueue_result=enqueue_result, task_count=len(tasks))
     for lane in lanes:
@@ -1430,6 +1486,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             gateway_unreachable = True
             _append_event(campaign_ctx, "gateway", "result_read_failed", error=str(exc)[:1000])
             break
+        ack_lease_ids: list[str] = []
         for lab_result in result_batch:
             task_id = str(lab_result.get("task_id") or "")
             lane = lanes_by_task.get(task_id)
@@ -1442,20 +1499,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     task_id=task_id,
                     lease_id=lease_id,
                 )
-                _safe_ack_gateway_results(
-                    gateway,
-                    campaign_ctx,
-                    lease_ids=[lease_id],
-                    task_id=task_id,
-                )
+                ack_lease_ids.append(lease_id)
                 continue
             if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
-                _safe_ack_gateway_results(
-                    gateway,
-                    campaign_ctx,
-                    lease_ids=[lease_id],
-                    task_id=task_id,
-                )
+                ack_lease_ids.append(lease_id)
                 continue
             recorded_successfully = False
             try:
@@ -1495,12 +1542,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 if runtime.strict_scoring:
                     raise
                 if recorded_successfully:
-                    _safe_ack_gateway_results(
-                        gateway,
-                        campaign_ctx,
-                        lease_ids=[lease_id],
-                        task_id=task_id,
-                    )
+                    ack_lease_ids.append(lease_id)
                     continue
                 failure_result = dict(lab_result)
                 original_result = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
@@ -1521,12 +1563,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 recorded_result_count += 1
                 _add_recorded_result_sample(recorded_results, recorded)
                 lane.failed_task_ids.add(task_id)
-            _safe_ack_gateway_results(
-                gateway,
-                campaign_ctx,
-                lease_ids=[lease_id],
-                task_id=task_id,
-            )
+            ack_lease_ids.append(lease_id)
             lane_terminal_count = len(lane.completed_task_ids) + len(lane.failed_task_ids)
             _write_lane_metadata(
                 lane,
@@ -1540,6 +1577,13 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     else "running"
                 ),
                 started_at=started_at,
+            )
+        if ack_lease_ids:
+            _safe_ack_gateway_results(
+                gateway,
+                campaign_ctx,
+                lease_ids=ack_lease_ids,
+                task_id="batch",
             )
         completed_count = sum(len(lane.completed_task_ids) for lane in lanes)
         failed_count = sum(len(lane.failed_task_ids) for lane in lanes)
@@ -1564,13 +1608,13 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 )
                 break
             metrics = last_snapshot.get("metrics") if isinstance(last_snapshot.get("metrics"), dict) else {}
-            if int(metrics.get("results_dropped") or 0) > 0:
+            if _metric_delta(last_snapshot, gateway_metric_baseline, "results_dropped") > 0:
                 result_loss_detected = True
                 _append_event(
                     campaign_ctx,
                     "gateway",
                     "result_loss_detected",
-                    results_dropped=int(metrics.get("results_dropped") or 0),
+                    results_dropped=_metric_delta(last_snapshot, gateway_metric_baseline, "results_dropped"),
                 )
                 break
         except requests.RequestException as exc:
@@ -1594,7 +1638,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     try:
         last_snapshot = gateway.snapshot()
         metrics = last_snapshot.get("metrics") if isinstance(last_snapshot.get("metrics"), dict) else {}
-        if int(metrics.get("results_dropped") or 0) > 0 and status == "completed":
+        if _metric_delta(last_snapshot, gateway_metric_baseline, "results_dropped") > 0 and status == "completed":
             status = "result_loss"
     except Exception as exc:
         _append_event(campaign_ctx, "gateway", "final_snapshot_failed", error=str(exc)[:500])
@@ -1605,7 +1649,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         status=status,
         started_at=started_at,
         completed_at=completed_at,
-        gateway_snapshot=last_snapshot,
+        gateway_snapshot=_campaign_gateway_snapshot(
+            last_snapshot,
+            metric_baseline=gateway_metric_baseline,
+            lanes=lanes,
+        ),
         recorded_results=recorded_results,
         recorded_result_count=recorded_result_count,
     )

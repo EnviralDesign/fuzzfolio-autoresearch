@@ -259,6 +259,7 @@ Any failure gate should produce a small reproduction artifact: config, worker co
 - The gateway state machine currently uses one process-local lock. This is acceptable only while loopback saturation remains healthy for realistic task durations. If the lock shows up as the first bottleneck, split claim/completion/result paths before adding features.
 - The result backlog is bounded. Dropped results increment `results_dropped`, and the coordinator treats observed result loss as a failed campaign status.
 - The coordinator does not retain all completed result summaries in memory. It writes full per-lane artifacts and keeps only a bounded campaign-summary sample.
+- The coordinator still prepares all lanes before enqueueing the first task. This is acceptable for the first cloud validation round, but if workers sit idle during lane prep, replace the up-front list build with a streaming producer that keeps a bounded worker-scaled backlog.
 - Coordinator-side result artifact/scoring/render persistence is still serial in v1. That is acceptable for initial real-compute smoke tests, but sustained cloud runs must watch result-drain time and stop if workers finish faster than the coordinator can durably record results.
 - Keepalive sidecars remain product-bootstrap oriented. They are useful for VM liveness, but lab worker health should be judged by gateway `/snapshot` worker and claim metrics.
 - Lab gateway request bodies default to 64 MiB and are configurable with `--max-body-mb`; large deep-replay completions should still be watched because body-size headroom is not a substitute for result-spooling design.
@@ -467,13 +468,19 @@ Observed and fixed during validation:
 - Product lease heartbeats could persist lab loop metadata as replay progress. Product lease heartbeats no longer receive shared-loop progress metadata.
 - Lab HTTP heartbeat handling ignored successful error-status bodies. It now re-registers on `worker_not_registered` and raises `LeaseLost` on `lease_lost`.
 - Lab worker bootstrap generation could prefer product gateway env vars in lab mode. Transport mode now decides whether lab or product env vars are used.
-- Lab transport files were part of the core replay worker contract hash. They are now excluded so lab protocol churn does not invalidate user-facing worker compatibility.
+- Lab transport files are part of the replay worker contract hash. Until the lab protocol has a separate negotiated compatibility version with stronger coverage, this prevents mixed lab worker images from silently accepting incompatible tasks.
 - Lab protocol compatibility was implicit. Lab workers now advertise `playhand_lab_protocol:playhand-lab-worker-v1`, and lab tasks require it.
 - Expired leases could be completed or renewed before the periodic reaper ran. Completion, heartbeat, result reads, and snapshots now reap/reject expired leases immediately.
 - VM/Lightning keepalive sidecars could ping the lab gateway for `/bootstrap.sh`. Generated commands and bootstrap scripts now carry `FUZZFOLIO_KEEPALIVE_TARGET_URL` so keepalive targets the product bootstrap endpoint.
 - Lab gateway body-size defaults were too low for larger deep-replay result payloads. The default is now 64 MiB and can be set with `--max-body-mb`.
 - Product worker-gateway prefetch could serve a stale buffered stream message after that message had been reclaimed and leased elsewhere. The prefetch path now drops buffered messages that already have an active lease before handing work to another worker.
 - Coordinator summaries could grow with completed task count. They now retain an accurate count plus a bounded result sample.
+- Cumulative gateway metrics could contaminate later campaign summaries. Summaries now report campaign-scoped task counts and metric deltas while preserving raw gateway counters for diagnostics.
+- Deep-replay `--tasks-per-lane` values above `1` duplicated the same generated profile. The coordinator now rejects that configuration and requires scaling through `--lanes`.
+- The coordinator acked results one lease at a time. It now batches successful result acks per read batch.
+- The gateway now rejects non-loopback startup without a token, and HTTP/WebSocket failure payloads parse string booleans such as `"false"` as false.
+- Lab WebSocket workers now send tokens only in the Authorization header, not in the URL query string.
+- `fake_compute` task durations are finite and capped by `FUZZFOLIO_LAB_FAKE_COMPUTE_MAX_SECONDS` so load tests cannot accidentally monopolize workers indefinitely.
 
 Remaining cloud-scale validation:
 

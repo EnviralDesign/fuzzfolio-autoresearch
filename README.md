@@ -87,6 +87,8 @@ Play Hand defaults are tuned for long unattended runs: deep-replay jobs can wait
 
 Play Hand Massive v2 is the lab gateway path: in-memory queue, in-memory worker registry, no Redis/Appwrite/backend hot path, and no shards. In the AutoResearch process manager, start **play hand massive v2 - lab gateway** before starting a v2 coordinator.
 
+When the gateway binds outside loopback, set `FUZZFOLIO_LAB_GATEWAY_TOKEN` or pass `--token`; unauthenticated non-loopback gateway startup is rejected. Deep-replay v2 runs require `--tasks-per-lane 1`; scale by increasing `--lanes` so each worker task maps to a distinct generated profile.
+
 Safe starting point:
 
 ```powershell

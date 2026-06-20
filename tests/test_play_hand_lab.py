@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import requests
 
 from autoresearch import play_hand_lab as lab
@@ -118,6 +119,13 @@ def test_fake_compute_tasks_require_lab_protocol_capability(tmp_path: Path) -> N
         lab.PLAY_HAND_LAB_FAKE_COMPUTE_CAPABILITY,
         lab.PLAY_HAND_LAB_WORKER_PROTOCOL_CAPABILITY,
     ]
+
+
+def test_deep_replay_rejects_duplicate_tasks_per_lane() -> None:
+    with pytest.raises(ValueError, match="tasks-per-lane 1"):
+        lab._normalize_runtime(
+            lab.PlayHandLabRuntimeConfig(task_mode="deep_replay", tasks_per_lane=2)
+        )
 
 
 def test_worker_ready_profile_snapshot_converts_stored_profile(tmp_path: Path, monkeypatch) -> None:
@@ -308,6 +316,8 @@ def test_play_hand_lab_refreshes_gateway_snapshot_after_final_result(
             self.tasks: list[dict] = []
             self.drain_calls = 0
             self.completed = False
+            self.historical_completed = 100
+            self.historical_results_dropped = 5
 
         def health(self) -> dict:
             return {"ok": True}
@@ -343,10 +353,15 @@ def test_play_hand_lab_refreshes_gateway_snapshot_after_final_result(
             ]
 
         def snapshot(self) -> dict:
+            campaign_completed = len(self.tasks) if self.completed else 0
             return {
                 "ok": True,
-                "completed_tasks": len(self.tasks) if self.completed else 0,
+                "completed_tasks": self.historical_completed + campaign_completed,
                 "queued_tasks": 0 if self.completed else len(self.tasks),
+                "metrics": {
+                    "completions_accepted": self.historical_completed + campaign_completed,
+                    "results_dropped": self.historical_results_dropped,
+                },
             }
 
     monkeypatch.setattr(lab, "load_config", lambda: fake_config)
@@ -378,6 +393,9 @@ def test_play_hand_lab_refreshes_gateway_snapshot_after_final_result(
     )
     assert summary["completed_tasks"] == 1
     assert summary["gateway_snapshot"]["completed_tasks"] == 1
+    assert summary["gateway_snapshot"]["raw_completed_tasks"] == 101
+    assert summary["gateway_snapshot"]["metrics"]["results_dropped"] == 0
+    assert summary["gateway_snapshot"]["raw_metrics"]["results_dropped"] == 5
     assert summary["gateway_snapshot"]["queued_tasks"] == 0
 
 
@@ -605,6 +623,8 @@ def test_play_hand_lab_summary_keeps_bounded_recorded_result_sample(
         def __init__(self, _config):
             self.config = _config
 
+    ack_calls: list[list[str]] = []
+
     class FakeGateway:
         def __init__(self, *, base_url: str, token: str | None = None):
             self.base_url = base_url
@@ -645,6 +665,7 @@ def test_play_hand_lab_summary_keeps_bounded_recorded_result_sample(
             return self.results[:limit]
 
         def ack_results(self, lease_ids: list[str]) -> int:
+            ack_calls.append(list(lease_ids))
             requested = set(lease_ids)
             before = len(self.results)
             self.results = [
@@ -699,6 +720,7 @@ def test_play_hand_lab_summary_keeps_bounded_recorded_result_sample(
     assert summary["recorded_results_truncated"] is True
     assert len(summary["recorded_results"]) == 2
     assert len(attempts) == 3
+    assert ack_calls == [["lease-0", "lease-1", "lease-2"]]
 
 
 def test_play_hand_lab_fails_fast_when_gateway_result_read_dies(

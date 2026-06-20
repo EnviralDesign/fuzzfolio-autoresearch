@@ -1,6 +1,7 @@
 import asyncio
 import threading
 
+import pytest
 import requests
 from autoresearch.__main__ import build_parser
 from autoresearch.play_hand_lab_gateway import (
@@ -10,6 +11,7 @@ from autoresearch.play_hand_lab_gateway import (
     SaturationSimulationConfig,
     WebSocketSaturationSimulationConfig,
     build_lab_gateway_http_server,
+    cmd_play_hand_lab_gateway,
     run_http_saturation_simulation_sync,
     run_saturation_simulation,
     HttpSaturationSimulationConfig,
@@ -126,6 +128,63 @@ def test_lab_gateway_requeues_retryable_failure_until_cap() -> None:
     assert len(results) == 1
     assert results[0]["status"] == "failed"
     assert results[0]["result"]["error"] == "temporary"
+
+
+def test_lab_gateway_http_retryable_false_string_is_terminal() -> None:
+    gateway = PlayHandLabGateway()
+    server = build_lab_gateway_http_server(
+        host="127.0.0.1",
+        port=0,
+        token="secret",
+        gateway=gateway,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    base_url = f"http://{host}:{port}"
+    headers = {"Authorization": "Bearer secret"}
+    try:
+        assert requests.post(
+            f"{base_url}/tasks",
+            json={
+                "tasks": [
+                    {
+                        "task_id": "task-1",
+                        "lane_id": "lane-1",
+                        "attempt_id": "attempt-1",
+                        "max_attempts": 2,
+                    }
+                ]
+            },
+            headers=headers,
+            timeout=5,
+        ).json()["enqueued"] == 1
+        assert requests.post(
+            f"{base_url}/register",
+            json={"worker_id": "worker-1"},
+            headers=headers,
+            timeout=5,
+        ).json()["status"] == "registered"
+        claim = requests.post(
+            f"{base_url}/claim",
+            json={"worker_id": "worker-1"},
+            headers=headers,
+            timeout=5,
+        ).json()
+
+        failed = requests.post(
+            f"{base_url}/leases/{claim['lease_id']}/fail",
+            json={"worker_id": "worker-1", "retryable": "false", "error": "terminal"},
+            headers=headers,
+            timeout=5,
+        ).json()
+
+        assert failed["status"] == "failed"
+        assert gateway.snapshot()["queued_tasks"] == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_lab_gateway_results_are_peeked_until_acked() -> None:
@@ -540,6 +599,13 @@ def test_lab_gateway_asgi_rejects_oversized_body() -> None:
 
     sent = asyncio.run(run())
     assert sent[0]["status"] == 413
+
+
+def test_lab_gateway_cli_rejects_non_loopback_bind_without_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("FUZZFOLIO_LAB_GATEWAY_TOKEN", raising=False)
+
+    with pytest.raises(RuntimeError, match="requires --token"):
+        cmd_play_hand_lab_gateway(host="0.0.0.0", port=8799)
 
 
 def test_saturation_simulation_keeps_100_virtual_workers_busy() -> None:
