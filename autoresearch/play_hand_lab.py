@@ -96,6 +96,8 @@ SUMMARY_RECORDED_RESULTS_SAMPLE_LIMIT = 1000
 DEFAULT_LAB_GATEWAY_URL = "http://127.0.0.1:8799"
 DEFAULT_LAB_USER_ID = "autoresearch-lab"
 DEFAULT_LAB_ACTIVE_RUNS = 64
+DEFAULT_LAB_RESULT_BATCH_SIZE = 25
+DEFAULT_LAB_RESULT_READ_FAILURE_LIMIT = 5
 DEFAULT_LAB_SWEEP_SHARD_SIZE = 8
 DEFAULT_LAB_SCRUTINY_MONTHS = 36
 PLAY_HAND_LAB_PIPELINE_VERSION = "play_hand_lab_pipeline_v2"
@@ -149,7 +151,8 @@ class PlayHandLabRuntimeConfig:
     max_attempts: int = 2
     poll_interval_seconds: float = 1.0
     max_wait_seconds: float = 3600.0
-    result_batch_size: int = 500
+    result_batch_size: int = DEFAULT_LAB_RESULT_BATCH_SIZE
+    result_read_failure_limit: int = DEFAULT_LAB_RESULT_READ_FAILURE_LIMIT
     dry_run: bool = False
     strict_scoring: bool = False
     json_output: bool = False
@@ -382,6 +385,7 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         poll_interval_seconds=max(float(runtime.poll_interval_seconds), 0.1),
         max_wait_seconds=max(float(runtime.max_wait_seconds), 1.0),
         result_batch_size=max(int(runtime.result_batch_size), 1),
+        result_read_failure_limit=max(int(runtime.result_read_failure_limit), 1),
         dry_run=bool(runtime.dry_run),
         strict_scoring=bool(runtime.strict_scoring),
         json_output=bool(runtime.json_output),
@@ -1448,6 +1452,8 @@ def _rank_sweep_permutations(
                 continue
             result_payload = item.get("result") if isinstance(item.get("result"), dict) else {}
             score = _score_from_replay_payload(result_payload)
+            if score is None:
+                score = _score_from_replay_payload(item)
             ranked.append(
                 {
                     "permutation_index": item.get("permutation_index"),
@@ -1755,6 +1761,7 @@ def _make_sweep_shard_tasks(
             "required_worker_contract_hash": worker_contract_hash,
             "required_worker_contract_schema": runtime.worker_contract_schema,
             "required_capabilities": ["deep_replay", "sweep_shard"],
+            "result_detail": "summary",
         }
         _register_task_spec(
             lane,
@@ -3437,6 +3444,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     result_loss_detected = False
     gateway_unreachable = False
     interrupted = False
+    consecutive_result_read_failures = 0
     try:
         last_snapshot = gateway.snapshot()
         initial_gateway_id = (
@@ -3452,9 +3460,21 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             try:
                 result_batch = _read_gateway_results(gateway, limit=runtime.result_batch_size)
             except requests.RequestException as exc:
-                gateway_unreachable = True
-                _append_event(campaign_ctx, "gateway", "result_read_failed", error=str(exc)[:1000])
-                break
+                consecutive_result_read_failures += 1
+                _append_event(
+                    campaign_ctx,
+                    "gateway",
+                    "result_read_failed",
+                    error=str(exc)[:1000],
+                    consecutive_failures=consecutive_result_read_failures,
+                    failure_limit=runtime.result_read_failure_limit,
+                )
+                if consecutive_result_read_failures >= runtime.result_read_failure_limit:
+                    gateway_unreachable = True
+                    break
+                time.sleep(runtime.poll_interval_seconds)
+                continue
+            consecutive_result_read_failures = 0
             ack_lease_ids: list[str] = []
             for lab_result in result_batch:
                 task_id = str(lab_result.get("task_id") or "")

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import threading
+import time
 
 import pytest
 import requests
@@ -452,6 +453,93 @@ def test_lab_gateway_snapshot_reaps_crashed_worker_lease() -> None:
     second_claim = gateway.claim("worker-2")
     assert second_claim["status"] == "leased"
     assert second_claim["attempt_number"] == 2
+
+
+def test_lab_gateway_snapshot_requeues_stale_worker_lease_before_deadline() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(
+            lease_ttl_seconds=600,
+            worker_stale_after_seconds=10,
+            worker_prune_after_seconds=600,
+        )
+    )
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            deadline_seconds=600,
+            max_attempts=2,
+        )
+    )
+    gateway.register_worker("worker-1")
+    claim = gateway.claim("worker-1")
+    assert claim["status"] == "leased"
+
+    gateway._workers["worker-1"].heartbeat_at = time.monotonic() - 20.0
+    snapshot = gateway.snapshot(include_workers=True)
+
+    assert snapshot["worker_count"] == 0
+    assert snapshot["online_worker_count"] == 0
+    assert snapshot["registered_worker_count"] == 1
+    assert snapshot["stale_worker_count"] == 1
+    assert snapshot["busy_worker_count"] == 0
+    assert snapshot["worker_slots"] == 0
+    assert snapshot["busy_slots"] == 0
+    assert snapshot["queued_tasks"] == 1
+    assert snapshot["active_leases"] == 0
+    assert snapshot["metrics"]["stale_worker_leases_requeued"] == 1
+    assert snapshot["metrics"]["expired_leases_requeued"] == 0
+    assert snapshot["workers"] == []
+    assert snapshot["stale_workers"][0]["worker_id"] == "worker-1"
+
+    second_claim = gateway.claim("worker-2")
+    assert second_claim["status"] == "leased"
+    assert second_claim["attempt_number"] == 2
+
+
+def test_lab_gateway_snapshot_prunes_old_idle_stale_workers() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(worker_stale_after_seconds=10, worker_prune_after_seconds=20)
+    )
+    gateway.register_worker("worker-1")
+    gateway._workers["worker-1"].heartbeat_at = 0.0
+
+    snapshot = gateway.snapshot(include_workers=True)
+
+    assert snapshot["worker_count"] == 0
+    assert snapshot["registered_worker_count"] == 0
+    assert snapshot["retained_worker_count"] == 0
+    assert snapshot["stale_worker_count"] == 0
+    assert snapshot["workers"] == []
+    assert snapshot["stale_workers"] == []
+    assert snapshot["metrics"]["workers_pruned"] == 1
+
+
+def test_lab_gateway_unregister_worker_requeues_active_lease() -> None:
+    gateway = PlayHandLabGateway()
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            deadline_seconds=600,
+            max_attempts=2,
+        )
+    )
+    gateway.register_worker("worker-1")
+    claim = gateway.claim("worker-1")
+    assert claim["status"] == "leased"
+
+    assert gateway.unregister_worker("worker-1") is True
+    snapshot = gateway.snapshot(include_workers=True)
+
+    assert snapshot["worker_count"] == 0
+    assert snapshot["registered_worker_count"] == 0
+    assert snapshot["queued_tasks"] == 1
+    assert snapshot["active_leases"] == 0
+    assert snapshot["metrics"]["stale_worker_leases_requeued"] == 1
+    assert snapshot["metrics"]["workers_unregistered"] == 1
 
 
 def test_lab_gateway_expired_lease_heartbeat_does_not_renew() -> None:

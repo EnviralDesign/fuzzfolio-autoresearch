@@ -191,9 +191,44 @@ def test_make_sweep_shard_tasks_honors_permutation_budget(
     assert len(tasks) == 4
     assert sum(int(task["payload"]["permutation_count"]) for task in tasks) == 16
     assert max(len(task["payload"]["params_by_index"]) for task in tasks) == 4
+    assert {task["payload"].get("result_detail") for task in tasks} == {"summary"}
     first_spec = lane.task_specs[tasks[0]["task_id"]]
     assert first_spec["permutation_budget_applied"] is True
     assert first_spec["expanded_permutation_count"] == 16
+
+
+def test_rank_sweep_permutations_accepts_compact_summary_results() -> None:
+    payload = lab._rank_sweep_permutations(
+        phase="coarse_probe",
+        shard_results=[
+            {
+                "permutation_results": [
+                    {
+                        "permutation_index": 0,
+                        "child_job_id": "child-0",
+                        "status": "success",
+                        "parameters": {"alpha": 1},
+                        "result": {
+                            "result_detail": "summary",
+                            "aggregate": {"score_lab": {"score": 12.5}},
+                            "full_result_omitted": True,
+                        },
+                    },
+                    {
+                        "permutation_index": 1,
+                        "child_job_id": "child-1",
+                        "status": "success",
+                        "parameters": {"alpha": 2},
+                        "fitness": {"score_lab": 9.0},
+                    },
+                ]
+            }
+        ],
+    )
+
+    assert payload["best"]["child_job_id"] == "child-0"
+    assert payload["best"]["score"] == 12.5
+    assert [item["score"] for item in payload["ranked"]] == [12.5, 9.0]
 
 
 class _IndicatorIndexCli:
@@ -575,6 +610,123 @@ def test_play_hand_lab_fake_compute_writes_lane_attempts(
         assert len(attempts) == 2
         assert {attempt["generated_by_runner"] for attempt in attempts} == {lab.PLAY_HAND_LAB_RUNNER}
         assert {attempt["attempt_role"] for attempt in attempts} == {"lab_smoke"}
+
+
+def test_play_hand_lab_retries_transient_result_read_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    fake_config = _test_config(tmp_path)
+
+    class FakeCli:
+        def __init__(self, _config):
+            self.config = _config
+
+    class FakeGateway:
+        read_calls = 0
+
+        def __init__(self, *, base_url: str, token: str | None = None):
+            self.base_url = base_url
+            self.token = token
+            self.tasks: list[dict] = []
+            self.results: list[dict] = []
+
+        def health(self) -> dict:
+            return {"ok": True}
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            self.tasks = list(tasks)
+            self.results = [
+                {
+                    "task_id": task["task_id"],
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "success",
+                    "worker_id": "fake-worker",
+                    "lease_id": f"lease-{index}",
+                    "result": {
+                        "job_id": task["task_id"],
+                        "status": "success",
+                        "result": {
+                            "task_id": task["task_id"],
+                            "task_kind": "fake_compute",
+                            "work_seconds": task["payload"]["work_seconds"],
+                        },
+                    },
+                }
+                for index, task in enumerate(tasks)
+            ]
+            return {"enqueued": len(tasks)}
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            type(self).read_calls += 1
+            if type(self).read_calls == 1:
+                raise requests.ConnectTimeout("temporary gateway accept stall")
+            return self.results[:limit]
+
+        def ack_results(self, lease_ids: list[str]) -> int:
+            requested = set(lease_ids)
+            before = len(self.results)
+            self.results = [
+                result for result in self.results if result.get("lease_id") not in requested
+            ]
+            return before - len(self.results)
+
+        def snapshot(self) -> dict:
+            return {
+                "ok": True,
+                "completed_tasks": len(self.tasks) - len(self.results),
+                "queued_tasks": len(self.results),
+                "metrics": {},
+            }
+
+    FakeGateway.read_calls = 0
+    monkeypatch.setattr(lab, "load_config", lambda: fake_config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", FakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", FakeGateway)
+
+    exit_code = lab.cmd_play_hand_lab(
+        lab.PlayHandLabRuntimeConfig(
+            gateway_url="http://127.0.0.1:8799",
+            task_mode="fake_compute",
+            lanes=1,
+            tasks_per_lane=1,
+            indicator=["RSI"],
+            profile_path=profile_path,
+            fake_work_seconds=0.0,
+            poll_interval_seconds=0.1,
+            max_wait_seconds=2.0,
+            result_read_failure_limit=3,
+        )
+    )
+
+    assert exit_code == 0
+    assert FakeGateway.read_calls >= 2
+    campaign_dir = next(
+        (fake_config.runs_root / "derived" / lab.PLAY_HAND_LAB_CAMPAIGNS_DIR).glob(
+            "*-playhand-lab-campaign-v1"
+        )
+    )
+    summary = json.loads(
+        (campaign_dir / "play-hand-lab-campaign-summary.json").read_text(encoding="utf-8")
+    )
+    events = [
+        json.loads(line)
+        for line in (campaign_dir / "play-hand-lab-campaign-events.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+    ]
+
+    assert summary["status"] == "completed"
+    assert summary["completed_tasks"] == 1
+    assert any(
+        event["phase"] == "gateway"
+        and event["status"] == "result_read_failed"
+        and event["consecutive_failures"] == 1
+        for event in events
+    )
 
 
 def test_play_hand_lab_rolls_finite_runs_with_active_run_limit(

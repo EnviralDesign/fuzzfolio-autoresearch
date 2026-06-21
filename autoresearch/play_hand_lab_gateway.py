@@ -153,16 +153,28 @@ class LabWorker:
     contract_hash: str | None = None
     capabilities: set[str] = field(default_factory=set)
 
-    def to_payload(self, now: float | None = None) -> dict[str, Any]:
+    def to_payload(
+        self,
+        now: float | None = None,
+        *,
+        stale_after_seconds: float | None = None,
+    ) -> dict[str, Any]:
         current = _now() if now is None else now
+        heartbeat_age = current - self.heartbeat_at
+        is_stale = (
+            stale_after_seconds is not None
+            and heartbeat_age > max(float(stale_after_seconds), 0.0)
+        )
         payload: dict[str, Any] = {
             "worker_id": self.worker_id,
             "pool": self.pool,
             "slots": self.slots,
             "registered_age_seconds": round(current - self.registered_at, 3),
-            "heartbeat_age_seconds": round(current - self.heartbeat_at, 3),
+            "heartbeat_age_seconds": round(heartbeat_age, 3),
             "status_detail": self.status_detail,
             "active_lease_count": len(self.active_lease_ids),
+            "online": not is_stale,
+            "stale": is_stale,
         }
         if self.progress is not None:
             payload["progress"] = dict(self.progress)
@@ -239,6 +251,8 @@ class LabGatewayConfig:
     max_recent_completions: int = 20_000
     max_result_backlog: int = 100_000
     no_work_retry_after_seconds: float = 1.0
+    worker_stale_after_seconds: float = 120.0
+    worker_prune_after_seconds: float = 600.0
 
 
 @dataclass(slots=True)
@@ -313,6 +327,10 @@ class PlayHandLabGateway:
             "incompatible_claims": 0,
             "results_acked": 0,
             "results_dropped": 0,
+            "stale_worker_leases_requeued": 0,
+            "stale_worker_leases_final": 0,
+            "workers_pruned": 0,
+            "workers_unregistered": 0,
         }
 
     def enqueue(self, task: LabTask) -> None:
@@ -381,7 +399,7 @@ class PlayHandLabGateway:
         capabilities: list[str] | set[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
-            self._requeue_expired_leases_locked(_now())
+            self._maintain_lifecycle_locked(_now())
             if worker_id not in self._workers:
                 self.register_worker(
                     worker_id,
@@ -504,6 +522,7 @@ class PlayHandLabGateway:
     ) -> dict[str, Any]:
         now = _now()
         with self._lock:
+            self._maintain_lifecycle_locked(now)
             if lease_id in self._completed_by_lease:
                 self._metrics["duplicate_completions"] += 1
                 return {
@@ -557,6 +576,7 @@ class PlayHandLabGateway:
     ) -> dict[str, Any]:
         with self._lock:
             now = _now()
+            self._maintain_lifecycle_locked(now)
             lease = self._leases.get(lease_id)
             if lease is None or lease.worker_id != worker_id:
                 return {"status": "lease_lost", "lease_id": lease_id}
@@ -596,6 +616,17 @@ class PlayHandLabGateway:
         with self._lock:
             return self._requeue_expired_leases_locked(_now())
 
+    def unregister_worker(self, worker_id: str) -> bool:
+        now = _now()
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if worker is None:
+                return False
+            self._expire_worker_leases_locked(worker, now)
+            self._workers.pop(worker_id, None)
+            self._metrics["workers_unregistered"] += 1
+            return True
+
     def drain_results(self, limit: int | None = None) -> list[dict[str, Any]]:
         results = self.read_results(limit=limit)
         self.ack_results([str(result.get("lease_id") or "") for result in results])
@@ -603,7 +634,7 @@ class PlayHandLabGateway:
 
     def read_results(self, limit: int | None = None) -> list[dict[str, Any]]:
         with self._lock:
-            self._requeue_expired_leases_locked(_now())
+            self._maintain_lifecycle_locked(_now())
             count = len(self._results) if limit is None else min(max(int(limit), 0), len(self._results))
             return [self._results[index].to_payload() for index in range(count)]
 
@@ -627,11 +658,23 @@ class PlayHandLabGateway:
     def snapshot(self, *, include_workers: bool = False) -> dict[str, Any]:
         now = _now()
         with self._lock:
-            self._requeue_expired_leases_locked(now)
-            active_workers = sum(1 for worker in self._workers.values() if worker.active_lease_ids)
-            worker_count = len(self._workers)
-            worker_slots = sum(max(int(worker.slots), 1) for worker in self._workers.values())
-            busy_slots = sum(len(worker.active_lease_ids) for worker in self._workers.values())
+            self._maintain_lifecycle_locked(now)
+            stale_after = self._worker_stale_after_seconds()
+            online_workers = [
+                worker
+                for worker in self._workers.values()
+                if self._worker_is_online_locked(worker, now)
+            ]
+            stale_workers = [
+                worker
+                for worker in self._workers.values()
+                if not self._worker_is_online_locked(worker, now)
+            ]
+            active_workers = sum(1 for worker in online_workers if worker.active_lease_ids)
+            worker_count = len(online_workers)
+            retained_worker_count = len(self._workers)
+            worker_slots = sum(max(int(worker.slots), 1) for worker in online_workers)
+            busy_slots = sum(len(worker.active_lease_ids) for worker in online_workers)
             completed_count = sum(1 for task in self._tasks.values() if task.status == "completed")
             failed_count = sum(1 for task in self._tasks.values() if task.status == "failed")
             queued_count = sum(1 for task in self._tasks.values() if task.status == "queued")
@@ -641,6 +684,10 @@ class PlayHandLabGateway:
                 "gateway_id": self.gateway_id,
                 "started_at_wall": self.started_at_wall,
                 "worker_count": worker_count,
+                "online_worker_count": worker_count,
+                "registered_worker_count": retained_worker_count,
+                "retained_worker_count": retained_worker_count,
+                "stale_worker_count": len(stale_workers),
                 "busy_worker_count": active_workers,
                 "worker_busy_rate": (active_workers / worker_count) if worker_count else 0.0,
                 "worker_slots": worker_slots,
@@ -655,7 +702,14 @@ class PlayHandLabGateway:
                 "metrics": dict(self._metrics),
             }
             if include_workers:
-                payload["workers"] = [worker.to_payload(now) for worker in self._workers.values()]
+                payload["workers"] = [
+                    worker.to_payload(now, stale_after_seconds=stale_after)
+                    for worker in online_workers
+                ]
+                payload["stale_workers"] = [
+                    worker.to_payload(now, stale_after_seconds=stale_after)
+                    for worker in stale_workers
+                ]
             return payload
 
     def _remove_lease_locked(self, lease: LabLease) -> None:
@@ -672,19 +726,28 @@ class PlayHandLabGateway:
             self._expire_lease_locked(lease, now)
         return len(expired)
 
-    def _expire_lease_locked(self, lease: LabLease, now: float) -> None:
+    def _expire_lease_locked(
+        self,
+        lease: LabLease,
+        now: float,
+        *,
+        requeue_reason: str = "lease_expired",
+        requeue_metric: str = "expired_leases_requeued",
+        final_reason: str = "lease_expired_retry_limit",
+        final_metric: str = "failures_final",
+    ) -> None:
         task = self._tasks.get(lease.task_id)
         self._remove_lease_locked(lease)
         if task is None or task.status in {"completed", "failed"}:
             return
         if task.attempt_number < task.max_attempts:
             task.status = "queued"
-            task.last_error = "lease_expired"
+            task.last_error = requeue_reason
             self._pending.append(task.task_id)
-            self._metrics["expired_leases_requeued"] += 1
+            self._metrics[requeue_metric] += 1
             return
         task.status = "failed"
-        task.last_error = "lease_expired_retry_limit"
+        task.last_error = final_reason
         self._failed_tasks.add(task.task_id)
         self._append_result_locked(
             LabResult(
@@ -697,13 +760,59 @@ class PlayHandLabGateway:
                 accepted_at=now,
                 result={
                     "status": "failed",
-                    "error": "lease_expired_retry_limit",
+                    "error": final_reason,
                     "retryable": False,
                     "attempt_number": task.attempt_number,
                 },
             )
         )
-        self._metrics["failures_final"] += 1
+        self._metrics[final_metric] += 1
+        if final_metric != "failures_final":
+            self._metrics["failures_final"] += 1
+
+    def _worker_stale_after_seconds(self) -> float:
+        return max(float(self.config.worker_stale_after_seconds), 1.0)
+
+    def _worker_prune_after_seconds(self) -> float:
+        return max(
+            float(self.config.worker_prune_after_seconds),
+            self._worker_stale_after_seconds(),
+        )
+
+    def _worker_is_online_locked(self, worker: LabWorker, now: float) -> bool:
+        return (now - worker.heartbeat_at) <= self._worker_stale_after_seconds()
+
+    def _expire_worker_leases_locked(self, worker: LabWorker, now: float) -> int:
+        expired = 0
+        for lease_id in list(worker.active_lease_ids):
+            lease = self._leases.get(lease_id)
+            if lease is None:
+                worker.active_lease_ids.discard(lease_id)
+                continue
+            self._expire_lease_locked(
+                lease,
+                now,
+                requeue_reason="worker_stale",
+                requeue_metric="stale_worker_leases_requeued",
+                final_reason="worker_stale_retry_limit",
+                final_metric="stale_worker_leases_final",
+            )
+            expired += 1
+        if not worker.active_lease_ids:
+            worker.status_detail = "offline"
+        return expired
+
+    def _maintain_lifecycle_locked(self, now: float) -> None:
+        self._requeue_expired_leases_locked(now)
+        prune_after = self._worker_prune_after_seconds()
+        for worker_id, worker in list(self._workers.items()):
+            heartbeat_age = now - worker.heartbeat_at
+            if self._worker_is_online_locked(worker, now):
+                continue
+            self._expire_worker_leases_locked(worker, now)
+            if heartbeat_age >= prune_after and not worker.active_lease_ids:
+                self._workers.pop(worker_id, None)
+                self._metrics["workers_pruned"] += 1
 
     def _trim_completion_history_locked(self) -> None:
         max_recent = max(int(self.config.max_recent_completions), 0)
@@ -1087,36 +1196,43 @@ class LabGatewayAsgiApp:
             await send({"type": "websocket.close", "code": 1008})
             return
         await send({"type": "websocket.accept"})
-        while True:
-            message = await receive()
-            message_type = message.get("type")
-            if message_type == "websocket.disconnect":
-                return
-            if message_type != "websocket.receive":
-                continue
-            raw_payload = message.get("text")
-            if raw_payload is None and message.get("bytes") is not None:
-                raw_bytes = bytes(message["bytes"])
-                if len(raw_bytes) > self.max_body_bytes:
-                    await send({"type": "websocket.close", "code": 1009})
+        websocket_worker_id: str | None = None
+        try:
+            while True:
+                message = await receive()
+                message_type = message.get("type")
+                if message_type == "websocket.disconnect":
                     return
-                raw_payload = raw_bytes.decode("utf-8")
-            try:
-                if raw_payload is not None and len(str(raw_payload).encode("utf-8")) > self.max_body_bytes:
-                    await send({"type": "websocket.close", "code": 1009})
-                    return
-                payload = json.loads(str(raw_payload or "{}"))
-                if not isinstance(payload, dict):
-                    raise ValueError("json_object_required")
-                response = self._handle_worker_message(payload)
-            except Exception as exc:
-                response = {"type": "error", "error": str(exc)}
-            await send(
-                {
-                    "type": "websocket.send",
-                    "text": json.dumps(response, separators=(",", ":"), sort_keys=True),
-                }
-            )
+                if message_type != "websocket.receive":
+                    continue
+                raw_payload = message.get("text")
+                if raw_payload is None and message.get("bytes") is not None:
+                    raw_bytes = bytes(message["bytes"])
+                    if len(raw_bytes) > self.max_body_bytes:
+                        await send({"type": "websocket.close", "code": 1009})
+                        return
+                    raw_payload = raw_bytes.decode("utf-8")
+                try:
+                    if raw_payload is not None and len(str(raw_payload).encode("utf-8")) > self.max_body_bytes:
+                        await send({"type": "websocket.close", "code": 1009})
+                        return
+                    payload = json.loads(str(raw_payload or "{}"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("json_object_required")
+                    if str(payload.get("type") or "") == "register":
+                        websocket_worker_id = str(payload.get("worker_id") or "") or websocket_worker_id
+                    response = self._handle_worker_message(payload)
+                except Exception as exc:
+                    response = {"type": "error", "error": str(exc)}
+                await send(
+                    {
+                        "type": "websocket.send",
+                        "text": json.dumps(response, separators=(",", ":"), sort_keys=True),
+                    }
+                )
+        finally:
+            if websocket_worker_id:
+                self.gateway.unregister_worker(websocket_worker_id)
 
     def _handle_worker_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         message_type = str(payload.get("type") or "")

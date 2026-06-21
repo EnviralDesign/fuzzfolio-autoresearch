@@ -249,8 +249,14 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
     play_hand_lab.add_argument(
         "--result-batch-size",
         type=int,
-        default=500,
-        help="Maximum completed results drained per poll. Default: 500.",
+        default=25,
+        help="Maximum completed results drained per poll. Default: 25.",
+    )
+    play_hand_lab.add_argument(
+        "--result-read-failure-limit",
+        type=int,
+        default=5,
+        help="Consecutive gateway result-read failures before ending the campaign. Default: 5.",
     )
     play_hand_lab.add_argument(
         "--worker-contract-hash",
@@ -461,6 +467,7 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 poll_interval_seconds=args.poll_interval_seconds,
                 max_wait_seconds=args.max_wait_seconds,
                 result_batch_size=args.result_batch_size,
+                result_read_failure_limit=args.result_read_failure_limit,
                 dry_run=bool(args.dry_run),
                 strict_scoring=bool(args.strict_scoring),
                 json_output=bool(args.json),
