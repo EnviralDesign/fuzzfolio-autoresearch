@@ -288,6 +288,14 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         help="Fail if deep-replay artifact scoring fails.",
     )
     play_hand_lab.add_argument(
+        "--retain-raw-lab-artifacts",
+        action="store_true",
+        help=(
+            "Retain verbose lab-result/lab-worker-result/sweep-shard-result debug JSON. "
+            "Default is compact canonical artifacts only."
+        ),
+    )
+    play_hand_lab.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON summary.",
@@ -470,6 +478,7 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 result_read_failure_limit=args.result_read_failure_limit,
                 dry_run=bool(args.dry_run),
                 strict_scoring=bool(args.strict_scoring),
+                retain_raw_lab_artifacts=bool(args.retain_raw_lab_artifacts),
                 json_output=bool(args.json),
                 worker_contract_hash=args.worker_contract_hash,
                 worker_contract_schema=args.worker_contract_schema,

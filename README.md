@@ -93,6 +93,8 @@ When `--instrument-pool-preset` is omitted, v2 uses the existing Play Hand defau
 
 Deep-replay worker completions must also be scoreable. If the coordinator cannot score a returned artifact, it records the attempt as failed and the campaign exits failed instead of treating an unusable artifact as a screened result.
 
+By default v2 writes only canonical scoreable artifacts and compact JSON. It does not retain the verbose `lab-result.json`, `lab-worker-result.json`, or `sweep-shard-result.json` debug envelopes unless `--retain-raw-lab-artifacts` is set.
+
 Safe starting point:
 
 ```powershell
@@ -100,6 +102,15 @@ uv run play-hand-massive-v2 --mode finite --task-mode deep_replay --target-runs 
 ```
 
 Use `--mode continuous --active-runs N` for a run-until-stopped campaign. Continuous mode keeps replacing completed runs until the process is stopped; interrupted lane folders are expected and can be cleaned with the incomplete-run cleanup tool.
+
+Corpus maintenance commands are dry-run by default:
+
+```powershell
+uv run cleanup-playhand-lab-raw-artifacts --json
+uv run cleanup-playhand-lab-raw-artifacts --yes --json
+uv run compact-runs-json --json
+uv run compact-runs-json --yes --json
+```
 
 The old `play-hand-massive` command is v1 legacy and still uses the FuzzFolio worker gateway. It should not be used for high-scale research runs; keep it only for compatibility while v2 finishes taking over the operational surface.
 

@@ -1905,7 +1905,10 @@ def write_optimizer_report(
         "pareto_front": pareto_front,
     }
     json_path = report_root / "portfolio-optimization.json"
-    json_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
     candidate_csv = report_root / "optimizer-candidates.csv"
     candidate_search = PortfolioSearch(candidates, spec)
     with candidate_csv.open("w", newline="", encoding="utf-8") as handle:
@@ -2018,7 +2021,7 @@ def write_optimizer_report(
         if spec.account:
             config_payload["account"] = spec.account
         (report_root / f"build-portfolio-{name}.json").write_text(
-            json.dumps(config_payload, ensure_ascii=True, indent=2),
+            json.dumps(config_payload, ensure_ascii=True, separators=(",", ":")),
             encoding="utf-8",
         )
     pareto_csv = report_root / "portfolio-pareto-front.csv"
@@ -2135,7 +2138,7 @@ def write_optimizer_report(
         if spec.account:
             config_payload["account"] = spec.account
         (report_root / f"build-portfolio-pareto-{index:02d}.json").write_text(
-            json.dumps(config_payload, ensure_ascii=True, indent=2),
+            json.dumps(config_payload, ensure_ascii=True, separators=(",", ":")),
             encoding="utf-8",
         )
     markdown_path = report_root / "portfolio-optimization.md"

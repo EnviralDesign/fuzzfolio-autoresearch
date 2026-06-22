@@ -127,8 +127,7 @@ def _load_optional_json(path: Path) -> Any | None:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=True, indent=2)
-        handle.write("\n")
+        json.dump(payload, handle, ensure_ascii=True, separators=(",", ":"))
 
 
 def _tail_text(path: Path, *, max_chars: int = 12000) -> str:
@@ -1324,13 +1323,12 @@ def _write_live_portfolio_payload(config: AppConfig, attempt_ids: list[str]) -> 
         "selected_attempt_ids": _normalize_attempt_id_list(attempt_ids),
     }
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=True, indent=2)
-        handle.write("\n")
+        json.dump(payload, handle, ensure_ascii=True, separators=(",", ":"))
     return _live_portfolio_payload(config)
 
 
 def _json_bytes(payload: Any) -> bytes:
-    return json.dumps(payload, ensure_ascii=True, indent=2).encode("utf-8")
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
 
 
 def make_handler(state: ViewerState) -> type[BaseHTTPRequestHandler]:

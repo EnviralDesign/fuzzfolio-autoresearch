@@ -81,6 +81,7 @@ Common arguments:
 - `--instrument-pool-preset`: named pool preset to deal across lanes. Repeat or comma-separate values such as `fx,metals`, `crypto`, or `all`.
 - `--instrument-pool`: explicit comma-separated or repeatable instruments to add to the resolved pool.
 - `--min-indicators`, `--max-indicators`: generated profile width.
+- `--retain-raw-lab-artifacts`: keep verbose lab debug envelopes. By default v2 writes only canonical scoreable artifacts.
 - `--dry-run`: write campaign/lane folders without enqueuing work.
 - `--json`: print machine-readable summary.
 
@@ -765,3 +766,40 @@ uv run nuke-deep-caches --json
 ```
 
 Deletes rebuildable deep artifacts so `finalize-corpus` or `build-portfolio` can regenerate them from source. It preserves run ledgers, source artifacts, `runs/`, `runs_archive/`, `sweeps/`, and the main `.venv/`.
+
+## cleanup-playhand-lab-raw-artifacts
+
+```powershell
+uv run cleanup-playhand-lab-raw-artifacts --json
+uv run cleanup-playhand-lab-raw-artifacts --yes --json
+uv run cleanup-playhand-lab-raw-artifacts <run-id> --yes --json
+```
+
+Deletes redundant Play Hand Massive v2 raw debug files: `lab-result.json`, `lab-worker-result.json`, and `sweep-shard-result.json`. It only deletes a raw file when a canonical sibling artifact such as `sensitivity-response.json`, `deep-replay-job.json`, `sweep-results.json`, or `lab-failure.json` exists.
+
+Arguments:
+
+- `run_id`: optional v2 lane run IDs to target.
+- `--older-than-minutes`: only touch older raw artifacts.
+- `--yes`: apply deletion; omitted means dry run.
+- `--preview`: matched runs to show.
+- `--json`: print machine-readable summary.
+
+## compact-runs-json
+
+```powershell
+uv run compact-runs-json --json
+uv run compact-runs-json --yes --json
+uv run compact-runs-json <run-id> --yes --workers 16 --json
+```
+
+Rewrites `.json` artifacts under `runs/` to semantic-equivalent compact JSON. It parses each file before rewriting, reports blocked parse/write errors, and preserves original mtimes after atomic replacement.
+
+Arguments:
+
+- `target`: optional run IDs or paths under `runs/`; omitted scans the whole `runs/` tree including `derived`.
+- `--older-than-minutes`: only touch older JSON files.
+- `--workers`: concurrent parse/rewrite workers. Default `8`.
+- `--yes`: apply rewrite; omitted means dry run.
+- `--preview`: changed files to show.
+- `--json`: print machine-readable summary.

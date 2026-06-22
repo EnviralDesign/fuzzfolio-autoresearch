@@ -100,6 +100,34 @@ def test_resolve_attempt_scrutiny_source_falls_back_to_full_backtest(tmp_path):
     assert resolved["instruments"] == ["EURUSD"]
 
 
+def test_resolve_attempt_scrutiny_source_uses_matching_attempt_result(tmp_path):
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    _write_json(
+        artifact_dir / "sensitivity-response.json",
+        _sample_sensitivity_payload(54.25),
+    )
+    _write_json(
+        artifact_dir / "deep-replay-job.json",
+        {"request": {"timeframe": "M5", "instruments": ["GBPUSD"]}},
+    )
+
+    attempt = {
+        "run_id": "run-1",
+        "attempt_id": "attempt-1",
+        "artifact_dir": str(artifact_dir),
+        "requested_horizon_months": 36,
+    }
+    resolved = ct.resolve_attempt_scrutiny_source(attempt, 36)
+
+    assert resolved["available"] is True
+    assert resolved["source"] == "attempt_self_scrutiny"
+    assert resolved["score"] == 54.25
+    assert resolved["curve_path"] is None
+    assert resolved["timeframe"] == "M5"
+    assert resolved["instruments"] == ["GBPUSD"]
+
+
 def test_validate_full_backtest_artifacts_accepts_valid_pair(tmp_path):
     artifact_dir = tmp_path / "artifact"
     artifact_dir.mkdir()

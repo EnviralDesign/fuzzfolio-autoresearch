@@ -588,6 +588,8 @@ PUBLIC_CLI_COMMANDS = {
     "build-portfolio-risk-sizing",
     "render-portfolio-profile-drops",
     "cleanup-incomplete-playhand-runs",
+    "cleanup-playhand-lab-raw-artifacts",
+    "compact-runs-json",
     "dashboard",
     "record-attempt",
     "nuke-deep-caches",
@@ -2499,6 +2501,73 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     cleanup_cmd.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
+    lab_raw_cleanup = subparsers.add_parser(
+        "cleanup-playhand-lab-raw-artifacts",
+        help="Delete redundant PlayHand Massive v2 raw lab debug artifacts.",
+    )
+    lab_raw_cleanup.add_argument(
+        "run_id",
+        nargs="*",
+        help="Optional v2 lane run IDs to target. When omitted, all PlayHand lab runs are scanned.",
+    )
+    lab_raw_cleanup.add_argument(
+        "--older-than-minutes",
+        type=float,
+        default=None,
+        help="Only touch raw artifacts with no file updates in at least this many minutes.",
+    )
+    lab_raw_cleanup.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually delete matched raw artifacts. Without this flag the command is a dry run.",
+    )
+    lab_raw_cleanup.add_argument(
+        "--preview",
+        type=int,
+        default=20,
+        help="How many matched runs to include in the preview output.",
+    )
+    lab_raw_cleanup.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+    compact_json = subparsers.add_parser(
+        "compact-runs-json",
+        help="Rewrite runs/*.json artifacts to semantic-equivalent compact JSON.",
+    )
+    compact_json.add_argument(
+        "target",
+        nargs="*",
+        help=(
+            "Optional run IDs or paths under the runs directory. When omitted, "
+            "the entire runs tree, including derived artifacts, is scanned."
+        ),
+    )
+    compact_json.add_argument(
+        "--older-than-minutes",
+        type=float,
+        default=None,
+        help="Only touch JSON files with no updates in at least this many minutes.",
+    )
+    compact_json.add_argument(
+        "--yes",
+        action="store_true",
+        help="Actually rewrite matched JSON files. Without this flag the command is a dry run.",
+    )
+    compact_json.add_argument(
+        "--preview",
+        type=int,
+        default=20,
+        help="How many changed files to include in the preview output.",
+    )
+    compact_json.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Concurrent JSON files to parse/rewrite. Default: 8.",
+    )
+    compact_json.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
     stop_all = subparsers.add_parser(
         "stop-all-runs",
         help="Clear local queued Fuzzfolio research work and optionally stop local autoresearch processes.",
@@ -4270,6 +4339,337 @@ def cmd_cleanup_incomplete_playhand_runs(
     if blocked:
         payload["blocked_preview"] = blocked[: max(0, preview)]
 
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0 if not blocked else 1
+    _print_json_payload(payload)
+    return 0 if not blocked else 1
+
+
+PLAY_HAND_LAB_RAW_ARTIFACT_NAMES = {
+    "lab-result.json",
+    "lab-worker-result.json",
+    "sweep-shard-result.json",
+}
+PLAY_HAND_LAB_CANONICAL_ARTIFACT_NAMES = {
+    "sensitivity-response.json",
+    "deep-replay-job.json",
+    "sweep-results.json",
+    "lab-failure.json",
+}
+
+
+def _is_path_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _is_stale_path(
+    path: Path,
+    *,
+    older_than_minutes: float | None,
+    now: datetime,
+) -> bool:
+    if older_than_minutes is None or older_than_minutes <= 0:
+        return True
+    try:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return True
+    age = now - mtime
+    if age.total_seconds() < 0:
+        return True
+    return age.total_seconds() >= older_than_minutes * 60.0
+
+
+def _is_playhand_lab_run_dir(run_dir: Path) -> bool:
+    if "playhand-lab" in run_dir.name:
+        return True
+    try:
+        metadata = load_run_metadata(run_dir)
+    except OSError:
+        return False
+    return str(metadata.get("runner") or "").strip() == "play_hand_lab_v1"
+
+
+def _raw_lab_artifact_has_canonical_sibling(path: Path) -> bool:
+    if path.name == "sweep-shard-result.json":
+        return (path.parent / "sweep-results.json").exists()
+    return any((path.parent / name).exists() for name in PLAY_HAND_LAB_CANONICAL_ARTIFACT_NAMES)
+
+
+def _playhand_lab_raw_artifacts_for_run(
+    run_dir: Path,
+    *,
+    older_than_minutes: float | None,
+    now: datetime,
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    matched: list[Path] = []
+    blocked: list[dict[str, Any]] = []
+    for path in run_dir.rglob("*.json"):
+        if path.name not in PLAY_HAND_LAB_RAW_ARTIFACT_NAMES:
+            continue
+        if not _is_stale_path(path, older_than_minutes=older_than_minutes, now=now):
+            continue
+        if not _raw_lab_artifact_has_canonical_sibling(path):
+            blocked.append(
+                {
+                    "path": str(path),
+                    "reason": "missing_canonical_sibling",
+                }
+            )
+            continue
+        matched.append(path)
+    return matched, blocked
+
+
+def _file_size(path: Path) -> int:
+    try:
+        return int(path.stat().st_size)
+    except OSError:
+        return 0
+
+
+def cmd_cleanup_playhand_lab_raw_artifacts(
+    *,
+    run_ids: list[str] | None,
+    older_than_minutes: float | None,
+    execute: bool,
+    preview: int,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    target_runs = _matching_run_dirs(config, run_ids)
+    now = datetime.now(timezone.utc)
+    matched_runs: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    total_files = 0
+    reclaimable_bytes = 0
+
+    for run_dir in target_runs:
+        if not _is_playhand_lab_run_dir(run_dir):
+            continue
+        paths, run_blocked = _playhand_lab_raw_artifacts_for_run(
+            run_dir,
+            older_than_minutes=older_than_minutes,
+            now=now,
+        )
+        blocked.extend({"run_id": run_dir.name, **item} for item in run_blocked)
+        if not paths:
+            continue
+        file_bytes = sum(_file_size(path) for path in paths)
+        total_files += len(paths)
+        reclaimable_bytes += file_bytes
+        item = {
+            "run_id": run_dir.name,
+            "run_dir": str(run_dir),
+            "files": len(paths),
+            "bytes": file_bytes,
+            "preview_files": [str(path) for path in paths[:5]],
+        }
+        matched_runs.append(item)
+
+    payload: dict[str, Any] = {
+        "command": "cleanup-playhand-lab-raw-artifacts",
+        "runs_root": str(config.runs_root),
+        "run_ids_filter": run_ids or [],
+        "older_than_minutes": older_than_minutes,
+        "total_runs": len(target_runs),
+        "matched_runs": len(matched_runs),
+        "matched_files": total_files,
+        "reclaimable_bytes": reclaimable_bytes,
+        "dry_run": not execute,
+        "preview": matched_runs[: max(0, preview)],
+        "blocked_files": len(blocked),
+    }
+    if blocked:
+        payload["blocked_preview"] = blocked[: max(0, preview)]
+
+    if not execute:
+        payload["message"] = (
+            "Dry run only. Re-run with --yes to delete redundant PlayHand lab raw artifacts."
+        )
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0
+        _print_json_payload(payload)
+        return 0
+
+    deleted: list[dict[str, Any]] = []
+    delete_blocked: list[dict[str, Any]] = []
+    for item in matched_runs:
+        run_deleted_files = 0
+        run_deleted_bytes = 0
+        run_dir = Path(str(item["run_dir"]))
+        paths, _ = _playhand_lab_raw_artifacts_for_run(
+            run_dir,
+            older_than_minutes=older_than_minutes,
+            now=now,
+        )
+        for path in paths:
+            size = _file_size(path)
+            try:
+                path.unlink()
+            except OSError as exc:
+                delete_blocked.append(
+                    {
+                        "run_id": run_dir.name,
+                        "path": str(path),
+                        "error": str(exc),
+                    }
+                )
+                continue
+            run_deleted_files += 1
+            run_deleted_bytes += size
+        if run_deleted_files:
+            deleted.append(
+                {
+                    "run_id": run_dir.name,
+                    "run_dir": str(run_dir),
+                    "files": run_deleted_files,
+                    "bytes": run_deleted_bytes,
+                }
+            )
+
+    payload["deleted_runs"] = len(deleted)
+    payload["deleted_files"] = sum(int(item["files"]) for item in deleted)
+    payload["deleted_bytes"] = sum(int(item["bytes"]) for item in deleted)
+    payload["deleted_preview"] = deleted[: max(0, preview)]
+    if delete_blocked:
+        payload["blocked_files"] = int(payload.get("blocked_files") or 0) + len(delete_blocked)
+        payload["delete_blocked_preview"] = delete_blocked[: max(0, preview)]
+
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0 if not delete_blocked else 1
+    _print_json_payload(payload)
+    return 0 if not delete_blocked else 1
+
+
+def _resolve_json_compaction_targets(config, targets: list[str] | None) -> list[Path]:
+    runs_root = Path(config.runs_root).resolve()
+    if not targets:
+        return [runs_root]
+    resolved: list[Path] = []
+    for raw in targets:
+        token = str(raw or "").strip()
+        if not token:
+            continue
+        candidate = Path(token)
+        if not candidate.is_absolute():
+            run_candidate = runs_root / token
+            candidate = run_candidate if run_candidate.exists() else (Path.cwd() / token)
+        candidate = candidate.resolve()
+        if candidate != runs_root and not _is_path_under(candidate, runs_root):
+            raise SystemExit(f"Refusing to compact JSON outside runs root: {candidate}")
+        if not candidate.exists():
+            raise SystemExit(f"JSON compaction target does not exist: {candidate}")
+        resolved.append(candidate)
+    return resolved
+
+
+def _iter_json_compaction_paths(targets: list[Path]) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for target in targets:
+        candidates = [target] if target.is_file() else target.rglob("*.json")
+        for path in candidates:
+            if not path.is_file() or path.suffix.lower() != ".json":
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            paths.append(path)
+    return sorted(paths)
+
+
+def _compact_json_file(path: Path, *, execute: bool) -> dict[str, Any]:
+    stat = path.stat()
+    raw = path.read_bytes()
+    payload = json.loads(raw)
+    compact = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    changed = compact != raw
+    item = {
+        "path": str(path),
+        "before_bytes": len(raw),
+        "after_bytes": len(compact),
+        "saved_bytes": len(raw) - len(compact),
+        "changed": changed,
+    }
+    if execute and changed:
+        tmp_path = path.with_name(f".{path.name}.compact-tmp")
+        tmp_path.write_bytes(compact)
+        os.replace(tmp_path, path)
+        os.utime(path, (stat.st_atime, stat.st_mtime))
+    return item
+
+
+def cmd_compact_runs_json(
+    *,
+    targets: list[str] | None,
+    older_than_minutes: float | None,
+    execute: bool,
+    preview: int,
+    workers: int = 1,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    roots = _resolve_json_compaction_targets(config, targets)
+    now = datetime.now(timezone.utc)
+    paths = [
+        path
+        for path in _iter_json_compaction_paths(roots)
+        if _is_stale_path(path, older_than_minutes=older_than_minutes, now=now)
+    ]
+    changed: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    inspected_files = 0
+    before_bytes = 0
+    after_bytes = 0
+
+    def process(path: Path) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        try:
+            return _compact_json_file(path, execute=execute), None
+        except (OSError, json.JSONDecodeError, TypeError) as exc:
+            return None, {"path": str(path), "error": str(exc)}
+
+    max_workers = max(int(workers or 1), 1)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = executor.map(process, paths)
+        for item, error in results:
+            inspected_files += 1
+            if error is not None:
+                blocked.append(error)
+                continue
+            if item is None:
+                continue
+            before_bytes += int(item["before_bytes"])
+            after_bytes += int(item["after_bytes"])
+            if bool(item["changed"]):
+                changed.append(item)
+
+    payload: dict[str, Any] = {
+        "command": "compact-runs-json",
+        "runs_root": str(config.runs_root),
+        "targets": [str(path) for path in roots],
+        "older_than_minutes": older_than_minutes,
+        "inspected_files": inspected_files,
+        "changed_files": len(changed),
+        "before_bytes": before_bytes,
+        "after_bytes": after_bytes,
+        "saved_bytes": before_bytes - after_bytes,
+        "dry_run": not execute,
+        "preview": changed[: max(0, preview)],
+        "blocked_files": len(blocked),
+    }
+    if blocked:
+        payload["blocked_preview"] = blocked[: max(0, preview)]
+    if not execute:
+        payload["message"] = "Dry run only. Re-run with --yes to rewrite compact JSON."
     if as_json:
         print(json.dumps(payload, ensure_ascii=True, indent=2))
         return 0 if not blocked else 1
@@ -6780,7 +7180,10 @@ def _cli_subcommand_supports_option(
 
 def _write_json_file(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
 
 
 def _normalize_profile_description(text: str | None) -> str:
@@ -15566,6 +15969,31 @@ def main(argv: list[str] | None = None) -> int:
             ),
             dry_run=bool(args.dry_run),
             preview=int(args.preview),
+            as_json=bool(args.json),
+        )
+    if args.command == "cleanup-playhand-lab-raw-artifacts":
+        return cmd_cleanup_playhand_lab_raw_artifacts(
+            run_ids=args.run_id,
+            older_than_minutes=(
+                float(args.older_than_minutes)
+                if args.older_than_minutes is not None
+                else None
+            ),
+            execute=bool(args.yes),
+            preview=int(args.preview),
+            as_json=bool(args.json),
+        )
+    if args.command == "compact-runs-json":
+        return cmd_compact_runs_json(
+            targets=args.target,
+            older_than_minutes=(
+                float(args.older_than_minutes)
+                if args.older_than_minutes is not None
+                else None
+            ),
+            execute=bool(args.yes),
+            preview=int(args.preview),
+            workers=int(args.workers),
             as_json=bool(args.json),
         )
     if args.command == "stop-all-runs":

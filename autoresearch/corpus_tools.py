@@ -570,6 +570,40 @@ def resolve_attempt_scrutiny_source(
                 **summary,
             }
 
+    result_path = artifact_dir / "sensitivity-response.json"
+    if result_path.exists():
+        try:
+            requested_horizon = int(attempt.get("requested_horizon_months") or 0)
+        except (TypeError, ValueError):
+            requested_horizon = 0
+        if requested_horizon == int(lookback_months):
+            summary = load_scored_sensitivity_result(result_path) or {}
+            job_path = artifact_dir / "deep-replay-job.json"
+            curve_path = artifact_dir / "best-cell-path-detail.json"
+            request_payload = _request_payload_for_source(
+                attempt,
+                source_job_path=job_path if job_path.exists() else None,
+            )
+            return {
+                "available": True,
+                "source": "attempt_self_scrutiny",
+                "artifact_dir": str(artifact_dir),
+                "result_path": str(result_path),
+                "curve_path": str(curve_path) if curve_path.exists() else None,
+                "job_path": str(job_path) if job_path.exists() else None,
+                "manifest_path": None,
+                "timeframe": str(
+                    request_payload.get("timeframe") or attempt_timeframe(attempt) or ""
+                )
+                .strip()
+                .upper()
+                or None,
+                "instruments": normalize_tokens(
+                    list(request_payload.get("instruments") or attempt_instruments(attempt))
+                ),
+                **summary,
+            }
+
     if validation_cache_root is not None:
         run_id = str(attempt.get("run_id") or "").strip()
         if run_id:
@@ -1130,7 +1164,10 @@ def build_full_backtest_audit(
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:

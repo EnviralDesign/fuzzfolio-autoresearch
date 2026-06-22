@@ -101,7 +101,10 @@ def load_run_metadata(run_dir: Path) -> dict[str, Any]:
 def write_run_metadata(run_dir: Path, metadata: dict[str, Any]) -> Path:
     path = run_metadata_path_for_run_dir(run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(metadata, ensure_ascii=True, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(metadata, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
     return path
 
 

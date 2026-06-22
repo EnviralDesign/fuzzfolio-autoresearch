@@ -291,7 +291,7 @@ def write_risk_sizing_report(
     json_path = output_dir / "risk-sizing-schedule.json"
     csv_path = output_dir / "risk-sizing-schedule.csv"
     md_path = output_dir / "risk-sizing-report.md"
-    json_path.write_text(json.dumps(schedule, indent=2), encoding="utf-8")
+    json_path.write_text(json.dumps(schedule, separators=(",", ":")), encoding="utf-8")
     if schedule:
         with csv_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(schedule[0].keys()))
@@ -345,5 +345,7 @@ def write_risk_sizing_report(
             )
         )
     md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    (output_dir / "manifest.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    (output_dir / "manifest.json").write_text(
+        json.dumps(summary, separators=(",", ":")), encoding="utf-8"
+    )
     return summary

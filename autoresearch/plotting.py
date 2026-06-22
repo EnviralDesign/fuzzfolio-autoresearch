@@ -199,7 +199,7 @@ def write_progress_index(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     rows = _progress_index_rows(attempts, run_metadata)
     output_path.write_text(
-        json.dumps(rows, ensure_ascii=True, indent=2), encoding="utf-8"
+        json.dumps(rows, ensure_ascii=True, separators=(",", ":")), encoding="utf-8"
     )
 
     csv_path = output_path.with_suffix(".csv")
@@ -564,7 +564,8 @@ def render_leaderboard_artifacts(
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
     json_output_path.write_text(
-        json.dumps(enriched_ranked, ensure_ascii=True, indent=2), encoding="utf-8"
+        json.dumps(enriched_ranked, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
     )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -649,7 +650,8 @@ def render_model_leaderboard_artifacts(
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
     json_output_path.write_text(
-        json.dumps(summary_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+        json.dumps(summary_rows, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
     )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -758,7 +760,8 @@ def render_tradeoff_leaderboard_artifacts(
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
     json_output_path.write_text(
-        json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+        json.dumps(serializable_rows, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
     )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -894,7 +897,8 @@ def render_attempt_tradeoff_scatter_artifacts(
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
     json_output_path.write_text(
-        json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+        json.dumps(serializable_rows, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
     )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1020,7 +1024,8 @@ def render_attempt_tradeoff_overlay_artifacts(
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
     json_output_path.write_text(
-        json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+        json.dumps(serializable_rows, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
     )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1131,7 +1136,8 @@ def render_attempt_drawdown_scatter_artifacts(
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
     json_output_path.write_text(
-        json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+        json.dumps(serializable_rows, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
     )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1239,7 +1245,8 @@ def render_validation_scatter_artifacts(
 
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
     json_output_path.write_text(
-        json.dumps(serializable_rows, ensure_ascii=True, indent=2), encoding="utf-8"
+        json.dumps(serializable_rows, ensure_ascii=True, separators=(",", ":")),
+        encoding="utf-8",
     )
 
     png_output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1412,7 +1419,7 @@ def render_similarity_heatmap_artifacts(
     }
     json_output_path.parent.mkdir(parents=True, exist_ok=True)
     json_output_path.write_text(
-        json.dumps(serializable_payload, ensure_ascii=True, indent=2),
+        json.dumps(serializable_payload, ensure_ascii=True, separators=(",", ":")),
         encoding="utf-8",
     )
 

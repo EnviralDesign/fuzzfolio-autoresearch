@@ -457,7 +457,7 @@ def _read_json_if_exists(path: Path | None) -> dict[str, Any] | None:
 
 def _write_json_payload(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(
-        json.dumps(payload, ensure_ascii=True, indent=2) + "\n",
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
         encoding="utf-8",
     )
 
@@ -2034,7 +2034,10 @@ class ResearchController:
         prior["controller"] = snapshot
         prior["controller_updated_at"] = datetime.now(timezone.utc).isoformat()
         prior["manager"] = self._manager_runtime.to_snapshot_dict()
-        path.write_text(json.dumps(prior, ensure_ascii=True, indent=2), encoding="utf-8")
+        path.write_text(
+            json.dumps(prior, ensure_ascii=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
 
     def _build_branch_runtime_snapshot(
         self, tool_context: ToolContext, step: int
@@ -3352,7 +3355,8 @@ class ResearchController:
             path.write_text("{}", encoding="utf-8")
             return path
         path.write_text(
-            json.dumps(catalog, ensure_ascii=True, indent=2), encoding="utf-8"
+            json.dumps(catalog, ensure_ascii=True, separators=(",", ":")),
+            encoding="utf-8",
         )
         return path
 
@@ -11152,7 +11156,7 @@ class ResearchController:
             except (OSError, json.JSONDecodeError):
                 pass
         state_path.write_text(
-            json.dumps(merged, ensure_ascii=True, indent=2),
+            json.dumps(merged, ensure_ascii=True, separators=(",", ":")),
             encoding="utf-8",
         )
         parts = [

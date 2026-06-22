@@ -155,6 +155,7 @@ class PlayHandLabRuntimeConfig:
     result_read_failure_limit: int = DEFAULT_LAB_RESULT_READ_FAILURE_LIMIT
     dry_run: bool = False
     strict_scoring: bool = False
+    retain_raw_lab_artifacts: bool = False
     json_output: bool = False
     worker_contract_hash: str | None = None
     worker_contract_schema: str = "replay-worker-contract-v1"
@@ -388,6 +389,7 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         result_read_failure_limit=max(int(runtime.result_read_failure_limit), 1),
         dry_run=bool(runtime.dry_run),
         strict_scoring=bool(runtime.strict_scoring),
+        retain_raw_lab_artifacts=bool(runtime.retain_raw_lab_artifacts),
         json_output=bool(runtime.json_output),
         worker_contract_hash=str(contract_hash).strip() if contract_hash else None,
         worker_contract_schema=contract_schema,
@@ -1968,8 +1970,9 @@ def _record_lab_result(
     result_payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
     artifact_dir = (lane_ctx.evals_dir / f"eval_lab_{phase}_{task_id}_{_utc_stamp()}").resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(artifact_dir / "lab-result.json", lab_result)
-    _write_json(artifact_dir / "lab-worker-result.json", dict(result_payload))
+    if runtime.retain_raw_lab_artifacts:
+        _write_json(artifact_dir / "lab-result.json", lab_result)
+        _write_json(artifact_dir / "lab-worker-result.json", dict(result_payload))
     score_warning: dict[str, Any] | None = None
     sensitivity_snapshot_path: Path | None = None
     sweep_payload: dict[str, Any] | None = None
@@ -1996,7 +1999,8 @@ def _record_lab_result(
             phase=phase,
             shard_results=[result_payload],
         )
-        _write_json(artifact_dir / "sweep-shard-result.json", _sweep_payload_from_worker_result(result_payload))
+        if runtime.retain_raw_lab_artifacts:
+            _write_json(artifact_dir / "sweep-shard-result.json", _sweep_payload_from_worker_result(result_payload))
         _write_json(artifact_dir / "sweep-results.json", sweep_payload)
         score = _as_float((sweep_payload.get("best") or {}).get("score"))
         attempt_score = AttemptScore(
@@ -2145,7 +2149,8 @@ def _record_lab_failure(
     error = str(result_payload.get("error") or lab_result.get("error") or "lab_worker_failed")
     artifact_dir = (lane_ctx.evals_dir / f"eval_lab_failed_{task_id}_{_utc_stamp()}").resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    _write_json(artifact_dir / "lab-result.json", lab_result)
+    if runtime.retain_raw_lab_artifacts:
+        _write_json(artifact_dir / "lab-result.json", lab_result)
     _write_json(
         artifact_dir / "lab-failure.json",
         {
