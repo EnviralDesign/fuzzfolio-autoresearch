@@ -1230,7 +1230,7 @@ def _append_event(ctx: PlayHandContext, phase: str, status: str, **payload: Any)
         if callable(formatter):
             formatted = formatter(event)
             if formatted:
-                console.print(str(formatted), markup=False)
+                print(str(formatted), flush=True)
             return
 
         score = payload.get("score")

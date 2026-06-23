@@ -3048,7 +3048,7 @@ def _campaign_gateway_snapshot(
     return scoped
 
 
-LAB_BARRIER_BOX_WIDTH = 120
+LAB_BARRIER_BOX_WIDTH = 100
 
 
 def _ascii_clip(value: Any, width: int) -> str:
@@ -3213,12 +3213,12 @@ def _format_lab_barrier_snapshot(
             _format_columns(
                 [
                     ("lane", 9),
-                    ("phase", 20),
+                    ("phase", 14),
                     ("status", 10),
                     ("score", 7),
                     ("tasks", 9),
-                    ("symbols", 22),
-                    ("detail", 34),
+                    ("symbols", 15),
+                    ("detail", 27),
                 ]
             )
         ),
@@ -3238,12 +3238,12 @@ def _format_lab_barrier_snapshot(
                 _format_columns(
                     [
                         (lane.lane_id, 9),
-                        (lane.current_phase, 20),
+                        (lane.current_phase, 14),
                         (_lane_run_status_for_log(lane), 10),
                         (_score_text(_lane_best_score_for_log(lane)), 7),
                         (f"{_lane_terminal_count_for_log(lane)}/{len(lane.task_ids)}", 9),
-                        (_format_lane_symbols(lane), 22),
-                        (_lane_detail_for_log(lane), 34),
+                        (_format_lane_symbols(lane), 15),
+                        (_lane_detail_for_log(lane), 27),
                     ]
                 )
             )
@@ -3771,7 +3771,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             return
         barrier_index += 1
         last_barrier_at = now
-        console.print(
+        print(
             _format_lab_barrier_snapshot(
                 barrier_index=barrier_index,
                 campaign_id=campaign_ctx.run_id,
@@ -3783,7 +3783,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 recorded_result_count=recorded_result_count,
                 status=status,
             ),
-            markup=False,
+            flush=True,
         )
 
     try:
