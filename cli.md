@@ -82,8 +82,10 @@ Common arguments:
 - `--instrument-pool`: explicit comma-separated or repeatable instruments to add to the resolved pool.
 - `--min-indicators`, `--max-indicators`: generated profile width.
 - `--retain-raw-lab-artifacts`: keep verbose lab debug envelopes. By default v2 writes only canonical scoreable artifacts.
+- `--log-mode`: `barrier` prints bounded ASCII lane snapshots plus explicit failure notices; `stream` prints every event with lane/task context; `quiet` suppresses event chatter. Default: `barrier`.
+- `--barrier-interval-seconds`, `--barrier-lane-limit`: tune snapshot cadence and visible lane rows.
 - `--dry-run`: write campaign/lane folders without enqueuing work.
-- `--json`: print machine-readable summary.
+- `--json`: print a machine-readable summary after coordinator logs.
 
 ## play-hand-massive legacy
 

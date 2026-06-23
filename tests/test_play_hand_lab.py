@@ -122,6 +122,102 @@ def test_normalize_runtime_continuous_has_no_target_by_default() -> None:
     assert runtime.active_runs == lab.DEFAULT_LAB_ACTIVE_RUNS
 
 
+def test_normalize_runtime_defaults_to_barrier_logging() -> None:
+    runtime = lab._normalize_runtime(lab.PlayHandLabRuntimeConfig())
+
+    assert runtime.log_mode == "barrier"
+    assert runtime.barrier_interval_seconds == 5.0
+    assert runtime.barrier_lane_limit == 24
+
+
+def test_lab_barrier_snapshot_is_bounded_and_lane_oriented(tmp_path: Path) -> None:
+    first_lane = lab.LabLaneState(
+        lane_id="lane_007",
+        lane_index=7,
+        run_id="20260622-playhand-lab-lane-007-v1",
+        run_dir=tmp_path / "lane-007",
+        instruments=["EURUSD", "XAUUSD"],
+        timeframe="M5",
+    )
+    first_lane.current_phase = "coarse"
+    first_lane.task_ids = ["task-1", "task-2"]
+    first_lane.completed_task_ids = {"task-1"}
+    first_lane.best_score = 78.125
+    first_lane.incumbent_phase = "baseline"
+    hidden_lane = lab.LabLaneState(
+        lane_id="lane_008",
+        lane_index=8,
+        run_id="20260622-playhand-lab-lane-008-v1",
+        run_dir=tmp_path / "lane-008",
+        instruments=["GBPUSD"],
+        timeframe="M5",
+    )
+    hidden_lane.current_phase = "baseline"
+    hidden_lane.task_ids = ["task-3"]
+
+    text = lab._format_lab_barrier_snapshot(
+        barrier_index=3,
+        campaign_id="campaign-1",
+        runtime=lab.PlayHandLabRuntimeConfig(
+            campaign_mode="continuous",
+            active_runs=2,
+            barrier_lane_limit=1,
+        ),
+        lanes=[first_lane, hidden_lane],
+        tasks=[{"task_id": "task-1"}, {"task_id": "task-2"}, {"task_id": "task-3"}],
+        snapshot={
+            "worker_count": 4,
+            "busy_worker_count": 2,
+            "worker_slots": 4,
+            "busy_slots": 2,
+            "queued_tasks": 5,
+            "live_tasks": 7,
+            "completed_tasks": 11,
+            "failed_tasks": 0,
+            "result_backlog": 1,
+            "metrics": {"tasks_enqueued": 13, "completions_accepted": 11},
+        },
+        metric_baseline={"tasks_enqueued": 3, "completions_accepted": 1},
+        recorded_result_count=11,
+    )
+
+    lines = text.splitlines()
+    assert lines[0].startswith("+")
+    assert lines[-1].startswith("+")
+    assert all(len(line) == lab.LAB_BARRIER_BOX_WIDTH for line in lines)
+    assert "PlayHand Massive v2 barrier #0003" in text
+    assert "workers=2/4 busy slots=2/4 sat=50%" in text
+    assert "lane_007" in text
+    assert "coarse" in text
+    assert "78.12" in text
+    assert "1 more lane(s) hidden" in text
+
+
+def test_lab_failure_notice_includes_lane_task_phase_and_reason() -> None:
+    line = lab._format_lab_event_notice(
+        {
+            "phase": "lab_result",
+            "status": "failed",
+            "run_id": "20260622-playhand-lab-lane-003-v1",
+            "task_id": "task-123",
+            "task_phase": "baseline",
+            "task_kind": "deep_replay",
+            "worker_id": "vast-worker-1",
+            "lease_id": "lease-abc",
+            "error": "remote data lake timeout",
+        }
+    )
+
+    assert line is not None
+    assert line.startswith("! lab_result failed")
+    assert "lane=lane_003" in line
+    assert "task_id=task-123" in line
+    assert "task_phase=baseline" in line
+    assert "worker_id=vast-worker-1" in line
+    assert "reason=remote data lake timeout" in line
+    assert lab._format_lab_event_notice({"phase": "lab_result", "status": "recorded"}) is None
+
+
 def test_expand_sweep_params_enforces_permutation_budget() -> None:
     axes = [
         {"target": "profile_field", "param_key": "alpha", "values": list(range(100))},

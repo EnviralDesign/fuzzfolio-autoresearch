@@ -460,6 +460,8 @@ class PlayHandContext:
     resource_trace_spans: list[dict[str, Any]] = field(default_factory=list)
     resource_trace_next_id: int = 0
     resource_trace_local: Any = field(default_factory=threading.local, repr=False)
+    event_print_mode: str = "stream"
+    event_formatter: Any = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -1220,6 +1222,16 @@ def _append_event(ctx: PlayHandContext, phase: str, status: str, **payload: Any)
         ctx.events_path.parent.mkdir(parents=True, exist_ok=True)
         with ctx.events_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=True) + "\n")
+
+        print_mode = str(getattr(ctx, "event_print_mode", "stream") or "stream").strip().lower()
+        if print_mode == "quiet":
+            return
+        formatter = getattr(ctx, "event_formatter", None)
+        if callable(formatter):
+            formatted = formatter(event)
+            if formatted:
+                console.print(str(formatted), markup=False)
+            return
 
         score = payload.get("score")
         detail = f" score={score:.4f}" if isinstance(score, (int, float)) else ""

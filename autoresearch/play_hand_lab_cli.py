@@ -298,7 +298,28 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
     play_hand_lab.add_argument(
         "--json",
         action="store_true",
-        help="Print machine-readable JSON summary.",
+        help="Print a machine-readable JSON summary after coordinator logs.",
+    )
+    play_hand_lab.add_argument(
+        "--log-mode",
+        choices=["barrier", "stream", "quiet"],
+        default="barrier",
+        help=(
+            "Coordinator stdout style. barrier prints bounded periodic snapshots plus explicit failures; "
+            "stream prints every event; quiet suppresses event chatter. Default: barrier."
+        ),
+    )
+    play_hand_lab.add_argument(
+        "--barrier-interval-seconds",
+        type=float,
+        default=5.0,
+        help="Seconds between barrier snapshot boxes in --log-mode barrier. Default: 5.",
+    )
+    play_hand_lab.add_argument(
+        "--barrier-lane-limit",
+        type=int,
+        default=24,
+        help="Maximum lane rows shown in each barrier snapshot. Default: 24.",
     )
 
     play_hand_lab_sim = subparsers.add_parser(
@@ -480,6 +501,9 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 strict_scoring=bool(args.strict_scoring),
                 retain_raw_lab_artifacts=bool(args.retain_raw_lab_artifacts),
                 json_output=bool(args.json),
+                log_mode=args.log_mode,
+                barrier_interval_seconds=args.barrier_interval_seconds,
+                barrier_lane_limit=args.barrier_lane_limit,
                 worker_contract_hash=args.worker_contract_hash,
                 worker_contract_schema=args.worker_contract_schema,
                 trading_dashboard_root=args.trading_dashboard_root,

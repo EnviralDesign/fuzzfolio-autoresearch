@@ -98,6 +98,9 @@ DEFAULT_LAB_USER_ID = "autoresearch-lab"
 DEFAULT_LAB_ACTIVE_RUNS = 64
 DEFAULT_LAB_RESULT_BATCH_SIZE = 25
 DEFAULT_LAB_RESULT_READ_FAILURE_LIMIT = 5
+DEFAULT_LAB_LOG_MODE = "barrier"
+DEFAULT_LAB_BARRIER_INTERVAL_SECONDS = 5.0
+DEFAULT_LAB_BARRIER_LANE_LIMIT = 24
 DEFAULT_LAB_SWEEP_SHARD_SIZE = 8
 DEFAULT_LAB_SCRUTINY_MONTHS = 36
 PLAY_HAND_LAB_PIPELINE_VERSION = "play_hand_lab_pipeline_v2"
@@ -157,6 +160,9 @@ class PlayHandLabRuntimeConfig:
     strict_scoring: bool = False
     retain_raw_lab_artifacts: bool = False
     json_output: bool = False
+    log_mode: Literal["barrier", "stream", "quiet"] = "barrier"
+    barrier_interval_seconds: float = DEFAULT_LAB_BARRIER_INTERVAL_SECONDS
+    barrier_lane_limit: int = DEFAULT_LAB_BARRIER_LANE_LIMIT
     worker_contract_hash: str | None = None
     worker_contract_schema: str = "replay-worker-contract-v1"
     trading_dashboard_root: Path | None = None
@@ -346,6 +352,9 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
     coarse_halving_mode = str(runtime.coarse_halving_mode or "enforce").strip().lower()
     if coarse_halving_mode not in {"off", "enforce"}:
         raise ValueError("--coarse-halving-mode must be off or enforce")
+    log_mode = str(runtime.log_mode or DEFAULT_LAB_LOG_MODE).strip().lower()
+    if log_mode not in {"barrier", "stream", "quiet"}:
+        raise ValueError("--log-mode must be barrier, stream, or quiet")
     return PlayHandLabRuntimeConfig(
         gateway_url=gateway_url.rstrip("/"),
         gateway_token=str(token).strip() if token else None,
@@ -391,6 +400,9 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         strict_scoring=bool(runtime.strict_scoring),
         retain_raw_lab_artifacts=bool(runtime.retain_raw_lab_artifacts),
         json_output=bool(runtime.json_output),
+        log_mode=log_mode,  # type: ignore[arg-type]
+        barrier_interval_seconds=max(float(runtime.barrier_interval_seconds), 1.0),
+        barrier_lane_limit=max(int(runtime.barrier_lane_limit), 1),
         worker_contract_hash=str(contract_hash).strip() if contract_hash else None,
         worker_contract_schema=contract_schema,
         trading_dashboard_root=(
@@ -2244,6 +2256,11 @@ def _record_lab_failure(
         "lab_result",
         "failed",
         task_id=task_id,
+        lane_id=lane.lane_id,
+        task_phase=phase,
+        task_kind=task_kind,
+        worker_id=lab_result.get("worker_id"),
+        lease_id=lab_result.get("lease_id"),
         artifact_dir=str(artifact_dir),
         attempt_id=record.attempt_id,
         error=error[:1000],
@@ -3031,6 +3048,296 @@ def _campaign_gateway_snapshot(
     return scoped
 
 
+LAB_BARRIER_BOX_WIDTH = 120
+
+
+def _ascii_clip(value: Any, width: int) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = text.encode("ascii", "replace").decode("ascii")
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= 3:
+        return text[:width]
+    return text[: width - 3] + "..."
+
+
+def _box_row(text: Any, *, width: int = LAB_BARRIER_BOX_WIDTH) -> str:
+    inner = max(width - 4, 1)
+    clipped = _ascii_clip(text, inner)
+    return f"| {clipped:<{inner}} |"
+
+
+def _box_rule(*, width: int = LAB_BARRIER_BOX_WIDTH) -> str:
+    return "+" + ("-" * max(width - 2, 1)) + "+"
+
+
+def _format_columns(values: list[tuple[Any, int]]) -> str:
+    return " ".join(_ascii_clip(value, width).ljust(width) for value, width in values)
+
+
+def _percent(numerator: int, denominator: int) -> str:
+    if denominator <= 0:
+        return "0%"
+    return f"{(numerator / denominator) * 100.0:.0f}%"
+
+
+def _score_text(score: float | None) -> str:
+    return f"{score:.2f}" if isinstance(score, (int, float)) else "-"
+
+
+def _lane_terminal_count_for_log(lane: LabLaneState) -> int:
+    return len(lane.completed_task_ids) + len(lane.failed_task_ids)
+
+
+def _lane_run_status_for_log(lane: LabLaneState) -> str:
+    if lane.terminal:
+        if lane.run_promoted:
+            return "promoted"
+        if lane.tombstone_reason:
+            return "tombstoned"
+    terminal_count = _lane_terminal_count_for_log(lane)
+    if terminal_count >= len(lane.task_ids) and lane.failed_task_ids:
+        return "failed"
+    if terminal_count >= len(lane.task_ids) and lane.task_ids:
+        return "completed"
+    if lane.task_ids:
+        return "running"
+    return "queued"
+
+
+def _lane_is_active_for_log(lane: LabLaneState) -> bool:
+    return bool(lane.task_ids) and _lane_terminal_count_for_log(lane) < len(lane.task_ids)
+
+
+def _lane_best_score_for_log(lane: LabLaneState) -> float | None:
+    candidates: list[float] = []
+    if isinstance(lane.best_score, (int, float)):
+        candidates.append(float(lane.best_score))
+    for score in lane.phase_scores.values():
+        if isinstance(score, (int, float)):
+            candidates.append(float(score))
+    return max(candidates) if candidates else None
+
+
+def _lane_detail_for_log(lane: LabLaneState) -> str:
+    if lane.tombstone_reason:
+        return lane.tombstone_reason
+    if lane.run_promoted:
+        return lane.final_attempt_id or lane.best_attempt_id or "canonical"
+    if lane.failed_task_ids:
+        return f"failed={len(lane.failed_task_ids)}"
+    if lane.incumbent_phase and lane.incumbent_phase != "scaffold":
+        return f"incumbent={lane.incumbent_phase}"
+    return lane.run_id
+
+
+def _format_lane_symbols(lane: LabLaneState) -> str:
+    symbols = list(lane.incumbent_instruments or lane.instruments)
+    if len(symbols) > 3:
+        return ",".join(symbols[:3]) + f"+{len(symbols) - 3}"
+    return ",".join(symbols) if symbols else "-"
+
+
+def _format_lab_barrier_snapshot(
+    *,
+    barrier_index: int,
+    campaign_id: str,
+    runtime: PlayHandLabRuntimeConfig,
+    lanes: list[LabLaneState],
+    tasks: list[dict[str, Any]],
+    snapshot: dict[str, Any] | None,
+    metric_baseline: dict[str, int],
+    recorded_result_count: int,
+    status: str | None = None,
+) -> str:
+    scoped_snapshot = snapshot if isinstance(snapshot, dict) else {}
+    total_tasks = sum(len(lane.task_ids) for lane in lanes)
+    completed_tasks = sum(len(lane.completed_task_ids) for lane in lanes)
+    failed_tasks = sum(len(lane.failed_task_ids) for lane in lanes)
+    active_lanes = [lane for lane in lanes if _lane_is_active_for_log(lane)]
+    terminal_lanes = [lane for lane in lanes if lane.terminal]
+    promoted_lanes = sum(1 for lane in lanes if lane.run_promoted)
+    tombstoned_lanes = sum(1 for lane in lanes if lane.tombstone_reason)
+    best_score = max(
+        [score for lane in lanes if (score := _lane_best_score_for_log(lane)) is not None],
+        default=None,
+    )
+    worker_slots = int(scoped_snapshot.get("worker_slots") or 0)
+    busy_slots = int(scoped_snapshot.get("busy_slots") or 0)
+    worker_count = int(
+        scoped_snapshot.get("online_worker_count")
+        or scoped_snapshot.get("worker_count")
+        or 0
+    )
+    busy_workers = int(scoped_snapshot.get("busy_worker_count") or 0)
+    queued_tasks = int(scoped_snapshot.get("queued_tasks") or 0)
+    live_tasks = int(scoped_snapshot.get("live_tasks") or 0)
+    result_backlog = int(scoped_snapshot.get("result_backlog") or 0)
+    gateway_done = int(scoped_snapshot.get("completed_tasks") or 0)
+    gateway_failed = int(scoped_snapshot.get("failed_tasks") or 0)
+    enqueued_delta = _metric_delta(scoped_snapshot, metric_baseline, "tasks_enqueued")
+    accepted_delta = _metric_delta(scoped_snapshot, metric_baseline, "completions_accepted")
+    result_loss_delta = _metric_delta(scoped_snapshot, metric_baseline, "results_dropped")
+    incompatible_delta = _metric_delta(scoped_snapshot, metric_baseline, "incompatible_claims")
+
+    header_status = f" status={status}" if status else ""
+    lines = [
+        _box_rule(),
+        _box_row(
+            f"PlayHand Massive v2 barrier #{barrier_index:04d}{header_status} "
+            f"campaign={campaign_id} mode={runtime.campaign_mode} "
+            f"target={runtime.target_runs or 'continuous'} active-runs={runtime.active_runs}"
+        ),
+        _box_row(
+            "gateway "
+            f"workers={busy_workers}/{worker_count} busy slots={busy_slots}/{worker_slots} "
+            f"sat={_percent(busy_slots, worker_slots)} queued={queued_tasks} live={live_tasks} "
+            f"done={gateway_done} failed={gateway_failed} result-backlog={result_backlog}"
+        ),
+        _box_row(
+            "lanes "
+            f"created={len(lanes)} active={len(active_lanes)} terminal={len(terminal_lanes)} "
+            f"promoted={promoted_lanes} tombstoned={tombstoned_lanes} "
+            f"tasks={completed_tasks + failed_tasks}/{total_tasks or len(tasks)} failed={failed_tasks} "
+            f"recorded={recorded_result_count} best={_score_text(best_score)}"
+        ),
+        _box_row(
+            "gateway deltas "
+            f"enqueued={enqueued_delta} completions={accepted_delta} "
+            f"dropped={result_loss_delta} incompatible-claims={incompatible_delta}"
+        ),
+        _box_rule(),
+        _box_row(
+            _format_columns(
+                [
+                    ("lane", 9),
+                    ("phase", 20),
+                    ("status", 10),
+                    ("score", 7),
+                    ("tasks", 9),
+                    ("symbols", 22),
+                    ("detail", 34),
+                ]
+            )
+        ),
+    ]
+    lane_limit = max(int(runtime.barrier_lane_limit), 1)
+    ordered_lanes = sorted(
+        lanes,
+        key=lambda lane: (
+            0 if _lane_is_active_for_log(lane) else 1 if not lane.terminal else 2,
+            lane.lane_index,
+        ),
+    )
+    visible_lanes = ordered_lanes[:lane_limit]
+    for lane in visible_lanes:
+        lines.append(
+            _box_row(
+                _format_columns(
+                    [
+                        (lane.lane_id, 9),
+                        (lane.current_phase, 20),
+                        (_lane_run_status_for_log(lane), 10),
+                        (_score_text(_lane_best_score_for_log(lane)), 7),
+                        (f"{_lane_terminal_count_for_log(lane)}/{len(lane.task_ids)}", 9),
+                        (_format_lane_symbols(lane), 22),
+                        (_lane_detail_for_log(lane), 34),
+                    ]
+                )
+            )
+        )
+    hidden_count = max(len(ordered_lanes) - len(visible_lanes), 0)
+    if hidden_count:
+        lines.append(
+            _box_row(
+                f"... {hidden_count} more lane(s) hidden; raise --barrier-lane-limit to show more ..."
+            )
+        )
+    if not lanes:
+        lines.append(_box_row("No lanes prepared yet."))
+    lines.append(_box_rule())
+    return "\n".join(lines)
+
+
+def _lab_event_lane_id(event: dict[str, Any]) -> str | None:
+    lane_id = event.get("lane_id")
+    if lane_id:
+        return str(lane_id)
+    run_id = str(event.get("run_id") or "")
+    match = re.search(r"playhand-lab-lane-(\d+)", run_id)
+    return f"lane_{match.group(1)}" if match else None
+
+
+def _format_lab_event_fields(event: dict[str, Any], *, include_status: bool) -> str:
+    fields: list[str] = []
+    lane_id = _lab_event_lane_id(event)
+    if lane_id:
+        fields.append(f"lane={lane_id}")
+    for key in ("task_id", "attempt_id", "task_kind", "worker_id", "lease_id"):
+        value = event.get(key)
+        if value:
+            fields.append(f"{key}={_ascii_clip(value, 48)}")
+    task_phase = event.get("task_phase")
+    if task_phase:
+        fields.append(f"task_phase={_ascii_clip(task_phase, 48)}")
+    score = event.get("score")
+    if isinstance(score, (int, float)):
+        fields.append(f"score={score:.4f}")
+    if include_status:
+        fields.insert(0, f"event={event.get('phase')}/{event.get('status')}")
+    return " ".join(fields)
+
+
+def _format_lab_event_notice(event: dict[str, Any]) -> str | None:
+    phase = str(event.get("phase") or "")
+    status = str(event.get("status") or "")
+    error = event.get("error") or event.get("reason") or event.get("scoring_warning")
+    important_statuses = {
+        "failed",
+        "baseline_snapshot_failed",
+        "final_snapshot_failed",
+        "initial_snapshot_failed",
+        "interrupted",
+        "restarted",
+        "result_loss_detected",
+        "result_read_failed",
+        "snapshot_failed",
+    }
+    is_important = status in important_statuses or status.endswith("_failed")
+    if phase == "campaign" and status in {"gateway_restarted", "gateway_unreachable", "result_loss", "timeout"}:
+        is_important = True
+    if not is_important:
+        return None
+    label = f"! {phase} {status}"
+    fields = _format_lab_event_fields(event, include_status=False)
+    detail = f" reason={_ascii_clip(error, 120)}" if error else ""
+    return _ascii_clip(f"{label} {fields}{detail}", 240)
+
+
+def _format_lab_stream_event(event: dict[str, Any]) -> str:
+    phase = str(event.get("phase") or "")
+    status = str(event.get("status") or "")
+    fields = _format_lab_event_fields(event, include_status=False)
+    error = event.get("error") or event.get("reason") or event.get("scoring_warning")
+    detail = f" detail={_ascii_clip(error, 120)}" if error else ""
+    return _ascii_clip(f"{phase} {status} {fields}{detail}", 240)
+
+
+def _configure_lab_event_output(ctx: PlayHandContext, runtime: PlayHandLabRuntimeConfig) -> None:
+    if runtime.log_mode == "quiet":
+        ctx.event_print_mode = "quiet"
+        ctx.event_formatter = None
+        return
+    ctx.event_print_mode = "formatted"
+    ctx.event_formatter = (
+        _format_lab_stream_event
+        if runtime.log_mode == "stream"
+        else _format_lab_event_notice
+    )
+
+
 def _write_summary(
     campaign_ctx: PlayHandContext,
     lanes: list[LabLaneState],
@@ -3121,6 +3428,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         campaign_dir=campaign_dir,
         runtime=runtime,
     )
+    _configure_lab_event_output(campaign_ctx, runtime)
     campaign_dir.mkdir(parents=True, exist_ok=True)
     _write_campaign_metadata(campaign_ctx, runtime=runtime, status="starting", started_at=started_at)
     _append_event(
@@ -3202,6 +3510,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             run_dir=run_dir,
             runtime=runtime,
         )
+        _configure_lab_event_output(lane_ctx, runtime)
         lane_ctx.profiles_dir.mkdir(parents=True, exist_ok=True)
         lane_ctx.evals_dir.mkdir(parents=True, exist_ok=True)
         lane = LabLaneState(
@@ -3450,6 +3759,33 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     gateway_unreachable = False
     interrupted = False
     consecutive_result_read_failures = 0
+    barrier_index = 0
+    last_barrier_at = 0.0
+
+    def emit_barrier_snapshot(*, force: bool = False, status: str | None = None) -> None:
+        nonlocal barrier_index, last_barrier_at
+        if runtime.log_mode != "barrier":
+            return
+        now = time.monotonic()
+        if not force and (now - last_barrier_at) < runtime.barrier_interval_seconds:
+            return
+        barrier_index += 1
+        last_barrier_at = now
+        console.print(
+            _format_lab_barrier_snapshot(
+                barrier_index=barrier_index,
+                campaign_id=campaign_ctx.run_id,
+                runtime=runtime,
+                lanes=lanes,
+                tasks=tasks,
+                snapshot=last_snapshot,
+                metric_baseline=gateway_metric_baseline,
+                recorded_result_count=recorded_result_count,
+                status=status,
+            ),
+            markup=False,
+        )
+
     try:
         last_snapshot = gateway.snapshot()
         initial_gateway_id = (
@@ -3459,6 +3795,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         )
     except requests.RequestException as exc:
         _append_event(campaign_ctx, "gateway", "initial_snapshot_failed", error=str(exc)[:500])
+    emit_barrier_snapshot(force=True)
 
     try:
         while deadline is None or time.monotonic() < deadline:
@@ -3620,6 +3957,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                         results_dropped=_metric_delta(last_snapshot, gateway_metric_baseline, "results_dropped"),
                     )
                     break
+                emit_barrier_snapshot()
             except requests.RequestException as exc:
                 _append_event(campaign_ctx, "gateway", "snapshot_failed", error=str(exc)[:500])
             time.sleep(runtime.poll_interval_seconds)
@@ -3650,6 +3988,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             status = "result_loss"
     except Exception as exc:
         _append_event(campaign_ctx, "gateway", "final_snapshot_failed", error=str(exc)[:500])
+    emit_barrier_snapshot(force=True, status=status)
     summary = _write_summary(
         campaign_ctx,
         lanes,
