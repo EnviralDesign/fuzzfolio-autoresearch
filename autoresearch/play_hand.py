@@ -41,6 +41,18 @@ from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 console = Console(safe_box=True)
 
+PLAY_HAND_TRANSIENT_CLI_RETRY_MARKERS = (
+    "http request failed",
+    "connection error",
+    "connection refused",
+    "forcibly closed",
+    "connection reset",
+    "server disconnected",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+)
+
 DEFAULT_INSTRUMENT_POOL = (
     "EURUSD",
     "GBPUSD",
@@ -3127,9 +3139,43 @@ def _scaffold_profile(
         args.extend(["--instrument", instrument])
     args.extend(["--timeframe", timeframe])
     args.extend(["--out", str(out_path), "--pretty"])
-    ctx.cli.run(args)
+    _run_scaffold_cli_with_retries(ctx, args, candidate_name=candidate_name)
     _repair_degenerate_profile_ranges(out_path)
     return out_path
+
+
+def _is_retryable_cli_scaffold_error(exc: CliError) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in PLAY_HAND_TRANSIENT_CLI_RETRY_MARKERS)
+
+
+def _run_scaffold_cli_with_retries(
+    ctx: PlayHandContext,
+    args: list[str],
+    *,
+    candidate_name: str,
+    max_attempts: int = 4,
+) -> None:
+    attempts = max(int(max_attempts), 1)
+    for attempt_index in range(1, attempts + 1):
+        try:
+            ctx.cli.run(args)
+            return
+        except CliError as exc:
+            if attempt_index >= attempts or not _is_retryable_cli_scaffold_error(exc):
+                raise
+            delay_seconds = min(0.5 * (2 ** (attempt_index - 1)), 4.0)
+            _append_event(
+                ctx,
+                "profile_scaffold_retry",
+                "retrying",
+                candidate_name=candidate_name,
+                attempt=attempt_index,
+                max_attempts=attempts,
+                delay_seconds=round(delay_seconds, 3),
+                error=str(exc)[:1200],
+            )
+            time.sleep(delay_seconds)
 
 
 def _repair_degenerate_profile_ranges(profile_path: Path) -> bool:

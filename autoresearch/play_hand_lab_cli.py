@@ -231,8 +231,8 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
     play_hand_lab.add_argument(
         "--max-attempts",
         type=int,
-        default=2,
-        help="Maximum gateway lease attempts before failure. Default: 2.",
+        default=4,
+        help="Maximum gateway lease attempts before failure. Default: 4.",
     )
     play_hand_lab.add_argument(
         "--poll-interval-seconds",

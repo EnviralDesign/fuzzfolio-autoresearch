@@ -107,6 +107,62 @@ def _family_policy_seed_plan(policy: str) -> dict[str, object]:
     }
 
 
+def test_scaffold_profile_retries_transient_cli_failure(monkeypatch, tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    class FakeCli:
+        def run(self, args: list[str]) -> None:
+            calls.append(list(args))
+            out_path = Path(args[args.index("--out") + 1])
+            if len(calls) == 1:
+                raise play_hand_mod.CliError(
+                    "Command failed: fuzzfolio-agent-cli profiles scaffold\n"
+                    "stderr:\nError: HTTP request failed\n"
+                    "Caused by: An existing connection was forcibly closed by the remote host."
+                )
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(
+                json.dumps(
+                    {
+                        "profile": {
+                            "name": "candidate",
+                            "instruments": ["EURUSD"],
+                            "indicators": [
+                                {
+                                    "meta": {"id": "RSI_DIVERGENCE"},
+                                    "config": {"timeframe": "M5", "isActive": True},
+                                }
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+    monkeypatch.setattr(play_hand_mod.time, "sleep", lambda _seconds: None)
+    ctx = SimpleNamespace(
+        cli=FakeCli(),
+        profiles_dir=tmp_path / "profiles",
+        dry_run=False,
+        io_lock=threading.RLock(),
+        events_path=tmp_path / "events.jsonl",
+        run_id="run-1",
+    )
+
+    path = play_hand_mod._scaffold_profile(
+        ctx,
+        ["RSI_DIVERGENCE"],
+        ["EURUSD"],
+        "M5",
+        "candidate",
+    )
+
+    assert path.exists()
+    assert len(calls) == 2
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[0]["phase"] == "profile_scaffold_retry"
+
+
 def test_repair_degenerate_profile_ranges_expands_binary_defaults(tmp_path: Path) -> None:
     profile_path = tmp_path / "profile.json"
     profile_path.write_text(

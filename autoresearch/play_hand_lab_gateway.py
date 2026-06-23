@@ -94,7 +94,7 @@ class LabTask:
     payload: dict[str, Any] = field(default_factory=dict)
     required_worker_capabilities: set[str] = field(default_factory=set)
     deadline_seconds: float = 300.0
-    max_attempts: int = 2
+    max_attempts: int = 4
     created_at: float = field(default_factory=_now)
     attempt_number: int = 0
     status: TaskStatus = "queued"
@@ -124,7 +124,7 @@ class LabTask:
             payload=task_payload,
             required_worker_capabilities=required_worker_capabilities,
             deadline_seconds=max(float(payload.get("deadline_seconds") or 300.0), 1.0),
-            max_attempts=max(int(payload.get("max_attempts") or 2), 1),
+            max_attempts=max(int(payload.get("max_attempts") or 4), 1),
         )
 
     def to_payload(self) -> dict[str, Any]:
