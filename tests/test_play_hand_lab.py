@@ -74,6 +74,12 @@ def test_normalize_runtime_loads_existing_gateway_token_file(
     assert runtime.gateway_token == "shared-token"
 
 
+def test_normalize_runtime_defaults_to_cloud_tolerant_lab_attempts() -> None:
+    runtime = lab._normalize_runtime(lab.PlayHandLabRuntimeConfig())
+
+    assert runtime.max_attempts == 8
+
+
 def test_normalize_runtime_resolves_instrument_pool_presets() -> None:
     runtime = lab._normalize_runtime(
         lab.PlayHandLabRuntimeConfig(

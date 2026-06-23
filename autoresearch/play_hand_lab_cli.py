@@ -231,8 +231,8 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
     play_hand_lab.add_argument(
         "--max-attempts",
         type=int,
-        default=4,
-        help="Maximum gateway lease attempts before failure. Default: 4.",
+        default=8,
+        help="Maximum gateway lease attempts before failure. Default: 8.",
     )
     play_hand_lab.add_argument(
         "--poll-interval-seconds",
@@ -396,6 +396,24 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         default=DEFAULT_MAX_BODY_BYTES / (1024 * 1024),
         help="Maximum HTTP/WebSocket request body size in MiB. Default: 64.",
     )
+    play_hand_lab_gateway.add_argument(
+        "--lease-ttl-seconds",
+        type=float,
+        default=600.0,
+        help="Minimum gateway lease TTL in seconds. Task deadlines can extend this. Default: 600.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--worker-stale-after-seconds",
+        type=float,
+        default=600.0,
+        help="Seconds without worker heartbeat before active lab leases are requeued. Default: 600.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--worker-prune-after-seconds",
+        type=float,
+        default=1800.0,
+        help="Seconds without worker heartbeat before idle lab workers are pruned. Default: 1800.",
+    )
 
     play_hand_lab_http_sim = subparsers.add_parser(
         "play-hand-massive-v2-http-sim",
@@ -532,6 +550,9 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
             port=int(args.port),
             token=args.token,
             max_body_bytes=max(int(float(args.max_body_mb) * 1024 * 1024), 1024),
+            lease_ttl_seconds=args.lease_ttl_seconds,
+            worker_stale_after_seconds=args.worker_stale_after_seconds,
+            worker_prune_after_seconds=args.worker_prune_after_seconds,
         )
     if args.command in PLAY_HAND_LAB_HTTP_SIM_COMMANDS:
         result = cmd_play_hand_lab_http_sim(

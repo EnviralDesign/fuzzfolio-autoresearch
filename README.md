@@ -89,6 +89,8 @@ Play Hand Massive v2 is the lab gateway path: in-memory queue, in-memory worker 
 
 When the gateway binds outside loopback, it uses `--token`, `FUZZFOLIO_LAB_GATEWAY_TOKEN`, or the per-user `FUZZFOLIO_LAB_GATEWAY_TOKEN_FILE` fallback. Deep-replay v2 runs require `--tasks-per-lane 1`; scale finite campaigns with `--target-runs` and keep worker pressure bounded with `--active-runs`. The legacy `--lanes` flag remains as an alias for `--target-runs`.
 
+The lab gateway defaults are cloud-tolerant: leases stay live for at least `600` seconds, workers are treated stale after `600` seconds without heartbeat, and stale records prune after `1800` seconds. Coordinators default to `--max-attempts 8` so transient Vast worker churn requeues work instead of quickly final-failing useful shards.
+
 When `--instrument-pool-preset` is omitted, v2 uses the existing Play Hand default pool and still allows seed-template instrument narrowing. Named presets can be repeated or comma-separated: `core/default`, `fx`, `fx-major`, `fx-minor`, `metals`, `energies`, `indices`, `crypto`, `commodities`, `cfds`, and `all`. The `all` preset tracks the trimmed FuzzFolio Dukascopy constants set: all FX plus selected metals, energies, indices, and crypto.
 
 Deep-replay worker completions must also be scoreable. If the coordinator cannot score a returned artifact, it records the attempt as failed and the campaign exits failed instead of treating an unusable artifact as a screened result.

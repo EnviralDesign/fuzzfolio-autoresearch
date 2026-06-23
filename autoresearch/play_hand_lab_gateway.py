@@ -247,12 +247,12 @@ class LabResult:
 
 @dataclass(slots=True)
 class LabGatewayConfig:
-    lease_ttl_seconds: float = 120.0
+    lease_ttl_seconds: float = 600.0
     max_recent_completions: int = 20_000
     max_result_backlog: int = 100_000
     no_work_retry_after_seconds: float = 1.0
-    worker_stale_after_seconds: float = 120.0
-    worker_prune_after_seconds: float = 600.0
+    worker_stale_after_seconds: float = 600.0
+    worker_prune_after_seconds: float = 1800.0
 
 
 @dataclass(slots=True)
@@ -1405,10 +1405,20 @@ def serve_lab_gateway(
     port: int,
     token: str | None = None,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    lease_ttl_seconds: float = 600.0,
+    worker_stale_after_seconds: float = 600.0,
+    worker_prune_after_seconds: float = 1800.0,
 ) -> None:
     import uvicorn
 
-    gateway = PlayHandLabGateway()
+    stale_after = max(float(worker_stale_after_seconds), 1.0)
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(
+            lease_ttl_seconds=max(float(lease_ttl_seconds), 1.0),
+            worker_stale_after_seconds=stale_after,
+            worker_prune_after_seconds=max(float(worker_prune_after_seconds), stale_after),
+        )
+    )
     app = create_lab_gateway_app(gateway, token=token, max_body_bytes=max_body_bytes)
     uvicorn.run(
         app,
@@ -1428,6 +1438,9 @@ def cmd_play_hand_lab_gateway(
     port: int,
     token: str | None = None,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
+    lease_ttl_seconds: float = 600.0,
+    worker_stale_after_seconds: float = 600.0,
+    worker_prune_after_seconds: float = 1800.0,
 ) -> int:
     token = token or load_lab_gateway_token(create=not _is_loopback_host(host))
     if not token and not _is_loopback_host(host):
@@ -1435,7 +1448,15 @@ def cmd_play_hand_lab_gateway(
             "PlayHand Lab gateway requires --token, FUZZFOLIO_LAB_GATEWAY_TOKEN, "
             "or a writable FUZZFOLIO_LAB_GATEWAY_TOKEN_FILE for non-loopback binds."
         )
-    serve_lab_gateway(host=host, port=port, token=token, max_body_bytes=max_body_bytes)
+    serve_lab_gateway(
+        host=host,
+        port=port,
+        token=token,
+        max_body_bytes=max_body_bytes,
+        lease_ttl_seconds=lease_ttl_seconds,
+        worker_stale_after_seconds=worker_stale_after_seconds,
+        worker_prune_after_seconds=worker_prune_after_seconds,
+    )
     return 0
 
 

@@ -23,6 +23,14 @@ from autoresearch.play_hand_lab_gateway import (
 )
 
 
+def test_lab_gateway_defaults_are_cloud_tolerant() -> None:
+    config = LabGatewayConfig()
+
+    assert config.lease_ttl_seconds == 600.0
+    assert config.worker_stale_after_seconds == 600.0
+    assert config.worker_prune_after_seconds == 1800.0
+
+
 def test_lab_gateway_claim_complete_and_duplicate_completion() -> None:
     gateway = PlayHandLabGateway()
     gateway.enqueue(

@@ -151,7 +151,7 @@ class PlayHandLabRuntimeConfig:
     instrument_scout_max_selected: int = INSTRUMENT_SCOUT_DEFAULT_MAX_SELECTED
     fake_work_seconds: float = 1.0
     deadline_seconds: float = 3600.0
-    max_attempts: int = 4
+    max_attempts: int = 8
     poll_interval_seconds: float = 1.0
     max_wait_seconds: float = 3600.0
     result_batch_size: int = DEFAULT_LAB_RESULT_BATCH_SIZE

@@ -73,11 +73,13 @@ Common arguments:
 
 - `--gateway-url`, `--gateway-token`: lab gateway connection details.
 - `--token`: gateway bearer token. Non-loopback gateway binds auto-create/read `FUZZFOLIO_LAB_GATEWAY_TOKEN_FILE` when neither `--token` nor `FUZZFOLIO_LAB_GATEWAY_TOKEN` is set.
+- `--lease-ttl-seconds`, `--worker-stale-after-seconds`, `--worker-prune-after-seconds`: lab gateway lifecycle knobs. Defaults are `600`, `600`, and `1800` for cloud-worker tolerance.
 - `--mode`: `finite` drains and exits after `--target-runs`; `continuous` replaces completed runs until stopped.
 - `--task-mode`: `deep_replay` or `fake_compute`.
 - `--target-runs`: total candidate run folders to create in finite mode. `--lanes` remains a compatibility alias.
 - `--active-runs`: candidate runs kept in flight at once.
 - `--tasks-per-lane`: replay tasks queued for each lane.
+- `--max-attempts`: gateway lease attempts before a task is final-failed. Default: `8`.
 - `--instrument-pool-preset`: named pool preset to deal across lanes. Repeat or comma-separate values such as `fx,metals`, `crypto`, or `all`.
 - `--instrument-pool`: explicit comma-separated or repeatable instruments to add to the resolved pool.
 - `--min-indicators`, `--max-indicators`: generated profile width.
