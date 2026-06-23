@@ -193,7 +193,9 @@ def test_lab_barrier_snapshot_is_bounded_and_lane_oriented(tmp_path: Path) -> No
     assert all(len(line) == lab.LAB_BARRIER_BOX_WIDTH for line in lines)
     assert "PlayHand Massive v2 barrier #0003" in text
     assert "workers=2/4 busy slots=2/4 sat=50%" in text
+    assert "lane     | phase" in text
     assert "lane_007" in text
+    assert "lane_007 | coarse" in text
     assert "coarse" in text
     assert "78.12" in text
     assert "1 more active lane(s) hidden" in text

@@ -3051,8 +3051,12 @@ def _campaign_gateway_snapshot(
 LAB_BARRIER_BOX_WIDTH = 100
 
 
-def _ascii_clip(value: Any, width: int) -> str:
-    text = re.sub(r"\s+", " ", str(value or "")).strip()
+def _ascii_clip(value: Any, width: int, *, collapse_whitespace: bool = True) -> str:
+    text = str(value or "")
+    if collapse_whitespace:
+        text = re.sub(r"\s+", " ", text).strip()
+    else:
+        text = re.sub(r"[\r\n\t]+", " ", text)
     text = text.encode("ascii", "replace").decode("ascii")
     if width <= 0:
         return ""
@@ -3063,9 +3067,14 @@ def _ascii_clip(value: Any, width: int) -> str:
     return text[: width - 3] + "..."
 
 
-def _box_row(text: Any, *, width: int = LAB_BARRIER_BOX_WIDTH) -> str:
+def _box_row(
+    text: Any,
+    *,
+    width: int = LAB_BARRIER_BOX_WIDTH,
+    preserve_spacing: bool = False,
+) -> str:
     inner = max(width - 4, 1)
-    clipped = _ascii_clip(text, inner)
+    clipped = _ascii_clip(text, inner, collapse_whitespace=not preserve_spacing)
     return f"| {clipped:<{inner}} |"
 
 
@@ -3074,7 +3083,7 @@ def _box_rule(*, width: int = LAB_BARRIER_BOX_WIDTH) -> str:
 
 
 def _format_columns(values: list[tuple[Any, int]]) -> str:
-    return " ".join(_ascii_clip(value, width).ljust(width) for value, width in values)
+    return " | ".join(_ascii_clip(value, width).ljust(width) for value, width in values)
 
 
 def _percent(numerator: int, denominator: int) -> str:
@@ -3212,15 +3221,16 @@ def _format_lab_barrier_snapshot(
         _box_row(
             _format_columns(
                 [
-                    ("lane", 9),
-                    ("phase", 14),
+                    ("lane", 8),
+                    ("phase", 13),
                     ("status", 10),
-                    ("score", 7),
-                    ("tasks", 9),
-                    ("symbols", 15),
-                    ("detail", 27),
+                    ("score", 6),
+                    ("tasks", 7),
+                    ("symbols", 13),
+                    ("detail", 21),
                 ]
-            )
+            ),
+            preserve_spacing=True,
         ),
     ]
     lane_limit = max(int(runtime.barrier_lane_limit), 1)
@@ -3242,15 +3252,16 @@ def _format_lab_barrier_snapshot(
             _box_row(
                 _format_columns(
                     [
-                        (lane.lane_id, 9),
-                        (lane.current_phase, 14),
+                        (lane.lane_id, 8),
+                        (lane.current_phase, 13),
                         (_lane_run_status_for_log(lane), 10),
-                        (_score_text(_lane_best_score_for_log(lane)), 7),
-                        (f"{_lane_terminal_count_for_log(lane)}/{len(lane.task_ids)}", 9),
-                        (_format_lane_symbols(lane), 15),
-                        (_lane_detail_for_log(lane), 27),
+                        (_score_text(_lane_best_score_for_log(lane)), 6),
+                        (f"{_lane_terminal_count_for_log(lane)}/{len(lane.task_ids)}", 7),
+                        (_format_lane_symbols(lane), 13),
+                        (_lane_detail_for_log(lane), 21),
                     ]
-                )
+                ),
+                preserve_spacing=True,
             )
         )
     hidden_count = max(len(ordered_lanes) - len(visible_lanes), 0)
