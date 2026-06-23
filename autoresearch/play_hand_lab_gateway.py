@@ -1280,7 +1280,11 @@ class LabGatewayAsgiApp:
                     disconnect_detail,
                     worker_snapshot,
                 )
-                self.gateway.unregister_worker(websocket_worker_id)
+                # A WebSocket disconnect is transport state, not proof that the
+                # worker died. Cloud tunnels and Vast instances can drop the
+                # socket while the worker process immediately reconnects with
+                # the same worker_id. Keep leases alive until normal stale
+                # lifecycle cleanup decides the worker is gone.
 
     def _handle_worker_message(self, payload: dict[str, Any]) -> dict[str, Any]:
         message_type = str(payload.get("type") or "")

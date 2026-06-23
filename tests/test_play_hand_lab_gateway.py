@@ -837,6 +837,61 @@ def test_lab_gateway_websocket_rejects_query_token_auth() -> None:
         thread.join(timeout=5)
 
 
+def test_lab_gateway_websocket_disconnect_keeps_active_lease_for_reconnect() -> None:
+    gateway = PlayHandLabGateway()
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            deadline_seconds=600,
+            max_attempts=2,
+        )
+    )
+    server, thread, base_url = _start_uvicorn_gateway_thread(gateway, token="secret")
+    ws_url = base_url.replace("http://", "ws://", 1) + "/ws"
+
+    async def run_probe() -> str:
+        async with websocket_connect(
+            ws_url,
+            additional_headers={"Authorization": "Bearer secret"},
+            open_timeout=5,
+            ping_interval=None,
+        ) as websocket:
+            await websocket.send(
+                json.dumps(
+                    {
+                        "type": "register",
+                        "worker_id": "worker-1",
+                        "pool": "ws-test",
+                        "slots": 1,
+                    }
+                )
+            )
+            register_response = json.loads(await websocket.recv())
+            assert register_response["status"] == "registered"
+
+            await websocket.send(
+                json.dumps({"type": "claim", "worker_id": "worker-1", "pool": "ws-test"})
+            )
+            claim_response = json.loads(await websocket.recv())
+            assert claim_response["status"] == "leased"
+            return str(claim_response["lease_id"])
+
+    try:
+        lease_id = asyncio.run(run_probe())
+        snapshot = gateway.snapshot(include_workers=True)
+
+        assert snapshot["worker_count"] == 1
+        assert snapshot["queued_tasks"] == 0
+        assert snapshot["active_leases"] == 1
+        assert snapshot["metrics"]["workers_unregistered"] == 0
+        assert gateway.heartbeat_lease("worker-1", lease_id) is True
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+
+
 def test_build_parser_accepts_play_hand_lab_sim_defaults() -> None:
     parser = build_parser()
     args = parser.parse_args(["play-hand-lab-sim"])
