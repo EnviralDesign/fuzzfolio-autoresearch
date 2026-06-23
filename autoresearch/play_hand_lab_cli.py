@@ -15,6 +15,8 @@ from .play_hand_lab import (
 )
 from .play_hand_lab_gateway import (
     DEFAULT_MAX_BODY_BYTES,
+    DEFAULT_LAB_WS_PING_INTERVAL_SECONDS,
+    DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS,
     cmd_play_hand_lab_gateway,
     cmd_play_hand_lab_http_sim,
     cmd_play_hand_lab_sim,
@@ -414,6 +416,18 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         default=1800.0,
         help="Seconds without worker heartbeat before idle lab workers are pruned. Default: 1800.",
     )
+    play_hand_lab_gateway.add_argument(
+        "--ws-ping-interval-seconds",
+        type=float,
+        default=DEFAULT_LAB_WS_PING_INTERVAL_SECONDS,
+        help=f"Gateway WebSocket keepalive ping interval. Default: {DEFAULT_LAB_WS_PING_INTERVAL_SECONDS:g}.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--ws-ping-timeout-seconds",
+        type=float,
+        default=DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS,
+        help=f"Gateway WebSocket keepalive ping timeout. Default: {DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS:g}.",
+    )
 
     play_hand_lab_http_sim = subparsers.add_parser(
         "play-hand-massive-v2-http-sim",
@@ -553,6 +567,8 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
             lease_ttl_seconds=args.lease_ttl_seconds,
             worker_stale_after_seconds=args.worker_stale_after_seconds,
             worker_prune_after_seconds=args.worker_prune_after_seconds,
+            ws_ping_interval_seconds=args.ws_ping_interval_seconds,
+            ws_ping_timeout_seconds=args.ws_ping_timeout_seconds,
         )
     if args.command in PLAY_HAND_LAB_HTTP_SIM_COMMANDS:
         result = cmd_play_hand_lab_http_sim(

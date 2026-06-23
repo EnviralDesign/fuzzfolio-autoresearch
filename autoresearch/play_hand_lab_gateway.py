@@ -33,6 +33,8 @@ ClaimStatus = Literal["leased", "no_work"]
 CompletionStatus = Literal["accepted", "duplicate", "lease_lost"]
 FailureStatus = Literal["requeued", "failed", "lease_lost"]
 DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024
+DEFAULT_LAB_WS_PING_INTERVAL_SECONDS = 30.0
+DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS = 180.0
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +65,32 @@ def _parse_bool(value: Any, *, default: bool = True) -> bool:
     if normalized in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return default
+    return max(value, minimum)
+
+
+def _is_expected_websocket_disconnect_exception(exc: Exception) -> bool:
+    exc_type = type(exc)
+    exc_name = exc_type.__name__
+    exc_module = exc_type.__module__
+    if exc_name in {
+        "ClientDisconnected",
+        "ConnectionClosed",
+        "ConnectionClosedError",
+        "ConnectionClosedOK",
+        "WebSocketDisconnect",
+    }:
+        return True
+    return exc_module.startswith("uvicorn.protocols.") and "Disconnect" in exc_name
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -1259,6 +1287,13 @@ class LabGatewayAsgiApp:
                     }
                 )
         except Exception as exc:
+            if _is_expected_websocket_disconnect_exception(exc):
+                disconnect_detail = {
+                    "reason": "transport_disconnect",
+                    "exception_type": type(exc).__name__,
+                    "exception": str(exc),
+                }
+                return
             disconnect_detail = {
                 "reason": "handler_exception",
                 "exception_type": type(exc).__name__,
@@ -1414,6 +1449,8 @@ def _start_uvicorn_gateway_thread(
     token: str | None,
     host: str = "127.0.0.1",
     port: int | None = None,
+    ws_ping_interval_seconds: float | None = None,
+    ws_ping_timeout_seconds: float | None = None,
 ) -> tuple[Any, threading.Thread, str]:
     import uvicorn
 
@@ -1429,6 +1466,16 @@ def _start_uvicorn_gateway_thread(
         http="httptools",
         backlog=4096,
         timeout_keep_alive=60,
+        ws_ping_interval=(
+            DEFAULT_LAB_WS_PING_INTERVAL_SECONDS
+            if ws_ping_interval_seconds is None
+            else max(float(ws_ping_interval_seconds), 0.0)
+        ),
+        ws_ping_timeout=(
+            DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS
+            if ws_ping_timeout_seconds is None
+            else max(float(ws_ping_timeout_seconds), 0.0)
+        ),
     )
     server = uvicorn.Server(config)
 
@@ -1460,6 +1507,8 @@ def serve_lab_gateway(
     lease_ttl_seconds: float = 600.0,
     worker_stale_after_seconds: float = 600.0,
     worker_prune_after_seconds: float = 1800.0,
+    ws_ping_interval_seconds: float | None = None,
+    ws_ping_timeout_seconds: float | None = None,
 ) -> None:
     import uvicorn
 
@@ -1481,6 +1530,24 @@ def serve_lab_gateway(
         http="httptools",
         backlog=4096,
         timeout_keep_alive=60,
+        ws_ping_interval=(
+            _env_float(
+                "PLAYHAND_LAB_WS_PING_INTERVAL_SECONDS",
+                DEFAULT_LAB_WS_PING_INTERVAL_SECONDS,
+                minimum=0.0,
+            )
+            if ws_ping_interval_seconds is None
+            else max(float(ws_ping_interval_seconds), 0.0)
+        ),
+        ws_ping_timeout=(
+            _env_float(
+                "PLAYHAND_LAB_WS_PING_TIMEOUT_SECONDS",
+                DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS,
+                minimum=0.0,
+            )
+            if ws_ping_timeout_seconds is None
+            else max(float(ws_ping_timeout_seconds), 0.0)
+        ),
     )
 
 
@@ -1493,6 +1560,8 @@ def cmd_play_hand_lab_gateway(
     lease_ttl_seconds: float = 600.0,
     worker_stale_after_seconds: float = 600.0,
     worker_prune_after_seconds: float = 1800.0,
+    ws_ping_interval_seconds: float | None = None,
+    ws_ping_timeout_seconds: float | None = None,
 ) -> int:
     token = token or load_lab_gateway_token(create=not _is_loopback_host(host))
     if not token and not _is_loopback_host(host):
@@ -1508,6 +1577,8 @@ def cmd_play_hand_lab_gateway(
         lease_ttl_seconds=lease_ttl_seconds,
         worker_stale_after_seconds=worker_stale_after_seconds,
         worker_prune_after_seconds=worker_prune_after_seconds,
+        ws_ping_interval_seconds=ws_ping_interval_seconds,
+        ws_ping_timeout_seconds=ws_ping_timeout_seconds,
     )
     return 0
 

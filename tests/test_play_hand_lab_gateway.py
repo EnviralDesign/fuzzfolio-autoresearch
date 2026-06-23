@@ -928,12 +928,18 @@ def test_build_parser_accepts_play_hand_lab_sim_defaults() -> None:
             "8799",
             "--token",
             "secret",
+            "--ws-ping-interval-seconds",
+            "45",
+            "--ws-ping-timeout-seconds",
+            "240",
         ]
     )
     assert args.command == "play-hand-lab-gateway"
     assert args.host == "0.0.0.0"
     assert args.port == 8799
     assert args.token == "secret"
+    assert args.ws_ping_interval_seconds == 45
+    assert args.ws_ping_timeout_seconds == 240
 
     args = parser.parse_args(
         [
