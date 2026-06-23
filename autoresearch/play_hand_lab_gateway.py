@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import ipaddress
 import json
+import logging
 import math
 import os
 import random
@@ -32,6 +33,7 @@ ClaimStatus = Literal["leased", "no_work"]
 CompletionStatus = Literal["accepted", "duplicate", "lease_lost"]
 FailureStatus = Literal["requeued", "failed", "lease_lost"]
 DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024
+logger = logging.getLogger(__name__)
 
 
 def _now() -> float:
@@ -627,6 +629,25 @@ class PlayHandLabGateway:
             self._metrics["workers_unregistered"] += 1
             return True
 
+    def worker_debug_snapshot(self, worker_id: str) -> dict[str, Any] | None:
+        now = _now()
+        with self._lock:
+            worker = self._workers.get(worker_id)
+            if worker is None:
+                return None
+            return {
+                "worker_id": worker.worker_id,
+                "pool": worker.pool,
+                "slots": worker.slots,
+                "status_detail": worker.status_detail,
+                "active_lease_count": len(worker.active_lease_ids),
+                "active_lease_ids": sorted(worker.active_lease_ids)[:8],
+                "heartbeat_age_seconds": round(now - worker.heartbeat_at, 3),
+                "registered_age_seconds": round(now - worker.registered_at, 3),
+                "contract_hash": worker.contract_hash,
+                "capabilities": sorted(worker.capabilities),
+            }
+
     def drain_results(self, limit: int | None = None) -> list[dict[str, Any]]:
         results = self.read_results(limit=limit)
         self.ack_results([str(result.get("lease_id") or "") for result in results])
@@ -1197,11 +1218,17 @@ class LabGatewayAsgiApp:
             return
         await send({"type": "websocket.accept"})
         websocket_worker_id: str | None = None
+        disconnect_detail: dict[str, Any] = {"reason": "handler_exit"}
         try:
             while True:
                 message = await receive()
                 message_type = message.get("type")
                 if message_type == "websocket.disconnect":
+                    disconnect_detail = {
+                        "reason": "websocket_disconnect",
+                        "code": message.get("code"),
+                        "message_reason": message.get("reason"),
+                    }
                     return
                 if message_type != "websocket.receive":
                     continue
@@ -1209,6 +1236,7 @@ class LabGatewayAsgiApp:
                 if raw_payload is None and message.get("bytes") is not None:
                     raw_bytes = bytes(message["bytes"])
                     if len(raw_bytes) > self.max_body_bytes:
+                        disconnect_detail = {"reason": "body_too_large", "code": 1009}
                         await send({"type": "websocket.close", "code": 1009})
                         return
                     raw_payload = raw_bytes.decode("utf-8")
@@ -1230,8 +1258,28 @@ class LabGatewayAsgiApp:
                         "text": json.dumps(response, separators=(",", ":"), sort_keys=True),
                     }
                 )
+        except Exception as exc:
+            disconnect_detail = {
+                "reason": "handler_exception",
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+            }
+            logger.warning(
+                "lab_ws_handler_exception worker_id=%s detail=%s",
+                websocket_worker_id,
+                disconnect_detail,
+                exc_info=True,
+            )
+            raise
         finally:
             if websocket_worker_id:
+                worker_snapshot = self.gateway.worker_debug_snapshot(websocket_worker_id)
+                logger.warning(
+                    "lab_ws_disconnect worker_id=%s disconnect=%s worker=%s",
+                    websocket_worker_id,
+                    disconnect_detail,
+                    worker_snapshot,
+                )
                 self.gateway.unregister_worker(websocket_worker_id)
 
     def _handle_worker_message(self, payload: dict[str, Any]) -> dict[str, Any]:
