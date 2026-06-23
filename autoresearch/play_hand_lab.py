@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 import copy
 import concurrent.futures
 import itertools
@@ -37,7 +38,6 @@ from .play_hand import (
     PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
     PLAY_HAND_EARLY_EXIT_TOMBSTONE_REASON,
     PLAY_HAND_FINAL_SCRUTINY_FAILED_REASON,
-    PLAY_HAND_FINAL_SCRUTINY_MIN_SCORE,
     PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
     PLAY_HAND_RUNNER,
     PLAY_HAND_SWEEP_PERMUTATION_LIMIT,
@@ -46,7 +46,6 @@ from .play_hand import (
     _append_event,
     _as_float,
     _fallback_indicator_deal,
-    _final_scrutiny_outcome,
     _load_json,
     _load_play_hand_seed_plan,
     _lowest_profile_timeframe,
@@ -77,6 +76,7 @@ from .play_hand import (
     play_hand_reward_matrix,
     resolve_instrument_pool_presets,
     resolve_sweep_budget,
+    sample_screen_anchor,
 )
 from .playhand_health import build_play_hand_evidence, build_play_hand_health
 from .plotting import render_progress_artifacts
@@ -103,7 +103,12 @@ DEFAULT_LAB_BARRIER_INTERVAL_SECONDS = 5.0
 DEFAULT_LAB_BARRIER_LANE_LIMIT = 24
 DEFAULT_LAB_SWEEP_SHARD_SIZE = 8
 DEFAULT_LAB_SCRUTINY_MONTHS = 36
-PLAY_HAND_LAB_PIPELINE_VERSION = "play_hand_lab_pipeline_v2"
+DEFAULT_LAB_VALIDATION_MONTHS = 12
+DEFAULT_LAB_VALIDATION_MIN_SCORE = 45.0
+DEFAULT_LAB_FINAL_MIN_SCORE = 40.0
+DEFAULT_LAB_SCREEN_ANCHOR_MODE = "random"
+DEFAULT_LAB_SCREEN_ANCHOR_ENVELOPE_MONTHS = 36
+PLAY_HAND_LAB_PIPELINE_VERSION = "play_hand_lab_pipeline_v3"
 PLAY_HAND_LAB_SCREEN_PIPELINE = "screen"
 PLAY_HAND_LAB_PLAY_HAND_PIPELINE = "play_hand"
 PLAY_HAND_LAB_STAGE_ORDER = (
@@ -111,6 +116,7 @@ PLAY_HAND_LAB_STAGE_ORDER = (
     "lookback",
     "coarse",
     "focused",
+    "validation",
     "instrument_scout",
     "scrutiny",
     "artifacts",
@@ -146,7 +152,12 @@ class PlayHandLabRuntimeConfig:
     early_exit_mode: Literal["off", "report", "enforce"] = "enforce"
     coarse_halving_mode: Literal["off", "enforce"] = "enforce"
     coarse_probe_budget: int = PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET
+    validation_months: int = DEFAULT_LAB_VALIDATION_MONTHS
+    validation_min_score: float = DEFAULT_LAB_VALIDATION_MIN_SCORE
     scrutiny_months: int = DEFAULT_LAB_SCRUTINY_MONTHS
+    final_min_score: float = DEFAULT_LAB_FINAL_MIN_SCORE
+    screen_anchor_mode: Literal["now", "random"] = DEFAULT_LAB_SCREEN_ANCHOR_MODE
+    screen_anchor_envelope_months: int = DEFAULT_LAB_SCREEN_ANCHOR_ENVELOPE_MONTHS
     instrument_scout_size: int = INSTRUMENT_SCOUT_DEFAULT_SIZE
     instrument_scout_max_selected: int = INSTRUMENT_SCOUT_DEFAULT_MAX_SELECTED
     fake_work_seconds: float = 1.0
@@ -200,6 +211,10 @@ class LabLaneState:
     incumbent_instruments: list[str] = field(default_factory=list)
     incumbent_score: float | None = None
     incumbent_phase: str | None = None
+    screen_anchor_mode: str = DEFAULT_LAB_SCREEN_ANCHOR_MODE
+    screen_analysis_window_start: str | None = None
+    screen_analysis_window_end: str | None = None
+    screen_anchor_offset_days: int | None = None
     last_sweep_payload: dict[str, Any] | None = None
     last_sweep_axes: list[str] = field(default_factory=list)
     skip_focused_and_scout: bool = False
@@ -355,6 +370,15 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
     log_mode = str(runtime.log_mode or DEFAULT_LAB_LOG_MODE).strip().lower()
     if log_mode not in {"barrier", "stream", "quiet"}:
         raise ValueError("--log-mode must be barrier, stream, or quiet")
+    screen_anchor_mode = str(runtime.screen_anchor_mode or DEFAULT_LAB_SCREEN_ANCHOR_MODE).strip().lower()
+    if screen_anchor_mode not in {"now", "random"}:
+        raise ValueError("--screen-anchor-mode must be now or random")
+    validation_months = max(int(runtime.validation_months), 1)
+    scrutiny_months = max(int(runtime.scrutiny_months), 1)
+    screen_anchor_envelope_months = max(
+        int(runtime.screen_anchor_envelope_months),
+        lookback_months,
+    )
     return PlayHandLabRuntimeConfig(
         gateway_url=gateway_url.rstrip("/"),
         gateway_token=str(token).strip() if token else None,
@@ -386,7 +410,12 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         early_exit_mode=early_exit_mode,  # type: ignore[arg-type]
         coarse_halving_mode=coarse_halving_mode,  # type: ignore[arg-type]
         coarse_probe_budget=max(int(runtime.coarse_probe_budget), 1),
-        scrutiny_months=max(int(runtime.scrutiny_months), 1),
+        validation_months=validation_months,
+        validation_min_score=float(runtime.validation_min_score),
+        scrutiny_months=scrutiny_months,
+        final_min_score=float(runtime.final_min_score),
+        screen_anchor_mode=screen_anchor_mode,  # type: ignore[arg-type]
+        screen_anchor_envelope_months=screen_anchor_envelope_months,
         instrument_scout_size=max(int(runtime.instrument_scout_size), 1),
         instrument_scout_max_selected=max(int(runtime.instrument_scout_max_selected), 1),
         fake_work_seconds=max(float(runtime.fake_work_seconds), 0.0),
@@ -725,7 +754,12 @@ def _write_campaign_metadata(
             "early_exit_mode": runtime.early_exit_mode,
             "coarse_halving_mode": runtime.coarse_halving_mode,
             "coarse_probe_budget": runtime.coarse_probe_budget,
+            "validation_months": runtime.validation_months,
+            "validation_min_score": runtime.validation_min_score,
             "scrutiny_months": runtime.scrutiny_months,
+            "final_min_score": runtime.final_min_score,
+            "screen_anchor_mode": runtime.screen_anchor_mode,
+            "screen_anchor_envelope_months": runtime.screen_anchor_envelope_months,
             "instrument_scout_size": runtime.instrument_scout_size,
             "instrument_scout_max_selected": runtime.instrument_scout_max_selected,
             "required_worker_contract_hash": runtime.worker_contract_hash,
@@ -779,6 +813,15 @@ def _write_lane_metadata(
             "current_phase": lane.current_phase,
             "timeframe": lane.timeframe,
             "lookback_months": runtime.lookback_months,
+            "validation_months": runtime.validation_months,
+            "validation_min_score": runtime.validation_min_score,
+            "scrutiny_months": runtime.scrutiny_months,
+            "final_min_score": runtime.final_min_score,
+            "screen_anchor_mode": lane.screen_anchor_mode,
+            "screen_analysis_window_start": lane.screen_analysis_window_start,
+            "screen_analysis_window_end": lane.screen_analysis_window_end,
+            "screen_anchor_offset_days": lane.screen_anchor_offset_days,
+            "screen_anchor_envelope_months": runtime.screen_anchor_envelope_months,
             "bar_limit": runtime.bar_limit,
             "instruments": list(lane.instruments),
             "indicators": list(lane.indicator_ids),
@@ -1062,6 +1105,104 @@ def _reward_matrix_payload(reward_matrix: dict[str, Any] | None) -> dict[str, An
 
 def _copy_profile_payload(profile_payload: dict[str, Any] | None) -> dict[str, Any]:
     return copy.deepcopy(profile_payload or {})
+
+
+def _utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _subtract_calendar_months(value: datetime, months: int) -> datetime:
+    month_index = value.month - 1 - max(int(months), 0)
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _sample_lane_screen_anchor(lane: LabLaneState, runtime: PlayHandLabRuntimeConfig) -> None:
+    lane.screen_anchor_mode = str(runtime.screen_anchor_mode or DEFAULT_LAB_SCREEN_ANCHOR_MODE)
+    lane.screen_analysis_window_start = None
+    lane.screen_analysis_window_end = None
+    lane.screen_anchor_offset_days = None
+    if lane.screen_anchor_mode != "random":
+        return
+
+    now = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    anchor = sample_screen_anchor(
+        mode=lane.screen_anchor_mode,
+        screen_months=int(runtime.lookback_months),
+        max_offset_months=max(int(runtime.screen_anchor_envelope_months) - int(runtime.lookback_months), 0),
+        seed=f"{runtime.seed}:{lane.run_id}:{lane.lane_index}",
+        now=now,
+    )
+    offset_days = int(anchor.get("offset_days") or 0)
+    as_of_date = str(anchor.get("as_of_date") or "").strip()
+    end = (
+        datetime.fromisoformat(as_of_date).replace(tzinfo=timezone.utc)
+        if as_of_date
+        else now
+    )
+    start = _subtract_calendar_months(end, int(runtime.lookback_months))
+    lane.screen_anchor_offset_days = offset_days
+    lane.screen_analysis_window_start = _utc_iso(start)
+    lane.screen_analysis_window_end = _utc_iso(end)
+
+
+def _lane_screen_window(lane: LabLaneState) -> tuple[str | None, str | None]:
+    return lane.screen_analysis_window_start, lane.screen_analysis_window_end
+
+
+def _validation_phase(runtime: PlayHandLabRuntimeConfig) -> str:
+    return f"validation_{int(runtime.validation_months)}mo"
+
+
+def _score_gate_outcome(
+    *,
+    score: Any,
+    min_score: float,
+    missing_reason: str,
+    below_reason_prefix: str,
+    failed_reason: str,
+) -> dict[str, Any]:
+    numeric = _as_float(score)
+    if numeric is None:
+        return {
+            "passed": False,
+            "score": None,
+            "reason": missing_reason,
+            "reasons": [failed_reason, missing_reason],
+        }
+    if numeric < float(min_score):
+        threshold_text = f"{float(min_score):g}"
+        reason = f"{below_reason_prefix}_{threshold_text}"
+        return {
+            "passed": False,
+            "score": numeric,
+            "reason": reason,
+            "reasons": [failed_reason, reason],
+        }
+    return {"passed": True, "score": numeric, "reason": None, "reasons": []}
+
+
+def _validation_outcome(score: Any, runtime: PlayHandLabRuntimeConfig) -> dict[str, Any]:
+    months = int(runtime.validation_months)
+    return _score_gate_outcome(
+        score=score,
+        min_score=float(runtime.validation_min_score),
+        missing_reason="missing_validation_score",
+        below_reason_prefix="validation_score_below",
+        failed_reason=f"validation_{months}mo_failed",
+    )
+
+
+def _lab_final_scrutiny_outcome(score: Any, runtime: PlayHandLabRuntimeConfig) -> dict[str, Any]:
+    return _score_gate_outcome(
+        score=score,
+        min_score=float(runtime.final_min_score),
+        missing_reason="missing_final_36mo_score",
+        below_reason_prefix="final_36mo_score_below",
+        failed_reason=PLAY_HAND_FINAL_SCRUTINY_FAILED_REASON,
+    )
 
 
 def _profile_direction_mode(profile_payload: dict[str, Any] | None) -> str:
@@ -1542,6 +1683,8 @@ def _deep_replay_job_payload(
     instruments: list[str] | None = None,
     timeframe: str | None = None,
     lookback_months: int | None = None,
+    analysis_window_start: str | None = None,
+    analysis_window_end: str | None = None,
 ) -> dict[str, Any]:
     profile_payload = _copy_profile_payload(profile_payload or lane.profile_payload)
     job: dict[str, Any] = {
@@ -1562,6 +1705,8 @@ def _deep_replay_job_payload(
         "timeframe": str(timeframe or lane.timeframe),
         "market_data_source": "lake_bars",
         "lookback_months": int(lookback_months or runtime.lookback_months),
+        "analysis_window_start": analysis_window_start,
+        "analysis_window_end": analysis_window_end,
         "bar_limit": int(runtime.bar_limit),
         "alert_threshold": float(profile_payload.get("notificationThreshold") or 80.0),
         "view_mode": "overview",
@@ -1617,6 +1762,8 @@ def _make_deep_replay_task(
     instruments: list[str],
     timeframe: str,
     lookback_months: int,
+    analysis_window_start: str | None = None,
+    analysis_window_end: str | None = None,
     required_worker_capabilities: list[str] | None = None,
 ) -> dict[str, Any]:
     task_id = f"{lane.run_id}-task-{len(lane.task_ids) + 1:05d}-{phase}"
@@ -1635,6 +1782,8 @@ def _make_deep_replay_task(
         instruments=instruments,
         timeframe=timeframe,
         lookback_months=lookback_months,
+        analysis_window_start=analysis_window_start,
+        analysis_window_end=analysis_window_end,
     )
     _register_task_spec(
         lane,
@@ -1648,6 +1797,8 @@ def _make_deep_replay_task(
             "instruments": list(instruments),
             "timeframe": timeframe,
             "lookback_months": lookback_months,
+            "analysis_window_start": analysis_window_start,
+            "analysis_window_end": analysis_window_end,
         },
     )
     return {
@@ -1672,6 +1823,8 @@ def _sweep_definition_payload(
     profile_ref: str,
     profile_payload: dict[str, Any],
     lookback_months: int,
+    analysis_window_start: str | None,
+    analysis_window_end: str | None,
     mode: str,
 ) -> dict[str, Any]:
     definition: dict[str, Any] = {
@@ -1681,6 +1834,8 @@ def _sweep_definition_payload(
         "mode": "deterministic" if mode not in {"deterministic", "evolutionary"} else mode,
         "evolutionary_config": None,
         "lookback_months": int(lookback_months),
+        "analysis_window_start": analysis_window_start,
+        "analysis_window_end": analysis_window_end,
         "bar_limit": int(runtime.bar_limit),
         "alert_threshold": None,
         "view_mode": "overview",
@@ -1716,6 +1871,8 @@ def _make_sweep_shard_tasks(
     lookback_months: int,
     axis_texts: list[str],
     mode: str,
+    analysis_window_start: str | None = None,
+    analysis_window_end: str | None = None,
 ) -> list[dict[str, Any]]:
     if not axis_texts:
         return []
@@ -1747,6 +1904,8 @@ def _make_sweep_shard_tasks(
         profile_ref=profile_ref,
         profile_payload=profile_payload,
         lookback_months=lookback_months,
+        analysis_window_start=analysis_window_start,
+        analysis_window_end=analysis_window_end,
         mode=mode,
     )
     tasks: list[dict[str, Any]] = []
@@ -1791,6 +1950,8 @@ def _make_sweep_shard_tasks(
                 "instruments": list(instruments),
                 "timeframe": lane.incumbent_timeframe or lane.timeframe,
                 "lookback_months": lookback_months,
+                "analysis_window_start": analysis_window_start,
+                "analysis_window_end": analysis_window_end,
                 "axes": list(axis_plan.axes),
                 "axis_key_map": {
                     _sweep_axis_key(axis): str(axis.get("lab_axis_key") or "")
@@ -1839,6 +2000,7 @@ def _build_tasks(
             if not worker_contract_hash:
                 raise RuntimeError("Deep-replay lab tasks require a worker contract hash.")
             lane.current_phase = "baseline"
+            analysis_window_start, analysis_window_end = _lane_screen_window(lane)
             tasks.append(
                 _make_deep_replay_task(
                     lane,
@@ -1852,6 +2014,8 @@ def _build_tasks(
                     instruments=list(lane.instruments),
                     timeframe=lane.timeframe,
                     lookback_months=runtime.lookback_months,
+                    analysis_window_start=analysis_window_start,
+                    analysis_window_end=analysis_window_end,
                 )
             )
             continue
@@ -2088,6 +2252,8 @@ def _record_lab_result(
             "lab_lane_id": lane.lane_id,
             "lab_task_kind": task_kind,
             "play_hand_phase": phase,
+            "analysis_window_start": task_spec.get("analysis_window_start"),
+            "analysis_window_end": task_spec.get("analysis_window_end"),
             "worker_id": lab_result.get("worker_id"),
             "worker_lease_id": lab_result.get("lease_id"),
             "run_status": "failed" if score_warning else "screened",
@@ -2133,6 +2299,8 @@ def _record_lab_result(
         "instruments": list(task_spec.get("instruments") or lane.instruments),
         "timeframe": str(task_spec.get("timeframe") or lane.timeframe),
         "lookback_months": int(task_spec.get("lookback_months") or runtime.lookback_months),
+        "analysis_window_start": task_spec.get("analysis_window_start"),
+        "analysis_window_end": task_spec.get("analysis_window_end"),
         "sweep_payload": sweep_payload if task_kind == "sweep_shard" else None,
     }
 
@@ -2295,6 +2463,10 @@ def _write_stage_metadata(lane: LabLaneState, lane_ctx: PlayHandContext) -> None
         {
             "pipeline_version": PLAY_HAND_LAB_PIPELINE_VERSION,
             "current_phase": lane.current_phase,
+            "screen_anchor_mode": lane.screen_anchor_mode,
+            "screen_analysis_window_start": lane.screen_analysis_window_start,
+            "screen_analysis_window_end": lane.screen_analysis_window_end,
+            "screen_anchor_offset_days": lane.screen_anchor_offset_days,
             "phase_rows": list(lane.phase_rows),
             "play_hand_phase_scores": dict(lane.phase_scores),
             "stage_incumbent": {
@@ -2467,6 +2639,7 @@ def _enqueue_lookback_stage(
         _append_phase_row(lane, phase="lookback", status="skipped", detail="no timing axes")
         return []
     lane.current_phase = "lookback"
+    analysis_window_start, analysis_window_end = _lane_screen_window(lane)
     return _make_sweep_shard_tasks(
         lane,
         phase="lookback_timing",
@@ -2480,6 +2653,8 @@ def _enqueue_lookback_stage(
         lookback_months=runtime.lookback_months,
         axis_texts=axes,
         mode="deterministic",
+        analysis_window_start=analysis_window_start,
+        analysis_window_end=analysis_window_end,
     )
 
 
@@ -2502,6 +2677,7 @@ def _enqueue_coarse_stage(
     effective_runtime = runtime
     if budget is not None:
         effective_runtime = replace(runtime, max_sweep_permutations=max(int(budget), 1))
+    analysis_window_start, analysis_window_end = _lane_screen_window(lane)
     return _make_sweep_shard_tasks(
         lane,
         phase=phase,
@@ -2515,6 +2691,8 @@ def _enqueue_coarse_stage(
         lookback_months=runtime.lookback_months,
         axis_texts=axes,
         mode="evolutionary",
+        analysis_window_start=analysis_window_start,
+        analysis_window_end=analysis_window_end,
     )
 
 
@@ -2541,6 +2719,7 @@ def _enqueue_focused_stage(
         _append_phase_row(lane, phase="focused", status="skipped", detail="no high-impact axes")
         return []
     lane.current_phase = "focused"
+    analysis_window_start, analysis_window_end = _lane_screen_window(lane)
     return _make_sweep_shard_tasks(
         lane,
         phase="focused",
@@ -2554,6 +2733,8 @@ def _enqueue_focused_stage(
         lookback_months=runtime.lookback_months,
         axis_texts=axes,
         mode="deterministic",
+        analysis_window_start=analysis_window_start,
+        analysis_window_end=analysis_window_end,
     )
 
 
@@ -2580,7 +2761,7 @@ def _enqueue_instrument_scout_stage(
         tasks.append(
             _make_deep_replay_task(
                 lane,
-                phase=f"instrument_scout_{instrument}_{runtime.lookback_months}mo",
+                phase=f"instrument_scout_{instrument}_{runtime.validation_months}mo",
                 runtime=runtime,
                 reward_matrix=reward_matrix,
                 worker_contract_hash=worker_contract_hash,
@@ -2589,10 +2770,38 @@ def _enqueue_instrument_scout_stage(
                 profile_ref=lane.incumbent_profile_ref,
                 instruments=[instrument],
                 timeframe=lane.incumbent_timeframe or lane.timeframe,
-                lookback_months=runtime.lookback_months,
+                lookback_months=runtime.validation_months,
             )
         )
     return tasks
+
+
+def _enqueue_validation_stage(
+    lane: LabLaneState,
+    *,
+    runtime: PlayHandLabRuntimeConfig,
+    reward_matrix: dict[str, Any] | None,
+    worker_contract_hash: str,
+) -> list[dict[str, Any]]:
+    if lane.incumbent_profile_ref is None or lane.incumbent_profile_payload is None:
+        return []
+    lane.current_phase = "validation"
+    phase = _validation_phase(runtime)
+    return [
+        _make_deep_replay_task(
+            lane,
+            phase=phase,
+            runtime=runtime,
+            reward_matrix=reward_matrix,
+            worker_contract_hash=worker_contract_hash,
+            profile_payload=lane.incumbent_profile_payload,
+            profile_path=lane.incumbent_profile_path,
+            profile_ref=lane.incumbent_profile_ref,
+            instruments=list(lane.incumbent_instruments or lane.instruments),
+            timeframe=lane.incumbent_timeframe or lane.timeframe,
+            lookback_months=runtime.validation_months,
+        )
+    ]
 
 
 def _enqueue_final_stage(
@@ -2688,7 +2897,7 @@ def _advance_lane_after_result(
                 worker_contract_hash=worker_contract_hash,
             )
         if not tasks:
-            tasks = _enqueue_final_stage(
+            tasks = _enqueue_validation_stage(
                 lane,
                 runtime=runtime,
                 reward_matrix=reward_matrix,
@@ -2725,25 +2934,24 @@ def _advance_lane_after_result(
                     runtime=runtime,
                     reward_matrix=reward_matrix,
                     worker_contract_hash=worker_contract_hash,
-                ) or _enqueue_final_stage(
+                ) or _enqueue_validation_stage(
                     lane,
                     runtime=runtime,
                     reward_matrix=reward_matrix,
                     worker_contract_hash=worker_contract_hash,
                 )
             if phase in {"coarse", "coarse_expand", "coarse_probe"}:
-                return _enqueue_final_stage(
+                return _enqueue_validation_stage(
                     lane,
                     runtime=runtime,
                     reward_matrix=reward_matrix,
                     worker_contract_hash=worker_contract_hash,
                 )
-            return _enqueue_instrument_scout_stage(
+            return _enqueue_validation_stage(
                 lane,
                 runtime=runtime,
                 reward_matrix=reward_matrix,
                 worker_contract_hash=worker_contract_hash,
-                rng=random.Random(f"instrument-scout:{runtime.seed}:{lane.lane_index}"),
             )
         candidate_path, candidate_ref, candidate_payload, params = materialized
         candidate_score = _as_float((payload.get("best") or {}).get("score"))
@@ -2805,7 +3013,7 @@ def _advance_lane_after_result(
                     worker_contract_hash=worker_contract_hash,
                     phase="coarse_probe",
                     budget=runtime.coarse_probe_budget,
-                ) or _enqueue_final_stage(
+                ) or _enqueue_validation_stage(
                     lane,
                     runtime=runtime,
                     reward_matrix=reward_matrix,
@@ -2816,7 +3024,7 @@ def _advance_lane_after_result(
                 runtime=runtime,
                 reward_matrix=reward_matrix,
                 worker_contract_hash=worker_contract_hash,
-            ) or _enqueue_final_stage(
+            ) or _enqueue_validation_stage(
                 lane,
                 runtime=runtime,
                 reward_matrix=reward_matrix,
@@ -2843,7 +3051,7 @@ def _advance_lane_after_result(
                     budget=max(int(halving.get("expand_budget") or 1), 1),
                 )
             lane.skip_focused_and_scout = True
-            return _enqueue_final_stage(
+            return _enqueue_validation_stage(
                 lane,
                 runtime=runtime,
                 reward_matrix=reward_matrix,
@@ -2855,21 +3063,61 @@ def _advance_lane_after_result(
                 runtime=runtime,
                 reward_matrix=reward_matrix,
                 worker_contract_hash=worker_contract_hash,
-            ) or _enqueue_instrument_scout_stage(
+            ) or _enqueue_validation_stage(
                 lane,
                 runtime=runtime,
                 reward_matrix=reward_matrix,
                 worker_contract_hash=worker_contract_hash,
-                rng=random.Random(f"instrument-scout:{runtime.seed}:{lane.lane_index}"),
             )
         if phase == "focused":
-            return _enqueue_instrument_scout_stage(
+            return _enqueue_validation_stage(
                 lane,
                 runtime=runtime,
                 reward_matrix=reward_matrix,
                 worker_contract_hash=worker_contract_hash,
-                rng=random.Random(f"instrument-scout:{runtime.seed}:{lane.lane_index}"),
             )
+
+    if phase == _validation_phase(runtime):
+        validation_score = _as_float(recorded.get("score"))
+        lane.incumbent_score = validation_score
+        lane.incumbent_phase = _validation_phase(runtime)
+        _record_phase_score(lane, _validation_phase(runtime), validation_score)
+        outcome = _validation_outcome(validation_score, runtime)
+        _append_phase_row(
+            lane,
+            phase="validation",
+            status="evaluated" if outcome.get("passed") else "failed",
+            score=validation_score,
+            detail=f"{runtime.validation_months}mo min={runtime.validation_min_score:g}",
+        )
+        _write_stage_metadata(lane, lane_ctx)
+        if not outcome.get("passed"):
+            _mark_lane_tombstoned(
+                lane,
+                lane_ctx=lane_ctx,
+                reason=str(outcome.get("reason") or "validation_failed"),
+                reasons=list(outcome.get("reasons") or []),
+            )
+            return []
+        if lane.skip_focused_and_scout:
+            return _enqueue_final_stage(
+                lane,
+                runtime=runtime,
+                reward_matrix=reward_matrix,
+                worker_contract_hash=worker_contract_hash,
+            )
+        return _enqueue_instrument_scout_stage(
+            lane,
+            runtime=runtime,
+            reward_matrix=reward_matrix,
+            worker_contract_hash=worker_contract_hash,
+            rng=random.Random(f"instrument-scout:{runtime.seed}:{lane.lane_index}"),
+        ) or _enqueue_final_stage(
+            lane,
+            runtime=runtime,
+            reward_matrix=reward_matrix,
+            worker_contract_hash=worker_contract_hash,
+        )
 
     if phase.startswith("instrument_scout_"):
         scout_phase_ids = [
@@ -2939,13 +3187,16 @@ def _advance_lane_after_result(
         final_score = _as_float(recorded.get("score"))
         lane.final_attempt_id = str(recorded.get("attempt_id") or "") or None
         _record_phase_score(lane, "final_36mo", final_score)
-        outcome = _final_scrutiny_outcome({"score": final_score})
+        outcome = _lab_final_scrutiny_outcome(final_score, runtime)
         _append_phase_row(
             lane,
             phase="scrutiny",
             status="evaluated" if outcome.get("passed") else "failed",
             score=final_score,
-            detail=f"{runtime.scrutiny_months}mo on {', '.join(lane.incumbent_instruments)}",
+            detail=(
+                f"{runtime.scrutiny_months}mo min={runtime.final_min_score:g} "
+                f"on {', '.join(lane.incumbent_instruments)}"
+            ),
         )
         if outcome.get("passed"):
             _mark_lane_promoted(lane, lane_ctx=lane_ctx, final_score=final_score)
@@ -3559,6 +3810,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             deal=deal,
             rng=lane_rng,
         )
+        _sample_lane_screen_anchor(lane, runtime)
         _write_lane_metadata(
             lane,
             campaign_ctx=campaign_ctx,
@@ -3582,6 +3834,8 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             indicators=lane.indicator_ids,
             instruments=lane.instruments,
             timeframe=lane.timeframe,
+            screen_analysis_window_start=lane.screen_analysis_window_start,
+            screen_analysis_window_end=lane.screen_analysis_window_end,
         )
         return lane, lane_ctx
 

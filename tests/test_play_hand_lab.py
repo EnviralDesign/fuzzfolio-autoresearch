@@ -80,6 +80,17 @@ def test_normalize_runtime_defaults_to_cloud_tolerant_lab_attempts() -> None:
     assert runtime.max_attempts == 8
 
 
+def test_normalize_runtime_defaults_to_random_screen_and_validation_rung() -> None:
+    runtime = lab._normalize_runtime(lab.PlayHandLabRuntimeConfig())
+
+    assert runtime.screen_anchor_mode == "random"
+    assert runtime.screen_anchor_envelope_months == 36
+    assert runtime.validation_months == 12
+    assert runtime.validation_min_score == 45.0
+    assert runtime.scrutiny_months == 36
+    assert runtime.final_min_score == 40.0
+
+
 def test_normalize_runtime_resolves_instrument_pool_presets() -> None:
     runtime = lab._normalize_runtime(
         lab.PlayHandLabRuntimeConfig(
@@ -539,7 +550,9 @@ def test_deep_replay_tasks_are_self_contained_and_contract_pinned(tmp_path: Path
         tasks_per_lane=1,
         bar_limit=250,
         worker_contract_hash="sha256:" + "a" * 64,
+        seed=123,
     )
+    lab._sample_lane_screen_anchor(lane, runtime)
 
     tasks = lab._build_tasks(
         [lane],
@@ -564,6 +577,14 @@ def test_deep_replay_tasks_are_self_contained_and_contract_pinned(tmp_path: Path
     assert payload["inline_profile_snapshot"]["name"] == "Lab Smoke"
     assert payload["instruments"] == ["EURUSD"]
     assert payload["market_data_source"] == "lake_bars"
+    assert payload["analysis_window_start"]
+    assert payload["analysis_window_end"]
+    assert payload["analysis_window_start"].endswith("Z")
+    assert payload["analysis_window_end"].endswith("Z")
+    assert lane.screen_anchor_mode == "random"
+    assert lane.screen_anchor_offset_days is not None
+    assert lane.task_specs[task["task_id"]]["analysis_window_start"] == payload["analysis_window_start"]
+    assert lane.task_specs[task["task_id"]]["analysis_window_end"] == payload["analysis_window_end"]
 
 
 def test_fake_compute_tasks_require_lab_protocol_capability(tmp_path: Path) -> None:
@@ -588,6 +609,80 @@ def test_fake_compute_tasks_require_lab_protocol_capability(tmp_path: Path) -> N
         lab.PLAY_HAND_LAB_FAKE_COMPUTE_CAPABILITY,
         lab.PLAY_HAND_LAB_WORKER_PROTOCOL_CAPABILITY,
     ]
+
+
+def test_play_hand_lab_validation_and_final_score_gates() -> None:
+    runtime = lab.PlayHandLabRuntimeConfig(validation_min_score=45.0, final_min_score=40.0)
+
+    validation = lab._validation_outcome(44.9, runtime)
+    final = lab._lab_final_scrutiny_outcome(0.1, runtime)
+
+    assert validation["passed"] is False
+    assert validation["reason"] == "validation_score_below_45"
+    assert "validation_12mo_failed" in validation["reasons"]
+    assert lab._validation_outcome(45.0, runtime)["passed"] is True
+    assert final["passed"] is False
+    assert final["reason"] == "final_36mo_score_below_40"
+    assert lab.PLAY_HAND_FINAL_SCRUTINY_FAILED_REASON in final["reasons"]
+    assert lab._lab_final_scrutiny_outcome(40.0, runtime)["passed"] is True
+
+
+def test_play_hand_lab_validation_failure_tombstones_before_final(tmp_path: Path) -> None:
+    fake_config = _test_config(tmp_path)
+    lane_dir = fake_config.runs_root / "lane-validation-fail"
+    lane_dir.mkdir(parents=True)
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    lane_ctx = _campaign_ctx(lane_dir)
+    lane_ctx.attempts_path = lane_dir / "attempts.jsonl"
+    runtime = lab.PlayHandLabRuntimeConfig(
+        task_mode="deep_replay",
+        pipeline_mode="play_hand",
+        validation_min_score=45.0,
+        worker_contract_hash="sha256:" + "a" * 64,
+    )
+    phase = lab._validation_phase(runtime)
+    task_id = "lane-validation-fail-task-00001-validation_12mo"
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="lane-validation-fail",
+        run_dir=lane_dir,
+        profile_path=profile_path,
+        profile_payload=_profile_payload()["profile"],
+        profile_ref="lab-inline:lane-validation-fail:lane_000",
+        instruments=["EURUSD"],
+        timeframe="M5",
+        indicator_ids=["RSI"],
+        incumbent_profile_path=profile_path,
+        incumbent_profile_payload=_profile_payload()["profile"],
+        incumbent_profile_ref="focused_top_3mo",
+        incumbent_instruments=["EURUSD"],
+        current_phase="validation",
+    )
+    lane.task_ids.append(task_id)
+    lane.completed_task_ids.add(task_id)
+    lane.phase_task_ids[phase] = [task_id]
+    lab.write_run_metadata(lane_dir, {"run_status": "running"})
+
+    follow_up = lab._advance_lane_after_result(
+        config=fake_config,
+        lane_ctx=lane_ctx,
+        lane=lane,
+        runtime=runtime,
+        reward_matrix=None,
+        worker_contract_hash=runtime.worker_contract_hash,
+        recorded={"phase": phase, "score": 44.0, "status": "success"},
+    )
+
+    metadata = json.loads((lane_dir / "run-metadata.json").read_text(encoding="utf-8"))
+    assert follow_up == []
+    assert lane.terminal is True
+    assert lane.tombstone_reason == "validation_score_below_45"
+    assert "validation_12mo_failed" in lane.tombstone_reasons
+    assert metadata["run_status"] == "tombstoned"
+    assert metadata["final_scrutiny_passed"] is False
+    assert "final_36mo" not in lane.phase_task_ids
 
 
 def test_deep_replay_rejects_duplicate_tasks_per_lane() -> None:
@@ -1764,6 +1859,8 @@ def test_play_hand_lab_pipeline_promotes_good_lane_with_sweep_shards(
                 return 68.0 + offset
             if "focused" in task_id:
                 return 70.0 + offset
+            if "validation_12mo" in task_id:
+                return 65.0
             if "instrument_scout" in task_id:
                 return 58.0 + offset
             if "final_36mo" in task_id:
@@ -1846,6 +1943,8 @@ def test_play_hand_lab_pipeline_promotes_good_lane_with_sweep_shards(
     def fake_score_lab_artifact(*, cli, artifact_dir, strict):
         path = str(artifact_dir)
         score = 60.0
+        if "validation_12mo" in path:
+            score = 65.0
         if "instrument_scout" in path:
             score = 58.0
         if "final_36mo" in path:
@@ -1898,11 +1997,30 @@ def test_play_hand_lab_pipeline_promotes_good_lane_with_sweep_shards(
     ]
 
     assert metadata["run_status"] == "promoted"
+    assert metadata["validation_months"] == 12
+    assert metadata["validation_min_score"] == 45.0
+    assert metadata["screen_anchor_mode"] == "random"
+    assert metadata["screen_analysis_window_start"]
+    assert metadata["screen_analysis_window_end"]
     assert metadata["final_scrutiny_passed"] is True
     assert metadata["final_scrutiny_score"] == 72.0
     assert metadata["completed_task_count"] > 1
     assert "coarse_halving" in metadata
-    assert {"baseline", "lookback_top_3mo", "coarse_top_3mo", "final_36mo"} <= set(
-        metadata["play_hand_phase_scores"]
-    )
+    assert {
+        "baseline",
+        "lookback_top_3mo",
+        "coarse_top_3mo",
+        "validation_12mo",
+        "final_36mo",
+    } <= set(metadata["play_hand_phase_scores"])
     assert any(attempt["lab_task_kind"] == "sweep_shard" for attempt in attempts)
+    assert any(
+        attempt["play_hand_phase"] == "validation_12mo"
+        and attempt["requested_horizon_months"] == 12
+        for attempt in attempts
+    )
+    assert any(
+        attempt["play_hand_phase"] == "final_36mo"
+        and attempt["requested_horizon_months"] == 36
+        for attempt in attempts
+    )

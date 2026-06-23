@@ -9,7 +9,13 @@ from rich.console import Console
 
 from .play_hand import INSTRUMENT_POOL_PRESET_NAMES
 from .play_hand_lab import (
+    DEFAULT_LAB_FINAL_MIN_SCORE,
     DEFAULT_LAB_GATEWAY_URL,
+    DEFAULT_LAB_SCRUTINY_MONTHS,
+    DEFAULT_LAB_SCREEN_ANCHOR_ENVELOPE_MONTHS,
+    DEFAULT_LAB_SCREEN_ANCHOR_MODE,
+    DEFAULT_LAB_VALIDATION_MIN_SCORE,
+    DEFAULT_LAB_VALIDATION_MONTHS,
     PlayHandLabRuntimeConfig,
     cmd_play_hand_lab,
 )
@@ -150,7 +156,25 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         "--lookback-months",
         type=int,
         default=3,
-        help="Deep-replay lookback window. Default: 3.",
+        help="Cheap screen/discovery lookback window. Default: 3.",
+    )
+    play_hand_lab.add_argument(
+        "--screen-anchor-mode",
+        choices=["now", "random"],
+        default=DEFAULT_LAB_SCREEN_ANCHOR_MODE,
+        help=(
+            "Screen window anchor for cheap discovery phases. "
+            f"Default: {DEFAULT_LAB_SCREEN_ANCHOR_MODE}."
+        ),
+    )
+    play_hand_lab.add_argument(
+        "--screen-anchor-envelope-months",
+        type=int,
+        default=DEFAULT_LAB_SCREEN_ANCHOR_ENVELOPE_MONTHS,
+        help=(
+            "Rolling envelope used by random screen anchoring. "
+            f"Default: {DEFAULT_LAB_SCREEN_ANCHOR_ENVELOPE_MONTHS}."
+        ),
     )
     play_hand_lab.add_argument(
         "--bar-limit",
@@ -201,10 +225,37 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         help="Permutation budget for the coarse probe. Default: 128.",
     )
     play_hand_lab.add_argument(
+        "--validation-months",
+        type=int,
+        default=DEFAULT_LAB_VALIDATION_MONTHS,
+        help=(
+            "Intermediate validation lookback months before instrument scout/final. "
+            f"Default: {DEFAULT_LAB_VALIDATION_MONTHS}."
+        ),
+    )
+    play_hand_lab.add_argument(
+        "--validation-min-score",
+        type=float,
+        default=DEFAULT_LAB_VALIDATION_MIN_SCORE,
+        help=(
+            "Minimum validation score required to continue. "
+            f"Default: {DEFAULT_LAB_VALIDATION_MIN_SCORE:g}."
+        ),
+    )
+    play_hand_lab.add_argument(
         "--scrutiny-months",
         type=int,
-        default=36,
-        help="Final scrutiny lookback months. Default: 36.",
+        default=DEFAULT_LAB_SCRUTINY_MONTHS,
+        help=f"Final scrutiny lookback months. Default: {DEFAULT_LAB_SCRUTINY_MONTHS}.",
+    )
+    play_hand_lab.add_argument(
+        "--final-min-score",
+        type=float,
+        default=DEFAULT_LAB_FINAL_MIN_SCORE,
+        help=(
+            "Minimum final scrutiny score required for promotion. "
+            f"Default: {DEFAULT_LAB_FINAL_MIN_SCORE:g}."
+        ),
     )
     play_hand_lab.add_argument(
         "--instrument-scout-size",
@@ -519,7 +570,12 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 early_exit_mode=args.early_exit_mode,
                 coarse_halving_mode=args.coarse_halving_mode,
                 coarse_probe_budget=args.coarse_probe_budget,
+                validation_months=args.validation_months,
+                validation_min_score=args.validation_min_score,
                 scrutiny_months=args.scrutiny_months,
+                final_min_score=args.final_min_score,
+                screen_anchor_mode=args.screen_anchor_mode,
+                screen_anchor_envelope_months=args.screen_anchor_envelope_months,
                 instrument_scout_size=args.instrument_scout_size,
                 instrument_scout_max_selected=args.instrument_scout_max_selected,
                 fake_work_seconds=args.fake_work_seconds,

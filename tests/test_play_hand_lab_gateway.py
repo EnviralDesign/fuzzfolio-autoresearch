@@ -984,10 +984,34 @@ def test_build_parser_accepts_play_hand_massive_v2_aliases() -> None:
     assert args.active_runs == 3
     assert args.mode == "finite"
     assert args.instrument_pool_preset == ["fx", "metals,crypto"]
+    assert args.screen_anchor_mode == "random"
+    assert args.screen_anchor_envelope_months == 36
+    assert args.validation_months == 12
+    assert args.validation_min_score == 45.0
+    assert args.scrutiny_months == 36
+    assert args.final_min_score == 40.0
     assert args.json is True
 
-    args = parser.parse_args(["play-hand-massive-v2", "--lanes", "12"])
+    args = parser.parse_args(
+        [
+            "play-hand-massive-v2",
+            "--lanes",
+            "12",
+            "--screen-anchor-mode",
+            "now",
+            "--validation-months",
+            "9",
+            "--validation-min-score",
+            "47.5",
+            "--final-min-score",
+            "42.5",
+        ]
+    )
     assert args.target_runs == 12
+    assert args.screen_anchor_mode == "now"
+    assert args.validation_months == 9
+    assert args.validation_min_score == 47.5
+    assert args.final_min_score == 42.5
 
     args = parser.parse_args(["play-hand-massive-v2-gateway", "--port", "8799"])
     assert args.command == "play-hand-massive-v2-gateway"
