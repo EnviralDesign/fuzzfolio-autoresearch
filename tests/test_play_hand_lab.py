@@ -196,7 +196,57 @@ def test_lab_barrier_snapshot_is_bounded_and_lane_oriented(tmp_path: Path) -> No
     assert "lane_007" in text
     assert "coarse" in text
     assert "78.12" in text
-    assert "1 more lane(s) hidden" in text
+    assert "1 more active lane(s) hidden" in text
+
+
+def test_lab_barrier_snapshot_prefers_active_lanes_over_terminal_noise(tmp_path: Path) -> None:
+    lanes: list[lab.LabLaneState] = []
+    for index in range(8):
+        lane = lab.LabLaneState(
+            lane_id=f"lane_{index:03d}",
+            lane_index=index,
+            run_id=f"20260622-playhand-lab-lane-{index:03d}-v1",
+            run_dir=tmp_path / f"lane-{index:03d}",
+            instruments=["EURUSD"],
+            timeframe="M5",
+        )
+        lane.current_phase = "scrutiny"
+        lane.task_ids = [f"task-{index}"]
+        lanes.append(lane)
+    terminal_lane = lab.LabLaneState(
+        lane_id="lane_099",
+        lane_index=99,
+        run_id="20260622-playhand-lab-lane-099-v1",
+        run_dir=tmp_path / "lane-099",
+        instruments=["GBPUSD"],
+        timeframe="M5",
+    )
+    terminal_lane.terminal = True
+    terminal_lane.current_phase = "tombstoned"
+    terminal_lane.tombstone_reason = "early_exit_policy_enforced"
+    terminal_lane.task_ids = ["task-terminal"]
+    terminal_lane.completed_task_ids = {"task-terminal"}
+    lanes.append(terminal_lane)
+
+    text = lab._format_lab_barrier_snapshot(
+        barrier_index=4,
+        campaign_id="campaign-1",
+        runtime=lab.PlayHandLabRuntimeConfig(
+            campaign_mode="continuous",
+            active_runs=8,
+            barrier_lane_limit=8,
+        ),
+        lanes=lanes,
+        tasks=[{"task_id": f"task-{index}"} for index in range(8)],
+        snapshot={},
+        metric_baseline={},
+        recorded_result_count=0,
+    )
+
+    assert "lane_000" in text
+    assert "lane_007" in text
+    assert "lane_099" not in text
+    assert "terminal lanes summarized: 1 terminal, 0 promoted, 1 tombstoned" in text
 
 
 def test_lab_failure_notice_includes_lane_task_phase_and_reason() -> None:

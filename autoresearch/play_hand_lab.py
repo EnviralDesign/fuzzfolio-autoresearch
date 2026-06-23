@@ -3224,12 +3224,17 @@ def _format_lab_barrier_snapshot(
         ),
     ]
     lane_limit = max(int(runtime.barrier_lane_limit), 1)
-    ordered_lanes = sorted(
-        lanes,
-        key=lambda lane: (
-            0 if _lane_is_active_for_log(lane) else 1 if not lane.terminal else 2,
-            lane.lane_index,
-        ),
+    active_ordered_lanes = sorted(active_lanes, key=lambda lane: lane.lane_index)
+    ordered_lanes = (
+        active_ordered_lanes
+        if active_ordered_lanes
+        else sorted(
+            lanes,
+            key=lambda lane: (
+                0 if not lane.terminal else 1,
+                lane.lane_index,
+            ),
+        )
     )
     visible_lanes = ordered_lanes[:lane_limit]
     for lane in visible_lanes:
@@ -3252,7 +3257,15 @@ def _format_lab_barrier_snapshot(
     if hidden_count:
         lines.append(
             _box_row(
-                f"... {hidden_count} more lane(s) hidden; raise --barrier-lane-limit to show more ..."
+                f"... {hidden_count} more active lane(s) hidden; raise --barrier-lane-limit to show more ..."
+            )
+        )
+    if active_ordered_lanes and terminal_lanes:
+        lines.append(
+            _box_row(
+                "terminal lanes summarized: "
+                f"{len(terminal_lanes)} terminal, {promoted_lanes} promoted, "
+                f"{tombstoned_lanes} tombstoned"
             )
         )
     if not lanes:
