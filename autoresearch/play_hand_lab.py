@@ -97,6 +97,8 @@ DEFAULT_LAB_GATEWAY_URL = "http://127.0.0.1:8799"
 DEFAULT_LAB_USER_ID = "autoresearch-lab"
 DEFAULT_LAB_ACTIVE_RUNS = 64
 DEFAULT_LAB_RESULT_BATCH_SIZE = 25
+DEFAULT_LAB_MAX_RESULTS_PER_CYCLE = 1000
+DEFAULT_LAB_MAX_DRAIN_SECONDS = 0.5
 DEFAULT_LAB_RESULT_READ_FAILURE_LIMIT = 5
 DEFAULT_LAB_LOG_MODE = "barrier"
 DEFAULT_LAB_BARRIER_INTERVAL_SECONDS = 5.0
@@ -166,6 +168,8 @@ class PlayHandLabRuntimeConfig:
     poll_interval_seconds: float = 1.0
     max_wait_seconds: float = 3600.0
     result_batch_size: int = DEFAULT_LAB_RESULT_BATCH_SIZE
+    max_results_per_cycle: int = DEFAULT_LAB_MAX_RESULTS_PER_CYCLE
+    max_drain_seconds: float = DEFAULT_LAB_MAX_DRAIN_SECONDS
     result_read_failure_limit: int = DEFAULT_LAB_RESULT_READ_FAILURE_LIMIT
     dry_run: bool = False
     strict_scoring: bool = False
@@ -379,6 +383,8 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         int(runtime.screen_anchor_envelope_months),
         lookback_months,
     )
+    result_batch_size = max(int(runtime.result_batch_size), 1)
+    max_results_per_cycle = max(int(runtime.max_results_per_cycle), result_batch_size)
     return PlayHandLabRuntimeConfig(
         gateway_url=gateway_url.rstrip("/"),
         gateway_token=str(token).strip() if token else None,
@@ -423,7 +429,9 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         max_attempts=max(int(runtime.max_attempts), 1),
         poll_interval_seconds=max(float(runtime.poll_interval_seconds), 0.1),
         max_wait_seconds=max(float(runtime.max_wait_seconds), 1.0),
-        result_batch_size=max(int(runtime.result_batch_size), 1),
+        result_batch_size=result_batch_size,
+        max_results_per_cycle=max_results_per_cycle,
+        max_drain_seconds=max(float(runtime.max_drain_seconds), 0.0),
         result_read_failure_limit=max(int(runtime.result_read_failure_limit), 1),
         dry_run=bool(runtime.dry_run),
         strict_scoring=bool(runtime.strict_scoring),
@@ -2138,6 +2146,7 @@ def _record_lab_result(
     runtime: PlayHandLabRuntimeConfig,
     lab_result: dict[str, Any],
     reward_matrix: dict[str, Any] | None,
+    render_progress: bool = True,
 ) -> dict[str, Any]:
     task_id = str(lab_result.get("task_id") or "")
     task_spec = lane.task_specs.get(task_id, {})
@@ -2268,12 +2277,13 @@ def _record_lab_result(
     ):
         lane.best_score = record.composite_score
         lane.best_attempt_id = record.attempt_id
-    render_progress_artifacts(
-        attempts,
-        lane.run_dir / "progress.png",
-        run_metadata_path=lane.run_dir / "run-metadata.json",
-        lower_is_better=config.research.plot_lower_is_better,
-    )
+    if render_progress:
+        render_progress_artifacts(
+            attempts,
+            lane.run_dir / "progress.png",
+            run_metadata_path=lane.run_dir / "run-metadata.json",
+            lower_is_better=config.research.plot_lower_is_better,
+        )
     _append_event(
         lane_ctx,
         "lab_result",
@@ -2320,6 +2330,7 @@ def _record_lab_failure(
     runtime: PlayHandLabRuntimeConfig,
     lab_result: dict[str, Any],
     reward_matrix: dict[str, Any] | None,
+    render_progress: bool = True,
 ) -> dict[str, Any]:
     task_id = str(lab_result.get("task_id") or "")
     task_spec = lane.task_specs.get(task_id, {})
@@ -2413,12 +2424,13 @@ def _record_lab_failure(
     )
     attempts.append(row)
     write_attempts(lane_ctx.attempts_path, attempts)
-    render_progress_artifacts(
-        attempts,
-        lane.run_dir / "progress.png",
-        run_metadata_path=lane.run_dir / "run-metadata.json",
-        lower_is_better=config.research.plot_lower_is_better,
-    )
+    if render_progress:
+        render_progress_artifacts(
+            attempts,
+            lane.run_dir / "progress.png",
+            run_metadata_path=lane.run_dir / "run-metadata.json",
+            lower_is_better=config.research.plot_lower_is_better,
+        )
     _append_event(
         lane_ctx,
         "lab_result",
@@ -2443,6 +2455,16 @@ def _record_lab_failure(
         "phase": phase,
         "task_kind": task_kind,
     }
+
+
+def _render_lane_progress_artifacts(*, config: AppConfig, lane_ctx: PlayHandContext) -> None:
+    attempts = load_attempts(lane_ctx.attempts_path)
+    render_progress_artifacts(
+        attempts,
+        lane_ctx.run_dir / "progress.png",
+        run_metadata_path=lane_ctx.run_dir / "run-metadata.json",
+        lower_is_better=config.research.plot_lower_is_better,
+    )
 
 
 def _phase_terminal(lane: LabLaneState, phase: str) -> bool:
@@ -3441,6 +3463,16 @@ def _format_lab_barrier_snapshot(
     accepted_delta = _metric_delta(scoped_snapshot, metric_baseline, "completions_accepted")
     result_loss_delta = _metric_delta(scoped_snapshot, metric_baseline, "results_dropped")
     incompatible_delta = _metric_delta(scoped_snapshot, metric_baseline, "incompatible_claims")
+    raw_busy_phases = scoped_snapshot.get("busy_slots_by_phase")
+    busy_phase_parts: list[str] = []
+    if isinstance(raw_busy_phases, dict):
+        for phase, count in sorted(raw_busy_phases.items(), key=lambda item: (-int(item[1] or 0), str(item[0]))):
+            try:
+                phase_count = int(count)
+            except (TypeError, ValueError):
+                continue
+            if phase_count > 0:
+                busy_phase_parts.append(f"{str(phase)[:24]}={phase_count}")
 
     header_status = f" status={status}" if status else ""
     lines = [
@@ -3456,6 +3488,14 @@ def _format_lab_barrier_snapshot(
             f"sat={_percent(busy_slots, worker_slots)} queued={queued_tasks} live={live_tasks} "
             f"done={gateway_done} failed={gateway_failed} result-backlog={result_backlog}"
         ),
+    ]
+    if busy_phase_parts:
+        visible_phases = busy_phase_parts[:5]
+        if len(busy_phase_parts) > len(visible_phases):
+            visible_phases.append(f"+{len(busy_phase_parts) - len(visible_phases)} more")
+        lines.append(_box_row("worker phases " + " ".join(visible_phases)))
+    lines.extend(
+        [
         _box_row(
             "lanes "
             f"created={len(lanes)} active={len(active_lanes)} terminal={len(terminal_lanes)} "
@@ -3483,7 +3523,8 @@ def _format_lab_barrier_snapshot(
             ),
             preserve_spacing=True,
         ),
-    ]
+        ]
+    )
     lane_limit = max(int(runtime.barrier_lane_limit), 1)
     active_ordered_lanes = sorted(active_lanes, key=lambda lane: lane.lane_index)
     ordered_lanes = (
@@ -4039,6 +4080,37 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     consecutive_result_read_failures = 0
     barrier_index = 0
     last_barrier_at = 0.0
+    dirty_progress_run_ids: set[str] = set()
+    last_progress_render_at = 0.0
+
+    def mark_progress_dirty(lane: LabLaneState) -> None:
+        dirty_progress_run_ids.add(lane.run_id)
+
+    def flush_dirty_progress(*, force: bool = False) -> None:
+        nonlocal last_progress_render_at
+        if not dirty_progress_run_ids:
+            return
+        now = time.monotonic()
+        if not force and (now - last_progress_render_at) < runtime.barrier_interval_seconds:
+            return
+        last_progress_render_at = now
+        for run_id in sorted(list(dirty_progress_run_ids)):
+            lane_ctx = lane_contexts.get(run_id)
+            if lane_ctx is None:
+                dirty_progress_run_ids.discard(run_id)
+                continue
+            try:
+                _render_lane_progress_artifacts(config=config, lane_ctx=lane_ctx)
+            except Exception as exc:
+                _append_event(
+                    campaign_ctx,
+                    "progress",
+                    "render_failed",
+                    run_id=run_id,
+                    error=str(exc)[:1000],
+                )
+            else:
+                dirty_progress_run_ids.discard(run_id)
 
     def emit_barrier_snapshot(*, force: bool = False, status: str | None = None) -> None:
         nonlocal barrier_index, last_barrier_at
@@ -4064,6 +4136,123 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             flush=True,
         )
 
+    def process_result_batch(result_batch: list[dict[str, Any]]) -> None:
+        nonlocal recorded_result_count
+        ack_lease_ids: list[str] = []
+        for lab_result in result_batch:
+            task_id = str(lab_result.get("task_id") or "")
+            lane = lanes_by_task.get(task_id)
+            lease_id = str(lab_result.get("lease_id") or "")
+            if lane is None:
+                _append_event(
+                    campaign_ctx,
+                    "result_reader",
+                    "unknown_task",
+                    task_id=task_id,
+                    lease_id=lease_id,
+                )
+                ack_lease_ids.append(lease_id)
+                continue
+            if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
+                ack_lease_ids.append(lease_id)
+                continue
+            recorded_successfully = False
+            new_stage_tasks: list[dict[str, Any]] = []
+            try:
+                if _is_failed_lab_result(lab_result):
+                    recorded = _record_lab_failure(
+                        config=config,
+                        lane_ctx=lane_contexts[lane.run_id],
+                        lane=lane,
+                        runtime=runtime,
+                        lab_result=lab_result,
+                        reward_matrix=reward_matrix,
+                        render_progress=False,
+                    )
+                    mark_progress_dirty(lane)
+                    lane.failed_task_ids.add(task_id)
+                else:
+                    recorded = _record_lab_result(
+                        config=config,
+                        cli=cli,
+                        lane_ctx=lane_contexts[lane.run_id],
+                        lane=lane,
+                        runtime=runtime,
+                        lab_result=lab_result,
+                        reward_matrix=reward_matrix,
+                        render_progress=False,
+                    )
+                    mark_progress_dirty(lane)
+                    if recorded.get("status") == "failed":
+                        lane.failed_task_ids.add(task_id)
+                    else:
+                        lane.completed_task_ids.add(task_id)
+                new_stage_tasks = _advance_lane_after_result(
+                    config=config,
+                    lane_ctx=lane_contexts[lane.run_id],
+                    lane=lane,
+                    runtime=runtime,
+                    reward_matrix=reward_matrix,
+                    worker_contract_hash=worker_contract_hash,
+                    recorded=recorded,
+                )
+                recorded_result_count += 1
+                _add_recorded_result_sample(recorded_results, recorded)
+                recorded_successfully = True
+            except Exception as exc:
+                _append_event(
+                    campaign_ctx,
+                    "result_writer",
+                    "failed",
+                    task_id=task_id,
+                    lane_id=lane.lane_id,
+                    error=str(exc)[:1000],
+                )
+                if runtime.strict_scoring:
+                    raise
+                if recorded_successfully:
+                    ack_lease_ids.append(lease_id)
+                    continue
+                failure_result = dict(lab_result)
+                original_result = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
+                failure_result["status"] = "failed"
+                failure_result["result"] = {
+                    **dict(original_result),
+                    "status": "failed",
+                    "error": f"result_writer_failed: {str(exc)[:500]}",
+                }
+                recorded = _record_lab_failure(
+                    config=config,
+                    lane_ctx=lane_contexts[lane.run_id],
+                    lane=lane,
+                    runtime=runtime,
+                    lab_result=failure_result,
+                    reward_matrix=reward_matrix,
+                    render_progress=False,
+                )
+                mark_progress_dirty(lane)
+                recorded_result_count += 1
+                _add_recorded_result_sample(recorded_results, recorded)
+                lane.failed_task_ids.add(task_id)
+            ack_lease_ids.append(lease_id)
+            if new_stage_tasks:
+                enqueue_existing_tasks(new_stage_tasks, reason=f"stage:{_task_phase(lane, task_id)}")
+            _write_lane_metadata(
+                lane,
+                campaign_ctx=campaign_ctx,
+                runtime=runtime,
+                status=lane_run_status(lane),
+                started_at=started_at,
+            )
+        if ack_lease_ids:
+            _safe_ack_gateway_results(
+                gateway,
+                campaign_ctx,
+                lease_ids=ack_lease_ids,
+                task_id="batch",
+            )
+        create_and_enqueue_more()
+
     try:
         last_snapshot = gateway.snapshot()
         initial_gateway_id = (
@@ -4077,138 +4266,49 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
 
     try:
         while deadline is None or time.monotonic() < deadline:
-            try:
-                result_batch = _read_gateway_results(gateway, limit=runtime.result_batch_size)
-            except requests.RequestException as exc:
-                consecutive_result_read_failures += 1
-                _append_event(
-                    campaign_ctx,
-                    "gateway",
-                    "result_read_failed",
-                    error=str(exc)[:1000],
-                    consecutive_failures=consecutive_result_read_failures,
-                    failure_limit=runtime.result_read_failure_limit,
-                )
-                if consecutive_result_read_failures >= runtime.result_read_failure_limit:
-                    gateway_unreachable = True
-                    break
-                time.sleep(runtime.poll_interval_seconds)
-                continue
-            consecutive_result_read_failures = 0
-            ack_lease_ids: list[str] = []
-            for lab_result in result_batch:
-                task_id = str(lab_result.get("task_id") or "")
-                lane = lanes_by_task.get(task_id)
-                lease_id = str(lab_result.get("lease_id") or "")
-                if lane is None:
-                    _append_event(
-                        campaign_ctx,
-                        "result_reader",
-                        "unknown_task",
-                        task_id=task_id,
-                        lease_id=lease_id,
-                    )
-                    ack_lease_ids.append(lease_id)
-                    continue
-                if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
-                    ack_lease_ids.append(lease_id)
-                    continue
-                recorded_successfully = False
-                new_stage_tasks: list[dict[str, Any]] = []
+            cycle_started_at = time.monotonic()
+            cycle_result_count = 0
+            read_failed = False
+            while cycle_result_count < runtime.max_results_per_cycle:
+                limit = min(runtime.result_batch_size, runtime.max_results_per_cycle - cycle_result_count)
                 try:
-                    if _is_failed_lab_result(lab_result):
-                        recorded = _record_lab_failure(
-                            config=config,
-                            lane_ctx=lane_contexts[lane.run_id],
-                            lane=lane,
-                            runtime=runtime,
-                            lab_result=lab_result,
-                            reward_matrix=reward_matrix,
-                        )
-                        lane.failed_task_ids.add(task_id)
-                    else:
-                        recorded = _record_lab_result(
-                            config=config,
-                            cli=cli,
-                            lane_ctx=lane_contexts[lane.run_id],
-                            lane=lane,
-                            runtime=runtime,
-                            lab_result=lab_result,
-                            reward_matrix=reward_matrix,
-                        )
-                        if recorded.get("status") == "failed":
-                            lane.failed_task_ids.add(task_id)
-                        else:
-                            lane.completed_task_ids.add(task_id)
-                    new_stage_tasks = _advance_lane_after_result(
-                        config=config,
-                        lane_ctx=lane_contexts[lane.run_id],
-                        lane=lane,
-                        runtime=runtime,
-                        reward_matrix=reward_matrix,
-                        worker_contract_hash=worker_contract_hash,
-                        recorded=recorded,
-                    )
-                    recorded_result_count += 1
-                    _add_recorded_result_sample(recorded_results, recorded)
-                    recorded_successfully = True
-                except Exception as exc:
+                    result_batch = _read_gateway_results(gateway, limit=limit)
+                except requests.RequestException as exc:
+                    consecutive_result_read_failures += 1
                     _append_event(
                         campaign_ctx,
-                        "result_writer",
-                        "failed",
-                        task_id=task_id,
-                        lane_id=lane.lane_id,
+                        "gateway",
+                        "result_read_failed",
                         error=str(exc)[:1000],
+                        consecutive_failures=consecutive_result_read_failures,
+                        failure_limit=runtime.result_read_failure_limit,
                     )
-                    if runtime.strict_scoring:
-                        raise
-                    if recorded_successfully:
-                        ack_lease_ids.append(lease_id)
-                        continue
-                    failure_result = dict(lab_result)
-                    original_result = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
-                    failure_result["status"] = "failed"
-                    failure_result["result"] = {
-                        **dict(original_result),
-                        "status": "failed",
-                        "error": f"result_writer_failed: {str(exc)[:500]}",
-                    }
-                    recorded = _record_lab_failure(
-                        config=config,
-                        lane_ctx=lane_contexts[lane.run_id],
-                        lane=lane,
-                        runtime=runtime,
-                        lab_result=failure_result,
-                        reward_matrix=reward_matrix,
-                    )
-                    recorded_result_count += 1
-                    _add_recorded_result_sample(recorded_results, recorded)
-                    lane.failed_task_ids.add(task_id)
-                ack_lease_ids.append(lease_id)
-                if new_stage_tasks:
-                    enqueue_existing_tasks(new_stage_tasks, reason=f"stage:{_task_phase(lane, task_id)}")
-                terminal_count_for_lane = lane_terminal_count(lane)
-                _write_lane_metadata(
-                    lane,
-                    campaign_ctx=campaign_ctx,
-                    runtime=runtime,
-                    status=lane_run_status(lane),
-                    started_at=started_at,
-                )
-            if ack_lease_ids:
-                _safe_ack_gateway_results(
-                    gateway,
-                    campaign_ctx,
-                    lease_ids=ack_lease_ids,
-                    task_id="batch",
-                )
+                    if consecutive_result_read_failures >= runtime.result_read_failure_limit:
+                        gateway_unreachable = True
+                        break
+                    time.sleep(runtime.poll_interval_seconds)
+                    read_failed = True
+                    break
+                consecutive_result_read_failures = 0
+                if not result_batch:
+                    break
+                process_result_batch(result_batch)
+                cycle_result_count += len(result_batch)
+                if len(result_batch) < limit:
+                    break
+                if runtime.max_drain_seconds > 0 and (time.monotonic() - cycle_started_at) >= runtime.max_drain_seconds:
+                    break
+            if gateway_unreachable:
+                break
+            if read_failed:
+                continue
             create_and_enqueue_more()
             completed_count = sum(len(lane.completed_task_ids) for lane in lanes)
             failed_count = sum(len(lane.failed_task_ids) for lane in lanes)
             terminal_count = completed_count + failed_count
             if runtime.campaign_mode == "finite" and not can_create_more() and tasks and terminal_count >= len(tasks):
                 break
+            flush_dirty_progress()
             try:
                 last_snapshot = gateway.snapshot()
                 current_gateway_id = (
@@ -4238,11 +4338,13 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 emit_barrier_snapshot()
             except requests.RequestException as exc:
                 _append_event(campaign_ctx, "gateway", "snapshot_failed", error=str(exc)[:500])
-            time.sleep(runtime.poll_interval_seconds)
+            if cycle_result_count <= 0:
+                time.sleep(runtime.poll_interval_seconds)
     except KeyboardInterrupt:
         interrupted = True
         _append_event(campaign_ctx, "campaign", "interrupted")
 
+    flush_dirty_progress(force=True)
     completed_count = sum(len(lane.completed_task_ids) for lane in lanes)
     failed_count = sum(len(lane.failed_task_ids) for lane in lanes)
     terminal_count = completed_count + failed_count

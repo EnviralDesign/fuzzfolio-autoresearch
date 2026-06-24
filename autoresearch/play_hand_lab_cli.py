@@ -11,6 +11,8 @@ from .play_hand import INSTRUMENT_POOL_PRESET_NAMES
 from .play_hand_lab import (
     DEFAULT_LAB_FINAL_MIN_SCORE,
     DEFAULT_LAB_GATEWAY_URL,
+    DEFAULT_LAB_MAX_DRAIN_SECONDS,
+    DEFAULT_LAB_MAX_RESULTS_PER_CYCLE,
     DEFAULT_LAB_SCRUTINY_MONTHS,
     DEFAULT_LAB_SCREEN_ANCHOR_ENVELOPE_MONTHS,
     DEFAULT_LAB_SCREEN_ANCHOR_MODE,
@@ -306,6 +308,24 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         help="Maximum completed results drained per poll. Default: 25.",
     )
     play_hand_lab.add_argument(
+        "--max-results-per-cycle",
+        type=int,
+        default=DEFAULT_LAB_MAX_RESULTS_PER_CYCLE,
+        help=(
+            "Maximum completed results processed before yielding to snapshots/sleep. "
+            f"Default: {DEFAULT_LAB_MAX_RESULTS_PER_CYCLE}."
+        ),
+    )
+    play_hand_lab.add_argument(
+        "--max-drain-seconds",
+        type=float,
+        default=DEFAULT_LAB_MAX_DRAIN_SECONDS,
+        help=(
+            "Maximum wall seconds spent draining consecutive full result batches per coordinator cycle. "
+            f"Default: {DEFAULT_LAB_MAX_DRAIN_SECONDS:g}."
+        ),
+    )
+    play_hand_lab.add_argument(
         "--result-read-failure-limit",
         type=int,
         default=5,
@@ -584,6 +604,8 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 poll_interval_seconds=args.poll_interval_seconds,
                 max_wait_seconds=args.max_wait_seconds,
                 result_batch_size=args.result_batch_size,
+                max_results_per_cycle=args.max_results_per_cycle,
+                max_drain_seconds=args.max_drain_seconds,
                 result_read_failure_limit=args.result_read_failure_limit,
                 dry_run=bool(args.dry_run),
                 strict_scoring=bool(args.strict_scoring),

@@ -437,6 +437,34 @@ def test_lab_gateway_rejects_expired_completion_without_manual_reap() -> None:
     assert snapshot["metrics"]["lost_completions"] == 1
 
 
+def test_lab_gateway_lease_progress_updates_worker_status_detail() -> None:
+    gateway = PlayHandLabGateway()
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+        )
+    )
+    gateway.register_worker("worker-1")
+    gateway.heartbeat_worker("worker-1", status_detail="processing lab lease")
+    claim = gateway.claim("worker-1")
+
+    assert gateway.heartbeat_lease(
+        "worker-1",
+        claim["lease_id"],
+        progress={
+            "status_detail": "Warming lake cache.",
+            "current_step": "warming_lake_cache",
+        },
+    ) is True
+
+    snapshot = gateway.snapshot(include_workers=True)
+    assert snapshot["workers"][0]["status_detail"] == "Warming lake cache."
+    assert snapshot["workers"][0]["progress"]["current_step"] == "warming_lake_cache"
+    assert snapshot["busy_slots_by_phase"] == {"warming_lake_cache": 1}
+
+
 def test_lab_gateway_snapshot_reaps_crashed_worker_lease() -> None:
     gateway = PlayHandLabGateway(LabGatewayConfig(lease_ttl_seconds=0.001))
     gateway.enqueue(
@@ -970,6 +998,10 @@ def test_build_parser_accepts_play_hand_massive_v2_aliases() -> None:
             "12",
             "--active-runs",
             "3",
+            "--max-results-per-cycle",
+            "500",
+            "--max-drain-seconds",
+            "0.75",
             "--mode",
             "finite",
             "--instrument-pool-preset",
@@ -982,6 +1014,8 @@ def test_build_parser_accepts_play_hand_massive_v2_aliases() -> None:
     assert args.command == "play-hand-massive-v2"
     assert args.target_runs == 12
     assert args.active_runs == 3
+    assert args.max_results_per_cycle == 500
+    assert args.max_drain_seconds == 0.75
     assert args.mode == "finite"
     assert args.instrument_pool_preset == ["fx", "metals,crypto"]
     assert args.screen_anchor_mode == "random"

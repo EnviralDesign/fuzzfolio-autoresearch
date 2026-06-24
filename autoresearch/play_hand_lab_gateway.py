@@ -215,6 +215,18 @@ class LabWorker:
         return payload
 
 
+def _worker_progress_phase(worker: LabWorker) -> str:
+    progress = worker.progress if isinstance(worker.progress, dict) else {}
+    phase = str(progress.get("current_step") or "").strip()
+    if not phase:
+        subprocess_progress = progress.get("subprocess_progress")
+        if isinstance(subprocess_progress, dict):
+            phase = str(subprocess_progress.get("phase") or "").strip()
+    if not phase:
+        phase = str(worker.status_detail or "").strip().lower().replace(" ", "_")
+    return phase or "unknown"
+
+
 @dataclass(slots=True)
 class LabLease:
     lease_id: str
@@ -540,6 +552,9 @@ class PlayHandLabGateway:
                 worker.active_lease_ids.add(lease_id)
                 if progress is not None:
                     worker.progress = dict(progress)
+                    progress_detail = str(progress.get("status_detail") or "").strip()
+                    if progress_detail:
+                        worker.status_detail = progress_detail
             return True
 
     def complete(
@@ -724,6 +739,13 @@ class PlayHandLabGateway:
             retained_worker_count = len(self._workers)
             worker_slots = sum(max(int(worker.slots), 1) for worker in online_workers)
             busy_slots = sum(len(worker.active_lease_ids) for worker in online_workers)
+            busy_slots_by_phase: dict[str, int] = {}
+            for worker in online_workers:
+                active_slot_count = len(worker.active_lease_ids)
+                if active_slot_count <= 0:
+                    continue
+                phase = _worker_progress_phase(worker)
+                busy_slots_by_phase[phase] = busy_slots_by_phase.get(phase, 0) + active_slot_count
             completed_count = sum(1 for task in self._tasks.values() if task.status == "completed")
             failed_count = sum(1 for task in self._tasks.values() if task.status == "failed")
             queued_count = sum(1 for task in self._tasks.values() if task.status == "queued")
@@ -741,6 +763,7 @@ class PlayHandLabGateway:
                 "worker_busy_rate": (active_workers / worker_count) if worker_count else 0.0,
                 "worker_slots": worker_slots,
                 "busy_slots": busy_slots,
+                "busy_slots_by_phase": dict(sorted(busy_slots_by_phase.items())),
                 "slot_busy_rate": (busy_slots / worker_slots) if worker_slots else 0.0,
                 "queued_tasks": queued_count,
                 "active_leases": leased_count,
