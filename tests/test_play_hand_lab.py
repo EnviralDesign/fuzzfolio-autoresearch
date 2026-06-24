@@ -74,6 +74,21 @@ def test_normalize_runtime_loads_existing_gateway_token_file(
     assert runtime.gateway_token == "shared-token"
 
 
+def test_runtime_event_payload_redacts_gateway_token_and_preserves_paths(tmp_path: Path) -> None:
+    runtime = lab.PlayHandLabRuntimeConfig(
+        gateway_token="super-secret-lab-token",
+        profile_path=tmp_path / "profile.json",
+        trading_dashboard_root=tmp_path / "Trading-Dashboard",
+    )
+
+    payload = lab._runtime_event_payload(runtime)
+
+    assert payload["gateway_token"] == "[redacted]"
+    assert payload["profile_path"] == str(tmp_path / "profile.json")
+    assert payload["trading_dashboard_root"] == str(tmp_path / "Trading-Dashboard")
+    assert "super-secret-lab-token" not in json.dumps(payload)
+
+
 def test_normalize_runtime_defaults_to_cloud_tolerant_lab_attempts() -> None:
     runtime = lab._normalize_runtime(lab.PlayHandLabRuntimeConfig())
 

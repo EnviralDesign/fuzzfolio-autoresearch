@@ -543,13 +543,29 @@ def _filter_scaffoldable_seed_indicators(
     return valid, invalid
 
 
+_SENSITIVE_EVENT_KEY_PARTS = ("authorization", "password", "secret", "token")
+
+
+def _redact_sensitive_event_payload(value: Any, *, key: str | None = None) -> Any:
+    if key and any(part in key.lower() for part in _SENSITIVE_EVENT_KEY_PARTS):
+        return "[redacted]"
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(child_key): _redact_sensitive_event_payload(child_value, key=str(child_key))
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive_event_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_redact_sensitive_event_payload(item) for item in value]
+    return value
+
+
 def _runtime_event_payload(runtime: PlayHandLabRuntimeConfig) -> dict[str, Any]:
-    payload = asdict(runtime)
-    for key in ("profile_path", "trading_dashboard_root"):
-        value = payload.get(key)
-        if isinstance(value, Path):
-            payload[key] = str(value)
-    return payload
+    payload = _redact_sensitive_event_payload(asdict(runtime))
+    return payload if isinstance(payload, dict) else {}
 
 
 def _derived_campaign_root(config: AppConfig) -> Path:
