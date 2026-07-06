@@ -1972,6 +1972,13 @@ def build_signal_atlas_via_gateway(
 
     successful_rows = [row for row in rows if row.get("status") == "ok"]
     failed_rows = [row for row in rows if row.get("status") != "ok"]
+    if total_calls > 0 and not successful_rows:
+        sample_errors = [
+            str(row.get("error") or row.get("error_type") or "unknown_error")[:200]
+            for row in failed_rows[:3]
+        ]
+        detail = "; ".join(sample_errors) if sample_errors else "no successful signal atlas cells"
+        raise RuntimeError(f"Gateway signal atlas build produced zero successful cells: {detail}")
     density_counts: dict[str, int] = {}
     balance_counts: dict[str, int] = {}
     role_counts: dict[str, int] = {}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from autoresearch.signal_atlas import (
     _normalize_signal_roles,
+    _profile_document_for_indicator,
     _select_indicator_ids,
     compute_signal_metrics,
 )
@@ -86,3 +87,51 @@ def test_normalize_signal_roles_all_is_empty_filter() -> None:
         "setup",
         "context",
     ]
+
+
+def test_profile_document_preserves_worker_required_indicator_metadata() -> None:
+    catalog_item = {
+        "meta": {
+            "id": "RSI_CROSSBACK",
+            "name": "RSI Crossback",
+            "namespace": "TRIGGERS",
+            "talibFunction": "RSI_CROSSBACK",
+            "supportsTradingMode": True,
+            "usesRangeConfiguration": True,
+            "description": "Event trigger.",
+            "inputs": ["close"],
+            "valueRange": {"min": 0, "max": 1, "step": 1, "marks": [], "minRange": 0},
+            "talibMeta": [],
+            "requiredPaddingBars": 300,
+            "signalRole": "trigger",
+        },
+        "config": {
+            "label": "RSI Crossback",
+            "ranges": {"buy": [0, 1], "sell": [0, 1]},
+            "talibConfig": [],
+            "weight": 1,
+            "timeframe": "M5",
+            "lookbackBars": 1,
+            "isActive": False,
+        },
+    }
+
+    document = _profile_document_for_indicator(
+        catalog_item,
+        indicator_id="RSI_CROSSBACK",
+        timeframe="M15",
+        instruments=["EURUSD"],
+        label_prefix="Signal Atlas",
+    )
+
+    indicator = document["profile"]["indicators"][0]
+    meta = indicator["meta"]
+    assert meta["id"] == "RSI_CROSSBACK"
+    assert meta["instanceId"] == "signal-atlas-rsi-crossback-m15"
+    assert meta["name"] == "RSI Crossback"
+    assert meta["namespace"] == "TRIGGERS"
+    assert meta["talibFunction"] == "RSI_CROSSBACK"
+    assert meta["supportsTradingMode"] is True
+    assert meta["usesRangeConfiguration"] is True
+    assert indicator["config"]["timeframe"] == "M15"
+    assert indicator["config"]["isActive"] is True

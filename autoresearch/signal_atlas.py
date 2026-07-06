@@ -261,6 +261,9 @@ def _profile_document_for_indicator(
         config["scale"] = 1.0
 
     instance_id = f"signal-atlas-{indicator_id.lower().replace('_', '-')}-{timeframe.lower()}"
+    meta = dict(_as_dict(catalog_item.get("meta")))
+    meta["id"] = indicator_id
+    meta["instanceId"] = instance_id
     return {
         "format": "fuzzfolio.scoring-profile",
         "formatVersion": 1,
@@ -270,10 +273,7 @@ def _profile_document_for_indicator(
             "directionMode": "both",
             "indicators": [
                 {
-                    "meta": {
-                        "id": indicator_id,
-                        "instanceId": instance_id,
-                    },
+                    "meta": meta,
                     "config": config,
                 }
             ],
