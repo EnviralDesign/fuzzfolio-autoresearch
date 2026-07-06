@@ -29,6 +29,7 @@ from .anchor_pair_atlas import (
     _write_json,
     _write_run_script,
     build_pair_profile_document,
+    resolve_probe_as_of_date,
 )
 from .config import AppConfig
 from .discovery_cluster_atlas import DEFAULT_DISCOVERY_CLUSTER_DIRNAME
@@ -55,10 +56,16 @@ DEFAULT_INCLUDED_CONFIDENCE = (
 DEFAULT_LOOKBACK_MONTHS = 12
 DEFAULT_SCRUTINY_LOOKBACK_MONTHS = 36
 DEFAULT_SCRUTINY_BUCKETS = ("retained_strong", "retained")
-DEFAULT_MAX_RECIPES = 8
+DEFAULT_SCRUTINY_FALLBACK_BUCKETS = ("partial_retention", "new_positive_cluster_expansion")
+DEFAULT_SCRUTINY_FALLBACK_MAX_ROWS = 8
+DEFAULT_SCRUTINY_FALLBACK_MIN_TRADES = 20
+DEFAULT_SAMPLE_FLOOR_TRADES = 20
+DEFAULT_SAMPLE_SHRINK_TARGET_SCORE = 45.0
+DEFAULT_MAX_RECIPES = 128
 DEFAULT_MAX_PAIRS_PER_RECIPE = 8
 DEFAULT_FIRST_MEMBER_LIMIT = 6
 DEFAULT_SECOND_MEMBER_LIMIT = 6
+DEFAULT_DIVERSITY_PENALTY_SCALE = 18.0
 DEFAULT_JOB_TIMEOUT_SECONDS = max(7200, DISCOVERY_PAIR_DEFAULT_JOB_TIMEOUT_SECONDS)
 DEFAULT_PROBE_TIMEOUT_SECONDS = (DEFAULT_JOB_TIMEOUT_SECONDS * 2) + 300
 
@@ -168,17 +175,206 @@ def _candidate_score(
     evidence: dict[str, Any] | None,
 ) -> float:
     recipe_score = _float_value(recipe.get("compatibility_score"))
-    evidence_score = _float_value(_as_dict(evidence).get("composite_score"))
+    evidence_fields = _sample_evidence_fields(evidence)
+    raw_evidence_score = _float_value(_as_dict(evidence).get("composite_score"))
+    evidence_score = _sample_adjusted_score(
+        raw_evidence_score,
+        sample_confidence_score=float(evidence_fields["sample_confidence_score"]),
+    )
     rank_penalty = (first_rank * 1.75) + (second_rank * 1.75) + (timeframe_rank * 1.25)
     score = recipe_score * 0.55 + evidence_score * 0.35 - rank_penalty
     if evidence:
         score += 12.0
+        score -= (1.0 - float(evidence_fields["sample_confidence_score"])) * 6.0
     confidence = _clean_token(recipe.get("confidence"))
     if confidence == "high_candidate":
         score += 6.0
     elif confidence == "promising_candidate":
         score += 3.0
     return round(score, 4)
+
+
+def _sample_trade_count(row: dict[str, Any]) -> int:
+    for key in ("best_trades", "trade_count", "signal_count"):
+        value = _int_value(row.get(key))
+        if value > 0:
+            return value
+    return 0
+
+
+def _sample_unique_months(row: dict[str, Any]) -> int:
+    for key in (
+        "unique_months",
+        "active_months",
+        "trade_months",
+        "calendar_months",
+        "sample_unique_months",
+    ):
+        value = _int_value(row.get(key))
+        if value > 0:
+            return value
+    return 0
+
+
+def _sample_confidence_score(trade_count: int) -> float:
+    if trade_count >= 120:
+        return 1.0
+    if trade_count >= 50:
+        return 0.70
+    if trade_count >= DEFAULT_SCRUTINY_FALLBACK_MIN_TRADES:
+        return 0.35
+    if trade_count > 0:
+        return 0.15
+    return 0.0
+
+
+def _sample_confidence_bucket(trade_count: int) -> str:
+    score = _sample_confidence_score(trade_count)
+    if score >= 1.0:
+        return "high"
+    if score >= 0.70:
+        return "medium"
+    if score >= 0.35:
+        return "low"
+    if score > 0.0:
+        return "sparse"
+    return "unknown"
+
+
+def _sample_coverage_score(unique_months: int, lookback_months: int | None) -> float:
+    if unique_months <= 0:
+        return 0.0
+    if lookback_months is None or lookback_months <= 0:
+        return min(1.0, unique_months / 12.0)
+    return round(min(1.0, unique_months / max(1.0, float(lookback_months))), 4)
+
+
+def _sample_evidence_fields(
+    row: dict[str, Any] | None,
+    *,
+    lookback_months: int | None = None,
+    min_trades: int = DEFAULT_SAMPLE_FLOOR_TRADES,
+) -> dict[str, Any]:
+    source = _as_dict(row)
+    trade_count = _sample_trade_count(source)
+    unique_months = _sample_unique_months(source)
+    confidence_score = _sample_confidence_score(trade_count)
+    return {
+        "sample_trade_count": trade_count,
+        "sample_unique_months": unique_months,
+        "sample_coverage_score": _sample_coverage_score(unique_months, lookback_months),
+        "sample_confidence": _sample_confidence_bucket(trade_count),
+        "sample_confidence_score": confidence_score,
+        "sample_floor_passed": trade_count >= max(1, int(min_trades)),
+    }
+
+
+def _sample_adjusted_score(
+    score: float,
+    *,
+    sample_confidence_score: float,
+    shrink_target_score: float = DEFAULT_SAMPLE_SHRINK_TARGET_SCORE,
+) -> float:
+    if score <= 0.0:
+        return 0.0
+    confidence = max(0.0, min(1.0, float(sample_confidence_score)))
+    adjusted = (score * confidence) + (float(shrink_target_score) * (1.0 - confidence))
+    return round(adjusted, 4)
+
+
+def _unordered_pair_id(first_id: str, second_id: str) -> str:
+    return "+".join(sorted([_clean_upper(first_id), _clean_upper(second_id)]))
+
+
+def _canonical_pair_family_id(row: dict[str, Any]) -> str:
+    recipe_id = _clean_token(row.get("recipe_id") or row.get("recipe") or "unknown_recipe")
+    timeframe = _clean_upper(row.get("probe_timeframe") or row.get("best_pair_timeframe") or "mixed")
+    first_id = _clean_upper(row.get("first_indicator_id") or row.get("anchor_id"))
+    second_id = _clean_upper(row.get("second_indicator_id") or row.get("trigger_id"))
+    return f"{recipe_id}|{timeframe}|{_unordered_pair_id(first_id, second_id)}"
+
+
+def _instrument_overlap(left: Any, right: Any) -> float:
+    left_set = set(_normalize_tokens(_split_csv_tokens(left) if isinstance(left, str) else list(left or [])))
+    right_set = set(_normalize_tokens(_split_csv_tokens(right) if isinstance(right, str) else list(right or [])))
+    if not left_set or not right_set:
+        return 0.0
+    return len(left_set & right_set) / len(left_set | right_set)
+
+
+def _retained_inventory_rows(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    retained: list[dict[str, Any]] = []
+    for row in rows or []:
+        bucket = _clean_token(row.get("retention_bucket"))
+        lane = _clean_token(row.get("pair_sampling_lane"))
+        score = _float_value(row.get("pair_sampling_score"), _float_value(row.get("composite_score")))
+        if bucket in {"retained", "retained_strong"} or lane in {"high_prior", "medium_prior"} or score >= 60.0:
+            candidate = dict(row)
+            candidate.setdefault("canonical_pair_family_id", _canonical_pair_family_id(candidate))
+            candidate.setdefault(
+                "unordered_pair_id",
+                _unordered_pair_id(candidate.get("anchor_id"), candidate.get("trigger_id")),
+            )
+            retained.append(candidate)
+    return retained
+
+
+def _diversity_pressure(
+    row: dict[str, Any],
+    retained_inventory: list[dict[str, Any]],
+    *,
+    penalty_scale: float,
+) -> dict[str, Any]:
+    canonical_id = _canonical_pair_family_id(row)
+    unordered_id = _unordered_pair_id(row.get("first_indicator_id"), row.get("second_indicator_id"))
+    if not retained_inventory:
+        return {
+            "canonical_pair_family_id": canonical_id,
+            "diversity_penalty": 0.0,
+            "nearest_retained_similarity": 0.0,
+            "diversity_reason": "no_retained_inventory",
+        }
+
+    best_similarity = 0.0
+    best_reason = "distinct"
+    for retained in retained_inventory:
+        similarity = 0.0
+        reasons: list[str] = []
+        if canonical_id == _clean_token(retained.get("canonical_pair_family_id")):
+            similarity += 0.55
+            reasons.append("canonical_family")
+        elif unordered_id == _clean_token(retained.get("unordered_pair_id")):
+            similarity += 0.30
+            reasons.append("unordered_pair")
+        if _clean_upper(row.get("probe_timeframe")) and _clean_upper(row.get("probe_timeframe")) == _clean_upper(
+            retained.get("probe_timeframe") or retained.get("best_pair_timeframe")
+        ):
+            similarity += 0.10
+            reasons.append("timeframe")
+        overlap = _instrument_overlap(row.get("instruments"), retained.get("instruments"))
+        if overlap > 0.0:
+            similarity += min(0.12, overlap * 0.12)
+            reasons.append("instrument_overlap")
+        if _clean_token(row.get("first_cluster_id")) and _clean_token(row.get("first_cluster_id")) == _clean_token(
+            retained.get("first_cluster_id")
+        ):
+            similarity += 0.08
+            reasons.append("first_cluster")
+        if _clean_token(row.get("second_cluster_id")) and _clean_token(row.get("second_cluster_id")) == _clean_token(
+            retained.get("second_cluster_id")
+        ):
+            similarity += 0.08
+            reasons.append("second_cluster")
+        similarity = min(1.0, similarity)
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_reason = "+".join(reasons) if reasons else "weak_overlap"
+    return {
+        "canonical_pair_family_id": canonical_id,
+        "diversity_penalty": round(best_similarity * max(0.0, float(penalty_scale)), 4),
+        "nearest_retained_similarity": round(best_similarity, 4),
+        "diversity_reason": best_reason,
+    }
 
 
 def build_validation_queue_rows(
@@ -189,8 +385,10 @@ def build_validation_queue_rows(
     max_pairs_per_recipe: int = DEFAULT_MAX_PAIRS_PER_RECIPE,
     first_member_limit: int = DEFAULT_FIRST_MEMBER_LIMIT,
     second_member_limit: int = DEFAULT_SECOND_MEMBER_LIMIT,
+    diversity_penalty_scale: float = DEFAULT_DIVERSITY_PENALTY_SCALE,
     timeframes: list[str] | None = None,
     instruments: list[str] | None = None,
+    retained_inventory_rows: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     confidence_set = {_clean_token(value) for value in included_confidence if _clean_token(value)}
     recipe_candidates = [
@@ -207,6 +405,7 @@ def build_validation_queue_rows(
     )
     selected_recipes = recipe_candidates[: max(0, int(max_recipes))]
     instrument_panel = _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS)
+    retained_inventory = _retained_inventory_rows(retained_inventory_rows)
     explicit_timeframes = _normalize_tokens(timeframes)
     queue: list[dict[str, Any]] = []
     for recipe in selected_recipes:
@@ -248,7 +447,17 @@ def build_validation_queue_rows(
                         timeframe_rank=timeframe_rank,
                         evidence=evidence,
                     )
-                    candidate_rows.append(
+                    evidence_sample = _sample_evidence_fields(evidence)
+                    raw_evidence_score = _float_value(
+                        _as_dict(evidence).get("composite_score")
+                    )
+                    adjusted_evidence_score = _sample_adjusted_score(
+                        raw_evidence_score,
+                        sample_confidence_score=float(
+                            evidence_sample["sample_confidence_score"]
+                        ),
+                    )
+                    candidate_row = (
                         {
                             "recipe_id": recipe_id,
                             "recipe_confidence": recipe.get("confidence"),
@@ -268,10 +477,15 @@ def build_validation_queue_rows(
                             "anchor_type": "discovered_recipe",
                             "probe_timeframe": timeframe,
                             "instruments": ",".join(instrument_panel),
+                            "pre_diversity_priority_score": priority_score,
                             "validation_priority_score": priority_score,
-                            "discovery_evidence_score": _float_value(
-                                _as_dict(evidence).get("composite_score")
+                            "discovery_evidence_score": raw_evidence_score,
+                            "sample_adjusted_discovery_evidence_score": adjusted_evidence_score,
+                            "sample_shrinkage_penalty": round(
+                                raw_evidence_score - adjusted_evidence_score,
+                                4,
                             ),
+                            **evidence_sample,
                             "discovery_evidence_probe_id": _clean_token(
                                 _as_dict(evidence).get("probe_id")
                             ),
@@ -286,6 +500,23 @@ def build_validation_queue_rows(
                             "known_pair_status": "discovered_recipe_candidate",
                         }
                     )
+                    diversity_fields = _diversity_pressure(
+                        candidate_row,
+                        retained_inventory,
+                        penalty_scale=diversity_penalty_scale,
+                    )
+                    candidate_row.update(diversity_fields)
+                    candidate_row["validation_priority_score"] = round(
+                        max(
+                            0.1,
+                            _float_value(candidate_row.get("pre_diversity_priority_score"))
+                            - _float_value(candidate_row.get("diversity_penalty")),
+                        ),
+                        4,
+                    )
+                    candidate_row["pair_prior_score"] = candidate_row["validation_priority_score"]
+                    candidate_row["local_discovery_score"] = candidate_row["validation_priority_score"]
+                    candidate_rows.append(candidate_row)
         candidate_rows.sort(
             key=lambda row: (
                 -_float_value(row.get("validation_priority_score")),
@@ -328,18 +559,146 @@ def build_validation_queue_rows(
     return deduped
 
 
+def _count_by_key(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        token = _clean_token(row.get(key)) or "unknown"
+        counts[token] = counts.get(token, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _validation_candidate_capacity(
+    recipe: dict[str, Any],
+    *,
+    explicit_timeframes: list[str],
+    first_member_limit: int,
+    second_member_limit: int,
+) -> int:
+    first_slot = _cluster_slot(recipe, "context_or_setup_cluster")
+    second_slot = _cluster_slot(recipe, "trigger_or_response_cluster")
+    first_members = _normalize_tokens(
+        [
+            str(value)
+            for value in _as_list(first_slot.get("recommended_indicators"))[
+                : max(1, int(first_member_limit))
+            ]
+        ]
+    )
+    second_members = _normalize_tokens(
+        [
+            str(value)
+            for value in _as_list(second_slot.get("recommended_indicators"))[
+                : max(1, int(second_member_limit))
+            ]
+        ]
+    )
+    preferred_timeframes = explicit_timeframes or _normalize_tokens(
+        _split_csv_tokens(recipe.get("top_timeframes"))
+    ) or ["M5", "M15"]
+    total = 0
+    for first_id in first_members:
+        for second_id in second_members:
+            if first_id == second_id:
+                continue
+            total += len(preferred_timeframes)
+    return total
+
+
+def _validation_selection_diagnostics(
+    recipes: list[dict[str, Any]],
+    *,
+    included_confidence: list[str] | tuple[str, ...],
+    max_recipes: int,
+    max_pairs_per_recipe: int,
+    first_member_limit: int,
+    second_member_limit: int,
+    timeframes: list[str] | None,
+    queue_rows_before_catalog_filter: list[dict[str, Any]],
+    queue_rows_after_catalog_filter: list[dict[str, Any]],
+) -> dict[str, Any]:
+    confidence_set = {
+        _clean_token(value) for value in included_confidence if _clean_token(value)
+    }
+    eligible_recipes = [
+        recipe
+        for recipe in recipes
+        if _clean_token(recipe.get("confidence")) in confidence_set
+    ]
+    eligible_recipes.sort(
+        key=lambda recipe: (
+            -_float_value(recipe.get("compatibility_score")),
+            -_float_value(recipe.get("best_score")),
+            str(recipe.get("recipe_id") or ""),
+        )
+    )
+    selected_recipes = eligible_recipes[: max(0, int(max_recipes))]
+    explicit_timeframes = _normalize_tokens(timeframes)
+    capacity_by_recipe: dict[str, int] = {}
+    for recipe in selected_recipes:
+        recipe_id = _clean_token(recipe.get("recipe_id")) or "unknown"
+        capacity_by_recipe[recipe_id] = _validation_candidate_capacity(
+            recipe,
+            explicit_timeframes=explicit_timeframes,
+            first_member_limit=first_member_limit,
+            second_member_limit=second_member_limit,
+        )
+    capped_capacity_by_recipe = {
+        recipe_id: min(max(1, int(max_pairs_per_recipe)), capacity)
+        for recipe_id, capacity in capacity_by_recipe.items()
+    }
+    return {
+        "available_recipe_confidence_counts": _count_by_key(recipes, "confidence"),
+        "eligible_recipe_count": len(eligible_recipes),
+        "eligible_recipe_confidence_counts": _count_by_key(eligible_recipes, "confidence"),
+        "filtered_by_confidence_count": max(0, len(recipes) - len(eligible_recipes)),
+        "selected_recipe_count": len(selected_recipes),
+        "selected_recipe_confidence_counts": _count_by_key(selected_recipes, "confidence"),
+        "selected_recipe_ids": [
+            _clean_token(recipe.get("recipe_id")) for recipe in selected_recipes
+        ],
+        "recipes_truncated_by_max": max(0, len(eligible_recipes) - len(selected_recipes)),
+        "candidate_pair_rows_before_pair_cap": sum(capacity_by_recipe.values()),
+        "candidate_pair_rows_after_pair_cap": sum(capped_capacity_by_recipe.values()),
+        "candidate_pair_capacity_by_recipe": dict(sorted(capacity_by_recipe.items())),
+        "capped_pair_capacity_by_recipe": dict(sorted(capped_capacity_by_recipe.items())),
+        "queue_rows_before_catalog_filter": len(queue_rows_before_catalog_filter),
+        "queue_rows_after_catalog_filter": len(queue_rows_after_catalog_filter),
+        "filtered_by_catalog_count": max(
+            0,
+            len(queue_rows_before_catalog_filter) - len(queue_rows_after_catalog_filter),
+        ),
+        "queued_recipe_counts_before_catalog_filter": _count_by_key(
+            queue_rows_before_catalog_filter,
+            "recipe_id",
+        ),
+        "queued_recipe_counts_after_catalog_filter": _count_by_key(
+            queue_rows_after_catalog_filter,
+            "recipe_id",
+        ),
+    }
+
+
 def build_retained_scrutiny_queue_rows(
     validation_result_rows: list[dict[str, Any]],
     *,
     included_buckets: list[str] | tuple[str, ...] = DEFAULT_SCRUTINY_BUCKETS,
+    fallback_buckets: list[str] | tuple[str, ...] | None = DEFAULT_SCRUTINY_FALLBACK_BUCKETS,
+    fallback_max_rows: int | None = DEFAULT_SCRUTINY_FALLBACK_MAX_ROWS,
+    fallback_min_trades: int = DEFAULT_SCRUTINY_FALLBACK_MIN_TRADES,
     max_rows: int | None = None,
     timeframes: list[str] | None = None,
     instruments: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     bucket_set = {_clean_token(value) for value in included_buckets if _clean_token(value)}
+    fallback_bucket_set = {
+        _clean_token(value)
+        for value in (fallback_buckets or [])
+        if _clean_token(value)
+    }
     timeframe_set = set(_normalize_tokens(timeframes))
     instrument_panel = _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS)
-    candidates: list[dict[str, Any]] = []
+    strict_candidates: list[dict[str, Any]] = []
+    fallback_candidates: list[dict[str, Any]] = []
     for source_row in validation_result_rows:
         status = _clean_token(source_row.get("status"))
         bucket = _clean_token(source_row.get("retention_bucket"))
@@ -350,14 +709,35 @@ def build_retained_scrutiny_queue_rows(
         timeframe = _clean_upper(source_row.get("probe_timeframe"))
         if status not in {"", "ok", "skipped_existing"}:
             continue
-        if bucket not in bucket_set:
-            continue
         if validation_score <= 0.0:
             continue
         if timeframe_set and timeframe not in timeframe_set:
             continue
+        sample_fields = _sample_evidence_fields(
+            source_row,
+            lookback_months=_int_value(source_row.get("lookback_months")),
+            min_trades=fallback_min_trades,
+        )
+        sample_trade_count = int(sample_fields["sample_trade_count"])
+        sample_confidence_score = float(sample_fields["sample_confidence_score"])
+        sample_confidence = str(sample_fields["sample_confidence"])
+        if bucket in bucket_set:
+            selection_reason = "strict_retention"
+            selection_tier = 0
+        elif (
+            bucket in fallback_bucket_set
+            and sample_trade_count >= max(1, int(fallback_min_trades))
+        ):
+            selection_reason = f"fallback_{bucket}"
+            selection_tier = 1
+        else:
+            continue
+        sample_adjusted_validation_score = _sample_adjusted_score(
+            validation_score,
+            sample_confidence_score=sample_confidence_score,
+        )
         priority_score = round(
-            (validation_score * 0.72)
+            (sample_adjusted_validation_score * 0.72)
             + (_float_value(source_row.get("discovery_evidence_score")) * 0.16)
             + (_float_value(source_row.get("validation_priority_score")) * 0.06),
             4,
@@ -367,43 +747,70 @@ def build_retained_scrutiny_queue_rows(
         recipe_id = _clean_token(source_row.get("recipe_id"))
         if not first_id or not second_id or not recipe_id:
             continue
-        candidates.append(
-            {
-                "recipe_id": recipe_id,
-                "recipe_confidence": source_row.get("recipe_confidence"),
-                "recipe_name": source_row.get("recipe_id"),
-                "recipe_compatibility_score": source_row.get("validation_priority_score"),
-                "recipe_best_score": validation_score,
-                "recipe_positive_pair_count": 1,
-                "recipe_strong_pair_count": 1 if validation_score >= 70.0 else 0,
-                "first_cluster_id": source_row.get("first_cluster_id"),
-                "first_cluster_label": source_row.get("first_cluster_id"),
-                "second_cluster_id": source_row.get("second_cluster_id"),
-                "second_cluster_label": source_row.get("second_cluster_id"),
-                "first_indicator_id": first_id,
-                "second_indicator_id": second_id,
-                "anchor_id": first_id,
-                "trigger_id": second_id,
-                "anchor_type": "discovered_recipe_scrutiny",
-                "probe_timeframe": timeframe,
-                "instruments": ",".join(instrument_panel),
-                "validation_priority_score": priority_score,
-                "discovery_evidence_score": source_row.get("discovery_evidence_score"),
-                "discovery_evidence_probe_id": source_row.get("discovery_evidence_probe_id"),
-                "discovery_lane": source_row.get("discovery_lane"),
-                "pair_prior_score": priority_score,
-                "pair_prior_bucket": "recipe_scrutiny",
-                "local_discovery_score": priority_score,
-                "local_score_bucket": "scrutiny",
-                "known_pair_status": "retained_discovered_recipe_36m_candidate",
-                "source_validation_probe_id": source_row.get("probe_id"),
-                "source_retention_bucket": bucket,
-                "source_validation_score": validation_score,
-                "source_retention_ratio": source_row.get("retention_ratio"),
-            }
+        candidate = {
+            "recipe_id": recipe_id,
+            "recipe_confidence": source_row.get("recipe_confidence"),
+            "recipe_name": source_row.get("recipe_id"),
+            "recipe_compatibility_score": source_row.get("validation_priority_score"),
+            "recipe_best_score": validation_score,
+            "recipe_positive_pair_count": 1,
+            "recipe_strong_pair_count": 1 if validation_score >= 70.0 else 0,
+            "first_cluster_id": source_row.get("first_cluster_id"),
+            "first_cluster_label": source_row.get("first_cluster_label"),
+            "second_cluster_id": source_row.get("second_cluster_id"),
+            "second_cluster_label": source_row.get("second_cluster_label"),
+            "first_indicator_id": first_id,
+            "second_indicator_id": second_id,
+            "anchor_id": first_id,
+            "trigger_id": second_id,
+            "anchor_type": "discovered_recipe_scrutiny",
+            "probe_timeframe": timeframe,
+            "instruments": ",".join(instrument_panel),
+            "validation_priority_score": priority_score,
+            "discovery_evidence_score": source_row.get("discovery_evidence_score"),
+            "discovery_evidence_probe_id": source_row.get("discovery_evidence_probe_id"),
+            "discovery_lane": source_row.get("discovery_lane"),
+            "pair_prior_score": priority_score,
+            "pair_prior_bucket": "recipe_scrutiny",
+            "local_discovery_score": priority_score,
+            "local_score_bucket": "scrutiny",
+            "known_pair_status": "retained_discovered_recipe_36m_candidate",
+            "source_validation_probe_id": source_row.get("probe_id"),
+            "source_retention_bucket": bucket,
+            "source_validation_score": validation_score,
+            "source_retention_ratio": source_row.get("retention_ratio"),
+            "sample_adjusted_validation_score": sample_adjusted_validation_score,
+            "sample_shrinkage_penalty": round(
+                validation_score - sample_adjusted_validation_score,
+                4,
+            ),
+            "scrutiny_selection_reason": selection_reason,
+            "scrutiny_selection_tier": selection_tier,
+            **sample_fields,
+        }
+        if selection_tier == 0:
+            strict_candidates.append(candidate)
+        else:
+            fallback_candidates.append(candidate)
+
+    def _sort_key(row: dict[str, Any]) -> tuple[float, float, str, str, str]:
+        return (
+            -_float_value(row.get("sample_confidence_score")),
+            -_float_value(row.get("validation_priority_score")),
+            str(row.get("recipe_id") or ""),
+            str(row.get("first_indicator_id") or ""),
+            str(row.get("second_indicator_id") or ""),
         )
+
+    strict_candidates.sort(key=_sort_key)
+    fallback_candidates.sort(key=_sort_key)
+    if fallback_max_rows is not None:
+        fallback_candidates = fallback_candidates[: max(0, int(fallback_max_rows))]
+    candidates = [*strict_candidates, *fallback_candidates]
     candidates.sort(
         key=lambda row: (
+            _int_value(row.get("scrutiny_selection_tier")),
+            -_float_value(row.get("sample_confidence_score")),
             -_float_value(row.get("validation_priority_score")),
             str(row.get("recipe_id") or ""),
             str(row.get("first_indicator_id") or ""),
@@ -443,8 +850,22 @@ def _queue_fieldnames() -> list[str]:
         "second_indicator_id",
         "probe_timeframe",
         "instruments",
+        "canonical_pair_family_id",
+        "pre_diversity_priority_score",
         "validation_priority_score",
+        "diversity_penalty",
+        "nearest_retained_similarity",
+        "diversity_reason",
         "discovery_evidence_score",
+        "sample_adjusted_discovery_evidence_score",
+        "sample_adjusted_validation_score",
+        "sample_shrinkage_penalty",
+        "sample_trade_count",
+        "sample_unique_months",
+        "sample_coverage_score",
+        "sample_confidence",
+        "sample_confidence_score",
+        "sample_floor_passed",
         "discovery_evidence_probe_id",
         "discovery_lane",
         "anchor_type",
@@ -460,6 +881,8 @@ def _queue_fieldnames() -> list[str]:
         "source_retention_bucket",
         "source_validation_score",
         "source_retention_ratio",
+        "scrutiny_selection_reason",
+        "scrutiny_selection_tier",
         "source_profile_path",
         "profile_path",
         "result_dir",
@@ -499,6 +922,16 @@ def _result_fieldnames() -> list[str]:
         "source_retention_bucket",
         "source_validation_score",
         "source_retention_ratio",
+        "scrutiny_selection_reason",
+        "scrutiny_selection_tier",
+        "sample_adjusted_validation_score",
+        "sample_shrinkage_penalty",
+        "sample_trade_count",
+        "sample_unique_months",
+        "sample_coverage_score",
+        "sample_confidence",
+        "sample_confidence_score",
+        "sample_floor_passed",
         "error",
     ]
 
@@ -507,6 +940,7 @@ def build_discovery_recipe_validation_atlas(
     config: AppConfig,
     *,
     cluster_atlas_dir: Path | None = None,
+    recipe_priors_dir: Path | None = None,
     out_dir: Path | None = None,
     workspace_root: Path | None = None,
     catalog_path: Path | None = None,
@@ -518,7 +952,9 @@ def build_discovery_recipe_validation_atlas(
     max_pairs_per_recipe: int = DEFAULT_MAX_PAIRS_PER_RECIPE,
     first_member_limit: int = DEFAULT_FIRST_MEMBER_LIMIT,
     second_member_limit: int = DEFAULT_SECOND_MEMBER_LIMIT,
+    diversity_penalty_scale: float = 18.0,
     lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
+    as_of_date: str | None = None,
     job_timeout_seconds: int | None = DEFAULT_JOB_TIMEOUT_SECONDS,
     emit_profile_docs: bool = True,
     quality_score_preset: str = DEFAULT_QUALITY_SCORE_PRESET,
@@ -542,6 +978,13 @@ def build_discovery_recipe_validation_atlas(
     result_root.mkdir(parents=True, exist_ok=True)
 
     recipes = _load_discovered_recipes(source_dir)
+    priors_dir = (
+        recipe_priors_dir.expanduser().resolve()
+        if recipe_priors_dir is not None
+        else config.derived_root / "recipe-priors"
+    )
+    pair_priors_path = priors_dir / "pair-priors.csv"
+    retained_inventory = _read_csv_rows(pair_priors_path) if pair_priors_path.exists() else []
     included = included_confidence or list(DEFAULT_INCLUDED_CONFIDENCE)
     queue_rows = build_validation_queue_rows(
         recipes,
@@ -552,8 +995,11 @@ def build_discovery_recipe_validation_atlas(
         second_member_limit=second_member_limit,
         timeframes=timeframes,
         instruments=instruments,
+        retained_inventory_rows=retained_inventory,
+        diversity_penalty_scale=diversity_penalty_scale,
     )
     lookback_months = max(1, int(lookback_months or DEFAULT_LOOKBACK_MONTHS))
+    resolved_as_of_date = resolve_probe_as_of_date(as_of_date)
     catalog_payload, resolved_workspace_root, resolved_catalog_path = load_indicator_catalog(
         config=config,
         workspace_root=workspace_root,
@@ -612,6 +1058,7 @@ def build_discovery_recipe_validation_atlas(
         sensitivity_args = _sensitivity_args_for_row(
             row,
             lookback_months=lookback_months,
+            as_of_date=resolved_as_of_date,
             quality_score_preset=quality_score_preset,
             execution_cost_mode=execution_cost_mode,
             result_dir=result_dir,
@@ -642,14 +1089,33 @@ def build_discovery_recipe_validation_atlas(
         key = _clean_token(row.get("recipe_confidence")) or "unknown"
         confidence_counts[key] = confidence_counts.get(key, 0) + 1
     recipe_counts: dict[str, int] = {}
+    sample_confidence_counts: dict[str, int] = {}
+    sample_floor_pass_count = 0
     for row in filtered_rows:
         key = _clean_token(row.get("recipe_id")) or "unknown"
         recipe_counts[key] = recipe_counts.get(key, 0) + 1
+        confidence_key = _clean_token(row.get("sample_confidence")) or "unknown"
+        sample_confidence_counts[confidence_key] = sample_confidence_counts.get(confidence_key, 0) + 1
+        if bool(row.get("sample_floor_passed")):
+            sample_floor_pass_count += 1
+    selection_diagnostics = _validation_selection_diagnostics(
+        recipes,
+        included_confidence=included,
+        max_recipes=max_recipes,
+        max_pairs_per_recipe=max_pairs_per_recipe,
+        first_member_limit=first_member_limit,
+        second_member_limit=second_member_limit,
+        timeframes=timeframes,
+        queue_rows_before_catalog_filter=queue_rows,
+        queue_rows_after_catalog_filter=filtered_rows,
+    )
     summary = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": {
             "cluster_atlas_dir": str(source_dir),
+            "recipe_priors_dir": str(priors_dir),
+            "pair_priors_path": str(pair_priors_path) if pair_priors_path.exists() else None,
             "workspace_root": str(resolved_workspace_root) if resolved_workspace_root else None,
             "catalog_path": str(resolved_catalog_path),
         },
@@ -661,18 +1127,38 @@ def build_discovery_recipe_validation_atlas(
             "max_pairs_per_recipe": max_pairs_per_recipe,
             "first_member_limit": first_member_limit,
             "second_member_limit": second_member_limit,
+            "diversity_penalty_scale": diversity_penalty_scale,
             "lookback_months": lookback_months,
+            "as_of_date": resolved_as_of_date,
             "job_timeout_seconds": job_timeout_seconds,
             "quality_score_preset": quality_score_preset,
             "execution_cost_mode": execution_cost_mode,
         },
         "result_counts": {
             "available_recipes": len(recipes),
+            "eligible_recipes": selection_diagnostics["eligible_recipe_count"],
+            "selected_recipes": selection_diagnostics["selected_recipe_count"],
+            "filtered_by_confidence_count": selection_diagnostics["filtered_by_confidence_count"],
+            "recipes_truncated_by_max": selection_diagnostics["recipes_truncated_by_max"],
+            "candidate_pair_rows_before_pair_cap": selection_diagnostics[
+                "candidate_pair_rows_before_pair_cap"
+            ],
+            "candidate_pair_rows_after_pair_cap": selection_diagnostics[
+                "candidate_pair_rows_after_pair_cap"
+            ],
+            "queue_rows_before_catalog_filter": selection_diagnostics[
+                "queue_rows_before_catalog_filter"
+            ],
             "queue_rows": len(filtered_rows),
+            "filtered_by_catalog_count": selection_diagnostics["filtered_by_catalog_count"],
+            "retained_inventory_rows": len(_retained_inventory_rows(retained_inventory)),
             "profile_docs": len(probes) if emit_profile_docs else 0,
             "queued_recipe_counts": dict(sorted(recipe_counts.items())),
             "queued_confidence_counts": dict(sorted(confidence_counts.items())),
+            "sample_confidence_counts": dict(sorted(sample_confidence_counts.items())),
+            "sample_floor_pass_count": sample_floor_pass_count,
         },
+        "selection_diagnostics": selection_diagnostics,
         "top_queue": filtered_rows[:15],
     }
     atlas_payload = {
@@ -733,10 +1219,14 @@ def build_discovery_recipe_scrutiny_atlas(
     catalog_path: Path | None = None,
     refresh_static_atlas: bool = False,
     included_buckets: list[str] | None = None,
+    fallback_buckets: list[str] | None = None,
+    fallback_max_rows: int | None = DEFAULT_SCRUTINY_FALLBACK_MAX_ROWS,
+    fallback_min_trades: int = DEFAULT_SCRUTINY_FALLBACK_MIN_TRADES,
     instruments: list[str] | None = None,
     timeframes: list[str] | None = None,
     max_rows: int | None = None,
     lookback_months: int = DEFAULT_SCRUTINY_LOOKBACK_MONTHS,
+    as_of_date: str | None = None,
     job_timeout_seconds: int | None = DEFAULT_JOB_TIMEOUT_SECONDS,
     emit_profile_docs: bool = True,
     quality_score_preset: str = DEFAULT_QUALITY_SCORE_PRESET,
@@ -770,11 +1260,19 @@ def build_discovery_recipe_scrutiny_atlas(
     queue_rows = build_retained_scrutiny_queue_rows(
         source_rows,
         included_buckets=included,
+        fallback_buckets=(
+            list(DEFAULT_SCRUTINY_FALLBACK_BUCKETS)
+            if fallback_buckets is None
+            else fallback_buckets
+        ),
+        fallback_max_rows=fallback_max_rows,
+        fallback_min_trades=fallback_min_trades,
         max_rows=max_rows,
         timeframes=timeframes,
         instruments=instruments,
     )
     lookback_months = max(1, int(lookback_months or DEFAULT_SCRUTINY_LOOKBACK_MONTHS))
+    resolved_as_of_date = resolve_probe_as_of_date(as_of_date)
     catalog_payload, resolved_workspace_root, resolved_catalog_path = load_indicator_catalog(
         config=config,
         workspace_root=workspace_root,
@@ -844,6 +1342,7 @@ def build_discovery_recipe_scrutiny_atlas(
         sensitivity_args = _sensitivity_args_for_row(
             row,
             lookback_months=lookback_months,
+            as_of_date=resolved_as_of_date,
             quality_score_preset=quality_score_preset,
             execution_cost_mode=execution_cost_mode,
             result_dir=result_dir,
@@ -868,15 +1367,27 @@ def build_discovery_recipe_scrutiny_atlas(
                 "validation_priority_score": row.get("validation_priority_score"),
                 "source_validation_probe_id": row.get("source_validation_probe_id"),
                 "source_retention_bucket": row.get("source_retention_bucket"),
+                "scrutiny_selection_reason": row.get("scrutiny_selection_reason"),
+                "sample_trade_count": row.get("sample_trade_count"),
+                "sample_confidence": row.get("sample_confidence"),
                 "source_profile_path": row.get("source_profile_path"),
             }
         )
 
     bucket_counts: dict[str, int] = {}
+    reason_counts: dict[str, int] = {}
+    sample_confidence_counts: dict[str, int] = {}
+    sample_floor_pass_count = 0
     copied_profile_count = 0
     for row in filtered_rows:
         key = _clean_token(row.get("source_retention_bucket")) or "unknown"
         bucket_counts[key] = bucket_counts.get(key, 0) + 1
+        reason = _clean_token(row.get("scrutiny_selection_reason")) or "unknown"
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        confidence_key = _clean_token(row.get("sample_confidence")) or "unknown"
+        sample_confidence_counts[confidence_key] = sample_confidence_counts.get(confidence_key, 0) + 1
+        if bool(row.get("sample_floor_passed")):
+            sample_floor_pass_count += 1
         if _clean_token(row.get("source_profile_path")):
             copied_profile_count += 1
     summary = {
@@ -890,10 +1401,18 @@ def build_discovery_recipe_scrutiny_atlas(
         },
         "selection": {
             "included_buckets": included,
+            "fallback_buckets": (
+                list(DEFAULT_SCRUTINY_FALLBACK_BUCKETS)
+                if fallback_buckets is None
+                else fallback_buckets
+            ),
+            "fallback_max_rows": fallback_max_rows,
+            "fallback_min_trades": fallback_min_trades,
             "instruments": _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS),
             "timeframes": _normalize_tokens(timeframes),
             "max_rows": max_rows,
             "lookback_months": lookback_months,
+            "as_of_date": resolved_as_of_date,
             "job_timeout_seconds": job_timeout_seconds,
             "quality_score_preset": quality_score_preset,
             "execution_cost_mode": execution_cost_mode,
@@ -904,6 +1423,9 @@ def build_discovery_recipe_scrutiny_atlas(
             "profile_docs": len(probes) if emit_profile_docs else 0,
             "copied_source_profile_docs": copied_profile_count,
             "source_retention_bucket_counts": dict(sorted(bucket_counts.items())),
+            "scrutiny_selection_reason_counts": dict(sorted(reason_counts.items())),
+            "sample_confidence_counts": dict(sorted(sample_confidence_counts.items())),
+            "sample_floor_pass_count": sample_floor_pass_count,
         },
         "top_queue": filtered_rows[:15],
     }
@@ -1003,6 +1525,15 @@ def _result_row_from_validation_score(
     )
     discovery_score = _float_value(row.get("discovery_evidence_score"))
     validation_score = _float_value(anchor_result.get("composite_score"))
+    sample_fields = _sample_evidence_fields(
+        anchor_result,
+        lookback_months=lookback_months,
+        min_trades=DEFAULT_SAMPLE_FLOOR_TRADES,
+    )
+    sample_adjusted_validation_score = _sample_adjusted_score(
+        validation_score,
+        sample_confidence_score=float(sample_fields["sample_confidence_score"]),
+    )
     ratio: float | None = None
     has_discovery_evidence = discovery_score > 0.0
     if has_discovery_evidence:
@@ -1043,6 +1574,12 @@ def _result_row_from_validation_score(
         "source_retention_bucket": row.get("source_retention_bucket"),
         "source_validation_score": row.get("source_validation_score"),
         "source_retention_ratio": row.get("source_retention_ratio"),
+        "sample_adjusted_validation_score": sample_adjusted_validation_score,
+        "sample_shrinkage_penalty": round(
+            validation_score - sample_adjusted_validation_score,
+            4,
+        ),
+        **sample_fields,
         "error": error,
     }
 
@@ -1133,6 +1670,7 @@ def run_discovery_recipe_validation_probes(
                 sensitivity_args = _sensitivity_args_for_row(
                     row,
                     lookback_months=lookback_months,
+                    as_of_date=None,
                     quality_score_preset=DEFAULT_QUALITY_SCORE_PRESET,
                     execution_cost_mode=DEFAULT_EXECUTION_COST_MODE,
                     result_dir=output_dir,

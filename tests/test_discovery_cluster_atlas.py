@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import csv
+
 from autoresearch.discovery_cluster_atlas import (
+    build_discovery_cluster_atlas,
     build_cluster_pair_rows,
     build_discovered_recipes,
     build_indicator_success_signatures,
@@ -119,3 +122,37 @@ def test_cluster_pair_rows_emit_discovered_recipe_templates() -> None:
     assert recipes[0]["source"] == "discovery_pair_cluster_atlas"
     assert "ANCHOR_A" in recipes[0]["slots"]["context_or_setup_cluster"]["recommended_indicators"]
     assert "TRIGGER_X" in recipes[0]["slots"]["trigger_or_response_cluster"]["recommended_indicators"]
+
+
+def test_build_discovery_cluster_atlas_reports_recipe_truncation(tmp_path) -> None:
+    source_dir = tmp_path / "discovery-pair-atlas"
+    source_dir.mkdir()
+    queue_path = source_dir / "discovery-pair-queue.csv"
+    results_path = source_dir / "discovery-pair-probe-results.csv"
+    rows = [
+        _row("ANCHOR_A", "TRIGGER_X", 72, first_strategy="mean-reversion", second_strategy="breakout"),
+        _row("ANCHOR_B", "TRIGGER_Y", 73, first_strategy="trend", second_strategy="momentum"),
+    ]
+    with queue_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["probe_id"])
+        writer.writeheader()
+        writer.writerows({"probe_id": row["probe_id"]} for row in rows)
+    with results_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    result = build_discovery_cluster_atlas(
+        object(),
+        discovery_pair_dir=source_dir,
+        out_dir=tmp_path / "cluster-atlas",
+        min_similarity=0.9,
+        max_recipes=1,
+    )
+
+    counts = result.summary["result_counts"]
+    assert counts["recipe_candidates_before_max"] == 2
+    assert counts["discovered_recipes"] == 1
+    assert counts["recipes_truncated_by_max"] == 1
+    assert result.summary["cluster_shape"]["first"]["cluster_count"] == 2
+    assert result.summary["cluster_shape"]["second"]["cluster_count"] == 2

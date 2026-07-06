@@ -62,6 +62,7 @@ from .play_hand import (
     apply_role_timeframe_defaults,
     apply_seed_indicator_metadata,
     apply_seed_pair_template_defaults,
+    apply_seed_pair_timing_hints,
     build_coarse_axes,
     build_coarse_halving_decision,
     build_early_exit_decision,
@@ -100,6 +101,9 @@ DEFAULT_LAB_RESULT_BATCH_SIZE = 25
 DEFAULT_LAB_MAX_RESULTS_PER_CYCLE = 1000
 DEFAULT_LAB_MAX_DRAIN_SECONDS = 0.5
 DEFAULT_LAB_RESULT_READ_FAILURE_LIMIT = 5
+DEFAULT_LAB_ENQUEUE_FAILURE_LIMIT = 5
+DEFAULT_LAB_ENQUEUE_RETRY_BASE_SECONDS = 1.0
+DEFAULT_LAB_TERMINAL_LANE_RETENTION = 512
 DEFAULT_LAB_LOG_MODE = "barrier"
 DEFAULT_LAB_BARRIER_INTERVAL_SECONDS = 5.0
 DEFAULT_LAB_BARRIER_LANE_LIMIT = 24
@@ -142,6 +146,7 @@ class PlayHandLabRuntimeConfig:
     instrument_pool_preset: list[str] | None = None
     indicator: list[str] | None = None
     profile_path: Path | None = None
+    seed_plan_path: Path | None = None
     min_indicators: int = 1
     max_indicators: int = 4
     seed: int | None = None
@@ -171,6 +176,9 @@ class PlayHandLabRuntimeConfig:
     max_results_per_cycle: int = DEFAULT_LAB_MAX_RESULTS_PER_CYCLE
     max_drain_seconds: float = DEFAULT_LAB_MAX_DRAIN_SECONDS
     result_read_failure_limit: int = DEFAULT_LAB_RESULT_READ_FAILURE_LIMIT
+    enqueue_failure_limit: int = DEFAULT_LAB_ENQUEUE_FAILURE_LIMIT
+    enqueue_retry_base_seconds: float = DEFAULT_LAB_ENQUEUE_RETRY_BASE_SECONDS
+    terminal_lane_retention: int = DEFAULT_LAB_TERMINAL_LANE_RETENTION
     dry_run: bool = False
     strict_scoring: bool = False
     retain_raw_lab_artifacts: bool = False
@@ -203,6 +211,12 @@ class LabLaneState:
     phase_scores: dict[str, float | None] = field(default_factory=dict)
     phase_rows: list[dict[str, Any]] = field(default_factory=list)
     phase_results: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    phase_started_at: dict[str, str] = field(default_factory=dict)
+    phase_completed_at: dict[str, str] = field(default_factory=dict)
+    phase_task_counts: dict[str, int] = field(default_factory=dict)
+    phase_completed_task_counts: dict[str, int] = field(default_factory=dict)
+    phase_failed_task_counts: dict[str, int] = field(default_factory=dict)
+    phase_lifecycle_events: list[dict[str, Any]] = field(default_factory=list)
     current_phase: str = "queued"
     terminal: bool = False
     run_promoted: bool = False
@@ -228,23 +242,38 @@ class LabLaneState:
     best_attempt_id: str | None = None
 
 
+@dataclass
+class LabCampaignHistory:
+    pruned_lane_count: int = 0
+    pruned_task_count: int = 0
+    pruned_completed_task_count: int = 0
+    pruned_failed_task_count: int = 0
+    pruned_promoted_lane_count: int = 0
+    pruned_tombstoned_lane_count: int = 0
+    best_score: float | None = None
+
+
 class LabGatewayClient:
     def __init__(self, *, base_url: str, token: str | None = None, timeout_seconds: float = 30.0) -> None:
         self.base_url = str(base_url or DEFAULT_LAB_GATEWAY_URL).rstrip("/")
         self.token = str(token or "").strip() or None
         self.timeout_seconds = max(float(timeout_seconds), 1.0)
+        self.session = requests.Session()
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"} if self.token else {}
 
+    def close(self) -> None:
+        self.session.close()
+
     def health(self) -> dict[str, Any]:
-        response = requests.get(f"{self.base_url}/healthz", timeout=self.timeout_seconds)
+        response = self.session.get(f"{self.base_url}/healthz", timeout=self.timeout_seconds)
         response.raise_for_status()
         payload = response.json()
         return payload if isinstance(payload, dict) else {}
 
     def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
-        response = requests.post(
+        response = self.session.post(
             f"{self.base_url}/tasks",
             json={"tasks": tasks},
             headers=self._headers(),
@@ -255,7 +284,7 @@ class LabGatewayClient:
         return payload if isinstance(payload, dict) else {}
 
     def snapshot(self) -> dict[str, Any]:
-        response = requests.get(
+        response = self.session.get(
             f"{self.base_url}/snapshot",
             headers=self._headers(),
             timeout=self.timeout_seconds,
@@ -265,7 +294,7 @@ class LabGatewayClient:
         return payload if isinstance(payload, dict) else {}
 
     def read_results(self, *, limit: int) -> list[dict[str, Any]]:
-        response = requests.get(
+        response = self.session.get(
             f"{self.base_url}/results",
             params={"limit": max(int(limit), 1)},
             headers=self._headers(),
@@ -279,7 +308,7 @@ class LabGatewayClient:
         return [item for item in results if isinstance(item, dict)] if isinstance(results, list) else []
 
     def ack_results(self, lease_ids: list[str]) -> int:
-        response = requests.post(
+        response = self.session.post(
             f"{self.base_url}/results/ack",
             json={"lease_ids": [str(lease_id) for lease_id in lease_ids if str(lease_id)]},
             headers=self._headers(),
@@ -299,6 +328,91 @@ class LabGatewayClient:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _append_lane_lifecycle_event(
+    lane: LabLaneState,
+    event: str,
+    *,
+    phase: str,
+    at: str | None = None,
+    **extra: Any,
+) -> None:
+    entry: dict[str, Any] = {
+        "at": at or _now_iso(),
+        "event": str(event),
+        "phase": str(phase),
+        "current_phase": lane.current_phase,
+    }
+    entry.update({key: value for key, value in extra.items() if value is not None})
+    lane.phase_lifecycle_events.append(entry)
+
+
+def _set_lane_phase(lane: LabLaneState, phase: str, *, event: str = "phase_entered", **extra: Any) -> None:
+    phase = str(phase)
+    previous_phase = lane.current_phase
+    lane.current_phase = phase
+    now = _now_iso()
+    if phase not in lane.phase_started_at:
+        lane.phase_started_at[phase] = now
+    if previous_phase != phase or extra:
+        _append_lane_lifecycle_event(
+            lane,
+            event,
+            phase=phase,
+            at=now,
+            previous_phase=previous_phase,
+            **extra,
+        )
+
+
+def _record_lane_phase_tasks_started(
+    lane: LabLaneState,
+    *,
+    phase: str,
+    task_kind: str,
+) -> None:
+    phase = str(phase)
+    now = _now_iso()
+    if phase not in lane.phase_started_at:
+        lane.phase_started_at[phase] = now
+        _append_lane_lifecycle_event(
+            lane,
+            "phase_tasks_started",
+            phase=phase,
+            at=now,
+            task_kind=task_kind,
+            task_count=len(lane.phase_task_ids.get(phase) or []),
+        )
+    lane.phase_task_counts[phase] = len(lane.phase_task_ids.get(phase) or [])
+
+
+def _refresh_lane_phase_result_counts(lane: LabLaneState, *, task_id: str) -> None:
+    phase = _task_phase(lane, task_id)
+    phase_task_ids = lane.phase_task_ids.get(phase) or []
+    if not phase_task_ids:
+        return
+    completed_count = sum(1 for item in phase_task_ids if item in lane.completed_task_ids)
+    failed_count = sum(1 for item in phase_task_ids if item in lane.failed_task_ids)
+    lane.phase_task_counts[phase] = len(phase_task_ids)
+    lane.phase_completed_task_counts[phase] = completed_count
+    lane.phase_failed_task_counts[phase] = failed_count
+    if completed_count + failed_count < len(phase_task_ids):
+        return
+    if phase in lane.phase_completed_at:
+        return
+    now = _now_iso()
+    lane.phase_completed_at[phase] = now
+    _append_lane_lifecycle_event(
+        lane,
+        "phase_tasks_completed",
+        phase=phase,
+        at=now,
+        task_count=len(phase_task_ids),
+        completed_task_count=completed_count,
+        failed_task_count=failed_count,
+        status="failed" if failed_count else "completed",
+    )
 
 
 def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeConfig:
@@ -404,6 +518,9 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         instrument_pool_preset=_clean_pool_names(runtime.instrument_pool_preset),
         indicator=_clean_symbols(runtime.indicator),
         profile_path=runtime.profile_path,
+        seed_plan_path=Path(runtime.seed_plan_path).expanduser().resolve()
+        if runtime.seed_plan_path
+        else None,
         min_indicators=min_indicators,
         max_indicators=max_indicators,
         seed=runtime.seed,
@@ -433,6 +550,9 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         max_results_per_cycle=max_results_per_cycle,
         max_drain_seconds=max(float(runtime.max_drain_seconds), 0.0),
         result_read_failure_limit=max(int(runtime.result_read_failure_limit), 1),
+        enqueue_failure_limit=max(int(runtime.enqueue_failure_limit), 1),
+        enqueue_retry_base_seconds=max(float(runtime.enqueue_retry_base_seconds), 0.0),
+        terminal_lane_retention=max(int(runtime.terminal_lane_retention), 0),
         dry_run=bool(runtime.dry_run),
         strict_scoring=bool(runtime.strict_scoring),
         retain_raw_lab_artifacts=bool(runtime.retain_raw_lab_artifacts),
@@ -856,6 +976,12 @@ def _write_lane_metadata(
             "failed_task_count": len(lane.failed_task_ids),
             "phase_scores": dict(lane.phase_scores),
             "phase_rows": list(lane.phase_rows),
+            "phase_started_at": dict(lane.phase_started_at),
+            "phase_completed_at": dict(lane.phase_completed_at),
+            "phase_task_counts": dict(lane.phase_task_counts),
+            "phase_completed_task_counts": dict(lane.phase_completed_task_counts),
+            "phase_failed_task_counts": dict(lane.phase_failed_task_counts),
+            "phase_lifecycle_events": list(lane.phase_lifecycle_events),
             "terminal": lane.terminal,
             "run_promoted": lane.run_promoted,
             "tombstone_reason": lane.tombstone_reason,
@@ -887,7 +1013,7 @@ def _seed_indicators(
     campaign_ctx: PlayHandContext,
     runtime: PlayHandLabRuntimeConfig,
 ) -> tuple[list[SeedIndicator], dict[str, Any] | None, Path | None]:
-    seed_plan, seed_plan_path = _load_play_hand_seed_plan(config)
+    seed_plan, seed_plan_path = _load_play_hand_seed_plan(config, runtime.seed_plan_path)
     pinned = [SeedIndicator(id=item) for item in runtime.indicator or []]
     scaffoldable_indicator_ids: set[str] | None = None
     if runtime.profile_path is None:
@@ -1032,6 +1158,58 @@ def _deal_lane(
     }
 
 
+def _indicator_id_from_deal_entry(entry: Any) -> str | None:
+    if isinstance(entry, SeedIndicator):
+        indicator_id = entry.id
+    elif isinstance(entry, dict):
+        indicator_id = entry.get("id") or entry.get("indicator_id")
+    else:
+        indicator_id = entry
+    indicator_id = str(indicator_id or "").strip().upper()
+    return indicator_id or None
+
+
+def _indicator_deal_metadata(indicator_deal: dict[str, Any] | None) -> dict[str, Any]:
+    deal = indicator_deal if isinstance(indicator_deal, dict) else {}
+    indicator_ids = [
+        indicator_id
+        for item in deal.get("indicators") or []
+        if (indicator_id := _indicator_id_from_deal_entry(item))
+    ]
+    payload = {
+        "indicator_ids": indicator_ids,
+        "source": deal.get("source"),
+        "reason": deal.get("reason"),
+        "recipe": deal.get("recipe"),
+        "recipe_source": deal.get("recipe_source"),
+        "recipe_confidence": deal.get("recipe_confidence"),
+        "guided_recipe_source_mix_expected": deal.get("guided_recipe_source_mix_expected"),
+        "guided_recipe_source_bucket": deal.get("guided_recipe_source_bucket"),
+        "guided_recipe_source_bucket_matched": deal.get("guided_recipe_source_bucket_matched"),
+        "guided_recipe_source_bucket_fallback": deal.get("guided_recipe_source_bucket_fallback"),
+        "pair": deal.get("pair"),
+        "family_policy": deal.get("family_policy"),
+        "policy_target_count": deal.get("policy_target_count"),
+        "selected_slots": deal.get("selected_slots"),
+    }
+    return {
+        "indicator_deal": payload,
+        "dealt_indicator_source": payload["source"],
+        "dealt_indicator_source_reason": payload["reason"],
+        "dealt_recipe": payload["recipe"],
+        "dealt_recipe_source": payload["recipe_source"],
+        "dealt_recipe_confidence": payload["recipe_confidence"],
+        "guided_recipe_source_mix_expected": payload["guided_recipe_source_mix_expected"],
+        "guided_recipe_source_bucket": payload["guided_recipe_source_bucket"],
+        "guided_recipe_source_bucket_matched": payload["guided_recipe_source_bucket_matched"],
+        "guided_recipe_source_bucket_fallback": payload["guided_recipe_source_bucket_fallback"],
+        "dealt_recipe_pair": payload["pair"],
+        "dealt_pair_family_policy": payload["family_policy"],
+        "dealt_policy_target_count": payload["policy_target_count"],
+        "dealt_recipe_slots": payload["selected_slots"],
+    }
+
+
 def _inner_profile_payload(payload: dict[str, Any]) -> dict[str, Any]:
     profile = payload.get("profile") if isinstance(payload, dict) else None
     return dict(profile) if isinstance(profile, dict) else dict(payload)
@@ -1082,8 +1260,12 @@ def _prepare_lane_profile(
             profile_payload,
             deal["indicator_deal"].get("pair"),
         )
+        timing_hint_changes = apply_seed_pair_timing_hints(
+            profile_payload,
+            deal["indicator_deal"].get("pair"),
+        )
         default_changes = apply_play_hand_profile_defaults(profile_payload, rng=rng)
-        if metadata_changes or timeframe_changes or template_changes or default_changes:
+        if metadata_changes or timeframe_changes or template_changes or timing_hint_changes or default_changes:
             _write_json(lane.profile_path, profile_payload)
         lane.indicator_ids = list(deal["dealt"])
         lane.instruments = list(deal["instruments"])
@@ -1095,6 +1277,7 @@ def _prepare_lane_profile(
             metadata_changes=metadata_changes,
             timeframe_changes=timeframe_changes,
             template_changes=template_changes,
+            timing_hint_changes=timing_hint_changes,
             default_changes=default_changes,
         )
     lane.profile_payload = _inner_profile_payload(_load_json(lane.profile_path))
@@ -1313,7 +1496,7 @@ def _mark_lane_tombstoned(
 ) -> None:
     lane.terminal = True
     lane.run_promoted = False
-    lane.current_phase = "tombstoned"
+    _set_lane_phase(lane, "tombstoned", event="lane_tombstoned", reason=reason)
     lane.tombstone_reason = reason
     lane.tombstone_reasons = sorted({item for item in [reason, *(reasons or [])] if item})
     metadata = load_run_metadata(lane.run_dir)
@@ -1325,6 +1508,12 @@ def _mark_lane_tombstoned(
             "tombstone_reasons": lane.tombstone_reasons,
             "phase_rows": list(lane.phase_rows),
             "play_hand_phase_scores": dict(lane.phase_scores),
+            "phase_started_at": dict(lane.phase_started_at),
+            "phase_completed_at": dict(lane.phase_completed_at),
+            "phase_task_counts": dict(lane.phase_task_counts),
+            "phase_completed_task_counts": dict(lane.phase_completed_task_counts),
+            "phase_failed_task_counts": dict(lane.phase_failed_task_counts),
+            "phase_lifecycle_events": list(lane.phase_lifecycle_events),
             "final_attempt_id": lane.final_attempt_id,
             "final_scrutiny_passed": False,
             "final_scrutiny_score": None,
@@ -1362,7 +1551,7 @@ def _mark_lane_promoted(
 ) -> None:
     lane.terminal = True
     lane.run_promoted = True
-    lane.current_phase = "promoted"
+    _set_lane_phase(lane, "promoted", event="lane_promoted", final_score=final_score)
     metadata = load_run_metadata(lane.run_dir)
     metadata.update(
         {
@@ -1372,6 +1561,12 @@ def _mark_lane_promoted(
             "tombstone_reasons": [],
             "phase_rows": list(lane.phase_rows),
             "play_hand_phase_scores": dict(lane.phase_scores),
+            "phase_started_at": dict(lane.phase_started_at),
+            "phase_completed_at": dict(lane.phase_completed_at),
+            "phase_task_counts": dict(lane.phase_task_counts),
+            "phase_completed_task_counts": dict(lane.phase_completed_task_counts),
+            "phase_failed_task_counts": dict(lane.phase_failed_task_counts),
+            "phase_lifecycle_events": list(lane.phase_lifecycle_events),
             "final_attempt_id": lane.final_attempt_id,
             "final_scrutiny_passed": True,
             "final_scrutiny_score": final_score,
@@ -1771,6 +1966,7 @@ def _register_task_spec(
     lane.task_ids.append(task_id)
     lane.task_specs[task_id] = {"phase": phase, "task_kind": task_kind, **spec}
     lane.phase_task_ids.setdefault(phase, []).append(task_id)
+    _record_lane_phase_tasks_started(lane, phase=phase, task_kind=task_kind)
 
 
 def _make_deep_replay_task(
@@ -2023,7 +2219,7 @@ def _build_tasks(
         ):
             if not worker_contract_hash:
                 raise RuntimeError("Deep-replay lab tasks require a worker contract hash.")
-            lane.current_phase = "baseline"
+            _set_lane_phase(lane, "baseline")
             analysis_window_start, analysis_window_end = _lane_screen_window(lane)
             tasks.append(
                 _make_deep_replay_task(
@@ -2507,6 +2703,12 @@ def _write_stage_metadata(lane: LabLaneState, lane_ctx: PlayHandContext) -> None
             "screen_anchor_offset_days": lane.screen_anchor_offset_days,
             "phase_rows": list(lane.phase_rows),
             "play_hand_phase_scores": dict(lane.phase_scores),
+            "phase_started_at": dict(lane.phase_started_at),
+            "phase_completed_at": dict(lane.phase_completed_at),
+            "phase_task_counts": dict(lane.phase_task_counts),
+            "phase_completed_task_counts": dict(lane.phase_completed_task_counts),
+            "phase_failed_task_counts": dict(lane.phase_failed_task_counts),
+            "phase_lifecycle_events": list(lane.phase_lifecycle_events),
             "stage_incumbent": {
                 "profile_path": (
                     str(lane.incumbent_profile_path.resolve())
@@ -2673,10 +2875,10 @@ def _enqueue_lookback_stage(
     profile_payload = lane.incumbent_profile_payload or lane.profile_payload or {}
     axes = build_timing_axes(profile_payload)
     if not axes or lane.incumbent_profile_path is None or lane.incumbent_profile_ref is None:
-        lane.current_phase = "lookback_skipped"
+        _set_lane_phase(lane, "lookback_skipped", event="phase_skipped", reason="no timing axes")
         _append_phase_row(lane, phase="lookback", status="skipped", detail="no timing axes")
         return []
-    lane.current_phase = "lookback"
+    _set_lane_phase(lane, "lookback")
     analysis_window_start, analysis_window_end = _lane_screen_window(lane)
     return _make_sweep_shard_tasks(
         lane,
@@ -2708,10 +2910,10 @@ def _enqueue_coarse_stage(
     profile_payload = lane.incumbent_profile_payload or lane.profile_payload or {}
     axes = build_coarse_axes(profile_payload)
     if not axes or lane.incumbent_profile_path is None or lane.incumbent_profile_ref is None:
-        lane.current_phase = "coarse_skipped"
+        _set_lane_phase(lane, "coarse_skipped", event="phase_skipped", reason="no numeric talib axes")
         _append_phase_row(lane, phase="coarse", status="skipped", detail="no numeric talib axes")
         return []
-    lane.current_phase = phase
+    _set_lane_phase(lane, phase)
     effective_runtime = runtime
     if budget is not None:
         effective_runtime = replace(runtime, max_sweep_permutations=max(int(budget), 1))
@@ -2753,10 +2955,10 @@ def _enqueue_focused_stage(
         lane.last_sweep_axes,
     )
     if not axes:
-        lane.current_phase = "focused_skipped"
+        _set_lane_phase(lane, "focused_skipped", event="phase_skipped", reason="no high-impact axes")
         _append_phase_row(lane, phase="focused", status="skipped", detail="no high-impact axes")
         return []
-    lane.current_phase = "focused"
+    _set_lane_phase(lane, "focused")
     analysis_window_start, analysis_window_end = _lane_screen_window(lane)
     return _make_sweep_shard_tasks(
         lane,
@@ -2793,7 +2995,7 @@ def _enqueue_instrument_scout_stage(
     selected_candidates = candidates[: max(int(runtime.instrument_scout_size), 1)]
     scout_instruments = current[:1] + selected_candidates
     scout_instruments = list(dict.fromkeys([symbol for symbol in scout_instruments if symbol]))
-    lane.current_phase = "instrument_scout"
+    _set_lane_phase(lane, "instrument_scout")
     tasks: list[dict[str, Any]] = []
     for instrument in scout_instruments:
         tasks.append(
@@ -2823,7 +3025,7 @@ def _enqueue_validation_stage(
 ) -> list[dict[str, Any]]:
     if lane.incumbent_profile_ref is None or lane.incumbent_profile_payload is None:
         return []
-    lane.current_phase = "validation"
+    _set_lane_phase(lane, "validation")
     phase = _validation_phase(runtime)
     return [
         _make_deep_replay_task(
@@ -2851,7 +3053,7 @@ def _enqueue_final_stage(
 ) -> list[dict[str, Any]]:
     if lane.incumbent_profile_ref is None or lane.incumbent_profile_payload is None:
         return []
-    lane.current_phase = "scrutiny"
+    _set_lane_phase(lane, "scrutiny")
     return [
         _make_deep_replay_task(
             lane,
@@ -3284,6 +3486,41 @@ def _safe_ack_gateway_results(
         return False
 
 
+def _enqueue_gateway_tasks_with_retries(
+    gateway: Any,
+    campaign_ctx: PlayHandContext,
+    tasks: list[dict[str, Any]],
+    *,
+    reason: str,
+    failure_limit: int,
+    retry_base_seconds: float,
+) -> dict[str, Any]:
+    if not tasks:
+        return {}
+    max_failures = max(int(failure_limit), 1)
+    retry_base = max(float(retry_base_seconds), 0.0)
+    for attempt in range(1, max_failures + 1):
+        try:
+            result = gateway.enqueue_tasks(tasks)
+            return result if isinstance(result, dict) else {}
+        except requests.RequestException as exc:
+            _append_event(
+                campaign_ctx,
+                "gateway",
+                "task_enqueue_failed",
+                reason=reason,
+                error=str(exc)[:1000],
+                attempt=attempt,
+                failure_limit=max_failures,
+                task_count=len(tasks),
+            )
+            if attempt >= max_failures:
+                raise
+            if retry_base > 0:
+                time.sleep(min(retry_base * attempt, 30.0))
+    return {}
+
+
 def _add_recorded_result_sample(recorded_results: list[dict[str, Any]], recorded: dict[str, Any]) -> None:
     if len(recorded_results) < max(int(SUMMARY_RECORDED_RESULTS_SAMPLE_LIMIT), 0):
         recorded_results.append(recorded)
@@ -3309,11 +3546,51 @@ def _metric_delta(snapshot: dict[str, Any] | None, baseline: dict[str, int], key
     return max(int(metrics.get(key, 0)) - int(baseline.get(key, 0)), 0)
 
 
+def _lane_history_totals(
+    lanes: list[LabLaneState],
+    history: LabCampaignHistory | None = None,
+) -> dict[str, Any]:
+    history = history or LabCampaignHistory()
+    retained_completed = sum(len(lane.completed_task_ids) for lane in lanes)
+    retained_failed = sum(len(lane.failed_task_ids) for lane in lanes)
+    retained_promoted = sum(1 for lane in lanes if lane.run_promoted)
+    retained_tombstoned = sum(1 for lane in lanes if lane.tombstone_reason)
+    best_scores = [lane.best_score for lane in lanes if lane.best_score is not None]
+    if history.best_score is not None:
+        best_scores.append(history.best_score)
+    return {
+        "lane_count": int(history.pruned_lane_count) + len(lanes),
+        "retained_lane_count": len(lanes),
+        "pruned_lane_count": int(history.pruned_lane_count),
+        "total_tasks": int(history.pruned_task_count) + sum(len(lane.task_ids) for lane in lanes),
+        "completed_tasks": int(history.pruned_completed_task_count) + retained_completed,
+        "failed_tasks": int(history.pruned_failed_task_count) + retained_failed,
+        "terminal_lanes": int(history.pruned_lane_count) + sum(1 for lane in lanes if lane.terminal),
+        "promoted_lanes": int(history.pruned_promoted_lane_count) + retained_promoted,
+        "tombstoned_lanes": int(history.pruned_tombstoned_lane_count) + retained_tombstoned,
+        "best_score": max(best_scores, default=None),
+    }
+
+
+def _compact_terminal_lane_state(lane: LabLaneState) -> None:
+    terminal_task_count = len(lane.completed_task_ids) + len(lane.failed_task_ids)
+    if not lane.terminal and (not lane.task_ids or terminal_task_count < len(lane.task_ids)):
+        return
+    lane.profile_payload = None
+    lane.incumbent_profile_payload = None
+    lane.last_sweep_payload = None
+    lane.instrument_scout_result = None
+    lane.task_specs.clear()
+    lane.phase_rows.clear()
+    lane.phase_results.clear()
+
+
 def _campaign_gateway_snapshot(
     snapshot: dict[str, Any] | None,
     *,
     metric_baseline: dict[str, int],
     lanes: list[LabLaneState],
+    history: LabCampaignHistory | None = None,
 ) -> dict[str, Any] | None:
     if not isinstance(snapshot, dict):
         return None
@@ -3327,9 +3604,10 @@ def _campaign_gateway_snapshot(
     for key in ("queued_tasks", "active_leases", "completed_tasks", "failed_tasks", "live_tasks", "result_backlog"):
         if key in snapshot:
             scoped[f"raw_{key}"] = snapshot.get(key)
-    total_tasks = sum(len(lane.task_ids) for lane in lanes)
-    completed_tasks = sum(len(lane.completed_task_ids) for lane in lanes)
-    failed_tasks = sum(len(lane.failed_task_ids) for lane in lanes)
+    totals = _lane_history_totals(lanes, history)
+    total_tasks = int(totals["total_tasks"])
+    completed_tasks = int(totals["completed_tasks"])
+    failed_tasks = int(totals["failed_tasks"])
     scoped["total_tasks"] = total_tasks
     scoped["completed_tasks"] = completed_tasks
     scoped["failed_tasks"] = failed_tasks
@@ -3449,19 +3727,24 @@ def _format_lab_barrier_snapshot(
     metric_baseline: dict[str, int],
     recorded_result_count: int,
     status: str | None = None,
+    history: LabCampaignHistory | None = None,
 ) -> str:
-    scoped_snapshot = snapshot if isinstance(snapshot, dict) else {}
-    total_tasks = sum(len(lane.task_ids) for lane in lanes)
-    completed_tasks = sum(len(lane.completed_task_ids) for lane in lanes)
-    failed_tasks = sum(len(lane.failed_task_ids) for lane in lanes)
+    scoped_snapshot = _campaign_gateway_snapshot(
+        snapshot,
+        metric_baseline=metric_baseline,
+        lanes=lanes,
+        history=history,
+    ) or {}
+    totals = _lane_history_totals(lanes, history)
+    total_tasks = int(totals["total_tasks"])
+    completed_tasks = int(totals["completed_tasks"])
+    failed_tasks = int(totals["failed_tasks"])
     active_lanes = [lane for lane in lanes if _lane_is_active_for_log(lane)]
     terminal_lanes = [lane for lane in lanes if lane.terminal]
-    promoted_lanes = sum(1 for lane in lanes if lane.run_promoted)
-    tombstoned_lanes = sum(1 for lane in lanes if lane.tombstone_reason)
-    best_score = max(
-        [score for lane in lanes if (score := _lane_best_score_for_log(lane)) is not None],
-        default=None,
-    )
+    terminal_lane_count = int(totals["terminal_lanes"])
+    promoted_lanes = int(totals["promoted_lanes"])
+    tombstoned_lanes = int(totals["tombstoned_lanes"])
+    best_score = totals["best_score"]
     worker_slots = int(scoped_snapshot.get("worker_slots") or 0)
     busy_slots = int(scoped_snapshot.get("busy_slots") or 0)
     worker_count = int(
@@ -3514,7 +3797,7 @@ def _format_lab_barrier_snapshot(
         [
         _box_row(
             "lanes "
-            f"created={len(lanes)} active={len(active_lanes)} terminal={len(terminal_lanes)} "
+            f"created={int(totals['lane_count'])} active={len(active_lanes)} terminal={terminal_lane_count} "
             f"promoted={promoted_lanes} tombstoned={tombstoned_lanes} "
             f"tasks={completed_tasks + failed_tasks}/{total_tasks or len(tasks)} failed={failed_tasks} "
             f"recorded={recorded_result_count} best={_score_text(best_score)}"
@@ -3579,11 +3862,11 @@ def _format_lab_barrier_snapshot(
                 f"... {hidden_count} more active lane(s) hidden; raise --barrier-lane-limit to show more ..."
             )
         )
-    if active_ordered_lanes and terminal_lanes:
+    if active_ordered_lanes and terminal_lane_count:
         lines.append(
             _box_row(
                 "terminal lanes summarized: "
-                f"{len(terminal_lanes)} terminal, {promoted_lanes} promoted, "
+                f"{terminal_lane_count} terminal, {promoted_lanes} promoted, "
                 f"{tombstoned_lanes} tombstoned"
             )
         )
@@ -3681,10 +3964,12 @@ def _write_summary(
     gateway_snapshot: dict[str, Any] | None,
     recorded_results: list[dict[str, Any]],
     recorded_result_count: int | None = None,
+    history: LabCampaignHistory | None = None,
 ) -> dict[str, Any]:
-    total_tasks = sum(len(lane.task_ids) for lane in lanes)
-    completed_tasks = sum(len(lane.completed_task_ids) for lane in lanes)
-    failed_tasks = sum(len(lane.failed_task_ids) for lane in lanes)
+    totals = _lane_history_totals(lanes, history)
+    total_tasks = int(totals["total_tasks"])
+    completed_tasks = int(totals["completed_tasks"])
+    failed_tasks = int(totals["failed_tasks"])
     total_recorded_results = max(
         int(recorded_result_count) if recorded_result_count is not None else len(recorded_results),
         len(recorded_results),
@@ -3704,17 +3989,17 @@ def _write_summary(
         "pipeline_version": PLAY_HAND_LAB_PIPELINE_VERSION,
         "target_runs": runtime.target_runs,
         "active_runs": runtime.active_runs,
-        "lane_count": len(lanes),
+        "lane_count": int(totals["lane_count"]),
+        "retained_lane_count": int(totals["retained_lane_count"]),
+        "pruned_lane_count": int(totals["pruned_lane_count"]),
         "total_tasks": total_tasks,
         "completed_tasks": completed_tasks,
         "failed_tasks": failed_tasks,
         "recorded_result_count": total_recorded_results,
         "recorded_results_sample_limit": max(int(SUMMARY_RECORDED_RESULTS_SAMPLE_LIMIT), 0),
         "recorded_results_truncated": total_recorded_results > len(recorded_results),
-        "best_score": max(
-            [lane.best_score for lane in lanes if lane.best_score is not None],
-            default=None,
-        ),
+        "best_score": totals["best_score"],
+        "lanes_truncated": int(totals["pruned_lane_count"]) > 0,
         "lanes": [
             {
                 "lane_id": lane.lane_id,
@@ -3728,6 +4013,12 @@ def _write_summary(
                 "run_promoted": lane.run_promoted,
                 "tombstone_reason": lane.tombstone_reason,
                 "phase_scores": dict(lane.phase_scores),
+                "phase_started_at": dict(lane.phase_started_at),
+                "phase_completed_at": dict(lane.phase_completed_at),
+                "phase_task_counts": dict(lane.phase_task_counts),
+                "phase_completed_task_counts": dict(lane.phase_completed_task_counts),
+                "phase_failed_task_counts": dict(lane.phase_failed_task_counts),
+                "phase_lifecycle_events": list(lane.phase_lifecycle_events),
                 "best_score": lane.best_score,
                 "best_attempt_id": lane.best_attempt_id,
                 "instruments": list(lane.instruments),
@@ -3812,9 +4103,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     tasks: list[dict[str, Any]] = []
     lanes_by_task: dict[str, LabLaneState] = {}
     lane_contexts: dict[str, PlayHandContext] = {}
+    history = LabCampaignHistory()
     target_runs = runtime.target_runs if runtime.campaign_mode == "finite" else None
     active_runs = max(int(runtime.active_runs or 1), 1)
     observed_worker_slots = 0
+    next_lane_index = 0
 
     def enqueue_chunk_run_limit() -> int:
         pressure_slots = observed_worker_slots if observed_worker_slots > 0 else active_runs
@@ -3875,6 +4168,9 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             status="queued",
             started_at=started_at,
             extra={
+                **_indicator_deal_metadata(
+                    deal.get("indicator_deal") if isinstance(deal, dict) else None
+                ),
                 "play_hand_seed_plan_path": str(seed_plan_path) if seed_plan_path else None,
                 "play_hand_seed_plan_loaded": seed_plan is not None,
                 "reward_matrix": reward_matrix,
@@ -3948,15 +4244,27 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     def active_lane_count() -> int:
         return sum(1 for lane in lanes if lane_is_active(lane))
 
+    def created_run_count() -> int:
+        return max(next_lane_index, int(history.pruned_lane_count) + len(lanes))
+
+    def total_task_count() -> int:
+        return int(history.pruned_task_count) + sum(len(lane.task_ids) for lane in lanes)
+
+    def completed_task_count() -> int:
+        return int(history.pruned_completed_task_count) + sum(len(lane.completed_task_ids) for lane in lanes)
+
+    def failed_task_count() -> int:
+        return int(history.pruned_failed_task_count) + sum(len(lane.failed_task_ids) for lane in lanes)
+
     def can_create_more() -> bool:
-        return runtime.campaign_mode == "continuous" or target_runs is None or len(lanes) < target_runs
+        return runtime.campaign_mode == "continuous" or target_runs is None or created_run_count() < target_runs
 
     def top_up_run_count() -> int:
         deficit = max(active_runs - active_lane_count(), 0)
         if deficit <= 0 or not can_create_more():
             return 0
         if target_runs is not None:
-            deficit = min(deficit, max(target_runs - len(lanes), 0))
+            deficit = min(deficit, max(target_runs - created_run_count(), 0))
         return min(deficit, enqueue_chunk_run_limit())
 
     def enqueue_lanes(new_lanes: list[LabLaneState]) -> None:
@@ -3968,7 +4276,14 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             reward_matrix=reward_matrix,
             worker_contract_hash=worker_contract_hash,
         )
-        enqueue_result = gateway.enqueue_tasks(new_tasks)
+        enqueue_result = _enqueue_gateway_tasks_with_retries(
+            gateway,
+            campaign_ctx,
+            new_tasks,
+            reason="lane_top_up",
+            failure_limit=runtime.enqueue_failure_limit,
+            retry_base_seconds=runtime.enqueue_retry_base_seconds,
+        )
         tasks.extend(new_tasks)
         for lane in new_lanes:
             for task_id in lane.task_ids:
@@ -3986,8 +4301,8 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             "tasks_enqueued",
             enqueue_result=enqueue_result,
             task_count=len(new_tasks),
-            total_enqueued_task_count=len(tasks),
-            created_run_count=len(lanes),
+            total_enqueued_task_count=total_task_count(),
+            created_run_count=created_run_count(),
             active_run_count=active_lane_count(),
         )
         _write_campaign_metadata(
@@ -3996,8 +4311,8 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             status="running",
             started_at=started_at,
             extra={
-                "enqueued_task_count": len(tasks),
-                "created_run_count": len(lanes),
+                "enqueued_task_count": total_task_count(),
+                "created_run_count": created_run_count(),
                 "active_run_count": active_lane_count(),
             },
         )
@@ -4005,7 +4320,14 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     def enqueue_existing_tasks(new_tasks: list[dict[str, Any]], *, reason: str) -> None:
         if not new_tasks:
             return
-        enqueue_result = gateway.enqueue_tasks(new_tasks)
+        enqueue_result = _enqueue_gateway_tasks_with_retries(
+            gateway,
+            campaign_ctx,
+            new_tasks,
+            reason=reason,
+            failure_limit=runtime.enqueue_failure_limit,
+            retry_base_seconds=runtime.enqueue_retry_base_seconds,
+        )
         tasks.extend(new_tasks)
         for task in new_tasks:
             task_id = str(task.get("task_id") or "")
@@ -4020,7 +4342,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             reason=reason,
             enqueue_result=enqueue_result,
             task_count=len(new_tasks),
-            total_enqueued_task_count=len(tasks),
+            total_enqueued_task_count=total_task_count(),
             active_run_count=active_lane_count(),
         )
         _write_campaign_metadata(
@@ -4029,19 +4351,21 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             status="running",
             started_at=started_at,
             extra={
-                "enqueued_task_count": len(tasks),
-                "created_run_count": len(lanes),
+                "enqueued_task_count": total_task_count(),
+                "created_run_count": created_run_count(),
                 "active_run_count": active_lane_count(),
             },
         )
 
     def create_and_enqueue_more() -> int:
+        nonlocal next_lane_index
         count = top_up_run_count()
         if count <= 0:
             return 0
-        start_index = len(lanes)
+        start_index = next_lane_index
         new_lanes = prepare_lanes(start_index, count)
         enqueue_lanes(new_lanes)
+        next_lane_index += len(new_lanes)
         return len(new_lanes)
 
     if runtime.dry_run:
@@ -4083,7 +4407,6 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     except requests.RequestException as exc:
         _append_event(campaign_ctx, "gateway", "baseline_snapshot_failed", error=str(exc)[:500])
 
-    create_and_enqueue_more()
     recorded_results: list[dict[str, Any]] = []
     recorded_result_count = 0
     deadline = None if runtime.campaign_mode == "continuous" else time.monotonic() + runtime.max_wait_seconds
@@ -4128,6 +4451,81 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             else:
                 dirty_progress_run_ids.discard(run_id)
 
+    def terminal_lane_ready_for_retention(lane: LabLaneState) -> bool:
+        return bool(lane.task_ids) and (lane.terminal or lane_terminal_count(lane) >= len(lane.task_ids))
+
+    def render_before_prune(lane: LabLaneState) -> None:
+        if lane.run_id not in dirty_progress_run_ids:
+            return
+        lane_ctx = lane_contexts.get(lane.run_id)
+        if lane_ctx is None:
+            dirty_progress_run_ids.discard(lane.run_id)
+            return
+        try:
+            _render_lane_progress_artifacts(config=config, lane_ctx=lane_ctx)
+        except Exception as exc:
+            _append_event(
+                campaign_ctx,
+                "progress",
+                "render_failed",
+                run_id=lane.run_id,
+                error=str(exc)[:1000],
+            )
+        dirty_progress_run_ids.discard(lane.run_id)
+
+    def prune_terminal_lane_history() -> None:
+        retention = max(int(runtime.terminal_lane_retention), 0)
+        terminal_lanes = [lane for lane in lanes if terminal_lane_ready_for_retention(lane)]
+        terminal_task_ids = {
+            task_id
+            for lane in terminal_lanes
+            for task_id in lane.task_ids
+            if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids
+        }
+        if terminal_task_ids:
+            tasks[:] = [
+                task
+                for task in tasks
+                if str(task.get("task_id") or "") not in terminal_task_ids
+            ]
+        for lane in terminal_lanes:
+            _compact_terminal_lane_state(lane)
+        overflow = len(terminal_lanes) - retention
+        if overflow <= 0:
+            return
+        prune_ids = {
+            lane.run_id
+            for lane in sorted(terminal_lanes, key=lambda candidate: candidate.lane_index)[:overflow]
+        }
+        retained_lanes: list[LabLaneState] = []
+        pruned_task_ids: set[str] = set()
+        for lane in lanes:
+            if lane.run_id not in prune_ids:
+                retained_lanes.append(lane)
+                continue
+            render_before_prune(lane)
+            history.pruned_lane_count += 1
+            history.pruned_task_count += len(lane.task_ids)
+            history.pruned_completed_task_count += len(lane.completed_task_ids)
+            history.pruned_failed_task_count += len(lane.failed_task_ids)
+            if lane.run_promoted:
+                history.pruned_promoted_lane_count += 1
+            if lane.tombstone_reason:
+                history.pruned_tombstoned_lane_count += 1
+            if lane.best_score is not None:
+                history.best_score = (
+                    lane.best_score
+                    if history.best_score is None
+                    else max(history.best_score, lane.best_score)
+                )
+            pruned_task_ids.update(lane.task_ids)
+            lane_contexts.pop(lane.run_id, None)
+            dirty_progress_run_ids.discard(lane.run_id)
+        if len(retained_lanes) != len(lanes):
+            lanes[:] = retained_lanes
+        for task_id in pruned_task_ids:
+            lanes_by_task.pop(task_id, None)
+
     def emit_barrier_snapshot(*, force: bool = False, status: str | None = None) -> None:
         nonlocal barrier_index, last_barrier_at
         if runtime.log_mode != "barrier":
@@ -4148,6 +4546,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 metric_baseline=gateway_metric_baseline,
                 recorded_result_count=recorded_result_count,
                 status=status,
+                history=history,
             ),
             flush=True,
         )
@@ -4203,6 +4602,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                         lane.failed_task_ids.add(task_id)
                     else:
                         lane.completed_task_ids.add(task_id)
+                _refresh_lane_phase_result_counts(lane, task_id=task_id)
                 new_stage_tasks = _advance_lane_after_result(
                     config=config,
                     lane_ctx=lane_contexts[lane.run_id],
@@ -4250,6 +4650,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 recorded_result_count += 1
                 _add_recorded_result_sample(recorded_results, recorded)
                 lane.failed_task_ids.add(task_id)
+                _refresh_lane_phase_result_counts(lane, task_id=task_id)
             ack_lease_ids.append(lease_id)
             if new_stage_tasks:
                 enqueue_existing_tasks(new_stage_tasks, reason=f"stage:{_task_phase(lane, task_id)}")
@@ -4267,7 +4668,14 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 lease_ids=ack_lease_ids,
                 task_id="batch",
             )
+        prune_terminal_lane_history()
         create_and_enqueue_more()
+
+    try:
+        create_and_enqueue_more()
+    except requests.RequestException as exc:
+        gateway_unreachable = True
+        _append_event(campaign_ctx, "gateway", "initial_task_enqueue_failed", error=str(exc)[:1000])
 
     try:
         last_snapshot = gateway.snapshot()
@@ -4281,7 +4689,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     emit_barrier_snapshot(force=True)
 
     try:
-        while deadline is None or time.monotonic() < deadline:
+        while not gateway_unreachable and (deadline is None or time.monotonic() < deadline):
             cycle_started_at = time.monotonic()
             cycle_result_count = 0
             read_failed = False
@@ -4319,10 +4727,16 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             if read_failed:
                 continue
             create_and_enqueue_more()
-            completed_count = sum(len(lane.completed_task_ids) for lane in lanes)
-            failed_count = sum(len(lane.failed_task_ids) for lane in lanes)
+            completed_count = completed_task_count()
+            failed_count = failed_task_count()
             terminal_count = completed_count + failed_count
-            if runtime.campaign_mode == "finite" and not can_create_more() and tasks and terminal_count >= len(tasks):
+            current_total_tasks = total_task_count()
+            if (
+                runtime.campaign_mode == "finite"
+                and not can_create_more()
+                and current_total_tasks
+                and terminal_count >= current_total_tasks
+            ):
                 break
             flush_dirty_progress()
             try:
@@ -4356,13 +4770,16 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 _append_event(campaign_ctx, "gateway", "snapshot_failed", error=str(exc)[:500])
             if cycle_result_count <= 0:
                 time.sleep(runtime.poll_interval_seconds)
+    except requests.RequestException as exc:
+        gateway_unreachable = True
+        _append_event(campaign_ctx, "gateway", "task_enqueue_exhausted", error=str(exc)[:1000])
     except KeyboardInterrupt:
         interrupted = True
         _append_event(campaign_ctx, "campaign", "interrupted")
 
     flush_dirty_progress(force=True)
-    completed_count = sum(len(lane.completed_task_ids) for lane in lanes)
-    failed_count = sum(len(lane.failed_task_ids) for lane in lanes)
+    completed_count = completed_task_count()
+    failed_count = failed_task_count()
     terminal_count = completed_count + failed_count
     if interrupted:
         status = "stopped"
@@ -4372,7 +4789,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         status = "gateway_restarted"
     elif result_loss_detected:
         status = "result_loss"
-    elif runtime.campaign_mode == "finite" and tasks and terminal_count >= len(tasks) and not can_create_more():
+    elif runtime.campaign_mode == "finite" and total_task_count() and terminal_count >= total_task_count() and not can_create_more():
         status = "failed" if failed_count else "completed"
     else:
         status = "timeout"
@@ -4396,9 +4813,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             last_snapshot,
             metric_baseline=gateway_metric_baseline,
             lanes=lanes,
+            history=history,
         ),
         recorded_results=recorded_results,
         recorded_result_count=recorded_result_count,
+        history=history,
     )
     _write_campaign_metadata(
         campaign_ctx,
@@ -4409,7 +4828,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             "completed_at": completed_at,
             "completed_task_count": completed_count,
             "failed_task_count": failed_count,
-            "total_task_count": len(tasks),
+            "total_task_count": total_task_count(),
             "summary_path": str(campaign_ctx.summary_path.resolve()),
         },
     )
@@ -4419,7 +4838,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     else:
         console.print(
             "[bold]PlayHand Lab[/bold] "
-            f"{status}: {completed_count}/{len(tasks)} completed, {failed_count} failed, "
+            f"{status}: {completed_count}/{total_task_count()} completed, {failed_count} failed, "
             f"campaign={campaign_ctx.run_id}"
         )
     return 0 if status in {"completed", "stopped"} else 2

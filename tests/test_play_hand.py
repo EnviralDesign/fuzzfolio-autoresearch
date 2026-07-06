@@ -230,6 +230,16 @@ def test_deal_seed_plan_indicators_uses_validated_discovered_pair() -> None:
     assert deal["pair"]["retention_bucket"] == "retained_strong"
 
 
+def test_seed_plan_horizon_multiplier_recognizes_emitted_recipe_prior_buckets() -> None:
+    def row(bucket: str) -> dict[str, object]:
+        return {"features": {"horizon_stability_bucket": bucket}}
+
+    assert play_hand_mod._seed_plan_horizon_multiplier(row("retained_36m")) == 1.30
+    assert play_hand_mod._seed_plan_horizon_multiplier(row("retained_12m_only")) == 1.12
+    assert play_hand_mod._seed_plan_horizon_multiplier(row("neutral_36m")) == 0.92
+    assert play_hand_mod._seed_plan_horizon_multiplier(row("decayed_36m")) == 0.68
+
+
 def test_deal_seed_plan_indicators_can_use_seed_plan_candidate_pair() -> None:
     indicators = [
         play_hand_mod.SeedIndicator("FILL_A", "filter", "state", "higher-context"),
@@ -355,6 +365,62 @@ def test_deal_seed_plan_indicators_uses_explicit_recipe_sampling_weight() -> Non
     assert [indicator.id for indicator in deal["indicators"]] == ["STRONG_A", "STRONG_B"]
 
 
+def test_deal_seed_plan_indicators_uses_richer_atlas_pair_features() -> None:
+    indicators = [
+        play_hand_mod.SeedIndicator("LUCKY_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("LUCKY_B", "trigger", "event", "entry"),
+        play_hand_mod.SeedIndicator("DURABLE_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("DURABLE_B", "trigger", "event", "entry"),
+    ]
+    seed_plan = {
+        "feature_schema_version": "atlas_feature_vector_v1",
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {
+            "discovered_recipe_001": {
+                "source": "discovery_recipe_validation",
+                "pair_menu": [
+                    {
+                        "anchor_id": "LUCKY_A",
+                        "trigger_id": "LUCKY_B",
+                        "pair_sampling_weight": 90,
+                        "pair_sampling_score": 80,
+                        "sample_confidence": "sparse",
+                        "sample_adjusted_validation_score": 20,
+                        "sample_shrinkage_penalty": 30,
+                        "horizon_stability_bucket": "decayed_36m",
+                    },
+                    {
+                        "anchor_id": "DURABLE_A",
+                        "trigger_id": "DURABLE_B",
+                        "pair_sampling_weight": 30,
+                        "pair_sampling_score": 45,
+                        "sample_confidence": "high",
+                        "sample_adjusted_validation_score": 58,
+                        "sample_shrinkage_penalty": 0,
+                        "horizon_stability_bucket": "retained_36m",
+                        "timing_policy": "allow_variant",
+                        "timing_variant_side": "anchor",
+                        "recommended_trigger_lookback_bars": 9,
+                    },
+                ],
+                "slot_menus": {},
+            }
+        },
+    }
+
+    deal = deal_seed_plan_indicators(
+        indicators,
+        target_count=2,
+        seed_plan=seed_plan,
+        rng=random.Random(0),
+    )
+
+    assert [indicator.id for indicator in deal["indicators"]] == ["DURABLE_A", "DURABLE_B"]
+    assert deal["pair"]["effective_pair_sampling_weight"] > deal["pair"]["pair_sampling_weight"]
+    assert deal["pair"]["horizon_stability_bucket"] == "retained_36m"
+    assert deal["pair"]["timing_variant_side"] == "anchor"
+
+
 def test_deal_seed_plan_indicators_selects_guided_recipe_source_bucket() -> None:
     indicators = [
         play_hand_mod.SeedIndicator("CURATED_A", "setup", "event", "mid-setup"),
@@ -443,6 +509,24 @@ def test_seed_plan_indicator_metadata_reads_config_derived_root(tmp_path: Path) 
     metadata = play_hand_mod._seed_plan_indicator_metadata(config)
 
     assert metadata["RSI_CROSSBACK"]["signal_role"] == "trigger"
+
+
+def test_load_play_hand_seed_plan_accepts_explicit_json_or_directory(tmp_path: Path) -> None:
+    config = SimpleNamespace(derived_root=tmp_path / "derived")
+    seed_dir = tmp_path / "isolated-recipe-priors"
+    seed_dir.mkdir()
+    seed_json = seed_dir / "play-hand-seed-plan.json"
+    seed_json.write_text(json.dumps({"recipes": {"recipe_a": {}}}), encoding="utf-8")
+
+    payload, path = play_hand_mod._load_play_hand_seed_plan(config, seed_json)
+
+    assert payload == {"recipes": {"recipe_a": {}}}
+    assert path == seed_json
+
+    payload_from_dir, path_from_dir = play_hand_mod._load_play_hand_seed_plan(config, seed_dir)
+
+    assert payload_from_dir == payload
+    assert path_from_dir == seed_json
 
 
 def test_seed_template_profile_path_prefers_existing_profile_path(tmp_path: Path) -> None:
@@ -537,6 +621,61 @@ def test_deal_seed_plan_indicators_applies_negative_guard_to_role_balanced_fill(
         "SECOND_A",
         "GOOD_FILL",
     ]
+
+
+def test_deal_seed_plan_indicators_treats_atlas_negative_pairs_as_soft_penalties() -> None:
+    indicators = [
+        play_hand_mod.SeedIndicator("FIRST_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("SECOND_A", "trigger", "event", "entry"),
+        play_hand_mod.SeedIndicator("BAD_FILL", "trigger", "event", "entry"),
+    ]
+    seed_plan = {
+        "feature_schema_version": "atlas_feature_vector_v1",
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "negative_pairs": [
+            {
+                "first_indicator_id": "FIRST_A",
+                "second_indicator_id": "BAD_FILL",
+                "negative_reason": "positive_discovery_collapsed",
+                "negative_reason_category": "positive_discovery_collapsed",
+                "negative_weight": 1.5,
+                "negative_evidence_strength": 1.5,
+                "sample_confidence_score": 1.0,
+                "is_hard_block": False,
+            }
+        ],
+        "recipes": {
+            "discovered_recipe_001": {
+                "source": "discovery_recipe_validation",
+                "pair_menu": [
+                    {
+                        "source": "discovery_recipe_validation",
+                        "anchor_id": "FIRST_A",
+                        "trigger_id": "SECOND_A",
+                        "pair_sampling_weight": 50,
+                        "pair_sampling_score": 75,
+                    }
+                ],
+                "slot_menus": {},
+            }
+        },
+    }
+
+    deal = deal_seed_plan_indicators(
+        indicators,
+        target_count=3,
+        seed_plan=seed_plan,
+        rng=random.Random(7),
+    )
+
+    assert [indicator.id for indicator in deal["indicators"]] == [
+        "FIRST_A",
+        "SECOND_A",
+        "BAD_FILL",
+    ]
+    fill_slot = next(slot for slot in deal["selected_slots"] if slot["indicator_id"] == "BAD_FILL")
+    assert fill_slot["negative_pair_multiplier"] < 1.0
+    assert fill_slot["effective_sampling_weight"] < fill_slot["sampling_weight"]
 
 
 def test_deal_seed_plan_indicators_template_locked_caps_to_pair_only() -> None:
@@ -666,6 +805,65 @@ def test_apply_seed_pair_template_defaults_preserves_validated_pair_config() -> 
     assert config["lookbackBars"] == 1
     assert config["ranges"]["buy"] == [0, 1]
     assert profile_payload["profile"]["indicators"][1]["config"]["timeframe"] == "H1"
+
+
+def test_apply_seed_pair_timing_hints_updates_selected_variant_side() -> None:
+    profile_payload = {
+        "profile": {
+            "indicators": [
+                {"meta": {"id": "FIRST_A"}, "config": {"lookbackBars": 3}},
+                {"meta": {"id": "SECOND_A"}, "config": {"lookbackBars": 2}},
+            ]
+        }
+    }
+    pair = {
+        "first_indicator_id": "FIRST_A",
+        "second_indicator_id": "SECOND_A",
+        "timing_policy": "allow_variant",
+        "timing_variant_side": "anchor",
+        "recommended_trigger_lookback_bars": 11,
+        "probe_id": "timing-test",
+    }
+
+    changes = play_hand_mod.apply_seed_pair_timing_hints(profile_payload, pair)
+
+    indicators = profile_payload["profile"]["indicators"]
+    assert indicators[0]["config"]["lookbackBars"] == 11
+    assert indicators[1]["config"]["lookbackBars"] == 2
+    assert changes == [
+        {
+            "indicator_index": 0,
+            "indicator_id": "FIRST_A",
+            "timing_policy": "allow_variant",
+            "timing_variant_side": "anchor",
+            "previous_lookbackBars": 3,
+            "lookbackBars": 11,
+            "source_probe_id": "timing-test",
+        }
+    ]
+
+
+def test_apply_seed_pair_timing_hints_can_update_both_sides() -> None:
+    profile_payload = {
+        "profile": {
+            "indicators": [
+                {"meta": {"id": "FIRST_A"}, "config": {"lookbackBars": 3}},
+                {"meta": {"id": "SECOND_A"}, "config": {"lookbackBars": 2}},
+            ]
+        }
+    }
+    pair = {
+        "first_indicator_id": "FIRST_A",
+        "second_indicator_id": "SECOND_A",
+        "timing_policy": "watch_variant",
+        "timing_variant_side": "both",
+        "recommended_trigger_lookback_bars": 8,
+    }
+
+    changes = play_hand_mod.apply_seed_pair_timing_hints(profile_payload, pair)
+
+    assert [item["config"]["lookbackBars"] for item in profile_payload["profile"]["indicators"]] == [8, 8]
+    assert [change["indicator_id"] for change in changes] == ["FIRST_A", "SECOND_A"]
 
 
 def test_build_early_exit_decision_reports_lookback_drop() -> None:
@@ -2949,6 +3147,28 @@ def test_deal_instruments_honors_pinned_instrument() -> None:
     assert dealt["instruments"] == ["XAUUSD"]
 
 
+def test_deal_instruments_filters_excluded_research_instruments() -> None:
+    dealt = deal_instruments(
+        instrument=["SOLUSD", "EURUSD"],
+        instrument_pool=["SOLUSD", "GBPUSD"],
+        rng=random.Random(123),
+    )
+
+    assert dealt["source"] == "pinned"
+    assert dealt["primary_instrument"] == "EURUSD"
+    assert dealt["instruments"] == ["EURUSD"]
+    assert "SOLUSD" not in dealt["instrument_pool"]
+
+
+def test_deal_instruments_rejects_only_excluded_pinned_instrument() -> None:
+    with pytest.raises(ValueError, match="excluded AutoResearch instrument"):
+        deal_instruments(
+            instrument=["SOLUSD"],
+            instrument_pool=["EURUSD", "GBPUSD"],
+            rng=random.Random(123),
+        )
+
+
 def test_deal_instruments_shuffles_from_pool_when_unpinned() -> None:
     dealt = deal_instruments(
         instrument=None,
@@ -2966,7 +3186,8 @@ def test_resolve_instrument_pool_preset_all_matches_catalog_trimmed_set() -> Non
     pool = resolve_instrument_pool_presets(presets=["all"], instrument_pool=None)
 
     assert pool == list(ALL_INSTRUMENT_POOL)
-    assert len(pool or []) == 45
+    assert "SOLUSD" not in (pool or [])
+    assert len(pool or []) == 44
 
 
 def test_resolve_instrument_pool_presets_union_multiple_sets_and_explicit_symbols() -> None:
@@ -2981,6 +3202,12 @@ def test_resolve_instrument_pool_presets_union_multiple_sets_and_explicit_symbol
         *CRYPTO_INSTRUMENT_POOL,
         "US500",
     ]
+    assert "SOLUSD" not in (pool or [])
+
+
+def test_resolve_instrument_pool_presets_rejects_only_excluded_explicit_symbols() -> None:
+    with pytest.raises(ValueError, match="excluded AutoResearch instrument"):
+        resolve_instrument_pool_presets(presets=None, instrument_pool=["SOLUSD"])
 
 
 def test_resolve_instrument_pool_presets_rejects_unknown_name() -> None:

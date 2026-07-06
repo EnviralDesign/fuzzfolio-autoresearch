@@ -9,6 +9,8 @@ from rich.console import Console
 
 from .play_hand import INSTRUMENT_POOL_PRESET_NAMES
 from .play_hand_lab import (
+    DEFAULT_LAB_ENQUEUE_FAILURE_LIMIT,
+    DEFAULT_LAB_ENQUEUE_RETRY_BASE_SECONDS,
     DEFAULT_LAB_FINAL_MIN_SCORE,
     DEFAULT_LAB_GATEWAY_URL,
     DEFAULT_LAB_MAX_DRAIN_SECONDS,
@@ -16,15 +18,20 @@ from .play_hand_lab import (
     DEFAULT_LAB_SCRUTINY_MONTHS,
     DEFAULT_LAB_SCREEN_ANCHOR_ENVELOPE_MONTHS,
     DEFAULT_LAB_SCREEN_ANCHOR_MODE,
+    DEFAULT_LAB_TERMINAL_LANE_RETENTION,
     DEFAULT_LAB_VALIDATION_MIN_SCORE,
     DEFAULT_LAB_VALIDATION_MONTHS,
     PlayHandLabRuntimeConfig,
     cmd_play_hand_lab,
 )
 from .play_hand_lab_gateway import (
+    DEFAULT_MAX_RESULT_BACKLOG_BYTES,
     DEFAULT_MAX_BODY_BYTES,
     DEFAULT_LAB_WS_PING_INTERVAL_SECONDS,
     DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS,
+    DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS,
+    DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS,
+    DEFAULT_RESULT_BACKPRESSURE_BYTES,
     cmd_play_hand_lab_gateway,
     cmd_play_hand_lab_http_sim,
     cmd_play_hand_lab_sim,
@@ -140,6 +147,12 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         type=Path,
         default=None,
         help="Optional full scoring profile JSON to reuse for every lane.",
+    )
+    play_hand_lab.add_argument(
+        "--seed-plan-path",
+        type=Path,
+        default=None,
+        help="Optional PlayHand seed-plan JSON or recipe-priors directory override.",
     )
     play_hand_lab.add_argument(
         "--min-indicators",
@@ -332,6 +345,30 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         help="Consecutive gateway result-read failures before ending the campaign. Default: 5.",
     )
     play_hand_lab.add_argument(
+        "--enqueue-failure-limit",
+        type=int,
+        default=DEFAULT_LAB_ENQUEUE_FAILURE_LIMIT,
+        help=f"Consecutive gateway task enqueue failures before ending the campaign. Default: {DEFAULT_LAB_ENQUEUE_FAILURE_LIMIT}.",
+    )
+    play_hand_lab.add_argument(
+        "--enqueue-retry-base-seconds",
+        type=float,
+        default=DEFAULT_LAB_ENQUEUE_RETRY_BASE_SECONDS,
+        help=(
+            "Base sleep for gateway task enqueue retries; retry N sleeps base*N seconds, capped at 30. "
+            f"Default: {DEFAULT_LAB_ENQUEUE_RETRY_BASE_SECONDS:g}."
+        ),
+    )
+    play_hand_lab.add_argument(
+        "--terminal-lane-retention",
+        type=int,
+        default=DEFAULT_LAB_TERMINAL_LANE_RETENTION,
+        help=(
+            "Number of terminal lane states retained in coordinator memory before rolling older lanes into "
+            f"campaign counters. Default: {DEFAULT_LAB_TERMINAL_LANE_RETENTION}."
+        ),
+    )
+    play_hand_lab.add_argument(
         "--worker-contract-hash",
         default=os.environ.get("FUZZFOLIO_REPLAY_WORKER_CONTRACT_HASH")
         or os.environ.get("FUZZFOLIO_WORKER_CONTRACT_HASH"),
@@ -476,6 +513,36 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         help="Minimum gateway lease TTL in seconds. Task deadlines can extend this. Default: 600.",
     )
     play_hand_lab_gateway.add_argument(
+        "--max-recent-completions",
+        type=int,
+        default=20_000,
+        help="Recent completion receipts retained for idempotent duplicate completion handling. Default: 20000.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--max-result-backlog",
+        type=int,
+        default=100_000,
+        help="Maximum unacked result count retained before oldest results are dropped. Default: 100000.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--max-result-backlog-mb",
+        type=float,
+        default=DEFAULT_MAX_RESULT_BACKLOG_BYTES / (1024 * 1024),
+        help="Maximum approximate unacked result backlog size in MiB. Default: 2048.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--result-backpressure-mb",
+        type=float,
+        default=DEFAULT_RESULT_BACKPRESSURE_BYTES / (1024 * 1024),
+        help="Approximate result backlog size in MiB that pauses new claims until drained. Default: 1024.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--max-recent-terminal-task-ids",
+        type=int,
+        default=100_000,
+        help="Recent terminal task ids retained for idempotent enqueue retries. Default: 100000.",
+    )
+    play_hand_lab_gateway.add_argument(
         "--worker-stale-after-seconds",
         type=float,
         default=600.0,
@@ -486,6 +553,24 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         type=float,
         default=1800.0,
         help="Seconds without worker heartbeat before idle lab workers are pruned. Default: 1800.",
+    )
+    play_hand_lab_gateway.add_argument(
+        "--lake-mutation-retry-after-seconds",
+        type=float,
+        default=DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS,
+        help=(
+            "Delay before requeueing retryable remote-lake mutation failures. "
+            f"Default: {DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS:g}."
+        ),
+    )
+    play_hand_lab_gateway.add_argument(
+        "--lake-timeout-retry-after-seconds",
+        type=float,
+        default=DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS,
+        help=(
+            "Delay before requeueing retryable remote-lake read timeout failures. "
+            f"Default: {DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS:g}."
+        ),
     )
     play_hand_lab_gateway.add_argument(
         "--ws-ping-interval-seconds",
@@ -578,6 +663,7 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 instrument_pool=args.instrument_pool,
                 indicator=args.indicator,
                 profile_path=args.profile_path,
+                seed_plan_path=args.seed_plan_path,
                 min_indicators=args.min_indicators,
                 max_indicators=args.max_indicators,
                 seed=args.seed,
@@ -607,6 +693,9 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 max_results_per_cycle=args.max_results_per_cycle,
                 max_drain_seconds=args.max_drain_seconds,
                 result_read_failure_limit=args.result_read_failure_limit,
+                enqueue_failure_limit=args.enqueue_failure_limit,
+                enqueue_retry_base_seconds=args.enqueue_retry_base_seconds,
+                terminal_lane_retention=args.terminal_lane_retention,
                 dry_run=bool(args.dry_run),
                 strict_scoring=bool(args.strict_scoring),
                 retain_raw_lab_artifacts=bool(args.retain_raw_lab_artifacts),
@@ -643,8 +732,15 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
             token=args.token,
             max_body_bytes=max(int(float(args.max_body_mb) * 1024 * 1024), 1024),
             lease_ttl_seconds=args.lease_ttl_seconds,
+            max_recent_completions=args.max_recent_completions,
+            max_result_backlog=args.max_result_backlog,
+            max_result_backlog_bytes=max(int(float(args.max_result_backlog_mb) * 1024 * 1024), 0),
+            result_backpressure_bytes=max(int(float(args.result_backpressure_mb) * 1024 * 1024), 0),
+            max_recent_terminal_task_ids=args.max_recent_terminal_task_ids,
             worker_stale_after_seconds=args.worker_stale_after_seconds,
             worker_prune_after_seconds=args.worker_prune_after_seconds,
+            lake_mutation_retry_after_seconds=args.lake_mutation_retry_after_seconds,
+            lake_timeout_retry_after_seconds=args.lake_timeout_retry_after_seconds,
             ws_ping_interval_seconds=args.ws_ping_interval_seconds,
             ws_ping_timeout_seconds=args.ws_ping_timeout_seconds,
         )

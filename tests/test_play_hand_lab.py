@@ -74,6 +74,41 @@ def test_normalize_runtime_loads_existing_gateway_token_file(
     assert runtime.gateway_token == "shared-token"
 
 
+def test_enqueue_gateway_tasks_retries_transient_request_errors(tmp_path: Path) -> None:
+    class FlakyGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def enqueue_tasks(self, tasks):
+            self.calls += 1
+            if self.calls < 3:
+                raise requests.exceptions.ReadTimeout("gateway timed out")
+            return {"enqueued": len(tasks)}
+
+    gateway = FlakyGateway()
+    ctx = _campaign_ctx(tmp_path)
+
+    result = lab._enqueue_gateway_tasks_with_retries(
+        gateway,
+        ctx,
+        [{"task_id": "task-1"}],
+        reason="test",
+        failure_limit=3,
+        retry_base_seconds=0.0,
+    )
+
+    events = [
+        json.loads(line)
+        for line in ctx.events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert result == {"enqueued": 1}
+    assert gateway.calls == 3
+    assert [event["status"] for event in events] == ["task_enqueue_failed", "task_enqueue_failed"]
+    assert events[0]["attempt"] == 1
+    assert events[1]["attempt"] == 2
+
+
 def test_runtime_event_payload_redacts_gateway_token_and_preserves_paths(tmp_path: Path) -> None:
     runtime = lab.PlayHandLabRuntimeConfig(
         gateway_token="super-secret-lab-token",
@@ -160,6 +195,94 @@ def test_normalize_runtime_defaults_to_barrier_logging() -> None:
     assert runtime.log_mode == "barrier"
     assert runtime.barrier_interval_seconds == 5.0
     assert runtime.barrier_lane_limit == 24
+    assert runtime.terminal_lane_retention == 512
+
+
+def test_lane_lifecycle_telemetry_tracks_phase_completion(tmp_path: Path) -> None:
+    lane = lab.LabLaneState(
+        lane_id="lane_001",
+        lane_index=1,
+        run_id="run-1",
+        run_dir=tmp_path / "run-1",
+    )
+
+    lab._set_lane_phase(lane, "baseline")
+    lab._register_task_spec(
+        lane,
+        task_id="task-1",
+        phase="baseline_3mo",
+        task_kind="deep_replay",
+        spec={},
+    )
+    lab._register_task_spec(
+        lane,
+        task_id="task-2",
+        phase="baseline_3mo",
+        task_kind="deep_replay",
+        spec={},
+    )
+    lane.completed_task_ids.add("task-1")
+    lab._refresh_lane_phase_result_counts(lane, task_id="task-1")
+
+    assert lane.phase_task_counts["baseline_3mo"] == 2
+    assert lane.phase_completed_task_counts["baseline_3mo"] == 1
+    assert "baseline_3mo" not in lane.phase_completed_at
+
+    lane.failed_task_ids.add("task-2")
+    lab._refresh_lane_phase_result_counts(lane, task_id="task-2")
+
+    assert lane.phase_completed_at["baseline_3mo"]
+    assert lane.phase_failed_task_counts["baseline_3mo"] == 1
+    assert any(
+        event["event"] == "phase_tasks_completed"
+        and event["phase"] == "baseline_3mo"
+        and event["status"] == "failed"
+        for event in lane.phase_lifecycle_events
+    )
+
+
+def test_campaign_summary_includes_lane_lifecycle_telemetry(tmp_path: Path) -> None:
+    lane = lab.LabLaneState(
+        lane_id="lane_001",
+        lane_index=1,
+        run_id="run-1",
+        run_dir=tmp_path / "run-1",
+    )
+    lab._set_lane_phase(lane, "baseline")
+    lab._register_task_spec(
+        lane,
+        task_id="task-1",
+        phase="baseline_3mo",
+        task_kind="deep_replay",
+        spec={},
+    )
+    lane.completed_task_ids.add("task-1")
+    lab._refresh_lane_phase_result_counts(lane, task_id="task-1")
+
+    campaign_dir = tmp_path / "campaign"
+    campaign_dir.mkdir()
+    campaign_ctx = SimpleNamespace(
+        run_id="campaign-1",
+        summary_path=campaign_dir / "play-hand-lab-campaign-summary.json",
+    )
+
+    summary = lab._write_summary(
+        campaign_ctx,
+        [lane],
+        runtime=lab.PlayHandLabRuntimeConfig(),
+        status="completed",
+        started_at="2026-07-05T00:00:00+00:00",
+        completed_at="2026-07-05T00:01:00+00:00",
+        gateway_snapshot=None,
+        recorded_results=[],
+    )
+
+    summary_lane = summary["lanes"][0]
+    assert summary_lane["phase_started_at"]["baseline_3mo"]
+    assert summary_lane["phase_completed_at"]["baseline_3mo"]
+    assert summary_lane["phase_task_counts"]["baseline_3mo"] == 1
+    assert summary_lane["phase_completed_task_counts"]["baseline_3mo"] == 1
+    assert summary_lane["phase_lifecycle_events"]
 
 
 def test_lab_barrier_snapshot_is_bounded_and_lane_oriented(tmp_path: Path) -> None:
@@ -275,6 +398,77 @@ def test_lab_barrier_snapshot_prefers_active_lanes_over_terminal_noise(tmp_path:
     assert "lane_007" in text
     assert "lane_099" not in text
     assert "terminal lanes summarized: 1 terminal, 0 promoted, 1 tombstoned" in text
+
+
+def test_lab_barrier_snapshot_includes_pruned_lane_history(tmp_path: Path) -> None:
+    lane = lab.LabLaneState(
+        lane_id="lane_010",
+        lane_index=10,
+        run_id="20260622-playhand-lab-lane-010-v1",
+        run_dir=tmp_path / "lane-010",
+        instruments=["EURUSD"],
+        timeframe="M5",
+    )
+    lane.current_phase = "baseline"
+    lane.task_ids = ["task-active"]
+    history = lab.LabCampaignHistory(
+        pruned_lane_count=10,
+        pruned_task_count=25,
+        pruned_completed_task_count=20,
+        pruned_failed_task_count=3,
+        pruned_promoted_lane_count=2,
+        pruned_tombstoned_lane_count=8,
+        best_score=81.25,
+    )
+
+    text = lab._format_lab_barrier_snapshot(
+        barrier_index=5,
+        campaign_id="campaign-1",
+        runtime=lab.PlayHandLabRuntimeConfig(campaign_mode="continuous", active_runs=1),
+        lanes=[lane],
+        tasks=[{"task_id": "task-active"}],
+        snapshot={},
+        metric_baseline={},
+        recorded_result_count=20,
+        history=history,
+    )
+
+    assert "created=11 active=1 terminal=10" in text
+    assert "promoted=2 tombstoned=8" in text
+    assert "tasks=23/26 failed=3" in text
+    assert "terminal lanes summarized: 10 terminal, 2 promoted, 8 tombstoned" in text
+
+
+def test_compact_terminal_lane_state_drops_heavy_payloads(tmp_path: Path) -> None:
+    lane = lab.LabLaneState(
+        lane_id="lane_001",
+        lane_index=1,
+        run_id="run-1",
+        run_dir=tmp_path,
+        profile_payload={"large": "profile"},
+        incumbent_profile_payload={"large": "incumbent"},
+    )
+    lane.terminal = True
+    lane.task_ids = ["task-1"]
+    lane.completed_task_ids.add("task-1")
+    lane.task_specs["task-1"] = {"payload": "large"}
+    lane.phase_rows.append({"row": 1})
+    lane.phase_results["baseline"] = [{"result": 1}]
+    lane.last_sweep_payload = {"large": "sweep"}
+    lane.instrument_scout_result = {"large": "scout"}
+    lane.best_score = 77.0
+
+    lab._compact_terminal_lane_state(lane)
+
+    assert lane.profile_payload is None
+    assert lane.incumbent_profile_payload is None
+    assert lane.last_sweep_payload is None
+    assert lane.instrument_scout_result is None
+    assert lane.task_specs == {}
+    assert lane.phase_rows == []
+    assert lane.phase_results == {}
+    assert lane.best_score == 77.0
+    assert lane.task_ids == ["task-1"]
 
 
 def test_lab_failure_notice_includes_lane_task_phase_and_reason() -> None:
@@ -449,7 +643,7 @@ def test_seed_indicators_filter_unscaffoldable_seed_plan_ids(
     monkeypatch.setattr(
         lab,
         "_load_play_hand_seed_plan",
-        lambda _config: (seed_plan, tmp_path / "seed-plan.json"),
+        lambda _config, _seed_plan_path=None: (seed_plan, tmp_path / "seed-plan.json"),
     )
 
     indicators, loaded_seed_plan, _seed_plan_path = lab._seed_indicators(
@@ -475,6 +669,86 @@ def test_seed_indicators_filter_unscaffoldable_seed_plan_ids(
     assert set(deal["dealt"]) <= {"RSI", "ADX"}
     assert "SPEARMAN_RANK_CORRELATION" not in deal["dealt"]
     assert "TTF_DSL_TRANSITION" not in deal["dealt"]
+
+
+def test_seed_indicators_uses_runtime_seed_plan_path(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    expected_path = tmp_path / "isolated" / "play-hand-seed-plan.json"
+    seed_plan = {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {
+            "pair": {
+                "recipe_sampling_weight": 1.0,
+                "pair_menu": [
+                    {
+                        "anchor_id": "RSI",
+                        "trigger_id": "ADX",
+                        "pair_sampling_weight": 1.0,
+                    }
+                ],
+                "slot_menus": {},
+            }
+        },
+    }
+    seen_paths: list[Path | None] = []
+
+    def fake_load_seed_plan(_config, seed_plan_path=None):
+        seen_paths.append(seed_plan_path)
+        return seed_plan, expected_path
+
+    monkeypatch.setattr(lab, "_load_play_hand_seed_plan", fake_load_seed_plan)
+
+    indicators, loaded_seed_plan, loaded_seed_plan_path = lab._seed_indicators(
+        config=_test_config(tmp_path),
+        cli=_IndicatorIndexCli(["RSI", "ADX"]),
+        campaign_ctx=_campaign_ctx(tmp_path),
+        runtime=lab.PlayHandLabRuntimeConfig(
+            seed_plan_path=expected_path,
+            min_indicators=2,
+            max_indicators=2,
+        ),
+    )
+
+    assert seen_paths == [expected_path]
+    assert loaded_seed_plan is seed_plan
+    assert loaded_seed_plan_path == expected_path
+    assert [indicator.id for indicator in indicators] == ["RSI", "ADX"]
+
+
+def test_indicator_deal_metadata_is_json_safe_and_health_compatible() -> None:
+    metadata = lab._indicator_deal_metadata(
+        {
+            "source": "play_hand_seed_plan",
+            "reason": None,
+            "recipe": "discovered_recipe_012",
+            "recipe_source": "discovery_recipe_validation",
+            "recipe_confidence": "high_candidate",
+            "guided_recipe_source_bucket": "discovery_recipe_validation",
+            "guided_recipe_source_bucket_matched": True,
+            "guided_recipe_source_bucket_fallback": False,
+            "indicators": [
+                lab.SeedIndicator("MOM_MEAN_REVERSION"),
+                {"indicator_id": "MFI_TREND"},
+            ],
+            "pair": {
+                "anchor_id": "MOM_MEAN_REVERSION",
+                "trigger_id": "MFI_TREND",
+                "horizon_stability_bucket": "retained_36m",
+            },
+            "family_policy": {"family_policy": "template_guarded"},
+            "policy_target_count": 2,
+            "selected_slots": ["pair_menu"],
+        }
+    )
+
+    assert metadata["indicator_deal"]["indicator_ids"] == ["MOM_MEAN_REVERSION", "MFI_TREND"]
+    assert metadata["dealt_indicator_source"] == "play_hand_seed_plan"
+    assert metadata["dealt_recipe"] == "discovered_recipe_012"
+    assert metadata["dealt_recipe_source"] == "discovery_recipe_validation"
+    assert metadata["dealt_recipe_pair"]["horizon_stability_bucket"] == "retained_36m"
+    json.dumps(metadata)
 
 
 def test_seed_indicators_reject_unscaffoldable_pinned_ids(tmp_path: Path) -> None:

@@ -25,9 +25,9 @@ SCHEMA_VERSION = "discovery_cluster_atlas_v1"
 DEFAULT_DISCOVERY_CLUSTER_DIRNAME = "discovery-cluster-atlas"
 DEFAULT_MIN_POSITIVE_SCORE = 50.0
 DEFAULT_STRONG_SCORE = 70.0
-DEFAULT_MIN_SIMILARITY = 0.22
+DEFAULT_MIN_SIMILARITY = 0.50
 DEFAULT_MIN_SHARED_PARTNERS = 1
-DEFAULT_MAX_RECIPES = 32
+DEFAULT_MAX_RECIPES = 128
 
 
 @dataclass(frozen=True)
@@ -116,6 +116,27 @@ def _top_counts(counter: dict[str, float], limit: int = 6) -> list[dict[str, Any
             key=lambda item: (-float(item[1]), str(item[0])),
         )[:limit]
     ]
+
+
+def _count_by_key(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        token = _clean_token(row.get(key)) or "unknown"
+        counts[token] = counts.get(token, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _cluster_shape(clusters: list[dict[str, Any]]) -> dict[str, Any]:
+    member_counts = sorted(
+        [_int_value(cluster.get("member_count")) for cluster in clusters],
+        reverse=True,
+    )
+    return {
+        "cluster_count": len(clusters),
+        "singleton_clusters": sum(1 for count in member_counts if count <= 1),
+        "max_member_count": member_counts[0] if member_counts else 0,
+        "top_member_counts": member_counts[:8],
+    }
 
 
 def build_indicator_success_signatures(
@@ -783,15 +804,23 @@ def build_discovery_cluster_atlas(
         min_positive_score=min_positive_score,
         strong_score=strong_score,
     )
-    recipes = build_discovered_recipes(
+    recipe_candidates = build_discovered_recipes(
         cluster_pair_rows,
         first_clusters=first_clusters,
         second_clusters=second_clusters,
-        max_recipes=max_recipes,
+        max_recipes=max(1, len(cluster_pair_rows)),
     )
+    max_recipes = max(1, int(max_recipes))
+    recipes = recipe_candidates[:max_recipes]
     lane_counts: dict[str, float] = {}
     for row in positive_rows:
         _counter_add(lane_counts, row.get("discovery_lane"), 1.0)
+    positive_cluster_pairs = [
+        row for row in cluster_pair_rows if _int_value(row.get("positive_pair_count")) > 0
+    ]
+    strong_cluster_pairs = [
+        row for row in cluster_pair_rows if _int_value(row.get("strong_pair_count")) > 0
+    ]
     summary = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -817,8 +846,18 @@ def build_discovery_cluster_atlas(
             "first_clusters": len(first_clusters),
             "second_clusters": len(second_clusters),
             "cluster_pair_rows": len(cluster_pair_rows),
+            "positive_cluster_pair_rows": len(positive_cluster_pairs),
+            "strong_cluster_pair_rows": len(strong_cluster_pairs),
+            "recipe_candidates_before_max": len(recipe_candidates),
             "discovered_recipes": len(recipes),
+            "recipes_truncated_by_max": max(0, len(recipe_candidates) - len(recipes)),
+            "recipe_candidate_confidence_counts": _count_by_key(recipe_candidates, "confidence"),
+            "recipe_confidence_counts": _count_by_key(recipes, "confidence"),
             "positive_lane_counts": dict(sorted(lane_counts.items())),
+        },
+        "cluster_shape": {
+            "first": _cluster_shape(first_clusters),
+            "second": _cluster_shape(second_clusters),
         },
         "top_cluster_pairs": cluster_pair_rows[:10],
         "top_discovered_recipes": recipes[:10],

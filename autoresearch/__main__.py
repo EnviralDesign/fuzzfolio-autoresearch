@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-from dataclasses import replace
+from dataclasses import is_dataclass, replace
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import redirect_stdout
 import io
@@ -101,6 +101,8 @@ if __package__ in {None, ""}:
     )
     from autoresearch.indicator_atlas import build_indicator_atlas
     from autoresearch.recipe_priors import (
+        DEFAULT_MAX_PAIR_CANDIDATES as RECIPE_PRIORS_DEFAULT_MAX_PAIR_CANDIDATES,
+        DEFAULT_MAX_SLOT_CANDIDATES as RECIPE_PRIORS_DEFAULT_MAX_SLOT_CANDIDATES,
         DEFAULT_RECIPE_PRIORS_DIRNAME,
         build_recipe_priors,
     )
@@ -136,6 +138,7 @@ if __package__ in {None, ""}:
     from autoresearch.discovery_recipe_validation import (
         DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME,
         DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME,
+        DEFAULT_DIVERSITY_PENALTY_SCALE,
         DEFAULT_FIRST_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_FIRST_MEMBER_LIMIT,
         DEFAULT_INCLUDED_CONFIDENCE as DISCOVERY_VALIDATION_DEFAULT_INCLUDED_CONFIDENCE,
         DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_VALIDATION_DEFAULT_JOB_TIMEOUT_SECONDS,
@@ -145,6 +148,9 @@ if __package__ in {None, ""}:
         DEFAULT_PROBE_TIMEOUT_SECONDS as DISCOVERY_VALIDATION_DEFAULT_PROBE_TIMEOUT_SECONDS,
         DEFAULT_SECOND_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT,
         DEFAULT_SCRUTINY_BUCKETS as DISCOVERY_SCRUTINY_DEFAULT_BUCKETS,
+        DEFAULT_SCRUTINY_FALLBACK_BUCKETS as DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_BUCKETS,
+        DEFAULT_SCRUTINY_FALLBACK_MAX_ROWS as DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_MAX_ROWS,
+        DEFAULT_SCRUTINY_FALLBACK_MIN_TRADES as DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_MIN_TRADES,
         DEFAULT_SCRUTINY_LOOKBACK_MONTHS as DISCOVERY_SCRUTINY_DEFAULT_LOOKBACK_MONTHS,
         build_discovery_recipe_scrutiny_atlas,
         build_discovery_recipe_validation_atlas,
@@ -194,6 +200,7 @@ if __package__ in {None, ""}:
         validate_generated_metadata_with_reasons,
     )
     from autoresearch.portfolio import (
+        _resolve_account_spec,
         build_sleeve_prefilter,
         build_sleeve_selection,
         enrich_rows_for_account,
@@ -263,6 +270,25 @@ if __package__ in {None, ""}:
         cmd_play_hand_massive,
     )
     from autoresearch.play_hand_lab_cli import add_play_hand_lab_subparsers, dispatch_play_hand_lab_command
+    from autoresearch.atlas_lab import (
+        DEFAULT_ATLAS_LAB_ACTIVE_PROBES,
+        DEFAULT_ATLAS_LAB_DEADLINE_SECONDS,
+        DEFAULT_ATLAS_LAB_ENQUEUE_CHUNK,
+        DEFAULT_DISCOVERY_VALIDATION_CONFIDENCE,
+        DEFAULT_ATLAS_LAB_LOG_INTERVAL_SECONDS,
+        DEFAULT_ATLAS_LAB_MAX_ATTEMPTS,
+        DEFAULT_ATLAS_LAB_MAX_DRAIN_SECONDS,
+        DEFAULT_ATLAS_LAB_MAX_RESULTS_PER_CYCLE,
+        DEFAULT_ATLAS_LAB_POLL_INTERVAL_SECONDS,
+        DEFAULT_ATLAS_LAB_RESULT_BATCH_SIZE,
+        ATLAS_PROFILE_CONFIGS,
+        AtlasLabRuntimeConfig,
+        DEFAULT_ATLAS_PROFILE,
+        run_atlas_lab,
+    )
+    from autoresearch.discovery_recipe_validation import (
+        DEFAULT_DIVERSITY_PENALTY_SCALE as DEFAULT_DISCOVERY_VALIDATION_DIVERSITY_PENALTY_SCALE,
+    )
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
@@ -321,6 +347,8 @@ else:
     )
     from .indicator_atlas import build_indicator_atlas
     from .recipe_priors import (
+        DEFAULT_MAX_PAIR_CANDIDATES as RECIPE_PRIORS_DEFAULT_MAX_PAIR_CANDIDATES,
+        DEFAULT_MAX_SLOT_CANDIDATES as RECIPE_PRIORS_DEFAULT_MAX_SLOT_CANDIDATES,
         DEFAULT_RECIPE_PRIORS_DIRNAME,
         build_recipe_priors,
     )
@@ -356,6 +384,7 @@ else:
     from .discovery_recipe_validation import (
         DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME,
         DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME,
+        DEFAULT_DIVERSITY_PENALTY_SCALE,
         DEFAULT_FIRST_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_FIRST_MEMBER_LIMIT,
         DEFAULT_INCLUDED_CONFIDENCE as DISCOVERY_VALIDATION_DEFAULT_INCLUDED_CONFIDENCE,
         DEFAULT_JOB_TIMEOUT_SECONDS as DISCOVERY_VALIDATION_DEFAULT_JOB_TIMEOUT_SECONDS,
@@ -365,6 +394,9 @@ else:
         DEFAULT_PROBE_TIMEOUT_SECONDS as DISCOVERY_VALIDATION_DEFAULT_PROBE_TIMEOUT_SECONDS,
         DEFAULT_SECOND_MEMBER_LIMIT as DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT,
         DEFAULT_SCRUTINY_BUCKETS as DISCOVERY_SCRUTINY_DEFAULT_BUCKETS,
+        DEFAULT_SCRUTINY_FALLBACK_BUCKETS as DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_BUCKETS,
+        DEFAULT_SCRUTINY_FALLBACK_MAX_ROWS as DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_MAX_ROWS,
+        DEFAULT_SCRUTINY_FALLBACK_MIN_TRADES as DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_MIN_TRADES,
         DEFAULT_SCRUTINY_LOOKBACK_MONTHS as DISCOVERY_SCRUTINY_DEFAULT_LOOKBACK_MONTHS,
         build_discovery_recipe_scrutiny_atlas,
         build_discovery_recipe_validation_atlas,
@@ -414,6 +446,7 @@ else:
         validate_generated_metadata_with_reasons,
     )
     from .portfolio import (
+        _resolve_account_spec,
         build_sleeve_prefilter,
         build_sleeve_selection,
         enrich_rows_for_account,
@@ -483,6 +516,25 @@ else:
         cmd_play_hand_massive,
     )
     from .play_hand_lab_cli import add_play_hand_lab_subparsers, dispatch_play_hand_lab_command
+    from .atlas_lab import (
+        DEFAULT_ATLAS_LAB_ACTIVE_PROBES,
+        DEFAULT_ATLAS_LAB_DEADLINE_SECONDS,
+        DEFAULT_ATLAS_LAB_ENQUEUE_CHUNK,
+        DEFAULT_DISCOVERY_VALIDATION_CONFIDENCE,
+        DEFAULT_ATLAS_LAB_LOG_INTERVAL_SECONDS,
+        DEFAULT_ATLAS_LAB_MAX_ATTEMPTS,
+        DEFAULT_ATLAS_LAB_MAX_DRAIN_SECONDS,
+        DEFAULT_ATLAS_LAB_MAX_RESULTS_PER_CYCLE,
+        DEFAULT_ATLAS_LAB_POLL_INTERVAL_SECONDS,
+        DEFAULT_ATLAS_LAB_RESULT_BATCH_SIZE,
+        ATLAS_PROFILE_CONFIGS,
+        AtlasLabRuntimeConfig,
+        DEFAULT_ATLAS_PROFILE,
+        run_atlas_lab,
+    )
+    from .discovery_recipe_validation import (
+        DEFAULT_DIVERSITY_PENALTY_SCALE as DEFAULT_DISCOVERY_VALIDATION_DIVERSITY_PENALTY_SCALE,
+    )
     from .typed_tools import CLI_OK_TOOLS
 
 
@@ -564,6 +616,7 @@ PUBLIC_CLI_COMMANDS = {
     "play-hand-massive-v2-http-sim",
     "play-hand-massive-v2-sim",
     "play-hand-massive-v2-ws-sim",
+    "atlas-lab",
     "build-indicator-atlas",
     "build-signal-atlas",
     "build-forward-response-atlas",
@@ -1243,6 +1296,261 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
 
     add_play_hand_lab_subparsers(subparsers)
 
+    atlas_lab = subparsers.add_parser(
+        "atlas-lab",
+        help="Run the versioned Atlas pipeline through the lab gateway worker fleet.",
+    )
+    atlas_lab.add_argument(
+        "--run-id",
+        default="auto",
+        help="Atlas run id. Use auto for a timestamped run id. Default: auto.",
+    )
+    atlas_lab.add_argument(
+        "--gateway-url",
+        default=None,
+        help="Lab gateway URL. Default: the PlayHand lab gateway default.",
+    )
+    atlas_lab.add_argument(
+        "--gateway-token",
+        default=None,
+        help="Optional lab gateway bearer token. Defaults to the configured token file/env fallback.",
+    )
+    atlas_lab.add_argument(
+        "--trading-dashboard-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard repo root for worker contract resolution.",
+    )
+    atlas_lab.add_argument(
+        "--atlas-profile",
+        choices=sorted(ATLAS_PROFILE_CONFIGS),
+        default=DEFAULT_ATLAS_PROFILE,
+        help=(
+            "Atlas evidence profile. standard preserves the current trigger-only surface; "
+            "rich-roles broadens roles on the current market panel; rich-timeframes and rich-markets "
+            "expand one more axis; rich expands roles, instruments, and timeframes together; "
+            "rich-discovery also widens the discovery-pair probe timeframe matrix."
+        ),
+    )
+    atlas_lab.add_argument(
+        "--worker-contract-hash",
+        default=None,
+        help="Optional explicit replay worker contract hash.",
+    )
+    atlas_lab.add_argument(
+        "--phase",
+        action="append",
+        choices=["full", "build", "probes", "publish"],
+        default=None,
+        help="Pipeline phase to run. Can be repeated. Default: full.",
+    )
+    atlas_lab.add_argument(
+        "--active-probes",
+        type=int,
+        default=DEFAULT_ATLAS_LAB_ACTIVE_PROBES,
+        help=f"Maximum Atlas probes active at once. Default: {DEFAULT_ATLAS_LAB_ACTIVE_PROBES}.",
+    )
+    atlas_lab.add_argument(
+        "--enqueue-chunk-size",
+        type=int,
+        default=DEFAULT_ATLAS_LAB_ENQUEUE_CHUNK,
+        help=f"Maximum aggregate tasks enqueued per top-up. Default: {DEFAULT_ATLAS_LAB_ENQUEUE_CHUNK}.",
+    )
+    atlas_lab.add_argument(
+        "--result-batch-size",
+        type=int,
+        default=DEFAULT_ATLAS_LAB_RESULT_BATCH_SIZE,
+        help=f"Gateway result read batch size. Default: {DEFAULT_ATLAS_LAB_RESULT_BATCH_SIZE}.",
+    )
+    atlas_lab.add_argument(
+        "--max-results-per-cycle",
+        type=int,
+        default=DEFAULT_ATLAS_LAB_MAX_RESULTS_PER_CYCLE,
+        help=f"Maximum results drained before returning to admission. Default: {DEFAULT_ATLAS_LAB_MAX_RESULTS_PER_CYCLE}.",
+    )
+    atlas_lab.add_argument(
+        "--max-drain-seconds",
+        type=float,
+        default=DEFAULT_ATLAS_LAB_MAX_DRAIN_SECONDS,
+        help=f"Maximum result drain time per cycle. Default: {DEFAULT_ATLAS_LAB_MAX_DRAIN_SECONDS}.",
+    )
+    atlas_lab.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=DEFAULT_ATLAS_LAB_POLL_INTERVAL_SECONDS,
+        help=f"Gateway poll interval when no results are ready. Default: {DEFAULT_ATLAS_LAB_POLL_INTERVAL_SECONDS}.",
+    )
+    atlas_lab.add_argument(
+        "--deadline-seconds",
+        type=float,
+        default=DEFAULT_ATLAS_LAB_DEADLINE_SECONDS,
+        help=f"Per-task gateway deadline. Default: {DEFAULT_ATLAS_LAB_DEADLINE_SECONDS}.",
+    )
+    atlas_lab.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_ATLAS_LAB_MAX_ATTEMPTS,
+        help=f"Maximum gateway lease attempts per task. Default: {DEFAULT_ATLAS_LAB_MAX_ATTEMPTS}.",
+    )
+    atlas_lab.add_argument(
+        "--log-interval-seconds",
+        type=float,
+        default=DEFAULT_ATLAS_LAB_LOG_INTERVAL_SECONDS,
+        help=f"Barrier-style status log interval. Default: {DEFAULT_ATLAS_LAB_LOG_INTERVAL_SECONDS}.",
+    )
+    atlas_lab.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional per-probe-stage limit for smoke tests.",
+    )
+    atlas_lab.add_argument(
+        "--signal-max-indicators",
+        type=int,
+        default=None,
+        help="Optional build-stage signal indicator cap for smoke tests. Default: no cap.",
+    )
+    atlas_lab.add_argument(
+        "--signal-instrument-limit",
+        type=int,
+        default=None,
+        help="Optional build-stage signal instrument panel cap for smoke tests. Default: no cap.",
+    )
+    atlas_lab.add_argument(
+        "--signal-timeframe-limit",
+        type=int,
+        default=None,
+        help="Optional build-stage signal timeframe panel cap for smoke tests. Default: no cap.",
+    )
+    atlas_lab.add_argument(
+        "--signal-atlas-executor",
+        choices=["local", "gateway"],
+        default="local",
+        help=(
+            "Executor for build-stage signal atlas cells. local preserves the legacy "
+            "fuzzfolio-agent-cli path; gateway distributes cells through the lab worker pool."
+        ),
+    )
+    atlas_lab.add_argument(
+        "--as-of-date",
+        default=None,
+        help=(
+            "Anchor Atlas probe lookback windows at this UTC date/time. "
+            "Default: latest complete UTC month end."
+        ),
+    )
+    atlas_lab.add_argument(
+        "--discovery-queue",
+        choices=["default", "full"],
+        default="full",
+        help="Discovery pair queue size mode. Default: full.",
+    )
+    atlas_lab.add_argument(
+        "--discovery-cluster-min-similarity",
+        type=float,
+        default=DISCOVERY_CLUSTER_DEFAULT_MIN_SIMILARITY,
+        help="Minimum similarity threshold for clustering discovered indicator signatures.",
+    )
+    atlas_lab.add_argument(
+        "--discovery-cluster-min-shared-partners",
+        type=int,
+        default=DISCOVERY_CLUSTER_DEFAULT_MIN_SHARED_PARTNERS,
+        help="Minimum shared partners required when assigning a signature into a cluster.",
+    )
+    atlas_lab.add_argument(
+        "--discovery-cluster-max-recipes",
+        type=int,
+        default=DISCOVERY_CLUSTER_DEFAULT_MAX_RECIPES,
+        help="Cap on discovered recipes emitted from cluster summary stage.",
+    )
+    atlas_lab.add_argument(
+        "--discovery-validation-confidence",
+        default=DEFAULT_DISCOVERY_VALIDATION_CONFIDENCE,
+        help=(
+            "Comma-separated validation confidence buckets. Default: "
+            f"{DEFAULT_DISCOVERY_VALIDATION_CONFIDENCE}"
+        ),
+    )
+    atlas_lab.add_argument(
+        "--discovery-validation-instruments",
+        default=None,
+        help=(
+            "Optional comma-separated instrument panel override for validation queue "
+            "(defaults to built-in discovery universe)."
+        ),
+    )
+    atlas_lab.add_argument(
+        "--discovery-validation-timeframes",
+        default=None,
+        help=(
+            "Optional comma-separated timeframe panel override for validation queue "
+            "(defaults to evidence timeframe list on each recipe)."
+        ),
+    )
+    atlas_lab.add_argument(
+        "--discovery-validation-max-recipes",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_MAX_RECIPES,
+        help="Maximum number of recipes used to build the validation queue.",
+    )
+    atlas_lab.add_argument(
+        "--discovery-validation-max-pairs-per-recipe",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_MAX_PAIRS_PER_RECIPE,
+        help="Maximum pair candidates emitted per validated recipe.",
+    )
+    atlas_lab.add_argument(
+        "--discovery-validation-first-member-limit",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_FIRST_MEMBER_LIMIT,
+        help="Maximum preferred indicators considered from the first (context/setup) slot.",
+    )
+    atlas_lab.add_argument(
+        "--discovery-validation-second-member-limit",
+        type=int,
+        default=DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT,
+        help="Maximum preferred indicators considered from the second (trigger/response) slot.",
+    )
+    atlas_lab.add_argument(
+        "--discovery-validation-diversity-penalty-scale",
+        type=float,
+        default=DEFAULT_DISCOVERY_VALIDATION_DIVERSITY_PENALTY_SCALE,
+        help="Penalty multiplier applied to nearest retained-solution similarity.",
+    )
+    atlas_lab.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-run probes even when existing sensitivity artifacts are present.",
+    )
+    atlas_lab.add_argument(
+        "--no-detail",
+        action="store_true",
+        help="Skip deep_replay_detail artifacts. Intended only for diagnostics.",
+    )
+    atlas_lab.add_argument(
+        "--keep-raw-probe-artifacts",
+        action="store_true",
+        help=(
+            "Keep full raw per-probe gateway artifacts on disk. Default compacts Atlas "
+            "probe artifacts after scoring to prevent large discovery runs from filling disk."
+        ),
+    )
+    atlas_lab.add_argument(
+        "--no-strict-parity",
+        action="store_true",
+        help="Do not fail the probe when detail/scoring parity artifacts are missing.",
+    )
+    atlas_lab.add_argument(
+        "--publish",
+        action="store_true",
+        help="Publish final recipe priors to the stable recipe-priors directory after success.",
+    )
+    atlas_lab.add_argument(
+        "--json",
+        action="store_true",
+        help="Print machine-readable JSON summary.",
+    )
+
     indicator_atlas = subparsers.add_parser(
         "build-indicator-atlas",
         help="Build static indicator atlas, dependency, pair-matrix, and recipe-prior artifacts.",
@@ -1287,7 +1595,10 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     signal_atlas.add_argument(
         "--signal-role",
         default="trigger",
-        help="Catalog signalRole filter when --indicator is omitted. Default: trigger.",
+        help=(
+            "Catalog signalRole filter when --indicator is omitted. Accepts a single role, "
+            "comma-separated roles, or all. Default: trigger."
+        ),
     )
     signal_atlas.add_argument(
         "--instrument",
@@ -1564,6 +1875,12 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help=f"Per sensitivity-basket timeout. Default: {ANCHOR_PAIR_DEFAULT_PROBE_TIMEOUT_SECONDS}.",
     )
     run_anchor_pair_probes.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of local probe workers to keep in flight. Default: 1.",
+    )
+    run_anchor_pair_probes.add_argument(
         "--json",
         action="store_true",
         help="Print machine-readable JSON summary.",
@@ -1615,8 +1932,18 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         action="append",
         default=None,
         help=(
-            "Trigger lookbackBars value to test. Can be repeated. "
+            "lookbackBars value to test. Can be repeated. "
             f"Default: {', '.join(str(value) for value in ANCHOR_PAIR_DEFAULT_TIMING_LOOKBACK_BARS)}."
+        ),
+    )
+    anchor_pair_timing_atlas.add_argument(
+        "--variant-side",
+        choices=["anchor", "trigger", "both"],
+        action="append",
+        default=None,
+        help=(
+            "Pair side whose lookbackBars should vary. Can be repeated. "
+            "Default: trigger and anchor. Use both for paired anchor+trigger variants."
         ),
     )
     anchor_pair_timing_atlas.add_argument(
@@ -1739,13 +2066,35 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     recipe_priors.add_argument(
+        "--discovery-recipe-scrutiny-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Input discovery-recipe-scrutiny-atlas directory. "
+            "Default: runs/derived/discovery-recipe-scrutiny-atlas when present."
+        ),
+    )
+    recipe_priors.add_argument(
         "--playhand-outcome-priors-dir",
         type=Path,
         default=None,
         help=(
             "Input Play Hand outcome-priors directory. "
-            "Default: runs/derived/playhand-outcome-priors when present."
+            "Used only with --include-playhand-outcome-priors."
         ),
+    )
+    recipe_priors.add_argument(
+        "--include-playhand-outcome-priors",
+        action="store_true",
+        help=(
+            "Fold PlayHand outcome priors into recipe priors. "
+            "Default is off so Atlas remains a one-way input to PlayHand."
+        ),
+    )
+    recipe_priors.add_argument(
+        "--no-playhand-outcome-priors",
+        action="store_true",
+        help="Deprecated no-op kept for compatibility; outcome priors are opt-in.",
     )
     recipe_priors.add_argument(
         "--out-dir",
@@ -1756,14 +2105,20 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     recipe_priors.add_argument(
         "--max-slot-candidates",
         type=int,
-        default=40,
-        help="Maximum candidates kept per recipe slot. Default: 40.",
+        default=RECIPE_PRIORS_DEFAULT_MAX_SLOT_CANDIDATES,
+        help=(
+            "Maximum candidates kept per recipe slot. "
+            f"Default: {RECIPE_PRIORS_DEFAULT_MAX_SLOT_CANDIDATES}."
+        ),
     )
     recipe_priors.add_argument(
         "--max-pair-candidates",
         type=int,
-        default=80,
-        help="Maximum empirical pair candidates kept. Default: 80.",
+        default=RECIPE_PRIORS_DEFAULT_MAX_PAIR_CANDIDATES,
+        help=(
+            "Maximum empirical pair candidates kept. "
+            f"Default: {RECIPE_PRIORS_DEFAULT_MAX_PAIR_CANDIDATES}."
+        ),
     )
     recipe_priors.add_argument(
         "--json",
@@ -2086,6 +2441,12 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help=f"Input discovery-cluster atlas directory. Default: runs/derived/{DEFAULT_DISCOVERY_CLUSTER_DIRNAME}.",
     )
     discovery_recipe_validation.add_argument(
+        "--recipe-priors-dir",
+        type=Path,
+        default=None,
+        help="Optional recipe-priors directory whose pair-priors.csv is used as retained inventory for soft diversity pressure.",
+    )
+    discovery_recipe_validation.add_argument(
         "--out-dir",
         type=Path,
         default=None,
@@ -2152,6 +2513,12 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         type=int,
         default=DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT,
         help=f"Second-side cluster members considered per recipe. Default: {DISCOVERY_VALIDATION_DEFAULT_SECOND_MEMBER_LIMIT}.",
+    )
+    discovery_recipe_validation.add_argument(
+        "--diversity-penalty-scale",
+        type=float,
+        default=18.0,
+        help="Maximum soft priority penalty for candidates very similar to retained inventory. Default: 18.",
     )
     discovery_recipe_validation.add_argument(
         "--lookback-months",
@@ -2226,6 +2593,33 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help=(
             "12-month retention bucket to promote to 36-month scrutiny. Can be repeated. "
             f"Default: {', '.join(DISCOVERY_SCRUTINY_DEFAULT_BUCKETS)}."
+        ),
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--fallback-bucket",
+        action="append",
+        default=None,
+        help=(
+            "Lower-confidence 12-month retention bucket eligible for the bounded scrutiny fallback. "
+            f"Can be repeated. Default: {', '.join(DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_BUCKETS)}."
+        ),
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--fallback-max-rows",
+        type=int,
+        default=DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_MAX_ROWS,
+        help=(
+            "Maximum fallback rows to add after strict retained rows. "
+            f"Default: {DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_MAX_ROWS}."
+        ),
+    )
+    discovery_recipe_scrutiny.add_argument(
+        "--fallback-min-trades",
+        type=int,
+        default=DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_MIN_TRADES,
+        help=(
+            "Minimum best_trades/signal_count required for fallback scrutiny rows. "
+            f"Default: {DISCOVERY_SCRUTINY_DEFAULT_FALLBACK_MIN_TRADES}."
         ),
     )
     discovery_recipe_scrutiny.add_argument(
@@ -3130,6 +3524,16 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         action="append",
         default=None,
         help="Blocked instrument symbol or comma-separated symbols. Can be repeated.",
+    )
+    optimize_portfolio.add_argument(
+        "--account-config",
+        default=None,
+        help="Path to a portfolio account preset JSON. Defaults to repo-root portfolio.account-presets.json when --account-preset is used.",
+    )
+    optimize_portfolio.add_argument(
+        "--account-preset",
+        default=None,
+        help="Account preset name to attach to optimizer metrics, such as coinexx-micro or darwinex-zero.",
     )
     optimize_portfolio.add_argument(
         "--max-avg-hold-hours",
@@ -7381,7 +7785,10 @@ def _provider_profile_for_presentation_chain(
     *,
     is_primary: bool,
 ):
-    if is_primary and str(profile.provider_type or "").strip().lower() == "codex":
+    provider_type = str(
+        getattr(profile, "provider_type", None) or getattr(profile, "type", "") or ""
+    ).strip().lower()
+    if is_primary and provider_type == "codex" and is_dataclass(profile):
         return replace(profile, codex_usage_limit_wait=False)
     return profile
 
@@ -9752,8 +10159,8 @@ def _render_profile_drop_for_attempt(
     lookback_months: int,
     force_rebuild: bool,
     timeout_seconds: int,
-    exit_policy_cell: str,
-    emit: Callable[[str], None] | None,
+    exit_policy_cell: str = "recommended",
+    emit: Callable[[str], None] | None = None,
     layout_mode: str = "derived",
     require_presentation_metadata: bool = False,
 ) -> dict[str, Any]:
@@ -11396,6 +11803,8 @@ def cmd_optimize_portfolio(
     allowed_asset_classes: list[str] | None,
     allowed_instruments: list[str] | None,
     blocked_instruments: list[str] | None,
+    account_config_path: str | None,
+    account_preset: str | None,
     max_avg_hold_hours: float,
     max_p90_hold_hours: float,
     max_single_hold_hours: float,
@@ -11461,6 +11870,12 @@ def cmd_optimize_portfolio(
     if extra_baseline_ids:
         baselines_raw.append(("baseline-attempt-ids", extra_baseline_ids))
         baseline_ids.extend(extra_baseline_ids)
+    optimizer_account = _resolve_optimizer_account_spec(
+        config=config,
+        account_config_path=account_config_path,
+        account_preset=account_preset,
+        fallback=baseline_account,
+    )
 
     spec = PortfolioOptimizerSpec(
         portfolio_name=str(portfolio_name or "portfolio-optimizer").strip()
@@ -11497,7 +11912,7 @@ def cmd_optimize_portfolio(
         diversification_mode=str(diversification_mode or "penalty"),
         portfolio_sharpe_weight=float(portfolio_sharpe_weight),
         baseline_attempt_ids=tuple(dict.fromkeys(baseline_ids)),
-        account=baseline_account,
+        account=optimizer_account,
     )
     report_root = config.derived_root / "portfolio-optimization" / _slug_token(
         spec.portfolio_name
@@ -12188,6 +12603,44 @@ def _default_portfolio_config_path(config) -> Path:
     if legacy_path.exists():
         return legacy_path
     return modern_path
+
+
+def _optimizer_account_config_path(config, raw_path: str | None) -> Path:
+    if raw_path:
+        return Path(raw_path).expanduser().resolve()
+    return config.repo_root / "portfolio.account-presets.json"
+
+
+def _load_optimizer_account_presets(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Account preset file must contain a JSON object: {path}")
+    presets = payload.get("account_presets")
+    return dict(presets) if isinstance(presets, dict) else {}
+
+
+def _resolve_optimizer_account_spec(
+    *,
+    config,
+    account_config_path: str | None,
+    account_preset: str | None,
+    fallback: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    preset_name = str(account_preset or "").strip()
+    fallback_account = copy.deepcopy(fallback) if isinstance(fallback, dict) else {}
+    if not preset_name:
+        return _resolve_account_spec(fallback_account)
+    path = _optimizer_account_config_path(config, account_config_path)
+    presets = _load_optimizer_account_presets(path)
+    if preset_name not in presets:
+        available = ", ".join(sorted(presets)) or "none"
+        raise SystemExit(
+            f"Account preset {preset_name!r} was not found in {path}. "
+            f"Available presets: {available}."
+        )
+    return _resolve_account_spec(preset_name, presets, fallback=fallback_account)
 
 
 def _portfolio_bundle_root(config, portfolio_name: str) -> Path:
@@ -13170,7 +13623,7 @@ def cmd_render_portfolio_profile_drops(
     *,
     portfolio_report: str | None,
     profile_drop_workers: int | None,
-    profile_drop_exit_policy_cell: str | None,
+    profile_drop_exit_policy_cell: str | None = None,
     force_rebuild: bool,
     as_json: bool,
 ) -> int:
@@ -14066,6 +14519,157 @@ def cmd_rescore_attempts() -> int:
     return 0
 
 
+def cmd_atlas_lab(
+    *,
+    run_id: str | None,
+    gateway_url: str | None,
+    gateway_token: str | None,
+    trading_dashboard_root: Path | None,
+    atlas_profile: str,
+    worker_contract_hash: str | None,
+    phases: list[str] | None,
+    active_probes: int,
+    enqueue_chunk_size: int,
+    result_batch_size: int,
+    max_results_per_cycle: int,
+    max_drain_seconds: float,
+    poll_interval_seconds: float,
+    deadline_seconds: float,
+    max_attempts: int,
+    log_interval_seconds: float,
+    limit: int | None,
+    signal_max_indicators: int | None,
+    signal_instrument_limit: int | None,
+    signal_timeframe_limit: int | None,
+    signal_atlas_executor: str = "local",
+    as_of_date: str | None,
+    discovery_queue: str,
+    discovery_cluster_min_similarity: float,
+    discovery_cluster_min_shared_partners: int,
+    discovery_cluster_max_recipes: int,
+    discovery_validation_confidence: str,
+    discovery_validation_instruments: str | None,
+    discovery_validation_timeframes: str | None,
+    discovery_validation_max_recipes: int,
+    discovery_validation_max_pairs_per_recipe: int,
+    discovery_validation_first_member_limit: int,
+    discovery_validation_second_member_limit: int,
+    discovery_validation_diversity_penalty_scale: float,
+    force: bool,
+    include_detail: bool,
+    compact_probe_artifacts: bool,
+    strict_parity: bool,
+    publish: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    runtime = AtlasLabRuntimeConfig(
+        gateway_url=gateway_url or AtlasLabRuntimeConfig.gateway_url,
+        gateway_token=gateway_token,
+        trading_dashboard_root=trading_dashboard_root,
+        atlas_profile=atlas_profile,
+        worker_contract_hash=worker_contract_hash,
+        active_probes=max(1, int(active_probes)),
+        enqueue_chunk_size=max(1, int(enqueue_chunk_size)),
+        result_batch_size=max(1, int(result_batch_size)),
+        max_results_per_cycle=max(1, int(max_results_per_cycle)),
+        max_drain_seconds=max(float(max_drain_seconds), 0.0),
+        poll_interval_seconds=max(float(poll_interval_seconds), 0.0),
+        deadline_seconds=max(float(deadline_seconds), 1.0),
+        max_attempts=max(1, int(max_attempts)),
+        log_interval_seconds=max(float(log_interval_seconds), 0.1),
+        strict_parity=bool(strict_parity),
+        force=bool(force),
+        json_output=bool(as_json),
+        publish=bool(publish),
+        limit=limit,
+        signal_max_indicators=(
+            None if signal_max_indicators is None else max(0, int(signal_max_indicators))
+        ),
+        signal_instrument_limit=(
+            None if signal_instrument_limit is None else max(0, int(signal_instrument_limit))
+        ),
+        signal_timeframe_limit=(
+            None if signal_timeframe_limit is None else max(0, int(signal_timeframe_limit))
+        ),
+        signal_atlas_executor="gateway" if str(signal_atlas_executor or "local") == "gateway" else "local",
+        full_discovery_queue=str(discovery_queue or "full") == "full",
+        include_detail=bool(include_detail),
+        compact_probe_artifacts=bool(compact_probe_artifacts),
+        as_of_date=as_of_date,
+        discovery_cluster_min_similarity=float(discovery_cluster_min_similarity),
+        discovery_cluster_min_shared_partners=max(0, int(discovery_cluster_min_shared_partners)),
+        discovery_cluster_max_recipes=max(1, int(discovery_cluster_max_recipes)),
+        discovery_validation_included_confidence=[
+            confidence.strip()
+            for confidence in str(discovery_validation_confidence).split(",")
+            if confidence.strip()
+        ],
+        discovery_validation_instruments=(
+            [instrument.strip().upper() for instrument in str(discovery_validation_instruments).split(",") if instrument.strip()]
+            if discovery_validation_instruments is not None else None
+        ),
+        discovery_validation_timeframes=(
+            [timeframe.strip().upper() for timeframe in str(discovery_validation_timeframes).split(",") if timeframe.strip()]
+            if discovery_validation_timeframes is not None else None
+        ),
+        discovery_validation_max_recipes=max(1, int(discovery_validation_max_recipes)),
+        discovery_validation_max_pairs_per_recipe=max(1, int(discovery_validation_max_pairs_per_recipe)),
+        discovery_validation_first_member_limit=max(1, int(discovery_validation_first_member_limit)),
+        discovery_validation_second_member_limit=max(1, int(discovery_validation_second_member_limit)),
+        discovery_validation_diversity_penalty_scale=float(discovery_validation_diversity_penalty_scale),
+    )
+
+    def progress(payload: dict[str, Any]) -> None:
+        if as_json:
+            return
+        console.print(
+            "[atlas-lab] "
+            f"{payload.get('kind')} {payload.get('completed')}/{payload.get('total')} "
+            f"{payload.get('probe_id')} {payload.get('status')} score={payload.get('score')}"
+        )
+
+    result = run_atlas_lab(
+        config,
+        run_id=run_id,
+        runtime=runtime,
+        phases=phases,
+        progress_callback=progress,
+    )
+    payload = {
+        "run_id": result.run_id,
+        "run_root": str(result.run_root),
+        "status": result.status,
+        "summary_path": str(result.summary_path),
+        "published_manifest_path": (
+            str(result.published_manifest_path)
+            if result.published_manifest_path is not None
+            else None
+        ),
+        "probe_summaries": result.probe_summaries,
+        "pipeline_summaries": result.pipeline_summaries,
+    }
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0 if result.status == "completed" else 2
+    console.print(
+        Panel.fit(
+            "\n".join(
+                [
+                    f"Status: {result.status}",
+                    f"Run: {result.run_id}",
+                    f"Run root: {result.run_root}",
+                    f"Summary: {result.summary_path}",
+                    f"Published: {result.published_manifest_path or ''}",
+                ]
+            ),
+            title="Atlas Lab",
+            border_style="green" if result.status == "completed" else "red",
+        )
+    )
+    return 0 if result.status == "completed" else 2
+
+
 def cmd_build_indicator_atlas(
     *,
     workspace_root: Path | None,
@@ -14180,6 +14784,9 @@ def cmd_build_signal_atlas(
     table.add_column("Metric")
     table.add_column("Value", justify="right")
     table.add_row("Indicators", str(selection.get("indicator_count", 0)))
+    table.add_row("Signal roles", str(selection.get("signal_role_filter") or selection.get("signal_role") or ""))
+    table.add_row("Instruments", str(len(selection.get("instruments") or [])))
+    table.add_row("Timeframes", str(len(selection.get("timeframes") or [])))
     table.add_row("Replay source", str(selection.get("replay_source") or ""))
     table.add_row("Requested calls", str(selection.get("total_requested_calls", 0)))
     table.add_row("Successful calls", str(counts.get("successful_calls", 0)))
@@ -14376,6 +14983,7 @@ def cmd_run_anchor_pair_probes(
     force: bool,
     keep_profiles: bool,
     timeout_seconds: int | None,
+    probe_workers: int,
     as_json: bool,
 ) -> int:
     config = load_config()
@@ -14459,6 +15067,7 @@ def cmd_build_anchor_pair_timing_atlas(
     base_probe_ids: list[str] | None,
     limit_base_pairs: int | None,
     lookback_bars: list[int] | None,
+    variant_sides: list[str] | None,
     include_baseline_variants: bool,
     lookback_months: int,
     quality_score_preset: str,
@@ -14476,6 +15085,7 @@ def cmd_build_anchor_pair_timing_atlas(
         base_probe_ids=base_probe_ids,
         limit_base_pairs=limit_base_pairs,
         lookback_bars=lookback_bars,
+        variant_sides=variant_sides,
         include_baseline_variants=include_baseline_variants,
         emit_profile_docs=emit_profile_docs,
         lookback_months=lookback_months,
@@ -14497,9 +15107,14 @@ def cmd_build_anchor_pair_timing_atlas(
     table.add_row("Timing variants", str(counts.get("timing_variants", 0)))
     table.add_row("Profile docs", str(counts.get("profile_docs", 0)))
     table.add_row("Lookback bars", json.dumps(selection.get("lookback_bars", [])))
+    table.add_row("Variant sides", json.dumps(selection.get("variant_sides", [])))
     table.add_row(
         "Variant counts",
         json.dumps(counts.get("lookback_variant_counts", {}), ensure_ascii=True),
+    )
+    table.add_row(
+        "Side counts",
+        json.dumps(counts.get("variant_side_counts", {}), ensure_ascii=True),
     )
     console.print(table)
     console.print(
@@ -14613,7 +15228,9 @@ def cmd_build_recipe_priors(
     anchor_pair_dir: Path | None,
     anchor_pair_timing_dir: Path | None,
     discovery_recipe_validation_dir: Path | None,
+    discovery_recipe_scrutiny_dir: Path | None,
     playhand_outcome_priors_dir: Path | None,
+    include_playhand_outcome_priors: bool,
     out_dir: Path | None,
     max_slot_candidates: int,
     max_pair_candidates: int,
@@ -14628,7 +15245,9 @@ def cmd_build_recipe_priors(
         anchor_pair_dir=anchor_pair_dir,
         anchor_pair_timing_dir=anchor_pair_timing_dir,
         discovery_recipe_validation_dir=discovery_recipe_validation_dir,
+        discovery_recipe_scrutiny_dir=discovery_recipe_scrutiny_dir,
         playhand_outcome_priors_dir=playhand_outcome_priors_dir,
+        include_playhand_outcome_priors=include_playhand_outcome_priors,
         out_dir=out_dir,
         max_slot_candidates=max_slot_candidates,
         max_pair_candidates=max_pair_candidates,
@@ -15107,6 +15726,7 @@ def cmd_build_discovery_cluster_atlas(
 def cmd_build_discovery_recipe_validation_atlas(
     *,
     cluster_atlas_dir: Path | None,
+    recipe_priors_dir: Path | None,
     out_dir: Path | None,
     workspace_root: Path | None,
     catalog_path: Path | None,
@@ -15118,6 +15738,7 @@ def cmd_build_discovery_recipe_validation_atlas(
     max_pairs_per_recipe: int,
     first_member_limit: int,
     second_member_limit: int,
+    diversity_penalty_scale: float,
     lookback_months: int,
     job_timeout_seconds: int | None,
     quality_score_preset: str,
@@ -15129,6 +15750,7 @@ def cmd_build_discovery_recipe_validation_atlas(
     result = build_discovery_recipe_validation_atlas(
         config,
         cluster_atlas_dir=cluster_atlas_dir,
+        recipe_priors_dir=recipe_priors_dir,
         out_dir=out_dir,
         workspace_root=workspace_root,
         catalog_path=catalog_path,
@@ -15140,6 +15762,7 @@ def cmd_build_discovery_recipe_validation_atlas(
         max_pairs_per_recipe=max_pairs_per_recipe,
         first_member_limit=first_member_limit,
         second_member_limit=second_member_limit,
+        diversity_penalty_scale=diversity_penalty_scale,
         lookback_months=lookback_months,
         job_timeout_seconds=job_timeout_seconds,
         quality_score_preset=quality_score_preset,
@@ -15159,6 +15782,7 @@ def cmd_build_discovery_recipe_validation_atlas(
     table.add_column("Value", justify="right")
     table.add_row("Available recipes", str(counts.get("available_recipes", 0)))
     table.add_row("Queue rows", str(counts.get("queue_rows", 0)))
+    table.add_row("Retained inventory", str(counts.get("retained_inventory_rows", 0)))
     table.add_row("Profile docs", str(counts.get("profile_docs", 0)))
     table.add_row("Lookback months", str(selection.get("lookback_months", 0)))
     table.add_row(
@@ -15222,6 +15846,9 @@ def cmd_build_discovery_recipe_scrutiny_atlas(
     catalog_path: Path | None,
     refresh_static_atlas: bool,
     included_buckets: list[str] | None,
+    fallback_buckets: list[str] | None,
+    fallback_max_rows: int | None,
+    fallback_min_trades: int,
     instruments: list[str] | None,
     timeframes: list[str] | None,
     max_rows: int | None,
@@ -15241,6 +15868,9 @@ def cmd_build_discovery_recipe_scrutiny_atlas(
         catalog_path=catalog_path,
         refresh_static_atlas=refresh_static_atlas,
         included_buckets=included_buckets,
+        fallback_buckets=fallback_buckets,
+        fallback_max_rows=fallback_max_rows,
+        fallback_min_trades=fallback_min_trades,
         instruments=instruments,
         timeframes=timeframes,
         max_rows=max_rows,
@@ -15514,6 +16144,49 @@ def main(argv: list[str] | None = None) -> int:
     play_hand_lab_exit = dispatch_play_hand_lab_command(args, console=console)
     if play_hand_lab_exit is not None:
         return play_hand_lab_exit
+    if args.command == "atlas-lab":
+        return cmd_atlas_lab(
+            run_id=args.run_id,
+            gateway_url=args.gateway_url,
+            gateway_token=args.gateway_token,
+            trading_dashboard_root=args.trading_dashboard_root,
+            atlas_profile=args.atlas_profile,
+            worker_contract_hash=args.worker_contract_hash,
+            phases=args.phase,
+            active_probes=int(args.active_probes),
+            enqueue_chunk_size=int(args.enqueue_chunk_size),
+            result_batch_size=int(args.result_batch_size),
+            max_results_per_cycle=int(args.max_results_per_cycle),
+            max_drain_seconds=float(args.max_drain_seconds),
+            poll_interval_seconds=float(args.poll_interval_seconds),
+            deadline_seconds=float(args.deadline_seconds),
+            max_attempts=int(args.max_attempts),
+            log_interval_seconds=float(args.log_interval_seconds),
+            limit=args.limit,
+            signal_max_indicators=args.signal_max_indicators,
+            signal_instrument_limit=args.signal_instrument_limit,
+            signal_timeframe_limit=args.signal_timeframe_limit,
+            signal_atlas_executor=args.signal_atlas_executor,
+            as_of_date=args.as_of_date,
+            discovery_queue=args.discovery_queue,
+            discovery_cluster_min_similarity=args.discovery_cluster_min_similarity,
+            discovery_cluster_min_shared_partners=args.discovery_cluster_min_shared_partners,
+            discovery_cluster_max_recipes=args.discovery_cluster_max_recipes,
+            discovery_validation_confidence=args.discovery_validation_confidence,
+            discovery_validation_instruments=args.discovery_validation_instruments,
+            discovery_validation_timeframes=args.discovery_validation_timeframes,
+            discovery_validation_max_recipes=args.discovery_validation_max_recipes,
+            discovery_validation_max_pairs_per_recipe=args.discovery_validation_max_pairs_per_recipe,
+            discovery_validation_first_member_limit=args.discovery_validation_first_member_limit,
+            discovery_validation_second_member_limit=args.discovery_validation_second_member_limit,
+            discovery_validation_diversity_penalty_scale=args.discovery_validation_diversity_penalty_scale,
+            force=bool(args.force),
+            include_detail=not bool(args.no_detail),
+            compact_probe_artifacts=not bool(args.keep_raw_probe_artifacts),
+            strict_parity=not bool(args.no_strict_parity),
+            publish=bool(args.publish),
+            as_json=bool(args.json),
+        )
     if args.command == "build-indicator-atlas":
         return cmd_build_indicator_atlas(
             workspace_root=args.workspace_root,
@@ -15589,6 +16262,7 @@ def main(argv: list[str] | None = None) -> int:
             base_probe_ids=args.base_probe_id,
             limit_base_pairs=args.limit_base_pairs,
             lookback_bars=args.lookback_bars,
+            variant_sides=args.variant_side,
             include_baseline_variants=bool(args.include_baseline),
             lookback_months=args.lookback_months,
             quality_score_preset=args.quality_score_preset,
@@ -15617,7 +16291,12 @@ def main(argv: list[str] | None = None) -> int:
             max_slot_candidates=args.max_slot_candidates,
             max_pair_candidates=args.max_pair_candidates,
             discovery_recipe_validation_dir=args.discovery_recipe_validation_dir,
+            discovery_recipe_scrutiny_dir=args.discovery_recipe_scrutiny_dir,
             playhand_outcome_priors_dir=args.playhand_outcome_priors_dir,
+            include_playhand_outcome_priors=(
+                bool(args.include_playhand_outcome_priors)
+                and not bool(args.no_playhand_outcome_priors)
+            ),
             as_json=bool(args.json),
         )
     if args.command == "build-playhand-outcome-priors":
@@ -15686,6 +16365,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "build-discovery-recipe-validation-atlas":
         return cmd_build_discovery_recipe_validation_atlas(
             cluster_atlas_dir=args.cluster_atlas_dir,
+            recipe_priors_dir=args.recipe_priors_dir,
             out_dir=args.out_dir,
             workspace_root=args.workspace_root,
             catalog_path=args.catalog_path,
@@ -15697,6 +16377,7 @@ def main(argv: list[str] | None = None) -> int:
             max_pairs_per_recipe=args.max_pairs_per_recipe,
             first_member_limit=args.first_member_limit,
             second_member_limit=args.second_member_limit,
+            diversity_penalty_scale=args.diversity_penalty_scale,
             lookback_months=args.lookback_months,
             job_timeout_seconds=args.job_timeout_seconds,
             quality_score_preset=args.quality_score_preset,
@@ -15712,6 +16393,9 @@ def main(argv: list[str] | None = None) -> int:
             catalog_path=args.catalog_path,
             refresh_static_atlas=bool(args.refresh_static_atlas),
             included_buckets=args.bucket,
+            fallback_buckets=args.fallback_bucket,
+            fallback_max_rows=args.fallback_max_rows,
+            fallback_min_trades=args.fallback_min_trades,
             instruments=args.instrument,
             timeframes=args.timeframe,
             max_rows=args.max_rows,
@@ -15871,6 +16555,8 @@ def main(argv: list[str] | None = None) -> int:
             allowed_asset_classes=args.allowed_asset_class,
             allowed_instruments=args.allowed_instrument,
             blocked_instruments=args.blocked_instrument,
+            account_config_path=args.account_config,
+            account_preset=args.account_preset,
             max_avg_hold_hours=float(args.max_avg_hold_hours),
             max_p90_hold_hours=float(args.max_p90_hold_hours),
             max_single_hold_hours=float(args.max_single_hold_hours),

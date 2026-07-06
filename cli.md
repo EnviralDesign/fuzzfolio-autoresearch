@@ -389,7 +389,7 @@ Default settings:
 - input: `runs/derived/indicator-atlas/`, `runs/derived/signal-atlas/`, `runs/derived/forward-response-atlas/`, `runs/derived/anchor-pair-atlas/`, `runs/derived/anchor-pair-timing-atlas/`, and, when present, `runs/derived/discovery-recipe-validation-atlas/` plus `runs/derived/discovery-recipe-scrutiny-atlas/`
 - output: `runs/derived/recipe-priors/`
 - max slot candidates per recipe slot: `40`
-- max empirical pair candidates: `80`
+- max empirical pair candidates guard: `256`
 - sampling policy: `60/25/15` guided/uncertain/wild until 36-month retained evidence exists, then `80/15/5`
 
 Outputs:
@@ -507,8 +507,8 @@ Default settings:
 - output: `runs/derived/discovery-cluster-atlas/`
 - positive pair threshold: `50`
 - strong pair threshold: `70`
-- minimum cluster similarity: `0.22`
-- maximum discovered recipes: `32`
+- minimum cluster similarity: `0.50`
+- maximum discovered recipes safety guard: `128`
 
 Outputs:
 
@@ -549,7 +549,7 @@ Default settings:
 - included confidence buckets: `high_candidate`, `promising_candidate`
 - instruments: `EURUSD`, `GBPUSD`, `USDJPY`, `XAUUSD`
 - timeframes: each recipe's top empirical timeframes
-- max recipes: `8`
+- max recipes safety guard: `128`
 - max pairs per recipe: `8`
 - validation lookback: `12` months
 

@@ -34,6 +34,7 @@ from .anchor_pair_atlas import (
     _write_json,
     _write_run_script,
     build_pair_profile_document,
+    resolve_probe_as_of_date,
 )
 from .config import AppConfig
 from .forward_response_atlas import DEFAULT_FORWARD_RESPONSE_DIRNAME
@@ -916,6 +917,7 @@ def build_discovery_pair_atlas(
     include_known_retests: bool = False,
     random_seed: int = DEFAULT_RANDOM_SEED,
     lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
+    as_of_date: str | None = None,
     job_timeout_seconds: int | None = DEFAULT_JOB_TIMEOUT_SECONDS,
     emit_profile_docs: bool = True,
     quality_score_preset: str = DEFAULT_QUALITY_SCORE_PRESET,
@@ -989,6 +991,7 @@ def build_discovery_pair_atlas(
     instrument_panel = _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS)
     timeframe_panel = _normalize_tokens(timeframes) or list(DEFAULT_TIMEFRAMES)
     lookback_months = max(1, int(lookback_months or DEFAULT_LOOKBACK_MONTHS))
+    resolved_as_of_date = resolve_probe_as_of_date(as_of_date)
     rows = build_discovery_pair_rows(
         rows_by_id=rows_by_id,
         signal_rollups=signal_rollups,
@@ -1049,6 +1052,7 @@ def build_discovery_pair_atlas(
         sensitivity_args = _sensitivity_args_for_row(
             row,
             lookback_months=lookback_months,
+            as_of_date=resolved_as_of_date,
             quality_score_preset=quality_score_preset,
             execution_cost_mode=execution_cost_mode,
             result_dir=result_dir,
@@ -1106,6 +1110,7 @@ def build_discovery_pair_atlas(
             "random_seed": random_seed,
             "lane_fractions": DISCOVERY_LANE_FRACTIONS,
             "lookback_months": lookback_months,
+            "as_of_date": resolved_as_of_date,
             "job_timeout_seconds": job_timeout_seconds,
             "quality_score_preset": quality_score_preset,
             "execution_cost_mode": execution_cost_mode,
@@ -1344,6 +1349,7 @@ def run_discovery_pair_probes(
                 sensitivity_args = _sensitivity_args_for_row(
                     row,
                     lookback_months=DEFAULT_LOOKBACK_MONTHS,
+                    as_of_date=None,
                     quality_score_preset=DEFAULT_QUALITY_SCORE_PRESET,
                     execution_cost_mode=DEFAULT_EXECUTION_COST_MODE,
                     result_dir=output_dir,

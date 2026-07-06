@@ -598,6 +598,7 @@ def build_forward_response_atlas(
         _clean_upper(value)
         for value in _as_list(_as_dict(signal_summary.get("selection")).get("indicator_ids"))
     ]
+    signal_selection = _as_dict(signal_summary.get("selection"))
 
     all_events: list[dict[str, Any]] = []
     cell_rollups: list[dict[str, Any]] = []
@@ -696,6 +697,10 @@ def build_forward_response_atlas(
         "source": {
             "signal_atlas_path": str(signal_atlas_path),
             "signal_atlas_generated_at": signal_payload.get("generated_at"),
+            "signal_role_filter": signal_selection.get("signal_role_filter"),
+            "signal_roles": signal_selection.get("signal_roles"),
+            "signal_instruments": signal_selection.get("instruments"),
+            "signal_timeframes": signal_selection.get("timeframes"),
         },
         "selection": {
             "indicator_count": len(selected_indicator_ids),

@@ -119,6 +119,44 @@ def test_default_portfolio_config_path_falls_back_to_legacy(tmp_path: Path) -> N
     assert ar_main._default_portfolio_config_path(config) == legacy_path
 
 
+def test_resolve_optimizer_account_spec_loads_repo_account_preset(
+    tmp_path: Path,
+) -> None:
+    account_path = tmp_path / "portfolio.account-presets.json"
+    account_path.write_text(
+        json.dumps(
+            {
+                "account_presets": {
+                    "coinexx-micro": {
+                        "name": "Coinexx Micro",
+                        "account_size_usd": 150,
+                        "leverage": 500,
+                        "risk_per_trade_pct": 1.0,
+                        "min_lot": 0.01,
+                        "lot_step": 0.01,
+                        "allowed_asset_classes": ["forex"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = SimpleNamespace(repo_root=tmp_path)
+
+    account = ar_main._resolve_optimizer_account_spec(
+        config=config,
+        account_config_path=None,
+        account_preset="coinexx-micro",
+        fallback={"risk_per_trade_pct": 0.25},
+    )
+
+    assert account["account_preset_name"] == "coinexx-micro"
+    assert account["account_size_usd"] == 150.0
+    assert account["risk_per_trade_pct"] == 1.0
+    assert account["min_lot"] == 0.01
+    assert account["allowed_asset_classes"] == ["fx"]
+
+
 def test_build_sleeve_selection_annotates_selected_rows() -> None:
     rows = [
         {

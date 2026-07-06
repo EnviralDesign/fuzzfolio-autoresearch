@@ -7,7 +7,7 @@ import statistics
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .config import AppConfig
 from .fuzzfolio import CliError, FuzzfolioCli
@@ -92,6 +92,30 @@ def _normalize_tokens(values: list[str] | tuple[str, ...] | None) -> list[str]:
             cleaned.append(token)
             seen.add(token)
     return cleaned
+
+
+def _normalize_signal_roles(signal_role: str | Iterable[str] | None) -> list[str]:
+    raw_values: list[str] = []
+    if signal_role is None:
+        raw_values = [DEFAULT_SIGNAL_ROLE]
+    elif isinstance(signal_role, str):
+        raw_values = [signal_role]
+    else:
+        raw_values = [str(value) for value in signal_role]
+
+    roles: list[str] = []
+    seen: set[str] = set()
+    for raw_value in raw_values:
+        for part in str(raw_value or "").replace(";", ",").split(","):
+            role = part.strip().lower()
+            if not role:
+                continue
+            if role in {"all", "*", "any"}:
+                return []
+            if role not in seen:
+                roles.append(role)
+                seen.add(role)
+    return roles or [DEFAULT_SIGNAL_ROLE]
 
 
 def _cell_key(row: dict[str, Any]) -> tuple[str, str, str]:
@@ -184,18 +208,18 @@ def _select_indicator_ids(
     rows_by_id: dict[str, dict[str, Any]],
     *,
     indicator_ids: list[str] | None,
-    signal_role: str | None,
+    signal_role: str | Iterable[str] | None,
     max_indicators: int | None,
 ) -> list[str]:
     explicit = _normalize_tokens(indicator_ids)
     if explicit:
         selected = [indicator_id for indicator_id in explicit if indicator_id in rows_by_id]
     else:
-        role = _clean_token(signal_role or DEFAULT_SIGNAL_ROLE).lower()
+        roles = set(_normalize_signal_roles(signal_role))
         selected = [
             indicator_id
             for indicator_id, row in rows_by_id.items()
-            if not role or _clean_token(row.get("signal_role")).lower() == role
+            if not roles or _clean_token(row.get("signal_role")).lower() in roles
         ]
         selected.sort(
             key=lambda indicator_id: (
@@ -613,12 +637,13 @@ def build_signal_atlas(
     config: AppConfig,
     *,
     indicator_ids: list[str] | None = None,
-    signal_role: str | None = DEFAULT_SIGNAL_ROLE,
+    signal_role: str | Iterable[str] | None = DEFAULT_SIGNAL_ROLE,
     instruments: list[str] | None = None,
     timeframes: list[str] | None = None,
     bar_limit: int = DEFAULT_BAR_LIMIT,
     max_indicators: int | None = None,
     out_dir: Path | None = None,
+    indicator_atlas_dir: Path | None = None,
     workspace_root: Path | None = None,
     catalog_path: Path | None = None,
     refresh_static_atlas: bool = False,
@@ -638,12 +663,18 @@ def build_signal_atlas(
     profile_dir.mkdir(parents=True, exist_ok=True)
 
     static_atlas_result = None
-    static_atlas_path = config.derived_root / DEFAULT_ATLAS_DIRNAME / "indicator-atlas.json"
+    static_dir = (
+        indicator_atlas_dir.expanduser().resolve()
+        if indicator_atlas_dir is not None
+        else config.derived_root / DEFAULT_ATLAS_DIRNAME
+    )
+    static_atlas_path = static_dir / "indicator-atlas.json"
     if refresh_static_atlas or not static_atlas_path.exists():
         static_atlas_result = build_indicator_atlas(
             config,
             workspace_root=workspace_root,
             catalog_path=catalog_path,
+            out_dir=static_dir,
         )
         static_atlas_path = static_atlas_result.atlas_path
 
@@ -654,6 +685,7 @@ def build_signal_atlas(
     )
     catalog_by_id = _indicator_catalog_by_id(catalog_payload)
     rows_by_id = _atlas_rows_by_id(static_atlas_path)
+    selected_signal_roles = _normalize_signal_roles(signal_role)
     selected_indicator_ids = _select_indicator_ids(
         rows_by_id,
         indicator_ids=indicator_ids,
@@ -825,11 +857,14 @@ def build_signal_atlas(
     failed_rows = [row for row in rows if row.get("status") != "ok"]
     density_counts: dict[str, int] = {}
     balance_counts: dict[str, int] = {}
+    role_counts: dict[str, int] = {}
     for row in successful_rows:
         density = str(row.get("density_bucket") or "unknown")
         balance = str(row.get("balance_bucket") or "unknown")
+        role = str(row.get("signal_role") or "unknown")
         density_counts[density] = density_counts.get(density, 0) + 1
         balance_counts[balance] = balance_counts.get(balance, 0) + 1
+        role_counts[role] = role_counts.get(role, 0) + 1
 
     summary = {
         "schema_version": SCHEMA_VERSION,
@@ -843,6 +878,8 @@ def build_signal_atlas(
         },
         "selection": {
             "signal_role": signal_role,
+            "signal_roles": selected_signal_roles,
+            "signal_role_filter": "all" if not selected_signal_roles else ",".join(selected_signal_roles),
             "indicator_ids": selected_indicator_ids,
             "indicator_count": len(selected_indicator_ids),
             "instruments": instrument_panel,
@@ -856,6 +893,7 @@ def build_signal_atlas(
             "failed_calls": len(failed_rows),
             "density_bucket_counts": dict(sorted(density_counts.items())),
             "balance_bucket_counts": dict(sorted(balance_counts.items())),
+            "signal_role_counts": dict(sorted(role_counts.items())),
         },
         "indicator_rollups": by_indicator,
         "profiles": profile_records,
@@ -878,6 +916,11 @@ def build_signal_atlas(
         request_manifest_path,
         {
             "schema_version": "signal_atlas_request_manifest_v1",
+            "signal_roles": selected_signal_roles,
+            "signal_role_filter": "all" if not selected_signal_roles else ",".join(selected_signal_roles),
+            "indicator_count": len(selected_indicator_ids),
+            "instruments": instrument_panel,
+            "timeframes": timeframe_panel,
             "profiles": profile_records,
             "replay_source": _clean_token(replay_source) or None,
             "raw_dir": str(raw_dir),

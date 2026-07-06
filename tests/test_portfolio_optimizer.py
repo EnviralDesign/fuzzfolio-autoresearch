@@ -495,6 +495,89 @@ def test_optimizer_metrics_include_account_realistic_lot_floor(tmp_path: Path) -
     assert account["blown"] is False
 
 
+def test_optimizer_rejects_account_risk_variance_outside_tolerance(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        _row(tmp_path, "too-large-min-lot", "EURUSD", [1, 0.5, 1.5], score=70),
+    ]
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=1,
+        min_fx_share=0,
+        account={
+            "account_size_usd": 100.0,
+            "risk_per_trade_pct": 1.0,
+            "min_lot": 0.01,
+            "lot_step": 0.01,
+            "notional_usd_per_lot": 100000.0,
+            "risk_variance_filter_enabled": True,
+            "risk_variance_tolerance_pct": 5.0,
+            "risk_variance_direction": "upside",
+        },
+    )
+
+    candidates, rejections = build_optimizer_candidates(rows, spec)
+
+    assert candidates == []
+    assert rejections["account_risk_variance_too_high"] == 1
+
+
+def test_optimizer_account_risk_variance_filter_uses_result_cell_stop_loss(
+    tmp_path: Path,
+) -> None:
+    row = _row(tmp_path, "cell-stop-loss", "EURUSD", [1, 0.5, 1.5], score=70)
+    row.pop("selected_stop_loss_percent_36m", None)
+    result_path = Path(row["full_backtest_result_path_36m"])
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload["data"]["aggregate"]["best_cell"] = {"stop_loss_percent": 1.0}
+    result_path.write_text(json.dumps(payload), encoding="utf-8")
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=1,
+        min_fx_share=0,
+        account={
+            "account_size_usd": 100.0,
+            "risk_per_trade_pct": 1.0,
+            "min_lot": 0.01,
+            "lot_step": 0.01,
+            "notional_usd_per_lot": 100000.0,
+            "risk_variance_filter_enabled": True,
+            "risk_variance_tolerance_pct": 5.0,
+            "risk_variance_direction": "upside",
+        },
+    )
+
+    candidates, rejections = build_optimizer_candidates([row], spec)
+
+    assert candidates == []
+    assert rejections["account_risk_variance_too_high"] == 1
+
+
+def test_optimizer_account_risk_variance_filter_can_be_disabled(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        _row(tmp_path, "accepted-min-lot", "EURUSD", [1, 0.5, 1.5], score=70),
+    ]
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=1,
+        min_fx_share=0,
+        account={
+            "account_size_usd": 100.0,
+            "risk_per_trade_pct": 1.0,
+            "min_lot": 0.01,
+            "lot_step": 0.01,
+            "notional_usd_per_lot": 100000.0,
+            "risk_variance_filter_enabled": False,
+            "risk_variance_tolerance_pct": 5.0,
+        },
+    )
+
+    candidates, rejections = build_optimizer_candidates(rows, spec)
+
+    assert [candidate.attempt_id for candidate in candidates] == ["accepted-min-lot"]
+    assert "account_risk_variance_too_high" not in rejections
+
+
 def test_optimizer_account_current_basis_compounds_from_balance(tmp_path: Path) -> None:
     rows = [
         _row(tmp_path, "compound", "EURUSD", [1, 2], score=70),

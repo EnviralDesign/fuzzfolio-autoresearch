@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "suites": {
+    "coinexx-micro-strict": {
+      "description": "Strict Coinexx small-account FX-only feasibility suite for about $150 at 1.0% target risk with 5% upside risk-variance tolerance. Current corpus may not produce enough candidates for a 20/30-strategy portfolio under this preset; treat that as a useful infeasibility signal.",
+      "account_preset": "coinexx-micro",
+      "sizes": [
+        20,
+        30
+      ],
+      "common_optimize_args": {
+        "candidate_scope": "promoted",
+        "candidate_limit": 180,
+        "swap_candidate_limit": 120,
+        "min_score": 45.0,
+        "allowed_asset_class": [
+          "fx"
+        ],
+        "max_avg_hold_hours": 48.0,
+        "max_p90_hold_hours": 144.0,
+        "max_single_hold_hours": 336.0,
+        "objective": [
+          "balanced",
+          "stability",
+          "deployable"
+        ],
+        "random_starts": 16,
+        "max_swaps": 16,
+        "max_per_family": 1,
+        "max_instrument_share": 4.0,
+        "min_fx_share": 7.0,
+        "max_metal_share": 0.0,
+        "max_index_share": 0.0,
+        "max_avg_open_positions": 6.0,
+        "max_peak_open_positions": 24.0,
+        "target_trades_per_month": 120.0,
+        "max_trades_per_month": 220.0,
+        "correlation_penalty_weight": 10.0,
+        "diversification_mode": "marginal_sharpe",
+        "portfolio_sharpe_weight": 20.0,
+        "optimizer_backend": "auto"
+      },
+      "hard_filter_expectations": {
+        "account_initial_blown": false,
+        "account_current_blown": false,
+        "account_initial_min_lot_forced_trade_pct_max": 25.0,
+        "account_current_min_lot_forced_trade_pct_max": 25.0,
+        "account_initial_max_actual_risk_pct_max": 5.0,
+        "account_current_max_actual_risk_pct_max": 5.0,
+        "note": "The optimizer account preset should reject candidates whose min-lot sizing exceeds the configured risk variance before search. Keep these fields as audit expectations for the final selected portfolio."
+      },
+      "build_portfolio_followup": {
+        "generate_profile_drops": true,
+        "export_bundle": true,
+        "profile_drop_exit_policy_cell": "best"
+      }
+    },
+    "coinexx-micro-200-risk1p5": {
+      "description": "Practical Coinexx FX-only micro-account suite for about $200 at 1.5% target risk with 5% upside risk-variance tolerance. This remains min-lot aware while yielding a usable candidate pool in the current corpus.",
+      "account_preset": "coinexx-micro-200-risk1p5",
+      "sizes": [
+        20,
+        30
+      ],
+      "common_optimize_args": {
+        "candidate_scope": "promoted",
+        "candidate_limit": 180,
+        "swap_candidate_limit": 120,
+        "min_score": 45.0,
+        "allowed_asset_class": [
+          "fx"
+        ],
+        "max_avg_hold_hours": 48.0,
+        "max_p90_hold_hours": 144.0,
+        "max_single_hold_hours": 336.0,
+        "objective": [
+          "balanced",
+          "stability",
+          "deployable"
+        ],
+        "random_starts": 16,
+        "max_swaps": 16,
+        "max_per_family": 1,
+        "max_instrument_share": 4.0,
+        "min_fx_share": 7.0,
+        "max_metal_share": 0.0,
+        "max_index_share": 0.0,
+        "max_avg_open_positions": 6.0,
+        "max_peak_open_positions": 24.0,
+        "target_trades_per_month": 120.0,
+        "max_trades_per_month": 220.0,
+        "correlation_penalty_weight": 10.0,
+        "diversification_mode": "marginal_sharpe",
+        "portfolio_sharpe_weight": 20.0,
+        "optimizer_backend": "auto"
+      },
+      "hard_filter_expectations": {
+        "account_initial_blown": false,
+        "account_current_blown": false,
+        "account_initial_min_lot_forced_trade_pct_max": 0.0,
+        "account_current_min_lot_forced_trade_pct_max": 0.0,
+        "account_initial_max_actual_risk_pct_max": 5.0,
+        "account_current_max_actual_risk_pct_max": 5.0,
+        "note": "The optimizer account preset should reject candidates whose min-lot sizing exceeds the configured risk variance before search. Final selected portfolios should have no min-lot forced trades under this preset."
+      },
+      "build_portfolio_followup": {
+        "generate_profile_drops": true,
+        "export_bundle": true,
+        "profile_drop_exit_policy_cell": "best"
+      }
+    }
+  }
+}

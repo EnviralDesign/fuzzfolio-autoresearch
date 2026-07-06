@@ -35,6 +35,10 @@ FailureStatus = Literal["requeued", "failed", "lease_lost"]
 DEFAULT_MAX_BODY_BYTES = 64 * 1024 * 1024
 DEFAULT_LAB_WS_PING_INTERVAL_SECONDS = 30.0
 DEFAULT_LAB_WS_PING_TIMEOUT_SECONDS = 180.0
+DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS = 90.0
+DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS = 45.0
+DEFAULT_MAX_RESULT_BACKLOG_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_RESULT_BACKPRESSURE_BYTES = 1024 * 1024 * 1024
 logger = logging.getLogger(__name__)
 
 
@@ -78,6 +82,18 @@ def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
     return max(value, minimum)
 
 
+def _parse_positive_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        return None
+    return parsed
+
+
 def _is_expected_websocket_disconnect_exception(exc: Exception) -> bool:
     exc_type = type(exc)
     exc_name = exc_type.__name__
@@ -91,6 +107,33 @@ def _is_expected_websocket_disconnect_exception(exc: Exception) -> bool:
     }:
         return True
     return exc_module.startswith("uvicorn.protocols.") and "Disconnect" in exc_name
+
+
+def _retry_delay_for_failure(
+    *,
+    error: str,
+    retry_after_seconds: float | None,
+    config: "LabGatewayConfig",
+) -> float:
+    explicit = _parse_positive_float(retry_after_seconds)
+    if explicit is not None:
+        return explicit
+
+    normalized = str(error or "").strip().lower()
+    if "remote market data lake is mutating" in normalized:
+        return max(float(config.lake_mutation_retry_after_seconds), 0.0)
+    if "read timed out" in normalized and ("192.168.1.2" in normalized or "market data lake" in normalized):
+        return max(float(config.lake_timeout_retry_after_seconds), 0.0)
+    return 0.0
+
+
+def _failure_preserves_attempt_budget(error: str) -> bool:
+    normalized = str(error or "").strip().lower()
+    return (
+        "remote market data lake is mutating" in normalized
+        or "retry after the mutation completes" in normalized
+        or ("read timed out" in normalized and ("192.168.1.2" in normalized or "market data lake" in normalized))
+    )
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -126,9 +169,11 @@ class LabTask:
     deadline_seconds: float = 300.0
     max_attempts: int = 4
     created_at: float = field(default_factory=_now)
+    available_at: float = field(default_factory=_now)
     attempt_number: int = 0
     status: TaskStatus = "queued"
     last_error: str | None = None
+    last_retry_after_seconds: float | None = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> "LabTask":
@@ -167,6 +212,7 @@ class LabTask:
             "deadline_seconds": self.deadline_seconds,
             "max_attempts": self.max_attempts,
             "attempt_number": self.attempt_number,
+            "available_in_seconds": max(self.available_at - _now(), 0.0),
         }
 
 
@@ -287,14 +333,39 @@ class LabResult:
         }
 
 
+def _json_payload_size_bytes(payload: Any) -> int:
+    try:
+        raw = json.dumps(payload, separators=(",", ":"), sort_keys=False).encode("utf-8")
+    except Exception:
+        raw = repr(payload).encode("utf-8", errors="replace")
+    return len(raw)
+
+
+def _completion_receipt(result: LabResult) -> dict[str, Any]:
+    return {
+        "task_id": result.task_id,
+        "lease_id": result.lease_id,
+        "worker_id": result.worker_id,
+        "lane_id": result.lane_id,
+        "attempt_id": result.attempt_id,
+        "status": result.status,
+        "accepted_at": result.accepted_at,
+    }
+
+
 @dataclass(slots=True)
 class LabGatewayConfig:
     lease_ttl_seconds: float = 600.0
     max_recent_completions: int = 20_000
     max_result_backlog: int = 100_000
+    max_result_backlog_bytes: int = DEFAULT_MAX_RESULT_BACKLOG_BYTES
+    result_backpressure_bytes: int = DEFAULT_RESULT_BACKPRESSURE_BYTES
+    max_recent_terminal_task_ids: int = 100_000
     no_work_retry_after_seconds: float = 1.0
     worker_stale_after_seconds: float = 600.0
     worker_prune_after_seconds: float = 1800.0
+    lake_mutation_retry_after_seconds: float = DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS
+    lake_timeout_retry_after_seconds: float = DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS
 
 
 @dataclass(slots=True)
@@ -351,11 +422,15 @@ class PlayHandLabGateway:
         self._leases: dict[str, LabLease] = {}
         self._workers: dict[str, LabWorker] = {}
         self._results: deque[LabResult] = deque()
-        self._completed_by_lease: dict[str, LabResult] = {}
+        self._result_sizes: deque[int] = deque()
+        self._result_backlog_bytes = 0
+        self._completed_by_lease: dict[str, dict[str, Any]] = {}
         self._recent_completed_order: deque[str] = deque()
-        self._failed_tasks: set[str] = set()
+        self._recent_terminal_task_ids: set[str] = set()
+        self._recent_terminal_task_order: deque[str] = deque()
         self._metrics: dict[str, int] = {
             "tasks_enqueued": 0,
+            "duplicate_task_enqueues": 0,
             "claims": 0,
             "no_work_claims": 0,
             "completions_accepted": 0,
@@ -365,6 +440,8 @@ class PlayHandLabGateway:
             "failures_final": 0,
             "failed_completions": 0,
             "expired_leases_requeued": 0,
+            "retry_delayed_requeues": 0,
+            "retry_preserved_attempt_requeues": 0,
             "slot_limited_claims": 0,
             "incompatible_claims": 0,
             "results_acked": 0,
@@ -373,20 +450,26 @@ class PlayHandLabGateway:
             "stale_worker_leases_final": 0,
             "workers_pruned": 0,
             "workers_unregistered": 0,
+            "terminal_tasks_pruned": 0,
         }
 
-    def enqueue(self, task: LabTask) -> None:
+    def enqueue(self, task: LabTask) -> bool:
         with self._lock:
-            if task.task_id in self._tasks:
-                raise ValueError(f"Duplicate lab task id: {task.task_id}")
+            if task.task_id in self._tasks or task.task_id in self._recent_terminal_task_ids:
+                self._metrics["duplicate_task_enqueues"] += 1
+                return False
             task.status = "queued"
             self._tasks[task.task_id] = task
             self._pending.append(task.task_id)
             self._metrics["tasks_enqueued"] += 1
+            return True
 
-    def enqueue_many(self, tasks: list[LabTask]) -> None:
+    def enqueue_many(self, tasks: list[LabTask]) -> int:
+        enqueued = 0
         for task in tasks:
-            self.enqueue(task)
+            if self.enqueue(task):
+                enqueued += 1
+        return enqueued
 
     def register_worker(
         self,
@@ -464,20 +547,45 @@ class PlayHandLabGateway:
                     "retry_after_seconds": self.config.no_work_retry_after_seconds,
                     "reason": "worker_slots_full",
                 }
+            if self._result_backpressure_active_locked():
+                worker.status_detail = "result_backpressure"
+                self._metrics["no_work_claims"] += 1
+                return {
+                    "status": "no_work",
+                    "retry_after_seconds": self.config.no_work_retry_after_seconds,
+                    "reason": "result_backlog_pressure",
+                    "result_backlog": len(self._results),
+                    "result_backlog_bytes": self._result_backlog_bytes,
+                }
+            now = _now()
             task_id: str | None = None
+            delayed_retry_after: float | None = None
+            saw_incompatible = False
             initial_pending = len(self._pending)
             for _ in range(initial_pending):
                 candidate = self._pending.popleft()
                 task = self._tasks.get(candidate)
                 if task is None or task.status != "queued":
                     continue
+                if task.available_at > now:
+                    delay = max(task.available_at - now, 0.0)
+                    delayed_retry_after = delay if delayed_retry_after is None else min(delayed_retry_after, delay)
+                    self._pending.append(candidate)
+                    continue
                 if not self._worker_matches_task(worker, task):
+                    saw_incompatible = True
                     self._pending.append(candidate)
                     continue
                 task_id = candidate
                 break
             if task_id is None:
                 self._metrics["no_work_claims"] += 1
+                if delayed_retry_after is not None and not saw_incompatible:
+                    return {
+                        "status": "no_work",
+                        "retry_after_seconds": max(delayed_retry_after, self.config.no_work_retry_after_seconds),
+                        "reason": "retry_delay",
+                    }
                 if self._pending:
                     self._metrics["incompatible_claims"] += 1
                     return {
@@ -572,7 +680,7 @@ class PlayHandLabGateway:
                 self._metrics["duplicate_completions"] += 1
                 return {
                     "status": "duplicate",
-                    "completion": self._completed_by_lease[lease_id].to_payload(),
+                    "completion": dict(self._completed_by_lease[lease_id]),
                 }
 
             lease = self._leases.get(lease_id)
@@ -591,7 +699,6 @@ class PlayHandLabGateway:
             completion_status = "failed" if failed_completion else "success"
             task.status = "failed" if failed_completion else "completed"
             if failed_completion:
-                self._failed_tasks.add(task.task_id)
                 self._metrics["failed_completions"] += 1
             completion = LabResult(
                 task_id=task.task_id,
@@ -604,12 +711,13 @@ class PlayHandLabGateway:
                 result=result_payload,
             )
             self._remove_lease_locked(lease)
-            self._completed_by_lease[lease_id] = completion
+            self._completed_by_lease[lease_id] = _completion_receipt(completion)
             self._recent_completed_order.append(lease_id)
             self._append_result_locked(completion)
             self._metrics["completions_accepted"] += 1
+            self._prune_terminal_task_locked(task)
             self._trim_completion_history_locked()
-            return {"status": "accepted", "completion": completion.to_payload()}
+            return {"status": "accepted", "completion": _completion_receipt(completion)}
 
     def fail(
         self,
@@ -618,6 +726,7 @@ class PlayHandLabGateway:
         *,
         error: str,
         retryable: bool = True,
+        retry_after_seconds: float | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             now = _now()
@@ -631,13 +740,31 @@ class PlayHandLabGateway:
             task = self._tasks[lease.task_id]
             task.last_error = error
             self._remove_lease_locked(lease)
-            if retryable and task.attempt_number < task.max_attempts:
+            retry_delay = _retry_delay_for_failure(
+                error=error,
+                retry_after_seconds=retry_after_seconds,
+                config=self.config,
+            )
+            preserve_attempt_budget = bool(retryable and retry_delay > 0 and _failure_preserves_attempt_budget(error))
+            if retryable and (task.attempt_number < task.max_attempts or preserve_attempt_budget):
+                if preserve_attempt_budget and task.attempt_number > 0:
+                    task.attempt_number -= 1
                 task.status = "queued"
+                task.last_retry_after_seconds = retry_delay or None
+                task.available_at = now + retry_delay if retry_delay > 0 else now
                 self._pending.append(task.task_id)
                 self._metrics["failures_requeued"] += 1
-                return {"status": "requeued", "task_id": task.task_id}
+                if retry_delay > 0:
+                    self._metrics["retry_delayed_requeues"] += 1
+                if preserve_attempt_budget:
+                    self._metrics["retry_preserved_attempt_requeues"] += 1
+                return {
+                    "status": "requeued",
+                    "task_id": task.task_id,
+                    "retry_after_seconds": retry_delay,
+                    "attempt_budget_preserved": preserve_attempt_budget,
+                }
             task.status = "failed"
-            self._failed_tasks.add(task.task_id)
             failure = LabResult(
                 task_id=task.task_id,
                 lease_id=lease_id,
@@ -651,10 +778,12 @@ class PlayHandLabGateway:
                     "error": str(error),
                     "retryable": bool(retryable),
                     "attempt_number": task.attempt_number,
+                    "retry_after_seconds": _parse_positive_float(retry_after_seconds),
                 },
             )
             self._append_result_locked(failure)
             self._metrics["failures_final"] += 1
+            self._prune_terminal_task_locked(task)
             return {"status": "failed", "task_id": task.task_id, "failure": failure.to_payload()}
 
     def reap_expired_leases(self) -> int:
@@ -708,14 +837,21 @@ class PlayHandLabGateway:
             return 0
         with self._lock:
             kept: deque[LabResult] = deque()
+            kept_sizes: deque[int] = deque()
             acked = 0
+            new_backlog_bytes = 0
             while self._results:
                 result = self._results.popleft()
+                size = self._result_sizes.popleft() if self._result_sizes else 0
                 if result.lease_id in requested:
                     acked += 1
                     continue
                 kept.append(result)
+                kept_sizes.append(size)
+                new_backlog_bytes += size
             self._results = kept
+            self._result_sizes = kept_sizes
+            self._result_backlog_bytes = new_backlog_bytes
             self._metrics["results_acked"] += acked
             return acked
 
@@ -746,10 +882,13 @@ class PlayHandLabGateway:
                     continue
                 phase = _worker_progress_phase(worker)
                 busy_slots_by_phase[phase] = busy_slots_by_phase.get(phase, 0) + active_slot_count
-            completed_count = sum(1 for task in self._tasks.values() if task.status == "completed")
-            failed_count = sum(1 for task in self._tasks.values() if task.status == "failed")
             queued_count = sum(1 for task in self._tasks.values() if task.status == "queued")
             leased_count = len(self._leases)
+            completed_count = max(
+                int(self._metrics["completions_accepted"]) - int(self._metrics["failed_completions"]),
+                0,
+            )
+            failed_count = int(self._metrics["failed_completions"]) + int(self._metrics["failures_final"])
             payload: dict[str, Any] = {
                 "ok": True,
                 "gateway_id": self.gateway_id,
@@ -771,6 +910,11 @@ class PlayHandLabGateway:
                 "failed_tasks": failed_count,
                 "live_tasks": queued_count + leased_count,
                 "result_backlog": len(self._results),
+                "result_backlog_bytes": self._result_backlog_bytes,
+                "retained_task_count": len(self._tasks),
+                "recent_completion_receipts": len(self._completed_by_lease),
+                "recent_terminal_task_ids": len(self._recent_terminal_task_ids),
+                "result_backpressure_active": self._result_backpressure_active_locked(),
                 "metrics": dict(self._metrics),
             }
             if include_workers:
@@ -820,7 +964,6 @@ class PlayHandLabGateway:
             return
         task.status = "failed"
         task.last_error = final_reason
-        self._failed_tasks.add(task.task_id)
         self._append_result_locked(
             LabResult(
                 task_id=task.task_id,
@@ -841,6 +984,7 @@ class PlayHandLabGateway:
         self._metrics[final_metric] += 1
         if final_metric != "failures_final":
             self._metrics["failures_final"] += 1
+        self._prune_terminal_task_locked(task)
 
     def _worker_stale_after_seconds(self) -> float:
         return max(float(self.config.worker_stale_after_seconds), 1.0)
@@ -893,14 +1037,51 @@ class PlayHandLabGateway:
             self._completed_by_lease.pop(old_lease_id, None)
 
     def _append_result_locked(self, result: LabResult) -> None:
+        size = _json_payload_size_bytes(result.to_payload())
         self._results.append(result)
+        self._result_sizes.append(size)
+        self._result_backlog_bytes += size
         self._trim_result_backlog_locked()
 
     def _trim_result_backlog_locked(self) -> None:
         max_backlog = max(int(self.config.max_result_backlog), 0)
-        while len(self._results) > max_backlog:
+        max_bytes = max(int(self.config.max_result_backlog_bytes), 0)
+        while self._results and len(self._results) > max_backlog:
             self._results.popleft()
+            size = self._result_sizes.popleft() if self._result_sizes else 0
+            self._result_backlog_bytes = max(self._result_backlog_bytes - size, 0)
             self._metrics["results_dropped"] += 1
+        while (
+            max_bytes > 0
+            and len(self._results) > 1
+            and self._result_backlog_bytes > max_bytes
+        ):
+            self._results.popleft()
+            size = self._result_sizes.popleft() if self._result_sizes else 0
+            self._result_backlog_bytes = max(self._result_backlog_bytes - size, 0)
+            self._metrics["results_dropped"] += 1
+
+    def _result_backpressure_active_locked(self) -> bool:
+        threshold = max(int(self.config.result_backpressure_bytes), 0)
+        return threshold > 0 and self._result_backlog_bytes >= threshold
+
+    def _record_terminal_task_id_locked(self, task_id: str) -> None:
+        if not task_id or task_id in self._recent_terminal_task_ids:
+            return
+        self._recent_terminal_task_ids.add(task_id)
+        self._recent_terminal_task_order.append(task_id)
+        max_recent = max(int(self.config.max_recent_terminal_task_ids), 0)
+        while len(self._recent_terminal_task_order) > max_recent:
+            old_task_id = self._recent_terminal_task_order.popleft()
+            self._recent_terminal_task_ids.discard(old_task_id)
+
+    def _prune_terminal_task_locked(self, task: LabTask) -> None:
+        if task.status not in {"completed", "failed"}:
+            return
+        if task.task_id in self._tasks:
+            self._tasks.pop(task.task_id, None)
+            self._record_terminal_task_id_locked(task.task_id)
+            self._metrics["terminal_tasks_pruned"] += 1
 
 
 class LabGatewayHttpServer(ThreadingHTTPServer):
@@ -1006,8 +1187,16 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
                 tasks = [LabTask.from_payload(item) for item in raw_tasks if isinstance(item, dict)]
             else:
                 tasks = [LabTask.from_payload(payload)]
-            self.server.gateway.enqueue_many(tasks)
-            self._write_json({"status": "accepted", "enqueued": len(tasks)})
+            accepted = self.server.gateway.enqueue_many(tasks)
+            self._write_json(
+                {
+                    "status": "accepted",
+                    "submitted": len(tasks),
+                    "accepted": accepted,
+                    "enqueued": accepted,
+                    "rejected": len(tasks) - accepted,
+                }
+            )
             return
         if path == "/results/ack":
             raw_lease_ids = payload.get("lease_ids")
@@ -1052,6 +1241,7 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
                     lease_id,
                     error=str(payload.get("error") or "worker_failed"),
                     retryable=_parse_bool(payload.get("retryable"), default=True),
+                    retry_after_seconds=_parse_positive_float(payload.get("retry_after_seconds")),
                 )
                 status = HTTPStatus.NOT_FOUND if result.get("status") == "lease_lost" else HTTPStatus.OK
                 self._write_json(result, status=status)
@@ -1159,8 +1349,17 @@ class LabGatewayAsgiApp:
                     tasks = [LabTask.from_payload(item) for item in raw_tasks if isinstance(item, dict)]
                 else:
                     tasks = [LabTask.from_payload(payload)]
-                self.gateway.enqueue_many(tasks)
-                await self._send_json(send, {"status": "accepted", "enqueued": len(tasks)})
+                accepted = self.gateway.enqueue_many(tasks)
+                await self._send_json(
+                    send,
+                    {
+                        "status": "accepted",
+                        "submitted": len(tasks),
+                        "accepted": accepted,
+                        "enqueued": accepted,
+                        "rejected": len(tasks) - accepted,
+                    },
+                )
                 return
             if method == "POST" and path == "/results/ack":
                 raw_lease_ids = payload.get("lease_ids")
@@ -1241,6 +1440,7 @@ class LabGatewayAsgiApp:
                         lease_id,
                         error=str(payload.get("error") or "worker_failed"),
                         retryable=_parse_bool(payload.get("retryable"), default=True),
+                        retry_after_seconds=_parse_positive_float(payload.get("retry_after_seconds")),
                     )
                     status = 404 if result.get("status") == "lease_lost" else 200
                     await self._send_json(send, result, status=status)
@@ -1404,6 +1604,7 @@ class LabGatewayAsgiApp:
                 lease_id,
                 error=str(payload.get("error") or "worker_failed"),
                 retryable=_parse_bool(payload.get("retryable"), default=True),
+                retry_after_seconds=_parse_positive_float(payload.get("retry_after_seconds")),
             )
             result["type"] = "fail"
             return result
@@ -1528,8 +1729,15 @@ def serve_lab_gateway(
     token: str | None = None,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     lease_ttl_seconds: float = 600.0,
+    max_recent_completions: int = 20_000,
+    max_result_backlog: int = 100_000,
+    max_result_backlog_bytes: int = DEFAULT_MAX_RESULT_BACKLOG_BYTES,
+    result_backpressure_bytes: int = DEFAULT_RESULT_BACKPRESSURE_BYTES,
+    max_recent_terminal_task_ids: int = 100_000,
     worker_stale_after_seconds: float = 600.0,
     worker_prune_after_seconds: float = 1800.0,
+    lake_mutation_retry_after_seconds: float = DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS,
+    lake_timeout_retry_after_seconds: float = DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS,
     ws_ping_interval_seconds: float | None = None,
     ws_ping_timeout_seconds: float | None = None,
 ) -> None:
@@ -1539,8 +1747,15 @@ def serve_lab_gateway(
     gateway = PlayHandLabGateway(
         LabGatewayConfig(
             lease_ttl_seconds=max(float(lease_ttl_seconds), 1.0),
+            max_recent_completions=max(int(max_recent_completions), 0),
+            max_result_backlog=max(int(max_result_backlog), 0),
+            max_result_backlog_bytes=max(int(max_result_backlog_bytes), 0),
+            result_backpressure_bytes=max(int(result_backpressure_bytes), 0),
+            max_recent_terminal_task_ids=max(int(max_recent_terminal_task_ids), 0),
             worker_stale_after_seconds=stale_after,
             worker_prune_after_seconds=max(float(worker_prune_after_seconds), stale_after),
+            lake_mutation_retry_after_seconds=max(float(lake_mutation_retry_after_seconds), 0.0),
+            lake_timeout_retry_after_seconds=max(float(lake_timeout_retry_after_seconds), 0.0),
         )
     )
     app = create_lab_gateway_app(gateway, token=token, max_body_bytes=max_body_bytes)
@@ -1581,8 +1796,15 @@ def cmd_play_hand_lab_gateway(
     token: str | None = None,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     lease_ttl_seconds: float = 600.0,
+    max_recent_completions: int = 20_000,
+    max_result_backlog: int = 100_000,
+    max_result_backlog_bytes: int = DEFAULT_MAX_RESULT_BACKLOG_BYTES,
+    result_backpressure_bytes: int = DEFAULT_RESULT_BACKPRESSURE_BYTES,
+    max_recent_terminal_task_ids: int = 100_000,
     worker_stale_after_seconds: float = 600.0,
     worker_prune_after_seconds: float = 1800.0,
+    lake_mutation_retry_after_seconds: float = DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS,
+    lake_timeout_retry_after_seconds: float = DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS,
     ws_ping_interval_seconds: float | None = None,
     ws_ping_timeout_seconds: float | None = None,
 ) -> int:
@@ -1598,8 +1820,15 @@ def cmd_play_hand_lab_gateway(
         token=token,
         max_body_bytes=max_body_bytes,
         lease_ttl_seconds=lease_ttl_seconds,
+        max_recent_completions=max_recent_completions,
+        max_result_backlog=max_result_backlog,
+        max_result_backlog_bytes=max_result_backlog_bytes,
+        result_backpressure_bytes=result_backpressure_bytes,
+        max_recent_terminal_task_ids=max_recent_terminal_task_ids,
         worker_stale_after_seconds=worker_stale_after_seconds,
         worker_prune_after_seconds=worker_prune_after_seconds,
+        lake_mutation_retry_after_seconds=lake_mutation_retry_after_seconds,
+        lake_timeout_retry_after_seconds=lake_timeout_retry_after_seconds,
         ws_ping_interval_seconds=ws_ping_interval_seconds,
         ws_ping_timeout_seconds=ws_ping_timeout_seconds,
     )

@@ -382,6 +382,115 @@ def _account_value(account: dict[str, Any], *keys: str, default: float | None = 
     return default
 
 
+def _account_bool(account: dict[str, Any], key: str, *, default: bool = False) -> bool:
+    value = account.get(key)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    token = str(value).strip().lower()
+    if token in {"1", "true", "yes", "y", "on"}:
+        return True
+    if token in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _candidate_account_risk_rejection(
+    row: dict[str, Any],
+    account: dict[str, Any],
+) -> str | None:
+    if not isinstance(account, dict) or not account:
+        return None
+    variance_tolerance = _account_value(
+        account,
+        "risk_variance_tolerance_pct",
+        "max_risk_variance_pct",
+        "riskVarianceTolerancePct",
+    )
+    max_actual_risk_pct = _account_value(
+        account,
+        "max_actual_risk_pct",
+        "maxActualRiskPct",
+    )
+    filter_enabled = _account_bool(
+        account,
+        "risk_variance_filter_enabled",
+        default=variance_tolerance is not None or max_actual_risk_pct is not None,
+    )
+    if not filter_enabled:
+        return None
+    starting_balance = _account_value(
+        account,
+        "balance_usd",
+        "account_size_usd",
+        "balance",
+        "account_balance",
+    )
+    configured_risk_pct = _account_value(
+        account,
+        "risk_per_trade_pct",
+        "risk_per_trade_percent",
+        "risk_pct",
+    )
+    min_lot = _account_value(account, "min_lot", "minLot", default=0.0) or 0.0
+    lot_step = _account_value(account, "lot_step", "lotStep", default=0.0001) or 0.0001
+    notional_per_lot = (
+        _account_value(
+            account,
+            "notional_usd_per_lot",
+            "notionalUsdPerLot",
+            default=100000.0,
+        )
+        or 100000.0
+    )
+    stop_loss_percent = _candidate_stop_loss_percent(row)
+    if stop_loss_percent is None:
+        stop_loss_percent = _hold_metrics(row).get("stop_loss")
+    if (
+        starting_balance is None
+        or starting_balance <= 0
+        or configured_risk_pct is None
+        or configured_risk_pct <= 0
+        or stop_loss_percent is None
+        or stop_loss_percent <= 0
+        or notional_per_lot <= 0
+    ):
+        return None
+
+    target_risk = float(starting_balance) * (float(configured_risk_pct) / 100.0)
+    risk_per_lot = float(notional_per_lot) * (float(stop_loss_percent) / 100.0)
+    if target_risk <= 0 or risk_per_lot <= 0:
+        return None
+    raw_lots = target_risk / risk_per_lot
+    rounded_lots = (
+        math.floor((raw_lots / lot_step) + 1e-9) * lot_step
+        if lot_step > 0
+        else raw_lots
+    )
+    lots = min_lot if min_lot > 0 and rounded_lots < min_lot else max(0.0, rounded_lots)
+    if lots <= 0:
+        return None
+    actual_risk = lots * risk_per_lot
+    actual_risk_pct = (actual_risk / float(starting_balance)) * 100.0
+    actual_multiple = actual_risk / target_risk
+    upward_variance_pct = max(0.0, (actual_multiple - 1.0) * 100.0)
+    absolute_variance_pct = abs(actual_multiple - 1.0) * 100.0
+    direction = str(account.get("risk_variance_direction") or "upside").strip().lower()
+    measured_variance = (
+        absolute_variance_pct
+        if direction in {"absolute", "both", "abs"}
+        else upward_variance_pct
+    )
+    if variance_tolerance is not None and measured_variance > float(variance_tolerance):
+        return "account_risk_variance_too_high"
+    if max_actual_risk_pct is not None and actual_risk_pct > float(max_actual_risk_pct):
+        return "account_actual_risk_too_high"
+    return None
+
+
 def _candidate_stop_loss_percent(row: dict[str, Any]) -> float | None:
     for key in (
         "selected_stop_loss_percent_36m",
@@ -464,6 +573,9 @@ def candidate_rejection_reason(
     }
     if allowed_instruments and not normalized_instruments <= allowed_instruments:
         return "unsupported_instrument"
+    account_rejection = _candidate_account_risk_rejection(row, spec.account)
+    if account_rejection:
+        return account_rejection
     score_values = [
         safe_float(row.get("score_36m")),
         safe_float(row.get("score_lab_score_36m")),

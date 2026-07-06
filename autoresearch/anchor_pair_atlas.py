@@ -5,7 +5,7 @@ import csv
 import json
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +50,23 @@ DENSITY_BUCKET_SCORES: dict[str, float] = {
     "flat": 0.0,
     "no_data": 0.0,
 }
+
+
+def default_probe_as_of_date(now: datetime | None = None) -> str:
+    """Return a lake-safe default as-of date at the end of the previous UTC month."""
+    value = now or datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    first_of_month = value.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    previous_month_end = first_of_month - timedelta(seconds=1)
+    return previous_month_end.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def resolve_probe_as_of_date(as_of_date: str | None = None) -> str:
+    value = str(as_of_date or "").strip()
+    return value or default_probe_as_of_date()
 
 
 @dataclass(frozen=True)
@@ -523,6 +540,18 @@ def _profile_config(
     return config
 
 
+def _profile_meta(
+    catalog_item: dict[str, Any],
+    *,
+    indicator_id: str,
+    instance_id: str,
+) -> dict[str, Any]:
+    meta = copy.deepcopy(_as_dict(catalog_item.get("meta")))
+    meta["id"] = indicator_id
+    meta["instanceId"] = instance_id
+    return meta
+
+
 def build_pair_profile_document(
     *,
     catalog_by_id: dict[str, dict[str, Any]],
@@ -550,10 +579,11 @@ def build_pair_profile_document(
             "directionMode": "both",
             "indicators": [
                 {
-                    "meta": {
-                        "id": anchor_id,
-                        "instanceId": f"{probe_id}-anchor",
-                    },
+                    "meta": _profile_meta(
+                        anchor_item,
+                        indicator_id=anchor_id,
+                        instance_id=f"{probe_id}-anchor",
+                    ),
                     "config": _profile_config(
                         anchor_item,
                         indicator_id=anchor_id,
@@ -563,10 +593,11 @@ def build_pair_profile_document(
                     ),
                 },
                 {
-                    "meta": {
-                        "id": trigger_id,
-                        "instanceId": f"{probe_id}-trigger",
-                    },
+                    "meta": _profile_meta(
+                        trigger_item,
+                        indicator_id=trigger_id,
+                        instance_id=f"{probe_id}-trigger",
+                    ),
                     "config": _profile_config(
                         trigger_item,
                         indicator_id=trigger_id,
@@ -794,6 +825,7 @@ def _sensitivity_args_for_row(
     row: dict[str, Any],
     *,
     lookback_months: int,
+    as_of_date: str | None,
     quality_score_preset: str,
     execution_cost_mode: str,
     result_dir: Path,
@@ -806,6 +838,8 @@ def _sensitivity_args_for_row(
         _clean_upper(row.get("probe_timeframe")),
         "--lookback-months",
         str(int(lookback_months)),
+        "--as-of-date",
+        resolve_probe_as_of_date(as_of_date),
     ]
     for instrument in [
         token for token in _clean_token(row.get("instruments")).split(",") if token
@@ -948,6 +982,7 @@ def build_anchor_pair_atlas(
     max_triggers: int | None = None,
     max_pairs: int = DEFAULT_MAX_QUEUE_PAIRS,
     lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
+    as_of_date: str | None = None,
     emit_profile_docs: bool = True,
     quality_score_preset: str = DEFAULT_QUALITY_SCORE_PRESET,
     execution_cost_mode: str = DEFAULT_EXECUTION_COST_MODE,
@@ -1012,6 +1047,7 @@ def build_anchor_pair_atlas(
     instrument_panel = _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS)
     timeframe_panel = _normalize_tokens(timeframes) or list(DEFAULT_TIMEFRAMES)
     lookback_months = max(1, int(lookback_months or DEFAULT_LOOKBACK_MONTHS))
+    resolved_as_of_date = resolve_probe_as_of_date(as_of_date)
     rows = build_anchor_pair_rows(
         rows_by_id=indicator_rows_by_id,
         static_pairs=static_pairs,
@@ -1057,6 +1093,7 @@ def build_anchor_pair_atlas(
         sensitivity_args = _sensitivity_args_for_row(
             row,
             lookback_months=lookback_months,
+            as_of_date=resolved_as_of_date,
             quality_score_preset=quality_score_preset,
             execution_cost_mode=execution_cost_mode,
             result_dir=result_dir,
@@ -1119,6 +1156,7 @@ def build_anchor_pair_atlas(
             "timeframes": timeframe_panel,
             "max_pairs": max_pairs,
             "lookback_months": lookback_months,
+            "as_of_date": resolved_as_of_date,
             "quality_score_preset": quality_score_preset,
             "execution_cost_mode": execution_cost_mode,
         },
@@ -1215,8 +1253,28 @@ def _timing_lookback_values(values: list[int] | tuple[int, ...] | None) -> list[
     return sorted(cleaned)
 
 
-def _timing_probe_id(*, rank: int, base_probe_id: str, lookback_bars: int) -> str:
-    return f"l3b-{rank:03d}-{base_probe_id}-tr-lb{lookback_bars}"
+def _timing_probe_id(
+    *,
+    rank: int,
+    base_probe_id: str,
+    variant_side: str,
+    lookback_bars: int,
+) -> str:
+    side_token = _clean_token(variant_side)
+    side = "an" if side_token == "anchor" else "bt" if side_token == "both" else "tr"
+    return f"l3b-{rank:03d}-{base_probe_id}-{side}-lb{lookback_bars}"
+
+
+def _timing_variant_sides(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for value in values or ("trigger", "anchor"):
+        side = _clean_token(value).lower()
+        if side not in {"trigger", "anchor", "both"} or side in seen:
+            continue
+        cleaned.append(side)
+        seen.add(side)
+    return cleaned or ["trigger"]
 
 
 def _timing_queue_fieldnames() -> list[str]:
@@ -1231,6 +1289,10 @@ def _timing_queue_fieldnames() -> list[str]:
         "variant_indicator_id",
         "variant_lookback_bars",
         "baseline_lookback_bars",
+        "anchor_baseline_lookback_bars",
+        "trigger_baseline_lookback_bars",
+        "anchor_variant_lookback_bars",
+        "trigger_variant_lookback_bars",
         "anchor_type",
         "recipe",
         "anchor_id",
@@ -1265,9 +1327,11 @@ def build_anchor_pair_timing_atlas(
     base_probe_ids: list[str] | None = None,
     limit_base_pairs: int | None = None,
     lookback_bars: list[int] | tuple[int, ...] | None = None,
+    variant_sides: list[str] | tuple[str, ...] | None = None,
     include_baseline_variants: bool = False,
     emit_profile_docs: bool = True,
     lookback_months: int = DEFAULT_LOOKBACK_MONTHS,
+    as_of_date: str | None = None,
     quality_score_preset: str = DEFAULT_QUALITY_SCORE_PRESET,
     execution_cost_mode: str = DEFAULT_EXECUTION_COST_MODE,
 ) -> AnchorPairTimingAtlasBuildResult:
@@ -1320,7 +1384,9 @@ def build_anchor_pair_timing_atlas(
     )
     catalog_by_id = _catalog_by_id(catalog_payload)
     timing_lookbacks = _timing_lookback_values(lookback_bars)
+    timing_variant_sides = _timing_variant_sides(variant_sides)
     lookback_months = max(1, int(lookback_months or DEFAULT_LOOKBACK_MONTHS))
+    resolved_as_of_date = resolve_probe_as_of_date(as_of_date)
 
     exe, base_args = _fuzzfolio_base_args(config)
     timing_rows: list[dict[str, Any]] = []
@@ -1339,108 +1405,159 @@ def build_anchor_pair_timing_atlas(
         if anchor_id not in catalog_by_id or trigger_id not in catalog_by_id:
             skipped_missing_catalog.append(base_probe_id)
             continue
-        baseline_lookback = _catalog_lookback_bars(catalog_by_id, trigger_id)
         anchor_timeframe = _clean_upper(base_row.get("anchor_timeframe")) or _anchor_timeframe(
             catalog_by_id[anchor_id],
             probe_timeframe=_clean_upper(base_row.get("probe_timeframe")),
         )
-        for variant_lookback in timing_lookbacks:
-            if (
-                not include_baseline_variants
-                and variant_lookback == baseline_lookback
-            ):
-                continue
-            rank += 1
-            timing_probe_id = _timing_probe_id(
-                rank=rank,
-                base_probe_id=base_probe_id,
-                lookback_bars=variant_lookback,
+        for variant_side in timing_variant_sides:
+            if variant_side == "anchor":
+                variant_indicator_id = anchor_id
+            elif variant_side == "both":
+                variant_indicator_id = f"{anchor_id}+{trigger_id}"
+            else:
+                variant_indicator_id = trigger_id
+            anchor_baseline_lookback = _catalog_lookback_bars(catalog_by_id, anchor_id)
+            trigger_baseline_lookback = _catalog_lookback_bars(catalog_by_id, trigger_id)
+            baseline_lookback = (
+                anchor_baseline_lookback
+                if variant_side == "anchor"
+                else f"{anchor_baseline_lookback}+{trigger_baseline_lookback}"
+                if variant_side == "both"
+                else trigger_baseline_lookback
             )
-            profile_path = profile_dir / f"{timing_probe_id}.json"
-            result_dir = result_root / timing_probe_id
-            if emit_profile_docs:
-                profile_doc = build_pair_profile_document(
-                    catalog_by_id=catalog_by_id,
-                    anchor_id=anchor_id,
-                    trigger_id=trigger_id,
-                    anchor_type=_clean_token(base_row.get("anchor_type")),
-                    probe_timeframe=_clean_upper(base_row.get("probe_timeframe")),
-                    anchor_timeframe=anchor_timeframe,
-                    instruments=_row_instruments(base_row),
-                    probe_id=timing_probe_id,
-                    trigger_lookback_bars=variant_lookback,
+            for variant_lookback in timing_lookbacks:
+                is_baseline_variant = (
+                    variant_lookback == anchor_baseline_lookback
+                    if variant_side == "anchor"
+                    else (
+                        variant_lookback == anchor_baseline_lookback
+                        and variant_lookback == trigger_baseline_lookback
+                    )
+                    if variant_side == "both"
+                    else variant_lookback == trigger_baseline_lookback
                 )
-                profile_doc["profile"]["name"] = (
-                    f"Atlas L3b timing {base_row.get('anchor_type')} "
-                    f"{anchor_id}+{trigger_id} {_clean_upper(base_row.get('probe_timeframe'))} "
-                    f"trigger lb{variant_lookback}"
+                if (
+                    not include_baseline_variants
+                    and is_baseline_variant
+                ):
+                    continue
+                rank += 1
+                timing_probe_id = _timing_probe_id(
+                    rank=rank,
+                    base_probe_id=base_probe_id,
+                    variant_side=variant_side,
+                    lookback_bars=variant_lookback,
                 )
-                profile_doc["profile"]["description"] = (
-                    "Temporary AutoResearch Layer 3b timing-tolerance probe profile. "
-                    "Tests whether trigger score persistence improves confluence with a fixed anchor."
-                )
-                _write_json(profile_path, profile_doc)
+                profile_path = profile_dir / f"{timing_probe_id}.json"
+                result_dir = result_root / timing_probe_id
+                if emit_profile_docs:
+                    profile_doc = build_pair_profile_document(
+                        catalog_by_id=catalog_by_id,
+                        anchor_id=anchor_id,
+                        trigger_id=trigger_id,
+                        anchor_type=_clean_token(base_row.get("anchor_type")),
+                        probe_timeframe=_clean_upper(base_row.get("probe_timeframe")),
+                        anchor_timeframe=anchor_timeframe,
+                        instruments=_row_instruments(base_row),
+                        probe_id=timing_probe_id,
+                        anchor_lookback_bars=variant_lookback
+                        if variant_side in {"anchor", "both"}
+                        else None,
+                        trigger_lookback_bars=variant_lookback
+                        if variant_side in {"trigger", "both"}
+                        else None,
+                    )
+                    profile_doc["profile"]["name"] = (
+                        f"Atlas L3b timing {base_row.get('anchor_type')} "
+                        f"{anchor_id}+{trigger_id} {_clean_upper(base_row.get('probe_timeframe'))} "
+                        f"{variant_side} lb{variant_lookback}"
+                    )
+                    profile_doc["profile"]["description"] = (
+                        "Temporary AutoResearch Layer 3b timing-tolerance probe profile. "
+                        f"Tests whether {variant_side} score persistence improves pair confluence."
+                    )
+                    _write_json(profile_path, profile_doc)
 
-            timing_row = dict(base_row)
-            timing_row.update(
-                {
-                    "queue_rank": rank,
-                    "probe_id": timing_probe_id,
-                    "timing_rank": rank,
-                    "timing_probe_id": timing_probe_id,
-                    "base_queue_rank": base_row.get("queue_rank"),
-                    "base_probe_id": base_probe_id,
-                    "variant_side": "trigger",
-                    "variant_indicator_id": trigger_id,
-                    "variant_lookback_bars": variant_lookback,
-                    "baseline_lookback_bars": baseline_lookback,
-                    "anchor_timeframe": anchor_timeframe,
-                    "baseline_status": baseline_row.get("status"),
-                    "baseline_composite_score": baseline_row.get("composite_score"),
-                    "baseline_signal_count": baseline_row.get("signal_count"),
-                    "baseline_best_expectancy_r": baseline_row.get("best_expectancy_r"),
-                    "baseline_best_trades": baseline_row.get("best_trades"),
-                    "baseline_best_profit_factor": baseline_row.get("best_profit_factor"),
-                    "profile_path": str(profile_path),
-                    "result_dir": str(result_dir),
-                }
-            )
-            sensitivity_args = _sensitivity_args_for_row(
-                timing_row,
-                lookback_months=lookback_months,
-                quality_score_preset=quality_score_preset,
-                execution_cost_mode=execution_cost_mode,
-                result_dir=result_dir,
-            )
-            timing_rows.append(timing_row)
-            probes.append(
-                {
-                    "probe_id": timing_probe_id,
-                    "timing_probe_id": timing_probe_id,
-                    "timing_rank": rank,
-                    "base_probe_id": base_probe_id,
-                    "variant_side": "trigger",
-                    "variant_indicator_id": trigger_id,
-                    "variant_lookback_bars": variant_lookback,
-                    "baseline_lookback_bars": baseline_lookback,
-                    "anchor_type": base_row.get("anchor_type"),
-                    "anchor_id": anchor_id,
-                    "trigger_id": trigger_id,
-                    "probe_timeframe": base_row.get("probe_timeframe"),
-                    "anchor_timeframe": anchor_timeframe,
-                    "profile_path": str(profile_path),
-                    "output_dir": str(result_dir),
-                    "create_profile_args": ["profiles", "create", "--file", str(profile_path), "--pretty"],
-                    "sensitivity_basket_args": sensitivity_args,
-                    "pair_prior_score": base_row.get("pair_prior_score"),
-                    "pair_prior_bucket": base_row.get("pair_prior_bucket"),
-                }
-            )
+                timing_row = dict(base_row)
+                timing_row.update(
+                    {
+                        "queue_rank": rank,
+                        "probe_id": timing_probe_id,
+                        "timing_rank": rank,
+                        "timing_probe_id": timing_probe_id,
+                        "base_queue_rank": base_row.get("queue_rank"),
+                        "base_probe_id": base_probe_id,
+                        "variant_side": variant_side,
+                        "variant_indicator_id": variant_indicator_id,
+                        "variant_lookback_bars": variant_lookback,
+                        "baseline_lookback_bars": baseline_lookback,
+                        "anchor_baseline_lookback_bars": anchor_baseline_lookback,
+                        "trigger_baseline_lookback_bars": trigger_baseline_lookback,
+                        "anchor_variant_lookback_bars": variant_lookback
+                        if variant_side in {"anchor", "both"}
+                        else "",
+                        "trigger_variant_lookback_bars": variant_lookback
+                        if variant_side in {"trigger", "both"}
+                        else "",
+                        "anchor_timeframe": anchor_timeframe,
+                        "baseline_status": baseline_row.get("status"),
+                        "baseline_composite_score": baseline_row.get("composite_score"),
+                        "baseline_signal_count": baseline_row.get("signal_count"),
+                        "baseline_best_expectancy_r": baseline_row.get("best_expectancy_r"),
+                        "baseline_best_trades": baseline_row.get("best_trades"),
+                        "baseline_best_profit_factor": baseline_row.get("best_profit_factor"),
+                        "profile_path": str(profile_path),
+                        "result_dir": str(result_dir),
+                    }
+                )
+                sensitivity_args = _sensitivity_args_for_row(
+                    timing_row,
+                    lookback_months=lookback_months,
+                    as_of_date=resolved_as_of_date,
+                    quality_score_preset=quality_score_preset,
+                    execution_cost_mode=execution_cost_mode,
+                    result_dir=result_dir,
+                )
+                timing_rows.append(timing_row)
+                probes.append(
+                    {
+                        "probe_id": timing_probe_id,
+                        "timing_probe_id": timing_probe_id,
+                        "timing_rank": rank,
+                        "base_probe_id": base_probe_id,
+                        "variant_side": variant_side,
+                        "variant_indicator_id": variant_indicator_id,
+                        "variant_lookback_bars": variant_lookback,
+                        "baseline_lookback_bars": baseline_lookback,
+                        "anchor_baseline_lookback_bars": anchor_baseline_lookback,
+                        "trigger_baseline_lookback_bars": trigger_baseline_lookback,
+                        "anchor_variant_lookback_bars": variant_lookback
+                        if variant_side in {"anchor", "both"}
+                        else "",
+                        "trigger_variant_lookback_bars": variant_lookback
+                        if variant_side in {"trigger", "both"}
+                        else "",
+                        "anchor_type": base_row.get("anchor_type"),
+                        "anchor_id": anchor_id,
+                        "trigger_id": trigger_id,
+                        "probe_timeframe": base_row.get("probe_timeframe"),
+                        "anchor_timeframe": anchor_timeframe,
+                        "profile_path": str(profile_path),
+                        "output_dir": str(result_dir),
+                        "create_profile_args": ["profiles", "create", "--file", str(profile_path), "--pretty"],
+                        "sensitivity_basket_args": sensitivity_args,
+                        "pair_prior_score": base_row.get("pair_prior_score"),
+                        "pair_prior_bucket": base_row.get("pair_prior_bucket"),
+                    }
+                )
 
     lookback_variant_counts: dict[str, int] = {}
+    variant_side_counts: dict[str, int] = {}
     for row in timing_rows:
         lookback = _clean_token(row.get("variant_lookback_bars"))
         lookback_variant_counts[lookback] = lookback_variant_counts.get(lookback, 0) + 1
+        side = _clean_token(row.get("variant_side")) or "unknown"
+        variant_side_counts[side] = variant_side_counts.get(side, 0) + 1
 
     summary = {
         "schema_version": TIMING_SCHEMA_VERSION,
@@ -1455,9 +1572,10 @@ def build_anchor_pair_timing_atlas(
             "requested_base_probe_ids": base_probe_ids or [],
             "limit_base_pairs": limit_base_pairs,
             "lookback_bars": timing_lookbacks,
+            "variant_sides": timing_variant_sides,
             "include_baseline_variants": include_baseline_variants,
-            "variant_side": "trigger",
             "lookback_months": lookback_months,
+            "as_of_date": resolved_as_of_date,
             "quality_score_preset": quality_score_preset,
             "execution_cost_mode": execution_cost_mode,
         },
@@ -1466,6 +1584,7 @@ def build_anchor_pair_timing_atlas(
             "timing_variants": len(timing_rows),
             "profile_docs": len(probes) if emit_profile_docs else 0,
             "lookback_variant_counts": dict(sorted(lookback_variant_counts.items())),
+            "variant_side_counts": dict(sorted(variant_side_counts.items())),
             "skipped_missing_baseline": len(skipped_missing_baseline),
             "skipped_missing_catalog": len(skipped_missing_catalog),
         },
@@ -1734,6 +1853,10 @@ def _timing_result_row_from_score(
         "variant_indicator_id": row.get("variant_indicator_id"),
         "variant_lookback_bars": row.get("variant_lookback_bars"),
         "baseline_lookback_bars": row.get("baseline_lookback_bars"),
+        "anchor_baseline_lookback_bars": row.get("anchor_baseline_lookback_bars"),
+        "trigger_baseline_lookback_bars": row.get("trigger_baseline_lookback_bars"),
+        "anchor_variant_lookback_bars": row.get("anchor_variant_lookback_bars"),
+        "trigger_variant_lookback_bars": row.get("trigger_variant_lookback_bars"),
         "anchor_type": row.get("anchor_type"),
         "anchor_id": row.get("anchor_id"),
         "trigger_id": row.get("trigger_id"),
@@ -1792,6 +1915,10 @@ def _timing_results_fieldnames() -> list[str]:
         "variant_indicator_id",
         "variant_lookback_bars",
         "baseline_lookback_bars",
+        "anchor_baseline_lookback_bars",
+        "trigger_baseline_lookback_bars",
+        "anchor_variant_lookback_bars",
+        "trigger_variant_lookback_bars",
         "anchor_type",
         "anchor_id",
         "trigger_id",
@@ -1913,6 +2040,7 @@ def run_anchor_pair_probes(
                 sensitivity_args = _sensitivity_args_for_row(
                     row,
                     lookback_months=DEFAULT_LOOKBACK_MONTHS,
+                    as_of_date=None,
                     quality_score_preset=DEFAULT_QUALITY_SCORE_PRESET,
                     execution_cost_mode=DEFAULT_EXECUTION_COST_MODE,
                     result_dir=output_dir,
@@ -2108,6 +2236,7 @@ def run_anchor_pair_timing_probes(
                 sensitivity_args = _sensitivity_args_for_row(
                     row,
                     lookback_months=DEFAULT_LOOKBACK_MONTHS,
+                    as_of_date=None,
                     quality_score_preset=DEFAULT_QUALITY_SCORE_PRESET,
                     execution_cost_mode=DEFAULT_EXECUTION_COST_MODE,
                     result_dir=output_dir,

@@ -24,6 +24,8 @@ DEFAULT_RECIPE_PRIORS_DIRNAME = "recipe-priors"
 DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME = "discovery-recipe-validation-atlas"
 DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME = "discovery-recipe-scrutiny-atlas"
 DEFAULT_PLAYHAND_OUTCOME_PRIORS_FILENAME = "playhand-outcome-priors.json"
+DEFAULT_MAX_SLOT_CANDIDATES = 40
+DEFAULT_MAX_PAIR_CANDIDATES = 256
 
 RECIPE_BY_ANCHOR_TYPE: dict[str, str] = {
     "trend": "trend_pullback_continuation",
@@ -350,6 +352,16 @@ def build_pair_evidence(
                 "anchor_type": anchor_type,
                 "anchor_id": anchor_id,
                 "trigger_id": trigger_id,
+                "ordered_pair_id": f"{anchor_id}->{trigger_id}",
+                "unordered_pair_id": _unordered_pair_id(anchor_id, trigger_id),
+                "canonical_pair_family_id": _canonical_pair_family_id(
+                    {
+                        "recipe": recipe_name,
+                        "probe_timeframe": timeframe,
+                        "anchor_id": anchor_id,
+                        "trigger_id": trigger_id,
+                    }
+                ),
                 "probe_timeframe": timeframe,
                 "probe_id": probe_id,
                 "pair_prior_score": row.get("pair_prior_score"),
@@ -371,38 +383,58 @@ def build_timing_evidence(
     evidence: dict[tuple[str, str], dict[str, Any]] = {}
     for row in timing_rows:
         recipe_name = RECIPE_BY_ANCHOR_TYPE.get(_clean_token(row.get("anchor_type")))
-        trigger_id = _clean_upper(row.get("trigger_id"))
-        if not recipe_name or not trigger_id:
+        variant_side = _clean_token(row.get("variant_side")) or "trigger"
+        if variant_side == "both":
+            variant_indicator_ids = [
+                _clean_upper(row.get("anchor_id")),
+                _clean_upper(row.get("trigger_id")),
+            ]
+        else:
+            variant_indicator_ids = [
+                _clean_upper(row.get("variant_indicator_id"))
+                or _clean_upper(row.get("trigger_id"))
+            ]
+        variant_indicator_ids = [value for value in variant_indicator_ids if value]
+        if not recipe_name or not variant_indicator_ids:
             continue
-        item = evidence.setdefault(
-            (recipe_name, trigger_id),
-            {
-                "count": 0,
-                "positive_delta_count": 0,
-                "material_improved_count": 0,
-                "degraded_count": 0,
-                "lost_positive_count": 0,
-                "best_delta": None,
-                "best_variant_lookback_bars": None,
-                "best_timing_probe_id": None,
-            },
-        )
         delta = _float_value(row.get("score_delta"))
-        item["count"] = int(item.get("count") or 0) + 1
-        if delta > 0:
-            item["positive_delta_count"] = int(item.get("positive_delta_count") or 0) + 1
-        if delta >= 5.0:
-            item["material_improved_count"] = int(item.get("material_improved_count") or 0) + 1
         bucket = _clean_token(row.get("timing_bucket"))
-        if bucket == "degraded":
-            item["degraded_count"] = int(item.get("degraded_count") or 0) + 1
-        if bucket == "lost_positive":
-            item["lost_positive_count"] = int(item.get("lost_positive_count") or 0) + 1
-        best_delta = item.get("best_delta")
-        if best_delta is None or delta > _float_value(best_delta):
-            item["best_delta"] = round(delta, 4)
-            item["best_variant_lookback_bars"] = row.get("variant_lookback_bars")
-            item["best_timing_probe_id"] = row.get("timing_probe_id")
+        for variant_indicator_id in variant_indicator_ids:
+            item = evidence.setdefault(
+                (recipe_name, variant_indicator_id),
+                {
+                    "count": 0,
+                    "positive_delta_count": 0,
+                    "material_improved_count": 0,
+                    "degraded_count": 0,
+                    "lost_positive_count": 0,
+                    "best_delta": None,
+                    "best_variant_lookback_bars": None,
+                    "best_variant_side": None,
+                    "best_variant_indicator_id": variant_indicator_id,
+                    "best_timing_probe_id": None,
+                    "variant_side_counts": {},
+                },
+            )
+            side_counts = item.setdefault("variant_side_counts", {})
+            if isinstance(side_counts, dict):
+                side_counts[variant_side] = int(side_counts.get(variant_side) or 0) + 1
+            item["count"] = int(item.get("count") or 0) + 1
+            if delta > 0:
+                item["positive_delta_count"] = int(item.get("positive_delta_count") or 0) + 1
+            if delta >= 5.0:
+                item["material_improved_count"] = int(item.get("material_improved_count") or 0) + 1
+            if bucket == "degraded":
+                item["degraded_count"] = int(item.get("degraded_count") or 0) + 1
+            if bucket == "lost_positive":
+                item["lost_positive_count"] = int(item.get("lost_positive_count") or 0) + 1
+            best_delta = item.get("best_delta")
+            if best_delta is None or delta > _float_value(best_delta):
+                item["best_delta"] = round(delta, 4)
+                item["best_variant_lookback_bars"] = row.get("variant_lookback_bars")
+                item["best_variant_side"] = variant_side
+                item["best_variant_indicator_id"] = variant_indicator_id
+                item["best_timing_probe_id"] = row.get("timing_probe_id")
     return evidence
 
 
@@ -424,6 +456,23 @@ def timing_policy_for(evidence: dict[str, Any] | None) -> tuple[str, float, str 
             evidence.get("best_variant_lookback_bars")
         )
     return "catalog_default", 0.0, None
+
+
+def _best_pair_timing(
+    *,
+    recipe_name: str,
+    anchor_id: str,
+    trigger_id: str,
+    timing_evidence: dict[tuple[str, str], dict[str, Any]],
+) -> tuple[str, float, str | None, str | None]:
+    candidates: list[tuple[str, float, str | None, str | None]] = []
+    for indicator_id, expected_side in ((trigger_id, "trigger"), (anchor_id, "anchor")):
+        evidence = timing_evidence.get((recipe_name, indicator_id))
+        policy, adjustment, recommended_lookback = timing_policy_for(evidence)
+        variant_side = _clean_token(_as_dict(evidence).get("best_variant_side")) or expected_side
+        candidates.append((policy, adjustment, recommended_lookback, variant_side))
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return candidates[0] if candidates else ("catalog_default", 0.0, None, None)
 
 
 def sampling_lane(
@@ -481,15 +530,117 @@ def _retention_bucket_counts(rows: list[dict[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def _count_by_key(rows: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        token = _clean_token(row.get(key)) or "unknown"
+        counts[token] = counts.get(token, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _sample_trade_count(row: dict[str, Any]) -> int:
+    for key in ("best_trades", "trade_count", "signal_count"):
+        value = _int_value(row.get(key))
+        if value > 0:
+            return value
+    return 0
+
+
+def _sample_confidence_score(trade_count: int) -> float:
+    if trade_count >= 120:
+        return 1.0
+    if trade_count >= 50:
+        return 0.70
+    if trade_count >= 20:
+        return 0.35
+    if trade_count > 0:
+        return 0.15
+    return 0.0
+
+
+def _sample_confidence_bucket(trade_count: int) -> str:
+    score = _sample_confidence_score(trade_count)
+    if score >= 1.0:
+        return "high"
+    if score >= 0.70:
+        return "medium"
+    if score >= 0.35:
+        return "low"
+    if score > 0.0:
+        return "sparse"
+    return "unknown"
+
+
+def _sample_adjusted_validation_score(row: dict[str, Any], validation_score: float) -> float:
+    explicit = _float_value(row.get("sample_adjusted_validation_score"))
+    if explicit > 0.0:
+        return explicit
+    sample_confidence = _float_value(row.get("sample_confidence_score"))
+    if sample_confidence <= 0.0:
+        sample_confidence = _sample_confidence_score(_sample_trade_count(row))
+    if validation_score <= 0.0:
+        return 0.0
+    adjusted = (validation_score * sample_confidence) + (45.0 * (1.0 - sample_confidence))
+    return round(adjusted, 4)
+
+
+def _negative_source_stage(row: dict[str, Any]) -> str:
+    lookback = _int_value(row.get("lookback_months"))
+    if lookback >= 36:
+        return "scrutiny_36m"
+    if lookback >= 12:
+        return "validation_12m"
+    if lookback > 0:
+        return f"validation_{lookback}m"
+    return "validation_unknown"
+
+
+def _negative_reason_category(row: dict[str, Any], *, reason: str, validation_score: float) -> str:
+    bucket = _clean_token(row.get("retention_bucket"))
+    lookback = _int_value(row.get("lookback_months"))
+    trade_count = _sample_trade_count(row)
+    if trade_count > 0 and trade_count < 20:
+        return "low_sample_uncertain"
+    if lookback >= 36 and bucket in DISCOVERY_RECIPE_NEGATIVE_BUCKETS:
+        return "validation_decay_36m"
+    if reason == "positive_discovery_collapsed":
+        return "positive_discovery_collapsed"
+    if bucket.startswith("new_"):
+        return "cluster_expansion_failed"
+    if validation_score <= 0.0:
+        return "no_positive_validation"
+    return "retention_failed"
+
+
+def _negative_scope_type(row: dict[str, Any], *, reason_category: str) -> str:
+    if reason_category == "low_sample_uncertain":
+        return "uncertain_pair_cell"
+    if reason_category == "validation_decay_36m":
+        return "recipe_family_timeframe"
+    if reason_category == "positive_discovery_collapsed":
+        return "unordered_pair_timeframe"
+    if reason_category == "cluster_expansion_failed":
+        return "cluster_timeframe"
+    return "ordered_pair_timeframe"
+
+
+def _negative_evidence_strength(row: dict[str, Any], *, base_weight: float) -> float:
+    confidence = _float_value(row.get("sample_confidence_score"))
+    if confidence <= 0.0:
+        confidence = _sample_confidence_score(_sample_trade_count(row))
+    return round(max(0.10, float(base_weight) * max(0.25, confidence)), 4)
+
+
 def _discovery_recipe_score(row: dict[str, Any]) -> float:
     validation_score = _float_value(
         row.get("primary_score"),
         _float_value(row.get("composite_score")),
     )
+    adjusted_validation_score = _sample_adjusted_validation_score(row, validation_score)
     discovery_score = _float_value(row.get("discovery_evidence_score"))
     priority_score = _float_value(row.get("validation_priority_score"))
     bucket = _clean_token(row.get("retention_bucket"))
-    score = (validation_score * 0.78) + (discovery_score * 0.12) + (priority_score * 0.05)
+    score = (adjusted_validation_score * 0.78) + (discovery_score * 0.12) + (priority_score * 0.05)
     score += DISCOVERY_RECIPE_BUCKET_ADJUSTMENT.get(bucket, 0.0)
     return round(_clamp(score), 4)
 
@@ -512,6 +663,8 @@ def _discovery_slot_row(
         result_row.get("primary_score"),
         _float_value(result_row.get("composite_score")),
     )
+    adjusted_validation_score = _sample_adjusted_validation_score(result_row, validation_score)
+    sample_shrinkage_penalty = round(validation_score - adjusted_validation_score, 4)
     return {
         "source": "discovery_recipe_validation",
         "recipe": recipe_id,
@@ -541,7 +694,19 @@ def _discovery_slot_row(
         "retention_bucket": bucket,
         "validation_probe_id": result_row.get("probe_id"),
         "validation_score": round(validation_score, 4),
+        "sample_adjusted_validation_score": adjusted_validation_score,
+        "sample_shrinkage_penalty": sample_shrinkage_penalty,
         "retention_ratio": result_row.get("retention_ratio"),
+        "features": {
+            "source": "discovery_recipe_validation",
+            "validation_score": round(validation_score, 4),
+            "sample_adjusted_validation_score": adjusted_validation_score,
+            "sample_shrinkage_penalty": sample_shrinkage_penalty,
+            "retention_bucket": bucket,
+            "retention_ratio": result_row.get("retention_ratio"),
+            "sample_trade_count": _sample_trade_count(result_row),
+            "sample_confidence": _sample_confidence_bucket(_sample_trade_count(result_row)),
+        },
     }
 
 
@@ -808,6 +973,7 @@ def build_discovered_recipe_prior_evidence(
     profile_dir: Path | list[Path] | tuple[Path, ...] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     latest_rows = _latest_validation_rows_by_pair(validation_rows)
+    rows_by_family = _validation_rows_by_family(validation_rows)
     retained_rows = [
         row
         for row in latest_rows
@@ -847,6 +1013,24 @@ def build_discovered_recipe_prior_evidence(
         lane = DISCOVERY_RECIPE_INCLUDED_BUCKETS.get(bucket, pair_sampling_lane(recipe_score))
         pair_weight = sampling_weight(recipe_score, lane)
         recommended_template = _load_recommended_profile_template(profile_dir, row)
+        family_key = _validation_family_key(row)
+        horizon_evidence = _horizon_evidence_for_rows(rows_by_family.get(family_key, [row]))
+        horizon_stability = _horizon_stability_bucket(horizon_evidence)
+        sample_trade_count = _sample_trade_count(row)
+        sample_confidence_score = _sample_confidence_score(sample_trade_count)
+        sample_confidence = _sample_confidence_bucket(sample_trade_count)
+        adjusted_validation_score = _sample_adjusted_validation_score(row, validation_score)
+        sample_shrinkage_penalty = round(validation_score - adjusted_validation_score, 4)
+        ordered_pair_id = f"{first_id}->{second_id}"
+        unordered_pair_id = _unordered_pair_id(first_id, second_id)
+        canonical_pair_family_id = _canonical_pair_family_id(
+            {
+                "recipe": recipe_id,
+                "probe_timeframe": row.get("probe_timeframe"),
+                "first_indicator_id": first_id,
+                "second_indicator_id": second_id,
+            }
+        )
         recipe_meta.setdefault(
             recipe_id,
             {
@@ -863,14 +1047,23 @@ def build_discovered_recipe_prior_evidence(
                 "anchor_type": "discovered_recipe_validation",
                 "anchor_id": first_id,
                 "trigger_id": second_id,
+                "ordered_pair_id": ordered_pair_id,
+                "unordered_pair_id": unordered_pair_id,
+                "canonical_pair_family_id": canonical_pair_family_id,
                 "probe_timeframe": _clean_upper(row.get("probe_timeframe")),
                 "probe_id": row.get("probe_id"),
+                "lookback_months": row.get("lookback_months"),
                 "pair_prior_score": round(_float_value(row.get("validation_priority_score")), 4),
                 "composite_score": round(validation_score, 4),
+                "sample_adjusted_validation_score": adjusted_validation_score,
+                "sample_shrinkage_penalty": sample_shrinkage_penalty,
                 "signal_count": row.get("signal_count"),
                 "best_expectancy_r": row.get("best_expectancy_r"),
                 "best_trades": row.get("best_trades"),
                 "best_profit_factor": row.get("best_profit_factor"),
+                "sample_trade_count": sample_trade_count,
+                "sample_confidence": sample_confidence,
+                "sample_confidence_score": sample_confidence_score,
                 "timing_policy": "catalog_default",
                 "timing_adjustment": 0.0,
                 "recommended_trigger_lookback_bars": None,
@@ -885,6 +1078,20 @@ def build_discovered_recipe_prior_evidence(
                 "retention_bucket": bucket,
                 "validation_score": round(validation_score, 4),
                 "retention_ratio": row.get("retention_ratio"),
+                "horizon_stability_bucket": horizon_stability,
+                "horizon_evidence": horizon_evidence,
+                "features": {
+                    "source": "discovery_recipe_validation",
+                    "raw_validation_score": round(validation_score, 4),
+                    "sample_adjusted_validation_score": adjusted_validation_score,
+                    "sample_shrinkage_penalty": sample_shrinkage_penalty,
+                    "sample_trade_count": sample_trade_count,
+                    "sample_confidence": sample_confidence,
+                    "sample_confidence_score": sample_confidence_score,
+                    "horizon_stability_bucket": horizon_stability,
+                    "horizon_evidence_count": len(horizon_evidence),
+                    "canonical_pair_family_id": canonical_pair_family_id,
+                },
                 "discovery_evidence_score": row.get("discovery_evidence_score"),
                 "recommended_profile_template": recommended_template,
                 **_profile_template_csv_bits(recommended_template),
@@ -946,9 +1153,11 @@ def build_discovered_recipe_prior_evidence(
     summary = {
         "source_rows": len(validation_rows),
         "latest_pair_rows": len(latest_rows),
+        "canonical_family_rows": len(rows_by_family),
         "retained_rows": len(retained_rows),
         "retention_bucket_counts": _retention_bucket_counts(validation_rows),
         "included_retention_buckets": sorted(DISCOVERY_RECIPE_INCLUDED_BUCKETS),
+        "multi_horizon_family_rows": sum(1 for rows in rows_by_family.values() if len(rows) > 1),
         "recommended_template_rows": sum(
             1 for row in pair_priors if isinstance(row.get("recommended_profile_template"), dict)
         ),
@@ -964,6 +1173,15 @@ def _unordered_pair_id(first_id: Any, second_id: Any) -> str:
     return "+".join(values)
 
 
+def _canonical_pair_family_id(row: dict[str, Any]) -> str:
+    recipe = _clean_token(row.get("recipe") or row.get("recipe_id")) or "unknown_recipe"
+    timeframe = _clean_upper(row.get("probe_timeframe")) or "UNKNOWN_TF"
+    first_id = row.get("first_indicator_id") or row.get("anchor_id")
+    second_id = row.get("second_indicator_id") or row.get("trigger_id")
+    unordered = _unordered_pair_id(first_id, second_id) or "UNKNOWN_PAIR"
+    return f"{recipe}|{timeframe}|{unordered}"
+
+
 def _validation_pair_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
     return (
         _clean_token(row.get("recipe_id")),
@@ -971,6 +1189,87 @@ def _validation_pair_key(row: dict[str, Any]) -> tuple[str, str, str, str]:
         _clean_upper(row.get("second_indicator_id")),
         _clean_upper(row.get("probe_timeframe")),
     )
+
+
+def _validation_family_key(row: dict[str, Any]) -> tuple[str, str, str]:
+    return (
+        _clean_token(row.get("recipe_id")),
+        _unordered_pair_id(row.get("first_indicator_id"), row.get("second_indicator_id")),
+        _clean_upper(row.get("probe_timeframe")),
+    )
+
+
+def _validation_rows_by_family(
+    validation_rows: list[dict[str, Any]],
+) -> dict[tuple[str, str, str], list[dict[str, Any]]]:
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in validation_rows:
+        status = _clean_token(row.get("status"))
+        if status not in {"", "ok", "skipped_existing"}:
+            continue
+        key = _validation_family_key(row)
+        if not all(key):
+            continue
+        grouped.setdefault(key, []).append(row)
+    for rows in grouped.values():
+        rows.sort(
+            key=lambda row: (
+                _int_value(row.get("lookback_months")),
+                _clean_token(row.get("probe_id")),
+            )
+        )
+    return grouped
+
+
+def _horizon_evidence_for_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for row in rows:
+        validation_score = _float_value(
+            row.get("primary_score"),
+            _float_value(row.get("composite_score")),
+        )
+        evidence.append(
+            {
+                "lookback_months": _int_value(row.get("lookback_months")),
+                "probe_id": row.get("probe_id"),
+                "retention_bucket": row.get("retention_bucket"),
+                "validation_score": round(validation_score, 4),
+                "retention_ratio": row.get("retention_ratio"),
+                "trade_count": row.get("best_trades") or row.get("trade_count"),
+                "signal_count": row.get("signal_count"),
+            }
+        )
+    return evidence
+
+
+def _horizon_stability_bucket(evidence: list[dict[str, Any]]) -> str:
+    if not evidence:
+        return "unknown"
+    has_36m = any(_int_value(row.get("lookback_months")) >= 36 for row in evidence)
+    retained_36m = any(
+        _int_value(row.get("lookback_months")) >= 36
+        and _clean_token(row.get("retention_bucket")) in {"retained", "retained_strong"}
+        for row in evidence
+    )
+    failed_36m = any(
+        _int_value(row.get("lookback_months")) >= 36
+        and _clean_token(row.get("retention_bucket")) in DISCOVERY_RECIPE_NEGATIVE_BUCKETS
+        for row in evidence
+    )
+    retained_12m = any(
+        12 <= _int_value(row.get("lookback_months")) < 36
+        and _clean_token(row.get("retention_bucket")) in DISCOVERY_RECIPE_INCLUDED_BUCKETS
+        for row in evidence
+    )
+    if retained_36m:
+        return "retained_36m"
+    if failed_36m:
+        return "decayed_36m"
+    if has_36m:
+        return "neutral_36m"
+    if retained_12m:
+        return "retained_12m_only"
+    return "pre_scrutiny"
 
 
 def _latest_validation_rows_by_pair(validation_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1098,6 +1397,16 @@ def build_discovery_negative_priors(
             if negative_weight >= 1.5 and reason == "positive_discovery_collapsed"
             else "soft_exact_timeframe"
         )
+        sample_trade_count = _sample_trade_count(row)
+        sample_confidence = _sample_confidence_bucket(sample_trade_count)
+        sample_confidence_score = _sample_confidence_score(sample_trade_count)
+        reason_category = _negative_reason_category(
+            row,
+            reason=reason,
+            validation_score=validation_score,
+        )
+        scope_type = _negative_scope_type(row, reason_category=reason_category)
+        evidence_strength = _negative_evidence_strength(row, base_weight=negative_weight)
         pair_row = {
             "source": "discovery_recipe_validation",
             "recipe": row.get("recipe_id"),
@@ -1120,6 +1429,30 @@ def build_discovery_negative_priors(
             "negative_reason": reason,
             "negative_scope": negative_scope,
             "negative_weight": negative_weight,
+            "negative_scope_type": scope_type,
+            "negative_reason_category": reason_category,
+            "negative_evidence_strength": evidence_strength,
+            "sample_trade_count": sample_trade_count,
+            "sample_confidence": sample_confidence,
+            "sample_confidence_score": sample_confidence_score,
+            "source_stage": _negative_source_stage(row),
+            "decay_policy": "soft_decay_next_atlas_runs",
+            "expires_after_atlas_runs": 3 if reason_category == "low_sample_uncertain" else 6,
+            "is_hard_block": False,
+            "features": {
+                "negative_scope_type": scope_type,
+                "negative_reason_category": reason_category,
+                "negative_evidence_strength": evidence_strength,
+                "sample_trade_count": sample_trade_count,
+                "sample_confidence": sample_confidence,
+                "sample_confidence_score": sample_confidence_score,
+                "source_stage": _negative_source_stage(row),
+                "decay_policy": "soft_decay_next_atlas_runs",
+                "expires_after_atlas_runs": 3
+                if reason_category == "low_sample_uncertain"
+                else 6,
+                "is_hard_block": False,
+            },
         }
         pair_rows.append(pair_row)
         if discovery_score >= 50.0:
@@ -1168,11 +1501,20 @@ def build_discovery_negative_priors(
             str(row.get("ordered_pair_id") or ""),
         )
     )
+    reason_category_counts: dict[str, int] = {}
+    scope_type_counts: dict[str, int] = {}
+    for row in pair_rows:
+        reason_category = _clean_token(row.get("negative_reason_category")) or "unknown"
+        scope_type = _clean_token(row.get("negative_scope_type")) or "unknown"
+        reason_category_counts[reason_category] = reason_category_counts.get(reason_category, 0) + 1
+        scope_type_counts[scope_type] = scope_type_counts.get(scope_type, 0) + 1
     summary = {
         "negative_pair_rows": len(pair_rows),
         "cluster_negative_rows": len(cluster_rows),
         "retention_failure_rows": len(retention_failures),
         "negative_retention_buckets": sorted(DISCOVERY_RECIPE_NEGATIVE_BUCKETS),
+        "negative_reason_category_counts": dict(sorted(reason_category_counts.items())),
+        "negative_scope_type_counts": dict(sorted(scope_type_counts.items())),
     }
     return pair_rows, cluster_rows, retention_failures, summary
 
@@ -1218,7 +1560,7 @@ def score_slot_candidate(
     if slot_role_fit == "mismatch":
         score -= 5.0 if empirical_count else 18.0
 
-    timing = timing_evidence.get((recipe_name, indicator_id)) if slot_name == "trigger" else None
+    timing = timing_evidence.get((recipe_name, indicator_id))
     timing_policy, timing_adjustment, recommended_lookback = timing_policy_for(timing)
     score += timing_adjustment
 
@@ -1255,10 +1597,20 @@ def score_slot_candidate(
         "best_pair_timeframe": empirical.get("best_timeframe"),
         "timing_policy": timing_policy,
         "timing_adjustment": round(timing_adjustment, 4),
+        "timing_variant_side": _as_dict(timing).get("best_variant_side"),
         "recommended_trigger_lookback_bars": recommended_lookback,
         "recipe_slot_score": score,
         "sampling_lane": lane,
         "sampling_weight": sampling_weight(score, lane),
+        "features": {
+            "source": "curated_recipe_prior",
+            "signal_density_bucket": density_bucket,
+            "forward_response_bucket": forward_bucket,
+            "empirical_pair_count": empirical_count,
+            "positive_pair_count": _int_value(empirical.get("positive_count")),
+            "timing_policy": timing_policy,
+            "timing_variant_side": _as_dict(timing).get("best_variant_side"),
+        },
     }
 
 
@@ -1273,8 +1625,8 @@ def build_recipe_prior_artifacts(
     discovery_validation_results: list[dict[str, Any]] | None = None,
     discovery_validation_profile_dir: Path | list[Path] | tuple[Path, ...] | None = None,
     playhand_outcome_priors: dict[str, Any] | None = None,
-    max_slot_candidates: int = 40,
-    max_pair_candidates: int = 80,
+    max_slot_candidates: int = DEFAULT_MAX_SLOT_CANDIDATES,
+    max_pair_candidates: int = DEFAULT_MAX_PAIR_CANDIDATES,
 ) -> tuple[
     dict[str, Any],
     list[dict[str, Any]],
@@ -1355,12 +1707,18 @@ def build_recipe_prior_artifacts(
             continue
         recipe_name = _clean_token(pair.get("recipe"))
         trigger_id = _clean_upper(pair.get("trigger_id"))
-        trigger_timing = timing.get((recipe_name, trigger_id))
-        policy, adjustment, recommended_lookback = timing_policy_for(trigger_timing)
+        anchor_id = _clean_upper(pair.get("anchor_id"))
+        policy, adjustment, recommended_lookback, variant_side = _best_pair_timing(
+            recipe_name=recipe_name,
+            anchor_id=anchor_id,
+            trigger_id=trigger_id,
+            timing_evidence=timing,
+        )
         score = _float_value(pair.get("composite_score"))
         prior = _float_value(pair.get("pair_prior_score"))
         pair["timing_policy"] = policy
         pair["timing_adjustment"] = round(adjustment, 4)
+        pair["timing_variant_side"] = variant_side
         pair["recommended_trigger_lookback_bars"] = recommended_lookback
         pair["pair_sampling_score"] = round(_clamp((score * 0.72) + (prior * 0.18) + adjustment), 4)
         pair["pair_sampling_lane"] = (
@@ -1385,6 +1743,7 @@ def build_recipe_prior_artifacts(
         ),
         reverse=True,
     )
+    pair_priors_before_cap = list(pair_priors)
     pair_priors = pair_priors[:max_pair_candidates]
     retained_36m_families: set[tuple[str, str, tuple[str, str]]] = set()
     for row in discovery_validation_results or []:
@@ -1424,8 +1783,8 @@ def build_recipe_prior_artifacts(
             "uncertain_prior_fraction": 0.20,
             "wild_exploration_fraction": 0.10,
             "guided_recipe_source_mix": {
-                "discovery_recipe_validation": 0.60,
-                "curated_recipe_prior": 0.40,
+                "discovery_recipe_validation": 0.45,
+                "curated_recipe_prior": 0.55,
             },
             "maturity": "limited_36m_retention",
             "retained_36m_family_count": retained_36m_family_count,
@@ -1438,8 +1797,8 @@ def build_recipe_prior_artifacts(
             "uncertain_prior_fraction": 0.25,
             "wild_exploration_fraction": 0.15,
             "guided_recipe_source_mix": {
-                "discovery_recipe_validation": 0.60,
-                "curated_recipe_prior": 0.40,
+                "discovery_recipe_validation": 0.25,
+                "curated_recipe_prior": 0.75,
             },
             "maturity": "pre_36m_retention",
             "retained_36m_family_count": retained_36m_family_count,
@@ -1454,6 +1813,7 @@ def build_recipe_prior_artifacts(
     )
     seed_plan = {
         "schema_version": "play_hand_seed_plan_v1",
+        "feature_schema_version": "atlas_feature_vector_v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "sampling_policy": sampling_policy,
         "playhand_outcome_prior_summary": {
@@ -1477,6 +1837,7 @@ def build_recipe_prior_artifacts(
                             "sampling_lane": row["sampling_lane"],
                             "recipe_slot_score": row["recipe_slot_score"],
                             "timing_policy": row["timing_policy"],
+                            "timing_variant_side": row.get("timing_variant_side"),
                             "recommended_trigger_lookback_bars": row[
                                 "recommended_trigger_lookback_bars"
                             ],
@@ -1484,6 +1845,7 @@ def build_recipe_prior_artifacts(
                             "retention_bucket": row.get("retention_bucket"),
                             "validation_probe_id": row.get("validation_probe_id"),
                             "validation_score": row.get("validation_score"),
+                            "features": row.get("features"),
                         }
                         for row in recipe_payload["slots"][slot_name]
                     ]
@@ -1514,7 +1876,17 @@ def build_recipe_prior_artifacts(
             "indicator_rows": len(indicator_rows),
             "generation_eligible": len(generation_rows),
             "slot_indicator_rows": len(slot_rows),
+            "pair_prior_rows_before_cap": len(pair_priors_before_cap),
             "pair_prior_rows": len(pair_priors),
+            "pair_prior_rows_truncated_by_max": max(
+                0,
+                len(pair_priors_before_cap) - len(pair_priors),
+            ),
+            "pair_prior_source_counts_before_cap": _count_by_key(
+                pair_priors_before_cap,
+                "source",
+            ),
+            "pair_prior_source_counts": _count_by_key(pair_priors, "source"),
             "slot_sampling_lane_counts": dict(sorted(lane_counts.items())),
             "discovered_validation_rows": discovered_summary["source_rows"],
             "discovered_validation_retained_rows": discovered_summary["retained_rows"],
@@ -1544,6 +1916,7 @@ def build_recipe_prior_artifacts(
     }
     payload = {
         "schema_version": SCHEMA_VERSION,
+        "feature_schema_version": "atlas_feature_vector_v1",
         "generated_at": summary["generated_at"],
         "note": (
             "Empirical recipe priors blend static catalog roles, signal density, forward response, "
@@ -1592,6 +1965,7 @@ def _slot_fieldnames() -> list[str]:
         "best_pair_timeframe",
         "timing_policy",
         "timing_adjustment",
+        "timing_variant_side",
         "recommended_trigger_lookback_bars",
         "recipe_slot_score",
         "sampling_lane",
@@ -1599,6 +1973,8 @@ def _slot_fieldnames() -> list[str]:
         "retention_bucket",
         "validation_probe_id",
         "validation_score",
+        "sample_adjusted_validation_score",
+        "sample_shrinkage_penalty",
         "retention_ratio",
     ]
 
@@ -1610,16 +1986,26 @@ def _pair_fieldnames() -> list[str]:
         "anchor_type",
         "anchor_id",
         "trigger_id",
+        "ordered_pair_id",
+        "unordered_pair_id",
+        "canonical_pair_family_id",
         "probe_timeframe",
         "probe_id",
+        "lookback_months",
         "pair_prior_score",
         "composite_score",
+        "sample_adjusted_validation_score",
+        "sample_shrinkage_penalty",
         "signal_count",
         "best_expectancy_r",
         "best_trades",
         "best_profit_factor",
+        "sample_trade_count",
+        "sample_confidence",
+        "sample_confidence_score",
         "timing_policy",
         "timing_adjustment",
+        "timing_variant_side",
         "recommended_trigger_lookback_bars",
         "pair_sampling_score",
         "pair_sampling_lane",
@@ -1628,6 +2014,7 @@ def _pair_fieldnames() -> list[str]:
         "retention_bucket",
         "validation_score",
         "retention_ratio",
+        "horizon_stability_bucket",
         "discovery_evidence_score",
         "recommended_profile_template_path",
         "recommended_template_timeframe",
@@ -1674,6 +2061,16 @@ def _pair_negative_fieldnames() -> list[str]:
         "negative_reason",
         "negative_scope",
         "negative_weight",
+        "negative_scope_type",
+        "negative_reason_category",
+        "negative_evidence_strength",
+        "sample_trade_count",
+        "sample_confidence",
+        "sample_confidence_score",
+        "source_stage",
+        "decay_policy",
+        "expires_after_atlas_runs",
+        "is_hard_block",
     ]
 
 
@@ -1713,10 +2110,12 @@ def build_recipe_priors(
     anchor_pair_dir: Path | None = None,
     anchor_pair_timing_dir: Path | None = None,
     discovery_recipe_validation_dir: Path | None = None,
+    discovery_recipe_scrutiny_dir: Path | None = None,
     playhand_outcome_priors_dir: Path | None = None,
+    include_playhand_outcome_priors: bool = False,
     out_dir: Path | None = None,
-    max_slot_candidates: int = 40,
-    max_pair_candidates: int = 80,
+    max_slot_candidates: int = DEFAULT_MAX_SLOT_CANDIDATES,
+    max_pair_candidates: int = DEFAULT_MAX_PAIR_CANDIDATES,
 ) -> RecipePriorsBuildResult:
     indicator_dir = (
         indicator_atlas_dir.expanduser().resolve()
@@ -1753,7 +2152,11 @@ def build_recipe_priors(
         if playhand_outcome_priors_dir is not None
         else config.derived_root / DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME
     )
-    discovery_scrutiny_dir = config.derived_root / DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME
+    discovery_scrutiny_dir = (
+        discovery_recipe_scrutiny_dir.expanduser().resolve()
+        if discovery_recipe_scrutiny_dir is not None
+        else config.derived_root / DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME
+    )
     target_dir = (
         out_dir.expanduser().resolve()
         if out_dir is not None
@@ -1785,10 +2188,14 @@ def build_recipe_priors(
     )
     if discovery_scrutiny_results_path.exists():
         discovery_validation_results.extend(_read_csv_rows(discovery_scrutiny_results_path))
-    playhand_outcome_priors_path = outcome_priors_dir / DEFAULT_PLAYHAND_OUTCOME_PRIORS_FILENAME
+    playhand_outcome_priors_path = (
+        outcome_priors_dir / DEFAULT_PLAYHAND_OUTCOME_PRIORS_FILENAME
+        if include_playhand_outcome_priors
+        else None
+    )
     playhand_outcome_priors = (
         _load_json(playhand_outcome_priors_path)
-        if playhand_outcome_priors_path.exists()
+        if playhand_outcome_priors_path is not None and playhand_outcome_priors_path.exists()
         else None
     )
 
@@ -1835,9 +2242,10 @@ def build_recipe_priors(
         ),
         "playhand_outcome_priors_path": (
             str(playhand_outcome_priors_path)
-            if playhand_outcome_priors_path.exists()
+            if playhand_outcome_priors_path is not None and playhand_outcome_priors_path.exists()
             else None
         ),
+        "playhand_outcome_priors_enabled": bool(include_playhand_outcome_priors),
     }
     payload["summary"] = summary
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from autoresearch.recipe_priors import (
     build_recipe_prior_artifacts,
+    build_timing_evidence,
     score_slot_candidate,
     timing_policy_for,
 )
@@ -38,6 +39,31 @@ def test_timing_policy_allows_only_material_nonfragile_variants() -> None:
     assert policy == "allow_variant"
     assert adjustment > 0
     assert lookback == "3"
+
+
+def test_build_timing_evidence_maps_both_side_variants_to_anchor_and_trigger() -> None:
+    evidence = build_timing_evidence(
+        [
+            {
+                "anchor_type": "trend",
+                "anchor_id": "ANCHOR_A",
+                "trigger_id": "TRIGGER_X",
+                "variant_side": "both",
+                "variant_indicator_id": "ANCHOR_A+TRIGGER_X",
+                "variant_lookback_bars": "4",
+                "score_delta": "8",
+                "timing_bucket": "improved",
+                "timing_probe_id": "l3b-both",
+            }
+        ]
+    )
+
+    anchor = evidence[("trend_pullback_continuation", "ANCHOR_A")]
+    trigger = evidence[("trend_pullback_continuation", "TRIGGER_X")]
+    assert anchor["best_variant_side"] == "both"
+    assert trigger["best_variant_side"] == "both"
+    assert anchor["variant_side_counts"]["both"] == 1
+    assert trigger["best_variant_lookback_bars"] == "4"
 
     policy, adjustment, lookback = timing_policy_for(
         {
@@ -102,6 +128,41 @@ def test_score_slot_candidate_blends_static_signal_forward_pair_and_timing() -> 
     assert scored["recommended_trigger_lookback_bars"] == "3"
 
 
+def test_score_slot_candidate_applies_anchor_side_timing_to_non_trigger_slot() -> None:
+    row = _indicator("ANCHOR_A", signal_role="setup", strategy_role="mean-reversion")
+
+    scored = score_slot_candidate(
+        row,
+        recipe_name="mean_reversion_reclaim",
+        slot_name="setup",
+        static_slot_scores={("mean_reversion_reclaim", "setup", "ANCHOR_A"): 76},
+        signal_rollups={"ANCHOR_A": {"density_bucket": "usable"}},
+        forward_priors={},
+        trigger_pair_stats={},
+        anchor_pair_stats={
+            ("mean_reversion_reclaim", "ANCHOR_A"): {
+                "count": 2,
+                "positive_count": 1,
+                "best_score": 62,
+            }
+        },
+        timing_evidence={
+            ("mean_reversion_reclaim", "ANCHOR_A"): {
+                "material_improved_count": 1,
+                "lost_positive_count": 0,
+                "degraded_count": 0,
+                "best_delta": 8,
+                "best_variant_side": "anchor",
+                "best_variant_lookback_bars": "12",
+            }
+        },
+    )
+
+    assert scored["timing_policy"] == "allow_variant"
+    assert scored["timing_variant_side"] == "anchor"
+    assert scored["recommended_trigger_lookback_bars"] == "12"
+
+
 def test_build_recipe_prior_artifacts_emits_play_hand_seed_plan() -> None:
     indicators = [
         _indicator("ANCHOR_A", signal_role="setup", strategy_role="mean-reversion"),
@@ -155,6 +216,58 @@ def test_build_recipe_prior_artifacts_emits_play_hand_seed_plan() -> None:
     assert any(row["indicator_id"] == "TRIGGER_A" for row in slot_rows)
     assert trigger_menu[0]["indicator_id"] == "TRIGGER_A"
     assert trigger_menu[0]["timing_policy"] == "allow_variant"
+
+
+def test_build_recipe_prior_artifacts_reports_pair_prior_cap() -> None:
+    indicators = [
+        _indicator("ANCHOR_A", signal_role="setup", strategy_role="mean-reversion"),
+        _indicator("TRIGGER_A", signal_role="trigger", strategy_role="mean-reversion"),
+        _indicator("TRIGGER_B", signal_role="trigger", strategy_role="mean-reversion"),
+        _indicator("TRIGGER_C", signal_role="trigger", strategy_role="mean-reversion"),
+    ]
+
+    (
+        _payload,
+        _slot_rows,
+        pair_rows,
+        _negative_pairs,
+        _negative_clusters,
+        _retention_failures,
+        _seed_plan,
+        summary,
+    ) = build_recipe_prior_artifacts(
+        indicator_rows=indicators,
+        static_slot_scores={},
+        signal_rollups={},
+        forward_priors={},
+        pair_results=[
+            {
+                "anchor_type": "mean_reversion",
+                "anchor_id": "ANCHOR_A",
+                "trigger_id": trigger_id,
+                "probe_timeframe": "M5",
+                "probe_id": f"l3-{trigger_id.lower()}",
+                "pair_prior_score": "80",
+                "composite_score": str(score),
+            }
+            for trigger_id, score in (
+                ("TRIGGER_A", 70),
+                ("TRIGGER_B", 65),
+                ("TRIGGER_C", 60),
+            )
+        ],
+        timing_results=[],
+        max_slot_candidates=5,
+        max_pair_candidates=2,
+    )
+
+    counts = summary["result_counts"]
+    assert len(pair_rows) == 2
+    assert counts["pair_prior_rows_before_cap"] == 3
+    assert counts["pair_prior_rows"] == 2
+    assert counts["pair_prior_rows_truncated_by_max"] == 1
+    assert counts["pair_prior_source_counts_before_cap"] == {"anchor_pair_atlas": 3}
+    assert counts["pair_prior_source_counts"] == {"anchor_pair_atlas": 2}
 
 
 def test_build_recipe_prior_artifacts_adds_validated_discovered_recipes() -> None:
@@ -362,12 +475,22 @@ def test_build_recipe_prior_artifacts_emits_negative_priors_for_retention_failur
     assert negative_pairs[0]["unordered_pair_id"] == "FIRST_A+SECOND_A"
     assert retention_failures[0]["negative_reason"] == "positive_discovery_collapsed"
     assert negative_pairs[0]["negative_scope"] == "hard_unordered"
+    assert negative_pairs[0]["negative_scope_type"] == "unordered_pair_timeframe"
+    assert negative_pairs[0]["negative_reason_category"] == "positive_discovery_collapsed"
+    assert negative_pairs[0]["negative_evidence_strength"] > 0
+    assert negative_pairs[0]["source_stage"] == "validation_unknown"
+    assert negative_pairs[0]["decay_policy"] == "soft_decay_next_atlas_runs"
+    assert negative_pairs[0]["is_hard_block"] is False
     assert negative_clusters[0]["tested_count"] == 2
     assert negative_clusters[0]["retained_count"] == 1
     assert negative_clusters[0]["failure_rate"] == 0.5
     assert negative_clusters[0]["retained_rate"] == 0.5
     assert seed_plan["negative_pairs"][0]["probe_id"] == "drv-failed"
+    assert seed_plan["negative_pairs"][0]["features"]["negative_scope_type"] == "unordered_pair_timeframe"
     assert summary["result_counts"]["negative_pair_rows"] == 1
+    assert summary["negative_priors"]["negative_reason_category_counts"] == {
+        "positive_discovery_collapsed": 1
+    }
 
 
 def test_build_recipe_prior_artifacts_uses_36m_result_over_12m_retention() -> None:
@@ -434,7 +557,87 @@ def test_build_recipe_prior_artifacts_uses_36m_result_over_12m_retention() -> No
     assert all(row.get("probe_id") != "drv-12m" for row in pair_rows)
     assert negative_pairs[0]["probe_id"] == "drs-36m"
     assert summary["discovered_recipe_validation"]["latest_pair_rows"] == 1
+    assert summary["discovered_recipe_validation"]["multi_horizon_family_rows"] == 1
     assert summary["result_counts"]["discovered_recipe_pair_rows"] == 0
+
+
+def test_build_recipe_prior_artifacts_preserves_horizon_evidence_for_retained_pairs() -> None:
+    indicators = [
+        _indicator("FIRST_A", signal_role="setup", strategy_role="trend"),
+        _indicator("SECOND_A", signal_role="trigger", strategy_role="mean-reversion"),
+    ]
+
+    (
+        _payload,
+        _slot_rows,
+        pair_rows,
+        _negative_pairs,
+        _negative_clusters,
+        _retention_failures,
+        seed_plan,
+        summary,
+    ) = build_recipe_prior_artifacts(
+        indicator_rows=indicators,
+        static_slot_scores={},
+        signal_rollups={},
+        forward_priors={},
+        pair_results=[],
+        timing_results=[],
+        discovery_validation_results=[
+            {
+                "status": "ok",
+                "recipe_id": "discovered_recipe_001",
+                "recipe_confidence": "high_candidate",
+                "first_indicator_id": "FIRST_A",
+                "second_indicator_id": "SECOND_A",
+                "probe_timeframe": "M5",
+                "probe_id": "drv-12m",
+                "lookback_months": "12",
+                "primary_score": "60",
+                "composite_score": "60",
+                "validation_priority_score": "70",
+                "discovery_evidence_score": "74",
+                "retention_ratio": "0.82",
+                "retention_bucket": "retained",
+                "best_trades": "80",
+            },
+            {
+                "status": "ok",
+                "recipe_id": "discovered_recipe_001",
+                "recipe_confidence": "high_candidate",
+                "first_indicator_id": "FIRST_A",
+                "second_indicator_id": "SECOND_A",
+                "probe_timeframe": "M5",
+                "probe_id": "drs-36m",
+                "lookback_months": "36",
+                "primary_score": "63",
+                "composite_score": "63",
+                "validation_priority_score": "70",
+                "discovery_evidence_score": "74",
+                "retention_ratio": "0.88",
+                "retention_bucket": "retained",
+                "best_trades": "160",
+            },
+        ],
+        max_slot_candidates=5,
+        max_pair_candidates=5,
+    )
+
+    pair = pair_rows[0]
+    seed_pair = seed_plan["recipes"]["discovered_recipe_001"]["pair_menu"][0]
+    seed_slot = seed_plan["recipes"]["discovered_recipe_001"]["slot_menus"][
+        "context_or_setup_cluster"
+    ][0]
+    assert pair["probe_id"] == "drs-36m"
+    assert pair["canonical_pair_family_id"] == "discovered_recipe_001|M5|FIRST_A+SECOND_A"
+    assert pair["horizon_stability_bucket"] == "retained_36m"
+    assert [row["lookback_months"] for row in pair["horizon_evidence"]] == [12, 36]
+    assert seed_pair["horizon_evidence"] == pair["horizon_evidence"]
+    assert seed_plan["feature_schema_version"] == "atlas_feature_vector_v1"
+    assert pair["features"]["horizon_evidence_count"] == 2
+    assert seed_slot["features"]["sample_confidence"] == "high"
+    assert pair["sample_confidence"] == "high"
+    assert summary["discovered_recipe_validation"]["multi_horizon_family_rows"] == 1
 
 
 def test_build_recipe_prior_artifacts_tiers_sampling_policy_by_distinct_36m_families() -> None:
@@ -471,6 +674,37 @@ def test_build_recipe_prior_artifacts_tiers_sampling_policy_by_distinct_36m_fami
         _negative_pairs,
         _negative_clusters,
         _retention_failures,
+        pre_36m_seed_plan,
+        _summary,
+    ) = build_recipe_prior_artifacts(
+        indicator_rows=indicators,
+        static_slot_scores={},
+        signal_rollups={},
+        forward_priors={},
+        pair_results=[],
+        timing_results=[],
+        discovery_validation_results=[],
+        max_slot_candidates=10,
+        max_pair_candidates=10,
+    )
+
+    assert pre_36m_seed_plan["sampling_policy"]["retained_36m_family_count"] == 0
+    assert pre_36m_seed_plan["sampling_policy"]["guided_prior_fraction"] == 0.60
+    assert pre_36m_seed_plan["sampling_policy"]["uncertain_prior_fraction"] == 0.25
+    assert pre_36m_seed_plan["sampling_policy"]["wild_exploration_fraction"] == 0.15
+    assert pre_36m_seed_plan["sampling_policy"]["guided_recipe_source_mix"] == {
+        "discovery_recipe_validation": 0.25,
+        "curated_recipe_prior": 0.75,
+    }
+    assert pre_36m_seed_plan["sampling_policy"]["maturity"] == "pre_36m_retention"
+
+    (
+        _payload,
+        _slot_rows,
+        _pair_rows,
+        _negative_pairs,
+        _negative_clusters,
+        _retention_failures,
         limited_seed_plan,
         _summary,
     ) = build_recipe_prior_artifacts(
@@ -493,8 +727,8 @@ def test_build_recipe_prior_artifacts_tiers_sampling_policy_by_distinct_36m_fami
     assert limited_seed_plan["sampling_policy"]["uncertain_prior_fraction"] == 0.20
     assert limited_seed_plan["sampling_policy"]["wild_exploration_fraction"] == 0.10
     assert limited_seed_plan["sampling_policy"]["guided_recipe_source_mix"] == {
-        "discovery_recipe_validation": 0.60,
-        "curated_recipe_prior": 0.40,
+        "discovery_recipe_validation": 0.45,
+        "curated_recipe_prior": 0.55,
     }
     assert limited_seed_plan["sampling_policy"]["maturity"] == "limited_36m_retention"
 

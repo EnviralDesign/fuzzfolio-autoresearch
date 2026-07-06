@@ -17,6 +17,44 @@
         "fx"
       ]
     },
+    "coinexx-micro": {
+      "name": "Coinexx Micro FX",
+      "broker": "coinexx",
+      "account_size_usd": 150,
+      "leverage": 500,
+      "risk_per_trade_pct": 1.0,
+      "min_lot": 0.01,
+      "lot_step": 0.01,
+      "notional_usd_per_lot": 100000,
+      "margin_call_level_pct": 100,
+      "stop_out_level_pct": 50,
+      "risk_variance_filter_enabled": true,
+      "risk_variance_tolerance_pct": 5.0,
+      "risk_variance_direction": "upside",
+      "max_actual_risk_pct": 5.0,
+      "allowed_asset_classes": [
+        "fx"
+      ]
+    },
+    "coinexx-micro-200-risk1p5": {
+      "name": "Coinexx Micro FX 200 Risk 1.5",
+      "broker": "coinexx",
+      "account_size_usd": 200,
+      "leverage": 500,
+      "risk_per_trade_pct": 1.5,
+      "min_lot": 0.01,
+      "lot_step": 0.01,
+      "notional_usd_per_lot": 100000,
+      "margin_call_level_pct": 100,
+      "stop_out_level_pct": 50,
+      "risk_variance_filter_enabled": true,
+      "risk_variance_tolerance_pct": 5.0,
+      "risk_variance_direction": "upside",
+      "max_actual_risk_pct": 5.0,
+      "allowed_asset_classes": [
+        "fx"
+      ]
+    },
     "darwinex-zero": {
       "name": "Darwinex Zero",
       "account_size_usd": 100000,

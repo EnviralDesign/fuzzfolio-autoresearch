@@ -1,14 +1,47 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from pathlib import Path
+
 from autoresearch.anchor_pair_atlas import (
     build_pair_profile_document,
+    default_probe_as_of_date,
+    resolve_probe_as_of_date,
+    _sensitivity_args_for_row,
     _timing_bucket,
     _timing_lookback_values,
+    _timing_variant_sides,
     _replace_profile_id_arg,
     score_anchor_pair,
     select_anchor_pair_queue,
     signal_density_score,
 )
+
+
+def test_default_probe_as_of_date_uses_previous_utc_month_end() -> None:
+    assert (
+        default_probe_as_of_date(datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc))
+        == "2026-06-30T23:59:59Z"
+    )
+    assert resolve_probe_as_of_date("2026-05-15T00:00:00Z") == "2026-05-15T00:00:00Z"
+
+
+def test_sensitivity_args_include_lake_safe_as_of_date() -> None:
+    args = _sensitivity_args_for_row(
+        {
+            "probe_timeframe": "M5",
+            "instruments": "EURUSD,XAUUSD",
+        },
+        lookback_months=3,
+        as_of_date="2026-06-30T23:59:59Z",
+        quality_score_preset="profile-drop",
+        execution_cost_mode="research-conservative",
+        result_dir=Path("probe-results") / "probe-1",
+    )
+
+    assert args[args.index("--lookback-months") + 1] == "3"
+    assert args[args.index("--as-of-date") + 1] == "2026-06-30T23:59:59Z"
+    assert args.count("--instrument") == 2
 
 
 def test_signal_density_score_prefers_usable_balanced_rollups() -> None:
@@ -97,6 +130,17 @@ def test_select_anchor_pair_queue_diversifies_anchor_types() -> None:
 def test_build_pair_profile_document_uses_anchor_and_trigger_timeframes() -> None:
     catalog_by_id = {
         "ANCHOR": {
+            "meta": {
+                "id": "ANCHOR",
+                "name": "Anchor",
+                "namespace": "Trend",
+                "talibFunction": "ANCHOR_FN",
+                "supportsTradingMode": False,
+                "usesRangeConfiguration": True,
+                "description": "Anchor description",
+                "inputs": ["close"],
+                "valueRange": {"min": 0, "max": 1},
+            },
             "config": {
                 "label": "Anchor",
                 "timeframe": "M15",
@@ -104,6 +148,17 @@ def test_build_pair_profile_document_uses_anchor_and_trigger_timeframes() -> Non
             }
         },
         "TRIGGER": {
+            "meta": {
+                "id": "TRIGGER",
+                "name": "Trigger",
+                "namespace": "Momentum",
+                "talibFunction": "TRIGGER_FN",
+                "supportsTradingMode": False,
+                "usesRangeConfiguration": True,
+                "description": "Trigger description",
+                "inputs": ["close"],
+                "valueRange": {"min": 0, "max": 1},
+            },
             "config": {
                 "label": "Trigger",
                 "timeframe": "M5",
@@ -127,6 +182,14 @@ def test_build_pair_profile_document_uses_anchor_and_trigger_timeframes() -> Non
     assert doc["profile"]["notificationThreshold"] == 80
     assert indicators[0]["config"]["timeframe"] == "M15"
     assert indicators[1]["config"]["timeframe"] == "M5"
+    assert indicators[0]["meta"]["name"] == "Anchor"
+    assert indicators[0]["meta"]["namespace"] == "Trend"
+    assert indicators[0]["meta"]["talibFunction"] == "ANCHOR_FN"
+    assert indicators[0]["meta"]["instanceId"] == "l3-test-anchor"
+    assert indicators[1]["meta"]["name"] == "Trigger"
+    assert indicators[1]["meta"]["namespace"] == "Momentum"
+    assert indicators[1]["meta"]["talibFunction"] == "TRIGGER_FN"
+    assert indicators[1]["meta"]["instanceId"] == "l3-test-trigger"
     assert doc["profile"]["instruments"] == ["EURUSD", "GBPUSD"]
 
 
@@ -167,6 +230,13 @@ def test_build_pair_profile_document_can_override_trigger_lookback_bars() -> Non
 
 def test_timing_lookback_values_deduplicates_and_sorts() -> None:
     assert _timing_lookback_values([3, 1, 2, 2, 0]) == [1, 2, 3]
+
+
+def test_timing_variant_sides_accepts_both_side_variant() -> None:
+    assert _timing_variant_sides(["both", "trigger", "bogus", "both"]) == [
+        "both",
+        "trigger",
+    ]
 
 
 def test_timing_bucket_identifies_rescued_and_lost_positive() -> None:

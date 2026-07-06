@@ -63,6 +63,8 @@ DEFAULT_INSTRUMENT_POOL = (
     "USDCHF",
     "XAUUSD",
 )
+EXCLUDED_RESEARCH_INSTRUMENTS = ("SOLUSD",)
+_EXCLUDED_RESEARCH_INSTRUMENT_SET = set(EXCLUDED_RESEARCH_INSTRUMENTS)
 
 FX_MAJOR_INSTRUMENT_POOL = (
     "AUDUSD",
@@ -109,7 +111,11 @@ INDICES_INSTRUMENT_POOL = (
     "US500",
     "USTECH",
 )
-CRYPTO_INSTRUMENT_POOL = ("BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD")
+CRYPTO_INSTRUMENT_POOL = tuple(
+    symbol
+    for symbol in ("BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD")
+    if symbol not in _EXCLUDED_RESEARCH_INSTRUMENT_SET
+)
 ALL_INSTRUMENT_POOL = (
     *FX_MAJOR_INSTRUMENT_POOL,
     *FX_MINOR_INSTRUMENT_POOL,
@@ -204,6 +210,7 @@ COARSE_HALVING_EXPAND_SCORE = 55.0
 COARSE_HALVING_MIN_NEAR_INCUMBENT_SCORE = 50.0
 COARSE_HALVING_NEAR_INCUMBENT_TOLERANCE = 5.0
 PLAY_HAND_SEED_PLAN_PATH = Path("recipe-priors") / "play-hand-seed-plan.json"
+PLAY_HAND_ATLAS_FEATURE_SCHEMA_VERSION = "atlas_feature_vector_v1"
 SEED_TEMPLATE_CONFIG_KEYS = (
     "timeframe",
     "lookbackBars",
@@ -573,6 +580,32 @@ def _clean_instrument_pool_preset_names(values: list[str] | tuple[str, ...] | No
     return cleaned
 
 
+def filter_research_instruments(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    return [
+        token
+        for token in _clean_tokens(values)
+        if token not in _EXCLUDED_RESEARCH_INSTRUMENT_SET
+    ]
+
+
+def _raise_if_only_excluded_research_instruments(
+    *,
+    raw_values: list[str],
+    filtered_values: list[str],
+    label: str,
+) -> None:
+    if not raw_values or filtered_values:
+        return
+    excluded = sorted(set(raw_values).intersection(_EXCLUDED_RESEARCH_INSTRUMENT_SET))
+    if not excluded:
+        return
+    raise ValueError(
+        f"{label} only contains excluded AutoResearch instrument(s): "
+        + ", ".join(excluded)
+        + "."
+    )
+
+
 def resolve_instrument_pool_presets(
     *,
     presets: list[str] | tuple[str, ...] | None,
@@ -589,6 +622,8 @@ def resolve_instrument_pool_presets(
             continue
         for instrument in pool:
             token = str(instrument).strip().upper()
+            if token in _EXCLUDED_RESEARCH_INSTRUMENT_SET:
+                continue
             if token and token not in seen:
                 resolved.append(token)
                 seen.add(token)
@@ -601,7 +636,14 @@ def resolve_instrument_pool_presets(
             + f". Available presets: {available}."
         )
 
-    for instrument in _clean_tokens(instrument_pool):
+    explicit_pool = _clean_tokens(instrument_pool)
+    filtered_explicit_pool = filter_research_instruments(instrument_pool)
+    _raise_if_only_excluded_research_instruments(
+        raw_values=explicit_pool,
+        filtered_values=filtered_explicit_pool,
+        label="Instrument pool",
+    )
+    for instrument in filtered_explicit_pool:
         if instrument not in seen:
             resolved.append(instrument)
             seen.add(instrument)
@@ -655,7 +697,13 @@ def deal_instruments(
     instrument_pool: list[str] | None,
     rng: random.Random,
 ) -> dict[str, Any]:
-    pinned = _clean_tokens(instrument)
+    raw_pinned = _clean_tokens(instrument)
+    pinned = filter_research_instruments(instrument)
+    _raise_if_only_excluded_research_instruments(
+        raw_values=raw_pinned,
+        filtered_values=pinned,
+        label="Pinned instrument",
+    )
     if pinned:
         return {
             "source": "pinned",
@@ -664,7 +712,14 @@ def deal_instruments(
             "instrument_pool": pinned,
         }
 
-    pool = _clean_tokens(instrument_pool) or list(DEFAULT_INSTRUMENT_POOL)
+    raw_pool = _clean_tokens(instrument_pool)
+    filtered_pool = filter_research_instruments(instrument_pool)
+    _raise_if_only_excluded_research_instruments(
+        raw_values=raw_pool,
+        filtered_values=filtered_pool,
+        label="Instrument pool",
+    )
+    pool = filtered_pool or list(DEFAULT_INSTRUMENT_POOL)
     shuffled = list(pool)
     rng.shuffle(shuffled)
     primary = shuffled[0]
@@ -749,6 +804,177 @@ def _seed_plan_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _seed_plan_uses_atlas_features(seed_plan: dict[str, Any] | None) -> bool:
+    return (
+        isinstance(seed_plan, dict)
+        and str(seed_plan.get("feature_schema_version") or "").strip()
+        == PLAY_HAND_ATLAS_FEATURE_SCHEMA_VERSION
+    )
+
+
+def _seed_plan_features(row: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        return {}
+    features = dict(row.get("features") or {}) if isinstance(row.get("features"), dict) else {}
+    for key in (
+        "sample_adjusted_validation_score",
+        "sample_shrinkage_penalty",
+        "sample_trade_count",
+        "sample_confidence",
+        "sample_confidence_score",
+        "horizon_stability_bucket",
+        "canonical_pair_family_id",
+        "retention_bucket",
+        "retention_ratio",
+        "timing_policy",
+        "timing_variant_side",
+        "recommended_trigger_lookback_bars",
+    ):
+        if key in row and row.get(key) not in {None, ""}:
+            features[key] = row.get(key)
+    return features
+
+
+def _seed_plan_sample_confidence_multiplier(row: dict[str, Any] | None) -> float:
+    features = _seed_plan_features(row)
+    bucket = str(features.get("sample_confidence") or "").strip().lower()
+    if bucket == "high":
+        return 1.08
+    if bucket == "medium":
+        return 1.0
+    if bucket == "low":
+        return 0.82
+    if bucket == "sparse":
+        return 0.60
+    score = _seed_plan_float(features.get("sample_confidence_score"), 1.0)
+    if score <= 0.0:
+        return 1.0
+    return max(0.60, min(1.08, 0.55 + (score * 0.53)))
+
+
+def _seed_plan_horizon_multiplier(row: dict[str, Any] | None) -> float:
+    features = _seed_plan_features(row)
+    bucket = str(features.get("horizon_stability_bucket") or "").strip().lower()
+    if bucket == "retained_36m":
+        return 1.30
+    if bucket in {"retained_12m", "retained_12m_only"}:
+        return 1.12
+    if bucket in {"partial_12m", "partial_36m", "neutral_36m", "pre_scrutiny"}:
+        return 0.92
+    if bucket in {"decayed_36m", "decayed_12m", "collapsed"}:
+        return 0.68
+    return 1.0
+
+
+def _seed_plan_shrinkage_multiplier(row: dict[str, Any] | None) -> float:
+    features = _seed_plan_features(row)
+    penalty = max(0.0, _seed_plan_float(features.get("sample_shrinkage_penalty")))
+    if penalty <= 0.0:
+        return 1.0
+    adjusted = _seed_plan_float(features.get("sample_adjusted_validation_score"))
+    denominator = max(25.0, adjusted + penalty)
+    return max(0.55, 1.0 - min(0.45, penalty / denominator))
+
+
+def _seed_plan_timing_multiplier(row: dict[str, Any] | None) -> float:
+    features = _seed_plan_features(row)
+    policy = str(features.get("timing_policy") or "").strip().lower()
+    if policy == "allow_variant":
+        return 1.08
+    if policy == "watch_variant":
+        return 1.03
+    if policy == "catalog_default_only":
+        return 0.90
+    return 1.0
+
+
+def _seed_plan_atlas_feature_multiplier(row: dict[str, Any] | None) -> float:
+    multiplier = (
+        _seed_plan_sample_confidence_multiplier(row)
+        * _seed_plan_horizon_multiplier(row)
+        * _seed_plan_shrinkage_multiplier(row)
+        * _seed_plan_timing_multiplier(row)
+    )
+    return round(max(0.15, min(2.0, multiplier)), 4)
+
+
+def _seed_plan_effective_pair_weight(
+    row: dict[str, Any],
+    *,
+    seed_plan: dict[str, Any] | None = None,
+) -> float:
+    base = max(
+        _seed_plan_float(row.get("pair_sampling_weight")),
+        _seed_plan_float(row.get("pair_sampling_score")) * 0.20,
+    )
+    if not _seed_plan_uses_atlas_features(seed_plan):
+        return base
+    return round(base * _seed_plan_atlas_feature_multiplier(row), 4)
+
+
+def _seed_plan_effective_slot_weight(
+    row: dict[str, Any],
+    *,
+    seed_plan: dict[str, Any] | None = None,
+) -> float:
+    base = _seed_plan_float(row.get("sampling_weight"))
+    if not _seed_plan_uses_atlas_features(seed_plan):
+        return base
+    return round(base * _seed_plan_atlas_feature_multiplier(row), 4)
+
+
+def _negative_pair_ids(row: dict[str, Any]) -> tuple[str, str] | None:
+    first_id = _seed_plan_upper(row.get("first_indicator_id"))
+    second_id = _seed_plan_upper(row.get("second_indicator_id"))
+    if not first_id or not second_id:
+        return None
+    return tuple(sorted((first_id, second_id)))
+
+
+def _seed_plan_negative_reason_multiplier(row: dict[str, Any]) -> float:
+    reason = str(
+        row.get("negative_reason_category")
+        or row.get("negative_reason")
+        or ""
+    ).strip().lower()
+    base = {
+        "positive_discovery_collapsed": 0.48,
+        "validation_decay_36m": 0.58,
+        "retention_failed": 0.66,
+        "no_positive_validation": 0.70,
+        "cluster_expansion_failed": 0.78,
+        "low_sample_uncertain": 0.92,
+    }.get(reason, 0.74)
+    strength = max(
+        _seed_plan_float(row.get("negative_evidence_strength")),
+        _seed_plan_float(row.get("negative_weight")),
+    )
+    confidence = _seed_plan_float(row.get("sample_confidence_score"), 1.0)
+    confidence = max(0.25, min(1.0, confidence))
+    strength = max(0.25, min(1.0, strength / 2.0))
+    effective = 1.0 - ((1.0 - base) * confidence * strength)
+    return round(max(0.20, min(1.0, effective)), 4)
+
+
+def _seed_plan_soft_negative_pair_multipliers(
+    seed_plan: dict[str, Any] | None,
+) -> dict[tuple[str, str], float]:
+    if not _seed_plan_uses_atlas_features(seed_plan):
+        return {}
+    multipliers: dict[tuple[str, str], float] = {}
+    for row in seed_plan.get("negative_pairs") or []:
+        if not isinstance(row, dict):
+            continue
+        if bool(row.get("is_hard_block")):
+            continue
+        pair_ids = _negative_pair_ids(row)
+        if pair_ids is None:
+            continue
+        multiplier = _seed_plan_negative_reason_multiplier(row)
+        multipliers[pair_ids] = min(multipliers.get(pair_ids, 1.0), multiplier)
+    return multipliers
+
+
 def _seed_plan_hard_negative_pair_keys(seed_plan: dict[str, Any] | None) -> set[tuple[str, str]]:
     if not isinstance(seed_plan, dict):
         return set()
@@ -756,15 +982,16 @@ def _seed_plan_hard_negative_pair_keys(seed_plan: dict[str, Any] | None) -> set[
     for row in seed_plan.get("negative_pairs") or []:
         if not isinstance(row, dict):
             continue
+        if _seed_plan_uses_atlas_features(seed_plan) and not bool(row.get("is_hard_block")):
+            continue
         if (
             _seed_plan_float(row.get("negative_weight")) < 1.5
             or str(row.get("negative_reason") or "") != "positive_discovery_collapsed"
         ):
             continue
-        first_id = _seed_plan_upper(row.get("first_indicator_id"))
-        second_id = _seed_plan_upper(row.get("second_indicator_id"))
-        if first_id and second_id:
-            keys.add(tuple(sorted((first_id, second_id))))
+        pair_ids = _negative_pair_ids(row)
+        if pair_ids is not None:
+            keys.add(pair_ids)
     return keys
 
 
@@ -813,17 +1040,21 @@ def _weighted_seed_plan_choice(
     return weighted[-1][0]
 
 
-def _seed_plan_recipe_weight(recipe_payload: dict[str, Any]) -> float:
+def _seed_plan_recipe_weight(
+    recipe_payload: dict[str, Any],
+    *,
+    seed_plan: dict[str, Any] | None = None,
+) -> float:
     explicit_weight = _seed_plan_float(recipe_payload.get("recipe_sampling_weight"))
     if explicit_weight > 0.0:
-        return explicit_weight
+        if not _seed_plan_uses_atlas_features(seed_plan):
+            return explicit_weight
+        recipe_features = _seed_plan_dict(recipe_payload.get("features"))
+        return round(explicit_weight * _seed_plan_atlas_feature_multiplier(recipe_features), 4)
     pair_menu = recipe_payload.get("pair_menu")
     if isinstance(pair_menu, list) and pair_menu:
         return sum(
-            max(
-                _seed_plan_float(row.get("pair_sampling_weight")),
-                _seed_plan_float(row.get("pair_sampling_score")) * 0.20,
-            )
+            _seed_plan_effective_pair_weight(row, seed_plan=seed_plan)
             for row in pair_menu
             if isinstance(row, dict)
         )
@@ -835,7 +1066,7 @@ def _seed_plan_recipe_weight(recipe_payload: dict[str, Any]) -> float:
         if not isinstance(rows, list):
             continue
         total += sum(
-            _seed_plan_float(row.get("sampling_weight"))
+            _seed_plan_effective_slot_weight(row, seed_plan=seed_plan)
             for row in rows[:8]
             if isinstance(row, dict)
         )
@@ -880,8 +1111,23 @@ def _seed_pair_family_policy(pair: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def _load_play_hand_seed_plan(config: AppConfig) -> tuple[dict[str, Any] | None, Path | None]:
-    path = config.derived_root / PLAY_HAND_SEED_PLAN_PATH
+def _resolve_play_hand_seed_plan_path(
+    config: AppConfig,
+    seed_plan_path: Path | str | None = None,
+) -> Path:
+    if seed_plan_path is None:
+        return config.derived_root / PLAY_HAND_SEED_PLAN_PATH
+    path = Path(seed_plan_path).expanduser()
+    if path.is_dir() or path.suffix.lower() != ".json":
+        return path / PLAY_HAND_SEED_PLAN_PATH.name
+    return path
+
+
+def _load_play_hand_seed_plan(
+    config: AppConfig,
+    seed_plan_path: Path | str | None = None,
+) -> tuple[dict[str, Any] | None, Path | None]:
+    path = _resolve_play_hand_seed_plan_path(config, seed_plan_path)
     if not path.exists():
         return None, None
     try:
@@ -996,7 +1242,7 @@ def deal_seed_plan_indicators(
     recipe_items = [
         (str(name), payload)
         for name, payload in recipes.items()
-        if isinstance(payload, dict) and _seed_plan_recipe_weight(payload) > 0.0
+        if isinstance(payload, dict) and _seed_plan_recipe_weight(payload, seed_plan=seed_plan) > 0.0
     ]
     recipe_source_mix = _seed_plan_guided_recipe_source_mix(policy)
     recipe_source_bucket: str | None = None
@@ -1024,7 +1270,7 @@ def deal_seed_plan_indicators(
     selected_recipe = _weighted_seed_plan_choice(
         recipe_candidates,
         rng=rng,
-        weight_fn=lambda item: _seed_plan_recipe_weight(item[1]),
+        weight_fn=lambda item: _seed_plan_recipe_weight(item[1], seed_plan=seed_plan),
     )
     if selected_recipe is None:
         return _fallback_indicator_deal(
@@ -1041,6 +1287,17 @@ def deal_seed_plan_indicators(
     policy_target_count = target_count
     role_balanced_fill_limit: int | None = None
     negative_pair_keys = _seed_plan_hard_negative_pair_keys(seed_plan)
+    soft_negative_pair_multipliers = _seed_plan_soft_negative_pair_multipliers(seed_plan)
+
+    def negative_pair_multiplier_for(indicator_id: Any) -> float:
+        clean_id = _seed_plan_upper(indicator_id)
+        if not clean_id:
+            return 1.0
+        multiplier = 1.0
+        for selected_id in selected_ids:
+            pair_key = tuple(sorted((clean_id, selected_id)))
+            multiplier = min(multiplier, soft_negative_pair_multipliers.get(pair_key, 1.0))
+        return multiplier
 
     def add_indicator(
         indicator_id: Any,
@@ -1048,6 +1305,8 @@ def deal_seed_plan_indicators(
         slot: str,
         evidence: dict[str, Any] | None = None,
         allow_negative_pair: bool = False,
+        effective_sampling_weight: float | None = None,
+        negative_pair_multiplier: float | None = None,
     ) -> bool:
         clean_id = _seed_plan_upper(indicator_id)
         if not clean_id or clean_id in selected_ids or clean_id not in by_id:
@@ -1056,17 +1315,41 @@ def deal_seed_plan_indicators(
             for selected_id in selected_ids:
                 if tuple(sorted((clean_id, selected_id))) in negative_pair_keys:
                     return False
+        evidence_dict = _seed_plan_dict(evidence)
+        features = _seed_plan_features(evidence_dict)
+        raw_sampling_weight = max(
+            _seed_plan_float(evidence_dict.get("sampling_weight")),
+            _seed_plan_float(evidence_dict.get("pair_sampling_weight")),
+        )
+        if raw_sampling_weight <= 0.0 and slot == "role_balanced_fill":
+            raw_sampling_weight = 1.0
+        atlas_multiplier = (
+            _seed_plan_atlas_feature_multiplier(evidence_dict)
+            if _seed_plan_uses_atlas_features(seed_plan)
+            else 1.0
+        )
+        negative_multiplier = (
+            negative_pair_multiplier
+            if negative_pair_multiplier is not None
+            else negative_pair_multiplier_for(clean_id)
+        )
         selected_ids.append(clean_id)
         selected_slots.append(
             {
                 "slot": slot,
                 "indicator_id": clean_id,
-                "sampling_weight": max(
-                    _seed_plan_float(_seed_plan_dict(evidence).get("sampling_weight")),
-                    _seed_plan_float(_seed_plan_dict(evidence).get("pair_sampling_weight")),
+                "sampling_weight": raw_sampling_weight,
+                "effective_sampling_weight": (
+                    effective_sampling_weight
+                    if effective_sampling_weight is not None
+                    else round(raw_sampling_weight * atlas_multiplier * negative_multiplier, 4)
                 ),
-                "sampling_lane": _seed_plan_dict(evidence).get("sampling_lane"),
-                "source": _seed_plan_dict(evidence).get("source"),
+                "atlas_feature_multiplier": atlas_multiplier,
+                "negative_pair_multiplier": negative_multiplier,
+                "sample_confidence": features.get("sample_confidence"),
+                "horizon_stability_bucket": features.get("horizon_stability_bucket"),
+                "sampling_lane": evidence_dict.get("sampling_lane"),
+                "source": evidence_dict.get("source"),
             }
         )
         return True
@@ -1076,10 +1359,7 @@ def deal_seed_plan_indicators(
         pair = _weighted_seed_plan_choice(
             [row for row in pair_menu if isinstance(row, dict)],
             rng=rng,
-            weight_fn=lambda row: max(
-                _seed_plan_float(row.get("pair_sampling_weight")),
-                _seed_plan_float(row.get("pair_sampling_score")) * 0.20,
-            ),
+            weight_fn=lambda row: _seed_plan_effective_pair_weight(row, seed_plan=seed_plan),
         )
         if isinstance(pair, dict):
             candidate_family_policy = _seed_pair_family_policy(pair)
@@ -1088,17 +1368,22 @@ def deal_seed_plan_indicators(
             )
             first_id = pair.get("anchor_id")
             second_id = pair.get("trigger_id")
+            pair_effective_weight = _seed_plan_effective_pair_weight(pair, seed_plan=seed_plan)
             added_first = add_indicator(
                 first_id,
                 slot="pair_first",
                 evidence=pair,
                 allow_negative_pair=True,
+                effective_sampling_weight=pair_effective_weight,
+                negative_pair_multiplier=1.0,
             )
             added_second = add_indicator(
                 second_id,
                 slot="pair_second",
                 evidence=pair,
                 allow_negative_pair=True,
+                effective_sampling_weight=pair_effective_weight,
+                negative_pair_multiplier=1.0,
             )
             if added_first or added_second:
                 selected_family_policy = candidate_family_policy
@@ -1113,8 +1398,25 @@ def deal_seed_plan_indicators(
                     "second_indicator_id": _seed_plan_upper(second_id),
                     "probe_timeframe": pair.get("probe_timeframe"),
                     "pair_sampling_score": pair.get("pair_sampling_score"),
+                    "pair_sampling_weight": pair.get("pair_sampling_weight"),
+                    "effective_pair_sampling_weight": pair_effective_weight,
                     "composite_score": pair.get("composite_score"),
                     "retention_bucket": pair.get("retention_bucket"),
+                    "retention_ratio": pair.get("retention_ratio"),
+                    "ordered_pair_id": pair.get("ordered_pair_id"),
+                    "unordered_pair_id": pair.get("unordered_pair_id"),
+                    "canonical_pair_family_id": pair.get("canonical_pair_family_id"),
+                    "sample_adjusted_validation_score": pair.get("sample_adjusted_validation_score"),
+                    "sample_shrinkage_penalty": pair.get("sample_shrinkage_penalty"),
+                    "sample_trade_count": pair.get("sample_trade_count"),
+                    "sample_confidence": pair.get("sample_confidence"),
+                    "sample_confidence_score": pair.get("sample_confidence_score"),
+                    "horizon_stability_bucket": pair.get("horizon_stability_bucket"),
+                    "horizon_evidence": pair.get("horizon_evidence"),
+                    "timing_policy": pair.get("timing_policy"),
+                    "timing_variant_side": pair.get("timing_variant_side"),
+                    "recommended_trigger_lookback_bars": pair.get("recommended_trigger_lookback_bars"),
+                    "features": pair.get("features"),
                     "recommended_profile_template": pair.get("recommended_profile_template"),
                     "source": pair.get("source"),
                     "playhand_family_policy": selected_family_policy.get("family_policy"),
@@ -1142,10 +1444,22 @@ def deal_seed_plan_indicators(
             candidate = _weighted_seed_plan_choice(
                 rows,
                 rng=rng,
-                weight_fn=lambda row: _seed_plan_float(row.get("sampling_weight")),
+                weight_fn=lambda row: (
+                    _seed_plan_effective_slot_weight(row, seed_plan=seed_plan)
+                    * negative_pair_multiplier_for(row.get("indicator_id"))
+                ),
             )
             if isinstance(candidate, dict):
-                add_indicator(candidate.get("indicator_id"), slot=slot_name, evidence=candidate)
+                add_indicator(
+                    candidate.get("indicator_id"),
+                    slot=slot_name,
+                    evidence=candidate,
+                    effective_sampling_weight=round(
+                        _seed_plan_effective_slot_weight(candidate, seed_plan=seed_plan)
+                        * negative_pair_multiplier_for(candidate.get("indicator_id")),
+                        4,
+                    ),
+                )
 
     if len(selected_ids) < target_count:
         role_balanced_added = 0
@@ -1154,10 +1468,16 @@ def deal_seed_plan_indicators(
             for indicator in guided_indicators
             if indicator.id.upper() not in selected_ids
         ]
-        for indicator in deal_role_balanced_indicators(
+        fill_candidates = deal_role_balanced_indicators(
             remaining,
             target_count=len(remaining),
-        ):
+        )
+        if _seed_plan_uses_atlas_features(seed_plan):
+            fill_candidates.sort(
+                key=lambda indicator: negative_pair_multiplier_for(indicator.id),
+                reverse=True,
+            )
+        for indicator in fill_candidates:
             if len(selected_ids) >= policy_target_count:
                 break
             if (
@@ -2114,6 +2434,63 @@ def apply_seed_pair_template_defaults(
                     "config": applied,
                 }
             )
+    return changes
+
+
+def apply_seed_pair_timing_hints(
+    profile_payload: dict[str, Any],
+    pair_evidence: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    pair = _seed_plan_dict(pair_evidence)
+    if not pair:
+        return []
+    policy = str(pair.get("timing_policy") or "").strip().lower()
+    if policy not in {"allow_variant", "watch_variant"}:
+        return []
+    recommended = _seed_plan_float(pair.get("recommended_trigger_lookback_bars"))
+    if recommended <= 0.0:
+        return []
+    variant_side = str(pair.get("timing_variant_side") or "trigger").strip().lower()
+    first_id = _seed_plan_upper(pair.get("first_indicator_id") or pair.get("anchor_id"))
+    second_id = _seed_plan_upper(pair.get("second_indicator_id") or pair.get("trigger_id"))
+    if variant_side == "anchor":
+        target_ids = {first_id}
+    elif variant_side == "both":
+        target_ids = {first_id, second_id}
+    else:
+        target_ids = {second_id}
+    target_ids = {indicator_id for indicator_id in target_ids if indicator_id}
+    if not target_ids:
+        return []
+    profile = _extract_profile(profile_payload)
+    changes: list[dict[str, Any]] = []
+    lookback_value = int(recommended) if float(recommended).is_integer() else recommended
+    for index, item in enumerate(profile.get("indicators") or []):
+        if not isinstance(item, dict):
+            continue
+        meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+        indicator_id = _seed_plan_upper(meta.get("id"))
+        if indicator_id not in target_ids:
+            continue
+        config = item.setdefault("config", {})
+        if not isinstance(config, dict):
+            item["config"] = {}
+            config = item["config"]
+        previous = copy.deepcopy(config.get("lookbackBars"))
+        if previous == lookback_value:
+            continue
+        config["lookbackBars"] = lookback_value
+        changes.append(
+            {
+                "indicator_index": index,
+                "indicator_id": indicator_id,
+                "timing_policy": policy,
+                "timing_variant_side": variant_side,
+                "previous_lookbackBars": previous,
+                "lookbackBars": lookback_value,
+                "source_probe_id": pair.get("probe_id"),
+            }
+        )
     return changes
 
 
@@ -6269,8 +6646,9 @@ def cmd_play_hand(
     metadata_changes = apply_seed_indicator_metadata(profile_payload, dealt_entries)
     timeframe_changes = apply_role_timeframe_defaults(profile_payload, rng=rng)
     template_changes = apply_seed_pair_template_defaults(profile_payload, indicator_deal.get("pair"))
+    timing_hint_changes = apply_seed_pair_timing_hints(profile_payload, indicator_deal.get("pair"))
     default_changes = apply_play_hand_profile_defaults(profile_payload, rng=rng)
-    if metadata_changes or timeframe_changes or template_changes or default_changes:
+    if metadata_changes or timeframe_changes or template_changes or timing_hint_changes or default_changes:
         _write_json(profile_path, profile_payload)
     if metadata_changes:
         _append_event(
@@ -6297,6 +6675,17 @@ def cmd_play_hand(
             timeframe,
         )
         metadata["timeframe"] = metadata["effective_timeframe"]
+        write_run_metadata(run_dir, metadata)
+    if timing_hint_changes:
+        _append_event(
+            ctx,
+            "scaffold",
+            "timing_hints_applied",
+            stage=stages["scaffold"],
+            profile_path=str(profile_path),
+            changes=timing_hint_changes,
+        )
+        metadata["seed_plan_timing_hints"] = timing_hint_changes
         write_run_metadata(run_dir, metadata)
     if template_changes:
         _append_event(

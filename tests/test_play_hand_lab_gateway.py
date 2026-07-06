@@ -2,6 +2,7 @@ import asyncio
 import json
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import requests
@@ -29,6 +30,10 @@ def test_lab_gateway_defaults_are_cloud_tolerant() -> None:
     assert config.lease_ttl_seconds == 600.0
     assert config.worker_stale_after_seconds == 600.0
     assert config.worker_prune_after_seconds == 1800.0
+    assert config.max_result_backlog_bytes == 2 * 1024 * 1024 * 1024
+    assert config.result_backpressure_bytes == 1024 * 1024 * 1024
+    assert config.lake_mutation_retry_after_seconds == 90.0
+    assert config.lake_timeout_retry_after_seconds == 45.0
 
 
 def test_lab_gateway_claim_complete_and_duplicate_completion() -> None:
@@ -55,7 +60,8 @@ def test_lab_gateway_claim_complete_and_duplicate_completion() -> None:
         result={"score": 12.5},
     )
     assert completion["status"] == "accepted"
-    assert completion["completion"]["result"]["score"] == 12.5
+    assert completion["completion"]["task_id"] == "task-1"
+    assert completion["completion"]["status"] == "success"
 
     duplicate = gateway.complete(
         "worker-1",
@@ -63,11 +69,14 @@ def test_lab_gateway_claim_complete_and_duplicate_completion() -> None:
         result={"score": 99.0},
     )
     assert duplicate["status"] == "duplicate"
-    assert duplicate["completion"]["result"]["score"] == 12.5
+    assert duplicate["completion"]["task_id"] == "task-1"
+    assert duplicate["completion"]["status"] == "success"
 
     snapshot = gateway.snapshot()
     assert snapshot["completed_tasks"] == 1
     assert snapshot["active_leases"] == 0
+    assert snapshot["retained_task_count"] == 0
+    assert snapshot["metrics"]["terminal_tasks_pruned"] == 1
     assert snapshot["worker_busy_rate"] == 0.0
 
 
@@ -168,6 +177,82 @@ def test_lab_gateway_requeues_retryable_failure_until_cap() -> None:
     assert results[0]["result"]["error"] == "temporary"
 
 
+def test_lab_gateway_delays_lake_mutation_retryable_failure() -> None:
+    gateway = PlayHandLabGateway(LabGatewayConfig(lake_mutation_retry_after_seconds=30.0))
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            max_attempts=3,
+        )
+    )
+
+    gateway.register_worker("worker-1")
+    first_claim = gateway.claim("worker-1")
+    failed = gateway.fail(
+        "worker-1",
+        first_claim["lease_id"],
+        error="Remote market data lake is mutating; retry after the mutation completes",
+        retryable=True,
+    )
+
+    assert failed["status"] == "requeued"
+    assert failed["retry_after_seconds"] == 30.0
+    assert gateway.snapshot()["metrics"]["retry_delayed_requeues"] == 1
+
+    delayed_claim = gateway.claim("worker-1")
+    assert delayed_claim["status"] == "no_work"
+    assert delayed_claim["reason"] == "retry_delay"
+    assert delayed_claim["retry_after_seconds"] >= 29.0
+
+    gateway._tasks["task-1"].available_at = time.monotonic() - 0.001
+    second_claim = gateway.claim("worker-1")
+    assert second_claim["status"] == "leased"
+    assert second_claim["task_id"] == "task-1"
+    assert second_claim["attempt_number"] == 1
+    assert failed["attempt_budget_preserved"] is True
+
+
+def test_lab_gateway_lake_mutation_retries_do_not_exhaust_attempt_cap() -> None:
+    gateway = PlayHandLabGateway(LabGatewayConfig(lake_mutation_retry_after_seconds=30.0))
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            max_attempts=1,
+        )
+    )
+    gateway.register_worker("worker-1")
+
+    first_claim = gateway.claim("worker-1")
+    first_failed = gateway.fail(
+        "worker-1",
+        first_claim["lease_id"],
+        error="Remote market data lake is mutating; retry after the mutation completes",
+        retryable=True,
+    )
+    assert first_failed["status"] == "requeued"
+    assert first_failed["attempt_budget_preserved"] is True
+
+    gateway._tasks["task-1"].available_at = time.monotonic() - 0.001
+    second_claim = gateway.claim("worker-1")
+    second_failed = gateway.fail(
+        "worker-1",
+        second_claim["lease_id"],
+        error="Remote market data lake is mutating; retry after the mutation completes",
+        retryable=True,
+    )
+
+    snapshot = gateway.snapshot()
+    assert second_failed["status"] == "requeued"
+    assert snapshot["failed_tasks"] == 0
+    assert snapshot["queued_tasks"] == 1
+    assert snapshot["metrics"]["failures_final"] == 0
+    assert snapshot["metrics"]["retry_preserved_attempt_requeues"] == 2
+
+
 def test_lab_gateway_http_retryable_false_string_is_terminal() -> None:
     gateway = PlayHandLabGateway()
     server = build_lab_gateway_http_server(
@@ -239,6 +324,108 @@ def test_lab_gateway_results_are_peeked_until_acked() -> None:
     assert gateway.snapshot()["result_backlog"] == 1
     assert gateway.ack_results([claim["lease_id"]]) == 1
     assert gateway.read_results(limit=1) == []
+    assert gateway.snapshot()["result_backlog_bytes"] == 0
+
+
+def test_lab_gateway_duplicate_task_enqueue_is_idempotent_across_terminal_prune() -> None:
+    gateway = PlayHandLabGateway()
+    task = LabTask(task_id="task-1", lane_id="lane-1", attempt_id="attempt-1")
+
+    assert gateway.enqueue(task) is True
+    assert gateway.enqueue(LabTask(task_id="task-1", lane_id="lane-1", attempt_id="attempt-1")) is False
+    gateway.register_worker("worker-1")
+    claim = gateway.claim("worker-1")
+    gateway.complete("worker-1", claim["lease_id"], result={"ok": True})
+
+    assert gateway.snapshot()["retained_task_count"] == 0
+    assert gateway.enqueue(LabTask(task_id="task-1", lane_id="lane-1", attempt_id="attempt-1")) is False
+    assert gateway.snapshot()["metrics"]["duplicate_task_enqueues"] == 2
+
+
+def test_lab_gateway_http_tasks_reports_actual_accepted_count() -> None:
+    gateway = PlayHandLabGateway()
+    server = build_lab_gateway_http_server(
+        host="127.0.0.1",
+        port=0,
+        token="secret",
+        gateway=gateway,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    base_url = f"http://{host}:{port}"
+    headers = {"Authorization": "Bearer secret"}
+    try:
+        response = requests.post(
+            f"{base_url}/tasks",
+            json={
+                "tasks": [
+                    {"task_id": "task-1", "lane_id": "lane-1", "attempt_id": "attempt-1"},
+                    {"task_id": "task-1", "lane_id": "lane-1", "attempt_id": "attempt-1"},
+                ]
+            },
+            headers=headers,
+            timeout=5,
+        )
+        payload = response.json()
+
+        assert response.status_code == 200
+        assert payload["submitted"] == 2
+        assert payload["accepted"] == 1
+        assert payload["enqueued"] == 1
+        assert payload["rejected"] == 1
+        assert gateway.snapshot()["metrics"]["duplicate_task_enqueues"] == 1
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+def test_lab_gateway_result_backpressure_pauses_new_claims() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(
+            max_result_backlog_bytes=10_000,
+            result_backpressure_bytes=100,
+        )
+    )
+    gateway.enqueue_many(
+        [
+            LabTask(task_id="task-1", lane_id="lane-1", attempt_id="attempt-1"),
+            LabTask(task_id="task-2", lane_id="lane-1", attempt_id="attempt-2"),
+        ]
+    )
+    gateway.register_worker("worker-1")
+    first = gateway.claim("worker-1")
+    gateway.complete("worker-1", first["lease_id"], result={"payload": "x" * 500})
+
+    second = gateway.claim("worker-1")
+
+    assert second["status"] == "no_work"
+    assert second["reason"] == "result_backlog_pressure"
+    snapshot = gateway.snapshot()
+    assert snapshot["result_backpressure_active"] is True
+    assert snapshot["queued_tasks"] == 1
+
+
+def test_lab_gateway_result_backlog_is_byte_bounded() -> None:
+    gateway = PlayHandLabGateway(
+        LabGatewayConfig(
+            max_result_backlog=100,
+            max_result_backlog_bytes=900,
+            result_backpressure_bytes=0,
+        )
+    )
+    for index in range(4):
+        gateway.enqueue(LabTask(task_id=f"task-{index}", lane_id="lane-1", attempt_id=f"attempt-{index}"))
+    gateway.register_worker("worker-1")
+
+    for _ in range(4):
+        claim = gateway.claim("worker-1")
+        gateway.complete("worker-1", claim["lease_id"], result={"payload": "x" * 500})
+
+    snapshot = gateway.snapshot()
+    assert snapshot["completed_tasks"] == 4
+    assert snapshot["result_backlog"] < 4
+    assert snapshot["metrics"]["results_dropped"] > 0
 
 
 def test_lab_gateway_enforces_worker_slots() -> None:
@@ -600,6 +787,35 @@ def test_lab_gateway_expired_lease_heartbeat_does_not_renew() -> None:
     assert snapshot["metrics"]["expired_leases_requeued"] == 1
 
 
+def test_lab_gateway_expired_lease_final_failure_is_pruned_and_reported() -> None:
+    gateway = PlayHandLabGateway(LabGatewayConfig(lease_ttl_seconds=0.001))
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            deadline_seconds=0.001,
+            max_attempts=1,
+        )
+    )
+    gateway.register_worker("worker-1")
+    claim = gateway.claim("worker-1")
+    gateway._leases[claim["lease_id"]].expires_at = 0.0
+
+    assert gateway.heartbeat_lease("worker-1", claim["lease_id"]) is False
+
+    snapshot = gateway.snapshot()
+    results = gateway.read_results(limit=1)
+    assert snapshot["queued_tasks"] == 0
+    assert snapshot["active_leases"] == 0
+    assert snapshot["retained_task_count"] == 0
+    assert snapshot["failed_tasks"] == 1
+    assert snapshot["metrics"]["failures_final"] == 1
+    assert snapshot["metrics"]["terminal_tasks_pruned"] == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["result"]["error"] == "lease_expired_retry_limit"
+
+
 def test_lab_gateway_result_backlog_is_bounded() -> None:
     gateway = PlayHandLabGateway(LabGatewayConfig(max_result_backlog=2))
     for index in range(4):
@@ -767,13 +983,20 @@ def test_lab_gateway_cli_uses_token_file_for_non_loopback_bind(
 
     monkeypatch.setattr("autoresearch.play_hand_lab_gateway.serve_lab_gateway", fake_serve_lab_gateway)
 
-    assert cmd_play_hand_lab_gateway(host="0.0.0.0", port=8799) == 0
+    assert cmd_play_hand_lab_gateway(
+        host="0.0.0.0",
+        port=8799,
+        lake_mutation_retry_after_seconds=120.0,
+        lake_timeout_retry_after_seconds=60.0,
+    ) == 0
 
     token = token_file.read_text(encoding="ascii").strip()
     assert token
     assert served["host"] == "0.0.0.0"
     assert served["port"] == 8799
     assert served["token"] == token
+    assert served["lake_mutation_retry_after_seconds"] == 120.0
+    assert served["lake_timeout_retry_after_seconds"] == 60.0
 
 
 def test_saturation_simulation_keeps_100_virtual_workers_busy() -> None:
@@ -1004,6 +1227,14 @@ def test_build_parser_accepts_play_hand_massive_v2_aliases() -> None:
             "0.75",
             "--mode",
             "finite",
+            "--enqueue-failure-limit",
+            "7",
+            "--enqueue-retry-base-seconds",
+            "0.25",
+            "--terminal-lane-retention",
+            "123",
+            "--seed-plan-path",
+            "isolated-recipe-priors",
             "--instrument-pool-preset",
             "fx",
             "--instrument-pool-set",
@@ -1016,6 +1247,10 @@ def test_build_parser_accepts_play_hand_massive_v2_aliases() -> None:
     assert args.active_runs == 3
     assert args.max_results_per_cycle == 500
     assert args.max_drain_seconds == 0.75
+    assert args.enqueue_failure_limit == 7
+    assert args.enqueue_retry_base_seconds == 0.25
+    assert args.terminal_lane_retention == 123
+    assert args.seed_plan_path == Path("isolated-recipe-priors")
     assert args.mode == "finite"
     assert args.instrument_pool_preset == ["fx", "metals,crypto"]
     assert args.screen_anchor_mode == "random"
@@ -1047,9 +1282,33 @@ def test_build_parser_accepts_play_hand_massive_v2_aliases() -> None:
     assert args.validation_min_score == 47.5
     assert args.final_min_score == 42.5
 
-    args = parser.parse_args(["play-hand-massive-v2-gateway", "--port", "8799"])
+    args = parser.parse_args(
+        [
+            "play-hand-massive-v2-gateway",
+            "--port",
+            "8799",
+            "--max-result-backlog-mb",
+            "512",
+            "--result-backpressure-mb",
+            "256",
+            "--max-recent-completions",
+            "1000",
+            "--max-recent-terminal-task-ids",
+            "2000",
+            "--lake-mutation-retry-after-seconds",
+            "120",
+            "--lake-timeout-retry-after-seconds",
+            "60",
+        ]
+    )
     assert args.command == "play-hand-massive-v2-gateway"
     assert args.port == 8799
+    assert args.max_result_backlog_mb == 512
+    assert args.result_backpressure_mb == 256
+    assert args.max_recent_completions == 1000
+    assert args.max_recent_terminal_task_ids == 2000
+    assert args.lake_mutation_retry_after_seconds == 120
+    assert args.lake_timeout_retry_after_seconds == 60
 
     args = parser.parse_args(["play-hand-massive-v2-ws-sim", "--workers", "1000"])
     assert args.command == "play-hand-massive-v2-ws-sim"
