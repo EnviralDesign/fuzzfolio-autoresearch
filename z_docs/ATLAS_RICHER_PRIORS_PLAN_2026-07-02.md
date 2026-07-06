@@ -781,3 +781,56 @@ Staged recipe-stream v2 result on 2026-07-04:
   - The survival funnel is now visible: 88 recipe candidates -> 344 12m probes -> 71 12m usable rows -> 39 36m probes -> 12 36m usable rows -> 27 discovered recipes in final priors because retained 12m-only material is still preserved with lower maturity.
   - This is a stronger candidate for publishing than the previous rich run because it gives PlayHand many more discovered recipe shapes while still carrying 36-month survival evidence for the strongest subset.
   - The next bottleneck is qualitative, not quantity-only: decide whether `0.50` is good enough to publish and test in PlayHand, or run a controlled `0.55` validation experiment to see whether finer clusters improve 36-month survival rate enough to justify about 2.25x validation probes.
+
+Published default and full-upstream-rich controlled-discovery run on 2026-07-06:
+
+- Published current winner:
+  - Source run: `runs/derived/atlas-runs/20260704T180024472466Z-atlas-recipe-stream-v2/recipe-priors`.
+  - Published target: `runs/derived/recipe-priors`.
+  - Publish manifest: `runs/derived/recipe-priors/atlas-lab-publish-manifest.json`.
+  - Prior default was backed up before replacement.
+- New experiment run:
+  - Run folder: `runs/derived/atlas-runs/20260706T232304665612Z-atlas-lab`.
+  - Command shape: `atlas-lab --atlas-profile rich --signal-atlas-executor gateway --active-probes 256 --enqueue-chunk-size 256 --result-batch-size 250 --max-results-per-cycle 1000 --max-drain-seconds 0.5 --poll-interval-seconds 0.25 --discovery-queue full --json`.
+  - Published default was not overwritten by this run.
+- Worker pool:
+  - Local desktop Docker workers: 0.
+  - LAN workers: 8 `sager-lan`, 8 `mac-lan`.
+  - Vast workers: 3 AMD instances, 195 registered `vast-burst` workers.
+  - Peak gateway slots observed: 211.
+  - Vast hourly rate while active: about `$0.774/hr`; instances were destroyed immediately after run completion.
+- Gateway/runtime result:
+  - Full run completed in about 26 minutes from Atlas process start to final JSON log write.
+  - Gateway task failures: 0.
+  - Result backlog stayed small and never entered result backpressure.
+  - Large discovery-pair stage sustained roughly 90-96% slot saturation once fully warmed.
+- Upstream signal surface:
+  - Signal calls: 13,728 successful, 0 failed.
+  - Roles: trigger, setup, context, filter.
+  - Instruments: 39 rich-market instruments.
+  - Timeframes: M1, M5, M15, H1.
+- Controlled discovery/downstream surface:
+  - Discovery pair queue rows: 15,223.
+  - Discovery pair positives: 1,508.
+  - Discovery pair strong rows: 138.
+  - Available discovered recipes: 128, versus 88 in the published default run.
+  - 12-month validation queue rows: 416, versus 344 in the published default run.
+  - 36-month scrutiny queue rows: 105, versus 39 in the published default run.
+- Final main recipe priors:
+  - Slot rows: 787, versus 714 in the published default.
+  - Pair rows: 155, versus 92 in the published default.
+  - Pair source mix: 48 anchor-pair rows and 107 discovery-recipe-validation rows.
+  - Discovered validation rows: 521, versus 383 in the published default.
+  - Discovered validation retained rows: 107, versus 44 in the published default.
+  - Discovered recipe count: 39, versus 27 in the published default.
+  - Negative pair rows: 297, versus 272 in the published default.
+  - PlayHand seed-plan recipe objects: 43, versus 31 in the published default.
+  - Seed-plan 36-month retained family count: 36, versus 9 in the published default.
+- Layer-3 recipe priors:
+  - Produced separately under `recipe-priors-layer3`.
+  - Anchor-only in this run: 48 pair rows, 4 seed recipes, and no discovered validation rows.
+  - Treat the main `recipe-priors` directory as the relevant PlayHand candidate for this experiment.
+- Interpretation:
+  - Full upstream rich signal evidence increased the amount of useful recipe material even while discovery/downstream stayed controlled.
+  - The main new prior set looks materially richer than the published default by count, retention breadth, and discovery-validation contribution.
+  - The result is a strong candidate for the next PlayHand A/B, but it should not become the default solely from Atlas richness metrics; the next decision point is whether it improves PlayHand promotion rate and promoted-run quality versus the currently published `recipe-stream-v2` default.
