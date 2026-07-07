@@ -10,6 +10,7 @@ import pytest
 
 from autoresearch.atlas_lab import (
     AtlasLabRuntimeConfig,
+    DEFAULT_ATLAS_PROFILE,
     ProbeRunSpec,
     _compact_sensitivity_snapshot_for_atlas,
     _deep_replay_request_from_probe,
@@ -782,6 +783,12 @@ def test_atlas_rich_profile_declares_broader_observation_surface() -> None:
     assert rich_plus_discovery["signal_timeframes"] == rich["signal_timeframes"]
     assert rich_plus_discovery["discovery_instruments"] == standard["discovery_instruments"]
     assert rich_plus_discovery["discovery_timeframes"] == rich_discovery["discovery_timeframes"]
+
+
+def test_atlas_lab_default_profile_is_current_winner() -> None:
+    assert DEFAULT_ATLAS_PROFILE == "rich"
+    assert AtlasLabRuntimeConfig().atlas_profile == "rich"
+    assert atlas_profile_config(None)["name"] == "rich"
 
 
 def test_effective_atlas_build_profile_can_bound_rich_surface_for_smoke() -> None:

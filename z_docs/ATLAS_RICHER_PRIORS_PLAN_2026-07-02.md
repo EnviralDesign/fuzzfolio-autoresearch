@@ -903,4 +903,5 @@ Final rich-plus-discovery push on 2026-07-07:
 - Stable default after this test:
   - Published default source: `runs/derived/atlas-runs/20260706T232304665612Z-atlas-lab/recipe-priors`.
   - Publish manifest: `runs/derived/recipe-priors/atlas-lab-publish-manifest.json`.
+  - Code default: `atlas-lab` now defaults to `--atlas-profile rich`.
   - The weaker final-push seed plan was not published.

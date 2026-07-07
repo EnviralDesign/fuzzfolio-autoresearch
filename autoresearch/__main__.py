@@ -1326,7 +1326,7 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         choices=sorted(ATLAS_PROFILE_CONFIGS),
         default=DEFAULT_ATLAS_PROFILE,
         help=(
-            "Atlas evidence profile. standard preserves the current trigger-only surface; "
+            "Atlas evidence profile. Default: rich. standard preserves the current trigger-only surface; "
             "rich-roles broadens roles on the current market panel; rich-timeframes and rich-markets "
             "expand one more axis; rich expands roles, instruments, and timeframes together; "
             "rich-discovery widens discovery with standard upstream timeframes; rich-plus-discovery "
