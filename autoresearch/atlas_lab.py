@@ -267,6 +267,30 @@ ATLAS_PROFILE_CONFIGS: dict[str, dict[str, Any]] = {
             "rich-timeframe local precompute cost."
         ),
     },
+    "rich-plus-discovery": {
+        "signal_roles": list(ATLAS_RICH_SIGNAL_ROLES),
+        "signal_role": ",".join(ATLAS_RICH_SIGNAL_ROLES),
+        "signal_instruments": list(ATLAS_RICH_INSTRUMENTS),
+        "signal_timeframes": list(ATLAS_RICH_TIMEFRAMES),
+        "discovery_instruments": list(ATLAS_STANDARD_INSTRUMENTS),
+        "discovery_timeframes": list(ATLAS_WIDE_DISCOVERY_TIMEFRAMES),
+        "timing_variant_sides": ["trigger", "anchor", "both"],
+        "instrument_buckets": [
+            "fx-major",
+            "fx-minor",
+            "metals",
+            "energies",
+            "indices-core",
+            "crypto-core",
+        ],
+        "timeframe_panel": "m1_m5_m15_h1",
+        "discovery_panel": "m1_m5_m15_m30_h1_h4_d1",
+        "description": (
+            "Full rich upstream evidence surface with a wider discovery-pair probe matrix. "
+            "This keeps the richer role, market, and timeframe signal atlas while widening "
+            "the downstream recipe-discovery timeframe panel."
+        ),
+    },
 }
 
 ProbeKind = Literal[

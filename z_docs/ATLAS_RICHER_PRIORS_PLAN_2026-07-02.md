@@ -867,3 +867,40 @@ Fixed PlayHand A/B benchmark on 2026-07-07:
   - This is a clean apples-to-apples win for the richer upstream Atlas candidate, but the margin is modest.
   - The result supports publishing or further testing the richer candidate, not claiming a large quality jump from one 512-lane run.
   - Future comparisons should reuse the fixed benchmark contract above so promotion-rate deltas stay interpretable.
+
+Final rich-plus-discovery push on 2026-07-07:
+
+- New Atlas profile:
+  - Profile name: `rich-plus-discovery`.
+  - Purpose: keep the full `rich` upstream surface while widening the downstream discovery-pair timeframe panel.
+  - Upstream roles: trigger, setup, context, filter.
+  - Upstream instruments: 39 rich-market instruments.
+  - Upstream timeframes: M1, M5, M15, H1.
+  - Discovery instruments: EURUSD, GBPUSD, USDJPY, XAUUSD.
+  - Discovery timeframes: M1, M5, M15, M30, H1, H4, D1.
+  - Explicit wider validation knobs: discovery cluster max recipes 192, validation max recipes 192, max pairs per recipe 12, first/second member limits 8.
+- Atlas run:
+  - Run folder: `runs/derived/atlas-runs/20260707T020517993374Z-atlas-rich-plus-discovery-v1`.
+  - Signal rows: 13,728.
+  - Discovery-pair queue rows: 53,511, versus 15,223 in the 7.23% candidate.
+  - Validation queue/results rows: 564, versus 416 in the 7.23% candidate.
+  - Scrutiny queue/results rows: 51, versus 105 in the 7.23% candidate.
+  - PlayHand seed-plan recipe objects: 37, versus 43 in the 7.23% candidate.
+  - Atlas runtime: about 1h44m.
+  - Operational note: the large discovery phase sustained about 90-96% slot saturation with four Vast instances; one completed-but-not-returned Vast tail lease required worker recycling and was requeued safely. No final gateway failures or result drops.
+- Fixed PlayHand benchmark:
+  - Campaign: `20260707T035339644991Z-playhand-lab-campaign-v1`.
+  - Seed plan: `runs/derived/atlas-runs/20260707T020517993374Z-atlas-rich-plus-discovery-v1/recipe-priors/play-hand-seed-plan.json`.
+  - Same benchmark contract as above: 512 target runs, 64 active runs, finite full drain, seed `20260704`, instrument pool `all`.
+  - Result: 24 promoted out of 512 terminal lanes, 4.69%.
+  - Delta versus 7.23% candidate: -13 promoted, -2.54 percentage points.
+  - Delta versus old 6.84% baseline: -11 promoted, -2.15 percentage points.
+  - Benchmark completed cleanly: 24,914 completed tasks, 0 failed tasks, 0 gateway result drops, 0 final gateway failures.
+- Decision:
+  - Reject this final-push candidate for PlayHand default use.
+  - The widened discovery-pair surface was not a free improvement. It generated a much broader discovery queue but fewer seed-plan recipe objects and a much lower fixed benchmark promotion rate.
+  - Keep the 7.23% rich-upstream controlled-discovery run as the current winner.
+- Stable default after this test:
+  - Published default source: `runs/derived/atlas-runs/20260706T232304665612Z-atlas-lab/recipe-priors`.
+  - Publish manifest: `runs/derived/recipe-priors/atlas-lab-publish-manifest.json`.
+  - The weaker final-push seed plan was not published.

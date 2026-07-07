@@ -739,6 +739,7 @@ def test_atlas_rich_profile_declares_broader_observation_surface() -> None:
     rich_markets = atlas_profile_config("rich-markets")
     rich = atlas_profile_config("rich")
     rich_discovery = atlas_profile_config("rich-discovery")
+    rich_plus_discovery = atlas_profile_config("rich-plus-discovery")
 
     assert standard["signal_roles"] == ["trigger"]
     assert rich_roles["signal_roles"] == ["trigger", "setup", "context", "filter"]
@@ -759,6 +760,7 @@ def test_atlas_rich_profile_declares_broader_observation_surface() -> None:
     assert "SOLUSD" not in rich_markets["signal_instruments"]
     assert "SOLUSD" not in rich["signal_instruments"]
     assert "SOLUSD" not in rich_discovery["signal_instruments"]
+    assert "SOLUSD" not in rich_plus_discovery["signal_instruments"]
     assert rich["signal_timeframes"] == ["M1", "M5", "M15", "H1"]
     assert rich["discovery_timeframes"] == standard["discovery_timeframes"]
     assert rich["discovery_instruments"] == standard["discovery_instruments"]
@@ -775,6 +777,11 @@ def test_atlas_rich_profile_declares_broader_observation_surface() -> None:
         "H4",
         "D1",
     ]
+    assert rich_plus_discovery["signal_roles"] == rich["signal_roles"]
+    assert rich_plus_discovery["signal_instruments"] == rich["signal_instruments"]
+    assert rich_plus_discovery["signal_timeframes"] == rich["signal_timeframes"]
+    assert rich_plus_discovery["discovery_instruments"] == standard["discovery_instruments"]
+    assert rich_plus_discovery["discovery_timeframes"] == rich_discovery["discovery_timeframes"]
 
 
 def test_effective_atlas_build_profile_can_bound_rich_surface_for_smoke() -> None:

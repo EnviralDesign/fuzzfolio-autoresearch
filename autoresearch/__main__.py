@@ -1329,7 +1329,8 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
             "Atlas evidence profile. standard preserves the current trigger-only surface; "
             "rich-roles broadens roles on the current market panel; rich-timeframes and rich-markets "
             "expand one more axis; rich expands roles, instruments, and timeframes together; "
-            "rich-discovery also widens the discovery-pair probe timeframe matrix."
+            "rich-discovery widens discovery with standard upstream timeframes; rich-plus-discovery "
+            "keeps rich upstream evidence and widens the discovery-pair probe timeframe matrix."
         ),
     )
     atlas_lab.add_argument(
