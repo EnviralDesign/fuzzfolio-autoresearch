@@ -834,3 +834,36 @@ Published default and full-upstream-rich controlled-discovery run on 2026-07-06:
   - Full upstream rich signal evidence increased the amount of useful recipe material even while discovery/downstream stayed controlled.
   - The main new prior set looks materially richer than the published default by count, retention breadth, and discovery-validation contribution.
   - The result is a strong candidate for the next PlayHand A/B, but it should not become the default solely from Atlas richness metrics; the next decision point is whether it improves PlayHand promotion rate and promoted-run quality versus the currently published `recipe-stream-v2` default.
+
+Fixed PlayHand A/B benchmark on 2026-07-07:
+
+- Benchmark contract:
+  - Keep this shape stable for future seed-plan comparisons unless explicitly changing the benchmark itself.
+  - Target runs: 512.
+  - Active runs: 64.
+  - Mode: finite full drain.
+  - Seed: `20260704`.
+  - Task mode: `deep_replay`.
+  - Instrument pool preset: `all`.
+  - Max wait seconds: 57,600.
+  - Experimental variable: seed-plan path only.
+- Baseline:
+  - Campaign: `20260706T073034244694Z-playhand-lab-campaign-v1`.
+  - Seed plan: `runs/derived/atlas-runs/20260704T180024472466Z-atlas-recipe-stream-v2/recipe-priors/play-hand-seed-plan.json`.
+  - Result: 35 promoted out of 512 terminal lanes, 6.84%.
+- Candidate:
+  - Campaign: `20260707T002626949253Z-playhand-lab-campaign-v1`.
+  - Seed plan: `runs/derived/atlas-runs/20260706T232304665612Z-atlas-lab/recipe-priors/play-hand-seed-plan.json`.
+  - Report: `runs/derived/playhand-ab-tests/20260707T002625Z-rich-upstream-full-drain-512/AB_REPORT.md`.
+  - Result: 37 promoted out of 512 terminal lanes, 7.23%.
+  - Delta: +2 promoted, +0.39 percentage points, +5.7% relative lift.
+  - Candidate completed cleanly: 22,504 completed tasks, 0 failed tasks, 0 gateway result drops, 0 final gateway failures.
+- Operational read:
+  - Four transient Vast instances were used after the gateway showed high saturation; all were destroyed after completion.
+  - Worker slots peaked at 239.
+  - Runtime was about 34 minutes.
+  - The fourth Vast instance was useful during the mid-run fan-out phase but the fixed 64-active-run benchmark naturally became bursty near the tail.
+- Interpretation:
+  - This is a clean apples-to-apples win for the richer upstream Atlas candidate, but the margin is modest.
+  - The result supports publishing or further testing the richer candidate, not claiming a large quality jump from one 512-lane run.
+  - Future comparisons should reuse the fixed benchmark contract above so promotion-rate deltas stay interpretable.
