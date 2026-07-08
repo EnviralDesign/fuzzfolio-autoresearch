@@ -541,6 +541,7 @@ else:
 console = Console(safe_box=True)
 DISPLAY_CONTEXT: dict[str, Path | None] = {"repo_root": None, "run_dir": None}
 PLAIN_PROGRESS_MODE = False
+DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS = 7.0
 PLAIN_PROGRESS_STATE: dict[str, Any] = {
     "best_score": None,
     "last_score": None,
@@ -641,6 +642,7 @@ PUBLIC_CLI_COMMANDS = {
     "build-portfolio-risk-sizing",
     "render-portfolio-profile-drops",
     "cleanup-incomplete-playhand-runs",
+    "cleanup-atlas-artifacts",
     "cleanup-playhand-lab-raw-artifacts",
     "compact-runs-json",
     "dashboard",
@@ -2896,6 +2898,47 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     cleanup_cmd.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
+    cleanup_atlas = subparsers.add_parser(
+        "cleanup-atlas-artifacts",
+        help=(
+            "Delete rebuildable Atlas lab artifact directories while preserving the "
+            "published recipe priors used by PlayHand."
+        ),
+    )
+    cleanup_mode = cleanup_atlas.add_mutually_exclusive_group()
+    cleanup_mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview matched Atlas artifacts without deleting anything. This is the default.",
+    )
+    cleanup_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Delete the matched Atlas artifact directories.",
+    )
+    cleanup_atlas.add_argument(
+        "--keep-latest",
+        type=int,
+        default=1,
+        help="Keep this many newest atlas-runs entries by modification time. Default: 1.",
+    )
+    cleanup_atlas.add_argument(
+        "--keep-current-priors",
+        action="store_true",
+        help=(
+            "Also keep the Atlas run referenced by the active recipe-priors publish "
+            "manifest, when that source run is still present."
+        ),
+    )
+    cleanup_atlas.add_argument(
+        "--preview",
+        type=int,
+        default=20,
+        help="How many matched/kept entries to include in the JSON preview.",
+    )
+    cleanup_atlas.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
     lab_raw_cleanup = subparsers.add_parser(
         "cleanup-playhand-lab-raw-artifacts",
         help="Delete redundant PlayHand Massive v2 raw lab debug artifacts.",
@@ -3036,6 +3079,16 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--force-rebuild",
         action="store_true",
         help="Recalculate even if full-backtest file already exists.",
+    )
+    calc_backtests.add_argument(
+        "--full-backtest-max-age-days",
+        type=float,
+        default=DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+        help=(
+            "Recalculate cached 36mo full-backtests when their effective data end "
+            "is older than this many days. Use a negative value to disable. "
+            f"Default: {DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS:g}"
+        ),
     )
     calc_backtests.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
@@ -3422,6 +3475,17 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Override the portfolio config and force full-backtest rebuilds during the optional catch-up phase.",
+    )
+    portfolio_report.add_argument(
+        "--catch-up-full-backtest-max-age-days",
+        type=float,
+        default=None,
+        help=(
+            "Override the portfolio config and recalculate cached 36mo "
+            "full-backtests during catch-up when their effective data end is "
+            "older than this many days. Defaults to 7 days when catch-up runs; "
+            "use a negative value to disable."
+        ),
     )
     portfolio_report.add_argument(
         "--catch-up-require-scrutiny-36",
@@ -3818,6 +3882,16 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Maximum seconds to wait for each deep replay full-backtest job during catch-up. Default: 2400",
     )
     render_corpus_profile_drops.add_argument(
+        "--full-backtest-max-age-days",
+        type=float,
+        default=DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+        help=(
+            "Recalculate cached 36mo full-backtests during catch-up when their "
+            "effective data end is older than this many days. Use a negative "
+            f"value to disable. Default: {DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS:g}"
+        ),
+    )
+    render_corpus_profile_drops.add_argument(
         "--profile-drop-timeout-seconds",
         type=int,
         default=1800,
@@ -3880,6 +3954,16 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         type=int,
         default=2400,
         help="Maximum seconds to wait for each deep replay full-backtest job during catch-up. Default: 2400",
+    )
+    finalize_corpus.add_argument(
+        "--full-backtest-max-age-days",
+        type=float,
+        default=DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+        help=(
+            "Recalculate cached 36mo full-backtests when their effective data end "
+            "is older than this many days. Use a negative value to disable. "
+            f"Default: {DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS:g}"
+        ),
     )
     finalize_corpus.add_argument(
         "--profile-drop-timeout-seconds",
@@ -4634,6 +4718,326 @@ def _is_run_dir_stale(
     if age.total_seconds() < 0:
         return True
     return age.total_seconds() >= (older_than_minutes * 60.0)
+
+
+def _directory_tree_stats(root: Path) -> dict[str, int]:
+    total_bytes = 0
+    file_count = 0
+    dir_count = 0
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        dir_count += 1
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False):
+                            file_count += 1
+                            total_bytes += int(entry.stat(follow_symlinks=False).st_size)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return {
+        "bytes": total_bytes,
+        "files": file_count,
+        "dirs": dir_count,
+    }
+
+
+def _format_bytes(value: Any) -> str:
+    try:
+        size = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if abs(size) < 1024.0 or unit == units[-1]:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} TB"
+
+
+def _compact_atlas_run_id(value: Any) -> str:
+    text = str(value or "")
+    match = re.match(r"^(\d{8}T\d{6})\d*Z-(.+)$", text)
+    if match:
+        return f"{match.group(1)}Z-{match.group(2)}"
+    if len(text) <= 32:
+        return text
+    return f"{text[:18]}...{text[-11:]}"
+
+
+def _published_atlas_run_ids(
+    *,
+    atlas_runs_root: Path,
+    recipe_priors_dir: Path,
+) -> set[str]:
+    manifest_path = recipe_priors_dir / "atlas-lab-publish-manifest.json"
+    if not manifest_path.exists():
+        return set()
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(manifest, dict):
+        return set()
+    run_ids: set[str] = set()
+    run_id = str(manifest.get("run_id") or "").strip()
+    if run_id:
+        run_ids.add(run_id)
+    source_dir = str(manifest.get("source_dir") or "").strip()
+    if source_dir:
+        source_path = Path(source_dir).expanduser()
+        try:
+            rel = source_path.resolve().relative_to(atlas_runs_root.resolve())
+        except (OSError, ValueError):
+            rel = None
+        if rel is not None and rel.parts:
+            run_ids.add(rel.parts[0])
+    return run_ids
+
+
+def _print_cleanup_atlas_artifacts_summary(payload: dict[str, Any]) -> None:
+    dry_run = bool(payload.get("dry_run"))
+    blocked = int(payload.get("blocked_artifacts") or 0)
+    title = "Atlas Artifact Cleanup"
+    mode = "Dry run" if dry_run else "Apply"
+    lines = [
+        f"Mode: {mode}",
+        f"Matched: {int(payload.get('matched_artifacts') or 0)} artifact dirs",
+        f"Kept: {int(payload.get('kept_artifacts') or 0)} artifact dirs",
+        f"Reclaimable: {_format_bytes(payload.get('reclaimable_bytes'))}",
+        f"Files: {int(payload.get('reclaimable_files') or 0):,}",
+        f"Dirs: {int(payload.get('reclaimable_dirs') or 0):,}",
+    ]
+    if not dry_run:
+        lines.extend(
+            [
+                f"Deleted: {int(payload.get('deleted_artifacts') or 0)} artifact dirs",
+                f"Deleted bytes: {_format_bytes(payload.get('deleted_bytes'))}",
+            ]
+        )
+    if blocked:
+        lines.append(f"Blocked: {blocked}")
+    protected = payload.get("protected_current_priors_run_ids")
+    if protected:
+        lines.append(f"Current-priors source kept: {', '.join(str(item) for item in protected)}")
+    message = str(payload.get("message") or "").strip()
+    if message:
+        lines.append(message)
+
+    console.print(Panel("\n".join(lines), title=title, border_style="yellow"))
+
+    largest = payload.get("largest_candidate_preview") or payload.get("candidate_preview") or []
+    if largest:
+        table = Table(title="Largest Matched Atlas Artifacts", box=box.SIMPLE_HEAVY)
+        table.add_column("Run", no_wrap=True)
+        table.add_column("Size", justify="right")
+        table.add_column("Files", justify="right")
+        table.add_column("Dirs", justify="right")
+        for item in largest[:10]:
+            table.add_row(
+                _compact_atlas_run_id(item.get("run_id")),
+                _format_bytes(item.get("bytes")),
+                f"{int(item.get('files') or 0):,}",
+                f"{int(item.get('dirs') or 0):,}",
+            )
+        console.print(table)
+
+    kept = payload.get("kept_preview") or []
+    if kept:
+        table = Table(title="Kept Atlas Artifacts", box=box.SIMPLE)
+        table.add_column("Run", overflow="fold")
+        table.add_column("Reason")
+        for item in kept[:8]:
+            reasons = item.get("keep_reasons") or []
+            table.add_row(
+                str(item.get("run_id") or ""),
+                ", ".join(str(reason) for reason in reasons),
+            )
+        console.print(table)
+
+
+def cmd_cleanup_atlas_artifacts(
+    *,
+    keep_latest: int,
+    keep_current_priors: bool,
+    apply: bool,
+    preview: int,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    derived_root = config.derived_root.resolve()
+    atlas_runs_root = (derived_root / "atlas-runs").resolve()
+    recipe_priors_dir = (derived_root / DEFAULT_RECIPE_PRIORS_DIRNAME).resolve()
+    dry_run = not apply
+    keep_latest = max(0, int(keep_latest))
+    preview = max(0, int(preview))
+
+    if not atlas_runs_root.exists():
+        payload = {
+            "command": "cleanup-atlas-artifacts",
+            "derived_root": str(derived_root),
+            "atlas_runs_root": str(atlas_runs_root),
+            "dry_run": dry_run,
+            "applied": False,
+            "message": "No atlas-runs directory exists.",
+            "matched_artifacts": 0,
+            "reclaimable_bytes": 0,
+        }
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0
+        _print_cleanup_atlas_artifacts_summary(payload)
+        return 0
+
+    if not _is_path_under(atlas_runs_root, derived_root):
+        raise RuntimeError(f"Refusing to clean Atlas path outside derived root: {atlas_runs_root}")
+
+    protected_run_ids: set[str] = set()
+    if keep_current_priors:
+        protected_run_ids = _published_atlas_run_ids(
+            atlas_runs_root=atlas_runs_root,
+            recipe_priors_dir=recipe_priors_dir,
+        )
+
+    run_entries: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
+    for child in sorted(atlas_runs_root.iterdir(), key=lambda path: path.name):
+        if child.is_symlink():
+            skipped.append({"path": str(child), "reason": "symlink_skipped"})
+            continue
+        if not child.is_dir():
+            skipped.append({"path": str(child), "reason": "not_directory"})
+            continue
+        try:
+            stat = child.stat()
+            mtime_ns = int(stat.st_mtime_ns)
+            updated_at = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+        except OSError:
+            mtime_ns = 0
+            updated_at = None
+        run_entries.append(
+            {
+                "run_id": child.name,
+                "path": str(child),
+                "mtime_ns": mtime_ns,
+                "updated_at": updated_at,
+            }
+        )
+
+    newest = sorted(
+        run_entries,
+        key=lambda item: (int(item.get("mtime_ns") or 0), str(item.get("run_id") or "")),
+        reverse=True,
+    )
+    latest_keep_ids = {str(item["run_id"]) for item in newest[:keep_latest]}
+
+    kept: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    for item in newest:
+        reasons: list[str] = []
+        run_id = str(item["run_id"])
+        if run_id in latest_keep_ids:
+            reasons.append("keep_latest")
+        if run_id in protected_run_ids:
+            reasons.append("current_priors_source")
+        if reasons:
+            kept.append({**item, "keep_reasons": reasons})
+        else:
+            candidates.append(item)
+
+    reclaimable_bytes = 0
+    reclaimable_files = 0
+    reclaimable_dirs = 0
+    measured_candidates: list[dict[str, Any]] = []
+    for item in candidates:
+        path = Path(str(item["path"]))
+        stats = _directory_tree_stats(path)
+        measured = {
+            **item,
+            "bytes": stats["bytes"],
+            "files": stats["files"],
+            "dirs": stats["dirs"],
+        }
+        measured_candidates.append(measured)
+        reclaimable_bytes += stats["bytes"]
+        reclaimable_files += stats["files"]
+        reclaimable_dirs += stats["dirs"]
+
+    payload: dict[str, Any] = {
+        "command": "cleanup-atlas-artifacts",
+        "derived_root": str(derived_root),
+        "atlas_runs_root": str(atlas_runs_root),
+        "recipe_priors_dir": str(recipe_priors_dir),
+        "keep_latest": keep_latest,
+        "keep_current_priors": keep_current_priors,
+        "protected_current_priors_run_ids": sorted(protected_run_ids),
+        "dry_run": dry_run,
+        "matched_artifacts": len(measured_candidates),
+        "kept_artifacts": len(kept),
+        "skipped_entries": len(skipped),
+        "reclaimable_bytes": reclaimable_bytes,
+        "reclaimable_files": reclaimable_files,
+        "reclaimable_dirs": reclaimable_dirs,
+        "candidate_preview": measured_candidates[:preview],
+        "largest_candidate_preview": sorted(
+            measured_candidates,
+            key=lambda item: int(item.get("bytes") or 0),
+            reverse=True,
+        )[:preview],
+        "kept_preview": kept[:preview],
+    }
+    if skipped:
+        payload["skipped_preview"] = skipped[:preview]
+
+    if dry_run:
+        payload["message"] = "Dry run only. Re-run with --apply to delete matched Atlas artifacts."
+        if as_json:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0
+        _print_cleanup_atlas_artifacts_summary(payload)
+        return 0
+
+    deleted: list[dict[str, Any]] = []
+    blocked: list[dict[str, Any]] = []
+    for item in measured_candidates:
+        path = Path(str(item["path"]))
+        try:
+            resolved = path.resolve()
+            if resolved == atlas_runs_root:
+                raise RuntimeError("refusing to delete atlas-runs root")
+            if not _is_path_under(resolved, atlas_runs_root):
+                raise RuntimeError("candidate is outside atlas-runs root")
+            shutil.rmtree(resolved)
+            deleted.append(item)
+        except (OSError, RuntimeError) as exc:
+            blocked.append(
+                {
+                    "run_id": item.get("run_id"),
+                    "path": item.get("path"),
+                    "error": str(exc),
+                }
+            )
+
+    payload["deleted_artifacts"] = len(deleted)
+    payload["deleted_bytes"] = sum(int(item.get("bytes") or 0) for item in deleted)
+    payload["deleted_files"] = sum(int(item.get("files") or 0) for item in deleted)
+    payload["deleted_dirs"] = sum(int(item.get("dirs") or 0) for item in deleted)
+    payload["blocked_artifacts"] = len(blocked)
+    payload["deleted_preview"] = deleted[:preview]
+    if blocked:
+        payload["blocked_preview"] = blocked[:preview]
+
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0 if not blocked else 1
+    _print_cleanup_atlas_artifacts_summary(payload)
+    return 0 if not blocked else 1
 
 
 def cmd_cleanup_incomplete_playhand_runs(
@@ -6664,6 +7068,100 @@ def _result_matches_attempt_reward_matrix(path: Path, attempt: dict[str, Any]) -
             return True
         effective_max = reward_step * reward_columns
     return max(reward_values) <= (float(effective_max) + 1e-6)
+
+
+def _iter_payload_key_values(payload: Any, key: str) -> list[Any]:
+    values: list[Any] = []
+    if isinstance(payload, dict):
+        for current_key, current_value in payload.items():
+            if current_key == key:
+                values.append(current_value)
+            values.extend(_iter_payload_key_values(current_value, key))
+    elif isinstance(payload, list):
+        for item in payload:
+            values.extend(_iter_payload_key_values(item, key))
+    return values
+
+
+def _parse_payload_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        token = str(value or "").strip()
+        if not token:
+            return None
+        if token.endswith("Z"):
+            token = token[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(token)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _truthy_payload_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _full_backtest_freshness_issue(
+    result_path: Path,
+    *,
+    max_age_days: float | None,
+    now: datetime | None = None,
+) -> str | None:
+    if max_age_days is None or float(max_age_days) < 0:
+        return None
+    try:
+        payload = _load_json_if_exists(result_path)
+    except Exception:
+        return "invalid_result_json"
+    if not isinstance(payload, dict) or not payload:
+        return "missing_freshness_metadata"
+
+    effective_ends = [
+        parsed
+        for parsed in (
+            _parse_payload_datetime(value)
+            for value in _iter_payload_key_values(payload, "effective_window_end")
+        )
+        if parsed is not None
+    ]
+    if not effective_ends:
+        return "missing_effective_window_end"
+
+    max_age = timedelta(days=max(0.0, float(max_age_days)))
+    now_utc = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    latest_effective_end = max(effective_ends)
+    if latest_effective_end < now_utc - max_age:
+        return "stale_effective_window_end"
+
+    if any(
+        _truthy_payload_flag(value)
+        for value in _iter_payload_key_values(payload, "window_truncated_end")
+    ):
+        requested_ends = [
+            parsed
+            for parsed in (
+                _parse_payload_datetime(value)
+                for value in _iter_payload_key_values(payload, "requested_window_end")
+            )
+            if parsed is not None
+        ]
+        if not requested_ends:
+            return "truncated_window_missing_requested_end"
+        latest_requested_end = max(requested_ends)
+        if latest_requested_end - latest_effective_end > max_age:
+            return "truncated_window_gap"
+
+    return None
 
 
 def _run_full_backtest_with_retry(
@@ -9760,6 +10258,7 @@ def cmd_calculate_full_backtests(
     require_scrutiny_36: bool,
     force_rebuild: bool,
     job_timeout_seconds: int | None,
+    full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
     as_json: bool,
     emit_summary: bool = True,
 ) -> int:
@@ -9784,30 +10283,39 @@ def cmd_calculate_full_backtests(
             )
         return 0
 
-    def needs_calculation(attempt: dict[str, Any]) -> bool:
+    def calculation_needed_reason(attempt: dict[str, Any]) -> str | None:
         artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
         if not artifact_dir.exists():
-            return False
+            return None
         if force_rebuild:
-            return True
+            return "force_rebuild"
         curve_path = artifact_dir / "full-backtest-36mo-curve.json"
         result_path = artifact_dir / "full-backtest-36mo-result.json"
         calendar_curve_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
         if not curve_path.exists() or not result_path.exists():
-            return True
+            return "missing_full_backtest_artifact"
         if not calendar_curve_path.exists():
-            return True
+            return "missing_calendar_curve"
         if not _result_has_canonical_score_lab(result_path):
-            return True
+            return "stale_score_lab"
         if not result_matches_execution_cost_model(result_path, config):
-            return True
-        return not _result_matches_attempt_reward_matrix(result_path, attempt)
+            return "execution_cost_model_mismatch"
+        if not _result_matches_attempt_reward_matrix(result_path, attempt):
+            return "reward_matrix_mismatch"
+        freshness_issue = _full_backtest_freshness_issue(
+            result_path,
+            max_age_days=full_backtest_max_age_days,
+        )
+        if freshness_issue is not None:
+            return freshness_issue
+        return None
 
     filter_rejections = {
         "already_has_full_backtest": 0,
         "missing_scrutiny_36m": 0,
         "no_backtestable_cell": 0,
     }
+    calculation_reasons: dict[str, int] = {}
     eligible_items: list[tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
     for run_dir, _attempts, attempt in matched_items:
         run_metadata = load_run_metadata(run_dir)
@@ -9816,9 +10324,13 @@ def cmd_calculate_full_backtests(
             run_metadata=run_metadata,
         )
         row = catalog_by_attempt_id.get(str(attempt.get("attempt_id") or "")) or {}
-        if not needs_calculation(attempt):
+        calculation_reason = calculation_needed_reason(attempt)
+        if calculation_reason is None:
             filter_rejections["already_has_full_backtest"] += 1
             continue
+        calculation_reasons[calculation_reason] = (
+            calculation_reasons.get(calculation_reason, 0) + 1
+        )
         if not _attempt_has_backtestable_cell(attempt):
             filter_rejections["no_backtestable_cell"] += 1
             continue
@@ -10036,7 +10548,9 @@ def cmd_calculate_full_backtests(
             "require_scrutiny_36": require_scrutiny_36,
             "force_rebuild": force_rebuild,
             "job_timeout_seconds": job_timeout_seconds,
+            "full_backtest_max_age_days": full_backtest_max_age_days,
         },
+        "calculation_reasons": calculation_reasons,
         "max_workers_used": resolved_max_workers,
         "max_workers_source": worker_source,
         "detected_dev_sim_workers": detected_sim_workers,
@@ -11295,6 +11809,7 @@ def cmd_build_portfolio(
     candidate_scope: str | None = None,
     catch_up_full_backtests: bool | None,
     catch_up_force_rebuild: bool | None,
+    catch_up_full_backtest_max_age_days: float | None = None,
     catch_up_require_scrutiny_36: bool | None,
     generate_profile_drops: bool | None,
     export_bundle: bool | None,
@@ -11315,6 +11830,10 @@ def cmd_build_portfolio(
             portfolio_spec["catch_up_full_backtests"] = bool(catch_up_full_backtests)
         if catch_up_force_rebuild is not None:
             portfolio_spec["catch_up_force_rebuild"] = bool(catch_up_force_rebuild)
+        if catch_up_full_backtest_max_age_days is not None:
+            portfolio_spec["catch_up_full_backtest_max_age_days"] = float(
+                catch_up_full_backtest_max_age_days
+            )
         if catch_up_require_scrutiny_36 is not None:
             portfolio_spec["catch_up_require_scrutiny_36"] = bool(
                 catch_up_require_scrutiny_36
@@ -11350,6 +11869,20 @@ def cmd_build_portfolio(
     catch_up_timeout_seconds = (
         max(catch_up_timeout_candidates) if catch_up_timeout_candidates else None
     )
+    catch_up_max_age_candidates: list[float] = []
+    for portfolio_spec in portfolio_specs:
+        raw_max_age = portfolio_spec.get("catch_up_full_backtest_max_age_days")
+        if raw_max_age is None:
+            continue
+        try:
+            catch_up_max_age_candidates.append(float(raw_max_age))
+        except (TypeError, ValueError):
+            continue
+    catch_up_max_age_days = (
+        min(catch_up_max_age_candidates)
+        if catch_up_max_age_candidates
+        else DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS
+    )
     if catch_up_requested:
         if as_json:
             with io.StringIO() as capture, redirect_stdout(capture):
@@ -11362,6 +11895,7 @@ def cmd_build_portfolio(
                     require_scrutiny_36=catch_up_require_scrutiny,
                     force_rebuild=catch_up_force,
                     job_timeout_seconds=catch_up_timeout_seconds,
+                    full_backtest_max_age_days=catch_up_max_age_days,
                     as_json=True,
                 )
         else:
@@ -11374,6 +11908,7 @@ def cmd_build_portfolio(
                 require_scrutiny_36=catch_up_require_scrutiny,
                 force_rebuild=catch_up_force,
                 job_timeout_seconds=catch_up_timeout_seconds,
+                full_backtest_max_age_days=catch_up_max_age_days,
                 as_json=False,
             )
         full_backtest_failures = load_json_if_exists(config.full_backtest_failures_json_path)
@@ -13742,6 +14277,7 @@ def cmd_render_corpus_profile_drops(
     force_rebuild: bool,
     full_backtest_workers: int | None = None,
     full_backtest_job_timeout_seconds: int | None = 2400,
+    full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
     require_presentation_metadata: bool = False,
     as_json: bool,
 ) -> int:
@@ -13796,6 +14332,7 @@ def cmd_render_corpus_profile_drops(
         f"canonical_only={'yes' if canonical_only else 'no'}, workers={worker_count}, "
         f"full_backtest_workers={full_backtest_worker_count if full_backtest_worker_count is not None else 'auto'}, "
         f"full_backtest_job_timeout={full_backtest_job_timeout if full_backtest_job_timeout is not None else 'default'}, "
+        f"full_backtest_max_age_days={full_backtest_max_age_days}, "
         f"lookback={lookback_months}mo, force_rebuild={'yes' if force_rebuild else 'no'})",
         as_json=as_json,
     )
@@ -13839,6 +14376,7 @@ def cmd_render_corpus_profile_drops(
                     require_scrutiny_36=False,
                     force_rebuild=bool(force_rebuild),
                     job_timeout_seconds=full_backtest_job_timeout,
+                    full_backtest_max_age_days=full_backtest_max_age_days,
                     as_json=True,
                 )
         else:
@@ -13851,6 +14389,7 @@ def cmd_render_corpus_profile_drops(
                 require_scrutiny_36=False,
                 force_rebuild=bool(force_rebuild),
                 job_timeout_seconds=full_backtest_job_timeout,
+                full_backtest_max_age_days=full_backtest_max_age_days,
                 as_json=False,
                 emit_summary=False,
             )
@@ -14117,6 +14656,7 @@ def cmd_finalize_corpus(
     as_json: bool,
     full_backtest_workers: int | None = None,
     full_backtest_job_timeout_seconds: int | None = 2400,
+    full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
 ) -> int:
     set_provider_trace_stderr_mode("warnings_only")
     config = load_config()
@@ -14165,6 +14705,7 @@ def cmd_finalize_corpus(
         f"workers={max(1, int(profile_drop_workers))}, "
         f"full_backtest_workers={full_backtest_worker_count if full_backtest_worker_count is not None else 'auto'}, "
         f"full_backtest_job_timeout={full_backtest_job_timeout if full_backtest_job_timeout is not None else 'default'}, "
+        f"full_backtest_max_age_days={full_backtest_max_age_days}, "
         f"lookback={int(lookback_months)}mo, dry_run={'yes' if dry_run else 'no'})",
         as_json=as_json,
     )
@@ -14195,6 +14736,7 @@ def cmd_finalize_corpus(
         "profile_drop_workers": max(1, int(profile_drop_workers)),
         "full_backtest_workers": full_backtest_worker_count,
         "full_backtest_job_timeout_seconds": full_backtest_job_timeout,
+        "full_backtest_max_age_days": full_backtest_max_age_days,
         "profile_drop_timeout_seconds": max(1, int(profile_drop_timeout_seconds)),
         "force_rebuild": bool(force_rebuild),
         "require_presentation_metadata": bool(require_presentation_metadata),
@@ -14236,6 +14778,7 @@ def cmd_finalize_corpus(
                 force_rebuild=bool(force_rebuild),
                 full_backtest_workers=full_backtest_worker_count,
                 full_backtest_job_timeout_seconds=full_backtest_job_timeout,
+                full_backtest_max_age_days=full_backtest_max_age_days,
                 require_presentation_metadata=bool(require_presentation_metadata),
                 as_json=True,
             )
@@ -14258,6 +14801,7 @@ def cmd_finalize_corpus(
             force_rebuild=bool(force_rebuild),
             full_backtest_workers=full_backtest_worker_count,
             full_backtest_job_timeout_seconds=full_backtest_job_timeout,
+            full_backtest_max_age_days=full_backtest_max_age_days,
             require_presentation_metadata=bool(require_presentation_metadata),
             as_json=False,
         )
@@ -16452,6 +16996,7 @@ def main(argv: list[str] | None = None) -> int:
             require_scrutiny_36=bool(args.require_scrutiny_36),
             force_rebuild=bool(args.force_rebuild),
             job_timeout_seconds=None,
+            full_backtest_max_age_days=args.full_backtest_max_age_days,
             as_json=bool(args.json),
         )
     if args.command == "build-attempt-catalog":
@@ -16536,6 +17081,7 @@ def main(argv: list[str] | None = None) -> int:
             candidate_scope=args.candidate_scope,
             catch_up_full_backtests=args.catch_up_full_backtests,
             catch_up_force_rebuild=args.catch_up_force_rebuild,
+            catch_up_full_backtest_max_age_days=args.catch_up_full_backtest_max_age_days,
             catch_up_require_scrutiny_36=args.catch_up_require_scrutiny_36,
             generate_profile_drops=args.generate_profile_drops,
             export_bundle=args.export_bundle,
@@ -16618,6 +17164,7 @@ def main(argv: list[str] | None = None) -> int:
             force_rebuild=bool(args.force_rebuild),
             full_backtest_workers=args.full_backtest_workers,
             full_backtest_job_timeout_seconds=args.full_backtest_job_timeout_seconds,
+            full_backtest_max_age_days=args.full_backtest_max_age_days,
             as_json=bool(args.json),
         )
     if args.command == "finalize-corpus":
@@ -16634,6 +17181,7 @@ def main(argv: list[str] | None = None) -> int:
             as_json=bool(args.json),
             full_backtest_workers=args.full_backtest_workers,
             full_backtest_job_timeout_seconds=args.full_backtest_job_timeout_seconds,
+            full_backtest_max_age_days=args.full_backtest_max_age_days,
         )
     if args.command == "nuke-deep-caches":
         return cmd_nuke_deep_caches(as_json=bool(args.json))
@@ -16655,6 +17203,14 @@ def main(argv: list[str] | None = None) -> int:
                 else None
             ),
             dry_run=bool(args.dry_run),
+            preview=int(args.preview),
+            as_json=bool(args.json),
+        )
+    if args.command == "cleanup-atlas-artifacts":
+        return cmd_cleanup_atlas_artifacts(
+            keep_latest=int(args.keep_latest),
+            keep_current_priors=bool(args.keep_current_priors),
+            apply=bool(args.apply),
             preview=int(args.preview),
             as_json=bool(args.json),
         )
