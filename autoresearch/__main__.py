@@ -58,6 +58,10 @@ if __package__ in {None, ""}:
         write_csv,
         write_json,
     )
+    from autoresearch.corpus_lab_backtests import (
+        resolve_lab_backtest_config,
+        run_lab_full_backtests,
+    )
     from autoresearch.controller import (
         ResearchController,
         RunPolicy,
@@ -307,6 +311,10 @@ else:
         subset_similarity_payload,
         write_csv,
         write_json,
+    )
+    from .corpus_lab_backtests import (
+        resolve_lab_backtest_config,
+        run_lab_full_backtests,
     )
     from .controller import ResearchController, RunPolicy, set_runtime_trace_stderr_mode
     from .dashboard import (
@@ -3091,6 +3099,39 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     calc_backtests.add_argument(
+        "--full-backtest-backend",
+        choices=("local", "lab-gateway"),
+        default="local",
+        help="Execution backend for 36mo full-backtests. Default: local.",
+    )
+    calc_backtests.add_argument(
+        "--full-backtest-gateway-url",
+        default=None,
+        help="Lab gateway URL when --full-backtest-backend=lab-gateway.",
+    )
+    calc_backtests.add_argument(
+        "--full-backtest-gateway-token",
+        default=None,
+        help="Lab gateway bearer token. Defaults to the configured local lab gateway token.",
+    )
+    calc_backtests.add_argument(
+        "--full-backtest-worker-contract-hash",
+        default=None,
+        help="Optional replay worker contract hash required for lab-gateway full-backtest jobs.",
+    )
+    calc_backtests.add_argument(
+        "--full-backtest-result-batch-size",
+        type=int,
+        default=25,
+        help="Gateway result drain batch size for lab-gateway full-backtests. Default: 25",
+    )
+    calc_backtests.add_argument(
+        "--trading-dashboard-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard repo root used to resolve the worker contract hash when available.",
+    )
+    calc_backtests.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
@@ -3892,6 +3933,39 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     render_corpus_profile_drops.add_argument(
+        "--full-backtest-backend",
+        choices=("local", "lab-gateway"),
+        default="local",
+        help="Execution backend for 36mo full-backtest catch-up. Default: local.",
+    )
+    render_corpus_profile_drops.add_argument(
+        "--full-backtest-gateway-url",
+        default=None,
+        help="Lab gateway URL when --full-backtest-backend=lab-gateway.",
+    )
+    render_corpus_profile_drops.add_argument(
+        "--full-backtest-gateway-token",
+        default=None,
+        help="Lab gateway bearer token. Defaults to the configured local lab gateway token.",
+    )
+    render_corpus_profile_drops.add_argument(
+        "--full-backtest-worker-contract-hash",
+        default=None,
+        help="Optional replay worker contract hash required for lab-gateway full-backtest jobs.",
+    )
+    render_corpus_profile_drops.add_argument(
+        "--full-backtest-result-batch-size",
+        type=int,
+        default=25,
+        help="Gateway result drain batch size for lab-gateway full-backtests. Default: 25",
+    )
+    render_corpus_profile_drops.add_argument(
+        "--trading-dashboard-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard repo root used to resolve the worker contract hash when available.",
+    )
+    render_corpus_profile_drops.add_argument(
         "--profile-drop-timeout-seconds",
         type=int,
         default=1800,
@@ -3964,6 +4038,39 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
             "is older than this many days. Use a negative value to disable. "
             f"Default: {DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS:g}"
         ),
+    )
+    finalize_corpus.add_argument(
+        "--full-backtest-backend",
+        choices=("local", "lab-gateway"),
+        default="local",
+        help="Execution backend for 36mo full-backtest catch-up. Default: local.",
+    )
+    finalize_corpus.add_argument(
+        "--full-backtest-gateway-url",
+        default=None,
+        help="Lab gateway URL when --full-backtest-backend=lab-gateway.",
+    )
+    finalize_corpus.add_argument(
+        "--full-backtest-gateway-token",
+        default=None,
+        help="Lab gateway bearer token. Defaults to the configured local lab gateway token.",
+    )
+    finalize_corpus.add_argument(
+        "--full-backtest-worker-contract-hash",
+        default=None,
+        help="Optional replay worker contract hash required for lab-gateway full-backtest jobs.",
+    )
+    finalize_corpus.add_argument(
+        "--full-backtest-result-batch-size",
+        type=int,
+        default=25,
+        help="Gateway result drain batch size for lab-gateway full-backtests. Default: 25",
+    )
+    finalize_corpus.add_argument(
+        "--trading-dashboard-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard repo root used to resolve the worker contract hash when available.",
     )
     finalize_corpus.add_argument(
         "--profile-drop-timeout-seconds",
@@ -10259,10 +10366,19 @@ def cmd_calculate_full_backtests(
     force_rebuild: bool,
     job_timeout_seconds: int | None,
     full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+    full_backtest_backend: str = "local",
+    full_backtest_gateway_url: str | None = None,
+    full_backtest_gateway_token: str | None = None,
+    full_backtest_worker_contract_hash: str | None = None,
+    full_backtest_result_batch_size: int | None = None,
+    trading_dashboard_root: Path | None = None,
     as_json: bool,
     emit_summary: bool = True,
 ) -> int:
     config = load_config()
+    backend = str(full_backtest_backend or "local").strip().lower().replace("-", "_")
+    if backend not in {"local", "lab_gateway"}:
+        raise SystemExit("--full-backtest-backend must be local or lab-gateway")
     run_dirs = _matching_run_dirs(config, run_ids)
     catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
     catalog_by_attempt_id = {
@@ -10393,6 +10509,59 @@ def cmd_calculate_full_backtests(
             progress.console.print(message)
             return
         _write_plain_line(message)
+
+    if backend == "lab_gateway":
+        if total > 0:
+            lab_config = resolve_lab_backtest_config(
+                gateway_url=full_backtest_gateway_url,
+                gateway_token=full_backtest_gateway_token,
+                trading_dashboard_root=trading_dashboard_root,
+                worker_contract_hash=full_backtest_worker_contract_hash,
+                deadline_seconds=job_timeout_seconds or 3600,
+                result_batch_size=full_backtest_result_batch_size,
+            )
+            results, calculated, failed = run_lab_full_backtests(
+                config=config,
+                items=to_calculate,
+                lab_config=lab_config,
+                max_workers=resolved_max_workers,
+                force_rebuild=force_rebuild,
+                emit=emit,
+            )
+        derived_refresh = _refresh_global_derived_corpus_state(config)
+        failure_summary = _build_full_backtest_failure_summary(results)
+        write_json(config.full_backtest_failures_json_path, failure_summary)
+        payload = {
+            "runs_considered": len({run_dir.name for run_dir, *_ in matched_items}),
+            "matched_attempts": len(matched_items),
+            "eligible_attempts": len(eligible_items),
+            "skipped": skipped,
+            "filter_rejections": filter_rejections,
+            "filters": {
+                "run_ids": run_ids,
+                "attempt_ids": attempt_ids,
+                "limit": limit,
+                "require_scrutiny_36": require_scrutiny_36,
+                "force_rebuild": force_rebuild,
+                "job_timeout_seconds": job_timeout_seconds,
+                "full_backtest_max_age_days": full_backtest_max_age_days,
+                "full_backtest_backend": "lab_gateway",
+            },
+            "calculation_reasons": calculation_reasons,
+            "max_workers_used": resolved_max_workers,
+            "max_workers_source": worker_source,
+            "detected_dev_sim_workers": detected_sim_workers,
+            "calculated": calculated,
+            "seeded_materialized": seeded_materialized,
+            "failed": failed,
+            "failure_summary": failure_summary,
+            "failure_summary_json": str(config.full_backtest_failures_json_path),
+            "derived_refresh": derived_refresh,
+            "results": results,
+        }
+        if emit_summary:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0 if failed == 0 else 1
 
     with progress:
         task_id = progress.add_task("calculate full backtests", total=total or 1)
@@ -14278,6 +14447,12 @@ def cmd_render_corpus_profile_drops(
     full_backtest_workers: int | None = None,
     full_backtest_job_timeout_seconds: int | None = 2400,
     full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+    full_backtest_backend: str = "local",
+    full_backtest_gateway_url: str | None = None,
+    full_backtest_gateway_token: str | None = None,
+    full_backtest_worker_contract_hash: str | None = None,
+    full_backtest_result_batch_size: int | None = None,
+    trading_dashboard_root: Path | None = None,
     require_presentation_metadata: bool = False,
     as_json: bool,
 ) -> int:
@@ -14377,6 +14552,12 @@ def cmd_render_corpus_profile_drops(
                     force_rebuild=bool(force_rebuild),
                     job_timeout_seconds=full_backtest_job_timeout,
                     full_backtest_max_age_days=full_backtest_max_age_days,
+                    full_backtest_backend=full_backtest_backend,
+                    full_backtest_gateway_url=full_backtest_gateway_url,
+                    full_backtest_gateway_token=full_backtest_gateway_token,
+                    full_backtest_worker_contract_hash=full_backtest_worker_contract_hash,
+                    full_backtest_result_batch_size=full_backtest_result_batch_size,
+                    trading_dashboard_root=trading_dashboard_root,
                     as_json=True,
                 )
         else:
@@ -14390,6 +14571,12 @@ def cmd_render_corpus_profile_drops(
                 force_rebuild=bool(force_rebuild),
                 job_timeout_seconds=full_backtest_job_timeout,
                 full_backtest_max_age_days=full_backtest_max_age_days,
+                full_backtest_backend=full_backtest_backend,
+                full_backtest_gateway_url=full_backtest_gateway_url,
+                full_backtest_gateway_token=full_backtest_gateway_token,
+                full_backtest_worker_contract_hash=full_backtest_worker_contract_hash,
+                full_backtest_result_batch_size=full_backtest_result_batch_size,
+                trading_dashboard_root=trading_dashboard_root,
                 as_json=False,
                 emit_summary=False,
             )
@@ -14657,6 +14844,12 @@ def cmd_finalize_corpus(
     full_backtest_workers: int | None = None,
     full_backtest_job_timeout_seconds: int | None = 2400,
     full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+    full_backtest_backend: str = "local",
+    full_backtest_gateway_url: str | None = None,
+    full_backtest_gateway_token: str | None = None,
+    full_backtest_worker_contract_hash: str | None = None,
+    full_backtest_result_batch_size: int | None = None,
+    trading_dashboard_root: Path | None = None,
 ) -> int:
     set_provider_trace_stderr_mode("warnings_only")
     config = load_config()
@@ -14779,6 +14972,12 @@ def cmd_finalize_corpus(
                 full_backtest_workers=full_backtest_worker_count,
                 full_backtest_job_timeout_seconds=full_backtest_job_timeout,
                 full_backtest_max_age_days=full_backtest_max_age_days,
+                full_backtest_backend=full_backtest_backend,
+                full_backtest_gateway_url=full_backtest_gateway_url,
+                full_backtest_gateway_token=full_backtest_gateway_token,
+                full_backtest_worker_contract_hash=full_backtest_worker_contract_hash,
+                full_backtest_result_batch_size=full_backtest_result_batch_size,
+                trading_dashboard_root=trading_dashboard_root,
                 require_presentation_metadata=bool(require_presentation_metadata),
                 as_json=True,
             )
@@ -14802,6 +15001,12 @@ def cmd_finalize_corpus(
             full_backtest_workers=full_backtest_worker_count,
             full_backtest_job_timeout_seconds=full_backtest_job_timeout,
             full_backtest_max_age_days=full_backtest_max_age_days,
+            full_backtest_backend=full_backtest_backend,
+            full_backtest_gateway_url=full_backtest_gateway_url,
+            full_backtest_gateway_token=full_backtest_gateway_token,
+            full_backtest_worker_contract_hash=full_backtest_worker_contract_hash,
+            full_backtest_result_batch_size=full_backtest_result_batch_size,
+            trading_dashboard_root=trading_dashboard_root,
             require_presentation_metadata=bool(require_presentation_metadata),
             as_json=False,
         )
@@ -16997,6 +17202,12 @@ def main(argv: list[str] | None = None) -> int:
             force_rebuild=bool(args.force_rebuild),
             job_timeout_seconds=None,
             full_backtest_max_age_days=args.full_backtest_max_age_days,
+            full_backtest_backend=args.full_backtest_backend,
+            full_backtest_gateway_url=args.full_backtest_gateway_url,
+            full_backtest_gateway_token=args.full_backtest_gateway_token,
+            full_backtest_worker_contract_hash=args.full_backtest_worker_contract_hash,
+            full_backtest_result_batch_size=args.full_backtest_result_batch_size,
+            trading_dashboard_root=args.trading_dashboard_root,
             as_json=bool(args.json),
         )
     if args.command == "build-attempt-catalog":
@@ -17165,6 +17376,12 @@ def main(argv: list[str] | None = None) -> int:
             full_backtest_workers=args.full_backtest_workers,
             full_backtest_job_timeout_seconds=args.full_backtest_job_timeout_seconds,
             full_backtest_max_age_days=args.full_backtest_max_age_days,
+            full_backtest_backend=args.full_backtest_backend,
+            full_backtest_gateway_url=args.full_backtest_gateway_url,
+            full_backtest_gateway_token=args.full_backtest_gateway_token,
+            full_backtest_worker_contract_hash=args.full_backtest_worker_contract_hash,
+            full_backtest_result_batch_size=args.full_backtest_result_batch_size,
+            trading_dashboard_root=args.trading_dashboard_root,
             as_json=bool(args.json),
         )
     if args.command == "finalize-corpus":
@@ -17182,6 +17399,12 @@ def main(argv: list[str] | None = None) -> int:
             full_backtest_workers=args.full_backtest_workers,
             full_backtest_job_timeout_seconds=args.full_backtest_job_timeout_seconds,
             full_backtest_max_age_days=args.full_backtest_max_age_days,
+            full_backtest_backend=args.full_backtest_backend,
+            full_backtest_gateway_url=args.full_backtest_gateway_url,
+            full_backtest_gateway_token=args.full_backtest_gateway_token,
+            full_backtest_worker_contract_hash=args.full_backtest_worker_contract_hash,
+            full_backtest_result_batch_size=args.full_backtest_result_batch_size,
+            trading_dashboard_root=args.trading_dashboard_root,
         )
     if args.command == "nuke-deep-caches":
         return cmd_nuke_deep_caches(as_json=bool(args.json))
