@@ -6847,37 +6847,6 @@ def _attempt_catalog_manifest_payload(
     }
 
 
-def _attempt_catalog_manifest_matches_run_dirs(
-    manifest_payload: dict[str, Any] | None,
-    run_dirs: list[Path],
-) -> bool:
-    if not isinstance(manifest_payload, dict):
-        return False
-    raw_runs = manifest_payload.get("runs")
-    if not isinstance(raw_runs, list):
-        return False
-    manifest_by_run_id: dict[str, dict[str, Any]] = {}
-    for item in raw_runs:
-        if not isinstance(item, dict):
-            return False
-        run_id = str(item.get("run_id") or "").strip()
-        if not run_id:
-            return False
-        manifest_by_run_id[run_id] = item
-    expected_run_ids = {run_dir.name for run_dir in run_dirs}
-    if set(manifest_by_run_id) != expected_run_ids:
-        return False
-    for run_dir in run_dirs:
-        manifest_item = manifest_by_run_id.get(run_dir.name) or {}
-        attempts_signature = manifest_item.get("attempts")
-        metadata_signature = manifest_item.get("run_metadata")
-        if attempts_signature != _catalog_file_signature(attempts_path_for_run_dir(run_dir)):
-            return False
-        if metadata_signature != _catalog_file_signature(run_metadata_path_for_run_dir(run_dir)):
-            return False
-    return True
-
-
 def _write_materialized_corpus_index(
     config,
     *,
@@ -6906,24 +6875,6 @@ def _write_materialized_corpus_index(
     return summary
 
 
-def _load_materialized_corpus_index_rows(
-    config,
-    *,
-    run_dirs: list[Path],
-) -> list[dict[str, Any]] | None:
-    rows_payload = load_json_if_exists(config.attempt_catalog_json_path)
-    if not isinstance(rows_payload, list) or not all(
-        isinstance(row, dict) for row in rows_payload
-    ):
-        return None
-    manifest_payload = load_json_if_exists(config.attempt_catalog_manifest_path)
-    if not _attempt_catalog_manifest_matches_run_dirs(manifest_payload, run_dirs):
-        return None
-    rows = [dict(row) for row in rows_payload if isinstance(row, dict)]
-    rows.sort(key=_full_backtest_priority_key)
-    return rows
-
-
 def _selection_corpus_rows(
     config,
     *,
@@ -6934,63 +6885,34 @@ def _selection_corpus_rows(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     run_dirs = _matching_run_dirs(config, run_ids)
     full_corpus_scope = not run_ids
-    catalog_json_path = getattr(config, "attempt_catalog_json_path", None)
-    catalog_manifest_path = getattr(config, "attempt_catalog_manifest_path", None)
     catalog_sqlite_path = getattr(config, "attempt_catalog_sqlite_path", None)
-    if catalog_json_path is None and hasattr(config, "derived_root"):
-        catalog_json_path = Path(config.derived_root) / "attempt-catalog.json"
-    if catalog_manifest_path is None and hasattr(config, "derived_root"):
-        catalog_manifest_path = Path(config.derived_root) / "attempt-catalog-manifest.json"
     if catalog_sqlite_path is None and hasattr(config, "derived_root"):
         catalog_sqlite_path = Path(config.derived_root) / "attempt-catalog.sqlite"
-    if full_corpus_scope:
-        _phase_emit(
-            f"[{label}] refreshing incremental corpus index {catalog_sqlite_path}",
-            as_json=as_json,
-        )
-        rows, index_info = refresh_incremental_attempt_catalog(
-            config,
-            run_dirs=run_dirs,
-            progress_callback=_catalog_phase_callback(label, as_json=as_json),
-            load_rows=False,
-        )
-        if materialize_full_corpus:
-            _write_materialized_corpus_index(
-                config,
-                run_dirs=run_dirs,
-                write_csv_output=False,
-                from_sqlite=True,
-            )
-        rows = list(iter_catalog_rows(config))
-        return rows, index_info
-
     _phase_emit(
-        f"[{label}] rebuilding corpus index from source artifacts",
+        f"[{label}] refreshing incremental corpus index {catalog_sqlite_path}",
         as_json=as_json,
     )
-    rebuilt_rows = _catalog_rows_for_run_dirs(
+    rows, index_info = refresh_incremental_attempt_catalog(
         config,
-        run_dirs,
+        run_dirs=run_dirs,
         progress_callback=_catalog_phase_callback(label, as_json=as_json),
+        load_rows=False,
+        prune_missing=full_corpus_scope,
     )
-    summary = catalog_summary(rebuilt_rows)
     if full_corpus_scope and materialize_full_corpus:
-        summary = _write_materialized_corpus_index(
+        _write_materialized_corpus_index(
             config,
             run_dirs=run_dirs,
-            rows=rebuilt_rows,
+            write_csv_output=False,
+            from_sqlite=True,
         )
-    return rebuilt_rows, {
-        "source": "cold_rebuild",
-        "path": str(catalog_json_path) if catalog_json_path is not None else None,
-        "manifest_path": str(catalog_manifest_path)
-        if catalog_manifest_path is not None
-        else None,
-        "refreshed": bool(full_corpus_scope and materialize_full_corpus),
-        "row_count": len(rebuilt_rows),
-        "run_count": len(run_dirs),
-        "summary": summary,
-    }
+    if full_corpus_scope:
+        rows = list(iter_catalog_rows(config))
+    else:
+        rows = list(
+            iter_catalog_rows(config, run_ids=sorted(run_dir.name for run_dir in run_dirs))
+        )
+    return rows, index_info
 
 
 def _refresh_global_derived_corpus_state(config) -> dict[str, Any]:
@@ -10883,6 +10805,7 @@ def cmd_calculate_full_backtests(
 def cmd_build_attempt_catalog(*, run_ids: list[str] | None, as_json: bool) -> int:
     config = load_config()
     run_dirs = _matching_run_dirs(config, run_ids)
+    selected_run_ids = sorted(run_dir.name for run_dir in run_dirs)
     if not run_ids:
         _rows, index_info = refresh_incremental_attempt_catalog(
             config,
@@ -10900,10 +10823,33 @@ def cmd_build_attempt_catalog(*, run_ids: list[str] | None, as_json: bool) -> in
         )
         attempt_count = int(index_info.get("row_count") or 0)
     else:
-        rows = _catalog_rows_for_run_dirs(config, run_dirs)
-        index_info = {"source": "cold_rebuild", "run_count": len(run_dirs), "row_count": len(rows)}
-        summary = _write_materialized_corpus_index(config, run_dirs=run_dirs, rows=rows)
-        attempt_count = len(rows)
+        _rows, index_info = refresh_incremental_attempt_catalog(
+            config,
+            run_dirs=run_dirs,
+            progress_callback=_catalog_phase_callback(
+                "build-attempt-catalog",
+                as_json=as_json,
+            ),
+            load_rows=False,
+            prune_missing=False,
+        )
+        row_count = stream_catalog_json_from_sqlite(
+            config,
+            config.attempt_catalog_json_path,
+            run_ids=selected_run_ids,
+        )
+        stream_catalog_csv_from_sqlite(
+            config,
+            config.attempt_catalog_csv_path,
+            run_ids=selected_run_ids,
+        )
+        summary = catalog_summary_from_sqlite(config, run_ids=selected_run_ids)
+        write_json(config.attempt_catalog_summary_path, summary)
+        write_json(
+            config.attempt_catalog_manifest_path,
+            _attempt_catalog_manifest_payload(run_dirs, row_count=row_count),
+        )
+        attempt_count = int(index_info.get("row_count") or row_count)
     payload = {
         "run_count": len(run_dirs),
         "attempt_count": attempt_count,

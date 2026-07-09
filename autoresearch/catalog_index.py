@@ -68,7 +68,10 @@ def _catalog_db_path(config: Any) -> Path:
     path = getattr(config, "attempt_catalog_sqlite_path", None)
     if path is not None:
         return Path(path)
-    return Path(config.derived_root) / "attempt-catalog.sqlite"
+    derived_root = getattr(config, "derived_root", None)
+    if derived_root is not None:
+        return Path(derived_root) / "attempt-catalog.sqlite"
+    return Path(config.runs_root) / "derived" / "attempt-catalog.sqlite"
 
 
 def _file_signature(path: Path) -> dict[str, Any]:
@@ -583,6 +586,7 @@ def refresh_incremental_attempt_catalog(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     commit_interval_runs: int = CATALOG_COMMIT_INTERVAL_RUNS,
     load_rows: bool = True,
+    prune_missing: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     db_path = _catalog_db_path(config)
     validation_cache_root = getattr(config, "validation_cache_root", None)
@@ -600,13 +604,14 @@ def refresh_incremental_attempt_catalog(
     with _connect_catalog_db(db_path) as conn:
         existing_signatures = _load_existing_signatures(conn)
         current_run_ids = {run_dir.name for run_dir in run_dirs}
-        for stale_run_id in sorted(set(existing_signatures) - current_run_ids):
-            _delete_run(conn, stale_run_id)
-            deleted_runs += 1
-            pending_commit_runs += 1
-        if pending_commit_runs:
-            conn.commit()
-            pending_commit_runs = 0
+        if prune_missing:
+            for stale_run_id in sorted(set(existing_signatures) - current_run_ids):
+                _delete_run(conn, stale_run_id)
+                deleted_runs += 1
+                pending_commit_runs += 1
+            if pending_commit_runs:
+                conn.commit()
+                pending_commit_runs = 0
 
         for index, run_dir in enumerate(run_dirs, start=1):
             run_id = run_dir.name
@@ -679,8 +684,17 @@ def refresh_incremental_attempt_catalog(
         if pending_commit_runs:
             conn.commit()
             pending_commit_runs = 0
-        rows = _load_rows(conn) if load_rows else []
-        summary = catalog_summary(rows) if load_rows else _catalog_summary_from_db(conn)
+        selected_run_ids = sorted(current_run_ids)
+        if selected_run_ids:
+            rows = _load_rows(conn, run_ids=selected_run_ids) if load_rows else []
+            summary = (
+                catalog_summary(rows)
+                if load_rows
+                else _catalog_summary_from_db(conn, run_ids=selected_run_ids)
+            )
+        else:
+            rows = []
+            summary = catalog_summary([])
 
     return rows, {
         "source": "sqlite_incremental",
@@ -688,6 +702,7 @@ def refresh_incremental_attempt_catalog(
         "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
         "extraction_version": CATALOG_EXTRACTION_VERSION,
         "refreshed": rebuilt_runs > 0 or deleted_runs > 0,
+        "prune_missing": bool(prune_missing),
         "run_count": len(run_dirs),
         "row_count": len(rows) if load_rows else row_count,
         "reused_run_count": reused_runs,

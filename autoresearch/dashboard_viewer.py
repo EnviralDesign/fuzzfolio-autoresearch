@@ -1199,9 +1199,7 @@ class ViewerState:
             "attempt_catalog_sqlite_path",
             self.config.derived_root / "attempt-catalog.sqlite",
         )
-        if sqlite_path.exists():
-            return _file_signature(sqlite_path)
-        return _file_signature(self.config.attempt_catalog_json_path)
+        return _file_signature(sqlite_path)
 
     def _load_catalog_rows(self) -> list[dict[str, Any]]:
         sqlite_path = getattr(
@@ -1209,15 +1207,11 @@ class ViewerState:
             "attempt_catalog_sqlite_path",
             self.config.derived_root / "attempt-catalog.sqlite",
         )
-        if sqlite_path.exists():
-            try:
-                return [dict(row) for row in iter_catalog_rows(self.config)]
-            except Exception:
-                pass
-        rows = _load_optional_json(self.config.attempt_catalog_json_path) or []
-        if not isinstance(rows, list):
-            return []
-        return [dict(row) for row in rows if isinstance(row, dict)]
+        if not sqlite_path.exists():
+            raise FileNotFoundError(
+                f"Attempt catalog SQLite database is missing: {sqlite_path}"
+            )
+        return [dict(row) for row in iter_catalog_rows(self.config)]
 
     def catalog_rows(self) -> list[dict[str, Any]]:
         signature = self._catalog_source_signature()

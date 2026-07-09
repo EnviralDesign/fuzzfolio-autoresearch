@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import pytest
 from types import SimpleNamespace
 
 from autoresearch.catalog_index import refresh_incremental_attempt_catalog
@@ -64,7 +66,28 @@ def test_viewer_state_loads_catalog_from_sqlite_without_json(tmp_path) -> None:
     assert not config.attempt_catalog_json_path.exists()
 
 
-def test_viewer_state_falls_back_to_json_when_sqlite_is_unreadable(tmp_path) -> None:
+def test_viewer_state_requires_sqlite_catalog(tmp_path) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    derived_root.mkdir(parents=True, exist_ok=True)
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=runs_root,
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+        attempt_catalog_json_path=derived_root / "attempt-catalog.json",
+        attempt_catalog_summary_path=derived_root / "attempt-catalog-summary.json",
+        full_backtest_audit_json_path=derived_root / "full-backtest-audit.json",
+        promotion_board_json_path=derived_root / "promotion-board.json",
+        corpus_tradeoff_plot_path=derived_root / "corpus-score-vs-trades.png",
+    )
+
+    with pytest.raises(FileNotFoundError, match="Attempt catalog SQLite database"):
+        ViewerState(config).catalog_rows()
+
+
+def test_viewer_state_surfaces_corrupt_sqlite_catalog(tmp_path) -> None:
     runs_root = tmp_path / "runs"
     derived_root = runs_root / "derived"
     derived_root.mkdir(parents=True, exist_ok=True)
@@ -83,9 +106,8 @@ def test_viewer_state_falls_back_to_json_when_sqlite_is_unreadable(tmp_path) -> 
     config.attempt_catalog_sqlite_path.write_text("not sqlite", encoding="utf-8")
     _write_json(config.attempt_catalog_json_path, [{"attempt_id": "json-attempt"}])
 
-    rows = ViewerState(config).catalog_rows()
-
-    assert [row["attempt_id"] for row in rows] == ["json-attempt"]
+    with pytest.raises(sqlite3.DatabaseError):
+        ViewerState(config).catalog_rows()
 
 
 def test_dashboard_catalog_prefers_rendered_profile_drop_exit_policy(tmp_path) -> None:

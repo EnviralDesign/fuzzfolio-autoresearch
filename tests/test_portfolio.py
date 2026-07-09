@@ -705,45 +705,6 @@ def test_build_sleeve_selection_reports_prefilter_counts() -> None:
     assert sleeve["prefilter_limit"] == 2
 
 
-def test_materialized_corpus_index_requires_fresh_manifest(tmp_path: Path) -> None:
-    runs_root = tmp_path / "runs"
-    run_dir = runs_root / "run-a"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    attempts_path = run_dir / "attempts.jsonl"
-    attempts_path.write_text("{}", encoding="utf-8")
-    (run_dir / "run-metadata.json").write_text("{}", encoding="utf-8")
-
-    derived_root = runs_root / "derived"
-    derived_root.mkdir(parents=True, exist_ok=True)
-    rows = [
-        {"attempt_id": "B", "composite_score": 1.0},
-        {"attempt_id": "A", "composite_score": 2.0},
-    ]
-    (derived_root / "attempt-catalog.json").write_text(
-        json.dumps(rows, ensure_ascii=True, indent=2),
-        encoding="utf-8",
-    )
-    (derived_root / "attempt-catalog-manifest.json").write_text(
-        json.dumps(
-            ar_main._attempt_catalog_manifest_payload([run_dir], rows),
-            ensure_ascii=True,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    config = SimpleNamespace(
-        attempt_catalog_json_path=derived_root / "attempt-catalog.json",
-        attempt_catalog_manifest_path=derived_root / "attempt-catalog-manifest.json",
-    )
-
-    loaded_rows = ar_main._load_materialized_corpus_index_rows(config, run_dirs=[run_dir])
-    assert [row["attempt_id"] for row in loaded_rows] == ["A", "B"]
-
-    attempts_path.write_text("{}\n{}", encoding="utf-8")
-    assert ar_main._load_materialized_corpus_index_rows(config, run_dirs=[run_dir]) is None
-
-
 def test_merge_portfolio_sleeves_unions_and_labels_overlap() -> None:
     merged = pf.merge_portfolio_sleeves(
         [

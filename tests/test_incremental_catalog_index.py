@@ -288,6 +288,36 @@ def test_incremental_catalog_iterates_selected_attempt_ids(tmp_path) -> None:
     ] == 1
 
 
+def test_incremental_catalog_subset_refresh_does_not_prune_other_runs(tmp_path) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    run_1 = runs_root / "run-1"
+    run_2 = runs_root / "run-2"
+    _write_attempt(run_1, attempt_id="attempt-a", score=10.0)
+    _write_attempt(run_2, attempt_id="attempt-b", score=30.0)
+    config = SimpleNamespace(
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+    )
+
+    refresh_incremental_attempt_catalog(config, run_dirs=[run_1, run_2], load_rows=False)
+    rows, info = refresh_incremental_attempt_catalog(
+        config,
+        run_dirs=[run_1],
+        load_rows=True,
+        prune_missing=False,
+    )
+
+    assert info["deleted_run_count"] == 0
+    assert info["prune_missing"] is False
+    assert [row["attempt_id"] for row in rows] == ["attempt-a"]
+    assert [row["attempt_id"] for row in iter_catalog_rows(config)] == [
+        "attempt-b",
+        "attempt-a",
+    ]
+
+
 def test_incremental_catalog_sqlite_order_matches_catalog_priority(tmp_path) -> None:
     runs_root = tmp_path / "runs"
     derived_root = runs_root / "derived"
