@@ -365,11 +365,7 @@ def _replace_run_rows(
     )
 
 
-def _load_rows(
-    conn: sqlite3.Connection,
-    *,
-    run_ids: list[str] | None = None,
-) -> list[dict[str, Any]]:
+def _row_select_sql(run_ids: list[str] | None = None) -> tuple[str, list[Any]]:
     params: list[Any] = []
     where = ""
     if run_ids:
@@ -390,12 +386,72 @@ def _load_rows(
             attempt_id ASC,
             row_key ASC
     """
+    return sql, params
+
+
+def iter_catalog_rows(
+    config: Any,
+    *,
+    run_ids: list[str] | None = None,
+) -> Any:
+    db_path = _catalog_db_path(config)
+    with _connect_catalog_db(db_path) as conn:
+        sql, params = _row_select_sql(run_ids)
+        for (row_json,) in conn.execute(sql, params):
+            payload = _json_loads(row_json)
+            if isinstance(payload, dict):
+                yield payload
+
+
+def _load_rows(
+    conn: sqlite3.Connection,
+    *,
+    run_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    sql, params = _row_select_sql(run_ids)
     for (row_json,) in conn.execute(sql, params):
         payload = _json_loads(row_json)
         if isinstance(payload, dict):
             rows.append(payload)
     return rows
+
+
+def _catalog_summary_from_db(
+    conn: sqlite3.Connection,
+    *,
+    run_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    where = ""
+    params: list[Any] = []
+    if run_ids:
+        where = f" WHERE run_id IN ({','.join('?' for _ in run_ids)})"
+        params.extend(run_ids)
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*),
+            COUNT(DISTINCT run_id),
+            SUM(CASE WHEN composite_score IS NOT NULL THEN 1 ELSE 0 END),
+            SUM(CASE WHEN has_full_backtest_36m != 0 THEN 1 ELSE 0 END),
+            SUM(CASE WHEN full_backtest_validation_status_36m = 'valid' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN full_backtest_validation_status_36m = 'invalid' THEN 1 ELSE 0 END)
+        FROM attempt_rows
+        {where}
+        """,
+        params,
+    ).fetchone()
+    if not row:
+        return catalog_summary([])
+    return {
+        "summary_mode": "sqlite_counts",
+        "attempt_count": int(row[0] or 0),
+        "run_count": int(row[1] or 0),
+        "scored_attempt_count": int(row[2] or 0),
+        "attempts_with_full_backtest_36m": int(row[3] or 0),
+        "attempts_with_valid_full_backtest_36m": int(row[4] or 0),
+        "attempts_with_invalid_full_backtest_36m": int(row[5] or 0),
+    }
 
 
 def refresh_incremental_attempt_catalog(
@@ -404,6 +460,7 @@ def refresh_incremental_attempt_catalog(
     run_dirs: list[Path],
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     commit_interval_runs: int = CATALOG_COMMIT_INTERVAL_RUNS,
+    load_rows: bool = True,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     db_path = _catalog_db_path(config)
     validation_cache_root = getattr(config, "validation_cache_root", None)
@@ -500,9 +557,9 @@ def refresh_incremental_attempt_catalog(
         if pending_commit_runs:
             conn.commit()
             pending_commit_runs = 0
-        rows = _load_rows(conn)
+        rows = _load_rows(conn) if load_rows else []
+        summary = catalog_summary(rows) if load_rows else _catalog_summary_from_db(conn)
 
-    summary = catalog_summary(rows)
     return rows, {
         "source": "sqlite_incremental",
         "path": str(db_path),
@@ -510,9 +567,10 @@ def refresh_incremental_attempt_catalog(
         "extraction_version": CATALOG_EXTRACTION_VERSION,
         "refreshed": rebuilt_runs > 0 or deleted_runs > 0,
         "run_count": len(run_dirs),
-        "row_count": len(rows),
+        "row_count": len(rows) if load_rows else row_count,
         "reused_run_count": reused_runs,
         "rebuilt_run_count": rebuilt_runs,
         "deleted_run_count": deleted_runs,
         "summary": summary,
+        "rows_loaded": bool(load_rows),
     }

@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import autoresearch.catalog_index as catalog_index
-from autoresearch.catalog_index import refresh_incremental_attempt_catalog
+from autoresearch.catalog_index import iter_catalog_rows, refresh_incremental_attempt_catalog
 from autoresearch.corpus_tools import (
     FULL_BACKTEST_CURVE_FILENAME,
     FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
@@ -189,6 +189,42 @@ def test_incremental_catalog_preserves_duplicate_attempt_ids_within_run(tmp_path
         "same-attempt",
         "same-attempt-second",
     }
+
+
+def test_incremental_catalog_can_refresh_without_loading_all_rows(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    run_1 = runs_root / "run-1"
+    run_2 = runs_root / "run-2"
+    _write_attempt(run_1, attempt_id="attempt-1", score=20.0)
+    _write_attempt(run_2, attempt_id="attempt-2", score=15.0)
+    config = SimpleNamespace(
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+    )
+
+    def fail_load_rows(*_args, **_kwargs):
+        raise AssertionError("load_rows=False should not decode every catalog row")
+
+    monkeypatch.setattr(catalog_index, "_load_rows", fail_load_rows)
+
+    rows, info = refresh_incremental_attempt_catalog(
+        config,
+        run_dirs=[run_1, run_2],
+        load_rows=False,
+    )
+    streamed_rows = list(iter_catalog_rows(config))
+
+    assert rows == []
+    assert info["rows_loaded"] is False
+    assert info["row_count"] == 2
+    assert info["summary"]["summary_mode"] == "sqlite_counts"
+    assert info["summary"]["attempt_count"] == 2
+    assert [row["attempt_id"] for row in streamed_rows] == ["attempt-1", "attempt-2"]
 
 
 def test_incremental_catalog_migrates_old_unique_attempt_schema(tmp_path) -> None:
