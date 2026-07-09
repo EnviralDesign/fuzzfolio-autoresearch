@@ -480,13 +480,13 @@ def run_lab_full_backtests(
                     results.append(entry)
                 if ack_ids:
                     gateway.ack_results(ack_ids)
+                if unknown_result_count:
+                    raise RuntimeError(
+                        "Lab gateway result backlog contains unrelated results ahead of corpus "
+                        "full-backtest results. Drain stale results or run corpus catch-up on a "
+                        "dedicated gateway before retrying."
+                    )
                 continue
-            if drained and unknown_result_count:
-                raise RuntimeError(
-                    "Lab gateway result backlog contains unrelated results ahead of corpus "
-                    "full-backtest results. Drain stale results or run corpus catch-up on a "
-                    "dedicated gateway before retrying."
-                )
             time.sleep(lab_config.poll_interval_seconds)
     finally:
         gateway.close()

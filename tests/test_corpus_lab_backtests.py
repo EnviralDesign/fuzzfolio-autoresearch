@@ -225,6 +225,73 @@ def test_run_lab_full_backtests_skips_missing_profile(tmp_path: Path, monkeypatc
     assert FakeGateway.enqueued == []
 
 
+def test_run_lab_full_backtests_fails_fast_on_unrelated_gateway_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "final"
+    profile_path = run_dir / "profiles" / "profile.json"
+    artifact_dir.mkdir(parents=True)
+    _write_json(
+        profile_path,
+        {"profile": {"name": "profile", "instruments": ["EURUSD"], "indicators": []}},
+    )
+    _write_json(
+        artifact_dir / "deep-replay-job.json",
+        {"request": {"timeframe": "M15", "instruments": ["EURUSD"]}},
+    )
+    attempt = {
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+    }
+    row = {"attempt_id": "attempt-a", "run_id": "run-a", "candidate_name": "final"}
+
+    class FakeGateway:
+        acked: list[list[str]] = []
+        read_count = 0
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            _ = limit
+            self.__class__.read_count += 1
+            if self.__class__.read_count == 1:
+                return []
+            return [
+                {
+                    "task_id": "foreign-task",
+                    "lease_id": "foreign-lease",
+                    "status": "success",
+                    "result": {},
+                }
+            ]
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            return {"accepted": len(tasks)}
+
+        def ack_results(self, lease_ids: list[str]) -> None:
+            self.acked.append(list(lease_ids))
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("autoresearch.corpus_lab_backtests.LabGatewayClient", FakeGateway)
+
+    with pytest.raises(RuntimeError, match="unrelated results"):
+        run_lab_full_backtests(
+            config=SimpleNamespace(
+                research=SimpleNamespace(quality_score_preset="profile_drop")
+            ),
+            items=[(run_dir, attempt, row, {})],
+            lab_config=LabBacktestConfig(poll_interval_seconds=0.1),
+            max_workers=1,
+        )
+
+    assert FakeGateway.acked == []
+
+
 def test_cmd_calculate_full_backtests_lab_gateway_backend(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:

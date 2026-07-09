@@ -7335,6 +7335,43 @@ def _full_backtest_profile_drop_reuse_issue(
     return None
 
 
+def _profile_drop_artifact_native_row_issue(
+    *,
+    config,
+    row: dict[str, Any],
+    attempt: dict[str, Any] | None = None,
+    lookback_months: int = 36,
+) -> str | None:
+    if int(lookback_months) != 36:
+        return "unsupported_profile_drop_lookback"
+    artifact_dir_raw = str(row.get("artifact_dir") or "").strip()
+    if not artifact_dir_raw:
+        return "missing_artifact_dir"
+    artifact_dir = Path(artifact_dir_raw)
+    if not artifact_dir.exists():
+        return "missing_artifact_dir"
+    profile_path_raw = str(row.get("profile_path") or "").strip()
+    if not profile_path_raw:
+        return "missing_profile_file"
+    if not Path(profile_path_raw).exists():
+        return "missing_profile_file"
+
+    result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
+    curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
+    recommended_detail_path = artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+    if not result_path.exists() or not curve_path.exists():
+        return "missing_full_backtest_artifact"
+    if not recommended_detail_path.exists():
+        return "missing_recommended_cell_detail"
+    if not _result_has_canonical_score_lab(result_path):
+        return "stale_score_lab"
+    if not result_matches_execution_cost_model(result_path, config):
+        return "execution_cost_model_mismatch"
+    if not _result_matches_attempt_reward_matrix(result_path, attempt or row):
+        return "reward_matrix_mismatch"
+    return None
+
+
 def _run_full_backtest_with_retry(
     config,
     attempt: dict[str, Any],
@@ -11055,27 +11092,13 @@ def _render_profile_drop_for_attempt(
             recreated_profile=recreated_profile,
         )
 
-    if profile_ref and not _cloud_profile_exists(cli, profile_ref):
-        profile_ref = ""
-    if not profile_ref:
-        if not isinstance(profile_path, Path) or not profile_path.exists():
-            raise RuntimeError(
-                f"Attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
-            )
-        profile_ref = _create_cloud_profile(cli, profile_path)
-        _update_attempt_profile_ref(
-            run_dir, str(attempt.get("attempt_id") or ""), profile_ref
-        )
-        recreated_profile = True
-        base_manifest_payload["profile_ref"] = profile_ref
-
     if attempt_root.exists():
         shutil.rmtree(attempt_root)
     package_output_root.mkdir(parents=True, exist_ok=True)
     bundle_dir = _materialize_profile_drop_bundle_from_existing_artifacts(
         config=config,
-        cli=cli,
-        working_dir=working_dir,
+        cli=None,
+        working_dir=None,
         attempt=attempt,
         package_inputs=package_inputs,
         package_output_root=package_output_root,
@@ -11086,6 +11109,41 @@ def _render_profile_drop_for_attempt(
         exit_policy_cell=exit_policy_cell,
         timeout_seconds=int(timeout_seconds),
     )
+    if bundle_dir is None:
+        ensure_login = getattr(cli, "ensure_login", None)
+        if callable(ensure_login):
+            ensure_login()
+        if profile_ref and not _cloud_profile_exists(cli, profile_ref):
+            profile_ref = ""
+        if not profile_ref:
+            if not isinstance(profile_path, Path) or not profile_path.exists():
+                raise RuntimeError(
+                    f"Attempt is missing a valid cloud profile ref and local profile file: {profile_path}"
+                )
+            profile_ref = _create_cloud_profile(cli, profile_path)
+            _update_attempt_profile_ref(
+                run_dir, str(attempt.get("attempt_id") or ""), profile_ref
+            )
+            recreated_profile = True
+            base_manifest_payload["profile_ref"] = profile_ref
+
+        if attempt_root.exists():
+            shutil.rmtree(attempt_root)
+        package_output_root.mkdir(parents=True, exist_ok=True)
+        bundle_dir = _materialize_profile_drop_bundle_from_existing_artifacts(
+            config=config,
+            cli=cli,
+            working_dir=working_dir,
+            attempt=attempt,
+            package_inputs=package_inputs,
+            package_output_root=package_output_root,
+            lookback_months=int(lookback_months),
+            profile_ref=profile_ref,
+            attempt_token=attempt_token,
+            layout_mode=layout_mode,
+            exit_policy_cell=exit_policy_cell,
+            timeout_seconds=int(timeout_seconds),
+        )
     if bundle_dir is not None:
         if emit:
             emit(
@@ -11266,11 +11324,31 @@ def _should_retry_profile_drop_error(message: str) -> bool:
     normalized = str(message or "").lower()
     retry_tokens = [
         "http request failed",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "http 524",
         "connection was forcibly closed",
         "connection error",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "econnreset",
+        "etimedout",
+        "econnrefused",
         "sendrequest",
         "timed out",
         "timeout",
+        "rate limit",
+        "too many requests",
+        "browser has been closed",
+        "target closed",
+        "executable doesn't exist",
+        "failed to launch",
+        "another process",
+        "resource temporarily unavailable",
     ]
     return any(token in normalized for token in retry_tokens)
 
@@ -11336,8 +11414,6 @@ def _render_profile_drop_rows(
     if require_presentation_metadata:
         _preflight_presentation_metadata_provider(config)
 
-    cli = FuzzfolioCli(config.fuzzfolio)
-    cli.ensure_login()
     renderer_executable, workspace_root = _resolve_drop_renderer_executable(config)
     working_dir = workspace_root or config.repo_root
 
@@ -11355,8 +11431,16 @@ def _render_profile_drop_rows(
             if child.name not in expected_drop_dirs:
                 shutil.rmtree(child)
 
+    matched_run_ids = sorted(
+        {
+            str(row.get("run_id") or "").strip()
+            for row in rows
+            if str(row.get("run_id") or "").strip()
+        }
+    )
     matched_items = _matched_attempt_items(
         config,
+        run_ids=matched_run_ids or None,
         attempt_ids=[
             str(row.get("attempt_id") or "").strip()
             for row in rows
@@ -14624,22 +14708,66 @@ def cmd_render_corpus_profile_drops(
         for row in selected_rows
         if str(row.get("attempt_id") or "").strip()
     ]
+    catch_up_attempt_ids = list(selected_attempt_ids)
+    artifact_native_ready_attempt_ids: list[str] = []
+    if lookback_months == 36 and selected_attempt_ids and not force_rebuild:
+        selected_run_ids = sorted(
+            {
+                str(row.get("run_id") or "").strip()
+                for row in selected_rows
+                if str(row.get("run_id") or "").strip()
+            }
+        )
+        try:
+            matched_items = _matched_attempt_items(
+                config,
+                run_ids=selected_run_ids or None,
+                attempt_ids=selected_attempt_ids,
+                require_scored=False,
+            )
+        except SystemExit:
+            matched_items = []
+        attempt_by_id = {
+            str(attempt.get("attempt_id") or "").strip(): _attempt_with_run_reward_matrix(
+                attempt,
+                run_dir=run_dir,
+            )
+            for run_dir, _attempts, attempt in matched_items
+            if str(attempt.get("attempt_id") or "").strip()
+        }
+        catch_up_attempt_ids = []
+        for row in selected_rows:
+            attempt_id = str(row.get("attempt_id") or "").strip()
+            if not attempt_id:
+                continue
+            attempt = attempt_by_id.get(attempt_id)
+            issue = _profile_drop_artifact_native_row_issue(
+                config=config,
+                row=row,
+                attempt=attempt,
+                lookback_months=int(lookback_months),
+            ) if attempt is not None else "missing_attempt_ledger"
+            if issue is None:
+                artifact_native_ready_attempt_ids.append(attempt_id)
+            else:
+                catch_up_attempt_ids.append(attempt_id)
     before_rows_by_attempt_id = {
         str(row.get("attempt_id") or "").strip(): row for row in selected_rows
     }
 
     catch_up_exit_code = 0
-    if lookback_months == 36 and selected_attempt_ids:
+    if lookback_months == 36 and catch_up_attempt_ids:
         _job_status_emit(
             f"[render-corpus-profile-drops] full-backtest catch-up starting for "
-            f"{len(selected_attempt_ids)} selected attempts",
+            f"{len(catch_up_attempt_ids)}/{len(selected_attempt_ids)} selected attempts "
+            f"(artifact_native_ready={len(artifact_native_ready_attempt_ids)})",
             as_json=as_json,
         )
         if as_json:
             with io.StringIO() as capture, redirect_stdout(capture):
                 catch_up_exit_code = cmd_calculate_full_backtests(
                     run_ids=run_ids,
-                    attempt_ids=selected_attempt_ids,
+                    attempt_ids=catch_up_attempt_ids,
                     limit=None,
                     max_workers=full_backtest_worker_count,
                     use_dev_sim_worker_count=True,
@@ -14658,7 +14786,7 @@ def cmd_render_corpus_profile_drops(
         else:
             catch_up_exit_code = cmd_calculate_full_backtests(
                 run_ids=run_ids,
-                attempt_ids=selected_attempt_ids,
+                attempt_ids=catch_up_attempt_ids,
                 limit=None,
                 max_workers=full_backtest_worker_count,
                 use_dev_sim_worker_count=True,
@@ -14704,7 +14832,8 @@ def cmd_render_corpus_profile_drops(
         _job_status_emit(
             f"[render-corpus-profile-drops] full-backtest catch-up complete "
             f"exit={catch_up_exit_code} healed={healed_full_backtests}/"
-            f"{len(selected_attempt_ids)}",
+            f"{len(catch_up_attempt_ids)} artifact_native_ready="
+            f"{len(artifact_native_ready_attempt_ids)}",
             as_json=as_json,
         )
 
@@ -14750,6 +14879,8 @@ def cmd_render_corpus_profile_drops(
         "selected_count": len(selected_rows),
         "healed_full_backtests": healed_full_backtests,
         "full_backtest_catch_up_exit_code": catch_up_exit_code,
+        "full_backtest_catch_up_selected_count": len(catch_up_attempt_ids),
+        "artifact_native_ready_count": len(artifact_native_ready_attempt_ids),
         "profile_drop_rendered": profile_drop_rendered,
         "profile_drop_cached": profile_drop_cached,
         "profile_drop_skipped": profile_drop_skipped,

@@ -1968,6 +1968,229 @@ def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(
     assert payload["profile_drop_failed"] == 0
 
 
+def test_cmd_render_corpus_profile_drops_skips_catch_up_when_artifact_native_ready(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=tmp_path / "runs",
+        fuzzfolio=SimpleNamespace(),
+        research=SimpleNamespace(execution_cost_mode="none"),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+    run_dir = config.runs_root / "run-fast"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir, profile_path = _write_existing_full_backtest_profile_drop_inputs(tmp_path)
+    recommended_detail = {
+        "artifact_mode": "profile_drop_cell_detail_compact_v1",
+        "job_id": "deepreplay-fast-1",
+        "scope": "instrument",
+        "instrument": "EURUSD",
+        "cell": {
+            "stop_loss_percent": 0.05,
+            "reward_multiple": 2.0,
+            "take_profit_percent": 0.1,
+        },
+        "path_metrics": {"final_equity_r": 8.2, "max_drawdown_r": 0.9},
+        "curve": {"points": []},
+    }
+    (
+        artifact_dir / ar_main.FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+    ).write_text(json.dumps(recommended_detail, ensure_ascii=True), encoding="utf-8")
+    row = {
+        "attempt_id": "attempt-fast",
+        "run_id": "run-fast",
+        "candidate_name": "candidate",
+        "score_36m": 90.0,
+        "composite_score": 88.0,
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+        "has_full_backtest_36m": True,
+        "full_backtest_validation_status_36m": "valid",
+    }
+    attempt = {
+        "attempt_id": "attempt-fast",
+        "candidate_name": "candidate",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+    }
+    monkeypatch.setattr(
+        ar_main,
+        "_selection_corpus_rows",
+        lambda *_args, **_kwargs: ([row], {"source": "materialized"}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_matched_attempt_items",
+        lambda *_args, **_kwargs: [(run_dir, [attempt], attempt)],
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "cmd_calculate_full_backtests",
+        lambda **_kwargs: pytest.fail("artifact-native row should skip full-backtest catch-up"),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_render_profile_drop_rows",
+        lambda **_kwargs: [
+            {
+                "attempt_id": "attempt-fast",
+                "run_id": "run-fast",
+                "candidate_name": "candidate",
+                "status": "rendered",
+                "png_path": str(artifact_dir / "profile-drop-36mo.png"),
+                "manifest_path": str(artifact_dir / "profile-drop-36mo.manifest.json"),
+            }
+        ],
+    )
+
+    exit_code = ar_main.cmd_render_corpus_profile_drops(
+        run_ids=None,
+        attempt_ids=None,
+        top_results=None,
+        rank_start=0,
+        lookback_months=36,
+        profile_drop_workers=2,
+        profile_drop_timeout_seconds=60,
+        force_rebuild=False,
+        as_json=True,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["full_backtest_catch_up_selected_count"] == 0
+    assert payload["artifact_native_ready_count"] == 1
+    assert payload["profile_drop_rendered"] == 1
+
+
+def test_cmd_render_corpus_profile_drops_catches_up_only_non_artifact_native_rows(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=tmp_path / "runs",
+        fuzzfolio=SimpleNamespace(),
+        research=SimpleNamespace(execution_cost_mode="none"),
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+    run_dir = config.runs_root / "run-mixed"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ready_artifact_dir, ready_profile_path = _write_existing_full_backtest_profile_drop_inputs(
+        tmp_path
+    )
+    (
+        ready_artifact_dir / ar_main.FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+    ).write_text(
+        json.dumps(
+            {
+                "artifact_mode": "profile_drop_cell_detail_compact_v1",
+                "job_id": "deepreplay-fast-1",
+                "scope": "instrument",
+                "instrument": "EURUSD",
+                "cell": {
+                    "stop_loss_percent": 0.05,
+                    "reward_multiple": 2.0,
+                    "take_profit_percent": 0.1,
+                },
+                "path_metrics": {"final_equity_r": 8.2},
+                "curve": {"points": []},
+            },
+            ensure_ascii=True,
+        ),
+        encoding="utf-8",
+    )
+    missing_artifact_dir = tmp_path / "runs" / "run-mixed" / "evals" / "missing"
+    missing_artifact_dir.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {
+            "attempt_id": "attempt-ready",
+            "run_id": "run-mixed",
+            "candidate_name": "ready",
+            "score_36m": 90.0,
+            "composite_score": 88.0,
+            "artifact_dir": str(ready_artifact_dir),
+            "profile_path": str(ready_profile_path),
+            "has_full_backtest_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+        },
+        {
+            "attempt_id": "attempt-missing",
+            "run_id": "run-mixed",
+            "candidate_name": "missing",
+            "score_36m": 80.0,
+            "composite_score": 78.0,
+            "artifact_dir": str(missing_artifact_dir),
+            "profile_path": str(ready_profile_path),
+            "has_full_backtest_36m": False,
+            "full_backtest_validation_status_36m": "missing",
+        },
+    ]
+    attempts = [
+        {
+            "attempt_id": "attempt-ready",
+            "candidate_name": "ready",
+            "artifact_dir": str(ready_artifact_dir),
+            "profile_path": str(ready_profile_path),
+        },
+        {
+            "attempt_id": "attempt-missing",
+            "candidate_name": "missing",
+            "artifact_dir": str(missing_artifact_dir),
+            "profile_path": str(ready_profile_path),
+        },
+    ]
+    monkeypatch.setattr(
+        ar_main,
+        "_selection_corpus_rows",
+        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_matched_attempt_items",
+        lambda *_args, **_kwargs: [(run_dir, attempts, attempt) for attempt in attempts],
+    )
+    catchup_calls: list[dict[str, object]] = []
+
+    def fake_calculate_full_backtests(**kwargs):
+        catchup_calls.append(kwargs)
+        return 0
+
+    monkeypatch.setattr(ar_main, "cmd_calculate_full_backtests", fake_calculate_full_backtests)
+    monkeypatch.setattr(
+        ar_main,
+        "_render_profile_drop_rows",
+        lambda **_kwargs: [
+            {
+                "attempt_id": "attempt-ready",
+                "run_id": "run-mixed",
+                "candidate_name": "ready",
+                "status": "cached",
+                "png_path": str(ready_artifact_dir / "profile-drop-36mo.png"),
+                "manifest_path": str(ready_artifact_dir / "profile-drop-36mo.manifest.json"),
+            }
+        ],
+    )
+
+    exit_code = ar_main.cmd_render_corpus_profile_drops(
+        run_ids=None,
+        attempt_ids=None,
+        top_results=None,
+        rank_start=0,
+        lookback_months=36,
+        profile_drop_workers=2,
+        profile_drop_timeout_seconds=60,
+        force_rebuild=False,
+        as_json=True,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert len(catchup_calls) == 1
+    assert catchup_calls[0]["attempt_ids"] == ["attempt-missing"]
+    assert payload["full_backtest_catch_up_selected_count"] == 1
+    assert payload["artifact_native_ready_count"] == 1
+
+
 def test_cmd_render_corpus_profile_drops_streams_catch_up_progress_in_plain_mode(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -2476,6 +2699,26 @@ def test_render_profile_drop_rows_preflights_required_metadata_provider(
             layout_mode="attempt_local",
             require_presentation_metadata=True,
         )
+
+
+def test_should_retry_profile_drop_error_classifies_transient_failures() -> None:
+    retryable = [
+        "HTTP 524 from lake while packaging profile drop",
+        "ECONNRESET while rendering profile drop",
+        "429 too many requests",
+        "browser has been closed",
+        "resource temporarily unavailable",
+    ]
+    nonretryable = [
+        "Deep replay job has not completed successfully",
+        "Attempt ledger record missing for attempt abc",
+        "Packaged bundle recommended-cell-path-detail.json does not match",
+    ]
+
+    assert all(ar_main._should_retry_profile_drop_error(message) for message in retryable)
+    assert not any(
+        ar_main._should_retry_profile_drop_error(message) for message in nonretryable
+    )
 
 
 def test_generate_presentation_metadata_repairs_invalid_writer_copy(
@@ -3793,6 +4036,9 @@ def test_render_profile_drop_for_attempt_skips_cli_package_when_full_artifacts_e
     renderer_calls: list[list[str]] = []
 
     class FakeCli:
+        def ensure_login(self):
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
         def run(self, args, cwd=None, timeout_seconds=None, check=True):
             if args and args[0] == "package":
                 pytest.fail("profile-drop rendering should reuse existing full-backtest artifacts")
@@ -3878,3 +4124,105 @@ def test_render_profile_drop_for_attempt_skips_cli_package_when_full_artifacts_e
     assert ar_main.load_json_if_exists(bundle_dirs[0] / "run-metadata.json")["analysis"][
         "analysis_backend"
     ] == "deep_replay_existing_artifact"
+
+
+def test_render_profile_drop_for_attempt_reuses_full_artifacts_before_cloud_profile_check(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "runs" / "run-fast"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir, profile_path = _write_existing_full_backtest_profile_drop_inputs(tmp_path)
+    recommended_detail = {
+        "artifact_mode": "profile_drop_cell_detail_compact_v1",
+        "job_id": "deepreplay-fast-1",
+        "scope": "instrument",
+        "instrument": "EURUSD",
+        "cell": {
+            "stop_loss_percent": 0.05,
+            "reward_multiple": 2.0,
+            "take_profit_percent": 0.1,
+        },
+        "path_metrics": {"final_equity_r": 8.2, "max_drawdown_r": 0.9},
+        "curve": {"points": []},
+    }
+    (
+        artifact_dir / ar_main.FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+    ).write_text(
+        json.dumps(recommended_detail, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    renderer_calls: list[list[str]] = []
+
+    class FakeCli:
+        def run(self, args, cwd=None, timeout_seconds=None, check=True):
+            pytest.fail(f"artifact-native profile drop should not call CLI: {args}")
+
+    def fake_run_external(argv, cwd=None, timeout_seconds=None):
+        renderer_calls.append(list(argv))
+        png_path = Path(argv[argv.index("--out") + 1])
+        png_path.parent.mkdir(parents=True, exist_ok=True)
+        png_path.write_text("png", encoding="utf-8")
+
+    config = SimpleNamespace(
+        research=SimpleNamespace(
+            quality_score_preset="profile-drop",
+            presentation_metadata_provider_profile="",
+        ),
+        fuzzfolio=SimpleNamespace(workspace_root=None, base_url="http://localhost:7946/api/dev"),
+        providers={},
+    )
+    row = {
+        "attempt_id": "attempt-fast",
+        "run_id": "run-fast",
+        "candidate_name": "candidate",
+        "profile_ref": "profile-stale",
+    }
+    attempt = {
+        "attempt_id": "attempt-fast",
+        "candidate_name": "candidate",
+        "profile_ref": "profile-stale",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+    }
+
+    monkeypatch.setattr(
+        ar_main,
+        "_cloud_profile_exists",
+        lambda *_args, **_kwargs: pytest.fail("artifact-native profile drop should not check cloud profile"),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_create_cloud_profile",
+        lambda *_args, **_kwargs: pytest.fail("artifact-native profile drop should not create cloud profile"),
+    )
+    monkeypatch.setattr(ar_main, "_run_external", fake_run_external)
+
+    result = ar_main._render_profile_drop_for_attempt(
+        config=config,
+        cli=FakeCli(),
+        renderer_executable=tmp_path / "renderer",
+        working_dir=tmp_path,
+        run_dir=run_dir,
+        attempts=[attempt],
+        row=row,
+        attempt=attempt,
+        output_root=None,
+        lookback_months=36,
+        force_rebuild=False,
+        timeout_seconds=30,
+        emit=None,
+        layout_mode="attempt_local",
+    )
+
+    hidden_root = artifact_dir / ".profile-drop-36mo"
+    bundle_dirs = list((hidden_root / "bundle").iterdir())
+    bundle_response = ar_main.load_json_if_exists(
+        bundle_dirs[0] / "sensitivity-response.json"
+    )
+
+    assert result["status"] == "rendered"
+    assert len(renderer_calls) == 1
+    assert len(bundle_dirs) == 1
+    assert bundle_response["data"]["aggregate"]["recommended_cell_path_metrics"][
+        "final_equity_r"
+    ] == 8.2
