@@ -19,6 +19,8 @@ from autoresearch.corpus_tools import (
     FULL_BACKTEST_CURVE_FILENAME,
     FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
     FULL_BACKTEST_RESULT_FILENAME,
+    build_full_backtest_audit,
+    catalog_summary,
 )
 from autoresearch.ledger import ATTEMPTS_FILE_NAME, RUN_METADATA_FILE_NAME
 from autoresearch.scoring import CANONICAL_SCORE_LAB_VERSION
@@ -412,6 +414,164 @@ def test_incremental_catalog_streams_materialized_outputs_from_sqlite(tmp_path) 
     assert summary["scored_attempt_count"] == 2
 
 
+def test_sqlite_summary_and_audit_match_streaming_semantics(tmp_path) -> None:
+    derived_root = tmp_path / "runs" / "derived"
+    config = SimpleNamespace(
+        runs_root=tmp_path / "runs",
+        derived_root=derived_root,
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+    )
+    rows = [
+        {
+            "run_id": "run-a",
+            "attempt_id": "attempt-a",
+            "composite_score": 45.0,
+            "score_36m": 50.0,
+            "runner": "play_hand_v1",
+            "is_canonical_attempt": True,
+            "is_canonical_playhand_attempt": True,
+            "base_strategy_key": "M5|EURUSD",
+            "has_scrutiny_12m": True,
+            "has_scrutiny_36m": True,
+            "strategy_key_36m": "M5|EURUSD",
+            "has_full_backtest_36m": True,
+            "has_full_backtest_result_36m": True,
+            "has_full_backtest_curve_36m": True,
+            "full_backtest_validation_status_36m": "valid",
+            "has_sensitivity_response": True,
+        },
+        {
+            "run_id": "run-a",
+            "attempt_id": "attempt-a2",
+            "composite_score": 10.0,
+            "score_36m": None,
+            "runner": "play_hand_v1",
+            "is_canonical_attempt": False,
+            "is_canonical_playhand_attempt": False,
+            "base_strategy_key": "M5|EURUSD",
+            "has_scrutiny_12m": False,
+            "has_scrutiny_36m": False,
+            "strategy_key_36m": None,
+            "has_full_backtest_36m": False,
+            "has_full_backtest_result_36m": False,
+            "has_full_backtest_curve_36m": False,
+            "full_backtest_validation_status_36m": "missing",
+            "has_sensitivity_response": True,
+        },
+        {
+            "run_id": "run-b",
+            "attempt_id": "attempt-b",
+            "composite_score": 65.0,
+            "score_36m": 70.0,
+            "runner": "manual",
+            "is_canonical_attempt": True,
+            "is_canonical_playhand_attempt": False,
+            "base_strategy_key": "H1|GBPUSD",
+            "has_scrutiny_12m": True,
+            "has_scrutiny_36m": True,
+            "strategy_key_36m": "H1|GBPUSD",
+            "has_full_backtest_36m": False,
+            "has_full_backtest_result_36m": False,
+            "has_full_backtest_curve_36m": False,
+            "full_backtest_validation_status_36m": "missing",
+            "has_sensitivity_response": True,
+        },
+        {
+            "run_id": "run-c",
+            "attempt_id": "attempt-c",
+            "composite_score": 25.0,
+            "score_36m": 20.0,
+            "runner": "manual",
+            "is_canonical_attempt": True,
+            "is_canonical_playhand_attempt": False,
+            "base_strategy_key": "M15|XAUUSD",
+            "has_scrutiny_12m": False,
+            "has_scrutiny_36m": True,
+            "strategy_key_36m": "M15|XAUUSD",
+            "has_full_backtest_36m": True,
+            "has_full_backtest_result_36m": True,
+            "has_full_backtest_curve_36m": False,
+            "full_backtest_validation_status_36m": "invalid",
+            "has_sensitivity_response": False,
+        },
+    ]
+    with catalog_index._connect_catalog_db(config.attempt_catalog_sqlite_path) as conn:
+        for index, row in enumerate(rows):
+            conn.execute(
+                """
+                INSERT INTO attempt_rows(
+                    run_id, row_key, row_index, attempt_id, composite_score,
+                    score_36m, is_tombstoned, has_full_backtest_36m,
+                    full_backtest_validation_status_36m, runner,
+                    base_strategy_key, strategy_key_36m,
+                    is_canonical_attempt, is_canonical_playhand_attempt,
+                    has_scrutiny_12m, has_scrutiny_36m,
+                    has_full_backtest_result_36m,
+                    has_full_backtest_curve_36m, has_sensitivity_response,
+                    row_json, updated_at
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    row["run_id"],
+                    f"{index:08d}:{row['attempt_id']}",
+                    index,
+                    row["attempt_id"],
+                    row["composite_score"],
+                    row["score_36m"],
+                    0,
+                    int(bool(row["has_full_backtest_36m"])),
+                    row["full_backtest_validation_status_36m"],
+                    *catalog_index._audit_column_values(row),
+                    json.dumps(row),
+                    "now",
+                ),
+            )
+        conn.commit()
+
+    expected_summary = catalog_summary(rows)
+    actual_summary = catalog_summary_from_sqlite(config)
+    expected_audit = build_full_backtest_audit(rows)
+    actual_audit = catalog_index.build_full_backtest_audit_from_sqlite(config)
+
+    assert actual_summary == expected_summary
+    assert actual_audit == expected_audit
+
+
+def test_metadata_only_signature_ack_avoids_catalog_rebuild(tmp_path) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    run_dir = runs_root / "run-a"
+    _write_attempt(run_dir, attempt_id="attempt-a", score=10.0)
+    config = SimpleNamespace(
+        runs_root=runs_root,
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+    )
+    refresh_incremental_attempt_catalog(config, run_dirs=[run_dir], load_rows=False)
+    metadata_path = run_dir / RUN_METADATA_FILE_NAME
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["play_hand_health"] = {"version": "test"}
+    _write_json(metadata_path, metadata)
+
+    acknowledged = catalog_index.acknowledge_run_metadata_only_updates(
+        config,
+        run_ids=[run_dir.name],
+    )
+    _rows, info = refresh_incremental_attempt_catalog(
+        config,
+        run_dirs=[run_dir],
+        load_rows=False,
+        prune_missing=False,
+    )
+
+    assert acknowledged == 1
+    assert info["reused_run_count"] == 1
+    assert info["rebuilt_run_count"] == 0
+
+
 def test_build_attempt_catalog_debug_exports_are_explicit(
     tmp_path,
     monkeypatch,
@@ -635,6 +795,88 @@ def test_incremental_catalog_migrates_old_unique_attempt_schema(tmp_path) -> Non
     finally:
         conn.close()
     assert "row_key" in columns
+
+
+def test_catalog_backfills_typed_audit_columns_without_rebuilding_runs(tmp_path) -> None:
+    db_path = tmp_path / "derived" / "attempt-catalog.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "run_id": "run-a",
+        "attempt_id": "attempt-a",
+        "runner": "play_hand_v1",
+        "base_strategy_key": "M5|EURUSD",
+        "strategy_key_36m": "M5|EURUSD",
+        "is_canonical_attempt": True,
+        "is_canonical_playhand_attempt": True,
+        "has_scrutiny_12m": True,
+        "has_scrutiny_36m": True,
+        "has_full_backtest_36m": True,
+        "has_full_backtest_result_36m": True,
+        "has_full_backtest_curve_36m": False,
+        "has_sensitivity_response": True,
+        "composite_score": 60.0,
+        "score_36m": 72.0,
+        "full_backtest_validation_status_36m": "invalid",
+    }
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE attempt_rows (
+                run_id TEXT NOT NULL,
+                row_key TEXT NOT NULL,
+                row_index INTEGER NOT NULL,
+                attempt_id TEXT NOT NULL,
+                composite_score REAL,
+                score_36m REAL,
+                is_tombstoned INTEGER NOT NULL,
+                has_full_backtest_36m INTEGER NOT NULL,
+                full_backtest_validation_status_36m TEXT,
+                row_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (run_id, row_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO attempt_rows VALUES (
+                'run-a', '00000000:attempt-a', 0, 'attempt-a', 60.0, 72.0,
+                0, 1, 'invalid', ?, 'now'
+            )
+            """,
+            (json.dumps(payload),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    with catalog_index._connect_catalog_db(db_path) as conn:
+        typed = conn.execute(
+            """
+            SELECT runner, base_strategy_key, strategy_key_36m,
+                   is_canonical_attempt, has_scrutiny_12m, has_scrutiny_36m,
+                   has_full_backtest_result_36m, has_full_backtest_curve_36m,
+                   has_sensitivity_response
+            FROM attempt_rows
+            """
+        ).fetchone()
+        version = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'audit_columns_version'"
+        ).fetchone()[0]
+
+    assert typed == (
+        "play_hand_v1",
+        "M5|EURUSD",
+        "M5|EURUSD",
+        1,
+        1,
+        1,
+        1,
+        0,
+        1,
+    )
+    assert version == str(catalog_index.CATALOG_AUDIT_COLUMNS_VERSION)
 
 
 def test_incremental_catalog_commits_batches_before_later_failure(

@@ -43,6 +43,8 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from autoresearch.config import load_config
     from autoresearch.catalog_index import (
+        acknowledge_run_metadata_only_updates,
+        build_full_backtest_audit_from_sqlite,
         catalog_summary_from_sqlite,
         iter_catalog_rows,
         refresh_incremental_attempt_catalog,
@@ -313,6 +315,8 @@ if __package__ in {None, ""}:
 else:
     from .config import load_config
     from .catalog_index import (
+        acknowledge_run_metadata_only_updates,
+        build_full_backtest_audit_from_sqlite,
         catalog_summary_from_sqlite,
         iter_catalog_rows,
         refresh_incremental_attempt_catalog,
@@ -7066,8 +7070,28 @@ def _refresh_global_derived_corpus_state(
     config,
     *,
     refresh_run_ids: list[str] | None = None,
+    rebuild_audit: bool = True,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
+    started_at = pytime.monotonic()
+
+    def progress(stage: str, **payload: Any) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": stage,
+                    "elapsed_seconds": round(pytime.monotonic() - started_at, 3),
+                    **payload,
+                }
+            )
+
     all_run_dirs = _matching_run_dirs(config, None)
+    progress(
+        "catalog_refresh_start",
+        refresh_run_count=(
+            len(all_run_dirs) if refresh_run_ids is None else len(refresh_run_ids)
+        ),
+    )
     if refresh_run_ids is None:
         refresh_run_dirs = all_run_dirs
         _rows, index_info = refresh_incremental_attempt_catalog(
@@ -7092,10 +7116,36 @@ def _refresh_global_derived_corpus_state(
             "row_count": 0,
             "rows_loaded": False,
         }
-    audit_payload = build_full_backtest_audit(
-        iter_catalog_rows(config, order_by_priority=False)
+    progress(
+        "catalog_refresh_done",
+        refreshed=bool(index_info.get("refreshed")),
+        rebuilt_run_count=int(index_info.get("rebuilt_run_count") or 0),
     )
+    if not rebuild_audit:
+        summary = load_json_if_exists(config.attempt_catalog_summary_path)
+        audit_payload = load_json_if_exists(config.full_backtest_audit_json_path)
+        return {
+            "run_count": len(all_run_dirs),
+            "attempt_count": int(summary.get("attempt_count") or 0),
+            "attempt_catalog_sqlite": str(config.attempt_catalog_sqlite_path),
+            "attempt_catalog_json": None,
+            "attempt_catalog_csv": None,
+            "attempt_catalog_summary_json": str(config.attempt_catalog_summary_path),
+            "attempt_catalog_manifest_json": str(config.attempt_catalog_manifest_path),
+            "attempt_catalog_json_refreshed": False,
+            "attempt_catalog_csv_refreshed": False,
+            "full_backtest_audit_json": str(config.full_backtest_audit_json_path),
+            "audit_refreshed": False,
+            "index": index_info,
+            "summary": summary,
+            "audit": audit_payload,
+            "elapsed_seconds": round(pytime.monotonic() - started_at, 3),
+        }
+
+    progress("audit_start")
+    audit_payload = build_full_backtest_audit_from_sqlite(config)
     summary = dict(audit_payload.get("summary") or {})
+    progress("audit_done", attempt_count=int(summary.get("attempt_count") or 0))
     _write_attempt_catalog_summary_artifacts(
         config,
         run_dirs=all_run_dirs,
@@ -7105,6 +7155,7 @@ def _refresh_global_derived_corpus_state(
         ),
     )
     write_json(config.full_backtest_audit_json_path, audit_payload)
+    progress("artifacts_written")
     return {
         "run_count": len(all_run_dirs),
         "attempt_count": int(summary.get("attempt_count") or 0),
@@ -7116,9 +7167,11 @@ def _refresh_global_derived_corpus_state(
         "attempt_catalog_json_refreshed": False,
         "attempt_catalog_csv_refreshed": False,
         "full_backtest_audit_json": str(config.full_backtest_audit_json_path),
+        "audit_refreshed": True,
         "index": index_info,
         "summary": summary,
         "audit": audit_payload,
+        "elapsed_seconds": round(pytime.monotonic() - started_at, 3),
     }
 
 
@@ -10595,6 +10648,7 @@ def cmd_calculate_full_backtests(
     as_json: bool,
     emit_summary: bool = True,
     catalog_already_refreshed: bool = False,
+    defer_global_audit: bool = False,
 ) -> int:
     config = load_config()
     backend = str(full_backtest_backend or "local").strip().lower().replace("-", "_")
@@ -10793,6 +10847,7 @@ def cmd_calculate_full_backtests(
         derived_refresh = _refresh_global_derived_corpus_state(
             config,
             refresh_run_ids=changed_run_ids,
+            rebuild_audit=not defer_global_audit,
         )
         failure_summary = _build_full_backtest_failure_summary(results)
         write_json(config.full_backtest_failures_json_path, failure_summary)
@@ -10971,6 +11026,7 @@ def cmd_calculate_full_backtests(
     derived_refresh = _refresh_global_derived_corpus_state(
         config,
         refresh_run_ids=changed_run_ids,
+        rebuild_audit=not defer_global_audit,
     )
     failure_summary = _build_full_backtest_failure_summary(results)
     write_json(config.full_backtest_failures_json_path, failure_summary)
@@ -15037,6 +15093,7 @@ def cmd_render_corpus_profile_drops(
                     full_backtest_result_batch_size=full_backtest_result_batch_size,
                     trading_dashboard_root=trading_dashboard_root,
                     catalog_already_refreshed=True,
+                    defer_global_audit=True,
                     as_json=True,
                 )
         else:
@@ -15057,6 +15114,7 @@ def cmd_render_corpus_profile_drops(
                 full_backtest_result_batch_size=full_backtest_result_batch_size,
                 trading_dashboard_root=trading_dashboard_root,
                 catalog_already_refreshed=True,
+                defer_global_audit=True,
                 as_json=False,
                 emit_summary=False,
             )
@@ -15420,6 +15478,96 @@ def _select_finalize_corpus_rows(
     }
 
 
+def _heal_finalize_play_hand_runs(
+    *,
+    config: Any,
+    selected_rows: list[dict[str, Any]],
+    force_rebuild: bool,
+    max_workers: int,
+    as_json: bool,
+) -> tuple[list[dict[str, Any]], list[str], int, float]:
+    row_by_run_id = {
+        str(row.get("run_id") or "").strip(): row
+        for row in selected_rows
+        if str(row.get("run_id") or "").strip()
+        and (
+            str(row.get("runner") or "").strip() == "play_hand_v1"
+            or bool(row.get("is_canonical_playhand_attempt"))
+            or (
+                bool(row.get("canonical_attempt_id"))
+                and "playhand" in str(row.get("run_id") or "").lower()
+            )
+        )
+    }
+    run_ids = sorted(row_by_run_id)
+    if not run_ids:
+        return [], [], 0, 0.0
+
+    worker_count = min(max(1, int(max_workers)), 4, len(run_ids))
+    started_at = pytime.monotonic()
+    _job_status_emit(
+        f"[finalize-corpus tail] health healing starting runs={len(run_ids)} "
+        f"workers={worker_count}",
+        as_json=as_json,
+    )
+
+    def heal(run_id: str) -> dict[str, Any]:
+        run_dir = config.runs_root / run_id
+        if not run_dir.exists():
+            return {"run_id": run_id, "updated": False, "error": "run_dir_missing"}
+        row = row_by_run_id[run_id]
+        attempt_id = str(row.get("attempt_id") or "").strip()
+        canonical_attempt_id = str(row.get("canonical_attempt_id") or "").strip()
+        catalog_row = (
+            row
+            if bool(row.get("is_canonical_playhand_attempt"))
+            or (canonical_attempt_id and attempt_id == canonical_attempt_id)
+            else None
+        )
+        try:
+            return heal_play_hand_run_metadata(
+                run_dir,
+                catalog_row=catalog_row,
+                force=bool(force_rebuild),
+            )
+        except Exception as exc:
+            return {"run_id": run_id, "updated": False, "error": str(exc)}
+
+    results: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_by_run_id = {
+            executor.submit(heal, run_id): run_id for run_id in run_ids
+        }
+        for completed, future in enumerate(as_completed(future_by_run_id), start=1):
+            results.append(future.result())
+            if completed == len(run_ids) or completed % 100 == 0:
+                _job_status_emit(
+                    f"[finalize-corpus tail] health healing {completed}/{len(run_ids)} "
+                    f"complete elapsed={_elapsed_text(started_at)}",
+                    as_json=as_json,
+                )
+
+    results.sort(key=lambda item: str(item.get("run_id") or ""))
+    updated_run_ids = sorted(
+        str(item.get("run_id") or "").strip()
+        for item in results
+        if item.get("updated") and str(item.get("run_id") or "").strip()
+    )
+    acknowledged = acknowledge_run_metadata_only_updates(
+        config,
+        run_ids=updated_run_ids,
+    )
+    elapsed = pytime.monotonic() - started_at
+    _job_status_emit(
+        f"[finalize-corpus tail] health healing complete updated={len(updated_run_ids)} "
+        f"signature_updates={acknowledged} errors="
+        f"{sum(1 for item in results if item.get('error'))} "
+        f"elapsed={_elapsed_text(started_at)}",
+        as_json=as_json,
+    )
+    return results, run_ids, acknowledged, elapsed
+
+
 def cmd_finalize_corpus(
     *,
     run_ids: list[str] | None,
@@ -15612,49 +15760,41 @@ def cmd_finalize_corpus(
             as_json=False,
         )
 
-    play_hand_health_results: list[dict[str, Any]] = []
-    play_hand_run_ids = sorted(
-        {
-            str(row.get("run_id") or "").strip()
-            for row in selected_rows
-            if str(row.get("run_id") or "").strip()
-            and (
-                str(row.get("runner") or "").strip() == "play_hand_v1"
-                or bool(row.get("is_canonical_playhand_attempt"))
-                or (
-                    bool(row.get("canonical_attempt_id"))
-                    and "playhand" in str(row.get("run_id") or "").lower()
-                )
-            )
-        }
+    tail_started_at = pytime.monotonic()
+    (
+        play_hand_health_results,
+        play_hand_run_ids,
+        acknowledged_health_signatures,
+        health_elapsed_seconds,
+    ) = _heal_finalize_play_hand_runs(
+        config=config,
+        selected_rows=selected_rows,
+        force_rebuild=bool(force_rebuild),
+        max_workers=max(1, int(profile_drop_workers)),
+        as_json=as_json,
     )
-    for run_id in play_hand_run_ids:
-        run_dir = config.runs_root / run_id
-        if not run_dir.exists():
-            play_hand_health_results.append(
-                {
-                    "run_id": run_id,
-                    "updated": False,
-                    "error": "run_dir_missing",
-                }
-            )
-            continue
-        try:
-            play_hand_health_results.append(
-                heal_play_hand_run_metadata(run_dir, force=bool(force_rebuild))
-            )
-        except Exception as exc:
-            play_hand_health_results.append(
-                {
-                    "run_id": run_id,
-                    "updated": False,
-                    "error": str(exc),
-                }
-            )
+
+    def emit_tail_refresh_progress(payload: dict[str, Any]) -> None:
+        stage = str(payload.get("stage") or "working")
+        detail = ""
+        if payload.get("attempt_count") is not None:
+            detail += f" attempts={int(payload['attempt_count'])}"
+        if payload.get("rebuilt_run_count") is not None:
+            detail += f" rebuilt_runs={int(payload['rebuilt_run_count'])}"
+        _job_status_emit(
+            f"[finalize-corpus tail] {stage}{detail} "
+            f"elapsed={float(payload.get('elapsed_seconds') or 0.0):.1f}s",
+            as_json=as_json,
+        )
 
     refresh_summary = _refresh_global_derived_corpus_state(
         config,
-        refresh_run_ids=play_hand_run_ids,
+        refresh_run_ids=[],
+        progress_callback=emit_tail_refresh_progress,
+    )
+    _job_status_emit(
+        "[finalize-corpus tail] loading refreshed selected rows",
+        as_json=as_json,
     )
     refreshed_catalog_rows = list(
         iter_catalog_rows(config, attempt_ids=selected_attempt_ids)
@@ -15683,10 +15823,16 @@ def cmd_finalize_corpus(
     summary["play_hand_health"] = {
         "selected_play_hand_runs": len(play_hand_run_ids),
         "updated": sum(1 for item in play_hand_health_results if item.get("updated")),
+        "signature_updates": acknowledged_health_signatures,
         "errors": [item for item in play_hand_health_results if item.get("error")],
         "results": play_hand_health_results,
     }
     summary["refresh_summary"] = refresh_summary
+    summary["tail"] = {
+        "health_elapsed_seconds": round(health_elapsed_seconds, 3),
+        "refresh_elapsed_seconds": refresh_summary.get("elapsed_seconds"),
+        "elapsed_seconds": round(pytime.monotonic() - tail_started_at, 3),
+    }
     _job_status_emit(
         f"[finalize-corpus] passing strategies: +{passing_delta['newly_passing_count']} "
         f"new this run ({passing_delta['passing_count']}/"

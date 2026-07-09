@@ -18,6 +18,7 @@ from .corpus_tools import (
     catalog_json_cache,
     catalog_priority_key,
     catalog_summary,
+    build_full_backtest_audit,
     extract_attempt_catalog_row,
     legacy_validation_cache_dir,
     scrutiny_cache_dir_for_artifact_dir,
@@ -34,10 +35,23 @@ from .scoring import CANONICAL_SCORE_LAB_VERSION
 CATALOG_INDEX_SCHEMA_VERSION = 2
 CATALOG_EXTRACTION_VERSION = f"2026-07-09.1:{CANONICAL_SCORE_LAB_VERSION}"
 CATALOG_COMMIT_INTERVAL_RUNS = 250
+CATALOG_AUDIT_COLUMNS_VERSION = 1
 RUST_CATALOG_SCAN_ENV = "AUTORESEARCH_RUST_CATALOG_SCAN"
 CATALOG_LEDGER_MIGRATION_SOURCE_VERSIONS = {
     f"2026-07-08.2:{CANONICAL_SCORE_LAB_VERSION}",
 }
+CATALOG_AUDIT_COLUMN_DEFINITIONS = (
+    ("runner", "TEXT"),
+    ("base_strategy_key", "TEXT"),
+    ("strategy_key_36m", "TEXT"),
+    ("is_canonical_attempt", "INTEGER"),
+    ("is_canonical_playhand_attempt", "INTEGER"),
+    ("has_scrutiny_12m", "INTEGER"),
+    ("has_scrutiny_36m", "INTEGER"),
+    ("has_full_backtest_result_36m", "INTEGER"),
+    ("has_full_backtest_curve_36m", "INTEGER"),
+    ("has_sensitivity_response", "INTEGER"),
+)
 
 
 def _json_dumps(payload: Any) -> str:
@@ -290,12 +304,78 @@ def _connect_catalog_db(path: Path) -> sqlite3.Connection:
             is_tombstoned INTEGER NOT NULL,
             has_full_backtest_36m INTEGER NOT NULL,
             full_backtest_validation_status_36m TEXT,
+            runner TEXT,
+            base_strategy_key TEXT,
+            strategy_key_36m TEXT,
+            is_canonical_attempt INTEGER,
+            is_canonical_playhand_attempt INTEGER,
+            has_scrutiny_12m INTEGER,
+            has_scrutiny_36m INTEGER,
+            has_full_backtest_result_36m INTEGER,
+            has_full_backtest_curve_36m INTEGER,
+            has_sensitivity_response INTEGER,
             row_json TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             PRIMARY KEY (run_id, row_key)
         )
         """
     )
+    columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(attempt_rows)").fetchall()
+    }
+    for column_name, column_type in CATALOG_AUDIT_COLUMN_DEFINITIONS:
+        if column_name not in columns:
+            conn.execute(
+                f"ALTER TABLE attempt_rows ADD COLUMN {column_name} {column_type}"
+            )
+    audit_columns_version_row = conn.execute(
+        "SELECT value FROM metadata WHERE key = 'audit_columns_version'"
+    ).fetchone()
+    try:
+        audit_columns_version = (
+            int(audit_columns_version_row[0]) if audit_columns_version_row else 0
+        )
+    except (TypeError, ValueError):
+        audit_columns_version = 0
+    if audit_columns_version != CATALOG_AUDIT_COLUMNS_VERSION:
+        conn.execute(
+            """
+            UPDATE attempt_rows
+            SET
+                runner = NULLIF(json_extract(row_json, '$.runner'), ''),
+                base_strategy_key = NULLIF(
+                    json_extract(row_json, '$.base_strategy_key'), ''
+                ),
+                strategy_key_36m = NULLIF(
+                    json_extract(row_json, '$.strategy_key_36m'), ''
+                ),
+                is_canonical_attempt = COALESCE(
+                    json_extract(row_json, '$.is_canonical_attempt'), 0
+                ),
+                is_canonical_playhand_attempt = COALESCE(
+                    json_extract(row_json, '$.is_canonical_playhand_attempt'), 0
+                ),
+                has_scrutiny_12m = COALESCE(
+                    json_extract(row_json, '$.has_scrutiny_12m'), 0
+                ),
+                has_scrutiny_36m = COALESCE(
+                    json_extract(row_json, '$.has_scrutiny_36m'), 0
+                ),
+                has_full_backtest_result_36m = COALESCE(
+                    json_extract(row_json, '$.has_full_backtest_result_36m'), 0
+                ),
+                has_full_backtest_curve_36m = COALESCE(
+                    json_extract(row_json, '$.has_full_backtest_curve_36m'), 0
+                ),
+                has_sensitivity_response = COALESCE(
+                    json_extract(row_json, '$.has_sensitivity_response'), 0
+                )
+            """
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES (?, ?)",
+            ("audit_columns_version", str(CATALOG_AUDIT_COLUMNS_VERSION)),
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_attempt_rows_attempt_id ON attempt_rows(attempt_id)"
     )
@@ -306,6 +386,35 @@ def _connect_catalog_db(path: Path) -> sqlite3.Connection:
         """
         CREATE INDEX IF NOT EXISTS idx_attempt_rows_priority
         ON attempt_rows(score_36m DESC, composite_score DESC, attempt_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_attempt_rows_scrutiny_score
+        ON attempt_rows(has_scrutiny_36m, score_36m)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_attempt_rows_audit_cover
+        ON attempt_rows(
+            run_id,
+            attempt_id,
+            composite_score,
+            score_36m,
+            runner,
+            is_canonical_attempt,
+            is_canonical_playhand_attempt,
+            base_strategy_key,
+            has_scrutiny_12m,
+            has_scrutiny_36m,
+            strategy_key_36m,
+            has_full_backtest_36m,
+            full_backtest_validation_status_36m,
+            has_full_backtest_result_36m,
+            has_full_backtest_curve_36m,
+            has_sensitivity_response
+        )
         """
     )
     conn.execute(
@@ -323,6 +432,26 @@ def _safe_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_text(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
+
+
+def _audit_column_values(row: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        _optional_text(row.get("runner")),
+        _optional_text(row.get("base_strategy_key")),
+        _optional_text(row.get("strategy_key_36m")),
+        1 if bool(row.get("is_canonical_attempt")) else 0,
+        1 if bool(row.get("is_canonical_playhand_attempt")) else 0,
+        1 if bool(row.get("has_scrutiny_12m")) else 0,
+        1 if bool(row.get("has_scrutiny_36m")) else 0,
+        1 if bool(row.get("has_full_backtest_result_36m")) else 0,
+        1 if bool(row.get("has_full_backtest_curve_36m")) else 0,
+        1 if bool(row.get("has_sensitivity_response")) else 0,
+    )
 
 
 def _query_signature_rows(
@@ -394,6 +523,46 @@ def _load_existing_signature_counts(
     except sqlite3.OperationalError:
         return {}
     return {str(run_id): int(row_count or 0) for run_id, row_count in rows}
+
+
+def acknowledge_run_metadata_only_updates(
+    config: Any,
+    *,
+    run_ids: list[str],
+) -> int:
+    """Advance cached metadata signatures after a non-indexed metadata-only edit."""
+    wanted = sorted({str(run_id).strip() for run_id in run_ids if str(run_id).strip()})
+    if not wanted:
+        return 0
+    updated = 0
+    now = datetime.now().astimezone().isoformat()
+    with _connect_catalog_db(_catalog_db_path(config)) as conn:
+        signatures = _load_existing_signatures(conn, run_ids=wanted)
+        for run_id in wanted:
+            signature = signatures.get(run_id)
+            if not isinstance(signature, dict):
+                continue
+            if signature.get("schema_version") != CATALOG_INDEX_SCHEMA_VERSION:
+                continue
+            if signature.get("extraction_version") != CATALOG_EXTRACTION_VERSION:
+                continue
+            sources = signature.get("sources")
+            if not isinstance(sources, dict):
+                continue
+            signature = dict(signature)
+            signature["sources"] = {
+                **sources,
+                "run_metadata": _file_signature(
+                    run_metadata_path_for_run_dir(Path(config.runs_root) / run_id)
+                ),
+            }
+            conn.execute(
+                "UPDATE run_signatures SET signature_json = ?, updated_at = ? WHERE run_id = ?",
+                (_json_dumps(signature), now, run_id),
+            )
+            updated += 1
+        conn.commit()
+    return updated
 
 
 def _repo_root() -> Path:
@@ -693,10 +862,20 @@ def _replace_run_rows(
             is_tombstoned,
             has_full_backtest_36m,
             full_backtest_validation_status_36m,
+            runner,
+            base_strategy_key,
+            strategy_key_36m,
+            is_canonical_attempt,
+            is_canonical_playhand_attempt,
+            has_scrutiny_12m,
+            has_scrutiny_36m,
+            has_full_backtest_result_36m,
+            has_full_backtest_curve_36m,
+            has_sensitivity_response,
             row_json,
             updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -709,6 +888,7 @@ def _replace_run_rows(
                 1 if bool(row.get("is_tombstoned")) else 0,
                 1 if bool(row.get("has_full_backtest_36m")) else 0,
                 str(row.get("full_backtest_validation_status_36m") or "") or None,
+                *_audit_column_values(row),
                 _json_dumps(row),
                 now,
             )
@@ -789,8 +969,215 @@ def catalog_summary_from_sqlite(
     run_ids: list[str] | None = None,
     attempt_ids: list[str] | None = None,
 ) -> dict[str, Any]:
-    return catalog_summary(
-        iter_catalog_rows(config, run_ids=run_ids, attempt_ids=attempt_ids)
+    with _connect_catalog_db(_catalog_db_path(config)) as conn:
+        return _complete_catalog_summary_from_db(
+            conn,
+            run_ids=run_ids,
+            attempt_ids=attempt_ids,
+        )
+
+
+def _catalog_filter_sql(
+    *,
+    run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if run_ids:
+        clauses.append(f"run_id IN ({','.join('?' for _ in run_ids)})")
+        params.extend(run_ids)
+    if attempt_ids:
+        clauses.append(f"attempt_id IN ({','.join('?' for _ in attempt_ids)})")
+        params.extend(attempt_ids)
+    return (f"WHERE {' AND '.join(clauses)}" if clauses else ""), params
+
+
+def _complete_catalog_summary_from_db(
+    conn: sqlite3.Connection,
+    *,
+    run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    where, params = _catalog_filter_sql(run_ids=run_ids, attempt_ids=attempt_ids)
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*),
+            COUNT(DISTINCT run_id),
+            SUM(composite_score IS NOT NULL),
+            SUM(COALESCE(runner = 'play_hand_v1', 0)),
+            SUM(COALESCE(is_canonical_attempt, 0)),
+            SUM(COALESCE(is_canonical_playhand_attempt, 0)),
+            COUNT(DISTINCT base_strategy_key),
+            SUM(COALESCE(has_scrutiny_12m, 0)),
+            SUM(COALESCE(has_scrutiny_36m, 0)),
+            COUNT(DISTINCT CASE
+                WHEN COALESCE(has_scrutiny_36m, 0)
+                THEN strategy_key_36m
+            END),
+            COUNT(DISTINCT CASE
+                WHEN has_full_backtest_36m != 0
+                THEN strategy_key_36m
+            END),
+            SUM(has_full_backtest_36m != 0),
+            SUM(full_backtest_validation_status_36m = 'valid'),
+            SUM(full_backtest_validation_status_36m = 'invalid'),
+            SUM(
+                COALESCE(has_full_backtest_result_36m, 0)
+                != COALESCE(has_full_backtest_curve_36m, 0)
+            ),
+            SUM(COALESCE(has_sensitivity_response, 0)),
+            SUM(
+                COALESCE(has_scrutiny_36m, 0)
+                AND score_36m IS NOT NULL
+            ),
+            SUM(
+                COALESCE(has_scrutiny_36m, 0)
+                AND score_36m >= 40.0
+            ),
+            SUM(
+                COALESCE(has_scrutiny_36m, 0)
+                AND score_36m >= 60.0
+            ),
+            SUM(
+                COALESCE(has_scrutiny_36m, 0)
+                AND score_36m >= 70.0
+            ),
+            SUM(has_full_backtest_36m != 0 AND score_36m >= 40.0),
+            SUM(has_full_backtest_36m != 0 AND score_36m >= 60.0),
+            SUM(has_full_backtest_36m != 0 AND score_36m >= 70.0)
+        FROM attempt_rows INDEXED BY idx_attempt_rows_audit_cover
+        {where}
+        """,
+        params,
+    ).fetchone()
+    if not row or int(row[0] or 0) == 0:
+        return catalog_summary([])
+
+    score_count = int(row[16] or 0)
+    median_score_36: float | None = None
+    if score_count:
+        median_where = (
+            f"{where} AND " if where else "WHERE "
+        ) + "COALESCE(has_scrutiny_36m, 0) != 0 AND score_36m IS NOT NULL"
+        median_row = conn.execute(
+            f"""
+            SELECT score_36m
+            FROM attempt_rows
+            {median_where}
+            ORDER BY score_36m ASC
+            LIMIT 1 OFFSET ?
+            """,
+            [*params, score_count // 2],
+        ).fetchone()
+        if median_row is not None and median_row[0] is not None:
+            median_score_36 = float(median_row[0])
+
+    attempt_count = int(row[0] or 0)
+    scrutiny_36_count = int(row[8] or 0)
+    full_backtest_36_count = int(row[11] or 0)
+    valid_full_backtest_36_count = int(row[12] or 0)
+    return {
+        "run_count": int(row[1] or 0),
+        "attempt_count": attempt_count,
+        "scored_attempt_count": int(row[2] or 0),
+        "playhand_attempt_count": int(row[3] or 0),
+        "canonical_attempt_count": int(row[4] or 0),
+        "canonical_playhand_attempt_count": int(row[5] or 0),
+        "unique_base_strategy_count": int(row[6] or 0),
+        "unique_strategy_count_36m": int(row[9] or 0),
+        "unique_full_backtest_strategy_count_36m": int(row[10] or 0),
+        "attempts_with_scrutiny_12m": int(row[7] or 0),
+        "attempts_with_scrutiny_36m": scrutiny_36_count,
+        "attempts_with_full_backtest_36m": full_backtest_36_count,
+        "attempts_with_valid_full_backtest_36m": valid_full_backtest_36_count,
+        "attempts_with_invalid_full_backtest_36m": int(row[13] or 0),
+        "attempts_with_partial_full_backtest_36m": int(row[14] or 0),
+        "attempts_with_base_sensitivity": int(row[15] or 0),
+        "scrutiny_36m_coverage_ratio": (
+            float(scrutiny_36_count) / float(attempt_count)
+        ),
+        "full_backtest_36m_coverage_ratio": (
+            float(full_backtest_36_count) / float(attempt_count)
+        ),
+        "valid_full_backtest_36m_coverage_ratio": (
+            float(valid_full_backtest_36_count) / float(attempt_count)
+        ),
+        "full_backtest_36m_vs_scrutiny_coverage_ratio": (
+            float(full_backtest_36_count) / float(scrutiny_36_count)
+            if scrutiny_36_count > 0
+            else None
+        ),
+        "valid_full_backtest_36m_vs_scrutiny_coverage_ratio": (
+            float(valid_full_backtest_36_count) / float(scrutiny_36_count)
+            if scrutiny_36_count > 0
+            else None
+        ),
+        "median_score_36m": median_score_36,
+        "score_36m_ge_40": int(row[17] or 0),
+        "score_36m_ge_60": int(row[18] or 0),
+        "score_36m_ge_70": int(row[19] or 0),
+        "full_backtest_36m_ge_40": int(row[20] or 0),
+        "full_backtest_36m_ge_60": int(row[21] or 0),
+        "full_backtest_36m_ge_70": int(row[22] or 0),
+    }
+
+
+def build_full_backtest_audit_from_sqlite(
+    config: Any,
+    *,
+    run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
+    invalid_example_limit: int = 25,
+    pending_example_limit: int = 25,
+) -> dict[str, Any]:
+    with _connect_catalog_db(_catalog_db_path(config)) as conn:
+        summary = _complete_catalog_summary_from_db(
+            conn,
+            run_ids=run_ids,
+            attempt_ids=attempt_ids,
+        )
+        where, params = _catalog_filter_sql(run_ids=run_ids, attempt_ids=attempt_ids)
+
+        def example_rows(condition: str, limit: int) -> list[dict[str, Any]]:
+            if limit <= 0:
+                return []
+            filtered_where = f"{where} AND {condition}" if where else f"WHERE {condition}"
+            rows: list[dict[str, Any]] = []
+            for (row_json,) in conn.execute(
+                f"""
+                SELECT row_json
+                FROM attempt_rows
+                {filtered_where}
+                ORDER BY
+                    COALESCE(score_36m, -1.0e308) DESC,
+                    COALESCE(composite_score, -1.0e308) DESC,
+                    run_id ASC,
+                    row_key ASC
+                LIMIT ?
+                """,
+                [*params, int(limit)],
+            ):
+                payload = _json_loads(row_json)
+                if isinstance(payload, dict):
+                    rows.append(payload)
+            return rows
+
+        invalid_rows = example_rows(
+            "full_backtest_validation_status_36m = 'invalid'",
+            invalid_example_limit,
+        )
+        pending_rows = example_rows(
+            "COALESCE(has_scrutiny_36m, 0) != 0 "
+            "AND has_full_backtest_36m = 0",
+            pending_example_limit,
+        )
+    return build_full_backtest_audit(
+        [*invalid_rows, *pending_rows],
+        invalid_example_limit=invalid_example_limit,
+        pending_example_limit=pending_example_limit,
+        summary_override=summary,
     )
 
 

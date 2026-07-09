@@ -1169,6 +1169,7 @@ def build_full_backtest_audit(
     *,
     invalid_example_limit: int = 25,
     pending_example_limit: int = 25,
+    summary_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     invalid_rows: list[dict[str, Any]] = []
     pending_rows: list[dict[str, Any]] = []
@@ -1203,7 +1204,13 @@ def build_full_backtest_audit(
                 retain_best(pending_rows, row, pending_example_limit)
             yield row
 
-    summary = catalog_summary(observed_rows())
+    observed = observed_rows()
+    if summary_override is None:
+        summary = catalog_summary(observed)
+    else:
+        for _row in observed:
+            pass
+        summary = dict(summary_override)
     invalid_rows.sort(
         key=lambda row: (
             float(row.get("score_36m") or float("-inf")),
