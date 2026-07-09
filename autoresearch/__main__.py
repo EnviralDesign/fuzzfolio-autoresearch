@@ -3166,6 +3166,16 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Only catalog the named run id. Can be repeated.",
     )
     attempt_catalog.add_argument(
+        "--debug-export-json",
+        action="store_true",
+        help="Write the large legacy JSON catalog export for debugging.",
+    )
+    attempt_catalog.add_argument(
+        "--debug-export-csv",
+        action="store_true",
+        help="Write the large CSV catalog export for debugging.",
+    )
+    attempt_catalog.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
 
@@ -6847,32 +6857,51 @@ def _attempt_catalog_manifest_payload(
     }
 
 
-def _write_materialized_corpus_index(
+def _write_attempt_catalog_summary_artifacts(
     config,
     *,
     run_dirs: list[Path],
-    rows: list[dict[str, Any]] | None = None,
-    write_csv_output: bool = True,
-    from_sqlite: bool = False,
+    summary: dict[str, Any],
+    row_count: int,
 ) -> dict[str, Any]:
-    if from_sqlite:
-        row_count = stream_catalog_json_from_sqlite(config, config.attempt_catalog_json_path)
-        if write_csv_output:
-            stream_catalog_csv_from_sqlite(config, config.attempt_catalog_csv_path)
-        summary = catalog_summary_from_sqlite(config)
-    else:
-        row_items = list(rows or [])
-        row_count = len(row_items)
-        summary = catalog_summary(row_items)
-        write_json(config.attempt_catalog_json_path, row_items)
-        if write_csv_output:
-            write_csv(config.attempt_catalog_csv_path, row_items)
     write_json(config.attempt_catalog_summary_path, summary)
     write_json(
         config.attempt_catalog_manifest_path,
-        _attempt_catalog_manifest_payload(run_dirs, rows, row_count=row_count),
+        _attempt_catalog_manifest_payload(run_dirs, row_count=row_count),
     )
     return summary
+
+
+def _export_attempt_catalog_debug_artifacts(
+    config,
+    *,
+    run_ids: list[str] | None,
+    export_json: bool,
+    export_csv: bool,
+) -> dict[str, Any]:
+    exports: dict[str, Any] = {
+        "json_exported": False,
+        "csv_exported": False,
+        "json_path": None,
+        "csv_path": None,
+    }
+    if export_json:
+        exports["json_row_count"] = stream_catalog_json_from_sqlite(
+            config,
+            config.attempt_catalog_json_path,
+            run_ids=run_ids,
+        )
+        exports["json_exported"] = True
+        exports["json_path"] = str(config.attempt_catalog_json_path)
+    if export_csv:
+        exports["csv_row_count"] = stream_catalog_csv_from_sqlite(
+            config,
+            config.attempt_catalog_csv_path,
+            run_ids=run_ids,
+        )
+        exports["csv_exported"] = True
+        exports["csv_path"] = str(config.attempt_catalog_csv_path)
+    return exports
 
 
 def _selection_corpus_rows(
@@ -6900,11 +6929,14 @@ def _selection_corpus_rows(
         prune_missing=full_corpus_scope,
     )
     if full_corpus_scope and materialize_full_corpus:
-        _write_materialized_corpus_index(
+        summary = catalog_summary_from_sqlite(config)
+        _write_attempt_catalog_summary_artifacts(
             config,
             run_dirs=run_dirs,
-            write_csv_output=False,
-            from_sqlite=True,
+            summary=summary,
+            row_count=int(
+                index_info.get("row_count") or summary.get("attempt_count") or 0
+            ),
         )
     if full_corpus_scope:
         rows = list(iter_catalog_rows(config))
@@ -6922,11 +6954,14 @@ def _refresh_global_derived_corpus_state(config) -> dict[str, Any]:
         run_dirs=run_dirs,
         load_rows=False,
     )
-    summary = _write_materialized_corpus_index(
+    summary = catalog_summary_from_sqlite(config)
+    _write_attempt_catalog_summary_artifacts(
         config,
         run_dirs=run_dirs,
-        write_csv_output=False,
-        from_sqlite=True,
+        summary=summary,
+        row_count=int(
+            index_info.get("row_count") or summary.get("attempt_count") or 0
+        ),
     )
     rows = list(iter_catalog_rows(config))
     audit_payload = build_full_backtest_audit(rows)
@@ -6935,10 +6970,11 @@ def _refresh_global_derived_corpus_state(config) -> dict[str, Any]:
         "run_count": len(run_dirs),
         "attempt_count": len(rows),
         "attempt_catalog_sqlite": str(config.attempt_catalog_sqlite_path),
-        "attempt_catalog_json": str(config.attempt_catalog_json_path),
-        "attempt_catalog_csv": str(config.attempt_catalog_csv_path),
+        "attempt_catalog_json": None,
+        "attempt_catalog_csv": None,
         "attempt_catalog_summary_json": str(config.attempt_catalog_summary_path),
         "attempt_catalog_manifest_json": str(config.attempt_catalog_manifest_path),
+        "attempt_catalog_json_refreshed": False,
         "attempt_catalog_csv_refreshed": False,
         "full_backtest_audit_json": str(config.full_backtest_audit_json_path),
         "index": index_info,
@@ -10802,7 +10838,13 @@ def cmd_calculate_full_backtests(
     return 0 if failed == 0 else 1
 
 
-def cmd_build_attempt_catalog(*, run_ids: list[str] | None, as_json: bool) -> int:
+def cmd_build_attempt_catalog(
+    *,
+    run_ids: list[str] | None,
+    debug_export_json: bool,
+    debug_export_csv: bool,
+    as_json: bool,
+) -> int:
     config = load_config()
     run_dirs = _matching_run_dirs(config, run_ids)
     selected_run_ids = sorted(run_dir.name for run_dir in run_dirs)
@@ -10816,12 +10858,8 @@ def cmd_build_attempt_catalog(*, run_ids: list[str] | None, as_json: bool) -> in
             ),
             load_rows=False,
         )
-        summary = _write_materialized_corpus_index(
-            config,
-            run_dirs=run_dirs,
-            from_sqlite=True,
-        )
         attempt_count = int(index_info.get("row_count") or 0)
+        summary = catalog_summary_from_sqlite(config)
     else:
         _rows, index_info = refresh_incremental_attempt_catalog(
             config,
@@ -10833,31 +10871,31 @@ def cmd_build_attempt_catalog(*, run_ids: list[str] | None, as_json: bool) -> in
             load_rows=False,
             prune_missing=False,
         )
-        row_count = stream_catalog_json_from_sqlite(
-            config,
-            config.attempt_catalog_json_path,
-            run_ids=selected_run_ids,
-        )
-        stream_catalog_csv_from_sqlite(
-            config,
-            config.attempt_catalog_csv_path,
-            run_ids=selected_run_ids,
-        )
         summary = catalog_summary_from_sqlite(config, run_ids=selected_run_ids)
-        write_json(config.attempt_catalog_summary_path, summary)
-        write_json(
-            config.attempt_catalog_manifest_path,
-            _attempt_catalog_manifest_payload(run_dirs, row_count=row_count),
+        attempt_count = int(
+            index_info.get("row_count") or summary.get("attempt_count") or 0
         )
-        attempt_count = int(index_info.get("row_count") or row_count)
+    _write_attempt_catalog_summary_artifacts(
+        config,
+        run_dirs=run_dirs,
+        summary=summary,
+        row_count=attempt_count,
+    )
+    debug_exports = _export_attempt_catalog_debug_artifacts(
+        config,
+        run_ids=(None if not run_ids else selected_run_ids),
+        export_json=bool(debug_export_json),
+        export_csv=bool(debug_export_csv),
+    )
     payload = {
         "run_count": len(run_dirs),
         "attempt_count": attempt_count,
         "attempt_catalog_sqlite": str(config.attempt_catalog_sqlite_path),
-        "attempt_catalog_json": str(config.attempt_catalog_json_path),
-        "attempt_catalog_csv": str(config.attempt_catalog_csv_path),
+        "attempt_catalog_json": debug_exports["json_path"],
+        "attempt_catalog_csv": debug_exports["csv_path"],
         "attempt_catalog_summary_json": str(config.attempt_catalog_summary_path),
         "attempt_catalog_manifest_json": str(config.attempt_catalog_manifest_path),
+        "debug_exports": debug_exports,
         "index": index_info,
         "summary": summary,
     }
@@ -17423,6 +17461,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "build-attempt-catalog":
         return cmd_build_attempt_catalog(
             run_ids=args.run_id,
+            debug_export_json=bool(args.debug_export_json),
+            debug_export_csv=bool(args.debug_export_csv),
             as_json=bool(args.json),
         )
     if args.command == "audit-full-backtests":

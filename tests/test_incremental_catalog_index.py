@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import autoresearch.catalog_index as catalog_index
+import autoresearch.__main__ as ar_main
 from autoresearch.catalog_index import (
     catalog_summary_from_sqlite,
     iter_catalog_rows,
@@ -264,6 +265,61 @@ def test_incremental_catalog_streams_materialized_outputs_from_sqlite(tmp_path) 
     assert csv_text.splitlines()[0].startswith("run_id,attempt_id,")
     assert summary["attempt_count"] == 2
     assert summary["scored_attempt_count"] == 2
+
+
+def test_build_attempt_catalog_debug_exports_are_explicit(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    run_dir = runs_root / "run-1"
+    _write_attempt(run_dir, attempt_id="attempt-a", score=10.0)
+    config = SimpleNamespace(
+        runs_root=runs_root,
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+        attempt_catalog_json_path=derived_root / "attempt-catalog.json",
+        attempt_catalog_csv_path=derived_root / "attempt-catalog.csv",
+        attempt_catalog_summary_path=derived_root / "attempt-catalog-summary.json",
+        attempt_catalog_manifest_path=derived_root / "attempt-catalog-manifest.json",
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+
+    exit_code = ar_main.cmd_build_attempt_catalog(
+        run_ids=None,
+        debug_export_json=False,
+        debug_export_csv=False,
+        as_json=True,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert config.attempt_catalog_sqlite_path.exists()
+    assert config.attempt_catalog_summary_path.exists()
+    assert config.attempt_catalog_manifest_path.exists()
+    assert not config.attempt_catalog_json_path.exists()
+    assert not config.attempt_catalog_csv_path.exists()
+    assert payload["attempt_catalog_json"] is None
+    assert payload["attempt_catalog_csv"] is None
+    assert payload["debug_exports"]["json_exported"] is False
+    assert payload["debug_exports"]["csv_exported"] is False
+
+    exit_code = ar_main.cmd_build_attempt_catalog(
+        run_ids=None,
+        debug_export_json=True,
+        debug_export_csv=True,
+        as_json=True,
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert exit_code == 0
+    assert config.attempt_catalog_json_path.exists()
+    assert config.attempt_catalog_csv_path.exists()
+    assert payload["debug_exports"]["json_exported"] is True
+    assert payload["debug_exports"]["csv_exported"] is True
 
 
 def test_incremental_catalog_iterates_selected_attempt_ids(tmp_path) -> None:
