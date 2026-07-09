@@ -4,11 +4,14 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from autoresearch import __main__ as ar_main
 from autoresearch.corpus_lab_backtests import (
     LabBacktestConfig,
     build_full_backtest_lab_task,
     materialize_full_backtest_lab_result,
+    run_lab_full_backtests,
 )
 
 
@@ -141,6 +144,85 @@ def test_materialize_full_backtest_lab_result_accepts_nested_worker_result(tmp_p
         (artifact_dir / "full-backtest-36mo-deep-replay-job.json").read_text(encoding="utf-8")
     )
     assert full_job_payload["request"]["profile_id"] == "profile-a"
+
+
+def test_materialize_full_backtest_lab_result_requires_recommended_detail(tmp_path: Path) -> None:
+    artifact_dir = tmp_path / "eval"
+    attempt = {"attempt_id": "attempt-a", "artifact_dir": str(artifact_dir)}
+    lab_result = {
+        "status": "success",
+        "task_id": "task-1",
+        "lease_id": "lease-1",
+        "worker_id": "worker-1",
+        "result": {
+            "sensitivity_response": {
+                "status": "success",
+                "data": {
+                    "aggregate": {
+                        "best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 2.0},
+                        "score_lab": {
+                            "version": ar_main.CANONICAL_SCORE_LAB_VERSION,
+                            "score": 80,
+                        },
+                    }
+                },
+            },
+            "best_cell_detail": {
+                "cell": {"stop_loss_percent": 0.1, "reward_multiple": 2.0},
+                "curve": {"points": [{"date": "2026-01-01", "equity_r": 1.0}]},
+            },
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="recommended_cell_detail"):
+        materialize_full_backtest_lab_result(attempt=attempt, lab_result=lab_result)
+
+
+def test_run_lab_full_backtests_skips_missing_profile(tmp_path: Path, monkeypatch) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "final"
+    artifact_dir.mkdir(parents=True)
+    attempt = {
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": None,
+    }
+    row = {"attempt_id": "attempt-a", "run_id": "run-a", "candidate_name": "final"}
+    emitted: list[str] = []
+
+    class FakeGateway:
+        enqueued: list[list[dict]] = []
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            _ = limit
+            return []
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            self.enqueued.append(tasks)
+            return {"accepted": len(tasks)}
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("autoresearch.corpus_lab_backtests.LabGatewayClient", FakeGateway)
+
+    results, calculated, failed = run_lab_full_backtests(
+        config=SimpleNamespace(research=SimpleNamespace(quality_score_preset="profile_drop")),
+        items=[(run_dir, attempt, row, {})],
+        lab_config=LabBacktestConfig(poll_interval_seconds=0.1),
+        max_workers=1,
+        emit=emitted.append,
+    )
+
+    assert calculated == 0
+    assert failed == 1
+    assert results[0]["status"] == "failed"
+    assert "missing a local profile file" in results[0]["error"]
+    assert emitted and "lab skipped" in emitted[0]
+    assert FakeGateway.enqueued == []
 
 
 def test_cmd_calculate_full_backtests_lab_gateway_backend(

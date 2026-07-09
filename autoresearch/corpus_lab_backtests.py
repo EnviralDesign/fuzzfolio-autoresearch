@@ -238,6 +238,8 @@ def materialize_full_backtest_lab_result(
     if not isinstance(calendar_curve, dict):
         calendar_curve = best_detail
     recommended_detail = worker_result.get("recommended_cell_detail")
+    if not isinstance(recommended_detail, dict):
+        raise RuntimeError("Lab full-backtest result did not include recommended_cell_detail")
     request_payload = worker_result.get("request") if isinstance(worker_result.get("request"), dict) else {}
 
     result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
@@ -246,8 +248,7 @@ def materialize_full_backtest_lab_result(
     _write_json(result_path, sensitivity_response)
     _write_json(curve_path, best_detail)
     _write_json(calendar_path, calendar_curve)
-    if isinstance(recommended_detail, dict):
-        _write_json(artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME, recommended_detail)
+    _write_json(artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME, recommended_detail)
     if isinstance(request_payload, dict) and request_payload:
         request_record = {
             "request": request_payload,
@@ -268,11 +269,7 @@ def materialize_full_backtest_lab_result(
         "curve_path": str(curve_path),
         "result_path": str(result_path),
         "calendar_curve_path": str(calendar_path),
-        "recommended_curve_path": (
-            str(artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME)
-            if isinstance(recommended_detail, dict)
-            else None
-        ),
+        "recommended_curve_path": str(artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME),
         "backend": "lab_gateway",
     }
 
@@ -390,14 +387,32 @@ def run_lab_full_backtests(
             tasks: list[dict[str, Any]] = []
             while pending_items and len(task_by_id) + len(tasks) < max(1, int(max_workers)):
                 run_dir, attempt, row, run_metadata = pending_items.pop(0)
-                task = build_full_backtest_lab_task(
-                    config=config,
-                    run_dir=run_dir,
-                    attempt=attempt,
-                    run_metadata=run_metadata,
-                    lab_config=lab_config,
-                    batch_id=batch_id,
-                )
+                attempt_id = str(attempt.get("attempt_id") or "")
+                try:
+                    task = build_full_backtest_lab_task(
+                        config=config,
+                        run_dir=run_dir,
+                        attempt=attempt,
+                        run_metadata=run_metadata,
+                        lab_config=lab_config,
+                        batch_id=batch_id,
+                    )
+                except Exception as exc:
+                    failed += 1
+                    entry = {
+                        "run_id": run_dir.name,
+                        "attempt_id": attempt_id,
+                        "candidate_name": row.get("candidate_name"),
+                        "score_36m": row.get("score_36m"),
+                        "composite_score": row.get("composite_score"),
+                        "backend": "lab_gateway",
+                        "status": "failed",
+                        "error": f"could not build lab task: {exc}",
+                    }
+                    results.append(entry)
+                    if emit is not None:
+                        emit(f"  lab skipped: {run_dir.name} {attempt_id} {entry['error']}")
+                    continue
                 tasks.append(task)
                 task_by_id[str(task["task_id"])] = (run_dir, attempt, row, time.time())
             if tasks:
@@ -414,6 +429,8 @@ def run_lab_full_backtests(
                     )
                 if emit is not None:
                     emit(f"lab enqueue accepted={accepted}/{len(tasks)} in_flight={len(task_by_id)} pending={len(pending_items)}")
+            if not pending_items and not task_by_id:
+                break
             drained = gateway.read_results(limit=lab_config.result_batch_size)
             ack_ids: list[str] = []
             unknown_result_count = 0

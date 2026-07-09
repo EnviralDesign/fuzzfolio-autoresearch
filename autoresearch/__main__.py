@@ -42,6 +42,7 @@ from rich.text import Text
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from autoresearch.config import load_config
+    from autoresearch.catalog_index import refresh_incremental_attempt_catalog
     from autoresearch.corpus_tools import (
         build_full_backtest_audit,
         catalog_summary,
@@ -68,8 +69,10 @@ if __package__ in {None, ""}:
         set_runtime_trace_stderr_mode,
     )
     from autoresearch.dashboard import (
-        FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
         FULL_BACKTEST_CALENDAR_CURVE_FILENAME,
+        FULL_BACKTEST_CURVE_FILENAME,
+        FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
+        FULL_BACKTEST_RESULT_FILENAME,
         _has_full_backtest,
         _reward_matrix_cli_args_from_attempt,
         _reward_matrix_from_attempt,
@@ -296,6 +299,7 @@ if __package__ in {None, ""}:
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
+    from .catalog_index import refresh_incremental_attempt_catalog
     from .corpus_tools import (
         build_full_backtest_audit,
         catalog_summary,
@@ -318,8 +322,10 @@ else:
     )
     from .controller import ResearchController, RunPolicy, set_runtime_trace_stderr_mode
     from .dashboard import (
-        FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
         FULL_BACKTEST_CALENDAR_CURVE_FILENAME,
+        FULL_BACKTEST_CURVE_FILENAME,
+        FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
+        FULL_BACKTEST_RESULT_FILENAME,
         _has_full_backtest,
         _reward_matrix_cli_args_from_attempt,
         _reward_matrix_from_attempt,
@@ -6864,10 +6870,12 @@ def _write_materialized_corpus_index(
     *,
     run_dirs: list[Path],
     rows: list[dict[str, Any]],
+    write_csv_output: bool = True,
 ) -> dict[str, Any]:
     summary = catalog_summary(rows)
     write_json(config.attempt_catalog_json_path, rows)
-    write_csv(config.attempt_catalog_csv_path, rows)
+    if write_csv_output:
+        write_csv(config.attempt_catalog_csv_path, rows)
     write_json(config.attempt_catalog_summary_path, summary)
     write_json(
         config.attempt_catalog_manifest_path,
@@ -6904,21 +6912,26 @@ def _selection_corpus_rows(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     run_dirs = _matching_run_dirs(config, run_ids)
     full_corpus_scope = not run_ids
-    materialized_rows = _load_materialized_corpus_index_rows(config, run_dirs=run_dirs)
-    if materialized_rows is not None:
+    catalog_json_path = getattr(config, "attempt_catalog_json_path", None)
+    catalog_manifest_path = getattr(config, "attempt_catalog_manifest_path", None)
+    catalog_sqlite_path = getattr(config, "attempt_catalog_sqlite_path", None)
+    if catalog_json_path is None and hasattr(config, "derived_root"):
+        catalog_json_path = Path(config.derived_root) / "attempt-catalog.json"
+    if catalog_manifest_path is None and hasattr(config, "derived_root"):
+        catalog_manifest_path = Path(config.derived_root) / "attempt-catalog-manifest.json"
+    if catalog_sqlite_path is None and hasattr(config, "derived_root"):
+        catalog_sqlite_path = Path(config.derived_root) / "attempt-catalog.sqlite"
+    if full_corpus_scope:
         _phase_emit(
-            f"[{label}] using materialized corpus index {config.attempt_catalog_json_path}",
+            f"[{label}] refreshing incremental corpus index {catalog_sqlite_path}",
             as_json=as_json,
         )
-        return materialized_rows, {
-            "source": "materialized",
-            "path": str(config.attempt_catalog_json_path),
-            "manifest_path": str(config.attempt_catalog_manifest_path),
-            "refreshed": False,
-            "row_count": len(materialized_rows),
-            "run_count": len(run_dirs),
-            "summary": load_json_if_exists(config.attempt_catalog_summary_path),
-        }
+        rows, index_info = refresh_incremental_attempt_catalog(
+            config,
+            run_dirs=run_dirs,
+            progress_callback=_catalog_phase_callback(label, as_json=as_json),
+        )
+        return rows, index_info
 
     _phase_emit(
         f"[{label}] rebuilding corpus index from source artifacts",
@@ -6938,8 +6951,10 @@ def _selection_corpus_rows(
         )
     return rebuilt_rows, {
         "source": "cold_rebuild",
-        "path": str(config.attempt_catalog_json_path),
-        "manifest_path": str(config.attempt_catalog_manifest_path),
+        "path": str(catalog_json_path) if catalog_json_path is not None else None,
+        "manifest_path": str(catalog_manifest_path)
+        if catalog_manifest_path is not None
+        else None,
         "refreshed": bool(full_corpus_scope and materialize_full_corpus),
         "row_count": len(rebuilt_rows),
         "run_count": len(run_dirs),
@@ -6949,18 +6964,29 @@ def _selection_corpus_rows(
 
 def _refresh_global_derived_corpus_state(config) -> dict[str, Any]:
     run_dirs = _matching_run_dirs(config, None)
-    rows = _catalog_rows_for_run_dirs(config, run_dirs)
-    summary = _write_materialized_corpus_index(config, run_dirs=run_dirs, rows=rows)
+    rows, index_info = refresh_incremental_attempt_catalog(
+        config,
+        run_dirs=run_dirs,
+    )
+    summary = _write_materialized_corpus_index(
+        config,
+        run_dirs=run_dirs,
+        rows=rows,
+        write_csv_output=False,
+    )
     audit_payload = build_full_backtest_audit(rows)
     write_json(config.full_backtest_audit_json_path, audit_payload)
     return {
         "run_count": len(run_dirs),
         "attempt_count": len(rows),
+        "attempt_catalog_sqlite": str(config.attempt_catalog_sqlite_path),
         "attempt_catalog_json": str(config.attempt_catalog_json_path),
         "attempt_catalog_csv": str(config.attempt_catalog_csv_path),
         "attempt_catalog_summary_json": str(config.attempt_catalog_summary_path),
         "attempt_catalog_manifest_json": str(config.attempt_catalog_manifest_path),
+        "attempt_catalog_csv_refreshed": False,
         "full_backtest_audit_json": str(config.full_backtest_audit_json_path),
+        "index": index_info,
         "summary": summary,
         "audit": audit_payload,
     }
@@ -7268,6 +7294,44 @@ def _full_backtest_freshness_issue(
         if latest_requested_end - latest_effective_end > max_age:
             return "truncated_window_gap"
 
+    return None
+
+
+def _full_backtest_profile_drop_reuse_issue(
+    *,
+    config,
+    attempt: dict[str, Any],
+    artifact_dir: Path,
+    lookback_months: int = 36,
+    max_age_days: float | None = None,
+) -> str | None:
+    if int(lookback_months) != 36:
+        return "unsupported_full_backtest_lookback"
+    if not artifact_dir.exists():
+        return "missing_artifact_dir"
+
+    curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
+    result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
+    calendar_curve_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
+    recommended_detail_path = artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+    if not curve_path.exists() or not result_path.exists():
+        return "missing_full_backtest_artifact"
+    if not calendar_curve_path.exists():
+        return "missing_calendar_curve"
+    if not _result_has_canonical_score_lab(result_path):
+        return "stale_score_lab"
+    if not result_matches_execution_cost_model(result_path, config):
+        return "execution_cost_model_mismatch"
+    if not _result_matches_attempt_reward_matrix(result_path, attempt):
+        return "reward_matrix_mismatch"
+    freshness_issue = _full_backtest_freshness_issue(
+        result_path,
+        max_age_days=max_age_days,
+    )
+    if freshness_issue is not None:
+        return freshness_issue
+    if not recommended_detail_path.exists():
+        return "missing_recommended_cell_detail"
     return None
 
 
@@ -9204,7 +9268,11 @@ def _materialize_profile_drop_bundle_from_existing_artifacts(
         _align_profile_drop_response_to_detail(response_payload, detail_payload)
     )
     quality_score_preset = _profile_drop_quality_score_preset(config, bundle_response)
-    job_payload = _load_json_if_exists(artifact_dir / "deep-replay-job.json")
+    job_payload = _load_json_if_exists(
+        artifact_dir / "full-backtest-36mo-deep-replay-job.json"
+    )
+    if not job_payload:
+        job_payload = _load_json_if_exists(artifact_dir / "deep-replay-job.json")
     generated_at_utc = _profile_drop_package_timestamp_utc()
     analysis_metadata = _profile_drop_analysis_metadata_from_existing_artifacts(
         config=config,
@@ -10379,14 +10447,32 @@ def cmd_calculate_full_backtests(
     backend = str(full_backtest_backend or "local").strip().lower().replace("-", "_")
     if backend not in {"local", "lab_gateway"}:
         raise SystemExit("--full-backtest-backend must be local or lab-gateway")
-    run_dirs = _matching_run_dirs(config, run_ids)
-    catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    catalog_rows, corpus_index_info = _selection_corpus_rows(
+        config,
+        run_ids=run_ids,
+        label="calculate-full-backtests",
+        as_json=as_json,
+    )
     catalog_by_attempt_id = {
         str(row.get("attempt_id") or ""): row for row in catalog_rows
     }
+    effective_run_ids = run_ids
+    if not run_ids and attempt_ids:
+        wanted_attempt_ids = {
+            str(token).strip() for token in attempt_ids if str(token).strip()
+        }
+        selected_run_ids = sorted(
+            {
+                str((catalog_by_attempt_id.get(attempt_id) or {}).get("run_id") or "").strip()
+                for attempt_id in wanted_attempt_ids
+                if str((catalog_by_attempt_id.get(attempt_id) or {}).get("run_id") or "").strip()
+            }
+        )
+        if selected_run_ids:
+            effective_run_ids = selected_run_ids
     matched_items = _matched_attempt_items(
         config,
-        run_ids=run_ids,
+        run_ids=effective_run_ids,
         attempt_ids=attempt_ids,
         require_scored=False,
     )
@@ -10405,26 +10491,13 @@ def cmd_calculate_full_backtests(
             return None
         if force_rebuild:
             return "force_rebuild"
-        curve_path = artifact_dir / "full-backtest-36mo-curve.json"
-        result_path = artifact_dir / "full-backtest-36mo-result.json"
-        calendar_curve_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
-        if not curve_path.exists() or not result_path.exists():
-            return "missing_full_backtest_artifact"
-        if not calendar_curve_path.exists():
-            return "missing_calendar_curve"
-        if not _result_has_canonical_score_lab(result_path):
-            return "stale_score_lab"
-        if not result_matches_execution_cost_model(result_path, config):
-            return "execution_cost_model_mismatch"
-        if not _result_matches_attempt_reward_matrix(result_path, attempt):
-            return "reward_matrix_mismatch"
-        freshness_issue = _full_backtest_freshness_issue(
-            result_path,
+        return _full_backtest_profile_drop_reuse_issue(
+            config=config,
+            attempt=attempt,
+            artifact_dir=artifact_dir,
+            lookback_months=36,
             max_age_days=full_backtest_max_age_days,
         )
-        if freshness_issue is not None:
-            return freshness_issue
-        return None
 
     filter_rejections = {
         "already_has_full_backtest": 0,
@@ -10539,6 +10612,7 @@ def cmd_calculate_full_backtests(
             "filter_rejections": filter_rejections,
             "filters": {
                 "run_ids": run_ids,
+                "effective_run_ids": effective_run_ids,
                 "attempt_ids": attempt_ids,
                 "limit": limit,
                 "require_scrutiny_36": require_scrutiny_36,
@@ -10547,6 +10621,7 @@ def cmd_calculate_full_backtests(
                 "full_backtest_max_age_days": full_backtest_max_age_days,
                 "full_backtest_backend": "lab_gateway",
             },
+            "corpus_index": corpus_index_info,
             "calculation_reasons": calculation_reasons,
             "max_workers_used": resolved_max_workers,
             "max_workers_source": worker_source,
@@ -10712,6 +10787,7 @@ def cmd_calculate_full_backtests(
         "filter_rejections": filter_rejections,
         "filters": {
             "run_ids": run_ids,
+            "effective_run_ids": effective_run_ids,
             "attempt_ids": attempt_ids,
             "limit": limit,
             "require_scrutiny_36": require_scrutiny_36,
@@ -10719,6 +10795,7 @@ def cmd_calculate_full_backtests(
             "job_timeout_seconds": job_timeout_seconds,
             "full_backtest_max_age_days": full_backtest_max_age_days,
         },
+        "corpus_index": corpus_index_info,
         "calculation_reasons": calculation_reasons,
         "max_workers_used": resolved_max_workers,
         "max_workers_source": worker_source,
@@ -10739,15 +10816,28 @@ def cmd_calculate_full_backtests(
 def cmd_build_attempt_catalog(*, run_ids: list[str] | None, as_json: bool) -> int:
     config = load_config()
     run_dirs = _matching_run_dirs(config, run_ids)
-    rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    if not run_ids:
+        rows, index_info = refresh_incremental_attempt_catalog(
+            config,
+            run_dirs=run_dirs,
+            progress_callback=_catalog_phase_callback(
+                "build-attempt-catalog",
+                as_json=as_json,
+            ),
+        )
+    else:
+        rows = _catalog_rows_for_run_dirs(config, run_dirs)
+        index_info = {"source": "cold_rebuild", "run_count": len(run_dirs), "row_count": len(rows)}
     summary = _write_materialized_corpus_index(config, run_dirs=run_dirs, rows=rows)
     payload = {
         "run_count": len(run_dirs),
         "attempt_count": len(rows),
+        "attempt_catalog_sqlite": str(config.attempt_catalog_sqlite_path),
         "attempt_catalog_json": str(config.attempt_catalog_json_path),
         "attempt_catalog_csv": str(config.attempt_catalog_csv_path),
         "attempt_catalog_summary_json": str(config.attempt_catalog_summary_path),
         "attempt_catalog_manifest_json": str(config.attempt_catalog_manifest_path),
+        "index": index_info,
         "summary": summary,
     }
     print(json.dumps(payload, ensure_ascii=True, indent=2))
@@ -11208,16 +11298,13 @@ def _profile_drop_skip_reason_for_attempt(
         return None
 
     artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
-    full_result_path = artifact_dir / f"full-backtest-{int(lookback_months)}mo-result.json"
-    full_curve_path = artifact_dir / f"full-backtest-{int(lookback_months)}mo-curve.json"
-    if (
-        int(lookback_months) == 36
-        and full_result_path.exists()
-        and full_curve_path.exists()
-        and _result_has_canonical_score_lab(full_result_path)
-        and _result_matches_attempt_reward_matrix(full_result_path, attempt)
-        and result_matches_execution_cost_model(full_result_path, config)
-    ):
+    if _full_backtest_profile_drop_reuse_issue(
+        config=config,
+        attempt=attempt,
+        artifact_dir=artifact_dir,
+        lookback_months=int(lookback_months),
+        max_age_days=None,
+    ) is None:
         return None
 
     validation_status = str(
@@ -11611,8 +11698,16 @@ def _catalog_phase_callback(label: str, *, as_json: bool) -> Callable[[dict[str,
             run_id = str(event.get("run_id") or "")
             row_count = int(event.get("row_count") or 0)
             if completed == 1 or completed == total_runs or completed % 10 == 0:
+                cache_detail = ""
+                if "reused_runs" in event or "rebuilt_runs" in event:
+                    cache_detail = (
+                        f", reused={int(event.get('reused_runs') or 0)}, "
+                        f"rebuilt={int(event.get('rebuilt_runs') or 0)}, "
+                        f"deleted={int(event.get('deleted_runs') or 0)}"
+                    )
                 _write_plain_line(
-                    f"[{label}] catalog {completed}/{total_runs} runs, {row_count} rows loaded, latest={run_id}"
+                    f"[{label}] catalog {completed}/{total_runs} runs, "
+                    f"{row_count} rows loaded{cache_detail}, latest={run_id}"
                 )
 
     return callback

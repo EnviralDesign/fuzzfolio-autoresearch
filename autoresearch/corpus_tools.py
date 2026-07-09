@@ -12,6 +12,9 @@ from .scoring import CANONICAL_SCORE_LAB_VERSION, build_attempt_score
 SCRUTINY_CACHE_DIRNAME = "scrutiny-cache"
 FULL_BACKTEST_CURVE_FILENAME = "full-backtest-36mo-curve.json"
 FULL_BACKTEST_CALENDAR_CURVE_FILENAME = "full-backtest-36mo-calendar-curve.json"
+FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME = (
+    "full-backtest-36mo-recommended-cell-path-detail.json"
+)
 FULL_BACKTEST_RESULT_FILENAME = "full-backtest-36mo-result.json"
 
 
@@ -371,14 +374,18 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
             "curve_path": None,
             "calendar_curve_path": None,
             "calendar_curve_exists": False,
+            "recommended_curve_path": None,
+            "recommended_curve_exists": False,
         }
 
     result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
     curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
     calendar_curve_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
+    recommended_curve_path = artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
     result_exists = result_path.exists()
     curve_exists = curve_path.exists()
     calendar_curve_exists = calendar_curve_path.exists()
+    recommended_curve_exists = recommended_curve_path.exists()
     issues: list[str] = []
 
     if not result_exists and not curve_exists:
@@ -394,11 +401,15 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
             "curve_path": str(curve_path),
             "calendar_curve_path": str(calendar_curve_path),
             "calendar_curve_exists": calendar_curve_exists,
+            "recommended_curve_path": str(recommended_curve_path),
+            "recommended_curve_exists": recommended_curve_exists,
         }
     if not result_exists:
         issues.append("missing_result_file")
     if not curve_exists:
         issues.append("missing_curve_file")
+    if not recommended_curve_exists:
+        issues.append("missing_recommended_cell_detail_file")
 
     result_payload = load_json_if_exists(result_path) if result_exists else None
     curve_payload = load_json_if_exists(curve_path) if curve_exists else None
@@ -480,6 +491,8 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
         "curve_path": str(curve_path),
         "calendar_curve_path": str(calendar_curve_path),
         "calendar_curve_exists": calendar_curve_exists,
+        "recommended_curve_path": str(recommended_curve_path),
+        "recommended_curve_exists": recommended_curve_exists,
     }
 
 
@@ -546,13 +559,14 @@ def resolve_attempt_scrutiny_source(
     if int(lookback_months) == 36:
         full_result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
         full_curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
+        full_job_path = artifact_dir / "full-backtest-36mo-deep-replay-job.json"
+        if not full_job_path.exists():
+            full_job_path = artifact_dir / "deep-replay-job.json"
         if full_result_path.exists() and full_curve_path.exists():
             summary = load_scored_sensitivity_result(full_result_path) or {}
             request_payload = _request_payload_for_source(
                 attempt,
-                source_job_path=(artifact_dir / "deep-replay-job.json")
-                if (artifact_dir / "deep-replay-job.json").exists()
-                else None,
+                source_job_path=full_job_path if full_job_path.exists() else None,
             )
             return {
                 "available": True,
@@ -560,9 +574,7 @@ def resolve_attempt_scrutiny_source(
                 "artifact_dir": str(artifact_dir),
                 "result_path": str(full_result_path),
                 "curve_path": str(full_curve_path),
-                "job_path": str(artifact_dir / "deep-replay-job.json")
-                if (artifact_dir / "deep-replay-job.json").exists()
-                else None,
+                "job_path": str(full_job_path) if full_job_path.exists() else None,
                 "manifest_path": None,
                 "timeframe": str(request_payload.get("timeframe") or attempt_timeframe(attempt) or "").strip().upper()
                 or None,
@@ -889,6 +901,12 @@ def extract_attempt_catalog_row(
         ),
         "has_full_backtest_calendar_curve_36m": bool(
             full_backtest_validation.get("calendar_curve_exists")
+        ),
+        "full_backtest_recommended_curve_path_36m": full_backtest_validation.get(
+            "recommended_curve_path"
+        ),
+        "has_full_backtest_recommended_curve_36m": bool(
+            full_backtest_validation.get("recommended_curve_exists")
         ),
         "full_backtest_validation_status_36m": full_backtest_validation.get("status"),
         "full_backtest_validation_issue_count_36m": len(

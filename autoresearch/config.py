@@ -262,6 +262,10 @@ class AppConfig:
         return self.derived_root / "attempt-catalog-manifest.json"
 
     @property
+    def attempt_catalog_sqlite_path(self) -> Path:
+        return self.derived_root / "attempt-catalog.sqlite"
+
+    @property
     def promotion_board_json_path(self) -> Path:
         return self.derived_root / "promotion-board.json"
 

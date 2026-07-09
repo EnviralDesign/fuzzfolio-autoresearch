@@ -139,6 +139,10 @@ def test_validate_full_backtest_artifacts_accepts_valid_pair(tmp_path):
         artifact_dir / ct.FULL_BACKTEST_CURVE_FILENAME,
         _sample_curve_payload(1.0),
     )
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
+        _sample_curve_payload(0.9),
+    )
 
     attempt = {"artifact_dir": str(artifact_dir)}
     validation = ct.validate_full_backtest_artifacts(attempt)
@@ -147,6 +151,26 @@ def test_validate_full_backtest_artifacts_accepts_valid_pair(tmp_path):
     assert validation["issues"] == []
     assert validation["curve_point_count"] == 39
     assert validation["cell_match"] is True
+    assert validation["recommended_curve_exists"] is True
+
+
+def test_validate_full_backtest_artifacts_requires_recommended_detail(tmp_path):
+    artifact_dir = tmp_path / "artifact"
+    artifact_dir.mkdir()
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_RESULT_FILENAME,
+        _sample_sensitivity_payload(61.25),
+    )
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_CURVE_FILENAME,
+        _sample_curve_payload(1.0),
+    )
+
+    validation = ct.validate_full_backtest_artifacts({"artifact_dir": str(artifact_dir)})
+
+    assert validation["status"] == "invalid"
+    assert "missing_recommended_cell_detail_file" in validation["issues"]
+    assert validation["recommended_curve_exists"] is False
 
 
 def test_validate_full_backtest_artifacts_flags_mismatched_cell(tmp_path):
