@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sqlite3
+import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +15,7 @@ from .corpus_tools import (
     FULL_BACKTEST_CURVE_FILENAME,
     FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
     FULL_BACKTEST_RESULT_FILENAME,
+    catalog_json_cache,
     catalog_priority_key,
     catalog_summary,
     extract_attempt_catalog_row,
@@ -31,6 +34,10 @@ from .scoring import CANONICAL_SCORE_LAB_VERSION
 CATALOG_INDEX_SCHEMA_VERSION = 2
 CATALOG_EXTRACTION_VERSION = f"2026-07-09.1:{CANONICAL_SCORE_LAB_VERSION}"
 CATALOG_COMMIT_INTERVAL_RUNS = 250
+RUST_CATALOG_SCAN_ENV = "AUTORESEARCH_RUST_CATALOG_SCAN"
+CATALOG_LEDGER_MIGRATION_SOURCE_VERSIONS = {
+    f"2026-07-08.2:{CANONICAL_SCORE_LAB_VERSION}",
+}
 
 
 def _json_dumps(payload: Any) -> str:
@@ -318,10 +325,39 @@ def _safe_float(value: Any) -> float | None:
         return None
 
 
-def _load_existing_signatures(conn: sqlite3.Connection) -> dict[str, dict[str, Any]]:
-    rows = conn.execute(
-        "SELECT run_id, signature_json FROM run_signatures"
-    ).fetchall()
+def _query_signature_rows(
+    conn: sqlite3.Connection,
+    *,
+    columns: str,
+    run_ids: list[str] | None,
+) -> list[tuple[Any, ...]]:
+    if run_ids is None:
+        return conn.execute(f"SELECT {columns} FROM run_signatures").fetchall()
+    rows: list[tuple[Any, ...]] = []
+    for offset in range(0, len(run_ids), 900):
+        chunk = run_ids[offset : offset + 900]
+        if not chunk:
+            continue
+        placeholders = ",".join("?" for _ in chunk)
+        rows.extend(
+            conn.execute(
+                f"SELECT {columns} FROM run_signatures WHERE run_id IN ({placeholders})",
+                chunk,
+            ).fetchall()
+        )
+    return rows
+
+
+def _load_existing_signatures(
+    conn: sqlite3.Connection,
+    *,
+    run_ids: list[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    rows = _query_signature_rows(
+        conn,
+        columns="run_id, signature_json",
+        run_ids=run_ids,
+    )
     signatures: dict[str, dict[str, Any]] = {}
     for run_id, signature_json in rows:
         payload = _json_loads(signature_json)
@@ -330,9 +366,310 @@ def _load_existing_signatures(conn: sqlite3.Connection) -> dict[str, dict[str, A
     return signatures
 
 
+def _load_existing_signature(
+    conn: sqlite3.Connection,
+    run_id: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT signature_json FROM run_signatures WHERE run_id = ?",
+        (run_id,),
+    ).fetchone()
+    if not row:
+        return None
+    payload = _json_loads(row[0])
+    return payload if isinstance(payload, dict) else None
+
+
+def _load_existing_signature_counts(
+    conn: sqlite3.Connection,
+    *,
+    run_ids: list[str] | None = None,
+) -> dict[str, int]:
+    try:
+        rows = _query_signature_rows(
+            conn,
+            columns="run_id, row_count",
+            run_ids=run_ids,
+        )
+    except sqlite3.OperationalError:
+        return {}
+    return {str(run_id): int(row_count or 0) for run_id, row_count in rows}
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _rust_catalog_scanner_manifest() -> Path:
+    return _repo_root() / "rust" / "catalog-indexer" / "Cargo.toml"
+
+
+def _rust_catalog_scanner_binary() -> Path:
+    suffix = ".exe" if os.name == "nt" else ""
+    return (
+        _repo_root()
+        / "rust"
+        / "catalog-indexer"
+        / "target"
+        / "release"
+        / f"catalog-indexer-rs{suffix}"
+    )
+
+
+def _rust_catalog_scanner_sources() -> list[Path]:
+    root = _repo_root() / "rust" / "catalog-indexer"
+    return [
+        root / "Cargo.toml",
+        root / "src" / "main.rs",
+    ]
+
+
+def _needs_rebuild(binary_path: Path, source_paths: list[Path]) -> bool:
+    if not binary_path.exists():
+        return True
+    try:
+        binary_mtime = binary_path.stat().st_mtime
+    except OSError:
+        return True
+    for source_path in source_paths:
+        try:
+            if source_path.stat().st_mtime > binary_mtime:
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _ensure_rust_catalog_scanner_binary() -> Path | None:
+    setting = str(os.environ.get(RUST_CATALOG_SCAN_ENV) or "auto").strip().lower()
+    if setting in {"0", "false", "off", "disabled", "python"}:
+        return None
+    manifest = _rust_catalog_scanner_manifest()
+    if not manifest.exists():
+        if setting in {"1", "true", "on", "required", "rust"}:
+            raise RuntimeError(f"Rust catalog scanner manifest not found: {manifest}")
+        return None
+    binary_path = _rust_catalog_scanner_binary()
+    source_paths = _rust_catalog_scanner_sources()
+    if not _needs_rebuild(binary_path, source_paths):
+        return binary_path
+    command = [
+        "cargo",
+        "build",
+        "--quiet",
+        "--release",
+        "--manifest-path",
+        str(manifest),
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(_repo_root()),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        if setting in {"1", "true", "on", "required", "rust"}:
+            raise
+        return None
+    if proc.returncode != 0:
+        if setting in {"1", "true", "on", "required", "rust"}:
+            raise RuntimeError(
+                "failed to build Rust catalog scanner: "
+                f"stdout={proc.stdout[-1600:]} stderr={proc.stderr[-1600:]}"
+            )
+        return None
+    return binary_path if binary_path.exists() else None
+
+
+def _rust_catalog_scan(
+    *,
+    db_path: Path,
+    run_dirs: list[Path],
+) -> tuple[dict[str, int], dict[str, dict[str, Any]], dict[str, Any]]:
+    scanner = _ensure_rust_catalog_scanner_binary()
+    if scanner is None:
+        return {}, {}, {
+            "backend": "python",
+            "available": False,
+            "reusable_run_count": 0,
+            "migration_candidate_count": 0,
+        }
+    payload = {
+        "db_path": str(db_path),
+        "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
+        "extraction_version": CATALOG_EXTRACTION_VERSION,
+        "run_dirs": [
+            {
+                "run_id": run_dir.name,
+                "path": str(run_dir),
+            }
+            for run_dir in run_dirs
+        ],
+    }
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        newline="",
+        dir=db_path.parent,
+        prefix=".catalog-rust-scan.",
+        suffix=".json",
+        delete=False,
+    ) as handle:
+        json.dump(payload, handle, ensure_ascii=True, separators=(",", ":"))
+        input_path = Path(handle.name)
+    try:
+        proc = subprocess.run(
+            [str(scanner), str(input_path)],
+            cwd=str(_repo_root()),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=300,
+        )
+    finally:
+        try:
+            input_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "Rust catalog scanner failed: "
+            f"stdout={proc.stdout[-1600:]} stderr={proc.stderr[-1600:]}"
+        )
+    try:
+        output = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"Rust catalog scanner returned invalid JSON: {proc.stdout[-1600:]}"
+        ) from exc
+    reusable_runs = output.get("reusable_runs")
+    if not isinstance(reusable_runs, list):
+        raise RuntimeError("Rust catalog scanner output missing reusable_runs list")
+    reusable: dict[str, int] = {}
+    for item in reusable_runs:
+        if not isinstance(item, dict):
+            continue
+        run_id = str(item.get("run_id") or "").strip()
+        if not run_id:
+            continue
+        reusable[run_id] = int(item.get("row_count") or 0)
+    migration_runs = output.get("migration_runs")
+    if not isinstance(migration_runs, list):
+        raise RuntimeError("Rust catalog scanner output missing migration_runs list")
+    migrations: dict[str, dict[str, Any]] = {}
+    for item in migration_runs:
+        if not isinstance(item, dict):
+            continue
+        run_id = str(item.get("run_id") or "").strip()
+        if not run_id:
+            continue
+        migrations[run_id] = {
+            "row_count": int(item.get("row_count") or 0),
+            "from_extraction_version": str(item.get("from_extraction_version") or ""),
+        }
+    info = {
+        "backend": "rust",
+        "available": True,
+        "reusable_run_count": len(reusable),
+        "migration_candidate_count": len(migrations),
+        "scanned_run_count": int(output.get("scanned_run_count") or 0),
+        "existing_signature_count": int(output.get("existing_signature_count") or 0),
+        "invalid_run_count": int(output.get("invalid_run_count") or 0),
+        "missing_signature_count": int(output.get("missing_signature_count") or 0),
+        "stale_signature_count": int(output.get("stale_signature_count") or 0),
+    }
+    return reusable, migrations, info
+
+
 def _delete_run(conn: sqlite3.Connection, run_id: str) -> None:
     conn.execute("DELETE FROM attempt_rows WHERE run_id = ?", (run_id,))
     conn.execute("DELETE FROM run_signatures WHERE run_id = ?", (run_id,))
+
+
+def _recommended_curve_path_for_row(row: dict[str, Any]) -> str | None:
+    artifact_dir_raw = str(row.get("artifact_dir") or "").strip()
+    if not artifact_dir_raw:
+        return None
+    return str(Path(artifact_dir_raw) / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME)
+
+
+def _migrate_run_rows_from_ledger(
+    conn: sqlite3.Connection,
+    *,
+    run_dir: Path,
+    existing_signature: dict[str, Any],
+    from_extraction_version: str,
+) -> int | None:
+    if from_extraction_version not in CATALOG_LEDGER_MIGRATION_SOURCE_VERSIONS:
+        return None
+    run_id = run_dir.name
+    rows = conn.execute(
+        """
+        SELECT row_key, row_index, attempt_id, row_json
+        FROM attempt_rows
+        WHERE run_id = ?
+        ORDER BY row_key
+        """,
+        (run_id,),
+    ).fetchall()
+    attempts = load_run_attempts(run_dir)
+    if len(rows) != len(attempts):
+        return None
+    migrated: list[tuple[str, str]] = []
+    for position, (row_key, row_index, attempt_id, row_json) in enumerate(rows):
+        payload = _json_loads(row_json)
+        if not isinstance(payload, dict):
+            return None
+        try:
+            row_index_int = int(row_index)
+        except (TypeError, ValueError):
+            return None
+        if row_index_int != position:
+            return None
+        attempt = attempts[position]
+        if str(attempt.get("attempt_id") or "") != str(attempt_id or ""):
+            return None
+        if str(payload.get("attempt_id") or "") != str(attempt_id or ""):
+            return None
+        recommended_curve_path = _recommended_curve_path_for_row(payload)
+        payload["full_backtest_recommended_curve_path_36m"] = recommended_curve_path
+        payload["has_full_backtest_recommended_curve_36m"] = bool(
+            recommended_curve_path and Path(recommended_curve_path).exists()
+        )
+        payload["profile_ref"] = attempt.get("profile_ref")
+        migrated.append((str(row_key), _json_dumps(payload)))
+
+    now = datetime.now().astimezone().isoformat()
+    conn.executemany(
+        """
+        UPDATE attempt_rows
+        SET row_json = ?, updated_at = ?
+        WHERE run_id = ? AND row_key = ?
+        """,
+        [
+            (
+                row_json,
+                now,
+                run_id,
+                row_key,
+            )
+            for row_key, row_json in migrated
+        ],
+    )
+    signature = dict(existing_signature)
+    signature["extraction_version"] = CATALOG_EXTRACTION_VERSION
+    conn.execute(
+        """
+        UPDATE run_signatures
+        SET signature_json = ?, updated_at = ?
+        WHERE run_id = ?
+        """,
+        (_json_dumps(signature), now, run_id),
+    )
+    return len(migrated)
 
 
 def _replace_run_rows(
@@ -392,6 +729,8 @@ def _replace_run_rows(
 def _row_select_sql(
     run_ids: list[str] | None = None,
     attempt_ids: list[str] | None = None,
+    *,
+    order_by_priority: bool = True,
 ) -> tuple[str, list[Any]]:
     params: list[Any] = []
     clauses: list[str] = []
@@ -404,10 +743,7 @@ def _row_select_sql(
         clauses.append(f"attempt_id IN ({placeholders})")
         params.extend(attempt_ids)
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    sql = f"""
-        SELECT row_json
-        FROM attempt_rows
-        {where}
+    order_sql = """
         ORDER BY
             CASE
                 WHEN score_36m IS NULL AND composite_score IS NULL THEN 1
@@ -417,6 +753,12 @@ def _row_select_sql(
             COALESCE(composite_score, -1.0e308) DESC,
             attempt_id ASC,
             row_key ASC
+    """ if order_by_priority else "ORDER BY run_id ASC, row_key ASC"
+    sql = f"""
+        SELECT row_json
+        FROM attempt_rows
+        {where}
+        {order_sql}
     """
     return sql, params
 
@@ -426,10 +768,15 @@ def iter_catalog_rows(
     *,
     run_ids: list[str] | None = None,
     attempt_ids: list[str] | None = None,
+    order_by_priority: bool = True,
 ) -> Any:
     db_path = _catalog_db_path(config)
     with _connect_catalog_db(db_path) as conn:
-        sql, params = _row_select_sql(run_ids, attempt_ids)
+        sql, params = _row_select_sql(
+            run_ids,
+            attempt_ids,
+            order_by_priority=order_by_priority,
+        )
         for (row_json,) in conn.execute(sql, params):
             payload = _json_loads(row_json)
             if isinstance(payload, dict):
@@ -596,16 +943,95 @@ def refresh_incremental_attempt_catalog(
         progress_callback({"stage": "start", "total_runs": total_runs})
 
     reused_runs = 0
+    migrated_runs = 0
     rebuilt_runs = 0
     deleted_runs = 0
     row_count = 0
     pending_commit_runs = 0
+    reuse_scan_info: dict[str, Any] = {
+        "backend": "python",
+        "available": False,
+        "reusable_run_count": 0,
+        "migration_candidate_count": 0,
+    }
 
     with _connect_catalog_db(db_path) as conn:
-        existing_signatures = _load_existing_signatures(conn)
         current_run_ids = {run_dir.name for run_dir in run_dirs}
+        scoped_run_ids = None if prune_missing else sorted(current_run_ids)
+        existing_signature_counts = _load_existing_signature_counts(
+            conn,
+            run_ids=scoped_run_ids,
+        )
+        existing_signatures: dict[str, dict[str, Any]] = {}
+        rust_reusable_counts: dict[str, int] = {}
+        rust_migration_info: dict[str, dict[str, Any]] = {}
+        if existing_signature_counts and prune_missing:
+            try:
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "reuse_scan_start",
+                            "backend": "rust",
+                            "total_runs": total_runs,
+                            "existing_signature_count": len(existing_signature_counts),
+                        }
+                    )
+                (
+                    rust_reusable_counts,
+                    rust_migration_info,
+                    reuse_scan_info,
+                ) = _rust_catalog_scan(
+                    db_path=db_path,
+                    run_dirs=run_dirs,
+                )
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "reuse_scan_done",
+                            **reuse_scan_info,
+                        }
+                    )
+            except Exception as exc:
+                required = str(os.environ.get(RUST_CATALOG_SCAN_ENV) or "").strip().lower() in {
+                    "1",
+                    "true",
+                    "on",
+                    "required",
+                    "rust",
+                }
+                if required:
+                    raise
+                reuse_scan_info = {
+                    "backend": "python",
+                    "available": False,
+                    "reusable_run_count": 0,
+                    "migration_candidate_count": 0,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "stage": "reuse_scan_unavailable",
+                            **reuse_scan_info,
+                        }
+                    )
+                rust_reusable_counts = {}
+                rust_migration_info = {}
+        use_rust_reuse_scan = bool(reuse_scan_info.get("available")) and (
+            reuse_scan_info.get("backend") == "rust"
+        )
+        if not use_rust_reuse_scan:
+            existing_signatures = _load_existing_signatures(
+                conn,
+                run_ids=scoped_run_ids,
+            )
         if prune_missing:
-            for stale_run_id in sorted(set(existing_signatures) - current_run_ids):
+            existing_run_ids = (
+                set(existing_signature_counts)
+                if use_rust_reuse_scan
+                else set(existing_signatures)
+            )
+            for stale_run_id in sorted(existing_run_ids - current_run_ids):
                 _delete_run(conn, stale_run_id)
                 deleted_runs += 1
                 pending_commit_runs += 1
@@ -615,55 +1041,87 @@ def refresh_incremental_attempt_catalog(
 
         for index, run_dir in enumerate(run_dirs, start=1):
             run_id = run_dir.name
-            source_signature = _source_signature(run_dir)
-            existing_signature = existing_signatures.get(run_id)
-            current_signature = (
-                _signature_from_existing(
-                    run_dir=run_dir,
-                    source_signature=source_signature,
-                    existing_signature=existing_signature,
-                )
-                if existing_signature is not None
-                else None
-            )
-            if current_signature is not None and current_signature == existing_signature:
+            rust_reused_count = rust_reusable_counts.get(run_id)
+            if rust_reused_count is not None:
                 reused_runs += 1
-                old_count = conn.execute(
-                    "SELECT row_count FROM run_signatures WHERE run_id = ?",
-                    (run_id,),
-                ).fetchone()
-                row_count += int(old_count[0]) if old_count else 0
-                attempt_count = int(old_count[0]) if old_count else 0
+                row_count += int(rust_reused_count)
+                attempt_count = int(rust_reused_count)
             else:
-                run_metadata = load_run_metadata(run_dir)
-                attempts = load_run_attempts(run_dir)
-                rows = [
-                    extract_attempt_catalog_row(
-                        attempt,
-                        run_metadata,
-                        validation_cache_root=validation_cache_root,
+                source_signature = _source_signature(run_dir)
+                migration_info = rust_migration_info.get(run_id)
+                migrated_count: int | None = None
+                if migration_info is not None:
+                    migration_signature = _load_existing_signature(conn, run_id)
+                    if migration_signature is not None:
+                        migrated_count = _migrate_run_rows_from_ledger(
+                            conn,
+                            run_dir=run_dir,
+                            existing_signature=migration_signature,
+                            from_extraction_version=str(
+                                migration_info.get("from_extraction_version") or ""
+                            ),
+                        )
+                if migrated_count is not None:
+                    migrated_runs += 1
+                    pending_commit_runs += 1
+                    row_count += int(migrated_count)
+                    attempt_count = int(migrated_count)
+                    if pending_commit_runs >= max(1, int(commit_interval_runs)):
+                        conn.commit()
+                        pending_commit_runs = 0
+                else:
+                    existing_signature = existing_signatures.get(run_id)
+                    current_signature = (
+                        _signature_from_existing(
+                            run_dir=run_dir,
+                            source_signature=source_signature,
+                            existing_signature=existing_signature,
+                        )
+                        if existing_signature is not None
+                        else None
                     )
-                    for attempt in attempts
-                ]
-                rebuilt_signature = _signature_from_attempts(
-                    run_dir=run_dir,
-                    attempts=attempts,
-                    source_signature=source_signature,
-                    validation_cache_root=validation_cache_root,
-                )
-                _replace_run_rows(
-                    conn,
-                    run_id=run_id,
-                    signature=rebuilt_signature,
-                    rows=rows,
-                )
-                rebuilt_runs += 1
-                pending_commit_runs += 1
-                attempt_count = len(rows)
-                row_count += len(rows)
-                if pending_commit_runs >= max(1, int(commit_interval_runs)):
-                    conn.commit()
-                    pending_commit_runs = 0
+                    if current_signature is not None and current_signature == existing_signature:
+                        reused_runs += 1
+                        old_count = existing_signature_counts.get(run_id)
+                        if old_count is None:
+                            fetched_count = conn.execute(
+                                "SELECT row_count FROM run_signatures WHERE run_id = ?",
+                                (run_id,),
+                            ).fetchone()
+                            old_count = int(fetched_count[0]) if fetched_count else 0
+                        row_count += int(old_count)
+                        attempt_count = int(old_count)
+                    else:
+                        with catalog_json_cache():
+                            run_metadata = load_run_metadata(run_dir)
+                            attempts = load_run_attempts(run_dir)
+                            rows = [
+                                extract_attempt_catalog_row(
+                                    attempt,
+                                    run_metadata,
+                                    validation_cache_root=validation_cache_root,
+                                )
+                                for attempt in attempts
+                            ]
+                            rebuilt_signature = _signature_from_attempts(
+                                run_dir=run_dir,
+                                attempts=attempts,
+                                source_signature=source_signature,
+                                validation_cache_root=validation_cache_root,
+                            )
+                        _replace_run_rows(
+                            conn,
+                            run_id=run_id,
+                            signature=rebuilt_signature,
+                            rows=rows,
+                        )
+                        rebuilt_runs += 1
+                        pending_commit_runs += 1
+                        attempt_count = len(rows)
+                        row_count += len(rows)
+                        if pending_commit_runs >= max(1, int(commit_interval_runs)):
+                            conn.commit()
+                            pending_commit_runs = 0
 
             if progress_callback is not None:
                 progress_callback(
@@ -675,6 +1133,7 @@ def refresh_incremental_attempt_catalog(
                         "attempt_count": attempt_count,
                         "row_count": row_count,
                         "reused_runs": reused_runs,
+                        "migrated_runs": migrated_runs,
                         "rebuilt_runs": rebuilt_runs,
                         "deleted_runs": deleted_runs,
                         "committed": pending_commit_runs == 0,
@@ -701,13 +1160,15 @@ def refresh_incremental_attempt_catalog(
         "path": str(db_path),
         "schema_version": CATALOG_INDEX_SCHEMA_VERSION,
         "extraction_version": CATALOG_EXTRACTION_VERSION,
-        "refreshed": rebuilt_runs > 0 or deleted_runs > 0,
+        "refreshed": migrated_runs > 0 or rebuilt_runs > 0 or deleted_runs > 0,
         "prune_missing": bool(prune_missing),
         "run_count": len(run_dirs),
         "row_count": len(rows) if load_rows else row_count,
         "reused_run_count": reused_runs,
+        "migrated_run_count": migrated_runs,
         "rebuilt_run_count": rebuilt_runs,
         "deleted_run_count": deleted_runs,
+        "reuse_scan": reuse_scan_info,
         "summary": summary,
         "rows_loaded": bool(load_rows),
     }

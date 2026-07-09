@@ -668,7 +668,9 @@ def test_build_full_backtest_audit_marks_partial_corpus_as_provisional():
         },
     ]
 
-    audit = ct.build_full_backtest_audit(rows, invalid_example_limit=5, pending_example_limit=5)
+    audit = ct.build_full_backtest_audit(
+        iter(rows), invalid_example_limit=5, pending_example_limit=5
+    )
 
     assert audit["status"] == "provisional"
     assert audit["summary"]["attempts_with_valid_full_backtest_36m"] == 1

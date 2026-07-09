@@ -158,6 +158,11 @@ def _worker_contract_fields(payload: dict[str, Any]) -> tuple[str | None, list[s
     return contract_hash, _string_list(raw_capabilities)
 
 
+def _worker_instance_id(payload: dict[str, Any]) -> str | None:
+    value = str(payload.get("worker_instance_id") or "").strip()
+    return value or None
+
+
 @dataclass(slots=True)
 class LabTask:
     task_id: str
@@ -220,6 +225,7 @@ class LabTask:
 class LabWorker:
     worker_id: str
     pool: str
+    instance_id: str | None = None
     slots: int = 1
     registered_at: float = field(default_factory=_now)
     heartbeat_at: float = field(default_factory=_now)
@@ -244,6 +250,7 @@ class LabWorker:
         payload: dict[str, Any] = {
             "worker_id": self.worker_id,
             "pool": self.pool,
+            "worker_instance_id": self.instance_id,
             "slots": self.slots,
             "registered_age_seconds": round(current - self.registered_at, 3),
             "heartbeat_age_seconds": round(heartbeat_age, 3),
@@ -448,6 +455,9 @@ class PlayHandLabGateway:
             "results_dropped": 0,
             "stale_worker_leases_requeued": 0,
             "stale_worker_leases_final": 0,
+            "worker_instance_replacements": 0,
+            "worker_instance_leases_requeued": 0,
+            "worker_instance_leases_final": 0,
             "workers_pruned": 0,
             "workers_unregistered": 0,
             "terminal_tasks_pruned": 0,
@@ -477,6 +487,7 @@ class PlayHandLabGateway:
         pool: str = "lab",
         slots: int = 1,
         *,
+        instance_id: str | None = None,
         contract_hash: str | None = None,
         capabilities: list[str] | set[str] | tuple[str, ...] | None = None,
     ) -> dict[str, Any]:
@@ -484,8 +495,28 @@ class PlayHandLabGateway:
         with self._lock:
             worker = self._workers.get(worker_id)
             if worker is None:
-                worker = LabWorker(worker_id=worker_id, pool=pool, slots=max(int(slots), 1))
+                worker = LabWorker(
+                    worker_id=worker_id,
+                    pool=pool,
+                    instance_id=str(instance_id) if instance_id else None,
+                    slots=max(int(slots), 1),
+                )
                 self._workers[worker_id] = worker
+            elif instance_id and worker.instance_id and str(instance_id) != worker.instance_id:
+                self._expire_worker_leases_locked(
+                    worker,
+                    now,
+                    requeue_reason="worker_instance_replaced",
+                    requeue_metric="worker_instance_leases_requeued",
+                    final_reason="worker_instance_replaced_retry_limit",
+                    final_metric="worker_instance_leases_final",
+                )
+                self._metrics["worker_instance_replacements"] += 1
+                worker.registered_at = now
+                worker.progress = None
+                worker.instance_id = str(instance_id)
+            elif instance_id and not worker.instance_id:
+                worker.instance_id = str(instance_id)
             worker.pool = pool
             worker.slots = max(int(slots), 1)
             worker.heartbeat_at = now
@@ -501,6 +532,7 @@ class PlayHandLabGateway:
         worker_id: str,
         *,
         pool: str | None = None,
+        instance_id: str | None = None,
         status_detail: str | None = None,
     ) -> bool:
         now = _now()
@@ -508,6 +540,10 @@ class PlayHandLabGateway:
             worker = self._workers.get(worker_id)
             if worker is None:
                 return False
+            if instance_id and worker.instance_id and str(instance_id) != worker.instance_id:
+                return False
+            if instance_id and not worker.instance_id:
+                worker.instance_id = str(instance_id)
             if pool:
                 worker.pool = pool
             worker.heartbeat_at = now
@@ -998,7 +1034,16 @@ class PlayHandLabGateway:
     def _worker_is_online_locked(self, worker: LabWorker, now: float) -> bool:
         return (now - worker.heartbeat_at) <= self._worker_stale_after_seconds()
 
-    def _expire_worker_leases_locked(self, worker: LabWorker, now: float) -> int:
+    def _expire_worker_leases_locked(
+        self,
+        worker: LabWorker,
+        now: float,
+        *,
+        requeue_reason: str = "worker_stale",
+        requeue_metric: str = "stale_worker_leases_requeued",
+        final_reason: str = "worker_stale_retry_limit",
+        final_metric: str = "stale_worker_leases_final",
+    ) -> int:
         expired = 0
         for lease_id in list(worker.active_lease_ids):
             lease = self._leases.get(lease_id)
@@ -1008,10 +1053,10 @@ class PlayHandLabGateway:
             self._expire_lease_locked(
                 lease,
                 now,
-                requeue_reason="worker_stale",
-                requeue_metric="stale_worker_leases_requeued",
-                final_reason="worker_stale_retry_limit",
-                final_metric="stale_worker_leases_final",
+                requeue_reason=requeue_reason,
+                requeue_metric=requeue_metric,
+                final_reason=final_reason,
+                final_metric=final_metric,
             )
             expired += 1
         if not worker.active_lease_ids:
@@ -1151,6 +1196,7 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
                 worker_id=str(payload.get("worker_id") or ""),
                 pool=str(payload.get("pool") or "lab"),
                 slots=int(payload.get("slots") or 1),
+                instance_id=_worker_instance_id(payload),
                 contract_hash=contract_hash,
                 capabilities=capabilities,
             )
@@ -1160,6 +1206,7 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
             ok = self.server.gateway.heartbeat_worker(
                 str(payload.get("worker_id") or ""),
                 pool=str(payload.get("pool") or "lab"),
+                instance_id=_worker_instance_id(payload),
                 status_detail=(
                     str(payload.get("status_detail"))
                     if payload.get("status_detail") is not None
@@ -1373,6 +1420,7 @@ class LabGatewayAsgiApp:
                     worker_id=str(payload.get("worker_id") or ""),
                     pool=str(payload.get("pool") or "lab"),
                     slots=int(payload.get("slots") or 1),
+                    instance_id=_worker_instance_id(payload),
                     contract_hash=contract_hash,
                     capabilities=capabilities,
                 )
@@ -1382,6 +1430,7 @@ class LabGatewayAsgiApp:
                 ok = self.gateway.heartbeat_worker(
                     str(payload.get("worker_id") or ""),
                     pool=str(payload.get("pool") or "lab"),
+                    instance_id=_worker_instance_id(payload),
                     status_detail=(
                         str(payload.get("status_detail")) if payload.get("status_detail") is not None else None
                     ),
@@ -1554,6 +1603,7 @@ class LabGatewayAsgiApp:
                 worker_id=worker_id,
                 pool=pool,
                 slots=int(payload.get("slots") or 1),
+                instance_id=_worker_instance_id(payload),
                 contract_hash=contract_hash,
                 capabilities=capabilities,
             )
@@ -1562,6 +1612,7 @@ class LabGatewayAsgiApp:
             ok = self.gateway.heartbeat_worker(
                 worker_id,
                 pool=pool,
+                instance_id=_worker_instance_id(payload),
                 status_detail=(
                     str(payload.get("status_detail")) if payload.get("status_detail") is not None else None
                 ),

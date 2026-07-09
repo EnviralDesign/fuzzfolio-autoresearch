@@ -765,6 +765,68 @@ def test_lab_gateway_unregister_worker_requeues_active_lease() -> None:
     assert snapshot["metrics"]["workers_unregistered"] == 1
 
 
+def test_lab_gateway_same_worker_instance_preserves_lease_on_reregister() -> None:
+    gateway = PlayHandLabGateway()
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            deadline_seconds=600,
+            max_attempts=2,
+        )
+    )
+    gateway.register_worker("worker-1", instance_id="instance-a")
+    claim = gateway.claim("worker-1")
+
+    worker = gateway.register_worker("worker-1", instance_id="instance-a")
+    snapshot = gateway.snapshot()
+
+    assert worker["worker_instance_id"] == "instance-a"
+    assert snapshot["queued_tasks"] == 0
+    assert snapshot["active_leases"] == 1
+    assert snapshot["metrics"]["worker_instance_replacements"] == 0
+    assert gateway.heartbeat_lease("worker-1", claim["lease_id"]) is True
+
+
+def test_lab_gateway_new_worker_instance_immediately_requeues_old_lease() -> None:
+    gateway = PlayHandLabGateway()
+    gateway.enqueue(
+        LabTask(
+            task_id="task-1",
+            lane_id="lane-1",
+            attempt_id="attempt-1",
+            deadline_seconds=2400,
+            max_attempts=2,
+        )
+    )
+    gateway.register_worker("worker-1", instance_id="instance-a")
+    first_claim = gateway.claim("worker-1")
+
+    worker = gateway.register_worker("worker-1", instance_id="instance-b")
+    snapshot = gateway.snapshot()
+
+    assert worker["worker_instance_id"] == "instance-b"
+    assert snapshot["queued_tasks"] == 1
+    assert snapshot["active_leases"] == 0
+    assert snapshot["metrics"]["worker_instance_replacements"] == 1
+    assert snapshot["metrics"]["worker_instance_leases_requeued"] == 1
+    assert gateway.heartbeat_lease("worker-1", first_claim["lease_id"]) is False
+
+    second_claim = gateway.claim("worker-1")
+    assert second_claim["status"] == "leased"
+    assert second_claim["task_id"] == "task-1"
+    assert second_claim["attempt_number"] == 2
+
+
+def test_lab_gateway_rejects_heartbeat_from_wrong_worker_instance() -> None:
+    gateway = PlayHandLabGateway()
+    gateway.register_worker("worker-1", instance_id="instance-a")
+
+    assert gateway.heartbeat_worker("worker-1", instance_id="instance-b") is False
+    assert gateway.heartbeat_worker("worker-1", instance_id="instance-a") is True
+
+
 def test_lab_gateway_expired_lease_heartbeat_does_not_renew() -> None:
     gateway = PlayHandLabGateway(LabGatewayConfig(lease_ttl_seconds=0.001))
     gateway.enqueue(

@@ -1508,6 +1508,7 @@ def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(
     config = SimpleNamespace(
         repo_root=tmp_path,
         runs_root=tmp_path / "runs",
+        attempt_catalog_sqlite_path=tmp_path / "runs" / "derived" / "attempt-catalog.sqlite",
         fuzzfolio=SimpleNamespace(),
     )
     monkeypatch.setattr(ar_main, "load_config", lambda: config)
@@ -1542,10 +1543,16 @@ def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(
             "composite_score": 72.0,
         },
     ]
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         ar_main,
-        "_selection_corpus_rows",
-        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+        "refresh_incremental_attempt_catalog",
+        lambda *_args, **_kwargs: ([], {"source": "sqlite_incremental", "row_count": len(rows)}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: iter(rows),
     )
     render_calls: list[dict[str, object]] = []
 
@@ -1569,7 +1576,7 @@ def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(
     monkeypatch.setattr(
         ar_main,
         "_refresh_global_derived_corpus_state",
-        lambda _config: {"attempt_count": len(rows)},
+        lambda _config, **_kwargs: {"attempt_count": len(rows)},
     )
 
     exit_code = ar_main.cmd_finalize_corpus(
@@ -1593,6 +1600,7 @@ def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(
     ]
     assert render_calls[0]["profile_drop_workers"] == 2
     assert render_calls[0]["full_backtest_workers"] == 12
+    assert render_calls[0]["catalog_already_refreshed"] is True
     payload = json.loads(capsys.readouterr().out)
     assert payload["selected_count"] == 2
     assert payload["selection"]["selection_scope"] == "dashboard"
@@ -1656,6 +1664,7 @@ def test_cmd_finalize_corpus_skips_tombstoned_runs(
     config = SimpleNamespace(
         repo_root=tmp_path,
         runs_root=tmp_path / "runs",
+        attempt_catalog_sqlite_path=tmp_path / "runs" / "derived" / "attempt-catalog.sqlite",
         fuzzfolio=SimpleNamespace(),
     )
     monkeypatch.setattr(ar_main, "load_config", lambda: config)
@@ -1688,10 +1697,16 @@ def test_cmd_finalize_corpus_skips_tombstoned_runs(
             "is_canonical_playhand_attempt": True,
         },
     ]
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         ar_main,
-        "_selection_corpus_rows",
-        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+        "refresh_incremental_attempt_catalog",
+        lambda *_args, **_kwargs: ([], {"source": "sqlite_incremental", "row_count": len(rows)}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: iter(rows),
     )
     render_calls: list[dict[str, object]] = []
     monkeypatch.setattr(
@@ -1702,7 +1717,7 @@ def test_cmd_finalize_corpus_skips_tombstoned_runs(
     monkeypatch.setattr(
         ar_main,
         "_refresh_global_derived_corpus_state",
-        lambda _config: {"attempt_count": len(rows)},
+        lambda _config, **_kwargs: {"attempt_count": len(rows)},
     )
 
     exit_code = ar_main.cmd_finalize_corpus(
@@ -1762,6 +1777,7 @@ def test_cmd_finalize_corpus_heals_selected_playhand_run_health(
     config = SimpleNamespace(
         repo_root=tmp_path,
         runs_root=runs_root,
+        attempt_catalog_sqlite_path=runs_root / "derived" / "attempt-catalog.sqlite",
         fuzzfolio=SimpleNamespace(),
     )
     monkeypatch.setattr(ar_main, "load_config", lambda: config)
@@ -1776,10 +1792,16 @@ def test_cmd_finalize_corpus_heals_selected_playhand_run_health(
             "is_canonical_playhand_attempt": True,
         }
     ]
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [run_dir])
     monkeypatch.setattr(
         ar_main,
-        "_selection_corpus_rows",
-        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+        "refresh_incremental_attempt_catalog",
+        lambda *_args, **_kwargs: ([], {"source": "sqlite_incremental", "row_count": len(rows)}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: iter(rows),
     )
     monkeypatch.setattr(
         ar_main,
@@ -1789,7 +1811,7 @@ def test_cmd_finalize_corpus_heals_selected_playhand_run_health(
     monkeypatch.setattr(
         ar_main,
         "_refresh_global_derived_corpus_state",
-        lambda _config: {"attempt_count": len(rows)},
+        lambda _config, **_kwargs: {"attempt_count": len(rows)},
     )
 
     exit_code = ar_main.cmd_finalize_corpus(
@@ -1866,6 +1888,11 @@ def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(
         return rows, {"source": "materialized"}
 
     monkeypatch.setattr(ar_main, "_selection_corpus_rows", fake_selection_corpus_rows)
+    monkeypatch.setattr(
+        ar_main,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: iter(refreshed_rows),
+    )
 
     catchup_calls: list[dict[str, object]] = []
 
@@ -1913,7 +1940,8 @@ def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(
     assert catchup_calls[0]["max_workers"] == 17
     assert catchup_calls[0]["force_rebuild"] is False
     assert catchup_calls[0]["require_scrutiny_36"] is False
-    assert selection_calls["count"] == 2
+    assert catchup_calls[0]["catalog_already_refreshed"] is True
+    assert selection_calls["count"] == 1
     assert len(render_calls) == 1
     assert render_calls[0]["layout_mode"] == "attempt_local"
     assert render_calls[0]["output_root"] is None
@@ -1929,12 +1957,76 @@ def test_cmd_render_corpus_profile_drops_heals_selected_attempts_before_render(
     assert payload["profile_drop_failed"] == 0
 
 
+def test_profile_drop_selection_streams_logical_runs_and_drops_tombstoned_runs(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = SimpleNamespace(
+        runs_root=tmp_path / "runs",
+        attempt_catalog_sqlite_path=tmp_path / "runs" / "derived" / "attempt-catalog.sqlite",
+        derived_root=tmp_path / "runs" / "derived",
+    )
+    run_a = config.runs_root / "run-a"
+    run_b = config.runs_root / "run-b"
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args: [run_a, run_b])
+    monkeypatch.setattr(
+        ar_main,
+        "refresh_incremental_attempt_catalog",
+        lambda *_args, **_kwargs: ([], {"source": "sqlite_incremental", "row_count": 4}),
+    )
+    catalog_rows = [
+        {"run_id": "run-a", "attempt_id": "a-1"},
+        {"run_id": "run-b", "attempt_id": "b-1"},
+        {"run_id": "run-a", "attempt_id": "a-2", "is_tombstoned": True},
+        {"run_id": "run-b", "attempt_id": "b-2"},
+    ]
+    monkeypatch.setattr(
+        ar_main,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: iter(catalog_rows),
+    )
+
+    rows, info = ar_main._selection_corpus_rows(
+        config,
+        run_ids=None,
+        label="test",
+        as_json=True,
+        visible_candidates_only=True,
+    )
+
+    assert [row["attempt_id"] for row in rows] == ["b-1", "b-2"]
+    assert info["catalog_total_row_count"] == 4
+    assert info["materialized_row_count"] == 2
+    assert info["bounded_candidate_selection"] is True
+
+
+def test_matched_attempt_items_can_release_unselected_siblings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    attempts = [
+        {"attempt_id": "attempt-a", "composite_score": 1.0},
+        {"attempt_id": "attempt-b", "composite_score": 2.0},
+    ]
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [run_dir])
+    monkeypatch.setattr(ar_main, "load_run_attempts", lambda *_args, **_kwargs: attempts)
+
+    items = ar_main._matched_attempt_items(
+        SimpleNamespace(),
+        attempt_ids=["attempt-b"],
+        require_scored=False,
+        include_run_attempts=False,
+    )
+
+    assert items == [(run_dir, [attempts[1]], attempts[1])]
+
+
 def test_cmd_render_corpus_profile_drops_skips_catch_up_when_artifact_native_ready(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     config = SimpleNamespace(
         repo_root=tmp_path,
         runs_root=tmp_path / "runs",
+        attempt_catalog_sqlite_path=tmp_path / "runs" / "derived" / "attempt-catalog.sqlite",
         fuzzfolio=SimpleNamespace(),
         research=SimpleNamespace(execution_cost_mode="none"),
     )
@@ -2030,6 +2122,7 @@ def test_cmd_render_corpus_profile_drops_catches_up_only_non_artifact_native_row
     config = SimpleNamespace(
         repo_root=tmp_path,
         runs_root=tmp_path / "runs",
+        attempt_catalog_sqlite_path=tmp_path / "runs" / "derived" / "attempt-catalog.sqlite",
         fuzzfolio=SimpleNamespace(),
         research=SimpleNamespace(execution_cost_mode="none"),
     )
@@ -2100,10 +2193,16 @@ def test_cmd_render_corpus_profile_drops_catches_up_only_non_artifact_native_row
             "profile_path": str(ready_profile_path),
         },
     ]
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         ar_main,
-        "_selection_corpus_rows",
-        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+        "refresh_incremental_attempt_catalog",
+        lambda *_args, **_kwargs: ([], {"source": "sqlite_incremental", "row_count": len(rows)}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: iter(rows),
     )
     monkeypatch.setattr(
         ar_main,
@@ -2174,10 +2273,16 @@ def test_cmd_render_corpus_profile_drops_streams_catch_up_progress_in_plain_mode
             "full_backtest_validation_status_36m": "missing",
         }
     ]
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         ar_main,
-        "_selection_corpus_rows",
-        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+        "refresh_incremental_attempt_catalog",
+        lambda *_args, **_kwargs: ([], {"source": "sqlite_incremental", "row_count": len(rows)}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: iter(rows),
     )
 
     catchup_calls: list[dict[str, object]] = []
@@ -2256,6 +2361,11 @@ def test_cmd_render_corpus_profile_drops_continues_when_catch_up_returns_nonzero
     monkeypatch.setattr(ar_main, "_selection_corpus_rows", fake_selection_corpus_rows)
     monkeypatch.setattr(
         ar_main,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: iter(rows),
+    )
+    monkeypatch.setattr(
+        ar_main,
         "cmd_calculate_full_backtests",
         lambda **_kwargs: 1,
     )
@@ -2289,7 +2399,7 @@ def test_cmd_render_corpus_profile_drops_continues_when_catch_up_returns_nonzero
     )
 
     assert exit_code == 1
-    assert selection_calls["count"] == 2
+    assert selection_calls["count"] == 1
     assert len(render_calls) == 1
     assert render_calls[0]["layout_mode"] == "attempt_local"
 
@@ -2326,10 +2436,16 @@ def test_cmd_render_corpus_profile_drops_fails_when_catch_up_fails_even_if_drop_
         }
     ]
 
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         ar_main,
-        "_selection_corpus_rows",
-        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+        "refresh_incremental_attempt_catalog",
+        lambda *_args, **_kwargs: ([], {"source": "sqlite_incremental", "row_count": len(rows)}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: iter(rows),
     )
     monkeypatch.setattr(
         ar_main,
@@ -2423,10 +2539,16 @@ def test_cmd_render_corpus_profile_drops_respects_rank_start(
         },
     ]
 
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         ar_main,
-        "_selection_corpus_rows",
-        lambda *_args, **_kwargs: (rows, {"source": "materialized"}),
+        "refresh_incremental_attempt_catalog",
+        lambda *_args, **_kwargs: ([], {"source": "sqlite_incremental", "row_count": len(rows)}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: iter(rows),
     )
     monkeypatch.setattr(
         ar_main,

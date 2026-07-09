@@ -41,6 +41,7 @@ def _write_attempt(run_dir, *, attempt_id: str, score: float = 10.0) -> dict:
         "created_at": "2026-01-01T00:00:00Z",
         "candidate_name": attempt_id,
         "artifact_dir": str(artifact_dir),
+        "profile_ref": f"profile:{attempt_id}",
         "profile_path": str(profile_path),
         "composite_score": score,
         "score_basis": "test",
@@ -234,6 +235,150 @@ def test_incremental_catalog_can_refresh_without_loading_all_rows(
     assert [row["attempt_id"] for row in streamed_rows] == ["attempt-1", "attempt-2"]
 
 
+def test_incremental_catalog_uses_rust_reuse_scan_to_skip_unchanged_runs(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    run_1 = runs_root / "run-1"
+    run_2 = runs_root / "run-2"
+    _write_attempt(run_1, attempt_id="attempt-1", score=20.0)
+    _write_attempt(run_2, attempt_id="attempt-2", score=15.0)
+    config = SimpleNamespace(
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+    )
+    refresh_incremental_attempt_catalog(config, run_dirs=[run_1, run_2], load_rows=False)
+
+    def fake_rust_scan(*, db_path, run_dirs):
+        return (
+            {"run-1": 1},
+            {},
+            {
+                "backend": "rust",
+                "available": True,
+                "reusable_run_count": 1,
+                "migration_candidate_count": 0,
+                "scanned_run_count": len(run_dirs),
+                "existing_signature_count": 2,
+                "invalid_run_count": 1,
+                "missing_signature_count": 0,
+                "stale_signature_count": 0,
+            },
+        )
+
+    original_load_run_attempts = catalog_index.load_run_attempts
+
+    def guarded_load_run_attempts(run_dir):
+        if Path(run_dir).name == "run-1":
+            raise AssertionError("Rust-reused run should not load attempts.jsonl")
+        return original_load_run_attempts(run_dir)
+
+    monkeypatch.setattr(catalog_index, "_rust_catalog_scan", fake_rust_scan)
+    monkeypatch.setattr(catalog_index, "load_run_attempts", guarded_load_run_attempts)
+
+    rows, info = refresh_incremental_attempt_catalog(
+        config,
+        run_dirs=[run_1, run_2],
+        load_rows=True,
+    )
+
+    assert info["reuse_scan"]["backend"] == "rust"
+    assert info["reused_run_count"] == 1
+    assert info["rebuilt_run_count"] == 1
+    assert [row["attempt_id"] for row in rows] == ["attempt-1", "attempt-2"]
+
+
+def test_incremental_catalog_migrates_known_old_extraction_rows_without_rebuild(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    run_dir = runs_root / "run-1"
+    attempt = _write_attempt(run_dir, attempt_id="attempt-1", score=20.0)
+    config = SimpleNamespace(
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+    )
+    refresh_incremental_attempt_catalog(config, run_dirs=[run_dir], load_rows=False)
+
+    old_version = f"2026-07-08.2:{CANONICAL_SCORE_LAB_VERSION}"
+    conn = sqlite3.connect(config.attempt_catalog_sqlite_path)
+    try:
+        row_json = conn.execute(
+            "SELECT row_json FROM attempt_rows WHERE run_id = ?",
+            (run_dir.name,),
+        ).fetchone()[0]
+        payload = json.loads(row_json)
+        payload.pop("full_backtest_recommended_curve_path_36m", None)
+        payload.pop("has_full_backtest_recommended_curve_36m", None)
+        payload["profile_ref"] = "lab-inline:legacy"
+        conn.execute(
+            "UPDATE attempt_rows SET row_json = ? WHERE run_id = ?",
+            (
+                json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+                run_dir.name,
+            ),
+        )
+        signature_json = conn.execute(
+            "SELECT signature_json FROM run_signatures WHERE run_id = ?",
+            (run_dir.name,),
+        ).fetchone()[0]
+        signature = json.loads(signature_json)
+        signature["extraction_version"] = old_version
+        conn.execute(
+            "UPDATE run_signatures SET signature_json = ? WHERE run_id = ?",
+            (
+                json.dumps(signature, ensure_ascii=True, separators=(",", ":")),
+                run_dir.name,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    def fake_rust_scan(*, db_path, run_dirs):
+        return (
+            {},
+            {
+                "run-1": {
+                    "row_count": 1,
+                    "from_extraction_version": old_version,
+                }
+            },
+            {
+                "backend": "rust",
+                "available": True,
+                "reusable_run_count": 0,
+                "migration_candidate_count": 1,
+                "scanned_run_count": len(run_dirs),
+                "existing_signature_count": 1,
+                "invalid_run_count": 0,
+                "missing_signature_count": 0,
+                "stale_signature_count": 0,
+            },
+        )
+
+    def fail_extract(*_args, **_kwargs):
+        raise AssertionError("known old catalog rows should migrate without rebuild")
+
+    monkeypatch.setattr(catalog_index, "_rust_catalog_scan", fake_rust_scan)
+    monkeypatch.setattr(catalog_index, "extract_attempt_catalog_row", fail_extract)
+
+    rows, info = refresh_incremental_attempt_catalog(config, run_dirs=[run_dir])
+
+    assert info["migrated_run_count"] == 1
+    assert info["rebuilt_run_count"] == 0
+    assert rows[0]["profile_ref"] == attempt["profile_ref"]
+    assert rows[0]["full_backtest_recommended_curve_path_36m"].endswith(
+        "full-backtest-36mo-recommended-cell-path-detail.json"
+    )
+
+
 def test_incremental_catalog_streams_materialized_outputs_from_sqlite(tmp_path) -> None:
     runs_root = tmp_path / "runs"
     derived_root = runs_root / "derived"
@@ -419,11 +564,17 @@ def test_incremental_catalog_sqlite_order_matches_catalog_priority(tmp_path) -> 
     finally:
         conn.close()
     streamed_rows = list(iter_catalog_rows(config))
+    unordered_rows = list(iter_catalog_rows(config, order_by_priority=False))
 
     assert [row["attempt_id"] for row in streamed_rows] == [
         "scrutiny-high",
         "scrutiny-low-composite",
         "composite-high",
+    ]
+    assert [row["attempt_id"] for row in unordered_rows] == [
+        "composite-high",
+        "scrutiny-low-composite",
+        "scrutiny-high",
     ]
 
 

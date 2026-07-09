@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 from math import log1p
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator
 
 from .scoring import CANONICAL_SCORE_LAB_VERSION, build_attempt_score
 
@@ -16,17 +18,45 @@ FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME = (
     "full-backtest-36mo-recommended-cell-path-detail.json"
 )
 FULL_BACKTEST_RESULT_FILENAME = "full-backtest-36mo-result.json"
+_JSON_CACHE_MISSING = object()
+_CATALOG_JSON_CACHE: ContextVar[dict[str, Any] | None] = ContextVar(
+    "catalog_json_cache",
+    default=None,
+)
+
+
+@contextmanager
+def catalog_json_cache() -> Iterator[None]:
+    token = _CATALOG_JSON_CACHE.set({})
+    try:
+        yield
+    finally:
+        _CATALOG_JSON_CACHE.reset(token)
 
 
 def load_json_if_exists(path: Path) -> dict[str, Any] | list[Any] | None:
+    cache = _CATALOG_JSON_CACHE.get()
+    cache_key = str(path)
+    if cache is not None:
+        cached = cache.get(cache_key, _JSON_CACHE_MISSING)
+        if cached is not _JSON_CACHE_MISSING:
+            return cached
     if not path.exists():
+        if cache is not None:
+            cache[cache_key] = None
         return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        if cache is not None:
+            cache[cache_key] = None
         return None
     if isinstance(payload, (dict, list)):
+        if cache is not None:
+            cache[cache_key] = payload
         return payload
+    if cache is not None:
+        cache[cache_key] = None
     return None
 
 
@@ -1135,22 +1165,45 @@ def full_backtest_provisional_reasons(
 
 
 def build_full_backtest_audit(
-    rows: list[dict[str, Any]],
+    rows: Iterable[dict[str, Any]],
     *,
     invalid_example_limit: int = 25,
     pending_example_limit: int = 25,
 ) -> dict[str, Any]:
-    summary = catalog_summary(rows)
-    invalid_rows = [
-        row
-        for row in rows
-        if str(row.get("full_backtest_validation_status_36m") or "") == "invalid"
-    ]
-    pending_rows = [
-        row
-        for row in rows
-        if bool(row.get("has_scrutiny_36m")) and not bool(row.get("has_full_backtest_36m"))
-    ]
+    invalid_rows: list[dict[str, Any]] = []
+    pending_rows: list[dict[str, Any]] = []
+
+    def priority(row: dict[str, Any]) -> tuple[float, float]:
+        return (
+            float(row.get("score_36m") or float("-inf")),
+            float(row.get("composite_score") or float("-inf")),
+        )
+
+    def retain_best(
+        retained: list[dict[str, Any]],
+        row: dict[str, Any],
+        limit: int,
+    ) -> None:
+        if limit <= 0:
+            return
+        if len(retained) < limit:
+            retained.append(row)
+            return
+        weakest_index = min(range(len(retained)), key=lambda index: priority(retained[index]))
+        if priority(row) > priority(retained[weakest_index]):
+            retained[weakest_index] = row
+
+    def observed_rows() -> Iterator[dict[str, Any]]:
+        for row in rows:
+            if str(row.get("full_backtest_validation_status_36m") or "") == "invalid":
+                retain_best(invalid_rows, row, invalid_example_limit)
+            if bool(row.get("has_scrutiny_36m")) and not bool(
+                row.get("has_full_backtest_36m")
+            ):
+                retain_best(pending_rows, row, pending_example_limit)
+            yield row
+
+    summary = catalog_summary(observed_rows())
     invalid_rows.sort(
         key=lambda row: (
             float(row.get("score_36m") or float("-inf")),

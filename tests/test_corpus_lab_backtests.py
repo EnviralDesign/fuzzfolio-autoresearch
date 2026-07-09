@@ -317,7 +317,11 @@ def test_cmd_calculate_full_backtests_lab_gateway_backend(
         "_matched_attempt_items",
         lambda *_args, **_kwargs: [(run_dir, [attempt], attempt)],
     )
-    monkeypatch.setattr(ar_main, "_refresh_global_derived_corpus_state", lambda _config: {"status": "refreshed"})
+    monkeypatch.setattr(
+        ar_main,
+        "_refresh_global_derived_corpus_state",
+        lambda _config, **_kwargs: {"status": "refreshed"},
+    )
     monkeypatch.setattr(ar_main, "resolve_lab_backtest_config", lambda **_kwargs: LabBacktestConfig())
     calls: list[dict] = []
 

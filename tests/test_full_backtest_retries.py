@@ -473,7 +473,7 @@ def test_calculate_full_backtests_rebuilds_stale_score_lab_result(
     monkeypatch.setattr(
         ar_main,
         "_refresh_global_derived_corpus_state",
-        lambda _config: {"status": "refreshed"},
+        lambda _config, **_kwargs: {"status": "refreshed"},
     )
     calls: list[dict[str, object]] = []
 
@@ -592,7 +592,7 @@ def test_calculate_full_backtests_rebuilds_stale_effective_window(
     monkeypatch.setattr(
         ar_main,
         "_refresh_global_derived_corpus_state",
-        lambda _config: {"status": "refreshed"},
+        lambda _config, **_kwargs: {"status": "refreshed"},
     )
     monkeypatch.setattr(
         ar_main,
@@ -713,7 +713,7 @@ def test_calculate_full_backtests_keeps_recent_truncated_window(
     monkeypatch.setattr(
         ar_main,
         "_refresh_global_derived_corpus_state",
-        lambda _config: {"status": "refreshed"},
+        lambda _config, **_kwargs: {"status": "refreshed"},
     )
     monkeypatch.setattr(
         ar_main,
@@ -827,7 +827,7 @@ def test_calculate_full_backtests_rebuilds_missing_recommended_detail(
     monkeypatch.setattr(
         ar_main,
         "_refresh_global_derived_corpus_state",
-        lambda _config: {"status": "refreshed"},
+        lambda _config, **_kwargs: {"status": "refreshed"},
     )
     monkeypatch.setattr(
         ar_main,

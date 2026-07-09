@@ -52,3 +52,6 @@ wheels/
 /.codex-remote-attachments
 /diagnostics
 /cgpt review
+
+# Rust build output
+/rust/catalog-indexer/target/

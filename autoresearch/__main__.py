@@ -214,15 +214,21 @@ if __package__ in {None, ""}:
         validate_generated_metadata_with_reasons,
     )
     from autoresearch.portfolio import (
+        _row_is_canonical_attempt,
+        _row_is_canonical_play_hand,
+        _row_is_final_scrutiny_attempt,
+        _row_is_play_hand,
         _resolve_account_spec,
         build_sleeve_prefilter,
         build_sleeve_selection,
+        dashboard_attempt_score_sort_key,
         enrich_rows_for_account,
         finalize_sleeve_selection,
         filter_dashboard_visible_candidate_rows,
         filter_play_hand_candidate_scope,
         filter_selection_candidate_rows,
         filter_tombstoned_candidate_rows,
+        is_tombstoned_attempt_row,
         load_portfolio_build_specs,
         load_portfolio_spec,
         merge_portfolio_sleeves,
@@ -474,15 +480,21 @@ else:
         validate_generated_metadata_with_reasons,
     )
     from .portfolio import (
+        _row_is_canonical_attempt,
+        _row_is_canonical_play_hand,
+        _row_is_final_scrutiny_attempt,
+        _row_is_play_hand,
         _resolve_account_spec,
         build_sleeve_prefilter,
         build_sleeve_selection,
+        dashboard_attempt_score_sort_key,
         enrich_rows_for_account,
         finalize_sleeve_selection,
         filter_dashboard_visible_candidate_rows,
         filter_play_hand_candidate_scope,
         filter_selection_candidate_rows,
         filter_tombstoned_candidate_rows,
+        is_tombstoned_attempt_row,
         load_portfolio_build_specs,
         load_portfolio_spec,
         merge_portfolio_sleeves,
@@ -6904,6 +6916,91 @@ def _export_attempt_catalog_debug_artifacts(
     return exports
 
 
+def _stream_visible_catalog_candidates(
+    config,
+    *,
+    run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    canonical_only: bool,
+) -> list[dict[str, Any]]:
+    tombstoned_run_ids: set[str] = set()
+    for row in iter_catalog_rows(
+        config,
+        run_ids=run_ids,
+        order_by_priority=False,
+    ):
+        run_id = str(row.get("run_id") or "").strip()
+        if run_id and is_tombstoned_attempt_row(row):
+            tombstoned_run_ids.add(run_id)
+
+    wanted_attempt_ids = {
+        str(token).strip() for token in (attempt_ids or []) if str(token).strip()
+    }
+    selected: list[dict[str, Any]] = []
+    canonical_states: dict[str, dict[str, Any]] = {}
+    for row in iter_catalog_rows(
+        config,
+        run_ids=run_ids,
+        order_by_priority=False,
+    ):
+        run_id = str(row.get("run_id") or "").strip()
+        if run_id in tombstoned_run_ids or (
+            not run_id and is_tombstoned_attempt_row(row)
+        ):
+            continue
+        attempt_id = str(row.get("attempt_id") or "").strip()
+        if wanted_attempt_ids:
+            if attempt_id in wanted_attempt_ids:
+                selected.append(row)
+            continue
+        if not canonical_only:
+            selected.append(row)
+            continue
+        if not run_id:
+            orphan_rows, _ = filter_play_hand_candidate_scope([row], "promoted")
+            selected.extend(orphan_rows)
+            continue
+
+        state = canonical_states.setdefault(
+            run_id,
+            {
+                "is_playhand": False,
+                "non_playhand_rows": [],
+                "canonical_rows": [],
+                "canonical_playhand_rows": [],
+                "best_final_row": None,
+            },
+        )
+        row_is_playhand = _row_is_play_hand(row)
+        if row_is_playhand and not state["is_playhand"]:
+            state["is_playhand"] = True
+            state["non_playhand_rows"].clear()
+        elif not state["is_playhand"]:
+            state["non_playhand_rows"].append(row)
+        if _row_is_canonical_attempt(row):
+            state["canonical_rows"].append(row)
+        if _row_is_canonical_play_hand(row):
+            state["canonical_playhand_rows"].append(row)
+        if _row_is_final_scrutiny_attempt(row):
+            current = state["best_final_row"]
+            if current is None or dashboard_attempt_score_sort_key(
+                row
+            ) < dashboard_attempt_score_sort_key(current):
+                state["best_final_row"] = row
+
+    if canonical_only and not wanted_attempt_ids:
+        for state in canonical_states.values():
+            if not state["is_playhand"]:
+                selected.extend(state["non_playhand_rows"])
+            elif state["canonical_rows"]:
+                selected.extend(state["canonical_rows"])
+            elif state["canonical_playhand_rows"]:
+                selected.extend(state["canonical_playhand_rows"])
+            elif state["best_final_row"] is not None:
+                selected.append(state["best_final_row"])
+    return selected
+
+
 def _selection_corpus_rows(
     config,
     *,
@@ -6911,6 +7008,9 @@ def _selection_corpus_rows(
     label: str,
     as_json: bool,
     materialize_full_corpus: bool = False,
+    visible_candidates_only: bool = False,
+    attempt_ids: list[str] | None = None,
+    canonical_only: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     run_dirs = _matching_run_dirs(config, run_ids)
     full_corpus_scope = not run_ids
@@ -6938,37 +7038,76 @@ def _selection_corpus_rows(
                 index_info.get("row_count") or summary.get("attempt_count") or 0
             ),
         )
-    if full_corpus_scope:
+    selected_run_ids = sorted(run_dir.name for run_dir in run_dirs)
+    catalog_total_row_count = int(index_info.get("row_count") or 0)
+    if visible_candidates_only:
+        rows = _stream_visible_catalog_candidates(
+            config,
+            run_ids=None if full_corpus_scope else selected_run_ids,
+            attempt_ids=attempt_ids,
+            canonical_only=canonical_only,
+        )
+    elif full_corpus_scope:
         rows = list(iter_catalog_rows(config))
     else:
         rows = list(
-            iter_catalog_rows(config, run_ids=sorted(run_dir.name for run_dir in run_dirs))
+            iter_catalog_rows(config, run_ids=selected_run_ids)
         )
+    index_info = {
+        **index_info,
+        "catalog_total_row_count": catalog_total_row_count,
+        "materialized_row_count": len(rows),
+        "bounded_candidate_selection": bool(visible_candidates_only),
+    }
     return rows, index_info
 
 
-def _refresh_global_derived_corpus_state(config) -> dict[str, Any]:
-    run_dirs = _matching_run_dirs(config, None)
-    _rows, index_info = refresh_incremental_attempt_catalog(
-        config,
-        run_dirs=run_dirs,
-        load_rows=False,
+def _refresh_global_derived_corpus_state(
+    config,
+    *,
+    refresh_run_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    all_run_dirs = _matching_run_dirs(config, None)
+    if refresh_run_ids is None:
+        refresh_run_dirs = all_run_dirs
+        _rows, index_info = refresh_incremental_attempt_catalog(
+            config,
+            run_dirs=refresh_run_dirs,
+            load_rows=False,
+        )
+    elif refresh_run_ids:
+        refresh_run_dirs = _matching_run_dirs(config, refresh_run_ids)
+        _rows, index_info = refresh_incremental_attempt_catalog(
+            config,
+            run_dirs=refresh_run_dirs,
+            load_rows=False,
+            prune_missing=False,
+        )
+    else:
+        index_info = {
+            "source": "sqlite_existing",
+            "path": str(config.attempt_catalog_sqlite_path),
+            "refreshed": False,
+            "run_count": 0,
+            "row_count": 0,
+            "rows_loaded": False,
+        }
+    audit_payload = build_full_backtest_audit(
+        iter_catalog_rows(config, order_by_priority=False)
     )
-    summary = catalog_summary_from_sqlite(config)
+    summary = dict(audit_payload.get("summary") or {})
     _write_attempt_catalog_summary_artifacts(
         config,
-        run_dirs=run_dirs,
+        run_dirs=all_run_dirs,
         summary=summary,
         row_count=int(
-            index_info.get("row_count") or summary.get("attempt_count") or 0
+            summary.get("attempt_count") or 0
         ),
     )
-    rows = list(iter_catalog_rows(config))
-    audit_payload = build_full_backtest_audit(rows)
     write_json(config.full_backtest_audit_json_path, audit_payload)
     return {
-        "run_count": len(run_dirs),
-        "attempt_count": len(rows),
+        "run_count": len(all_run_dirs),
+        "attempt_count": int(summary.get("attempt_count") or 0),
         "attempt_catalog_sqlite": str(config.attempt_catalog_sqlite_path),
         "attempt_catalog_json": None,
         "attempt_catalog_csv": None,
@@ -6989,6 +7128,7 @@ def _matched_attempt_items(
     run_ids: list[str] | None = None,
     attempt_ids: list[str] | None = None,
     require_scored: bool = True,
+    include_run_attempts: bool = True,
 ) -> list[tuple[Path, list[dict[str, Any]], dict[str, Any]]]:
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
@@ -7004,7 +7144,13 @@ def _matched_attempt_items(
                 continue
             if require_scored and not wanted_attempt_ids and attempt.get("composite_score") is None:
                 continue
-            items.append((run_dir, attempts, attempt))
+            items.append(
+                (
+                    run_dir,
+                    attempts if include_run_attempts else [attempt],
+                    attempt,
+                )
+            )
     if wanted_attempt_ids:
         matched_attempt_ids = {
             str(attempt.get("attempt_id") or "").strip() for _, _, attempt in items
@@ -10448,6 +10594,7 @@ def cmd_calculate_full_backtests(
     trading_dashboard_root: Path | None = None,
     as_json: bool,
     emit_summary: bool = True,
+    catalog_already_refreshed: bool = False,
 ) -> int:
     config = load_config()
     backend = str(full_backtest_backend or "local").strip().lower().replace("-", "_")
@@ -10456,7 +10603,22 @@ def cmd_calculate_full_backtests(
     wanted_attempt_ids = {
         str(token).strip() for token in (attempt_ids or []) if str(token).strip()
     }
-    if not run_ids and wanted_attempt_ids:
+    if catalog_already_refreshed:
+        catalog_rows = list(
+            iter_catalog_rows(
+                config,
+                run_ids=run_ids,
+                attempt_ids=sorted(wanted_attempt_ids) if wanted_attempt_ids else None,
+            )
+        )
+        corpus_index_info = {
+            "source": "sqlite_existing",
+            "path": str(config.attempt_catalog_sqlite_path),
+            "refreshed": False,
+            "row_count": len(catalog_rows),
+            "rows_loaded": True,
+        }
+    elif not run_ids and wanted_attempt_ids:
         run_dirs = _matching_run_dirs(config, None)
         _phase_emit(
             f"[calculate-full-backtests] refreshing incremental corpus index {config.attempt_catalog_sqlite_path}",
@@ -10500,6 +10662,7 @@ def cmd_calculate_full_backtests(
         run_ids=effective_run_ids,
         attempt_ids=attempt_ids,
         require_scored=False,
+        include_run_attempts=False,
     )
     if not matched_items:
         if emit_summary:
@@ -10626,7 +10789,11 @@ def cmd_calculate_full_backtests(
                 force_rebuild=force_rebuild,
                 emit=emit,
             )
-        derived_refresh = _refresh_global_derived_corpus_state(config)
+        changed_run_ids = sorted({run_dir.name for run_dir, *_ in to_calculate})
+        derived_refresh = _refresh_global_derived_corpus_state(
+            config,
+            refresh_run_ids=changed_run_ids,
+        )
         failure_summary = _build_full_backtest_failure_summary(results)
         write_json(config.full_backtest_failures_json_path, failure_summary)
         payload = {
@@ -10800,7 +10967,11 @@ def cmd_calculate_full_backtests(
                         progress.advance(task_id, 1)
                         refresh_progress(run_dir.name)
 
-    derived_refresh = _refresh_global_derived_corpus_state(config)
+    changed_run_ids = sorted({run_dir.name for run_dir, *_ in to_calculate})
+    derived_refresh = _refresh_global_derived_corpus_state(
+        config,
+        refresh_run_ids=changed_run_ids,
+    )
     failure_summary = _build_full_backtest_failure_summary(results)
     write_json(config.full_backtest_failures_json_path, failure_summary)
 
@@ -11810,6 +11981,35 @@ def _catalog_phase_callback(label: str, *, as_json: bool) -> Callable[[dict[str,
             total_runs = int(event.get("total_runs") or 0)
             _write_plain_line(f"[{label}] loading corpus rows from {total_runs} run directories")
             return
+        if stage == "reuse_scan_start":
+            total_runs = int(event.get("total_runs") or 0)
+            existing = int(event.get("existing_signature_count") or 0)
+            _write_plain_line(
+                f"[{label}] Rust catalog reuse scan starting "
+                f"({existing} cached signatures, {total_runs} run directories)"
+            )
+            return
+        if stage == "reuse_scan_done":
+            reusable = int(event.get("reusable_run_count") or 0)
+            migration_candidates = int(event.get("migration_candidate_count") or 0)
+            scanned = int(event.get("scanned_run_count") or 0)
+            invalid = int(event.get("invalid_run_count") or 0)
+            missing = int(event.get("missing_signature_count") or 0)
+            stale = int(event.get("stale_signature_count") or 0)
+            _write_plain_line(
+                f"[{label}] Rust catalog reuse scan done: "
+                f"{reusable}/{scanned} reusable, "
+                f"migration_candidates={migration_candidates}, invalid={invalid}, "
+                f"missing={missing}, stale={stale}"
+            )
+            return
+        if stage == "reuse_scan_unavailable":
+            error = str(event.get("error") or "not available")
+            _write_plain_line(
+                f"[{label}] Rust catalog reuse scan unavailable; "
+                f"using Python scan ({error})"
+            )
+            return
         if stage == "progress":
             completed = int(event.get("completed_runs") or 0)
             total_runs = int(event.get("total_runs") or 0)
@@ -11820,6 +12020,7 @@ def _catalog_phase_callback(label: str, *, as_json: bool) -> Callable[[dict[str,
                 if "reused_runs" in event or "rebuilt_runs" in event:
                     cache_detail = (
                         f", reused={int(event.get('reused_runs') or 0)}, "
+                        f"migrated={int(event.get('migrated_runs') or 0)}, "
                         f"rebuilt={int(event.get('rebuilt_runs') or 0)}, "
                         f"deleted={int(event.get('deleted_runs') or 0)}"
                     )
@@ -14655,6 +14856,7 @@ def cmd_render_corpus_profile_drops(
     full_backtest_result_batch_size: int | None = None,
     trading_dashboard_root: Path | None = None,
     require_presentation_metadata: bool = False,
+    catalog_already_refreshed: bool = False,
     as_json: bool,
 ) -> int:
     set_provider_trace_stderr_mode("warnings_only")
@@ -14693,16 +14895,46 @@ def cmd_render_corpus_profile_drops(
             return rows[rank_start:]
         return rows[rank_start : rank_start + limit]
 
-    full_catalog_rows, corpus_index_info = _selection_corpus_rows(
-        config,
-        run_ids=run_ids,
-        label="render-corpus-profile-drops",
-        as_json=as_json,
-    )
+    if catalog_already_refreshed:
+        selected_run_ids = (
+            sorted(run_dir.name for run_dir in _matching_run_dirs(config, run_ids))
+            if run_ids
+            else None
+        )
+        full_catalog_rows = list(
+            iter_catalog_rows(
+                config,
+                run_ids=selected_run_ids,
+                attempt_ids=sorted(wanted_attempt_ids) if wanted_attempt_ids else None,
+            )
+        )
+        total_summary = catalog_summary_from_sqlite(config, run_ids=selected_run_ids)
+        corpus_index_info = {
+            "source": "sqlite_existing",
+            "path": str(config.attempt_catalog_sqlite_path),
+            "row_count": int(total_summary.get("attempt_count") or 0),
+            "catalog_total_row_count": int(total_summary.get("attempt_count") or 0),
+            "materialized_row_count": len(full_catalog_rows),
+            "bounded_candidate_selection": True,
+            "refreshed": False,
+        }
+    else:
+        full_catalog_rows, corpus_index_info = _selection_corpus_rows(
+            config,
+            run_ids=run_ids,
+            label="render-corpus-profile-drops",
+            as_json=as_json,
+            visible_candidates_only=True,
+            attempt_ids=sorted(wanted_attempt_ids),
+            canonical_only=bool(canonical_only),
+        )
     selected_rows = select_rows(full_catalog_rows)
-    skipped_by_selection = max(0, len(full_catalog_rows) - len(selected_rows))
+    catalog_total_row_count = int(
+        corpus_index_info.get("catalog_total_row_count") or len(full_catalog_rows)
+    )
+    skipped_by_selection = max(0, catalog_total_row_count - len(selected_rows))
     _job_status_emit(
-        f"[render-corpus-profile-drops] selected {len(selected_rows)}/{len(full_catalog_rows)} "
+        f"[render-corpus-profile-drops] selected {len(selected_rows)}/{catalog_total_row_count} "
         f"attempts (skipped_by_selection={skipped_by_selection}, rank_start={rank_start}, "
         f"top_results={limit if limit is not None else 'all'}, "
         f"canonical_only={'yes' if canonical_only else 'no'}, workers={worker_count}, "
@@ -14746,6 +14978,7 @@ def cmd_render_corpus_profile_drops(
                 run_ids=selected_run_ids or None,
                 attempt_ids=selected_attempt_ids,
                 require_scored=False,
+                include_run_attempts=False,
             )
         except SystemExit:
             matched_items = []
@@ -14803,6 +15036,7 @@ def cmd_render_corpus_profile_drops(
                     full_backtest_worker_contract_hash=full_backtest_worker_contract_hash,
                     full_backtest_result_batch_size=full_backtest_result_batch_size,
                     trading_dashboard_root=trading_dashboard_root,
+                    catalog_already_refreshed=True,
                     as_json=True,
                 )
         else:
@@ -14822,14 +15056,12 @@ def cmd_render_corpus_profile_drops(
                 full_backtest_worker_contract_hash=full_backtest_worker_contract_hash,
                 full_backtest_result_batch_size=full_backtest_result_batch_size,
                 trading_dashboard_root=trading_dashboard_root,
+                catalog_already_refreshed=True,
                 as_json=False,
                 emit_summary=False,
             )
-        refreshed_rows, _ = _selection_corpus_rows(
-            config,
-            run_ids=run_ids,
-            label="render-corpus-profile-drops-refresh",
-            as_json=as_json,
+        refreshed_rows = list(
+            iter_catalog_rows(config, attempt_ids=selected_attempt_ids)
         )
         refreshed_by_attempt_id = {
             str(row.get("attempt_id") or "").strip(): row for row in refreshed_rows
@@ -15002,23 +15234,146 @@ def _build_finalize_corpus_passing_delta(
 
 
 def _select_finalize_corpus_rows(
-    rows: list[dict[str, Any]],
+    config,
     *,
+    run_ids: list[str] | None,
     scope: str,
     attempt_ids: list[str] | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    input_count = len(rows)
-    rows, tombstone_info = filter_tombstoned_candidate_rows(list(rows))
-    rows, incomplete_info = filter_dashboard_visible_candidate_rows(rows)
+    input_count = 0
+    logical_states: dict[str, dict[str, Any]] = {}
+    orphan_tombstoned_runs = 0
+    orphan_tombstoned_rows = 0
+    orphan_incomplete_runs = 0
+    orphan_incomplete_rows = 0
+    visible_orphan_rows = 0
+    for row in iter_catalog_rows(
+        config,
+        run_ids=run_ids,
+        order_by_priority=False,
+    ):
+        input_count += 1
+        run_id = str(row.get("run_id") or "").strip()
+        tombstoned = is_tombstoned_attempt_row(row)
+        is_playhand = _row_is_play_hand(row)
+        is_canonical = _row_is_canonical_attempt(row)
+        is_final = _row_is_final_scrutiny_attempt(row)
+        if not run_id:
+            if tombstoned:
+                orphan_tombstoned_runs += 1
+                orphan_tombstoned_rows += 1
+            elif is_playhand and not is_canonical and not is_final:
+                orphan_incomplete_runs += 1
+                orphan_incomplete_rows += 1
+            else:
+                visible_orphan_rows += 1
+            continue
+        state = logical_states.setdefault(
+            run_id,
+            {
+                "row_count": 0,
+                "tombstoned": False,
+                "is_playhand": False,
+                "has_canonical": False,
+                "has_final": False,
+            },
+        )
+        state["row_count"] += 1
+        state["tombstoned"] = bool(state["tombstoned"] or tombstoned)
+        state["is_playhand"] = bool(state["is_playhand"] or is_playhand)
+        state["has_canonical"] = bool(state["has_canonical"] or is_canonical)
+        state["has_final"] = bool(state["has_final"] or is_final)
+
+    tombstoned_run_ids = {
+        run_id for run_id, state in logical_states.items() if state["tombstoned"]
+    }
+    incomplete_run_ids = {
+        run_id
+        for run_id, state in logical_states.items()
+        if not state["tombstoned"]
+        and state["is_playhand"]
+        and not state["has_canonical"]
+        and not state["has_final"]
+    }
+    tombstoned_run_count = len(tombstoned_run_ids) + orphan_tombstoned_runs
+    tombstoned_dropped_count = orphan_tombstoned_rows + sum(
+        int(logical_states[run_id]["row_count"]) for run_id in tombstoned_run_ids
+    )
+    incomplete_run_count = len(incomplete_run_ids) + orphan_incomplete_runs
+    incomplete_dropped_count = orphan_incomplete_rows + sum(
+        int(logical_states[run_id]["row_count"]) for run_id in incomplete_run_ids
+    )
+    visible_group_count = (
+        len(logical_states) - len(tombstoned_run_ids) - len(incomplete_run_ids)
+    ) + visible_orphan_rows
+
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
     }
-    if wanted_attempt_ids:
-        selected = [
+    selected: list[dict[str, Any]] = []
+    dashboard_best_by_run: dict[str, dict[str, Any]] = {}
+    dashboard_canonical_run_ids: set[str] = set()
+    dashboard_score_run_ids: set[str] = set()
+    orphan_index = 0
+    for row in iter_catalog_rows(
+        config,
+        run_ids=run_ids,
+        order_by_priority=False,
+    ):
+        run_id = str(row.get("run_id") or "").strip()
+        if run_id:
+            if run_id in tombstoned_run_ids or run_id in incomplete_run_ids:
+                continue
+            state = logical_states[run_id]
+        else:
+            if is_tombstoned_attempt_row(row):
+                continue
+            if (
+                _row_is_play_hand(row)
+                and not _row_is_canonical_attempt(row)
+                and not _row_is_final_scrutiny_attempt(row)
+            ):
+                continue
+            orphan_index += 1
+            state = {
+                "is_playhand": _row_is_play_hand(row),
+                "has_canonical": _row_is_canonical_attempt(row),
+                "has_final": _row_is_final_scrutiny_attempt(row),
+            }
+
+        attempt_id = str(row.get("attempt_id") or "").strip()
+        if wanted_attempt_ids:
+            if attempt_id in wanted_attempt_ids:
+                selected.append(row)
+            continue
+        if scope == "all":
+            selected.append(row)
+            continue
+
+        candidate = True
+        if state["is_playhand"]:
+            if state["has_canonical"]:
+                candidate = _row_is_canonical_attempt(row)
+            else:
+                candidate = _row_is_final_scrutiny_attempt(row)
+        if not candidate:
+            continue
+        key = run_id or f"__orphan_{orphan_index}"
+        current = dashboard_best_by_run.get(key)
+        if current is None or dashboard_attempt_score_sort_key(
             row
-            for row in rows
-            if str(row.get("attempt_id") or "").strip() in wanted_attempt_ids
-        ]
+        ) < dashboard_attempt_score_sort_key(current):
+            dashboard_best_by_run[key] = row
+
+    if not wanted_attempt_ids and scope == "dashboard":
+        selected = list(dashboard_best_by_run.values())
+        for key, row in dashboard_best_by_run.items():
+            if _row_is_canonical_attempt(row):
+                dashboard_canonical_run_ids.add(key)
+            else:
+                dashboard_score_run_ids.add(key)
+
+    if wanted_attempt_ids:
         matched_attempt_ids = {
             str(row.get("attempt_id") or "").strip()
             for row in selected
@@ -15033,48 +15388,36 @@ def _select_finalize_corpus_rows(
             "input_count": input_count,
             "output_count": len(selected),
             "run_count": len({str(row.get("run_id") or "").strip() for row in selected}),
-            "tombstoned_run_count": tombstone_info["tombstoned_run_count"],
-            "tombstoned_dropped_count": tombstone_info["tombstoned_dropped_count"],
-            "incomplete_playhand_run_count": incomplete_info[
-                "incomplete_playhand_run_count"
-            ],
-            "incomplete_playhand_dropped_count": incomplete_info[
-                "incomplete_playhand_dropped_count"
-            ],
+            "tombstoned_run_count": tombstoned_run_count,
+            "tombstoned_dropped_count": tombstoned_dropped_count,
+            "incomplete_playhand_run_count": incomplete_run_count,
+            "incomplete_playhand_dropped_count": incomplete_dropped_count,
         }
     if scope == "all":
-        selected = list(rows)
         selected.sort(key=_full_backtest_priority_key)
         return selected, {
             "selection_scope": "all",
             "input_count": input_count,
             "output_count": len(selected),
             "run_count": len({str(row.get("run_id") or "").strip() for row in selected}),
-            "tombstoned_run_count": tombstone_info["tombstoned_run_count"],
-            "tombstoned_dropped_count": tombstone_info["tombstoned_dropped_count"],
-            "incomplete_playhand_run_count": incomplete_info[
-                "incomplete_playhand_run_count"
-            ],
-            "incomplete_playhand_dropped_count": incomplete_info[
-                "incomplete_playhand_dropped_count"
-            ],
+            "tombstoned_run_count": tombstoned_run_count,
+            "tombstoned_dropped_count": tombstoned_dropped_count,
+            "incomplete_playhand_run_count": incomplete_run_count,
+            "incomplete_playhand_dropped_count": incomplete_dropped_count,
         }
-    selected, info = select_dashboard_preferred_attempt_rows(rows)
     selected.sort(key=_full_backtest_priority_key)
-    merged_info = {
+    return selected, {
         "selection_scope": "dashboard",
-        **info,
+        "input_count": input_count,
+        "output_count": len(selected),
+        "run_count": visible_group_count,
+        "canonical_run_count": len(dashboard_canonical_run_ids),
+        "score_selected_run_count": len(dashboard_score_run_ids),
+        "tombstoned_run_count": tombstoned_run_count,
+        "tombstoned_dropped_count": tombstoned_dropped_count,
+        "incomplete_playhand_run_count": incomplete_run_count,
+        "incomplete_playhand_dropped_count": incomplete_dropped_count,
     }
-    merged_info["input_count"] = input_count
-    merged_info["tombstoned_run_count"] = tombstone_info["tombstoned_run_count"]
-    merged_info["tombstoned_dropped_count"] = tombstone_info["tombstoned_dropped_count"]
-    merged_info["incomplete_playhand_run_count"] = incomplete_info[
-        "incomplete_playhand_run_count"
-    ]
-    merged_info["incomplete_playhand_dropped_count"] = incomplete_info[
-        "incomplete_playhand_dropped_count"
-    ]
-    return selected, merged_info
 
 
 def cmd_finalize_corpus(
@@ -15114,15 +15457,22 @@ def cmd_finalize_corpus(
         if full_backtest_job_timeout_seconds is not None
         else None
     )
-    full_catalog_rows, corpus_index_info = _selection_corpus_rows(
-        config,
-        run_ids=run_ids,
-        label="finalize-corpus",
+    run_dirs = _matching_run_dirs(config, run_ids)
+    full_corpus_scope = not run_ids
+    _phase_emit(
+        f"[finalize-corpus] refreshing incremental corpus index {config.attempt_catalog_sqlite_path}",
         as_json=as_json,
-        materialize_full_corpus=False,
+    )
+    _rows, corpus_index_info = refresh_incremental_attempt_catalog(
+        config,
+        run_dirs=run_dirs,
+        progress_callback=_catalog_phase_callback("finalize-corpus", as_json=as_json),
+        load_rows=False,
+        prune_missing=full_corpus_scope,
     )
     selected_rows, selection_info = _select_finalize_corpus_rows(
-        full_catalog_rows,
+        config,
+        run_ids=None if full_corpus_scope else sorted(run_dir.name for run_dir in run_dirs),
         scope=scope,
         attempt_ids=attempt_ids,
     )
@@ -15131,13 +15481,14 @@ def cmd_finalize_corpus(
         for row in selected_rows
         if str(row.get("attempt_id") or "").strip()
     ]
-    skipped_by_selection = max(0, len(full_catalog_rows) - len(selected_rows))
+    catalog_total_row_count = int(selection_info.get("input_count") or 0)
+    skipped_by_selection = max(0, catalog_total_row_count - len(selected_rows))
     passing_before_summary = _finalize_corpus_passing_summary(
         selected_rows,
         lookback_months=int(lookback_months),
     )
     _job_status_emit(
-        f"[finalize-corpus] selected {len(selected_rows)}/{len(full_catalog_rows)} "
+        f"[finalize-corpus] selected {len(selected_rows)}/{catalog_total_row_count} "
         f"attempts (skipped_by_selection={skipped_by_selection}, "
         f"scope={selection_info.get('selection_scope')}, "
         f"runs={selection_info.get('run_count')}, "
@@ -15227,6 +15578,7 @@ def cmd_finalize_corpus(
                 full_backtest_result_batch_size=full_backtest_result_batch_size,
                 trading_dashboard_root=trading_dashboard_root,
                 require_presentation_metadata=bool(require_presentation_metadata),
+                catalog_already_refreshed=True,
                 as_json=True,
             )
             render_output = capture.getvalue().strip()
@@ -15256,6 +15608,7 @@ def cmd_finalize_corpus(
             full_backtest_result_batch_size=full_backtest_result_batch_size,
             trading_dashboard_root=trading_dashboard_root,
             require_presentation_metadata=bool(require_presentation_metadata),
+            catalog_already_refreshed=True,
             as_json=False,
         )
 
@@ -15299,13 +15652,12 @@ def cmd_finalize_corpus(
                 }
             )
 
-    refresh_summary = _refresh_global_derived_corpus_state(config)
-    refreshed_catalog_rows, _ = _selection_corpus_rows(
+    refresh_summary = _refresh_global_derived_corpus_state(
         config,
-        run_ids=run_ids,
-        label="finalize-corpus-passing-refresh",
-        as_json=as_json,
-        materialize_full_corpus=False,
+        refresh_run_ids=play_hand_run_ids,
+    )
+    refreshed_catalog_rows = list(
+        iter_catalog_rows(config, attempt_ids=selected_attempt_ids)
     )
     refreshed_by_attempt_id = {
         str(row.get("attempt_id") or "").strip(): row
