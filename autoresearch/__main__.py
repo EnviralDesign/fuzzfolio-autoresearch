@@ -42,9 +42,16 @@ from rich.text import Text
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from autoresearch.config import load_config
-    from autoresearch.catalog_index import refresh_incremental_attempt_catalog
+    from autoresearch.catalog_index import (
+        catalog_summary_from_sqlite,
+        iter_catalog_rows,
+        refresh_incremental_attempt_catalog,
+        stream_catalog_csv_from_sqlite,
+        stream_catalog_json_from_sqlite,
+    )
     from autoresearch.corpus_tools import (
         build_full_backtest_audit,
+        catalog_priority_key,
         catalog_summary,
         build_similarity_payload as build_candidate_similarity_payload,
         extract_attempt_catalog_row,
@@ -299,9 +306,16 @@ if __package__ in {None, ""}:
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
-    from .catalog_index import refresh_incremental_attempt_catalog
+    from .catalog_index import (
+        catalog_summary_from_sqlite,
+        iter_catalog_rows,
+        refresh_incremental_attempt_catalog,
+        stream_catalog_csv_from_sqlite,
+        stream_catalog_json_from_sqlite,
+    )
     from .corpus_tools import (
         build_full_backtest_audit,
+        catalog_priority_key,
         catalog_summary,
         build_similarity_payload as build_candidate_similarity_payload,
         extract_attempt_catalog_row,
@@ -6786,13 +6800,7 @@ def _catalog_rows_for_run_dirs(
                     "row_count": len(rows),
                 }
             )
-    rows.sort(
-        key=lambda row: (
-            row.get("composite_score") is None,
-            -(float(row["composite_score"]) if row.get("composite_score") is not None else float("-inf")),
-            str(row.get("attempt_id") or ""),
-        )
-    )
+    rows.sort(key=catalog_priority_key)
     return rows
 
 
@@ -6813,7 +6821,12 @@ def _catalog_file_signature(path: Path) -> dict[str, Any]:
     }
 
 
-def _attempt_catalog_manifest_payload(run_dirs: list[Path], rows: list[dict[str, Any]]) -> dict[str, Any]:
+def _attempt_catalog_manifest_payload(
+    run_dirs: list[Path],
+    rows: list[dict[str, Any]] | None = None,
+    *,
+    row_count: int | None = None,
+) -> dict[str, Any]:
     run_items: list[dict[str, Any]] = []
     for run_dir in run_dirs:
         run_items.append(
@@ -6829,7 +6842,7 @@ def _attempt_catalog_manifest_payload(run_dirs: list[Path], rows: list[dict[str,
         "version": 1,
         "generated_at": datetime.now().astimezone().isoformat(),
         "run_count": len(run_dirs),
-        "row_count": len(rows),
+        "row_count": int(row_count if row_count is not None else len(rows or [])),
         "runs": run_items,
     }
 
@@ -6869,17 +6882,26 @@ def _write_materialized_corpus_index(
     config,
     *,
     run_dirs: list[Path],
-    rows: list[dict[str, Any]],
+    rows: list[dict[str, Any]] | None = None,
     write_csv_output: bool = True,
+    from_sqlite: bool = False,
 ) -> dict[str, Any]:
-    summary = catalog_summary(rows)
-    write_json(config.attempt_catalog_json_path, rows)
-    if write_csv_output:
-        write_csv(config.attempt_catalog_csv_path, rows)
+    if from_sqlite:
+        row_count = stream_catalog_json_from_sqlite(config, config.attempt_catalog_json_path)
+        if write_csv_output:
+            stream_catalog_csv_from_sqlite(config, config.attempt_catalog_csv_path)
+        summary = catalog_summary_from_sqlite(config)
+    else:
+        row_items = list(rows or [])
+        row_count = len(row_items)
+        summary = catalog_summary(row_items)
+        write_json(config.attempt_catalog_json_path, row_items)
+        if write_csv_output:
+            write_csv(config.attempt_catalog_csv_path, row_items)
     write_json(config.attempt_catalog_summary_path, summary)
     write_json(
         config.attempt_catalog_manifest_path,
-        _attempt_catalog_manifest_payload(run_dirs, rows),
+        _attempt_catalog_manifest_payload(run_dirs, rows, row_count=row_count),
     )
     return summary
 
@@ -6908,7 +6930,7 @@ def _selection_corpus_rows(
     run_ids: list[str] | None,
     label: str,
     as_json: bool,
-    materialize_full_corpus: bool = True,
+    materialize_full_corpus: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     run_dirs = _matching_run_dirs(config, run_ids)
     full_corpus_scope = not run_ids
@@ -6930,7 +6952,16 @@ def _selection_corpus_rows(
             config,
             run_dirs=run_dirs,
             progress_callback=_catalog_phase_callback(label, as_json=as_json),
+            load_rows=False,
         )
+        if materialize_full_corpus:
+            _write_materialized_corpus_index(
+                config,
+                run_dirs=run_dirs,
+                write_csv_output=False,
+                from_sqlite=True,
+            )
+        rows = list(iter_catalog_rows(config))
         return rows, index_info
 
     _phase_emit(
@@ -6964,16 +6995,18 @@ def _selection_corpus_rows(
 
 def _refresh_global_derived_corpus_state(config) -> dict[str, Any]:
     run_dirs = _matching_run_dirs(config, None)
-    rows, index_info = refresh_incremental_attempt_catalog(
+    _rows, index_info = refresh_incremental_attempt_catalog(
         config,
         run_dirs=run_dirs,
+        load_rows=False,
     )
     summary = _write_materialized_corpus_index(
         config,
         run_dirs=run_dirs,
-        rows=rows,
         write_csv_output=False,
+        from_sqlite=True,
     )
+    rows = list(iter_catalog_rows(config))
     audit_payload = build_full_backtest_audit(rows)
     write_json(config.full_backtest_audit_json_path, audit_payload)
     return {
@@ -7036,29 +7069,7 @@ def _matched_attempt_items(
 
 
 def _full_backtest_priority_key(row: dict[str, Any] | None) -> tuple[bool, float, float, str]:
-    row = row or {}
-    score_36 = row.get("score_36m")
-    composite_score = row.get("composite_score")
-    primary = (
-        float(score_36)
-        if score_36 is not None
-        else (
-            float(composite_score)
-            if composite_score is not None
-            else float("-inf")
-        )
-    )
-    secondary = (
-        float(composite_score)
-        if composite_score is not None
-        else float("-inf")
-    )
-    return (
-        primary == float("-inf"),
-        -primary,
-        -secondary,
-        str(row.get("attempt_id") or ""),
-    )
+    return catalog_priority_key(row)
 
 
 def _attempt_has_backtestable_cell(attempt: dict[str, Any]) -> bool:
@@ -10484,20 +10495,39 @@ def cmd_calculate_full_backtests(
     backend = str(full_backtest_backend or "local").strip().lower().replace("-", "_")
     if backend not in {"local", "lab_gateway"}:
         raise SystemExit("--full-backtest-backend must be local or lab-gateway")
-    catalog_rows, corpus_index_info = _selection_corpus_rows(
-        config,
-        run_ids=run_ids,
-        label="calculate-full-backtests",
-        as_json=as_json,
-    )
+    wanted_attempt_ids = {
+        str(token).strip() for token in (attempt_ids or []) if str(token).strip()
+    }
+    if not run_ids and wanted_attempt_ids:
+        run_dirs = _matching_run_dirs(config, None)
+        _phase_emit(
+            f"[calculate-full-backtests] refreshing incremental corpus index {config.attempt_catalog_sqlite_path}",
+            as_json=as_json,
+        )
+        _rows, corpus_index_info = refresh_incremental_attempt_catalog(
+            config,
+            run_dirs=run_dirs,
+            progress_callback=_catalog_phase_callback(
+                "calculate-full-backtests",
+                as_json=as_json,
+            ),
+            load_rows=False,
+        )
+        catalog_rows = list(
+            iter_catalog_rows(config, attempt_ids=sorted(wanted_attempt_ids))
+        )
+    else:
+        catalog_rows, corpus_index_info = _selection_corpus_rows(
+            config,
+            run_ids=run_ids,
+            label="calculate-full-backtests",
+            as_json=as_json,
+        )
     catalog_by_attempt_id = {
         str(row.get("attempt_id") or ""): row for row in catalog_rows
     }
     effective_run_ids = run_ids
-    if not run_ids and attempt_ids:
-        wanted_attempt_ids = {
-            str(token).strip() for token in attempt_ids if str(token).strip()
-        }
+    if not run_ids and wanted_attempt_ids:
         selected_run_ids = sorted(
             {
                 str((catalog_by_attempt_id.get(attempt_id) or {}).get("run_id") or "").strip()
@@ -10854,21 +10884,29 @@ def cmd_build_attempt_catalog(*, run_ids: list[str] | None, as_json: bool) -> in
     config = load_config()
     run_dirs = _matching_run_dirs(config, run_ids)
     if not run_ids:
-        rows, index_info = refresh_incremental_attempt_catalog(
+        _rows, index_info = refresh_incremental_attempt_catalog(
             config,
             run_dirs=run_dirs,
             progress_callback=_catalog_phase_callback(
                 "build-attempt-catalog",
                 as_json=as_json,
             ),
+            load_rows=False,
         )
+        summary = _write_materialized_corpus_index(
+            config,
+            run_dirs=run_dirs,
+            from_sqlite=True,
+        )
+        attempt_count = int(index_info.get("row_count") or 0)
     else:
         rows = _catalog_rows_for_run_dirs(config, run_dirs)
         index_info = {"source": "cold_rebuild", "run_count": len(run_dirs), "row_count": len(rows)}
-    summary = _write_materialized_corpus_index(config, run_dirs=run_dirs, rows=rows)
+        summary = _write_materialized_corpus_index(config, run_dirs=run_dirs, rows=rows)
+        attempt_count = len(rows)
     payload = {
         "run_count": len(run_dirs),
-        "attempt_count": len(rows),
+        "attempt_count": attempt_count,
         "attempt_catalog_sqlite": str(config.attempt_catalog_sqlite_path),
         "attempt_catalog_json": str(config.attempt_catalog_json_path),
         "attempt_catalog_csv": str(config.attempt_catalog_csv_path),
@@ -10889,7 +10927,13 @@ def cmd_audit_full_backtests(
 ) -> int:
     config = load_config()
     run_dirs = _matching_run_dirs(config, run_ids)
-    rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    rows, _index_info = _selection_corpus_rows(
+        config,
+        run_ids=run_ids,
+        label="audit-full-backtests",
+        as_json=as_json,
+        materialize_full_corpus=False,
+    )
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
     }
@@ -10925,7 +10969,13 @@ def cmd_plot_corpus_score_vs_trades(
 ) -> int:
     config = load_config()
     run_dirs = _matching_run_dirs(config, run_ids)
-    rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    rows, _index_info = _selection_corpus_rows(
+        config,
+        run_ids=run_ids,
+        label="plot-corpus-score-vs-trades",
+        as_json=as_json,
+        materialize_full_corpus=False,
+    )
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
     }
@@ -13082,35 +13132,17 @@ def cmd_build_promotion_board(
 ) -> int:
     config = load_config()
     run_dirs = _matching_run_dirs(config, run_ids)
-    full_catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    full_catalog_rows, _index_info = _selection_corpus_rows(
+        config,
+        run_ids=run_ids,
+        label="build-promotion-board",
+        as_json=as_json,
+        materialize_full_corpus=False,
+    )
     initial_rows = list(full_catalog_rows)
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
     }
-
-    def promotion_sort_key(row: dict[str, Any]) -> tuple[bool, float, float, str]:
-        score_36 = row.get("score_36m")
-        composite_score = row.get("composite_score")
-        primary = (
-            float(score_36)
-            if score_36 is not None
-            else (
-                float(composite_score)
-                if composite_score is not None
-                else float("-inf")
-            )
-        )
-        secondary = (
-            float(composite_score)
-            if composite_score is not None
-            else float("-inf")
-        )
-        return (
-            primary == float("-inf"),
-            -primary,
-            -secondary,
-            str(row.get("attempt_id") or ""),
-        )
 
     if wanted_attempt_ids:
         initial_rows = [
@@ -13130,7 +13162,7 @@ def cmd_build_promotion_board(
             initial_rows,
             candidate_scope,
         )
-    initial_rows.sort(key=promotion_sort_key)
+    initial_rows.sort(key=_full_backtest_priority_key)
     if candidate_limit >= 0:
         initial_rows = initial_rows[:candidate_limit]
 
@@ -13160,7 +13192,13 @@ def cmd_build_promotion_board(
                     emit=None,
                 )
 
-    full_catalog_rows = _catalog_rows_for_run_dirs(config, run_dirs)
+    full_catalog_rows, _index_info = _selection_corpus_rows(
+        config,
+        run_ids=run_ids,
+        label="build-promotion-board",
+        as_json=as_json,
+        materialize_full_corpus=False,
+    )
     rows = list(full_catalog_rows)
     if wanted_attempt_ids:
         rows = [
@@ -13169,7 +13207,7 @@ def cmd_build_promotion_board(
     scope_info = dict(initial_scope_info)
     if not wanted_attempt_ids:
         rows, scope_info = filter_play_hand_candidate_scope(rows, candidate_scope)
-    rows.sort(key=promotion_sort_key)
+    rows.sort(key=_full_backtest_priority_key)
     if candidate_limit >= 0:
         rows = rows[:candidate_limit]
 
@@ -15097,7 +15135,7 @@ def cmd_finalize_corpus(
         run_ids=run_ids,
         label="finalize-corpus",
         as_json=as_json,
-        materialize_full_corpus=not dry_run,
+        materialize_full_corpus=False,
     )
     selected_rows, selection_info = _select_finalize_corpus_rows(
         full_catalog_rows,

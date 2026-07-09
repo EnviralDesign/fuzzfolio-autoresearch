@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import json
 import sqlite3
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -11,6 +13,7 @@ from .corpus_tools import (
     FULL_BACKTEST_CURVE_FILENAME,
     FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
     FULL_BACKTEST_RESULT_FILENAME,
+    catalog_priority_key,
     catalog_summary,
     extract_attempt_catalog_row,
     legacy_validation_cache_dir,
@@ -41,6 +44,24 @@ def _json_loads(payload: str | None) -> Any:
         return json.loads(payload)
     except json.JSONDecodeError:
         return None
+
+
+def _atomic_text_path(path: Path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        newline="",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+
+
+def _replace_atomic(tmp_path: Path, final_path: Path) -> None:
+    Path(tmp_path).replace(final_path)
 
 
 def _catalog_db_path(config: Any) -> Path:
@@ -365,13 +386,21 @@ def _replace_run_rows(
     )
 
 
-def _row_select_sql(run_ids: list[str] | None = None) -> tuple[str, list[Any]]:
+def _row_select_sql(
+    run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
+) -> tuple[str, list[Any]]:
     params: list[Any] = []
-    where = ""
+    clauses: list[str] = []
     if run_ids:
         placeholders = ",".join("?" for _ in run_ids)
-        where = f"WHERE run_id IN ({placeholders})"
+        clauses.append(f"run_id IN ({placeholders})")
         params.extend(run_ids)
+    if attempt_ids:
+        placeholders = ",".join("?" for _ in attempt_ids)
+        clauses.append(f"attempt_id IN ({placeholders})")
+        params.extend(attempt_ids)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     sql = f"""
         SELECT row_json
         FROM attempt_rows
@@ -393,27 +422,120 @@ def iter_catalog_rows(
     config: Any,
     *,
     run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
 ) -> Any:
     db_path = _catalog_db_path(config)
     with _connect_catalog_db(db_path) as conn:
-        sql, params = _row_select_sql(run_ids)
+        sql, params = _row_select_sql(run_ids, attempt_ids)
         for (row_json,) in conn.execute(sql, params):
             payload = _json_loads(row_json)
             if isinstance(payload, dict):
                 yield payload
 
 
+def catalog_summary_from_sqlite(
+    config: Any,
+    *,
+    run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
+) -> dict[str, Any]:
+    return catalog_summary(
+        iter_catalog_rows(config, run_ids=run_ids, attempt_ids=attempt_ids)
+    )
+
+
+def stream_catalog_json_from_sqlite(
+    config: Any,
+    output_path: Path,
+    *,
+    run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
+) -> int:
+    output_path = Path(output_path)
+    handle = _atomic_text_path(output_path)
+    tmp_path = Path(handle.name)
+    count = 0
+    try:
+        with handle:
+            handle.write("[")
+            db_path = _catalog_db_path(config)
+            with _connect_catalog_db(db_path) as conn:
+                sql, params = _row_select_sql(run_ids, attempt_ids)
+                for (row_json,) in conn.execute(sql, params):
+                    if count:
+                        handle.write(",")
+                    handle.write(str(row_json))
+                    count += 1
+            handle.write("]")
+        _replace_atomic(tmp_path, output_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return count
+
+
+def stream_catalog_csv_from_sqlite(
+    config: Any,
+    output_path: Path,
+    *,
+    run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
+) -> int:
+    output_path = Path(output_path)
+    fieldnames: list[str] = []
+    seen: set[str] = set()
+    for row in iter_catalog_rows(config, run_ids=run_ids, attempt_ids=attempt_ids):
+        for key in row.keys():
+            if key in seen:
+                continue
+            seen.add(key)
+            fieldnames.append(key)
+
+    handle = _atomic_text_path(output_path)
+    tmp_path = Path(handle.name)
+    count = 0
+    try:
+        with handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in iter_catalog_rows(
+                config, run_ids=run_ids, attempt_ids=attempt_ids
+            ):
+                serialized: dict[str, Any] = {}
+                for key in fieldnames:
+                    value = row.get(key)
+                    if isinstance(value, (list, dict)):
+                        serialized[key] = json.dumps(value, ensure_ascii=True)
+                    else:
+                        serialized[key] = value
+                writer.writerow(serialized)
+                count += 1
+        _replace_atomic(tmp_path, output_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return count
+
+
 def _load_rows(
     conn: sqlite3.Connection,
     *,
     run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    sql, params = _row_select_sql(run_ids)
+    sql, params = _row_select_sql(run_ids, attempt_ids)
     for (row_json,) in conn.execute(sql, params):
         payload = _json_loads(row_json)
         if isinstance(payload, dict):
             rows.append(payload)
+    rows.sort(key=catalog_priority_key)
     return rows
 
 

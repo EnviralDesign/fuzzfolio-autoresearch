@@ -4,7 +4,7 @@ import csv
 import json
 from math import log1p
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from .scoring import CANONICAL_SCORE_LAB_VERSION, build_attempt_score
 
@@ -37,6 +37,32 @@ def nested_get(payload: Any, path: list[str]) -> Any:
             return None
         current = current.get(key)
     return current
+
+
+def catalog_priority_key(row: dict[str, Any] | None) -> tuple[bool, float, float, str]:
+    row = row or {}
+    score_36 = row.get("score_36m")
+    composite_score = row.get("composite_score")
+    primary = (
+        float(score_36)
+        if score_36 is not None
+        else (
+            float(composite_score)
+            if composite_score is not None
+            else float("-inf")
+        )
+    )
+    secondary = (
+        float(composite_score)
+        if composite_score is not None
+        else float("-inf")
+    )
+    return (
+        primary == float("-inf"),
+        -primary,
+        -secondary,
+        str(row.get("attempt_id") or ""),
+    )
 
 
 def normalize_tokens(values: list[Any]) -> list[str]:
@@ -933,84 +959,111 @@ def extract_attempt_catalog_row(
     }
 
 
-def catalog_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    scored_rows = [row for row in rows if _safe_float(row.get("composite_score")) is not None]
-    scrutiny_36 = [row for row in rows if row.get("has_scrutiny_36m")]
-    full_backtest_36 = [row for row in rows if row.get("has_full_backtest_36m")]
-    valid_full_backtest_36 = [
-        row
-        for row in rows
-        if str(row.get("full_backtest_validation_status_36m") or "") == "valid"
-    ]
-    invalid_full_backtest_36 = [
-        row
-        for row in rows
-        if str(row.get("full_backtest_validation_status_36m") or "") == "invalid"
-    ]
-    partial_full_backtest_36 = [
-        row
-        for row in rows
-        if bool(row.get("has_full_backtest_result_36m"))
-        != bool(row.get("has_full_backtest_curve_36m"))
-    ]
-    score_36_values = [
-        float(row["score_36m"])
-        for row in scrutiny_36
-        if _safe_float(row.get("score_36m")) is not None
-    ]
+def catalog_summary(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    scored_count = 0
+    scrutiny_12_count = 0
+    scrutiny_36_count = 0
+    full_backtest_36_count = 0
+    valid_full_backtest_36_count = 0
+    invalid_full_backtest_36_count = 0
+    partial_full_backtest_36_count = 0
+    base_sensitivity_count = 0
+    canonical_playhand_count = 0
+    canonical_count = 0
+    playhand_count = 0
+    score_36_ge_40 = 0
+    score_36_ge_60 = 0
+    score_36_ge_70 = 0
+    full_backtest_36_ge_40 = 0
+    full_backtest_36_ge_60 = 0
+    full_backtest_36_ge_70 = 0
+    score_36_values: list[float] = []
+    run_ids: set[str] = set()
+    base_strategy_keys: set[str] = set()
+    strategy_keys_36: set[str] = set()
+    full_backtest_strategy_keys_36: set[str] = set()
+    attempt_count = 0
+
+    for row in rows:
+        attempt_count += 1
+        if _safe_float(row.get("composite_score")) is not None:
+            scored_count += 1
+        run_id = str(row.get("run_id") or "").strip()
+        if run_id:
+            run_ids.add(run_id)
+        base_strategy_key = str(row.get("base_strategy_key") or "").strip()
+        if base_strategy_key:
+            base_strategy_keys.add(base_strategy_key)
+        if bool(row.get("is_canonical_playhand_attempt")):
+            canonical_playhand_count += 1
+        if bool(row.get("is_canonical_attempt")):
+            canonical_count += 1
+        if str(row.get("runner") or "") == "play_hand_v1":
+            playhand_count += 1
+        if row.get("has_scrutiny_12m"):
+            scrutiny_12_count += 1
+        has_scrutiny_36 = bool(row.get("has_scrutiny_36m"))
+        if has_scrutiny_36:
+            scrutiny_36_count += 1
+            strategy_key_36 = str(row.get("strategy_key_36m") or "").strip()
+            if strategy_key_36:
+                strategy_keys_36.add(strategy_key_36)
+            score_36 = _safe_float(row.get("score_36m"))
+            if score_36 is not None:
+                score_36_values.append(score_36)
+                if score_36 >= 40.0:
+                    score_36_ge_40 += 1
+                if score_36 >= 60.0:
+                    score_36_ge_60 += 1
+                if score_36 >= 70.0:
+                    score_36_ge_70 += 1
+        has_full_backtest_36 = bool(row.get("has_full_backtest_36m"))
+        if has_full_backtest_36:
+            full_backtest_36_count += 1
+            strategy_key_36 = str(row.get("strategy_key_36m") or "").strip()
+            if strategy_key_36:
+                full_backtest_strategy_keys_36.add(strategy_key_36)
+            score_36 = _safe_float(row.get("score_36m"))
+            if score_36 is not None:
+                if score_36 >= 40.0:
+                    full_backtest_36_ge_40 += 1
+                if score_36 >= 60.0:
+                    full_backtest_36_ge_60 += 1
+                if score_36 >= 70.0:
+                    full_backtest_36_ge_70 += 1
+        status_36 = str(row.get("full_backtest_validation_status_36m") or "")
+        if status_36 == "valid":
+            valid_full_backtest_36_count += 1
+        if status_36 == "invalid":
+            invalid_full_backtest_36_count += 1
+        if bool(row.get("has_full_backtest_result_36m")) != bool(
+            row.get("has_full_backtest_curve_36m")
+        ):
+            partial_full_backtest_36_count += 1
+        if row.get("has_sensitivity_response"):
+            base_sensitivity_count += 1
+
     score_36_values.sort()
     median_score_36 = (
         score_36_values[len(score_36_values) // 2] if score_36_values else None
     )
-    run_ids = {str(row.get("run_id") or "").strip() for row in rows if str(row.get("run_id") or "").strip()}
-    base_strategy_keys = {
-        str(row.get("base_strategy_key") or "").strip()
-        for row in rows
-        if str(row.get("base_strategy_key") or "").strip()
-    }
-    strategy_keys_36 = {
-        str(row.get("strategy_key_36m") or "").strip()
-        for row in scrutiny_36
-        if str(row.get("strategy_key_36m") or "").strip()
-    }
-    full_backtest_strategy_keys_36 = {
-        str(row.get("strategy_key_36m") or "").strip()
-        for row in full_backtest_36
-        if str(row.get("strategy_key_36m") or "").strip()
-    }
-    attempt_count = len(rows)
-    scrutiny_36_count = len(scrutiny_36)
-    full_backtest_36_count = len(full_backtest_36)
-    canonical_playhand_rows = [
-        row for row in rows if bool(row.get("is_canonical_playhand_attempt"))
-    ]
-    canonical_rows = [
-        row for row in rows if bool(row.get("is_canonical_attempt"))
-    ]
-    playhand_rows = [
-        row for row in rows if str(row.get("runner") or "") == "play_hand_v1"
-    ]
     return {
         "run_count": len(run_ids),
         "attempt_count": attempt_count,
-        "scored_attempt_count": len(scored_rows),
-        "playhand_attempt_count": len(playhand_rows),
-        "canonical_attempt_count": len(canonical_rows),
-        "canonical_playhand_attempt_count": len(canonical_playhand_rows),
+        "scored_attempt_count": scored_count,
+        "playhand_attempt_count": playhand_count,
+        "canonical_attempt_count": canonical_count,
+        "canonical_playhand_attempt_count": canonical_playhand_count,
         "unique_base_strategy_count": len(base_strategy_keys),
         "unique_strategy_count_36m": len(strategy_keys_36),
         "unique_full_backtest_strategy_count_36m": len(full_backtest_strategy_keys_36),
-        "attempts_with_scrutiny_12m": sum(
-            1 for row in rows if row.get("has_scrutiny_12m")
-        ),
+        "attempts_with_scrutiny_12m": scrutiny_12_count,
         "attempts_with_scrutiny_36m": scrutiny_36_count,
         "attempts_with_full_backtest_36m": full_backtest_36_count,
-        "attempts_with_valid_full_backtest_36m": len(valid_full_backtest_36),
-        "attempts_with_invalid_full_backtest_36m": len(invalid_full_backtest_36),
-        "attempts_with_partial_full_backtest_36m": len(partial_full_backtest_36),
-        "attempts_with_base_sensitivity": sum(
-            1 for row in rows if row.get("has_sensitivity_response")
-        ),
+        "attempts_with_valid_full_backtest_36m": valid_full_backtest_36_count,
+        "attempts_with_invalid_full_backtest_36m": invalid_full_backtest_36_count,
+        "attempts_with_partial_full_backtest_36m": partial_full_backtest_36_count,
+        "attempts_with_base_sensitivity": base_sensitivity_count,
         "scrutiny_36m_coverage_ratio": (
             (float(scrutiny_36_count) / float(attempt_count)) if attempt_count > 0 else None
         ),
@@ -1020,7 +1073,7 @@ def catalog_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             else None
         ),
         "valid_full_backtest_36m_coverage_ratio": (
-            (float(len(valid_full_backtest_36)) / float(attempt_count))
+            (float(valid_full_backtest_36_count) / float(attempt_count))
             if attempt_count > 0
             else None
         ),
@@ -1030,47 +1083,17 @@ def catalog_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
             else None
         ),
         "valid_full_backtest_36m_vs_scrutiny_coverage_ratio": (
-            (float(len(valid_full_backtest_36)) / float(scrutiny_36_count))
+            (float(valid_full_backtest_36_count) / float(scrutiny_36_count))
             if scrutiny_36_count > 0
             else None
         ),
         "median_score_36m": median_score_36,
-        "score_36m_ge_40": sum(
-            1
-            for row in scrutiny_36
-            if _safe_float(row.get("score_36m")) is not None
-            and float(row["score_36m"]) >= 40.0
-        ),
-        "score_36m_ge_60": sum(
-            1
-            for row in scrutiny_36
-            if _safe_float(row.get("score_36m")) is not None
-            and float(row["score_36m"]) >= 60.0
-        ),
-        "score_36m_ge_70": sum(
-            1
-            for row in scrutiny_36
-            if _safe_float(row.get("score_36m")) is not None
-            and float(row["score_36m"]) >= 70.0
-        ),
-        "full_backtest_36m_ge_40": sum(
-            1
-            for row in full_backtest_36
-            if _safe_float(row.get("score_36m")) is not None
-            and float(row["score_36m"]) >= 40.0
-        ),
-        "full_backtest_36m_ge_60": sum(
-            1
-            for row in full_backtest_36
-            if _safe_float(row.get("score_36m")) is not None
-            and float(row["score_36m"]) >= 60.0
-        ),
-        "full_backtest_36m_ge_70": sum(
-            1
-            for row in full_backtest_36
-            if _safe_float(row.get("score_36m")) is not None
-            and float(row["score_36m"]) >= 70.0
-        ),
+        "score_36m_ge_40": score_36_ge_40,
+        "score_36m_ge_60": score_36_ge_60,
+        "score_36m_ge_70": score_36_ge_70,
+        "full_backtest_36m_ge_40": full_backtest_36_ge_40,
+        "full_backtest_36m_ge_60": full_backtest_36_ge_60,
+        "full_backtest_36m_ge_70": full_backtest_36_ge_70,
     }
 
 

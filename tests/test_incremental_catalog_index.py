@@ -7,7 +7,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import autoresearch.catalog_index as catalog_index
-from autoresearch.catalog_index import iter_catalog_rows, refresh_incremental_attempt_catalog
+from autoresearch.catalog_index import (
+    catalog_summary_from_sqlite,
+    iter_catalog_rows,
+    refresh_incremental_attempt_catalog,
+    stream_catalog_csv_from_sqlite,
+    stream_catalog_json_from_sqlite,
+)
 from autoresearch.corpus_tools import (
     FULL_BACKTEST_CURVE_FILENAME,
     FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
@@ -225,6 +231,114 @@ def test_incremental_catalog_can_refresh_without_loading_all_rows(
     assert info["summary"]["summary_mode"] == "sqlite_counts"
     assert info["summary"]["attempt_count"] == 2
     assert [row["attempt_id"] for row in streamed_rows] == ["attempt-1", "attempt-2"]
+
+
+def test_incremental_catalog_streams_materialized_outputs_from_sqlite(tmp_path) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    run_1 = runs_root / "run-1"
+    run_2 = runs_root / "run-2"
+    _write_attempt(run_1, attempt_id="attempt-low", score=10.0)
+    _write_attempt(run_2, attempt_id="attempt-high", score=30.0)
+    config = SimpleNamespace(
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+    )
+
+    refresh_incremental_attempt_catalog(config, run_dirs=[run_1, run_2], load_rows=False)
+    json_count = stream_catalog_json_from_sqlite(
+        config, derived_root / "attempt-catalog.json"
+    )
+    csv_count = stream_catalog_csv_from_sqlite(
+        config, derived_root / "attempt-catalog.csv"
+    )
+
+    rows = json.loads((derived_root / "attempt-catalog.json").read_text(encoding="utf-8"))
+    csv_text = (derived_root / "attempt-catalog.csv").read_text(encoding="utf-8")
+    summary = catalog_summary_from_sqlite(config)
+
+    assert json_count == 2
+    assert csv_count == 2
+    assert [row["attempt_id"] for row in rows] == ["attempt-high", "attempt-low"]
+    assert csv_text.splitlines()[0].startswith("run_id,attempt_id,")
+    assert summary["attempt_count"] == 2
+    assert summary["scored_attempt_count"] == 2
+
+
+def test_incremental_catalog_iterates_selected_attempt_ids(tmp_path) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    run_1 = runs_root / "run-1"
+    run_2 = runs_root / "run-2"
+    _write_attempt(run_1, attempt_id="attempt-a", score=10.0)
+    _write_attempt(run_2, attempt_id="attempt-b", score=30.0)
+    config = SimpleNamespace(
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+    )
+
+    refresh_incremental_attempt_catalog(config, run_dirs=[run_1, run_2], load_rows=False)
+    rows = list(iter_catalog_rows(config, attempt_ids=["attempt-a"]))
+
+    assert [row["attempt_id"] for row in rows] == ["attempt-a"]
+    assert catalog_summary_from_sqlite(config, attempt_ids=["attempt-a"])[
+        "attempt_count"
+    ] == 1
+
+
+def test_incremental_catalog_sqlite_order_matches_catalog_priority(tmp_path) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    run_1 = runs_root / "run-1"
+    run_2 = runs_root / "run-2"
+    run_3 = runs_root / "run-3"
+    _write_attempt(run_1, attempt_id="composite-high", score=90.0)
+    _write_attempt(run_2, attempt_id="scrutiny-low-composite", score=10.0)
+    _write_attempt(run_3, attempt_id="scrutiny-high", score=20.0)
+    config = SimpleNamespace(
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+    )
+
+    refresh_incremental_attempt_catalog(config, run_dirs=[run_1, run_2, run_3])
+    conn = sqlite3.connect(config.attempt_catalog_sqlite_path)
+    try:
+        for attempt_id, score_36 in (
+            ("scrutiny-low-composite", 95.0),
+            ("scrutiny-high", 96.0),
+        ):
+            row_json = conn.execute(
+                "SELECT row_json FROM attempt_rows WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()[0]
+            payload = json.loads(row_json)
+            payload["has_scrutiny_36m"] = True
+            payload["score_36m"] = score_36
+            conn.execute(
+                """
+                UPDATE attempt_rows
+                SET score_36m = ?, row_json = ?
+                WHERE attempt_id = ?
+                """,
+                (
+                    score_36,
+                    json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+                    attempt_id,
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    streamed_rows = list(iter_catalog_rows(config))
+
+    assert [row["attempt_id"] for row in streamed_rows] == [
+        "scrutiny-high",
+        "scrutiny-low-composite",
+        "composite-high",
+    ]
 
 
 def test_incremental_catalog_migrates_old_unique_attempt_schema(tmp_path) -> None:

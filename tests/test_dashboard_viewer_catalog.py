@@ -3,16 +3,89 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+from autoresearch.catalog_index import refresh_incremental_attempt_catalog
 from autoresearch.dashboard_viewer import (
     _PROFILE_DROP_EXIT_POLICY_CACHE,
     _RESULT_CELL_CACHE,
+    ViewerState,
     _normalize_path_fields,
 )
+from autoresearch.ledger import ATTEMPTS_FILE_NAME, RUN_METADATA_FILE_NAME
 
 
 def _write_json(path, payload) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _write_attempt(run_dir, *, attempt_id: str, score: float) -> None:
+    artifact_dir = run_dir / "evals" / attempt_id
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    profile_path = artifact_dir / "profile.json"
+    _write_json(profile_path, {"profile": {"instruments": ["EURUSD"]}})
+    attempt = {
+        "run_id": run_dir.name,
+        "attempt_id": attempt_id,
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+        "composite_score": score,
+        "best_summary": {"best_cell": {"trade_count": 4, "resolved_trades": 4}},
+    }
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / ATTEMPTS_FILE_NAME).write_text(
+        json.dumps(attempt, ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    _write_json(run_dir / RUN_METADATA_FILE_NAME, {"run_status": "complete"})
+
+
+def test_viewer_state_loads_catalog_from_sqlite_without_json(tmp_path) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    run_dir = runs_root / "run-1"
+    _write_attempt(run_dir, attempt_id="sqlite-attempt", score=42.0)
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=runs_root,
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+        attempt_catalog_json_path=derived_root / "attempt-catalog.json",
+        attempt_catalog_summary_path=derived_root / "attempt-catalog-summary.json",
+        full_backtest_audit_json_path=derived_root / "full-backtest-audit.json",
+        promotion_board_json_path=derived_root / "promotion-board.json",
+        corpus_tradeoff_plot_path=derived_root / "corpus-score-vs-trades.png",
+    )
+    refresh_incremental_attempt_catalog(config, run_dirs=[run_dir], load_rows=False)
+
+    rows = ViewerState(config).catalog_rows()
+
+    assert [row["attempt_id"] for row in rows] == ["sqlite-attempt"]
+    assert not config.attempt_catalog_json_path.exists()
+
+
+def test_viewer_state_falls_back_to_json_when_sqlite_is_unreadable(tmp_path) -> None:
+    runs_root = tmp_path / "runs"
+    derived_root = runs_root / "derived"
+    derived_root.mkdir(parents=True, exist_ok=True)
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=runs_root,
+        derived_root=derived_root,
+        validation_cache_root=derived_root / "validation-cache",
+        attempt_catalog_sqlite_path=derived_root / "attempt-catalog.sqlite",
+        attempt_catalog_json_path=derived_root / "attempt-catalog.json",
+        attempt_catalog_summary_path=derived_root / "attempt-catalog-summary.json",
+        full_backtest_audit_json_path=derived_root / "full-backtest-audit.json",
+        promotion_board_json_path=derived_root / "promotion-board.json",
+        corpus_tradeoff_plot_path=derived_root / "corpus-score-vs-trades.png",
+    )
+    config.attempt_catalog_sqlite_path.write_text("not sqlite", encoding="utf-8")
+    _write_json(config.attempt_catalog_json_path, [{"attempt_id": "json-attempt"}])
+
+    rows = ViewerState(config).catalog_rows()
+
+    assert [row["attempt_id"] for row in rows] == ["json-attempt"]
 
 
 def test_dashboard_catalog_prefers_rendered_profile_drop_exit_policy(tmp_path) -> None:

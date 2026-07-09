@@ -14,6 +14,7 @@ from statistics import mean
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .catalog_index import iter_catalog_rows
 from .config import AppConfig
 from .ledger import list_run_dirs, load_run_metadata
 from .portfolio import (
@@ -1192,14 +1193,34 @@ class ViewerState:
         self._catalog_rows: list[dict[str, Any]] | None = None
         self._catalog_signature: tuple[str, bool, int | None, int | None] | None = None
 
+    def _catalog_source_signature(self) -> tuple[str, bool, int | None, int | None]:
+        sqlite_path = getattr(
+            self.config,
+            "attempt_catalog_sqlite_path",
+            self.config.derived_root / "attempt-catalog.sqlite",
+        )
+        if sqlite_path.exists():
+            return _file_signature(sqlite_path)
+        return _file_signature(self.config.attempt_catalog_json_path)
+
     def _load_catalog_rows(self) -> list[dict[str, Any]]:
+        sqlite_path = getattr(
+            self.config,
+            "attempt_catalog_sqlite_path",
+            self.config.derived_root / "attempt-catalog.sqlite",
+        )
+        if sqlite_path.exists():
+            try:
+                return [dict(row) for row in iter_catalog_rows(self.config)]
+            except Exception:
+                pass
         rows = _load_optional_json(self.config.attempt_catalog_json_path) or []
         if not isinstance(rows, list):
             return []
         return [dict(row) for row in rows if isinstance(row, dict)]
 
     def catalog_rows(self) -> list[dict[str, Any]]:
-        signature = _file_signature(self.config.attempt_catalog_json_path)
+        signature = self._catalog_source_signature()
         with self._lock:
             if self._catalog_rows is None or self._catalog_signature != signature:
                 self._catalog_rows = self._load_catalog_rows()
@@ -1212,7 +1233,7 @@ class ViewerState:
             _file_signature(self.config.attempt_catalog_summary_path),
             _file_signature(self.config.full_backtest_audit_json_path),
             _file_signature(self.config.promotion_board_json_path),
-            _file_signature(self.config.attempt_catalog_json_path),
+            self._catalog_source_signature(),
             _file_signature(
                 self.config.derived_root / SHORTLIST_REPORT_ROOTNAME / "shortlist-report.json"
             ),
