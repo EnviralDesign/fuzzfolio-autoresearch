@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import importlib.machinery
 import importlib.util
 import json
 import math
-import shutil
 import statistics
 import subprocess
 import sys
-import sysconfig
 import tempfile
 import time
 from dataclasses import asdict
@@ -19,6 +18,8 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUST_MANIFEST = REPO_ROOT / "rust" / "portfolio-optimizer" / "Cargo.toml"
+_BUILT_RUST_BINARIES: set[bool] = set()
+_BUILT_PYO3_EXTENSIONS: set[bool] = set()
 RUST_TARGET = REPO_ROOT / "rust" / "portfolio-optimizer" / "target"
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -221,14 +222,21 @@ def rust_cdylib_path(*, release: bool) -> Path:
 
 
 def ensure_rust_binary(*, release: bool) -> Path:
+    binary = rust_binary_path(release=release)
+    if bool(release) in _BUILT_RUST_BINARIES and binary.exists():
+        return binary
     command = ["cargo", "build", "--quiet", "--manifest-path", str(RUST_MANIFEST)]
     if release:
         command.insert(2, "--release")
     subprocess.run(command, cwd=REPO_ROOT, check=True)
-    return rust_binary_path(release=release)
+    _BUILT_RUST_BINARIES.add(bool(release))
+    return binary
 
 
 def ensure_pyo3_extension(*, release: bool) -> Path:
+    extension = rust_cdylib_path(release=release)
+    if bool(release) in _BUILT_PYO3_EXTENSIONS and extension.exists():
+        return extension
     command = [
         "cargo",
         "build",
@@ -242,20 +250,20 @@ def ensure_pyo3_extension(*, release: bool) -> Path:
     if release:
         command.insert(2, "--release")
     subprocess.run(command, cwd=REPO_ROOT, check=True)
-    return rust_cdylib_path(release=release)
+    _BUILT_PYO3_EXTENSIONS.add(bool(release))
+    return extension
 
 
 def load_pyo3_module(*, release: bool):
     cdylib_path = ensure_pyo3_extension(release=release)
-    extension_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".pyd"
-    extension_root = REPO_ROOT / ".tmp" / "portfolio_optimizer_pyo3"
-    extension_root.mkdir(parents=True, exist_ok=True)
-    module_dir = Path(tempfile.mkdtemp(prefix="load-", dir=extension_root))
-    module_path = module_dir / f"portfolio_optimizer_rs{extension_suffix}"
-    shutil.copy2(cdylib_path, module_path)
-    spec = importlib.util.spec_from_file_location("portfolio_optimizer_rs", module_path)
+    loader = importlib.machinery.ExtensionFileLoader(
+        "portfolio_optimizer_rs", str(cdylib_path)
+    )
+    spec = importlib.util.spec_from_file_location(
+        "portfolio_optimizer_rs", cdylib_path, loader=loader
+    )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"failed to create import spec for {module_path}")
+        raise RuntimeError(f"failed to create import spec for {cdylib_path}")
     module = importlib.util.module_from_spec(spec)
     previous = sys.modules.pop("portfolio_optimizer_rs", None)
     try:
@@ -266,7 +274,7 @@ def load_pyo3_module(*, release: bool):
         if previous is not None:
             sys.modules["portfolio_optimizer_rs"] = previous
         raise
-    module._portfolio_optimizer_rs_module_path = str(module_path)
+    module._portfolio_optimizer_rs_module_path = str(cdylib_path)
     module._portfolio_optimizer_rs_previous = previous
     return module
 
@@ -917,6 +925,8 @@ def main() -> int:
 
     if args.release or args.benchmark:
         ensure_rust_binary(release=True)
+    if args.pyo3:
+        ensure_rust_binary(release=bool(args.release))
     pyo3_module = load_pyo3_module(release=bool(args.release)) if args.pyo3 else None
 
     timings: list[tuple[float, float, float | None, int]] = []

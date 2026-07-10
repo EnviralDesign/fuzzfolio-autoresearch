@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import csv
+import importlib.machinery
 import importlib.util
 import json
 import math
 import random
 import re
-import shutil
 import statistics
 import subprocess
 import sys
-import sysconfig
-import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -58,6 +56,7 @@ INDEX_SYMBOLS = {
 }
 COMMODITY_SYMBOLS = {"UKOUSD", "USOUSD", "XBRUSD", "XNGUSD", "XTIUSD"}
 CRYPTO_SYMBOLS = {"BCHUSD", "BTCUSD", "ETHUSD", "LTCUSD", "SOLUSD", "XRPUSD"}
+_RUST_OPTIMIZER_MODULES: dict[bool, Any] = {}
 
 
 DEFAULT_OBJECTIVES: dict[str, dict[str, float]] = {
@@ -364,6 +363,8 @@ class OptimizerCandidate:
     vector: list[float] = field(default_factory=list)
     open_vector: list[int] = field(default_factory=list)
     closed_vector: list[int] = field(default_factory=list)
+    month_vector: list[float] = field(default_factory=list)
+    week_vector: list[float] = field(default_factory=list)
 
     @property
     def final_r(self) -> float:
@@ -545,6 +546,23 @@ def _calendar_daily_curve(row: dict[str, Any]) -> tuple[list[str], list[float], 
     return dates, daily, open_counts, closed_counts
 
 
+
+def authoritative_candidate_score(row: dict[str, Any]) -> float:
+    """Return the current 36m score used for optimizer eligibility and ranking.
+
+    Discovery-era scores such as final_scrutiny_score/composite_score can be stale
+    after a forced 36m rebuild. Once a row has valid 36m full-backtest status,
+    the current 36m score is authoritative and stale discovery scores must not
+    override it.
+    """
+    score = safe_float(row.get("score_36m"))
+    if score is not None:
+        return score
+    lab_score = safe_float(row.get("score_lab_score_36m"))
+    if lab_score is not None:
+        return lab_score
+    return 0.0
+
 def candidate_rejection_reason(
     row: dict[str, Any],
     spec: PortfolioOptimizerSpec,
@@ -581,13 +599,7 @@ def candidate_rejection_reason(
     account_rejection = _candidate_account_risk_rejection(row, spec.account)
     if account_rejection:
         return account_rejection
-    score_values = [
-        safe_float(row.get("score_36m")),
-        safe_float(row.get("score_lab_score_36m")),
-        safe_float(row.get("final_scrutiny_score")),
-        safe_float(row.get("composite_score")),
-    ]
-    score = max([value for value in score_values if value is not None] or [0.0])
+    score = authoritative_candidate_score(row)
     if score < spec.min_score:
         return "score_below_min"
     holds = _hold_metrics(row)
@@ -627,13 +639,7 @@ def build_optimizer_candidates(
             continue
         instruments = row_instruments(row)
         asset_classes = {instrument_asset_class(item) for item in instruments} or {"other"}
-        score_values = [
-            safe_float(row.get("score_36m")),
-            safe_float(row.get("score_lab_score_36m")),
-            safe_float(row.get("final_scrutiny_score")),
-            safe_float(row.get("composite_score")),
-        ]
-        score = max([value for value in score_values if value is not None] or [0.0])
+        score = authoritative_candidate_score(row)
         holds = _hold_metrics(row)
         dates, daily, open_counts, closed_counts = _calendar_daily_curve(row)
         if len(asset_classes) == 1:
@@ -708,6 +714,22 @@ class PortfolioSearch:
         self._candidate_sumsq: dict[str, float] = {}
         self.dates = sorted({date for candidate in candidates for date in candidate.dates})
         self.date_index = {date: index for index, date in enumerate(self.dates)}
+        month_keys = list(dict.fromkeys(date[:7] for date in self.dates))
+        week_keys = list(
+            dict.fromkeys(
+                f"{parsed.isocalendar().year}-W{parsed.isocalendar().week:02d}"
+                for parsed in (datetime.fromisoformat(date) for date in self.dates)
+            )
+        )
+        month_lookup = {key: index for index, key in enumerate(month_keys)}
+        week_lookup = {key: index for index, key in enumerate(week_keys)}
+        self.month_index = [month_lookup[date[:7]] for date in self.dates]
+        self.week_index = []
+        for date in self.dates:
+            iso = datetime.fromisoformat(date).isocalendar()
+            self.week_index.append(week_lookup[f"{iso.year}-W{iso.week:02d}"])
+        self.month_count = len(month_keys)
+        self.week_count = len(week_keys)
         for candidate in self.candidates:
             vector = [0.0] * len(self.dates)
             open_vector = [0] * len(self.dates)
@@ -725,6 +747,8 @@ class PortfolioSearch:
             candidate.vector = vector
             candidate.open_vector = open_vector
             candidate.closed_vector = closed_vector
+            candidate.month_vector = self._group_sums(vector, self.month_index, self.month_count)
+            candidate.week_vector = self._group_sums(vector, self.week_index, self.week_count)
             self._candidate_sum[candidate.attempt_id] = sum(vector)
             self._candidate_sumsq[candidate.attempt_id] = sum(
                 value * value for value in vector
@@ -760,6 +784,186 @@ class PortfolioSearch:
                 open_counts[index] += candidate.open_vector[index]
                 closed_counts[index] += candidate.closed_vector[index]
         return daily, open_counts, closed_counts
+
+    @staticmethod
+    def _group_sums(values: list[float], indexes: list[int], size: int) -> list[float]:
+        grouped = [0.0] * size
+        for index, value in zip(indexes, values):
+            grouped[index] += value
+        return grouped
+
+    def _constraint_violation_size_from_stats(
+        self,
+        selected_ids: list[str],
+        *,
+        avg_open_positions: float,
+        peak_open_positions: float,
+        trades_per_month: float,
+    ) -> float:
+        instrument_counts, asset_counts, family_counts = self.exposure_counts(selected_ids)
+        violation_size = float(abs(len(selected_ids) - self.spec.portfolio_size))
+        violation_size += float(max(0, len(selected_ids) - len(set(selected_ids))))
+        violation_size += max(
+            0.0,
+            float(max(instrument_counts.values() or [0.0])) - self.spec.max_instrument_share,
+        )
+        violation_size += max(
+            0.0,
+            float(max(family_counts.values() or [0])) - self.spec.max_per_family,
+        )
+        violation_size += max(0.0, self.spec.min_fx_share - asset_counts.get("fx", 0.0))
+        violation_size += max(0.0, asset_counts.get("metal", 0.0) - self.spec.max_metal_share)
+        violation_size += max(0.0, asset_counts.get("index", 0.0) - self.spec.max_index_share)
+        if self.spec.max_avg_open_positions > 0:
+            violation_size += max(
+                0.0, avg_open_positions - self.spec.max_avg_open_positions
+            )
+        if self.spec.max_peak_open_positions > 0:
+            violation_size += max(
+                0.0, peak_open_positions - self.spec.max_peak_open_positions
+            )
+        if self.spec.max_trades_per_month > 0:
+            violation_size += max(
+                0.0, trades_per_month - self.spec.max_trades_per_month
+            )
+        return violation_size
+
+    def _avg_positive_pair_corr_uncached(self, selected_ids: list[str]) -> float:
+        ids = list(
+            dict.fromkeys(
+                attempt_id for attempt_id in selected_ids if attempt_id in self.by_id
+            )
+        )
+        total = 0.0
+        pairs = 0
+        for left_index, left_id in enumerate(ids):
+            for right_id in ids[left_index + 1 :]:
+                total += max(0.0, self.pair_corr(left_id, right_id))
+                pairs += 1
+        return total / pairs if pairs else 0.0
+
+    def _objective_score_extension(
+        self,
+        selected_ids: list[str],
+        added_id: str,
+        objective_name: str,
+        *,
+        base_daily: list[float],
+        base_open: list[int],
+        base_closed: list[int],
+        base_months: list[float],
+        base_weeks: list[float],
+    ) -> float:
+        """Score one transient base-plus-candidate trial without retaining it."""
+        candidate = self.by_id[added_id]
+        trial_ids = [*selected_ids, added_id]
+        final_r = 0.0
+        sumsq = 0.0
+        equity = 0.0
+        peak = 0.0
+        maxdd_r = 0.0
+        positive_day_gain = 0.0
+        best_day_r = float("-inf")
+        worst_day_r = float("inf")
+        current_loss_streak = 0
+        max_loss_streak = 0
+        open_total = 0
+        peak_open_positions = 0
+        total_closed_trades = 0
+        for index, base_value in enumerate(base_daily):
+            value = base_value + candidate.vector[index]
+            final_r += value
+            sumsq += value * value
+            equity += value
+            peak = max(peak, equity)
+            maxdd_r = max(maxdd_r, peak - equity)
+            positive_day_gain += max(0.0, value)
+            best_day_r = max(best_day_r, value)
+            worst_day_r = min(worst_day_r, value)
+            if value < -1e-9:
+                current_loss_streak += 1
+                max_loss_streak = max(max_loss_streak, current_loss_streak)
+            else:
+                current_loss_streak = 0
+            open_count = base_open[index] + candidate.open_vector[index]
+            open_total += open_count
+            peak_open_positions = max(peak_open_positions, open_count)
+            total_closed_trades += base_closed[index] + candidate.closed_vector[index]
+        if not base_daily:
+            best_day_r = 0.0
+            worst_day_r = 0.0
+
+        months = [
+            value + candidate.month_vector[index]
+            for index, value in enumerate(base_months)
+        ]
+        weeks = [
+            value + candidate.week_vector[index]
+            for index, value in enumerate(base_weeks)
+        ]
+        pos_months, neg_months, _ = count_positive_negative_flat(months)
+        _, neg_weeks, _ = count_positive_negative_flat(weeks)
+        worst_month_r = min(months) if months else 0.0
+        worst_week_r = min(weeks) if weeks else 0.0
+        avg_open_positions = open_total / len(base_open) if base_open else 0.0
+        trades_per_month = (
+            total_closed_trades / self.month_count if self.month_count else 0.0
+        )
+        mean_avg_hold_hours = statistics.mean(
+            self.by_id[attempt_id].avg_hold_hours for attempt_id in trial_ids
+        ) if trial_ids else 0.0
+        violation_size = self._constraint_violation_size_from_stats(
+            trial_ids,
+            avg_open_positions=avg_open_positions,
+            peak_open_positions=float(peak_open_positions),
+            trades_per_month=trades_per_month,
+        )
+        top_day_gain_share = (
+            best_day_r / positive_day_gain if positive_day_gain > 0.0 else 1.0
+        )
+
+        weights = DEFAULT_OBJECTIVES[objective_name]
+        score = 0.0
+        score += weights.get("final_r", 0.0) * final_r
+        score += weights.get("maxdd_r", 0.0) * maxdd_r
+        score += weights.get("positive_month", 0.0) * pos_months
+        score += weights.get("negative_month", 0.0) * neg_months
+        score += weights.get("negative_week", 0.0) * neg_weeks
+        score += weights.get("worst_month_abs", 0.0) * abs(min(0.0, worst_month_r))
+        score += weights.get("worst_week_abs", 0.0) * abs(min(0.0, worst_week_r))
+        score += weights.get("worst_day_abs", 0.0) * abs(min(0.0, worst_day_r))
+        score += weights.get("top_day_share", 0.0) * top_day_gain_share
+        score += weights.get("loss_streak", 0.0) * max_loss_streak
+        score += weights.get("hold_over_24h", 0.0) * max(
+            0.0, mean_avg_hold_hours - 24.0
+        )
+        score += weights.get("avg_open_position", 0.0) * avg_open_positions
+        score += weights.get("peak_open_position", 0.0) * peak_open_positions
+        score += weights.get("avg_open_over_target", 0.0) * max(
+            0.0, avg_open_positions - self.spec.max_avg_open_positions
+        )
+        score += weights.get("peak_open_over_target", 0.0) * max(
+            0.0, peak_open_positions - self.spec.max_peak_open_positions
+        )
+        score += weights.get("trade_over_target_pm", 0.0) * max(
+            0.0, trades_per_month - self.spec.target_trades_per_month
+        )
+        score += weights.get("constraint_violation", 0.0) * violation_size
+        if self.spec.correlation_penalty_weight > 0.0:
+            score -= self.spec.correlation_penalty_weight * self._avg_positive_pair_corr_uncached(
+                trial_ids
+            )
+        if (
+            str(self.spec.diversification_mode or "penalty").lower() == "marginal_sharpe"
+            and self.spec.portfolio_sharpe_weight > 0.0
+            and len(base_daily) >= 2
+        ):
+            mean = final_r / len(base_daily)
+            variance = max(0.0, (sumsq / len(base_daily)) - (mean * mean))
+            std = math.sqrt(variance)
+            sharpe = mean / std if std > 1e-12 else 0.0
+            score += self.spec.portfolio_sharpe_weight * sharpe
+        return score
 
     def pair_corr(self, left_id: str, right_id: str) -> float:
         """Pairwise daily-return correlation, computed at most once per pair per run."""
@@ -1390,13 +1594,26 @@ class PortfolioSearch:
         selected: list[str] = []
         pool = [candidate.attempt_id for candidate in self.candidates]
         while len(selected) < self.spec.portfolio_size:
+            base_daily, base_open, base_closed = self.combine_vectors(selected)
+            base_months = self._group_sums(
+                base_daily, self.month_index, self.month_count
+            )
+            base_weeks = self._group_sums(base_daily, self.week_index, self.week_count)
             best_attempt_id: str | None = None
             best_score = float("-inf")
             for attempt_id in pool:
                 if attempt_id in selected:
                     continue
-                trial = [*selected, attempt_id]
-                score = self.objective_score(trial, objective_name)
+                score = self._objective_score_extension(
+                    selected,
+                    attempt_id,
+                    objective_name,
+                    base_daily=base_daily,
+                    base_open=base_open,
+                    base_closed=base_closed,
+                    base_months=base_months,
+                    base_weeks=base_weeks,
+                )
                 if score > best_score:
                     best_score = score
                     best_attempt_id = attempt_id
@@ -1492,13 +1709,29 @@ class PortfolioSearch:
                 objective_score=best_score,
             )
             for removed in selected:
+                base_ids = [attempt_id for attempt_id in selected if attempt_id != removed]
+                base_daily, base_open, base_closed = self.combine_vectors(base_ids)
+                base_months = self._group_sums(
+                    base_daily, self.month_index, self.month_count
+                )
+                base_weeks = self._group_sums(
+                    base_daily, self.week_index, self.week_count
+                )
                 for added in pool:
                     if added in selected_set:
                         continue
                     evaluated += 1
-                    trial = [attempt_id for attempt_id in selected if attempt_id != removed]
-                    trial.append(added)
-                    score = self.objective_score(trial, objective_name)
+                    trial = [*base_ids, added]
+                    score = self._objective_score_extension(
+                        base_ids,
+                        added,
+                        objective_name,
+                        base_daily=base_daily,
+                        base_open=base_open,
+                        base_closed=base_closed,
+                        base_months=base_months,
+                        base_weeks=base_weeks,
+                    )
                     if score > best_score + 1e-9:
                         best_move = (score, removed, added, trial)
                         best_score = score
@@ -1514,6 +1747,7 @@ class PortfolioSearch:
                 )
                 break
             score, removed, added, trial = best_move
+            score = self.objective_score(trial, objective_name)
             swaps.append(
                 {
                     "removed": removed,
@@ -1817,16 +2051,18 @@ def _ensure_rust_optimizer_extension(*, release: bool = True) -> Path:
 
 
 def _load_rust_optimizer_module(*, release: bool = True) -> Any:
+    cached = _RUST_OPTIMIZER_MODULES.get(bool(release))
+    if cached is not None:
+        return cached
     cdylib_path = _ensure_rust_optimizer_extension(release=release)
-    extension_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".pyd"
-    extension_root = _repo_root() / ".tmp" / "portfolio_optimizer_pyo3"
-    extension_root.mkdir(parents=True, exist_ok=True)
-    module_dir = Path(tempfile.mkdtemp(prefix="runtime-", dir=extension_root))
-    module_path = module_dir / f"portfolio_optimizer_rs{extension_suffix}"
-    shutil.copy2(cdylib_path, module_path)
-    spec = importlib.util.spec_from_file_location("portfolio_optimizer_rs", module_path)
+    loader = importlib.machinery.ExtensionFileLoader(
+        "portfolio_optimizer_rs", str(cdylib_path)
+    )
+    spec = importlib.util.spec_from_file_location(
+        "portfolio_optimizer_rs", cdylib_path, loader=loader
+    )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"failed to create import spec for {module_path}")
+        raise RuntimeError(f"failed to create import spec for {cdylib_path}")
     module = importlib.util.module_from_spec(spec)
     previous_module = sys.modules.pop("portfolio_optimizer_rs", None)
     try:
@@ -1837,6 +2073,7 @@ def _load_rust_optimizer_module(*, release: bool = True) -> Any:
         if previous_module is not None:
             sys.modules["portfolio_optimizer_rs"] = previous_module
         raise
+    _RUST_OPTIMIZER_MODULES[bool(release)] = module
     return module
 
 
@@ -1882,10 +2119,10 @@ def run_optimizer_backend(
     candidates: list[OptimizerCandidate],
     spec: PortfolioOptimizerSpec,
     *,
-    backend: str = "python",
+    backend: str = "auto",
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[PortfolioSearch, dict[str, dict[str, Any]], list[dict[str, Any]], str]:
-    requested_backend = str(backend or "python").lower()
+    requested_backend = str(backend or "auto").lower()
     if requested_backend not in {"python", "pyo3", "auto"}:
         raise ValueError(f"Unsupported optimizer backend: {backend}")
     search = PortfolioSearch(candidates, spec, progress_callback=progress_callback)
@@ -1907,18 +2144,19 @@ def run_optimizer_backend(
             )
         return search, variants, pareto_front, "pyo3"
     except Exception as exc:
-        if requested_backend != "auto":
-            raise
         if progress_callback is not None:
             progress_callback(
                 {
-                    "event": "rust_optimizer_fallback",
-                    "backend": "python",
+                    "event": "rust_optimizer_failed",
+                    "backend": "pyo3",
+                    "requested_backend": requested_backend,
                     "reason": str(exc),
                 }
             )
-        variants = search.optimize()
-        return search, variants, search.pareto_front(limit=50), "python"
+        raise RuntimeError(
+            "Rust/PyO3 portfolio optimizer failed; Python fallback is disabled. "
+            "Fix the native backend before running portfolio optimization."
+        ) from exc
 
 
 def load_baseline_attempt_ids(report_path: Path) -> list[str]:

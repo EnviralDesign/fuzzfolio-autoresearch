@@ -11,6 +11,7 @@ import autoresearch.__main__ as ar_main
 from autoresearch.catalog_index import (
     catalog_summary_from_sqlite,
     iter_catalog_rows,
+    iter_promoted_catalog_rows,
     refresh_incremental_attempt_catalog,
     stream_catalog_csv_from_sqlite,
     stream_catalog_json_from_sqlite,
@@ -112,6 +113,71 @@ def _write_full_backtest(artifact_dir) -> None:
     )
 
 
+def test_promoted_catalog_query_deserializes_only_eligible_rows(tmp_path: Path) -> None:
+    config = SimpleNamespace(
+        attempt_catalog_sqlite_path=tmp_path / "attempt-catalog.sqlite"
+    )
+
+    def row(
+        run_id: str,
+        attempt_id: str,
+        *,
+        runner: str = "play_hand_v1",
+        canonical: bool = False,
+        final: bool = False,
+        score: float = 50.0,
+        tombstoned: bool = False,
+    ) -> dict:
+        return {
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "runner": runner,
+            "candidate_name": "final_36mo" if final else attempt_id,
+            "attempt_role": "final" if final else "probe",
+            "score_36m": score,
+            "composite_score": score,
+            "is_canonical_attempt": canonical,
+            "is_canonical_playhand_attempt": canonical,
+            "is_tombstoned": tombstoned,
+        }
+
+    runs = {
+        "canonical-playhand": [
+            row("canonical-playhand", "raw", score=99),
+            row("canonical-playhand", "canonical", canonical=True, score=60),
+        ],
+        "fallback-playhand": [
+            row("fallback-playhand", "final-low", final=True, score=55),
+            row("fallback-playhand", "final-high", final=True, score=75),
+        ],
+        "incomplete-playhand": [row("incomplete-playhand", "probe-only", score=90)],
+        "manual-run": [
+            row("manual-run", "manual-a", runner="manual", score=65),
+            row("manual-run", "manual-b", runner="manual", score=64),
+        ],
+        "tombstoned-run": [
+            row("tombstoned-run", "canonical-tomb", canonical=True, score=88),
+            row("tombstoned-run", "marker", tombstoned=True),
+        ],
+    }
+    with catalog_index._connect_catalog_db(config.attempt_catalog_sqlite_path) as conn:
+        for run_id, rows in runs.items():
+            catalog_index._replace_run_rows(
+                conn,
+                run_id=run_id,
+                signature={"run_id": run_id},
+                rows=rows,
+            )
+        conn.commit()
+
+    promoted = list(iter_promoted_catalog_rows(config))
+
+    assert {item["attempt_id"] for item in promoted} == {
+        "canonical",
+        "final-high",
+        "manual-a",
+        "manual-b",
+    }
 def test_incremental_catalog_reuses_unchanged_runs_and_rebuilds_changed_artifacts(tmp_path) -> None:
     runs_root = tmp_path / "runs"
     derived_root = runs_root / "derived"

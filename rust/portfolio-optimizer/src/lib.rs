@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use chrono::{Datelike, NaiveDate};
 #[cfg(feature = "python-extension")]
 use pyo3::{exceptions::PyValueError, prelude::*};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -278,6 +279,8 @@ struct OptimizerCandidate {
     vector: Vec<f64>,
     open_vector: Vec<i64>,
     closed_vector: Vec<i64>,
+    month_vector: Vec<f64>,
+    week_vector: Vec<f64>,
 }
 
 impl OptimizerCandidate {
@@ -420,12 +423,24 @@ struct PortfolioSearch {
     objectives: BTreeMap<String, BTreeMap<String, f64>>,
     by_id: HashMap<String, usize>,
     dates: Vec<String>,
+    month_indexes: Vec<usize>,
+    week_indexes: Vec<usize>,
+    month_count: usize,
+    week_count: usize,
     metrics_cache: HashMap<(String, bool, bool), Value>,
     score_cache: HashMap<(String, String), f64>,
     archive: HashMap<String, ArchiveItem>,
-    pair_corr_cache: HashMap<(String, String), f64>,
+    pair_corr_matrix: Option<Vec<f64>>,
     positive_corr_cache: HashMap<String, f64>,
     sharpe_cache: HashMap<String, f64>,
+}
+
+struct TrialBase {
+    daily: Vec<f64>,
+    open_counts: Vec<i64>,
+    closed_counts: Vec<i64>,
+    months: Vec<f64>,
+    weeks: Vec<f64>,
 }
 
 impl PortfolioSearch {
@@ -486,6 +501,8 @@ impl PortfolioSearch {
             .enumerate()
             .map(|(index, date)| (date.clone(), index))
             .collect();
+        let (month_indexes, month_count) = calendar_bucket_indexes(&dates, "month");
+        let (week_indexes, week_count) = calendar_bucket_indexes(&dates, "week");
         for candidate in &mut candidates {
             let mut vector = vec![0.0; dates.len()];
             let mut open_vector = vec![0; dates.len()];
@@ -501,22 +518,47 @@ impl PortfolioSearch {
             candidate.vector = vector;
             candidate.open_vector = open_vector;
             candidate.closed_vector = closed_vector;
+            candidate.month_vector =
+                group_by_indexes(&candidate.vector, &month_indexes, month_count);
+            candidate.week_vector = group_by_indexes(&candidate.vector, &week_indexes, week_count);
         }
-        let by_id = candidates
+        let by_id: HashMap<String, usize> = candidates
             .iter()
             .enumerate()
             .map(|(index, candidate)| (candidate.attempt_id.clone(), index))
             .collect();
+        let pair_corr_matrix = if spec.correlation_penalty_weight > 0.0 {
+            let candidate_count = candidates.len();
+            let mut matrix = vec![0.0; candidate_count * candidate_count];
+            matrix
+                .par_chunks_mut(candidate_count.max(1))
+                .enumerate()
+                .for_each(|(left_index, row)| {
+                    for right_index in (left_index + 1)..candidate_count {
+                        row[right_index] = pearson_corr(
+                            &candidates[left_index].vector,
+                            &candidates[right_index].vector,
+                        );
+                    }
+                });
+            Some(matrix)
+        } else {
+            None
+        };
         Self {
             spec,
             candidates,
             objectives,
             by_id,
             dates,
+            month_indexes,
+            week_indexes,
+            month_count,
+            week_count,
             metrics_cache: HashMap::new(),
             score_cache: HashMap::new(),
             archive: HashMap::new(),
-            pair_corr_cache: HashMap::new(),
+            pair_corr_matrix,
             positive_corr_cache: HashMap::new(),
             sharpe_cache: HashMap::new(),
         }
@@ -650,30 +692,289 @@ impl PortfolioSearch {
         (daily, open_counts, closed_counts)
     }
 
+    fn trial_base(&self, selected_ids: &[String], removed_index: Option<usize>) -> TrialBase {
+        let mut daily = vec![0.0; self.dates.len()];
+        let mut open_counts = vec![0; self.dates.len()];
+        let mut closed_counts = vec![0; self.dates.len()];
+        for (position, attempt_id) in selected_ids.iter().enumerate() {
+            if removed_index == Some(position) {
+                continue;
+            }
+            if let Some(candidate) = self.candidate(attempt_id) {
+                for index in 0..self.dates.len() {
+                    daily[index] += candidate.vector[index];
+                    open_counts[index] += candidate.open_vector[index];
+                    closed_counts[index] += candidate.closed_vector[index];
+                }
+            }
+        }
+        let months = group_by_indexes(&daily, &self.month_indexes, self.month_count);
+        let weeks = group_by_indexes(&daily, &self.week_indexes, self.week_count);
+        TrialBase {
+            daily,
+            open_counts,
+            closed_counts,
+            months,
+            weeks,
+        }
+    }
+
+    fn constraint_violation_size_from_stats(
+        &self,
+        selected_ids: &[&str],
+        avg_open_positions: f64,
+        peak_open_positions: f64,
+        trades_per_month: f64,
+    ) -> f64 {
+        let mut instrument_counts: HashMap<&str, f64> = HashMap::new();
+        let mut family_counts: HashMap<&str, usize> = HashMap::new();
+        let mut fx_share = 0.0;
+        let mut metal_share = 0.0;
+        let mut index_share = 0.0;
+        for attempt_id in selected_ids {
+            let Some(candidate) = self.candidate(attempt_id) else {
+                continue;
+            };
+            *family_counts.entry(candidate.family.as_str()).or_insert(0) += 1;
+            let share = 1.0 / candidate.instruments.len().max(1) as f64;
+            for instrument in &candidate.instruments {
+                *instrument_counts.entry(instrument.as_str()).or_insert(0.0) += share;
+                match instrument_asset_class(instrument).as_str() {
+                    "fx" => fx_share += share,
+                    "metal" => metal_share += share,
+                    "index" => index_share += share,
+                    _ => {}
+                }
+            }
+        }
+        let mut violation_size = selected_ids.len().abs_diff(self.spec.portfolio_size) as f64;
+        let unique_count = selected_ids.iter().copied().collect::<HashSet<_>>().len();
+        violation_size += selected_ids.len().saturating_sub(unique_count) as f64;
+        violation_size += (instrument_counts.values().copied().fold(0.0, f64::max)
+            - self.spec.max_instrument_share)
+            .max(0.0);
+        violation_size += (family_counts.values().copied().max().unwrap_or(0) as f64
+            - self.spec.max_per_family as f64)
+            .max(0.0);
+        violation_size += (self.spec.min_fx_share - fx_share).max(0.0);
+        violation_size += (metal_share - self.spec.max_metal_share).max(0.0);
+        violation_size += (index_share - self.spec.max_index_share).max(0.0);
+        if self.spec.max_avg_open_positions > 0.0 {
+            violation_size += (avg_open_positions - self.spec.max_avg_open_positions).max(0.0);
+        }
+        if self.spec.max_peak_open_positions > 0.0 {
+            violation_size += (peak_open_positions - self.spec.max_peak_open_positions).max(0.0);
+        }
+        if self.spec.max_trades_per_month > 0.0 {
+            violation_size += (trades_per_month - self.spec.max_trades_per_month).max(0.0);
+        }
+        violation_size
+    }
+
+    fn avg_positive_pair_corr_refs(&self, selected_ids: &[&str]) -> f64 {
+        let mut ids = selected_ids
+            .iter()
+            .copied()
+            .filter(|attempt_id| self.by_id.contains_key(*attempt_id))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let mut total = 0.0;
+        let mut pairs = 0usize;
+        for left_index in 0..ids.len() {
+            for right_id in ids.iter().skip(left_index + 1) {
+                total += self.pair_corr(ids[left_index], right_id).max(0.0);
+                pairs += 1;
+            }
+        }
+        if pairs > 0 { total / pairs as f64 } else { 0.0 }
+    }
+
+    fn objective_score_extension(
+        &self,
+        selected_ids: &[String],
+        removed_index: Option<usize>,
+        added_id: &str,
+        weights: &BTreeMap<String, f64>,
+        base: &TrialBase,
+    ) -> f64 {
+        let Some(added) = self.candidate(added_id) else {
+            return f64::NEG_INFINITY;
+        };
+        let mut trial_ids = Vec::with_capacity(selected_ids.len() + 1);
+        for (position, attempt_id) in selected_ids.iter().enumerate() {
+            if removed_index != Some(position) {
+                trial_ids.push(attempt_id.as_str());
+            }
+        }
+        trial_ids.push(added_id);
+
+        let mut final_r = 0.0;
+        let mut sumsq = 0.0;
+        let mut equity: f64 = 0.0;
+        let mut peak: f64 = 0.0;
+        let mut maxdd_r: f64 = 0.0;
+        let mut positive_day_gain = 0.0;
+        let mut best_day_r = f64::NEG_INFINITY;
+        let mut worst_day_r = f64::INFINITY;
+        let mut current_loss_streak = 0usize;
+        let mut max_loss_streak = 0usize;
+        let mut open_total = 0i64;
+        let mut peak_open_positions = 0i64;
+        let mut total_closed_trades = 0i64;
+        for index in 0..self.dates.len() {
+            let value = base.daily[index] + added.vector[index];
+            final_r += value;
+            sumsq += value * value;
+            equity += value;
+            peak = peak.max(equity);
+            maxdd_r = maxdd_r.max(peak - equity);
+            positive_day_gain += value.max(0.0);
+            best_day_r = best_day_r.max(value);
+            worst_day_r = worst_day_r.min(value);
+            if value < -1e-9 {
+                current_loss_streak += 1;
+                max_loss_streak = max_loss_streak.max(current_loss_streak);
+            } else {
+                current_loss_streak = 0;
+            }
+            let open_count = base.open_counts[index] + added.open_vector[index];
+            open_total += open_count;
+            peak_open_positions = peak_open_positions.max(open_count);
+            total_closed_trades += base.closed_counts[index] + added.closed_vector[index];
+        }
+        if self.dates.is_empty() {
+            best_day_r = 0.0;
+            worst_day_r = 0.0;
+        }
+
+        let mut pos_months = 0usize;
+        let mut neg_months = 0usize;
+        let mut worst_month_r = f64::INFINITY;
+        for (index, base_value) in base.months.iter().enumerate() {
+            let value = base_value + added.month_vector[index];
+            if value > 1e-9 {
+                pos_months += 1;
+            } else if value < -1e-9 {
+                neg_months += 1;
+            }
+            worst_month_r = worst_month_r.min(value);
+        }
+        if base.months.is_empty() {
+            worst_month_r = 0.0;
+        }
+        let mut neg_weeks = 0usize;
+        let mut worst_week_r = f64::INFINITY;
+        for (index, base_value) in base.weeks.iter().enumerate() {
+            let value = base_value + added.week_vector[index];
+            if value < -1e-9 {
+                neg_weeks += 1;
+            }
+            worst_week_r = worst_week_r.min(value);
+        }
+        if base.weeks.is_empty() {
+            worst_week_r = 0.0;
+        }
+
+        let day_count = self.dates.len();
+        let avg_open_positions = if day_count > 0 {
+            open_total as f64 / day_count as f64
+        } else {
+            0.0
+        };
+        let trades_per_month = if self.month_count > 0 {
+            total_closed_trades as f64 / self.month_count as f64
+        } else {
+            0.0
+        };
+        let mean_avg_hold_hours = if trial_ids.is_empty() {
+            0.0
+        } else {
+            trial_ids
+                .iter()
+                .filter_map(|attempt_id| self.candidate(attempt_id))
+                .map(|candidate| candidate.avg_hold_hours)
+                .sum::<f64>()
+                / trial_ids.len() as f64
+        };
+        let violation_size = self.constraint_violation_size_from_stats(
+            &trial_ids,
+            avg_open_positions,
+            peak_open_positions as f64,
+            trades_per_month,
+        );
+        let top_day_gain_share = if positive_day_gain > 0.0 {
+            best_day_r / positive_day_gain
+        } else {
+            1.0
+        };
+
+        let mut score = 0.0;
+        score += weight(weights, "final_r") * final_r;
+        score += weight(weights, "maxdd_r") * maxdd_r;
+        score += weight(weights, "positive_month") * pos_months as f64;
+        score += weight(weights, "negative_month") * neg_months as f64;
+        score += weight(weights, "negative_week") * neg_weeks as f64;
+        score += weight(weights, "worst_month_abs") * worst_month_r.min(0.0).abs();
+        score += weight(weights, "worst_week_abs") * worst_week_r.min(0.0).abs();
+        score += weight(weights, "worst_day_abs") * worst_day_r.min(0.0).abs();
+        score += weight(weights, "top_day_share") * top_day_gain_share;
+        score += weight(weights, "loss_streak") * max_loss_streak as f64;
+        score += weight(weights, "hold_over_24h") * (mean_avg_hold_hours - 24.0).max(0.0);
+        score += weight(weights, "avg_open_position") * avg_open_positions;
+        score += weight(weights, "peak_open_position") * peak_open_positions as f64;
+        score += weight(weights, "avg_open_over_target")
+            * (avg_open_positions - self.spec.max_avg_open_positions).max(0.0);
+        score += weight(weights, "peak_open_over_target")
+            * (peak_open_positions as f64 - self.spec.max_peak_open_positions).max(0.0);
+        score += weight(weights, "trade_over_target_pm")
+            * (trades_per_month - self.spec.target_trades_per_month).max(0.0);
+        score += weight(weights, "constraint_violation") * violation_size;
+        if self.spec.correlation_penalty_weight > 0.0 {
+            score -=
+                self.spec.correlation_penalty_weight * self.avg_positive_pair_corr_refs(&trial_ids);
+        }
+        if self.spec.diversification_mode.to_lowercase() == "marginal_sharpe"
+            && self.spec.portfolio_sharpe_weight > 0.0
+            && day_count >= 2
+        {
+            let mean = final_r / day_count as f64;
+            let variance = ((sumsq / day_count as f64) - (mean * mean)).max(0.0);
+            let std = variance.sqrt();
+            let sharpe = if std > 1e-12 { mean / std } else { 0.0 };
+            score += self.spec.portfolio_sharpe_weight * sharpe;
+        }
+        score
+    }
+
     fn candidate(&self, attempt_id: &str) -> Option<&OptimizerCandidate> {
         self.by_id
             .get(attempt_id)
             .and_then(|index| self.candidates.get(*index))
     }
 
-    fn pair_corr(&mut self, left_id: &str, right_id: &str) -> f64 {
+    fn pair_corr(&self, left_id: &str, right_id: &str) -> f64 {
         if left_id == right_id {
             return 1.0;
         }
-        let key = if left_id < right_id {
-            (left_id.to_string(), right_id.to_string())
-        } else {
-            (right_id.to_string(), left_id.to_string())
+        let Some(&left_index) = self.by_id.get(left_id) else {
+            return 0.0;
         };
-        if let Some(value) = self.pair_corr_cache.get(&key) {
-            return *value;
+        let Some(&right_index) = self.by_id.get(right_id) else {
+            return 0.0;
+        };
+        let (lower, upper) = if left_index < right_index {
+            (left_index, right_index)
+        } else {
+            (right_index, left_index)
+        };
+        if let Some(matrix) = &self.pair_corr_matrix {
+            return matrix[lower * self.candidates.len() + upper];
         }
-        let value = match (self.candidate(&key.0), self.candidate(&key.1)) {
+        match (self.candidates.get(lower), self.candidates.get(upper)) {
             (Some(left), Some(right)) => pearson_corr(&left.vector, &right.vector),
             _ => 0.0,
-        };
-        self.pair_corr_cache.insert(key, value);
-        value
+        }
     }
 
     fn avg_positive_pair_corr(&mut self, selected_ids: &[String]) -> f64 {
@@ -1179,18 +1480,30 @@ impl PortfolioSearch {
             .iter()
             .map(|candidate| candidate.attempt_id.clone())
             .collect();
+        let Some(weights) = self.objectives.get(objective_name).cloned() else {
+            return selected;
+        };
         while selected.len() < self.spec.portfolio_size {
+            let base = self.trial_base(&selected, None);
+            let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
+            let scores: Vec<f64> = pool
+                .par_iter()
+                .map(|attempt_id| {
+                    if selected_set.contains(attempt_id.as_str()) {
+                        f64::NEG_INFINITY
+                    } else {
+                        self.objective_score_extension(&selected, None, attempt_id, &weights, &base)
+                    }
+                })
+                .collect();
             let mut best_attempt_id: Option<String> = None;
             let mut best_score = f64::NEG_INFINITY;
-            for attempt_id in &pool {
-                if selected.contains(attempt_id) {
+            for (attempt_id, score) in pool.iter().zip(scores.iter()) {
+                if selected_set.contains(attempt_id.as_str()) {
                     continue;
                 }
-                let mut trial = selected.clone();
-                trial.push(attempt_id.clone());
-                let score = self.objective_score(&trial, objective_name);
-                if score > best_score {
-                    best_score = score;
+                if *score > best_score {
+                    best_score = *score;
                     best_attempt_id = Some(attempt_id.clone());
                 }
             }
@@ -1280,30 +1593,59 @@ impl PortfolioSearch {
                 pool.push(attempt_id.clone());
             }
         }
+        let Some(weights) = self.objectives.get(objective_name).cloned() else {
+            return (selected, swaps);
+        };
         for _ in 0..self.spec.max_swaps {
-            let mut best_move: Option<(f64, String, String, Vec<String>)> = None;
-            let selected_set: HashSet<String> = selected.iter().cloned().collect();
-            for removed in &selected {
-                for added in &pool {
-                    if selected_set.contains(added) {
-                        continue;
+            let selected_set: HashSet<&str> = selected.iter().map(String::as_str).collect();
+            let bases: Vec<TrialBase> = (0..selected.len())
+                .map(|removed_index| self.trial_base(&selected, Some(removed_index)))
+                .collect();
+            let trial_count = selected.len() * pool.len();
+            let scores: Vec<f64> = (0..trial_count)
+                .into_par_iter()
+                .map(|flat_index| {
+                    let removed_index = flat_index / pool.len();
+                    let added = &pool[flat_index % pool.len()];
+                    if selected_set.contains(added.as_str()) {
+                        f64::NEG_INFINITY
+                    } else {
+                        self.objective_score_extension(
+                            &selected,
+                            Some(removed_index),
+                            added,
+                            &weights,
+                            &bases[removed_index],
+                        )
                     }
-                    let mut trial: Vec<String> = selected
-                        .iter()
-                        .filter(|attempt_id| *attempt_id != removed)
-                        .cloned()
-                        .collect();
-                    trial.push(added.clone());
-                    let score = self.objective_score(&trial, objective_name);
-                    if score > best_score + 1e-9 {
-                        best_move = Some((score, removed.clone(), added.clone(), trial));
-                        best_score = score;
-                    }
+                })
+                .collect();
+            let mut best_flat_index = None;
+            for (flat_index, score) in scores.iter().enumerate() {
+                let added = &pool[flat_index % pool.len()];
+                if selected_set.contains(added.as_str()) {
+                    continue;
+                }
+                if *score > best_score + 1e-9 {
+                    best_score = *score;
+                    best_flat_index = Some(flat_index);
                 }
             }
-            let Some((score, removed, added, trial)) = best_move else {
+            let Some(flat_index) = best_flat_index else {
                 break;
             };
+            let removed_index = flat_index / pool.len();
+            let removed = selected[removed_index].clone();
+            let added = pool[flat_index % pool.len()].clone();
+            let mut trial: Vec<String> = selected
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| *position != removed_index)
+                .map(|(_, attempt_id)| attempt_id.clone())
+                .collect();
+            trial.push(added.clone());
+            let score = self.objective_score(&trial, objective_name);
+            best_score = score;
             swaps.push(SwapMove {
                 removed,
                 added,
@@ -1740,6 +2082,8 @@ fn candidate_from_input(input: OptimizerCandidateInput) -> OptimizerCandidate {
         vector: Vec::new(),
         open_vector: Vec::new(),
         closed_vector: Vec::new(),
+        month_vector: Vec::new(),
+        week_vector: Vec::new(),
     }
 }
 
@@ -1809,6 +2153,30 @@ fn loss_streak(values: &[f64]) -> (usize, f64) {
         streaks.iter().sum::<usize>() as f64 / streaks.len() as f64
     };
     (longest, average)
+}
+
+fn calendar_bucket_indexes(dates: &[String], mode: &str) -> (Vec<usize>, usize) {
+    let mut indexes = Vec::with_capacity(dates.len());
+    let mut by_key = HashMap::new();
+    for date_text in dates {
+        let key = match mode {
+            "month" => date_text.chars().take(7).collect::<String>(),
+            "week" => week_key(date_text),
+            _ => date_text.clone(),
+        };
+        let next_index = by_key.len();
+        let index = *by_key.entry(key).or_insert(next_index);
+        indexes.push(index);
+    }
+    (indexes, by_key.len())
+}
+
+fn group_by_indexes(values: &[f64], indexes: &[usize], size: usize) -> Vec<f64> {
+    let mut grouped = vec![0.0; size];
+    for (value, index) in values.iter().zip(indexes.iter()) {
+        grouped[*index] += value;
+    }
+    grouped
 }
 
 fn group_values(dates: &[String], values: &[f64], mode: &str) -> BTreeMap<String, f64> {
@@ -2351,6 +2719,44 @@ mod tests {
             output.variants["stability"].metrics["max_daily_loss_streak"],
             json!(0)
         );
+    }
+
+    #[test]
+    fn transient_trials_match_full_scores_without_growing_caches() {
+        let mut spec = PortfolioOptimizerSpec {
+            portfolio_size: 3,
+            candidate_limit: 4,
+            objective_names: vec!["balanced".to_string()],
+            random_starts: 0,
+            max_swaps: 2,
+            max_per_family: 3,
+            min_fx_share: 0.0,
+            max_instrument_share: 3.0,
+            correlation_penalty_weight: 10.0,
+            diversification_mode: "marginal_sharpe".to_string(),
+            portfolio_sharpe_weight: 20.0,
+            ..PortfolioOptimizerSpec::default()
+        };
+        spec.max_metal_share = 3.0;
+        let candidates = vec![
+            candidate("a", "EURUSD", vec![1.0, -0.5, 1.5, 0.2], 80.0),
+            candidate("b", "GBPUSD", vec![0.2, 0.8, -0.3, 1.1], 79.0),
+            candidate("c", "USDJPY", vec![-0.1, 0.7, 0.4, 0.6], 78.0),
+            candidate("d", "AUDUSD", vec![0.5, -0.2, 0.9, 0.3], 77.0),
+        ];
+        let mut search = PortfolioSearch::new(candidates, spec, default_objectives());
+        let selected = vec!["a".to_string(), "b".to_string()];
+        let base = search.trial_base(&selected, None);
+        let weights = search.objectives["balanced"].clone();
+        let transient = search.objective_score_extension(&selected, None, "c", &weights, &base);
+
+        assert!(search.metrics_cache.is_empty());
+        assert!(search.score_cache.is_empty());
+        assert!(search.positive_corr_cache.is_empty());
+        assert!(search.sharpe_cache.is_empty());
+        let trial = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let full = search.objective_score(&trial, "balanced");
+        assert!((transient - full).abs() < 1e-9);
     }
 
     #[test]

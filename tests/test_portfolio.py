@@ -1465,6 +1465,7 @@ def test_build_parser_includes_finalize_corpus_defaults() -> None:
     parser = ar_main.build_parser()
 
     args = parser.parse_args(["finalize-corpus"])
+    optimizer_args = parser.parse_args(["optimize-portfolio"])
 
     assert args.command == "finalize-corpus"
     assert args.scope == "dashboard"
@@ -1476,6 +1477,7 @@ def test_build_parser_includes_finalize_corpus_defaults() -> None:
     assert args.dry_run is False
     assert args.run_id is None
     assert args.attempt_id is None
+    assert optimizer_args.optimizer_backend == "auto"
     play_args = parser.parse_args(["play-hand"])
     assert play_args.early_exit_mode == "off"
     assert play_args.coarse_halving_mode == "off"
@@ -1501,6 +1503,37 @@ def test_build_parser_includes_finalize_corpus_defaults() -> None:
     assert enforced_args.coarse_probe_budget == 64
     assert enforced_args.family_policy_mode == "enforce"
     assert enforced_args.resource_trace is True
+
+
+def test_optimizer_artifact_preflight_warning_is_prominent_and_actionable() -> None:
+    warning = ar_main._optimizer_artifact_preflight_warning(
+        scoped_row_count=100,
+        rejected=[
+            {"run_id": "run-a", "attempt_id": "attempt-a"},
+            {"run_id": "run-b", "attempt_id": "attempt-b"},
+        ],
+        reason_counts={"stale_effective_end": 2, "threshold_mismatch": 1},
+    )
+
+    assert warning is not None
+    assert "PORTFOLIO OPTIMIZER CORPUS WARNING" in warning
+    assert "INCOMPLETE CANDIDATE UNIVERSE" in warning
+    assert "2 of 100" in warning
+    assert "stale_effective_end=2" in warning
+    assert "threshold_mismatch=1" in warning
+    assert "run-a/attempt-a" in warning
+    assert "DO NOT TREAT THIS RESULT AS PROMOTION-READY" in warning
+
+
+def test_optimizer_artifact_preflight_warning_is_silent_for_clean_corpus() -> None:
+    assert (
+        ar_main._optimizer_artifact_preflight_warning(
+            scoped_row_count=100,
+            rejected=[],
+            reason_counts={},
+        )
+        is None
+    )
 
 
 def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(

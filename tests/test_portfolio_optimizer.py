@@ -86,6 +86,26 @@ def _row(
     }
 
 
+def test_optimizer_uses_current_36m_score_over_stale_discovery_scores(tmp_path: Path) -> None:
+    stale_winner = _row(tmp_path, "stale-winner", "EURUSD", [1, 2, 3], score=0.0)
+    stale_winner["score_lab_score_36m"] = 0.0
+    stale_winner["final_scrutiny_score"] = 80.51
+    stale_winner["composite_score"] = 80.51
+
+    current_winner = _row(tmp_path, "current-winner", "GBPUSD", [1, 2, 3], score=61.0)
+    current_winner["final_scrutiny_score"] = 95.0
+    current_winner["composite_score"] = 95.0
+
+    candidates, rejections = build_optimizer_candidates(
+        [stale_winner, current_winner],
+        PortfolioOptimizerSpec(portfolio_size=1, min_score=50),
+    )
+
+    assert [candidate.attempt_id for candidate in candidates] == ["current-winner"]
+    assert candidates[0].score == 61.0
+    assert rejections["score_below_min"] == 1
+
+
 def test_optimizer_filters_long_hold_candidates(tmp_path: Path) -> None:
     rows = [
         _row(tmp_path, "fast", "EURUSD", [1, 2, 3], avg_hold=12),
@@ -164,7 +184,9 @@ def test_optimizer_selects_portfolio_from_source_calendar_curves(tmp_path: Path)
     assert metrics["max_daily_loss_streak"] == 0
 
 
-def test_optimizer_backend_dispatch_preserves_python_default(tmp_path: Path) -> None:
+def test_optimizer_backend_explicit_python_remains_available_for_parity(
+    tmp_path: Path,
+) -> None:
     rows = [
         _row(tmp_path, "smooth-a", "EURUSD", [1, 2, 3, 4], score=65),
         _row(tmp_path, "smooth-b", "XAUUSD", [0.5, 1.5, 2.5, 3.5], score=65),
@@ -187,6 +209,7 @@ def test_optimizer_backend_dispatch_preserves_python_default(tmp_path: Path) -> 
     search, variants, pareto_front, used_backend = run_optimizer_backend(
         candidates,
         spec,
+        backend="python",
     )
 
     assert used_backend == "python"
@@ -195,7 +218,7 @@ def test_optimizer_backend_dispatch_preserves_python_default(tmp_path: Path) -> 
     assert pareto_front
 
 
-def test_optimizer_backend_auto_falls_back_to_python(
+def test_optimizer_backend_default_auto_fails_closed_when_pyo3_is_unavailable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -224,16 +247,130 @@ def test_optimizer_backend_auto_falls_back_to_python(
 
     monkeypatch.setattr(portfolio_optimizer_module, "_run_pyo3_optimizer", broken_pyo3)
 
-    _, variants, _, used_backend = run_optimizer_backend(
-        candidates,
-        spec,
-        backend="auto",
-        progress_callback=events.append,
-    )
+    with pytest.raises(RuntimeError, match="Python fallback is disabled"):
+        run_optimizer_backend(
+            candidates,
+            spec,
+            progress_callback=events.append,
+        )
 
-    assert used_backend == "python"
-    assert set(variants["stability"]["selected_attempt_ids"]) == {"smooth-a", "smooth-b"}
-    assert any(event.get("event") == "rust_optimizer_fallback" for event in events)
+    assert any(
+        event.get("event") == "rust_optimizer_failed"
+        and event.get("requested_backend") == "auto"
+        for event in events
+    )
+    assert not any(event.get("event") == "rust_optimizer_fallback" for event in events)
+
+
+def test_transient_trials_match_full_scores_without_growing_selection_caches(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        _row(
+            tmp_path,
+            f"candidate-{index}",
+            ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF"][index],
+            [0.0, 1.0 + index * 0.1, 0.5, 2.0 + index * 0.2, 1.5, 3.0],
+            score=80 - index,
+        )
+        for index in range(6)
+    ]
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=3,
+        candidate_limit=6,
+        objective_names=("balanced",),
+        random_starts=0,
+        max_swaps=2,
+        min_fx_share=0,
+        max_instrument_share=3,
+        max_per_family=3,
+        correlation_penalty_weight=10,
+        diversification_mode="marginal_sharpe",
+        portfolio_sharpe_weight=20,
+    )
+    candidates, _ = build_optimizer_candidates(rows, spec)
+    search = PortfolioSearch(candidates, spec)
+    base_ids = [candidate.attempt_id for candidate in candidates[:2]]
+    base_daily, base_open, base_closed = search.combine_vectors(base_ids)
+    base_months = search._group_sums(base_daily, search.month_index, search.month_count)
+    base_weeks = search._group_sums(base_daily, search.week_index, search.week_count)
+
+    transient_scores = {}
+    for candidate in candidates[2:]:
+        transient_scores[candidate.attempt_id] = search._objective_score_extension(
+            base_ids,
+            candidate.attempt_id,
+            "balanced",
+            base_daily=base_daily,
+            base_open=base_open,
+            base_closed=base_closed,
+            base_months=base_months,
+            base_weeks=base_weeks,
+        )
+
+    assert search._metrics_cache == {}
+    assert search._score_cache == {}
+    assert search._positive_corr_cache == {}
+    assert search._sharpe_cache == {}
+    assert search._sum_stats_cache == {}
+    added_id = candidates[2].attempt_id
+    full_score = search.objective_score([*base_ids, added_id], "balanced")
+    assert transient_scores[added_id] == pytest.approx(full_score, abs=1e-9)
+
+
+def test_optimizer_caches_scale_with_accepted_portfolios_not_rejected_trials(
+    tmp_path: Path,
+) -> None:
+    instruments = [
+        "EURUSD",
+        "GBPUSD",
+        "USDJPY",
+        "AUDUSD",
+        "USDCAD",
+        "USDCHF",
+        "NZDUSD",
+        "EURGBP",
+        "EURJPY",
+        "GBPJPY",
+        "AUDJPY",
+        "CADJPY",
+    ]
+    rows = [
+        _row(
+            tmp_path,
+            f"candidate-{index}",
+            instruments[index],
+            [0.0, 1.0 + index * 0.05, 0.5, 1.8, 1.2, 2.5 + index * 0.03],
+            score=90 - index,
+        )
+        for index in range(len(instruments))
+    ]
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=4,
+        candidate_limit=len(rows),
+        swap_candidate_limit=-1,
+        objective_names=("balanced",),
+        random_starts=2,
+        max_swaps=3,
+        min_fx_share=0,
+        max_instrument_share=4,
+        max_per_family=4,
+        correlation_penalty_weight=5,
+        diversification_mode="marginal_sharpe",
+        portfolio_sharpe_weight=10,
+    )
+    candidates, _ = build_optimizer_candidates(rows, spec)
+    search = PortfolioSearch(candidates, spec)
+
+    search.optimize()
+
+    accepted_count = len(search._archive)
+    assert accepted_count > 0
+    assert len(search._metrics_cache) <= accepted_count * 2 + len(spec.objective_names)
+    assert len(search._score_cache) <= accepted_count * len(portfolio_optimizer_module.DEFAULT_OBJECTIVES)
+    assert len(search._positive_corr_cache) <= accepted_count
+    assert len(search._sharpe_cache) <= accepted_count
+    assert len(search._sum_stats_cache) <= accepted_count
 
 
 def test_pareto_front_keeps_nondominated_archived_portfolios(tmp_path: Path) -> None:

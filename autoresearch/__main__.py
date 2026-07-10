@@ -48,6 +48,7 @@ if __package__ in {None, ""}:
         catalog_summary_from_sqlite,
         iter_full_backtest_rows,
         iter_catalog_rows,
+        iter_promoted_catalog_rows,
         refresh_incremental_attempt_catalog,
         stream_catalog_csv_from_sqlite,
         stream_catalog_json_from_sqlite,
@@ -236,6 +237,8 @@ if __package__ in {None, ""}:
         filter_selection_candidate_rows,
         filter_tombstoned_candidate_rows,
         is_tombstoned_attempt_row,
+        normalize_candidate_scope,
+        PROMOTED_CANDIDATE_SCOPE,
         load_portfolio_build_specs,
         load_portfolio_spec,
         merge_portfolio_sleeves,
@@ -326,6 +329,7 @@ else:
         catalog_summary_from_sqlite,
         iter_full_backtest_rows,
         iter_catalog_rows,
+        iter_promoted_catalog_rows,
         refresh_incremental_attempt_catalog,
         stream_catalog_csv_from_sqlite,
         stream_catalog_json_from_sqlite,
@@ -510,6 +514,8 @@ else:
         filter_selection_candidate_rows,
         filter_tombstoned_candidate_rows,
         is_tombstoned_attempt_row,
+        normalize_candidate_scope,
+        PROMOTED_CANDIDATE_SCOPE,
         load_portfolio_build_specs,
         load_portfolio_spec,
         merge_portfolio_sleeves,
@@ -3866,8 +3872,12 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     optimize_portfolio.add_argument(
         "--optimizer-backend",
         choices=("python", "pyo3", "auto"),
-        default="python",
-        help="Search backend for dense portfolio optimization. Default: python.",
+        default="auto",
+        help=(
+            "Search backend for dense portfolio optimization. 'auto' requires Rust/PyO3 "
+            "and fails if it is unavailable; 'python' is for explicit diagnostic/parity "
+            "work only. Default: auto."
+        ),
     )
     optimize_portfolio.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
@@ -7112,12 +7122,20 @@ def _selection_corpus_rows(
     selected_run_ids = sorted(run_dir.name for run_dir in run_dirs)
     catalog_total_row_count = int(index_info.get("row_count") or 0)
     if visible_candidates_only:
-        rows = _stream_visible_catalog_candidates(
-            config,
-            run_ids=None if full_corpus_scope else selected_run_ids,
-            attempt_ids=attempt_ids,
-            canonical_only=canonical_only,
-        )
+        if canonical_only and not attempt_ids:
+            rows = list(
+                iter_promoted_catalog_rows(
+                    config,
+                    run_ids=None if full_corpus_scope else selected_run_ids,
+                )
+            )
+        else:
+            rows = _stream_visible_catalog_candidates(
+                config,
+                run_ids=None if full_corpus_scope else selected_run_ids,
+                attempt_ids=attempt_ids,
+                canonical_only=canonical_only,
+            )
     elif full_corpus_scope:
         rows = list(iter_catalog_rows(config))
     else:
@@ -11280,6 +11298,50 @@ def _live_validate_full_backtest_rows(
     return validated_rows, rejected, reason_counts
 
 
+def _optimizer_artifact_preflight_warning(
+    *,
+    scoped_row_count: int,
+    rejected: list[dict[str, Any]],
+    reason_counts: dict[str, int],
+    sample_limit: int = 20,
+) -> str | None:
+    if not rejected:
+        return None
+    affected: list[str] = []
+    for row in rejected[: max(1, int(sample_limit))]:
+        run_id = str(row.get("run_id") or "unknown-run").strip()
+        attempt_id = str(row.get("attempt_id") or "unknown-attempt").strip()
+        affected.append(f"{run_id}/{attempt_id}")
+    remaining = max(0, len(rejected) - len(affected))
+    affected_text = ", ".join(affected)
+    if remaining:
+        affected_text += f", ... +{remaining} more"
+    reasons_text = ", ".join(
+        f"{reason}={count}"
+        for reason, count in sorted(
+            reason_counts.items(), key=lambda item: (-item[1], item[0])
+        )
+    ) or "unknown"
+    return "\n".join(
+        [
+            "=" * 78,
+            "PORTFOLIO OPTIMIZER CORPUS WARNING",
+            "OPTIMIZATION WILL CONTINUE WITH AN INCOMPLETE CANDIDATE UNIVERSE.",
+            (
+                f"{len(rejected)} of {max(0, int(scoped_row_count))} in-scope strategies "
+                "failed live full-backtest validation and will be excluded."
+            ),
+            f"Reasons: {reasons_text}",
+            f"Affected: {affected_text}",
+            (
+                "DO NOT TREAT THIS RESULT AS PROMOTION-READY until corpus catchup or "
+                "artifact repair has resolved these failures."
+            ),
+            "=" * 78,
+        ]
+    )
+
+
 def cmd_audit_full_backtests(
     *,
     run_ids: list[str] | None,
@@ -13206,6 +13268,12 @@ def cmd_optimize_portfolio(
         run_ids=run_ids,
         label="portfolio-optimizer",
         as_json=as_json,
+        visible_candidates_only=True,
+        attempt_ids=attempt_ids,
+        canonical_only=(
+            not attempt_ids
+            and normalize_candidate_scope(candidate_scope) == PROMOTED_CANDIDATE_SCOPE
+        ),
     )
     wanted_attempt_ids = {
         token.strip() for token in (attempt_ids or []) if str(token).strip()
@@ -13232,6 +13300,13 @@ def cmd_optimize_portfolio(
             market_session_tolerance_days=5,
         )
     )
+    artifact_preflight_warning = _optimizer_artifact_preflight_warning(
+        scoped_row_count=len(rows),
+        rejected=artifact_validation_rejections,
+        reason_counts=artifact_validation_reason_counts,
+    )
+    if artifact_preflight_warning is not None:
+        _job_status_emit(artifact_preflight_warning, as_json=as_json)
 
     baseline_ids: list[str] = []
     baselines_raw: list[tuple[str, list[str]]] = []

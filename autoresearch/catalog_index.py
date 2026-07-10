@@ -964,6 +964,112 @@ def iter_catalog_rows(
                 yield payload
 
 
+def iter_promoted_catalog_rows(
+    config: Any,
+    *,
+    run_ids: list[str] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Stream promoted/canonical rows without deserializing the full catalog.
+
+    PlayHand runs contribute their canonical rows, or their highest-scoring final
+    scrutiny row when a canonical row is unavailable. Non-PlayHand rows remain
+    eligible, and any tombstoned row excludes its full run.
+    """
+    params: list[Any] = []
+    where = ""
+    if run_ids:
+        where = f"WHERE run_id IN ({','.join('?' for _ in run_ids)})"
+        params.extend(run_ids)
+    sql = f"""
+        WITH scoped AS (
+            SELECT
+                *,
+                CASE
+                    WHEN run_id = '' THEN '__orphan__' || row_key
+                    ELSE run_id
+                END AS group_key
+            FROM attempt_rows
+            {where}
+        ),
+        run_stats AS (
+            SELECT
+                group_key,
+                MAX(CASE WHEN is_tombstoned != 0 THEN 1 ELSE 0 END) AS tombstoned,
+                MAX(
+                    CASE
+                        WHEN runner = 'play_hand_v1' OR run_id LIKE '%-playhand-v1'
+                        THEN 1 ELSE 0
+                    END
+                ) AS is_playhand,
+                MAX(
+                    CASE
+                        WHEN COALESCE(is_canonical_attempt, 0) != 0
+                            OR COALESCE(is_canonical_playhand_attempt, 0) != 0
+                        THEN 1 ELSE 0
+                    END
+                ) AS has_canonical
+            FROM scoped
+            GROUP BY group_key
+        ),
+        eligible AS (
+            SELECT
+                scoped.*,
+                run_stats.is_playhand,
+                run_stats.has_canonical
+            FROM scoped
+            JOIN run_stats USING(group_key)
+            WHERE run_stats.tombstoned = 0
+              AND (
+                    run_stats.is_playhand = 0
+                    OR (
+                        run_stats.has_canonical = 1
+                        AND (
+                            COALESCE(scoped.is_canonical_attempt, 0) != 0
+                            OR COALESCE(scoped.is_canonical_playhand_attempt, 0) != 0
+                        )
+                    )
+                    OR (
+                        run_stats.has_canonical = 0
+                        AND run_stats.is_playhand = 1
+                        AND (
+                            LOWER(COALESCE(json_extract(scoped.row_json, '$.attempt_role'), json_extract(scoped.row_json, '$.play_hand_role'), '')) = 'final'
+                            OR LOWER(COALESCE(json_extract(scoped.row_json, '$.candidate_name'), '')) = 'final_36mo'
+                        )
+                    )
+              )
+        ),
+        ranked AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY group_key
+                    ORDER BY
+                        CASE WHEN score_36m IS NULL THEN 1 ELSE 0 END ASC,
+                        score_36m DESC,
+                        CASE WHEN composite_score IS NULL THEN 1 ELSE 0 END ASC,
+                        composite_score DESC,
+                        attempt_id ASC,
+                        row_key ASC
+                ) AS fallback_rank
+            FROM eligible
+        )
+        SELECT row_json
+        FROM ranked
+        WHERE is_playhand = 0 OR has_canonical = 1 OR fallback_rank = 1
+        ORDER BY
+            CASE WHEN score_36m IS NULL AND composite_score IS NULL THEN 1 ELSE 0 END ASC,
+            COALESCE(score_36m, composite_score, -1.0e308) DESC,
+            COALESCE(composite_score, -1.0e308) DESC,
+            attempt_id ASC,
+            row_key ASC
+    """
+    with _connect_catalog_db(_catalog_db_path(config)) as conn:
+        for (row_json,) in conn.execute(sql, params):
+            payload = _json_loads(row_json)
+            if isinstance(payload, dict):
+                yield payload
+
+
 def iter_full_backtest_rows(
     config: Any,
     *,
