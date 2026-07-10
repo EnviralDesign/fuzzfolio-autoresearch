@@ -553,7 +553,7 @@ def test_calculate_full_backtests_dry_run_is_selective_and_submits_no_work(
     assert payload["calculated"] == 0
 
 
-def test_calculate_full_backtests_does_not_submit_missing_canonical_profile(
+def test_calculate_full_backtests_does_not_submit_unrebuildable_profiles(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
     run_dir = tmp_path / "runs" / "run-a"
@@ -562,6 +562,27 @@ def test_calculate_full_backtests_does_not_submit_missing_canonical_profile(
     attempt = {
         "attempt_id": "attempt-a",
         "artifact_dir": str(artifact_dir),
+        "best_summary": {
+            "best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0}
+        },
+    }
+    sol_artifact_dir = run_dir / "evals" / "attempt-sol"
+    sol_profile_path = run_dir / "profiles" / "sol.json"
+    sol_artifact_dir.mkdir(parents=True)
+    _write_json(
+        sol_profile_path,
+        {
+            "profile": {
+                "notificationThreshold": 80,
+                "instruments": ["SOLUSD"],
+                "indicators": [],
+            }
+        },
+    )
+    sol_attempt = {
+        "attempt_id": "attempt-sol",
+        "artifact_dir": str(sol_artifact_dir),
+        "profile_path": str(sol_profile_path),
         "best_summary": {
             "best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0}
         },
@@ -577,13 +598,17 @@ def test_calculate_full_backtests_does_not_submit_missing_canonical_profile(
         ar_main,
         "_catalog_rows_for_run_dirs",
         lambda *_args, **_kwargs: [
-            {"attempt_id": "attempt-a", "run_id": "run-a", "candidate_name": "candidate"}
+            {"attempt_id": "attempt-a", "run_id": "run-a", "candidate_name": "candidate"},
+            {"attempt_id": "attempt-sol", "run_id": "run-a", "candidate_name": "sol"},
         ],
     )
     monkeypatch.setattr(
         ar_main,
         "_matched_attempt_items",
-        lambda *_args, **_kwargs: [(run_dir, [attempt], attempt)],
+        lambda *_args, **_kwargs: [
+            (run_dir, [attempt, sol_attempt], attempt),
+            (run_dir, [attempt, sol_attempt], sol_attempt),
+        ],
     )
     monkeypatch.setattr(
         ar_main,
@@ -598,7 +623,7 @@ def test_calculate_full_backtests_does_not_submit_missing_canonical_profile(
     monkeypatch.setattr(
         ar_main,
         "run_lab_full_backtests",
-        lambda **_kwargs: pytest.fail("profile-less attempt submitted gateway work"),
+        lambda **_kwargs: pytest.fail("unrebuildable attempt submitted gateway work"),
     )
 
     exit_code = ar_main.cmd_calculate_full_backtests(
@@ -619,3 +644,4 @@ def test_calculate_full_backtests_does_not_submit_missing_canonical_profile(
     assert exit_code == 0
     assert payload["selected_for_rebuild"] == 0
     assert payload["filter_rejections"]["missing_canonical_profile"] == 1
+    assert payload["filter_rejections"]["excluded_research_instrument"] == 1

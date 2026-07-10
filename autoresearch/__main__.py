@@ -62,6 +62,7 @@ if __package__ in {None, ""}:
         full_backtest_provisional_reasons,
         legacy_validation_cache_dir,
         load_json_if_exists,
+        load_profile_snapshot,
         load_market_data_coverage,
         normalize_tokens,
         resolve_attempt_scrutiny_source,
@@ -277,6 +278,7 @@ if __package__ in {None, ""}:
         build_signal_atlas,
     )
     from autoresearch.play_hand import (
+        EXCLUDED_RESEARCH_INSTRUMENTS,
         PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
         PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
         PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
@@ -338,6 +340,7 @@ else:
         full_backtest_provisional_reasons,
         legacy_validation_cache_dir,
         load_json_if_exists,
+        load_profile_snapshot,
         load_market_data_coverage,
         normalize_tokens,
         resolve_attempt_scrutiny_source,
@@ -549,6 +552,7 @@ else:
         build_signal_atlas,
     )
     from .play_hand import (
+        EXCLUDED_RESEARCH_INSTRUMENTS,
         PLAY_HAND_COARSE_HALVING_DEFAULT_PROBE_BUDGET,
         PLAY_HAND_DEFAULT_JOB_TIMEOUT_SECONDS,
         PLAY_HAND_DEFAULT_SWEEP_TIMEOUT_SECONDS,
@@ -10711,6 +10715,7 @@ def cmd_calculate_full_backtests(
         "already_has_full_backtest": 0,
         "missing_scrutiny_36m": 0,
         "missing_canonical_profile": 0,
+        "excluded_research_instrument": 0,
         "no_backtestable_cell": 0,
     }
     calculation_reasons: dict[str, int] = {}
@@ -10742,6 +10747,15 @@ def cmd_calculate_full_backtests(
         profile_path_raw = str(attempt.get("profile_path") or "").strip()
         if not profile_path_raw or not Path(profile_path_raw).exists():
             filter_rejections["missing_canonical_profile"] += 1
+            continue
+        profile_snapshot = load_profile_snapshot(Path(profile_path_raw)) or {}
+        profile_instruments = {
+            str(item).strip().upper()
+            for item in list(profile_snapshot.get("instruments") or [])
+            if str(item).strip()
+        }
+        if profile_instruments.intersection(EXCLUDED_RESEARCH_INSTRUMENTS):
+            filter_rejections["excluded_research_instrument"] += 1
             continue
         if not _attempt_has_backtestable_cell(attempt):
             filter_rejections["no_backtestable_cell"] += 1

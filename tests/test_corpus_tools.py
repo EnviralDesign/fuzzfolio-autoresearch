@@ -359,6 +359,37 @@ def test_profile_fingerprint_drift_invalidates_existing_artifact(tmp_path):
     assert "profile_fingerprint_mismatch" in validation["reason_codes"]
 
 
+def test_profile_fingerprint_uses_replay_request_timeframe_before_stage_metadata(
+    tmp_path,
+):
+    attempt, profile, result = _write_profile_equivalence_fixture(
+        tmp_path,
+        profile_threshold=80,
+        artifact_threshold=80,
+    )
+    artifact_dir = tmp_path / "artifact"
+    request = {
+        "alert_threshold": 80,
+        "instruments": ["EURUSD"],
+        "timeframe": "M5",
+        "direction_mode": "both",
+    }
+    provenance = ct.build_full_backtest_provenance(
+        attempt=attempt,
+        profile_snapshot=profile,
+        request_payload=request,
+        result_payload=result,
+        source_profile_path=tmp_path / "profile.json",
+    )
+    _write_json(artifact_dir / ct.FULL_BACKTEST_MANIFEST_FILENAME, provenance)
+    attempt["requested_timeframe"] = "H1"
+
+    validation = ct.validate_full_backtest_artifacts(attempt)
+
+    assert validation["status"] == "valid"
+    assert "profile_fingerprint_mismatch" not in validation["reason_codes"]
+
+
 def test_market_coverage_marks_may_artifact_stale(tmp_path):
     attempt, _profile, _result = _write_profile_equivalence_fixture(
         tmp_path,

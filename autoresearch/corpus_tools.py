@@ -922,9 +922,9 @@ def validate_full_backtest_artifacts(
             "instruments"
         )
         timeframe = str(
-            attempt.get("requested_timeframe")
+            request_payload.get("timeframe")
+            or attempt.get("requested_timeframe")
             or attempt.get("effective_timeframe")
-            or request_payload.get("timeframe")
             or ""
         )
         direction_mode = str(
