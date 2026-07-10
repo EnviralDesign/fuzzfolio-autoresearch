@@ -7473,35 +7473,23 @@ def _profile_drop_artifact_native_row_issue(
     row: dict[str, Any],
     attempt: dict[str, Any] | None = None,
     lookback_months: int = 36,
+    full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+    market_session_tolerance_days: int = DEFAULT_MARKET_SESSION_TOLERANCE_DAYS,
+    market_data_coverage: dict[tuple[str, str], datetime] | None = None,
 ) -> str | None:
     if int(lookback_months) != 36:
         return "unsupported_profile_drop_lookback"
-    artifact_dir_raw = str(row.get("artifact_dir") or "").strip()
-    if not artifact_dir_raw:
-        return "missing_artifact_dir"
-    artifact_dir = Path(artifact_dir_raw)
-    if not artifact_dir.exists():
-        return "missing_artifact_dir"
-    profile_path_raw = str(row.get("profile_path") or "").strip()
-    if not profile_path_raw:
-        return "missing_profile_file"
-    if not Path(profile_path_raw).exists():
-        return "missing_profile_file"
-
-    result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
-    curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
-    recommended_detail_path = artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
-    if not result_path.exists() or not curve_path.exists():
-        return "missing_full_backtest_artifact"
-    if not recommended_detail_path.exists():
-        return "missing_recommended_cell_detail"
-    if not _result_has_canonical_score_lab(result_path):
-        return "stale_score_lab"
-    if not result_matches_execution_cost_model(result_path, config):
-        return "execution_cost_model_mismatch"
-    if not _result_matches_attempt_reward_matrix(result_path, attempt or row):
-        return "reward_matrix_mismatch"
-    return None
+    validation_attempt = {**row, **(attempt or {})}
+    validation = validate_full_backtest_artifacts(
+        validation_attempt,
+        config=config,
+        full_backtest_max_age_days=full_backtest_max_age_days,
+        market_session_tolerance_days=market_session_tolerance_days,
+        market_data_coverage=market_data_coverage,
+        require_calendar_curve=True,
+    )
+    reason_codes = list(validation.get("reason_codes") or [])
+    return str(reason_codes[0]) if reason_codes else None
 
 
 def _run_full_backtest_with_retry(
@@ -11792,6 +11780,19 @@ def _profile_drop_skip_reason_for_attempt(
     lookback_months: int,
 ) -> str | None:
     attempt = _attempt_with_run_reward_matrix(attempt, run_dir=run_dir)
+    validation_status = str(
+        row.get(f"full_backtest_validation_status_{int(lookback_months)}m") or ""
+    ).strip()
+    if validation_status and validation_status not in {"valid", "missing"}:
+        reason_codes = list(
+            row.get(f"full_backtest_validation_reason_codes_{int(lookback_months)}m")
+            or []
+        )
+        reason_suffix = f"_{str(reason_codes[0])}" if reason_codes else ""
+        return (
+            f"full_backtest_{int(lookback_months)}m_{validation_status}"
+            f"{reason_suffix}"
+        )
     if _attempt_has_backtestable_cell(attempt):
         return None
 
@@ -11805,11 +11806,6 @@ def _profile_drop_skip_reason_for_attempt(
     ) is None:
         return None
 
-    validation_status = str(
-        row.get(f"full_backtest_validation_status_{int(lookback_months)}m") or ""
-    ).strip()
-    if validation_status and validation_status not in {"valid", "missing"}:
-        return f"full_backtest_{int(lookback_months)}m_{validation_status}"
     return "no_backtestable_exit_cell"
 
 
@@ -15211,6 +15207,7 @@ def cmd_render_corpus_profile_drops(
     catch_up_attempt_ids = list(selected_attempt_ids)
     artifact_native_ready_attempt_ids: list[str] = []
     if lookback_months == 36 and selected_attempt_ids and not force_rebuild:
+        market_data_coverage = load_market_data_coverage(trading_dashboard_root)
         selected_run_ids = sorted(
             {
                 str(row.get("run_id") or "").strip()
@@ -15247,6 +15244,9 @@ def cmd_render_corpus_profile_drops(
                 row=row,
                 attempt=attempt,
                 lookback_months=int(lookback_months),
+                full_backtest_max_age_days=full_backtest_max_age_days,
+                market_session_tolerance_days=market_session_tolerance_days,
+                market_data_coverage=market_data_coverage,
             ) if attempt is not None else "missing_attempt_ledger"
             if issue is None:
                 artifact_native_ready_attempt_ids.append(attempt_id)
@@ -15257,6 +15257,7 @@ def cmd_render_corpus_profile_drops(
     }
 
     catch_up_exit_code = 0
+    catch_up_summary: dict[str, Any] | None = None
     if lookback_months == 36 and catch_up_attempt_ids:
         _job_status_emit(
             f"[render-corpus-profile-drops] full-backtest catch-up starting for "
@@ -15286,6 +15287,22 @@ def cmd_render_corpus_profile_drops(
                     catalog_already_refreshed=True,
                     defer_global_audit=True,
                     as_json=True,
+                )
+                catch_up_output = capture.getvalue().strip()
+            if catch_up_output:
+                try:
+                    parsed_catch_up = json.loads(catch_up_output)
+                    if isinstance(parsed_catch_up, dict):
+                        catch_up_summary = parsed_catch_up
+                except json.JSONDecodeError:
+                    catch_up_summary = {"raw_output": catch_up_output}
+            if catch_up_summary is not None:
+                _job_status_emit(
+                    "[render-corpus-profile-drops] full-backtest catch-up result "
+                    f"calculated={int(catch_up_summary.get('calculated') or 0)} "
+                    f"failed={int(catch_up_summary.get('failed') or 0)} "
+                    f"reasons={json.dumps(catch_up_summary.get('calculation_reasons') or {}, ensure_ascii=True, sort_keys=True)}",
+                    as_json=as_json,
                 )
         else:
             catch_up_exit_code = cmd_calculate_full_backtests(
@@ -15384,6 +15401,7 @@ def cmd_render_corpus_profile_drops(
         "healed_full_backtests": healed_full_backtests,
         "full_backtest_catch_up_exit_code": catch_up_exit_code,
         "full_backtest_catch_up_selected_count": len(catch_up_attempt_ids),
+        "full_backtest_catch_up_summary": catch_up_summary,
         "artifact_native_ready_count": len(artifact_native_ready_attempt_ids),
         "profile_drop_rendered": profile_drop_rendered,
         "profile_drop_cached": profile_drop_cached,

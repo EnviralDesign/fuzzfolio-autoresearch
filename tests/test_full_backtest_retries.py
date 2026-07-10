@@ -106,6 +106,61 @@ def test_live_full_backtest_validation_uses_run_metadata_not_attempt_ledger(
     assert [attempt["reward_matrix"]["reward_columns"] for attempt in seen_attempts] == [8, 8]
 
 
+def test_profile_drop_native_check_uses_centralized_validation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    seen: list[dict] = []
+
+    def fake_validate(attempt, **kwargs):
+        seen.append({"attempt": attempt, **kwargs})
+        return {"reason_codes": ["threshold_mismatch"]}
+
+    monkeypatch.setattr(ar_main, "validate_full_backtest_artifacts", fake_validate)
+
+    issue = ar_main._profile_drop_artifact_native_row_issue(
+        config=SimpleNamespace(),
+        row={"artifact_dir": str(tmp_path / "artifact")},
+        attempt={"attempt_id": "attempt-a"},
+        full_backtest_max_age_days=7,
+        market_session_tolerance_days=3,
+        market_data_coverage={
+            ("EURUSD", "M5"): datetime(2026, 7, 9, tzinfo=timezone.utc)
+        },
+    )
+
+    assert issue == "threshold_mismatch"
+    assert seen[0]["attempt"]["attempt_id"] == "attempt-a"
+    assert seen[0]["full_backtest_max_age_days"] == 7
+    assert seen[0]["market_session_tolerance_days"] == 3
+    assert seen[0]["require_calendar_curve"] is True
+
+
+def test_profile_drop_skips_invalid_evidence_even_with_backtestable_cell(
+    tmp_path: Path,
+) -> None:
+    reason = ar_main._profile_drop_skip_reason_for_attempt(
+        config=SimpleNamespace(),
+        row={
+            "full_backtest_validation_status_36m": "invalid",
+            "full_backtest_validation_reason_codes_36m": [
+                "profile_fingerprint_mismatch"
+            ],
+        },
+        attempt={
+            "artifact_dir": str(tmp_path / "artifact"),
+            "best_summary": {
+                "best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0}
+            },
+        },
+        run_dir=tmp_path / "run-a",
+        lookback_months=36,
+    )
+
+    assert reason == (
+        "full_backtest_36m_invalid_profile_fingerprint_mismatch"
+    )
+
+
 def test_run_full_backtest_retries_with_local_profile_on_profile_not_found(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -1,6 +1,7 @@
 import json
 import struct
 import zlib
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3854,6 +3855,7 @@ def _write_existing_full_backtest_profile_drop_inputs(tmp_path: Path) -> tuple[P
                     "effective_bar_limit": 2000,
                     "requested_window_start": "2023-01-01T00:00:00+00:00",
                     "requested_window_end": "2026-01-01T00:00:00+00:00",
+                    "effective_window_end": datetime.now(timezone.utc).isoformat(),
                     "source": "lake_bars",
                 },
                 "matrix": {"avg_net_r_per_closed_trade": [[0.1, 0.2], [0.3, 0.4]]},
@@ -3931,6 +3933,10 @@ def _write_existing_full_backtest_profile_drop_inputs(tmp_path: Path) -> tuple[P
         encoding="utf-8",
     )
     (artifact_dir / "full-backtest-36mo-curve.json").write_text(
+        json.dumps(detail, ensure_ascii=True, indent=2),
+        encoding="utf-8",
+    )
+    (artifact_dir / "full-backtest-36mo-calendar-curve.json").write_text(
         json.dumps(detail, ensure_ascii=True, indent=2),
         encoding="utf-8",
     )
