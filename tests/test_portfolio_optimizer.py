@@ -99,6 +99,22 @@ def test_optimizer_filters_long_hold_candidates(tmp_path: Path) -> None:
     assert rejections["avg_hold_too_long"] == 1
 
 
+def test_optimizer_surfaces_full_backtest_validation_reason(tmp_path: Path) -> None:
+    row = _row(tmp_path, "stale", "EURUSD", [1, 2, 3])
+    row["full_backtest_validation_status_36m"] = "invalid"
+    row["full_backtest_validation_reason_codes_36m"] = [
+        "stale_effective_end",
+        "threshold_mismatch",
+    ]
+
+    candidates, rejections = build_optimizer_candidates(
+        [row], PortfolioOptimizerSpec(portfolio_size=1)
+    )
+
+    assert candidates == []
+    assert rejections["full_backtest_stale_effective_end"] == 1
+
+
 def test_optimizer_filters_unsupported_and_blocked_instruments(tmp_path: Path) -> None:
     rows = [
         _row(tmp_path, "darwin-ok", "US500", [1, 2, 3]),

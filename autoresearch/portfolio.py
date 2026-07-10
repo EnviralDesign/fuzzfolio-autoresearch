@@ -1166,6 +1166,11 @@ def filter_selection_candidate_rows(
             and str(row.get("full_backtest_validation_status_36m") or "") != "valid"
         ):
             filter_rejections["invalid_full_backtest_36m"] += 1
+            for reason_code in row.get(
+                "full_backtest_validation_reason_codes_36m"
+            ) or []:
+                key = f"full_backtest_rejected_{str(reason_code)}"
+                filter_rejections[key] = filter_rejections.get(key, 0) + 1
             continue
         row_rejected = False
         for index, filter_spec in enumerate(normalized_field_filters):

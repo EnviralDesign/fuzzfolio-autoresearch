@@ -80,13 +80,75 @@ def test_build_full_backtest_lab_task_unwraps_portable_profile(tmp_path: Path) -
     assert task["required_worker_capabilities"] == ["full_backtest_cache"]
     payload = task["payload"]
     assert payload["inline_profile_snapshot"]["name"] == "Portable"
-    assert payload["instruments"] == ["GBPUSD"]
+    assert payload["instruments"] == ["EURUSD"]
+    assert payload["alert_threshold"] == 77
     assert payload["timeframe"] == "M15"
     assert payload["lookback_months"] == 36
     assert payload["matrix"]["reward_step_r"] == 0.5
     assert payload["matrix"]["reward_columns"] == 8
     assert payload["options"]["quality_score_preset"] == "profile_drop"
     assert payload["required_capabilities"] == ["deep_replay", "full_backtest_cache"]
+
+
+@pytest.mark.parametrize(
+    ("profile_threshold", "historical_threshold", "expected_threshold"),
+    [(70, 80, 70), (80, 80, 80)],
+)
+def test_build_full_backtest_lab_task_uses_canonical_profile_threshold(
+    tmp_path: Path,
+    profile_threshold: float,
+    historical_threshold: float,
+    expected_threshold: float,
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "final"
+    profile_path = run_dir / "profiles" / "profile.json"
+    artifact_dir.mkdir(parents=True)
+    _write_json(
+        profile_path,
+        {
+            "profile": {
+                "version": "v1",
+                "notificationThreshold": profile_threshold,
+                "directionMode": "both",
+                "instruments": ["XAGUSD"],
+                "indicators": [],
+            }
+        },
+    )
+    _write_json(
+        artifact_dir / "deep-replay-job.json",
+        {
+            "request": {
+                "alert_threshold": historical_threshold,
+                "instruments": ["XAGUSD"],
+                "timeframe": "M5",
+            }
+        },
+    )
+    attempt = {
+        "run_id": "run-a",
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+    }
+
+    task = build_full_backtest_lab_task(
+        config=SimpleNamespace(
+            research=SimpleNamespace(quality_score_preset="profile_drop")
+        ),
+        run_dir=run_dir,
+        attempt=attempt,
+        run_metadata={},
+        lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+    )
+
+    assert task["payload"]["alert_threshold"] == expected_threshold
+    assert (
+        task["payload"]["inline_profile_snapshot"]["notificationThreshold"]
+        == expected_threshold
+    )
+    assert task["metadata"]["historical_request_alert_threshold"] == historical_threshold
 
 
 def test_materialize_full_backtest_lab_result_accepts_nested_worker_result(tmp_path: Path) -> None:
@@ -136,6 +198,15 @@ def test_materialize_full_backtest_lab_result_accepts_nested_worker_result(tmp_p
     assert Path(paths["curve_path"]).exists()
     assert Path(paths["calendar_curve_path"]).exists()
     assert Path(paths["recommended_curve_path"]).exists()
+    manifest_path = artifact_dir / "full-backtest-36mo-manifest.json"
+    assert manifest_path.exists()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema"] == "autoresearch-full-backtest-provenance-v1"
+    result_payload = json.loads(Path(paths["result_path"]).read_text(encoding="utf-8"))
+    assert (
+        result_payload["data"]["aggregate"]["autoresearch_provenance"]["schema"]
+        == "autoresearch-full-backtest-provenance-v1"
+    )
     result_payload = json.loads(Path(paths["result_path"]).read_text(encoding="utf-8"))
     assert result_payload["data"]["aggregate"]["score_lab"]["score"] == 80
     job_payload = json.loads((artifact_dir / "deep-replay-job.json").read_text(encoding="utf-8"))
@@ -361,3 +432,98 @@ def test_cmd_calculate_full_backtests_lab_gateway_backend(
     assert payload["calculated"] == 1
     assert calls[0]["max_workers"] == 1
     assert calls[0]["items"][0][1]["attempt_id"] == "attempt-a"
+
+
+@pytest.mark.parametrize(
+    ("force_rebuild", "expected_count"),
+    [(False, 1), (True, 2)],
+)
+def test_calculate_full_backtests_dry_run_is_selective_and_submits_no_work(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    force_rebuild: bool,
+    expected_count: int,
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    attempts = []
+    rows = []
+    for attempt_id in ("stale-attempt", "valid-attempt"):
+        artifact_dir = run_dir / "evals" / attempt_id
+        artifact_dir.mkdir(parents=True)
+        attempts.append(
+            {
+                "attempt_id": attempt_id,
+                "artifact_dir": str(artifact_dir),
+                "best_summary": {
+                    "best_cell": {
+                        "stop_loss_percent": 0.1,
+                        "reward_multiple": 1.0,
+                    }
+                },
+            }
+        )
+        rows.append(
+            {
+                "attempt_id": attempt_id,
+                "run_id": "run-a",
+                "candidate_name": attempt_id,
+            }
+        )
+    config = SimpleNamespace(
+        runs_root=tmp_path / "runs",
+        research=SimpleNamespace(validation_max_concurrency=2),
+        full_backtest_failures_json_path=tmp_path / "failures.json",
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [run_dir])
+    monkeypatch.setattr(ar_main, "_catalog_rows_for_run_dirs", lambda *_args, **_kwargs: rows)
+    monkeypatch.setattr(
+        ar_main,
+        "_matched_attempt_items",
+        lambda *_args, **_kwargs: [
+            (run_dir, attempts, attempt) for attempt in attempts
+        ],
+    )
+
+    def fake_validation(attempt, **_kwargs):
+        if attempt["attempt_id"] == "stale-attempt":
+            return {
+                "status": "invalid",
+                "reason_codes": ["stale_effective_end"],
+                "rebuild_reason_codes": ["stale_effective_end"],
+                "rebuild_required": True,
+            }
+        return {
+            "status": "valid",
+            "reason_codes": [],
+            "rebuild_reason_codes": [],
+            "rebuild_required": False,
+        }
+
+    monkeypatch.setattr(ar_main, "validate_full_backtest_artifacts", fake_validation)
+    monkeypatch.setattr(
+        ar_main,
+        "run_lab_full_backtests",
+        lambda **_kwargs: pytest.fail("dry run submitted gateway work"),
+    )
+
+    exit_code = ar_main.cmd_calculate_full_backtests(
+        run_ids=["run-a"],
+        attempt_ids=None,
+        limit=None,
+        max_workers=2,
+        use_dev_sim_worker_count=False,
+        require_scrutiny_36=False,
+        force_rebuild=force_rebuild,
+        job_timeout_seconds=120,
+        dry_run=True,
+        full_backtest_backend="lab-gateway",
+        as_json=True,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["status"] == "dry_run"
+    assert payload["selected_for_rebuild"] == expected_count
+    assert payload["calculated"] == 0

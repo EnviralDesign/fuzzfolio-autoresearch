@@ -550,6 +550,11 @@ def candidate_rejection_reason(
     spec: PortfolioOptimizerSpec,
 ) -> str | None:
     if str(row.get("full_backtest_validation_status_36m") or "") != "valid":
+        reason_codes = list(
+            row.get("full_backtest_validation_reason_codes_36m") or []
+        )
+        if reason_codes:
+            return f"full_backtest_{str(reason_codes[0])}"
         return "invalid_or_missing_full_backtest"
     if not Path(str(row.get("full_backtest_calendar_curve_path_36m") or "")).exists():
         return "missing_source_calendar_curve"

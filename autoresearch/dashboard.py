@@ -14,6 +14,11 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .config import AppConfig
+from .corpus_tools import (
+    FULL_BACKTEST_MANIFEST_FILENAME,
+    build_full_backtest_provenance,
+    load_profile_snapshot,
+)
 from .execution_costs import execution_cost_cli_args
 from .fuzzfolio import CliError, FuzzfolioCli
 from .ledger import (
@@ -625,10 +630,11 @@ def _run_full_backtest_for_attempt(
     else:
         instruments = []
 
-    if not profile_ref and profile_path is not None and profile_path.exists():
+    if profile_path is not None and profile_path.exists():
         try:
             print(
-                f"[calculate-backtest] uploading local profile to cloud...", flush=True
+                "[calculate-backtest] uploading authoritative local profile to cloud...",
+                flush=True,
             )
             profile_ref = cli.create_cloud_profile(profile_path)
         except Exception as exc:
@@ -643,6 +649,68 @@ def _run_full_backtest_for_attempt(
         temp_path = Path(temp_dir)
         sensitivity_output_dir = temp_path / "sensitivity-output"
         sensitivity_output_dir.mkdir(parents=True, exist_ok=True)
+
+        def materialize_outputs(
+            *,
+            calendar_curve_src: Path | None = None,
+            recovery_mode: str | None = None,
+        ) -> dict[str, Any]:
+            paths = _copy_full_backtest_outputs(
+                artifact_dir,
+                sensitivity_output_dir,
+                calendar_curve_src=calendar_curve_src,
+                recovery_mode=recovery_mode,
+            )
+            result_path = Path(str(paths.get("result_path") or ""))
+            result_payload = _load_optional_json(result_path)
+            profile_snapshot = load_profile_snapshot(profile_path) or {}
+            generated_job_path = sensitivity_output_dir / "deep-replay-job.json"
+            generated_job = _load_optional_json(generated_job_path)
+            generated_request = (
+                generated_job.get("request")
+                if isinstance(generated_job, dict)
+                and isinstance(generated_job.get("request"), dict)
+                else request_payload
+            )
+            generated_request = (
+                dict(generated_request) if isinstance(generated_request, dict) else {}
+            )
+            provenance = build_full_backtest_provenance(
+                attempt=attempt,
+                profile_snapshot=profile_snapshot,
+                request_payload=generated_request,
+                result_payload=result_payload
+                if isinstance(result_payload, dict)
+                else None,
+                source_profile_path=profile_path,
+            )
+            if isinstance(result_payload, dict):
+                data = result_payload.get("data")
+                aggregate = data.get("aggregate") if isinstance(data, dict) else None
+                if isinstance(aggregate, dict):
+                    aggregate["autoresearch_provenance"] = provenance
+                    result_path.write_text(
+                        json.dumps(
+                            result_payload,
+                            ensure_ascii=True,
+                            separators=(",", ":"),
+                        ),
+                        encoding="utf-8",
+                    )
+            (artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME).write_text(
+                json.dumps(provenance, ensure_ascii=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            if isinstance(generated_job, dict):
+                (artifact_dir / "full-backtest-36mo-deep-replay-job.json").write_text(
+                    json.dumps(
+                        generated_job,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                    ),
+                    encoding="utf-8",
+                )
+            return paths
 
         args = [
             *(
@@ -717,11 +785,7 @@ def _run_full_backtest_for_attempt(
                     "[calculate-backtest] sensitivity-basket timed out after writing outputs; salvaging artifacts",
                     flush=True,
                 )
-                return _copy_full_backtest_outputs(
-                    artifact_dir,
-                    sensitivity_output_dir,
-                    recovery_mode="timeout_salvaged",
-                )
+                return materialize_outputs(recovery_mode="timeout_salvaged")
             raise RuntimeError(message) from exc
 
         calendar_curve_src = _fetch_full_backtest_calendar_curve(
@@ -729,11 +793,7 @@ def _run_full_backtest_for_attempt(
             sensitivity_output_dir,
             timeout_seconds=cli_timeout_seconds,
         )
-        return _copy_full_backtest_outputs(
-            artifact_dir,
-            sensitivity_output_dir,
-            calendar_curve_src=calendar_curve_src,
-        )
+        return materialize_outputs(calendar_curve_src=calendar_curve_src)
 
 
 def _latest_run_log_state(run_dir: Path) -> tuple[int | None, str | None]:

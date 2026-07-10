@@ -3,11 +3,14 @@ from __future__ import annotations
 import csv
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 from math import log1p
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
+from .execution_costs import result_matches_execution_cost_model
 from .scoring import CANONICAL_SCORE_LAB_VERSION, build_attempt_score
 
 
@@ -18,6 +21,10 @@ FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME = (
     "full-backtest-36mo-recommended-cell-path-detail.json"
 )
 FULL_BACKTEST_RESULT_FILENAME = "full-backtest-36mo-result.json"
+FULL_BACKTEST_MANIFEST_FILENAME = "full-backtest-36mo-manifest.json"
+FULL_BACKTEST_PROVENANCE_SCHEMA = "autoresearch-full-backtest-provenance-v1"
+DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS = 7.0
+DEFAULT_MARKET_SESSION_TOLERANCE_DAYS = 5
 _JSON_CACHE_MISSING = object()
 _CATALOG_JSON_CACHE: ContextVar[dict[str, Any] | None] = ContextVar(
     "catalog_json_cache",
@@ -415,12 +422,331 @@ def _cell_value(payload: dict[str, Any] | None, key: str) -> float | None:
     return _safe_float(payload.get(key))
 
 
-def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
+def load_profile_snapshot(profile_path: Path | None) -> dict[str, Any] | None:
+    if profile_path is None:
+        return None
+    payload = load_json_if_exists(Path(profile_path))
+    if not isinstance(payload, dict):
+        return None
+    if isinstance(payload.get("profile"), dict):
+        return dict(payload["profile"])
+    profile_document = payload.get("profile_document")
+    if isinstance(profile_document, dict) and isinstance(
+        profile_document.get("profile"), dict
+    ):
+        return dict(profile_document["profile"])
+    return dict(payload) if payload else None
+
+
+def _profile_path_for_attempt(attempt: dict[str, Any]) -> Path | None:
+    raw = str(attempt.get("profile_path") or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    return path if path.exists() else None
+
+
+def _canonicalize_behavior_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _canonicalize_behavior_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in {"instanceId", "label"}
+        }
+    if isinstance(value, list):
+        return [_canonicalize_behavior_value(item) for item in value]
+    return value
+
+
+def canonical_strategy_definition(
+    profile_snapshot: dict[str, Any],
+    *,
+    instruments: Iterable[Any] | None = None,
+    timeframe: str | None = None,
+    direction_mode: str | None = None,
+    alert_threshold: float | None = None,
+) -> dict[str, Any]:
+    profile = dict(profile_snapshot or {})
+    effective_instruments = instruments
+    if effective_instruments is None:
+        effective_instruments = profile.get("instruments") or []
+    normalized_instruments = sorted(
+        {
+            str(item).strip().upper()
+            for item in effective_instruments
+            if str(item).strip()
+        }
+    )
+    threshold = _safe_float(alert_threshold)
+    if threshold is None:
+        threshold = _safe_float(profile.get("notificationThreshold"))
+    if threshold is None:
+        threshold = 80.0
+    indicators = profile.get("indicators")
+    if not isinstance(indicators, list):
+        indicators = []
+    return {
+        "schema": "autoresearch-canonical-strategy-v1",
+        "profile_version": str(profile.get("version") or ""),
+        "notification_threshold": float(threshold),
+        "direction_mode": str(
+            direction_mode or profile.get("directionMode") or "both"
+        ).strip().lower(),
+        "instruments": normalized_instruments,
+        "timeframe": str(timeframe or "").strip().upper(),
+        "indicators": _canonicalize_behavior_value(indicators),
+        "execution_config": _canonicalize_behavior_value(
+            profile.get("executionConfig")
+        ),
+    }
+
+
+def canonical_strategy_fingerprint(definition: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        definition,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _job_request_for_artifact(artifact_dir: Path) -> tuple[dict[str, Any], Path | None]:
+    for name in ("full-backtest-36mo-deep-replay-job.json", "deep-replay-job.json"):
+        path = artifact_dir / name
+        payload = load_json_if_exists(path)
+        request = payload.get("request") if isinstance(payload, dict) else None
+        if isinstance(request, dict):
+            return dict(request), path
+    return {}, None
+
+
+def _positive_float(value: Any) -> float | None:
+    number = _safe_float(value)
+    return number if number is not None and number > 0 else None
+
+
+def _positive_int(value: Any) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def reward_matrix_from_attempt(attempt: dict[str, Any]) -> dict[str, Any] | None:
+    raw_matrix = attempt.get("reward_matrix")
+    if isinstance(raw_matrix, dict):
+        reward_step = _positive_float(raw_matrix.get("reward_step_r"))
+        reward_columns = _positive_int(raw_matrix.get("reward_columns"))
+        if reward_step is not None and reward_columns is not None:
+            effective_max = _positive_float(raw_matrix.get("effective_max_reward_r"))
+            return {
+                **raw_matrix,
+                "reward_step_r": reward_step,
+                "reward_columns": reward_columns,
+                "effective_max_reward_r": effective_max
+                if effective_max is not None
+                else round(reward_step * reward_columns, 6),
+            }
+    reward_step = _positive_float(attempt.get("reward_step_r"))
+    reward_columns = _positive_int(attempt.get("reward_columns"))
+    if reward_step is None or reward_columns is None:
+        return None
+    return {
+        "reward_step_r": reward_step,
+        "reward_columns": reward_columns,
+        "effective_max_reward_r": _positive_float(
+            attempt.get("effective_max_reward_r")
+        )
+        or round(reward_step * reward_columns, 6),
+    }
+
+
+def _collect_reward_multiples(payload: Any) -> list[float]:
+    values: list[float] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key in {"reward_multiple", "rewardMultiple"}:
+                numeric = _safe_float(value)
+                if numeric is not None:
+                    values.append(numeric)
+            else:
+                values.extend(_collect_reward_multiples(value))
+    elif isinstance(payload, list):
+        for item in payload:
+            values.extend(_collect_reward_multiples(item))
+    return values
+
+
+def result_matches_reward_matrix(
+    result_payload: dict[str, Any], attempt: dict[str, Any]
+) -> bool:
+    matrix = reward_matrix_from_attempt(attempt)
+    if not matrix:
+        return True
+    reward_values = _collect_reward_multiples(result_payload)
+    if not reward_values:
+        return False
+    return max(reward_values) <= float(matrix["effective_max_reward_r"]) + 1e-6
+
+
+def load_market_data_coverage(
+    trading_dashboard_root: Path | None,
+) -> dict[tuple[str, str], datetime]:
+    if trading_dashboard_root is None:
+        return {}
+    manifest_path = (
+        Path(trading_dashboard_root)
+        / "data"
+        / "market_data_lake"
+        / "remote_state"
+        / "manifest.json"
+    )
+    payload = load_json_if_exists(manifest_path)
+    entries = payload.get("coverage") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        return {}
+    coverage: dict[tuple[str, str], datetime] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or str(entry.get("dataset") or "") != "bars":
+            continue
+        pair = str(entry.get("pair") or "").strip().upper()
+        timeframe = str(entry.get("timeframe") or "").strip().upper()
+        parsed = _parse_datetime(
+            entry.get("available_to") or entry.get("promoted_through")
+        )
+        if pair and timeframe and parsed is not None:
+            coverage[(pair, timeframe)] = parsed
+    return coverage
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    token = str(value or "").strip()
+    if not token:
+        return None
+    try:
+        parsed = datetime.fromisoformat(token.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _market_session_days_between(start: datetime, end: datetime) -> int:
+    if end <= start:
+        return 0
+    cursor = start.date() + timedelta(days=1)
+    end_date = end.date()
+    count = 0
+    while cursor <= end_date:
+        if cursor.weekday() < 5:
+            count += 1
+        cursor += timedelta(days=1)
+    return count
+
+
+def _profile_timeframes(profile_snapshot: dict[str, Any], fallback: str) -> list[str]:
+    values = {str(fallback or "").strip().upper()}
+    indicators = profile_snapshot.get("indicators")
+    if isinstance(indicators, list):
+        for indicator in indicators:
+            config = indicator.get("config") if isinstance(indicator, dict) else None
+            if isinstance(config, dict):
+                values.add(str(config.get("timeframe") or "").strip().upper())
+    return sorted(value for value in values if value)
+
+
+def build_full_backtest_provenance(
+    *,
+    attempt: dict[str, Any],
+    profile_snapshot: dict[str, Any],
+    request_payload: dict[str, Any],
+    result_payload: dict[str, Any] | None = None,
+    source_profile_path: Path | None = None,
+    worker_id: str | None = None,
+    worker_pool: str | None = None,
+) -> dict[str, Any]:
+    evaluated_profile = dict(profile_snapshot)
+    threshold = _safe_float(evaluated_profile.get("notificationThreshold"))
+    if threshold is None:
+        threshold = 80.0
+        evaluated_profile["notificationThreshold"] = threshold
+    instruments = request_payload.get("instruments") or evaluated_profile.get("instruments")
+    timeframe = str(request_payload.get("timeframe") or "").strip().upper()
+    direction_mode = str(
+        evaluated_profile.get("directionMode")
+        or request_payload.get("direction_mode")
+        or "both"
+    )
+    definition = canonical_strategy_definition(
+        evaluated_profile,
+        instruments=instruments if isinstance(instruments, list) else [],
+        timeframe=timeframe,
+        direction_mode=direction_mode,
+        alert_threshold=threshold,
+    )
+    aggregate = nested_get(result_payload, ["data", "aggregate"])
+    if not isinstance(aggregate, dict):
+        aggregate = {}
+    return {
+        "schema": FULL_BACKTEST_PROVENANCE_SCHEMA,
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "run_id": str(attempt.get("run_id") or "") or None,
+        "attempt_id": str(attempt.get("attempt_id") or "") or None,
+        "source_profile_path": str(source_profile_path) if source_profile_path else None,
+        "effective_alert_threshold": float(threshold),
+        "canonical_profile_fingerprint": canonical_strategy_fingerprint(definition),
+        "canonical_strategy_definition": definition,
+        "instruments": list(definition["instruments"]),
+        "timeframe": definition["timeframe"],
+        "direction_mode": definition["direction_mode"],
+        "market_data_window": aggregate.get("market_data_window"),
+        "cost_model": aggregate.get("cost_model")
+        or nested_get(result_payload, ["data", "cost_model"])
+        or nested_get(request_payload, ["options", "cost_model"]),
+        "reward_matrix": reward_matrix_from_attempt(attempt)
+        or request_payload.get("matrix"),
+        "worker_contract_hash": request_payload.get("required_worker_contract_hash"),
+        "worker_contract_schema": request_payload.get(
+            "required_worker_contract_schema"
+        ),
+        "worker_id": worker_id,
+        "worker_pool": worker_pool,
+    }
+
+
+def _validation_reason(
+    code: str, *, detail: str | None = None, rebuild_required: bool = True, **fields: Any
+) -> dict[str, Any]:
+    return {
+        "code": code,
+        "rebuild_required": bool(rebuild_required),
+        **({"detail": detail} if detail else {}),
+        **fields,
+    }
+
+
+def validate_full_backtest_artifacts(
+    attempt: dict[str, Any],
+    *,
+    config: Any | None = None,
+    full_backtest_max_age_days: float | None = None,
+    market_session_tolerance_days: int = DEFAULT_MARKET_SESSION_TOLERANCE_DAYS,
+    market_data_coverage: dict[tuple[str, str], datetime] | None = None,
+    now: datetime | None = None,
+    require_calendar_curve: bool = False,
+) -> dict[str, Any]:
     artifact_dir = attempt_artifact_dir(attempt)
     if artifact_dir is None:
         return {
             "status": "missing",
             "issues": ["missing_artifact_dir"],
+            "reason_codes": ["missing_artifact"],
+            "rebuild_reason_codes": ["missing_artifact"],
+            "reasons": [_validation_reason("missing_artifact", detail="missing_artifact_dir")],
+            "rebuild_required": True,
             "result_exists": False,
             "curve_exists": False,
             "curve_point_count": 0,
@@ -448,6 +774,10 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
         return {
             "status": "missing",
             "issues": [],
+            "reason_codes": ["missing_artifact"],
+            "rebuild_reason_codes": ["missing_artifact"],
+            "reasons": [_validation_reason("missing_artifact")],
+            "rebuild_required": True,
             "result_exists": False,
             "curve_exists": False,
             "curve_point_count": 0,
@@ -466,6 +796,8 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
         issues.append("missing_curve_file")
     if not recommended_curve_exists:
         issues.append("missing_recommended_cell_detail_file")
+    if require_calendar_curve and not calendar_curve_exists:
+        issues.append("missing_calendar_curve_file")
 
     result_payload = load_json_if_exists(result_path) if result_exists else None
     curve_payload = load_json_if_exists(curve_path) if curve_exists else None
@@ -534,10 +866,232 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
     if analysis_status and analysis_status != "success":
         issues.append(f"analysis_status:{analysis_status}")
 
-    status = "valid" if not issues else "invalid"
+    reasons: list[dict[str, Any]] = []
+    missing_issues = [issue for issue in issues if issue.startswith("missing_")]
+    if missing_issues:
+        reasons.append(
+            _validation_reason("missing_artifact", detail=",".join(missing_issues))
+        )
+    nonmissing_issues = [issue for issue in issues if issue not in missing_issues]
+    if nonmissing_issues:
+        reasons.append(
+            _validation_reason("invalid_artifact", detail=",".join(nonmissing_issues))
+        )
+
+    profile_path = _profile_path_for_attempt(attempt)
+    profile_snapshot = load_profile_snapshot(profile_path)
+    request_payload, request_path = _job_request_for_artifact(artifact_dir)
+    manifest_payload = load_json_if_exists(artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME)
+    provenance = manifest_payload if isinstance(manifest_payload, dict) else None
+    if provenance is None and isinstance(aggregate, dict):
+        embedded = aggregate.get("autoresearch_provenance")
+        provenance = embedded if isinstance(embedded, dict) else None
+
+    threshold_expected: float | None = None
+    threshold_observed: float | None = None
+    expected_fingerprint: str | None = None
+    observed_fingerprint: str | None = None
+    provenance_mode = "explicit" if provenance else "legacy_inferred"
+    if not isinstance(profile_snapshot, dict):
+        reasons.append(
+            _validation_reason(
+                "invalid_artifact",
+                detail="missing_canonical_profile",
+                rebuild_required=False,
+            )
+        )
+    else:
+        threshold_expected = _safe_float(profile_snapshot.get("notificationThreshold"))
+        if threshold_expected is None:
+            threshold_expected = 80.0
+        if isinstance(provenance, dict):
+            threshold_observed = _safe_float(
+                provenance.get("effective_alert_threshold")
+            )
+            observed_fingerprint = str(
+                provenance.get("canonical_profile_fingerprint") or ""
+            ).strip() or None
+        if threshold_observed is None:
+            threshold_observed = _safe_float(request_payload.get("alert_threshold"))
+        inline_profile = request_payload.get("inline_profile_snapshot")
+        if threshold_observed is None and isinstance(inline_profile, dict):
+            threshold_observed = _safe_float(
+                inline_profile.get("notificationThreshold")
+            )
+        instruments = profile_snapshot.get("instruments") or request_payload.get(
+            "instruments"
+        )
+        timeframe = str(
+            attempt.get("requested_timeframe")
+            or attempt.get("effective_timeframe")
+            or request_payload.get("timeframe")
+            or ""
+        )
+        direction_mode = str(
+            profile_snapshot.get("directionMode")
+            or request_payload.get("direction_mode")
+            or "both"
+        )
+        expected_definition = canonical_strategy_definition(
+            profile_snapshot,
+            instruments=instruments if isinstance(instruments, list) else [],
+            timeframe=timeframe,
+            direction_mode=direction_mode,
+            alert_threshold=threshold_expected,
+        )
+        expected_fingerprint = canonical_strategy_fingerprint(expected_definition)
+        if observed_fingerprint is None and isinstance(inline_profile, dict):
+            observed_definition = canonical_strategy_definition(
+                inline_profile,
+                instruments=request_payload.get("instruments") or [],
+                timeframe=str(request_payload.get("timeframe") or ""),
+                direction_mode=str(request_payload.get("direction_mode") or "both"),
+                alert_threshold=threshold_observed,
+            )
+            observed_fingerprint = canonical_strategy_fingerprint(observed_definition)
+        if (
+            threshold_observed is not None
+            and abs(float(threshold_expected) - float(threshold_observed)) > 1e-9
+        ):
+            reasons.append(
+                _validation_reason(
+                    "threshold_mismatch",
+                    expected=float(threshold_expected),
+                    observed=float(threshold_observed),
+                    request_path=str(request_path) if request_path else None,
+                )
+            )
+        if observed_fingerprint and observed_fingerprint != expected_fingerprint:
+            reasons.append(
+                _validation_reason(
+                    "profile_fingerprint_mismatch",
+                    expected=expected_fingerprint,
+                    observed=observed_fingerprint,
+                )
+            )
+
+    research_config = getattr(config, "research", None) if config is not None else None
+    if config is not None and result_exists and isinstance(result_payload, dict):
+        if (
+            research_config is not None
+            and hasattr(research_config, "execution_cost_mode")
+            and not result_matches_execution_cost_model(result_path, config)
+        ):
+            reasons.append(_validation_reason("cost_model_mismatch"))
+        if not result_matches_reward_matrix(result_payload, attempt):
+            reasons.append(_validation_reason("reward_matrix_mismatch"))
+
+    freshness: dict[str, Any] = {
+        "mode": "not_checked",
+        "effective_window_end": None,
+        "reference_end": None,
+        "market_session_lag_days": None,
+        "fallback_used": False,
+    }
+    if full_backtest_max_age_days is not None and isinstance(aggregate, dict):
+        market_window = aggregate.get("market_data_window")
+        market_window = market_window if isinstance(market_window, dict) else {}
+        effective_end = _parse_datetime(market_window.get("effective_window_end"))
+        freshness["effective_window_end"] = (
+            effective_end.isoformat() if effective_end else None
+        )
+        if effective_end is None:
+            reasons.append(
+                _validation_reason("invalid_artifact", detail="missing_effective_window_end")
+            )
+        else:
+            coverage = market_data_coverage or {}
+            required_pairs = (
+                list(profile_snapshot.get("instruments") or [])
+                if isinstance(profile_snapshot, dict)
+                else list(request_payload.get("instruments") or [])
+            )
+            fallback_timeframe = str(request_payload.get("timeframe") or "")
+            required_timeframes = (
+                _profile_timeframes(profile_snapshot, fallback_timeframe)
+                if isinstance(profile_snapshot, dict)
+                else [fallback_timeframe.upper()]
+            )
+            coverage_ends = [
+                coverage.get((str(pair).strip().upper(), timeframe))
+                for pair in required_pairs
+                for timeframe in required_timeframes
+            ]
+            if coverage_ends and all(item is not None for item in coverage_ends):
+                reference_end = min(item for item in coverage_ends if item is not None)
+                session_lag = _market_session_days_between(effective_end, reference_end)
+                freshness.update(
+                    {
+                        "mode": "market_coverage",
+                        "reference_end": reference_end.isoformat(),
+                        "market_session_lag_days": session_lag,
+                    }
+                )
+                if session_lag > max(0, int(market_session_tolerance_days)):
+                    reasons.append(
+                        _validation_reason(
+                            "stale_effective_end",
+                            effective_window_end=effective_end.isoformat(),
+                            reference_end=reference_end.isoformat(),
+                            market_session_lag_days=session_lag,
+                            tolerance_days=max(0, int(market_session_tolerance_days)),
+                            freshness_mode="market_coverage",
+                        )
+                    )
+            else:
+                now_utc = now or datetime.now(timezone.utc)
+                if now_utc.tzinfo is None:
+                    now_utc = now_utc.replace(tzinfo=timezone.utc)
+                now_utc = now_utc.astimezone(timezone.utc)
+                age_days = max(
+                    0.0, (now_utc - effective_end).total_seconds() / 86400.0
+                )
+                freshness.update(
+                    {
+                        "mode": "calendar_fallback",
+                        "reference_end": now_utc.isoformat(),
+                        "age_days": age_days,
+                        "fallback_used": True,
+                    }
+                )
+                if age_days > max(0.0, float(full_backtest_max_age_days)):
+                    reasons.append(
+                        _validation_reason(
+                            "stale_effective_end",
+                            effective_window_end=effective_end.isoformat(),
+                            reference_end=now_utc.isoformat(),
+                            age_days=round(age_days, 6),
+                            tolerance_days=max(
+                                0.0, float(full_backtest_max_age_days)
+                            ),
+                            freshness_mode="calendar_fallback",
+                        )
+                    )
+
+    deduped_reasons: list[dict[str, Any]] = []
+    seen_reason_codes: set[str] = set()
+    for reason in reasons:
+        code = str(reason.get("code") or "")
+        if not code or code in seen_reason_codes:
+            continue
+        seen_reason_codes.add(code)
+        deduped_reasons.append(reason)
+    reason_codes = [str(reason["code"]) for reason in deduped_reasons]
+    rebuild_reason_codes = [
+        str(reason["code"])
+        for reason in deduped_reasons
+        if bool(reason.get("rebuild_required"))
+    ]
+    status = "valid" if not reason_codes else "invalid"
     return {
         "status": status,
         "issues": issues,
+        "reason_codes": reason_codes,
+        "rebuild_reason_codes": rebuild_reason_codes,
+        "reasons": deduped_reasons,
+        "rebuild_required": any(
+            bool(reason.get("rebuild_required")) for reason in deduped_reasons
+        ),
         "result_exists": result_exists,
         "curve_exists": curve_exists,
         "curve_point_count": len(curve_points) if isinstance(curve_points, list) else 0,
@@ -549,6 +1103,15 @@ def validate_full_backtest_artifacts(attempt: dict[str, Any]) -> dict[str, Any]:
         "calendar_curve_exists": calendar_curve_exists,
         "recommended_curve_path": str(recommended_curve_path),
         "recommended_curve_exists": recommended_curve_exists,
+        "threshold_expected": threshold_expected,
+        "threshold_observed": threshold_observed,
+        "canonical_profile_fingerprint": expected_fingerprint,
+        "artifact_profile_fingerprint": observed_fingerprint,
+        "provenance_mode": provenance_mode,
+        "provenance_path": str(artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME)
+        if (artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME).exists()
+        else None,
+        "freshness": freshness,
     }
 
 
@@ -721,6 +1284,10 @@ def extract_attempt_catalog_row(
     run_metadata: dict[str, Any] | None,
     *,
     validation_cache_root: Path | None = None,
+    config: Any | None = None,
+    full_backtest_max_age_days: float | None = None,
+    market_session_tolerance_days: int = DEFAULT_MARKET_SESSION_TOLERANCE_DAYS,
+    market_data_coverage: dict[tuple[str, str], datetime] | None = None,
 ) -> dict[str, Any]:
     artifact_dir = attempt_artifact_dir(attempt)
     profile_path = attempt_profile_path(attempt)
@@ -753,7 +1320,13 @@ def extract_attempt_catalog_row(
         scrutiny_36.get("timeframe"),
         list(scrutiny_36.get("instruments") or []),
     )
-    full_backtest_validation = validate_full_backtest_artifacts(attempt)
+    full_backtest_validation = validate_full_backtest_artifacts(
+        attempt,
+        config=config,
+        full_backtest_max_age_days=full_backtest_max_age_days,
+        market_session_tolerance_days=market_session_tolerance_days,
+        market_data_coverage=market_data_coverage,
+    )
     metadata = run_metadata or {}
     runner = (
         str(attempt.get("runner") or attempt.get("play_hand_runner") or metadata.get("runner") or "")
@@ -835,6 +1408,7 @@ def extract_attempt_catalog_row(
         "artifact_dir": str(artifact_dir) if artifact_dir is not None else None,
         "profile_ref": attempt.get("profile_ref"),
         "profile_path": str(profile_path) if profile_path is not None else None,
+        "reward_matrix": reward_matrix_from_attempt(attempt),
         "composite_score": attempt.get("composite_score"),
         "score_basis": attempt.get("score_basis"),
         "score_lab_score": _safe_float(attempt_metrics.get("score_lab")),
@@ -970,6 +1544,36 @@ def extract_attempt_catalog_row(
         ),
         "full_backtest_validation_issues_36m": list(
             full_backtest_validation.get("issues") or []
+        ),
+        "full_backtest_validation_reason_codes_36m": list(
+            full_backtest_validation.get("reason_codes") or []
+        ),
+        "full_backtest_rebuild_reason_codes_36m": list(
+            full_backtest_validation.get("rebuild_reason_codes") or []
+        ),
+        "full_backtest_validation_reasons_36m": list(
+            full_backtest_validation.get("reasons") or []
+        ),
+        "full_backtest_rebuild_required_36m": bool(
+            full_backtest_validation.get("rebuild_required")
+        ),
+        "full_backtest_threshold_expected_36m": full_backtest_validation.get(
+            "threshold_expected"
+        ),
+        "full_backtest_threshold_observed_36m": full_backtest_validation.get(
+            "threshold_observed"
+        ),
+        "full_backtest_profile_fingerprint_36m": full_backtest_validation.get(
+            "canonical_profile_fingerprint"
+        ),
+        "full_backtest_artifact_profile_fingerprint_36m": full_backtest_validation.get(
+            "artifact_profile_fingerprint"
+        ),
+        "full_backtest_provenance_mode_36m": full_backtest_validation.get(
+            "provenance_mode"
+        ),
+        "full_backtest_freshness_36m": dict(
+            full_backtest_validation.get("freshness") or {}
         ),
         "full_backtest_curve_point_count_36m": full_backtest_validation.get(
             "curve_point_count"

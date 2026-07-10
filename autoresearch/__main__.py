@@ -46,12 +46,14 @@ if __package__ in {None, ""}:
         acknowledge_run_metadata_only_updates,
         build_full_backtest_audit_from_sqlite,
         catalog_summary_from_sqlite,
+        iter_full_backtest_rows,
         iter_catalog_rows,
         refresh_incremental_attempt_catalog,
         stream_catalog_csv_from_sqlite,
         stream_catalog_json_from_sqlite,
     )
     from autoresearch.corpus_tools import (
+        DEFAULT_MARKET_SESSION_TOLERANCE_DAYS,
         build_full_backtest_audit,
         catalog_priority_key,
         catalog_summary,
@@ -60,11 +62,13 @@ if __package__ in {None, ""}:
         full_backtest_provisional_reasons,
         legacy_validation_cache_dir,
         load_json_if_exists,
+        load_market_data_coverage,
         normalize_tokens,
         resolve_attempt_scrutiny_source,
         scrutiny_cache_dir_for_artifact_dir,
         select_promotion_board,
         subset_similarity_payload,
+        validate_full_backtest_artifacts,
         write_csv,
         write_json,
     )
@@ -318,12 +322,14 @@ else:
         acknowledge_run_metadata_only_updates,
         build_full_backtest_audit_from_sqlite,
         catalog_summary_from_sqlite,
+        iter_full_backtest_rows,
         iter_catalog_rows,
         refresh_incremental_attempt_catalog,
         stream_catalog_csv_from_sqlite,
         stream_catalog_json_from_sqlite,
     )
     from .corpus_tools import (
+        DEFAULT_MARKET_SESSION_TOLERANCE_DAYS,
         build_full_backtest_audit,
         catalog_priority_key,
         catalog_summary,
@@ -332,11 +338,13 @@ else:
         full_backtest_provisional_reasons,
         legacy_validation_cache_dir,
         load_json_if_exists,
+        load_market_data_coverage,
         normalize_tokens,
         resolve_attempt_scrutiny_source,
         scrutiny_cache_dir_for_artifact_dir,
         select_promotion_board,
         subset_similarity_payload,
+        validate_full_backtest_artifacts,
         write_csv,
         write_json,
     )
@@ -680,6 +688,8 @@ PUBLIC_CLI_COMMANDS = {
     "run-discovery-recipe-validation-probes",
     "run",
     "finalize-corpus",
+    "calculate-full-backtests",
+    "audit-full-backtests",
     "build-portfolio",
     "optimize-portfolio",
     "export-portfolio-bundle",
@@ -3125,6 +3135,14 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Recalculate even if full-backtest file already exists.",
     )
     calc_backtests.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Audit and list attempts that require rebuilding without submitting "
+            "local or gateway work."
+        ),
+    )
+    calc_backtests.add_argument(
         "--full-backtest-max-age-days",
         type=float,
         default=DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
@@ -3132,6 +3150,15 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
             "Recalculate cached 36mo full-backtests when their effective data end "
             "is older than this many days. Use a negative value to disable. "
             f"Default: {DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS:g}"
+        ),
+    )
+    calc_backtests.add_argument(
+        "--market-session-tolerance-days",
+        type=int,
+        default=5,
+        help=(
+            "Allowed weekday market-session lag from authoritative lake coverage "
+            "before an artifact is stale. Default: 5"
         ),
     )
     calc_backtests.add_argument(
@@ -3563,6 +3590,24 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         default=None,
         help="Override the portfolio config and force full-backtest rebuilds during the optional catch-up phase.",
     )
+    full_backtest_audit.add_argument(
+        "--full-backtest-max-age-days",
+        type=float,
+        default=DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+        help="Calendar-day freshness fallback when authoritative coverage is unavailable.",
+    )
+    full_backtest_audit.add_argument(
+        "--market-session-tolerance-days",
+        type=int,
+        default=5,
+        help="Allowed weekday lag from authoritative lake coverage. Default: 5",
+    )
+    full_backtest_audit.add_argument(
+        "--trading-dashboard-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard root containing the local lake coverage manifest.",
+    )
     portfolio_report.add_argument(
         "--catch-up-full-backtest-max-age-days",
         type=float,
@@ -3979,6 +4024,15 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     render_corpus_profile_drops.add_argument(
+        "--market-session-tolerance-days",
+        type=int,
+        default=DEFAULT_MARKET_SESSION_TOLERANCE_DAYS,
+        help=(
+            "Allowed closed-market session lag between an artifact's effective "
+            f"end and current lake coverage. Default: {DEFAULT_MARKET_SESSION_TOLERANCE_DAYS}"
+        ),
+    )
+    render_corpus_profile_drops.add_argument(
         "--full-backtest-backend",
         choices=("local", "lab-gateway"),
         default="local",
@@ -4083,6 +4137,15 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
             "Recalculate cached 36mo full-backtests when their effective data end "
             "is older than this many days. Use a negative value to disable. "
             f"Default: {DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS:g}"
+        ),
+    )
+    finalize_corpus.add_argument(
+        "--market-session-tolerance-days",
+        type=int,
+        default=DEFAULT_MARKET_SESSION_TOLERANCE_DAYS,
+        help=(
+            "Allowed closed-market session lag between an artifact's effective "
+            f"end and current lake coverage. Default: {DEFAULT_MARKET_SESSION_TOLERANCE_DAYS}"
         ),
     )
     finalize_corpus.add_argument(
@@ -7384,87 +7447,6 @@ def _iter_payload_key_values(payload: Any, key: str) -> list[Any]:
     return values
 
 
-def _parse_payload_datetime(value: Any) -> datetime | None:
-    if isinstance(value, datetime):
-        parsed = value
-    else:
-        token = str(value or "").strip()
-        if not token:
-            return None
-        if token.endswith("Z"):
-            token = token[:-1] + "+00:00"
-        try:
-            parsed = datetime.fromisoformat(token)
-        except ValueError:
-            return None
-    if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
-
-
-def _truthy_payload_flag(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return False
-
-
-def _full_backtest_freshness_issue(
-    result_path: Path,
-    *,
-    max_age_days: float | None,
-    now: datetime | None = None,
-) -> str | None:
-    if max_age_days is None or float(max_age_days) < 0:
-        return None
-    try:
-        payload = _load_json_if_exists(result_path)
-    except Exception:
-        return "invalid_result_json"
-    if not isinstance(payload, dict) or not payload:
-        return "missing_freshness_metadata"
-
-    effective_ends = [
-        parsed
-        for parsed in (
-            _parse_payload_datetime(value)
-            for value in _iter_payload_key_values(payload, "effective_window_end")
-        )
-        if parsed is not None
-    ]
-    if not effective_ends:
-        return "missing_effective_window_end"
-
-    max_age = timedelta(days=max(0.0, float(max_age_days)))
-    now_utc = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
-    latest_effective_end = max(effective_ends)
-    if latest_effective_end < now_utc - max_age:
-        return "stale_effective_window_end"
-
-    if any(
-        _truthy_payload_flag(value)
-        for value in _iter_payload_key_values(payload, "window_truncated_end")
-    ):
-        requested_ends = [
-            parsed
-            for parsed in (
-                _parse_payload_datetime(value)
-                for value in _iter_payload_key_values(payload, "requested_window_end")
-            )
-            if parsed is not None
-        ]
-        if not requested_ends:
-            return "truncated_window_missing_requested_end"
-        latest_requested_end = max(requested_ends)
-        if latest_requested_end - latest_effective_end > max_age:
-            return "truncated_window_gap"
-
-    return None
-
-
 def _full_backtest_profile_drop_reuse_issue(
     *,
     config,
@@ -7475,32 +7457,14 @@ def _full_backtest_profile_drop_reuse_issue(
 ) -> str | None:
     if int(lookback_months) != 36:
         return "unsupported_full_backtest_lookback"
-    if not artifact_dir.exists():
-        return "missing_artifact_dir"
-
-    curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
-    result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
-    calendar_curve_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
-    recommended_detail_path = artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
-    if not curve_path.exists() or not result_path.exists():
-        return "missing_full_backtest_artifact"
-    if not calendar_curve_path.exists():
-        return "missing_calendar_curve"
-    if not _result_has_canonical_score_lab(result_path):
-        return "stale_score_lab"
-    if not result_matches_execution_cost_model(result_path, config):
-        return "execution_cost_model_mismatch"
-    if not _result_matches_attempt_reward_matrix(result_path, attempt):
-        return "reward_matrix_mismatch"
-    freshness_issue = _full_backtest_freshness_issue(
-        result_path,
-        max_age_days=max_age_days,
+    validation = validate_full_backtest_artifacts(
+        attempt,
+        config=config,
+        full_backtest_max_age_days=max_age_days,
+        require_calendar_curve=True,
     )
-    if freshness_issue is not None:
-        return freshness_issue
-    if not recommended_detail_path.exists():
-        return "missing_recommended_cell_detail"
-    return None
+    reason_codes = list(validation.get("reason_codes") or [])
+    return str(reason_codes[0]) if reason_codes else None
 
 
 def _profile_drop_artifact_native_row_issue(
@@ -10638,7 +10602,9 @@ def cmd_calculate_full_backtests(
     require_scrutiny_36: bool,
     force_rebuild: bool,
     job_timeout_seconds: int | None,
+    dry_run: bool = False,
     full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+    market_session_tolerance_days: int = 5,
     full_backtest_backend: str = "local",
     full_backtest_gateway_url: str | None = None,
     full_backtest_gateway_token: str | None = None,
@@ -10727,19 +10693,31 @@ def cmd_calculate_full_backtests(
             )
         return 0
 
-    def calculation_needed_reason(attempt: dict[str, Any]) -> str | None:
-        artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
-        if not artifact_dir.exists():
-            return None
+    coverage_root = trading_dashboard_root
+    if coverage_root is None:
+        configured_root = str(os.environ.get("TRADING_DASHBOARD_ROOT") or "").strip()
+        if configured_root:
+            coverage_root = Path(configured_root)
+        else:
+            repo_root = getattr(config, "repo_root", None)
+            if repo_root is not None:
+                sibling = Path(repo_root).parent / "Trading-Dashboard"
+                if sibling.exists():
+                    coverage_root = sibling
+    market_data_coverage = load_market_data_coverage(coverage_root)
+
+    def calculation_needed_reasons(attempt: dict[str, Any]) -> list[str]:
         if force_rebuild:
-            return "force_rebuild"
-        return _full_backtest_profile_drop_reuse_issue(
+            return ["force_rebuild"]
+        validation = validate_full_backtest_artifacts(
+            attempt,
             config=config,
-            attempt=attempt,
-            artifact_dir=artifact_dir,
-            lookback_months=36,
-            max_age_days=full_backtest_max_age_days,
+            full_backtest_max_age_days=full_backtest_max_age_days,
+            market_session_tolerance_days=market_session_tolerance_days,
+            market_data_coverage=market_data_coverage,
+            require_calendar_curve=True,
         )
+        return list(validation.get("rebuild_reason_codes") or [])
 
     filter_rejections = {
         "already_has_full_backtest": 0,
@@ -10747,6 +10725,7 @@ def cmd_calculate_full_backtests(
         "no_backtestable_cell": 0,
     }
     calculation_reasons: dict[str, int] = {}
+    rebuild_inventory: list[dict[str, Any]] = []
     eligible_items: list[tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
     for run_dir, _attempts, attempt in matched_items:
         run_metadata = load_run_metadata(run_dir)
@@ -10755,12 +10734,21 @@ def cmd_calculate_full_backtests(
             run_metadata=run_metadata,
         )
         row = catalog_by_attempt_id.get(str(attempt.get("attempt_id") or "")) or {}
-        calculation_reason = calculation_needed_reason(attempt)
-        if calculation_reason is None:
+        calculation_reason_codes = calculation_needed_reasons(attempt)
+        if not calculation_reason_codes:
             filter_rejections["already_has_full_backtest"] += 1
             continue
-        calculation_reasons[calculation_reason] = (
-            calculation_reasons.get(calculation_reason, 0) + 1
+        for calculation_reason in calculation_reason_codes:
+            calculation_reasons[calculation_reason] = (
+                calculation_reasons.get(calculation_reason, 0) + 1
+            )
+        rebuild_inventory.append(
+            {
+                "run_id": run_dir.name,
+                "attempt_id": str(attempt.get("attempt_id") or ""),
+                "candidate_name": row.get("candidate_name"),
+                "reason_codes": calculation_reason_codes,
+            }
         )
         if not _attempt_has_backtestable_cell(attempt):
             filter_rejections["no_backtestable_cell"] += 1
@@ -10776,6 +10764,47 @@ def cmd_calculate_full_backtests(
         to_calculate = to_calculate[: int(limit)]
     total = len(to_calculate)
     skipped = len(matched_items) - total
+
+    if dry_run:
+        selected_attempt_ids = {
+            str(item[1].get("attempt_id") or "") for item in to_calculate
+        }
+        selected_inventory = [
+            item
+            for item in rebuild_inventory
+            if str(item.get("attempt_id") or "") in selected_attempt_ids
+        ]
+        payload = {
+            "status": "dry_run",
+            "runs_considered": len({run_dir.name for run_dir, *_ in matched_items}),
+            "matched_attempts": len(matched_items),
+            "eligible_attempts": len(eligible_items),
+            "selected_for_rebuild": len(to_calculate),
+            "skipped": skipped,
+            "filter_rejections": filter_rejections,
+            "calculation_reasons": calculation_reasons,
+            "rebuild_inventory": selected_inventory,
+            "filters": {
+                "run_ids": run_ids,
+                "effective_run_ids": effective_run_ids,
+                "attempt_ids": attempt_ids,
+                "limit": limit,
+                "require_scrutiny_36": require_scrutiny_36,
+                "force_rebuild": force_rebuild,
+                "full_backtest_max_age_days": full_backtest_max_age_days,
+                "market_session_tolerance_days": market_session_tolerance_days,
+                "market_data_coverage_entries": len(market_data_coverage),
+                "trading_dashboard_root": str(coverage_root)
+                if coverage_root is not None
+                else None,
+            },
+            "corpus_index": corpus_index_info,
+            "calculated": 0,
+            "failed": 0,
+        }
+        if emit_summary:
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+        return 0
 
     worker_source = "config.validation_max_concurrency"
     detected_sim_workers = None
@@ -10866,10 +10895,12 @@ def cmd_calculate_full_backtests(
                 "force_rebuild": force_rebuild,
                 "job_timeout_seconds": job_timeout_seconds,
                 "full_backtest_max_age_days": full_backtest_max_age_days,
+                "market_session_tolerance_days": market_session_tolerance_days,
                 "full_backtest_backend": "lab_gateway",
             },
             "corpus_index": corpus_index_info,
             "calculation_reasons": calculation_reasons,
+            "rebuild_inventory": rebuild_inventory,
             "max_workers_used": resolved_max_workers,
             "max_workers_source": worker_source,
             "detected_dev_sim_workers": detected_sim_workers,
@@ -11046,9 +11077,11 @@ def cmd_calculate_full_backtests(
             "force_rebuild": force_rebuild,
             "job_timeout_seconds": job_timeout_seconds,
             "full_backtest_max_age_days": full_backtest_max_age_days,
+            "market_session_tolerance_days": market_session_tolerance_days,
         },
         "corpus_index": corpus_index_info,
         "calculation_reasons": calculation_reasons,
+        "rebuild_inventory": rebuild_inventory,
         "max_workers_used": resolved_max_workers,
         "max_workers_source": worker_source,
         "detected_dev_sim_workers": detected_sim_workers,
@@ -11130,40 +11163,166 @@ def cmd_build_attempt_catalog(
     return 0
 
 
+def _live_validate_full_backtest_rows(
+    rows: list[dict[str, Any]],
+    *,
+    config: Any,
+    full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+    market_session_tolerance_days: int = 5,
+    trading_dashboard_root: Path | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    coverage_root = trading_dashboard_root
+    if coverage_root is None:
+        configured_root = str(os.environ.get("TRADING_DASHBOARD_ROOT") or "").strip()
+        if configured_root:
+            coverage_root = Path(configured_root)
+        else:
+            repo_root = getattr(config, "repo_root", None)
+            sibling = (
+                Path(repo_root).parent / "Trading-Dashboard"
+                if repo_root is not None
+                else None
+            )
+            if sibling is not None and sibling.exists():
+                coverage_root = sibling
+    coverage = load_market_data_coverage(coverage_root)
+    validated_rows: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    reason_counts: dict[str, int] = {}
+    cached_run_id = ""
+    cached_run_metadata: dict[str, Any] = {}
+    for source_row in rows:
+        row = dict(source_row)
+        has_full_backtest_artifact = any(
+            bool(row.get(field))
+            for field in (
+                "has_full_backtest_36m",
+                "has_full_backtest_result_36m",
+                "has_full_backtest_curve_36m",
+                "has_full_backtest_calendar_curve_36m",
+                "has_full_backtest_recommended_curve_36m",
+            )
+        )
+        if not has_full_backtest_artifact:
+            validated_rows.append(row)
+            continue
+        run_id = str(row.get("run_id") or "").strip()
+        attempt_id = str(row.get("attempt_id") or "").strip()
+        validation_attempt = row
+        if run_id and attempt_id and hasattr(config, "runs_root"):
+            if run_id != cached_run_id:
+                run_dir = Path(config.runs_root) / run_id
+                cached_run_metadata = load_run_metadata(run_dir)
+                cached_run_id = run_id
+            validation_attempt = _attempt_with_run_reward_matrix(
+                row,
+                run_metadata=cached_run_metadata,
+            )
+        validation = validate_full_backtest_artifacts(
+            validation_attempt,
+            config=config,
+            full_backtest_max_age_days=full_backtest_max_age_days,
+            market_session_tolerance_days=market_session_tolerance_days,
+            market_data_coverage=coverage,
+            require_calendar_curve=True,
+        )
+        reason_codes = list(validation.get("reason_codes") or [])
+        row["full_backtest_validation_status_36m"] = validation.get("status")
+        row["full_backtest_validation_reason_codes_36m"] = reason_codes
+        row["full_backtest_rebuild_reason_codes_36m"] = list(
+            validation.get("rebuild_reason_codes") or []
+        )
+        row["full_backtest_validation_reasons_36m"] = list(
+            validation.get("reasons") or []
+        )
+        row["full_backtest_rebuild_required_36m"] = bool(
+            validation.get("rebuild_required")
+        )
+        row["full_backtest_freshness_36m"] = dict(
+            validation.get("freshness") or {}
+        )
+        row["full_backtest_threshold_expected_36m"] = validation.get(
+            "threshold_expected"
+        )
+        row["full_backtest_threshold_observed_36m"] = validation.get(
+            "threshold_observed"
+        )
+        validated_rows.append(row)
+        if reason_codes:
+            rejected.append(
+                {
+                    "run_id": row.get("run_id"),
+                    "attempt_id": row.get("attempt_id"),
+                    "candidate_name": row.get("candidate_name"),
+                    "profile_path": row.get("profile_path"),
+                    "result_path": validation.get("result_path"),
+                    "reason_codes": reason_codes,
+                    "rebuild_reason_codes": list(
+                        validation.get("rebuild_reason_codes") or []
+                    ),
+                    "rebuild_required": bool(validation.get("rebuild_required")),
+                    "reasons": list(validation.get("reasons") or []),
+                    "freshness": dict(validation.get("freshness") or {}),
+                    "threshold_expected": validation.get("threshold_expected"),
+                    "threshold_observed": validation.get("threshold_observed"),
+                    "provenance_mode": validation.get("provenance_mode"),
+                }
+            )
+            for code in reason_codes:
+                reason_counts[code] = reason_counts.get(code, 0) + 1
+    return validated_rows, rejected, reason_counts
+
+
 def cmd_audit_full_backtests(
     *,
     run_ids: list[str] | None,
     attempt_ids: list[str] | None,
+    full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+    market_session_tolerance_days: int = 5,
+    trading_dashboard_root: Path | None = None,
     as_json: bool,
 ) -> int:
     config = load_config()
-    run_dirs = _matching_run_dirs(config, run_ids)
-    rows, _index_info = _selection_corpus_rows(
-        config,
-        run_ids=run_ids,
-        label="audit-full-backtests",
-        as_json=as_json,
-        materialize_full_corpus=False,
+    wanted_attempt_ids = sorted(
+        {token.strip() for token in (attempt_ids or []) if str(token).strip()}
     )
-    wanted_attempt_ids = {
-        token.strip() for token in (attempt_ids or []) if str(token).strip()
-    }
-    if wanted_attempt_ids:
-        rows = [
-            row for row in rows if str(row.get("attempt_id") or "") in wanted_attempt_ids
-        ]
+    rows = list(
+        iter_full_backtest_rows(
+            config,
+            run_ids=run_ids,
+            attempt_ids=wanted_attempt_ids or None,
+        )
+    )
+    rows, invalid_inventory, reason_counts = _live_validate_full_backtest_rows(
+        rows,
+        config=config,
+        full_backtest_max_age_days=full_backtest_max_age_days,
+        market_session_tolerance_days=market_session_tolerance_days,
+        trading_dashboard_root=trading_dashboard_root,
+    )
+    rebuild_inventory = [
+        item for item in invalid_inventory if bool(item.get("rebuild_required"))
+    ]
     audit_payload = build_full_backtest_audit(rows)
-    output_path = (
-        config.full_backtest_audit_json_path
-        if not run_ids and not wanted_attempt_ids
-        else None
-    )
-    if output_path is not None:
-        write_json(output_path, audit_payload)
     payload = {
-        "full_backtest_audit_json": str(output_path) if output_path is not None else None,
-        "run_count": len(run_dirs),
+        "status": "audit_only",
+        "full_backtest_audit_json": None,
+        "run_count": len({str(row.get("run_id") or "") for row in rows}),
         "attempt_count": len(rows),
+        "rebuild_required_count": len(rebuild_inventory),
+        "reason_counts": reason_counts,
+        "rebuild_inventory": rebuild_inventory,
+        "invalid_evidence_count": len(invalid_inventory),
+        "invalid_evidence_inventory": invalid_inventory,
+        "filters": {
+            "run_ids": run_ids,
+            "attempt_ids": wanted_attempt_ids or None,
+            "full_backtest_max_age_days": full_backtest_max_age_days,
+            "market_session_tolerance_days": market_session_tolerance_days,
+            "trading_dashboard_root": str(trading_dashboard_root)
+            if trading_dashboard_root is not None
+            else None,
+        },
         **audit_payload,
     }
     print(json.dumps(payload, ensure_ascii=True, indent=2))
@@ -12579,6 +12738,14 @@ def cmd_build_portfolio(
         rows = [
             row for row in rows if str(row.get("attempt_id") or "") in wanted_attempt_ids
         ]
+    rows, artifact_validation_rejections, artifact_validation_reason_counts = (
+        _live_validate_full_backtest_rows(
+            rows,
+            config=config,
+            full_backtest_max_age_days=catch_up_max_age_days,
+            market_session_tolerance_days=5,
+        )
+    )
     base_scope_info = {
         "candidate_scope": "explicit_attempts",
         "input_count": len(rows),
@@ -12806,6 +12973,11 @@ def cmd_build_portfolio(
             },
             "candidate_scope": variant_scope_info,
             "catch_up_summary": catch_up_summary,
+            "artifact_validation": {
+                "rejected_count": len(artifact_validation_rejections),
+                "reason_counts": artifact_validation_reason_counts,
+                "rejected": artifact_validation_rejections,
+            },
             "run_ids": run_ids,
             "attempt_ids": attempt_ids,
             "corpus_row_count": corpus_index_info.get("row_count"),
@@ -13028,6 +13200,14 @@ def cmd_optimize_portfolio(
         }
     else:
         rows, scope_info = filter_play_hand_candidate_scope(rows, candidate_scope)
+    rows, artifact_validation_rejections, artifact_validation_reason_counts = (
+        _live_validate_full_backtest_rows(
+            rows,
+            config=config,
+            full_backtest_max_age_days=DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+            market_session_tolerance_days=5,
+        )
+    )
 
     baseline_ids: list[str] = []
     baselines_raw: list[tuple[str, list[str]]] = []
@@ -13141,6 +13321,10 @@ def cmd_optimize_portfolio(
             "scoped_row_count": len(rows),
             "optimizer_backend": used_optimizer_backend,
             "requested_optimizer_backend": optimizer_backend,
+            "artifact_validation_rejected_count": len(
+                artifact_validation_rejections
+            ),
+            "artifact_validation_reason_counts": artifact_validation_reason_counts,
         },
     )
     output_payload = {
@@ -13149,6 +13333,11 @@ def cmd_optimize_portfolio(
         "optimizer_backend": used_optimizer_backend,
         "requested_optimizer_backend": optimizer_backend,
         "progress_jsonl": str(progress_path),
+        "artifact_validation": {
+            "rejected_count": len(artifact_validation_rejections),
+            "reason_counts": artifact_validation_reason_counts,
+            "rejected": artifact_validation_rejections,
+        },
         "variants": {
             name: {
                 "objective_score": variant.get("objective_score"),
@@ -14905,6 +15094,7 @@ def cmd_render_corpus_profile_drops(
     full_backtest_workers: int | None = None,
     full_backtest_job_timeout_seconds: int | None = 2400,
     full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+    market_session_tolerance_days: int = DEFAULT_MARKET_SESSION_TOLERANCE_DAYS,
     full_backtest_backend: str = "local",
     full_backtest_gateway_url: str | None = None,
     full_backtest_gateway_token: str | None = None,
@@ -15086,6 +15276,7 @@ def cmd_render_corpus_profile_drops(
                     force_rebuild=bool(force_rebuild),
                     job_timeout_seconds=full_backtest_job_timeout,
                     full_backtest_max_age_days=full_backtest_max_age_days,
+                    market_session_tolerance_days=market_session_tolerance_days,
                     full_backtest_backend=full_backtest_backend,
                     full_backtest_gateway_url=full_backtest_gateway_url,
                     full_backtest_gateway_token=full_backtest_gateway_token,
@@ -15107,6 +15298,7 @@ def cmd_render_corpus_profile_drops(
                 force_rebuild=bool(force_rebuild),
                 job_timeout_seconds=full_backtest_job_timeout,
                 full_backtest_max_age_days=full_backtest_max_age_days,
+                market_session_tolerance_days=market_session_tolerance_days,
                 full_backtest_backend=full_backtest_backend,
                 full_backtest_gateway_url=full_backtest_gateway_url,
                 full_backtest_gateway_token=full_backtest_gateway_token,
@@ -15583,6 +15775,7 @@ def cmd_finalize_corpus(
     full_backtest_workers: int | None = None,
     full_backtest_job_timeout_seconds: int | None = 2400,
     full_backtest_max_age_days: float | None = DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS,
+    market_session_tolerance_days: int = DEFAULT_MARKET_SESSION_TOLERANCE_DAYS,
     full_backtest_backend: str = "local",
     full_backtest_gateway_url: str | None = None,
     full_backtest_gateway_token: str | None = None,
@@ -15677,12 +15870,50 @@ def cmd_finalize_corpus(
         "full_backtest_workers": full_backtest_worker_count,
         "full_backtest_job_timeout_seconds": full_backtest_job_timeout,
         "full_backtest_max_age_days": full_backtest_max_age_days,
+        "market_session_tolerance_days": int(market_session_tolerance_days),
         "profile_drop_timeout_seconds": max(1, int(profile_drop_timeout_seconds)),
         "force_rebuild": bool(force_rebuild),
         "require_presentation_metadata": bool(require_presentation_metadata),
         "dry_run": bool(dry_run),
         "selected": selected_preview,
     }
+    if dry_run and selected_attempt_ids:
+        with io.StringIO() as capture, redirect_stdout(capture):
+            catchup_preview_exit_code = cmd_calculate_full_backtests(
+                run_ids=run_ids,
+                attempt_ids=selected_attempt_ids,
+                limit=None,
+                max_workers=full_backtest_worker_count,
+                use_dev_sim_worker_count=True,
+                require_scrutiny_36=False,
+                force_rebuild=bool(force_rebuild),
+                dry_run=True,
+                job_timeout_seconds=full_backtest_job_timeout,
+                full_backtest_max_age_days=full_backtest_max_age_days,
+                market_session_tolerance_days=market_session_tolerance_days,
+                full_backtest_backend=full_backtest_backend,
+                full_backtest_gateway_url=full_backtest_gateway_url,
+                full_backtest_gateway_token=full_backtest_gateway_token,
+                full_backtest_worker_contract_hash=full_backtest_worker_contract_hash,
+                full_backtest_result_batch_size=full_backtest_result_batch_size,
+                trading_dashboard_root=trading_dashboard_root,
+                as_json=True,
+                emit_summary=True,
+                catalog_already_refreshed=True,
+                defer_global_audit=True,
+            )
+            catchup_preview_output = capture.getvalue().strip()
+        summary["full_backtest_catchup_preview_exit_code"] = catchup_preview_exit_code
+        if catchup_preview_output:
+            try:
+                summary["full_backtest_catchup_preview"] = json.loads(
+                    catchup_preview_output
+                )
+            except json.JSONDecodeError:
+                summary["full_backtest_catchup_preview"] = {
+                    "status": "invalid_preview_output",
+                    "raw_output": catchup_preview_output,
+                }
     if dry_run or not selected_attempt_ids:
         summary["status"] = "dry_run" if dry_run else "no_attempts"
         if as_json:
@@ -15719,6 +15950,7 @@ def cmd_finalize_corpus(
                 full_backtest_workers=full_backtest_worker_count,
                 full_backtest_job_timeout_seconds=full_backtest_job_timeout,
                 full_backtest_max_age_days=full_backtest_max_age_days,
+                market_session_tolerance_days=market_session_tolerance_days,
                 full_backtest_backend=full_backtest_backend,
                 full_backtest_gateway_url=full_backtest_gateway_url,
                 full_backtest_gateway_token=full_backtest_gateway_token,
@@ -15749,6 +15981,7 @@ def cmd_finalize_corpus(
             full_backtest_workers=full_backtest_worker_count,
             full_backtest_job_timeout_seconds=full_backtest_job_timeout,
             full_backtest_max_age_days=full_backtest_max_age_days,
+            market_session_tolerance_days=market_session_tolerance_days,
             full_backtest_backend=full_backtest_backend,
             full_backtest_gateway_url=full_backtest_gateway_url,
             full_backtest_gateway_token=full_backtest_gateway_token,
@@ -17946,8 +18179,10 @@ def main(argv: list[str] | None = None) -> int:
             use_dev_sim_worker_count=not bool(args.no_use_dev_sim_worker_count),
             require_scrutiny_36=bool(args.require_scrutiny_36),
             force_rebuild=bool(args.force_rebuild),
+            dry_run=bool(args.dry_run),
             job_timeout_seconds=None,
             full_backtest_max_age_days=args.full_backtest_max_age_days,
+            market_session_tolerance_days=args.market_session_tolerance_days,
             full_backtest_backend=args.full_backtest_backend,
             full_backtest_gateway_url=args.full_backtest_gateway_url,
             full_backtest_gateway_token=args.full_backtest_gateway_token,
@@ -17967,6 +18202,9 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_audit_full_backtests(
             run_ids=args.run_id,
             attempt_ids=args.attempt_id,
+            full_backtest_max_age_days=args.full_backtest_max_age_days,
+            market_session_tolerance_days=args.market_session_tolerance_days,
+            trading_dashboard_root=args.trading_dashboard_root,
             as_json=bool(args.json),
         )
     if args.command == "plot-corpus-score-vs-trades":
@@ -18124,6 +18362,7 @@ def main(argv: list[str] | None = None) -> int:
             full_backtest_workers=args.full_backtest_workers,
             full_backtest_job_timeout_seconds=args.full_backtest_job_timeout_seconds,
             full_backtest_max_age_days=args.full_backtest_max_age_days,
+            market_session_tolerance_days=args.market_session_tolerance_days,
             full_backtest_backend=args.full_backtest_backend,
             full_backtest_gateway_url=args.full_backtest_gateway_url,
             full_backtest_gateway_token=args.full_backtest_gateway_token,
@@ -18147,6 +18386,7 @@ def main(argv: list[str] | None = None) -> int:
             full_backtest_workers=args.full_backtest_workers,
             full_backtest_job_timeout_seconds=args.full_backtest_job_timeout_seconds,
             full_backtest_max_age_days=args.full_backtest_max_age_days,
+            market_session_tolerance_days=args.market_session_tolerance_days,
             full_backtest_backend=args.full_backtest_backend,
             full_backtest_gateway_url=args.full_backtest_gateway_url,
             full_backtest_gateway_token=args.full_backtest_gateway_token,

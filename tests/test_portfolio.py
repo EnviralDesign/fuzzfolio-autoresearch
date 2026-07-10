@@ -1612,6 +1612,94 @@ def test_cmd_finalize_corpus_uses_dashboard_visible_attempts(
     assert payload["passing_summary"]["newly_passing_count"] == 0
 
 
+def test_cmd_finalize_corpus_dry_run_includes_selective_catchup_preview(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    config = SimpleNamespace(
+        repo_root=tmp_path,
+        runs_root=tmp_path / "runs",
+        attempt_catalog_sqlite_path=tmp_path / "runs" / "derived" / "attempt-catalog.sqlite",
+        fuzzfolio=SimpleNamespace(),
+    )
+    selected = [
+        {
+            "run_id": "run-a",
+            "attempt_id": "attempt-a",
+            "candidate_name": "candidate-a",
+            "has_full_backtest_36m": True,
+        }
+    ]
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        ar_main,
+        "refresh_incremental_attempt_catalog",
+        lambda *_args, **_kwargs: ([], {"source": "sqlite_incremental", "row_count": 1}),
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_select_finalize_corpus_rows",
+        lambda *_args, **_kwargs: (
+            selected,
+            {
+                "selection_scope": "dashboard",
+                "input_count": 1,
+                "output_count": 1,
+                "run_count": 1,
+            },
+        ),
+    )
+    calculate_calls: list[dict[str, object]] = []
+
+    def fake_calculate_full_backtests(**kwargs):
+        calculate_calls.append(kwargs)
+        print(
+            json.dumps(
+                {
+                    "status": "dry_run",
+                    "selected_for_rebuild": 1,
+                    "calculation_reasons": {"threshold_mismatch": 1},
+                    "rebuild_inventory": [
+                        {
+                            "attempt_id": "attempt-a",
+                            "reason_codes": ["threshold_mismatch"],
+                        }
+                    ],
+                }
+            )
+        )
+        return 0
+
+    monkeypatch.setattr(
+        ar_main, "cmd_calculate_full_backtests", fake_calculate_full_backtests
+    )
+
+    exit_code = ar_main.cmd_finalize_corpus(
+        run_ids=None,
+        attempt_ids=None,
+        scope="dashboard",
+        lookback_months=36,
+        profile_drop_workers=2,
+        profile_drop_timeout_seconds=90,
+        force_rebuild=False,
+        require_presentation_metadata=True,
+        dry_run=True,
+        as_json=True,
+        full_backtest_workers=12,
+    )
+
+    assert exit_code == 0
+    assert calculate_calls[0]["dry_run"] is True
+    assert calculate_calls[0]["attempt_ids"] == ["attempt-a"]
+    assert calculate_calls[0]["catalog_already_refreshed"] is True
+    payload = json.loads(capsys.readouterr().out)
+    preview = payload["full_backtest_catchup_preview"]
+    assert preview["selected_for_rebuild"] == 1
+    assert preview["rebuild_inventory"][0]["reason_codes"] == [
+        "threshold_mismatch"
+    ]
+
+
 def test_finalize_corpus_passing_delta_helpers(tmp_path: Path) -> None:
     def _write_passing_artifact(root: Path) -> None:
         root.mkdir(parents=True, exist_ok=True)

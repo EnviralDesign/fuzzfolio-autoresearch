@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from autoresearch.plotting import render_attempt_tradeoff_scatter_artifacts
 
 from autoresearch import corpus_tools as ct
@@ -130,6 +131,57 @@ def test_resolve_attempt_scrutiny_source_uses_matching_attempt_result(tmp_path):
 
 def test_validate_full_backtest_artifacts_accepts_valid_pair(tmp_path):
     artifact_dir = tmp_path / "artifact"
+    profile_path = tmp_path / "profile.json"
+    artifact_dir.mkdir()
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_RESULT_FILENAME,
+        _sample_sensitivity_payload(61.25),
+    )
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_CURVE_FILENAME,
+        _sample_curve_payload(1.0),
+    )
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
+        _sample_curve_payload(0.9),
+    )
+    _write_json(
+        profile_path,
+        {
+            "profile": {
+                "version": "v1",
+                "notificationThreshold": 80,
+                "directionMode": "both",
+                "instruments": ["EURUSD"],
+                "indicators": [],
+            }
+        },
+    )
+    _write_json(
+        artifact_dir / "deep-replay-job.json",
+        {
+            "request": {
+                "alert_threshold": 80,
+                "timeframe": "M15",
+                "instruments": ["EURUSD"],
+            }
+        },
+    )
+
+    attempt = {"artifact_dir": str(artifact_dir), "profile_path": str(profile_path)}
+    validation = ct.validate_full_backtest_artifacts(attempt)
+
+    assert validation["status"] == "valid"
+    assert validation["issues"] == []
+    assert validation["curve_point_count"] == 39
+    assert validation["cell_match"] is True
+    assert validation["recommended_curve_exists"] is True
+
+
+def test_validate_full_backtest_artifacts_rejects_missing_canonical_profile_without_rebuild(
+    tmp_path,
+):
+    artifact_dir = tmp_path / "artifact"
     artifact_dir.mkdir()
     _write_json(
         artifact_dir / ct.FULL_BACKTEST_RESULT_FILENAME,
@@ -144,14 +196,14 @@ def test_validate_full_backtest_artifacts_accepts_valid_pair(tmp_path):
         _sample_curve_payload(0.9),
     )
 
-    attempt = {"artifact_dir": str(artifact_dir)}
-    validation = ct.validate_full_backtest_artifacts(attempt)
+    validation = ct.validate_full_backtest_artifacts(
+        {"artifact_dir": str(artifact_dir)}
+    )
 
-    assert validation["status"] == "valid"
-    assert validation["issues"] == []
-    assert validation["curve_point_count"] == 39
-    assert validation["cell_match"] is True
-    assert validation["recommended_curve_exists"] is True
+    assert validation["status"] == "invalid"
+    assert validation["reason_codes"] == ["invalid_artifact"]
+    assert validation["rebuild_reason_codes"] == []
+    assert validation["rebuild_required"] is False
 
 
 def test_validate_full_backtest_artifacts_requires_recommended_detail(tmp_path):
@@ -198,6 +250,157 @@ def test_validate_full_backtest_artifacts_flags_mismatched_cell(tmp_path):
     assert validation["status"] == "invalid"
     assert "best_cell_mismatch" in validation["issues"]
     assert validation["cell_match"] is False
+
+
+def _write_profile_equivalence_fixture(
+    tmp_path,
+    *,
+    profile_threshold: float,
+    artifact_threshold: float,
+    effective_window_end: str = "2026-07-03T16:55:00Z",
+):
+    artifact_dir = tmp_path / "artifact"
+    profile_path = tmp_path / "profile.json"
+    profile = {
+        "version": "v1",
+        "notificationThreshold": profile_threshold,
+        "directionMode": "both",
+        "instruments": ["EURUSD"],
+        "executionConfig": None,
+        "indicators": [
+            {
+                "meta": {"id": "RSI_CROSSBACK", "instanceId": "volatile"},
+                "config": {"timeframe": "M5", "weight": 1.0, "label": "RSI"},
+            }
+        ],
+    }
+    _write_json(profile_path, {"profile": profile})
+    result = _sample_sensitivity_payload(61.25)
+    result["data"]["aggregate"]["market_data_window"] = {
+        "effective_window_end": effective_window_end,
+        "requested_window_end": "2026-07-09T12:00:00Z",
+        "window_truncated_end": True,
+    }
+    _write_json(artifact_dir / ct.FULL_BACKTEST_RESULT_FILENAME, result)
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_CURVE_FILENAME,
+        _sample_curve_payload(),
+    )
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
+        _sample_curve_payload(),
+    )
+    _write_json(
+        artifact_dir / "full-backtest-36mo-deep-replay-job.json",
+        {
+            "request": {
+                "alert_threshold": artifact_threshold,
+                "instruments": ["EURUSD"],
+                "timeframe": "M5",
+                "direction_mode": "both",
+            }
+        },
+    )
+    return {
+        "run_id": "run-a",
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+    }, profile, result
+
+
+def test_threshold_mismatch_invalidates_existing_artifact(tmp_path):
+    attempt, _profile, _result = _write_profile_equivalence_fixture(
+        tmp_path,
+        profile_threshold=70,
+        artifact_threshold=80,
+    )
+
+    validation = ct.validate_full_backtest_artifacts(attempt)
+
+    assert validation["status"] == "invalid"
+    assert validation["reason_codes"] == ["threshold_mismatch"]
+    assert validation["threshold_expected"] == 70
+    assert validation["threshold_observed"] == 80
+
+
+def test_profile_fingerprint_drift_invalidates_existing_artifact(tmp_path):
+    attempt, profile, result = _write_profile_equivalence_fixture(
+        tmp_path,
+        profile_threshold=80,
+        artifact_threshold=80,
+    )
+    artifact_dir = tmp_path / "artifact"
+    request = {
+        "alert_threshold": 80,
+        "instruments": ["EURUSD"],
+        "timeframe": "M5",
+        "direction_mode": "both",
+    }
+    provenance = ct.build_full_backtest_provenance(
+        attempt=attempt,
+        profile_snapshot=profile,
+        request_payload=request,
+        result_payload=result,
+        source_profile_path=tmp_path / "profile.json",
+    )
+    _write_json(artifact_dir / ct.FULL_BACKTEST_MANIFEST_FILENAME, provenance)
+    drifted = dict(profile)
+    drifted["indicators"] = [
+        {
+            "meta": {"id": "WILLR_MEAN_REVERSION"},
+            "config": {"timeframe": "M5", "weight": 1.0},
+        }
+    ]
+    _write_json(tmp_path / "profile.json", {"profile": drifted})
+
+    validation = ct.validate_full_backtest_artifacts(attempt)
+
+    assert "profile_fingerprint_mismatch" in validation["reason_codes"]
+
+
+def test_market_coverage_marks_may_artifact_stale(tmp_path):
+    attempt, _profile, _result = _write_profile_equivalence_fixture(
+        tmp_path,
+        profile_threshold=80,
+        artifact_threshold=80,
+        effective_window_end="2026-05-20T18:55:00Z",
+    )
+    coverage = {
+        ("EURUSD", "M5"): datetime(2026, 7, 9, tzinfo=timezone.utc),
+    }
+
+    validation = ct.validate_full_backtest_artifacts(
+        attempt,
+        full_backtest_max_age_days=7,
+        market_session_tolerance_days=5,
+        market_data_coverage=coverage,
+    )
+
+    assert "stale_effective_end" in validation["reason_codes"]
+    assert validation["freshness"]["mode"] == "market_coverage"
+
+
+def test_weekend_window_truncation_is_tolerated(tmp_path):
+    attempt, _profile, _result = _write_profile_equivalence_fixture(
+        tmp_path,
+        profile_threshold=80,
+        artifact_threshold=80,
+        effective_window_end="2026-07-03T16:55:00Z",
+    )
+    coverage = {
+        ("EURUSD", "M5"): datetime(2026, 7, 6, tzinfo=timezone.utc),
+    }
+
+    validation = ct.validate_full_backtest_artifacts(
+        attempt,
+        full_backtest_max_age_days=7,
+        market_session_tolerance_days=1,
+        market_data_coverage=coverage,
+    )
+
+    assert validation["status"] == "valid"
+    assert validation["freshness"]["market_session_lag_days"] == 1
 
 
 def test_build_similarity_payload_uses_instrument_overlap(tmp_path):

@@ -16,6 +16,12 @@ from .dashboard import (
     FULL_BACKTEST_RESULT_FILENAME,
     _reward_matrix_from_attempt,
 )
+from .corpus_tools import (
+    FULL_BACKTEST_MANIFEST_FILENAME,
+    build_full_backtest_provenance,
+    canonical_strategy_definition,
+    canonical_strategy_fingerprint,
+)
 from .execution_costs import execution_cost_manifest_payload
 from .play_hand_lab import DEFAULT_LAB_GATEWAY_URL, LabGatewayClient
 from .play_hand_lab_auth import load_lab_gateway_token
@@ -127,10 +133,20 @@ def build_full_backtest_lab_task(
     profile_path_raw = str(attempt.get("profile_path") or "").strip()
     profile_path = Path(profile_path_raw).resolve() if profile_path_raw else None
     profile_snapshot = _profile_snapshot_from_file(profile_path)
+    profile_threshold = profile_snapshot.get("notificationThreshold")
+    try:
+        effective_alert_threshold = float(
+            80.0 if profile_threshold is None else profile_threshold
+        )
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Profile has invalid notificationThreshold: {profile_threshold!r}"
+        ) from exc
+    profile_snapshot["notificationThreshold"] = effective_alert_threshold
     request_payload = _request_payload_from_attempt(attempt)
-    instruments = request_payload.get("instruments")
+    instruments = profile_snapshot.get("instruments")
     if not isinstance(instruments, list) or not instruments:
-        instruments = profile_snapshot.get("instruments")
+        instruments = request_payload.get("instruments")
     normalized_instruments = [
         str(item).strip().upper()
         for item in (instruments if isinstance(instruments, list) else [])
@@ -170,9 +186,13 @@ def build_full_backtest_lab_task(
         "analysis_window_start": None,
         "analysis_window_end": None,
         "bar_limit": int(request_payload.get("bar_limit") or 5000),
-        "alert_threshold": float(request_payload.get("alert_threshold") or profile_snapshot.get("notificationThreshold") or 80.0),
+        "alert_threshold": effective_alert_threshold,
         "view_mode": str(request_payload.get("view_mode") or "overview"),
-        "direction_mode": str(request_payload.get("direction_mode") or profile_snapshot.get("directionMode") or "both"),
+        "direction_mode": str(
+            profile_snapshot.get("directionMode")
+            or request_payload.get("direction_mode")
+            or "both"
+        ),
         "matrix": _matrix_payload(attempt, request_payload),
         "options": _option_payload(config, request_payload),
         "requested_at": _now_iso(),
@@ -197,6 +217,24 @@ def build_full_backtest_lab_task(
             "attempt_id": attempt_id,
             "artifact_dir": str(artifact_dir),
             "run_metadata_runner": (run_metadata or {}).get("runner"),
+            "source_profile_path": str(profile_path) if profile_path else None,
+            "historical_request_alert_threshold": request_payload.get(
+                "alert_threshold"
+            ),
+            "effective_alert_threshold": effective_alert_threshold,
+            "canonical_profile_fingerprint": canonical_strategy_fingerprint(
+                canonical_strategy_definition(
+                    profile_snapshot,
+                    instruments=normalized_instruments,
+                    timeframe=timeframe,
+                    direction_mode=str(
+                        profile_snapshot.get("directionMode")
+                        or request_payload.get("direction_mode")
+                        or "both"
+                    ),
+                    alert_threshold=effective_alert_threshold,
+                )
+            ),
         },
     }
 
@@ -217,6 +255,7 @@ def materialize_full_backtest_lab_result(
     *,
     attempt: dict[str, Any],
     lab_result: dict[str, Any],
+    task: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -242,6 +281,38 @@ def materialize_full_backtest_lab_result(
         raise RuntimeError("Lab full-backtest result did not include recommended_cell_detail")
     request_payload = worker_result.get("request") if isinstance(worker_result.get("request"), dict) else {}
 
+    task_payload = task.get("payload") if isinstance(task, dict) else None
+    task_payload = task_payload if isinstance(task_payload, dict) else request_payload
+    profile_snapshot = task_payload.get("inline_profile_snapshot")
+    profile_snapshot = profile_snapshot if isinstance(profile_snapshot, dict) else {}
+    source_profile_path_raw = (
+        (task.get("metadata") or {}).get("source_profile_path")
+        if isinstance(task, dict) and isinstance(task.get("metadata"), dict)
+        else None
+    )
+    provenance = build_full_backtest_provenance(
+        attempt=attempt,
+        profile_snapshot=profile_snapshot,
+        request_payload=task_payload,
+        result_payload=sensitivity_response,
+        source_profile_path=Path(source_profile_path_raw)
+        if source_profile_path_raw
+        else None,
+        worker_id=str(lab_result.get("worker_id") or "") or None,
+        worker_pool=str(
+            worker_result.get("worker_pool") or lab_result.get("worker_pool") or ""
+        )
+        or None,
+    )
+    aggregate = (
+        sensitivity_response.get("data", {}).get("aggregate")
+        if isinstance(sensitivity_response.get("data"), dict)
+        else None
+    )
+    if isinstance(aggregate, dict):
+        provenance["market_data_window"] = aggregate.get("market_data_window")
+        aggregate["autoresearch_provenance"] = provenance
+
     result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
     curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
     calendar_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
@@ -249,6 +320,7 @@ def materialize_full_backtest_lab_result(
     _write_json(curve_path, best_detail)
     _write_json(calendar_path, calendar_curve)
     _write_json(artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME, recommended_detail)
+    _write_json(artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME, provenance)
     if isinstance(request_payload, dict) and request_payload:
         request_record = {
             "request": request_payload,
@@ -369,7 +441,9 @@ def run_lab_full_backtests(
 ) -> tuple[list[dict[str, Any]], int, int]:
     _ = force_rebuild
     pending_items = list(items)
-    task_by_id: dict[str, tuple[Path, dict[str, Any], dict[str, Any], float]] = {}
+    task_by_id: dict[
+        str, tuple[Path, dict[str, Any], dict[str, Any], float, dict[str, Any]]
+    ] = {}
     results: list[dict[str, Any]] = []
     calculated = 0
     failed = 0
@@ -414,7 +488,13 @@ def run_lab_full_backtests(
                         emit(f"  lab skipped: {run_dir.name} {attempt_id} {entry['error']}")
                     continue
                 tasks.append(task)
-                task_by_id[str(task["task_id"])] = (run_dir, attempt, row, time.time())
+                task_by_id[str(task["task_id"])] = (
+                    run_dir,
+                    attempt,
+                    row,
+                    time.time(),
+                    task,
+                )
             if tasks:
                 response = gateway.enqueue_tasks(tasks)
                 accepted = int(response.get("accepted") or response.get("enqueued") or 0)
@@ -442,7 +522,7 @@ def run_lab_full_backtests(
                         unknown_result_count += 1
                         continue
                     ack_ids.append(str(lab_result.get("lease_id") or ""))
-                    run_dir, attempt, row, started_at = item
+                    run_dir, attempt, row, started_at, submitted_task = item
                     attempt_id = str(attempt.get("attempt_id") or "")
                     entry: dict[str, Any] = {
                         "run_id": run_dir.name,
@@ -458,6 +538,7 @@ def run_lab_full_backtests(
                             paths = materialize_full_backtest_lab_result(
                                 attempt=attempt,
                                 lab_result=lab_result,
+                                task=submitted_task,
                             )
                             entry.update(paths)
                             entry["status"] = "calculated"

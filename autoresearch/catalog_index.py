@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .corpus_tools import (
     FULL_BACKTEST_CALENDAR_CURVE_FILENAME,
@@ -21,6 +21,7 @@ from .corpus_tools import (
     build_full_backtest_audit,
     extract_attempt_catalog_row,
     legacy_validation_cache_dir,
+    load_market_data_coverage,
     scrutiny_cache_dir_for_artifact_dir,
 )
 from .ledger import (
@@ -963,6 +964,36 @@ def iter_catalog_rows(
                 yield payload
 
 
+def iter_full_backtest_rows(
+    config: Any,
+    *,
+    run_ids: list[str] | None = None,
+    attempt_ids: list[str] | None = None,
+) -> Iterator[dict[str, Any]]:
+    clauses = ["has_full_backtest_36m != 0"]
+    params: list[Any] = []
+    if run_ids:
+        clauses.append(f"run_id IN ({','.join('?' for _ in run_ids)})")
+        params.extend(run_ids)
+    if attempt_ids:
+        clauses.append(f"attempt_id IN ({','.join('?' for _ in attempt_ids)})")
+        params.extend(attempt_ids)
+    with _connect_catalog_db(_catalog_db_path(config)) as conn:
+        cursor = conn.execute(
+            f"""
+            SELECT row_json
+            FROM attempt_rows
+            WHERE {' AND '.join(clauses)}
+            ORDER BY run_id ASC, row_key ASC
+            """,
+            params,
+        )
+        for (row_json,) in cursor:
+            payload = _json_loads(row_json)
+            if isinstance(payload, dict):
+                yield payload
+
+
 def catalog_summary_from_sqlite(
     config: Any,
     *,
@@ -1325,6 +1356,15 @@ def refresh_incremental_attempt_catalog(
     db_path = _catalog_db_path(config)
     validation_cache_root = getattr(config, "validation_cache_root", None)
     validation_cache_root = Path(validation_cache_root) if validation_cache_root else None
+    repo_root = getattr(config, "repo_root", None)
+    trading_dashboard_root = (
+        Path(repo_root).parent / "Trading-Dashboard" if repo_root is not None else None
+    )
+    market_data_coverage = load_market_data_coverage(
+        trading_dashboard_root
+        if trading_dashboard_root is not None and trading_dashboard_root.exists()
+        else None
+    )
     total_runs = len(run_dirs)
     if progress_callback is not None:
         progress_callback({"stage": "start", "total_runs": total_runs})
@@ -1487,6 +1527,10 @@ def refresh_incremental_attempt_catalog(
                                     attempt,
                                     run_metadata,
                                     validation_cache_root=validation_cache_root,
+                                    config=config,
+                                    full_backtest_max_age_days=7.0,
+                                    market_session_tolerance_days=5,
+                                    market_data_coverage=market_data_coverage,
                                 )
                                 for attempt in attempts
                             ]

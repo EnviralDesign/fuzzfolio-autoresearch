@@ -5,10 +5,21 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from autoresearch import __main__ as ar_main
 from autoresearch import dashboard as dashboard_mod
 from autoresearch.config import FuzzfolioConfig
 from autoresearch.fuzzfolio import CliError
+
+
+@pytest.fixture(autouse=True)
+def _mock_authoritative_profile_upload(monkeypatch):
+    monkeypatch.setattr(
+        dashboard_mod.FuzzfolioCli,
+        "create_cloud_profile",
+        lambda _self, _path: "uploaded-local-profile",
+    )
 
 
 class _StubConfig:
@@ -22,6 +33,77 @@ class _StubConfig:
             base_url="http://localhost:7946/api/dev",
             auth_profile="robot",
         )
+
+
+def test_live_full_backtest_validation_skips_rows_without_artifacts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = SimpleNamespace(repo_root=tmp_path, runs_root=tmp_path / "runs")
+
+    def unexpected_ledger_load(_run_dir):
+        raise AssertionError("rows without full-backtest artifacts must not load ledgers")
+
+    monkeypatch.setattr(ar_main, "load_run_attempts", unexpected_ledger_load)
+
+    rows, rejected, reason_counts = ar_main._live_validate_full_backtest_rows(
+        [{"run_id": "run-a", "attempt_id": "attempt-a", "has_full_backtest_36m": False}],
+        config=config,
+        trading_dashboard_root=tmp_path,
+    )
+
+    assert rows == [
+        {"run_id": "run-a", "attempt_id": "attempt-a", "has_full_backtest_36m": False}
+    ]
+    assert rejected == []
+    assert reason_counts == {}
+
+
+def test_live_full_backtest_validation_uses_run_metadata_not_attempt_ledger(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config = SimpleNamespace(repo_root=tmp_path, runs_root=tmp_path / "runs")
+    metadata_loads: list[Path] = []
+    seen_attempts: list[dict] = []
+
+    monkeypatch.setattr(
+        ar_main,
+        "load_run_attempts",
+        lambda _run_dir: (_ for _ in ()).throw(
+            AssertionError("live validation must not load the attempts ledger")
+        ),
+    )
+
+    def fake_load_run_metadata(run_dir):
+        metadata_loads.append(run_dir)
+        return {"reward_matrix": {"reward_step_r": 0.5, "reward_columns": 8}}
+
+    def fake_validate(attempt, **_kwargs):
+        seen_attempts.append(attempt)
+        return {
+            "status": "valid",
+            "reason_codes": [],
+            "reasons": [],
+            "rebuild_required": False,
+            "freshness": {},
+        }
+
+    monkeypatch.setattr(ar_main, "load_run_metadata", fake_load_run_metadata)
+    monkeypatch.setattr(ar_main, "validate_full_backtest_artifacts", fake_validate)
+
+    rows, rejected, reason_counts = ar_main._live_validate_full_backtest_rows(
+        [
+            {"run_id": "run-a", "attempt_id": "attempt-a", "has_full_backtest_36m": True},
+            {"run_id": "run-a", "attempt_id": "attempt-b", "has_full_backtest_36m": True},
+        ],
+        config=config,
+        trading_dashboard_root=tmp_path,
+    )
+
+    assert len(rows) == 2
+    assert rejected == []
+    assert reason_counts == {}
+    assert metadata_loads == [tmp_path / "runs" / "run-a"]
+    assert [attempt["reward_matrix"]["reward_columns"] for attempt in seen_attempts] == [8, 8]
 
 
 def test_run_full_backtest_retries_with_local_profile_on_profile_not_found(
@@ -546,7 +628,15 @@ def test_calculate_full_backtests_rebuilds_stale_effective_window(
         ),
         encoding="utf-8",
     )
-    curve_path.write_text(json.dumps({"curve": {"points": []}}), encoding="utf-8")
+    curve_path.write_text(
+        json.dumps(
+            {
+                "cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0},
+                "curve": {"points": [{"x": 0, "y": 0}]},
+            }
+        ),
+        encoding="utf-8",
+    )
     calendar_curve_path.write_text(json.dumps({"curve": {"points": []}}), encoding="utf-8")
     recommended_curve_path.write_text(
         json.dumps(
@@ -628,7 +718,7 @@ def test_calculate_full_backtests_rebuilds_stale_effective_window(
     assert exit_code == 0
     assert len(calls) == 1
     assert payload["eligible_attempts"] == 1
-    assert payload["calculation_reasons"] == {"stale_effective_window_end": 1}
+    assert payload["calculation_reasons"] == {"stale_effective_end": 1}
 
 
 def test_calculate_full_backtests_keeps_recent_truncated_window(
@@ -667,7 +757,15 @@ def test_calculate_full_backtests_keeps_recent_truncated_window(
         ),
         encoding="utf-8",
     )
-    curve_path.write_text(json.dumps({"curve": {"points": []}}), encoding="utf-8")
+    curve_path.write_text(
+        json.dumps(
+            {
+                "cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0},
+                "curve": {"points": [{"x": 0, "y": 0}]},
+            }
+        ),
+        encoding="utf-8",
+    )
     calendar_curve_path.write_text(json.dumps({"curve": {"points": []}}), encoding="utf-8")
     recommended_curve_path.write_text(
         json.dumps(
@@ -790,7 +888,15 @@ def test_calculate_full_backtests_rebuilds_missing_recommended_detail(
         ),
         encoding="utf-8",
     )
-    curve_path.write_text(json.dumps({"curve": {"points": []}}), encoding="utf-8")
+    curve_path.write_text(
+        json.dumps(
+            {
+                "cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0},
+                "curve": {"points": [{"x": 0, "y": 0}]},
+            }
+        ),
+        encoding="utf-8",
+    )
     calendar_curve_path.write_text(json.dumps({"curve": {"points": []}}), encoding="utf-8")
     attempt = {
         "attempt_id": "run-a-attempt-00001",
@@ -863,7 +969,7 @@ def test_calculate_full_backtests_rebuilds_missing_recommended_detail(
     assert exit_code == 0
     assert len(calls) == 1
     assert payload["eligible_attempts"] == 1
-    assert payload["calculation_reasons"] == {"missing_recommended_cell_detail": 1}
+    assert payload["calculation_reasons"] == {"missing_artifact": 1}
 
 
 def test_result_matches_attempt_reward_matrix_rejects_expanded_reward_grid(
