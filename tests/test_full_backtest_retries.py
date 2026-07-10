@@ -153,9 +153,14 @@ def test_profile_drop_native_check_uses_centralized_validation(
     assert seen[0]["require_calendar_curve"] is True
 
 
-def test_profile_drop_skips_invalid_evidence_even_with_backtestable_cell(
-    tmp_path: Path,
+def test_profile_drop_ignores_stale_cached_fingerprint_verdict_when_live_artifact_is_valid(
+    tmp_path: Path, monkeypatch
 ) -> None:
+    monkeypatch.setattr(
+        ar_main,
+        "_full_backtest_profile_drop_reuse_issue",
+        lambda **_kwargs: None,
+    )
     reason = ar_main._profile_drop_skip_reason_for_attempt(
         config=SimpleNamespace(),
         row={
@@ -174,9 +179,7 @@ def test_profile_drop_skips_invalid_evidence_even_with_backtestable_cell(
         lookback_months=36,
     )
 
-    assert reason == (
-        "full_backtest_36m_invalid_profile_fingerprint_mismatch"
-    )
+    assert reason is None
 
 
 def test_run_full_backtest_retries_with_local_profile_on_profile_not_found(

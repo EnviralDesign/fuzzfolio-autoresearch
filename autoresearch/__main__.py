@@ -11799,33 +11799,42 @@ def _profile_drop_skip_reason_for_attempt(
     lookback_months: int,
 ) -> str | None:
     attempt = _attempt_with_run_reward_matrix(attempt, run_dir=run_dir)
-    validation_status = str(
-        row.get(f"full_backtest_validation_status_{int(lookback_months)}m") or ""
-    ).strip()
-    if validation_status and validation_status not in {"valid", "missing"}:
-        reason_codes = list(
-            row.get(f"full_backtest_validation_reason_codes_{int(lookback_months)}m")
-            or []
-        )
-        reason_suffix = f"_{str(reason_codes[0])}" if reason_codes else ""
-        return (
-            f"full_backtest_{int(lookback_months)}m_{validation_status}"
-            f"{reason_suffix}"
-        )
-    if _attempt_has_backtestable_cell(attempt):
-        return None
-
     artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
-    if _full_backtest_profile_drop_reuse_issue(
+    if not _attempt_has_backtestable_cell(attempt):
+        if _full_backtest_profile_drop_reuse_issue(
+            config=config,
+            attempt=attempt,
+            artifact_dir=artifact_dir,
+            lookback_months=int(lookback_months),
+            max_age_days=None,
+        ) is None:
+            return None
+        return "no_backtestable_exit_cell"
+    validation_field = f"full_backtest_validation_status_{int(lookback_months)}m"
+    if validation_field not in row:
+        return None
+    live_issue = _full_backtest_profile_drop_reuse_issue(
         config=config,
         attempt=attempt,
         artifact_dir=artifact_dir,
         lookback_months=int(lookback_months),
         max_age_days=None,
-    ) is None:
-        return None
-
-    return "no_backtestable_exit_cell"
+    )
+    if live_issue is not None:
+        return f"full_backtest_{int(lookback_months)}m_invalid_{live_issue}"
+    validation_status = str(
+        row.get(f"full_backtest_validation_status_{int(lookback_months)}m") or ""
+    ).strip()
+    reason_codes = list(
+        row.get(f"full_backtest_validation_reason_codes_{int(lookback_months)}m")
+        or []
+    )
+    if "stale_effective_end" in reason_codes:
+        return (
+            f"full_backtest_{int(lookback_months)}m_{validation_status}"
+            "_stale_effective_end"
+        )
+    return None
 
 
 def _render_profile_drop_rows(
@@ -15404,6 +15413,16 @@ def cmd_render_corpus_profile_drops(
     profile_drop_failed = sum(
         1 for row in profile_drop_results if row.get("status") == "failed"
     )
+    for failed_result in (
+        row for row in profile_drop_results if row.get("status") == "failed"
+    ):
+        _job_status_emit(
+            "[render-corpus-profile-drops] profile-drop failed "
+            f"run={failed_result.get('run_id')} "
+            f"attempt={failed_result.get('attempt_id')} "
+            f"error={failed_result.get('error')}",
+            as_json=as_json,
+        )
     catch_up_failed = int(catch_up_exit_code) != 0
     render_failed = profile_drop_failed > 0
     status = "partial_failure" if catch_up_failed or render_failed else "complete"
