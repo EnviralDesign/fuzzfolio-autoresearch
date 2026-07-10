@@ -368,10 +368,22 @@ def test_cmd_calculate_full_backtests_lab_gateway_backend(
 ) -> None:
     run_dir = tmp_path / "runs" / "run-a"
     artifact_dir = run_dir / "evals" / "final"
+    profile_path = run_dir / "profiles" / "profile.json"
     artifact_dir.mkdir(parents=True)
+    _write_json(
+        profile_path,
+        {
+            "profile": {
+                "notificationThreshold": 80,
+                "instruments": ["EURUSD"],
+                "indicators": [],
+            }
+        },
+    )
     attempt = {
         "attempt_id": "attempt-a",
         "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
         "best_summary": {"best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0}},
     }
     row = {"attempt_id": "attempt-a", "run_id": "run-a", "candidate_name": "final"}
@@ -446,6 +458,17 @@ def test_calculate_full_backtests_dry_run_is_selective_and_submits_no_work(
     expected_count: int,
 ) -> None:
     run_dir = tmp_path / "runs" / "run-a"
+    profile_path = run_dir / "profiles" / "profile.json"
+    _write_json(
+        profile_path,
+        {
+            "profile": {
+                "notificationThreshold": 80,
+                "instruments": ["EURUSD"],
+                "indicators": [],
+            }
+        },
+    )
     attempts = []
     rows = []
     for attempt_id in ("stale-attempt", "valid-attempt"):
@@ -455,6 +478,7 @@ def test_calculate_full_backtests_dry_run_is_selective_and_submits_no_work(
             {
                 "attempt_id": attempt_id,
                 "artifact_dir": str(artifact_dir),
+                "profile_path": str(profile_path),
                 "best_summary": {
                     "best_cell": {
                         "stop_loss_percent": 0.1,
@@ -527,3 +551,71 @@ def test_calculate_full_backtests_dry_run_is_selective_and_submits_no_work(
     assert payload["status"] == "dry_run"
     assert payload["selected_for_rebuild"] == expected_count
     assert payload["calculated"] == 0
+
+
+def test_calculate_full_backtests_does_not_submit_missing_canonical_profile(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "attempt-a"
+    artifact_dir.mkdir(parents=True)
+    attempt = {
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "best_summary": {
+            "best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0}
+        },
+    }
+    config = SimpleNamespace(
+        runs_root=tmp_path / "runs",
+        research=SimpleNamespace(validation_max_concurrency=2),
+        full_backtest_failures_json_path=tmp_path / "failures.json",
+    )
+    monkeypatch.setattr(ar_main, "load_config", lambda: config)
+    monkeypatch.setattr(ar_main, "_matching_run_dirs", lambda *_args, **_kwargs: [run_dir])
+    monkeypatch.setattr(
+        ar_main,
+        "_catalog_rows_for_run_dirs",
+        lambda *_args, **_kwargs: [
+            {"attempt_id": "attempt-a", "run_id": "run-a", "candidate_name": "candidate"}
+        ],
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "_matched_attempt_items",
+        lambda *_args, **_kwargs: [(run_dir, [attempt], attempt)],
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "validate_full_backtest_artifacts",
+        lambda *_args, **_kwargs: {
+            "status": "missing",
+            "reason_codes": ["missing_artifact"],
+            "rebuild_reason_codes": ["missing_artifact"],
+            "rebuild_required": True,
+        },
+    )
+    monkeypatch.setattr(
+        ar_main,
+        "run_lab_full_backtests",
+        lambda **_kwargs: pytest.fail("profile-less attempt submitted gateway work"),
+    )
+
+    exit_code = ar_main.cmd_calculate_full_backtests(
+        run_ids=["run-a"],
+        attempt_ids=None,
+        limit=None,
+        max_workers=2,
+        use_dev_sim_worker_count=False,
+        require_scrutiny_36=False,
+        force_rebuild=False,
+        job_timeout_seconds=120,
+        dry_run=True,
+        full_backtest_backend="lab-gateway",
+        as_json=True,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["selected_for_rebuild"] == 0
+    assert payload["filter_rejections"]["missing_canonical_profile"] == 1

@@ -10710,6 +10710,7 @@ def cmd_calculate_full_backtests(
     filter_rejections = {
         "already_has_full_backtest": 0,
         "missing_scrutiny_36m": 0,
+        "missing_canonical_profile": 0,
         "no_backtestable_cell": 0,
     }
     calculation_reasons: dict[str, int] = {}
@@ -10738,6 +10739,10 @@ def cmd_calculate_full_backtests(
                 "reason_codes": calculation_reason_codes,
             }
         )
+        profile_path_raw = str(attempt.get("profile_path") or "").strip()
+        if not profile_path_raw or not Path(profile_path_raw).exists():
+            filter_rejections["missing_canonical_profile"] += 1
+            continue
         if not _attempt_has_backtestable_cell(attempt):
             filter_rejections["no_backtestable_cell"] += 1
             continue

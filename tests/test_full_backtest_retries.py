@@ -35,6 +35,24 @@ class _StubConfig:
         )
 
 
+def _write_canonical_test_profile(tmp_path: Path) -> Path:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "profile": {
+                    "notificationThreshold": 80,
+                    "directionMode": "both",
+                    "instruments": ["EURUSD"],
+                    "indicators": [],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return profile_path
+
+
 def test_live_full_backtest_validation_skips_rows_without_artifacts(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -556,6 +574,7 @@ def test_calculate_full_backtests_rebuilds_stale_score_lab_result(
     artifact_dir.mkdir(parents=True)
     result_path = artifact_dir / "full-backtest-36mo-result.json"
     curve_path = artifact_dir / "full-backtest-36mo-curve.json"
+    profile_path = _write_canonical_test_profile(tmp_path)
     result_path.write_text(
         json.dumps(
             {
@@ -580,6 +599,7 @@ def test_calculate_full_backtests_rebuilds_stale_score_lab_result(
         "run_id": "run-a",
         "candidate_name": "final",
         "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
         "best_summary": {"best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0}},
         "reward_matrix": {
             "reward_step_r": 0.5,
@@ -654,6 +674,7 @@ def test_calculate_full_backtests_rebuilds_stale_effective_window(
     requested_end = datetime.now(timezone.utc).isoformat()
     result_path = artifact_dir / "full-backtest-36mo-result.json"
     curve_path = artifact_dir / "full-backtest-36mo-curve.json"
+    profile_path = _write_canonical_test_profile(tmp_path)
     calendar_curve_path = artifact_dir / ar_main.FULL_BACKTEST_CALENDAR_CURVE_FILENAME
     recommended_curve_path = artifact_dir / ar_main.FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
     result_path.write_text(
@@ -707,6 +728,7 @@ def test_calculate_full_backtests_rebuilds_stale_effective_window(
         "run_id": "run-a",
         "candidate_name": "final",
         "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
         "best_summary": {"best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0}},
         "reward_matrix": {
             "reward_step_r": 0.5,
@@ -788,6 +810,7 @@ def test_calculate_full_backtests_keeps_recent_truncated_window(
     curve_path = artifact_dir / "full-backtest-36mo-curve.json"
     calendar_curve_path = artifact_dir / ar_main.FULL_BACKTEST_CALENDAR_CURVE_FILENAME
     recommended_curve_path = artifact_dir / ar_main.FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+    profile_path = _write_canonical_test_profile(tmp_path)
     result_path.write_text(
         json.dumps(
             {
@@ -836,6 +859,7 @@ def test_calculate_full_backtests_keeps_recent_truncated_window(
         "run_id": "run-a",
         "candidate_name": "final",
         "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
         "best_summary": {"best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0}},
         "reward_matrix": {
             "reward_step_r": 0.5,
@@ -916,6 +940,7 @@ def test_calculate_full_backtests_rebuilds_missing_recommended_detail(
     result_path = artifact_dir / "full-backtest-36mo-result.json"
     curve_path = artifact_dir / "full-backtest-36mo-curve.json"
     calendar_curve_path = artifact_dir / ar_main.FULL_BACKTEST_CALENDAR_CURVE_FILENAME
+    profile_path = _write_canonical_test_profile(tmp_path)
     result_path.write_text(
         json.dumps(
             {
@@ -958,6 +983,7 @@ def test_calculate_full_backtests_rebuilds_missing_recommended_detail(
         "run_id": "run-a",
         "candidate_name": "final",
         "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
         "best_summary": {"best_cell": {"stop_loss_percent": 0.1, "reward_multiple": 1.0}},
         "reward_matrix": {
             "reward_step_r": 1.0,
