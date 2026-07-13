@@ -13,6 +13,7 @@ from .corpus_tools import (
     subset_similarity_payload,
     select_promotion_board,
 )
+from .instrument_universe import INSTRUMENT_UNIVERSE, instrument_asset_class as canonical_asset_class
 
 
 DEFAULT_SLEEVE_SPEC: dict[str, Any] = {
@@ -827,6 +828,8 @@ def infer_instrument_asset_class(instrument: Any) -> str:
     token = str(instrument or "").strip().upper()
     if not token:
         return "other"
+    if token in INSTRUMENT_UNIVERSE:
+        return canonical_asset_class(token)
     if token in METAL_SYMBOLS or token.startswith(("XAU", "XAG")):
         return "metal"
     if token in COMMODITY_SYMBOLS:

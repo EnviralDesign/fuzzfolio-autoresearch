@@ -15,9 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-
-METAL_SYMBOLS = {"XAUUSD", "XAGUSD"}
-INDEX_SYMBOLS = {"DE40", "US500", "USTECH", "US30", "JP225", "UK100"}
+from .instrument_universe import instrument_asset_class
 
 
 @dataclass(frozen=True)
@@ -87,12 +85,16 @@ def _export_profile_names(export_bundle: Path) -> dict[str, str]:
 
 
 def _asset_class(instruments: list[str]) -> str:
-    symbols = {str(item).upper() for item in instruments}
-    if symbols & METAL_SYMBOLS:
+    classes = {instrument_asset_class(item) for item in instruments}
+    if "metal" in classes:
         return "metal"
-    if symbols & INDEX_SYMBOLS:
+    if "index" in classes:
         return "index"
-    return "fx"
+    if "commodity" in classes:
+        return "commodity"
+    if "crypto" in classes:
+        return "crypto"
+    return "fx" if "fx" in classes else "other"
 
 
 def _path_metrics_for_row(row: dict[str, Any]) -> dict[str, Any]:

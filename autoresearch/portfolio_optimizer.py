@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .strategy_identity import derive_strategy_identity
+from .instrument_universe import INSTRUMENT_UNIVERSE, instrument_asset_class as canonical_asset_class
 
 
 FX_CODES = {
@@ -183,6 +184,8 @@ def parse_datetime(value: Any) -> datetime | None:
 
 def instrument_asset_class(symbol: str) -> str:
     token = str(symbol or "").strip().upper()
+    if token in INSTRUMENT_UNIVERSE:
+        return canonical_asset_class(token)
     if token in METAL_SYMBOLS:
         return "metal"
     if token in INDEX_SYMBOLS:

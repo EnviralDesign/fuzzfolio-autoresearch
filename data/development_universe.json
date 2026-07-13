@@ -1,0 +1,2144 @@
+{
+  "schema_version": 1,
+  "universe_id": "fuzzfolio-development-darwinex-zero",
+  "universe_version": 1,
+  "contract_status": "approved",
+  "activation_mode": "authoritative",
+  "canonical_historical_provider": "darwinex_zero_mt5",
+  "canonical_live_provider": "darwinex_zero_mt5",
+  "notes": "Development-only Darwinex-native universe. Production remains unchanged. Lifecycle policy is recorded but not enforced while activation_mode is shadow.",
+  "expected_counts": {
+    "total": 45,
+    "enabled": 36,
+    "retired": 7,
+    "deferred": 2,
+    "enabled_fx": 29
+  },
+  "stock_extension": {
+    "supported_by_schema": true,
+    "enabled": false,
+    "requires": [
+      "exchange_identity",
+      "trading_currency",
+      "corporate_action_policy",
+      "session_calendar",
+      "adjustment_policy"
+    ]
+  },
+  "instruments": [
+    {
+      "pair": "AUDUSD",
+      "display_name": "AUD / USD",
+      "asset_class": "fx-major",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "AUDUSD",
+          "supported": true,
+          "mt5_description": "Australian Dollar vs US Dollar",
+          "mt5_path": "Forex\\AUDUSD",
+          "currency_base": "AUD",
+          "currency_profit": "USD",
+          "currency_margin": "AUD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "audusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "EURUSD",
+      "display_name": "EUR / USD",
+      "asset_class": "fx-major",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "EURUSD",
+          "supported": true,
+          "mt5_description": "Euro vs US Dollar",
+          "mt5_path": "Forex\\EURUSD",
+          "currency_base": "EUR",
+          "currency_profit": "USD",
+          "currency_margin": "EUR",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "eurusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "GBPUSD",
+      "display_name": "GBP / USD",
+      "asset_class": "fx-major",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "GBPUSD",
+          "supported": true,
+          "mt5_description": "Great Britan Pound vs US Dollar",
+          "mt5_path": "Forex\\GBPUSD",
+          "currency_base": "GBP",
+          "currency_profit": "USD",
+          "currency_margin": "GBP",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "gbpusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "USDCAD",
+      "display_name": "USD / CAD",
+      "asset_class": "fx-major",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "USDCAD",
+          "supported": true,
+          "mt5_description": "US Dollar vs Canadian Dollar",
+          "mt5_path": "Forex\\USDCAD",
+          "currency_base": "USD",
+          "currency_profit": "CAD",
+          "currency_margin": "USD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "usdcad",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "USDCHF",
+      "display_name": "USD / CHF",
+      "asset_class": "fx-major",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "USDCHF",
+          "supported": true,
+          "mt5_description": "US Dollar vs Swiss Franc",
+          "mt5_path": "Forex\\USDCHF",
+          "currency_base": "USD",
+          "currency_profit": "CHF",
+          "currency_margin": "USD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "usdchf",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "USDJPY",
+      "display_name": "USD / JPY",
+      "asset_class": "fx-major",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "USDJPY",
+          "supported": true,
+          "mt5_description": "US Dollar vs Japanese Yen",
+          "mt5_path": "Forex\\USDJPY",
+          "currency_base": "USD",
+          "currency_profit": "JPY",
+          "currency_margin": "USD",
+          "digits": 3,
+          "point": 0.001,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "usdjpy",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "AUDCAD",
+      "display_name": "AUD / CAD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "AUDCAD",
+          "supported": true,
+          "mt5_description": "Australian Dollar vs Canadian Dollar",
+          "mt5_path": "Forex\\AUDCAD",
+          "currency_base": "AUD",
+          "currency_profit": "CAD",
+          "currency_margin": "AUD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "audcad",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "AUDCHF",
+      "display_name": "AUD / CHF",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "AUDCHF",
+          "supported": true,
+          "mt5_description": "Australian Dollar vs Swiss Franc",
+          "mt5_path": "Forex\\AUDCHF",
+          "currency_base": "AUD",
+          "currency_profit": "CHF",
+          "currency_margin": "AUD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "audchf",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "AUDJPY",
+      "display_name": "AUD / JPY",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "AUDJPY",
+          "supported": true,
+          "mt5_description": "Australian Dollar vs Japanese Yen",
+          "mt5_path": "Forex\\AUDJPY",
+          "currency_base": "AUD",
+          "currency_profit": "JPY",
+          "currency_margin": "AUD",
+          "digits": 3,
+          "point": 0.001,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "audjpy",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "AUDNZD",
+      "display_name": "AUD / NZD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "AUDNZD",
+          "supported": true,
+          "mt5_description": "Australian Dollar vs New Zealand Dollar",
+          "mt5_path": "Forex\\AUDNZD",
+          "currency_base": "AUD",
+          "currency_profit": "NZD",
+          "currency_margin": "AUD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "audnzd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "CADCHF",
+      "display_name": "CAD / CHF",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "CADCHF",
+          "supported": true,
+          "mt5_description": "Canadian Dollar vs Swiss Franc",
+          "mt5_path": "Forex\\CADCHF",
+          "currency_base": "CAD",
+          "currency_profit": "CHF",
+          "currency_margin": "CAD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "cadchf",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "CADJPY",
+      "display_name": "CAD / JPY",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "CADJPY",
+          "supported": true,
+          "mt5_description": "Canadian Dollar vs Japanese Yen",
+          "mt5_path": "Forex\\CADJPY",
+          "currency_base": "CAD",
+          "currency_profit": "JPY",
+          "currency_margin": "CAD",
+          "digits": 3,
+          "point": 0.001,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_history_date": "2013-03-19",
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "cadjpy",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "CHFJPY",
+      "display_name": "CHF / JPY",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "CHFJPY",
+          "supported": true,
+          "mt5_description": "Swiss Frank vs Japanese Yen",
+          "mt5_path": "Forex\\CHFJPY",
+          "currency_base": "CHF",
+          "currency_profit": "JPY",
+          "currency_margin": "CHF",
+          "digits": 3,
+          "point": 0.001,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "chfjpy",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "EURAUD",
+      "display_name": "EUR / AUD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "EURAUD",
+          "supported": true,
+          "mt5_description": "Euro vs Australian Dollar",
+          "mt5_path": "Forex\\EURAUD",
+          "currency_base": "EUR",
+          "currency_profit": "AUD",
+          "currency_margin": "EUR",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "euraud",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "EURCAD",
+      "display_name": "EUR / CAD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "EURCAD",
+          "supported": true,
+          "mt5_description": "Euro vs Canadian Dollar",
+          "mt5_path": "Forex\\EURCAD",
+          "currency_base": "EUR",
+          "currency_profit": "CAD",
+          "currency_margin": "EUR",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "eurcad",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "EURCHF",
+      "display_name": "EUR / CHF",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "EURCHF",
+          "supported": true,
+          "mt5_description": "Euro vs Swiss Franc",
+          "mt5_path": "Forex\\EURCHF",
+          "currency_base": "EUR",
+          "currency_profit": "CHF",
+          "currency_margin": "EUR",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "eurchf",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "EURGBP",
+      "display_name": "EUR / GBP",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "EURGBP",
+          "supported": true,
+          "mt5_description": "Euro vs Great Britain Pound ",
+          "mt5_path": "Forex\\EURGBP",
+          "currency_base": "EUR",
+          "currency_profit": "GBP",
+          "currency_margin": "EUR",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "eurgbp",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "EURJPY",
+      "display_name": "EUR / JPY",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "EURJPY",
+          "supported": true,
+          "mt5_description": "Euro vs Japanese Yen",
+          "mt5_path": "Forex\\EURJPY",
+          "currency_base": "EUR",
+          "currency_profit": "JPY",
+          "currency_margin": "EUR",
+          "digits": 3,
+          "point": 0.001,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "eurjpy",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "EURNZD",
+      "display_name": "EUR / NZD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "EURNZD",
+          "supported": true,
+          "mt5_description": "Euro vs New Zealand Dollar",
+          "mt5_path": "Forex\\EURNZD",
+          "currency_base": "EUR",
+          "currency_profit": "NZD",
+          "currency_margin": "EUR",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "eurnzd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "GBPAUD",
+      "display_name": "GBP / AUD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "GBPAUD",
+          "supported": true,
+          "mt5_description": "Great Britain Pound vs Australian Dollar",
+          "mt5_path": "Forex\\GBPAUD",
+          "currency_base": "GBP",
+          "currency_profit": "AUD",
+          "currency_margin": "GBP",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_history_date": "2013-03-19",
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "gbpaud",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "GBPCAD",
+      "display_name": "GBP / CAD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "GBPCAD",
+          "supported": true,
+          "mt5_description": "Great Britain Pound vs Canadian Dollar",
+          "mt5_path": "Forex\\GBPCAD",
+          "currency_base": "GBP",
+          "currency_profit": "CAD",
+          "currency_margin": "GBP",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "gbpcad",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "GBPCHF",
+      "display_name": "GBP / CHF",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "GBPCHF",
+          "supported": true,
+          "mt5_description": "Great Britain Pound vs Swiss Franc",
+          "mt5_path": "Forex\\GBPCHF",
+          "currency_base": "GBP",
+          "currency_profit": "CHF",
+          "currency_margin": "GBP",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "gbpchf",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "GBPJPY",
+      "display_name": "GBP / JPY",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "GBPJPY",
+          "supported": true,
+          "mt5_description": "British Pound vs Japanese Yen",
+          "mt5_path": "Forex\\GBPJPY",
+          "currency_base": "GBP",
+          "currency_profit": "JPY",
+          "currency_margin": "GBP",
+          "digits": 3,
+          "point": 0.001,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "gbpjpy",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "GBPNZD",
+      "display_name": "GBP / NZD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "GBPNZD",
+          "supported": true,
+          "mt5_description": "Great Britan Pound vs New Zealand Dollar",
+          "mt5_path": "Forex\\GBPNZD",
+          "currency_base": "GBP",
+          "currency_profit": "NZD",
+          "currency_margin": "GBP",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "gbpnzd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "NZDCAD",
+      "display_name": "NZD / CAD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "NZDCAD",
+          "supported": true,
+          "mt5_description": "New Zealand Dollar vs Canadian Dollar",
+          "mt5_path": "Forex\\NZDCAD",
+          "currency_base": "NZD",
+          "currency_profit": "CAD",
+          "currency_margin": "NZD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "nzdcad",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "NZDCHF",
+      "display_name": "NZD / CHF",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "NZDCHF",
+          "supported": true,
+          "mt5_description": "New Zealand Dollar vs Swiss Franc",
+          "mt5_path": "Forex\\NZDCHF",
+          "currency_base": "NZD",
+          "currency_profit": "CHF",
+          "currency_margin": "NZD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "nzdchf",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "NZDJPY",
+      "display_name": "NZD / JPY",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "NZDJPY",
+          "supported": true,
+          "mt5_description": "New Zealand vs Japanise Yen",
+          "mt5_path": "Forex\\NZDJPY",
+          "currency_base": "NZD",
+          "currency_profit": "JPY",
+          "currency_margin": "NZD",
+          "digits": 3,
+          "point": 0.001,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "nzdjpy",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "NZDUSD",
+      "display_name": "NZD / USD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "NZDUSD",
+          "supported": true,
+          "mt5_description": "New Zealand Dollar vs US Dollar",
+          "mt5_path": "Forex\\NZDUSD",
+          "currency_base": "NZD",
+          "currency_profit": "USD",
+          "currency_margin": "NZD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "nzdusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "USDSGD",
+      "display_name": "USD / SGD",
+      "asset_class": "fx-minor",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "fx_ny_close",
+      "decimal_factor": 100000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "USDSGD",
+          "supported": true,
+          "mt5_description": "US Dollar vs Singapore Dollar",
+          "mt5_path": "Forex\\USDSGD",
+          "currency_base": "USD",
+          "currency_profit": "SGD",
+          "currency_margin": "USD",
+          "digits": 5,
+          "point": 1E-05,
+          "contract_size": 100000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": null,
+          "verified_tick_checkpoint_utc": "2021-07-08T00:00:00Z"
+        },
+        "dukascopy": {
+          "symbol": "usdsgd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "fx",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "XAGUSD",
+      "display_name": "Silver Spot",
+      "asset_class": "metals",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "gold_silver_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "XAGUSD",
+          "supported": true,
+          "mt5_description": "Silver Spot",
+          "mt5_path": "Commodities\\Metals\\XAGUSD",
+          "currency_base": "USD",
+          "currency_profit": "USD",
+          "currency_margin": "USD",
+          "digits": 3,
+          "point": 0.001,
+          "contract_size": 5000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": "2018-01-25T13:04:41.313Z"
+        },
+        "dukascopy": {
+          "symbol": "xagusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "metal",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "XAUUSD",
+      "display_name": "Gold vs US Dollar",
+      "asset_class": "metals",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "gold_silver_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "XAUUSD",
+          "supported": true,
+          "mt5_description": "Gold vs US Dollar ",
+          "mt5_path": "Commodities\\Metals\\XAUUSD",
+          "currency_base": "USD",
+          "currency_profit": "USD",
+          "currency_margin": "USD",
+          "digits": 2,
+          "point": 0.01,
+          "contract_size": 100.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": "2018-01-25T13:04:11.084Z"
+        },
+        "dukascopy": {
+          "symbol": "xauusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "metal",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "XBRUSD",
+      "display_name": "Brent Crude Spot",
+      "asset_class": "energies",
+      "lifecycle_status": "retired",
+      "research_eligible": false,
+      "app_visible": false,
+      "publisher_enabled": false,
+      "historical_provider": null,
+      "live_provider": null,
+      "calendar_contract_id": "brent_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": null,
+          "supported": false,
+          "mt5_description": null,
+          "mt5_path": null,
+          "currency_base": null,
+          "currency_profit": null,
+          "currency_margin": null,
+          "digits": null,
+          "point": null,
+          "contract_size": null,
+          "datasets": [],
+          "native_timeframes": [],
+          "observed_first_tick_utc": null
+        },
+        "dukascopy": {
+          "symbol": "brentcmdusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "commodity",
+      "lifecycle_reason": "Not available through the audited Darwinex Zero mapping.",
+      "retirement_reason": "Not available through the audited Darwinex Zero mapping."
+    },
+    {
+      "pair": "XTIUSD",
+      "display_name": "US Crude Spot",
+      "asset_class": "energies",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "wti_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "XTIUSD",
+          "supported": true,
+          "mt5_description": "US Crude (Spot) vs US Dollar",
+          "mt5_path": "Commodities\\Energies\\XTIUSD",
+          "currency_base": "USD",
+          "currency_profit": "USD",
+          "currency_margin": "USD",
+          "digits": 2,
+          "point": 0.01,
+          "contract_size": 1000.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": "2020-01-02T01:00:06.278Z"
+        },
+        "dukascopy": {
+          "symbol": "lightcmdusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "commodity",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "DE40",
+      "display_name": "Germany 40",
+      "asset_class": "indices",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "europe_index_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "GDAXI",
+          "supported": true,
+          "mt5_description": "Germany 40",
+          "mt5_path": "Indices\\Index DAX\\GDAXI",
+          "currency_base": "EUR",
+          "currency_profit": "EUR",
+          "currency_margin": "EUR",
+          "digits": 1,
+          "point": 0.1,
+          "contract_size": 10.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": "2018-01-25T13:04:10.121Z"
+        },
+        "dukascopy": {
+          "symbol": "deuidxeur",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "index",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "HK50",
+      "display_name": "Hong Kong 50",
+      "asset_class": "indices",
+      "lifecycle_status": "retired",
+      "research_eligible": false,
+      "app_visible": false,
+      "publisher_enabled": false,
+      "historical_provider": null,
+      "live_provider": null,
+      "calendar_contract_id": "hong_kong_index_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": null,
+          "supported": false,
+          "mt5_description": null,
+          "mt5_path": null,
+          "currency_base": null,
+          "currency_profit": null,
+          "currency_margin": null,
+          "digits": null,
+          "point": null,
+          "contract_size": null,
+          "datasets": [],
+          "native_timeframes": [],
+          "observed_first_tick_utc": null
+        },
+        "dukascopy": {
+          "symbol": "hkgidxhkd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "index",
+      "lifecycle_reason": "Not available through the audited Darwinex Zero mapping.",
+      "retirement_reason": "Not available through the audited Darwinex Zero mapping."
+    },
+    {
+      "pair": "JP225",
+      "display_name": "Nikkei 225",
+      "asset_class": "indices",
+      "lifecycle_status": "deferred",
+      "research_eligible": false,
+      "app_visible": false,
+      "publisher_enabled": false,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": null,
+      "calendar_contract_id": "japan_index_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "NI225",
+          "supported": true,
+          "mt5_description": "Japan Stock Index “Nikkei 225” ",
+          "mt5_path": "Indices\\Index 1\\NI225",
+          "currency_base": "JPY",
+          "currency_profit": "JPY",
+          "currency_margin": "JPY",
+          "digits": 0,
+          "point": 1.0,
+          "contract_size": 100.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": "2023-03-27T01:00:07.453Z"
+        },
+        "dukascopy": {
+          "symbol": "jpnidxjpy",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "index",
+      "lifecycle_reason": "Deferred because Darwinex tick history begins 2023-03-27; deeper native bars require separate qualification.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "RUSS2000",
+      "display_name": "Russell 2000",
+      "asset_class": "indices",
+      "lifecycle_status": "retired",
+      "research_eligible": false,
+      "app_visible": false,
+      "publisher_enabled": false,
+      "historical_provider": null,
+      "live_provider": null,
+      "calendar_contract_id": "us_index_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": null,
+          "supported": false,
+          "mt5_description": null,
+          "mt5_path": null,
+          "currency_base": null,
+          "currency_profit": null,
+          "currency_margin": null,
+          "digits": null,
+          "point": null,
+          "contract_size": null,
+          "datasets": [],
+          "native_timeframes": [],
+          "observed_first_tick_utc": null
+        },
+        "dukascopy": {
+          "symbol": "ussc2000idxusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "index",
+      "lifecycle_reason": "Not available through the audited Darwinex Zero mapping.",
+      "retirement_reason": "Not available through the audited Darwinex Zero mapping."
+    },
+    {
+      "pair": "UK100",
+      "display_name": "FTSE 100",
+      "asset_class": "indices",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "uk_index_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "UK100",
+          "supported": true,
+          "mt5_description": "London Stock Exchange Index“FTSE 100”",
+          "mt5_path": "Indices\\Index 3\\UK100",
+          "currency_base": "GBP",
+          "currency_profit": "GBP",
+          "currency_margin": "GBP",
+          "digits": 1,
+          "point": 0.1,
+          "contract_size": 10.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": "2018-01-25T13:04:07.432Z"
+        },
+        "dukascopy": {
+          "symbol": "gbridxgbp",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "index",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "US30",
+      "display_name": "Wall Street 30",
+      "asset_class": "indices",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "us_index_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "WS30",
+          "supported": true,
+          "mt5_description": "Wall Street 30",
+          "mt5_path": "Indices\\Index 1\\WS30",
+          "currency_base": "USD",
+          "currency_profit": "USD",
+          "currency_margin": "USD",
+          "digits": 0,
+          "point": 1.0,
+          "contract_size": 1.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": "2018-01-31T15:39:12.017Z"
+        },
+        "dukascopy": {
+          "symbol": "usa30idxusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "index",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "US500",
+      "display_name": "S&P 500",
+      "asset_class": "indices",
+      "lifecycle_status": "deferred",
+      "research_eligible": false,
+      "app_visible": false,
+      "publisher_enabled": false,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": null,
+      "calendar_contract_id": "us_index_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "SP500",
+          "supported": true,
+          "mt5_description": "SP500",
+          "mt5_path": "Indices\\Index 2\\SP500",
+          "currency_base": "USD",
+          "currency_profit": "USD",
+          "currency_margin": "USD",
+          "digits": 1,
+          "point": 0.1,
+          "contract_size": 10.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": "2023-03-27T01:00:00.423Z"
+        },
+        "dukascopy": {
+          "symbol": "usa500idxusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "index",
+      "lifecycle_reason": "Deferred because Darwinex tick history begins 2023-03-27; deeper native bars require separate qualification.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "USTECH",
+      "display_name": "US Tech 100",
+      "asset_class": "indices",
+      "lifecycle_status": "enabled",
+      "research_eligible": true,
+      "app_visible": true,
+      "publisher_enabled": true,
+      "historical_provider": "darwinex_zero_mt5",
+      "live_provider": "darwinex_zero_mt5",
+      "calendar_contract_id": "us_index_cfd_broker",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": "NDX",
+          "supported": true,
+          "mt5_description": "US Tech 100",
+          "mt5_path": "Indices\\Index 3\\NDX",
+          "currency_base": "USD",
+          "currency_profit": "USD",
+          "currency_margin": "USD",
+          "digits": 1,
+          "point": 0.1,
+          "contract_size": 10.0,
+          "datasets": [
+            "ticks",
+            "bars"
+          ],
+          "native_timeframes": [
+            "M1",
+            "M5",
+            "M15",
+            "M30",
+            "H1",
+            "H4",
+            "D1"
+          ],
+          "observed_first_tick_utc": "2018-01-25T13:04:09.225Z"
+        },
+        "dukascopy": {
+          "symbol": "usatechidxusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "index",
+      "lifecycle_reason": "Included in Darwinex-native development universe version 1.",
+      "retirement_reason": null
+    },
+    {
+      "pair": "BTCUSD",
+      "display_name": "Bitcoin / US Dollar",
+      "asset_class": "crypto",
+      "lifecycle_status": "retired",
+      "research_eligible": false,
+      "app_visible": false,
+      "publisher_enabled": false,
+      "historical_provider": null,
+      "live_provider": null,
+      "calendar_contract_id": "crypto_24_7_utc",
+      "decimal_factor": 10,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": null,
+          "supported": false,
+          "mt5_description": null,
+          "mt5_path": null,
+          "currency_base": null,
+          "currency_profit": null,
+          "currency_margin": null,
+          "digits": null,
+          "point": null,
+          "contract_size": null,
+          "datasets": [],
+          "native_timeframes": [],
+          "observed_first_tick_utc": null
+        },
+        "dukascopy": {
+          "symbol": "btcusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "crypto",
+      "lifecycle_reason": "Not available through the audited Darwinex Zero mapping.",
+      "retirement_reason": "Not available through the audited Darwinex Zero mapping."
+    },
+    {
+      "pair": "ETHUSD",
+      "display_name": "Ether / US Dollar",
+      "asset_class": "crypto",
+      "lifecycle_status": "retired",
+      "research_eligible": false,
+      "app_visible": false,
+      "publisher_enabled": false,
+      "historical_provider": null,
+      "live_provider": null,
+      "calendar_contract_id": "crypto_24_7_utc",
+      "decimal_factor": 10,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": null,
+          "supported": false,
+          "mt5_description": null,
+          "mt5_path": null,
+          "currency_base": null,
+          "currency_profit": null,
+          "currency_margin": null,
+          "digits": null,
+          "point": null,
+          "contract_size": null,
+          "datasets": [],
+          "native_timeframes": [],
+          "observed_first_tick_utc": null
+        },
+        "dukascopy": {
+          "symbol": "ethusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "crypto",
+      "lifecycle_reason": "Not available through the audited Darwinex Zero mapping.",
+      "retirement_reason": "Not available through the audited Darwinex Zero mapping."
+    },
+    {
+      "pair": "SOLUSD",
+      "display_name": "Solana / US Dollar",
+      "asset_class": "crypto",
+      "lifecycle_status": "retired",
+      "research_eligible": false,
+      "app_visible": false,
+      "publisher_enabled": false,
+      "historical_provider": null,
+      "live_provider": null,
+      "calendar_contract_id": "crypto_24_7_utc",
+      "decimal_factor": 100,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": null,
+          "supported": false,
+          "mt5_description": null,
+          "mt5_path": null,
+          "currency_base": null,
+          "currency_profit": null,
+          "currency_margin": null,
+          "digits": null,
+          "point": null,
+          "contract_size": null,
+          "datasets": [],
+          "native_timeframes": [],
+          "observed_first_tick_utc": null
+        },
+        "dukascopy": {
+          "symbol": "solusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "crypto",
+      "lifecycle_reason": "Not available through the audited Darwinex Zero mapping and previously excluded from AutoResearch policy.",
+      "retirement_reason": "Not available through the audited Darwinex Zero mapping and previously excluded from AutoResearch policy."
+    },
+    {
+      "pair": "XRPUSD",
+      "display_name": "XRP / US Dollar",
+      "asset_class": "crypto",
+      "lifecycle_status": "retired",
+      "research_eligible": false,
+      "app_visible": false,
+      "publisher_enabled": false,
+      "historical_provider": null,
+      "live_provider": null,
+      "calendar_contract_id": "crypto_24_7_utc",
+      "decimal_factor": 1000,
+      "providers": {
+        "darwinex_zero_mt5": {
+          "symbol": null,
+          "supported": false,
+          "mt5_description": null,
+          "mt5_path": null,
+          "currency_base": null,
+          "currency_profit": null,
+          "currency_margin": null,
+          "digits": null,
+          "point": null,
+          "contract_size": null,
+          "datasets": [],
+          "native_timeframes": [],
+          "observed_first_tick_utc": null
+        },
+        "dukascopy": {
+          "symbol": "xrpusd",
+          "comparison_only": true
+        }
+      },
+      "portfolio_asset_class": "crypto",
+      "lifecycle_reason": "Not available through the audited Darwinex Zero mapping.",
+      "retirement_reason": "Not available through the audited Darwinex Zero mapping."
+    }
+  ]
+}
