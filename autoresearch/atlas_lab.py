@@ -76,6 +76,7 @@ from .play_hand import (
     METALS_INSTRUMENT_POOL,
 )
 from .play_hand_lab_auth import load_lab_gateway_token
+from .evidence_plan import build_replay_evidence_plan
 from .recipe_priors import DEFAULT_RECIPE_PRIORS_DIRNAME, build_recipe_priors
 from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapshot
 from .signal_atlas import (
@@ -331,6 +332,8 @@ class AtlasLabRuntimeConfig:
     include_detail: bool = True
     compact_probe_artifacts: bool = True
     as_of_date: str | None = None
+    lake_manifest_sha256: str | None = None
+    signal_lookback_months: int = 3
     discovery_cluster_min_similarity: float = DEFAULT_DISCOVERY_CLUSTER_MIN_SIMILARITY
     discovery_cluster_min_shared_partners: int = DEFAULT_DISCOVERY_CLUSTER_MIN_SHARED_PARTNERS
     discovery_cluster_max_recipes: int = DEFAULT_DISCOVERY_CLUSTER_MAX_RECIPES
@@ -449,6 +452,7 @@ class ProbeState:
     detail_task_id: str | None = None
     score: AttemptScore | None = None
     snapshot: dict[str, Any] | None = None
+    execution_evidence: dict[str, Any] | None = None
     status: str = "queued"
     error: str | None = None
 
@@ -776,6 +780,23 @@ def _deep_replay_request_from_probe(
             str(as_of_date),
             lookback_months,
         )
+    if bool(analysis_window_start) != bool(analysis_window_end):
+        raise ValueError(
+            f"Atlas probe {probe_id} must provide both analysis window bounds."
+        )
+    evidence_plan = None
+    if analysis_window_start and analysis_window_end:
+        evidence_plan = build_replay_evidence_plan(
+            campaign_plan_id=f"atlas-probe:{probe_id}",
+            evidence_role="training",
+            selection_data_end=analysis_window_end,
+            analysis_window_start=analysis_window_start,
+            analysis_window_end=analysis_window_end,
+            requested_horizon_months=lookback_months,
+            profile_snapshot=profile_payload,
+            lake_manifest_sha256=runtime.lake_manifest_sha256,
+            data_availability_cutoff=analysis_window_end,
+        )
     quality_score_preset = _normalize_quality_score_preset(
         parsed.get("quality_score_preset") or DEFAULT_QUALITY_SCORE_PRESET
     )
@@ -798,9 +819,12 @@ def _deep_replay_request_from_probe(
         "instruments": instruments,
         "timeframe": timeframe,
         "market_data_source": "lake_bars",
-        "lookback_months": lookback_months,
+        "lookback_months": None if evidence_plan else lookback_months,
         "analysis_window_start": analysis_window_start,
         "analysis_window_end": analysis_window_end,
+        "evidence_plan": (
+            evidence_plan.model_dump(mode="json") if evidence_plan else None
+        ),
         "bar_limit": 5000,
         "alert_threshold": alert_threshold if alert_threshold is not None else 80.0,
         "view_mode": "overview",
@@ -992,6 +1016,24 @@ def _materialize_aggregate_result(
     compact_artifacts: bool,
 ) -> None:
     result_payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
+    expected_plan = state.replay_request.get("evidence_plan")
+    expected_plan = expected_plan if isinstance(expected_plan, dict) else {}
+    receipt = result_payload.get("execution_evidence")
+    if expected_plan.get("lake_manifest_sha256"):
+        if not isinstance(receipt, dict):
+            raise RuntimeError("Historical Atlas probe omitted execution_evidence")
+        expected_receipt = {
+            "plan_id": expected_plan.get("plan_id"),
+            "profile_snapshot_sha256": expected_plan.get("profile_snapshot_sha256"),
+            "execution_cell_sha256": expected_plan.get("execution_cell_sha256"),
+            "observed_lake_manifest_sha256": expected_plan.get("lake_manifest_sha256"),
+        }
+        for key, value in expected_receipt.items():
+            if receipt.get(key) != value:
+                raise RuntimeError(
+                    f"Historical Atlas receipt {key} mismatch: expected {value!r}, observed {receipt.get(key)!r}"
+                )
+        state.execution_evidence = dict(receipt)
     state.output_dir.mkdir(parents=True, exist_ok=True)
     full_snapshot = _sensitivity_response_from_worker_result(
         result_payload,
@@ -1001,6 +1043,11 @@ def _materialize_aggregate_result(
         state.output_dir / "sensitivity-response.json",
         full_snapshot,
     )
+    if state.execution_evidence is not None:
+        _write_json(
+            state.output_dir / "execution-evidence.json",
+            state.execution_evidence,
+        )
     request_payload = result_payload.get("request") if isinstance(result_payload.get("request"), dict) else None
     if isinstance(request_payload, dict) and not compact_artifacts:
         _write_json(state.output_dir / "deep-replay-job.json", {"request": request_payload, **result_payload})
@@ -1138,7 +1185,13 @@ def _result_row(
             or 12
         )
         kwargs["lookback_months"] = lookback
-    return spec.row_builder(state.row, **kwargs)
+    row = spec.row_builder(state.row, **kwargs)
+    if state.execution_evidence is not None:
+        row["evidence_plan_id"] = state.execution_evidence.get("plan_id")
+        row["observed_lake_manifest_sha256"] = state.execution_evidence.get(
+            "observed_lake_manifest_sha256"
+        )
+    return row
 
 
 def _existing_result_row(
@@ -1652,6 +1705,25 @@ def _make_signal_atlas_cell_task(
     timeframe: str,
     bar_limit: int,
 ) -> dict[str, Any]:
+    analysis_window_start = None
+    analysis_window_end = None
+    evidence_plan = None
+    if runtime.as_of_date:
+        analysis_window_start, analysis_window_end = _analysis_window_from_as_of(
+            runtime.as_of_date,
+            max(int(runtime.signal_lookback_months), 1),
+        )
+        evidence_plan = build_replay_evidence_plan(
+            campaign_plan_id=f"atlas-signal:{task_id}",
+            evidence_role="training",
+            selection_data_end=analysis_window_end,
+            analysis_window_start=analysis_window_start,
+            analysis_window_end=analysis_window_end,
+            requested_horizon_months=max(int(runtime.signal_lookback_months), 1),
+            profile_snapshot=profile_payload,
+            lake_manifest_sha256=runtime.lake_manifest_sha256,
+            data_availability_cutoff=analysis_window_end,
+        )
     payload = {
         "task_id": task_id,
         "indicator_id": indicator_id,
@@ -1661,6 +1733,10 @@ def _make_signal_atlas_cell_task(
         "timeframe": timeframe,
         "bar_limit": int(bar_limit),
         "market_data_source": "lake_bars",
+        "lookback_months": None if evidence_plan else runtime.signal_lookback_months,
+        "analysis_window_start": analysis_window_start,
+        "analysis_window_end": analysis_window_end,
+        "evidence_plan": evidence_plan.model_dump(mode="json") if evidence_plan else None,
         "alert_threshold": _safe_float(profile_payload.get("notificationThreshold")) or 80.0,
         "direction_mode": _clean_token(profile_payload.get("directionMode")) or "both",
         "required_worker_contract_hash": worker_contract_hash,
@@ -1711,6 +1787,20 @@ def _row_from_signal_result(
     data = _as_dict(raw.get("data"))
     if not raw or not data:
         raise RuntimeError("signal_atlas_cell result did not include raw signal data")
+    evidence_plan = _as_dict(base_row.get("evidence_plan"))
+    execution_evidence = _as_dict(payload.get("execution_evidence"))
+    if evidence_plan.get("lake_manifest_sha256"):
+        expected = {
+            "plan_id": evidence_plan.get("plan_id"),
+            "profile_snapshot_sha256": evidence_plan.get("profile_snapshot_sha256"),
+            "execution_cell_sha256": evidence_plan.get("execution_cell_sha256"),
+            "observed_lake_manifest_sha256": evidence_plan.get("lake_manifest_sha256"),
+        }
+        for key, value in expected.items():
+            if execution_evidence.get(key) != value:
+                raise RuntimeError(
+                    f"Historical signal receipt {key} mismatch: expected {value!r}, observed {execution_evidence.get(key)!r}"
+                )
     _write_json(raw_path, raw)
     metrics = compute_signal_metrics(
         _numeric_signal_series(data.get("long_score")),
@@ -1722,6 +1812,10 @@ def _row_from_signal_result(
     row["status"] = "ok"
     if payload.get("analysis_status"):
         row["analysis_status"] = payload.get("analysis_status")
+    row["evidence_plan_id"] = execution_evidence.get("plan_id")
+    row["observed_lake_manifest_sha256"] = execution_evidence.get(
+        "observed_lake_manifest_sha256"
+    )
     return row
 
 
@@ -1907,6 +2001,9 @@ def build_signal_atlas_via_gateway(
                 timeframe=str(state["timeframe"]),
                 bar_limit=bar_limit,
             )
+            state["base_row"]["evidence_plan"] = task["payload"].get(
+                "evidence_plan"
+            )
             active[str(state["task_id"])] = state
             chunk.append(task)
         if chunk:
@@ -2035,6 +2132,9 @@ def build_signal_atlas_via_gateway(
             "timeframes": timeframe_panel,
             "bar_limit": bar_limit,
             "replay_source": "lake_bars",
+            "as_of_date": runtime.as_of_date,
+            "signal_lookback_months": runtime.signal_lookback_months,
+            "lake_manifest_sha256": runtime.lake_manifest_sha256,
             "total_requested_calls": total_calls,
         },
         "result_counts": {
@@ -2074,6 +2174,9 @@ def build_signal_atlas_via_gateway(
             "raw_dir": str(raw_dir),
             "profile_dir": str(profile_dir),
             "executor": "lab_gateway",
+            "as_of_date": runtime.as_of_date,
+            "signal_lookback_months": runtime.signal_lookback_months,
+            "lake_manifest_sha256": runtime.lake_manifest_sha256,
         },
     )
     _write_signal_rows_csv(csv_path, rows)
@@ -2101,9 +2204,20 @@ def run_atlas_lab(
     profile = atlas_profile_config(runtime.atlas_profile)
     build_profile = effective_atlas_build_profile(profile, runtime)
     paths = build_atlas_lab_paths(config, run_id=run_id)
-    paths.run_root.mkdir(parents=True, exist_ok=True)
     selected_phases = set(phases or ["full"])
     run_full = "full" in selected_phases
+    historical_build = bool(runtime.as_of_date) and (run_full or "build" in selected_phases)
+    if historical_build and runtime.signal_atlas_executor != "gateway":
+        raise ValueError(
+            "Historical Atlas requires signal_atlas_executor='gateway'; the local signal path is not evidence-bounded."
+        )
+    if runtime.as_of_date and not str(runtime.lake_manifest_sha256 or "").strip():
+        raise ValueError("Historical Atlas requires an exact lake_manifest_sha256.")
+    if runtime.as_of_date and paths.run_root.exists() and any(paths.run_root.iterdir()):
+        raise FileExistsError(
+            f"Historical Atlas run roots are create-only and already exist: {paths.run_root}"
+        )
+    paths.run_root.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now(timezone.utc).isoformat()
     _write_json(
         paths.metadata_path,

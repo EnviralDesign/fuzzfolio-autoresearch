@@ -55,3 +55,4 @@ wheels/
 
 # Rust build output
 /rust/catalog-indexer/target/
+/scripts/Process Manager logs

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from collections import Counter
 from dataclasses import is_dataclass, replace
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import redirect_stdout
@@ -18,7 +19,7 @@ import time as pytime
 import urllib.error
 import urllib.request
 import zlib
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from math import ceil
 from pathlib import Path
 from typing import Any, Callable
@@ -250,10 +251,29 @@ if __package__ in {None, ""}:
         PortfolioSearch,
         baseline_metrics_from_ids,
         build_optimizer_candidates,
+        instrument_asset_class,
         load_baseline_account,
         load_baseline_attempt_ids,
         run_optimizer_backend,
+        row_instruments,
         write_optimizer_report,
+    )
+    from autoresearch.portfolio_research import (
+        PortfolioResearchError,
+        expand_experiments,
+        latest_campaign_id,
+        load_research_suite,
+        make_campaign_id,
+        package_research_finalist,
+        rebuild_research_report,
+        run_research_campaign,
+    )
+    from autoresearch.level_c import (
+        LevelCCohortError,
+        bind_level_c_evidence_rows,
+        cohort_attempt_ids,
+        freeze_level_c_cohort,
+        validate_level_c_cohort,
     )
     from autoresearch.portfolio_risk_sizing import (
         RiskSizingSpec,
@@ -527,10 +547,29 @@ else:
         PortfolioSearch,
         baseline_metrics_from_ids,
         build_optimizer_candidates,
+        instrument_asset_class,
         load_baseline_account,
         load_baseline_attempt_ids,
         run_optimizer_backend,
+        row_instruments,
         write_optimizer_report,
+    )
+    from .portfolio_research import (
+        PortfolioResearchError,
+        expand_experiments,
+        latest_campaign_id,
+        load_research_suite,
+        make_campaign_id,
+        package_research_finalist,
+        rebuild_research_report,
+        run_research_campaign,
+    )
+    from .level_c import (
+        LevelCCohortError,
+        bind_level_c_evidence_rows,
+        cohort_attempt_ids,
+        freeze_level_c_cohort,
+        validate_level_c_cohort,
     )
     from .portfolio_risk_sizing import (
         RiskSizingSpec,
@@ -702,6 +741,11 @@ PUBLIC_CLI_COMMANDS = {
     "audit-full-backtests",
     "build-portfolio",
     "optimize-portfolio",
+    "portfolio-research",
+    "portfolio-research-report",
+    "portfolio-research-package",
+    "freeze-level-c-cohort",
+    "nested-evidence",
     "export-portfolio-bundle",
     "build-portfolio-risk-sizing",
     "render-portfolio-profile-drops",
@@ -2962,6 +3006,17 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     cleanup_cmd.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
+    atlas_lab.add_argument(
+        "--lake-manifest-sha256",
+        default=None,
+        help="Exact promoted lake coverage identity. Required with --as-of-date.",
+    )
+    atlas_lab.add_argument(
+        "--signal-lookback-months",
+        type=int,
+        default=3,
+        help="Bounded signal-surface history in months for historical Atlas. Default: 3.",
+    )
     cleanup_atlas = subparsers.add_parser(
         "cleanup-atlas-artifacts",
         help=(
@@ -3145,12 +3200,67 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Recalculate even if full-backtest file already exists.",
     )
     calc_backtests.add_argument(
+        "--scope",
+        choices=("matched", "canonical"),
+        default="matched",
+        help=(
+            "Materialization scope. 'matched' preserves legacy behavior; 'canonical' "
+            "keeps only frozen canonical attempts. Default: matched."
+        ),
+    )
+    calc_backtests.add_argument(
         "--dry-run",
         action="store_true",
         help=(
             "Audit and list attempts that require rebuilding without submitting "
             "local or gateway work."
         ),
+    )
+    calc_backtests.add_argument(
+        "--horizon-months",
+        type=int,
+        default=36,
+        help="Requested evidence horizon in calendar months. Default: 36.",
+    )
+    calc_backtests.add_argument(
+        "--evidence-window-start",
+        default=None,
+        help="Explicit UTC ISO-8601 evidence-window start. Defaults to end minus horizon.",
+    )
+    calc_backtests.add_argument(
+        "--evidence-window-end",
+        default=None,
+        help="Explicit UTC ISO-8601 evidence-window end. Frozen once per command.",
+    )
+    calc_backtests.add_argument(
+        "--selection-data-end",
+        default=None,
+        help="Latest UTC timestamp selection-consuming evidence may read.",
+    )
+    calc_backtests.add_argument(
+        "--evidence-role",
+        default="full_backtest",
+        help="Evidence role recorded in each immutable plan. Default: full_backtest.",
+    )
+    calc_backtests.add_argument(
+        "--campaign-plan-id",
+        default=None,
+        help="Stable campaign identity shared by the per-profile evidence plans.",
+    )
+    calc_backtests.add_argument(
+        "--lake-url",
+        default=None,
+        help="MarketDataLake base URL used to freeze promoted coverage identity.",
+    )
+    calc_backtests.add_argument(
+        "--lake-token",
+        default=None,
+        help="MarketDataLake bearer token when its manifest endpoint requires one.",
+    )
+    calc_backtests.add_argument(
+        "--lake-manifest-sha256",
+        default=None,
+        help="Explicit promoted lake coverage SHA-256; bypasses manifest lookup.",
     )
     calc_backtests.add_argument(
         "--full-backtest-max-age-days",
@@ -3881,6 +3991,196 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     )
     optimize_portfolio.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
+    )
+
+    portfolio_research = subparsers.add_parser(
+        "portfolio-research",
+        help="Run a resumable corpus-healed portfolio robustness and temporal-validation campaign.",
+    )
+    portfolio_research.add_argument(
+        "--suite",
+        default="darwin-master-v1",
+        help="Named suite in portfolio.research-suites.json. Default: darwin-master-v1.",
+    )
+    portfolio_research.add_argument(
+        "--suite-config",
+        type=Path,
+        default=None,
+        help="Research suite JSON path. Defaults to repo-root portfolio.research-suites.json.",
+    )
+    portfolio_research.add_argument(
+        "--campaign-name",
+        default=None,
+        help="Optional suffix for a newly generated timestamped campaign id.",
+    )
+    portfolio_research.add_argument(
+        "--campaign-id",
+        default=None,
+        help="Exact campaign id to create or resume.",
+    )
+    portfolio_research.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a campaign from its immutable snapshot and completed atomic experiments.",
+    )
+    portfolio_research.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Resolve the suite and preview corpus catchup without running experiments.",
+    )
+    portfolio_research.add_argument(
+        "--skip-catchup",
+        action="store_true",
+        help="Skip freshness healing and mark the campaign non-promotable. Intended for diagnostics only.",
+    )
+    portfolio_research.add_argument(
+        "--allow-incomplete-corpus",
+        action="store_true",
+        help="Exclude artifacts that remain invalid instead of failing; marks the campaign non-promotable.",
+    )
+    portfolio_research.add_argument(
+        "--full-backtest-workers",
+        type=int,
+        default=None,
+        help="Concurrent corpus-healing replay jobs. Default: auto/configured worker count.",
+    )
+    portfolio_research.add_argument(
+        "--full-backtest-job-timeout-seconds",
+        type=int,
+        default=2400,
+        help="Maximum seconds per corpus-healing replay job. Default: 2400.",
+    )
+    portfolio_research.add_argument(
+        "--full-backtest-max-age-days",
+        type=float,
+        default=None,
+        help="Override suite corpus freshness age in days. Negative disables age fallback.",
+    )
+    portfolio_research.add_argument(
+        "--market-session-tolerance-days",
+        type=int,
+        default=None,
+        help="Override suite allowed weekday lag from lake coverage.",
+    )
+    portfolio_research.add_argument(
+        "--full-backtest-backend",
+        choices=("local", "lab-gateway"),
+        default=None,
+        help="Override the suite corpus-healing backend.",
+    )
+    portfolio_research.add_argument(
+        "--gateway-url",
+        default=None,
+        help="Lab gateway URL for corpus healing. Defaults to the suite value.",
+    )
+    portfolio_research.add_argument(
+        "--gateway-token",
+        default=None,
+        help="Optional lab gateway bearer token. Defaults to local configured token.",
+    )
+    portfolio_research.add_argument(
+        "--trading-dashboard-root",
+        type=Path,
+        default=None,
+        help="Trading-Dashboard root used for lake coverage and worker contract resolution.",
+    )
+    portfolio_research.add_argument(
+        "--optimizer-backend",
+        choices=("python", "pyo3", "auto"),
+        default=None,
+        help="Override the suite optimizer backend. Formal suites default to auto/Rust.",
+    )
+    portfolio_research.add_argument(
+        "--experiment-limit",
+        type=int,
+        default=None,
+        help="Run only the first N full-window experiments. Intended for bounded verification.",
+    )
+    portfolio_research.add_argument(
+        "--frozen-cohort",
+        type=Path,
+        default=None,
+        help="Verified freeze-level-c-cohort manifest; restricts materialization and selection to its exact candidates and cutoff.",
+    )
+    portfolio_research.add_argument(
+        "--json", action="store_true", help="Print machine-readable final summary."
+    )
+
+    portfolio_research_report = subparsers.add_parser(
+        "portfolio-research-report",
+        help="Rebuild analysis and reports from a completed campaign's frozen artifacts.",
+    )
+    nested_evidence = subparsers.add_parser(
+        "nested-evidence",
+        help="Materialize resumable train-selected-cell and redacted outer evidence.",
+    )
+    nested_evidence.add_argument("--campaign-id", required=True)
+    nested_evidence.add_argument("--suite", default="darwin-master-v1")
+    nested_evidence.add_argument("--suite-config", type=Path, default=None)
+    nested_evidence.add_argument("--run-id", action="append", default=None)
+    nested_evidence.add_argument("--attempt-id", action="append", default=None)
+    nested_evidence.add_argument(
+        "--scope", choices=("matched", "canonical"), default="canonical"
+    )
+    nested_evidence.add_argument("--start", required=True)
+    nested_evidence.add_argument("--end", required=True)
+    nested_evidence.add_argument("--train-months", type=int, default=36)
+    nested_evidence.add_argument("--test-months", type=int, default=6)
+    nested_evidence.add_argument("--step-months", type=int, default=6)
+    nested_evidence.add_argument("--embargo-days", type=int, default=15)
+    nested_evidence.add_argument(
+        "--selection-basis",
+        choices=("best_cell", "recommended_cell", "robust_cell"),
+        default="recommended_cell",
+    )
+    nested_evidence.add_argument("--max-workers", type=int, default=8)
+    nested_evidence.add_argument("--gateway-url", default=None)
+    nested_evidence.add_argument("--gateway-token", default=None)
+    nested_evidence.add_argument("--lake-url", default=None)
+    nested_evidence.add_argument("--lake-token", default=None)
+    nested_evidence.add_argument("--lake-manifest-sha256", default=None)
+    nested_evidence.add_argument("--trading-dashboard-root", type=Path, default=None)
+    nested_evidence.add_argument(
+        "--optimizer-backend", choices=("python", "pyo3", "auto"), default="auto"
+    )
+    nested_evidence.add_argument("--dry-run", action="store_true")
+    nested_evidence.add_argument("--json", action="store_true")
+    portfolio_research_report.add_argument(
+        "--campaign-id",
+        default="latest",
+        help="Campaign id under runs/derived/portfolio-research, or latest. Default: latest.",
+    )
+
+    portfolio_research_package = subparsers.add_parser(
+        "portfolio-research-package",
+        help="Package one promotion-eligible frozen campaign finalist after explicit review.",
+    )
+    portfolio_research_package.add_argument(
+        "--campaign-id",
+        required=True,
+        help="Completed campaign id under runs/derived/portfolio-research.",
+    )
+    portfolio_research_package.add_argument(
+        "--finalist",
+        required=True,
+        choices=("champion", "conservative", "return-alternate"),
+    )
+    portfolio_research_package.add_argument(
+        "--json", action="store_true", help="Print machine-readable final summary."
+    )
+    freeze_level_c = subparsers.add_parser(
+        "freeze-level-c-cohort",
+        help="Freeze a cutoff-bounded Atlas/PlayHand discovery cohort for portfolio research.",
+    )
+    freeze_level_c.add_argument("--cohort-id", required=True)
+    freeze_level_c.add_argument("--as-of-date", required=True)
+    freeze_level_c.add_argument("--atlas-run-root", type=Path, required=True)
+    freeze_level_c.add_argument("--playhand-campaign-id", required=True)
+    freeze_level_c.add_argument("--lake-manifest-sha256", required=True)
+    freeze_level_c.add_argument("--output", type=Path, default=None)
+    freeze_level_c.add_argument("--json", action="store_true")
+    portfolio_research_report.add_argument(
+        "--json", action="store_true", help="Print machine-readable final summary."
     )
 
     export_portfolio_bundle = subparsers.add_parser(
@@ -10602,6 +10902,34 @@ def _build_validation_rows(
     ]
 
 
+def _resolve_promoted_lake_coverage_sha256(
+    *,
+    lake_url: str | None,
+    lake_token: str | None,
+    lake_manifest_sha256: str | None,
+) -> str | None:
+    resolved = str(lake_manifest_sha256 or "").strip() or None
+    resolved_url = str(
+        lake_url or os.environ.get("REMOTE_MARKET_DATA_LAKE_BASE_URL") or ""
+    ).strip()
+    if resolved is not None or not resolved_url:
+        return resolved
+    import requests
+
+    headers = (
+        {"Authorization": f"Bearer {lake_token}"}
+        if str(lake_token or "").strip()
+        else {}
+    )
+    response = requests.get(
+        f"{resolved_url.rstrip('/')}/api/lake/manifest",
+        headers=headers,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return str((response.json() or {}).get("coverage_sha256") or "").strip() or None
+
+
 def cmd_calculate_full_backtests(
     *,
     run_ids: list[str] | None,
@@ -10625,14 +10953,81 @@ def cmd_calculate_full_backtests(
     emit_summary: bool = True,
     catalog_already_refreshed: bool = False,
     defer_global_audit: bool = False,
+    horizon_months: int = 36,
+    evidence_window_start: str | None = None,
+    evidence_window_end: str | None = None,
+    selection_data_end: str | None = None,
+    evidence_role: str = "full_backtest",
+    campaign_plan_id: str | None = None,
+    lake_url: str | None = None,
+    lake_token: str | None = None,
+    lake_manifest_sha256: str | None = None,
+    scope: str = "matched",
 ) -> int:
     config = load_config()
     backend = str(full_backtest_backend or "local").strip().lower().replace("-", "_")
     if backend not in {"local", "lab_gateway"}:
         raise SystemExit("--full-backtest-backend must be local or lab-gateway")
+    horizon_months = int(horizon_months)
+    if horizon_months <= 0:
+        raise SystemExit("--horizon-months must be positive")
+    custom_evidence = bool(
+        horizon_months != 36
+        or evidence_window_start
+        or evidence_window_end
+        or selection_data_end
+        or str(evidence_role or "full_backtest") != "full_backtest"
+        or campaign_plan_id
+        or lake_manifest_sha256
+    )
+    if custom_evidence and backend != "lab_gateway":
+        raise SystemExit(
+            "Custom bounded evidence requires --full-backtest-backend lab-gateway."
+        )
+    if custom_evidence and force_rebuild:
+        raise SystemExit(
+            "Immutable bounded evidence cannot be force-overwritten; choose a new "
+            "--campaign-plan-id or corrected window instead."
+        )
+    resolved_lake_manifest_sha256 = _resolve_promoted_lake_coverage_sha256(
+        lake_url=lake_url,
+        lake_token=lake_token,
+        lake_manifest_sha256=lake_manifest_sha256,
+    )
+    if custom_evidence and not dry_run and resolved_lake_manifest_sha256 is None:
+        raise SystemExit(
+            "Custom bounded evidence requires the promoted lake coverage identity. "
+            "Provide --lake-manifest-sha256 or --lake-url."
+        )
+    from autoresearch.evidence_plan import (
+        build_replay_evidence_plan,
+        canonical_timestamp,
+        subtract_calendar_months,
+    )
+
+    frozen_evidence_window_end = canonical_timestamp(
+        evidence_window_end or datetime.now(timezone.utc).isoformat()
+    )
+    frozen_evidence_window_start = canonical_timestamp(
+        evidence_window_start
+        or subtract_calendar_months(frozen_evidence_window_end, horizon_months)
+    )
+    frozen_selection_data_end = canonical_timestamp(
+        selection_data_end or frozen_evidence_window_end
+    )
+    stable_campaign_plan_id = campaign_plan_id
+    if custom_evidence and not stable_campaign_plan_id:
+        stable_campaign_plan_id = (
+            f"corpus-materialization:{str(evidence_role).strip().lower()}:"
+            f"{horizon_months}:{frozen_evidence_window_start}:"
+            f"{frozen_evidence_window_end}:{frozen_selection_data_end}"
+        )
     wanted_attempt_ids = {
         str(token).strip() for token in (attempt_ids or []) if str(token).strip()
     }
+    scope = str(scope or "matched").strip().lower()
+    if scope not in {"matched", "canonical"}:
+        raise SystemExit("--scope must be matched or canonical")
     if catalog_already_refreshed:
         catalog_rows = list(
             iter_catalog_rows(
@@ -10673,6 +11068,13 @@ def cmd_calculate_full_backtests(
             label="calculate-full-backtests",
             as_json=as_json,
         )
+    if scope == "canonical":
+        catalog_rows = [
+            row
+            for row in catalog_rows
+            if bool(row.get("is_canonical_attempt"))
+            or bool(row.get("is_canonical_playhand_attempt"))
+        ]
     catalog_by_attempt_id = {
         str(row.get("attempt_id") or ""): row for row in catalog_rows
     }
@@ -10687,10 +11089,15 @@ def cmd_calculate_full_backtests(
         )
         if selected_run_ids:
             effective_run_ids = selected_run_ids
+    scoped_attempt_ids = (
+        sorted(catalog_by_attempt_id)
+        if scope == "canonical"
+        else attempt_ids
+    )
     matched_items = _matched_attempt_items(
         config,
         run_ids=effective_run_ids,
-        attempt_ids=attempt_ids,
+        attempt_ids=scoped_attempt_ids,
         require_scored=False,
         include_run_attempts=False,
     )
@@ -10719,6 +11126,28 @@ def cmd_calculate_full_backtests(
     def calculation_needed_reasons(attempt: dict[str, Any]) -> list[str]:
         if force_rebuild:
             return ["force_rebuild"]
+        expected_plan = None
+        if custom_evidence:
+            profile_path = Path(str(attempt.get("profile_path") or ""))
+            profile_snapshot = load_profile_snapshot(profile_path) or {}
+            try:
+                profile_snapshot["notificationThreshold"] = float(
+                    profile_snapshot.get("notificationThreshold")
+                    if profile_snapshot.get("notificationThreshold") is not None
+                    else 80.0
+                )
+            except (TypeError, ValueError):
+                return ["invalid_profile_threshold"]
+            expected_plan = build_replay_evidence_plan(
+                campaign_plan_id=stable_campaign_plan_id,
+                evidence_role=evidence_role,
+                selection_data_end=frozen_selection_data_end,
+                analysis_window_start=frozen_evidence_window_start,
+                analysis_window_end=frozen_evidence_window_end,
+                requested_horizon_months=horizon_months,
+                profile_snapshot=profile_snapshot,
+                lake_manifest_sha256=resolved_lake_manifest_sha256,
+            )
         validation = validate_full_backtest_artifacts(
             attempt,
             config=config,
@@ -10726,6 +11155,7 @@ def cmd_calculate_full_backtests(
             market_session_tolerance_days=market_session_tolerance_days,
             market_data_coverage=market_data_coverage,
             require_calendar_curve=True,
+            expected_evidence_plan=expected_plan,
         )
         return list(validation.get("rebuild_reason_codes") or [])
 
@@ -10813,6 +11243,7 @@ def cmd_calculate_full_backtests(
                 "run_ids": run_ids,
                 "effective_run_ids": effective_run_ids,
                 "attempt_ids": attempt_ids,
+                "scope": scope,
                 "limit": limit,
                 "require_scrutiny_36": require_scrutiny_36,
                 "force_rebuild": force_rebuild,
@@ -10822,6 +11253,16 @@ def cmd_calculate_full_backtests(
                 "trading_dashboard_root": str(coverage_root)
                 if coverage_root is not None
                 else None,
+                "horizon_months": horizon_months,
+                "evidence_window_start": frozen_evidence_window_start,
+                "evidence_window_end": frozen_evidence_window_end,
+                "selection_data_end": frozen_selection_data_end,
+                "evidence_role": evidence_role,
+                "campaign_plan_id": stable_campaign_plan_id,
+                "lake_manifest_sha256": resolved_lake_manifest_sha256,
+                "execution_ready": (
+                    not custom_evidence or resolved_lake_manifest_sha256 is not None
+                ),
             },
             "corpus_index": corpus_index_info,
             "calculated": 0,
@@ -10896,6 +11337,13 @@ def cmd_calculate_full_backtests(
                 max_workers=resolved_max_workers,
                 force_rebuild=force_rebuild,
                 emit=emit,
+                requested_horizon_months=horizon_months,
+                evidence_window_start=frozen_evidence_window_start,
+                evidence_window_end=frozen_evidence_window_end,
+                evidence_role=evidence_role,
+                selection_data_end=frozen_selection_data_end,
+                campaign_plan_id=stable_campaign_plan_id,
+                lake_manifest_sha256=resolved_lake_manifest_sha256,
             )
         changed_run_ids = sorted({run_dir.name for run_dir, *_ in to_calculate})
         derived_refresh = _refresh_global_derived_corpus_state(
@@ -13450,6 +13898,797 @@ def cmd_optimize_portfolio(
     }
     print(json.dumps(output_payload, ensure_ascii=True, indent=2))
     return 0
+
+
+def _git_provenance(repo_root: Path) -> dict[str, Any]:
+    def run(*args: str) -> str | None:
+        try:
+            completed = subprocess.run(
+                ["git", *args],
+                cwd=repo_root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return completed.stdout.strip() if completed.returncode == 0 else None
+
+    status = run("status", "--porcelain")
+    return {
+        "repo_root": str(repo_root),
+        "git_sha": run("rev-parse", "HEAD"),
+        "git_branch": run("branch", "--show-current"),
+        "worktree_dirty": bool(status),
+        "worktree_status": status.splitlines() if status else [],
+    }
+
+
+def cmd_portfolio_research(
+    *,
+    suite_name: str,
+    suite_config_path: Path | None,
+    campaign_name: str | None,
+    campaign_id: str | None,
+    resume: bool,
+    dry_run: bool,
+    skip_catchup: bool,
+    allow_incomplete_corpus: bool,
+    full_backtest_workers: int | None,
+    full_backtest_job_timeout_seconds: int,
+    full_backtest_max_age_days: float | None,
+    market_session_tolerance_days: int | None,
+    full_backtest_backend: str | None,
+    gateway_url: str | None,
+    gateway_token: str | None,
+    trading_dashboard_root: Path | None,
+    optimizer_backend: str | None,
+    experiment_limit: int | None,
+    frozen_cohort_path: Path | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    suite_path = (
+        suite_config_path.resolve()
+        if suite_config_path is not None
+        else config.repo_root / "portfolio.research-suites.json"
+    )
+    _suite_document, suite = load_research_suite(suite_path, suite_name)
+    campaigns_root = config.derived_root / "portfolio-research"
+    resolved_campaign_id = str(campaign_id or "").strip() or None
+    if resume and resolved_campaign_id is None:
+        resolved_campaign_id = latest_campaign_id(
+            campaigns_root, suite_name=suite_name
+        )
+        if resolved_campaign_id is None:
+            raise SystemExit(
+                f"No incomplete portfolio-research campaign found for suite {suite_name}."
+            )
+    if resolved_campaign_id is None:
+        resolved_campaign_id = make_campaign_id(suite_name, campaign_name)
+    campaign_root = campaigns_root / resolved_campaign_id
+    if campaign_root.exists() and not resume and any(campaign_root.iterdir()):
+        raise SystemExit(
+            f"Campaign already exists: {campaign_root}. Use --resume or a new campaign id."
+        )
+
+    existing_suite_path = campaign_root / "inputs" / "resolved-suite.json"
+    if resume and existing_suite_path.exists():
+        suite = json.loads(existing_suite_path.read_text(encoding="utf-8"))
+
+    frozen_cohort_input = campaign_root / "inputs" / "frozen-level-c-cohort.json"
+    cohort: dict[str, Any] | None = None
+    if resume and frozen_cohort_input.exists():
+        try:
+            cohort = validate_level_c_cohort(frozen_cohort_input)
+        except LevelCCohortError as exc:
+            raise SystemExit(str(exc)) from exc
+    elif frozen_cohort_path is not None:
+        try:
+            cohort = validate_level_c_cohort(frozen_cohort_path.expanduser().resolve())
+        except LevelCCohortError as exc:
+            raise SystemExit(str(exc)) from exc
+        frozen_cohort_input.parent.mkdir(parents=True, exist_ok=True)
+        frozen_cohort_input.write_text(
+            json.dumps(cohort, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    cohort_attempt_id_set = set(cohort_attempt_ids(cohort or {}))
+    cohort_run_ids = sorted(
+        {
+            str(item.get("run_id") or "")
+            for item in (cohort or {}).get("candidates") or []
+            if str(item.get("run_id") or "").strip()
+        }
+    )
+
+    account_preset = str(suite.get("account_preset") or "").strip() or None
+    account_config_path = str(suite.get("account_config") or "").strip() or None
+    frozen_account_path = campaign_root / "inputs" / "resolved-account.json"
+    account = (
+        json.loads(frozen_account_path.read_text(encoding="utf-8"))
+        if resume and frozen_account_path.exists()
+        else _resolve_optimizer_account_spec(
+            config=config,
+            account_config_path=account_config_path,
+            account_preset=account_preset,
+            fallback={},
+        )
+    )
+    if resume and (campaign_root / "inputs" / "candidate-snapshot.json").exists():
+        existing_health_path = campaign_root / "inputs" / "corpus-health.json"
+        existing_provenance_path = campaign_root / "inputs" / "provenance.json"
+        corpus_health = (
+            json.loads(existing_health_path.read_text(encoding="utf-8"))
+            if existing_health_path.exists()
+            else {"status": "resumed_snapshot", "promotable": False}
+        )
+        provenance = (
+            json.loads(existing_provenance_path.read_text(encoding="utf-8"))
+            if existing_provenance_path.exists()
+            else _git_provenance(config.repo_root)
+        )
+        rows: list[dict[str, Any]] = []
+    else:
+        corpus_config = suite.get("corpus") or {}
+        candidate_scope = str(corpus_config.get("scope") or "promoted")
+        initial_rows, corpus_info = _selection_corpus_rows(
+            config,
+            run_ids=cohort_run_ids or None,
+            label="portfolio-research",
+            as_json=True,
+            visible_candidates_only=True,
+            canonical_only=(
+                normalize_candidate_scope(candidate_scope)
+                == PROMOTED_CANDIDATE_SCOPE
+            ),
+        )
+        scoped_rows, scope_info = filter_play_hand_candidate_scope(
+            list(initial_rows), candidate_scope
+        )
+        if cohort is not None:
+            scoped_rows = [
+                row
+                for row in scoped_rows
+                if str(row.get("attempt_id") or "") in cohort_attempt_id_set
+            ]
+        scoped_attempt_ids = [
+            str(row.get("attempt_id") or "").strip()
+            for row in scoped_rows
+            if str(row.get("attempt_id") or "").strip()
+        ]
+        catchup_enabled = bool(corpus_config.get("catchup", True)) and not skip_catchup
+        max_age_days = (
+            float(full_backtest_max_age_days)
+            if full_backtest_max_age_days is not None
+            else float(corpus_config.get("full_backtest_max_age_days", 7.0))
+        )
+        tolerance_days = (
+            int(market_session_tolerance_days)
+            if market_session_tolerance_days is not None
+            else int(corpus_config.get("market_session_tolerance_days", 5))
+        )
+        catchup_backend = str(
+            full_backtest_backend
+            or corpus_config.get("full_backtest_backend")
+            or "lab-gateway"
+        )
+        resolved_gateway_url = str(
+            gateway_url
+            or corpus_config.get("gateway_url")
+            or "http://127.0.0.1:8799"
+        )
+        catchup_summary: dict[str, Any] = {
+            "status": "skipped" if not catchup_enabled else "pending"
+        }
+        catchup_exit_code = 0
+        if catchup_enabled:
+            with io.StringIO() as capture, redirect_stdout(capture):
+                catchup_exit_code = cmd_calculate_full_backtests(
+                    run_ids=None,
+                    attempt_ids=scoped_attempt_ids,
+                    limit=None,
+                    max_workers=full_backtest_workers,
+                    use_dev_sim_worker_count=True,
+                    require_scrutiny_36=False,
+                    force_rebuild=False,
+                    job_timeout_seconds=max(1, int(full_backtest_job_timeout_seconds)),
+                    dry_run=bool(dry_run),
+                    full_backtest_max_age_days=max_age_days,
+                    market_session_tolerance_days=tolerance_days,
+                    full_backtest_backend=catchup_backend,
+                    full_backtest_gateway_url=resolved_gateway_url,
+                    full_backtest_gateway_token=gateway_token,
+                    full_backtest_worker_contract_hash=None,
+                    full_backtest_result_batch_size=250,
+                    trading_dashboard_root=trading_dashboard_root,
+                    as_json=True,
+                    emit_summary=True,
+                    catalog_already_refreshed=True,
+                    defer_global_audit=cohort is not None,
+                    horizon_months=36,
+                    evidence_window_end=(cohort or {}).get("as_of_date"),
+                    selection_data_end=(cohort or {}).get("as_of_date"),
+                    evidence_role=(
+                        "portfolio_selection" if cohort is not None else "full_backtest"
+                    ),
+                    campaign_plan_id=(cohort or {}).get("manifest_id"),
+                    lake_manifest_sha256=(cohort or {}).get("lake_manifest_sha256"),
+                    scope="canonical" if cohort is not None else "matched",
+                )
+                catchup_output = capture.getvalue().strip()
+            if catchup_output:
+                try:
+                    catchup_summary = json.loads(catchup_output)
+                except json.JSONDecodeError:
+                    catchup_summary = {
+                        "status": "invalid_output",
+                        "raw_output": catchup_output,
+                    }
+            if catchup_exit_code != 0 and not dry_run:
+                raise SystemExit(
+                    f"Portfolio research corpus catchup failed with exit code {catchup_exit_code}."
+                )
+
+        if dry_run:
+            payload = {
+                "status": "dry_run",
+                "suite": suite_name,
+                "suite_config": str(suite_path),
+                "campaign_id": resolved_campaign_id,
+                "candidate_scope": scope_info,
+                "scoped_attempt_count": len(scoped_attempt_ids),
+                "catchup_enabled": catchup_enabled,
+                "catchup": catchup_summary,
+                "experiment_count": len(expand_experiments(suite)),
+                "experiment_limit": experiment_limit,
+                "optimizer_backend": optimizer_backend
+                or (suite.get("execution") or {}).get("optimizer_backend")
+                or "auto",
+                "promotable": False,
+                "level_c_cohort": (
+                    {
+                        "verified": True,
+                        "cohort_id": cohort.get("cohort_id"),
+                        "manifest_id": cohort.get("manifest_id"),
+                        "candidate_count": len(cohort_attempt_id_set),
+                    }
+                    if cohort is not None
+                    else None
+                ),
+            }
+            print(json.dumps(payload, ensure_ascii=True, indent=2))
+            return 0
+
+        refreshed_rows, refreshed_info = _selection_corpus_rows(
+            config,
+            run_ids=cohort_run_ids or None,
+            label="portfolio-research-post-catchup",
+            as_json=True,
+            visible_candidates_only=True,
+            canonical_only=(
+                normalize_candidate_scope(candidate_scope)
+                == PROMOTED_CANDIDATE_SCOPE
+            ),
+        )
+        refreshed_scoped_rows, refreshed_scope_info = filter_play_hand_candidate_scope(
+            list(refreshed_rows), candidate_scope
+        )
+        if cohort is not None:
+            refreshed_scoped_rows = [
+                row
+                for row in refreshed_scoped_rows
+                if str(row.get("attempt_id") or "") in cohort_attempt_id_set
+            ]
+            rows, level_c_rejections = bind_level_c_evidence_rows(
+                refreshed_scoped_rows,
+                cohort=cohort,
+            )
+            invalid_artifacts = [
+                {
+                    "attempt_id": item.get("attempt_id"),
+                    "reason_codes": [item.get("reason")],
+                    "level_c": item,
+                }
+                for item in level_c_rejections
+            ]
+            invalid_reason_counts = dict(
+                Counter(str(item.get("reason") or "unknown") for item in level_c_rejections)
+            )
+        else:
+            rows, invalid_artifacts, invalid_reason_counts = _live_validate_full_backtest_rows(
+                refreshed_scoped_rows,
+                config=config,
+                full_backtest_max_age_days=max_age_days,
+                market_session_tolerance_days=tolerance_days,
+                trading_dashboard_root=trading_dashboard_root,
+            )
+        artifact_valid_rows: list[dict[str, Any]] = []
+        for row in rows:
+            if (
+                str(row.get("full_backtest_validation_status_36m") or "")
+                == "valid"
+                and str(row.get("full_backtest_calendar_curve_path_36m") or "").strip()
+            ):
+                artifact_valid_rows.append(row)
+                continue
+            invalid_artifacts.append(
+                {
+                    "run_id": row.get("run_id"),
+                    "attempt_id": row.get("attempt_id"),
+                    "candidate_name": row.get("candidate_name"),
+                    "reason_codes": ["missing_full_backtest_artifacts"],
+                }
+            )
+            invalid_reason_counts["missing_full_backtest_artifacts"] = (
+                invalid_reason_counts.get("missing_full_backtest_artifacts", 0) + 1
+            )
+        rows = artifact_valid_rows
+        require_complete = bool(corpus_config.get("require_complete", True))
+        base_optimizer_args = (suite.get("portfolio") or {}).get(
+            "base_optimizer_args"
+        ) or {}
+        allowed_asset_classes = {
+            str(item).strip().lower()
+            for item in base_optimizer_args.get(
+                "allowed_asset_classes", ["fx", "metal", "index"]
+            )
+            if str(item).strip()
+        }
+        allowed_instruments = {
+            str(item).strip().upper()
+            for item in base_optimizer_args.get("allowed_instruments", [])
+            if str(item).strip()
+        }
+        blocked_instruments = {
+            str(item).strip().upper()
+            for item in base_optimizer_args.get("blocked_instruments", [])
+            if str(item).strip()
+        }
+        refreshed_by_attempt_id = {
+            str(row.get("attempt_id") or "").strip(): row
+            for row in refreshed_scoped_rows
+            if str(row.get("attempt_id") or "").strip()
+        }
+
+        def structural_exclusion_reason(row: dict[str, Any]) -> str | None:
+            profile_path = str(row.get("profile_path") or "").strip()
+            if not profile_path or not Path(profile_path).exists():
+                return "missing_canonical_profile"
+            instruments = {item.upper() for item in row_instruments(row)}
+            if instruments & set(EXCLUDED_RESEARCH_INSTRUMENTS):
+                return "excluded_research_instrument"
+            asset_classes = {
+                instrument_asset_class(item) for item in instruments
+            } or {"other"}
+            if not asset_classes <= allowed_asset_classes:
+                return "blocked_asset_class"
+            if allowed_instruments and not instruments <= allowed_instruments:
+                return "unsupported_instrument"
+            if blocked_instruments and instruments & blocked_instruments:
+                return "blocked_instrument"
+            if not _attempt_has_backtestable_cell(row):
+                return "no_backtestable_cell"
+            return None
+
+        structural_exclusion_counts: dict[str, int] = {}
+        unresolved_invalid_artifacts: list[dict[str, Any]] = []
+        for invalid in invalid_artifacts:
+            attempt_id = str(invalid.get("attempt_id") or "").strip()
+            source_row = refreshed_by_attempt_id.get(attempt_id) or invalid
+            reason = structural_exclusion_reason(source_row)
+            if reason is None:
+                unresolved_invalid_artifacts.append(invalid)
+                continue
+            invalid["structural_exclusion_reason"] = reason
+            structural_exclusion_counts[reason] = (
+                structural_exclusion_counts.get(reason, 0) + 1
+            )
+        structural_exclusion_count = sum(structural_exclusion_counts.values())
+        unresolved_candidate_invalid_count = len(unresolved_invalid_artifacts)
+        require_zero_unresolved_candidate_artifacts = bool(
+            (suite.get("selection_policy") or {}).get(
+                "require_zero_unresolved_candidate_artifacts", True
+            )
+        )
+        if (
+            unresolved_candidate_invalid_count > 0
+            and (require_complete or require_zero_unresolved_candidate_artifacts)
+            and not allow_incomplete_corpus
+        ):
+            preview = ", ".join(
+                str(item.get("attempt_id") or item.get("run_id") or "unknown")
+                for item in unresolved_invalid_artifacts[:10]
+            )
+            raise SystemExit(
+                f"Corpus health gate failed: {unresolved_candidate_invalid_count} optimizer-eligible "
+                f"artifacts remain invalid ({len(invalid_artifacts)} total invalid, "
+                f"{structural_exclusion_count} structurally quarantined) "
+                f"after catchup ({preview}). Use --allow-incomplete-corpus only for a non-promotable diagnostic campaign."
+            )
+        promotable = bool(
+            catchup_enabled
+            and catchup_exit_code == 0
+            and unresolved_candidate_invalid_count == 0
+            and not allow_incomplete_corpus
+            and experiment_limit is None
+            and cohort is not None
+        )
+        corpus_health = {
+            "status": "complete" if promotable else "diagnostic",
+            "promotable": promotable,
+            "catchup_enabled": catchup_enabled,
+            "catchup_exit_code": catchup_exit_code,
+            "catchup": catchup_summary,
+            "candidate_scope": candidate_scope,
+            "source": refreshed_info,
+            "scope": refreshed_scope_info,
+            "scoped_attempt_count": len(refreshed_scoped_rows),
+            "valid_after_catchup_count": len(rows),
+            "invalid_after_catchup_count": len(invalid_artifacts),
+            "structurally_quarantined_count": structural_exclusion_count,
+            "structural_exclusion_reasons": structural_exclusion_counts,
+            "unresolved_candidate_invalid_count": unresolved_candidate_invalid_count,
+            "require_zero_unresolved_candidate_artifacts": (
+                require_zero_unresolved_candidate_artifacts
+            ),
+            "unresolved_invalid_artifacts": unresolved_invalid_artifacts,
+            "invalid_reason_counts": invalid_reason_counts,
+            "invalid_artifacts": invalid_artifacts,
+            "bounded_experiment_limit": experiment_limit,
+            "full_backtest_max_age_days": max_age_days,
+            "market_session_tolerance_days": tolerance_days,
+            "verified_level_c": cohort is not None,
+            "level_c_manifest_id": (cohort or {}).get("manifest_id"),
+        }
+        provenance = {
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "autoresearch": _git_provenance(config.repo_root),
+            "suite_config": str(suite_path),
+            "suite_name": suite_name,
+            "account_preset": account_preset,
+            "optimizer_backend": optimizer_backend
+            or (suite.get("execution") or {}).get("optimizer_backend")
+            or "auto",
+            "corpus_index_before": corpus_info,
+            "level_c_cohort": (
+                {
+                    "verified": True,
+                    "path": str(frozen_cohort_input),
+                    "cohort_id": cohort.get("cohort_id"),
+                    "manifest_id": cohort.get("manifest_id"),
+                    "as_of_date": cohort.get("as_of_date"),
+                    "lake_manifest_sha256": cohort.get("lake_manifest_sha256"),
+                }
+                if cohort is not None
+                else {"verified": False}
+            ),
+        }
+
+    resolved_backend = str(
+        optimizer_backend
+        or (suite.get("execution") or {}).get("optimizer_backend")
+        or "auto"
+    )
+    try:
+        summary = run_research_campaign(
+            campaign_root=campaign_root,
+            campaign_id=resolved_campaign_id,
+            suite_name=suite_name,
+            suite=suite,
+            rows=rows,
+            account=account,
+            corpus_health=corpus_health,
+            provenance=provenance,
+            optimizer_backend=resolved_backend,
+            experiment_limit=experiment_limit,
+            resume=resume,
+        )
+    except PortfolioResearchError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(summary, ensure_ascii=True, indent=2))
+    return 0
+
+
+def cmd_portfolio_research_report(*, campaign_id: str, as_json: bool) -> int:
+    config = load_config()
+    campaigns_root = config.derived_root / "portfolio-research"
+    resolved_id = str(campaign_id or "latest").strip()
+    if resolved_id.lower() == "latest":
+        resolved_id = latest_campaign_id(
+            campaigns_root, include_complete=True
+        ) or ""
+    if not resolved_id:
+        raise SystemExit("No portfolio-research campaign is available.")
+    campaign_root = campaigns_root / resolved_id
+    try:
+        summary = rebuild_research_report(campaign_root=campaign_root)
+    except PortfolioResearchError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(summary, ensure_ascii=True, indent=2))
+    return 0
+
+
+def cmd_portfolio_research_package(
+    *, campaign_id: str, finalist: str, as_json: bool
+) -> int:
+    config = load_config()
+    campaign_root = config.derived_root / "portfolio-research" / campaign_id
+    try:
+        summary = package_research_finalist(
+            campaign_root=campaign_root,
+            finalist_name=finalist,
+        )
+    except PortfolioResearchError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(json.dumps(summary, ensure_ascii=True, indent=2))
+    return 0
+
+
+def cmd_freeze_level_c_cohort(
+    *,
+    cohort_id: str,
+    as_of_date: str,
+    atlas_run_root: Path,
+    playhand_campaign_id: str,
+    lake_manifest_sha256: str,
+    output_path: Path | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    resolved_output = (
+        output_path.expanduser().resolve()
+        if output_path is not None
+        else config.derived_root / "level-c-cohorts" / f"{cohort_id}.json"
+    )
+    try:
+        payload = freeze_level_c_cohort(
+            runs_root=config.runs_root,
+            atlas_run_root=atlas_run_root,
+            playhand_campaign_id=playhand_campaign_id,
+            as_of_date=as_of_date,
+            lake_manifest_sha256=lake_manifest_sha256,
+            output_path=resolved_output,
+            cohort_id=cohort_id,
+        )
+    except LevelCCohortError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(
+        json.dumps(
+            {
+                "cohort_id": payload["cohort_id"],
+                "manifest_id": payload["manifest_id"],
+                "candidate_count": payload["candidate_count"],
+                "output": str(resolved_output),
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_nested_evidence(
+    *,
+    campaign_id: str,
+    suite_name: str,
+    suite_config_path: Path | None,
+    run_ids: list[str] | None,
+    attempt_ids: list[str] | None,
+    scope: str,
+    start: str,
+    end: str,
+    train_months: int,
+    test_months: int,
+    step_months: int,
+    embargo_days: int,
+    selection_basis: str,
+    max_workers: int,
+    gateway_url: str | None,
+    gateway_token: str | None,
+    lake_url: str | None,
+    lake_token: str | None,
+    lake_manifest_sha256: str | None,
+    trading_dashboard_root: Path | None,
+    optimizer_backend: str,
+    dry_run: bool,
+    as_json: bool,
+) -> int:
+    from autoresearch.nested_gateway import run_nested_gateway_fold
+    from autoresearch.portfolio_research import (
+        load_research_suite,
+        run_nested_cell_temporal_validation,
+        temporal_folds,
+    )
+
+    config = load_config()
+    suite_path = (
+        suite_config_path.resolve()
+        if suite_config_path is not None
+        else config.repo_root / "portfolio.research-suites.json"
+    )
+    _suite_document, suite = load_research_suite(suite_path, suite_name)
+    folds = temporal_folds(
+        start=start,
+        end=end,
+        train_months=int(train_months),
+        test_months=int(test_months),
+        step_months=int(step_months),
+        embargo_days=int(embargo_days),
+    )
+    if not folds:
+        raise SystemExit("Nested fold geometry does not fit the requested range.")
+    wanted_ids = {
+        str(attempt_id).strip()
+        for attempt_id in (attempt_ids or [])
+        if str(attempt_id).strip()
+    }
+    catalog_rows = list(
+        iter_catalog_rows(
+            config,
+            run_ids=run_ids,
+            attempt_ids=sorted(wanted_ids) if wanted_ids else None,
+        )
+    )
+    resolved_scope = str(scope or "canonical").strip().lower()
+    items = []
+    for row in catalog_rows:
+        if resolved_scope == "canonical" and not (
+            bool(row.get("is_canonical_attempt"))
+            or bool(row.get("is_canonical_playhand_attempt"))
+        ):
+            continue
+        run_id = str(row.get("run_id") or "").strip()
+        run_dir = config.runs_root / run_id
+        items.append((run_dir, dict(row), row, load_run_metadata(run_dir)))
+    if not items:
+        raise SystemExit("No attempts matched the nested evidence scope.")
+    campaign_root = config.derived_root / "nested-evidence" / str(campaign_id)
+    inner_config = dict((suite.get("temporal_validation") or {}).get("inner_validation") or {})
+    inner_geometry = []
+    for outer_fold in folds:
+        outer_start = date.fromisoformat(str(outer_fold["train_start"])[:10])
+        outer_end = date.fromisoformat(str(outer_fold["train_end"])[:10])
+        total_months = max(
+            1,
+            (outer_end.year - outer_start.year) * 12
+            + outer_end.month
+            - outer_start.month,
+        )
+        inner_folds = temporal_folds(
+            start=str(outer_fold["train_start"]),
+            end=str(outer_fold["train_end"]),
+            train_months=int(inner_config.get("train_months") or max(1, total_months // 2)),
+            test_months=int(inner_config.get("test_months") or max(1, total_months // 6)),
+            step_months=int(
+                inner_config.get("step_months")
+                or inner_config.get("test_months")
+                or max(1, total_months // 6)
+            ),
+            embargo_days=int(
+                inner_config.get("embargo_days", outer_fold.get("embargo_days") or 0)
+            ),
+        )
+        inner_geometry.append(
+            {
+                "outer_fold_id": outer_fold["fold_id"],
+                "inner_fold_count": len(inner_folds),
+                "inner_folds": inner_folds,
+            }
+        )
+    preview = {
+        "status": "dry_run" if dry_run else "pending",
+        "campaign_id": campaign_id,
+        "suite": suite_name,
+        "suite_config": str(suite_path),
+        "campaign_root": str(campaign_root),
+        "scope": resolved_scope,
+        "attempt_count": len(items),
+        "fold_count": len(folds),
+        "planned_train_jobs": len(items) * len(folds),
+        "planned_outer_jobs": len(items) * len(folds),
+        "selection_basis": selection_basis,
+        "optimizer_backend": optimizer_backend,
+        "folds": folds,
+        "inner_validation": inner_geometry,
+    }
+    if dry_run:
+        print(json.dumps(preview, ensure_ascii=True, indent=2))
+        return 0
+    resolved_lake_manifest_sha256 = str(lake_manifest_sha256 or "").strip() or None
+    resolved_lake_url = str(
+        lake_url or os.environ.get("REMOTE_MARKET_DATA_LAKE_BASE_URL") or ""
+    ).strip()
+    if resolved_lake_manifest_sha256 is None and resolved_lake_url:
+        import requests
+
+        headers = (
+            {"Authorization": f"Bearer {lake_token}"}
+            if str(lake_token or "").strip()
+            else {}
+        )
+        response = requests.get(
+            f"{resolved_lake_url.rstrip('/')}/api/lake/manifest",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        manifest_payload = response.json()
+        resolved_lake_manifest_sha256 = str(
+            (manifest_payload or {}).get("coverage_sha256") or ""
+        ).strip() or None
+    if resolved_lake_manifest_sha256 is None:
+        raise SystemExit(
+            "Nested evidence requires the promoted lake coverage identity. Provide "
+            "--lake-manifest-sha256 or --lake-url after deploying the updated lake."
+        )
+    lab_config = resolve_lab_backtest_config(
+        gateway_url=gateway_url,
+        gateway_token=gateway_token,
+        trading_dashboard_root=trading_dashboard_root,
+        deadline_seconds=3600,
+        result_batch_size=max(25, int(max_workers) * 2),
+    )
+    fold_results = []
+    for fold in folds:
+        fold_results.append(
+            run_nested_gateway_fold(
+                config=config,
+                items=items,
+                fold=fold,
+                campaign_plan_id=str(campaign_id),
+                campaign_root=campaign_root,
+                lab_config=lab_config,
+                max_workers=max(1, int(max_workers)),
+                train_horizon_months=int(train_months),
+                test_horizon_months=int(test_months),
+                selection_basis=selection_basis,
+                lake_manifest_sha256=resolved_lake_manifest_sha256,
+                emit=(lambda message: print(message, file=sys.stderr, flush=True)),
+            )
+        )
+    failed = [row for row in fold_results if row.get("status") != "complete"]
+    account = _resolve_optimizer_account_spec(
+        config=config,
+        account_config_path=str(suite.get("account_config") or "").strip() or None,
+        account_preset=str(suite.get("account_preset") or "").strip() or None,
+        fallback={},
+    )
+    scoped_ids = {
+        str(item[1].get("attempt_id") or "") for item in items
+    }
+    scoped_rows = [
+        row
+        for row in catalog_rows
+        if str(row.get("attempt_id") or "") in scoped_ids
+    ]
+    nested_portfolio_results = (
+        run_nested_cell_temporal_validation(
+            rows=scoped_rows,
+            fold_reports=fold_results,
+            suite=suite,
+            account=account,
+            root=campaign_root / "portfolio-validation",
+            backend=optimizer_backend,
+        )
+        if not failed
+        else []
+    )
+    payload = {
+        **preview,
+        "status": "failed" if failed else "complete",
+        "fold_results": fold_results,
+        "portfolio_result_count": len(nested_portfolio_results),
+        "portfolio_results_path": str(
+            campaign_root
+            / "portfolio-validation"
+            / "nested-temporal-results.json"
+        ),
+    }
+    write_json(campaign_root / "nested-evidence-report.json", payload)
+    print(json.dumps(payload, ensure_ascii=True, indent=2))
+    return 1 if failed else 0
 
 
 def cmd_build_portfolio_risk_sizing(
@@ -16403,6 +17642,8 @@ def cmd_atlas_lab(
     signal_timeframe_limit: int | None,
     signal_atlas_executor: str = "local",
     as_of_date: str | None,
+    lake_manifest_sha256: str | None = None,
+    signal_lookback_months: int = 3,
     discovery_queue: str,
     discovery_cluster_min_similarity: float,
     discovery_cluster_min_shared_partners: int,
@@ -16457,6 +17698,10 @@ def cmd_atlas_lab(
         include_detail=bool(include_detail),
         compact_probe_artifacts=bool(compact_probe_artifacts),
         as_of_date=as_of_date,
+        lake_manifest_sha256=(
+            str(lake_manifest_sha256).strip() if lake_manifest_sha256 else None
+        ),
+        signal_lookback_months=max(1, int(signal_lookback_months)),
         discovery_cluster_min_similarity=float(discovery_cluster_min_similarity),
         discovery_cluster_min_shared_partners=max(0, int(discovery_cluster_min_shared_partners)),
         discovery_cluster_max_recipes=max(1, int(discovery_cluster_max_recipes)),
@@ -18028,6 +19273,8 @@ def main(argv: list[str] | None = None) -> int:
             signal_timeframe_limit=args.signal_timeframe_limit,
             signal_atlas_executor=args.signal_atlas_executor,
             as_of_date=args.as_of_date,
+            lake_manifest_sha256=args.lake_manifest_sha256,
+            signal_lookback_months=args.signal_lookback_months,
             discovery_queue=args.discovery_queue,
             discovery_cluster_min_similarity=args.discovery_cluster_min_similarity,
             discovery_cluster_min_shared_partners=args.discovery_cluster_min_shared_partners,
@@ -18321,6 +19568,15 @@ def main(argv: list[str] | None = None) -> int:
             full_backtest_result_batch_size=args.full_backtest_result_batch_size,
             trading_dashboard_root=args.trading_dashboard_root,
             as_json=bool(args.json),
+            horizon_months=args.horizon_months,
+            evidence_window_start=args.evidence_window_start,
+            evidence_window_end=args.evidence_window_end,
+            selection_data_end=args.selection_data_end,
+            evidence_role=args.evidence_role,
+            campaign_plan_id=args.campaign_plan_id,
+            lake_url=args.lake_url,
+            lake_token=args.lake_token,
+            lake_manifest_sha256=args.lake_manifest_sha256,
         )
     if args.command == "build-attempt-catalog":
         return cmd_build_attempt_catalog(
@@ -18333,6 +19589,7 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_audit_full_backtests(
             run_ids=args.run_id,
             attempt_ids=args.attempt_id,
+            scope=args.scope,
             full_backtest_max_age_days=args.full_backtest_max_age_days,
             market_session_tolerance_days=args.market_session_tolerance_days,
             trading_dashboard_root=args.trading_dashboard_root,
@@ -18500,6 +19757,78 @@ def main(argv: list[str] | None = None) -> int:
             full_backtest_worker_contract_hash=args.full_backtest_worker_contract_hash,
             full_backtest_result_batch_size=args.full_backtest_result_batch_size,
             trading_dashboard_root=args.trading_dashboard_root,
+            as_json=bool(args.json),
+        )
+    if args.command == "portfolio-research":
+        return cmd_portfolio_research(
+            suite_name=str(args.suite),
+            suite_config_path=args.suite_config,
+            campaign_name=args.campaign_name,
+            campaign_id=args.campaign_id,
+            resume=bool(args.resume),
+            dry_run=bool(args.dry_run),
+            skip_catchup=bool(args.skip_catchup),
+            allow_incomplete_corpus=bool(args.allow_incomplete_corpus),
+            full_backtest_workers=args.full_backtest_workers,
+            full_backtest_job_timeout_seconds=int(
+                args.full_backtest_job_timeout_seconds
+            ),
+            full_backtest_max_age_days=args.full_backtest_max_age_days,
+            market_session_tolerance_days=args.market_session_tolerance_days,
+            full_backtest_backend=args.full_backtest_backend,
+            gateway_url=args.gateway_url,
+            gateway_token=args.gateway_token,
+            trading_dashboard_root=args.trading_dashboard_root,
+            optimizer_backend=args.optimizer_backend,
+            experiment_limit=args.experiment_limit,
+            frozen_cohort_path=args.frozen_cohort,
+            as_json=bool(args.json),
+        )
+    if args.command == "portfolio-research-report":
+        return cmd_portfolio_research_report(
+            campaign_id=str(args.campaign_id),
+            as_json=bool(args.json),
+        )
+    if args.command == "portfolio-research-package":
+        return cmd_portfolio_research_package(
+            campaign_id=str(args.campaign_id),
+            finalist=str(args.finalist),
+            as_json=bool(args.json),
+        )
+    if args.command == "freeze-level-c-cohort":
+        return cmd_freeze_level_c_cohort(
+            cohort_id=str(args.cohort_id),
+            as_of_date=str(args.as_of_date),
+            atlas_run_root=args.atlas_run_root,
+            playhand_campaign_id=str(args.playhand_campaign_id),
+            lake_manifest_sha256=str(args.lake_manifest_sha256),
+            output_path=args.output,
+            as_json=bool(args.json),
+        )
+    if args.command == "nested-evidence":
+        return cmd_nested_evidence(
+            campaign_id=str(args.campaign_id),
+            suite_name=str(args.suite),
+            suite_config_path=args.suite_config,
+            run_ids=args.run_id,
+            attempt_ids=args.attempt_id,
+            scope=str(args.scope),
+            start=str(args.start),
+            end=str(args.end),
+            train_months=int(args.train_months),
+            test_months=int(args.test_months),
+            step_months=int(args.step_months),
+            embargo_days=int(args.embargo_days),
+            selection_basis=str(args.selection_basis),
+            max_workers=int(args.max_workers),
+            gateway_url=args.gateway_url,
+            gateway_token=args.gateway_token,
+            lake_url=args.lake_url,
+            lake_token=args.lake_token,
+            lake_manifest_sha256=args.lake_manifest_sha256,
+            trading_dashboard_root=args.trading_dashboard_root,
+            optimizer_backend=str(args.optimizer_backend),
+            dry_run=bool(args.dry_run),
             as_json=bool(args.json),
         )
     if args.command == "finalize-corpus":

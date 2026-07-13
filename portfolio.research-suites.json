@@ -1,0 +1,270 @@
+{
+  "version": 1,
+  "research_suites": {
+    "darwin-master-v1": {
+      "description": "Formal Darwinex portfolio campaign using a healed promoted corpus, full-window robustness experiments, and frozen-strategy Level A walk-forward validation.",
+      "account_preset": "darwinex-zero",
+      "corpus": {
+        "scope": "promoted",
+        "catchup": true,
+        "require_complete": true,
+        "common_effective_end": true,
+        "full_backtest_max_age_days": 7.0,
+        "market_session_tolerance_days": 5,
+        "full_backtest_backend": "lab-gateway",
+        "gateway_url": "http://127.0.0.1:8799"
+      },
+      "portfolio": {
+        "sizes": [
+          20,
+          30
+        ],
+        "objectives": [
+          "stability",
+          "deployable",
+          "balanced"
+        ],
+        "base_optimizer_args": {
+          "candidate_scope": "promoted",
+          "candidate_limit": 1500,
+          "swap_candidate_limit": -1,
+          "min_score": 45.0,
+          "allowed_asset_classes": [
+            "fx",
+            "metal",
+            "index"
+          ],
+          "allowed_instruments": [
+            "AUDCAD",
+            "AUDCHF",
+            "AUDJPY",
+            "AUDNZD",
+            "AUDUSD",
+            "CADCHF",
+            "CADJPY",
+            "CHFJPY",
+            "EURAUD",
+            "EURCAD",
+            "EURCHF",
+            "EURGBP",
+            "EURJPY",
+            "EURNZD",
+            "EURUSD",
+            "GBPAUD",
+            "GBPCAD",
+            "GBPCHF",
+            "GBPJPY",
+            "GBPNZD",
+            "GBPUSD",
+            "NZDCAD",
+            "NZDCHF",
+            "NZDJPY",
+            "NZDUSD",
+            "USDCAD",
+            "USDCHF",
+            "USDJPY",
+            "XAUUSD",
+            "XAGUSD",
+            "DE40",
+            "US500",
+            "USTECH",
+            "US30",
+            "UK100",
+            "JP225"
+          ],
+          "max_avg_hold_hours": 48.0,
+          "max_p90_hold_hours": 144.0,
+          "max_single_hold_hours": 336.0,
+          "random_starts": 3,
+          "max_swaps": 10,
+          "max_per_family": 1,
+          "max_instrument_share": 6.0,
+          "min_fx_share": 7.0,
+          "max_metal_share": 12.0,
+          "max_index_share": 9.0,
+          "max_avg_open_positions": 11.0,
+          "max_peak_open_positions": 42.0,
+          "target_trades_per_month": 240.0,
+          "max_trades_per_month": 390.0,
+          "correlation_penalty_weight": 200.0,
+          "diversification_mode": "marginal_sharpe",
+          "portfolio_sharpe_weight": 250.0
+        }
+      },
+      "robustness": {
+        "seeds": [
+          11,
+          29,
+          53
+        ],
+        "candidate_limits": [
+          1500
+        ],
+        "risk_weight_multipliers": [
+          0.85,
+          1.0,
+          1.15
+        ],
+        "diversification_profiles": [
+          {
+            "name": "darwin-base",
+            "correlation_penalty_weight": 200.0,
+            "diversification_mode": "marginal_sharpe",
+            "portfolio_sharpe_weight": 250.0
+          }
+        ]
+      },
+      "temporal_validation": {
+        "enabled": true,
+        "level": "portfolio_selection",
+        "train_months": 24,
+        "test_months": 4,
+        "step_months": 4,
+        "embargo_days": 15,
+        "seeds": [
+          29
+        ],
+        "inner_validation": {
+          "train_months": 12,
+          "test_months": 4,
+          "step_months": 4,
+          "embargo_days": 15,
+          "minimum_units": 2
+        },
+        "nested_cell_selection": false
+      },
+      "behavioral_clustering": {
+        "enabled": true,
+        "active_epsilon": 1e-09,
+        "worst_quantile": 0.1,
+        "min_observations": 3,
+        "cluster_threshold": 0.82,
+        "weights": {
+          "active_overlap": 0.2,
+          "return_correlation": 0.2,
+          "downside_correlation": 0.3,
+          "worst_decile_correlation": 0.3
+        }
+      },
+      "selection_policy": {
+        "require_zero_unresolved_candidate_artifacts": true,
+        "require_no_account_failure": true,
+        "minimum_selection_support": 2,
+        "minimum_oos_scenarios": 2,
+        "minimum_consensus_selection_frequency": 0.5,
+        "minimum_consensus_fold_frequency": 1.0,
+        "minimum_conditional_selection_count": 2,
+        "minimum_consensus_core_count": 5,
+        "minimum_consensus_core_share": 0.2,
+        "maximum_median_adjacent_fold_churn": 0.8,
+        "max_negative_test_folds": 1,
+        "minimum_worst_test_return_r": -10.0,
+        "rank_by": [
+          "robust_utility",
+          "worst_test_return_r",
+          "worst_test_drawdown_r",
+          "selection_support"
+        ]
+      },
+      "execution": {
+        "optimizer_backend": "auto"
+      },
+      "future_history": {
+        "target_years": 5,
+        "planned_evidence": [
+          "historical_unseen_holdout"
+        ],
+        "status": "pending_lake_backfill",
+        "notes": "The same suite runs on current three-year snapshots. After lake expansion, increase full-backtest horizon identity separately rather than silently replacing 36-month artifacts."
+      }
+    },
+    "darwin-smoke-v1": {
+      "description": "Bounded diagnostic suite for CLI and campaign plumbing verification. Never promote its output.",
+      "account_preset": "darwinex-zero",
+      "corpus": {
+        "scope": "promoted",
+        "catchup": false,
+        "require_complete": false,
+        "common_effective_end": true,
+        "full_backtest_max_age_days": 7.0,
+        "market_session_tolerance_days": 5
+      },
+      "portfolio": {
+        "sizes": [
+          2
+        ],
+        "objectives": [
+          "stability"
+        ],
+        "base_optimizer_args": {
+          "candidate_scope": "promoted",
+          "candidate_limit": 12,
+          "swap_candidate_limit": 12,
+          "min_score": 45.0,
+          "allowed_asset_classes": [
+            "fx",
+            "metal",
+            "index"
+          ],
+          "random_starts": 0,
+          "max_swaps": 2,
+          "max_per_family": 1,
+          "max_instrument_share": 2.0,
+          "min_fx_share": 0.0,
+          "max_metal_share": 2.0,
+          "max_index_share": 2.0,
+          "max_avg_open_positions": 20.0,
+          "max_peak_open_positions": 100.0,
+          "target_trades_per_month": 1000.0,
+          "max_trades_per_month": 2000.0
+        }
+      },
+      "robustness": {
+        "seeds": [
+          17
+        ],
+        "candidate_limits": [
+          12
+        ],
+        "risk_weight_multipliers": [
+          1.0
+        ],
+        "diversification_profiles": [
+          {
+            "name": "smoke"
+          }
+        ]
+      },
+      "temporal_validation": {
+        "enabled": true,
+        "level": "portfolio_selection",
+        "train_months": 12,
+        "test_months": 3,
+        "step_months": 6,
+        "embargo_days": 2,
+        "seeds": [
+          17
+        ],
+        "inner_validation": {
+          "train_months": 6,
+          "test_months": 2,
+          "step_months": 2,
+          "embargo_days": 2,
+          "minimum_units": 2
+        },
+        "nested_cell_selection": false
+      },
+      "selection_policy": {
+        "require_zero_unresolved_candidate_artifacts": false,
+        "require_no_account_failure": false,
+        "minimum_selection_support": 1,
+        "minimum_oos_scenarios": 1,
+        "max_negative_test_folds": 99,
+        "minimum_worst_test_return_r": -1000000.0
+      },
+      "execution": {
+        "optimizer_backend": "python"
+      }
+    }
+  }
+}

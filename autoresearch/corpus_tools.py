@@ -11,6 +11,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from .execution_costs import result_matches_execution_cost_model
+from .evidence_plan import enforce_replay_evidence_plan, validate_replay_evidence_plan
+from .evidence_artifacts import (
+    discover_evidence_artifact_bundles,
+    evidence_artifact_paths,
+)
 from .scoring import CANONICAL_SCORE_LAB_VERSION, build_attempt_score
 
 
@@ -714,6 +719,7 @@ def build_full_backtest_provenance(
         ),
         "worker_id": worker_id,
         "worker_pool": worker_pool,
+        "evidence_plan": request_payload.get("evidence_plan"),
     }
 
 
@@ -737,6 +743,7 @@ def validate_full_backtest_artifacts(
     market_data_coverage: dict[tuple[str, str], datetime] | None = None,
     now: datetime | None = None,
     require_calendar_curve: bool = False,
+    expected_evidence_plan: Any | None = None,
 ) -> dict[str, Any]:
     artifact_dir = attempt_artifact_dir(attempt)
     if artifact_dir is None:
@@ -760,10 +767,32 @@ def validate_full_backtest_artifacts(
             "recommended_curve_exists": False,
         }
 
-    result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
-    curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
-    calendar_curve_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
-    recommended_curve_path = artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+    resolved_expected_plan = (
+        validate_replay_evidence_plan(expected_evidence_plan)
+        if expected_evidence_plan is not None
+        else None
+    )
+    evidence_paths = (
+        evidence_artifact_paths(artifact_dir, resolved_expected_plan)
+        if resolved_expected_plan is not None
+        else None
+    )
+    result_path = (
+        evidence_paths.result if evidence_paths else artifact_dir / FULL_BACKTEST_RESULT_FILENAME
+    )
+    curve_path = (
+        evidence_paths.curve if evidence_paths else artifact_dir / FULL_BACKTEST_CURVE_FILENAME
+    )
+    calendar_curve_path = (
+        evidence_paths.calendar_curve
+        if evidence_paths
+        else artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
+    )
+    recommended_curve_path = (
+        evidence_paths.recommended_curve
+        if evidence_paths
+        else artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+    )
     result_exists = result_path.exists()
     curve_exists = curve_path.exists()
     calendar_curve_exists = calendar_curve_path.exists()
@@ -880,9 +909,22 @@ def validate_full_backtest_artifacts(
 
     profile_path = _profile_path_for_attempt(attempt)
     profile_snapshot = load_profile_snapshot(profile_path)
-    request_payload, request_path = _job_request_for_artifact(artifact_dir)
-    manifest_payload = load_json_if_exists(artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME)
+    if evidence_paths is not None:
+        request_path = evidence_paths.job
+        job_payload = load_json_if_exists(request_path)
+        request_payload = (
+            job_payload.get("request") if isinstance(job_payload, dict) else None
+        )
+        request_payload = request_payload if isinstance(request_payload, dict) else {}
+        manifest_path = evidence_paths.manifest
+    else:
+        request_payload, request_path = _job_request_for_artifact(artifact_dir)
+        manifest_path = artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME
+    manifest_payload = load_json_if_exists(manifest_path)
     provenance = manifest_payload if isinstance(manifest_payload, dict) else None
+    if evidence_paths is not None and isinstance(provenance, dict):
+        nested_provenance = provenance.get("provenance")
+        provenance = nested_provenance if isinstance(nested_provenance, dict) else None
     if provenance is None and isinstance(aggregate, dict):
         embedded = aggregate.get("autoresearch_provenance")
         provenance = embedded if isinstance(embedded, dict) else None
@@ -892,6 +934,12 @@ def validate_full_backtest_artifacts(
     expected_fingerprint: str | None = None
     observed_fingerprint: str | None = None
     provenance_mode = "explicit" if provenance else "legacy_inferred"
+    evidence_plan_payload = (
+        manifest_payload.get("evidence_plan")
+        if evidence_paths is not None and isinstance(manifest_payload, dict)
+        else (provenance.get("evidence_plan") if isinstance(provenance, dict) else None)
+    ) or request_payload.get("evidence_plan")
+    evidence_plan = None
     if not isinstance(profile_snapshot, dict):
         reasons.append(
             _validation_reason(
@@ -967,6 +1015,52 @@ def validate_full_backtest_artifacts(
                     "profile_fingerprint_mismatch",
                     expected=expected_fingerprint,
                     observed=observed_fingerprint,
+                )
+            )
+
+        if isinstance(evidence_plan_payload, dict):
+            try:
+                evidence_plan = enforce_replay_evidence_plan(
+                    validate_replay_evidence_plan(evidence_plan_payload),
+                    profile_snapshot=(
+                        inline_profile
+                        if isinstance(inline_profile, dict)
+                        else profile_snapshot
+                    ),
+                    analysis_window_start=request_payload.get(
+                        "analysis_window_start"
+                    ),
+                    analysis_window_end=request_payload.get("analysis_window_end"),
+                    lookback_months=request_payload.get("lookback_months"),
+                    execution_cell=request_payload.get("tracked_cell"),
+                )
+            except ValueError as exc:
+                reasons.append(
+                    _validation_reason(
+                        "evidence_plan_mismatch",
+                        detail=str(exc),
+                    )
+                )
+            if (
+                evidence_plan is not None
+                and resolved_expected_plan is not None
+                and evidence_plan.plan_id != resolved_expected_plan.plan_id
+            ):
+                reasons.append(
+                    _validation_reason(
+                        "evidence_plan_mismatch",
+                        detail=(
+                            f"expected {resolved_expected_plan.plan_id}, "
+                            f"observed {evidence_plan.plan_id}"
+                        ),
+                    )
+                )
+                evidence_plan = None
+        elif resolved_expected_plan is not None:
+            reasons.append(
+                _validation_reason(
+                    "evidence_plan_mismatch",
+                    detail="expected evidence artifact is missing its evidence plan",
                 )
             )
 
@@ -1108,8 +1202,13 @@ def validate_full_backtest_artifacts(
         "canonical_profile_fingerprint": expected_fingerprint,
         "artifact_profile_fingerprint": observed_fingerprint,
         "provenance_mode": provenance_mode,
-        "provenance_path": str(artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME)
-        if (artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME).exists()
+        "evidence_plan_id": evidence_plan.plan_id if evidence_plan else None,
+        "evidence_role": evidence_plan.evidence_role if evidence_plan else None,
+        "requested_horizon_months": (
+            evidence_plan.requested_horizon_months if evidence_plan else None
+        ),
+        "provenance_path": str(manifest_path)
+        if manifest_path.exists()
         else None,
         "freshness": freshness,
     }
@@ -1398,6 +1497,30 @@ def extract_attempt_catalog_row(
         ).strip()
         or None
     )
+    discovered_evidence_records = discover_evidence_artifact_bundles(artifact_dir)
+    legacy_evidence_record = (
+        {
+            "evidence_plan_id": full_backtest_validation.get("evidence_plan_id"),
+            "evidence_role": full_backtest_validation.get("evidence_role"),
+            "requested_horizon_months": full_backtest_validation.get(
+                "requested_horizon_months"
+            ),
+            "result_path": full_backtest_validation.get("result_path"),
+            "curve_path": full_backtest_validation.get("curve_path"),
+            "calendar_curve_path": full_backtest_validation.get(
+                "calendar_curve_path"
+            ),
+            "validation_status": full_backtest_validation.get("status"),
+            "compatibility_projection": "legacy_36m",
+        }
+        if full_backtest_validation.get("evidence_plan_id")
+        and not any(
+            record.get("evidence_plan_id")
+            == full_backtest_validation.get("evidence_plan_id")
+            for record in discovered_evidence_records
+        )
+        else None
+    )
 
     return {
         "run_id": str(attempt.get("run_id") or ""),
@@ -1572,6 +1695,17 @@ def extract_attempt_catalog_row(
         "full_backtest_provenance_mode_36m": full_backtest_validation.get(
             "provenance_mode"
         ),
+        "full_backtest_evidence_plan_id_36m": full_backtest_validation.get(
+            "evidence_plan_id"
+        ),
+        "full_backtest_evidence_role_36m": full_backtest_validation.get(
+            "evidence_role"
+        ),
+        "full_backtest_requested_horizon_months_36m": (
+            full_backtest_validation.get("requested_horizon_months")
+        ),
+        "evidence_records": discovered_evidence_records
+        + ([legacy_evidence_record] if legacy_evidence_record else []),
         "full_backtest_freshness_36m": dict(
             full_backtest_validation.get("freshness") or {}
         ),

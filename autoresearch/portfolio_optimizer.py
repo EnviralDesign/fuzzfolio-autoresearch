@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .strategy_identity import derive_strategy_identity
+
 
 FX_CODES = {
     "AUD",
@@ -212,26 +214,16 @@ def row_instruments(row: dict[str, Any]) -> list[str]:
     return output
 
 
+def strategy_family_identity(row: dict[str, Any]) -> tuple[str, str]:
+    identity = derive_strategy_identity(row)
+    return (
+        str(identity["structural_family_id"]),
+        str(identity["structural_family_source"]),
+    )
+
+
 def strategy_family_token(row: dict[str, Any]) -> str:
-    token = str(
-        row.get("candidate_name")
-        or row.get("strategy_key_36m")
-        or row.get("profile_ref")
-        or row.get("attempt_id")
-        or ""
-    ).lower()
-    if token in {"final_36mo", "mutated_final_36mo", "exact_template_36mo"}:
-        token = str(
-            row.get("strategy_key_36m")
-            or row.get("profile_ref")
-            or row.get("attempt_id")
-            or token
-        ).lower()
-    token = re.sub(r"\d{6,}", "", token)
-    token = re.sub(r"[-_]?attempt[-_]?\d+", "", token)
-    token = re.sub(r"[-_]?v\d+$", "", token)
-    token = re.sub(r"\s+", "-", token)
-    return token[:96] or "unknown"
+    return strategy_family_identity(row)[0]
 
 
 def max_drawdown(values: list[float]) -> float:
@@ -311,6 +303,7 @@ class PortfolioOptimizerSpec:
     portfolio_size: int = 20
     candidate_scope: str = "promoted"
     min_score: float = 45.0
+    require_positive_source_return: bool = True
     allowed_asset_classes: tuple[str, ...] = ("fx", "metal", "index")
     allowed_instruments: tuple[str, ...] = ()
     blocked_instruments: tuple[str, ...] = ()
@@ -335,8 +328,28 @@ class PortfolioOptimizerSpec:
     correlation_penalty_weight: float = 0.0
     diversification_mode: str = "penalty"
     portfolio_sharpe_weight: float = 0.0
+    risk_weight_multiplier: float = 1.0
     baseline_attempt_ids: tuple[str, ...] = ()
+    required_attempt_ids: tuple[str, ...] = ()
     account: dict[str, Any] = field(default_factory=dict, compare=False)
+
+
+def objective_weights_for_spec(
+    spec: PortfolioOptimizerSpec,
+) -> dict[str, dict[str, float]]:
+    """Resolve objective weights, scaling risk terms without scaling return reward."""
+    multiplier = max(0.0, float(spec.risk_weight_multiplier))
+    return {
+        name: {
+            key: (
+                float(value)
+                if key == "final_r"
+                else float(value) * multiplier
+            )
+            for key, value in weights.items()
+        }
+        for name, weights in DEFAULT_OBJECTIVES.items()
+    }
 
 
 @dataclass
@@ -347,6 +360,10 @@ class OptimizerCandidate:
     asset_classes: set[str]
     primary_asset_class: str
     family: str
+    family_source: str
+    lineage_id: str | None
+    behavior_fingerprint: str | None
+    structural_family_signature: dict[str, Any] | None
     score: float
     created_at: str | None
     avg_hold_hours: float
@@ -617,7 +634,7 @@ def candidate_rejection_reason(
     dates, daily, _, _ = _calendar_daily_curve(row)
     if not dates:
         return "empty_calendar_curve"
-    if sum(daily) <= 0.0:
+    if spec.require_positive_source_return and sum(daily) <= 0.0:
         return "nonpositive_source_calendar_return"
     return None
 
@@ -650,14 +667,31 @@ def build_optimizer_candidates(
             primary_asset_class = "index"
         else:
             primary_asset_class = "fx"
+        identity = derive_strategy_identity(row)
         candidates.append(
+            # Family identity is deliberately resolved before candidate construction so
+            # optimizer caps and research reporting consume the same durable token.
             OptimizerCandidate(
                 attempt_id=attempt_id,
                 row=row,
                 instruments=instruments,
                 asset_classes=asset_classes,
                 primary_asset_class=primary_asset_class,
-                family=strategy_family_token(row),
+                family=str(identity["structural_family_id"]),
+                family_source=str(identity["structural_family_source"]),
+                lineage_id=(
+                    str(identity["lineage_id"]) if identity.get("lineage_id") else None
+                ),
+                behavior_fingerprint=(
+                    str(identity["behavior_fingerprint"])
+                    if identity.get("behavior_fingerprint")
+                    else None
+                ),
+                structural_family_signature=(
+                    dict(identity["structural_family_signature"])
+                    if isinstance(identity.get("structural_family_signature"), dict)
+                    else None
+                ),
                 score=score,
                 created_at=str(row.get("created_at") or "") or None,
                 avg_hold_hours=float(holds["avg_hold"] or 0.0),
@@ -678,17 +712,17 @@ def build_optimizer_candidates(
         )
     candidates.sort(key=lambda item: (item.score, item.final_r), reverse=True)
     if spec.candidate_limit > 0:
-        baseline_ids = set(spec.baseline_attempt_ids)
-        baseline_candidates = [
-            candidate for candidate in candidates if candidate.attempt_id in baseline_ids
+        protected_ids = set(spec.baseline_attempt_ids) | set(spec.required_attempt_ids)
+        protected_candidates = [
+            candidate for candidate in candidates if candidate.attempt_id in protected_ids
         ]
-        baseline_seen = {candidate.attempt_id for candidate in baseline_candidates}
+        protected_seen = {candidate.attempt_id for candidate in protected_candidates}
         limited_candidates = [
             candidate
             for candidate in candidates
-            if candidate.attempt_id not in baseline_seen
+            if candidate.attempt_id not in protected_seen
         ][: spec.candidate_limit]
-        candidates = [*baseline_candidates, *limited_candidates]
+        candidates = [*protected_candidates, *limited_candidates]
     return candidates, dict(rejections)
 
 
@@ -922,7 +956,7 @@ class PortfolioSearch:
             best_day_r / positive_day_gain if positive_day_gain > 0.0 else 1.0
         )
 
-        weights = DEFAULT_OBJECTIVES[objective_name]
+        weights = objective_weights_for_spec(self.spec)[objective_name]
         score = 0.0
         score += weights.get("final_r", 0.0) * final_r
         score += weights.get("maxdd_r", 0.0) * maxdd_r
@@ -1473,7 +1507,7 @@ class PortfolioSearch:
         cached = self._score_cache.get(score_key)
         if cached is not None:
             return cached
-        weights = DEFAULT_OBJECTIVES[objective_name]
+        weights = objective_weights_for_spec(self.spec)[objective_name]
         metrics = self.metrics(selected_ids, include_account=False)
         violation_size = sum(float(value) for value in metrics["constraint_violations"].values())
         score = 0.0
@@ -1591,7 +1625,7 @@ class PortfolioSearch:
 
     def greedy_seed(self, objective_name: str) -> list[str]:
         self.progress("greedy_seed_start", objective=objective_name)
-        selected: list[str] = []
+        selected = self.ids_for_known_attempts(self.spec.required_attempt_ids)
         pool = [candidate.attempt_id for candidate in self.candidates]
         while len(selected) < self.spec.portfolio_size:
             base_daily, base_open, base_closed = self.combine_vectors(selected)
@@ -1632,11 +1666,20 @@ class PortfolioSearch:
     def random_seed(self, rng: random.Random) -> list[str] | None:
         if len(self.candidates) < self.spec.portfolio_size:
             return None
-        ids = [candidate.attempt_id for candidate in self.candidates]
+        required = self.ids_for_known_attempts(self.spec.required_attempt_ids)
+        if len(required) > self.spec.portfolio_size:
+            raise ValueError("required_attempt_ids exceed portfolio_size")
+        required_set = set(required)
+        ids = [
+            candidate.attempt_id
+            for candidate in self.candidates
+            if candidate.attempt_id not in required_set
+        ]
+        sample_size = self.spec.portfolio_size - len(required)
         best: list[str] | None = None
         best_violation = float("inf")
         for _ in range(500):
-            sample = rng.sample(ids, self.spec.portfolio_size)
+            sample = [*required, *rng.sample(ids, sample_size)]
             violations = self.constraint_violations(sample)
             violation_size = sum(float(value) for value in violations.values())
             if violation_size < best_violation:
@@ -1653,7 +1696,10 @@ class PortfolioSearch:
         *,
         start_name: str = "",
     ) -> tuple[list[str], list[dict[str, Any]]]:
-        selected = list(dict.fromkeys(seed_ids))
+        required = self.ids_for_known_attempts(self.spec.required_attempt_ids)
+        if len(required) > self.spec.portfolio_size:
+            raise ValueError("required_attempt_ids exceed portfolio_size")
+        selected = list(dict.fromkeys([*required, *seed_ids]))
         if len(selected) > self.spec.portfolio_size:
             selected = selected[: self.spec.portfolio_size]
         if len(selected) < self.spec.portfolio_size:
@@ -1709,6 +1755,8 @@ class PortfolioSearch:
                 objective_score=best_score,
             )
             for removed in selected:
+                if removed in required:
+                    continue
                 base_ids = [attempt_id for attempt_id in selected if attempt_id != removed]
                 base_daily, base_open, base_closed = self.combine_vectors(base_ids)
                 base_months = self._group_sums(
@@ -1945,6 +1993,10 @@ def optimizer_candidate_payload(candidate: OptimizerCandidate) -> dict[str, Any]
         "created_at": candidate.created_at,
         "instruments": candidate.instruments,
         "family": candidate.family,
+        "family_source": candidate.family_source,
+        "lineage_id": candidate.lineage_id,
+        "behavior_fingerprint": candidate.behavior_fingerprint,
+        "structural_family_signature": candidate.structural_family_signature,
         "score": candidate.score,
         "avg_hold_hours": candidate.avg_hold_hours,
         "p90_hold_hours": candidate.p90_hold_hours,
@@ -1965,6 +2017,7 @@ def _optimizer_spec_payload(spec: PortfolioOptimizerSpec) -> dict[str, Any]:
         "portfolio_name": spec.portfolio_name,
         "portfolio_size": spec.portfolio_size,
         "candidate_limit": spec.candidate_limit,
+        "require_positive_source_return": spec.require_positive_source_return,
         "swap_candidate_limit": spec.swap_candidate_limit,
         "objective_names": list(spec.objective_names),
         "max_swaps": spec.max_swaps,
@@ -1982,7 +2035,9 @@ def _optimizer_spec_payload(spec: PortfolioOptimizerSpec) -> dict[str, Any]:
         "correlation_penalty_weight": spec.correlation_penalty_weight,
         "diversification_mode": spec.diversification_mode,
         "portfolio_sharpe_weight": spec.portfolio_sharpe_weight,
+        "risk_weight_multiplier": spec.risk_weight_multiplier,
         "baseline_attempt_ids": list(spec.baseline_attempt_ids),
+        "required_attempt_ids": list(spec.required_attempt_ids),
         "account": spec.account,
     }
 
@@ -1994,7 +2049,7 @@ def _rust_optimizer_input_payload(
     return {
         "spec": _optimizer_spec_payload(spec),
         "candidates": [optimizer_candidate_payload(candidate) for candidate in candidates],
-        "objectives": DEFAULT_OBJECTIVES,
+        "objectives": objective_weights_for_spec(spec),
     }
 
 
@@ -2115,6 +2170,65 @@ def _run_pyo3_optimizer(
     return _hydrate_rust_variants(variants, search), pareto_front
 
 
+def analyze_behavioral_similarity(
+    candidates: list[OptimizerCandidate],
+    *,
+    reference_attempt_ids: list[str],
+    active_epsilon: float = 1e-9,
+    worst_quantile: float = 0.1,
+    min_observations: int = 3,
+    behavioral_weights: dict[str, float] | None = None,
+    cluster_threshold: float = 0.8,
+) -> dict[str, Any]:
+    if not candidates:
+        raise ValueError("Behavioral similarity requires candidates.")
+    known_ids = {candidate.attempt_id for candidate in candidates}
+    references = list(dict.fromkeys(str(item) for item in reference_attempt_ids))
+    if not references or any(item not in known_ids for item in references):
+        raise ValueError("Behavioral similarity requires known reference attempt IDs.")
+    weights = behavioral_weights or {
+        "active_overlap": 0.2,
+        "return_correlation": 0.2,
+        "downside_correlation": 0.3,
+        "worst_decile_correlation": 0.3,
+    }
+    module = _load_rust_optimizer_module(release=True)
+    payload = {
+        "schema_version": "portfolio-behavioral-similarity-v1",
+        "candidates": [
+            {
+                "attempt_id": candidate.attempt_id,
+                "dates": candidate.dates,
+                "daily_r": candidate.daily_r,
+            }
+            for candidate in candidates
+        ],
+        "reference_attempt_ids": references,
+        "active_epsilon": float(active_epsilon),
+        "worst_quantile": float(worst_quantile),
+        "min_observations": int(min_observations),
+        "behavioral_weights": {
+            key: float(weights.get(key, 0.0))
+            for key in (
+                "active_overlap",
+                "return_correlation",
+                "downside_correlation",
+                "worst_decile_correlation",
+            )
+        },
+        "cluster_threshold": float(cluster_threshold),
+    }
+    output_json = module.analyze_similarity_json(
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    )
+    output = json.loads(output_json)
+    if output.get("schema_version") != payload["schema_version"]:
+        raise RuntimeError("Rust behavioral similarity returned an unexpected schema.")
+    if output.get("attempt_ids") != sorted(known_ids):
+        raise RuntimeError("Rust behavioral similarity returned unexpected candidate IDs.")
+    return output
+
+
 def run_optimizer_backend(
     candidates: list[OptimizerCandidate],
     spec: PortfolioOptimizerSpec,
@@ -2125,6 +2239,16 @@ def run_optimizer_backend(
     requested_backend = str(backend or "auto").lower()
     if requested_backend not in {"python", "pyo3", "auto"}:
         raise ValueError(f"Unsupported optimizer backend: {backend}")
+    required_ids = tuple(dict.fromkeys(spec.required_attempt_ids))
+    known_ids = {candidate.attempt_id for candidate in candidates}
+    missing_required = sorted(set(required_ids) - known_ids)
+    if missing_required:
+        raise ValueError(
+            "required_attempt_ids are missing from the optimizer candidate pool: "
+            + ", ".join(missing_required)
+        )
+    if len(required_ids) > spec.portfolio_size:
+        raise ValueError("required_attempt_ids exceed portfolio_size")
     search = PortfolioSearch(candidates, spec, progress_callback=progress_callback)
     if requested_backend == "python":
         variants = search.optimize()
@@ -2226,6 +2350,7 @@ def write_optimizer_report(
             "portfolio_size": spec.portfolio_size,
             "candidate_scope": spec.candidate_scope,
             "min_score": spec.min_score,
+            "require_positive_source_return": spec.require_positive_source_return,
             "allowed_asset_classes": list(spec.allowed_asset_classes),
             "allowed_instruments": list(spec.allowed_instruments),
             "blocked_instruments": list(spec.blocked_instruments),
@@ -2250,6 +2375,7 @@ def write_optimizer_report(
             "correlation_penalty_weight": spec.correlation_penalty_weight,
             "diversification_mode": spec.diversification_mode,
             "portfolio_sharpe_weight": spec.portfolio_sharpe_weight,
+            "risk_weight_multiplier": spec.risk_weight_multiplier,
             "account": spec.account,
         },
         "source": source_info,

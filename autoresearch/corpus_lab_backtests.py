@@ -23,6 +23,19 @@ from .corpus_tools import (
     canonical_strategy_fingerprint,
 )
 from .execution_costs import execution_cost_manifest_payload
+from .evidence_plan import (
+    ReplayEvidencePlan,
+    build_execution_cell_sha256,
+    build_replay_evidence_plan,
+    subtract_calendar_months,
+    validate_replay_evidence_plan,
+)
+from .nested_evidence import FrozenExecutionCellReceipt
+from .evidence_artifacts import (
+    build_evidence_artifact_manifest,
+    evidence_artifact_paths,
+    write_immutable_json,
+)
 from .play_hand_lab import DEFAULT_LAB_GATEWAY_URL, LabGatewayClient
 from .play_hand_lab_auth import load_lab_gateway_token
 
@@ -125,6 +138,16 @@ def build_full_backtest_lab_task(
     run_metadata: dict[str, Any] | None,
     lab_config: LabBacktestConfig,
     batch_id: str | None = None,
+    evidence_window_end: str | None = None,
+    evidence_window_start: str | None = None,
+    requested_horizon_months: int = 36,
+    evidence_role: str = "full_backtest",
+    selection_data_end: str | None = None,
+    campaign_plan_id: str | None = None,
+    lake_manifest_sha256: str | None = None,
+    evidence_plan: ReplayEvidencePlan | dict[str, Any] | None = None,
+    tracked_cell: dict[str, float] | None = None,
+    task_id: str | None = None,
 ) -> dict[str, Any]:
     attempt_id = str(attempt.get("attempt_id") or "")
     artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
@@ -163,12 +186,44 @@ def build_full_backtest_lab_task(
     if not timeframe:
         raise RuntimeError(f"Could not resolve timeframe for attempt {attempt_id}")
 
+    if evidence_plan is None:
+        window_end = evidence_window_end or _now_iso()
+        window_start = evidence_window_start or subtract_calendar_months(
+            window_end, requested_horizon_months
+        )
+        resolved_evidence_plan = build_replay_evidence_plan(
+            campaign_plan_id=(
+                campaign_plan_id
+                if campaign_plan_id is not None
+                else (f"corpus-full-backtest:{batch_id}" if batch_id else None)
+            ),
+            evidence_role=evidence_role,
+            selection_data_end=selection_data_end or window_end,
+            analysis_window_start=window_start,
+            analysis_window_end=window_end,
+            requested_horizon_months=requested_horizon_months,
+            profile_snapshot=profile_snapshot,
+            lake_manifest_sha256=lake_manifest_sha256,
+        )
+    else:
+        resolved_evidence_plan = validate_replay_evidence_plan(evidence_plan)
+    if resolved_evidence_plan.execution_cell_sha256 is not None:
+        if not isinstance(tracked_cell, dict):
+            raise RuntimeError("Evidence plan requires a frozen tracked cell")
+        if (
+            build_execution_cell_sha256(tracked_cell)
+            != resolved_evidence_plan.execution_cell_sha256
+        ):
+            raise RuntimeError("Tracked cell does not match evidence plan")
+    elif tracked_cell is not None:
+        raise RuntimeError("Tracked cell requires an execution-cell-bound evidence plan")
+
     run_id = run_dir.name
-    task_id = f"full-backtest-cache-{attempt_id}"
-    if batch_id:
-        task_id = f"{task_id}-{batch_id}"
+    resolved_task_id = str(task_id or "").strip() or f"full-backtest-cache-{attempt_id}"
+    if batch_id and task_id is None:
+        resolved_task_id = f"{resolved_task_id}-{batch_id}"
     payload = {
-        "job_id": task_id,
+        "job_id": resolved_task_id,
         "user_id": "autoresearch-corpus",
         "profile_id": str(attempt.get("profile_ref") or request_payload.get("profile_id") or f"local:{attempt_id}"),
         "inline_profile_snapshot": profile_snapshot,
@@ -182,9 +237,11 @@ def build_full_backtest_lab_task(
         "instruments": normalized_instruments,
         "timeframe": timeframe,
         "market_data_source": str(request_payload.get("market_data_source") or "lake_bars"),
-        "lookback_months": 36,
-        "analysis_window_start": None,
-        "analysis_window_end": None,
+        "lookback_months": None,
+        "analysis_window_start": resolved_evidence_plan.analysis_window_start,
+        "analysis_window_end": resolved_evidence_plan.analysis_window_end,
+        "evidence_plan": resolved_evidence_plan.model_dump(mode="json"),
+        "tracked_cell": tracked_cell,
         "bar_limit": int(request_payload.get("bar_limit") or 5000),
         "alert_threshold": effective_alert_threshold,
         "view_mode": str(request_payload.get("view_mode") or "overview"),
@@ -204,7 +261,7 @@ def build_full_backtest_lab_task(
     }
     payload = {key: value for key, value in payload.items() if value is not None}
     return {
-        "task_id": task_id,
+        "task_id": resolved_task_id,
         "lane_id": "corpus-full-backtest",
         "attempt_id": attempt_id,
         "task_kind": FULL_BACKTEST_CACHE_TASK_KIND,
@@ -222,6 +279,8 @@ def build_full_backtest_lab_task(
                 "alert_threshold"
             ),
             "effective_alert_threshold": effective_alert_threshold,
+            "evidence_plan_id": resolved_evidence_plan.plan_id,
+            "evidence_role": resolved_evidence_plan.evidence_role,
             "canonical_profile_fingerprint": canonical_strategy_fingerprint(
                 canonical_strategy_definition(
                     profile_snapshot,
@@ -247,8 +306,44 @@ def _unwrap_worker_result(lab_result: dict[str, Any]) -> dict[str, Any]:
         or "best_cell_detail" in nested
         or "calendar_curve" in nested
     ):
-        return nested
+        return {
+            **nested,
+            **(
+                {"execution_evidence": payload["execution_evidence"]}
+                if isinstance(payload.get("execution_evidence"), dict)
+                else {}
+            ),
+            **(
+                {"completed_at": payload["completed_at"]}
+                if payload.get("completed_at") is not None
+                else {}
+            ),
+        }
     return payload
+
+
+def _validate_planned_execution_evidence(
+    *,
+    plan: ReplayEvidencePlan,
+    execution_evidence: Any,
+) -> dict[str, Any]:
+    if not isinstance(execution_evidence, dict):
+        raise RuntimeError("Planned worker result is missing execution evidence")
+    expected = {
+        "plan_id": plan.plan_id,
+        "profile_snapshot_sha256": plan.profile_snapshot_sha256,
+        "execution_cell_sha256": plan.execution_cell_sha256,
+    }
+    for key, value in expected.items():
+        if execution_evidence.get(key) != value:
+            raise RuntimeError(f"Planned execution evidence {key} mismatch")
+    if (
+        plan.lake_manifest_sha256 is not None
+        and execution_evidence.get("observed_lake_manifest_sha256")
+        != plan.lake_manifest_sha256
+    ):
+        raise RuntimeError("Planned execution evidence lake coverage hash mismatch")
+    return execution_evidence
 
 
 def materialize_full_backtest_lab_result(
@@ -312,24 +407,82 @@ def materialize_full_backtest_lab_result(
     if isinstance(aggregate, dict):
         provenance["market_data_window"] = aggregate.get("market_data_window")
         aggregate["autoresearch_provenance"] = provenance
+    execution_evidence = worker_result.get("execution_evidence")
+    if isinstance(execution_evidence, dict):
+        provenance["execution_evidence"] = execution_evidence
+
+    evidence_plan_payload = task_payload.get("evidence_plan")
+    resolved_evidence_plan = (
+        validate_replay_evidence_plan(evidence_plan_payload)
+        if isinstance(evidence_plan_payload, dict)
+        else None
+    )
+    if (
+        resolved_evidence_plan is not None
+        and resolved_evidence_plan.evidence_role == "outer_test"
+    ):
+        raise RuntimeError(
+            "Outer-test evidence must use materialize_outer_test_lab_result so "
+            "best-cell matrix outputs cannot enter OOS artifacts."
+        )
+    if resolved_evidence_plan is not None:
+        execution_evidence = _validate_planned_execution_evidence(
+            plan=resolved_evidence_plan,
+            execution_evidence=execution_evidence,
+        )
+        provenance["execution_evidence"] = execution_evidence
+    request_record = {
+        "request": request_payload,
+        "status": lab_result.get("status") or "success",
+        "job_kind": FULL_BACKTEST_CACHE_TASK_KIND,
+        "worker_id": lab_result.get("worker_id"),
+        "worker_pool": worker_result.get("worker_pool") or lab_result.get("worker_pool"),
+        "completed_at": worker_result.get("completed_at"),
+    }
+    immutable_paths = None
+    if resolved_evidence_plan is not None:
+        immutable_paths = evidence_artifact_paths(artifact_dir, resolved_evidence_plan)
+        immutable_manifest = build_evidence_artifact_manifest(
+            evidence_plan=resolved_evidence_plan,
+            provenance=provenance,
+            execution_evidence=(
+                execution_evidence if isinstance(execution_evidence, dict) else None
+            ),
+            artifact_payloads={
+                "result": sensitivity_response,
+                "curve": best_detail,
+                "calendar_curve": calendar_curve,
+                "recommended_curve": recommended_detail,
+                "job": request_record,
+            },
+        )
+        write_immutable_json(immutable_paths.result, sensitivity_response)
+        write_immutable_json(immutable_paths.curve, best_detail)
+        write_immutable_json(immutable_paths.calendar_curve, calendar_curve)
+        write_immutable_json(immutable_paths.recommended_curve, recommended_detail)
+        write_immutable_json(immutable_paths.manifest, immutable_manifest)
+        write_immutable_json(immutable_paths.job, request_record)
 
     result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
     curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
     calendar_path = artifact_dir / FULL_BACKTEST_CALENDAR_CURVE_FILENAME
-    _write_json(result_path, sensitivity_response)
-    _write_json(curve_path, best_detail)
-    _write_json(calendar_path, calendar_curve)
-    _write_json(artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME, recommended_detail)
-    _write_json(artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME, provenance)
-    if isinstance(request_payload, dict) and request_payload:
-        request_record = {
-            "request": request_payload,
-            "status": lab_result.get("status") or "success",
-            "job_kind": FULL_BACKTEST_CACHE_TASK_KIND,
-            "worker_id": lab_result.get("worker_id"),
-            "worker_pool": worker_result.get("worker_pool") or lab_result.get("worker_pool"),
-            "completed_at": worker_result.get("completed_at"),
-        }
+    write_legacy_aliases = (
+        resolved_evidence_plan is None
+        or (
+            resolved_evidence_plan.requested_horizon_months == 36
+            and resolved_evidence_plan.evidence_role == "full_backtest"
+        )
+    )
+    if write_legacy_aliases:
+        _write_json(result_path, sensitivity_response)
+        _write_json(curve_path, best_detail)
+        _write_json(calendar_path, calendar_curve)
+        _write_json(
+            artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
+            recommended_detail,
+        )
+        _write_json(artifact_dir / FULL_BACKTEST_MANIFEST_FILENAME, provenance)
+    if write_legacy_aliases and isinstance(request_payload, dict) and request_payload:
         _write_json(
             artifact_dir / "full-backtest-36mo-deep-replay-job.json",
             request_record,
@@ -338,10 +491,150 @@ def materialize_full_backtest_lab_result(
         if not original_job_path.exists():
             _write_json(original_job_path, request_record)
     return {
-        "curve_path": str(curve_path),
-        "result_path": str(result_path),
-        "calendar_curve_path": str(calendar_path),
-        "recommended_curve_path": str(artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME),
+        "curve_path": str(immutable_paths.curve if immutable_paths else curve_path),
+        "result_path": str(immutable_paths.result if immutable_paths else result_path),
+        "calendar_curve_path": str(
+            immutable_paths.calendar_curve if immutable_paths else calendar_path
+        ),
+        "recommended_curve_path": str(
+            immutable_paths.recommended_curve
+            if immutable_paths
+            else artifact_dir / FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME
+        ),
+        "evidence_manifest_path": (
+            str(immutable_paths.manifest) if immutable_paths else None
+        ),
+        "evidence_plan_id": (
+            resolved_evidence_plan.plan_id if resolved_evidence_plan else None
+        ),
+        "backend": "lab_gateway",
+    }
+
+
+def materialize_outer_test_lab_result(
+    *,
+    attempt: dict[str, Any],
+    lab_result: dict[str, Any],
+    task: dict[str, Any],
+    cell_receipt: FrozenExecutionCellReceipt | dict[str, Any],
+) -> dict[str, Any]:
+    if str(lab_result.get("task_id") or "") != str(task.get("task_id") or ""):
+        raise RuntimeError("Outer-test gateway result task ID mismatch")
+    worker_envelope = (
+        lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
+    )
+    if str(worker_envelope.get("job_kind") or "") != FULL_BACKTEST_CACHE_TASK_KIND:
+        raise RuntimeError("Outer-test gateway result has the wrong job kind")
+    task_payload = task.get("payload") if isinstance(task, dict) else None
+    if not isinstance(task_payload, dict):
+        raise RuntimeError("Outer-test task is missing its payload")
+    plan = validate_replay_evidence_plan(task_payload.get("evidence_plan"))
+    if plan.evidence_role != "outer_test":
+        raise RuntimeError("Dedicated outer materializer requires outer_test evidence")
+    receipt = (
+        cell_receipt
+        if isinstance(cell_receipt, FrozenExecutionCellReceipt)
+        else FrozenExecutionCellReceipt.model_validate(cell_receipt)
+    )
+    if receipt.execution_cell_sha256 != plan.execution_cell_sha256:
+        raise RuntimeError("Outer-test plan is not bound to the supplied cell receipt")
+    if task_payload.get("tracked_cell") != receipt.execution_cell:
+        raise RuntimeError("Outer-test task tracked cell differs from the frozen receipt")
+
+    worker_result = _unwrap_worker_result(lab_result)
+    sensitivity_response = worker_result.get("sensitivity_response")
+    data = sensitivity_response.get("data") if isinstance(sensitivity_response, dict) else None
+    aggregate = data.get("aggregate") if isinstance(data, dict) else None
+    tracked_result = (
+        aggregate.get("tracked_cell_result") if isinstance(aggregate, dict) else None
+    )
+    tracked_detail = worker_result.get("tracked_cell_detail")
+    if not isinstance(tracked_result, dict):
+        raise RuntimeError("Outer-test replay did not include tracked_cell_result")
+    if not isinstance(tracked_detail, dict):
+        raise RuntimeError("Outer-test replay did not include tracked_cell_detail")
+    detail_cell = tracked_detail.get("cell")
+    if not isinstance(detail_cell, dict) or any(
+        abs(float(detail_cell.get(key) or 0.0) - float(receipt.execution_cell[key]))
+        > 1e-12
+        for key in ("stop_loss_percent", "reward_multiple")
+    ):
+        raise RuntimeError("Outer-test tracked detail does not match the frozen cell")
+
+    allowed_aggregate_keys = {
+        "analysis_status",
+        "market_data_window",
+        "cost_model",
+        "signal_count",
+        "resolved_trade_count_max",
+        "behavior_summary",
+        "profile_revision",
+    }
+    redacted_aggregate = {
+        key: aggregate[key]
+        for key in allowed_aggregate_keys
+        if isinstance(aggregate, dict) and key in aggregate
+    }
+    redacted_aggregate["tracked_cell_result"] = tracked_result
+    redacted_result = {
+        "status": "success",
+        "message": "Frozen-cell outer-test evidence.",
+        "requested_timeframe": sensitivity_response.get("requested_timeframe"),
+        "effective_timeframe": sensitivity_response.get("effective_timeframe"),
+        "data": {"aggregate": redacted_aggregate},
+    }
+    execution_evidence = _validate_planned_execution_evidence(
+        plan=plan,
+        execution_evidence=worker_result.get("execution_evidence"),
+    )
+
+    artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+    paths = evidence_artifact_paths(artifact_dir, plan)
+    provenance = build_full_backtest_provenance(
+        attempt=attempt,
+        profile_snapshot=task_payload.get("inline_profile_snapshot") or {},
+        request_payload=task_payload,
+        result_payload=redacted_result,
+        source_profile_path=Path(str((task.get("metadata") or {}).get("source_profile_path")))
+        if (task.get("metadata") or {}).get("source_profile_path")
+        else None,
+        worker_id=str(lab_result.get("worker_id") or "") or None,
+        worker_pool=str(lab_result.get("worker_pool") or "") or None,
+    )
+    provenance["execution_evidence"] = execution_evidence
+    request_record = {
+        "request": worker_result.get("request") or task_payload,
+        "status": lab_result.get("status") or "success",
+        "job_kind": FULL_BACKTEST_CACHE_TASK_KIND,
+        "worker_id": lab_result.get("worker_id"),
+        "completed_at": worker_result.get("completed_at"),
+    }
+    receipt_payload = receipt.model_dump(mode="json")
+    manifest = build_evidence_artifact_manifest(
+        evidence_plan=plan,
+        provenance=provenance,
+        execution_evidence=execution_evidence,
+        artifact_payloads={
+            "result": redacted_result,
+            "curve": tracked_detail,
+            "job": request_record,
+            "cell_receipt": receipt_payload,
+        },
+    )
+    manifest["evidence_level"] = "train_selected_cell_outer_test"
+    manifest["cell_receipt"] = receipt_payload
+    write_immutable_json(paths.result, redacted_result)
+    write_immutable_json(paths.curve, tracked_detail)
+    write_immutable_json(paths.manifest, manifest)
+    write_immutable_json(paths.job, request_record)
+    write_immutable_json(paths.cell_receipt, receipt_payload)
+    return {
+        "result_path": str(paths.result),
+        "curve_path": str(paths.curve),
+        "evidence_manifest_path": str(paths.manifest),
+        "cell_receipt_path": str(paths.cell_receipt),
+        "evidence_plan_id": plan.plan_id,
+        "evidence_role": plan.evidence_role,
         "backend": "lab_gateway",
     }
 
@@ -438,6 +731,13 @@ def run_lab_full_backtests(
     max_workers: int,
     force_rebuild: bool = False,
     emit: Callable[[str], None] | None = None,
+    requested_horizon_months: int = 36,
+    evidence_window_start: str | None = None,
+    evidence_window_end: str | None = None,
+    evidence_role: str = "full_backtest",
+    selection_data_end: str | None = None,
+    campaign_plan_id: str | None = None,
+    lake_manifest_sha256: str | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     _ = force_rebuild
     pending_items = list(items)
@@ -448,6 +748,7 @@ def run_lab_full_backtests(
     calculated = 0
     failed = 0
     batch_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    frozen_evidence_window_end = evidence_window_end or _now_iso()
     gateway = LabGatewayClient(base_url=lab_config.gateway_url, token=lab_config.gateway_token)
     try:
         preexisting_results = gateway.read_results(limit=1)
@@ -470,6 +771,13 @@ def run_lab_full_backtests(
                         run_metadata=run_metadata,
                         lab_config=lab_config,
                         batch_id=batch_id,
+                        evidence_window_start=evidence_window_start,
+                        evidence_window_end=frozen_evidence_window_end,
+                        requested_horizon_months=requested_horizon_months,
+                        evidence_role=evidence_role,
+                        selection_data_end=selection_data_end,
+                        campaign_plan_id=campaign_plan_id,
+                        lake_manifest_sha256=lake_manifest_sha256,
                     )
                 except Exception as exc:
                     failed += 1

@@ -15,6 +15,8 @@ from autoresearch.atlas_lab import (
     _compact_sensitivity_snapshot_for_atlas,
     _deep_replay_request_from_probe,
     _enqueue_gateway_tasks_with_retries,
+    _make_signal_atlas_cell_task,
+    _row_from_signal_result,
     atlas_profile_config,
     effective_atlas_build_profile,
     run_atlas_lab,
@@ -131,13 +133,120 @@ def test_deep_replay_request_maps_as_of_date_to_explicit_window() -> None:
             ]
         },
         row={"probe_timeframe": "M5", "instruments": "XAUUSD"},
-        runtime=AtlasLabRuntimeConfig(),
+        runtime=AtlasLabRuntimeConfig(
+            lake_manifest_sha256="sha256:" + "a" * 64
+        ),
         worker_contract_hash="contract123",
     )
 
-    assert request["lookback_months"] == 3
+    assert request["lookback_months"] is None
     assert request["analysis_window_start"] == "2026-03-30T23:59:59Z"
     assert request["analysis_window_end"] == "2026-06-30T23:59:59Z"
+    assert request["evidence_plan"]["evidence_role"] == "training"
+    assert request["evidence_plan"]["requested_horizon_months"] == 3
+    assert request["evidence_plan"]["lake_manifest_sha256"] == "sha256:" + "a" * 64
+
+
+def test_signal_atlas_cell_task_is_bounded_in_historical_mode() -> None:
+    task = _make_signal_atlas_cell_task(
+        runtime=AtlasLabRuntimeConfig(
+            as_of_date="2025-06-30T00:00:00Z",
+            signal_lookback_months=3,
+            lake_manifest_sha256="sha256:" + "b" * 64,
+        ),
+        worker_contract_hash="contract123",
+        task_id="signal-1",
+        indicator_id="RSI",
+        profile_id="profile-1",
+        profile_payload=_profile_doc()["profile"],
+        instrument="EURUSD",
+        timeframe="M5",
+        bar_limit=5000,
+    )
+
+    payload = task["payload"]
+    assert payload["lookback_months"] is None
+    assert payload["analysis_window_start"] == "2025-03-30T00:00:00Z"
+    assert payload["analysis_window_end"] == "2025-06-30T00:00:00Z"
+    assert payload["evidence_plan"]["selection_data_end"] == "2025-06-30T00:00:00Z"
+    assert payload["evidence_plan"]["lake_manifest_sha256"] == "sha256:" + "b" * 64
+
+
+def test_historical_signal_result_preserves_observed_lake_receipt(tmp_path: Path) -> None:
+    task = _make_signal_atlas_cell_task(
+        runtime=AtlasLabRuntimeConfig(
+            as_of_date="2025-06-30T00:00:00Z",
+            lake_manifest_sha256="sha256:" + "b" * 64,
+        ),
+        worker_contract_hash="contract123",
+        task_id="signal-1",
+        indicator_id="RSI",
+        profile_id="profile-1",
+        profile_payload=_profile_doc()["profile"],
+        instrument="EURUSD",
+        timeframe="M5",
+        bar_limit=5000,
+    )
+    plan = task["payload"]["evidence_plan"]
+    receipt = {
+        "plan_id": plan["plan_id"],
+        "profile_snapshot_sha256": plan["profile_snapshot_sha256"],
+        "execution_cell_sha256": plan["execution_cell_sha256"],
+        "observed_lake_manifest_sha256": plan["lake_manifest_sha256"],
+    }
+    row = _row_from_signal_result(
+        base_row={"evidence_plan": plan},
+        lab_result={
+            "result": {
+                "result": {
+                    "execution_evidence": receipt,
+                    "raw": {
+                        "data": {
+                            "long_score": [0.0, 1.0],
+                            "short_score": [0.0, 0.0],
+                            "timestamp": [1, 2],
+                        }
+                    },
+                }
+            }
+        },
+        raw_path=tmp_path / "raw.json",
+    )
+
+    assert row["evidence_plan_id"] == plan["plan_id"]
+    assert row["observed_lake_manifest_sha256"] == plan["lake_manifest_sha256"]
+
+
+def test_historical_atlas_rejects_unbounded_signal_executor(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="requires signal_atlas_executor='gateway'"):
+        run_atlas_lab(
+            _config(tmp_path),
+            run_id="historical-local",
+            runtime=AtlasLabRuntimeConfig(
+                as_of_date="2025-06-30T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "c" * 64,
+                signal_atlas_executor="local",
+            ),
+            phases=["build"],
+        )
+
+
+def test_historical_atlas_run_root_is_create_only(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs" / "derived" / "atlas-runs" / "existing"
+    run_root.mkdir(parents=True)
+    (run_root / "atlas-lab-run.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="create-only"):
+        run_atlas_lab(
+            _config(tmp_path),
+            run_id="existing",
+            runtime=AtlasLabRuntimeConfig(
+                as_of_date="2025-06-30T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "d" * 64,
+                signal_atlas_executor="gateway",
+            ),
+            phases=["build"],
+        )
 
 
 def test_compact_sensitivity_snapshot_keeps_score_fields_and_drops_heavy_payloads() -> None:

@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from autoresearch.plotting import render_attempt_tradeoff_scatter_artifacts
 
 from autoresearch import corpus_tools as ct
+from autoresearch.evidence_plan import build_replay_evidence_plan
 
 
 def _write_json(path, payload):
@@ -176,6 +177,63 @@ def test_validate_full_backtest_artifacts_accepts_valid_pair(tmp_path):
     assert validation["curve_point_count"] == 39
     assert validation["cell_match"] is True
     assert validation["recommended_curve_exists"] is True
+
+
+def test_validate_full_backtest_artifacts_binds_evidence_plan_to_request(tmp_path):
+    artifact_dir = tmp_path / "artifact"
+    profile_path = tmp_path / "profile.json"
+    artifact_dir.mkdir()
+    profile = {
+        "version": "v1",
+        "notificationThreshold": 80,
+        "directionMode": "both",
+        "instruments": ["EURUSD"],
+        "indicators": [],
+    }
+    plan = build_replay_evidence_plan(
+        evidence_role="full_backtest",
+        selection_data_end="2026-07-08T23:59:59Z",
+        analysis_window_start="2023-07-08T23:59:59Z",
+        analysis_window_end="2026-07-08T23:59:59Z",
+        requested_horizon_months=36,
+        profile_snapshot=profile,
+    )
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_RESULT_FILENAME,
+        _sample_sensitivity_payload(61.25),
+    )
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_CURVE_FILENAME,
+        _sample_curve_payload(1.0),
+    )
+    _write_json(
+        artifact_dir / ct.FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME,
+        _sample_curve_payload(0.9),
+    )
+    _write_json(profile_path, {"profile": profile})
+    request = {
+        "alert_threshold": 80,
+        "timeframe": "M15",
+        "instruments": ["EURUSD"],
+        "inline_profile_snapshot": profile,
+        "analysis_window_start": plan.analysis_window_start,
+        "analysis_window_end": plan.analysis_window_end,
+        "evidence_plan": plan.model_dump(mode="json"),
+    }
+    _write_json(artifact_dir / "deep-replay-job.json", {"request": request})
+
+    attempt = {"artifact_dir": str(artifact_dir), "profile_path": str(profile_path)}
+    validation = ct.validate_full_backtest_artifacts(attempt)
+
+    assert validation["status"] == "valid"
+    assert validation["evidence_plan_id"] == plan.plan_id
+    assert validation["requested_horizon_months"] == 36
+
+    request["analysis_window_end"] = "2026-07-09T23:59:59Z"
+    _write_json(artifact_dir / "deep-replay-job.json", {"request": request})
+    invalid = ct.validate_full_backtest_artifacts(attempt)
+    assert invalid["status"] == "invalid"
+    assert "evidence_plan_mismatch" in invalid["reason_codes"]
 
 
 def test_validate_full_backtest_artifacts_rejects_missing_canonical_profile_without_rebuild(

@@ -80,6 +80,8 @@ pub struct PortfolioOptimizerSpec {
     #[serde(default)]
     pub baseline_attempt_ids: Vec<String>,
     #[serde(default)]
+    pub required_attempt_ids: Vec<String>,
+    #[serde(default)]
     pub account: Map<String, Value>,
 }
 
@@ -107,6 +109,7 @@ impl Default for PortfolioOptimizerSpec {
             diversification_mode: default_diversification_mode(),
             portfolio_sharpe_weight: 0.0,
             baseline_attempt_ids: Vec::new(),
+            required_attempt_ids: Vec::new(),
             account: Map::new(),
         }
     }
@@ -226,6 +229,69 @@ pub struct OptimizerOutput {
     pub pareto_front: Vec<ArchiveItem>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SimilarityInput {
+    pub schema_version: String,
+    pub candidates: Vec<SimilarityCandidateInput>,
+    pub reference_attempt_ids: Vec<String>,
+    pub active_epsilon: f64,
+    pub worst_quantile: f64,
+    pub min_observations: usize,
+    pub behavioral_weights: BehavioralWeights,
+    pub cluster_threshold: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SimilarityCandidateInput {
+    pub attempt_id: String,
+    pub dates: Vec<String>,
+    pub daily_r: Vec<f64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BehavioralWeights {
+    pub active_overlap: f64,
+    pub return_correlation: f64,
+    pub downside_correlation: f64,
+    pub worst_decile_correlation: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SimilarityOutput {
+    pub schema_version: String,
+    pub attempt_ids: Vec<String>,
+    pub reference: SimilarityReferenceMetadata,
+    pub active_overlap_matrix: Vec<Vec<f64>>,
+    pub return_correlation_matrix: Vec<Vec<f64>>,
+    pub downside_correlation_matrix: Vec<Vec<f64>>,
+    pub worst_decile_correlation_matrix: Vec<Vec<f64>>,
+    pub similarity_matrix: Vec<Vec<f64>>,
+    pub clusters: Vec<SimilarityCluster>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct SimilarityReferenceMetadata {
+    pub attempt_ids: Vec<String>,
+    pub calendar_dates: Vec<String>,
+    pub daily_r: Vec<f64>,
+    pub downside_observation_count: usize,
+    pub worst_quantile: f64,
+    pub worst_cutoff_r: Option<f64>,
+    pub worst_observation_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SimilarityCluster {
+    pub id: String,
+    pub members: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct SimilarityAlignedCandidate {
+    attempt_id: String,
+    daily_r: Vec<f64>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct OptimizerVariant {
     pub objective_name: String,
@@ -311,9 +377,432 @@ pub fn optimize_input(input: OptimizerInput) -> OptimizerOutput {
 pub fn optimize_json(input_json: &str) -> Result<String, String> {
     let input: OptimizerInput = serde_json::from_str(input_json)
         .map_err(|error| format!("invalid optimizer input JSON: {error}"))?;
+    validate_required_attempt_ids(&input)?;
     let output = optimize_input(input);
     serde_json::to_string(&output)
         .map_err(|error| format!("failed to serialize optimizer output: {error}"))
+}
+
+fn validate_required_attempt_ids(input: &OptimizerInput) -> Result<(), String> {
+    let required: BTreeSet<&str> = input
+        .spec
+        .required_attempt_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    if required.len() > input.spec.portfolio_size {
+        return Err("required_attempt_ids exceed portfolio_size".to_string());
+    }
+    let known: HashSet<&str> = input
+        .candidates
+        .iter()
+        .map(|candidate| candidate.attempt_id.as_str())
+        .collect();
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|attempt_id| !known.contains(attempt_id))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "required_attempt_ids are missing from the optimizer candidate pool: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+pub fn analyze_similarity_json(input_json: &str) -> Result<String, String> {
+    let input: SimilarityInput = serde_json::from_str(input_json)
+        .map_err(|error| format!("invalid similarity input JSON: {error}"))?;
+    let output = analyze_similarity(input)?;
+    serde_json::to_string(&output)
+        .map_err(|error| format!("failed to serialize similarity output: {error}"))
+}
+
+pub fn analyze_similarity(input: SimilarityInput) -> Result<SimilarityOutput, String> {
+    validate_similarity_input(&input)?;
+
+    let mut date_set = BTreeSet::new();
+    for candidate in &input.candidates {
+        date_set.extend(candidate.dates.iter().cloned());
+    }
+    let calendar_dates: Vec<String> = date_set.into_iter().collect();
+    let date_index: HashMap<&str, usize> = calendar_dates
+        .iter()
+        .enumerate()
+        .map(|(index, date)| (date.as_str(), index))
+        .collect();
+
+    let mut candidates: Vec<SimilarityAlignedCandidate> = input
+        .candidates
+        .into_iter()
+        .map(|candidate| {
+            let mut daily_r = vec![0.0; calendar_dates.len()];
+            for (date, value) in candidate.dates.iter().zip(candidate.daily_r.iter()) {
+                daily_r[*date_index
+                    .get(date.as_str())
+                    .expect("validated dates are present in the union calendar")] = *value;
+            }
+            SimilarityAlignedCandidate {
+                attempt_id: candidate.attempt_id,
+                daily_r,
+            }
+        })
+        .collect();
+    candidates.sort_by(|left, right| left.attempt_id.cmp(&right.attempt_id));
+
+    let attempt_ids: Vec<String> = candidates
+        .iter()
+        .map(|candidate| candidate.attempt_id.clone())
+        .collect();
+    let candidate_index: HashMap<&str, usize> = attempt_ids
+        .iter()
+        .enumerate()
+        .map(|(index, attempt_id)| (attempt_id.as_str(), index))
+        .collect();
+    let mut reference_attempt_ids = input.reference_attempt_ids;
+    reference_attempt_ids.sort();
+    let reference_indexes: Vec<usize> = reference_attempt_ids
+        .iter()
+        .map(|attempt_id| candidate_index[attempt_id.as_str()])
+        .collect();
+    let reference_daily_r: Vec<f64> = (0..calendar_dates.len())
+        .into_par_iter()
+        .map(|date_index| {
+            reference_indexes
+                .iter()
+                .map(|candidate_index| candidates[*candidate_index].daily_r[date_index])
+                .sum()
+        })
+        .collect();
+    if reference_daily_r.iter().any(|value| !value.is_finite()) {
+        return Err("reference daily return sum is not finite".to_string());
+    }
+
+    let downside_indexes: Vec<usize> = reference_daily_r
+        .iter()
+        .enumerate()
+        .filter_map(|(index, value)| (*value < 0.0).then_some(index))
+        .collect();
+    let worst_cutoff_r = interpolated_percentile(&reference_daily_r, input.worst_quantile);
+    let worst_indexes: Vec<usize> = worst_cutoff_r
+        .map(|cutoff| {
+            reference_daily_r
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| (*value <= cutoff).then_some(index))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let active_overlap_matrix = symmetric_similarity_matrix(candidates.len(), |left, right| {
+        active_overlap(
+            &candidates[left].daily_r,
+            &candidates[right].daily_r,
+            input.active_epsilon,
+        )
+    });
+    let return_correlation_matrix = symmetric_similarity_matrix(candidates.len(), |left, right| {
+        pearson_corr_with_minimum(
+            &candidates[left].daily_r,
+            &candidates[right].daily_r,
+            input.min_observations,
+        )
+    });
+    let downside_correlation_matrix =
+        symmetric_similarity_matrix(candidates.len(), |left, right| {
+            indexed_pearson_corr(
+                &candidates[left].daily_r,
+                &candidates[right].daily_r,
+                &downside_indexes,
+                input.min_observations,
+            )
+        });
+    let worst_decile_correlation_matrix =
+        symmetric_similarity_matrix(candidates.len(), |left, right| {
+            indexed_pearson_corr(
+                &candidates[left].daily_r,
+                &candidates[right].daily_r,
+                &worst_indexes,
+                input.min_observations,
+            )
+        });
+    let total_weight = input.behavioral_weights.active_overlap
+        + input.behavioral_weights.return_correlation
+        + input.behavioral_weights.downside_correlation
+        + input.behavioral_weights.worst_decile_correlation;
+    let similarity_matrix = symmetric_similarity_matrix(candidates.len(), |left, right| {
+        let similarity = input.behavioral_weights.active_overlap
+            * active_overlap_matrix[left][right]
+            + input.behavioral_weights.return_correlation
+                * return_correlation_matrix[left][right].max(0.0)
+            + input.behavioral_weights.downside_correlation
+                * downside_correlation_matrix[left][right].max(0.0)
+            + input.behavioral_weights.worst_decile_correlation
+                * worst_decile_correlation_matrix[left][right].max(0.0);
+        (similarity / total_weight).clamp(0.0, 1.0)
+    });
+
+    let clusters = similarity_clusters(&attempt_ids, &similarity_matrix, input.cluster_threshold);
+    Ok(SimilarityOutput {
+        schema_version: input.schema_version,
+        attempt_ids,
+        reference: SimilarityReferenceMetadata {
+            attempt_ids: reference_attempt_ids,
+            calendar_dates,
+            daily_r: reference_daily_r,
+            downside_observation_count: downside_indexes.len(),
+            worst_quantile: input.worst_quantile,
+            worst_cutoff_r,
+            worst_observation_count: worst_indexes.len(),
+        },
+        active_overlap_matrix,
+        return_correlation_matrix,
+        downside_correlation_matrix,
+        worst_decile_correlation_matrix,
+        similarity_matrix,
+        clusters,
+    })
+}
+
+fn validate_similarity_input(input: &SimilarityInput) -> Result<(), String> {
+    if input.schema_version.trim().is_empty() {
+        return Err("schema_version must be nonempty".to_string());
+    }
+    if input.candidates.is_empty() {
+        return Err("candidates must be nonempty".to_string());
+    }
+    let mut candidate_ids = HashSet::new();
+    for candidate in &input.candidates {
+        if candidate.attempt_id.trim().is_empty() {
+            return Err("candidate attempt_id must be nonempty".to_string());
+        }
+        if !candidate_ids.insert(candidate.attempt_id.as_str()) {
+            return Err(format!(
+                "duplicate candidate attempt_id: {}",
+                candidate.attempt_id
+            ));
+        }
+        if candidate.dates.len() != candidate.daily_r.len() {
+            return Err(format!(
+                "candidate {} has {} dates but {} daily_r values",
+                candidate.attempt_id,
+                candidate.dates.len(),
+                candidate.daily_r.len()
+            ));
+        }
+        let mut dates = HashSet::new();
+        for date in &candidate.dates {
+            if date.trim().is_empty() {
+                return Err(format!(
+                    "candidate {} has an empty date",
+                    candidate.attempt_id
+                ));
+            }
+            if !dates.insert(date.as_str()) {
+                return Err(format!(
+                    "candidate {} has duplicate date: {date}",
+                    candidate.attempt_id
+                ));
+            }
+        }
+        if candidate.daily_r.iter().any(|value| !value.is_finite()) {
+            return Err(format!(
+                "candidate {} contains a non-finite daily_r value",
+                candidate.attempt_id
+            ));
+        }
+    }
+    if input.reference_attempt_ids.is_empty() {
+        return Err("reference_attempt_ids must be nonempty".to_string());
+    }
+    let mut reference_ids = HashSet::new();
+    for attempt_id in &input.reference_attempt_ids {
+        if !reference_ids.insert(attempt_id.as_str()) {
+            return Err(format!("duplicate reference_attempt_id: {attempt_id}"));
+        }
+        if !candidate_ids.contains(attempt_id.as_str()) {
+            return Err(format!("unknown reference_attempt_id: {attempt_id}"));
+        }
+    }
+    if !input.active_epsilon.is_finite() || input.active_epsilon < 0.0 {
+        return Err("active_epsilon must be finite and nonnegative".to_string());
+    }
+    if !input.worst_quantile.is_finite() || !(0.0..=1.0).contains(&input.worst_quantile) {
+        return Err("worst_quantile must be finite and between 0 and 1".to_string());
+    }
+    if input.min_observations == 0 {
+        return Err("min_observations must be at least 1".to_string());
+    }
+    let weights = [
+        input.behavioral_weights.active_overlap,
+        input.behavioral_weights.return_correlation,
+        input.behavioral_weights.downside_correlation,
+        input.behavioral_weights.worst_decile_correlation,
+    ];
+    if weights
+        .iter()
+        .any(|weight| !weight.is_finite() || *weight < 0.0)
+    {
+        return Err("behavioral_weights must be finite and nonnegative".to_string());
+    }
+    if weights.iter().sum::<f64>() <= 0.0 {
+        return Err("behavioral_weights must have a positive total".to_string());
+    }
+    if !input.cluster_threshold.is_finite() || !(0.0..=1.0).contains(&input.cluster_threshold) {
+        return Err("cluster_threshold must be finite and between 0 and 1".to_string());
+    }
+    Ok(())
+}
+
+fn active_overlap(left: &[f64], right: &[f64], active_epsilon: f64) -> f64 {
+    let mut union = 0_usize;
+    let mut intersection = 0_usize;
+    for (left_value, right_value) in left.iter().zip(right.iter()) {
+        let left_active = left_value.abs() > active_epsilon;
+        let right_active = right_value.abs() > active_epsilon;
+        if left_active || right_active {
+            union += 1;
+        }
+        if left_active && right_active {
+            intersection += 1;
+        }
+    }
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+fn interpolated_percentile(values: &[f64], quantile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|left, right| left.partial_cmp(right).unwrap_or(Ordering::Equal));
+    let position = quantile * (sorted.len() - 1) as f64;
+    let lower_index = position.floor() as usize;
+    let upper_index = position.ceil() as usize;
+    let fraction = position - lower_index as f64;
+    Some(sorted[lower_index] + (sorted[upper_index] - sorted[lower_index]) * fraction)
+}
+
+fn pearson_corr_with_minimum(left: &[f64], right: &[f64], min_observations: usize) -> f64 {
+    let size = left.len().min(right.len());
+    if size < min_observations {
+        return 0.0;
+    }
+    let left = &left[..size];
+    let right = &right[..size];
+    let left_mean = left.iter().sum::<f64>() / size as f64;
+    let right_mean = right.iter().sum::<f64>() / size as f64;
+    let (covariance, left_sum_squares, right_sum_squares) = left.iter().zip(right.iter()).fold(
+        (0.0, 0.0, 0.0),
+        |(covariance, left_sum_squares, right_sum_squares), (left_value, right_value)| {
+            let left_delta = left_value - left_mean;
+            let right_delta = right_value - right_mean;
+            (
+                covariance + left_delta * right_delta,
+                left_sum_squares + left_delta * left_delta,
+                right_sum_squares + right_delta * right_delta,
+            )
+        },
+    );
+    if left_sum_squares <= f64::EPSILON || right_sum_squares <= f64::EPSILON {
+        0.0
+    } else {
+        (covariance / (left_sum_squares * right_sum_squares).sqrt()).clamp(-1.0, 1.0)
+    }
+}
+
+fn indexed_pearson_corr(
+    left: &[f64],
+    right: &[f64],
+    indexes: &[usize],
+    min_observations: usize,
+) -> f64 {
+    if indexes.len() < min_observations {
+        return 0.0;
+    }
+    let left_values: Vec<f64> = indexes.iter().map(|index| left[*index]).collect();
+    let right_values: Vec<f64> = indexes.iter().map(|index| right[*index]).collect();
+    pearson_corr_with_minimum(&left_values, &right_values, min_observations)
+}
+
+fn symmetric_similarity_matrix<F>(size: usize, value_at: F) -> Vec<Vec<f64>>
+where
+    F: Fn(usize, usize) -> f64 + Sync + Send,
+{
+    let entries: Vec<Vec<(usize, f64)>> = (0..size)
+        .into_par_iter()
+        .map(|left| {
+            (left..size)
+                .map(|right| (right, value_at(left, right)))
+                .collect()
+        })
+        .collect();
+    let mut matrix = vec![vec![0.0; size]; size];
+    for (left, row) in entries.into_iter().enumerate() {
+        for (right, value) in row {
+            matrix[left][right] = value;
+            matrix[right][left] = value;
+        }
+    }
+    matrix
+}
+
+fn similarity_clusters(
+    attempt_ids: &[String],
+    similarity_matrix: &[Vec<f64>],
+    threshold: f64,
+) -> Vec<SimilarityCluster> {
+    let mut parents: Vec<usize> = (0..attempt_ids.len()).collect();
+    for left in 0..attempt_ids.len() {
+        for right in (left + 1)..attempt_ids.len() {
+            if similarity_matrix[left][right] >= threshold {
+                union_similarity_nodes(&mut parents, left, right);
+            }
+        }
+    }
+    let mut members_by_root: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (index, attempt_id) in attempt_ids.iter().enumerate() {
+        let root = find_similarity_root(&mut parents, index);
+        members_by_root
+            .entry(root)
+            .or_default()
+            .push(attempt_id.clone());
+    }
+    let mut clusters: Vec<SimilarityCluster> = members_by_root
+        .into_values()
+        .map(|mut members| {
+            members.sort();
+            SimilarityCluster {
+                id: format!("behavior:{}", members[0]),
+                members,
+            }
+        })
+        .collect();
+    clusters.sort_by(|left, right| left.id.cmp(&right.id));
+    clusters
+}
+
+fn find_similarity_root(parents: &mut [usize], node: usize) -> usize {
+    if parents[node] != node {
+        let root = find_similarity_root(parents, parents[node]);
+        parents[node] = root;
+    }
+    parents[node]
+}
+
+fn union_similarity_nodes(parents: &mut [usize], left: usize, right: usize) {
+    let left_root = find_similarity_root(parents, left);
+    let right_root = find_similarity_root(parents, right);
+    if left_root != right_root {
+        parents[right_root] = left_root.min(right_root);
+        parents[left_root] = left_root.min(right_root);
+    }
 }
 
 #[cfg(feature = "python-extension")]
@@ -323,9 +812,16 @@ fn optimize_json_py(input_json: &str) -> PyResult<String> {
 }
 
 #[cfg(feature = "python-extension")]
+#[pyfunction(name = "analyze_similarity_json")]
+fn analyze_similarity_json_py(input_json: &str) -> PyResult<String> {
+    analyze_similarity_json(input_json).map_err(PyValueError::new_err)
+}
+
+#[cfg(feature = "python-extension")]
 #[pymodule]
 fn portfolio_optimizer_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(optimize_json_py, m)?)?;
+    m.add_function(wrap_pyfunction!(analyze_similarity_json_py, m)?)?;
     Ok(())
 }
 
@@ -464,24 +960,25 @@ impl PortfolioSearch {
                 })
         });
         if spec.candidate_limit > 0 {
-            let baseline_ids: HashSet<&str> = spec
+            let protected_ids: HashSet<&str> = spec
                 .baseline_attempt_ids
                 .iter()
+                .chain(spec.required_attempt_ids.iter())
                 .map(String::as_str)
                 .collect();
             let mut limited = Vec::new();
-            let mut baseline_seen = HashSet::new();
+            let mut protected_seen = HashSet::new();
             for candidate in &candidates {
-                if baseline_ids.contains(candidate.attempt_id.as_str()) {
-                    baseline_seen.insert(candidate.attempt_id.clone());
+                if protected_ids.contains(candidate.attempt_id.as_str()) {
+                    protected_seen.insert(candidate.attempt_id.clone());
                     limited.push(candidate.clone());
                 }
             }
             for candidate in &candidates {
-                if baseline_seen.contains(&candidate.attempt_id) {
+                if protected_seen.contains(&candidate.attempt_id) {
                     continue;
                 }
-                if limited.len() >= baseline_seen.len() + spec.candidate_limit as usize {
+                if limited.len() >= protected_seen.len() + spec.candidate_limit as usize {
                     break;
                 }
                 limited.push(candidate.clone());
@@ -1474,7 +1971,7 @@ impl PortfolioSearch {
     }
 
     fn greedy_seed(&mut self, objective_name: &str) -> Vec<String> {
-        let mut selected = Vec::new();
+        let mut selected = self.ids_for_known_attempts(&self.spec.required_attempt_ids.clone());
         let pool: Vec<String> = self
             .candidates
             .iter()
@@ -1519,15 +2016,23 @@ impl PortfolioSearch {
         if self.candidates.len() < self.spec.portfolio_size {
             return None;
         }
+        let required = self.ids_for_known_attempts(&self.spec.required_attempt_ids.clone());
+        if required.len() > self.spec.portfolio_size {
+            return None;
+        }
+        let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
         let ids: Vec<String> = self
             .candidates
             .iter()
+            .filter(|candidate| !required_set.contains(candidate.attempt_id.as_str()))
             .map(|candidate| candidate.attempt_id.clone())
             .collect();
+        let sample_size = self.spec.portfolio_size - required.len();
         let mut best = None;
         let mut best_violation = f64::INFINITY;
         for _ in 0..500 {
-            let sample = rng.sample(&ids, self.spec.portfolio_size);
+            let mut sample = required.clone();
+            sample.extend(rng.sample(&ids, sample_size));
             let violations = self.constraint_violations(&sample);
             let violation_size: f64 = violations.values().sum();
             if violation_size < best_violation {
@@ -1547,7 +2052,11 @@ impl PortfolioSearch {
         objective_name: &str,
         start_name: &str,
     ) -> (Vec<String>, Vec<SwapMove>) {
-        let mut selected = unique_preserve(seed_ids);
+        let required = self.ids_for_known_attempts(&self.spec.required_attempt_ids.clone());
+        let required_set: HashSet<&str> = required.iter().map(String::as_str).collect();
+        let mut selected = required.clone();
+        selected.extend(seed_ids);
+        let mut selected = unique_preserve(selected);
         if selected.len() > self.spec.portfolio_size {
             selected.truncate(self.spec.portfolio_size);
         }
@@ -1607,7 +2116,9 @@ impl PortfolioSearch {
                 .map(|flat_index| {
                     let removed_index = flat_index / pool.len();
                     let added = &pool[flat_index % pool.len()];
-                    if selected_set.contains(added.as_str()) {
+                    if required_set.contains(selected[removed_index].as_str())
+                        || selected_set.contains(added.as_str())
+                    {
                         f64::NEG_INFINITY
                     } else {
                         self.objective_score_extension(
@@ -2722,6 +3233,29 @@ mod tests {
     }
 
     #[test]
+    fn required_attempt_survives_all_starts_and_swaps() {
+        let mut spec = spec_for_smoke(vec!["stability"]);
+        spec.random_starts = 3;
+        spec.max_swaps = 8;
+        spec.required_attempt_ids = vec!["required-lumpy".to_string()];
+        let output = optimize_input(OptimizerInput {
+            spec,
+            candidates: vec![
+                candidate("required-lumpy", "EURUSD", vec![8.0, -7.0, 8.0, -7.0], 50.0),
+                candidate("smooth-a", "GBPUSD", vec![1.0, 1.0, 1.0, 1.0], 80.0),
+                candidate("smooth-b", "USDJPY", vec![0.5, 1.0, 1.0, 1.0], 75.0),
+            ],
+            objectives: default_objectives(),
+        });
+
+        assert!(
+            output.variants["stability"]
+                .selected_attempt_ids
+                .contains(&"required-lumpy".to_string())
+        );
+    }
+
+    #[test]
     fn transient_trials_match_full_scores_without_growing_caches() {
         let mut spec = PortfolioOptimizerSpec {
             portfolio_size: 3,
@@ -2945,6 +3479,243 @@ mod tests {
         assert_eq!(
             compound.variants["return"].metrics["account_current"]["final_balance"],
             json!(1020.1)
+        );
+    }
+
+    fn similarity_input(candidates: Vec<SimilarityCandidateInput>) -> SimilarityInput {
+        SimilarityInput {
+            schema_version: "similarity.v1".to_string(),
+            candidates,
+            reference_attempt_ids: vec!["alpha".to_string(), "beta".to_string()],
+            active_epsilon: 0.0,
+            worst_quantile: 0.5,
+            min_observations: 2,
+            behavioral_weights: BehavioralWeights {
+                active_overlap: 1.0,
+                return_correlation: 1.0,
+                downside_correlation: 1.0,
+                worst_decile_correlation: 1.0,
+            },
+            cluster_threshold: 0.9,
+        }
+    }
+
+    fn similarity_candidate(
+        attempt_id: &str,
+        dates: &[&str],
+        daily_r: &[f64],
+    ) -> SimilarityCandidateInput {
+        SimilarityCandidateInput {
+            attempt_id: attempt_id.to_string(),
+            dates: dates.iter().map(|date| (*date).to_string()).collect(),
+            daily_r: daily_r.to_vec(),
+        }
+    }
+
+    fn assert_symmetric(matrix: &[Vec<f64>]) {
+        for (left, row) in matrix.iter().enumerate() {
+            assert_eq!(row.len(), matrix.len());
+            for right in 0..matrix.len() {
+                assert_eq!(row[right], matrix[right][left]);
+            }
+        }
+    }
+
+    #[test]
+    fn similarity_analysis_aligns_reference_curves_and_clusters_deterministically() {
+        let output = analyze_similarity(similarity_input(vec![
+            similarity_candidate("gamma", &["2026-01-01", "2026-01-03"], &[3.0, 1.0]),
+            similarity_candidate(
+                "beta",
+                &["2026-01-01", "2026-01-02", "2026-01-03"],
+                &[0.0, 2.0, -1.0],
+            ),
+            similarity_candidate("alpha", &["2026-01-02", "2026-01-03"], &[2.0, -1.0]),
+        ]))
+        .unwrap();
+
+        assert_eq!(output.attempt_ids, vec!["alpha", "beta", "gamma"]);
+        assert_eq!(output.reference.attempt_ids, vec!["alpha", "beta"]);
+        assert_eq!(
+            output.reference.calendar_dates,
+            vec!["2026-01-01", "2026-01-02", "2026-01-03"]
+        );
+        assert_eq!(output.reference.daily_r, vec![0.0, 4.0, -2.0]);
+        assert_eq!(output.reference.downside_observation_count, 1);
+        assert_eq!(output.reference.worst_cutoff_r, Some(0.0));
+        assert_eq!(output.reference.worst_observation_count, 2);
+        assert_eq!(output.active_overlap_matrix[0][1], 1.0);
+        assert_eq!(output.return_correlation_matrix[0][1], 1.0);
+        assert_eq!(output.downside_correlation_matrix[0][1], 0.0);
+        assert_eq!(output.worst_decile_correlation_matrix[0][1], 1.0);
+        assert_eq!(output.similarity_matrix[0][1], 0.75);
+        assert_eq!(
+            output.clusters,
+            vec![
+                SimilarityCluster {
+                    id: "behavior:alpha".to_string(),
+                    members: vec!["alpha".to_string()],
+                },
+                SimilarityCluster {
+                    id: "behavior:beta".to_string(),
+                    members: vec!["beta".to_string()],
+                },
+                SimilarityCluster {
+                    id: "behavior:gamma".to_string(),
+                    members: vec!["gamma".to_string()],
+                },
+            ]
+        );
+        assert_symmetric(&output.active_overlap_matrix);
+        assert_symmetric(&output.return_correlation_matrix);
+        assert_symmetric(&output.downside_correlation_matrix);
+        assert_symmetric(&output.worst_decile_correlation_matrix);
+        assert_symmetric(&output.similarity_matrix);
+    }
+
+    #[test]
+    fn similarity_analysis_uses_positive_correlations_and_normalized_weights() {
+        let mut input = similarity_input(vec![
+            similarity_candidate(
+                "alpha",
+                &["2026-01-01", "2026-01-02", "2026-01-03"],
+                &[1.0, 2.0, 3.0],
+            ),
+            similarity_candidate(
+                "beta",
+                &["2026-01-01", "2026-01-02", "2026-01-03"],
+                &[-1.0, -2.0, -3.0],
+            ),
+        ]);
+        input.reference_attempt_ids = vec!["alpha".to_string()];
+        input.behavioral_weights = BehavioralWeights {
+            active_overlap: 1.0,
+            return_correlation: 3.0,
+            downside_correlation: 0.0,
+            worst_decile_correlation: 0.0,
+        };
+        let output = analyze_similarity(input).unwrap();
+        assert_eq!(output.active_overlap_matrix[0][1], 1.0);
+        assert_eq!(output.return_correlation_matrix[0][1], -1.0);
+        assert_eq!(output.similarity_matrix[0][1], 0.25);
+    }
+
+    #[test]
+    fn similarity_analysis_returns_zero_for_constant_or_insufficient_correlations() {
+        let mut input = similarity_input(vec![
+            similarity_candidate(
+                "alpha",
+                &["2026-01-01", "2026-01-02", "2026-01-03"],
+                &[1.0, 1.0, 1.0],
+            ),
+            similarity_candidate(
+                "beta",
+                &["2026-01-01", "2026-01-02", "2026-01-03"],
+                &[1.0, 2.0, 3.0],
+            ),
+        ]);
+        input.reference_attempt_ids = vec!["alpha".to_string()];
+        let output = analyze_similarity(input).unwrap();
+        assert_eq!(output.return_correlation_matrix[0][1], 0.0);
+        assert_eq!(output.return_correlation_matrix[0][0], 0.0);
+        assert_eq!(output.downside_correlation_matrix[0][1], 0.0);
+        assert_eq!(output.worst_decile_correlation_matrix[0][1], 0.0);
+
+        let mut insufficient = similarity_input(vec![
+            similarity_candidate("alpha", &["2026-01-01", "2026-01-02"], &[1.0, 2.0]),
+            similarity_candidate("beta", &["2026-01-01", "2026-01-02"], &[2.0, 3.0]),
+        ]);
+        insufficient.min_observations = 3;
+        let output = analyze_similarity(insufficient).unwrap();
+        assert_eq!(output.return_correlation_matrix[0][1], 0.0);
+    }
+
+    #[test]
+    fn similarity_analysis_json_is_stable_across_input_order() {
+        let mut first = similarity_input(vec![
+            similarity_candidate("beta", &["2026-01-01", "2026-01-02"], &[1.0, -1.0]),
+            similarity_candidate("alpha", &["2026-01-01", "2026-01-02"], &[1.0, -1.0]),
+        ]);
+        first.behavioral_weights = BehavioralWeights {
+            active_overlap: 1.0,
+            return_correlation: 1.0,
+            downside_correlation: 0.0,
+            worst_decile_correlation: 0.0,
+        };
+        let mut second = first.clone();
+        second.candidates.reverse();
+        second.reference_attempt_ids.reverse();
+        let first_json = analyze_similarity_json(&serde_json::to_string(&first).unwrap()).unwrap();
+        let second_json =
+            analyze_similarity_json(&serde_json::to_string(&second).unwrap()).unwrap();
+        assert_eq!(first_json, second_json);
+        let output: Value = serde_json::from_str(&first_json).unwrap();
+        assert_eq!(output["clusters"][0]["id"], json!("behavior:alpha"));
+        assert_eq!(output["clusters"][0]["members"], json!(["alpha", "beta"]));
+    }
+
+    #[test]
+    fn similarity_clusters_are_threshold_connected_components() {
+        let ids = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
+        let matrix = vec![
+            vec![1.0, 0.9, 0.1],
+            vec![0.9, 1.0, 0.9],
+            vec![0.1, 0.9, 1.0],
+        ];
+        assert_eq!(
+            similarity_clusters(&ids, &matrix, 0.9),
+            vec![SimilarityCluster {
+                id: "behavior:alpha".to_string(),
+                members: ids,
+            }]
+        );
+    }
+
+    #[test]
+    fn similarity_validation_rejects_invalid_contracts() {
+        let valid_candidates = vec![
+            similarity_candidate("alpha", &["2026-01-01"], &[1.0]),
+            similarity_candidate("beta", &["2026-01-01"], &[2.0]),
+        ];
+
+        let mut duplicate_candidate = similarity_input(valid_candidates.clone());
+        duplicate_candidate.candidates[1].attempt_id = "alpha".to_string();
+        assert!(
+            analyze_similarity(duplicate_candidate)
+                .unwrap_err()
+                .contains("duplicate candidate")
+        );
+
+        let mut unequal_vectors = similarity_input(valid_candidates.clone());
+        unequal_vectors.candidates[0].daily_r.clear();
+        assert!(
+            analyze_similarity(unequal_vectors)
+                .unwrap_err()
+                .contains("dates but")
+        );
+
+        let mut duplicate_reference = similarity_input(valid_candidates.clone());
+        duplicate_reference.reference_attempt_ids = vec!["alpha".to_string(), "alpha".to_string()];
+        assert!(
+            analyze_similarity(duplicate_reference)
+                .unwrap_err()
+                .contains("duplicate reference")
+        );
+
+        let mut unknown_reference = similarity_input(valid_candidates.clone());
+        unknown_reference.reference_attempt_ids = vec!["missing".to_string()];
+        assert!(
+            analyze_similarity(unknown_reference)
+                .unwrap_err()
+                .contains("unknown reference")
+        );
+
+        let mut non_finite = similarity_input(valid_candidates);
+        non_finite.candidates[0].daily_r[0] = f64::NAN;
+        assert!(
+            analyze_similarity(non_finite)
+                .unwrap_err()
+                .contains("non-finite")
         );
     }
 }

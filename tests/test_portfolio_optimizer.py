@@ -1,3 +1,4 @@
+import dataclasses
 import json
 from pathlib import Path
 
@@ -184,6 +185,56 @@ def test_optimizer_selects_portfolio_from_source_calendar_curves(tmp_path: Path)
     assert metrics["max_daily_loss_streak"] == 0
 
 
+@pytest.mark.parametrize("backend", ["python", "pyo3"])
+def test_optimizer_never_removes_required_attempts(
+    tmp_path: Path, backend: str
+) -> None:
+    rows = [
+        _row(tmp_path, "required-weak", "EURUSD", [0.1, 0.1, 0.1, 0.1], score=50),
+        _row(tmp_path, "smooth-a", "GBPUSD", [1, 2, 3, 4], score=80),
+        _row(tmp_path, "smooth-b", "USDJPY", [0.5, 1.5, 2.5, 3.5], score=75),
+    ]
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=2,
+        candidate_limit=3,
+        objective_names=("stability",),
+        required_attempt_ids=("required-weak",),
+        random_starts=3,
+        max_swaps=8,
+        max_per_family=1,
+        min_fx_share=0,
+        max_metal_share=2,
+        max_index_share=2,
+        max_instrument_share=1,
+    )
+    unlocked_spec = dataclasses.replace(spec, required_attempt_ids=())
+    candidates, _ = build_optimizer_candidates(rows, spec)
+    _search, unlocked, _pareto, _used_backend = run_optimizer_backend(
+        candidates, unlocked_spec, backend=backend
+    )
+    assert "required-weak" not in unlocked["stability"]["selected_attempt_ids"]
+
+    _search, variants, _pareto, used_backend = run_optimizer_backend(
+        candidates, spec, backend=backend
+    )
+
+    assert used_backend == backend
+    assert "required-weak" in variants["stability"]["selected_attempt_ids"]
+
+
+def test_optimizer_rejects_missing_required_attempt(tmp_path: Path) -> None:
+    rows = [_row(tmp_path, "available", "EURUSD", [1, 2, 3], score=70)]
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=1,
+        required_attempt_ids=("missing",),
+        min_fx_share=0,
+    )
+    candidates, _ = build_optimizer_candidates(rows, spec)
+
+    with pytest.raises(ValueError, match="missing from the optimizer candidate pool"):
+        run_optimizer_backend(candidates, spec, backend="python")
+
+
 def test_optimizer_backend_explicit_python_remains_available_for_parity(
     tmp_path: Path,
 ) -> None:
@@ -216,6 +267,46 @@ def test_optimizer_backend_explicit_python_remains_available_for_parity(
     assert isinstance(search, PortfolioSearch)
     assert set(variants["stability"]["selected_attempt_ids"]) == {"smooth-a", "smooth-b"}
     assert pareto_front
+
+
+def test_nondefault_risk_weight_multiplier_matches_python_and_pyo3(
+    tmp_path: Path,
+) -> None:
+    rows = [
+        _row(tmp_path, "smooth-a", "EURUSD", [1, 2, 3, 4], score=65),
+        _row(tmp_path, "smooth-b", "XAUUSD", [0.5, 1.5, 2.5, 3.5], score=65),
+        _row(tmp_path, "lumpy", "USDJPY", [8, 1, 9, 2], score=95),
+    ]
+    spec = PortfolioOptimizerSpec(
+        portfolio_size=2,
+        candidate_limit=3,
+        objective_names=("stability",),
+        random_starts=0,
+        max_swaps=4,
+        max_per_family=1,
+        min_fx_share=0,
+        max_metal_share=2,
+        max_index_share=2,
+        max_instrument_share=1,
+        risk_weight_multiplier=1.15,
+    )
+    candidates, _ = build_optimizer_candidates(rows, spec)
+
+    _python_search, python_variants, _python_front, _ = run_optimizer_backend(
+        candidates, spec, backend="python"
+    )
+    _rust_search, rust_variants, _rust_front, used_backend = run_optimizer_backend(
+        candidates, spec, backend="pyo3"
+    )
+
+    assert used_backend == "pyo3"
+    assert (
+        rust_variants["stability"]["selected_attempt_ids"]
+        == python_variants["stability"]["selected_attempt_ids"]
+    )
+    assert rust_variants["stability"]["objective_score"] == pytest.approx(
+        python_variants["stability"]["objective_score"], rel=1e-9
+    )
 
 
 def test_optimizer_backend_default_auto_fails_closed_when_pyo3_is_unavailable(

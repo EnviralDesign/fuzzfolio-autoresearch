@@ -224,6 +224,110 @@ From there you can build the portfolio either way:
 - In the dashboard, use Portfolio Workbench -> Auto Build. The dashboard writes a dashboard-owned config under `runs/derived/dashboard-portfolio-configs/`, starts a local `build-portfolio` job, shows status/logs, and can import the auto-selected result into the manual draft.
 - At the terminal, run `uv run build-portfolio` directly. This uses the same canonical candidate corpus and writes the latest report under `runs/derived/portfolio-report/`.
 
+### Portfolio Research Campaigns
+
+Use `portfolio-research` for formal portfolio selection. Unlike a one-shot `optimize-portfolio` run, it heals stale full backtests without rendering corpus profile drops, fails closed on invalid promoted artifacts, freezes an immutable candidate snapshot, runs deterministic robustness experiments, performs train/embargo/test walk-forward selection, and writes finalist evidence under `runs/derived/portfolio-research/<campaign-id>/`.
+
+Campaign analysis keeps full-window perturbations separate from temporal selections, derives fold-persistent consensus candidates, deduplicates exact and semantic strategy families, and runs Rust/PyO3 behavioral clustering over return, downside, worst-decile, and activity similarity. Consensus-core portfolios are jointly optimized and replayed across available folds, but remain explicitly diagnostic until an untouched outer holdout exists. `no_champion` and `no_defensible_consensus` are valid successful outcomes.
+
+```powershell
+# Preview freshness work and experiment count without mutation.
+uv run portfolio-research --suite darwin-master-v1 --dry-run --json
+
+# Formal Darwin campaign. The lab gateway must already be available.
+uv run portfolio-research `
+  --suite darwin-master-v1 `
+  --full-backtest-backend lab-gateway `
+  --gateway-url http://127.0.0.1:8799 `
+  --trading-dashboard-root C:\repos\Trading-Dashboard `
+  --json
+
+# Resume the newest interrupted Darwin campaign from its frozen snapshot.
+uv run portfolio-research --suite darwin-master-v1 --resume --json
+
+# Rebuild analysis and human/machine reports without rerunning optimization.
+uv run portfolio-research-report --campaign-id latest --json
+```
+
+`--skip-catchup` and `--allow-incomplete-corpus` are diagnostic escape hatches. Their campaigns are marked non-promotable. `--experiment-limit` exists for bounded verification and should not be used as the basis for a promotion decision.
+
+The current temporal layer freezes strategy definitions and execution cells, then selects portfolios using train-only calendar slices and scores them on untouched test slices. It does not remove lookahead from strategy generation or execution-cell selection; those require the later nested replay and historical AutoResearch layers recorded in the campaign report.
+
+### Bounded Evidence Materialization
+
+`calculate-full-backtests` can materialize immutable, plan-qualified evidence through the lab gateway. Each profile receives a content-addressed evidence plan with exact start/end bounds, horizon, role, and profile hash. Results are stored under `evidence/full-backtest/<plan-hash>/`; a 60-month or alternate-window result cannot overwrite or satisfy the legacy 36-month files.
+
+```powershell
+# Preview the frozen canonical cohort without submitting work.
+uv run calculate-full-backtests `
+  --scope canonical `
+  --horizon-months 60 `
+  --evidence-window-start 2021-07-08T23:59:59Z `
+  --evidence-window-end 2026-07-08T23:59:59Z `
+  --selection-data-end 2026-07-08T23:59:59Z `
+  --evidence-role full_backtest `
+  --campaign-plan-id corpus-60m-v1 `
+  --lake-url http://192.168.1.2:8010 `
+  --full-backtest-backend lab-gateway `
+  --dry-run --json
+
+# Run the same resumable materialization plan.
+uv run calculate-full-backtests `
+  --scope canonical `
+  --horizon-months 60 `
+  --evidence-window-start 2021-07-08T23:59:59Z `
+  --evidence-window-end 2026-07-08T23:59:59Z `
+  --selection-data-end 2026-07-08T23:59:59Z `
+  --evidence-role full_backtest `
+  --campaign-plan-id corpus-60m-v1 `
+  --lake-url http://192.168.1.2:8010 `
+  --full-backtest-backend lab-gateway `
+  --trading-dashboard-root C:\repos\Trading-Dashboard `
+  --json
+```
+
+Use repeated `--attempt-id` arguments instead of `--scope canonical` for a predeclared stable core, portfolio cohort, or audit cohort. The retrospective older-segment pass uses the same command with `--evidence-role retrospective_historical_unseen`, exact older-segment bounds, and the frozen attempt IDs. Real custom evidence requires `--lake-url` or an explicit `--lake-manifest-sha256`; dry runs report `execution_ready: false` when that identity is absent. Custom bounded evidence is rejected on the legacy local executor because that path does not enforce the evidence plan. `--force-rebuild` is also rejected for immutable bounded plans; correct the campaign ID or window instead of overwriting evidence.
+
+Train-only execution-cell selection and frozen-cell OOS evaluation use the resumable `nested-evidence` command. It creates deterministic train tasks, freezes the selected SL/reward cell before outer submission, and stores only redacted tracked-cell outer evidence. Inside each outer training window it then runs multiple inner temporal portfolio selections, derives a structurally deduplicated consensus core, jointly optimizes around that mandatory core using train-only curves, writes the frozen portfolio immutably, and only then evaluates it on outer curves. Weak consensus returns `no_defensible_consensus`; negative outer outcomes are never filtered from the evaluation universe.
+
+Formal runs require the promoted MarketDataLake `coverage_sha256`. The coordinator freezes it into every train and outer plan. Lake list/archive/download APIs reject a changed identity, worker caches are namespaced by it, workers record the observed identity, and materialization rejects results that merely repeat the planned hash without proving what the worker observed.
+
+```powershell
+# Current three-year architecture check: two 24m-train/4m-test folds.
+uv run nested-evidence `
+  --campaign-id darwin-nested-36m-v1 `
+  --suite darwin-master-v1 `
+  --scope canonical `
+  --start 2023-07-08 `
+  --end 2026-07-08 `
+  --train-months 24 `
+  --test-months 4 `
+  --step-months 4 `
+  --embargo-days 15 `
+  --selection-basis recommended_cell `
+  --lake-url http://192.168.1.2:8010 `
+  --trading-dashboard-root C:\repos\Trading-Dashboard `
+  --optimizer-backend auto `
+  --json
+
+# Five-year target geometry after lake coverage is verified.
+uv run nested-evidence `
+  --campaign-id darwin-nested-60m-v1 `
+  --suite darwin-master-v1 `
+  --scope canonical `
+  --start 2021-07-08 `
+  --end 2026-07-08 `
+  --train-months 36 `
+  --test-months 6 `
+  --step-months 6 `
+  --embargo-days 15 `
+  --lake-url http://192.168.1.2:8010 `
+  --trading-dashboard-root C:\repos\Trading-Dashboard `
+  --json
+```
+
+Nested execution requires a dedicated/empty lab-gateway result queue, a deployed lake image with expected-coverage enforcement, and workers built from the matching Trading-Dashboard worker contract. Use `--dry-run` to resolve the indexed cohort and outer-fold geometry without contacting the gateway. Inner-fold geometry comes from `temporal_validation.inner_validation` in the selected suite.
+
 ### Path B: Manual Assembly
 
 ```powershell

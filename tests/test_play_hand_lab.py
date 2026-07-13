@@ -130,6 +130,13 @@ def test_normalize_runtime_defaults_to_cloud_tolerant_lab_attempts() -> None:
     assert runtime.max_attempts == 8
 
 
+def test_normalize_runtime_requires_lake_identity_for_historical_mode() -> None:
+    with pytest.raises(ValueError, match="exact lake_manifest_sha256"):
+        lab._normalize_runtime(
+            lab.PlayHandLabRuntimeConfig(as_of_date="2025-06-30T00:00:00Z")
+        )
+
+
 def test_normalize_runtime_defaults_to_random_screen_and_validation_rung() -> None:
     runtime = lab._normalize_runtime(lab.PlayHandLabRuntimeConfig())
 
@@ -550,6 +557,7 @@ def test_make_sweep_shard_tasks_honors_permutation_budget(
             max_sweep_permutations=16,
             sweep_shard_size=4,
             worker_contract_hash="sha256:" + "a" * 64,
+            lake_manifest_sha256="sha256:" + "b" * 64,
         ),
         reward_matrix=None,
         worker_contract_hash="sha256:" + "a" * 64,
@@ -560,12 +568,18 @@ def test_make_sweep_shard_tasks_honors_permutation_budget(
         lookback_months=3,
         axis_texts=axis_texts,
         mode="evolutionary",
+        analysis_window_start="2025-03-30T00:00:00Z",
+        analysis_window_end="2025-06-30T00:00:00Z",
     )
 
     assert len(tasks) == 4
     assert sum(int(task["payload"]["permutation_count"]) for task in tasks) == 16
     assert max(len(task["payload"]["params_by_index"]) for task in tasks) == 4
     assert {task["payload"].get("result_detail") for task in tasks} == {"summary"}
+    assert {task["payload"]["definition"]["lookback_months"] for task in tasks} == {None}
+    assert {
+        task["payload"]["evidence_plan"]["lake_manifest_sha256"] for task in tasks
+    } == {"sha256:" + "b" * 64}
     first_spec = lane.task_specs[tasks[0]["task_id"]]
     assert first_spec["permutation_budget_applied"] is True
     assert first_spec["expanded_permutation_count"] == 16
@@ -870,10 +884,85 @@ def test_deep_replay_tasks_are_self_contained_and_contract_pinned(tmp_path: Path
     assert payload["analysis_window_end"]
     assert payload["analysis_window_start"].endswith("Z")
     assert payload["analysis_window_end"].endswith("Z")
+    assert payload["lookback_months"] is None
+    assert payload["evidence_plan"]["evidence_role"] == "training"
+    assert payload["evidence_plan"]["profile_snapshot_sha256"].startswith(
+        "sha256:"
+    )
     assert lane.screen_anchor_mode == "random"
     assert lane.screen_anchor_offset_days is not None
     assert lane.task_specs[task["task_id"]]["analysis_window_start"] == payload["analysis_window_start"]
     assert lane.task_specs[task["task_id"]]["analysis_window_end"] == payload["analysis_window_end"]
+
+
+def test_fixed_as_of_date_bounds_screen_validation_and_scrutiny(tmp_path: Path) -> None:
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="run-1",
+        run_dir=tmp_path / "run-1",
+        profile_path=tmp_path / "profile.json",
+        profile_payload=_profile_payload()["profile"],
+        profile_ref="lab-inline:run-1:lane_000",
+        instruments=["EURUSD"],
+        incumbent_profile_path=tmp_path / "profile.json",
+        incumbent_profile_payload=_profile_payload()["profile"],
+        incumbent_profile_ref="lab-inline:run-1:lane_000",
+        incumbent_instruments=["EURUSD"],
+        incumbent_timeframe="M5",
+    )
+    runtime = lab.PlayHandLabRuntimeConfig(
+        task_mode="deep_replay",
+        as_of_date="2025-06-30T00:00:00Z",
+        lookback_months=3,
+        validation_months=12,
+        scrutiny_months=36,
+        worker_contract_hash="sha256:" + "a" * 64,
+    )
+    lab._sample_lane_screen_anchor(lane, runtime)
+
+    validation = lab._enqueue_validation_stage(
+        lane,
+        runtime=runtime,
+        reward_matrix=None,
+        worker_contract_hash=runtime.worker_contract_hash,
+    )[0]["payload"]
+    scrutiny = lab._enqueue_final_stage(
+        lane,
+        runtime=runtime,
+        reward_matrix=None,
+        worker_contract_hash=runtime.worker_contract_hash,
+    )[0]["payload"]
+
+    assert lane.screen_anchor_mode == "fixed_as_of"
+    assert lane.screen_analysis_window_end == "2025-06-30T00:00:00Z"
+    assert validation["analysis_window_end"] == "2025-06-30T00:00:00Z"
+    assert validation["analysis_window_start"] == "2024-06-30T00:00:00Z"
+    assert scrutiny["analysis_window_end"] == "2025-06-30T00:00:00Z"
+    assert scrutiny["analysis_window_start"] == "2022-06-30T00:00:00Z"
+    assert validation["evidence_plan"]["selection_data_end"] == validation["analysis_window_end"]
+    assert scrutiny["evidence_plan"]["selection_data_end"] == scrutiny["analysis_window_end"]
+
+
+def test_historical_execution_receipt_must_match_plan() -> None:
+    plan = {
+        "plan_id": "sha256:" + "a" * 64,
+        "profile_snapshot_sha256": "sha256:" + "b" * 64,
+        "execution_cell_sha256": None,
+        "lake_manifest_sha256": "sha256:" + "c" * 64,
+    }
+    receipt = {
+        "plan_id": plan["plan_id"],
+        "profile_snapshot_sha256": plan["profile_snapshot_sha256"],
+        "execution_cell_sha256": None,
+        "observed_lake_manifest_sha256": plan["lake_manifest_sha256"],
+    }
+
+    assert lab._validated_execution_evidence(
+        {"execution_evidence": receipt}, plan
+    ) == receipt
+    with pytest.raises(RuntimeError, match="omitted execution_evidence"):
+        lab._validated_execution_evidence({}, plan)
 
 
 def test_fake_compute_tasks_require_lab_protocol_capability(tmp_path: Path) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import calendar
 import copy
 import concurrent.futures
+import hashlib
 import itertools
 import json
 import os
@@ -21,6 +22,7 @@ from rich.console import Console
 from .play_hand_lab_auth import load_lab_gateway_token
 from .config import AppConfig, load_config
 from .fuzzfolio import CliError, FuzzfolioCli
+from .evidence_plan import build_replay_evidence_plan
 from .ledger import (
     attempts_path_for_run_dir,
     load_attempts,
@@ -85,6 +87,14 @@ from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapsho
 
 
 console = Console(safe_box=True)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
 
 PLAY_HAND_LAB_RUNNER = "play_hand_lab_v1"
 PLAY_HAND_LAB_CAMPAIGN_SCHEMA_VERSION = "play_hand_lab_campaign_v1"
@@ -165,6 +175,8 @@ class PlayHandLabRuntimeConfig:
     final_min_score: float = DEFAULT_LAB_FINAL_MIN_SCORE
     screen_anchor_mode: Literal["now", "random"] = DEFAULT_LAB_SCREEN_ANCHOR_MODE
     screen_anchor_envelope_months: int = DEFAULT_LAB_SCREEN_ANCHOR_ENVELOPE_MONTHS
+    as_of_date: str | None = None
+    lake_manifest_sha256: str | None = None
     instrument_scout_size: int = INSTRUMENT_SCOUT_DEFAULT_SIZE
     instrument_scout_max_selected: int = INSTRUMENT_SCOUT_DEFAULT_MAX_SELECTED
     fake_work_seconds: float = 1.0
@@ -497,6 +509,20 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         int(runtime.screen_anchor_envelope_months),
         lookback_months,
     )
+    as_of_date = str(runtime.as_of_date or "").strip() or None
+    if as_of_date:
+        parsed_as_of = datetime.fromisoformat(as_of_date.replace("Z", "+00:00"))
+        if parsed_as_of.tzinfo is None:
+            parsed_as_of = parsed_as_of.replace(tzinfo=timezone.utc)
+        as_of_date = _utc_iso(parsed_as_of)
+        if not str(runtime.lake_manifest_sha256 or "").strip():
+            raise ValueError("Historical PlayHand requires an exact lake_manifest_sha256.")
+        if runtime.seed_plan_path is None:
+            raise ValueError("Historical PlayHand requires an explicit Atlas seed_plan_path.")
+        if not Path(runtime.seed_plan_path).expanduser().is_file():
+            raise ValueError(
+                f"Historical PlayHand seed_plan_path does not exist: {runtime.seed_plan_path}"
+            )
     result_batch_size = max(int(runtime.result_batch_size), 1)
     max_results_per_cycle = max(int(runtime.max_results_per_cycle), result_batch_size)
     return PlayHandLabRuntimeConfig(
@@ -539,6 +565,12 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         final_min_score=float(runtime.final_min_score),
         screen_anchor_mode=screen_anchor_mode,  # type: ignore[arg-type]
         screen_anchor_envelope_months=screen_anchor_envelope_months,
+        as_of_date=as_of_date,
+        lake_manifest_sha256=(
+            str(runtime.lake_manifest_sha256).strip()
+            if runtime.lake_manifest_sha256
+            else None
+        ),
         instrument_scout_size=max(int(runtime.instrument_scout_size), 1),
         instrument_scout_max_selected=max(int(runtime.instrument_scout_max_selected), 1),
         fake_work_seconds=max(float(runtime.fake_work_seconds), 0.0),
@@ -904,6 +936,8 @@ def _write_campaign_metadata(
             "final_min_score": runtime.final_min_score,
             "screen_anchor_mode": runtime.screen_anchor_mode,
             "screen_anchor_envelope_months": runtime.screen_anchor_envelope_months,
+            "as_of_date": runtime.as_of_date,
+            "lake_manifest_sha256": runtime.lake_manifest_sha256,
             "instrument_scout_size": runtime.instrument_scout_size,
             "instrument_scout_max_selected": runtime.instrument_scout_max_selected,
             "required_worker_contract_hash": runtime.worker_contract_hash,
@@ -966,6 +1000,8 @@ def _write_lane_metadata(
             "screen_analysis_window_end": lane.screen_analysis_window_end,
             "screen_anchor_offset_days": lane.screen_anchor_offset_days,
             "screen_anchor_envelope_months": runtime.screen_anchor_envelope_months,
+            "as_of_date": runtime.as_of_date,
+            "lake_manifest_sha256": runtime.lake_manifest_sha256,
             "bar_limit": runtime.bar_limit,
             "instruments": list(lane.instruments),
             "indicators": list(lane.indicator_ids),
@@ -1331,6 +1367,16 @@ def _sample_lane_screen_anchor(lane: LabLaneState, runtime: PlayHandLabRuntimeCo
     lane.screen_analysis_window_start = None
     lane.screen_analysis_window_end = None
     lane.screen_anchor_offset_days = None
+    if runtime.as_of_date:
+        end = datetime.fromisoformat(runtime.as_of_date.replace("Z", "+00:00"))
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        end = end.astimezone(timezone.utc)
+        start = _subtract_calendar_months(end, int(runtime.lookback_months))
+        lane.screen_anchor_mode = "fixed_as_of"
+        lane.screen_analysis_window_start = _utc_iso(start)
+        lane.screen_analysis_window_end = _utc_iso(end)
+        return
     if lane.screen_anchor_mode != "random":
         return
 
@@ -1357,6 +1403,18 @@ def _sample_lane_screen_anchor(lane: LabLaneState, runtime: PlayHandLabRuntimeCo
 
 def _lane_screen_window(lane: LabLaneState) -> tuple[str | None, str | None]:
     return lane.screen_analysis_window_start, lane.screen_analysis_window_end
+
+
+def _runtime_as_of_window(
+    runtime: PlayHandLabRuntimeConfig, months: int
+) -> tuple[str | None, str | None]:
+    if not runtime.as_of_date:
+        return None, None
+    end = datetime.fromisoformat(runtime.as_of_date.replace("Z", "+00:00"))
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    end = end.astimezone(timezone.utc)
+    return _utc_iso(_subtract_calendar_months(end, months)), _utc_iso(end)
 
 
 def _validation_phase(runtime: PlayHandLabRuntimeConfig) -> str:
@@ -1906,6 +1964,21 @@ def _deep_replay_job_payload(
     analysis_window_end: str | None = None,
 ) -> dict[str, Any]:
     profile_payload = _copy_profile_payload(profile_payload or lane.profile_payload)
+    if bool(analysis_window_start) != bool(analysis_window_end):
+        raise ValueError("Evidence-bound replay requires both analysis window bounds.")
+    evidence_plan = None
+    if analysis_window_start and analysis_window_end:
+        evidence_plan = build_replay_evidence_plan(
+            campaign_plan_id=f"playhand-lab:{lane.run_id}",
+            evidence_role="training",
+            selection_data_end=analysis_window_end,
+            analysis_window_start=analysis_window_start,
+            analysis_window_end=analysis_window_end,
+            requested_horizon_months=int(lookback_months or runtime.lookback_months),
+            profile_snapshot=profile_payload,
+            lake_manifest_sha256=runtime.lake_manifest_sha256,
+            data_availability_cutoff=analysis_window_end,
+        )
     job: dict[str, Any] = {
         "job_id": task_id,
         "user_id": DEFAULT_LAB_USER_ID,
@@ -1923,9 +1996,16 @@ def _deep_replay_job_payload(
         "instruments": list(instruments or lane.instruments),
         "timeframe": str(timeframe or lane.timeframe),
         "market_data_source": "lake_bars",
-        "lookback_months": int(lookback_months or runtime.lookback_months),
+        "lookback_months": (
+            None
+            if evidence_plan
+            else int(lookback_months or runtime.lookback_months)
+        ),
         "analysis_window_start": analysis_window_start,
         "analysis_window_end": analysis_window_end,
+        "evidence_plan": (
+            evidence_plan.model_dump(mode="json") if evidence_plan else None
+        ),
         "bar_limit": int(runtime.bar_limit),
         "alert_threshold": float(profile_payload.get("notificationThreshold") or 80.0),
         "view_mode": "overview",
@@ -2019,6 +2099,7 @@ def _make_deep_replay_task(
             "lookback_months": lookback_months,
             "analysis_window_start": analysis_window_start,
             "analysis_window_end": analysis_window_end,
+            "evidence_plan": payload.get("evidence_plan"),
         },
     )
     return {
@@ -2047,13 +2128,28 @@ def _sweep_definition_payload(
     analysis_window_end: str | None,
     mode: str,
 ) -> dict[str, Any]:
+    if bool(analysis_window_start) != bool(analysis_window_end):
+        raise ValueError("Evidence-bound sweep requires both analysis window bounds.")
+    evidence_plan = None
+    if analysis_window_start and analysis_window_end:
+        evidence_plan = build_replay_evidence_plan(
+            campaign_plan_id=f"playhand-lab:{lane.run_id}",
+            evidence_role="training",
+            selection_data_end=analysis_window_end,
+            analysis_window_start=analysis_window_start,
+            analysis_window_end=analysis_window_end,
+            requested_horizon_months=int(lookback_months),
+            profile_snapshot=profile_payload,
+            lake_manifest_sha256=runtime.lake_manifest_sha256,
+            data_availability_cutoff=analysis_window_end,
+        )
     definition: dict[str, Any] = {
         "base_profile_id": profile_ref,
         "axes": _sanitize_sweep_axes_for_contract(axes),
         "instruments": list(instruments),
         "mode": "deterministic" if mode not in {"deterministic", "evolutionary"} else mode,
         "evolutionary_config": None,
-        "lookback_months": int(lookback_months),
+        "lookback_months": None if evidence_plan else int(lookback_months),
         "analysis_window_start": analysis_window_start,
         "analysis_window_end": analysis_window_end,
         "bar_limit": int(runtime.bar_limit),
@@ -2070,6 +2166,9 @@ def _sweep_definition_payload(
             "slippage_bps": 1.0,
             "commission_bps": 0.5,
         },
+        "evidence_plan": (
+            evidence_plan.model_dump(mode="json") if evidence_plan else None
+        ),
     }
     matrix = _reward_matrix_payload(reward_matrix)
     if matrix:
@@ -2145,6 +2244,7 @@ def _make_sweep_shard_tasks(
             "source_kind": "workspace_attempt",
             "client_origin": PLAY_HAND_LAB_RUNNER,
             "definition": definition,
+            "evidence_plan": definition.get("evidence_plan"),
             "base_profile_snapshot": _copy_profile_payload(profile_payload),
             "permutation_start": start,
             "permutation_count": len(chunk),
@@ -2172,6 +2272,7 @@ def _make_sweep_shard_tasks(
                 "lookback_months": lookback_months,
                 "analysis_window_start": analysis_window_start,
                 "analysis_window_end": analysis_window_end,
+                "evidence_plan": definition.get("evidence_plan"),
                 "axes": list(axis_plan.axes),
                 "axis_key_map": {
                     _sweep_axis_key(axis): str(axis.get("lab_axis_key") or "")
@@ -2349,6 +2450,35 @@ def _fake_attempt_score(result: dict[str, Any]) -> AttemptScore:
     )
 
 
+def _validated_execution_evidence(
+    result_payload: dict[str, Any],
+    evidence_plan: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not evidence_plan:
+        return None
+    nested = result_payload.get("result")
+    nested = nested if isinstance(nested, dict) else {}
+    receipt = result_payload.get("execution_evidence") or nested.get(
+        "execution_evidence"
+    )
+    if not evidence_plan.get("lake_manifest_sha256") and not isinstance(receipt, dict):
+        return None
+    if not isinstance(receipt, dict):
+        raise RuntimeError("Evidence-bound historical result omitted execution_evidence")
+    expected = {
+        "plan_id": evidence_plan.get("plan_id"),
+        "profile_snapshot_sha256": evidence_plan.get("profile_snapshot_sha256"),
+        "execution_cell_sha256": evidence_plan.get("execution_cell_sha256"),
+        "observed_lake_manifest_sha256": evidence_plan.get("lake_manifest_sha256"),
+    }
+    for key, value in expected.items():
+        if receipt.get(key) != value:
+            raise RuntimeError(
+                f"Historical execution receipt {key} mismatch: expected {value!r}, observed {receipt.get(key)!r}"
+            )
+    return dict(receipt)
+
+
 def _record_lab_result(
     *,
     config: AppConfig,
@@ -2365,6 +2495,9 @@ def _record_lab_result(
     task_kind = str(task_spec.get("task_kind") or runtime.task_mode)
     phase = str(task_spec.get("phase") or task_kind)
     result_payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
+    evidence_plan = task_spec.get("evidence_plan")
+    evidence_plan = evidence_plan if isinstance(evidence_plan, dict) else {}
+    execution_evidence = _validated_execution_evidence(result_payload, evidence_plan)
     artifact_dir = (lane_ctx.evals_dir / f"eval_lab_{phase}_{task_id}_{_utc_stamp()}").resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
     if runtime.retain_raw_lab_artifacts:
@@ -2475,6 +2608,10 @@ def _record_lab_result(
             "play_hand_phase": phase,
             "analysis_window_start": task_spec.get("analysis_window_start"),
             "analysis_window_end": task_spec.get("analysis_window_end"),
+            "evidence_plan_id": evidence_plan.get("plan_id"),
+            "evidence_role": evidence_plan.get("evidence_role"),
+            "evidence_plan": evidence_plan or None,
+            "execution_evidence": execution_evidence,
             "worker_id": lab_result.get("worker_id"),
             "worker_lease_id": lab_result.get("lease_id"),
             "run_status": "failed" if score_warning else "screened",
@@ -2523,6 +2660,8 @@ def _record_lab_result(
         "lookback_months": int(task_spec.get("lookback_months") or runtime.lookback_months),
         "analysis_window_start": task_spec.get("analysis_window_start"),
         "analysis_window_end": task_spec.get("analysis_window_end"),
+        "evidence_plan_id": evidence_plan.get("plan_id"),
+        "evidence_role": evidence_plan.get("evidence_role"),
         "sweep_payload": sweep_payload if task_kind == "sweep_shard" else None,
     }
 
@@ -2997,6 +3136,9 @@ def _enqueue_instrument_scout_stage(
     scout_instruments = list(dict.fromkeys([symbol for symbol in scout_instruments if symbol]))
     _set_lane_phase(lane, "instrument_scout")
     tasks: list[dict[str, Any]] = []
+    analysis_window_start, analysis_window_end = _runtime_as_of_window(
+        runtime, runtime.validation_months
+    )
     for instrument in scout_instruments:
         tasks.append(
             _make_deep_replay_task(
@@ -3011,6 +3153,8 @@ def _enqueue_instrument_scout_stage(
                 instruments=[instrument],
                 timeframe=lane.incumbent_timeframe or lane.timeframe,
                 lookback_months=runtime.validation_months,
+                analysis_window_start=analysis_window_start,
+                analysis_window_end=analysis_window_end,
             )
         )
     return tasks
@@ -3027,6 +3171,9 @@ def _enqueue_validation_stage(
         return []
     _set_lane_phase(lane, "validation")
     phase = _validation_phase(runtime)
+    analysis_window_start, analysis_window_end = _runtime_as_of_window(
+        runtime, runtime.validation_months
+    )
     return [
         _make_deep_replay_task(
             lane,
@@ -3040,6 +3187,8 @@ def _enqueue_validation_stage(
             instruments=list(lane.incumbent_instruments or lane.instruments),
             timeframe=lane.incumbent_timeframe or lane.timeframe,
             lookback_months=runtime.validation_months,
+            analysis_window_start=analysis_window_start,
+            analysis_window_end=analysis_window_end,
         )
     ]
 
@@ -3054,6 +3203,9 @@ def _enqueue_final_stage(
     if lane.incumbent_profile_ref is None or lane.incumbent_profile_payload is None:
         return []
     _set_lane_phase(lane, "scrutiny")
+    analysis_window_start, analysis_window_end = _runtime_as_of_window(
+        runtime, runtime.scrutiny_months
+    )
     return [
         _make_deep_replay_task(
             lane,
@@ -3067,6 +3219,8 @@ def _enqueue_final_stage(
             instruments=list(lane.incumbent_instruments or lane.instruments),
             timeframe=lane.incumbent_timeframe or lane.timeframe,
             lookback_months=runtime.scrutiny_months,
+            analysis_window_start=analysis_window_start,
+            analysis_window_end=analysis_window_end,
         )
     ]
 
@@ -4083,6 +4237,19 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             campaign_ctx=campaign_ctx,
             runtime=runtime,
         )
+        if runtime.as_of_date:
+            if seed_plan is None or seed_plan_path is None:
+                raise RuntimeError("Historical PlayHand did not load its frozen Atlas seed plan.")
+            _write_campaign_metadata(
+                campaign_ctx,
+                runtime=runtime,
+                status="starting",
+                started_at=started_at,
+                extra={
+                    "play_hand_seed_plan_path": str(seed_plan_path.resolve()),
+                    "play_hand_seed_plan_sha256": _file_sha256(seed_plan_path),
+                },
+            )
     except Exception as exc:
         _append_event(
             campaign_ctx,
@@ -4172,6 +4339,9 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     deal.get("indicator_deal") if isinstance(deal, dict) else None
                 ),
                 "play_hand_seed_plan_path": str(seed_plan_path) if seed_plan_path else None,
+                "play_hand_seed_plan_sha256": (
+                    _file_sha256(seed_plan_path) if seed_plan_path else None
+                ),
                 "play_hand_seed_plan_loaded": seed_plan is not None,
                 "reward_matrix": reward_matrix,
                 "required_worker_contract_hash": worker_contract_hash,
