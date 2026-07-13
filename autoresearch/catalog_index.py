@@ -31,6 +31,8 @@ from .ledger import (
     run_metadata_path_for_run_dir,
 )
 from .scoring import CANONICAL_SCORE_LAB_VERSION
+from .corpus_archive import ExclusionLookup, exclusion_lookup, is_excluded_from_lookup
+from .instrument_universe import research_eligibility_report, universe_provenance
 
 
 CATALOG_INDEX_SCHEMA_VERSION = 2
@@ -66,6 +68,52 @@ def _json_loads(payload: str | None) -> Any:
         return json.loads(payload)
     except json.JSONDecodeError:
         return None
+
+
+def _catalog_row_instruments(row: dict[str, Any]) -> list[Any]:
+    for key in ("instruments_36m", "base_instruments", "request_instruments", "instruments"):
+        value = row.get(key)
+        if isinstance(value, list) and value:
+            return value
+    return []
+
+
+def annotate_universe_eligibility(row: dict[str, Any]) -> dict[str, Any]:
+    annotated = dict(row)
+    report = research_eligibility_report(_catalog_row_instruments(annotated))
+    annotated["universe_contract"] = universe_provenance()
+    annotated["research_eligible"] = bool(report["is_eligible"])
+    annotated["research_ineligible_instruments"] = list(report["ineligible"])
+    annotated["research_unknown_instruments"] = list(report["unknown"])
+    return annotated
+
+
+def _catalog_runs_root(config: Any) -> Path | None:
+    runs_root = getattr(config, "runs_root", None)
+    if runs_root is None:
+        derived_root = getattr(config, "derived_root", None)
+        runs_root = Path(derived_root).parent if derived_root is not None else None
+    return Path(runs_root) if runs_root is not None else None
+
+
+def catalog_row_is_active(
+    config: Any,
+    row: dict[str, Any],
+    *,
+    lookup: ExclusionLookup | None = None,
+) -> bool:
+    runs_root = _catalog_runs_root(config)
+    if runs_root is None:
+        # Small query-only callers may not have a corpus root or an exclusion index.
+        return True
+    lookup = lookup or exclusion_lookup(runs_root)
+    if is_excluded_from_lookup(
+        lookup,
+        run_id=str(row.get("run_id") or "") or None,
+        attempt_id=str(row.get("attempt_id") or "") or None,
+    ):
+        return False
+    return bool(annotate_universe_eligibility(row)["research_eligible"])
 
 
 def _atomic_text_path(path: Path):
@@ -952,6 +1000,8 @@ def iter_catalog_rows(
     order_by_priority: bool = True,
 ) -> Any:
     db_path = _catalog_db_path(config)
+    runs_root = _catalog_runs_root(config)
+    lookup = exclusion_lookup(runs_root) if runs_root is not None else None
     with _connect_catalog_db(db_path) as conn:
         sql, params = _row_select_sql(
             run_ids,
@@ -960,8 +1010,10 @@ def iter_catalog_rows(
         )
         for (row_json,) in conn.execute(sql, params):
             payload = _json_loads(row_json)
-            if isinstance(payload, dict):
-                yield payload
+            if isinstance(payload, dict) and catalog_row_is_active(
+                config, payload, lookup=lookup
+            ):
+                yield annotate_universe_eligibility(payload)
 
 
 def iter_promoted_catalog_rows(
@@ -1063,11 +1115,15 @@ def iter_promoted_catalog_rows(
             attempt_id ASC,
             row_key ASC
     """
+    runs_root = _catalog_runs_root(config)
+    lookup = exclusion_lookup(runs_root) if runs_root is not None else None
     with _connect_catalog_db(_catalog_db_path(config)) as conn:
         for (row_json,) in conn.execute(sql, params):
             payload = _json_loads(row_json)
-            if isinstance(payload, dict):
-                yield payload
+            if isinstance(payload, dict) and catalog_row_is_active(
+                config, payload, lookup=lookup
+            ):
+                yield annotate_universe_eligibility(payload)
 
 
 def iter_full_backtest_rows(
@@ -1084,6 +1140,8 @@ def iter_full_backtest_rows(
     if attempt_ids:
         clauses.append(f"attempt_id IN ({','.join('?' for _ in attempt_ids)})")
         params.extend(attempt_ids)
+    runs_root = _catalog_runs_root(config)
+    lookup = exclusion_lookup(runs_root) if runs_root is not None else None
     with _connect_catalog_db(_catalog_db_path(config)) as conn:
         cursor = conn.execute(
             f"""
@@ -1096,8 +1154,10 @@ def iter_full_backtest_rows(
         )
         for (row_json,) in cursor:
             payload = _json_loads(row_json)
-            if isinstance(payload, dict):
-                yield payload
+            if isinstance(payload, dict) and catalog_row_is_active(
+                config, payload, lookup=lookup
+            ):
+                yield annotate_universe_eligibility(payload)
 
 
 def catalog_summary_from_sqlite(
@@ -1629,7 +1689,7 @@ def refresh_incremental_attempt_catalog(
                             run_metadata = load_run_metadata(run_dir)
                             attempts = load_run_attempts(run_dir)
                             rows = [
-                                extract_attempt_catalog_row(
+                                annotate_universe_eligibility(extract_attempt_catalog_row(
                                     attempt,
                                     run_metadata,
                                     validation_cache_root=validation_cache_root,
@@ -1637,7 +1697,7 @@ def refresh_incremental_attempt_catalog(
                                     full_backtest_max_age_days=7.0,
                                     market_session_tolerance_days=5,
                                     market_data_coverage=market_data_coverage,
-                                )
+                                ))
                                 for attempt in attempts
                             ]
                             rebuilt_signature = _signature_from_attempts(

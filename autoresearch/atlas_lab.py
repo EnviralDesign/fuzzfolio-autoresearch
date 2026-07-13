@@ -67,14 +67,7 @@ from .play_hand_lab import (
     PLAY_HAND_LAB_WORKER_PROTOCOL_CAPABILITY,
     LabGatewayClient,
 )
-from .play_hand import (
-    CRYPTO_INSTRUMENT_POOL,
-    ENERGIES_INSTRUMENT_POOL,
-    FX_MAJOR_INSTRUMENT_POOL,
-    FX_MINOR_INSTRUMENT_POOL,
-    INDICES_INSTRUMENT_POOL,
-    METALS_INSTRUMENT_POOL,
-)
+from .instrument_universe import research_eligible_instruments, universe_provenance
 from .play_hand_lab_auth import load_lab_gateway_token
 from .evidence_plan import build_replay_evidence_plan
 from .recipe_priors import DEFAULT_RECIPE_PRIORS_DIRNAME, build_recipe_priors
@@ -133,25 +126,10 @@ def _ordered_unique_tokens(values: list[str] | tuple[str, ...]) -> list[str]:
 
 ATLAS_STANDARD_SIGNAL_ROLES = ("trigger",)
 ATLAS_RICH_SIGNAL_ROLES = ("trigger", "setup", "context", "filter")
-ATLAS_STANDARD_INSTRUMENTS = tuple(DEFAULT_SIGNAL_INSTRUMENTS)
-ATLAS_CORE_INDEX_INSTRUMENTS = tuple(
-    symbol for symbol in INDICES_INSTRUMENT_POOL if symbol in {"US500", "USTECH", "DE40", "JP225"}
+ATLAS_STANDARD_INSTRUMENTS = research_eligible_instruments(
+    asset_classes=("fx", "metal")
 )
-ATLAS_CORE_CRYPTO_INSTRUMENTS = tuple(
-    symbol for symbol in CRYPTO_INSTRUMENT_POOL if symbol in {"BTCUSD", "ETHUSD"}
-)
-ATLAS_RICH_INSTRUMENTS = tuple(
-    _ordered_unique_tokens(
-        (
-            *FX_MAJOR_INSTRUMENT_POOL,
-            *FX_MINOR_INSTRUMENT_POOL,
-            *METALS_INSTRUMENT_POOL,
-            *ENERGIES_INSTRUMENT_POOL,
-            *ATLAS_CORE_INDEX_INSTRUMENTS,
-            *ATLAS_CORE_CRYPTO_INSTRUMENTS,
-        )
-    )
-)
+ATLAS_RICH_INSTRUMENTS = research_eligible_instruments()
 ATLAS_STANDARD_TIMEFRAMES = tuple(DEFAULT_SIGNAL_TIMEFRAMES)
 ATLAS_RICH_TIMEFRAMES = ("M1", "M5", "M15", "H1")
 ATLAS_WIDE_DISCOVERY_TIMEFRAMES = ("M1", "M5", "M15", "M30", "H1", "H4", "D1")
@@ -2225,6 +2203,7 @@ def run_atlas_lab(
             "schema_version": ATLAS_LAB_RUN_SCHEMA_VERSION,
             "run_id": paths.run_id,
             "started_at": started_at,
+            "universe_contract": universe_provenance(),
             "status": "running",
             "runtime": asdict(runtime),
             "atlas_profile": profile,

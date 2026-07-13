@@ -43,6 +43,7 @@ from .indicator_atlas import DEFAULT_ATLAS_DIRNAME, build_indicator_atlas, load_
 from .recipe_priors import DEFAULT_RECIPE_PRIORS_DIRNAME
 from .scoring import build_attempt_score, load_sensitivity_snapshot
 from .signal_atlas import DEFAULT_INSTRUMENTS, DEFAULT_SIGNAL_ATLAS_DIRNAME, DEFAULT_TIMEFRAMES
+from .instrument_universe import require_research_eligible, universe_provenance
 
 
 SCHEMA_VERSION = "discovery_pair_atlas_v1"
@@ -988,7 +989,10 @@ def build_discovery_pair_atlas(
     )
     catalog_by_id = _catalog_by_id(catalog_payload)
 
-    instrument_panel = _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS)
+    instrument_panel = require_research_eligible(
+        _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS),
+        context="Discovery pair Atlas instruments",
+    )
     timeframe_panel = _normalize_tokens(timeframes) or list(DEFAULT_TIMEFRAMES)
     lookback_months = max(1, int(lookback_months or DEFAULT_LOOKBACK_MONTHS))
     resolved_as_of_date = resolve_probe_as_of_date(as_of_date)
@@ -1090,6 +1094,7 @@ def build_discovery_pair_atlas(
     summary = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "universe_contract": universe_provenance(),
         "source": {
             "indicator_atlas_dir": str(indicator_dir),
             "signal_atlas_dir": str(signal_dir),

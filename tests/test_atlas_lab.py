@@ -758,8 +758,8 @@ def test_run_atlas_lab_build_phase_writes_json_safe_metadata(tmp_path: Path, mon
     assert metadata["runtime"]["atlas_profile"] == "rich"
     assert metadata["atlas_profile"]["name"] == "rich"
     assert signal_kwargs[0]["signal_role"] == "trigger,setup,context,filter"
-    assert "US500" in signal_kwargs[0]["instruments"]
-    assert "ETHUSD" in signal_kwargs[0]["instruments"]
+    assert "US500" not in signal_kwargs[0]["instruments"]
+    assert "ETHUSD" not in signal_kwargs[0]["instruments"]
     assert signal_kwargs[0]["timeframes"] == ["M1", "M5", "M15", "H1"]
     assert metadata["paths"]["run_root"] == str(result.run_root)
 
@@ -864,7 +864,7 @@ def test_atlas_rich_profile_declares_broader_observation_surface() -> None:
     assert standard["timing_variant_sides"] == ["trigger", "anchor"]
     assert rich["timing_variant_sides"] == ["trigger", "anchor", "both"]
     assert len(rich["signal_instruments"]) > len(standard["signal_instruments"])
-    assert {"EURUSD", "XAUUSD", "XTIUSD", "US500", "ETHUSD"}.issubset(
+    assert {"EURUSD", "XAUUSD", "XTIUSD", "DE40", "US30"}.issubset(
         set(rich["signal_instruments"])
     )
     assert "SOLUSD" not in rich_markets["signal_instruments"]

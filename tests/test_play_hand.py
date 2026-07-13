@@ -3147,21 +3147,17 @@ def test_deal_instruments_honors_pinned_instrument() -> None:
     assert dealt["instruments"] == ["XAUUSD"]
 
 
-def test_deal_instruments_filters_excluded_research_instruments() -> None:
-    dealt = deal_instruments(
-        instrument=["SOLUSD", "EURUSD"],
-        instrument_pool=["SOLUSD", "GBPUSD"],
-        rng=random.Random(123),
-    )
-
-    assert dealt["source"] == "pinned"
-    assert dealt["primary_instrument"] == "EURUSD"
-    assert dealt["instruments"] == ["EURUSD"]
-    assert "SOLUSD" not in dealt["instrument_pool"]
+def test_deal_instruments_rejects_mixed_eligible_and_retired_inputs() -> None:
+    with pytest.raises(ValueError, match="ineligible=SOLUSD"):
+        deal_instruments(
+            instrument=["SOLUSD", "EURUSD"],
+            instrument_pool=["GBPUSD"],
+            rng=random.Random(123),
+        )
 
 
 def test_deal_instruments_rejects_only_excluded_pinned_instrument() -> None:
-    with pytest.raises(ValueError, match="excluded AutoResearch instrument"):
+    with pytest.raises(ValueError, match="ineligible=SOLUSD"):
         deal_instruments(
             instrument=["SOLUSD"],
             instrument_pool=["EURUSD", "GBPUSD"],
@@ -3187,26 +3183,19 @@ def test_resolve_instrument_pool_preset_all_matches_catalog_trimmed_set() -> Non
 
     assert pool == list(ALL_INSTRUMENT_POOL)
     assert "SOLUSD" not in (pool or [])
-    assert len(pool or []) == 44
+    assert len(pool or []) == 36
 
 
-def test_resolve_instrument_pool_presets_union_multiple_sets_and_explicit_symbols() -> None:
-    pool = resolve_instrument_pool_presets(
-        presets=["fx-major,metals", "crypto"],
-        instrument_pool=["EURUSD", "US500"],
-    )
-
-    assert pool == [
-        *FX_MAJOR_INSTRUMENT_POOL,
-        *METALS_INSTRUMENT_POOL,
-        *CRYPTO_INSTRUMENT_POOL,
-        "US500",
-    ]
-    assert "SOLUSD" not in (pool or [])
+def test_resolve_instrument_pool_presets_rejects_mixed_active_and_deferred_symbols() -> None:
+    with pytest.raises(ValueError, match="ineligible=US500"):
+        resolve_instrument_pool_presets(
+            presets=["fx-major,metals", "crypto"],
+            instrument_pool=["EURUSD", "US500"],
+        )
 
 
 def test_resolve_instrument_pool_presets_rejects_only_excluded_explicit_symbols() -> None:
-    with pytest.raises(ValueError, match="excluded AutoResearch instrument"):
+    with pytest.raises(ValueError, match="ineligible=SOLUSD"):
         resolve_instrument_pool_presets(presets=None, instrument_pool=["SOLUSD"])
 
 

@@ -43,6 +43,11 @@ from rich.text import Text
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from autoresearch.config import load_config
+    from autoresearch.corpus_archive import (
+        archive_retired_universe_runs,
+        compact_archive_metadata,
+    )
+    from autoresearch.instrument_universe import research_eligibility_report, universe_provenance
     from autoresearch.catalog_index import (
         acknowledge_run_metadata_only_updates,
         build_full_backtest_audit_from_sqlite,
@@ -190,6 +195,7 @@ if __package__ in {None, ""}:
         load_run_attempts,
         make_attempt_record,
         run_metadata_path_for_run_dir,
+        write_run_metadata,
         write_attempts,
     )
     from autoresearch.plotting import (
@@ -343,6 +349,8 @@ if __package__ in {None, ""}:
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
+    from .corpus_archive import archive_retired_universe_runs, compact_archive_metadata
+    from .instrument_universe import research_eligibility_report, universe_provenance
     from .catalog_index import (
         acknowledge_run_metadata_only_updates,
         build_full_backtest_audit_from_sqlite,
@@ -486,6 +494,7 @@ else:
         load_run_attempts,
         make_attempt_record,
         run_metadata_path_for_run_dir,
+        write_run_metadata,
         write_attempts,
     )
     from .plotting import (
@@ -752,6 +761,8 @@ PUBLIC_CLI_COMMANDS = {
     "cleanup-incomplete-playhand-runs",
     "cleanup-atlas-artifacts",
     "cleanup-playhand-lab-raw-artifacts",
+    "archive-retired-universe",
+    "compact-retired-universe-archive",
     "compact-runs-json",
     "dashboard",
     "record-attempt",
@@ -2964,6 +2975,42 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="How many matched runs to include in the preview output.",
     )
     prune_runs.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+    archive_universe = subparsers.add_parser(
+        "archive-retired-universe",
+        help="Archive runs referencing retired or deferred universe instruments into an indexed cohort.",
+    )
+    archive_universe.add_argument(
+        "--run-id",
+        action="append",
+        default=None,
+        help="Only consider the named run id. Can be repeated.",
+    )
+    archive_universe.add_argument(
+        "--cohort",
+        default=None,
+        help="Stable archive cohort name. Defaults to a dated universe-qualified cohort.",
+    )
+    archive_universe.add_argument(
+        "--apply",
+        action="store_true",
+        help="Move matched run directories and write the exclusion index. Default is dry-run.",
+    )
+    archive_universe.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+    compact_archive = subparsers.add_parser(
+        "compact-retired-universe-archive",
+        help="Compact existing universe archive metadata without touching archived runs.",
+    )
+    compact_archive.add_argument("--cohort", required=True, help="Archive cohort to compact.")
+    compact_archive.add_argument(
+        "--apply",
+        action="store_true",
+        help="Rewrite only archive metadata. Default is a dry-run size report.",
+    )
+    compact_archive.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
     cleanup_cmd = subparsers.add_parser(
@@ -5570,6 +5617,43 @@ def cmd_cleanup_atlas_artifacts(
     return 0 if not blocked else 1
 
 
+def cmd_archive_retired_universe(
+    *,
+    run_ids: list[str] | None,
+    cohort: str | None,
+    apply: bool,
+    as_json: bool,
+) -> int:
+    config = load_config()
+
+    def report_progress(message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
+
+    payload = archive_retired_universe_runs(
+        config.runs_root,
+        run_ids=run_ids,
+        cohort=cohort,
+        apply=apply,
+        progress_callback=report_progress,
+    )
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+    else:
+        _print_json_payload(payload)
+    return 0
+
+
+def cmd_compact_retired_universe_archive(
+    *, cohort: str, apply: bool, as_json: bool
+) -> int:
+    payload = compact_archive_metadata(load_config().runs_root, cohort=cohort, apply=apply)
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=True, indent=2))
+    else:
+        _print_json_payload(payload)
+    return 0
+
+
 def cmd_cleanup_incomplete_playhand_runs(
     *,
     run_ids: list[str] | None,
@@ -7244,6 +7328,7 @@ def _attempt_catalog_manifest_payload(
     return {
         "version": 1,
         "generated_at": datetime.now().astimezone().isoformat(),
+        "universe_contract": universe_provenance(),
         "run_count": len(run_dirs),
         "row_count": int(row_count if row_count is not None else len(rows or [])),
         "runs": run_items,
@@ -11202,7 +11287,7 @@ def cmd_calculate_full_backtests(
             for item in list(profile_snapshot.get("instruments") or [])
             if str(item).strip()
         }
-        if profile_instruments.intersection(EXCLUDED_RESEARCH_INSTRUMENTS):
+        if not research_eligibility_report(profile_instruments)["is_eligible"]:
             filter_rejections["excluded_research_instrument"] += 1
             continue
         if not _attempt_has_backtestable_cell(attempt):
@@ -17500,6 +17585,10 @@ def cmd_record_attempt(
     cli = FuzzfolioCli(config.fuzzfolio)
     run_dir = config.runs_root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
+    metadata = load_run_metadata(run_dir)
+    metadata.setdefault("run_id", run_id)
+    metadata.setdefault("runner", "manual_record")
+    write_run_metadata(run_dir, metadata)
     attempts_path = attempts_path_for_run_dir(run_dir)
     progress_plot_path = run_dir / "progress.png"
     compare_payload = cli.score_artifact(artifact_dir.resolve())
@@ -19876,6 +19965,17 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=bool(args.dry_run),
             preview=int(args.preview),
             as_json=bool(args.json),
+        )
+    if args.command == "archive-retired-universe":
+        return cmd_archive_retired_universe(
+            run_ids=args.run_id,
+            cohort=args.cohort,
+            apply=bool(args.apply),
+            as_json=bool(args.json),
+        )
+    if args.command == "compact-retired-universe-archive":
+        return cmd_compact_retired_universe_archive(
+            cohort=str(args.cohort), apply=bool(args.apply), as_json=bool(args.json)
         )
     if args.command == "cleanup-atlas-artifacts":
         return cmd_cleanup_atlas_artifacts(

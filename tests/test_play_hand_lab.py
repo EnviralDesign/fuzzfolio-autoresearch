@@ -152,7 +152,7 @@ def test_normalize_runtime_resolves_instrument_pool_presets() -> None:
     runtime = lab._normalize_runtime(
         lab.PlayHandLabRuntimeConfig(
             instrument_pool_preset=["fx-major", "metals"],
-            instrument_pool=["US500"],
+            instrument_pool=["DE40"],
         )
     )
 
@@ -166,7 +166,7 @@ def test_normalize_runtime_resolves_instrument_pool_presets() -> None:
         "USDJPY",
         "XAGUSD",
         "XAUUSD",
-        "US500",
+        "DE40",
     ]
 
 

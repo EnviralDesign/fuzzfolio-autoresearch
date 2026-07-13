@@ -17,7 +17,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .strategy_identity import derive_strategy_identity
-from .instrument_universe import INSTRUMENT_UNIVERSE, instrument_asset_class as canonical_asset_class
+from .instrument_universe import (
+    INSTRUMENT_UNIVERSE,
+    instrument_asset_class as canonical_asset_class,
+    research_eligibility_report,
+)
 
 
 FX_CODES = {
@@ -652,6 +656,10 @@ def build_optimizer_candidates(
         attempt_id = str(row.get("attempt_id") or "").strip()
         if not attempt_id:
             rejections["missing_attempt_id"] += 1
+            continue
+        eligibility = research_eligibility_report(row_instruments(row))
+        if not eligibility["is_eligible"]:
+            rejections["universe_ineligible_instruments"] += 1
             continue
         reason = candidate_rejection_reason(row, spec)
         if reason:

@@ -34,6 +34,10 @@ from .ledger import (
     write_attempts,
     write_run_metadata,
 )
+from .instrument_universe import (
+    require_research_eligible,
+    research_eligible_instruments,
+)
 from .playhand_health import build_play_hand_evidence, build_play_hand_health
 from .plotting import render_progress_artifacts
 from .scoring import build_attempt_score, load_sensitivity_snapshot
@@ -53,77 +57,22 @@ PLAY_HAND_TRANSIENT_CLI_RETRY_MARKERS = (
     "temporarily unavailable",
 )
 
-DEFAULT_INSTRUMENT_POOL = (
-    "EURUSD",
-    "GBPUSD",
-    "AUDUSD",
-    "USDCAD",
-    "NZDUSD",
-    "USDJPY",
-    "USDCHF",
-    "XAUUSD",
-)
-EXCLUDED_RESEARCH_INSTRUMENTS = ("SOLUSD",)
-_EXCLUDED_RESEARCH_INSTRUMENT_SET = set(EXCLUDED_RESEARCH_INSTRUMENTS)
+DEFAULT_INSTRUMENT_POOL = research_eligible_instruments()
+EXCLUDED_RESEARCH_INSTRUMENTS: tuple[str, ...] = ()
+_EXCLUDED_RESEARCH_INSTRUMENT_SET: set[str] = set()
 
-FX_MAJOR_INSTRUMENT_POOL = (
-    "AUDUSD",
-    "EURUSD",
-    "GBPUSD",
-    "USDCAD",
-    "USDCHF",
-    "USDJPY",
+# Compatibility names are derived exclusively from the universe contract.
+FX_MAJOR_INSTRUMENT_POOL = research_eligible_instruments(
+    source_asset_classes=("fx-major",)
 )
-FX_MINOR_INSTRUMENT_POOL = (
-    "AUDCAD",
-    "AUDCHF",
-    "AUDJPY",
-    "AUDNZD",
-    "CADCHF",
-    "CADJPY",
-    "CHFJPY",
-    "EURAUD",
-    "EURCAD",
-    "EURCHF",
-    "EURGBP",
-    "EURJPY",
-    "EURNZD",
-    "GBPAUD",
-    "GBPCAD",
-    "GBPCHF",
-    "GBPJPY",
-    "GBPNZD",
-    "NZDCAD",
-    "NZDCHF",
-    "NZDJPY",
-    "NZDUSD",
-    "USDSGD",
+FX_MINOR_INSTRUMENT_POOL = research_eligible_instruments(
+    source_asset_classes=("fx-minor",)
 )
-METALS_INSTRUMENT_POOL = ("XAGUSD", "XAUUSD")
-ENERGIES_INSTRUMENT_POOL = ("XBRUSD", "XTIUSD")
-INDICES_INSTRUMENT_POOL = (
-    "DE40",
-    "HK50",
-    "JP225",
-    "RUSS2000",
-    "UK100",
-    "US30",
-    "US500",
-    "USTECH",
-)
-CRYPTO_INSTRUMENT_POOL = tuple(
-    symbol
-    for symbol in ("BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD")
-    if symbol not in _EXCLUDED_RESEARCH_INSTRUMENT_SET
-)
-ALL_INSTRUMENT_POOL = (
-    *FX_MAJOR_INSTRUMENT_POOL,
-    *FX_MINOR_INSTRUMENT_POOL,
-    *METALS_INSTRUMENT_POOL,
-    *ENERGIES_INSTRUMENT_POOL,
-    *INDICES_INSTRUMENT_POOL,
-    *CRYPTO_INSTRUMENT_POOL,
-)
+METALS_INSTRUMENT_POOL = research_eligible_instruments(asset_classes=("metal",))
+ENERGIES_INSTRUMENT_POOL = research_eligible_instruments(asset_classes=("commodity",))
+INDICES_INSTRUMENT_POOL = research_eligible_instruments(asset_classes=("index",))
+CRYPTO_INSTRUMENT_POOL = research_eligible_instruments(asset_classes=("crypto",))
+ALL_INSTRUMENT_POOL = research_eligible_instruments()
 PLAY_HAND_INSTRUMENT_POOL_PRESETS: dict[str, tuple[str, ...]] = {
     "default": DEFAULT_INSTRUMENT_POOL,
     "core": DEFAULT_INSTRUMENT_POOL,
@@ -581,11 +530,9 @@ def _clean_instrument_pool_preset_names(values: list[str] | tuple[str, ...] | No
 
 
 def filter_research_instruments(values: list[str] | tuple[str, ...] | None) -> list[str]:
-    return [
-        token
-        for token in _clean_tokens(values)
-        if token not in _EXCLUDED_RESEARCH_INSTRUMENT_SET
-    ]
+    return require_research_eligible(
+        _clean_tokens(values), context="Research instruments", allow_empty=True
+    )
 
 
 def _raise_if_only_excluded_research_instruments(

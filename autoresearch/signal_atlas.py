@@ -16,12 +16,17 @@ from .indicator_atlas import (
     build_indicator_atlas,
     load_indicator_catalog,
 )
+from .instrument_universe import (
+    require_research_eligible,
+    research_eligible_instruments,
+    universe_provenance,
+)
 
 
 SCHEMA_VERSION = "signal_atlas_v1"
 DEFAULT_SIGNAL_ATLAS_DIRNAME = "signal-atlas"
 DEFAULT_SIGNAL_ROLE = "trigger"
-DEFAULT_INSTRUMENTS = ("EURUSD", "GBPUSD", "USDJPY", "XAUUSD")
+DEFAULT_INSTRUMENTS = research_eligible_instruments()
 DEFAULT_TIMEFRAMES = ("M5", "M15")
 DEFAULT_BAR_LIMIT = 5000
 DEFAULT_REPLAY_SOURCE = "system"
@@ -692,7 +697,10 @@ def build_signal_atlas(
         signal_role=signal_role,
         max_indicators=max_indicators,
     )
-    instrument_panel = _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS)
+    instrument_panel = require_research_eligible(
+        _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS),
+        context="Signal Atlas instruments",
+    )
     timeframe_panel = _normalize_tokens(timeframes) or list(DEFAULT_TIMEFRAMES)
     bar_limit = max(10, min(5000, int(bar_limit or DEFAULT_BAR_LIMIT)))
 
@@ -869,6 +877,7 @@ def build_signal_atlas(
     summary = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "universe_contract": universe_provenance(),
         "run_started_at": run_started,
         "source": {
             "workspace_root": str(resolved_workspace_root) if resolved_workspace_root else None,

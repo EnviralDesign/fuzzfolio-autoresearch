@@ -138,13 +138,13 @@ def test_optimizer_surfaces_full_backtest_validation_reason(tmp_path: Path) -> N
 
 def test_optimizer_filters_unsupported_and_blocked_instruments(tmp_path: Path) -> None:
     rows = [
-        _row(tmp_path, "darwin-ok", "US500", [1, 2, 3]),
-        _row(tmp_path, "unsupported", "RUSS2000", [1, 2, 3]),
+        _row(tmp_path, "darwin-ok", "DE40", [1, 2, 3]),
+        _row(tmp_path, "unsupported", "UK100", [1, 2, 3]),
         _row(tmp_path, "blocked", "XTIUSD", [1, 2, 3]),
     ]
     spec = PortfolioOptimizerSpec(
         allowed_asset_classes=("fx", "metal", "index", "commodity"),
-        allowed_instruments=("EURUSD", "US500", "XTIUSD"),
+        allowed_instruments=("EURUSD", "DE40", "XTIUSD"),
         blocked_instruments=("XTIUSD",),
     )
 

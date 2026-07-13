@@ -5,13 +5,14 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Any, Iterable, Mapping
 
 
 @dataclass(frozen=True)
 class ResearchInstrument:
     canonical_symbol: str
     provider_symbol: str | None
+    asset_class: str
     lifecycle_status: str
     portfolio_asset_class: str
     research_eligible: bool
@@ -58,6 +59,7 @@ def load_instrument_universe(
         instruments[canonical] = ResearchInstrument(
             canonical_symbol=canonical,
             provider_symbol=provider_symbol,
+            asset_class=str(raw.get("asset_class") or "").strip().lower(),
             lifecycle_status=lifecycle,
             portfolio_asset_class=str(raw.get("portfolio_asset_class") or "").strip().lower(),
             research_eligible=eligible,
@@ -88,12 +90,102 @@ def instrument_asset_class(symbol: str) -> str:
     return instrument.portfolio_asset_class if instrument else "other"
 
 
-def validation_report() -> dict[str, object]:
+def research_eligible_instruments(
+    *,
+    asset_classes: Iterable[str] | None = None,
+    source_asset_classes: Iterable[str] | None = None,
+) -> tuple[str, ...]:
+    """Return the authoritative, ordered active research surface."""
+    allowed_classes = {
+        str(value or "").strip().lower() for value in (asset_classes or [])
+    }
+    allowed_source_classes = {
+        str(value or "").strip().lower()
+        for value in (source_asset_classes or [])
+    }
+    return tuple(
+        symbol
+        for symbol, instrument in INSTRUMENT_UNIVERSE.items()
+        if instrument.research_eligible
+        and (not allowed_classes or instrument.portfolio_asset_class in allowed_classes)
+        and (not allowed_source_classes or instrument.asset_class in allowed_source_classes)
+    )
+
+
+def normalize_instruments(values: Iterable[Any] | None) -> list[str]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        token = str(value or "").strip().upper()
+        if token and token not in seen:
+            normalized.append(token)
+            seen.add(token)
+    return normalized
+
+
+def research_eligibility_report(values: Iterable[Any] | None) -> dict[str, Any]:
+    instruments = normalize_instruments(values)
+    eligible: list[str] = []
+    ineligible: list[str] = []
+    unknown: list[str] = []
+    lifecycle: dict[str, str] = {}
+    for symbol in instruments:
+        instrument = INSTRUMENT_UNIVERSE.get(symbol)
+        if instrument is None:
+            unknown.append(symbol)
+            continue
+        lifecycle[symbol] = instrument.lifecycle_status
+        if instrument.research_eligible:
+            eligible.append(symbol)
+        else:
+            ineligible.append(symbol)
+    return {
+        "instruments": instruments,
+        "eligible": eligible,
+        "ineligible": ineligible,
+        "unknown": unknown,
+        "lifecycle": lifecycle,
+        "is_eligible": bool(instruments) and not ineligible and not unknown,
+        "is_mixed": bool(eligible) and bool(ineligible or unknown),
+    }
+
+
+def require_research_eligible(
+    values: Iterable[Any] | None,
+    *,
+    context: str = "Instrument input",
+    allow_empty: bool = False,
+) -> list[str]:
+    report = research_eligibility_report(values)
+    if not report["instruments"] and allow_empty:
+        return []
+    if report["is_eligible"]:
+        return list(report["instruments"])
+    details: list[str] = []
+    if report["ineligible"]:
+        details.append("ineligible=" + ", ".join(report["ineligible"]))
+    if report["unknown"]:
+        details.append("unknown=" + ", ".join(report["unknown"]))
+    if not details:
+        details.append("no instruments supplied")
+    raise ValueError(
+        f"{context} must contain only research-eligible instruments from "
+        f"{DEVELOPMENT_UNIVERSE_ID}: " + "; ".join(details)
+    )
+
+
+def universe_provenance() -> dict[str, object]:
     return {
         "universe_id": DEVELOPMENT_UNIVERSE_ID,
         "universe_version": DEVELOPMENT_UNIVERSE_VERSION,
         "universe_hash": DEVELOPMENT_UNIVERSE_HASH,
-        "activation_mode": DEVELOPMENT_UNIVERSE["activation_mode"],
+        "activation_mode": str(DEVELOPMENT_UNIVERSE["activation_mode"]),
+    }
+
+
+def validation_report() -> dict[str, object]:
+    return {
+        **universe_provenance(),
         "enabled": list(ENABLED_INSTRUMENTS),
         "deferred": list(DEFERRED_INSTRUMENTS),
         "retired": list(RETIRED_INSTRUMENTS),
@@ -102,4 +194,3 @@ def validation_report() -> dict[str, object]:
 
 if __name__ == "__main__":
     print(json.dumps(validation_report(), indent=2, sort_keys=True))
-

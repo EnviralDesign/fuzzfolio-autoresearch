@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import AppConfig
+from .instrument_universe import universe_provenance
 from .scoring import AttemptScore
 
 ATTEMPTS_FILE_NAME = "attempts.jsonl"
@@ -99,6 +100,8 @@ def load_run_metadata(run_dir: Path) -> dict[str, Any]:
 
 
 def write_run_metadata(run_dir: Path, metadata: dict[str, Any]) -> Path:
+    metadata = dict(metadata)
+    metadata["universe_contract"] = universe_provenance()
     path = run_metadata_path_for_run_dir(run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -115,10 +118,13 @@ def load_run_attempts(run_dir: Path) -> list[dict[str, Any]]:
 def list_run_dirs(runs_root: Path) -> list[Path]:
     if not runs_root.exists():
         return []
+    from .corpus_archive import archived_run_ids
+
+    archived = archived_run_ids(runs_root)
     run_dirs = [
         path
         for path in runs_root.iterdir()
-        if path.is_dir() and path.name != "derived"
+        if path.is_dir() and path.name != "derived" and path.name not in archived
     ]
     return sorted(run_dirs)
 

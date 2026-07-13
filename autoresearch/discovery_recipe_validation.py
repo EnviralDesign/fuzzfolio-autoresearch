@@ -43,6 +43,7 @@ from .fuzzfolio import CliError, FuzzfolioCli
 from .indicator_atlas import build_indicator_atlas, load_indicator_catalog
 from .scoring import build_attempt_score, load_sensitivity_snapshot
 from .signal_atlas import DEFAULT_INSTRUMENTS
+from .instrument_universe import require_research_eligible, universe_provenance
 
 
 SCHEMA_VERSION = "discovery_recipe_validation_atlas_v1"
@@ -404,7 +405,10 @@ def build_validation_queue_rows(
         )
     )
     selected_recipes = recipe_candidates[: max(0, int(max_recipes))]
-    instrument_panel = _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS)
+    instrument_panel = require_research_eligible(
+        _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS),
+        context="Discovery recipe validation instruments",
+    )
     retained_inventory = _retained_inventory_rows(retained_inventory_rows)
     explicit_timeframes = _normalize_tokens(timeframes)
     queue: list[dict[str, Any]] = []
@@ -696,7 +700,10 @@ def build_retained_scrutiny_queue_rows(
         if _clean_token(value)
     }
     timeframe_set = set(_normalize_tokens(timeframes))
-    instrument_panel = _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS)
+    instrument_panel = require_research_eligible(
+        _normalize_tokens(instruments) or list(DEFAULT_INSTRUMENTS),
+        context="Discovery recipe scrutiny instruments",
+    )
     strict_candidates: list[dict[str, Any]] = []
     fallback_candidates: list[dict[str, Any]] = []
     for source_row in validation_result_rows:
@@ -1112,6 +1119,7 @@ def build_discovery_recipe_validation_atlas(
     summary = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "universe_contract": universe_provenance(),
         "source": {
             "cluster_atlas_dir": str(source_dir),
             "recipe_priors_dir": str(priors_dir),
@@ -1393,6 +1401,7 @@ def build_discovery_recipe_scrutiny_atlas(
     summary = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "universe_contract": universe_provenance(),
         "source": {
             "validation_atlas_dir": str(source_dir),
             "validation_results_path": str(results_path),
@@ -1778,6 +1787,7 @@ def run_discovery_recipe_validation_probes(
     summary = {
         "schema_version": RESULTS_SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "universe_contract": universe_provenance(),
         "source": {
             "discovery_recipe_validation_atlas_path": str(atlas_path),
         },
