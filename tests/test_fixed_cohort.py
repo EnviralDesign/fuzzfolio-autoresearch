@@ -16,17 +16,24 @@ from autoresearch.fixed_cohort import (
 
 
 def _write_source_campaign(tmp_path: Path) -> Path:
-    campaign_root = tmp_path / "portfolio-campaign"
+    campaign_root = (
+        tmp_path / "runs" / "derived" / "portfolio-research" / "portfolio-campaign"
+    )
     inputs = campaign_root / "inputs"
     inputs.mkdir(parents=True)
     snapshot_path = inputs / "candidate-snapshot.json"
     snapshot = {
         "schema_version": 1,
-        "candidate_count": 3,
+        "candidate_count": 4,
         "candidates": [
-            {"attempt_id": "alpha", "instruments": ["EURUSD"]},
-            {"attempt_id": "bravo", "instruments": ["JP225"]},
-            {"attempt_id": "charlie", "instruments": ["US500", "EURUSD"]},
+            {"attempt_id": "alpha", "run_id": "run-alpha", "instruments": ["EURUSD"]},
+            {"attempt_id": "bravo", "run_id": "run-bravo", "instruments": ["JP225"]},
+            {
+                "attempt_id": "charlie",
+                "run_id": "run-charlie",
+                "instruments": ["US500", "EURUSD"],
+            },
+            {"attempt_id": "delta", "run_id": "run-delta", "instruments": ["EURUSD"]},
         ],
     }
     snapshot_path.write_text(json.dumps(snapshot), encoding="utf-8")
@@ -35,7 +42,24 @@ def _write_source_campaign(tmp_path: Path) -> Path:
             {
                 "path": str(snapshot_path),
                 "sha256": hashlib.sha256(snapshot_path.read_bytes()).hexdigest(),
-                "candidate_count": 3,
+                "candidate_count": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+    exclusion_path = tmp_path / "runs" / "derived" / "universe-exclusions.json"
+    exclusion_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "universe_contract": ar_main.universe_provenance(),
+                "entries": [
+                    {
+                        "archive_scope": "attempts",
+                        "run_id": "run-delta",
+                        "attempt_ids": ["delta"],
+                    }
+                ],
             }
         ),
         encoding="utf-8",
@@ -45,7 +69,14 @@ def _write_source_campaign(tmp_path: Path) -> Path:
 
 def _freeze(tmp_path: Path) -> tuple[Path, dict]:
     campaign_root = _write_source_campaign(tmp_path)
-    output_path = tmp_path / "derived" / "fixed-corpus-cohorts" / "darwin" / "cohort.json"
+    output_path = (
+        tmp_path
+        / "runs"
+        / "derived"
+        / "fixed-corpus-cohorts"
+        / "darwin"
+        / "cohort.json"
+    )
     return output_path, freeze_fixed_corpus_cohort(
         campaign_root=campaign_root, cohort_id="darwin", output_path=output_path
     )
@@ -54,7 +85,9 @@ def _freeze(tmp_path: Path) -> tuple[Path, dict]:
 def test_freeze_is_idempotent_and_records_deterministic_exclusions(tmp_path: Path) -> None:
     output_path, first = _freeze(tmp_path)
     second = freeze_fixed_corpus_cohort(
-        campaign_root=tmp_path / "portfolio-campaign",
+        campaign_root=(
+            tmp_path / "runs" / "derived" / "portfolio-research" / "portfolio-campaign"
+        ),
         cohort_id="darwin",
         output_path=output_path,
     )
@@ -64,9 +97,13 @@ def test_freeze_is_idempotent_and_records_deterministic_exclusions(tmp_path: Pat
     assert [item["attempt_id"] for item in first["excluded_candidates"]] == [
         "bravo",
         "charlie",
+        "delta",
     ]
     assert first["excluded_candidates"][0]["reasons"] == [
         {"code": "ineligible_instruments", "instruments": ["JP225"]}
+    ]
+    assert first["excluded_candidates"][2]["reasons"] == [
+        {"code": "development_universe_archive"}
     ]
     assert validate_fixed_corpus_cohort(output_path)["manifest_id"] == first["manifest_id"]
 
@@ -80,7 +117,16 @@ def test_validation_fails_closed_on_manifest_or_source_mutation(tmp_path: Path) 
         validate_fixed_corpus_cohort(output_path)
 
     output_path, _payload = _freeze(tmp_path / "source-drift")
-    snapshot_path = tmp_path / "source-drift" / "portfolio-campaign" / "inputs" / "candidate-snapshot.json"
+    snapshot_path = (
+        tmp_path
+        / "source-drift"
+        / "runs"
+        / "derived"
+        / "portfolio-research"
+        / "portfolio-campaign"
+        / "inputs"
+        / "candidate-snapshot.json"
+    )
     snapshot_path.write_text(snapshot_path.read_text(encoding="utf-8").replace("EURUSD", "GBPUSD", 1), encoding="utf-8")
     with pytest.raises(FixedCohortError, match="changed"):
         validate_fixed_corpus_cohort(output_path)

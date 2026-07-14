@@ -259,17 +259,17 @@ The current temporal layer freezes strategy definitions and execution cells, the
 
 ### Fixed Existing-Corpus Cohorts
 
-Freeze the compatible existing corpus before requesting five-year evidence. The command verifies the immutable portfolio-research candidate snapshot and its manifest, applies the current development-universe contract to the snapshot instruments, records deterministic exclusions, and creates `runs/derived/fixed-corpus-cohorts/<cohort-id>/cohort.json`. Re-running with the same source succeeds; source drift or a different cohort at the same path fails closed.
+Freeze the compatible existing corpus before requesting five-year evidence. The command verifies the immutable portfolio-research candidate snapshot and its manifest, applies both the current development-universe contract and the authoritative corpus-exclusion ledger, records deterministic exclusions, and creates `runs/derived/fixed-corpus-cohorts/<cohort-id>/cohort.json`. The ledger check matters because a candidate's observed trades can omit retired instruments that were still configured in its attempt. Re-running with the same source succeeds; source, universe, or relevant exclusion drift fails closed.
 
 ```powershell
 uv run freeze-fixed-corpus-cohort `
   --portfolio-research-campaign 20260710T210709Z-darwin-master-v1 `
-  --cohort-id darwin-native-v1 `
+  --cohort-id darwin-native-v2 `
   --json
 
 # Use the complete frozen cohort. --scope canonical can narrow it but cannot expand it.
 uv run calculate-full-backtests `
-  --attempt-cohort runs/derived/fixed-corpus-cohorts/darwin-native-v1/cohort.json `
+  --attempt-cohort runs/derived/fixed-corpus-cohorts/darwin-native-v2/cohort.json `
   --scope matched `
   --horizon-months 60 `
   --evidence-window-start 2021-07-14T00:00:00Z `

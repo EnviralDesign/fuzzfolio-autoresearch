@@ -7,10 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from .corpus_archive import exclusion_index_path, exclusion_lookup, is_excluded_from_lookup
 from .instrument_universe import research_eligibility_report, universe_provenance
 
 
-FIXED_COHORT_SCHEMA = "autoresearch-fixed-corpus-cohort-v1"
+FIXED_COHORT_SCHEMA = "autoresearch-fixed-corpus-cohort-v2"
 
 
 class FixedCohortError(RuntimeError):
@@ -122,6 +123,9 @@ def _snapshot_candidates(snapshot_path: Path) -> list[dict[str, Any]]:
         attempt_id = _normalized_attempt_id(
             candidate.get("attempt_id"), label=f"candidate snapshot entry {index}"
         )
+        run_id = _normalized_attempt_id(
+            candidate.get("run_id"), label=f"candidate snapshot entry {index} run id"
+        )
         if attempt_id in seen_ids:
             raise FixedCohortError(f"Candidate snapshot contains duplicate attempt id: {attempt_id}")
         instruments = candidate.get("instruments")
@@ -138,12 +142,46 @@ def _snapshot_candidates(snapshot_path: Path) -> list[dict[str, Any]]:
             )
         seen_ids.add(attempt_id)
         normalized.append(
-            {"attempt_id": attempt_id, "instruments": [str(item) for item in instruments]}
+            {
+                "attempt_id": attempt_id,
+                "run_id": run_id,
+                "instruments": [str(item) for item in instruments],
+            }
         )
     return normalized
 
 
-def _exclusion_reasons(instruments: Iterable[str]) -> list[dict[str, Any]]:
+def _runs_root(campaign_root: Path) -> Path:
+    derived_root = campaign_root.parent.parent
+    if derived_root.name != "derived" or campaign_root.parent.name != "portfolio-research":
+        raise FixedCohortError(
+            "Portfolio-research campaign must live under runs/derived/portfolio-research"
+        )
+    return derived_root.parent.resolve()
+
+
+def _exclusion_contract(runs_root: Path) -> tuple[Any, dict[str, Any]]:
+    path = exclusion_index_path(runs_root).resolve()
+    if not path.is_file():
+        raise FixedCohortError(f"Missing development-universe exclusion index: {path}")
+    try:
+        lookup = exclusion_lookup(runs_root)
+    except (OSError, ValueError) as exc:
+        raise FixedCohortError(f"Invalid development-universe exclusion index: {path}") from exc
+    return lookup, {
+        "path": str(path),
+        "schema_version": lookup.payload.get("schema_version"),
+        "universe_contract": lookup.payload.get("universe_contract"),
+    }
+
+
+def _exclusion_reasons(
+    instruments: Iterable[str],
+    *,
+    run_id: str,
+    attempt_id: str,
+    exclusion_lookup_value: Any,
+) -> list[dict[str, Any]]:
     report = research_eligibility_report(instruments)
     reasons: list[dict[str, Any]] = []
     if not report["instruments"]:
@@ -156,6 +194,10 @@ def _exclusion_reasons(instruments: Iterable[str]) -> list[dict[str, Any]]:
         reasons.append(
             {"code": "unknown_instruments", "instruments": sorted(report["unknown"])}
         )
+    if is_excluded_from_lookup(
+        exclusion_lookup_value, run_id=run_id, attempt_id=attempt_id
+    ):
+        reasons.append({"code": "development_universe_archive"})
     return reasons
 
 
@@ -202,12 +244,19 @@ def freeze_fixed_corpus_cohort(
         manifest_path=snapshot_manifest_path,
     )
     candidates = _snapshot_candidates(snapshot_path)
+    runs_root = _runs_root(resolved_campaign_root)
+    exclusion_lookup_value, exclusion_contract = _exclusion_contract(runs_root)
     if manifest_source["candidate_count"] != len(candidates):
         raise FixedCohortError("Candidate snapshot manifest candidate_count does not match source")
     included: list[str] = []
     excluded: list[dict[str, Any]] = []
     for candidate in candidates:
-        reasons = _exclusion_reasons(candidate["instruments"])
+        reasons = _exclusion_reasons(
+            candidate["instruments"],
+            run_id=candidate["run_id"],
+            attempt_id=candidate["attempt_id"],
+            exclusion_lookup_value=exclusion_lookup_value,
+        )
         if reasons:
             excluded.append(
                 {
@@ -238,6 +287,7 @@ def freeze_fixed_corpus_cohort(
             "candidate_snapshot_manifest_sha256": manifest_source["sha256"],
         },
         "development_universe": universe_provenance(),
+        "corpus_exclusion_contract": exclusion_contract,
         "source_candidate_count": len(candidates),
         "attempt_ids": attempt_ids,
         "excluded_candidates": excluded,
@@ -309,6 +359,10 @@ def validate_fixed_corpus_cohort(path: Path) -> dict[str, Any]:
         snapshot_path=snapshot_path,
         manifest_path=manifest_path,
     )
+    runs_root = _runs_root(campaign_root)
+    exclusion_lookup_value, exclusion_contract = _exclusion_contract(runs_root)
+    if payload.get("corpus_exclusion_contract") != exclusion_contract:
+        raise FixedCohortError("Fixed cohort corpus exclusion contract mismatch")
     if source_check["snapshot_sha256"] != _require_sha256(
         source.get("candidate_snapshot_sha256"), label="fixed cohort source snapshot hash"
     ):
@@ -327,7 +381,12 @@ def validate_fixed_corpus_cohort(path: Path) -> dict[str, Any]:
     expected_included: list[str] = []
     expected_excluded: list[dict[str, Any]] = []
     for candidate in candidates:
-        reasons = _exclusion_reasons(candidate["instruments"])
+        reasons = _exclusion_reasons(
+            candidate["instruments"],
+            run_id=candidate["run_id"],
+            attempt_id=candidate["attempt_id"],
+            exclusion_lookup_value=exclusion_lookup_value,
+        )
         if reasons:
             expected_excluded.append(
                 {
