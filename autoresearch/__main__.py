@@ -281,6 +281,12 @@ if __package__ in {None, ""}:
         freeze_level_c_cohort,
         validate_level_c_cohort,
     )
+    from autoresearch.fixed_cohort import (
+        FixedCohortError,
+        fixed_cohort_attempt_ids,
+        freeze_fixed_corpus_cohort,
+        validate_fixed_corpus_cohort,
+    )
     from autoresearch.portfolio_risk_sizing import (
         RiskSizingSpec,
         build_risk_sizing_schedule,
@@ -580,6 +586,12 @@ else:
         freeze_level_c_cohort,
         validate_level_c_cohort,
     )
+    from .fixed_cohort import (
+        FixedCohortError,
+        fixed_cohort_attempt_ids,
+        freeze_fixed_corpus_cohort,
+        validate_fixed_corpus_cohort,
+    )
     from .portfolio_risk_sizing import (
         RiskSizingSpec,
         build_risk_sizing_schedule,
@@ -754,6 +766,7 @@ PUBLIC_CLI_COMMANDS = {
     "portfolio-research-report",
     "portfolio-research-package",
     "freeze-level-c-cohort",
+    "freeze-fixed-corpus-cohort",
     "nested-evidence",
     "export-portfolio-bundle",
     "build-portfolio-risk-sizing",
@@ -3220,6 +3233,12 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="Only process the named attempt id. Can be repeated.",
     )
     calc_backtests.add_argument(
+        "--attempt-cohort",
+        type=Path,
+        default=None,
+        help="Validated fixed-corpus cohort manifest. Replaces repeated --attempt-id flags.",
+    )
+    calc_backtests.add_argument(
         "--limit",
         type=int,
         default=None,
@@ -4167,6 +4186,12 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     nested_evidence.add_argument("--run-id", action="append", default=None)
     nested_evidence.add_argument("--attempt-id", action="append", default=None)
     nested_evidence.add_argument(
+        "--attempt-cohort",
+        type=Path,
+        default=None,
+        help="Validated fixed-corpus cohort manifest. Replaces repeated --attempt-id flags.",
+    )
+    nested_evidence.add_argument(
         "--scope", choices=("matched", "canonical"), default="canonical"
     )
     nested_evidence.add_argument("--start", required=True)
@@ -4226,6 +4251,25 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     freeze_level_c.add_argument("--lake-manifest-sha256", required=True)
     freeze_level_c.add_argument("--output", type=Path, default=None)
     freeze_level_c.add_argument("--json", action="store_true")
+    freeze_fixed_corpus = subparsers.add_parser(
+        "freeze-fixed-corpus-cohort",
+        help="Freeze the currently compatible subset of an immutable portfolio candidate snapshot.",
+    )
+    freeze_fixed_corpus.add_argument(
+        "--portfolio-research-campaign",
+        "--campaign",
+        dest="portfolio_research_campaign",
+        required=True,
+        help="Portfolio-research campaign id under runs/derived/portfolio-research, or its path.",
+    )
+    freeze_fixed_corpus.add_argument("--cohort-id", required=True)
+    freeze_fixed_corpus.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Derived-runs root. Defaults to the configured runs/derived directory.",
+    )
+    freeze_fixed_corpus.add_argument("--json", action="store_true")
     portfolio_research_report.add_argument(
         "--json", action="store_true", help="Print machine-readable final summary."
     )
@@ -11048,8 +11092,13 @@ def cmd_calculate_full_backtests(
     lake_token: str | None = None,
     lake_manifest_sha256: str | None = None,
     scope: str = "matched",
+    attempt_cohort: Path | None = None,
 ) -> int:
     config = load_config()
+    attempt_ids, cohort = _resolve_attempt_cohort(
+        attempt_cohort=attempt_cohort, attempt_ids=attempt_ids
+    )
+    cohort_manifest_id = str((cohort or {}).get("manifest_id") or "") or None
     backend = str(full_backtest_backend or "local").strip().lower().replace("-", "_")
     if backend not in {"local", "lab_gateway"}:
         raise SystemExit("--full-backtest-backend must be local or lab-gateway")
@@ -11107,6 +11156,10 @@ def cmd_calculate_full_backtests(
             f"{horizon_months}:{frozen_evidence_window_start}:"
             f"{frozen_evidence_window_end}:{frozen_selection_data_end}"
         )
+    if custom_evidence and cohort_manifest_id:
+        stable_campaign_plan_id = (
+            f"{stable_campaign_plan_id}:attempt-cohort:{cohort_manifest_id}"
+        )
     wanted_attempt_ids = {
         str(token).strip() for token in (attempt_ids or []) if str(token).strip()
     }
@@ -11153,6 +11206,12 @@ def cmd_calculate_full_backtests(
             label="calculate-full-backtests",
             as_json=as_json,
         )
+    if wanted_attempt_ids:
+        catalog_rows = [
+            row
+            for row in catalog_rows
+            if str(row.get("attempt_id") or "") in wanted_attempt_ids
+        ]
     if scope == "canonical":
         catalog_rows = [
             row
@@ -11328,6 +11387,8 @@ def cmd_calculate_full_backtests(
                 "run_ids": run_ids,
                 "effective_run_ids": effective_run_ids,
                 "attempt_ids": attempt_ids,
+                "attempt_cohort_manifest_id": cohort_manifest_id,
+                "attempt_cohort_path": str(attempt_cohort) if attempt_cohort else None,
                 "scope": scope,
                 "limit": limit,
                 "require_scrutiny_36": require_scrutiny_36,
@@ -11448,6 +11509,8 @@ def cmd_calculate_full_backtests(
                 "run_ids": run_ids,
                 "effective_run_ids": effective_run_ids,
                 "attempt_ids": attempt_ids,
+                "attempt_cohort_manifest_id": cohort_manifest_id,
+                "attempt_cohort_path": str(attempt_cohort) if attempt_cohort else None,
                 "limit": limit,
                 "require_scrutiny_36": require_scrutiny_36,
                 "force_rebuild": force_rebuild,
@@ -11630,6 +11693,8 @@ def cmd_calculate_full_backtests(
             "run_ids": run_ids,
             "effective_run_ids": effective_run_ids,
             "attempt_ids": attempt_ids,
+            "attempt_cohort_manifest_id": cohort_manifest_id,
+            "attempt_cohort_path": str(attempt_cohort) if attempt_cohort else None,
             "limit": limit,
             "require_scrutiny_36": require_scrutiny_36,
             "force_rebuild": force_rebuild,
@@ -14554,6 +14619,75 @@ def cmd_freeze_level_c_cohort(
     return 0
 
 
+def cmd_freeze_fixed_corpus_cohort(
+    *,
+    portfolio_research_campaign: str,
+    cohort_id: str,
+    output_root: Path | None,
+    as_json: bool,
+) -> int:
+    config = load_config()
+    campaign_token = Path(str(portfolio_research_campaign)).expanduser()
+    campaign_root = (
+        campaign_token.resolve()
+        if campaign_token.exists()
+        else (config.derived_root / "portfolio-research" / str(portfolio_research_campaign)).resolve()
+    )
+    derived_root = (
+        output_root.expanduser().resolve()
+        if output_root is not None
+        else config.derived_root.resolve()
+    )
+    output_path = (
+        derived_root / "fixed-corpus-cohorts" / str(cohort_id) / "cohort.json"
+    )
+    try:
+        payload = freeze_fixed_corpus_cohort(
+            campaign_root=campaign_root,
+            cohort_id=cohort_id,
+            output_path=output_path,
+        )
+    except FixedCohortError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(
+        json.dumps(
+            {
+                "cohort_id": payload["cohort_id"],
+                "manifest_id": payload["manifest_id"],
+                "source_candidate_count": payload["source_candidate_count"],
+                "attempt_count": len(payload["attempt_ids"]),
+                "excluded_count": len(payload["excluded_candidates"]),
+                "output": str(output_path),
+            },
+            ensure_ascii=True,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def _resolve_attempt_cohort(
+    *, attempt_cohort: Path | None, attempt_ids: list[str] | None
+) -> tuple[list[str] | None, dict[str, Any] | None]:
+    explicit_ids = {
+        str(attempt_id).strip()
+        for attempt_id in (attempt_ids or [])
+        if str(attempt_id).strip()
+    }
+    if attempt_cohort is None:
+        return attempt_ids, None
+    try:
+        cohort = validate_fixed_corpus_cohort(attempt_cohort)
+    except FixedCohortError as exc:
+        raise SystemExit(str(exc)) from exc
+    cohort_ids = fixed_cohort_attempt_ids(cohort)
+    if explicit_ids and explicit_ids != set(cohort_ids):
+        raise SystemExit(
+            "--attempt-cohort conflicts with --attempt-id; provide the identical cohort ids or omit --attempt-id"
+        )
+    return cohort_ids, cohort
+
+
 def cmd_nested_evidence(
     *,
     campaign_id: str,
@@ -14579,6 +14713,7 @@ def cmd_nested_evidence(
     optimizer_backend: str,
     dry_run: bool,
     as_json: bool,
+    attempt_cohort: Path | None = None,
 ) -> int:
     from autoresearch.nested_gateway import run_nested_gateway_fold
     from autoresearch.portfolio_research import (
@@ -14588,6 +14723,15 @@ def cmd_nested_evidence(
     )
 
     config = load_config()
+    attempt_ids, cohort = _resolve_attempt_cohort(
+        attempt_cohort=attempt_cohort, attempt_ids=attempt_ids
+    )
+    cohort_manifest_id = str((cohort or {}).get("manifest_id") or "") or None
+    evidence_campaign_plan_id = (
+        f"{campaign_id}:attempt-cohort:{cohort_manifest_id}"
+        if cohort_manifest_id
+        else str(campaign_id)
+    )
     suite_path = (
         suite_config_path.resolve()
         if suite_config_path is not None
@@ -14616,6 +14760,12 @@ def cmd_nested_evidence(
             attempt_ids=sorted(wanted_ids) if wanted_ids else None,
         )
     )
+    if wanted_ids:
+        catalog_rows = [
+            row
+            for row in catalog_rows
+            if str(row.get("attempt_id") or "") in wanted_ids
+        ]
     resolved_scope = str(scope or "canonical").strip().lower()
     items = []
     for row in catalog_rows:
@@ -14665,6 +14815,9 @@ def cmd_nested_evidence(
     preview = {
         "status": "dry_run" if dry_run else "pending",
         "campaign_id": campaign_id,
+        "evidence_campaign_plan_id": evidence_campaign_plan_id,
+        "attempt_cohort_manifest_id": cohort_manifest_id,
+        "attempt_cohort_path": str(attempt_cohort) if attempt_cohort else None,
         "suite": suite_name,
         "suite_config": str(suite_path),
         "campaign_root": str(campaign_root),
@@ -14722,7 +14875,7 @@ def cmd_nested_evidence(
                 config=config,
                 items=items,
                 fold=fold,
-                campaign_plan_id=str(campaign_id),
+                campaign_plan_id=evidence_campaign_plan_id,
                 campaign_root=campaign_root,
                 lab_config=lab_config,
                 max_workers=max(1, int(max_workers)),
@@ -19666,6 +19819,8 @@ def main(argv: list[str] | None = None) -> int:
             lake_url=args.lake_url,
             lake_token=args.lake_token,
             lake_manifest_sha256=args.lake_manifest_sha256,
+            scope=args.scope,
+            attempt_cohort=args.attempt_cohort,
         )
     if args.command == "build-attempt-catalog":
         return cmd_build_attempt_catalog(
@@ -19894,6 +20049,13 @@ def main(argv: list[str] | None = None) -> int:
             output_path=args.output,
             as_json=bool(args.json),
         )
+    if args.command == "freeze-fixed-corpus-cohort":
+        return cmd_freeze_fixed_corpus_cohort(
+            portfolio_research_campaign=str(args.portfolio_research_campaign),
+            cohort_id=str(args.cohort_id),
+            output_root=args.output_root,
+            as_json=bool(args.json),
+        )
     if args.command == "nested-evidence":
         return cmd_nested_evidence(
             campaign_id=str(args.campaign_id),
@@ -19919,6 +20081,7 @@ def main(argv: list[str] | None = None) -> int:
             optimizer_backend=str(args.optimizer_backend),
             dry_run=bool(args.dry_run),
             as_json=bool(args.json),
+            attempt_cohort=args.attempt_cohort,
         )
     if args.command == "finalize-corpus":
         return cmd_finalize_corpus(

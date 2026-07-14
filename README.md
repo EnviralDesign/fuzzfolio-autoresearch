@@ -257,6 +257,32 @@ The current temporal layer freezes strategy definitions and execution cells, the
 
 `calculate-full-backtests` can materialize immutable, plan-qualified evidence through the lab gateway. Each profile receives a content-addressed evidence plan with exact start/end bounds, horizon, role, and profile hash. Results are stored under `evidence/full-backtest/<plan-hash>/`; a 60-month or alternate-window result cannot overwrite or satisfy the legacy 36-month files.
 
+### Fixed Existing-Corpus Cohorts
+
+Freeze the compatible existing corpus before requesting five-year evidence. The command verifies the immutable portfolio-research candidate snapshot and its manifest, applies the current development-universe contract to the snapshot instruments, records deterministic exclusions, and creates `runs/derived/fixed-corpus-cohorts/<cohort-id>/cohort.json`. Re-running with the same source succeeds; source drift or a different cohort at the same path fails closed.
+
+```powershell
+uv run freeze-fixed-corpus-cohort `
+  --portfolio-research-campaign 20260710T210709Z-darwin-master-v1 `
+  --cohort-id darwin-native-v1 `
+  --json
+
+# Use the complete frozen cohort. --scope canonical can narrow it but cannot expand it.
+uv run calculate-full-backtests `
+  --attempt-cohort runs/derived/fixed-corpus-cohorts/darwin-native-v1/cohort.json `
+  --scope matched `
+  --horizon-months 60 `
+  --evidence-window-start 2021-07-14T00:00:00Z `
+  --evidence-window-end 2026-07-14T00:00:00Z `
+  --selection-data-end 2026-07-14T00:00:00Z `
+  --campaign-plan-id darwin-existing-corpus-60m-v1 `
+  --lake-url http://192.168.1.2:8010 `
+  --full-backtest-backend lab-gateway `
+  --dry-run --json
+```
+
+`nested-evidence --attempt-cohort <cohort.json>` uses the same validated IDs and records the cohort manifest ID in its evidence campaign identity. An explicit repeated `--attempt-id` is accepted only when it names the identical cohort.
+
 ```powershell
 # Preview the frozen canonical cohort without submitting work.
 uv run calculate-full-backtests `
