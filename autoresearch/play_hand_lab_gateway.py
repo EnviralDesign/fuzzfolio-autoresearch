@@ -39,6 +39,9 @@ DEFAULT_LAKE_MUTATION_RETRY_AFTER_SECONDS = 90.0
 DEFAULT_LAKE_TIMEOUT_RETRY_AFTER_SECONDS = 45.0
 DEFAULT_MAX_RESULT_BACKLOG_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_RESULT_BACKPRESSURE_BYTES = 1024 * 1024 * 1024
+LAB_DEEP_REPLAY_QUEUE = "QUEUE:deep_replay_jobs"
+LAB_DEEP_REPLAY_DETAIL_QUEUE = "QUEUE:deep_replay_detail_jobs"
+LAB_SWEEP_SHARD_QUEUE = "QUEUE:sweep_shard_jobs"
 logger = logging.getLogger(__name__)
 
 
@@ -48,6 +51,14 @@ def _now() -> float:
 
 def _wall_time_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _queue_name_for_task_kind(task_kind: str) -> str:
+    if task_kind == "deep_replay_detail":
+        return LAB_DEEP_REPLAY_DETAIL_QUEUE
+    if task_kind == "sweep_shard":
+        return LAB_SWEEP_SHARD_QUEUE
+    return LAB_DEEP_REPLAY_QUEUE
 
 
 def _string_list(value: Any) -> list[str]:
@@ -295,6 +306,8 @@ class LabLease:
     def to_payload(self, task: LabTask) -> dict[str, Any]:
         task_payload = task.to_payload()
         raw_task_payload = task_payload.get("payload")
+        worker_payload = dict(raw_task_payload) if isinstance(raw_task_payload, dict) else {}
+        resolved_profile: dict[str, Any] | None = None
         if isinstance(raw_task_payload, dict):
             resolved_profile = raw_task_payload.get("resolved_profile_snapshot")
             if not isinstance(resolved_profile, dict):
@@ -303,6 +316,7 @@ class LabLease:
                 resolved_profile = raw_task_payload.get("base_profile_snapshot")
             if isinstance(resolved_profile, dict):
                 task_payload["resolved_profile_snapshot"] = dict(resolved_profile)
+        required_hash = str(worker_payload.get("required_worker_contract_hash") or "").strip()
         return {
             "lease_id": self.lease_id,
             "task": task_payload,
@@ -312,6 +326,17 @@ class LabLease:
             "task_kind": task.task_kind,
             "attempt_number": self.attempt_number,
             "deadline_seconds": task.deadline_seconds,
+            # Keep the nested lab task above for existing coordinators while also
+            # exposing the canonical replay-worker lease envelope.
+            "queue_name": _queue_name_for_task_kind(task.task_kind),
+            "stream_message_id": f"lab:{self.task_id}:{self.attempt_number}",
+            "payload": worker_payload,
+            "job_kind": task.task_kind,
+            "resolved_profile_snapshot": (
+                dict(resolved_profile) if isinstance(resolved_profile, dict) else None
+            ),
+            "parent_state": None,
+            "required_worker_contract_hash": required_hash or None,
         }
 
 

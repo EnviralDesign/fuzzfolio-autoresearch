@@ -53,6 +53,10 @@ def test_lab_gateway_claim_complete_and_duplicate_completion() -> None:
     assert claim["status"] == "leased"
     assert claim["task_id"] == "task-1"
     assert claim["task"]["payload"]["work_seconds"] == 10
+    assert claim["queue_name"] == "QUEUE:deep_replay_jobs"
+    assert claim["stream_message_id"] == "lab:task-1:1"
+    assert claim["job_kind"] == "fake_compute"
+    assert claim["payload"] == {"work_seconds": 10}
 
     completion = gateway.complete(
         "worker-1",
@@ -146,6 +150,49 @@ def test_lab_gateway_sweep_claim_exposes_resolved_profile_snapshot() -> None:
     assert claim["status"] == "leased"
     assert claim["task"]["payload"]["base_profile_snapshot"] == profile_snapshot
     assert claim["task"]["resolved_profile_snapshot"] == profile_snapshot
+    assert claim["queue_name"] == "QUEUE:sweep_shard_jobs"
+    assert claim["job_kind"] == "sweep_shard"
+    assert claim["payload"]["base_profile_snapshot"] == profile_snapshot
+    assert claim["resolved_profile_snapshot"] == profile_snapshot
+
+
+def test_lab_gateway_full_backtest_claim_matches_replay_worker_contract() -> None:
+    profile_snapshot = {"name": "bounded", "notificationThreshold": 80}
+    required_hash = "sha256:" + "a" * 64
+    gateway = PlayHandLabGateway()
+    gateway.enqueue(
+        LabTask(
+            task_id="full-backtest-1",
+            lane_id="corpus-full-backtest",
+            attempt_id="attempt-1",
+            task_kind="full_backtest_cache",
+            payload={
+                "job_id": "full-backtest-1",
+                "inline_profile_snapshot": profile_snapshot,
+                "required_worker_contract_hash": required_hash,
+                "required_capabilities": ["deep_replay", "full_backtest_cache"],
+            },
+            required_worker_capabilities={"full_backtest_cache"},
+        )
+    )
+    gateway.register_worker(
+        "worker-1",
+        contract_hash=required_hash,
+        capabilities=["deep_replay", "full_backtest_cache"],
+    )
+
+    claim = gateway.claim(
+        "worker-1",
+        contract_hash=required_hash,
+        capabilities=["deep_replay", "full_backtest_cache"],
+    )
+
+    assert claim["status"] == "leased"
+    assert claim["queue_name"] == "QUEUE:deep_replay_jobs"
+    assert claim["job_kind"] == "full_backtest_cache"
+    assert claim["payload"]["job_id"] == "full-backtest-1"
+    assert claim["resolved_profile_snapshot"] == profile_snapshot
+    assert claim["required_worker_contract_hash"] == required_hash
 
 
 def test_lab_gateway_requeues_retryable_failure_until_cap() -> None:
@@ -963,6 +1010,8 @@ def test_lab_gateway_http_worker_lifecycle() -> None:
         claim_payload = claim.json()
         assert claim_payload["status"] == "leased"
         assert claim_payload["task"]["payload"]["work_seconds"] == 1.5
+        assert claim_payload["queue_name"] == "QUEUE:deep_replay_jobs"
+        assert claim_payload["payload"]["work_seconds"] == 1.5
 
         completed = requests.post(
             f"{base_url}/leases/{claim_payload['lease_id']}/complete",
@@ -1197,6 +1246,9 @@ def test_lab_gateway_websocket_disconnect_keeps_active_lease_for_reconnect() -> 
             )
             claim_response = json.loads(await websocket.recv())
             assert claim_response["status"] == "leased"
+            assert claim_response["queue_name"] == "QUEUE:deep_replay_jobs"
+            assert claim_response["job_kind"] == "fake_compute"
+            assert claim_response["payload"] == {}
             return str(claim_response["lease_id"])
 
     try:
