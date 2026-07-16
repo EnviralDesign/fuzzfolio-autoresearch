@@ -695,6 +695,140 @@ def test_run_lab_full_backtests_counts_no_valid_cell_as_nonviable_evidence(
     assert validation["freshness"]["mode"] == "plan_bound_terminal_outcome"
 
 
+def test_run_lab_full_backtests_counts_fixed_cell_outer_no_valid_cell_as_nonviable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "final"
+    profile_path = run_dir / "profiles" / "profile.json"
+    artifact_dir.mkdir(parents=True)
+    _write_json(
+        profile_path,
+        {
+            "profile": {
+                "instruments": ["EURUSD"],
+                "notificationThreshold": 80,
+                "indicators": [],
+            }
+        },
+    )
+    _write_json(
+        artifact_dir / "deep-replay-job.json",
+        {"request": {"timeframe": "M5", "instruments": ["EURUSD"]}},
+    )
+    attempt = {
+        "run_id": "run-a",
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+        "requested_timeframe": "M5",
+    }
+    row = {"attempt_id": "attempt-a", "run_id": "run-a", "candidate_name": "final"}
+    tracked_cell = {"reward_multiple": 3.0, "stop_loss_percent": 0.2}
+    receipt = {
+        "schema_version": "autoresearch-frozen-execution-cell-v1",
+        "campaign_plan_id": "retrospective-fixed:test",
+        "fold_id": "retrospective-fixed-cell:attempt-a",
+        "profile_snapshot_sha256": "sha256:" + "b" * 64,
+        "train_evidence_plan_id": "sha256:" + "c" * 64,
+        "selection_basis": "recommended_cell",
+        "execution_cell": tracked_cell,
+        "execution_cell_sha256": build_execution_cell_sha256(tracked_cell),
+        "source": {"kind": "test"},
+        "lake_manifest_sha256": "sha256:" + "a" * 64,
+    }
+
+    class FakeGateway:
+        task: dict | None = None
+        returned = False
+        acked: list[str] = []
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            _ = limit
+            if self.task is None or self.returned:
+                return []
+            self.__class__.returned = True
+            return [
+                {
+                    "task_id": self.task["task_id"],
+                    "lease_id": "lease-1",
+                    "worker_id": "worker-1",
+                    "status": "failed",
+                    "result": {
+                        "error": "FullBacktestNoValidCellError",
+                        "terminal_result": _no_valid_terminal_result(
+                            self.task,
+                            {
+                                "signal_count": 0,
+                                "resolved_trade_count_max": 0,
+                                "market_data_window": {
+                                    "filtered_bar_count": 123,
+                                    "effective_window_end": "2023-07-14T00:00:00Z",
+                                },
+                            },
+                        ),
+                    },
+                }
+            ]
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            self.__class__.task = tasks[0]
+            return {"accepted": len(tasks)}
+
+        def ack_results(self, lease_ids: list[str]) -> None:
+            self.__class__.acked.extend(lease_ids)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "autoresearch.corpus_lab_backtests.LabGatewayClient",
+        FakeGateway,
+    )
+
+    results, calculated, failed = run_lab_full_backtests(
+        config=SimpleNamespace(
+            research=SimpleNamespace(quality_score_preset="profile_drop")
+        ),
+        items=[(run_dir, attempt, row, {})],
+        lab_config=LabBacktestConfig(
+            worker_contract_hash="sha256:test",
+            poll_interval_seconds=0.01,
+        ),
+        max_workers=1,
+        requested_horizon_months=24,
+        evidence_window_start="2021-07-14T00:00:00Z",
+        evidence_window_end="2023-07-14T00:00:00Z",
+        evidence_role="outer_test",
+        selection_data_end="2026-07-14T00:00:00Z",
+        campaign_plan_id="retrospective-fixed:test",
+        lake_manifest_sha256="sha256:" + "a" * 64,
+        cell_receipts_by_attempt_id={"attempt-a": receipt},
+    )
+
+    assert calculated == 1
+    assert failed == 0
+    assert results[0]["status"] == "nonviable"
+    assert results[0]["terminal_outcome"]["outcome"] == "no_valid_cell"
+    assert FakeGateway.acked == ["lease-1"]
+
+    validation = ct.validate_full_backtest_artifacts(
+        attempt,
+        expected_evidence_plan=FakeGateway.task["payload"]["evidence_plan"],
+        full_backtest_max_age_days=7,
+        market_data_coverage={
+            ("EURUSD", "M5"): ar_main.datetime(2026, 7, 14, tzinfo=ar_main.timezone.utc)
+        },
+    )
+    assert validation["status"] == "nonviable"
+    assert validation["evidence_role"] == "outer_test"
+    assert validation["freshness"]["mode"] == "plan_bound_terminal_outcome"
+
+
 def test_run_lab_full_backtests_fixed_cell_outer_result_does_not_store_matrix_cells(
     tmp_path: Path,
     monkeypatch,
@@ -868,6 +1002,22 @@ def test_run_lab_full_backtests_fixed_cell_outer_result_does_not_store_matrix_ce
     assert "matrix_summary" not in aggregate
     assert "score_lab" not in aggregate
     assert FakeGateway.acked == ["lease-1"]
+
+    validation = ct.validate_full_backtest_artifacts(
+        attempt,
+        expected_evidence_plan=FakeGateway.task["payload"]["evidence_plan"],
+        full_backtest_max_age_days=7,
+        market_session_tolerance_days=5,
+        market_data_coverage={
+            ("EURUSD", "M5"): ar_main.datetime(2026, 7, 14, tzinfo=ar_main.timezone.utc)
+        },
+    )
+    assert validation["status"] == "valid"
+    assert validation["reason_codes"] == []
+    assert validation["evidence_role"] == "outer_test"
+    assert validation["freshness"]["mode"] == "bounded_evidence_plan"
+    assert validation["freshness"]["reference_end"] == "2023-07-14T00:00:00+00:00"
+    assert validation["recommended_curve_exists"] is False
 
 
 def test_run_lab_full_backtests_fails_fast_on_unrelated_gateway_result(

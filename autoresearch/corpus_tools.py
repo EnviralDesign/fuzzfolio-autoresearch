@@ -885,6 +885,126 @@ def validate_full_backtest_artifacts(
                 "freshness": {"mode": "plan_bound_terminal_outcome"},
                 "terminal_outcome": terminal_outcome,
             }
+        if (
+            bundle_validation.get("status") == "valid"
+            and resolved_expected_plan.evidence_role == "outer_test"
+        ):
+            result_payload = load_json_if_exists(evidence_paths.result)
+            curve_payload = load_json_if_exists(evidence_paths.curve)
+            aggregate = nested_get(result_payload, ["data", "aggregate"])
+            curve_points = nested_get(curve_payload, ["curve", "points"])
+            curve_points = curve_points if isinstance(curve_points, list) else []
+            issues: list[str] = []
+            if not isinstance(result_payload, dict):
+                issues.append("invalid_result_json")
+            if not isinstance(curve_payload, dict):
+                issues.append("invalid_curve_json")
+            if not isinstance(aggregate, dict):
+                issues.append("missing_result_aggregate")
+                aggregate = {}
+            tracked_cell_result = aggregate.get("tracked_cell_result")
+            if not isinstance(tracked_cell_result, dict):
+                issues.append("missing_tracked_cell_result")
+            leaked_matrix_keys = [
+                key
+                for key in (
+                    "best_cell",
+                    "recommended_cell",
+                    "matrix",
+                    "matrix_summary",
+                    "score_lab",
+                    "scoreLab",
+                )
+                if key in aggregate
+            ]
+            if leaked_matrix_keys:
+                issues.append(
+                    "outer_test_matrix_fields:"
+                    + ",".join(sorted(leaked_matrix_keys))
+                )
+
+            reasons: list[dict[str, Any]] = []
+            if issues:
+                reasons.append(
+                    _validation_reason("invalid_artifact", detail=",".join(issues))
+                )
+
+            freshness: dict[str, Any] = {
+                "mode": "not_checked",
+                "effective_window_end": None,
+                "reference_end": None,
+                "market_session_lag_days": None,
+                "fallback_used": False,
+            }
+            if full_backtest_max_age_days is not None:
+                market_window = aggregate.get("market_data_window")
+                market_window = market_window if isinstance(market_window, dict) else {}
+                effective_end = _parse_datetime(
+                    market_window.get("effective_window_end")
+                )
+                bounded_freshness, bounded_reason = _validate_bounded_effective_end(
+                    effective_end=effective_end,
+                    plan=resolved_expected_plan,
+                    market_session_tolerance_days=market_session_tolerance_days,
+                )
+                freshness.update(bounded_freshness)
+                if bounded_reason is not None:
+                    reasons.append(bounded_reason)
+
+            deduped_reasons: list[dict[str, Any]] = []
+            seen_reason_codes: set[str] = set()
+            for reason in reasons:
+                code = str(reason.get("code") or "")
+                if not code or code in seen_reason_codes:
+                    continue
+                seen_reason_codes.add(code)
+                deduped_reasons.append(reason)
+            reason_codes = [str(reason["code"]) for reason in deduped_reasons]
+            rebuild_reason_codes = [
+                str(reason["code"])
+                for reason in deduped_reasons
+                if bool(reason.get("rebuild_required"))
+            ]
+            analysis_status = (
+                str(aggregate.get("analysis_status") or "").strip().lower()
+                or str(result_payload.get("status") or "").strip().lower()
+                if isinstance(result_payload, dict)
+                else None
+            )
+            return {
+                "status": "valid" if not reason_codes else "invalid",
+                "issues": issues,
+                "reason_codes": reason_codes,
+                "rebuild_reason_codes": rebuild_reason_codes,
+                "reasons": deduped_reasons,
+                "rebuild_required": any(
+                    bool(reason.get("rebuild_required"))
+                    for reason in deduped_reasons
+                ),
+                "result_exists": True,
+                "curve_exists": True,
+                "curve_point_count": len(curve_points),
+                "analysis_status": analysis_status or None,
+                "cell_match": True,
+                "result_path": str(evidence_paths.result),
+                "curve_path": str(evidence_paths.curve),
+                "calendar_curve_path": str(evidence_paths.calendar_curve),
+                "calendar_curve_exists": False,
+                "recommended_curve_path": str(evidence_paths.recommended_curve),
+                "recommended_curve_exists": False,
+                "threshold_expected": None,
+                "threshold_observed": None,
+                "canonical_profile_fingerprint": None,
+                "artifact_profile_fingerprint": None,
+                "provenance_mode": "evidence_artifact",
+                "evidence_plan_id": resolved_expected_plan.plan_id,
+                "evidence_role": resolved_expected_plan.evidence_role,
+                "requested_horizon_months": (
+                    resolved_expected_plan.requested_horizon_months
+                ),
+                "provenance_path": str(evidence_paths.manifest),
+                "freshness": freshness,
+            }
     result_path = (
         evidence_paths.result if evidence_paths else artifact_dir / FULL_BACKTEST_RESULT_FILENAME
     )
