@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
+from importlib import metadata
 from pathlib import Path
 from typing import Any, Mapping
 
+from . import execution_costs as execution_costs_module
+from . import scoring as scoring_module
 from .evidence_plan import canonical_sha256
 from .execution_costs import execution_cost_manifest_payload
 from .scoring import CANONICAL_SCORE_LAB_VERSION
 
 
-POLICY_LOCK_SCHEMA = "autoresearch-runtime-policy-lock-v1"
+POLICY_LOCK_SCHEMA = "autoresearch-runtime-policy-lock-v2"
 ENGINE_POLICY_ID = "fuzzfolio-replay-engine-v1"
 SCORING_POLICY_ID = "score-lab-policy-v1"
 COST_POLICY_ID = "autoresearch-execution-cost-policy-v1"
@@ -18,6 +22,21 @@ COST_POLICY_ID = "autoresearch-execution-cost-policy-v1"
 
 class RuntimePolicyLockError(RuntimeError):
     """Raised when live engine/scoring/cost policy differs from a frozen lock."""
+
+
+def _implementation_surface(module: Any) -> dict[str, str]:
+    source_path = Path(str(module.__file__ or "")).resolve(strict=True)
+    try:
+        package_version = metadata.version("autoresearch")
+    except metadata.PackageNotFoundError:
+        package_version = "workspace-uninstalled"
+    return {
+        "module": str(module.__name__),
+        "package": "autoresearch",
+        "package_version": package_version,
+        "source_file": source_path.name,
+        "source_sha256": "sha256:" + hashlib.sha256(source_path.read_bytes()).hexdigest(),
+    }
 
 
 def build_runtime_policy_lock(
@@ -37,10 +56,12 @@ def build_runtime_policy_lock(
         "score_lab_version": CANONICAL_SCORE_LAB_VERSION,
         "quality_score_preset": str(getattr(research, "quality_score_preset", "") or ""),
         "score_builder": "autoresearch.scoring.build_attempt_score",
+        "implementation": _implementation_surface(scoring_module),
     }
     cost_surface = {
         **execution_cost_manifest_payload(config),
         "cost_builder": "autoresearch.execution_costs.execution_cost_manifest_payload",
+        "implementation": _implementation_surface(execution_costs_module),
     }
     components = {
         "engine": {

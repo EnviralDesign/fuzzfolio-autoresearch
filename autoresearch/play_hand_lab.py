@@ -26,7 +26,9 @@ from .evidence_plan import build_replay_evidence_plan, canonical_sha256
 from .durable_execution import (
     DurableExecutionError,
     DurableExecutionJournal,
+    artifact_receipt,
     atomic_write_json,
+    validate_artifact_receipt,
 )
 from .ledger import (
     attempts_path_for_run_dir,
@@ -36,6 +38,7 @@ from .ledger import (
     write_attempts,
     write_run_metadata,
 )
+from .level_c_operator import validate_executor_runtime_binding
 from .play_hand import (
     DEFAULT_INSTRUMENT_POOL,
     INSTRUMENT_SCOUT_DEFAULT_MAX_SELECTED,
@@ -145,6 +148,10 @@ PLAY_HAND_LAB_STAGE_ORDER = (
     "scrutiny",
     "artifacts",
 )
+TERMINAL_OUTCOME_PROMOTED = "promoted"
+TERMINAL_OUTCOME_RESEARCH_NONVIABLE = "research_nonviable"
+TERMINAL_OUTCOME_INFRASTRUCTURE_FAILURE = "infrastructure_failure"
+TERMINAL_OUTCOME_INCOMPLETE = "incomplete"
 
 
 @dataclass(frozen=True)
@@ -253,6 +260,7 @@ class LabLaneState:
     run_promoted: bool = False
     tombstone_reason: str | None = None
     tombstone_reasons: list[str] = field(default_factory=list)
+    terminal_outcome_category: str | None = None
     incumbent_profile_path: Path | None = None
     incumbent_profile_ref: str | None = None
     incumbent_profile_payload: dict[str, Any] | None = None
@@ -356,6 +364,7 @@ def _write_campaign_state(
     history: LabCampaignHistory,
     next_lane_index: int,
     recorded_result_count: int,
+    reserved_lane_indices: list[int] | None = None,
 ) -> None:
     atomic_write_json(
         path,
@@ -363,6 +372,7 @@ def _write_campaign_state(
             "schema_version": "play-hand-lab-durable-state-v1",
             "lineage": _campaign_state_lineage(runtime, campaign_id),
             "next_lane_index": int(next_lane_index),
+            "reserved_lane_indices": sorted({int(item) for item in reserved_lane_indices or []}),
             "recorded_result_count": int(recorded_result_count),
             "history": asdict(history),
             "lanes": [_lane_state_payload(lane) for lane in lanes],
@@ -375,7 +385,7 @@ def _load_campaign_state(
     *,
     runtime: PlayHandLabRuntimeConfig,
     campaign_id: str,
-) -> tuple[list[LabLaneState], LabCampaignHistory, int, int]:
+) -> tuple[list[LabLaneState], LabCampaignHistory, int, list[int], int]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -394,8 +404,13 @@ def _load_campaign_state(
         lanes,
         history,
         int(payload.get("next_lane_index") or 0),
+        sorted({int(item) for item in payload.get("reserved_lane_indices") or []}),
         int(payload.get("recorded_result_count") or 0),
     )
+
+
+def _lane_allocation_checkpoint(_name: str) -> None:
+    """No-op seam used by crash/restart tests around durable lane allocation."""
 
 
 class LabGatewayClient:
@@ -2035,12 +2050,14 @@ def _mark_lane_tombstoned(
     *,
     lane_ctx: PlayHandContext,
     reason: str,
+    outcome_category: str,
     reasons: list[str] | None = None,
 ) -> None:
     lane.terminal = True
     lane.run_promoted = False
     _set_lane_phase(lane, "tombstoned", event="lane_tombstoned", reason=reason)
     lane.tombstone_reason = reason
+    lane.terminal_outcome_category = outcome_category
     lane.tombstone_reasons = sorted({item for item in [reason, *(reasons or [])] if item})
     metadata = load_run_metadata(lane.run_dir)
     metadata.update(
@@ -2049,6 +2066,7 @@ def _mark_lane_tombstoned(
             "run_tombstoned": True,
             "tombstone_reason": lane.tombstone_reason,
             "tombstone_reasons": lane.tombstone_reasons,
+            "terminal_outcome_category": lane.terminal_outcome_category,
             "phase_rows": list(lane.phase_rows),
             "play_hand_phase_scores": dict(lane.phase_scores),
             "phase_started_at": dict(lane.phase_started_at),
@@ -2083,6 +2101,7 @@ def _mark_lane_tombstoned(
         "tombstoned",
         reason=reason,
         tombstone_reasons=lane.tombstone_reasons,
+        terminal_outcome_category=lane.terminal_outcome_category,
     )
 
 
@@ -2094,6 +2113,7 @@ def _mark_lane_promoted(
 ) -> None:
     lane.terminal = True
     lane.run_promoted = True
+    lane.terminal_outcome_category = TERMINAL_OUTCOME_PROMOTED
     _set_lane_phase(lane, "promoted", event="lane_promoted", final_score=final_score)
     metadata = load_run_metadata(lane.run_dir)
     metadata.update(
@@ -2102,6 +2122,7 @@ def _mark_lane_promoted(
             "run_tombstoned": False,
             "tombstone_reason": None,
             "tombstone_reasons": [],
+            "terminal_outcome_category": lane.terminal_outcome_category,
             "phase_rows": list(lane.phase_rows),
             "play_hand_phase_scores": dict(lane.phase_scores),
             "phase_started_at": dict(lane.phase_started_at),
@@ -2984,6 +3005,89 @@ def _validated_execution_evidence(
     return dict(receipt)
 
 
+TASK_RESULT_RECEIPT_SCHEMA = "play-hand-lab-task-result-receipt-v2"
+
+
+def _task_artifact_receipt(artifact_dir: Path) -> dict[str, Any]:
+    receipt_path = artifact_dir / "task-result-receipt.json"
+    files = [
+        path
+        for path in artifact_dir.rglob("*")
+        if path.is_file() and path != receipt_path
+    ]
+    return artifact_receipt(files, root=artifact_dir)
+
+
+def _write_task_result_receipt(
+    path: Path,
+    *,
+    task_id: str,
+    worker_result_sha256: str,
+    recorded_result: dict[str, Any],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "schema_version": TASK_RESULT_RECEIPT_SCHEMA,
+        "task_id": task_id,
+        "worker_result_sha256": worker_result_sha256,
+        "artifact_receipt": _task_artifact_receipt(path.parent),
+        "recorded_result": recorded_result,
+    }
+    payload["receipt_sha256"] = canonical_sha256(payload)
+    atomic_write_json(path, payload)
+    return payload
+
+
+def _validate_task_result_receipt_payload(
+    receipt: Any,
+    *,
+    task_id: str,
+    worker_result_sha256: str | None = None,
+) -> dict[str, Any]:
+    if not isinstance(receipt, dict):
+        raise DurableExecutionError(f"task result receipt is unreadable: {task_id}")
+    supplied = dict(receipt)
+    receipt_sha256 = str(supplied.pop("receipt_sha256", ""))
+    if (
+        supplied.get("schema_version") != TASK_RESULT_RECEIPT_SCHEMA
+        or receipt_sha256 != canonical_sha256(supplied)
+        or supplied.get("task_id") != task_id
+        or not isinstance(supplied.get("recorded_result"), dict)
+        or not isinstance(supplied.get("artifact_receipt"), dict)
+    ):
+        raise DurableExecutionError(f"task result receipt conflicts for task {task_id}")
+    if worker_result_sha256 is not None and supplied.get("worker_result_sha256") != worker_result_sha256:
+        raise DurableExecutionError(f"worker result identity conflicts for task {task_id}")
+    validate_artifact_receipt(supplied["artifact_receipt"])
+    supplied["receipt_sha256"] = receipt_sha256
+    return supplied
+
+
+def _validate_task_result_receipt(
+    path: Path,
+    *,
+    task_id: str,
+    worker_result_sha256: str | None = None,
+) -> dict[str, Any]:
+    return _validate_task_result_receipt_payload(
+        _load_json(path),
+        task_id=task_id,
+        worker_result_sha256=worker_result_sha256,
+    )
+
+
+def _terminal_receipt_for_result(
+    recorded: dict[str, Any],
+    lab_result: dict[str, Any],
+) -> dict[str, Any]:
+    task_id = str(lab_result.get("task_id") or "")
+    artifact_dir = Path(str(recorded.get("artifact_dir") or "")).resolve(strict=False)
+    return _validate_task_result_receipt(
+        artifact_dir / "task-result-receipt.json",
+        task_id=task_id,
+        worker_result_sha256=canonical_sha256(lab_result),
+    )
+
+
 def _record_lab_result(
     *,
     config: AppConfig,
@@ -3028,14 +3132,11 @@ def _record_lab_result(
             )
     receipt_path = artifact_dir / "task-result-receipt.json"
     if receipt_path.is_file():
-        receipt = _load_json(receipt_path)
-        if (
-            not isinstance(receipt, dict)
-            or receipt.get("task_id") != task_id
-            or receipt.get("worker_result_sha256") != result_identity
-            or not isinstance(receipt.get("recorded_result"), dict)
-        ):
-            raise DurableExecutionError(f"conflicting result receipt for task {task_id}")
+        receipt = _validate_task_result_receipt(
+            receipt_path,
+            task_id=task_id,
+            worker_result_sha256=result_identity,
+        )
         return dict(receipt["recorded_result"])
     if recovered_row is not None:
         row = recovered_row
@@ -3063,13 +3164,11 @@ def _record_lab_result(
                     else None
                 ),
         }
-        atomic_write_json(
+        _write_task_result_receipt(
             receipt_path,
-            {
-                "task_id": task_id,
-                "worker_result_sha256": result_identity,
-                "recorded_result": recorded,
-            },
+            task_id=task_id,
+            worker_result_sha256=result_identity,
+            recorded_result=recorded,
         )
         return recorded
     if artifact_dir.exists():
@@ -3118,6 +3217,7 @@ def _record_lab_result(
             best_summary=dict(sweep_payload.get("best") or {}),
         )
     else:
+        _write_json(artifact_dir / "fake-result.json", dict(result_payload))
         attempt_score = _fake_attempt_score(result_payload)
     attempts = load_attempts(lane_ctx.attempts_path)
     play_hand_role = (
@@ -3242,13 +3342,11 @@ def _record_lab_result(
         "evidence_role": evidence_plan.get("evidence_role"),
         "sweep_payload": sweep_payload if task_kind == "sweep_shard" else None,
     }
-    atomic_write_json(
+    _write_task_result_receipt(
         receipt_path,
-        {
-            "task_id": task_id,
-            "worker_result_sha256": result_identity,
-            "recorded_result": recorded,
-        },
+        task_id=task_id,
+        worker_result_sha256=result_identity,
+        recorded_result=recorded,
     )
     return recorded
 
@@ -3301,14 +3399,11 @@ def _record_lab_failure(
             )
     receipt_path = artifact_dir / "task-result-receipt.json"
     if receipt_path.is_file():
-        receipt = _load_json(receipt_path)
-        if (
-            not isinstance(receipt, dict)
-            or receipt.get("task_id") != task_id
-            or receipt.get("worker_result_sha256") != result_identity
-            or not isinstance(receipt.get("recorded_result"), dict)
-        ):
-            raise DurableExecutionError(f"conflicting failure receipt for task {task_id}")
+        receipt = _validate_task_result_receipt(
+            receipt_path,
+            task_id=task_id,
+            worker_result_sha256=result_identity,
+        )
         return dict(receipt["recorded_result"])
     if recovered_row is not None:
         row = recovered_row
@@ -3322,13 +3417,11 @@ def _record_lab_failure(
             "phase": phase,
             "task_kind": task_kind,
         }
-        atomic_write_json(
+        _write_task_result_receipt(
             receipt_path,
-            {
-                "task_id": task_id,
-                "worker_result_sha256": result_identity,
-                "recorded_result": recorded,
-            },
+            task_id=task_id,
+            worker_result_sha256=result_identity,
+            recorded_result=recorded,
         )
         return recorded
     if artifact_dir.exists():
@@ -3452,13 +3545,11 @@ def _record_lab_failure(
         "phase": phase,
         "task_kind": task_kind,
     }
-    atomic_write_json(
+    _write_task_result_receipt(
         receipt_path,
-        {
-            "task_id": task_id,
-            "worker_result_sha256": result_identity,
-            "recorded_result": recorded,
-        },
+        task_id=task_id,
+        worker_result_sha256=result_identity,
+        recorded_result=recorded,
     )
     return recorded
 
@@ -3907,6 +3998,7 @@ def _advance_lane_after_result(
             lane,
             lane_ctx=lane_ctx,
             reason="lab_stage_worker_failed",
+            outcome_category=TERMINAL_OUTCOME_INFRASTRUCTURE_FAILURE,
             reasons=[phase],
         )
         return []
@@ -3929,6 +4021,7 @@ def _advance_lane_after_result(
                 lane,
                 lane_ctx=lane_ctx,
                 reason=PLAY_HAND_EARLY_EXIT_TOMBSTONE_REASON,
+                outcome_category=TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
                 reasons=list(decision.get("enforce_reasons") or decision.get("rules_fired") or []),
             )
             return []
@@ -4050,6 +4143,7 @@ def _advance_lane_after_result(
                 lane,
                 lane_ctx=lane_ctx,
                 reason=PLAY_HAND_EARLY_EXIT_TOMBSTONE_REASON,
+                outcome_category=TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
                 reasons=list(decision.get("enforce_reasons") or decision.get("rules_fired") or []),
             )
             return []
@@ -4145,6 +4239,7 @@ def _advance_lane_after_result(
                 lane,
                 lane_ctx=lane_ctx,
                 reason=str(outcome.get("reason") or "validation_failed"),
+                outcome_category=TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
                 reasons=list(outcome.get("reasons") or []),
             )
             return []
@@ -4254,6 +4349,7 @@ def _advance_lane_after_result(
                 lane,
                 lane_ctx=lane_ctx,
                 reason=str(outcome.get("reason") or PLAY_HAND_FINAL_SCRUTINY_FAILED_REASON),
+                outcome_category=TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
                 reasons=list(outcome.get("reasons") or []),
             )
         return []
@@ -4828,6 +4924,7 @@ def _write_summary(
                 "terminal": lane.terminal,
                 "run_promoted": lane.run_promoted,
                 "tombstone_reason": lane.tombstone_reason,
+                "terminal_outcome_category": lane.terminal_outcome_category,
                 "phase_scores": dict(lane.phase_scores),
                 "phase_started_at": dict(lane.phase_started_at),
                 "phase_completed_at": dict(lane.phase_completed_at),
@@ -4855,21 +4952,10 @@ def _historical_lane_has_legitimate_terminal_outcome(lane: LabLaneState) -> bool
         return False
     if not lane.task_ids or not set(lane.task_ids).issubset(lane.completed_task_ids):
         return False
-    if lane.run_promoted:
-        return True
-
-    reason = str(lane.tombstone_reason or "").strip().lower().replace("-", "_")
-    if reason == PLAY_HAND_EARLY_EXIT_TOMBSTONE_REASON:
-        return True
-    return reason.startswith(
-        (
-            "validation_",
-            "final_",
-            "no_valid_cell",
-            "no_signal",
-            "nonviable",
-        )
-    )
+    return lane.terminal_outcome_category in {
+        TERMINAL_OUTCOME_PROMOTED,
+        TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
+    }
 
 
 def _historical_campaign_has_legitimate_terminal_outcomes(
@@ -4915,6 +5001,7 @@ def _finalize_historical_campaign_status(
         lane.run_promoted = False
         lane.terminal = True
         lane.tombstone_reason = reason
+        lane.terminal_outcome_category = TERMINAL_OUTCOME_INCOMPLETE
         if reason not in lane.tombstone_reasons:
             lane.tombstone_reasons.append(reason)
         _set_lane_phase(
@@ -4929,10 +5016,30 @@ def _finalize_historical_campaign_status(
 def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     runtime = _normalize_runtime(runtime or PlayHandLabRuntimeConfig())
     config = load_config()
+    if runtime.as_of_date:
+        if runtime.execution_plan_path is None:
+            raise ValueError("Historical PlayHand requires one authoritative execution plan.")
+        _expected_arguments, authoritative_plan = validate_executor_runtime_binding(
+            runtime.execution_plan_path,
+            executor="playhand",
+            observed={
+                **asdict(runtime),
+                "execution_plan_path": runtime.execution_plan_path,
+            },
+        )
+        authoritative_root = Path(
+            str((authoritative_plan.get("generation") or {}).get("active_runs_root") or "")
+        ).resolve(strict=False)
+        if config.runs_root.resolve(strict=False) != authoritative_root:
+            raise ValueError("Historical PlayHand config runs_root conflicts with authoritative execution plan.")
     cli = FuzzfolioCli(config.fuzzfolio)
     gateway = LabGatewayClient(base_url=runtime.gateway_url, token=runtime.gateway_token)
-    worker_contract_hash = _resolve_worker_contract_hash(config=config, runtime=runtime)
-    if worker_contract_hash and worker_contract_hash != runtime.worker_contract_hash:
+    worker_contract_hash = (
+        str(runtime.worker_contract_hash)
+        if runtime.as_of_date
+        else _resolve_worker_contract_hash(config=config, runtime=runtime)
+    )
+    if not runtime.as_of_date and worker_contract_hash and worker_contract_hash != runtime.worker_contract_hash:
         runtime = replace(runtime, worker_contract_hash=worker_contract_hash)
     started_at = _now_iso()
     campaign_id = runtime.campaign_id or _campaign_run_id()
@@ -5027,9 +5134,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     active_runs = max(int(runtime.active_runs or 1), 1)
     observed_worker_slots = 0
     next_lane_index = 0
+    reserved_lane_indices: list[int] = []
     recorded_result_count = 0
     if runtime.resume:
-        lanes, history, next_lane_index, recorded_result_count = _load_campaign_state(
+        lanes, history, next_lane_index, reserved_lane_indices, recorded_result_count = _load_campaign_state(
             state_path,
             runtime=runtime,
             campaign_id=campaign_id,
@@ -5057,6 +5165,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             lanes=lanes,
             history=history,
             next_lane_index=next_lane_index,
+            reserved_lane_indices=reserved_lane_indices,
             recorded_result_count=recorded_result_count,
         )
 
@@ -5064,17 +5173,29 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         recovered_tasks: list[dict[str, Any]] = []
         for lane in lanes:
             for task_id in list(lane.task_ids):
-                if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
-                    continue
                 terminal = journal.terminal(task_id)
                 if terminal is None:
+                    if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
+                        raise DurableExecutionError(
+                            f"campaign state marks task terminal without a journal receipt: {task_id}"
+                        )
                     continue
                 terminal_receipt = terminal.get("terminal_receipt") or {}
-                recorded = terminal_receipt.get("payload")
-                if not isinstance(recorded, dict):
+                receipt_payload = _validate_task_result_receipt_payload(
+                    terminal_receipt.get("payload"),
+                    task_id=task_id,
+                )
+                recorded = dict(receipt_payload["recorded_result"])
+                local_receipt = _validate_task_result_receipt(
+                    Path(str(recorded.get("artifact_dir") or "")) / "task-result-receipt.json",
+                    task_id=task_id,
+                )
+                if local_receipt != receipt_payload:
                     raise DurableExecutionError(
-                        f"terminal journal entry has no recorded result: {task_id}"
+                        f"journal and artifact receipts conflict for task {task_id}"
                     )
+                if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
+                    continue
                 if recorded.get("status") == "failed":
                     lane.failed_task_ids.add(task_id)
                 else:
@@ -5277,7 +5398,12 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         )
         for task in new_tasks:
             journal.register(str(task["task_id"]), task)
+        for lane in new_lanes:
+            if lane.lane_index in reserved_lane_indices:
+                reserved_lane_indices.remove(lane.lane_index)
         persist_campaign_state()
+        _lane_allocation_checkpoint("after_task_registration")
+        _lane_allocation_checkpoint("before_gateway_enqueue")
         enqueue_result = _enqueue_gateway_tasks_with_retries(
             gateway,
             campaign_ctx,
@@ -5368,10 +5494,15 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         if count <= 0:
             return 0
         start_index = next_lane_index
-        new_lanes = prepare_lanes(start_index, count)
-        enqueue_lanes(new_lanes)
-        next_lane_index += len(new_lanes)
+        new_indices = list(range(start_index, start_index + count))
+        reserved_lane_indices.extend(new_indices)
+        next_lane_index += count
         persist_campaign_state()
+        _lane_allocation_checkpoint("after_index_reservation")
+        new_lanes = prepare_lanes(start_index, count)
+        persist_campaign_state()
+        _lane_allocation_checkpoint("after_lane_registration")
+        enqueue_lanes(new_lanes)
         return len(new_lanes)
 
     if runtime.dry_run:
@@ -5404,6 +5535,24 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         if runtime.json_output:
             print(json.dumps(summary, ensure_ascii=True, sort_keys=True))
         return 0
+
+    resume_tasks_to_enqueue = list(tasks) if runtime.resume else []
+    if runtime.resume and reserved_lane_indices:
+        existing_indices = {lane.lane_index for lane in lanes}
+        missing_indices = [
+            lane_index
+            for lane_index in reserved_lane_indices
+            if lane_index not in existing_indices
+        ]
+        recovered_lanes = [prepare_lane(lane_index) for lane_index in missing_indices]
+        recovered_lanes.extend(
+            lane
+            for lane in lanes
+            if lane.lane_index in reserved_lane_indices and lane not in recovered_lanes
+        )
+        persist_campaign_state()
+        _lane_allocation_checkpoint("after_lane_registration")
+        enqueue_lanes(sorted(recovered_lanes, key=lambda lane: lane.lane_index))
 
     gateway_metric_baseline: dict[str, int] = {}
     try:
@@ -5574,6 +5723,29 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 ack_lease_ids.append(lease_id)
                 continue
             if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
+                terminal = journal.terminal(task_id)
+                terminal_receipt = (
+                    (terminal or {}).get("terminal_receipt")
+                    if isinstance(terminal, dict)
+                    else None
+                )
+                stored = _validate_task_result_receipt_payload(
+                    (terminal_receipt or {}).get("payload")
+                    if isinstance(terminal_receipt, dict)
+                    else None,
+                    task_id=task_id,
+                    worker_result_sha256=canonical_sha256(lab_result),
+                )
+                recorded = dict(stored["recorded_result"])
+                local = _validate_task_result_receipt(
+                    Path(str(recorded.get("artifact_dir") or "")) / "task-result-receipt.json",
+                    task_id=task_id,
+                    worker_result_sha256=canonical_sha256(lab_result),
+                )
+                if local != stored:
+                    raise DurableExecutionError(
+                        f"duplicate result conflicts with journal receipt for task {task_id}"
+                    )
                 ack_lease_ids.append(lease_id)
                 continue
             recorded_successfully = False
@@ -5619,7 +5791,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 )
                 recorded_result_count += 1
                 _add_recorded_result_sample(recorded_results, recorded)
-                journal.complete(task_id, recorded)
+                journal.complete(
+                    task_id,
+                    _terminal_receipt_for_result(recorded, lab_result),
+                )
                 recorded_successfully = True
             except Exception as exc:
                 _append_event(
@@ -5657,7 +5832,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 _add_recorded_result_sample(recorded_results, recorded)
                 lane.failed_task_ids.add(task_id)
                 _refresh_lane_phase_result_counts(lane, task_id=task_id)
-                journal.complete(task_id, recorded)
+                journal.complete(
+                    task_id,
+                    _terminal_receipt_for_result(recorded, failure_result),
+                )
             ack_lease_ids.append(lease_id)
             if new_stage_tasks:
                 enqueue_existing_tasks(new_stage_tasks, reason=f"stage:{_task_phase(lane, task_id)}")
@@ -5680,11 +5858,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         create_and_enqueue_more()
 
     try:
-        if runtime.resume and tasks:
+        if runtime.resume and resume_tasks_to_enqueue:
             _enqueue_gateway_tasks_with_retries(
                 gateway,
                 campaign_ctx,
-                tasks,
+                resume_tasks_to_enqueue,
                 reason="resume_unresolved",
                 failure_limit=runtime.enqueue_failure_limit,
                 retry_base_seconds=runtime.enqueue_retry_base_seconds,

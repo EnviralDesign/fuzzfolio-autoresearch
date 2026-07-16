@@ -340,6 +340,14 @@ def test_cmd_play_hand_lab_uses_explicit_historical_campaign_id_for_exact_path(
     monkeypatch.setattr(lab, "load_config", lambda: fake_config)
     monkeypatch.setattr(lab, "FuzzfolioCli", FakeCli)
     monkeypatch.setattr(lab, "LabGatewayClient", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        lab,
+        "validate_executor_runtime_binding",
+        lambda *_args, **_kwargs: (
+            {},
+            {"generation": {"active_runs_root": str(fake_config.runs_root)}},
+        ),
+    )
     monkeypatch.setattr(lab, "_write_campaign_metadata", stop_after_metadata)
 
     with pytest.raises(StopAfterCampaignSetup):
@@ -488,6 +496,7 @@ def test_historical_campaign_completion_accepts_terminal_research_rejections(
             task_ids=["task-0"],
             completed_task_ids={"task-0"},
             tombstone_reason="validation_12mo_failed",
+            terminal_outcome_category=lab.TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
         ),
         lab.LabLaneState(
             lane_id="lane_001",
@@ -498,6 +507,7 @@ def test_historical_campaign_completion_accepts_terminal_research_rejections(
             task_ids=["task-1"],
             completed_task_ids={"task-1"},
             tombstone_reason="final_36mo_failed",
+            terminal_outcome_category=lab.TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
         ),
         lab.LabLaneState(
             lane_id="lane_002",
@@ -508,6 +518,7 @@ def test_historical_campaign_completion_accepts_terminal_research_rejections(
             task_ids=["task-2"],
             completed_task_ids={"task-2"},
             tombstone_reason="no_signal",
+            terminal_outcome_category=lab.TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
         ),
         lab.LabLaneState(
             lane_id="lane_003",
@@ -518,6 +529,7 @@ def test_historical_campaign_completion_accepts_terminal_research_rejections(
             task_ids=["task-3"],
             completed_task_ids={"task-3"},
             tombstone_reason="no-valid-cell",
+            terminal_outcome_category=lab.TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
         ),
         lab.LabLaneState(
             lane_id="lane_004",
@@ -528,6 +540,7 @@ def test_historical_campaign_completion_accepts_terminal_research_rejections(
             task_ids=["task-4"],
             completed_task_ids={"task-4"},
             tombstone_reason="nonviable",
+            terminal_outcome_category=lab.TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
         ),
     ]
     runtime = lab.PlayHandLabRuntimeConfig(
@@ -1716,10 +1729,214 @@ def test_play_hand_lab_validation_failure_tombstones_before_final(tmp_path: Path
     assert follow_up == []
     assert lane.terminal is True
     assert lane.tombstone_reason == "validation_score_below_45"
+    assert lane.terminal_outcome_category == lab.TERMINAL_OUTCOME_RESEARCH_NONVIABLE
     assert "validation_12mo_failed" in lane.tombstone_reasons
     assert metadata["run_status"] == "tombstoned"
     assert metadata["final_scrutiny_passed"] is False
     assert "final_36mo" not in lane.phase_task_ids
+
+
+def test_missing_validation_score_is_typed_research_nonviability(tmp_path: Path) -> None:
+    fake_config = _test_config(tmp_path)
+    lane_dir = fake_config.runs_root / "lane-missing-score"
+    lane_dir.mkdir(parents=True)
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    lane_ctx = _campaign_ctx(lane_dir)
+    lane_ctx.attempts_path = lane_dir / "attempts.jsonl"
+    runtime = lab.PlayHandLabRuntimeConfig(
+        task_mode="deep_replay",
+        pipeline_mode="play_hand",
+        worker_contract_hash="sha256:" + "a" * 64,
+    )
+    phase = lab._validation_phase(runtime)
+    task_id = "missing-score-validation"
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="lane-missing-score",
+        run_dir=lane_dir,
+        incumbent_profile_path=profile_path,
+        incumbent_profile_payload=_profile_payload()["profile"],
+        incumbent_profile_ref="focused",
+        incumbent_instruments=["EURUSD"],
+        task_ids=[task_id],
+        completed_task_ids={task_id},
+        phase_task_ids={phase: [task_id]},
+    )
+    lab.write_run_metadata(lane_dir, {"run_status": "running"})
+
+    assert lab._advance_lane_after_result(
+        config=fake_config,
+        lane_ctx=lane_ctx,
+        lane=lane,
+        runtime=runtime,
+        reward_matrix=None,
+        worker_contract_hash=str(runtime.worker_contract_hash),
+        recorded={"phase": phase, "score": None, "status": "success"},
+    ) == []
+    assert lane.terminal_outcome_category == lab.TERMINAL_OUTCOME_RESEARCH_NONVIABLE
+    assert lab._historical_lane_has_legitimate_terminal_outcome(lane)
+
+
+class _DurabilityFakeCli:
+    def __init__(self, config) -> None:
+        self.config = config
+
+
+class _DurabilityFakeGateway:
+    enqueued_task_ids: list[str] = []
+    contradictory_duplicate = False
+
+    def __init__(self, **_kwargs) -> None:
+        self.results: list[dict] = []
+
+    def health(self) -> dict:
+        return {"ok": True}
+
+    def enqueue_tasks(self, tasks: list[dict]) -> dict:
+        for task in tasks:
+            task_id = str(task["task_id"])
+            self.enqueued_task_ids.append(task_id)
+            result = {
+                "task_id": task_id,
+                "lane_id": task["lane_id"],
+                "attempt_id": task["attempt_id"],
+                "status": "success",
+                "worker_id": "durability-worker",
+                "lease_id": f"lease-{len(self.enqueued_task_ids)}",
+                "result": {"status": "success", "result": {"task_id": task_id}},
+            }
+            self.results.append(result)
+            if self.contradictory_duplicate:
+                duplicate = json.loads(json.dumps(result))
+                duplicate["lease_id"] += "-duplicate"
+                duplicate["result"]["result"]["contradiction"] = True
+                self.results.append(duplicate)
+        return {"enqueued": len(tasks)}
+
+    def read_results(self, *, limit: int) -> list[dict]:
+        return self.results[:limit]
+
+    def drain_results(self, *, limit: int) -> list[dict]:
+        return self.read_results(limit=limit)
+
+    def ack_results(self, lease_ids: list[str]) -> int:
+        requested = set(lease_ids)
+        before = len(self.results)
+        self.results = [row for row in self.results if row.get("lease_id") not in requested]
+        return before - len(self.results)
+
+    def snapshot(self) -> dict:
+        return {"ok": True, "queued_tasks": len(self.results), "completed_tasks": 0, "metrics": {}}
+
+
+def _durability_runtime(profile_path: Path, *, campaign_id: str, resume: bool = False):
+    return lab.PlayHandLabRuntimeConfig(
+        campaign_id=campaign_id,
+        campaign_mode="finite",
+        task_mode="fake_compute",
+        pipeline_mode="screen",
+        target_runs=1,
+        active_runs=1,
+        tasks_per_lane=1,
+        profile_path=profile_path,
+        indicator=["RSI"],
+        fake_work_seconds=0.0,
+        poll_interval_seconds=0.01,
+        max_wait_seconds=1.0,
+        resume=resume,
+    )
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "after_index_reservation",
+        "after_lane_registration",
+        "after_task_registration",
+        "before_gateway_enqueue",
+    ],
+)
+def test_lane_index_crash_boundaries_resume_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    config = _test_config(tmp_path)
+    _DurabilityFakeGateway.enqueued_task_ids = []
+    _DurabilityFakeGateway.contradictory_duplicate = False
+    monkeypatch.setattr(lab, "load_config", lambda: config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", _DurabilityFakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", _DurabilityFakeGateway)
+
+    def crash(name: str) -> None:
+        if name == checkpoint:
+            raise RuntimeError(f"crash:{name}")
+
+    monkeypatch.setattr(lab, "_lane_allocation_checkpoint", crash)
+    with pytest.raises(RuntimeError, match=f"crash:{checkpoint}"):
+        lab.cmd_play_hand_lab(_durability_runtime(profile_path, campaign_id=f"crash-{checkpoint}"))
+
+    monkeypatch.setattr(lab, "_lane_allocation_checkpoint", lambda _name: None)
+    assert lab.cmd_play_hand_lab(
+        _durability_runtime(
+            profile_path,
+            campaign_id=f"crash-{checkpoint}",
+            resume=True,
+        )
+    ) == 0
+    assert len(_DurabilityFakeGateway.enqueued_task_ids) == 1
+    assert len(set(_DurabilityFakeGateway.enqueued_task_ids)) == 1
+
+
+@pytest.mark.parametrize("damage", ["mutate", "delete"])
+def test_resume_revalidates_terminal_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    config = _test_config(tmp_path)
+    _DurabilityFakeGateway.enqueued_task_ids = []
+    _DurabilityFakeGateway.contradictory_duplicate = False
+    monkeypatch.setattr(lab, "load_config", lambda: config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", _DurabilityFakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", _DurabilityFakeGateway)
+    campaign_id = f"receipt-{damage}"
+    assert lab.cmd_play_hand_lab(_durability_runtime(profile_path, campaign_id=campaign_id)) == 0
+    artifact = next(config.runs_root.glob("*-playhand-lab-lane-*-v1/evals/eval_lab_*/*result.json"))
+    if damage == "mutate":
+        artifact.write_text('{"mutated":true}', encoding="utf-8")
+    else:
+        artifact.unlink()
+
+    with pytest.raises(lab.DurableExecutionError, match="artifact receipt verification failed"):
+        lab.cmd_play_hand_lab(
+            _durability_runtime(profile_path, campaign_id=campaign_id, resume=True)
+        )
+
+
+def test_process_result_batch_rejects_contradictory_terminal_duplicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    config = _test_config(tmp_path)
+    _DurabilityFakeGateway.enqueued_task_ids = []
+    _DurabilityFakeGateway.contradictory_duplicate = True
+    monkeypatch.setattr(lab, "load_config", lambda: config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", _DurabilityFakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", _DurabilityFakeGateway)
+
+    with pytest.raises(lab.DurableExecutionError, match="worker result identity conflicts"):
+        lab.cmd_play_hand_lab(
+            _durability_runtime(profile_path, campaign_id="contradictory-duplicate")
+        )
 
 
 def test_deep_replay_rejects_duplicate_tasks_per_lane() -> None:

@@ -30,6 +30,11 @@ def test_runtime_policy_lock_is_content_addressed_and_revalidates_live_surfaces(
     assert validate_runtime_policy_lock(
         lock, config, worker_contract_sha256=contract
     ) == lock
+    for component in ("scoring", "cost"):
+        implementation = lock["components"][component]["surface"]["implementation"]
+        assert implementation["package"] == "autoresearch"
+        assert implementation["package_version"]
+        assert implementation["source_sha256"].startswith("sha256:")
 
 
 def test_runtime_policy_lock_fails_closed_on_contract_or_scoring_drift() -> None:
@@ -43,7 +48,6 @@ def test_runtime_policy_lock_fails_closed_on_contract_or_scoring_drift() -> None
             config,
             worker_contract_sha256="sha256:" + "b" * 64,
         )
-
     changed = replace(
         config,
         research=replace(config.research, quality_score_preset="policy-drift"),
@@ -54,3 +58,21 @@ def test_runtime_policy_lock_fails_closed_on_contract_or_scoring_drift() -> None
             changed,
             worker_contract_sha256="sha256:" + "a" * 64,
         )
+
+
+def test_runtime_policy_lock_fails_closed_on_implementation_digest_drift(monkeypatch) -> None:
+    from autoresearch import runtime_policy_lock as policy
+
+    config = load_config()
+    contract = "sha256:" + "a" * 64
+    lock = build_runtime_policy_lock(config, worker_contract_sha256=contract)
+    original = policy._implementation_surface
+
+    def changed(module):
+        surface = original(module)
+        surface["source_sha256"] = "sha256:" + "f" * 64
+        return surface
+
+    monkeypatch.setattr(policy, "_implementation_surface", changed)
+    with pytest.raises(RuntimePolicyLockError, match="differs"):
+        validate_runtime_policy_lock(lock, config, worker_contract_sha256=contract)

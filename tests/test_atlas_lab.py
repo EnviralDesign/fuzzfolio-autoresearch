@@ -333,6 +333,44 @@ def test_historical_atlas_existing_root_requires_explicit_resume(tmp_path: Path)
         )
 
 
+def test_historical_atlas_uses_plan_worker_contract_without_live_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from autoresearch import atlas_lab as atlas
+
+    config = _config(tmp_path)
+    contract = "sha256:" + "a" * 64
+    runtime = AtlasLabRuntimeConfig(
+        as_of_date="2025-06-30T00:00:00Z",
+        lake_manifest_sha256="sha256:" + "d" * 64,
+        worker_contract_hash=contract,
+        signal_atlas_executor="gateway",
+        **_historical_runtime_kwargs(),
+    )
+    monkeypatch.setattr(
+        atlas,
+        "validate_executor_runtime_binding",
+        lambda *_args, **_kwargs: (
+            {"worker_contract_hash": contract},
+            {"generation": {"active_runs_root": str(config.runs_root)}},
+        ),
+    )
+    monkeypatch.setattr(
+        atlas,
+        "resolve_atlas_worker_contract_hash",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("live resolver called")),
+    )
+
+    result = run_atlas_lab(
+        config,
+        run_id="plan-contract",
+        runtime=runtime,
+        phases=["none"],
+        gateway=object(),
+    )
+    assert result.status == "completed"
+
+
 def test_historical_atlas_stage_resume_requires_exact_artifact_receipt(tmp_path: Path) -> None:
     run_root = tmp_path / "atlas-run"
     stage_root = run_root / "indicator-atlas"

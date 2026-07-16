@@ -18,7 +18,10 @@ from autoresearch.level_c_operator import (
     executor_arguments_from_plan,
     load_level_c_execution_plan,
     validate_level_c_execution_plan,
+    validate_executor_runtime_binding,
 )
+from autoresearch.atlas_lab import AtlasLabRuntimeConfig, run_atlas_lab
+from autoresearch.play_hand_lab import PlayHandLabRuntimeConfig, cmd_play_hand_lab
 from autoresearch.level_c_protocol import (
     LevelCProtocolError,
     create_level_c_protocol,
@@ -225,6 +228,83 @@ def test_one_authoritative_plan_drives_atlas_and_playhand_executors(tmp_path: Pa
     assert set(inspect.signature(build_level_c_execution_plan).parameters) == {
         "active_runs_root", "protocol_path", "authority_path", "cutoff_key"
     }
+
+
+def _materialize_plan_seed(plan: dict[str, object]) -> None:
+    seed_path = Path(plan["playhand_arguments"]["seed_plan_path"])
+    seed_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_path.write_text('{"recipes":{},"sampling_policy":{}}', encoding="utf-8")
+    seed_sha256 = "sha256:" + hashlib.sha256(seed_path.read_bytes()).hexdigest()
+    (seed_path.parent / "level-c-lineage.json").write_text(
+        json.dumps({"artifact_sha256": {"play-hand-seed-plan.json": seed_sha256}}),
+        encoding="utf-8",
+    )
+
+
+def test_programmatic_atlas_executor_rejects_lineage_and_worker_contract_bypass(
+    tmp_path: Path,
+) -> None:
+    root, protocol_path, authority_path, _ = _bound_sources(tmp_path)
+    plan = build_level_c_execution_plan(root, protocol_path, authority_path, "C")
+    plan_path = tmp_path / "execution-plan.json"
+    create_level_c_execution_plan(plan_path, plan)
+    arguments, _ = executor_arguments_from_plan(plan_path, executor="atlas")
+    run_id = arguments.pop("run_id")
+
+    for field, replacement in (
+        ("source_snapshot_sha256", _hash("9")),
+        ("worker_contract_hash", _hash("8")),
+    ):
+        changed = {**arguments, field: replacement}
+        runtime = AtlasLabRuntimeConfig(**changed)
+        with pytest.raises(LevelCOperatorError, match=field):
+            run_atlas_lab(
+                load_config(),
+                run_id=run_id,
+                runtime=runtime,
+                phases=["build"],
+            )
+
+
+def test_programmatic_playhand_executor_rejects_formal_lineage_bypass(
+    tmp_path: Path,
+) -> None:
+    root, protocol_path, authority_path, _ = _bound_sources(tmp_path)
+    plan = build_level_c_execution_plan(root, protocol_path, authority_path, "C")
+    plan_path = tmp_path / "execution-plan.json"
+    create_level_c_execution_plan(plan_path, plan)
+    _materialize_plan_seed(plan)
+    arguments, _ = executor_arguments_from_plan(plan_path, executor="playhand")
+    runtime = PlayHandLabRuntimeConfig(
+        **{
+            **arguments,
+            "source_snapshot_sha256": _hash("9"),
+            "target_runs": 1,
+            "active_runs": 1,
+        }
+    )
+
+    with pytest.raises(LevelCOperatorError, match="source_snapshot_sha256"):
+        cmd_play_hand_lab(runtime)
+
+
+def test_runtime_binding_compares_every_plan_bound_field(tmp_path: Path) -> None:
+    root, protocol_path, authority_path, _ = _bound_sources(tmp_path)
+    plan = build_level_c_execution_plan(root, protocol_path, authority_path, "A")
+    plan_path = tmp_path / "execution-plan.json"
+    create_level_c_execution_plan(plan_path, plan)
+    arguments, _ = executor_arguments_from_plan(plan_path, executor="atlas")
+    validate_executor_runtime_binding(
+        plan_path,
+        executor="atlas",
+        observed=arguments,
+    )
+    with pytest.raises(LevelCOperatorError, match="lake_manifest_sha256"):
+        validate_executor_runtime_binding(
+            plan_path,
+            executor="atlas",
+            observed={**arguments, "lake_manifest_sha256": _hash("9")},
+        )
 
 
 @pytest.mark.parametrize("field", [

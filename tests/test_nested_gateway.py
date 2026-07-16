@@ -336,6 +336,77 @@ def test_nested_gateway_freezes_cells_without_submitting_or_reading_outer_eviden
     assert result["records"][0]["cell_receipt"]["execution_cell"]
 
 
+def test_outer_submissions_are_exactly_the_frozen_selection_union(
+    tmp_path: Path, monkeypatch
+) -> None:
+    items = []
+    for index in range(3):
+        run_dir, attempt = _attempt_fixture(
+            tmp_path,
+            run_id=f"run-union-{index}",
+            attempt_id=f"attempt-union-{index}",
+        )
+        items.append((run_dir, attempt, {"attempt_id": attempt["attempt_id"]}, {}))
+    selected = {"attempt-union-0", "attempt-union-2"}
+    observed_outer: set[str] = set()
+
+    def fake_train(*, tasks, **_kwargs):
+        results = []
+        for source_attempt, task in tasks:
+            paths = materialize_full_backtest_lab_result(
+                attempt=source_attempt,
+                task=task,
+                lab_result=_worker_result(task, tracked=False),
+            )
+            results.append({"status": "calculated", **paths})
+        return results
+
+    def fake_outer(*, tasks, **_kwargs):
+        results = []
+        for source_attempt, task, fold_payload in tasks:
+            observed_outer.add(str(source_attempt["attempt_id"]))
+            paths = materialize_outer_test_lab_result(
+                attempt=source_attempt,
+                task=task,
+                cell_receipt=fold_payload["cell_receipt"],
+                lab_result=_worker_result(task, tracked=True),
+            )
+            results.append({"status": "calculated", **paths})
+        return results
+
+    monkeypatch.setattr(ng, "_run_train_tasks", fake_train)
+    monkeypatch.setattr(ng, "_run_outer_tasks", fake_outer)
+    result = run_nested_gateway_fold(
+        config=SimpleNamespace(research=SimpleNamespace(quality_score_preset="profile_drop")),
+        items=items,
+        fold={
+            "fold_id": "fold-01",
+            "train_start": "2022-01-01",
+            "train_end": "2024-12-31",
+            "test_start": "2025-01-16",
+            "test_end": "2025-06-30",
+            "embargo_days": 15,
+        },
+        campaign_plan_id="nested:frozen-union",
+        campaign_root=tmp_path / "campaign-union",
+        lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+        max_workers=3,
+        train_horizon_months=36,
+        test_horizon_months=6,
+        lake_manifest_sha256="sha256:" + "a" * 64,
+        submit_outer=True,
+        outer_selected_attempt_ids=selected,
+    )
+
+    assert result["status"] == "complete"
+    assert observed_outer == selected
+    assert {
+        row["attempt_id"]
+        for row in result["records"]
+        if row["outer_validation_status"] in {"valid", "nonviable"}
+    } == selected
+
+
 def test_nested_gateway_preserves_no_signal_stage_semantics(
     tmp_path: Path, monkeypatch
 ) -> None:

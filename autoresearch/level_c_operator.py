@@ -498,6 +498,41 @@ def executor_arguments_from_plan(
     return arguments, plan
 
 
+def validate_executor_runtime_binding(
+    path: Path | str,
+    *,
+    executor: str,
+    observed: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Fail closed unless a callable executor exactly matches its authority plan.
+
+    Operational tuning fields are intentionally outside the frozen plan. Every
+    field that the plan does bind, including deferred Atlas provenance, is
+    compared here so programmatic callers cannot bypass the CLI boundary.
+    """
+    expected, plan = executor_arguments_from_plan(path, executor=executor)
+    actual = dict(observed)
+    path_fields = {"execution_plan_path", "seed_plan_path"}
+    conflicts: list[str] = []
+    for field, expected_value in expected.items():
+        actual_value = actual.get(field)
+        if field in path_fields:
+            expected_value = str(Path(str(expected_value)).expanduser().resolve(strict=False))
+            actual_value = (
+                str(Path(str(actual_value)).expanduser().resolve(strict=False))
+                if actual_value is not None
+                else None
+            )
+        if actual_value != expected_value:
+            conflicts.append(field)
+    if conflicts:
+        raise LevelCOperatorError(
+            f"formal {executor} runtime conflicts with authoritative execution plan: "
+            + ", ".join(sorted(conflicts))
+        )
+    return expected, plan
+
+
 def create_level_c_execution_plan(path: Path | str, payload: Mapping[str, Any]) -> dict[str, Any]:
     """Atomically create a plan file once; an existing target is never reused."""
     supplied = dict(_require_mapping(payload, label="Level C execution plan"))

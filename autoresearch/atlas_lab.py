@@ -75,6 +75,7 @@ from .play_hand_lab import (
     LabGatewayClient,
 )
 from .instrument_universe import research_eligible_instruments, universe_provenance
+from .level_c_operator import validate_executor_runtime_binding
 from .play_hand_lab_auth import load_lab_gateway_token
 from .evidence_plan import build_replay_evidence_plan, canonical_sha256, canonical_timestamp
 from .recipe_priors import DEFAULT_RECIPE_PRIORS_DIRNAME, build_recipe_priors
@@ -2443,6 +2444,23 @@ def run_atlas_lab(
         existing_metadata = _as_dict(_load_json(paths.metadata_path))
         if existing_metadata.get("historical_lineage") != historical_lineage:
             raise DurableExecutionError("Historical Atlas resume lineage does not match")
+    if runtime.as_of_date:
+        if runtime.execution_plan_path is None:
+            raise ValueError("Historical Atlas requires one authoritative execution plan.")
+        _expected_arguments, authoritative_plan = validate_executor_runtime_binding(
+            runtime.execution_plan_path,
+            executor="atlas",
+            observed={
+                **asdict(runtime),
+                "run_id": run_id,
+                "execution_plan_path": runtime.execution_plan_path,
+            },
+        )
+        authoritative_root = Path(
+            str((authoritative_plan.get("generation") or {}).get("active_runs_root") or "")
+        ).resolve(strict=False)
+        if config.runs_root.resolve(strict=False) != authoritative_root:
+            raise ValueError("Historical Atlas config runs_root conflicts with authoritative execution plan.")
     paths.run_root.mkdir(parents=True, exist_ok=True)
     journal = (
         DurableExecutionJournal(
@@ -2472,7 +2490,13 @@ def run_atlas_lab(
         },
     )
     _append_event(paths, "run", "started")
-    worker_contract_hash = resolve_atlas_worker_contract_hash(config=config, runtime=runtime)
+    if runtime.as_of_date:
+        worker_contract_hash = _require_exact_sha256(
+            runtime.worker_contract_hash,
+            label="worker_contract_hash",
+        )
+    else:
+        worker_contract_hash = resolve_atlas_worker_contract_hash(config=config, runtime=runtime)
     gateway_client = gateway or LabGatewayClient(
         base_url=runtime.gateway_url,
         token=runtime.gateway_token or load_lab_gateway_token(),
