@@ -31,6 +31,7 @@ class FrozenExecutionCellReceipt(BaseModel):
     selection_basis: Literal["best_cell", "recommended_cell", "robust_cell"]
     execution_cell: dict[str, float]
     execution_cell_sha256: str
+    source: dict[str, Any] | None = None
     lake_manifest_sha256: str | None = Field(
         default=None,
         pattern=r"^sha256:[0-9a-f]{64}$",

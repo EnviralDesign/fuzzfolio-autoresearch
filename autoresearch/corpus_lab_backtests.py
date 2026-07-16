@@ -346,6 +346,11 @@ def build_full_backtest_lab_task(
         window_start = evidence_window_start or subtract_calendar_months(
             window_end, requested_horizon_months
         )
+        execution_cell_sha256 = (
+            build_execution_cell_sha256(tracked_cell)
+            if isinstance(tracked_cell, dict)
+            else None
+        )
         resolved_evidence_plan = build_replay_evidence_plan(
             campaign_plan_id=(
                 campaign_plan_id
@@ -358,6 +363,7 @@ def build_full_backtest_lab_task(
             analysis_window_end=window_end,
             requested_horizon_months=requested_horizon_months,
             profile_snapshot=profile_snapshot,
+            execution_cell_sha256=execution_cell_sha256,
             lake_manifest_sha256=lake_manifest_sha256,
         )
     else:
@@ -925,6 +931,7 @@ def run_lab_full_backtests(
     selection_data_end: str | None = None,
     campaign_plan_id: str | None = None,
     lake_manifest_sha256: str | None = None,
+    cell_receipts_by_attempt_id: dict[str, FrozenExecutionCellReceipt | dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     _ = force_rebuild
     pending_items = list(items)
@@ -950,6 +957,12 @@ def run_lab_full_backtests(
             while pending_items and len(task_by_id) + len(tasks) < max(1, int(max_workers)):
                 run_dir, attempt, row, run_metadata = pending_items.pop(0)
                 attempt_id = str(attempt.get("attempt_id") or "")
+                cell_receipt_raw = (cell_receipts_by_attempt_id or {}).get(attempt_id)
+                cell_receipt = (
+                    FrozenExecutionCellReceipt.model_validate(cell_receipt_raw)
+                    if isinstance(cell_receipt_raw, dict)
+                    else cell_receipt_raw
+                )
                 try:
                     task = build_full_backtest_lab_task(
                         config=config,
@@ -965,6 +978,11 @@ def run_lab_full_backtests(
                         selection_data_end=selection_data_end,
                         campaign_plan_id=campaign_plan_id,
                         lake_manifest_sha256=lake_manifest_sha256,
+                        tracked_cell=(
+                            cell_receipt.execution_cell
+                            if isinstance(cell_receipt, FrozenExecutionCellReceipt)
+                            else None
+                        ),
                     )
                 except Exception as exc:
                     failed += 1
@@ -988,7 +1006,14 @@ def run_lab_full_backtests(
                     attempt,
                     row,
                     time.time(),
-                    task,
+                    {
+                        "task": task,
+                        "cell_receipt": (
+                            cell_receipt.model_dump(mode="json")
+                            if isinstance(cell_receipt, FrozenExecutionCellReceipt)
+                            else None
+                        ),
+                    },
                 )
             if tasks:
                 response = gateway.enqueue_tasks(tasks)
@@ -1017,7 +1042,11 @@ def run_lab_full_backtests(
                         unknown_result_count += 1
                         continue
                     ack_ids.append(str(lab_result.get("lease_id") or ""))
-                    run_dir, attempt, row, started_at, submitted_task = item
+                    run_dir, attempt, row, started_at, submitted = item
+                    submitted_task = submitted.get("task") if isinstance(submitted, dict) else submitted
+                    submitted_cell_receipt = (
+                        submitted.get("cell_receipt") if isinstance(submitted, dict) else None
+                    )
                     attempt_id = str(attempt.get("attempt_id") or "")
                     entry: dict[str, Any] = {
                         "run_id": run_dir.name,
@@ -1030,11 +1059,19 @@ def run_lab_full_backtests(
                     }
                     if str(lab_result.get("status") or "").lower() == "success":
                         try:
-                            paths = materialize_full_backtest_lab_result(
-                                attempt=attempt,
-                                lab_result=lab_result,
-                                task=submitted_task,
-                            )
+                            if submitted_cell_receipt is not None:
+                                paths = materialize_outer_test_lab_result(
+                                    attempt=attempt,
+                                    lab_result=lab_result,
+                                    task=submitted_task,
+                                    cell_receipt=submitted_cell_receipt,
+                                )
+                            else:
+                                paths = materialize_full_backtest_lab_result(
+                                    attempt=attempt,
+                                    lab_result=lab_result,
+                                    task=submitted_task,
+                                )
                             entry.update(paths)
                             entry["status"] = "calculated"
                             calculated += 1

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 from collections import Counter
 from dataclasses import is_dataclass, replace
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
@@ -3327,6 +3328,16 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--lake-manifest-sha256",
         default=None,
         help="Explicit promoted lake coverage SHA-256; bypasses manifest lookup.",
+    )
+    calc_backtests.add_argument(
+        "--fixed-cell-source",
+        choices=("none", "legacy-36m-recommended", "legacy-36m-best"),
+        default="none",
+        help=(
+            "Bind each evidence plan to a frozen execution cell resolved from the "
+            "fixed cohort source. Requires --attempt-cohort and --evidence-role "
+            "outer_test. Default: none."
+        ),
     )
     calc_backtests.add_argument(
         "--full-backtest-max-age-days",
@@ -11093,12 +11104,27 @@ def cmd_calculate_full_backtests(
     lake_manifest_sha256: str | None = None,
     scope: str = "matched",
     attempt_cohort: Path | None = None,
+    fixed_cell_source: str = "none",
 ) -> int:
     config = load_config()
     attempt_ids, cohort = _resolve_attempt_cohort(
         attempt_cohort=attempt_cohort, attempt_ids=attempt_ids
     )
     cohort_manifest_id = str((cohort or {}).get("manifest_id") or "") or None
+    fixed_cell_source = (
+        str(fixed_cell_source or "none").strip().lower().replace("_", "-")
+    )
+    if fixed_cell_source not in {
+        "none",
+        "legacy-36m-recommended",
+        "legacy-36m-best",
+    }:
+        raise SystemExit(
+            "--fixed-cell-source must be none, legacy-36m-recommended, or legacy-36m-best"
+        )
+    fixed_cell_mode = fixed_cell_source != "none"
+    if fixed_cell_mode and str(evidence_role or "").strip() != "outer_test":
+        raise SystemExit("--fixed-cell-source requires --evidence-role outer_test")
     backend = str(full_backtest_backend or "local").strip().lower().replace("-", "_")
     if backend not in {"local", "lab_gateway"}:
         raise SystemExit("--full-backtest-backend must be local or lab-gateway")
@@ -11113,6 +11139,7 @@ def cmd_calculate_full_backtests(
         or str(evidence_role or "full_backtest") != "full_backtest"
         or campaign_plan_id
         or lake_manifest_sha256
+        or fixed_cell_mode
     )
     if custom_evidence and backend != "lab_gateway":
         raise SystemExit(
@@ -11253,6 +11280,18 @@ def cmd_calculate_full_backtests(
                 )
             )
         return 0
+    fixed_cell_receipts_by_attempt_id: dict[str, Any] = {}
+    fixed_cell_summary: dict[str, Any] = {"enabled": False, "source": "none"}
+    if fixed_cell_mode:
+        fixed_cell_receipts_by_attempt_id, fixed_cell_summary = (
+            _resolve_fixed_execution_cell_receipts(
+                fixed_cell_source=fixed_cell_source,
+                cohort=cohort,
+                matched_items=matched_items,
+                campaign_plan_id=str(stable_campaign_plan_id or ""),
+                lake_manifest_sha256=resolved_lake_manifest_sha256,
+            )
+        )
 
     coverage_root = trading_dashboard_root
     if coverage_root is None:
@@ -11282,6 +11321,8 @@ def cmd_calculate_full_backtests(
                 )
             except (TypeError, ValueError):
                 return ["invalid_profile_threshold"]
+            attempt_id = str(attempt.get("attempt_id") or "").strip()
+            fixed_cell_receipt = fixed_cell_receipts_by_attempt_id.get(attempt_id)
             expected_plan = build_replay_evidence_plan(
                 campaign_plan_id=stable_campaign_plan_id,
                 evidence_role=evidence_role,
@@ -11290,6 +11331,11 @@ def cmd_calculate_full_backtests(
                 analysis_window_end=frozen_evidence_window_end,
                 requested_horizon_months=horizon_months,
                 profile_snapshot=profile_snapshot,
+                execution_cell_sha256=(
+                    fixed_cell_receipt.get("execution_cell_sha256")
+                    if isinstance(fixed_cell_receipt, dict)
+                    else None
+                ),
                 lake_manifest_sha256=resolved_lake_manifest_sha256,
             )
         validation = validate_full_backtest_artifacts(
@@ -11409,6 +11455,8 @@ def cmd_calculate_full_backtests(
                 "execution_ready": (
                     not custom_evidence or resolved_lake_manifest_sha256 is not None
                 ),
+                "fixed_cell_source": fixed_cell_source,
+                "fixed_cell_summary": fixed_cell_summary,
             },
             "corpus_index": corpus_index_info,
             "calculated": 0,
@@ -11490,6 +11538,7 @@ def cmd_calculate_full_backtests(
                 selection_data_end=frozen_selection_data_end,
                 campaign_plan_id=stable_campaign_plan_id,
                 lake_manifest_sha256=resolved_lake_manifest_sha256,
+                cell_receipts_by_attempt_id=fixed_cell_receipts_by_attempt_id,
             )
         changed_run_ids = sorted({run_dir.name for run_dir, *_ in to_calculate})
         derived_refresh = _refresh_global_derived_corpus_state(
@@ -11518,6 +11567,8 @@ def cmd_calculate_full_backtests(
                 "full_backtest_max_age_days": full_backtest_max_age_days,
                 "market_session_tolerance_days": market_session_tolerance_days,
                 "full_backtest_backend": "lab_gateway",
+                "fixed_cell_source": fixed_cell_source,
+                "fixed_cell_summary": fixed_cell_summary,
             },
             "corpus_index": corpus_index_info,
             "calculation_reasons": calculation_reasons,
@@ -14686,6 +14737,258 @@ def _resolve_attempt_cohort(
             "--attempt-cohort conflicts with --attempt-id; provide the identical cohort ids or omit --attempt-id"
         )
     return cohort_ids, cohort
+
+
+def _file_sha256_hex(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _expected_sha_matches(observed_hex: str, expected: Any) -> bool:
+    token = str(expected or "").strip().lower()
+    if token.startswith("sha256:"):
+        token = token.split(":", 1)[1]
+    return bool(token) and observed_hex.lower() == token
+
+
+def _cell_float(cell: Any, key: str) -> float | None:
+    if not isinstance(cell, dict):
+        return None
+    aliases = {
+        "stop_loss_percent": ("stop_loss_percent", "stopLossPercent", "stop_loss"),
+        "reward_multiple": ("reward_multiple", "rewardMultiple"),
+        "take_profit_percent": ("take_profit_percent", "takeProfitPercent", "take_profit"),
+    }
+    for candidate in aliases.get(key, (key,)):
+        if cell.get(candidate) is None:
+            continue
+        try:
+            return float(cell[candidate])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _normalize_execution_cell(cell: Any) -> dict[str, float] | None:
+    stop_loss = _cell_float(cell, "stop_loss_percent")
+    reward_multiple = _cell_float(cell, "reward_multiple")
+    take_profit = _cell_float(cell, "take_profit_percent")
+    if stop_loss is None or reward_multiple is None:
+        return None
+    if take_profit is None:
+        take_profit = stop_loss * reward_multiple
+    return {
+        "reward_multiple": float(reward_multiple),
+        "stop_loss_percent": float(stop_loss),
+        "take_profit_percent": float(take_profit),
+    }
+
+
+def _execution_cells_match(left: Any, right: Any) -> bool:
+    left_cell = _normalize_execution_cell(left)
+    right_cell = _normalize_execution_cell(right)
+    if left_cell is None or right_cell is None:
+        return False
+    return all(abs(left_cell[key] - right_cell[key]) <= 1e-9 for key in left_cell)
+
+
+def _load_cohort_candidate_snapshot(cohort: dict[str, Any]) -> tuple[Path, str | None, dict[str, dict[str, Any]]]:
+    source = cohort.get("source") if isinstance(cohort.get("source"), dict) else {}
+    snapshot_path = Path(str(source.get("candidate_snapshot_path") or "")).expanduser()
+    if not snapshot_path.exists():
+        raise SystemExit(
+            "Fixed-cell mode requires the cohort candidate snapshot, but it is missing: "
+            f"{snapshot_path}"
+        )
+    expected_snapshot_sha = str(
+        source.get("candidate_snapshot_sha256")
+        or source.get("candidate_snapshot_digest")
+        or ""
+    ).strip() or None
+    if expected_snapshot_sha and not _expected_sha_matches(
+        _file_sha256_hex(snapshot_path), expected_snapshot_sha
+    ):
+        raise SystemExit(
+            "Fixed-cell mode refuses to use a cohort candidate snapshot whose "
+            f"hash changed: {snapshot_path}"
+        )
+    snapshot = load_json_if_exists(snapshot_path)
+    candidates = snapshot.get("candidates") if isinstance(snapshot, dict) else None
+    if not isinstance(candidates, list):
+        raise SystemExit(f"Invalid cohort candidate snapshot: {snapshot_path}")
+    by_attempt = {
+        str(candidate.get("attempt_id") or ""): candidate
+        for candidate in candidates
+        if isinstance(candidate, dict) and str(candidate.get("attempt_id") or "")
+    }
+    return snapshot_path, expected_snapshot_sha, by_attempt
+
+
+def _source_path_from_candidate(
+    candidate: dict[str, Any], key: str
+) -> tuple[Path | None, str | None]:
+    source = candidate.get("source") if isinstance(candidate.get("source"), dict) else {}
+    paths = source.get("paths") if isinstance(source.get("paths"), dict) else {}
+    hashes = source.get("sha256") if isinstance(source.get("sha256"), dict) else {}
+    raw_path = str(paths.get(key) or "").strip()
+    return (Path(raw_path) if raw_path else None), str(hashes.get(key) or "").strip() or None
+
+
+def _validated_candidate_path(candidate: dict[str, Any], key: str, *, attempt_id: str) -> Path:
+    path, expected_sha = _source_path_from_candidate(candidate, key)
+    if path is None or not path.exists():
+        raise SystemExit(
+            f"Fixed-cell source for {attempt_id} is missing candidate path {key}: {path}"
+        )
+    if expected_sha and not _expected_sha_matches(_file_sha256_hex(path), expected_sha):
+        raise SystemExit(
+            f"Fixed-cell source for {attempt_id} changed since cohort freeze: {key}"
+        )
+    return path
+
+
+def _resolve_fixed_execution_cell_receipts(
+    *,
+    fixed_cell_source: str,
+    cohort: dict[str, Any] | None,
+    matched_items: list[tuple[Path, list[dict[str, Any]], dict[str, Any]]],
+    campaign_plan_id: str,
+    lake_manifest_sha256: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    source_token = str(fixed_cell_source or "none").strip().lower().replace("_", "-")
+    if source_token in {"", "none"}:
+        return {}, {"enabled": False, "source": "none"}
+    if source_token not in {"legacy-36m-recommended", "legacy-36m-best"}:
+        raise SystemExit(
+            "--fixed-cell-source must be none, legacy-36m-recommended, or legacy-36m-best"
+        )
+    if cohort is None:
+        raise SystemExit("--fixed-cell-source requires --attempt-cohort")
+    if not campaign_plan_id:
+        raise SystemExit("--fixed-cell-source requires a stable --campaign-plan-id")
+    from autoresearch.evidence_plan import (
+        build_execution_cell_sha256,
+        canonical_sha256,
+        normalize_evidence_profile_snapshot,
+    )
+    from autoresearch.nested_evidence import FrozenExecutionCellReceipt
+
+    snapshot_path, snapshot_sha, candidates_by_attempt = _load_cohort_candidate_snapshot(
+        cohort
+    )
+    cohort_manifest_id = str(cohort.get("manifest_id") or "").strip() or None
+    receipts: dict[str, Any] = {}
+    summary = {
+        "enabled": True,
+        "source": source_token,
+        "basis": (
+            "recommended_cell"
+            if source_token == "legacy-36m-recommended"
+            else "best_cell"
+        ),
+        "cohort_manifest_id": cohort_manifest_id,
+        "candidate_snapshot_path": str(snapshot_path),
+        "candidate_snapshot_sha256": snapshot_sha,
+        "resolved": 0,
+        "missing": 0,
+        "ambiguous": 0,
+    }
+    for _run_dir, _attempts, attempt in matched_items:
+        attempt_id = str(attempt.get("attempt_id") or "").strip()
+        if not attempt_id:
+            continue
+        candidate = candidates_by_attempt.get(attempt_id)
+        if not isinstance(candidate, dict):
+            summary["missing"] += 1
+            raise SystemExit(
+                f"Fixed-cell source cannot find attempt in cohort snapshot: {attempt_id}"
+            )
+        profile_path = _validated_candidate_path(
+            candidate, "profile_path", attempt_id=attempt_id
+        )
+        profile_snapshot = load_profile_snapshot(profile_path) or {}
+        try:
+            profile_snapshot = normalize_evidence_profile_snapshot(profile_snapshot)
+        except ValueError as exc:
+            raise SystemExit(
+                f"Fixed-cell source profile is invalid for {attempt_id}: {exc}"
+            ) from exc
+        result_path = _validated_candidate_path(
+            candidate, "full_backtest_result_path_36m", attempt_id=attempt_id
+        )
+        curve_path = _validated_candidate_path(
+            candidate, "full_backtest_curve_path_36m", attempt_id=attempt_id
+        )
+        if source_token == "legacy-36m-recommended":
+            detail_path = curve_path.with_name(FULL_BACKTEST_RECOMMENDED_CURVE_FILENAME)
+            selection_basis = "recommended_cell"
+        else:
+            detail_path = curve_path
+            selection_basis = "best_cell"
+        if not detail_path.exists():
+            summary["missing"] += 1
+            raise SystemExit(
+                f"Fixed-cell source detail file is missing for {attempt_id}: {detail_path}"
+            )
+        result_payload = load_json_if_exists(result_path)
+        detail_payload = load_json_if_exists(detail_path)
+        aggregate = _nested_get(result_payload, ["data", "aggregate"])
+        aggregate = aggregate if isinstance(aggregate, dict) else {}
+        matrix_summary = (
+            aggregate.get("matrix_summary")
+            if isinstance(aggregate.get("matrix_summary"), dict)
+            else {}
+        )
+        selected_cell = _normalize_execution_cell(detail_payload.get("cell"))
+        if selected_cell is None:
+            summary["missing"] += 1
+            raise SystemExit(
+                f"Fixed-cell source detail has no usable cell for {attempt_id}: {detail_path}"
+            )
+        if source_token == "legacy-36m-recommended":
+            reference_cell = matrix_summary.get("robust_cell") or aggregate.get(
+                "recommended_cell"
+            )
+        else:
+            reference_cell = aggregate.get("best_cell") or matrix_summary.get("best_cell")
+        if not _execution_cells_match(selected_cell, reference_cell):
+            summary["ambiguous"] += 1
+            raise SystemExit(
+                f"Fixed-cell source for {attempt_id} is ambiguous: {detail_path} "
+                "does not match its 36m result reference cell"
+            )
+        source_record = {
+            "kind": source_token,
+            "attempt_id": attempt_id,
+            "cohort_manifest_id": cohort_manifest_id,
+            "candidate_snapshot_path": str(snapshot_path),
+            "candidate_snapshot_sha256": snapshot_sha,
+            "profile_path": str(profile_path),
+            "profile_sha256": _file_sha256_hex(profile_path),
+            "result_path": str(result_path),
+            "result_sha256": _file_sha256_hex(result_path),
+            "detail_path": str(detail_path),
+            "detail_sha256": _file_sha256_hex(detail_path),
+            "selection_basis": selection_basis,
+            "execution_cell_sha256": build_execution_cell_sha256(selected_cell),
+        }
+        receipt = FrozenExecutionCellReceipt(
+            campaign_plan_id=campaign_plan_id,
+            fold_id=f"retrospective-fixed-cell:{attempt_id}",
+            profile_snapshot_sha256=canonical_sha256(profile_snapshot),
+            train_evidence_plan_id=canonical_sha256(source_record),
+            selection_basis=selection_basis,
+            execution_cell=selected_cell,
+            execution_cell_sha256=source_record["execution_cell_sha256"],
+            source=source_record,
+            lake_manifest_sha256=lake_manifest_sha256,
+        )
+        receipts[attempt_id] = receipt.model_dump(mode="json")
+        summary["resolved"] += 1
+    return receipts, summary
 
 
 def cmd_nested_evidence(
@@ -19821,6 +20124,7 @@ def main(argv: list[str] | None = None) -> int:
             lake_manifest_sha256=args.lake_manifest_sha256,
             scope=args.scope,
             attempt_cohort=args.attempt_cohort,
+            fixed_cell_source=args.fixed_cell_source,
         )
     if args.command == "build-attempt-catalog":
         return cmd_build_attempt_catalog(

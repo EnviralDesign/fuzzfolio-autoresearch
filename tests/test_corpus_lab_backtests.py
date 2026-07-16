@@ -17,6 +17,7 @@ from autoresearch.corpus_lab_backtests import (
     materialize_no_valid_cell_lab_result,
     run_lab_full_backtests,
 )
+from autoresearch.evidence_plan import build_execution_cell_sha256
 from autoresearch.evidence_artifacts import (
     discover_evidence_artifact_bundles,
     evidence_artifact_paths,
@@ -680,6 +681,192 @@ def test_run_lab_full_backtests_counts_no_valid_cell_as_nonviable_evidence(
     assert failed == 0
     assert results[0]["status"] == "nonviable"
     assert results[0]["terminal_outcome"]["outcome"] == "no_valid_cell"
+    assert FakeGateway.acked == ["lease-1"]
+
+    validation = ct.validate_full_backtest_artifacts(
+        attempt,
+        expected_evidence_plan=FakeGateway.task["payload"]["evidence_plan"],
+        full_backtest_max_age_days=7,
+        market_data_coverage={
+            ("EURUSD", "M5"): ar_main.datetime(2026, 7, 14, tzinfo=ar_main.timezone.utc)
+        },
+    )
+    assert validation["status"] == "nonviable"
+    assert validation["freshness"]["mode"] == "plan_bound_terminal_outcome"
+
+
+def test_run_lab_full_backtests_fixed_cell_outer_result_does_not_store_matrix_cells(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "final"
+    profile_path = run_dir / "profiles" / "profile.json"
+    artifact_dir.mkdir(parents=True)
+    _write_json(
+        profile_path,
+        {
+            "profile": {
+                "name": "Frozen",
+                "instruments": ["EURUSD"],
+                "notificationThreshold": 80,
+                "indicators": [],
+            }
+        },
+    )
+    _write_json(
+        artifact_dir / "deep-replay-job.json",
+        {"request": {"timeframe": "M5", "instruments": ["EURUSD"]}},
+    )
+    attempt = {
+        "run_id": "run-a",
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+        "requested_timeframe": "M5",
+    }
+    row = {"attempt_id": "attempt-a", "run_id": "run-a", "candidate_name": "final"}
+    tracked_cell = {
+        "reward_multiple": 3.0,
+        "stop_loss_percent": 0.2,
+        "take_profit_percent": 0.6,
+    }
+    receipt = {
+        "schema_version": "autoresearch-frozen-execution-cell-v1",
+        "campaign_plan_id": "retrospective-fixed:test",
+        "fold_id": "retrospective-fixed-cell:attempt-a",
+        "profile_snapshot_sha256": "sha256:" + "b" * 64,
+        "train_evidence_plan_id": "sha256:" + "c" * 64,
+        "selection_basis": "recommended_cell",
+        "execution_cell": tracked_cell,
+        "execution_cell_sha256": build_execution_cell_sha256(tracked_cell),
+        "source": {"kind": "test"},
+        "lake_manifest_sha256": "sha256:" + "a" * 64,
+    }
+
+    class FakeGateway:
+        task: dict | None = None
+        returned = False
+        acked: list[str] = []
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            _ = limit
+            if self.task is None or self.returned:
+                return []
+            self.__class__.returned = True
+            plan = self.task["payload"]["evidence_plan"]
+            matrix_best = {
+                "reward_multiple": 1.0,
+                "stop_loss_percent": 0.1,
+                "take_profit_percent": 0.1,
+            }
+            matrix_robust = {
+                "reward_multiple": 1.5,
+                "stop_loss_percent": 0.12,
+                "take_profit_percent": 0.18,
+            }
+            aggregate = {
+                "best_cell": matrix_best,
+                "matrix": {"rows": [{"expectancy_r": 999.0}]},
+                "matrix_summary": {"robust_cell": matrix_robust},
+                "score_lab": {
+                    "version": ar_main.CANONICAL_SCORE_LAB_VERSION,
+                    "score": 99,
+                },
+                "market_data_window": {
+                    "effective_window_end": "2023-07-14T00:00:00Z"
+                },
+                "tracked_cell_result": {
+                    **tracked_cell,
+                    "resolved_trades": 12,
+                    "expectancy_r": 0.42,
+                },
+            }
+            return [
+                {
+                    "task_id": self.task["task_id"],
+                    "lease_id": "lease-1",
+                    "worker_id": "worker-1",
+                    "status": "success",
+                    "result": {
+                        "status": "success",
+                        "job_kind": "full_backtest_cache",
+                        "execution_evidence": {
+                            **plan,
+                            "observed_lake_manifest_sha256": plan[
+                                "lake_manifest_sha256"
+                            ],
+                        },
+                        "result": {
+                            "request": self.task["payload"],
+                            "sensitivity_response": {
+                                "status": "success",
+                                "requested_timeframe": "M5",
+                                "effective_timeframe": "M5",
+                                "data": {"aggregate": aggregate},
+                            },
+                            "best_cell_detail": {
+                                "cell": matrix_best,
+                                "curve": {"points": []},
+                            },
+                            "recommended_cell_detail": {
+                                "cell": matrix_robust,
+                                "curve": {"points": []},
+                            },
+                            "tracked_cell_detail": {
+                                "cell": tracked_cell,
+                                "curve": {"points": [{"date": "2022-01-01"}]},
+                            },
+                        },
+                    },
+                }
+            ]
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            self.__class__.task = tasks[0]
+            return {"accepted": len(tasks)}
+
+        def ack_results(self, lease_ids: list[str]) -> None:
+            self.__class__.acked.extend(lease_ids)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("autoresearch.corpus_lab_backtests.LabGatewayClient", FakeGateway)
+
+    results, calculated, failed = run_lab_full_backtests(
+        config=SimpleNamespace(
+            research=SimpleNamespace(quality_score_preset="profile_drop")
+        ),
+        items=[(run_dir, attempt, row, {})],
+        lab_config=LabBacktestConfig(
+            worker_contract_hash="sha256:test",
+            poll_interval_seconds=0.01,
+        ),
+        max_workers=1,
+        requested_horizon_months=24,
+        evidence_window_start="2021-07-14T00:00:00Z",
+        evidence_window_end="2023-07-14T00:00:00Z",
+        evidence_role="outer_test",
+        selection_data_end="2026-07-14T00:00:00Z",
+        campaign_plan_id="retrospective-fixed:test",
+        lake_manifest_sha256="sha256:" + "a" * 64,
+        cell_receipts_by_attempt_id={"attempt-a": receipt},
+    )
+
+    assert calculated == 1
+    assert failed == 0
+    assert results[0]["status"] == "calculated"
+    payload = json.loads(Path(results[0]["result_path"]).read_text(encoding="utf-8"))
+    aggregate = payload["data"]["aggregate"]
+    assert aggregate["tracked_cell_result"]["reward_multiple"] == 3.0
+    assert "best_cell" not in aggregate
+    assert "matrix" not in aggregate
+    assert "matrix_summary" not in aggregate
+    assert "score_lab" not in aggregate
     assert FakeGateway.acked == ["lease-1"]
 
 

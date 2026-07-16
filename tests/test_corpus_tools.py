@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from autoresearch.plotting import render_attempt_tradeoff_scatter_artifacts
 
 from autoresearch import corpus_tools as ct
+from autoresearch.evidence_artifacts import evidence_artifact_paths
 from autoresearch.evidence_plan import build_replay_evidence_plan
 
 
@@ -468,6 +469,74 @@ def test_market_coverage_marks_may_artifact_stale(tmp_path):
 
     assert "stale_effective_end" in validation["reason_codes"]
     assert validation["freshness"]["mode"] == "market_coverage"
+
+
+def test_bounded_historical_evidence_uses_plan_end_not_current_coverage(tmp_path):
+    artifact_dir = tmp_path / "artifact"
+    profile_path = tmp_path / "profile.json"
+    profile = {
+        "version": "v1",
+        "notificationThreshold": 80,
+        "directionMode": "both",
+        "instruments": ["EURUSD"],
+        "indicators": [],
+    }
+    _write_json(profile_path, {"profile": profile})
+    plan = build_replay_evidence_plan(
+        campaign_plan_id="retrospective:test",
+        evidence_role="retrospective_historical_unseen",
+        selection_data_end="2026-07-14T00:00:00Z",
+        analysis_window_start="2021-07-14T00:00:00Z",
+        analysis_window_end="2023-07-14T00:00:00Z",
+        requested_horizon_months=24,
+        profile_snapshot=profile,
+        lake_manifest_sha256="sha256:" + "a" * 64,
+    )
+    paths = evidence_artifact_paths(artifact_dir, plan)
+    result = _sample_sensitivity_payload(61.25)
+    result["data"]["aggregate"]["market_data_window"] = {
+        "effective_window_end": "2023-07-14T00:00:00Z",
+        "requested_window_end": "2023-07-14T00:00:00Z",
+        "window_truncated_end": False,
+    }
+    request = {
+        "alert_threshold": 80,
+        "instruments": ["EURUSD"],
+        "timeframe": "M5",
+        "direction_mode": "both",
+        "inline_profile_snapshot": profile,
+        "analysis_window_start": plan.analysis_window_start,
+        "analysis_window_end": plan.analysis_window_end,
+        "evidence_plan": plan.model_dump(mode="json"),
+    }
+    _write_json(paths.result, result)
+    _write_json(paths.curve, _sample_curve_payload())
+    _write_json(paths.calendar_curve, _sample_curve_payload())
+    _write_json(paths.recommended_curve, _sample_curve_payload())
+    _write_json(paths.job, {"request": request})
+    _write_json(
+        paths.manifest,
+        {
+            "schema": "test-evidence-manifest",
+            "evidence_plan": plan.model_dump(mode="json"),
+            "provenance": {"effective_alert_threshold": 80},
+        },
+    )
+
+    validation = ct.validate_full_backtest_artifacts(
+        {"artifact_dir": str(artifact_dir), "profile_path": str(profile_path)},
+        expected_evidence_plan=plan,
+        full_backtest_max_age_days=7,
+        market_session_tolerance_days=5,
+        market_data_coverage={
+            ("EURUSD", "M5"): datetime(2026, 7, 14, tzinfo=timezone.utc)
+        },
+    )
+
+    assert validation["status"] == "valid"
+    assert "stale_effective_end" not in validation["reason_codes"]
+    assert validation["freshness"]["mode"] == "bounded_evidence_plan"
+    assert validation["freshness"]["reference_end"] == "2023-07-14T00:00:00+00:00"
 
 
 def test_weekend_window_truncation_is_tolerated(tmp_path):

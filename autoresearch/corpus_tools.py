@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
 from .execution_costs import result_matches_execution_cost_model
-from .evidence_plan import enforce_replay_evidence_plan, validate_replay_evidence_plan
+from .evidence_plan import (
+    ReplayEvidencePlan,
+    enforce_replay_evidence_plan,
+    validate_replay_evidence_plan,
+)
 from .evidence_artifacts import (
     discover_evidence_artifact_bundles,
     evidence_artifact_paths,
@@ -31,6 +35,7 @@ FULL_BACKTEST_MANIFEST_FILENAME = "full-backtest-36mo-manifest.json"
 FULL_BACKTEST_PROVENANCE_SCHEMA = "autoresearch-full-backtest-provenance-v1"
 DEFAULT_FULL_BACKTEST_MAX_AGE_DAYS = 7.0
 DEFAULT_MARKET_SESSION_TOLERANCE_DAYS = 5
+MOVING_WINDOW_EVIDENCE_ROLES = frozenset({"full_backtest", "scrutiny"})
 _JSON_CACHE_MISSING = object()
 _CATALOG_JSON_CACHE: ContextVar[dict[str, Any] | None] = ContextVar(
     "catalog_json_cache",
@@ -640,6 +645,61 @@ def _parse_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _plan_uses_bounded_freshness(plan: ReplayEvidencePlan | None) -> bool:
+    if plan is None:
+        return False
+    return str(plan.evidence_role or "").strip() not in MOVING_WINDOW_EVIDENCE_ROLES
+
+
+def _validate_bounded_effective_end(
+    *,
+    effective_end: datetime | None,
+    plan: ReplayEvidencePlan,
+    market_session_tolerance_days: int,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    freshness: dict[str, Any] = {
+        "mode": "bounded_evidence_plan",
+        "effective_window_end": effective_end.isoformat() if effective_end else None,
+        "reference_end": plan.analysis_window_end,
+        "market_session_lag_days": None,
+        "fallback_used": False,
+    }
+    if effective_end is None:
+        return freshness, _validation_reason(
+            "invalid_artifact",
+            detail="missing_effective_window_end",
+        )
+    planned_end = _parse_datetime(plan.analysis_window_end)
+    if planned_end is None:
+        return freshness, _validation_reason(
+            "evidence_plan_mismatch",
+            detail="invalid bounded evidence plan analysis_window_end",
+        )
+    if effective_end > planned_end + timedelta(seconds=1):
+        return freshness, _validation_reason(
+            "evidence_plan_mismatch",
+            detail=(
+                "artifact effective_window_end exceeds bounded evidence "
+                f"analysis_window_end: {effective_end.isoformat()} > "
+                f"{planned_end.isoformat()}"
+            ),
+        )
+    session_lag = _market_session_days_between(effective_end, planned_end)
+    freshness["reference_end"] = planned_end.isoformat()
+    freshness["market_session_lag_days"] = session_lag
+    tolerance = max(0, int(market_session_tolerance_days))
+    if session_lag > tolerance:
+        return freshness, _validation_reason(
+            "stale_effective_end",
+            effective_window_end=effective_end.isoformat(),
+            reference_end=planned_end.isoformat(),
+            market_session_lag_days=session_lag,
+            tolerance_days=tolerance,
+            freshness_mode="bounded_evidence_plan",
+        )
+    return freshness, None
+
+
 def _market_session_days_between(start: datetime, end: datetime) -> int:
     if end <= start:
         return 0
@@ -1137,7 +1197,16 @@ def validate_full_backtest_artifacts(
         freshness["effective_window_end"] = (
             effective_end.isoformat() if effective_end else None
         )
-        if effective_end is None:
+        if _plan_uses_bounded_freshness(evidence_plan):
+            bounded_freshness, bounded_reason = _validate_bounded_effective_end(
+                effective_end=effective_end,
+                plan=evidence_plan,
+                market_session_tolerance_days=market_session_tolerance_days,
+            )
+            freshness.update(bounded_freshness)
+            if bounded_reason is not None:
+                reasons.append(bounded_reason)
+        elif effective_end is None:
             reasons.append(
                 _validation_reason("invalid_artifact", detail="missing_effective_window_end")
             )
