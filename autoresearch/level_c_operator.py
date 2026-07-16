@@ -23,10 +23,16 @@ from .generation_archive import (
     GENERATION_SCHEMA_VERSION,
 )
 from .instrument_universe import universe_provenance
+from .config import load_config
 from .level_c_protocol import (
     LevelCProtocolError,
     load_level_c_protocol,
     load_level_c_protocol_authority,
+)
+from .runtime_policy_lock import (
+    build_runtime_policy_lock,
+    policy_lock_provenance,
+    validate_runtime_policy_lock,
 )
 
 
@@ -245,6 +251,21 @@ def build_level_c_execution_plan(
         protocol_path, expected_manifest_id=authority["protocol_manifest_id"]
     )
     _validate_protocol_binding(protocol, generation, generation_sha256)
+    runtime_policy_lock = build_runtime_policy_lock(
+        load_config(),
+        worker_contract_sha256=str(protocol["worker_contract_sha256"]),
+    )
+    live_policy_identities = policy_lock_provenance(runtime_policy_lock)
+    mismatched_policies = [
+        field
+        for field, value in live_policy_identities.items()
+        if protocol.get(field) != value
+    ]
+    if mismatched_policies:
+        raise LevelCOperatorError(
+            "frozen protocol policy identities do not match canonical runtime surfaces: "
+            + ", ".join(mismatched_policies)
+        )
     key = str(cutoff_key or "").strip()
     if key not in _CUTOFF_KEYS:
         raise LevelCOperatorError("cutoff_key must select exactly one of A, B, C, or D")
@@ -310,6 +331,7 @@ def build_level_c_execution_plan(
             "cost_policy_sha256": protocol["cost_policy_sha256"],
             "no_global_priors": True,
             "no_outer_feedback": True,
+            "runtime_policy_lock": runtime_policy_lock,
         },
         "atlas_arguments": {
             **common,
@@ -334,7 +356,7 @@ def build_level_c_execution_plan(
                 / "recipe-priors"
                 / "level-c-lineage.json"
             ),
-            "source_field": "artifact_sha256.play-hand-seed-plan.json",
+            "source_path_tokens": ["artifact_sha256", "play-hand-seed-plan.json"],
             "required_before_execution": True,
         },
     }
@@ -404,6 +426,76 @@ def load_level_c_execution_plan(
         protocol_path=protocol_path,
         authority_path=authority_path,
     )
+
+
+def load_authoritative_level_c_execution_plan(path: Path | str) -> dict[str, Any]:
+    """Load a plan and re-derive it from the exact sources named by that plan."""
+    preliminary = load_level_c_execution_plan(path)
+    generation = _require_mapping(
+        preliminary.get("generation"), label="execution plan generation"
+    )
+    protocol = _require_mapping(
+        preliminary.get("protocol"), label="execution plan protocol"
+    )
+    plan = load_level_c_execution_plan(
+        path,
+        active_runs_root=str(generation.get("active_runs_root") or ""),
+        protocol_path=str(protocol.get("protocol_path") or ""),
+        authority_path=str(protocol.get("authority_path") or ""),
+    )
+    bound = _require_mapping(plan.get("bound_contract"), label="execution plan bound_contract")
+    lock = _require_mapping(
+        bound.get("runtime_policy_lock"), label="execution plan runtime_policy_lock"
+    )
+    validate_runtime_policy_lock(
+        lock,
+        load_config(),
+        worker_contract_sha256=str(bound.get("worker_contract_sha256") or ""),
+    )
+    return plan
+
+
+def executor_arguments_from_plan(
+    path: Path | str,
+    *,
+    executor: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return one executor's arguments after authoritative source revalidation."""
+    plan = load_authoritative_level_c_execution_plan(path)
+    token = str(executor or "").strip().lower()
+    if token not in {"atlas", "playhand"}:
+        raise LevelCOperatorError("executor must be atlas or playhand")
+    arguments = dict(plan[f"{token}_arguments"])
+    if token == "playhand":
+        deferred = _require_mapping(
+            plan.get("playhand_deferred_binding"),
+            label="execution plan playhand_deferred_binding",
+        )
+        source_path = Path(str(deferred.get("source_path") or "")).resolve(strict=False)
+        try:
+            source = json.loads(source_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise LevelCOperatorError(
+                f"PlayHand deferred Atlas binding is unreadable: {source_path}"
+            ) from exc
+        source_path_tokens = deferred.get("source_path_tokens")
+        if not isinstance(source_path_tokens, list) or not source_path_tokens:
+            raise LevelCOperatorError("PlayHand deferred Atlas binding path is missing")
+        current: Any = source
+        for part in source_path_tokens:
+            if not isinstance(current, Mapping) or part not in current:
+                raise LevelCOperatorError("PlayHand deferred Atlas binding field is missing")
+            current = current[part]
+        expected_sha256 = _require_sha256(
+            current, label="PlayHand expected seed plan sha256"
+        )
+        seed_path = Path(str(arguments.get("seed_plan_path") or "")).resolve(strict=False)
+        if not seed_path.is_file() or _sha256_bytes(seed_path.read_bytes()) != expected_sha256:
+            raise LevelCOperatorError("PlayHand seed plan does not match its Atlas lineage receipt")
+        arguments[str(deferred.get("argument") or "expected_seed_plan_sha256")] = expected_sha256
+    arguments["execution_plan_path"] = str(Path(path).resolve(strict=True))
+    arguments["execution_plan_id"] = plan["plan_id"]
+    return arguments, plan
 
 
 def create_level_c_execution_plan(path: Path | str, payload: Mapping[str, Any]) -> dict[str, Any]:

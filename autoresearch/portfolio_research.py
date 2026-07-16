@@ -1182,6 +1182,7 @@ def run_nested_cell_temporal_validation(
     account: dict[str, Any],
     root: Path,
     backend: str,
+    freeze_only: bool = False,
 ) -> list[dict[str, Any]]:
     """Build train-only inner consensus, then score its frozen portfolio on outer curves."""
     root.mkdir(parents=True, exist_ok=True)
@@ -1214,7 +1215,12 @@ def run_nested_cell_temporal_validation(
             if train_stage_status == "nonviable":
                 continue
             outer_stage_status = str(record.get("outer_validation_status") or "")
-            if outer_stage_status not in {"valid", "nonviable"}:
+            allowed_outer_statuses = (
+                {"pending_selection", "not_selected", "valid", "nonviable"}
+                if freeze_only
+                else {"not_selected", "valid", "nonviable"}
+            )
+            if outer_stage_status not in allowed_outer_statuses:
                 raise PortfolioResearchError(
                     f"Nested fold {fold_id} has non-terminal outer evidence "
                     f"for {attempt_id}: {outer_stage_status or 'missing'}"
@@ -1284,24 +1290,25 @@ def run_nested_cell_temporal_validation(
                 }
             )
             # Holding/risk metadata stays train-only; only the return curve comes from OOS.
-            outer_rows.append(
-                {
-                    **common,
-                    "full_backtest_result_path_36m": record.get("train_result_path"),
-                    "full_backtest_calendar_curve_path_36m": (
-                        _flat_outer_no_signal_curve_path(
-                            root=root,
-                            fold_id=fold_id,
-                            attempt_id=attempt_id,
-                            fold=fold,
-                            terminal_outcome=dict(record.get("outer_terminal_outcome") or {}),
-                        )
-                        if outer_stage_status == "nonviable"
-                        else record.get("outer_curve_path")
-                    ),
-                    "outer_validation_status": outer_stage_status,
-                }
-            )
+            if outer_stage_status in {"valid", "nonviable"}:
+                outer_rows.append(
+                    {
+                        **common,
+                        "full_backtest_result_path_36m": record.get("train_result_path"),
+                        "full_backtest_calendar_curve_path_36m": (
+                            _flat_outer_no_signal_curve_path(
+                                root=root,
+                                fold_id=fold_id,
+                                attempt_id=attempt_id,
+                                fold=fold,
+                                terminal_outcome=dict(record.get("outer_terminal_outcome") or {}),
+                            )
+                            if outer_stage_status == "nonviable"
+                            else record.get("outer_curve_path")
+                        ),
+                        "outer_validation_status": outer_stage_status,
+                    }
+                )
         if not train_rows:
             raise PortfolioResearchError(f"Nested fold {fold_id} has no valid evidence rows")
         train_candidates, train_rejections = build_optimizer_candidates(
@@ -1321,27 +1328,31 @@ def run_nested_cell_temporal_validation(
                 name_prefix=f"nested-{fold_id}",
             ),
         )
-        outer_candidates, outer_rejections = build_optimizer_candidates(
-            outer_rows,
-            replace(
-                build_experiment_spec(
-                    suite,
-                    {
-                        "experiment_id": "nested-outer-base",
-                        "portfolio_size": max(sizes),
-                        "objective": objectives[0],
-                        "random_seed": seeds[0],
-                        "candidate_limit": -1,
-                        "risk_weight_multiplier": 1.0,
-                        "diversification_profile": {"name": "nested-outer-base"},
-                    },
-                    account=account,
-                    name_prefix=f"nested-{fold_id}",
+        outer_candidates, outer_rejections = (
+            ([], [])
+            if freeze_only
+            else build_optimizer_candidates(
+                outer_rows,
+                replace(
+                    build_experiment_spec(
+                        suite,
+                        {
+                            "experiment_id": "nested-outer-base",
+                            "portfolio_size": max(sizes),
+                            "objective": objectives[0],
+                            "random_seed": seeds[0],
+                            "candidate_limit": -1,
+                            "risk_weight_multiplier": 1.0,
+                            "diversification_profile": {"name": "nested-outer-base"},
+                        },
+                        account=account,
+                        name_prefix=f"nested-{fold_id}",
+                    ),
+                    min_score=float("-inf"),
+                    candidate_limit=-1,
+                    require_positive_source_return=False,
                 ),
-                min_score=float("-inf"),
-                candidate_limit=-1,
-                require_positive_source_return=False,
-            ),
+            )
         )
         candidate_by_id = {candidate.attempt_id: candidate for candidate in train_candidates}
         total_months = max(
@@ -1542,21 +1553,10 @@ def run_nested_cell_temporal_validation(
                         progress=None,
                         rank_on_slice=True,
                     )
-                    outer_by_id = {
-                        candidate.attempt_id: candidate for candidate in outer_candidates
-                    }
                     train_selected_ids = [
                         str(attempt_id)
                         for attempt_id in train_result["selected_attempt_ids"]
                     ]
-                    missing_outer_ids = sorted(
-                        set(train_selected_ids) - set(outer_by_id)
-                    )
-                    if missing_outer_ids:
-                        raise PortfolioResearchError(
-                            f"Nested fold {fold_id} outer evidence is missing frozen "
-                            f"portfolio members: {', '.join(missing_outer_ids)}"
-                        )
                     if len(train_selected_ids) != size:
                         raise PortfolioResearchError(
                             f"Nested fold {fold_id} selected {len(train_selected_ids)} "
@@ -1591,6 +1591,48 @@ def run_nested_cell_temporal_validation(
                         / "frozen-portfolio.json"
                     )
                     write_json_immutable(frozen_portfolio_path, frozen_portfolio)
+                    if freeze_only:
+                        result = {
+                            "fold": fold,
+                            "experiment_id": experiment["experiment_id"],
+                            "portfolio_size": size,
+                            "objective": objective,
+                            "random_seed": seed,
+                            "evidence_level": "level_b_train_selected_cell",
+                            "status": "frozen",
+                            "selected_attempt_ids": selected_ids,
+                            "train_metrics": train_result["metrics"],
+                            "cell_receipts": {
+                                attempt_id: receipt_by_id[attempt_id]
+                                for attempt_id in selected_ids
+                            },
+                            "inner_fold_count": len(inner_folds),
+                            "inner_unit_count": len(inner_results),
+                            "consensus_core_attempt_ids": frozen_core,
+                            "consensus_core_count": len(frozen_core),
+                            "consensus_core_share": len(frozen_core) / size if size else 0.0,
+                            "frozen_portfolio_path": str(frozen_portfolio_path),
+                            "frozen_portfolio_sha256": "sha256:" + payload_hash(frozen_portfolio),
+                            "train_rejections": train_rejections,
+                        }
+                        write_json_atomic(
+                            root / fold_id / experiment["experiment_id"] / "freeze-result.json",
+                            result,
+                            compact=True,
+                        )
+                        results.append(result)
+                        continue
+                    outer_by_id = {
+                        candidate.attempt_id: candidate for candidate in outer_candidates
+                    }
+                    missing_outer_ids = sorted(
+                        set(train_selected_ids) - set(outer_by_id)
+                    )
+                    if missing_outer_ids:
+                        raise PortfolioResearchError(
+                            f"Nested fold {fold_id} outer evidence is missing frozen "
+                            f"portfolio members: {', '.join(missing_outer_ids)}"
+                        )
                     outer_search = PortfolioSearch(
                         outer_candidates,
                         replace(

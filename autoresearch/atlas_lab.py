@@ -56,6 +56,13 @@ from .discovery_recipe_validation import (
     build_discovery_recipe_scrutiny_atlas,
     build_discovery_recipe_validation_atlas,
 )
+from .durable_execution import (
+    DurableExecutionError,
+    DurableExecutionJournal,
+    artifact_receipt,
+    atomic_write_json,
+    validate_artifact_receipt,
+)
 from .forward_response_atlas import (
     DEFAULT_FORWARD_RESPONSE_DIRNAME,
     build_forward_response_atlas,
@@ -69,7 +76,7 @@ from .play_hand_lab import (
 )
 from .instrument_universe import research_eligible_instruments, universe_provenance
 from .play_hand_lab_auth import load_lab_gateway_token
-from .evidence_plan import build_replay_evidence_plan, canonical_timestamp
+from .evidence_plan import build_replay_evidence_plan, canonical_sha256, canonical_timestamp
 from .recipe_priors import DEFAULT_RECIPE_PRIORS_DIRNAME, build_recipe_priors
 from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapshot
 from .signal_atlas import (
@@ -320,6 +327,9 @@ class AtlasLabRuntimeConfig:
     source_snapshot_sha256: str | None = None
     universe_id: str | None = None
     universe_manifest_sha256: str | None = None
+    execution_plan_path: Path | None = None
+    execution_plan_id: str | None = None
+    resume: bool = False
     signal_lookback_months: int = 3
     discovery_cluster_min_similarity: float = DEFAULT_DISCOVERY_CLUSTER_MIN_SIMILARITY
     discovery_cluster_min_shared_partners: int = DEFAULT_DISCOVERY_CLUSTER_MIN_SHARED_PARTNERS
@@ -486,6 +496,11 @@ def _historical_lineage(runtime: AtlasLabRuntimeConfig) -> dict[str, str] | None
     """Return the formal Level C lineage or fail closed for historical Atlas."""
     if not runtime.as_of_date:
         return None
+    execution_plan_id = _require_exact_sha256(
+        runtime.execution_plan_id, label="execution_plan_id"
+    )
+    if runtime.execution_plan_path is None:
+        raise ValueError("Historical Atlas requires one authoritative execution plan path.")
     generation_id = _clean_token(runtime.research_generation_id)
     if not _SAFE_RESEARCH_GENERATION_RE.fullmatch(generation_id):
         raise ValueError("Historical Atlas requires a safe, explicit research_generation_id.")
@@ -518,6 +533,7 @@ def _historical_lineage(runtime: AtlasLabRuntimeConfig) -> dict[str, str] | None
         ),
         "universe_id": universe_id,
         "universe_manifest_sha256": universe_manifest_sha256,
+        "execution_plan_id": execution_plan_id,
     }
 
 
@@ -575,11 +591,66 @@ def _safe_stage_summary(name: str, result: Any | None) -> dict[str, Any]:
 
 
 def _write_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(_json_safe(payload), ensure_ascii=True, separators=(",", ":")),
-        encoding="utf-8",
+    atomic_write_json(path, _json_safe(payload))
+
+
+def _stage_artifact_files(*roots: Path) -> list[Path]:
+    files: list[Path] = []
+    for root in roots:
+        resolved = Path(root).resolve(strict=False)
+        if resolved.is_file():
+            files.append(resolved)
+        elif resolved.is_dir():
+            files.extend(path for path in resolved.rglob("*") if path.is_file())
+    return files
+
+
+def _probe_artifact_roots(spec: ProbeRunSpec) -> tuple[Path, ...]:
+    return (
+        spec.source_dir / spec.results_filename,
+        spec.source_dir / spec.summary_filename,
+        spec.source_dir / "results",
+        spec.source_dir / "missing-manifest",
     )
+
+
+def _run_durable_atlas_stage(
+    *,
+    journal: DurableExecutionJournal | None,
+    run_root: Path,
+    stage: str,
+    payload: dict[str, Any],
+    artifact_roots: tuple[Path, ...],
+    action: Callable[[], Any],
+) -> tuple[Any | None, bool]:
+    """Run one Atlas stage or reuse only its receipt-verified exact artifacts."""
+    if journal is None:
+        return action(), False
+    task_id = canonical_sha256({"execution": journal.execution_id, "stage": stage})
+    existing = _as_dict(journal.load(create=True).get("tasks")).get(task_id)
+    journal.register(task_id, {"stage": stage, **payload})
+    terminal = journal.terminal(task_id)
+    if terminal is not None:
+        receipt = _as_dict(_as_dict(terminal.get("terminal_receipt")).get("payload"))
+        artifact = _as_dict(receipt.get("artifact_receipt"))
+        validate_artifact_receipt(artifact)
+        return None, True
+    if isinstance(existing, dict):
+        partial_root = run_root / "partial-stages" / f"{stage}-{_utc_stamp()}"
+        for index, raw_root in enumerate(artifact_roots):
+            source = Path(raw_root).resolve(strict=False)
+            if not source.exists():
+                continue
+            destination = partial_root / f"{index:02d}-{source.name}"
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(source), str(destination))
+    result = action()
+    receipt = artifact_receipt(
+        _stage_artifact_files(*artifact_roots),
+        root=run_root,
+    )
+    journal.complete(task_id, {"stage": stage, "artifact_receipt": receipt})
+    return result, False
 
 
 def _load_json(path: Path) -> Any:
@@ -2354,16 +2425,37 @@ def run_atlas_lab(
     run_full = "full" in selected_phases
     historical_build = bool(runtime.as_of_date) and (run_full or "build" in selected_phases)
     historical_lineage = _historical_lineage(runtime)
+    if historical_lineage is not None:
+        runtime.task_attempt_id = str(historical_lineage["execution_plan_id"])[-16:]
     if historical_build and runtime.signal_atlas_executor != "gateway":
         raise ValueError(
             "Historical Atlas requires signal_atlas_executor='gateway'; the local signal path is not evidence-bounded."
         )
+    existing_metadata: dict[str, Any] = {}
     if runtime.as_of_date and paths.run_root.exists() and any(paths.run_root.iterdir()):
-        raise FileExistsError(
-            f"Historical Atlas run roots are create-only and already exist: {paths.run_root}"
-        )
+        if not runtime.resume:
+            raise FileExistsError(
+                f"Historical Atlas run already exists; pass --resume to verify and continue: "
+                f"{paths.run_root}"
+            )
+        if not paths.metadata_path.is_file():
+            raise DurableExecutionError("Historical Atlas resume is missing run metadata")
+        existing_metadata = _as_dict(_load_json(paths.metadata_path))
+        if existing_metadata.get("historical_lineage") != historical_lineage:
+            raise DurableExecutionError("Historical Atlas resume lineage does not match")
     paths.run_root.mkdir(parents=True, exist_ok=True)
-    started_at = datetime.now(timezone.utc).isoformat()
+    journal = (
+        DurableExecutionJournal(
+            paths.run_root / "execution-journal.json",
+            execution_id=str(runtime.execution_plan_id),
+            lineage=historical_lineage or {},
+        )
+        if historical_lineage is not None
+        else None
+    )
+    if journal is not None:
+        journal.load(create=not runtime.resume)
+    started_at = str(existing_metadata.get("started_at") or datetime.now(timezone.utc).isoformat())
     _write_json(
         paths.metadata_path,
         {
@@ -2389,178 +2481,304 @@ def run_atlas_lab(
     pipeline_summaries: list[dict[str, Any]] = []
     status = "completed"
     published_manifest_path: Path | None = None
+    semantic_runtime = asdict(runtime)
+    for operational_field in (
+        "gateway_url",
+        "gateway_token",
+        "active_probes",
+        "enqueue_chunk_size",
+        "result_batch_size",
+        "max_results_per_cycle",
+        "max_drain_seconds",
+        "poll_interval_seconds",
+        "deadline_seconds",
+        "max_attempts",
+        "log_interval_seconds",
+        "json_output",
+        "resume",
+    ):
+        semantic_runtime.pop(operational_field, None)
+    stage_payload = {
+        "historical_lineage": historical_lineage,
+        "effective_build_profile": build_profile,
+        "worker_contract_hash": worker_contract_hash,
+        "semantic_runtime": _json_safe(semantic_runtime),
+    }
+
+    def run_stage(
+        name: str,
+        roots: tuple[Path, ...],
+        action: Callable[[], Any],
+    ) -> tuple[Any | None, bool]:
+        return _run_durable_atlas_stage(
+            journal=journal,
+            run_root=paths.run_root,
+            stage=name,
+            payload=stage_payload,
+            artifact_roots=roots,
+            action=action,
+        )
+
+    def record_probe(outcome: ProbeRunOutcome | None, spec: ProbeRunSpec) -> None:
+        if outcome is not None:
+            probe_summaries.append(outcome.summary)
+            return
+        summary_path = spec.source_dir / spec.summary_filename
+        summary = _load_json(summary_path)
+        if not isinstance(summary, dict):
+            raise DurableExecutionError(f"Reused Atlas probe summary is invalid: {summary_path}")
+        probe_summaries.append(summary)
+
+    def build_final_priors() -> Any:
+        result = build_recipe_priors(
+            config,
+            indicator_atlas_dir=paths.indicator_dir,
+            signal_atlas_dir=paths.signal_dir,
+            forward_response_dir=paths.forward_dir,
+            anchor_pair_dir=paths.anchor_pair_dir,
+            anchor_pair_timing_dir=paths.anchor_pair_timing_dir,
+            discovery_recipe_validation_dir=paths.discovery_validation_dir,
+            discovery_recipe_scrutiny_dir=paths.discovery_scrutiny_dir,
+            include_playhand_outcome_priors=False,
+            out_dir=paths.final_recipe_priors_dir,
+        )
+        if historical_lineage is not None:
+            _stamp_historical_recipe_prior_lineage(
+                paths.final_recipe_priors_dir,
+                lineage=historical_lineage,
+            )
+        return result
+
     try:
         if run_full or "build" in selected_phases:
-            build_indicator_atlas(config, out_dir=paths.indicator_dir)
+            run_stage(
+                "01-indicator-atlas",
+                (paths.indicator_dir,),
+                lambda: build_indicator_atlas(config, out_dir=paths.indicator_dir),
+            )
             if runtime.signal_atlas_executor == "gateway":
-                build_signal_atlas_via_gateway(
-                    config,
-                    indicator_atlas_dir=paths.indicator_dir,
-                    out_dir=paths.signal_dir,
-                    signal_role=build_profile["signal_role"],
-                    instruments=build_profile["signal_instruments"],
-                    timeframes=build_profile["signal_timeframes"],
-                    max_indicators=build_profile["signal_max_indicators"],
-                    gateway=gateway_client,
-                    runtime=runtime,
-                    worker_contract_hash=worker_contract_hash,
-                    progress_callback=progress_callback,
+                run_stage(
+                    "02-signal-atlas",
+                    (paths.signal_dir,),
+                    lambda: build_signal_atlas_via_gateway(
+                        config,
+                        indicator_atlas_dir=paths.indicator_dir,
+                        out_dir=paths.signal_dir,
+                        signal_role=build_profile["signal_role"],
+                        instruments=build_profile["signal_instruments"],
+                        timeframes=build_profile["signal_timeframes"],
+                        max_indicators=build_profile["signal_max_indicators"],
+                        gateway=gateway_client,
+                        runtime=runtime,
+                        worker_contract_hash=worker_contract_hash,
+                        progress_callback=progress_callback,
+                    ),
                 )
             else:
-                build_signal_atlas(
+                run_stage(
+                    "02-signal-atlas",
+                    (paths.signal_dir,),
+                    lambda: build_signal_atlas(
+                        config,
+                        indicator_atlas_dir=paths.indicator_dir,
+                        out_dir=paths.signal_dir,
+                        signal_role=build_profile["signal_role"],
+                        instruments=build_profile["signal_instruments"],
+                        timeframes=build_profile["signal_timeframes"],
+                        max_indicators=build_profile["signal_max_indicators"],
+                    ),
+                )
+            run_stage(
+                "03-forward-response-atlas",
+                (paths.forward_dir,),
+                lambda: build_forward_response_atlas(
+                    config,
+                    signal_atlas_dir=paths.signal_dir,
+                    out_dir=paths.forward_dir,
+                ),
+            )
+            run_stage(
+                "04-anchor-pair-atlas",
+                (paths.anchor_pair_dir,),
+                lambda: build_anchor_pair_atlas(
                     config,
                     indicator_atlas_dir=paths.indicator_dir,
-                    out_dir=paths.signal_dir,
-                    signal_role=build_profile["signal_role"],
-                    instruments=build_profile["signal_instruments"],
-                    timeframes=build_profile["signal_timeframes"],
-                    max_indicators=build_profile["signal_max_indicators"],
-                )
-            build_forward_response_atlas(
-                config,
-                signal_atlas_dir=paths.signal_dir,
-                out_dir=paths.forward_dir,
-            )
-            build_anchor_pair_atlas(
-                config,
-                indicator_atlas_dir=paths.indicator_dir,
-                signal_atlas_dir=paths.signal_dir,
-                forward_response_dir=paths.forward_dir,
-                out_dir=paths.anchor_pair_dir,
-                as_of_date=runtime.as_of_date,
+                    signal_atlas_dir=paths.signal_dir,
+                    forward_response_dir=paths.forward_dir,
+                    out_dir=paths.anchor_pair_dir,
+                    as_of_date=runtime.as_of_date,
+                ),
             )
         specs = _probe_specs(paths)
         if run_full or "probes" in selected_phases:
             for spec in specs[:1]:
-                outcome = run_probe_spec_via_gateway(
+                outcome, _reused = run_stage(
+                    "05-anchor-pair-probes",
+                    _probe_artifact_roots(spec),
+                    lambda spec=spec: run_probe_spec_via_gateway(
+                        config,
+                        spec=spec,
+                        gateway=gateway_client,
+                        runtime=runtime,
+                        worker_contract_hash=worker_contract_hash,
+                        progress_callback=progress_callback,
+                    ),
+                )
+                record_probe(outcome, spec)
+            run_stage(
+                "06-anchor-pair-timing-atlas",
+                (paths.anchor_pair_timing_dir,),
+                lambda: build_anchor_pair_timing_atlas(
                     config,
-                    spec=spec,
+                    anchor_pair_atlas_dir=paths.anchor_pair_dir,
+                    out_dir=paths.anchor_pair_timing_dir,
+                    variant_sides=profile["timing_variant_sides"],
+                    as_of_date=runtime.as_of_date,
+                ),
+            )
+            outcome, _reused = run_stage(
+                "07-anchor-pair-timing-probes",
+                _probe_artifact_roots(specs[1]),
+                lambda: run_probe_spec_via_gateway(
+                    config,
+                    spec=specs[1],
                     gateway=gateway_client,
                     runtime=runtime,
                     worker_contract_hash=worker_contract_hash,
                     progress_callback=progress_callback,
-                )
-                probe_summaries.append(outcome.summary)
-            build_anchor_pair_timing_atlas(
-                config,
-                anchor_pair_atlas_dir=paths.anchor_pair_dir,
-                out_dir=paths.anchor_pair_timing_dir,
-                variant_sides=profile["timing_variant_sides"],
-                as_of_date=runtime.as_of_date,
+                ),
             )
-            outcome = run_probe_spec_via_gateway(
-                config,
-                spec=specs[1],
-                gateway=gateway_client,
-                runtime=runtime,
-                worker_contract_hash=worker_contract_hash,
-                progress_callback=progress_callback,
+            record_probe(outcome, specs[1])
+            run_stage(
+                "08-recipe-priors",
+                (paths.recipe_priors_dir,),
+                lambda: build_recipe_priors(
+                    config,
+                    indicator_atlas_dir=paths.indicator_dir,
+                    signal_atlas_dir=paths.signal_dir,
+                    forward_response_dir=paths.forward_dir,
+                    anchor_pair_dir=paths.anchor_pair_dir,
+                    anchor_pair_timing_dir=paths.anchor_pair_timing_dir,
+                    discovery_recipe_validation_dir=paths.discovery_validation_dir,
+                    discovery_recipe_scrutiny_dir=paths.discovery_scrutiny_dir,
+                    include_playhand_outcome_priors=False,
+                    out_dir=paths.recipe_priors_dir,
+                ),
             )
-            probe_summaries.append(outcome.summary)
-            build_recipe_priors(
-                config,
-                indicator_atlas_dir=paths.indicator_dir,
-                signal_atlas_dir=paths.signal_dir,
-                forward_response_dir=paths.forward_dir,
-                anchor_pair_dir=paths.anchor_pair_dir,
-                anchor_pair_timing_dir=paths.anchor_pair_timing_dir,
-                discovery_recipe_validation_dir=paths.discovery_validation_dir,
-                discovery_recipe_scrutiny_dir=paths.discovery_scrutiny_dir,
-                include_playhand_outcome_priors=False,
-                out_dir=paths.recipe_priors_dir,
-            )
-            build_discovery_pair_atlas(
-                config,
-                indicator_atlas_dir=paths.indicator_dir,
-                signal_atlas_dir=paths.signal_dir,
-                forward_response_dir=paths.forward_dir,
-                recipe_priors_dir=paths.recipe_priors_dir,
-                out_dir=paths.discovery_pair_dir,
-                instruments=build_profile["discovery_instruments"],
-                timeframes=build_profile["discovery_timeframes"],
-                full_queue=runtime.full_discovery_queue,
-                as_of_date=runtime.as_of_date,
+            run_stage(
+                "09-discovery-pair-atlas",
+                (paths.discovery_pair_dir,),
+                lambda: build_discovery_pair_atlas(
+                    config,
+                    indicator_atlas_dir=paths.indicator_dir,
+                    signal_atlas_dir=paths.signal_dir,
+                    forward_response_dir=paths.forward_dir,
+                    recipe_priors_dir=paths.recipe_priors_dir,
+                    out_dir=paths.discovery_pair_dir,
+                    instruments=build_profile["discovery_instruments"],
+                    timeframes=build_profile["discovery_timeframes"],
+                    full_queue=runtime.full_discovery_queue,
+                    as_of_date=runtime.as_of_date,
+                ),
             )
             for spec in specs[2:3]:
-                outcome = run_probe_spec_via_gateway(
+                outcome, _reused = run_stage(
+                    "10-discovery-pair-probes",
+                    _probe_artifact_roots(spec),
+                    lambda spec=spec: run_probe_spec_via_gateway(
+                        config,
+                        spec=spec,
+                        gateway=gateway_client,
+                        runtime=runtime,
+                        worker_contract_hash=worker_contract_hash,
+                        progress_callback=progress_callback,
+                    ),
+                )
+                record_probe(outcome, spec)
+            discovery_cluster_result, discovery_cluster_reused = run_stage(
+                "11-discovery-cluster-atlas",
+                (paths.discovery_cluster_dir,),
+                lambda: build_discovery_cluster_atlas(
                     config,
-                    spec=spec,
+                    discovery_pair_dir=paths.discovery_pair_dir,
+                    out_dir=paths.discovery_cluster_dir,
+                    min_similarity=runtime.discovery_cluster_min_similarity,
+                    min_shared_partners=runtime.discovery_cluster_min_shared_partners,
+                    max_recipes=runtime.discovery_cluster_max_recipes,
+                ),
+            )
+            pipeline_summaries.append(
+                {
+                    **_safe_stage_summary("discovery_cluster", discovery_cluster_result),
+                    "status": "reused" if discovery_cluster_reused else "completed",
+                }
+            )
+            validation_result, validation_reused = run_stage(
+                "12-discovery-recipe-validation-atlas",
+                (paths.discovery_validation_dir,),
+                lambda: build_discovery_recipe_validation_atlas(
+                    config,
+                    cluster_atlas_dir=paths.discovery_cluster_dir,
+                    recipe_priors_dir=paths.recipe_priors_dir,
+                    out_dir=paths.discovery_validation_dir,
+                    as_of_date=runtime.as_of_date,
+                    included_confidence=runtime.discovery_validation_included_confidence,
+                    instruments=runtime.discovery_validation_instruments,
+                    timeframes=runtime.discovery_validation_timeframes,
+                    max_recipes=runtime.discovery_validation_max_recipes,
+                    max_pairs_per_recipe=runtime.discovery_validation_max_pairs_per_recipe,
+                    first_member_limit=runtime.discovery_validation_first_member_limit,
+                    second_member_limit=runtime.discovery_validation_second_member_limit,
+                    diversity_penalty_scale=runtime.discovery_validation_diversity_penalty_scale,
+                ),
+            )
+            pipeline_summaries.append(
+                {
+                    **_safe_stage_summary("discovery_recipe_validation", validation_result),
+                    "status": "reused" if validation_reused else "completed",
+                }
+            )
+            outcome, _reused = run_stage(
+                "13-discovery-recipe-validation-probes",
+                _probe_artifact_roots(specs[3]),
+                lambda: run_probe_spec_via_gateway(
+                    config,
+                    spec=specs[3],
                     gateway=gateway_client,
                     runtime=runtime,
                     worker_contract_hash=worker_contract_hash,
                     progress_callback=progress_callback,
-                )
-                probe_summaries.append(outcome.summary)
-            discovery_cluster_result = build_discovery_cluster_atlas(
-                config,
-                discovery_pair_dir=paths.discovery_pair_dir,
-                out_dir=paths.discovery_cluster_dir,
-                min_similarity=runtime.discovery_cluster_min_similarity,
-                min_shared_partners=runtime.discovery_cluster_min_shared_partners,
-                max_recipes=runtime.discovery_cluster_max_recipes,
+                ),
             )
-            pipeline_summaries.append(
-                _safe_stage_summary("discovery_cluster", discovery_cluster_result)
+            record_probe(outcome, specs[3])
+            run_stage(
+                "14-discovery-recipe-scrutiny-atlas",
+                (paths.discovery_scrutiny_dir,),
+                lambda: build_discovery_recipe_scrutiny_atlas(
+                    config,
+                    validation_atlas_dir=paths.discovery_validation_dir,
+                    out_dir=paths.discovery_scrutiny_dir,
+                    as_of_date=runtime.as_of_date,
+                ),
             )
-            validation_result = build_discovery_recipe_validation_atlas(
-                config,
-                cluster_atlas_dir=paths.discovery_cluster_dir,
-                recipe_priors_dir=paths.recipe_priors_dir,
-                out_dir=paths.discovery_validation_dir,
-                as_of_date=runtime.as_of_date,
-                included_confidence=runtime.discovery_validation_included_confidence,
-                instruments=runtime.discovery_validation_instruments,
-                timeframes=runtime.discovery_validation_timeframes,
-                max_recipes=runtime.discovery_validation_max_recipes,
-                max_pairs_per_recipe=runtime.discovery_validation_max_pairs_per_recipe,
-                first_member_limit=runtime.discovery_validation_first_member_limit,
-                second_member_limit=runtime.discovery_validation_second_member_limit,
-                diversity_penalty_scale=runtime.discovery_validation_diversity_penalty_scale,
+            outcome, _reused = run_stage(
+                "15-discovery-recipe-scrutiny-probes",
+                _probe_artifact_roots(specs[4]),
+                lambda: run_probe_spec_via_gateway(
+                    config,
+                    spec=specs[4],
+                    gateway=gateway_client,
+                    runtime=runtime,
+                    worker_contract_hash=worker_contract_hash,
+                    progress_callback=progress_callback,
+                ),
             )
-            pipeline_summaries.append(
-                _safe_stage_summary("discovery_recipe_validation", validation_result)
+            record_probe(outcome, specs[4])
+            run_stage(
+                "16-final-recipe-priors",
+                (paths.final_recipe_priors_dir,),
+                build_final_priors,
             )
-            outcome = run_probe_spec_via_gateway(
-                config,
-                spec=specs[3],
-                gateway=gateway_client,
-                runtime=runtime,
-                worker_contract_hash=worker_contract_hash,
-                progress_callback=progress_callback,
-            )
-            probe_summaries.append(outcome.summary)
-            build_discovery_recipe_scrutiny_atlas(
-                config,
-                validation_atlas_dir=paths.discovery_validation_dir,
-                out_dir=paths.discovery_scrutiny_dir,
-                as_of_date=runtime.as_of_date,
-            )
-            outcome = run_probe_spec_via_gateway(
-                config,
-                spec=specs[4],
-                gateway=gateway_client,
-                runtime=runtime,
-                worker_contract_hash=worker_contract_hash,
-                progress_callback=progress_callback,
-            )
-            probe_summaries.append(outcome.summary)
-            build_recipe_priors(
-                config,
-                indicator_atlas_dir=paths.indicator_dir,
-                signal_atlas_dir=paths.signal_dir,
-                forward_response_dir=paths.forward_dir,
-                anchor_pair_dir=paths.anchor_pair_dir,
-                anchor_pair_timing_dir=paths.anchor_pair_timing_dir,
-                discovery_recipe_validation_dir=paths.discovery_validation_dir,
-                discovery_recipe_scrutiny_dir=paths.discovery_scrutiny_dir,
-                include_playhand_outcome_priors=False,
-                out_dir=paths.final_recipe_priors_dir,
-            )
-            if historical_lineage is not None:
-                _stamp_historical_recipe_prior_lineage(
-                    paths.final_recipe_priors_dir,
-                    lineage=historical_lineage,
-                )
             if runtime.publish or "publish" in selected_phases:
                 published_manifest_path = publish_atlas_lab_priors(config, paths=paths)
             _append_event(paths, "run", "completed")

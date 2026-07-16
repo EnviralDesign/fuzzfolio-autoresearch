@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+import pytest
 from rich.console import Console
 
 from autoresearch import play_hand_lab as lab
@@ -29,32 +30,45 @@ def test_historical_cli_forwards_formal_identity_and_normalizes(tmp_path: Path, 
         encoding="utf-8",
     )
     expected_seed_plan_sha256 = lab._file_sha256(seed_plan_path)
+    execution_plan_path = tmp_path / "execution-plan.json"
+    execution_plan_path.write_text("{}", encoding="utf-8")
+    from autoresearch.instrument_universe import universe_provenance
+
+    universe = universe_provenance()
+    monkeypatch.setattr(
+        "autoresearch.level_c_operator.executor_arguments_from_plan",
+        lambda path, executor: (
+            {
+                "execution_plan_path": str(path),
+                "execution_plan_id": "sha256:" + "e" * 64,
+                "as_of_date": "2025-06-30T00:00:00Z",
+                "campaign_id": "formal-campaign-2025-06",
+                "research_generation_id": "generation-2025-06",
+                "level_c_protocol_id": "sha256:" + "c" * 64,
+                "cutoff_key": "A",
+                "seed_plan_path": str(seed_plan_path),
+                "expected_seed_plan_sha256": expected_seed_plan_sha256,
+                "lake_manifest_sha256": "sha256:" + "b" * 64,
+                "worker_contract_hash": "sha256:" + "a" * 64,
+                "source_snapshot_sha256": "sha256:" + "d" * 64,
+                "universe_id": str(universe["universe_id"]),
+                "universe_manifest_sha256": str(universe["universe_hash"]),
+                "seed": 17,
+                "campaign_mode": "finite",
+                "task_mode": "deep_replay",
+                "pipeline_mode": "play_hand",
+                "strict_scoring": True,
+            },
+            {},
+        ),
+    )
     args = _parse_play_hand_lab_args(
         [
             "play-hand-lab",
-            "--as-of-date",
-            "2025-06-30T00:00:00Z",
-            "--campaign-id",
-            "formal-campaign-2025-06",
-            "--research-generation-id",
-            "generation-2025-06",
-            "--level-c-protocol-id",
-            "sha256:" + "c" * 64,
-            "--cutoff-key",
-            "A",
-            "--seed-plan-path",
-            str(seed_plan_path),
-            "--expected-seed-plan-sha256",
-            expected_seed_plan_sha256,
-            "--lake-manifest-sha256",
-            "sha256:" + "b" * 64,
-            "--worker-contract-hash",
-            "sha256:" + "a" * 64,
-            "--seed",
-            "17",
+            "--execution-plan",
+            str(execution_plan_path),
             "--target-runs",
             "1",
-            "--strict-scoring",
         ]
     )
     captured: list[lab.PlayHandLabRuntimeConfig] = []
@@ -75,3 +89,18 @@ def test_exploratory_cli_leaves_campaign_id_unset_for_auto_id() -> None:
     args = _parse_play_hand_lab_args(["play-hand-lab"])
 
     assert args.campaign_id is None
+
+
+def test_formal_cli_rejects_independent_lineage_with_execution_plan(tmp_path: Path) -> None:
+    args = _parse_play_hand_lab_args(
+        [
+            "play-hand-lab",
+            "--execution-plan",
+            str(tmp_path / "plan.json"),
+            "--as-of-date",
+            "2025-06-30T00:00:00Z",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="must come only from --execution-plan"):
+        lab_cli.dispatch_play_hand_lab_command(args, console=Console())

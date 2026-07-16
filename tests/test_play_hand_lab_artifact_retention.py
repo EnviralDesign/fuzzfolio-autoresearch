@@ -107,6 +107,60 @@ def test_play_hand_lab_default_retention_writes_canonical_artifacts_only(
     assert (artifact_dir / "deep-replay-job.json").exists()
     assert not (artifact_dir / "lab-result.json").exists()
     assert not (artifact_dir / "lab-worker-result.json").exists()
+    (artifact_dir / "task-result-receipt.json").unlink()
+
+    duplicate = lab._record_lab_result(
+        config=_config(runs_root),
+        cli=SimpleNamespace(),
+        lane_ctx=lane_ctx,
+        lane=lane,
+        runtime=runtime,
+        lab_result={
+            "task_id": "task-1",
+            "attempt_id": "task-1",
+            "status": "success",
+            "worker_id": "worker-1",
+            "lease_id": "lease-1",
+            "result": {
+                "job_id": "task-1",
+                "status": "success",
+                "request": {"instruments": ["EURUSD"], "lookback_months": 3},
+                "result": {"aggregate": {"score_lab": {"score": 12.0}}},
+            },
+        },
+        reward_matrix=None,
+    )
+    assert duplicate == result
+    assert (artifact_dir / "task-result-receipt.json").is_file()
+    assert len(lab.load_attempts(lane_ctx.attempts_path)) == 1
+
+    with pytest.raises(lab.DurableExecutionError, match="identity conflicts"):
+        lab._record_lab_result(
+            config=_config(runs_root),
+            cli=SimpleNamespace(),
+            lane_ctx=lane_ctx,
+            lane=lane,
+            runtime=runtime,
+            lab_result={
+                "task_id": "task-1",
+                "status": "success",
+                "result": {"status": "success", "different": True},
+            },
+            reward_matrix=None,
+        )
+    with pytest.raises(lab.DurableExecutionError, match="ledger failure identity conflicts"):
+        lab._record_lab_failure(
+            config=_config(runs_root),
+            lane_ctx=lane_ctx,
+            lane=lane,
+            runtime=runtime,
+            lab_result={
+                "task_id": "task-1",
+                "status": "failed",
+                "result": {"status": "failed", "error": "contradictory duplicate"},
+            },
+            reward_matrix=None,
+        )
 
 
 def test_cleanup_playhand_lab_raw_artifacts_dry_run_and_execute(

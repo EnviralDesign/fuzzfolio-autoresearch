@@ -282,6 +282,8 @@ def run_nested_gateway_fold(
     test_horizon_months: int,
     selection_basis: Literal["best_cell", "recommended_cell", "robust_cell"] = "recommended_cell",
     lake_manifest_sha256: str | None = None,
+    submit_outer: bool = True,
+    outer_selected_attempt_ids: set[str] | None = None,
     emit: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     fold_id = str(fold.get("fold_id") or "").strip()
@@ -385,11 +387,25 @@ def run_nested_gateway_fold(
         outer_plan = frozen_fold.outer_test_plan
         if outer_plan is None or frozen_fold.cell_receipt is None:
             raise RuntimeError("Nested fold did not freeze outer evidence")
-        outer_validation = validate_evidence_artifact_bundle(
-            Path(str(attempt.get("artifact_dir") or "")).resolve(), outer_plan
+        attempt_id = str(attempt.get("attempt_id") or "")
+        selected_for_outer = (
+            outer_selected_attempt_ids is None
+            or attempt_id in outer_selected_attempt_ids
         )
-        outer_stage_status = _validation_stage_status(outer_validation)
-        outer_outcome = _no_valid_cell_outcome(outer_validation)
+        if not submit_outer:
+            outer_stage_status = "pending_selection"
+            outer_validation = {"status": "not_checked"}
+        elif not selected_for_outer:
+            outer_stage_status = "not_selected"
+            outer_validation = {"status": "not_checked"}
+        else:
+            outer_validation = validate_evidence_artifact_bundle(
+                Path(str(attempt.get("artifact_dir") or "")).resolve(), outer_plan
+            )
+            outer_stage_status = _validation_stage_status(outer_validation)
+        outer_outcome = (
+            _no_valid_cell_outcome(outer_validation) if selected_for_outer and submit_outer else None
+        )
         record = {
             "run_id": run_dir.name,
             "attempt_id": attempt.get("attempt_id"),
@@ -431,6 +447,8 @@ def run_nested_gateway_fold(
         if outer_outcome is not None:
             record["outer_terminal_outcome"] = outer_outcome
         fold_records.append(record)
+        if not submit_outer or not selected_for_outer:
+            continue
         if outer_stage_status in {"valid", "nonviable"}:
             continue
         task = build_full_backtest_lab_task(
@@ -455,9 +473,34 @@ def run_nested_gateway_fold(
             "fold": fold,
             "selection_basis": selection_basis,
             "records": fold_records,
-            "status": "outer_pending" if outer_tasks else "complete",
+            "status": (
+                "cells_frozen"
+                if not submit_outer
+                else "outer_pending" if outer_tasks else "complete"
+            ),
         },
     )
+    if not submit_outer:
+        payload = {
+            "campaign_plan_id": campaign_plan_id,
+            "fold": fold,
+            "selection_basis": selection_basis,
+            "strategy_count": len(planned),
+            "train_reused_count": len(planned) - len(train_pending),
+            "train_calculated_count": sum(
+                row.get("status") == "calculated" for row in train_results
+            ),
+            "train_nonviable_count": sum(
+                record.get("train_validation_status") == "nonviable"
+                for record in fold_records
+            ),
+            "records": fold_records,
+            "outer_results": [],
+            "status": "cells_frozen",
+            "state_path": str(state_path),
+        }
+        _write_state(state_path, payload)
+        return payload
     outer_results = _run_outer_tasks(
         tasks=outer_tasks,
         lab_config=lab_config,
@@ -467,6 +510,11 @@ def run_nested_gateway_fold(
     failed_outer = [row for row in outer_results if row.get("status") == "failed"]
     for record in fold_records:
         if not record.get("outer_test_plan"):
+            continue
+        if (
+            outer_selected_attempt_ids is not None
+            and str(record.get("attempt_id") or "") not in outer_selected_attempt_ids
+        ):
             continue
         outer_plan = validate_replay_evidence_plan(record["outer_test_plan"])
         attempt = next(
@@ -484,7 +532,15 @@ def run_nested_gateway_fold(
         if outer_outcome is not None:
             record["outer_terminal_outcome"] = outer_outcome
     final_status = "failed" if failed_outer else "complete"
-    outer_eligible_count = sum(1 for record in fold_records if record.get("outer_test_plan"))
+    outer_eligible_count = sum(
+        1
+        for record in fold_records
+        if record.get("outer_test_plan")
+        and (
+            outer_selected_attempt_ids is None
+            or str(record.get("attempt_id") or "") in outer_selected_attempt_ids
+        )
+    )
     payload = {
         "campaign_plan_id": campaign_plan_id,
         "fold": fold,

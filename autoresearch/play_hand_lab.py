@@ -22,7 +22,12 @@ from rich.console import Console
 from .play_hand_lab_auth import load_lab_gateway_token
 from .config import AppConfig, load_config
 from .fuzzfolio import CliError, FuzzfolioCli
-from .evidence_plan import build_replay_evidence_plan
+from .evidence_plan import build_replay_evidence_plan, canonical_sha256
+from .durable_execution import (
+    DurableExecutionError,
+    DurableExecutionJournal,
+    atomic_write_json,
+)
 from .ledger import (
     attempts_path_for_run_dir,
     load_attempts,
@@ -184,7 +189,13 @@ class PlayHandLabRuntimeConfig:
     research_generation_id: str | None = None
     level_c_protocol_id: str | None = None
     cutoff_key: str | None = None
+    source_snapshot_sha256: str | None = None
+    universe_id: str | None = None
+    universe_manifest_sha256: str | None = None
     expected_seed_plan_sha256: str | None = None
+    execution_plan_path: Path | None = None
+    execution_plan_id: str | None = None
+    resume: bool = False
     instrument_scout_size: int = INSTRUMENT_SCOUT_DEFAULT_SIZE
     instrument_scout_max_selected: int = INSTRUMENT_SCOUT_DEFAULT_MAX_SELECTED
     fake_work_seconds: float = 1.0
@@ -271,6 +282,120 @@ class LabCampaignHistory:
     pruned_promoted_lane_count: int = 0
     pruned_tombstoned_lane_count: int = 0
     best_score: float | None = None
+
+
+def _lane_state_payload(lane: LabLaneState) -> dict[str, Any]:
+    payload = asdict(lane)
+    for key in ("run_dir", "profile_path", "incumbent_profile_path"):
+        value = payload.get(key)
+        payload[key] = str(value) if value is not None else None
+    for key in ("completed_task_ids", "failed_task_ids"):
+        payload[key] = sorted(getattr(lane, key))
+    return payload
+
+
+def _lane_state_from_payload(payload: dict[str, Any]) -> LabLaneState:
+    values = dict(payload)
+    values["run_dir"] = Path(str(values["run_dir"])).resolve(strict=False)
+    for key in ("profile_path", "incumbent_profile_path"):
+        values[key] = Path(str(values[key])).resolve(strict=False) if values.get(key) else None
+    for key in ("completed_task_ids", "failed_task_ids"):
+        values[key] = {str(item) for item in values.get(key) or []}
+    return LabLaneState(**values)
+
+
+def _campaign_state_lineage(runtime: PlayHandLabRuntimeConfig, campaign_id: str) -> dict[str, Any]:
+    semantic_runtime = {
+        key: value
+        for key, value in asdict(runtime).items()
+        if key
+        not in {
+            "gateway_url",
+            "gateway_token",
+            "poll_interval_seconds",
+            "max_wait_seconds",
+            "result_batch_size",
+            "max_results_per_cycle",
+            "max_drain_seconds",
+            "result_read_failure_limit",
+            "enqueue_failure_limit",
+            "enqueue_retry_base_seconds",
+            "terminal_lane_retention",
+            "json_output",
+            "log_mode",
+            "barrier_interval_seconds",
+            "barrier_lane_limit",
+            "resume",
+        }
+    }
+    semantic_runtime = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in semantic_runtime.items()
+    }
+    return {
+        "campaign_id": campaign_id,
+        "execution_plan_id": runtime.execution_plan_id,
+        "research_generation_id": runtime.research_generation_id,
+        "level_c_protocol_id": runtime.level_c_protocol_id,
+        "cutoff_key": runtime.cutoff_key,
+        "source_snapshot_sha256": runtime.source_snapshot_sha256,
+        "universe_id": runtime.universe_id,
+        "universe_manifest_sha256": runtime.universe_manifest_sha256,
+        "seed": runtime.seed,
+        "target_runs": runtime.target_runs,
+        "semantic_runtime_sha256": canonical_sha256(semantic_runtime),
+    }
+
+
+def _write_campaign_state(
+    path: Path,
+    *,
+    runtime: PlayHandLabRuntimeConfig,
+    campaign_id: str,
+    lanes: list[LabLaneState],
+    history: LabCampaignHistory,
+    next_lane_index: int,
+    recorded_result_count: int,
+) -> None:
+    atomic_write_json(
+        path,
+        {
+            "schema_version": "play-hand-lab-durable-state-v1",
+            "lineage": _campaign_state_lineage(runtime, campaign_id),
+            "next_lane_index": int(next_lane_index),
+            "recorded_result_count": int(recorded_result_count),
+            "history": asdict(history),
+            "lanes": [_lane_state_payload(lane) for lane in lanes],
+        },
+    )
+
+
+def _load_campaign_state(
+    path: Path,
+    *,
+    runtime: PlayHandLabRuntimeConfig,
+    campaign_id: str,
+) -> tuple[list[LabLaneState], LabCampaignHistory, int, int]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DurableExecutionError(f"PlayHand durable state is unreadable: {path}") from exc
+    if payload.get("schema_version") != "play-hand-lab-durable-state-v1":
+        raise DurableExecutionError("PlayHand durable state schema mismatch")
+    if payload.get("lineage") != _campaign_state_lineage(runtime, campaign_id):
+        raise DurableExecutionError("PlayHand durable state lineage mismatch")
+    lanes = [
+        _lane_state_from_payload(dict(item))
+        for item in payload.get("lanes") or []
+        if isinstance(item, dict)
+    ]
+    history = LabCampaignHistory(**dict(payload.get("history") or {}))
+    return (
+        lanes,
+        history,
+        int(payload.get("next_lane_index") or 0),
+        int(payload.get("recorded_result_count") or 0),
+    )
 
 
 class LabGatewayClient:
@@ -506,6 +631,13 @@ def _validate_historical_runtime_contract(
         raise ValueError("Historical PlayHand derives indicators exclusively from its seed plan.")
     if not _is_exact_sha256(runtime.expected_seed_plan_sha256):
         raise ValueError("Historical PlayHand requires an exact expected_seed_plan_sha256.")
+    if not _is_exact_sha256(runtime.source_snapshot_sha256):
+        raise ValueError("Historical PlayHand requires an exact source_snapshot_sha256.")
+    _safe_lineage_identity(runtime.universe_id, field_name="universe_id")
+    if not _is_exact_sha256(runtime.universe_manifest_sha256):
+        raise ValueError("Historical PlayHand requires an exact universe_manifest_sha256.")
+    if not _is_exact_sha256(runtime.execution_plan_id) or runtime.execution_plan_path is None:
+        raise ValueError("Historical PlayHand requires one authoritative execution plan.")
 
     campaign_id = _safe_campaign_id(runtime.campaign_id, historical=True)
     research_generation_id = _safe_lineage_identity(
@@ -544,6 +676,10 @@ def _historical_lineage_payload(runtime: PlayHandLabRuntimeConfig) -> dict[str, 
         "as_of_date": str(runtime.as_of_date),
         "lake_manifest_sha256": str(runtime.lake_manifest_sha256),
         "expected_seed_plan_sha256": str(runtime.expected_seed_plan_sha256),
+        "source_snapshot_sha256": str(runtime.source_snapshot_sha256),
+        "universe_id": str(runtime.universe_id),
+        "universe_manifest_sha256": str(runtime.universe_manifest_sha256),
+        "execution_plan_id": str(runtime.execution_plan_id),
     }
 
 
@@ -745,6 +881,26 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
                 else None
             )
         ),
+        source_snapshot_sha256=(
+            str(runtime.source_snapshot_sha256).strip()
+            if runtime.source_snapshot_sha256
+            else None
+        ),
+        universe_id=str(runtime.universe_id).strip() if runtime.universe_id else None,
+        universe_manifest_sha256=(
+            str(runtime.universe_manifest_sha256).strip()
+            if runtime.universe_manifest_sha256
+            else None
+        ),
+        execution_plan_path=(
+            Path(runtime.execution_plan_path).expanduser().resolve()
+            if runtime.execution_plan_path
+            else None
+        ),
+        execution_plan_id=(
+            str(runtime.execution_plan_id).strip() if runtime.execution_plan_id else None
+        ),
+        resume=bool(runtime.resume),
         instrument_scout_size=max(int(runtime.instrument_scout_size), 1),
         instrument_scout_max_selected=max(int(runtime.instrument_scout_max_selected), 1),
         fake_work_seconds=max(float(runtime.fake_work_seconds), 0.0),
@@ -1019,6 +1175,10 @@ def _historical_campaign_lineage(runtime: PlayHandLabRuntimeConfig) -> dict[str,
         "level_c_protocol_id": runtime.level_c_protocol_id,
         "cutoff_key": runtime.cutoff_key,
         "expected_seed_plan_sha256": runtime.expected_seed_plan_sha256,
+        "source_snapshot_sha256": runtime.source_snapshot_sha256,
+        "universe_id": runtime.universe_id,
+        "universe_manifest_sha256": runtime.universe_manifest_sha256,
+        "execution_plan_id": runtime.execution_plan_id,
         "formal_historical_level_c": True,
     }
 
@@ -1028,7 +1188,7 @@ def _reject_existing_historical_campaign_path(
     *,
     runtime: PlayHandLabRuntimeConfig,
 ) -> None:
-    """Fail closed: this task deliberately does not define campaign resume semantics."""
+    """Fail closed unless an existing formal campaign has exact durable resume state."""
     if not campaign_dir.exists():
         return
     try:
@@ -1055,12 +1215,22 @@ def _reject_existing_historical_campaign_path(
             + ", ".join(conflicts)
             + "."
         )
+    if runtime.resume:
+        state_path = campaign_dir / "play-hand-lab-state.json"
+        journal_path = campaign_dir / "play-hand-lab-execution-journal.json"
+        if not state_path.is_file() or not journal_path.is_file():
+            raise ValueError(
+                "Historical PlayHand resume requires both durable state and execution journal."
+            )
+        return
     raise ValueError(
-        "Historical PlayHand campaign path already exists; resume behavior is not supported."
+        "Historical PlayHand campaign path already exists; pass --resume to continue it."
     )
 
 
-def _lane_run_id(lane_index: int) -> str:
+def _lane_run_id(lane_index: int, *, campaign_id: str | None = None) -> str:
+    if campaign_id:
+        return f"{campaign_id}-lane-{lane_index:05d}"
     return f"{_utc_stamp()}-playhand-lab-lane-{lane_index:03d}-v1"
 
 
@@ -1170,6 +1340,11 @@ def _write_campaign_metadata(
             "level_c_protocol_id": runtime.level_c_protocol_id,
             "cutoff_key": runtime.cutoff_key,
             "expected_seed_plan_sha256": runtime.expected_seed_plan_sha256,
+            "source_snapshot_sha256": runtime.source_snapshot_sha256,
+            "universe_id": runtime.universe_id,
+            "universe_manifest_sha256": runtime.universe_manifest_sha256,
+            "execution_plan_id": runtime.execution_plan_id,
+            "execution_plan_path": str(runtime.execution_plan_path) if runtime.execution_plan_path else None,
             "play_hand_seed_plan_path": (
                 str(runtime.seed_plan_path.resolve())
                 if runtime.as_of_date and runtime.seed_plan_path
@@ -1250,6 +1425,10 @@ def _write_lane_metadata(
             "level_c_protocol_id": runtime.level_c_protocol_id,
             "cutoff_key": runtime.cutoff_key,
             "expected_seed_plan_sha256": runtime.expected_seed_plan_sha256,
+            "source_snapshot_sha256": runtime.source_snapshot_sha256,
+            "universe_id": runtime.universe_id,
+            "universe_manifest_sha256": runtime.universe_manifest_sha256,
+            "execution_plan_id": runtime.execution_plan_id,
             "play_hand_seed_plan_path": (
                 str(runtime.seed_plan_path.resolve())
                 if runtime.as_of_date and runtime.seed_plan_path
@@ -2824,7 +3003,79 @@ def _record_lab_result(
     evidence_plan = task_spec.get("evidence_plan")
     evidence_plan = evidence_plan if isinstance(evidence_plan, dict) else {}
     execution_evidence = _validated_execution_evidence(result_payload, evidence_plan)
-    artifact_dir = (lane_ctx.evals_dir / f"eval_lab_{phase}_{task_id}_{_utc_stamp()}").resolve()
+    artifact_key = canonical_sha256({"task_id": task_id})[-20:]
+    artifact_dir = (lane_ctx.evals_dir / f"eval_lab_{phase}_{artifact_key}").resolve()
+    result_identity = canonical_sha256(lab_result)
+    matches = [
+        row
+        for row in load_attempts(lane_ctx.attempts_path)
+        if str(row.get("lab_campaign_task_id") or "") == task_id
+    ]
+    if len(matches) > 1:
+        raise DurableExecutionError(f"duplicate ledger rows exist for task {task_id}")
+    recovered_row = matches[0] if matches else None
+    if recovered_row is not None:
+        if recovered_row.get("lab_worker_result_sha256") != result_identity:
+            raise DurableExecutionError(
+                f"ledger result identity conflicts with duplicate task {task_id}"
+            )
+        artifact_dir = Path(str(recovered_row.get("artifact_dir") or "")).resolve(
+            strict=False
+        )
+        if not artifact_dir.is_dir():
+            raise DurableExecutionError(
+                f"ledger artifact is missing for duplicate task {task_id}"
+            )
+    receipt_path = artifact_dir / "task-result-receipt.json"
+    if receipt_path.is_file():
+        receipt = _load_json(receipt_path)
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("task_id") != task_id
+            or receipt.get("worker_result_sha256") != result_identity
+            or not isinstance(receipt.get("recorded_result"), dict)
+        ):
+            raise DurableExecutionError(f"conflicting result receipt for task {task_id}")
+        return dict(receipt["recorded_result"])
+    if recovered_row is not None:
+        row = recovered_row
+        recorded = {
+                "task_id": task_id,
+                "attempt_id": row.get("attempt_id"),
+                "artifact_dir": str(artifact_dir),
+                "score": row.get("composite_score"),
+                "score_basis": row.get("score_basis"),
+                "status": "failed" if row.get("lab_scoring_warning") else "success",
+                "phase": phase,
+                "task_kind": task_kind,
+                "profile_path": row.get("profile_path"),
+                "profile_ref": row.get("profile_ref"),
+                "instruments": list(task_spec.get("instruments") or lane.instruments),
+                "timeframe": str(task_spec.get("timeframe") or lane.timeframe),
+                "lookback_months": int(task_spec.get("lookback_months") or runtime.lookback_months),
+                "analysis_window_start": task_spec.get("analysis_window_start"),
+                "analysis_window_end": task_spec.get("analysis_window_end"),
+                "evidence_plan_id": evidence_plan.get("plan_id"),
+                "evidence_role": evidence_plan.get("evidence_role"),
+                "sweep_payload": (
+                    _load_json(artifact_dir / "sweep-results.json")
+                    if task_kind == "sweep_shard" and (artifact_dir / "sweep-results.json").is_file()
+                    else None
+                ),
+        }
+        atomic_write_json(
+            receipt_path,
+            {
+                "task_id": task_id,
+                "worker_result_sha256": result_identity,
+                "recorded_result": recorded,
+            },
+        )
+        return recorded
+    if artifact_dir.exists():
+        partial_root = lane_ctx.evals_dir / "partial-artifacts"
+        partial_root.mkdir(parents=True, exist_ok=True)
+        artifact_dir.replace(partial_root / f"{artifact_dir.name}-{_utc_stamp()}")
     artifact_dir.mkdir(parents=True, exist_ok=True)
     if runtime.retain_raw_lab_artifacts:
         _write_json(artifact_dir / "lab-result.json", lab_result)
@@ -2940,6 +3191,7 @@ def _record_lab_result(
             "execution_evidence": execution_evidence,
             "worker_id": lab_result.get("worker_id"),
             "worker_lease_id": lab_result.get("lease_id"),
+            "lab_worker_result_sha256": result_identity,
             "run_status": "failed" if score_warning else "screened",
         }
     )
@@ -2970,7 +3222,7 @@ def _record_lab_result(
         score_basis=record.score_basis,
         scoring_warning=score_warning,
     )
-    return {
+    recorded = {
         "task_id": task_id,
         "attempt_id": record.attempt_id,
         "artifact_dir": str(artifact_dir),
@@ -2990,6 +3242,15 @@ def _record_lab_result(
         "evidence_role": evidence_plan.get("evidence_role"),
         "sweep_payload": sweep_payload if task_kind == "sweep_shard" else None,
     }
+    atomic_write_json(
+        receipt_path,
+        {
+            "task_id": task_id,
+            "worker_result_sha256": result_identity,
+            "recorded_result": recorded,
+        },
+    )
+    return recorded
 
 
 def _is_failed_lab_result(lab_result: dict[str, Any]) -> bool:
@@ -3015,7 +3276,65 @@ def _record_lab_failure(
     task_kind = str(task_spec.get("task_kind") or runtime.task_mode)
     result_payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
     error = str(result_payload.get("error") or lab_result.get("error") or "lab_worker_failed")
-    artifact_dir = (lane_ctx.evals_dir / f"eval_lab_failed_{task_id}_{_utc_stamp()}").resolve()
+    artifact_key = canonical_sha256({"task_id": task_id})[-20:]
+    artifact_dir = (lane_ctx.evals_dir / f"eval_lab_failed_{artifact_key}").resolve()
+    result_identity = canonical_sha256(lab_result)
+    matches = [
+        row
+        for row in load_attempts(lane_ctx.attempts_path)
+        if str(row.get("lab_campaign_task_id") or "") == task_id
+    ]
+    if len(matches) > 1:
+        raise DurableExecutionError(f"duplicate ledger rows exist for task {task_id}")
+    recovered_row = matches[0] if matches else None
+    if recovered_row is not None:
+        if recovered_row.get("lab_worker_result_sha256") != result_identity:
+            raise DurableExecutionError(
+                f"ledger failure identity conflicts with duplicate task {task_id}"
+            )
+        artifact_dir = Path(str(recovered_row.get("artifact_dir") or "")).resolve(
+            strict=False
+        )
+        if not artifact_dir.is_dir():
+            raise DurableExecutionError(
+                f"ledger artifact is missing for duplicate task {task_id}"
+            )
+    receipt_path = artifact_dir / "task-result-receipt.json"
+    if receipt_path.is_file():
+        receipt = _load_json(receipt_path)
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("task_id") != task_id
+            or receipt.get("worker_result_sha256") != result_identity
+            or not isinstance(receipt.get("recorded_result"), dict)
+        ):
+            raise DurableExecutionError(f"conflicting failure receipt for task {task_id}")
+        return dict(receipt["recorded_result"])
+    if recovered_row is not None:
+        row = recovered_row
+        recorded = {
+            "task_id": task_id,
+            "attempt_id": row.get("attempt_id"),
+            "artifact_dir": str(artifact_dir),
+            "score": None,
+            "score_basis": "lab_worker_failed",
+            "status": "failed",
+            "phase": phase,
+            "task_kind": task_kind,
+        }
+        atomic_write_json(
+            receipt_path,
+            {
+                "task_id": task_id,
+                "worker_result_sha256": result_identity,
+                "recorded_result": recorded,
+            },
+        )
+        return recorded
+    if artifact_dir.exists():
+        partial_root = lane_ctx.evals_dir / "partial-artifacts"
+        partial_root.mkdir(parents=True, exist_ok=True)
+        artifact_dir.replace(partial_root / f"{artifact_dir.name}-{_utc_stamp()}")
     artifact_dir.mkdir(parents=True, exist_ok=True)
     if runtime.retain_raw_lab_artifacts:
         _write_json(artifact_dir / "lab-result.json", lab_result)
@@ -3095,6 +3414,7 @@ def _record_lab_failure(
             "lab_lane_id": lane.lane_id,
             "worker_id": lab_result.get("worker_id"),
             "worker_lease_id": lab_result.get("lease_id"),
+            "lab_worker_result_sha256": result_identity,
             "run_status": "failed",
             "lab_failure": {"error": error[:1000]},
         }
@@ -3122,7 +3442,7 @@ def _record_lab_failure(
         attempt_id=record.attempt_id,
         error=error[:1000],
     )
-    return {
+    recorded = {
         "task_id": task_id,
         "attempt_id": record.attempt_id,
         "artifact_dir": str(artifact_dir),
@@ -3132,6 +3452,15 @@ def _record_lab_failure(
         "phase": phase,
         "task_kind": task_kind,
     }
+    atomic_write_json(
+        receipt_path,
+        {
+            "task_id": task_id,
+            "worker_result_sha256": result_identity,
+            "recorded_result": recorded,
+        },
+    )
+    return recorded
 
 
 def _render_lane_progress_artifacts(*, config: AppConfig, lane_ctx: PlayHandContext) -> None:
@@ -4608,6 +4937,8 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     started_at = _now_iso()
     campaign_id = runtime.campaign_id or _campaign_run_id()
     campaign_dir = _derived_campaign_root(config) / campaign_id
+    state_path = campaign_dir / "play-hand-lab-state.json"
+    journal_path = campaign_dir / "play-hand-lab-execution-journal.json"
     if runtime.as_of_date:
         _reject_existing_historical_campaign_path(campaign_dir, runtime=runtime)
     campaign_ctx = _campaign_context(
@@ -4618,7 +4949,16 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         runtime=runtime,
     )
     _configure_lab_event_output(campaign_ctx, runtime)
-    campaign_dir.mkdir(parents=True, exist_ok=not bool(runtime.as_of_date))
+    campaign_dir.mkdir(
+        parents=True,
+        exist_ok=not bool(runtime.as_of_date) or bool(runtime.resume),
+    )
+    journal = DurableExecutionJournal(
+        journal_path,
+        execution_id=str(runtime.execution_plan_id or campaign_id),
+        lineage=_campaign_state_lineage(runtime, campaign_id),
+    )
+    journal.load(create=not bool(runtime.resume))
     _write_campaign_metadata(campaign_ctx, runtime=runtime, status="starting", started_at=started_at)
     _append_event(
         campaign_ctx,
@@ -4687,6 +5027,80 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     active_runs = max(int(runtime.active_runs or 1), 1)
     observed_worker_slots = 0
     next_lane_index = 0
+    recorded_result_count = 0
+    if runtime.resume:
+        lanes, history, next_lane_index, recorded_result_count = _load_campaign_state(
+            state_path,
+            runtime=runtime,
+            campaign_id=campaign_id,
+        )
+        for lane in lanes:
+            lane_cli = FuzzfolioCli(config.fuzzfolio)
+            lane_ctx = _new_context(
+                config=config,
+                cli=lane_cli,
+                run_id=lane.run_id,
+                run_dir=lane.run_dir,
+                runtime=runtime,
+            )
+            _configure_lab_event_output(lane_ctx, runtime)
+            lane_contexts[lane.run_id] = lane_ctx
+            for task_id in lane.task_ids:
+                lanes_by_task[task_id] = lane
+        tasks = [dict(item["payload"]) for item in journal.unresolved()]
+
+    def persist_campaign_state() -> None:
+        _write_campaign_state(
+            state_path,
+            runtime=runtime,
+            campaign_id=campaign_id,
+            lanes=lanes,
+            history=history,
+            next_lane_index=next_lane_index,
+            recorded_result_count=recorded_result_count,
+        )
+
+    if runtime.resume:
+        recovered_tasks: list[dict[str, Any]] = []
+        for lane in lanes:
+            for task_id in list(lane.task_ids):
+                if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
+                    continue
+                terminal = journal.terminal(task_id)
+                if terminal is None:
+                    continue
+                terminal_receipt = terminal.get("terminal_receipt") or {}
+                recorded = terminal_receipt.get("payload")
+                if not isinstance(recorded, dict):
+                    raise DurableExecutionError(
+                        f"terminal journal entry has no recorded result: {task_id}"
+                    )
+                if recorded.get("status") == "failed":
+                    lane.failed_task_ids.add(task_id)
+                else:
+                    lane.completed_task_ids.add(task_id)
+                _refresh_lane_phase_result_counts(lane, task_id=task_id)
+                recovered_tasks.extend(
+                    _advance_lane_after_result(
+                        config=config,
+                        lane_ctx=lane_contexts[lane.run_id],
+                        lane=lane,
+                        runtime=runtime,
+                        reward_matrix=reward_matrix,
+                        worker_contract_hash=worker_contract_hash,
+                        recorded=recorded,
+                    )
+                )
+        for task in recovered_tasks:
+            journal.register(str(task["task_id"]), task)
+            tasks.append(task)
+            lane = next(
+                candidate
+                for candidate in lanes
+                if candidate.lane_id == str(task.get("lane_id") or "")
+            )
+            lanes_by_task[str(task["task_id"])] = lane
+        persist_campaign_state()
 
     def enqueue_chunk_run_limit() -> int:
         pressure_slots = observed_worker_slots if observed_worker_slots > 0 else active_runs
@@ -4704,7 +5118,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
 
     def build_lane(lane_index: int) -> tuple[LabLaneState, PlayHandContext]:
         lane_id = f"lane_{lane_index:03d}"
-        run_id = _lane_run_id(lane_index)
+        run_id = _lane_run_id(
+            lane_index,
+            campaign_id=campaign_ctx.run_id if runtime.as_of_date else None,
+        )
         run_dir = config.runs_root / run_id
         lane_cli = FuzzfolioCli(config.fuzzfolio)
         lane_ctx = _new_context(
@@ -4858,6 +5275,9 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             reward_matrix=reward_matrix,
             worker_contract_hash=worker_contract_hash,
         )
+        for task in new_tasks:
+            journal.register(str(task["task_id"]), task)
+        persist_campaign_state()
         enqueue_result = _enqueue_gateway_tasks_with_retries(
             gateway,
             campaign_ctx,
@@ -4902,6 +5322,9 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     def enqueue_existing_tasks(new_tasks: list[dict[str, Any]], *, reason: str) -> None:
         if not new_tasks:
             return
+        for task in new_tasks:
+            journal.register(str(task["task_id"]), task)
+        persist_campaign_state()
         enqueue_result = _enqueue_gateway_tasks_with_retries(
             gateway,
             campaign_ctx,
@@ -4948,6 +5371,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         new_lanes = prepare_lanes(start_index, count)
         enqueue_lanes(new_lanes)
         next_lane_index += len(new_lanes)
+        persist_campaign_state()
         return len(new_lanes)
 
     if runtime.dry_run:
@@ -4990,7 +5414,6 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         _append_event(campaign_ctx, "gateway", "baseline_snapshot_failed", error=str(exc)[:500])
 
     recorded_results: list[dict[str, Any]] = []
-    recorded_result_count = 0
     deadline = None if runtime.campaign_mode == "continuous" else time.monotonic() + runtime.max_wait_seconds
     last_snapshot: dict[str, Any] | None = None
     initial_gateway_id: str | None = None
@@ -5196,6 +5619,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 )
                 recorded_result_count += 1
                 _add_recorded_result_sample(recorded_results, recorded)
+                journal.complete(task_id, recorded)
                 recorded_successfully = True
             except Exception as exc:
                 _append_event(
@@ -5233,6 +5657,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 _add_recorded_result_sample(recorded_results, recorded)
                 lane.failed_task_ids.add(task_id)
                 _refresh_lane_phase_result_counts(lane, task_id=task_id)
+                journal.complete(task_id, recorded)
             ack_lease_ids.append(lease_id)
             if new_stage_tasks:
                 enqueue_existing_tasks(new_stage_tasks, reason=f"stage:{_task_phase(lane, task_id)}")
@@ -5243,6 +5668,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 status=lane_run_status(lane),
                 started_at=started_at,
             )
+            persist_campaign_state()
         if ack_lease_ids:
             _safe_ack_gateway_results(
                 gateway,
@@ -5254,7 +5680,17 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         create_and_enqueue_more()
 
     try:
-        create_and_enqueue_more()
+        if runtime.resume and tasks:
+            _enqueue_gateway_tasks_with_retries(
+                gateway,
+                campaign_ctx,
+                tasks,
+                reason="resume_unresolved",
+                failure_limit=runtime.enqueue_failure_limit,
+                retry_base_seconds=runtime.enqueue_retry_base_seconds,
+            )
+        else:
+            create_and_enqueue_more()
     except requests.RequestException as exc:
         gateway_unreachable = True
         _append_event(campaign_ctx, "gateway", "initial_task_enqueue_failed", error=str(exc)[:1000])

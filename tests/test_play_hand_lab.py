@@ -10,6 +10,7 @@ import pytest
 import requests
 
 from autoresearch import play_hand_lab as lab
+from autoresearch.instrument_universe import universe_provenance
 
 
 def _profile_payload() -> dict:
@@ -122,6 +123,11 @@ def _level_c_runtime(
         "research_generation_id": "generation-2025-06",
         "level_c_protocol_id": "sha256:" + "c" * 64,
         "cutoff_key": "A",
+        "source_snapshot_sha256": "sha256:" + "d" * 64,
+        "universe_id": str(universe_provenance()["universe_id"]),
+        "universe_manifest_sha256": str(universe_provenance()["universe_hash"]),
+        "execution_plan_path": tmp_path / "execution-plan.json",
+        "execution_plan_id": "sha256:" + "e" * 64,
     }
     values.update(overrides)
     return lab.PlayHandLabRuntimeConfig(**values)
@@ -279,6 +285,28 @@ def test_normalize_runtime_historical_mode_preserves_verified_level_c_lineage(
     assert runtime.terminal_lane_retention >= 3
 
 
+def test_durable_campaign_state_rejects_semantic_runtime_drift(tmp_path: Path) -> None:
+    runtime = lab._normalize_runtime(_level_c_runtime(tmp_path, target_runs=1))
+    state_path = tmp_path / "state.json"
+    lab._write_campaign_state(
+        state_path,
+        runtime=runtime,
+        campaign_id=str(runtime.campaign_id),
+        lanes=[],
+        history=lab.LabCampaignHistory(),
+        next_lane_index=0,
+        recorded_result_count=0,
+    )
+
+    changed = lab.replace(runtime, final_min_score=runtime.final_min_score + 1.0)
+    with pytest.raises(lab.DurableExecutionError, match="lineage mismatch"):
+        lab._load_campaign_state(
+            state_path,
+            runtime=changed,
+            campaign_id=str(runtime.campaign_id),
+        )
+
+
 def test_normalize_runtime_exploratory_campaign_id_is_optional_and_validated() -> None:
     assert lab._normalize_runtime(lab.PlayHandLabRuntimeConfig()).campaign_id is None
     assert (
@@ -346,8 +374,8 @@ def test_historical_campaign_path_rejects_conflicting_lineage(tmp_path: Path) ->
         lab._reject_existing_historical_campaign_path(campaign_dir, runtime=runtime)
 
 
-def test_historical_campaign_path_rejects_resume_even_with_matching_lineage(tmp_path: Path) -> None:
-    runtime = lab._normalize_runtime(_level_c_runtime(tmp_path))
+def test_historical_campaign_path_accepts_resume_with_matching_durable_state(tmp_path: Path) -> None:
+    runtime = lab._normalize_runtime(_level_c_runtime(tmp_path, resume=True))
     campaign_dir = tmp_path / runtime.campaign_id
     campaign_dir.mkdir()
     (campaign_dir / "run-metadata.json").write_text(
@@ -355,8 +383,10 @@ def test_historical_campaign_path_rejects_resume_even_with_matching_lineage(tmp_
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="resume behavior is not supported"):
-        lab._reject_existing_historical_campaign_path(campaign_dir, runtime=runtime)
+    (campaign_dir / "play-hand-lab-state.json").write_text("{}", encoding="utf-8")
+    (campaign_dir / "play-hand-lab-execution-journal.json").write_text("{}", encoding="utf-8")
+
+    lab._reject_existing_historical_campaign_path(campaign_dir, runtime=runtime)
 
 
 def test_level_c_lineage_and_seed_hash_are_persisted_in_campaign_and_lane_metadata(

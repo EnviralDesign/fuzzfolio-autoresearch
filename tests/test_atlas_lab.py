@@ -18,12 +18,14 @@ from autoresearch.atlas_lab import (
     _enqueue_gateway_tasks_with_retries,
     _make_signal_atlas_cell_task,
     _row_from_signal_result,
+    _run_durable_atlas_stage,
     _stamp_historical_recipe_prior_lineage,
     atlas_profile_config,
     effective_atlas_build_profile,
     run_atlas_lab,
     run_probe_spec_via_gateway,
 )
+from autoresearch.durable_execution import DurableExecutionError, DurableExecutionJournal
 from autoresearch.anchor_pair_atlas import (
     _probe_results_fieldnames,
     _result_row_from_score,
@@ -76,7 +78,7 @@ def _profile_doc() -> dict[str, Any]:
     }
 
 
-def _historical_runtime_kwargs() -> dict[str, str]:
+def _historical_runtime_kwargs() -> dict[str, object]:
     universe = universe_provenance()
     return {
         "research_generation_id": "generation-001",
@@ -85,6 +87,8 @@ def _historical_runtime_kwargs() -> dict[str, str]:
         "source_snapshot_sha256": "sha256:" + "f" * 64,
         "universe_id": str(universe["universe_id"]),
         "universe_manifest_sha256": str(universe["universe_hash"]),
+        "execution_plan_path": Path("level-c-execution-plan.json"),
+        "execution_plan_id": "sha256:" + "9" * 64,
     }
 
 
@@ -303,17 +307,19 @@ def test_historical_atlas_requires_complete_formal_lineage(tmp_path: Path) -> No
                 as_of_date="2025-06-30T00:00:00Z",
                 lake_manifest_sha256="sha256:" + "c" * 64,
                 signal_atlas_executor="gateway",
+                execution_plan_path=tmp_path / "execution-plan.json",
+                execution_plan_id="sha256:" + "9" * 64,
             ),
             phases=["build"],
         )
 
 
-def test_historical_atlas_run_root_is_create_only(tmp_path: Path) -> None:
+def test_historical_atlas_existing_root_requires_explicit_resume(tmp_path: Path) -> None:
     run_root = tmp_path / "runs" / "derived" / "atlas-runs" / "existing"
     run_root.mkdir(parents=True)
     (run_root / "atlas-lab-run.json").write_text("{}", encoding="utf-8")
 
-    with pytest.raises(FileExistsError, match="create-only"):
+    with pytest.raises(FileExistsError, match="pass --resume"):
         run_atlas_lab(
             _config(tmp_path),
             run_id="existing",
@@ -325,6 +331,91 @@ def test_historical_atlas_run_root_is_create_only(tmp_path: Path) -> None:
             ),
             phases=["build"],
         )
+
+
+def test_historical_atlas_stage_resume_requires_exact_artifact_receipt(tmp_path: Path) -> None:
+    run_root = tmp_path / "atlas-run"
+    stage_root = run_root / "indicator-atlas"
+    run_root.mkdir()
+    journal = DurableExecutionJournal(
+        run_root / "execution-journal.json",
+        execution_id="sha256:" + "1" * 64,
+        lineage={"cutoff_key": "A"},
+    )
+
+    def build() -> str:
+        stage_root.mkdir()
+        (stage_root / "summary.json").write_text('{"status":"complete"}', encoding="utf-8")
+        return "built"
+
+    assert _run_durable_atlas_stage(
+        journal=journal,
+        run_root=run_root,
+        stage="01-indicator-atlas",
+        payload={"cutoff_key": "A"},
+        artifact_roots=(stage_root,),
+        action=build,
+    ) == ("built", False)
+    assert _run_durable_atlas_stage(
+        journal=journal,
+        run_root=run_root,
+        stage="01-indicator-atlas",
+        payload={"cutoff_key": "A"},
+        artifact_roots=(stage_root,),
+        action=lambda: (_ for _ in ()).throw(AssertionError("stage reran")),
+    ) == (None, True)
+
+    (stage_root / "summary.json").write_text('{"status":"partial"}', encoding="utf-8")
+    with pytest.raises(DurableExecutionError, match="verification failed"):
+        _run_durable_atlas_stage(
+            journal=journal,
+            run_root=run_root,
+            stage="01-indicator-atlas",
+            payload={"cutoff_key": "A"},
+            artifact_roots=(stage_root,),
+            action=lambda: None,
+        )
+
+
+def test_historical_atlas_resume_preserves_partial_stage_before_retry(tmp_path: Path) -> None:
+    run_root = tmp_path / "atlas-run"
+    stage_root = run_root / "signal-atlas"
+    run_root.mkdir()
+    journal = DurableExecutionJournal(
+        run_root / "execution-journal.json",
+        execution_id="sha256:" + "2" * 64,
+        lineage={"cutoff_key": "B"},
+    )
+
+    def crash() -> None:
+        stage_root.mkdir()
+        (stage_root / "partial.json").write_text("{}", encoding="utf-8")
+        raise RuntimeError("simulated crash")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        _run_durable_atlas_stage(
+            journal=journal,
+            run_root=run_root,
+            stage="02-signal-atlas",
+            payload={"cutoff_key": "B"},
+            artifact_roots=(stage_root,),
+            action=crash,
+        )
+
+    def retry() -> None:
+        stage_root.mkdir()
+        (stage_root / "complete.json").write_text("{}", encoding="utf-8")
+
+    _run_durable_atlas_stage(
+        journal=journal,
+        run_root=run_root,
+        stage="02-signal-atlas",
+        payload={"cutoff_key": "B"},
+        artifact_roots=(stage_root,),
+        action=retry,
+    )
+    assert (stage_root / "complete.json").is_file()
+    assert list((run_root / "partial-stages").rglob("partial.json"))
 
 
 def test_historical_recipe_priors_are_stamped_with_immutable_lineage(tmp_path: Path) -> None:
@@ -341,6 +432,7 @@ def test_historical_recipe_priors_are_stamped_with_immutable_lineage(tmp_path: P
         "as_of_date": "2025-06-30T00:00:00Z",
         "lake_manifest_sha256": "sha256:" + "d" * 64,
     }
+    lineage.pop("execution_plan_path")
 
     _stamp_historical_recipe_prior_lineage(recipe_priors_dir, lineage=lineage)
 

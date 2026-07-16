@@ -3112,6 +3112,17 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print machine-readable JSON."
     )
     atlas_lab.add_argument(
+        "--execution-plan",
+        type=Path,
+        default=None,
+        help="Authoritative Level-C execution plan. Required for formal historical execution.",
+    )
+    atlas_lab.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a matching formal Atlas run from immutable stage receipts.",
+    )
+    atlas_lab.add_argument(
         "--lake-manifest-sha256",
         default=None,
         help="Exact promoted lake coverage identity. Required with --as-of-date.",
@@ -15242,9 +15253,9 @@ def cmd_nested_evidence(
         deadline_seconds=3600,
         result_batch_size=max(25, int(max_workers) * 2),
     )
-    fold_results = []
+    train_fold_results = []
     for fold in folds:
-        fold_results.append(
+        train_fold_results.append(
             run_nested_gateway_fold(
                 config=config,
                 items=items,
@@ -15257,10 +15268,13 @@ def cmd_nested_evidence(
                 test_horizon_months=int(test_months),
                 selection_basis=selection_basis,
                 lake_manifest_sha256=resolved_lake_manifest_sha256,
+                submit_outer=False,
                 emit=(lambda message: print(message, file=sys.stderr, flush=True)),
             )
         )
-    failed = [row for row in fold_results if row.get("status") != "complete"]
+    failed = [
+        row for row in train_fold_results if row.get("status") != "cells_frozen"
+    ]
     account = _resolve_optimizer_account_spec(
         config=config,
         account_config_path=str(suite.get("account_config") or "").strip() or None,
@@ -15275,6 +15289,50 @@ def cmd_nested_evidence(
         for row in catalog_rows
         if str(row.get("attempt_id") or "") in scoped_ids
     ]
+    frozen_portfolio_results = (
+        run_nested_cell_temporal_validation(
+            rows=scoped_rows,
+            fold_reports=train_fold_results,
+            suite=suite,
+            account=account,
+            root=campaign_root / "portfolio-validation",
+            backend=optimizer_backend,
+            freeze_only=True,
+        )
+        if not failed
+        else []
+    )
+    selected_by_fold: dict[str, set[str]] = {}
+    for result in frozen_portfolio_results:
+        fold_id = str((result.get("fold") or {}).get("fold_id") or "")
+        selected_by_fold.setdefault(fold_id, set()).update(
+            str(attempt_id)
+            for attempt_id in result.get("selected_attempt_ids") or []
+        )
+    fold_results = []
+    if not failed:
+        for fold in folds:
+            fold_results.append(
+                run_nested_gateway_fold(
+                    config=config,
+                    items=items,
+                    fold=fold,
+                    campaign_plan_id=evidence_campaign_plan_id,
+                    campaign_root=campaign_root,
+                    lab_config=lab_config,
+                    max_workers=max(1, int(max_workers)),
+                    train_horizon_months=int(train_months),
+                    test_horizon_months=int(test_months),
+                    selection_basis=selection_basis,
+                    lake_manifest_sha256=resolved_lake_manifest_sha256,
+                    submit_outer=True,
+                    outer_selected_attempt_ids=selected_by_fold.get(
+                        str(fold.get("fold_id") or ""), set()
+                    ),
+                    emit=(lambda message: print(message, file=sys.stderr, flush=True)),
+                )
+            )
+        failed = [row for row in fold_results if row.get("status") != "complete"]
     nested_portfolio_results = (
         run_nested_cell_temporal_validation(
             rows=scoped_rows,
@@ -15284,7 +15342,7 @@ def cmd_nested_evidence(
             root=campaign_root / "portfolio-validation",
             backend=optimizer_backend,
         )
-        if not failed
+        if fold_results and not failed
         else []
     )
     payload = {
@@ -18265,6 +18323,8 @@ def cmd_atlas_lab(
     source_snapshot_sha256: str | None = None,
     universe_id: str | None = None,
     universe_manifest_sha256: str | None = None,
+    execution_plan: Path | None = None,
+    resume: bool = False,
     signal_lookback_months: int = 3,
     discovery_queue: str,
     discovery_cluster_min_similarity: float,
@@ -18286,6 +18346,30 @@ def cmd_atlas_lab(
     as_json: bool,
 ) -> int:
     config = load_config()
+    plan_arguments: dict[str, Any] = {}
+    formal_values = {
+        "run_id": run_id if str(run_id or "").strip().lower() not in {"", "auto"} else None,
+        "as_of_date": as_of_date,
+        "lake_manifest_sha256": lake_manifest_sha256,
+        "research_generation_id": research_generation_id,
+        "level_c_protocol_id": level_c_protocol_id,
+        "cutoff_key": cutoff_key,
+        "source_snapshot_sha256": source_snapshot_sha256,
+        "universe_id": universe_id,
+        "universe_manifest_sha256": universe_manifest_sha256,
+    }
+    if execution_plan is not None:
+        conflicts = sorted(key for key, value in formal_values.items() if value is not None)
+        if conflicts:
+            raise ValueError(
+                "Formal Atlas lineage must come only from --execution-plan; remove: "
+                + ", ".join("--" + key.replace("_", "-") for key in conflicts)
+            )
+        from autoresearch.level_c_operator import executor_arguments_from_plan
+
+        plan_arguments, _plan = executor_arguments_from_plan(execution_plan, executor="atlas")
+    elif as_of_date:
+        raise ValueError("Formal historical Atlas requires --execution-plan.")
     runtime = AtlasLabRuntimeConfig(
         gateway_url=gateway_url or AtlasLabRuntimeConfig.gateway_url,
         gateway_token=gateway_token,
@@ -18304,7 +18388,7 @@ def cmd_atlas_lab(
         strict_parity=bool(strict_parity),
         force=bool(force),
         json_output=bool(as_json),
-        publish=bool(publish),
+        publish=bool(plan_arguments.get("publish", publish)),
         limit=limit,
         signal_max_indicators=(
             None if signal_max_indicators is None else max(0, int(signal_max_indicators))
@@ -18315,30 +18399,39 @@ def cmd_atlas_lab(
         signal_timeframe_limit=(
             None if signal_timeframe_limit is None else max(0, int(signal_timeframe_limit))
         ),
-        signal_atlas_executor="gateway" if str(signal_atlas_executor or "local") == "gateway" else "local",
+        signal_atlas_executor=str(plan_arguments.get("signal_atlas_executor") or signal_atlas_executor or "local"),
         full_discovery_queue=str(discovery_queue or "full") == "full",
         include_detail=bool(include_detail),
         compact_probe_artifacts=bool(compact_probe_artifacts),
-        as_of_date=as_of_date,
+        as_of_date=plan_arguments.get("as_of_date", as_of_date),
         lake_manifest_sha256=(
-            str(lake_manifest_sha256).strip() if lake_manifest_sha256 else None
+            str(plan_arguments.get("lake_manifest_sha256") or lake_manifest_sha256).strip()
+            if (plan_arguments.get("lake_manifest_sha256") or lake_manifest_sha256) else None
         ),
         research_generation_id=(
-            str(research_generation_id).strip() if research_generation_id else None
+            str(plan_arguments.get("research_generation_id") or research_generation_id).strip()
+            if (plan_arguments.get("research_generation_id") or research_generation_id) else None
         ),
         level_c_protocol_id=(
-            str(level_c_protocol_id).strip() if level_c_protocol_id else None
+            str(plan_arguments.get("level_c_protocol_id") or level_c_protocol_id).strip()
+            if (plan_arguments.get("level_c_protocol_id") or level_c_protocol_id) else None
         ),
-        cutoff_key=str(cutoff_key).strip() if cutoff_key else None,
+        cutoff_key=str(plan_arguments.get("cutoff_key") or cutoff_key).strip()
+        if (plan_arguments.get("cutoff_key") or cutoff_key) else None,
         source_snapshot_sha256=(
-            str(source_snapshot_sha256).strip() if source_snapshot_sha256 else None
+            str(plan_arguments.get("source_snapshot_sha256") or source_snapshot_sha256).strip()
+            if (plan_arguments.get("source_snapshot_sha256") or source_snapshot_sha256) else None
         ),
-        universe_id=str(universe_id).strip() if universe_id else None,
+        universe_id=str(plan_arguments.get("universe_id") or universe_id).strip()
+        if (plan_arguments.get("universe_id") or universe_id) else None,
         universe_manifest_sha256=(
-            str(universe_manifest_sha256).strip()
-            if universe_manifest_sha256
+            str(plan_arguments.get("universe_manifest_sha256") or universe_manifest_sha256).strip()
+            if (plan_arguments.get("universe_manifest_sha256") or universe_manifest_sha256)
             else None
         ),
+        execution_plan_path=(Path(plan_arguments["execution_plan_path"]) if plan_arguments else None),
+        execution_plan_id=plan_arguments.get("execution_plan_id"),
+        resume=bool(resume),
         signal_lookback_months=max(1, int(signal_lookback_months)),
         discovery_cluster_min_similarity=float(discovery_cluster_min_similarity),
         discovery_cluster_min_shared_partners=max(0, int(discovery_cluster_min_shared_partners)),
@@ -18374,7 +18467,7 @@ def cmd_atlas_lab(
 
     result = run_atlas_lab(
         config,
-        run_id=run_id,
+        run_id=plan_arguments.get("run_id", run_id),
         runtime=runtime,
         phases=phases,
         progress_callback=progress,
@@ -19918,6 +20011,8 @@ def main(argv: list[str] | None = None) -> int:
             source_snapshot_sha256=args.source_snapshot_sha256,
             universe_id=args.universe_id,
             universe_manifest_sha256=args.universe_manifest_sha256,
+            execution_plan=args.execution_plan,
+            resume=bool(args.resume),
             signal_lookback_months=args.signal_lookback_months,
             discovery_queue=args.discovery_queue,
             discovery_cluster_min_similarity=args.discovery_cluster_min_similarity,

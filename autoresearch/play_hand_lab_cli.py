@@ -66,6 +66,17 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         help="Run first-class PlayHand Lab work through the in-memory lab gateway.",
     )
     play_hand_lab.add_argument(
+        "--execution-plan",
+        type=Path,
+        default=None,
+        help="Authoritative Level-C execution plan. Required for formal historical execution.",
+    )
+    play_hand_lab.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume a matching formal campaign from its durable task graph.",
+    )
+    play_hand_lab.add_argument(
         "--gateway-url",
         default=os.environ.get("FUZZFOLIO_LAB_GATEWAY_URL", DEFAULT_LAB_GATEWAY_URL),
         help=f"Lab gateway base URL. Default: {DEFAULT_LAB_GATEWAY_URL}.",
@@ -681,13 +692,39 @@ def _add_loopback_sim_args(parser: Any, *, transport_label: str, jitter_help: st
 
 def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None:
     if args.command in PLAY_HAND_LAB_COORDINATOR_COMMANDS:
+        formal_values = {
+            "as_of_date": args.as_of_date,
+            "campaign_id": args.campaign_id,
+            "lake_manifest_sha256": args.lake_manifest_sha256,
+            "research_generation_id": args.research_generation_id,
+            "level_c_protocol_id": args.level_c_protocol_id,
+            "cutoff_key": args.cutoff_key,
+            "expected_seed_plan_sha256": args.expected_seed_plan_sha256,
+            "seed_plan_path": args.seed_plan_path,
+            "seed": args.seed,
+        }
+        plan_arguments: dict[str, Any] = {}
+        if args.execution_plan is not None:
+            conflicts = sorted(key for key, value in formal_values.items() if value is not None)
+            if conflicts:
+                raise ValueError(
+                    "Formal PlayHand lineage must come only from --execution-plan; remove: "
+                    + ", ".join("--" + key.replace("_", "-") for key in conflicts)
+                )
+            from .level_c_operator import executor_arguments_from_plan
+
+            plan_arguments, _plan = executor_arguments_from_plan(
+                args.execution_plan, executor="playhand"
+            )
+        elif args.as_of_date:
+            raise ValueError("Formal historical PlayHand requires --execution-plan.")
         return cmd_play_hand_lab(
             PlayHandLabRuntimeConfig(
                 gateway_url=args.gateway_url,
                 gateway_token=args.gateway_token,
-                campaign_mode=args.mode,
-                task_mode=args.task_mode,
-                pipeline_mode=args.pipeline_mode,
+                campaign_mode=plan_arguments.get("campaign_mode", args.mode),
+                task_mode=plan_arguments.get("task_mode", args.task_mode),
+                pipeline_mode=plan_arguments.get("pipeline_mode", args.pipeline_mode),
                 target_runs=args.target_runs,
                 active_runs=args.active_runs,
                 lanes=args.target_runs or 4,
@@ -698,10 +735,10 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 instrument_pool=args.instrument_pool,
                 indicator=args.indicator,
                 profile_path=args.profile_path,
-                seed_plan_path=args.seed_plan_path,
+                seed_plan_path=(Path(plan_arguments["seed_plan_path"]) if plan_arguments else args.seed_plan_path),
                 min_indicators=args.min_indicators,
                 max_indicators=args.max_indicators,
-                seed=args.seed,
+                seed=plan_arguments.get("seed", args.seed),
                 lookback_months=args.lookback_months,
                 bar_limit=args.bar_limit,
                 max_reward_r=args.max_reward_r,
@@ -717,13 +754,19 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 final_min_score=args.final_min_score,
                 screen_anchor_mode=args.screen_anchor_mode,
                 screen_anchor_envelope_months=args.screen_anchor_envelope_months,
-                as_of_date=args.as_of_date,
-                campaign_id=args.campaign_id,
-                lake_manifest_sha256=args.lake_manifest_sha256,
-                research_generation_id=args.research_generation_id,
-                level_c_protocol_id=args.level_c_protocol_id,
-                cutoff_key=args.cutoff_key,
-                expected_seed_plan_sha256=args.expected_seed_plan_sha256,
+                as_of_date=plan_arguments.get("as_of_date", args.as_of_date),
+                campaign_id=plan_arguments.get("campaign_id", args.campaign_id),
+                lake_manifest_sha256=plan_arguments.get("lake_manifest_sha256", args.lake_manifest_sha256),
+                research_generation_id=plan_arguments.get("research_generation_id", args.research_generation_id),
+                level_c_protocol_id=plan_arguments.get("level_c_protocol_id", args.level_c_protocol_id),
+                cutoff_key=plan_arguments.get("cutoff_key", args.cutoff_key),
+                source_snapshot_sha256=plan_arguments.get("source_snapshot_sha256"),
+                universe_id=plan_arguments.get("universe_id"),
+                universe_manifest_sha256=plan_arguments.get("universe_manifest_sha256"),
+                expected_seed_plan_sha256=plan_arguments.get("expected_seed_plan_sha256", args.expected_seed_plan_sha256),
+                execution_plan_path=(Path(plan_arguments["execution_plan_path"]) if plan_arguments else None),
+                execution_plan_id=plan_arguments.get("execution_plan_id"),
+                resume=bool(args.resume),
                 instrument_scout_size=args.instrument_scout_size,
                 instrument_scout_max_selected=args.instrument_scout_max_selected,
                 fake_work_seconds=args.fake_work_seconds,
@@ -739,13 +782,13 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 enqueue_retry_base_seconds=args.enqueue_retry_base_seconds,
                 terminal_lane_retention=args.terminal_lane_retention,
                 dry_run=bool(args.dry_run),
-                strict_scoring=bool(args.strict_scoring),
+                strict_scoring=bool(plan_arguments.get("strict_scoring", args.strict_scoring)),
                 retain_raw_lab_artifacts=bool(args.retain_raw_lab_artifacts),
                 json_output=bool(args.json),
                 log_mode=args.log_mode,
                 barrier_interval_seconds=args.barrier_interval_seconds,
                 barrier_lane_limit=args.barrier_lane_limit,
-                worker_contract_hash=args.worker_contract_hash,
+                worker_contract_hash=plan_arguments.get("worker_contract_hash", args.worker_contract_hash),
                 worker_contract_schema=args.worker_contract_schema,
                 trading_dashboard_root=args.trading_dashboard_root,
             )

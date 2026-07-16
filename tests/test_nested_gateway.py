@@ -279,6 +279,63 @@ def test_nested_gateway_fold_is_redacted_and_resumable(
     assert second["outer_reused_count"] == 1
 
 
+def test_nested_gateway_freezes_cells_without_submitting_or_reading_outer_evidence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir, attempt = _attempt_fixture(
+        tmp_path, run_id="run-freeze", attempt_id="attempt-freeze"
+    )
+    config = SimpleNamespace(
+        research=SimpleNamespace(quality_score_preset="profile_drop")
+    )
+    lab_config = LabBacktestConfig(worker_contract_hash="sha256:test")
+
+    def fake_train(*, tasks, **_kwargs):
+        results = []
+        for source_attempt, task in tasks:
+            paths = materialize_full_backtest_lab_result(
+                attempt=source_attempt,
+                task=task,
+                lab_result=_worker_result(task, tracked=False),
+            )
+            results.append({"status": "calculated", **paths})
+        return results
+
+    monkeypatch.setattr(ng, "_run_train_tasks", fake_train)
+    monkeypatch.setattr(
+        ng,
+        "_run_outer_tasks",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("outer work was submitted before portfolio freeze")
+        ),
+    )
+    result = run_nested_gateway_fold(
+        config=config,
+        items=[(run_dir, attempt, {"attempt_id": attempt["attempt_id"]}, {})],
+        fold={
+            "fold_id": "fold-01",
+            "train_start": "2022-01-01",
+            "train_end": "2024-12-31",
+            "test_start": "2025-01-16",
+            "test_end": "2025-06-30",
+            "embargo_days": 15,
+        },
+        campaign_plan_id="nested:freeze-first",
+        campaign_root=tmp_path / "campaign",
+        lab_config=lab_config,
+        max_workers=1,
+        train_horizon_months=36,
+        test_horizon_months=6,
+        lake_manifest_sha256="sha256:" + "a" * 64,
+        submit_outer=False,
+    )
+
+    assert result["status"] == "cells_frozen"
+    assert result["outer_results"] == []
+    assert result["records"][0]["outer_validation_status"] == "pending_selection"
+    assert result["records"][0]["cell_receipt"]["execution_cell"]
+
+
 def test_nested_gateway_preserves_no_signal_stage_semantics(
     tmp_path: Path, monkeypatch
 ) -> None:

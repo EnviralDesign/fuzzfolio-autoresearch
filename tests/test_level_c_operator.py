@@ -15,6 +15,7 @@ from autoresearch.level_c_operator import (
     LevelCOperatorError,
     build_level_c_execution_plan,
     create_level_c_execution_plan,
+    executor_arguments_from_plan,
     load_level_c_execution_plan,
     validate_level_c_execution_plan,
 )
@@ -23,6 +24,8 @@ from autoresearch.level_c_protocol import (
     create_level_c_protocol,
     create_level_c_protocol_authority,
 )
+from autoresearch.config import load_config
+from autoresearch.runtime_policy_lock import build_runtime_policy_lock, policy_lock_provenance
 
 
 def _hash(character: str) -> str:
@@ -82,6 +85,9 @@ def _generation_payload(root: Path, provenance: dict[str, str]) -> dict[str, obj
 
 def _provenance() -> dict[str, str]:
     live = universe_provenance()
+    policy = policy_lock_provenance(
+        build_runtime_policy_lock(load_config(), worker_contract_sha256=_hash("c"))
+    )
     return {
         "lake_semantic_sha256": _hash("a"),
         "source_snapshot_sha256": _hash("b"),
@@ -90,12 +96,7 @@ def _provenance() -> dict[str, str]:
         "worker_contract_id": "worker-contract-v1",
         "worker_contract_sha256": _hash("c"),
         "worker_image": "worker-image-v1",
-        "engine_id": "engine-v1",
-        "engine_sha256": _hash("d"),
-        "scoring_policy_id": "score-v1",
-        "scoring_policy_sha256": _hash("e"),
-        "cost_policy_id": "cost-v1",
-        "cost_policy_sha256": _hash("f"),
+        **policy,
     }
 
 
@@ -178,6 +179,42 @@ def test_builds_exact_declarative_arguments_from_one_cutoff(tmp_path: Path) -> N
     assert plan["playhand_arguments"]["strict_scoring"] is True
     assert plan["atlas_arguments"]["signal_atlas_executor"] == "gateway"
     assert plan["atlas_arguments"]["publish"] is False
+    for arguments in (plan["atlas_arguments"], plan["playhand_arguments"]):
+        assert arguments["source_snapshot_sha256"] == _hash("b")
+        assert arguments["universe_id"] == universe_provenance()["universe_id"]
+        assert arguments["universe_manifest_sha256"] == universe_provenance()["universe_hash"]
+    assert plan["bound_contract"]["runtime_policy_lock"]["policy_lock_sha256"].startswith(
+        "sha256:"
+    )
+
+
+def test_one_authoritative_plan_drives_atlas_and_playhand_executors(tmp_path: Path) -> None:
+    root, protocol_path, authority_path, _ = _bound_sources(tmp_path)
+    plan = build_level_c_execution_plan(root, protocol_path, authority_path, "C")
+    plan_path = tmp_path / "execution-plan.json"
+    create_level_c_execution_plan(plan_path, plan)
+
+    atlas_args, atlas_plan = executor_arguments_from_plan(plan_path, executor="atlas")
+    assert atlas_args["run_id"] == "atlas-c"
+    assert atlas_args["execution_plan_id"] == atlas_plan["plan_id"]
+
+    seed_path = Path(plan["playhand_arguments"]["seed_plan_path"])
+    seed_path.parent.mkdir(parents=True, exist_ok=True)
+    seed_path.write_text('{"recipes":{},"sampling_policy":{}}', encoding="utf-8")
+    seed_sha256 = "sha256:" + hashlib.sha256(seed_path.read_bytes()).hexdigest()
+    (seed_path.parent / "level-c-lineage.json").write_text(
+        json.dumps(
+            {"artifact_sha256": {"play-hand-seed-plan.json": seed_sha256}}
+        ),
+        encoding="utf-8",
+    )
+
+    playhand_args, playhand_plan = executor_arguments_from_plan(
+        plan_path, executor="playhand"
+    )
+    assert playhand_args["campaign_id"] == "playhand-c"
+    assert playhand_args["expected_seed_plan_sha256"] == seed_sha256
+    assert playhand_args["execution_plan_id"] == playhand_plan["plan_id"]
     assert plan["bound_contract"]["no_global_priors"] is True
     assert plan["bound_contract"]["no_outer_feedback"] is True
     assert plan["cutoff"]["geometry"]["embargo_days"] == 15
