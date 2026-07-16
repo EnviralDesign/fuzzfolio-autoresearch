@@ -36,6 +36,37 @@ def test_evidence_plan_is_deterministic_and_self_authenticating() -> None:
     assert first.analysis_window_end == "2026-07-08T23:59:59Z"
 
 
+def test_missing_threshold_uses_the_effective_default_consistently() -> None:
+    profile_without_threshold = {"name": "frozen", "indicators": []}
+    explicit_default = {**profile_without_threshold, "notificationThreshold": 80.0}
+    kwargs = {
+        "campaign_plan_id": "campaign:test",
+        "evidence_role": "full_backtest",
+        "selection_data_end": "2026-07-08T23:59:59Z",
+        "analysis_window_start": "2023-07-08T23:59:59Z",
+        "analysis_window_end": "2026-07-08T23:59:59Z",
+        "requested_horizon_months": 36,
+    }
+
+    implicit_plan = build_replay_evidence_plan(
+        **kwargs,
+        profile_snapshot=profile_without_threshold,
+    )
+    explicit_plan = build_replay_evidence_plan(
+        **kwargs,
+        profile_snapshot=explicit_default,
+    )
+
+    assert implicit_plan.plan_id == explicit_plan.plan_id
+    enforce_replay_evidence_plan(
+        implicit_plan,
+        profile_snapshot=profile_without_threshold,
+        analysis_window_start=implicit_plan.analysis_window_start,
+        analysis_window_end=implicit_plan.analysis_window_end,
+        lookback_months=None,
+    )
+
+
 def test_evidence_plan_rejects_mutated_window() -> None:
     payload = _plan().model_dump(mode="json")
     payload["analysis_window_start"] = "2023-07-09T23:59:59Z"

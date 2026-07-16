@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -33,7 +34,9 @@ from .evidence_plan import (
 from .nested_evidence import FrozenExecutionCellReceipt
 from .evidence_artifacts import (
     build_evidence_artifact_manifest,
+    evidence_bundle_lock,
     evidence_artifact_paths,
+    validate_evidence_artifact_bundle,
     write_immutable_json,
 )
 from .play_hand_lab import DEFAULT_LAB_GATEWAY_URL, LabGatewayClient
@@ -41,6 +44,7 @@ from .play_hand_lab_auth import load_lab_gateway_token
 
 
 FULL_BACKTEST_CACHE_TASK_KIND = "full_backtest_cache"
+TERMINAL_OUTCOME_SCHEMA = "autoresearch-evidence-terminal-outcome-v1"
 DEFAULT_RESULT_BATCH_SIZE = 25
 
 
@@ -73,6 +77,157 @@ def _load_json(path: Path) -> dict[str, Any]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _reuse_valid_evidence_bundle(
+    artifact_dir: Path,
+    plan: ReplayEvidencePlan,
+    *,
+    expected_outcome: str,
+) -> dict[str, Any] | None:
+    validation = validate_evidence_artifact_bundle(artifact_dir, plan)
+    if validation.get("status") != "valid":
+        return None
+    terminal_outcome = validation.get("terminal_outcome")
+    actual_outcome = (
+        str(terminal_outcome.get("outcome"))
+        if isinstance(terminal_outcome, dict)
+        else "success"
+    )
+    if actual_outcome != expected_outcome:
+        raise RuntimeError(
+            "Existing immutable evidence outcome conflict: "
+            f"expected={expected_outcome} observed={actual_outcome}"
+        )
+    paths = evidence_artifact_paths(artifact_dir, plan)
+    payload = {
+        "result_path": str(paths.result),
+        "curve_path": str(paths.curve),
+        "evidence_manifest_path": str(paths.manifest),
+        "evidence_plan_id": plan.plan_id,
+        "evidence_role": plan.evidence_role,
+        "backend": "lab_gateway",
+        "reused_existing_evidence": True,
+    }
+    if isinstance(terminal_outcome, dict):
+        payload["terminal_outcome"] = dict(terminal_outcome)
+    if plan.evidence_role == "outer_test":
+        payload["cell_receipt_path"] = str(paths.cell_receipt)
+    else:
+        payload["calendar_curve_path"] = str(paths.calendar_curve)
+        payload["recommended_curve_path"] = str(paths.recommended_curve)
+    return payload
+
+
+def _prepare_evidence_bundle_slot(
+    artifact_dir: Path,
+    plan: ReplayEvidencePlan,
+    *,
+    expected_outcome: str,
+) -> dict[str, Any] | None:
+    reused = _reuse_valid_evidence_bundle(
+        artifact_dir,
+        plan,
+        expected_outcome=expected_outcome,
+    )
+    if reused is not None:
+        return reused
+    paths = evidence_artifact_paths(artifact_dir, plan)
+    if paths.manifest.exists():
+        validation = validate_evidence_artifact_bundle(artifact_dir, plan)
+        raise RuntimeError(
+            "Immutable evidence bundle has an invalid published manifest: "
+            + ",".join(validation.get("reason_codes") or ["unknown"])
+        )
+    if paths.root.exists():
+        shutil.rmtree(paths.root)
+    return None
+
+
+def materialize_no_valid_cell_lab_result(
+    *,
+    attempt: dict[str, Any],
+    lab_result: dict[str, Any],
+    task: dict[str, Any],
+) -> dict[str, Any]:
+    worker_result = _unwrap_worker_result(lab_result)
+    terminal_result = worker_result.get("terminal_result")
+    if (
+        not isinstance(terminal_result, dict)
+        or terminal_result.get("schema") != "fuzzfolio-replay-terminal-result-v1"
+        or terminal_result.get("status") != "nonviable"
+        or terminal_result.get("outcome") != "no_valid_cell"
+    ):
+        raise RuntimeError("Lab result is missing a worker-authored no-valid-cell outcome")
+    diagnostics = terminal_result.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise RuntimeError("Worker-authored no-valid-cell outcome is missing diagnostics")
+    market_window = diagnostics.get("market_data_window")
+    if (
+        diagnostics.get("signal_count") != 0
+        or diagnostics.get("resolved_trade_count_max") != 0
+        or not isinstance(market_window, dict)
+        or int(market_window.get("filtered_bar_count") or 0) <= 0
+    ):
+        raise RuntimeError(
+            "No-valid-cell outcome is missing zero-signal diagnostics or loaded bars"
+        )
+    task_payload = task.get("payload") if isinstance(task, dict) else None
+    if not isinstance(task_payload, dict):
+        raise RuntimeError("No-valid-cell task is missing its payload")
+    plan = validate_replay_evidence_plan(task_payload.get("evidence_plan"))
+    artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+    execution_evidence = _validate_planned_execution_evidence(
+        plan=plan,
+        execution_evidence=terminal_result.get("execution_evidence"),
+    )
+    terminal_outcome = {"status": "nonviable", "outcome": "no_valid_cell"}
+    result_payload = {
+        "schema": TERMINAL_OUTCOME_SCHEMA,
+        **terminal_outcome,
+        "evidence_plan_id": plan.plan_id,
+        "diagnostics": diagnostics,
+    }
+    request_record = {
+        "request": task_payload,
+        "status": "nonviable",
+        "job_kind": FULL_BACKTEST_CACHE_TASK_KIND,
+        "worker_id": lab_result.get("worker_id"),
+    }
+    provenance = {
+        "schema": TERMINAL_OUTCOME_SCHEMA,
+        "attempt_id": str(attempt.get("attempt_id") or ""),
+        "run_id": str(attempt.get("run_id") or ""),
+        "worker_id": lab_result.get("worker_id"),
+        "worker_contract_hash": task_payload.get("required_worker_contract_hash"),
+    }
+    manifest = build_evidence_artifact_manifest(
+        evidence_plan=plan,
+        provenance=provenance,
+        execution_evidence=execution_evidence,
+        artifact_payloads={"result": result_payload, "job": request_record},
+    )
+    manifest["terminal_outcome"] = terminal_outcome
+    paths = evidence_artifact_paths(artifact_dir, plan)
+    with evidence_bundle_lock(paths.root):
+        reused = _prepare_evidence_bundle_slot(
+            artifact_dir,
+            plan,
+            expected_outcome="no_valid_cell",
+        )
+        if reused is not None:
+            return reused
+        write_immutable_json(paths.result, result_payload)
+        write_immutable_json(paths.job, request_record)
+        write_immutable_json(paths.manifest, manifest)
+    return {
+        "result_path": str(paths.result),
+        "evidence_manifest_path": str(paths.manifest),
+        "evidence_plan_id": plan.plan_id,
+        "evidence_role": plan.evidence_role,
+        "terminal_outcome": terminal_outcome,
+        "backend": "lab_gateway",
+    }
 
 
 def _profile_snapshot_from_file(profile_path: Path | None) -> dict[str, Any]:
@@ -426,6 +581,14 @@ def materialize_full_backtest_lab_result(
             "best-cell matrix outputs cannot enter OOS artifacts."
         )
     if resolved_evidence_plan is not None:
+        reused = _reuse_valid_evidence_bundle(
+            artifact_dir,
+            resolved_evidence_plan,
+            expected_outcome="success",
+        )
+        if reused is not None:
+            return reused
+    if resolved_evidence_plan is not None:
         execution_evidence = _validate_planned_execution_evidence(
             plan=resolved_evidence_plan,
             execution_evidence=execution_evidence,
@@ -456,12 +619,20 @@ def materialize_full_backtest_lab_result(
                 "job": request_record,
             },
         )
-        write_immutable_json(immutable_paths.result, sensitivity_response)
-        write_immutable_json(immutable_paths.curve, best_detail)
-        write_immutable_json(immutable_paths.calendar_curve, calendar_curve)
-        write_immutable_json(immutable_paths.recommended_curve, recommended_detail)
-        write_immutable_json(immutable_paths.manifest, immutable_manifest)
-        write_immutable_json(immutable_paths.job, request_record)
+        with evidence_bundle_lock(immutable_paths.root):
+            reused = _prepare_evidence_bundle_slot(
+                artifact_dir,
+                resolved_evidence_plan,
+                expected_outcome="success",
+            )
+            if reused is not None:
+                return reused
+            write_immutable_json(immutable_paths.result, sensitivity_response)
+            write_immutable_json(immutable_paths.curve, best_detail)
+            write_immutable_json(immutable_paths.calendar_curve, calendar_curve)
+            write_immutable_json(immutable_paths.recommended_curve, recommended_detail)
+            write_immutable_json(immutable_paths.job, request_record)
+            write_immutable_json(immutable_paths.manifest, immutable_manifest)
 
     result_path = artifact_dir / FULL_BACKTEST_RESULT_FILENAME
     curve_path = artifact_dir / FULL_BACKTEST_CURVE_FILENAME
@@ -541,6 +712,15 @@ def materialize_outer_test_lab_result(
     if task_payload.get("tracked_cell") != receipt.execution_cell:
         raise RuntimeError("Outer-test task tracked cell differs from the frozen receipt")
 
+    artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+    reused = _reuse_valid_evidence_bundle(
+        artifact_dir,
+        plan,
+        expected_outcome="success",
+    )
+    if reused is not None:
+        return reused
+
     worker_result = _unwrap_worker_result(lab_result)
     sensitivity_response = worker_result.get("sensitivity_response")
     data = sensitivity_response.get("data") if isinstance(sensitivity_response, dict) else None
@@ -588,7 +768,6 @@ def materialize_outer_test_lab_result(
         execution_evidence=worker_result.get("execution_evidence"),
     )
 
-    artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
     paths = evidence_artifact_paths(artifact_dir, plan)
     provenance = build_full_backtest_provenance(
         attempt=attempt,
@@ -623,11 +802,19 @@ def materialize_outer_test_lab_result(
     )
     manifest["evidence_level"] = "train_selected_cell_outer_test"
     manifest["cell_receipt"] = receipt_payload
-    write_immutable_json(paths.result, redacted_result)
-    write_immutable_json(paths.curve, tracked_detail)
-    write_immutable_json(paths.manifest, manifest)
-    write_immutable_json(paths.job, request_record)
-    write_immutable_json(paths.cell_receipt, receipt_payload)
+    with evidence_bundle_lock(paths.root):
+        reused = _prepare_evidence_bundle_slot(
+            artifact_dir,
+            plan,
+            expected_outcome="success",
+        )
+        if reused is not None:
+            return reused
+        write_immutable_json(paths.result, redacted_result)
+        write_immutable_json(paths.curve, tracked_detail)
+        write_immutable_json(paths.job, request_record)
+        write_immutable_json(paths.cell_receipt, receipt_payload)
+        write_immutable_json(paths.manifest, manifest)
     return {
         "result_path": str(paths.result),
         "curve_path": str(paths.curve),
@@ -860,12 +1047,50 @@ def run_lab_full_backtests(
                             if emit is not None:
                                 emit(f"  lab materialize failed: {run_dir.name} {attempt_id} {exc}")
                     else:
-                        entry["status"] = "failed"
                         worker_result = _unwrap_worker_result(lab_result)
-                        entry["error"] = str(worker_result.get("error") or lab_result.get("result") or "lab worker failed")
-                        failed += 1
-                        if emit is not None:
-                            emit(f"  lab failed: {run_dir.name} {attempt_id} {entry['error']}")
+                        error = str(
+                            worker_result.get("error")
+                            or lab_result.get("result")
+                            or "lab worker failed"
+                        )
+                        terminal_result = worker_result.get("terminal_result")
+                        if (
+                            isinstance(terminal_result, dict)
+                            and terminal_result.get("outcome") == "no_valid_cell"
+                        ):
+                            try:
+                                paths = materialize_no_valid_cell_lab_result(
+                                    attempt=attempt,
+                                    lab_result=lab_result,
+                                    task=submitted_task,
+                                )
+                                entry.update(paths)
+                                entry["status"] = "nonviable"
+                                calculated += 1
+                                if emit is not None:
+                                    emit(
+                                        "  lab nonviable: "
+                                        f"{run_dir.name} {attempt_id} "
+                                        f"({entry['duration_seconds']}s)"
+                                    )
+                            except Exception as exc:
+                                entry["status"] = "failed"
+                                entry["error"] = str(exc)
+                                failed += 1
+                                if emit is not None:
+                                    emit(
+                                        "  lab terminal materialize failed: "
+                                        f"{run_dir.name} {attempt_id} {exc}"
+                                    )
+                        else:
+                            entry["status"] = "failed"
+                            entry["error"] = error
+                            failed += 1
+                            if emit is not None:
+                                emit(
+                                    f"  lab failed: {run_dir.name} "
+                                    f"{attempt_id} {entry['error']}"
+                                )
                     results.append(entry)
                 if ack_ids:
                     gateway.ack_results(ack_ids)

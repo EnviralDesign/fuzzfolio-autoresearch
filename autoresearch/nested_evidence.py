@@ -11,6 +11,7 @@ from .evidence_plan import (
     build_replay_evidence_plan,
     canonical_timestamp,
     canonical_sha256,
+    normalize_evidence_profile_snapshot,
 )
 
 
@@ -128,7 +129,10 @@ def freeze_nested_outer_test(
         raise ValueError(
             "outer test must start after the configured train-window embargo"
         )
-    if canonical_sha256(profile_snapshot) != fold.train_plan.profile_snapshot_sha256:
+    if (
+        canonical_sha256(normalize_evidence_profile_snapshot(profile_snapshot))
+        != fold.train_plan.profile_snapshot_sha256
+    ):
         raise ValueError("outer profile snapshot differs from the train plan")
     cell_hash = build_execution_cell_sha256(selected_cell)
     receipt = FrozenExecutionCellReceipt(

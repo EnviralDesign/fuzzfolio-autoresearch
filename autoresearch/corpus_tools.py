@@ -15,6 +15,7 @@ from .evidence_plan import enforce_replay_evidence_plan, validate_replay_evidenc
 from .evidence_artifacts import (
     discover_evidence_artifact_bundles,
     evidence_artifact_paths,
+    validate_evidence_artifact_bundle,
 )
 from .scoring import CANONICAL_SCORE_LAB_VERSION, build_attempt_score
 
@@ -777,6 +778,53 @@ def validate_full_backtest_artifacts(
         if resolved_expected_plan is not None
         else None
     )
+    if evidence_paths is not None and resolved_expected_plan is not None:
+        bundle_validation = validate_evidence_artifact_bundle(
+            artifact_dir,
+            resolved_expected_plan,
+        )
+        terminal_outcome = bundle_validation.get("terminal_outcome")
+        if (
+            bundle_validation.get("status") == "valid"
+            and isinstance(terminal_outcome, dict)
+            and terminal_outcome.get("outcome") == "no_valid_cell"
+        ):
+            reason = _validation_reason(
+                "no_valid_cell",
+                rebuild_required=False,
+            )
+            return {
+                "status": "nonviable",
+                "issues": [],
+                "reason_codes": ["no_valid_cell"],
+                "rebuild_reason_codes": [],
+                "reasons": [reason],
+                "rebuild_required": False,
+                "result_exists": True,
+                "curve_exists": False,
+                "curve_point_count": 0,
+                "analysis_status": "nonviable",
+                "cell_match": None,
+                "result_path": str(evidence_paths.result),
+                "curve_path": str(evidence_paths.curve),
+                "calendar_curve_path": str(evidence_paths.calendar_curve),
+                "calendar_curve_exists": False,
+                "recommended_curve_path": str(evidence_paths.recommended_curve),
+                "recommended_curve_exists": False,
+                "threshold_expected": None,
+                "threshold_observed": None,
+                "canonical_profile_fingerprint": None,
+                "artifact_profile_fingerprint": None,
+                "provenance_mode": "terminal_outcome",
+                "evidence_plan_id": resolved_expected_plan.plan_id,
+                "evidence_role": resolved_expected_plan.evidence_role,
+                "requested_horizon_months": (
+                    resolved_expected_plan.requested_horizon_months
+                ),
+                "provenance_path": str(evidence_paths.manifest),
+                "freshness": {"mode": "plan_bound_terminal_outcome"},
+                "terminal_outcome": terminal_outcome,
+            }
     result_path = (
         evidence_paths.result if evidence_paths else artifact_dir / FULL_BACKTEST_RESULT_FILENAME
     )

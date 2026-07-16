@@ -31,6 +31,20 @@ def canonical_sha256(payload: Any) -> str:
     return "sha256:" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def normalize_evidence_profile_snapshot(
+    profile_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = dict(profile_snapshot)
+    threshold = normalized.get("notificationThreshold")
+    if threshold is None:
+        threshold = 80.0
+    try:
+        normalized["notificationThreshold"] = float(threshold)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("profile notificationThreshold must be numeric") from exc
+    return normalized
+
+
 def build_execution_cell_sha256(execution_cell: Any) -> str:
     if hasattr(execution_cell, "model_dump"):
         execution_cell = execution_cell.model_dump(mode="json")
@@ -140,6 +154,7 @@ def build_replay_evidence_plan(
     data_availability_cutoff: Any | None = None,
     coverage_policy: CoveragePolicy = "require_complete",
 ) -> ReplayEvidencePlan:
+    normalized_profile_snapshot = normalize_evidence_profile_snapshot(profile_snapshot)
     normalized_payload = {
         "schema_version": EVIDENCE_PLAN_SCHEMA,
         "campaign_plan_id": campaign_plan_id,
@@ -148,7 +163,7 @@ def build_replay_evidence_plan(
         "analysis_window_start": canonical_timestamp(analysis_window_start),
         "analysis_window_end": canonical_timestamp(analysis_window_end),
         "requested_horizon_months": int(requested_horizon_months),
-        "profile_snapshot_sha256": canonical_sha256(profile_snapshot),
+        "profile_snapshot_sha256": canonical_sha256(normalized_profile_snapshot),
         "execution_cell_sha256": execution_cell_sha256,
         "lake_manifest_sha256": lake_manifest_sha256,
         "data_availability_cutoff": (
@@ -185,7 +200,9 @@ def enforce_replay_evidence_plan(
         raise ValueError("analysis_window_start does not match evidence plan")
     if canonical_timestamp(analysis_window_end) != resolved.analysis_window_end:
         raise ValueError("analysis_window_end does not match evidence plan")
-    observed_profile = canonical_sha256(profile_snapshot)
+    observed_profile = canonical_sha256(
+        normalize_evidence_profile_snapshot(profile_snapshot)
+    )
     if observed_profile != resolved.profile_snapshot_sha256:
         raise ValueError(
             "profile snapshot does not match evidence plan: "

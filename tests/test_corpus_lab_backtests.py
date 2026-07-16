@@ -1,23 +1,71 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from autoresearch import __main__ as ar_main
+from autoresearch import corpus_tools as ct
 from autoresearch.corpus_lab_backtests import (
     LabBacktestConfig,
     build_full_backtest_lab_task,
     materialize_full_backtest_lab_result,
+    materialize_no_valid_cell_lab_result,
     run_lab_full_backtests,
+)
+from autoresearch.evidence_artifacts import (
+    discover_evidence_artifact_bundles,
+    evidence_artifact_paths,
+    validate_evidence_artifact_bundle,
+    write_immutable_json,
 )
 
 
 def _write_json(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _no_valid_terminal_result(task: dict, diagnostics: dict) -> dict:
+    plan = dict(task["payload"]["evidence_plan"])
+    return {
+        "schema": "fuzzfolio-replay-terminal-result-v1",
+        "status": "nonviable",
+        "outcome": "no_valid_cell",
+        "diagnostics": diagnostics,
+        "execution_evidence": {
+            **plan,
+            "observed_lake_manifest_sha256": plan.get("lake_manifest_sha256"),
+        },
+    }
+
+
+def test_immutable_writer_atomically_preserves_one_concurrent_first_writer(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "immutable.json"
+    barrier = threading.Barrier(2)
+
+    def publish(payload: dict) -> str:
+        barrier.wait(timeout=5)
+        try:
+            write_immutable_json(destination, payload)
+            return "published"
+        except RuntimeError:
+            return "conflict"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(publish, [{"writer": 1}, {"writer": 2}]))
+
+    assert sorted(outcomes) == ["conflict", "published"]
+    assert json.loads(destination.read_text(encoding="utf-8")) in [
+        {"writer": 1},
+        {"writer": 2},
+    ]
 
 
 def test_build_full_backtest_lab_task_unwraps_portable_profile(tmp_path: Path) -> None:
@@ -197,7 +245,6 @@ def test_materialize_full_backtest_lab_result_accepts_nested_worker_result(tmp_p
         "worker_id": "worker-1",
         "result": {"status": "success", "result": worker_result},
     }
-
     paths = materialize_full_backtest_lab_result(attempt=attempt, lab_result=lab_result)
 
     assert Path(paths["result_path"]).exists()
@@ -347,6 +394,152 @@ def test_materialize_60m_evidence_does_not_overwrite_legacy_36m_files(
     assert not (artifact_dir / "full-backtest-36mo-result.json").exists()
     assert not (artifact_dir / "full-backtest-36mo-curve.json").exists()
 
+    original_result = Path(paths["result_path"]).read_text(encoding="utf-8")
+    conflicting_result = json.loads(json.dumps(lab_result))
+    conflicting_result["worker_id"] = "worker-2"
+    conflicting_result["result"]["result"]["completed_at"] = "2026-07-09T00:00:00Z"
+    conflicting_result["result"]["result"]["sensitivity_response"]["data"][
+        "aggregate"
+    ]["score_lab"]["score"] = 1
+
+    reused = materialize_full_backtest_lab_result(
+        attempt=attempt,
+        lab_result=conflicting_result,
+        task=task,
+    )
+
+    assert reused["reused_existing_evidence"] is True
+    assert Path(reused["result_path"]).read_text(encoding="utf-8") == original_result
+
+    diagnostics = {
+        "signal_count": 0,
+        "resolved_trade_count_max": 0,
+        "market_data_window": {"filtered_bar_count": 123},
+    }
+    with pytest.raises(RuntimeError, match="outcome conflict"):
+        materialize_no_valid_cell_lab_result(
+            attempt=attempt,
+            lab_result={
+                "worker_id": "worker-2",
+                "result": {
+                    "terminal_result": _no_valid_terminal_result(task, diagnostics)
+                },
+            },
+            task=task,
+        )
+
+
+def test_no_valid_cell_is_persisted_as_completed_nonviable_evidence(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "final"
+    profile_path = run_dir / "profiles" / "profile.json"
+    artifact_dir.mkdir(parents=True)
+    _write_json(
+        profile_path,
+        {
+            "profile": {
+                "name": "Uses effective default threshold",
+                "instruments": ["EURUSD"],
+                "indicators": [],
+            }
+        },
+    )
+    attempt = {
+        "run_id": "run-a",
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+        "requested_timeframe": "M5",
+    }
+    task = build_full_backtest_lab_task(
+        config=SimpleNamespace(
+            research=SimpleNamespace(quality_score_preset="profile_drop")
+        ),
+        run_dir=run_dir,
+        attempt=attempt,
+        run_metadata={},
+        lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+        requested_horizon_months=60,
+        evidence_window_start="2021-07-08T23:59:59Z",
+        evidence_window_end="2026-07-08T23:59:59Z",
+        campaign_plan_id="campaign:60m-test",
+        lake_manifest_sha256="sha256:" + "a" * 64,
+    )
+    error = (
+        "FullBacktestNoValidCellError: no best cell; diagnostics="
+        '{"signal_count":0,"resolved_trade_count_max":0,'
+        '"market_data_window":{"filtered_bar_count":123}}'
+    )
+
+    diagnostics = {
+        "signal_count": 0,
+        "resolved_trade_count_max": 0,
+        "market_data_window": {"filtered_bar_count": 123},
+    }
+    lab_result = {
+        "worker_id": "worker-1",
+        "result": {"terminal_result": _no_valid_terminal_result(task, diagnostics)},
+    }
+    evidence_paths = evidence_artifact_paths(
+        artifact_dir,
+        task["payload"]["evidence_plan"],
+    )
+    _write_json(evidence_paths.result, {"interrupted": True})
+    with pytest.raises(RuntimeError, match="worker-authored"):
+        materialize_no_valid_cell_lab_result(
+            attempt=attempt,
+            lab_result={"worker_id": "worker-1", "result": {"error": error}},
+            task=task,
+        )
+    paths = materialize_no_valid_cell_lab_result(
+        attempt=attempt,
+        lab_result=lab_result,
+        task=task,
+    )
+    validation = ct.validate_full_backtest_artifacts(
+        attempt,
+        expected_evidence_plan=task["payload"]["evidence_plan"],
+    )
+
+    assert paths["terminal_outcome"]["outcome"] == "no_valid_cell"
+    assert validation["status"] == "nonviable"
+    assert validation["rebuild_required"] is False
+    assert validation["rebuild_reason_codes"] == []
+    assert json.loads(Path(paths["result_path"]).read_text(encoding="utf-8"))["status"] == "nonviable"
+    discovered = discover_evidence_artifact_bundles(artifact_dir)
+    assert len(discovered) == 1
+    assert discovered[0]["validation_status"] == "valid"
+    assert discovered[0]["curve_path"].endswith("best-cell-path-detail.json")
+
+    manifest_path = Path(paths["evidence_manifest_path"])
+    original_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for field, bad_value, reason in (
+        ("profile_snapshot_sha256", "sha256:" + "b" * 64, "execution_profile_mismatch"),
+        ("execution_cell_sha256", "sha256:" + "c" * 64, "execution_cell_mismatch"),
+    ):
+        mutated = json.loads(json.dumps(original_manifest))
+        mutated["execution_evidence"][field] = bad_value
+        manifest_path.write_text(json.dumps(mutated), encoding="utf-8")
+        trust_validation = validate_evidence_artifact_bundle(
+            artifact_dir,
+            task["payload"]["evidence_plan"],
+        )
+        assert trust_validation["status"] == "invalid"
+        assert reason in trust_validation["reason_codes"]
+    manifest_path.write_text(json.dumps(original_manifest), encoding="utf-8")
+
+    result_path = Path(paths["result_path"])
+    corrupted = json.loads(result_path.read_text(encoding="utf-8"))
+    corrupted["diagnostics"]["market_data_window"]["filtered_bar_count"] = "invalid"
+    result_path.write_text(json.dumps(corrupted), encoding="utf-8")
+    invalid = ct.validate_full_backtest_artifacts(
+        attempt,
+        expected_evidence_plan=task["payload"]["evidence_plan"],
+    )
+    assert invalid["rebuild_required"] is True
+
 
 def test_run_lab_full_backtests_skips_missing_profile(tmp_path: Path, monkeypatch) -> None:
     run_dir = tmp_path / "runs" / "run-a"
@@ -393,6 +586,101 @@ def test_run_lab_full_backtests_skips_missing_profile(tmp_path: Path, monkeypatc
     assert "missing a local profile file" in results[0]["error"]
     assert emitted and "lab skipped" in emitted[0]
     assert FakeGateway.enqueued == []
+
+
+def test_run_lab_full_backtests_counts_no_valid_cell_as_nonviable_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "final"
+    profile_path = run_dir / "profiles" / "profile.json"
+    artifact_dir.mkdir(parents=True)
+    _write_json(
+        profile_path,
+        {"profile": {"instruments": ["EURUSD"], "indicators": []}},
+    )
+    attempt = {
+        "run_id": "run-a",
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+        "requested_timeframe": "M5",
+    }
+    row = {"attempt_id": "attempt-a", "run_id": "run-a", "candidate_name": "final"}
+    error = (
+        "FullBacktestNoValidCellError: no best cell; diagnostics="
+        '{"signal_count":0,"resolved_trade_count_max":0,'
+        '"market_data_window":{"filtered_bar_count":123}}'
+    )
+
+    class FakeGateway:
+        task: dict | None = None
+        returned = False
+        acked: list[str] = []
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            _ = limit
+            if self.task is None or self.returned:
+                return []
+            self.__class__.returned = True
+            return [
+                {
+                    "task_id": self.task["task_id"],
+                    "lease_id": "lease-1",
+                    "worker_id": "worker-1",
+                    "status": "failed",
+                    "result": {
+                        "error": error,
+                        "terminal_result": _no_valid_terminal_result(
+                            self.task,
+                            {
+                                "signal_count": 0,
+                                "resolved_trade_count_max": 0,
+                                "market_data_window": {"filtered_bar_count": 123},
+                            },
+                        ),
+                    },
+                }
+            ]
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            self.__class__.task = tasks[0]
+            return {"accepted": len(tasks)}
+
+        def ack_results(self, lease_ids: list[str]) -> None:
+            self.__class__.acked.extend(lease_ids)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("autoresearch.corpus_lab_backtests.LabGatewayClient", FakeGateway)
+
+    results, calculated, failed = run_lab_full_backtests(
+        config=SimpleNamespace(
+            research=SimpleNamespace(quality_score_preset="profile_drop")
+        ),
+        items=[(run_dir, attempt, row, {})],
+        lab_config=LabBacktestConfig(
+            worker_contract_hash="sha256:test",
+            poll_interval_seconds=0.01,
+        ),
+        max_workers=1,
+        requested_horizon_months=60,
+        evidence_window_start="2021-07-08T23:59:59Z",
+        evidence_window_end="2026-07-08T23:59:59Z",
+        campaign_plan_id="campaign:60m-test",
+        lake_manifest_sha256="sha256:" + "a" * 64,
+    )
+
+    assert calculated == 1
+    assert failed == 0
+    assert results[0]["status"] == "nonviable"
+    assert results[0]["terminal_outcome"]["outcome"] == "no_valid_cell"
+    assert FakeGateway.acked == ["lease-1"]
 
 
 def test_run_lab_full_backtests_fails_fast_on_unrelated_gateway_result(

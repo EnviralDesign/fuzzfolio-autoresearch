@@ -763,6 +763,7 @@ class PlayHandLabGateway:
         error: str,
         retryable: bool = True,
         retry_after_seconds: float | None = None,
+        terminal_result: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             now = _now()
@@ -815,6 +816,11 @@ class PlayHandLabGateway:
                     "retryable": bool(retryable),
                     "attempt_number": task.attempt_number,
                     "retry_after_seconds": _parse_positive_float(retry_after_seconds),
+                    **(
+                        {"terminal_result": dict(terminal_result)}
+                        if isinstance(terminal_result, dict)
+                        else {}
+                    ),
                 },
             )
             self._append_result_locked(failure)
@@ -1289,6 +1295,11 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
                     error=str(payload.get("error") or "worker_failed"),
                     retryable=_parse_bool(payload.get("retryable"), default=True),
                     retry_after_seconds=_parse_positive_float(payload.get("retry_after_seconds")),
+                    terminal_result=(
+                        dict(payload["terminal_result"])
+                        if isinstance(payload.get("terminal_result"), dict)
+                        else None
+                    ),
                 )
                 status = HTTPStatus.NOT_FOUND if result.get("status") == "lease_lost" else HTTPStatus.OK
                 self._write_json(result, status=status)
@@ -1490,6 +1501,11 @@ class LabGatewayAsgiApp:
                         error=str(payload.get("error") or "worker_failed"),
                         retryable=_parse_bool(payload.get("retryable"), default=True),
                         retry_after_seconds=_parse_positive_float(payload.get("retry_after_seconds")),
+                        terminal_result=(
+                            dict(payload["terminal_result"])
+                            if isinstance(payload.get("terminal_result"), dict)
+                            else None
+                        ),
                     )
                     status = 404 if result.get("status") == "lease_lost" else 200
                     await self._send_json(send, result, status=status)
@@ -1656,6 +1672,11 @@ class LabGatewayAsgiApp:
                 error=str(payload.get("error") or "worker_failed"),
                 retryable=_parse_bool(payload.get("retryable"), default=True),
                 retry_after_seconds=_parse_positive_float(payload.get("retry_after_seconds")),
+                terminal_result=(
+                    dict(payload["terminal_result"])
+                    if isinstance(payload.get("terminal_result"), dict)
+                    else None
+                ),
             )
             result["type"] = "fail"
             return result

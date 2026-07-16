@@ -165,7 +165,14 @@ def test_lab_gateway_requeues_retryable_failure_until_cap() -> None:
     assert failed["status"] == "requeued"
 
     second_claim = gateway.claim("worker-1")
-    failed_final = gateway.fail("worker-1", second_claim["lease_id"], error="temporary", retryable=True)
+    terminal_result = {"outcome": "no_valid_cell", "execution_evidence": {"plan_id": "p1"}}
+    failed_final = gateway.fail(
+        "worker-1",
+        second_claim["lease_id"],
+        error="temporary",
+        retryable=True,
+        terminal_result=terminal_result,
+    )
     assert failed_final["status"] == "failed"
 
     snapshot = gateway.snapshot()
@@ -175,6 +182,7 @@ def test_lab_gateway_requeues_retryable_failure_until_cap() -> None:
     assert len(results) == 1
     assert results[0]["status"] == "failed"
     assert results[0]["result"]["error"] == "temporary"
+    assert results[0]["result"]["terminal_result"] == terminal_result
 
 
 def test_lab_gateway_delays_lake_mutation_retryable_failure() -> None:
