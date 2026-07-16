@@ -69,7 +69,7 @@ from .play_hand_lab import (
 )
 from .instrument_universe import research_eligible_instruments, universe_provenance
 from .play_hand_lab_auth import load_lab_gateway_token
-from .evidence_plan import build_replay_evidence_plan
+from .evidence_plan import build_replay_evidence_plan, canonical_timestamp
 from .recipe_priors import DEFAULT_RECIPE_PRIORS_DIRNAME, build_recipe_priors
 from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapshot
 from .signal_atlas import (
@@ -311,6 +311,15 @@ class AtlasLabRuntimeConfig:
     compact_probe_artifacts: bool = True
     as_of_date: str | None = None
     lake_manifest_sha256: str | None = None
+    # Formal historical Level C runs are deliberately bound to one immutable
+    # research generation and protocol cutover.  These remain optional for
+    # exploratory Atlas work.
+    research_generation_id: str | None = None
+    level_c_protocol_id: str | None = None
+    cutoff_key: str | None = None
+    source_snapshot_sha256: str | None = None
+    universe_id: str | None = None
+    universe_manifest_sha256: str | None = None
     signal_lookback_months: int = 3
     discovery_cluster_min_similarity: float = DEFAULT_DISCOVERY_CLUSTER_MIN_SIMILARITY
     discovery_cluster_min_shared_partners: int = DEFAULT_DISCOVERY_CLUSTER_MIN_SHARED_PARTNERS
@@ -462,6 +471,56 @@ def _clean_token(value: Any) -> str:
     return str(value or "").strip()
 
 
+_EXACT_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SAFE_RESEARCH_GENERATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _require_exact_sha256(value: Any, *, label: str) -> str:
+    identity = _clean_token(value)
+    if not _EXACT_SHA256_RE.fullmatch(identity):
+        raise ValueError(f"Historical Atlas requires an exact {label} sha256: identity.")
+    return identity
+
+
+def _historical_lineage(runtime: AtlasLabRuntimeConfig) -> dict[str, str] | None:
+    """Return the formal Level C lineage or fail closed for historical Atlas."""
+    if not runtime.as_of_date:
+        return None
+    generation_id = _clean_token(runtime.research_generation_id)
+    if not _SAFE_RESEARCH_GENERATION_RE.fullmatch(generation_id):
+        raise ValueError("Historical Atlas requires a safe, explicit research_generation_id.")
+    cutoff_key = _clean_token(runtime.cutoff_key)
+    if cutoff_key not in {"A", "B", "C", "D"}:
+        raise ValueError("Historical Atlas requires cutoff_key to be one of A, B, C, or D.")
+    universe = universe_provenance()
+    universe_id = _clean_token(runtime.universe_id)
+    if universe_id != str(universe["universe_id"]):
+        raise ValueError("Historical Atlas universe_id does not match the active universe contract.")
+    universe_manifest_sha256 = _require_exact_sha256(
+        runtime.universe_manifest_sha256, label="universe_manifest_sha256"
+    )
+    if universe_manifest_sha256 != str(universe["universe_hash"]):
+        raise ValueError(
+            "Historical Atlas universe_manifest_sha256 does not match the active universe contract."
+        )
+    return {
+        "research_generation_id": generation_id,
+        "level_c_protocol_id": _require_exact_sha256(
+            runtime.level_c_protocol_id, label="level_c_protocol_id"
+        ),
+        "cutoff_key": cutoff_key,
+        "as_of_date": canonical_timestamp(runtime.as_of_date),
+        "lake_manifest_sha256": _require_exact_sha256(
+            runtime.lake_manifest_sha256, label="lake_manifest_sha256"
+        ),
+        "source_snapshot_sha256": _require_exact_sha256(
+            runtime.source_snapshot_sha256, label="source_snapshot_sha256"
+        ),
+        "universe_id": universe_id,
+        "universe_manifest_sha256": universe_manifest_sha256,
+    }
+
+
 def _clean_upper(value: Any) -> str:
     return _clean_token(value).upper()
 
@@ -528,12 +587,94 @@ def _load_json(path: Path) -> Any:
         return json.load(handle)
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _stamp_historical_recipe_prior_lineage(
+    recipe_priors_dir: Path,
+    *,
+    lineage: dict[str, str],
+) -> None:
+    """Bind the exact PlayHand seed surface to one historical Atlas lineage.
+
+    Recipe-prior builders are intentionally reusable for exploratory work and
+    do not know Level C.  Atlas owns the formal-run boundary, so it stamps and
+    immediately revalidates the final artifacts after they are built.
+    """
+    artifacts = (
+        recipe_priors_dir / "play-hand-seed-plan.json",
+        recipe_priors_dir / "recipe-priors.json",
+        recipe_priors_dir / "recipe-priors-summary.json",
+    )
+    for path in artifacts:
+        try:
+            payload = _load_json(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Historical Atlas missing or invalid recipe-prior artifact: {path}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError(f"Historical Atlas recipe-prior artifact must be an object: {path}")
+        existing = payload.get("historical_lineage")
+        if existing is not None and existing != lineage:
+            raise ValueError(f"Historical Atlas recipe-prior lineage conflicts: {path}")
+        payload["historical_lineage"] = lineage
+        _write_json(path, payload)
+    for path in artifacts:
+        observed = _load_json(path)
+        if not isinstance(observed, dict) or observed.get("historical_lineage") != lineage:
+            raise ValueError(f"Historical Atlas recipe-prior lineage was not persisted: {path}")
+    lineage_path = recipe_priors_dir / "level-c-lineage.json"
+    lineage_artifact = {
+        "schema_version": "atlas_level_c_lineage_v1",
+        "historical_lineage": lineage,
+        "artifact_sha256": {
+            path.name: _file_sha256(path) for path in artifacts
+        },
+    }
+    existing_lineage = _load_json(lineage_path) if lineage_path.exists() else None
+    if existing_lineage is not None and existing_lineage != lineage_artifact:
+        raise ValueError(f"Historical Atlas recipe-prior lineage conflicts: {lineage_path}")
+    _write_json(lineage_path, lineage_artifact)
+
+
 def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+
+_HISTORICAL_PROBE_RESULT_FIELDNAMES = (
+    "evidence_plan_id",
+    "observed_lake_manifest_sha256",
+)
+
+
+def _probe_result_fieldnames(
+    spec: ProbeRunSpec,
+    rows: list[dict[str, Any]],
+) -> list[str]:
+    """Return the explicit CSV schema for ordinary or historical probe results.
+
+    Historical gateway receipts add two known fields to the normal probe schema.
+    Keep DictWriter's default strict handling for every other unknown field.
+    """
+    fieldnames = list(spec.result_fieldnames())
+    if any(
+        any(fieldname in row for fieldname in _HISTORICAL_PROBE_RESULT_FIELDNAMES)
+        for row in rows
+    ):
+        fieldnames.extend(
+            fieldname
+            for fieldname in _HISTORICAL_PROBE_RESULT_FIELDNAMES
+            if fieldname not in fieldnames
+        )
+    return fieldnames
 
 
 def _append_event(paths: AtlasLabPaths, event: str, status: str, **payload: Any) -> None:
@@ -752,7 +893,23 @@ def _deep_replay_request_from_probe(
     lookback_months = int(parsed.get("lookback_months") or row.get("lookback_months") or 3)
     analysis_window_start = parsed.get("analysis_window_start")
     analysis_window_end = parsed.get("analysis_window_end")
-    as_of_date = parsed.get("as_of_date") or runtime.as_of_date
+    runtime_cutoff = _clean_token(runtime.as_of_date)
+    manifest_cutoff = _clean_token(parsed.get("as_of_date"))
+    if runtime_cutoff:
+        expected_cutoff = _parse_utc_datetime(runtime_cutoff)
+        if manifest_cutoff and _parse_utc_datetime(manifest_cutoff) != expected_cutoff:
+            raise ValueError(
+                f"Historical Atlas probe {probe_id} manifest cutoff {manifest_cutoff!r} "
+                f"does not match runtime cutoff {runtime_cutoff!r}."
+            )
+        if analysis_window_end and _parse_utc_datetime(analysis_window_end) != expected_cutoff:
+            raise ValueError(
+                f"Historical Atlas probe {probe_id} manifest analysis window end "
+                f"{analysis_window_end!r} does not match runtime cutoff {runtime_cutoff!r}."
+            )
+        as_of_date = runtime_cutoff
+    else:
+        as_of_date = manifest_cutoff
     if as_of_date and not (analysis_window_start or analysis_window_end):
         analysis_window_start, analysis_window_end = _analysis_window_from_as_of(
             str(as_of_date),
@@ -761,6 +918,10 @@ def _deep_replay_request_from_probe(
     if bool(analysis_window_start) != bool(analysis_window_end):
         raise ValueError(
             f"Atlas probe {probe_id} must provide both analysis window bounds."
+        )
+    if as_of_date and not (analysis_window_start and analysis_window_end):
+        raise ValueError(
+            f"Historical Atlas probe {probe_id} did not resolve an explicit bounded analysis window."
         )
     evidence_plan = None
     if analysis_window_start and analysis_window_end:
@@ -1423,6 +1584,11 @@ def run_probe_spec_via_gateway(
                 worker_contract_hash=worker_contract_hash,
             )
             if (state.output_dir / "sensitivity-response.json").exists() and not runtime.force:
+                if state.replay_request.get("evidence_plan"):
+                    raise RuntimeError(
+                        f"Historical Atlas probe {state.probe_id} cannot reuse an existing result "
+                        "without gateway receipt validation."
+                    )
                 try:
                     row = _existing_result_row(spec=spec, state=state, cli=cli)
                     persist_result_row(state, row, status=str(row.get("status") or "skipped_existing"))
@@ -1536,7 +1702,7 @@ def run_probe_spec_via_gateway(
     )
     results_csv_path = spec.source_dir / spec.results_filename
     summary_path = spec.source_dir / spec.summary_filename
-    fieldnames = spec.result_fieldnames()
+    fieldnames = _probe_result_fieldnames(spec, results)
     _write_csv(results_csv_path, results, fieldnames)
     scored = [row for row in results if row.get("composite_score") not in (None, "")]
     scored.sort(key=lambda row: float(row.get("composite_score") or 0.0), reverse=True)
@@ -2179,18 +2345,19 @@ def run_atlas_lab(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> AtlasLabRunResult:
     runtime = runtime or AtlasLabRuntimeConfig()
+    if runtime.as_of_date and (not _clean_token(run_id) or _clean_token(run_id).lower() == "auto"):
+        raise ValueError("Historical Atlas requires an explicit protocol-bound run_id.")
     profile = atlas_profile_config(runtime.atlas_profile)
     build_profile = effective_atlas_build_profile(profile, runtime)
     paths = build_atlas_lab_paths(config, run_id=run_id)
     selected_phases = set(phases or ["full"])
     run_full = "full" in selected_phases
     historical_build = bool(runtime.as_of_date) and (run_full or "build" in selected_phases)
+    historical_lineage = _historical_lineage(runtime)
     if historical_build and runtime.signal_atlas_executor != "gateway":
         raise ValueError(
             "Historical Atlas requires signal_atlas_executor='gateway'; the local signal path is not evidence-bounded."
         )
-    if runtime.as_of_date and not str(runtime.lake_manifest_sha256 or "").strip():
-        raise ValueError("Historical Atlas requires an exact lake_manifest_sha256.")
     if runtime.as_of_date and paths.run_root.exists() and any(paths.run_root.iterdir()):
         raise FileExistsError(
             f"Historical Atlas run roots are create-only and already exist: {paths.run_root}"
@@ -2206,6 +2373,7 @@ def run_atlas_lab(
             "universe_contract": universe_provenance(),
             "status": "running",
             "runtime": asdict(runtime),
+            "historical_lineage": historical_lineage,
             "atlas_profile": profile,
             "effective_build_profile": build_profile,
             "paths": {key: str(value) for key, value in asdict(paths).items() if isinstance(value, Path)},
@@ -2388,6 +2556,11 @@ def run_atlas_lab(
                 include_playhand_outcome_priors=False,
                 out_dir=paths.final_recipe_priors_dir,
             )
+            if historical_lineage is not None:
+                _stamp_historical_recipe_prior_lineage(
+                    paths.final_recipe_priors_dir,
+                    lineage=historical_lineage,
+                )
             if runtime.publish or "publish" in selected_phases:
                 published_manifest_path = publish_atlas_lab_priors(config, paths=paths)
             _append_event(paths, "run", "completed")
@@ -2406,6 +2579,7 @@ def run_atlas_lab(
             "run_root": str(paths.run_root),
             "atlas_profile": profile,
             "effective_build_profile": build_profile,
+            "historical_lineage": historical_lineage,
             "published_manifest_path": str(published_manifest_path) if published_manifest_path else None,
             "probe_summaries": probe_summaries,
             "pipeline_summaries": pipeline_summaries,

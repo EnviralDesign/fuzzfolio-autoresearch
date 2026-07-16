@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import itertools
 import json
 from pathlib import Path
@@ -17,6 +18,7 @@ from autoresearch.atlas_lab import (
     _enqueue_gateway_tasks_with_retries,
     _make_signal_atlas_cell_task,
     _row_from_signal_result,
+    _stamp_historical_recipe_prior_lineage,
     atlas_profile_config,
     effective_atlas_build_profile,
     run_atlas_lab,
@@ -38,6 +40,8 @@ from autoresearch.config import (
     SuperviseConfig,
 )
 from autoresearch.fuzzfolio import FuzzfolioCli
+from autoresearch.instrument_universe import universe_provenance
+from autoresearch.__main__ import build_parser
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -70,6 +74,49 @@ def _profile_doc() -> dict[str, Any]:
             "instruments": ["EURUSD"],
         },
     }
+
+
+def _historical_runtime_kwargs() -> dict[str, str]:
+    universe = universe_provenance()
+    return {
+        "research_generation_id": "generation-001",
+        "level_c_protocol_id": "sha256:" + "e" * 64,
+        "cutoff_key": "A",
+        "source_snapshot_sha256": "sha256:" + "f" * 64,
+        "universe_id": str(universe["universe_id"]),
+        "universe_manifest_sha256": str(universe["universe_hash"]),
+    }
+
+
+def test_atlas_cli_exposes_complete_historical_lineage_contract() -> None:
+    args = build_parser().parse_args(
+        [
+            "atlas-lab",
+            "--as-of-date",
+            "2025-06-30T00:00:00Z",
+            "--research-generation-id",
+            "generation-001",
+            "--level-c-protocol-id",
+            "sha256:" + "e" * 64,
+            "--cutoff-key",
+            "A",
+            "--lake-manifest-sha256",
+            "sha256:" + "d" * 64,
+            "--source-snapshot-sha256",
+            "sha256:" + "f" * 64,
+            "--universe-id",
+            "universe-1",
+            "--universe-manifest-sha256",
+            "sha256:" + "a" * 64,
+        ]
+    )
+
+    assert args.research_generation_id == "generation-001"
+    assert args.level_c_protocol_id == "sha256:" + "e" * 64
+    assert args.cutoff_key == "A"
+    assert args.source_snapshot_sha256 == "sha256:" + "f" * 64
+    assert args.universe_id == "universe-1"
+    assert args.universe_manifest_sha256 == "sha256:" + "a" * 64
 
 
 def test_deep_replay_request_preserves_atlas_sensitivity_semantics() -> None:
@@ -226,6 +273,36 @@ def test_historical_atlas_rejects_unbounded_signal_executor(tmp_path: Path) -> N
                 as_of_date="2025-06-30T00:00:00Z",
                 lake_manifest_sha256="sha256:" + "c" * 64,
                 signal_atlas_executor="local",
+                **_historical_runtime_kwargs(),
+            ),
+            phases=["build"],
+        )
+
+
+def test_historical_atlas_requires_explicit_protocol_bound_run_id(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="explicit protocol-bound run_id"):
+        run_atlas_lab(
+            _config(tmp_path),
+            run_id="auto",
+            runtime=AtlasLabRuntimeConfig(
+                as_of_date="2025-06-30T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "c" * 64,
+                signal_atlas_executor="gateway",
+                **_historical_runtime_kwargs(),
+            ),
+            phases=["build"],
+        )
+
+
+def test_historical_atlas_requires_complete_formal_lineage(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="research_generation_id"):
+        run_atlas_lab(
+            _config(tmp_path),
+            run_id="historical-missing-lineage",
+            runtime=AtlasLabRuntimeConfig(
+                as_of_date="2025-06-30T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "c" * 64,
+                signal_atlas_executor="gateway",
             ),
             phases=["build"],
         )
@@ -244,9 +321,43 @@ def test_historical_atlas_run_root_is_create_only(tmp_path: Path) -> None:
                 as_of_date="2025-06-30T00:00:00Z",
                 lake_manifest_sha256="sha256:" + "d" * 64,
                 signal_atlas_executor="gateway",
+                **_historical_runtime_kwargs(),
             ),
             phases=["build"],
         )
+
+
+def test_historical_recipe_priors_are_stamped_with_immutable_lineage(tmp_path: Path) -> None:
+    recipe_priors_dir = tmp_path / "recipe-priors"
+    recipe_priors_dir.mkdir()
+    for name in (
+        "play-hand-seed-plan.json",
+        "recipe-priors.json",
+        "recipe-priors-summary.json",
+    ):
+        (recipe_priors_dir / name).write_text(json.dumps({"recipes": {}}), encoding="utf-8")
+    lineage = {
+        **_historical_runtime_kwargs(),
+        "as_of_date": "2025-06-30T00:00:00Z",
+        "lake_manifest_sha256": "sha256:" + "d" * 64,
+    }
+
+    _stamp_historical_recipe_prior_lineage(recipe_priors_dir, lineage=lineage)
+
+    for name in (
+        "play-hand-seed-plan.json",
+        "recipe-priors.json",
+        "recipe-priors-summary.json",
+    ):
+        payload = json.loads((recipe_priors_dir / name).read_text(encoding="utf-8"))
+        assert payload["historical_lineage"] == lineage
+    descriptor = json.loads((recipe_priors_dir / "level-c-lineage.json").read_text(encoding="utf-8"))
+    assert descriptor["historical_lineage"] == lineage
+    assert set(descriptor["artifact_sha256"]) == {
+        "play-hand-seed-plan.json",
+        "recipe-priors.json",
+        "recipe-priors-summary.json",
+    }
 
 
 def test_compact_sensitivity_snapshot_keeps_score_fields_and_drops_heavy_payloads() -> None:
@@ -304,6 +415,17 @@ class FakeGateway:
             task_kind = task["task_kind"]
             if task_kind == "deep_replay":
                 payload = task["payload"]
+                evidence_plan = payload.get("evidence_plan") or {}
+                execution_evidence = (
+                    {
+                        "plan_id": evidence_plan["plan_id"],
+                        "profile_snapshot_sha256": evidence_plan["profile_snapshot_sha256"],
+                        "execution_cell_sha256": evidence_plan["execution_cell_sha256"],
+                        "observed_lake_manifest_sha256": evidence_plan["lake_manifest_sha256"],
+                    }
+                    if evidence_plan.get("lake_manifest_sha256")
+                    else None
+                )
                 self.results.append(
                     {
                         "task_id": task["task_id"],
@@ -315,6 +437,7 @@ class FakeGateway:
                         "result": {
                             "status": "success",
                             "request": payload,
+                            "execution_evidence": execution_evidence,
                             "result": {
                                 "aggregate": {
                                     "score_lab": {
@@ -414,6 +537,8 @@ def test_run_probe_spec_via_gateway_writes_scoreable_bundle(
                         "M5",
                         "--lookback-months",
                         "12",
+                        "--as-of-date",
+                        "2025-06-30T00:00:00Z",
                         "--instrument",
                         "EURUSD",
                         "--quality-score-preset",
@@ -460,7 +585,12 @@ def test_run_probe_spec_via_gateway_writes_scoreable_bundle(
             row_builder=_result_row_from_score,
         ),
         gateway=gateway,
-        runtime=AtlasLabRuntimeConfig(active_probes=1, result_batch_size=10),
+        runtime=AtlasLabRuntimeConfig(
+            active_probes=1,
+            result_batch_size=10,
+            as_of_date="2025-06-30T00:00:00Z",
+            lake_manifest_sha256="sha256:" + "e" * 64,
+        ),
         worker_contract_hash="contract123",
     )
 
@@ -481,7 +611,107 @@ def test_run_probe_spec_via_gateway_writes_scoreable_bundle(
     compact_snapshot = json.loads((result_dir / "sensitivity-response.json").read_text(encoding="utf-8"))
     assert compact_snapshot["data"]["aggregate"]["score_lab"]["score"] == 72.5
     assert "per_instrument" not in compact_snapshot["data"]
-    assert (source_dir / "anchor-pair-probe-results.csv").read_text(encoding="utf-8").count("\n") == 2
+    results_csv_path = source_dir / "anchor-pair-probe-results.csv"
+    results_csv = list(csv.DictReader(results_csv_path.open(encoding="utf-8")))
+    assert len(results_csv) == 1
+    assert results_csv[0]["evidence_plan_id"]
+    assert results_csv[0]["observed_lake_manifest_sha256"] == "sha256:" + "e" * 64
+
+
+def test_historical_runtime_cutoff_rejects_mismatched_probe_manifest_cutoff() -> None:
+    with pytest.raises(ValueError, match="does not match runtime cutoff"):
+        _deep_replay_request_from_probe(
+            probe_id="probe-1",
+            profile_payload=_profile_doc()["profile"],
+            manifest_probe={
+                "sensitivity_basket_args": [
+                    "sensitivity-basket",
+                    "--timeframe",
+                    "M5",
+                    "--lookback-months",
+                    "3",
+                    "--as-of-date",
+                    "2025-06-29T00:00:00Z",
+                    "--instrument",
+                    "EURUSD",
+                ]
+            },
+            row={"probe_timeframe": "M5", "instruments": "EURUSD"},
+            runtime=AtlasLabRuntimeConfig(as_of_date="2025-06-30T00:00:00Z"),
+            worker_contract_hash="contract123",
+        )
+
+
+def test_historical_probe_rejects_unverified_existing_result_fallback(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    source_dir = tmp_path / "runs" / "derived" / "atlas-runs" / "test" / "anchor-pair-atlas"
+    profile_dir = source_dir / "profiles"
+    result_dir = source_dir / "probe-results" / "probe-1"
+    profile_dir.mkdir(parents=True)
+    result_dir.mkdir(parents=True)
+    profile_path = profile_dir / "probe-1.json"
+    profile_path.write_text(json.dumps(_profile_doc()), encoding="utf-8")
+    (result_dir / "sensitivity-response.json").write_text("{}", encoding="utf-8")
+    (source_dir / "anchor-pair-atlas.json").write_text(
+        json.dumps(
+            {
+                "queue_rows": [
+                    {
+                        "probe_id": "probe-1",
+                        "queue_rank": 1,
+                        "anchor_type": "trend",
+                        "anchor_id": "ANCHOR",
+                        "trigger_id": "TRIGGER",
+                        "probe_timeframe": "M5",
+                        "pair_prior_score": 80,
+                        "pair_prior_bucket": "probe_now",
+                        "instruments": "EURUSD",
+                    }
+                ],
+                "run_manifest": {
+                    "probes": [
+                        {
+                            "probe_id": "probe-1",
+                            "profile_path": str(profile_path),
+                            "output_dir": str(result_dir),
+                            "sensitivity_basket_args": [
+                                "sensitivity-basket",
+                                "--timeframe",
+                                "M5",
+                                "--lookback-months",
+                                "3",
+                                "--instrument",
+                                "EURUSD",
+                            ],
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="cannot reuse an existing result"):
+        run_probe_spec_via_gateway(
+            config,
+            spec=ProbeRunSpec(
+                kind="anchor_pair",
+                source_dir=source_dir,
+                atlas_filename="anchor-pair-atlas.json",
+                results_filename="anchor-pair-probe-results.csv",
+                summary_filename="anchor-pair-probe-summary.json",
+                manifest_schema="anchor_pair_run_manifest_v1",
+                result_fieldnames=_probe_results_fieldnames,
+                row_builder=_result_row_from_score,
+            ),
+            gateway=FakeGateway(),
+            runtime=AtlasLabRuntimeConfig(
+                active_probes=1,
+                as_of_date="2025-06-30T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "f" * 64,
+            ),
+            worker_contract_hash="contract123",
+        )
 
 
 def test_enqueue_gateway_tasks_rejects_partial_acceptance() -> None:

@@ -114,6 +114,9 @@ DEFAULT_LAB_RESULT_READ_FAILURE_LIMIT = 5
 DEFAULT_LAB_ENQUEUE_FAILURE_LIMIT = 5
 DEFAULT_LAB_ENQUEUE_RETRY_BASE_SECONDS = 1.0
 DEFAULT_LAB_TERMINAL_LANE_RETENTION = 512
+_EXACT_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+_SAFE_LINEAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,127}$")
+_SAFE_CAMPAIGN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$")
 DEFAULT_LAB_LOG_MODE = "barrier"
 DEFAULT_LAB_BARRIER_INTERVAL_SECONDS = 5.0
 DEFAULT_LAB_BARRIER_LANE_LIMIT = 24
@@ -176,7 +179,12 @@ class PlayHandLabRuntimeConfig:
     screen_anchor_mode: Literal["now", "random"] = DEFAULT_LAB_SCREEN_ANCHOR_MODE
     screen_anchor_envelope_months: int = DEFAULT_LAB_SCREEN_ANCHOR_ENVELOPE_MONTHS
     as_of_date: str | None = None
+    campaign_id: str | None = None
     lake_manifest_sha256: str | None = None
+    research_generation_id: str | None = None
+    level_c_protocol_id: str | None = None
+    cutoff_key: str | None = None
+    expected_seed_plan_sha256: str | None = None
     instrument_scout_size: int = INSTRUMENT_SCOUT_DEFAULT_SIZE
     instrument_scout_max_selected: int = INSTRUMENT_SCOUT_DEFAULT_MAX_SELECTED
     fake_work_seconds: float = 1.0
@@ -427,6 +435,144 @@ def _refresh_lane_phase_result_counts(lane: LabLaneState, *, task_id: str) -> No
     )
 
 
+def _is_exact_sha256(value: Any) -> bool:
+    return bool(_EXACT_SHA256_RE.fullmatch(str(value or "").strip()))
+
+
+def _safe_lineage_identity(value: Any, *, field_name: str) -> str:
+    normalized = str(value or "").strip()
+    if not _SAFE_LINEAGE_ID_RE.fullmatch(normalized):
+        raise ValueError(
+            f"Historical PlayHand requires a safe, explicit {field_name}."
+        )
+    return normalized
+
+
+def _safe_campaign_id(value: Any, *, historical: bool) -> str:
+    normalized = str(value or "").strip()
+    if not _SAFE_CAMPAIGN_ID_RE.fullmatch(normalized):
+        requirement = "Historical PlayHand requires" if historical else "PlayHand campaign_id must be"
+        raise ValueError(f"{requirement} a safe, explicit campaign_id.")
+    return normalized
+
+
+def _load_exact_historical_seed_plan(
+    seed_plan_path: Path | str | None,
+    *,
+    expected_sha256: str,
+) -> tuple[dict[str, Any], Path, str]:
+    if seed_plan_path is None:
+        raise ValueError("Historical PlayHand requires one explicit JSON seed_plan_path.")
+    path = Path(seed_plan_path).expanduser().resolve()
+    if path.suffix.lower() != ".json" or not path.is_file():
+        raise ValueError("Historical PlayHand requires one existing JSON seed plan file.")
+    try:
+        raw_bytes = path.read_bytes()
+        payload = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Historical PlayHand seed plan must be valid JSON.") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("recipes"), dict):
+        raise ValueError("Historical PlayHand seed plan must be a JSON object with recipes.")
+    actual_sha256 = "sha256:" + hashlib.sha256(raw_bytes).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise ValueError("Historical PlayHand seed plan SHA-256 does not match expected_seed_plan_sha256.")
+    return payload, path, actual_sha256
+
+
+def _validate_historical_runtime_contract(
+    runtime: PlayHandLabRuntimeConfig,
+) -> dict[str, str]:
+    if not _is_exact_sha256(runtime.lake_manifest_sha256):
+        raise ValueError("Historical PlayHand requires an exact lake_manifest_sha256.")
+    if str(runtime.campaign_mode or "").strip().lower() != "finite":
+        raise ValueError("Historical PlayHand requires campaign_mode=finite.")
+    if str(runtime.task_mode or "").strip().lower() != "deep_replay":
+        raise ValueError("Historical PlayHand requires task_mode=deep_replay.")
+    if str(runtime.pipeline_mode or "").strip().lower() != PLAY_HAND_LAB_PLAY_HAND_PIPELINE:
+        raise ValueError("Historical PlayHand requires pipeline_mode=play_hand.")
+    if (
+        isinstance(runtime.target_runs, bool)
+        or not isinstance(runtime.target_runs, int)
+        or runtime.target_runs <= 0
+    ):
+        raise ValueError("Historical PlayHand requires a positive, explicit target_runs count.")
+    if runtime.strict_scoring is not True:
+        raise ValueError("Historical PlayHand requires strict_scoring=True.")
+    if runtime.seed is None:
+        raise ValueError("Historical PlayHand requires an explicit seed.")
+    if not _is_exact_sha256(runtime.worker_contract_hash):
+        raise ValueError("Historical PlayHand requires an explicit exact worker_contract_hash.")
+    if runtime.indicator:
+        raise ValueError("Historical PlayHand derives indicators exclusively from its seed plan.")
+    if not _is_exact_sha256(runtime.expected_seed_plan_sha256):
+        raise ValueError("Historical PlayHand requires an exact expected_seed_plan_sha256.")
+
+    campaign_id = _safe_campaign_id(runtime.campaign_id, historical=True)
+    research_generation_id = _safe_lineage_identity(
+        runtime.research_generation_id,
+        field_name="research_generation_id",
+    )
+    level_c_protocol_id = str(runtime.level_c_protocol_id or "").strip()
+    if not _is_exact_sha256(level_c_protocol_id):
+        raise ValueError(
+            "Historical PlayHand requires level_c_protocol_id to be an exact sha256: identity."
+        )
+    cutoff_key = str(runtime.cutoff_key or "").strip()
+    if cutoff_key not in {"A", "B", "C", "D"}:
+        raise ValueError("Historical PlayHand requires cutoff_key to be one of A, B, C, or D.")
+    _seed_plan, _seed_plan_path, seed_plan_sha256 = _load_exact_historical_seed_plan(
+        runtime.seed_plan_path,
+        expected_sha256=str(runtime.expected_seed_plan_sha256).strip(),
+    )
+    return {
+        "campaign_id": campaign_id,
+        "research_generation_id": research_generation_id,
+        "level_c_protocol_id": level_c_protocol_id,
+        "cutoff_key": cutoff_key,
+        "seed_plan_sha256": seed_plan_sha256,
+    }
+
+
+def _historical_lineage_payload(runtime: PlayHandLabRuntimeConfig) -> dict[str, str] | None:
+    if not runtime.as_of_date:
+        return None
+    return {
+        "campaign_id": str(runtime.campaign_id),
+        "research_generation_id": str(runtime.research_generation_id),
+        "level_c_protocol_id": str(runtime.level_c_protocol_id),
+        "cutoff_key": str(runtime.cutoff_key),
+        "as_of_date": str(runtime.as_of_date),
+        "lake_manifest_sha256": str(runtime.lake_manifest_sha256),
+        "expected_seed_plan_sha256": str(runtime.expected_seed_plan_sha256),
+    }
+
+
+def _require_historical_task_evidence(
+    *,
+    runtime: PlayHandLabRuntimeConfig,
+    analysis_window_start: str | None,
+    analysis_window_end: str | None,
+    evidence_plan: Any,
+) -> None:
+    if not runtime.as_of_date:
+        return
+    if not analysis_window_start or not analysis_window_end:
+        raise ValueError("Historical PlayHand tasks require explicit analysis window bounds.")
+    if analysis_window_end != runtime.as_of_date:
+        raise ValueError("Historical PlayHand task analysis_window_end must equal as_of_date.")
+    if evidence_plan is None:
+        raise ValueError("Historical PlayHand tasks require an evidence plan.")
+    payload = evidence_plan.model_dump(mode="json")
+    if payload.get("evidence_role") != "training":
+        raise ValueError("Historical PlayHand tasks require selection-consuming training evidence.")
+    if payload.get("selection_data_end") != runtime.as_of_date:
+        raise ValueError("Historical PlayHand evidence selection_data_end must equal as_of_date.")
+    if payload.get("data_availability_cutoff") != runtime.as_of_date:
+        raise ValueError(
+            "Historical PlayHand evidence data_availability_cutoff must equal as_of_date."
+        )
+
+
 def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeConfig:
     gateway_url = str(runtime.gateway_url or os.environ.get("FUZZFOLIO_LAB_GATEWAY_URL") or DEFAULT_LAB_GATEWAY_URL)
     token = runtime.gateway_token or load_lab_gateway_token(create=False)
@@ -510,19 +656,22 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         lookback_months,
     )
     as_of_date = str(runtime.as_of_date or "").strip() or None
+    historical_contract: dict[str, str] | None = None
     if as_of_date:
         parsed_as_of = datetime.fromisoformat(as_of_date.replace("Z", "+00:00"))
         if parsed_as_of.tzinfo is None:
             parsed_as_of = parsed_as_of.replace(tzinfo=timezone.utc)
         as_of_date = _utc_iso(parsed_as_of)
-        if not str(runtime.lake_manifest_sha256 or "").strip():
-            raise ValueError("Historical PlayHand requires an exact lake_manifest_sha256.")
-        if runtime.seed_plan_path is None:
-            raise ValueError("Historical PlayHand requires an explicit Atlas seed_plan_path.")
-        if not Path(runtime.seed_plan_path).expanduser().is_file():
-            raise ValueError(
-                f"Historical PlayHand seed_plan_path does not exist: {runtime.seed_plan_path}"
-            )
+        historical_contract = _validate_historical_runtime_contract(runtime)
+    campaign_id = (
+        historical_contract["campaign_id"]
+        if historical_contract
+        else (
+            _safe_campaign_id(runtime.campaign_id, historical=False)
+            if runtime.campaign_id is not None and str(runtime.campaign_id).strip()
+            else None
+        )
+    )
     result_batch_size = max(int(runtime.result_batch_size), 1)
     max_results_per_cycle = max(int(runtime.max_results_per_cycle), result_batch_size)
     return PlayHandLabRuntimeConfig(
@@ -566,10 +715,35 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         screen_anchor_mode=screen_anchor_mode,  # type: ignore[arg-type]
         screen_anchor_envelope_months=screen_anchor_envelope_months,
         as_of_date=as_of_date,
+        campaign_id=campaign_id,
         lake_manifest_sha256=(
             str(runtime.lake_manifest_sha256).strip()
             if runtime.lake_manifest_sha256
             else None
+        ),
+        research_generation_id=(
+            historical_contract["research_generation_id"]
+            if historical_contract
+            else (str(runtime.research_generation_id).strip() if runtime.research_generation_id else None)
+        ),
+        level_c_protocol_id=(
+            historical_contract["level_c_protocol_id"]
+            if historical_contract
+            else (str(runtime.level_c_protocol_id).strip() if runtime.level_c_protocol_id else None)
+        ),
+        cutoff_key=(
+            historical_contract["cutoff_key"]
+            if historical_contract
+            else (str(runtime.cutoff_key).strip() if runtime.cutoff_key else None)
+        ),
+        expected_seed_plan_sha256=(
+            historical_contract["seed_plan_sha256"]
+            if historical_contract
+            else (
+                str(runtime.expected_seed_plan_sha256).strip()
+                if runtime.expected_seed_plan_sha256
+                else None
+            )
         ),
         instrument_scout_size=max(int(runtime.instrument_scout_size), 1),
         instrument_scout_max_selected=max(int(runtime.instrument_scout_max_selected), 1),
@@ -584,7 +758,10 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
         result_read_failure_limit=max(int(runtime.result_read_failure_limit), 1),
         enqueue_failure_limit=max(int(runtime.enqueue_failure_limit), 1),
         enqueue_retry_base_seconds=max(float(runtime.enqueue_retry_base_seconds), 0.0),
-        terminal_lane_retention=max(int(runtime.terminal_lane_retention), 0),
+        terminal_lane_retention=max(
+            int(runtime.terminal_lane_retention),
+            int(target_runs or 0) if historical_contract else 0,
+        ),
         dry_run=bool(runtime.dry_run),
         strict_scoring=bool(runtime.strict_scoring),
         retain_raw_lab_artifacts=bool(runtime.retain_raw_lab_artifacts),
@@ -833,6 +1010,56 @@ def _campaign_run_id() -> str:
     return f"{_utc_stamp()}-playhand-lab-campaign-v1"
 
 
+def _historical_campaign_lineage(runtime: PlayHandLabRuntimeConfig) -> dict[str, Any]:
+    return {
+        "campaign_id": runtime.campaign_id,
+        "as_of_date": runtime.as_of_date,
+        "lake_manifest_sha256": runtime.lake_manifest_sha256,
+        "research_generation_id": runtime.research_generation_id,
+        "level_c_protocol_id": runtime.level_c_protocol_id,
+        "cutoff_key": runtime.cutoff_key,
+        "expected_seed_plan_sha256": runtime.expected_seed_plan_sha256,
+        "formal_historical_level_c": True,
+    }
+
+
+def _reject_existing_historical_campaign_path(
+    campaign_dir: Path,
+    *,
+    runtime: PlayHandLabRuntimeConfig,
+) -> None:
+    """Fail closed: this task deliberately does not define campaign resume semantics."""
+    if not campaign_dir.exists():
+        return
+    try:
+        metadata = load_run_metadata(campaign_dir)
+    except Exception as exc:
+        raise ValueError(
+            "Historical PlayHand campaign path already exists without readable lineage metadata."
+        ) from exc
+    if not isinstance(metadata, dict):
+        raise ValueError(
+            "Historical PlayHand campaign path already exists without readable lineage metadata."
+        )
+    expected = _historical_campaign_lineage(runtime)
+    observed = dict(metadata)
+    observed["campaign_id"] = observed.get("campaign_id") or observed.get("run_id")
+    conflicts = [
+        field_name
+        for field_name, expected_value in expected.items()
+        if observed.get(field_name) != expected_value
+    ]
+    if conflicts:
+        raise ValueError(
+            "Historical PlayHand campaign path contains conflicting historical lineage: "
+            + ", ".join(conflicts)
+            + "."
+        )
+    raise ValueError(
+        "Historical PlayHand campaign path already exists; resume behavior is not supported."
+    )
+
+
 def _lane_run_id(lane_index: int) -> str:
     return f"{_utc_stamp()}-playhand-lab-lane-{lane_index:03d}-v1"
 
@@ -901,6 +1128,7 @@ def _write_campaign_metadata(
             "generated_by_runner": PLAY_HAND_LAB_RUNNER,
             "run_kind": "play_hand_lab_campaign",
             "run_id": campaign_ctx.run_id,
+            "campaign_id": campaign_ctx.run_id,
             "run_status": status,
             "created_at": metadata.get("created_at") or started_at,
             "started_at": started_at,
@@ -938,6 +1166,21 @@ def _write_campaign_metadata(
             "screen_anchor_envelope_months": runtime.screen_anchor_envelope_months,
             "as_of_date": runtime.as_of_date,
             "lake_manifest_sha256": runtime.lake_manifest_sha256,
+            "research_generation_id": runtime.research_generation_id,
+            "level_c_protocol_id": runtime.level_c_protocol_id,
+            "cutoff_key": runtime.cutoff_key,
+            "expected_seed_plan_sha256": runtime.expected_seed_plan_sha256,
+            "play_hand_seed_plan_path": (
+                str(runtime.seed_plan_path.resolve())
+                if runtime.as_of_date and runtime.seed_plan_path
+                else metadata.get("play_hand_seed_plan_path")
+            ),
+            "play_hand_seed_plan_sha256": (
+                runtime.expected_seed_plan_sha256
+                if runtime.as_of_date
+                else metadata.get("play_hand_seed_plan_sha256")
+            ),
+            "formal_historical_level_c": bool(runtime.as_of_date),
             "instrument_scout_size": runtime.instrument_scout_size,
             "instrument_scout_max_selected": runtime.instrument_scout_max_selected,
             "required_worker_contract_hash": runtime.worker_contract_hash,
@@ -981,6 +1224,7 @@ def _write_lane_metadata(
             "started_at": started_at,
             "lab_campaign_id": campaign_ctx.run_id,
             "parent_campaign_id": campaign_ctx.run_id,
+            "campaign_id": campaign_ctx.run_id,
             "campaign_dir": str(campaign_ctx.run_dir.resolve()),
             "lab_lane_id": lane.lane_id,
             "lab_lane_index": lane.lane_index,
@@ -1002,6 +1246,21 @@ def _write_lane_metadata(
             "screen_anchor_envelope_months": runtime.screen_anchor_envelope_months,
             "as_of_date": runtime.as_of_date,
             "lake_manifest_sha256": runtime.lake_manifest_sha256,
+            "research_generation_id": runtime.research_generation_id,
+            "level_c_protocol_id": runtime.level_c_protocol_id,
+            "cutoff_key": runtime.cutoff_key,
+            "expected_seed_plan_sha256": runtime.expected_seed_plan_sha256,
+            "play_hand_seed_plan_path": (
+                str(runtime.seed_plan_path.resolve())
+                if runtime.as_of_date and runtime.seed_plan_path
+                else metadata.get("play_hand_seed_plan_path")
+            ),
+            "play_hand_seed_plan_sha256": (
+                runtime.expected_seed_plan_sha256
+                if runtime.as_of_date
+                else metadata.get("play_hand_seed_plan_sha256")
+            ),
+            "formal_historical_level_c": bool(runtime.as_of_date),
             "bar_limit": runtime.bar_limit,
             "instruments": list(lane.instruments),
             "indicators": list(lane.indicator_ids),
@@ -1049,7 +1308,13 @@ def _seed_indicators(
     campaign_ctx: PlayHandContext,
     runtime: PlayHandLabRuntimeConfig,
 ) -> tuple[list[SeedIndicator], dict[str, Any] | None, Path | None]:
-    seed_plan, seed_plan_path = _load_play_hand_seed_plan(config, runtime.seed_plan_path)
+    if runtime.as_of_date:
+        seed_plan, seed_plan_path, _seed_plan_sha256 = _load_exact_historical_seed_plan(
+            runtime.seed_plan_path,
+            expected_sha256=str(runtime.expected_seed_plan_sha256 or ""),
+        )
+    else:
+        seed_plan, seed_plan_path = _load_play_hand_seed_plan(config, runtime.seed_plan_path)
     pinned = [SeedIndicator(id=item) for item in runtime.indicator or []]
     scaffoldable_indicator_ids: set[str] | None = None
     if runtime.profile_path is None:
@@ -1079,10 +1344,28 @@ def _seed_indicators(
             )
         if require_all and invalid:
             raise ValueError(
-                "Pinned PlayHand indicators are not scaffoldable by the current FuzzFolio CLI: "
+                "PlayHand indicators are not scaffoldable by the current FuzzFolio CLI: "
                 + ", ".join(invalid[:10])
             )
         return valid, invalid
+
+    if runtime.as_of_date:
+        seed_plan_candidates = _seed_plan_indicator_candidates(config, seed_plan)
+        if not seed_plan_candidates:
+            raise RuntimeError(
+                "Historical PlayHand seed plan has no usable indicator candidates."
+            )
+        valid, _invalid = scaffoldable_pool(
+            seed_plan_candidates,
+            source="historical_seed_plan",
+            require_all=True,
+        )
+        if len(valid) < runtime.min_indicators:
+            raise RuntimeError(
+                "Historical PlayHand seed plan is smaller than --min-indicators after validation: "
+                f"{len(valid)} < {runtime.min_indicators}."
+            )
+        return valid, seed_plan, seed_plan_path
 
     if pinned:
         valid, _invalid = scaffoldable_pool(pinned, source="pinned", require_all=True)
@@ -1154,15 +1437,38 @@ def _deal_lane(
         max_indicators=runtime.max_indicators,
         rng=rng,
     )
+    deal_seed_plan = seed_plan
+    if runtime.as_of_date and isinstance(seed_plan, dict):
+        # Formal runs use the frozen plan's guided distribution only. Atlas's
+        # exploration fraction would otherwise select a generic fallback.
+        sampling_policy = seed_plan.get("sampling_policy")
+        deal_seed_plan = {
+            **seed_plan,
+            "sampling_policy": {
+                **(sampling_policy if isinstance(sampling_policy, dict) else {}),
+                "guided_prior_fraction": 1.0,
+            },
+        }
     indicator_deal = deal_seed_plan_indicators(
         shuffled,
         target_count=dealt_count,
-        seed_plan=seed_plan,
+        seed_plan=deal_seed_plan,
         rng=rng,
         seed_plan_candidates=seed_plan_candidates,
     )
     dealt_entries = list(indicator_deal.get("indicators") or [])
+    if runtime.as_of_date:
+        selected_slots = [str(slot) for slot in indicator_deal.get("selected_slots") or []]
+        if (
+            indicator_deal.get("source") != "play_hand_seed_plan"
+            or any(slot.startswith("role_balanced") for slot in selected_slots)
+        ):
+            raise RuntimeError(
+                "Historical PlayHand rejects fallback indicator deals; the seed plan must produce a guided deal."
+            )
     if not dealt_entries:
+        if runtime.as_of_date:
+            raise RuntimeError("Historical PlayHand seed plan produced an empty indicator deal.")
         indicator_deal = _fallback_indicator_deal(
             shuffled,
             target_count=dealt_count,
@@ -1977,8 +2283,17 @@ def _deep_replay_job_payload(
             requested_horizon_months=int(lookback_months or runtime.lookback_months),
             profile_snapshot=profile_payload,
             lake_manifest_sha256=runtime.lake_manifest_sha256,
-            data_availability_cutoff=analysis_window_end,
+            data_availability_cutoff=(
+                runtime.as_of_date if runtime.as_of_date else analysis_window_end
+            ),
         )
+    _require_historical_task_evidence(
+        runtime=runtime,
+        analysis_window_start=analysis_window_start,
+        analysis_window_end=analysis_window_end,
+        evidence_plan=evidence_plan,
+    )
+    evidence_payload = evidence_plan.model_dump(mode="json") if evidence_plan else None
     job: dict[str, Any] = {
         "job_id": task_id,
         "user_id": DEFAULT_LAB_USER_ID,
@@ -2003,9 +2318,7 @@ def _deep_replay_job_payload(
         ),
         "analysis_window_start": analysis_window_start,
         "analysis_window_end": analysis_window_end,
-        "evidence_plan": (
-            evidence_plan.model_dump(mode="json") if evidence_plan else None
-        ),
+        "evidence_plan": evidence_payload,
         "bar_limit": int(runtime.bar_limit),
         "alert_threshold": float(profile_payload.get("notificationThreshold") or 80.0),
         "view_mode": "overview",
@@ -2016,6 +2329,9 @@ def _deep_replay_job_payload(
         "required_worker_contract_schema": runtime.worker_contract_schema,
         "required_capabilities": ["deep_replay"],
     }
+    lineage = _historical_lineage_payload(runtime)
+    if lineage:
+        job["research_lineage"] = lineage
     matrix = _reward_matrix_payload(reward_matrix)
     if matrix:
         job["matrix"] = matrix
@@ -2141,8 +2457,17 @@ def _sweep_definition_payload(
             requested_horizon_months=int(lookback_months),
             profile_snapshot=profile_payload,
             lake_manifest_sha256=runtime.lake_manifest_sha256,
-            data_availability_cutoff=analysis_window_end,
+            data_availability_cutoff=(
+                runtime.as_of_date if runtime.as_of_date else analysis_window_end
+            ),
         )
+    _require_historical_task_evidence(
+        runtime=runtime,
+        analysis_window_start=analysis_window_start,
+        analysis_window_end=analysis_window_end,
+        evidence_plan=evidence_plan,
+    )
+    evidence_payload = evidence_plan.model_dump(mode="json") if evidence_plan else None
     definition: dict[str, Any] = {
         "base_profile_id": profile_ref,
         "axes": _sanitize_sweep_axes_for_contract(axes),
@@ -2166,10 +2491,11 @@ def _sweep_definition_payload(
             "slippage_bps": 1.0,
             "commission_bps": 0.5,
         },
-        "evidence_plan": (
-            evidence_plan.model_dump(mode="json") if evidence_plan else None
-        ),
+        "evidence_plan": evidence_payload,
     }
+    lineage = _historical_lineage_payload(runtime)
+    if lineage:
+        definition["research_lineage"] = lineage
     matrix = _reward_matrix_payload(reward_matrix)
     if matrix:
         definition["matrix"] = matrix
@@ -4143,6 +4469,13 @@ def _write_summary(
         "pipeline_version": PLAY_HAND_LAB_PIPELINE_VERSION,
         "target_runs": runtime.target_runs,
         "active_runs": runtime.active_runs,
+        "as_of_date": runtime.as_of_date,
+        "lake_manifest_sha256": runtime.lake_manifest_sha256,
+        "research_generation_id": runtime.research_generation_id,
+        "level_c_protocol_id": runtime.level_c_protocol_id,
+        "cutoff_key": runtime.cutoff_key,
+        "expected_seed_plan_sha256": runtime.expected_seed_plan_sha256,
+        "formal_historical_level_c": bool(runtime.as_of_date),
         "lane_count": int(totals["lane_count"]),
         "retained_lane_count": int(totals["retained_lane_count"]),
         "pruned_lane_count": int(totals["pruned_lane_count"]),
@@ -4187,6 +4520,83 @@ def _write_summary(
     return summary
 
 
+def _historical_lane_has_legitimate_terminal_outcome(lane: LabLaneState) -> bool:
+    """Whether a formal lane reached a research outcome without operational loss."""
+    if not lane.terminal or lane.failed_task_ids:
+        return False
+    if not lane.task_ids or not set(lane.task_ids).issubset(lane.completed_task_ids):
+        return False
+    if lane.run_promoted:
+        return True
+
+    reason = str(lane.tombstone_reason or "").strip().lower().replace("-", "_")
+    if reason == PLAY_HAND_EARLY_EXIT_TOMBSTONE_REASON:
+        return True
+    return reason.startswith(
+        (
+            "validation_",
+            "final_",
+            "no_valid_cell",
+            "no_signal",
+            "nonviable",
+        )
+    )
+
+
+def _historical_campaign_has_legitimate_terminal_outcomes(
+    lanes: list[LabLaneState],
+    *,
+    runtime: PlayHandLabRuntimeConfig,
+) -> bool:
+    target_runs = runtime.target_runs
+    if (
+        not runtime.as_of_date
+        or runtime.campaign_mode != "finite"
+        or isinstance(target_runs, bool)
+        or not isinstance(target_runs, int)
+        or target_runs <= 0
+        or len(lanes) != target_runs
+    ):
+        return False
+    return all(_historical_lane_has_legitimate_terminal_outcome(lane) for lane in lanes)
+
+
+def _finalize_historical_campaign_status(
+    status: str,
+    *,
+    lanes: list[LabLaneState],
+    runtime: PlayHandLabRuntimeConfig,
+) -> tuple[str, str | None]:
+    if not runtime.as_of_date:
+        return status, None
+    if status == "completed" and _historical_campaign_has_legitimate_terminal_outcomes(
+        lanes,
+        runtime=runtime,
+    ):
+        return status, None
+
+    reason = (
+        "historical_campaign_stopped"
+        if status == "stopped"
+        else "historical_campaign_incomplete"
+    )
+    for lane in lanes:
+        if not lane.run_promoted:
+            continue
+        lane.run_promoted = False
+        lane.terminal = True
+        lane.tombstone_reason = reason
+        if reason not in lane.tombstone_reasons:
+            lane.tombstone_reasons.append(reason)
+        _set_lane_phase(
+            lane,
+            "incomplete",
+            event="historical_promotion_revoked",
+            reason=reason,
+        )
+    return "failed", reason
+
+
 def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     runtime = _normalize_runtime(runtime or PlayHandLabRuntimeConfig())
     config = load_config()
@@ -4196,8 +4606,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     if worker_contract_hash and worker_contract_hash != runtime.worker_contract_hash:
         runtime = replace(runtime, worker_contract_hash=worker_contract_hash)
     started_at = _now_iso()
-    campaign_id = _campaign_run_id()
+    campaign_id = runtime.campaign_id or _campaign_run_id()
     campaign_dir = _derived_campaign_root(config) / campaign_id
+    if runtime.as_of_date:
+        _reject_existing_historical_campaign_path(campaign_dir, runtime=runtime)
     campaign_ctx = _campaign_context(
         config=config,
         cli=cli,
@@ -4206,7 +4618,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         runtime=runtime,
     )
     _configure_lab_event_output(campaign_ctx, runtime)
-    campaign_dir.mkdir(parents=True, exist_ok=True)
+    campaign_dir.mkdir(parents=True, exist_ok=not bool(runtime.as_of_date))
     _write_campaign_metadata(campaign_ctx, runtime=runtime, status="starting", started_at=started_at)
     _append_event(
         campaign_ctx,
@@ -4971,6 +5383,30 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             status = "result_loss"
     except Exception as exc:
         _append_event(campaign_ctx, "gateway", "final_snapshot_failed", error=str(exc)[:500])
+    status, historical_failure_reason = _finalize_historical_campaign_status(
+        status,
+        lanes=lanes,
+        runtime=runtime,
+    )
+    if historical_failure_reason:
+        _append_event(
+            campaign_ctx,
+            "campaign",
+            "historical_completion_failed",
+            reason=historical_failure_reason,
+        )
+        for lane in lanes:
+            lane_ctx = lane_contexts.get(lane.run_id)
+            if lane_ctx is None:
+                continue
+            _write_lane_metadata(
+                lane,
+                campaign_ctx=campaign_ctx,
+                runtime=runtime,
+                status="failed",
+                started_at=started_at,
+                extra={"historical_completion_failure_reason": historical_failure_reason},
+            )
     emit_barrier_snapshot(force=True, status=status)
     summary = _write_summary(
         campaign_ctx,
@@ -5000,6 +5436,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             "failed_task_count": failed_count,
             "total_task_count": total_task_count(),
             "summary_path": str(campaign_ctx.summary_path.resolve()),
+            "historical_completion_failure_reason": historical_failure_reason,
         },
     )
     _append_event(campaign_ctx, "campaign", status, summary_path=str(campaign_ctx.summary_path.resolve()))
@@ -5011,7 +5448,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             f"{status}: {completed_count}/{total_task_count()} completed, {failed_count} failed, "
             f"campaign={campaign_ctx.run_id}"
         )
-    return 0 if status in {"completed", "stopped"} else 2
+    return 0 if status == "completed" or (status == "stopped" and not runtime.as_of_date) else 2
 
 
 __all__ = [

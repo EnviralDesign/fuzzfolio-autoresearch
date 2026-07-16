@@ -353,6 +353,7 @@ if __package__ in {None, ""}:
     from autoresearch.discovery_recipe_validation import (
         DEFAULT_DIVERSITY_PENALTY_SCALE as DEFAULT_DISCOVERY_VALIDATION_DIVERSITY_PENALTY_SCALE,
     )
+    from autoresearch.generation_cli import cmd_archive_generation, cmd_restore_generation_plan
     from autoresearch.typed_tools import CLI_OK_TOOLS
 else:
     from .config import load_config
@@ -658,6 +659,7 @@ else:
     from .discovery_recipe_validation import (
         DEFAULT_DIVERSITY_PENALTY_SCALE as DEFAULT_DISCOVERY_VALIDATION_DIVERSITY_PENALTY_SCALE,
     )
+    from .generation_cli import cmd_archive_generation, cmd_restore_generation_plan
     from .typed_tools import CLI_OK_TOOLS
 
 
@@ -777,6 +779,8 @@ PUBLIC_CLI_COMMANDS = {
     "cleanup-playhand-lab-raw-artifacts",
     "archive-retired-universe",
     "compact-retired-universe-archive",
+    "archive-generation",
+    "restore-generation-plan",
     "compact-runs-json",
     "dashboard",
     "record-attempt",
@@ -3027,6 +3031,46 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     compact_archive.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
+    archive_generation = subparsers.add_parser(
+        "archive-generation",
+        help="Safely archive the active runs generation; dry-run unless --apply is set.",
+    )
+    archive_generation.add_argument("--archive-id", required=True, help="Stable archive id.")
+    archive_generation.add_argument(
+        "--new-generation-id", required=True, help="Stable id for the new empty generation."
+    )
+    archive_generation.add_argument(
+        "--provenance-json",
+        required=True,
+        help="Path to a JSON object containing the cutover audit provenance.",
+    )
+    archive_generation.add_argument(
+        "--critical-artifact",
+        action="append",
+        default=None,
+        help="Relative artifact path to hash and verify. Can be repeated.",
+    )
+    archive_generation.add_argument(
+        "--apply",
+        action="store_true",
+        help="Perform the archive cutover. Default is a non-mutating dry-run.",
+    )
+    archive_generation.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+    restore_generation_plan = subparsers.add_parser(
+        "restore-generation-plan",
+        help="Show a non-mutating restore plan for a complete generation archive.",
+    )
+    restore_generation_plan.add_argument("--archive-id", required=True, help="Archive id to inspect.")
+    restore_generation_plan.add_argument(
+        "--destination-runs-root",
+        default=None,
+        help="Proposed restore destination. Default is the configured active runs root.",
+    )
+    restore_generation_plan.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
     cleanup_cmd = subparsers.add_parser(
         "cleanup-incomplete-playhand-runs",
         help=(
@@ -3071,6 +3115,37 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         "--lake-manifest-sha256",
         default=None,
         help="Exact promoted lake coverage identity. Required with --as-of-date.",
+    )
+    atlas_lab.add_argument(
+        "--research-generation-id",
+        default=None,
+        help="Formal research-generation lineage. Required with --as-of-date.",
+    )
+    atlas_lab.add_argument(
+        "--level-c-protocol-id",
+        default=None,
+        help="Exact Level-C protocol sha256 identity. Required with --as-of-date.",
+    )
+    atlas_lab.add_argument(
+        "--cutoff-key",
+        choices=("A", "B", "C", "D"),
+        default=None,
+        help="Formal Level-C cutoff key. Required with --as-of-date.",
+    )
+    atlas_lab.add_argument(
+        "--source-snapshot-sha256",
+        default=None,
+        help="Exact lake source-lineage snapshot identity. Required with --as-of-date.",
+    )
+    atlas_lab.add_argument(
+        "--universe-id",
+        default=None,
+        help="Exact development-universe identity. Required with --as-of-date.",
+    )
+    atlas_lab.add_argument(
+        "--universe-manifest-sha256",
+        default=None,
+        help="Exact development-universe manifest identity. Required with --as-of-date.",
     )
     atlas_lab.add_argument(
         "--signal-lookback-months",
@@ -18184,6 +18259,12 @@ def cmd_atlas_lab(
     signal_atlas_executor: str = "local",
     as_of_date: str | None,
     lake_manifest_sha256: str | None = None,
+    research_generation_id: str | None = None,
+    level_c_protocol_id: str | None = None,
+    cutoff_key: str | None = None,
+    source_snapshot_sha256: str | None = None,
+    universe_id: str | None = None,
+    universe_manifest_sha256: str | None = None,
     signal_lookback_months: int = 3,
     discovery_queue: str,
     discovery_cluster_min_similarity: float,
@@ -18241,6 +18322,22 @@ def cmd_atlas_lab(
         as_of_date=as_of_date,
         lake_manifest_sha256=(
             str(lake_manifest_sha256).strip() if lake_manifest_sha256 else None
+        ),
+        research_generation_id=(
+            str(research_generation_id).strip() if research_generation_id else None
+        ),
+        level_c_protocol_id=(
+            str(level_c_protocol_id).strip() if level_c_protocol_id else None
+        ),
+        cutoff_key=str(cutoff_key).strip() if cutoff_key else None,
+        source_snapshot_sha256=(
+            str(source_snapshot_sha256).strip() if source_snapshot_sha256 else None
+        ),
+        universe_id=str(universe_id).strip() if universe_id else None,
+        universe_manifest_sha256=(
+            str(universe_manifest_sha256).strip()
+            if universe_manifest_sha256
+            else None
         ),
         signal_lookback_months=max(1, int(signal_lookback_months)),
         discovery_cluster_min_similarity=float(discovery_cluster_min_similarity),
@@ -19815,6 +19912,12 @@ def main(argv: list[str] | None = None) -> int:
             signal_atlas_executor=args.signal_atlas_executor,
             as_of_date=args.as_of_date,
             lake_manifest_sha256=args.lake_manifest_sha256,
+            research_generation_id=args.research_generation_id,
+            level_c_protocol_id=args.level_c_protocol_id,
+            cutoff_key=args.cutoff_key,
+            source_snapshot_sha256=args.source_snapshot_sha256,
+            universe_id=args.universe_id,
+            universe_manifest_sha256=args.universe_manifest_sha256,
             signal_lookback_months=args.signal_lookback_months,
             discovery_queue=args.discovery_queue,
             discovery_cluster_min_similarity=args.discovery_cluster_min_similarity,
@@ -20439,6 +20542,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "compact-retired-universe-archive":
         return cmd_compact_retired_universe_archive(
             cohort=str(args.cohort), apply=bool(args.apply), as_json=bool(args.json)
+        )
+    if args.command == "archive-generation":
+        return cmd_archive_generation(
+            archive_id=str(args.archive_id),
+            new_generation_id=str(args.new_generation_id),
+            provenance_json=args.provenance_json,
+            critical_artifacts=args.critical_artifact,
+            apply=bool(args.apply),
+            as_json=bool(args.json),
+        )
+    if args.command == "restore-generation-plan":
+        return cmd_restore_generation_plan(
+            archive_id=str(args.archive_id),
+            destination_runs_root=args.destination_runs_root,
+            as_json=bool(args.json),
         )
     if args.command == "cleanup-atlas-artifacts":
         return cmd_cleanup_atlas_artifacts(

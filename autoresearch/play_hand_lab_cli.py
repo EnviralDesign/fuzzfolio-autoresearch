@@ -197,9 +197,34 @@ def add_play_hand_lab_subparsers(subparsers: Any) -> None:
         help="Hard UTC data cutoff applied to every discovery, validation, scout, and scrutiny replay.",
     )
     play_hand_lab.add_argument(
+        "--campaign-id",
+        default=None,
+        help="Explicit campaign identity. Required with --as-of-date; otherwise a timestamp ID is generated.",
+    )
+    play_hand_lab.add_argument(
         "--lake-manifest-sha256",
         default=None,
         help="Exact promoted lake coverage identity. Required with --as-of-date.",
+    )
+    play_hand_lab.add_argument(
+        "--research-generation-id",
+        default=None,
+        help="Formal research-generation lineage. Required with --as-of-date.",
+    )
+    play_hand_lab.add_argument(
+        "--level-c-protocol-id",
+        default=None,
+        help="Formal Level-C protocol lineage. Required with --as-of-date.",
+    )
+    play_hand_lab.add_argument(
+        "--cutoff-key",
+        default=None,
+        help="Formal data-cutoff lineage key. Required with --as-of-date.",
+    )
+    play_hand_lab.add_argument(
+        "--expected-seed-plan-sha256",
+        default=None,
+        help="Exact SHA-256 of --seed-plan-path. Required with --as-of-date.",
     )
     play_hand_lab.add_argument(
         "--bar-limit",
@@ -693,7 +718,12 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 screen_anchor_mode=args.screen_anchor_mode,
                 screen_anchor_envelope_months=args.screen_anchor_envelope_months,
                 as_of_date=args.as_of_date,
+                campaign_id=args.campaign_id,
                 lake_manifest_sha256=args.lake_manifest_sha256,
+                research_generation_id=args.research_generation_id,
+                level_c_protocol_id=args.level_c_protocol_id,
+                cutoff_key=args.cutoff_key,
+                expected_seed_plan_sha256=args.expected_seed_plan_sha256,
                 instrument_scout_size=args.instrument_scout_size,
                 instrument_scout_max_selected=args.instrument_scout_max_selected,
                 fake_work_seconds=args.fake_work_seconds,

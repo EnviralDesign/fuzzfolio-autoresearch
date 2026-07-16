@@ -61,6 +61,72 @@ def _campaign_ctx(tmp_path: Path) -> SimpleNamespace:
     )
 
 
+def _historical_seed_plan() -> dict:
+    return {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {
+            "pair": {
+                "recipe_sampling_weight": 1.0,
+                "pair_menu": [
+                    {
+                        "anchor_id": "RSI",
+                        "trigger_id": "ADX",
+                        "pair_sampling_weight": 1.0,
+                    }
+                ],
+                "slot_menus": {},
+            }
+        },
+    }
+
+
+def _write_historical_seed_plan(tmp_path: Path, payload: dict | None = None) -> Path:
+    path = tmp_path / "historical-seed-plan.json"
+    path.write_text(
+        json.dumps(payload if payload is not None else _historical_seed_plan()),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _level_c_runtime(
+    tmp_path: Path,
+    *,
+    seed_plan_payload: dict | None = None,
+    **overrides,
+) -> lab.PlayHandLabRuntimeConfig:
+    seed_plan_path = (
+        overrides["seed_plan_path"]
+        if "seed_plan_path" in overrides
+        else _write_historical_seed_plan(tmp_path, seed_plan_payload)
+    )
+    expected_seed_plan_sha256 = (
+        overrides["expected_seed_plan_sha256"]
+        if "expected_seed_plan_sha256" in overrides
+        else lab._file_sha256(seed_plan_path)
+    )
+    values = {
+        "as_of_date": "2025-06-30T00:00:00Z",
+        "campaign_id": "formal-campaign-2025-06",
+        "campaign_mode": "finite",
+        "task_mode": "deep_replay",
+        "pipeline_mode": "play_hand",
+        "target_runs": 1,
+        "active_runs": 1,
+        "strict_scoring": True,
+        "seed": 17,
+        "worker_contract_hash": "sha256:" + "a" * 64,
+        "lake_manifest_sha256": "sha256:" + "b" * 64,
+        "seed_plan_path": seed_plan_path,
+        "expected_seed_plan_sha256": expected_seed_plan_sha256,
+        "research_generation_id": "generation-2025-06",
+        "level_c_protocol_id": "sha256:" + "c" * 64,
+        "cutoff_key": "A",
+    }
+    values.update(overrides)
+    return lab.PlayHandLabRuntimeConfig(**values)
+
+
 def test_normalize_runtime_loads_existing_gateway_token_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -135,6 +201,362 @@ def test_normalize_runtime_requires_lake_identity_for_historical_mode() -> None:
         lab._normalize_runtime(
             lab.PlayHandLabRuntimeConfig(as_of_date="2025-06-30T00:00:00Z")
         )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"campaign_mode": "continuous"}, "campaign_mode=finite"),
+        ({"target_runs": 0}, "positive, explicit target_runs"),
+        ({"strict_scoring": False}, "strict_scoring=True"),
+        ({"seed": None}, "explicit seed"),
+        ({"worker_contract_hash": None}, "explicit exact worker_contract_hash"),
+        ({"lake_manifest_sha256": "sha256:not-a-hash"}, "exact lake_manifest_sha256"),
+        ({"expected_seed_plan_sha256": None}, "exact expected_seed_plan_sha256"),
+        ({"campaign_id": None}, "campaign_id"),
+        ({"campaign_id": "unsafe/campaign"}, "campaign_id"),
+        ({"research_generation_id": ""}, "research_generation_id"),
+        ({"level_c_protocol_id": "level-c-v2"}, "level_c_protocol_id"),
+        ({"cutoff_key": "cutoff-2025-06-30"}, "cutoff_key"),
+    ],
+)
+def test_normalize_runtime_historical_mode_fails_closed_for_level_c_preconditions(
+    tmp_path: Path,
+    overrides: dict,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        lab._normalize_runtime(_level_c_runtime(tmp_path, **overrides))
+
+
+def test_normalize_runtime_historical_mode_rejects_non_json_seed_plan(tmp_path: Path) -> None:
+    non_json_path = tmp_path / "historical-seed-plan.txt"
+    non_json_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="existing JSON seed plan file"):
+        lab._normalize_runtime(
+            _level_c_runtime(
+                tmp_path,
+                seed_plan_path=non_json_path,
+            )
+        )
+
+
+def test_normalize_runtime_historical_mode_rejects_malformed_seed_plan(tmp_path: Path) -> None:
+    seed_plan_path = tmp_path / "historical-seed-plan.json"
+    seed_plan_path.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="seed plan must be valid JSON"):
+        lab._normalize_runtime(
+            _level_c_runtime(
+                tmp_path,
+                seed_plan_path=seed_plan_path,
+                expected_seed_plan_sha256=lab._file_sha256(seed_plan_path),
+            )
+        )
+
+
+def test_normalize_runtime_historical_mode_requires_matching_seed_plan_hash(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="does not match expected_seed_plan_sha256"):
+        lab._normalize_runtime(
+            _level_c_runtime(
+                tmp_path,
+                expected_seed_plan_sha256="sha256:" + "c" * 64,
+            )
+        )
+
+
+def test_normalize_runtime_historical_mode_preserves_verified_level_c_lineage(
+    tmp_path: Path,
+) -> None:
+    runtime = lab._normalize_runtime(_level_c_runtime(tmp_path, target_runs=3))
+
+    assert runtime.research_generation_id == "generation-2025-06"
+    assert runtime.campaign_id == "formal-campaign-2025-06"
+    assert runtime.level_c_protocol_id == "sha256:" + "c" * 64
+    assert runtime.cutoff_key == "A"
+    assert runtime.expected_seed_plan_sha256 == lab._file_sha256(runtime.seed_plan_path)
+    assert runtime.terminal_lane_retention >= 3
+
+
+def test_normalize_runtime_exploratory_campaign_id_is_optional_and_validated() -> None:
+    assert lab._normalize_runtime(lab.PlayHandLabRuntimeConfig()).campaign_id is None
+    assert (
+        lab._normalize_runtime(lab.PlayHandLabRuntimeConfig(campaign_id="explore-42")).campaign_id
+        == "explore-42"
+    )
+    with pytest.raises(ValueError, match="campaign_id"):
+        lab._normalize_runtime(lab.PlayHandLabRuntimeConfig(campaign_id="../escape"))
+
+
+def test_cmd_play_hand_lab_uses_explicit_historical_campaign_id_for_exact_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_config = _test_config(tmp_path)
+    runtime = _level_c_runtime(tmp_path, campaign_id="formal-campaign-2025-06")
+    captured: dict[str, object] = {}
+
+    class FakeCli:
+        def __init__(self, _config) -> None:
+            pass
+
+    class StopAfterCampaignSetup(Exception):
+        pass
+
+    def stop_after_metadata(campaign_ctx, **_kwargs) -> None:
+        captured["campaign_id"] = campaign_ctx.run_id
+        captured["campaign_dir"] = campaign_ctx.run_dir
+        raise StopAfterCampaignSetup()
+
+    monkeypatch.setattr(lab, "load_config", lambda: fake_config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", FakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", lambda **_kwargs: object())
+    monkeypatch.setattr(lab, "_write_campaign_metadata", stop_after_metadata)
+
+    with pytest.raises(StopAfterCampaignSetup):
+        lab.cmd_play_hand_lab(runtime)
+
+    expected_dir = (
+        fake_config.runs_root
+        / "derived"
+        / lab.PLAY_HAND_LAB_CAMPAIGNS_DIR
+        / "formal-campaign-2025-06"
+    )
+    assert captured["campaign_id"] == "formal-campaign-2025-06"
+    assert captured["campaign_dir"] == expected_dir
+    assert expected_dir.is_dir()
+
+
+def test_historical_campaign_path_rejects_conflicting_lineage(tmp_path: Path) -> None:
+    runtime = lab._normalize_runtime(_level_c_runtime(tmp_path))
+    campaign_dir = tmp_path / runtime.campaign_id
+    campaign_dir.mkdir()
+    (campaign_dir / "run-metadata.json").write_text(
+        json.dumps(
+            {
+                **lab._historical_campaign_lineage(runtime),
+                "research_generation_id": "generation-conflict",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="conflicting historical lineage: research_generation_id"):
+        lab._reject_existing_historical_campaign_path(campaign_dir, runtime=runtime)
+
+
+def test_historical_campaign_path_rejects_resume_even_with_matching_lineage(tmp_path: Path) -> None:
+    runtime = lab._normalize_runtime(_level_c_runtime(tmp_path))
+    campaign_dir = tmp_path / runtime.campaign_id
+    campaign_dir.mkdir()
+    (campaign_dir / "run-metadata.json").write_text(
+        json.dumps(lab._historical_campaign_lineage(runtime)),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="resume behavior is not supported"):
+        lab._reject_existing_historical_campaign_path(campaign_dir, runtime=runtime)
+
+
+def test_level_c_lineage_and_seed_hash_are_persisted_in_campaign_and_lane_metadata(
+    tmp_path: Path,
+) -> None:
+    runtime = lab._normalize_runtime(_level_c_runtime(tmp_path))
+    campaign_dir = tmp_path / "campaign"
+    campaign_dir.mkdir()
+    campaign_ctx = _campaign_ctx(campaign_dir)
+    lane_dir = tmp_path / "lane"
+    lane_dir.mkdir()
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="lane-1",
+        run_dir=lane_dir,
+    )
+
+    lab._write_campaign_metadata(
+        campaign_ctx,
+        runtime=runtime,
+        status="starting",
+        started_at="2025-06-30T00:00:00Z",
+    )
+    lab._write_lane_metadata(
+        lane,
+        campaign_ctx=campaign_ctx,
+        runtime=runtime,
+        status="queued",
+        started_at="2025-06-30T00:00:00Z",
+    )
+
+    campaign_metadata = json.loads(
+        (campaign_dir / "run-metadata.json").read_text(encoding="utf-8")
+    )
+    lane_metadata = json.loads(
+        (lane_dir / "run-metadata.json").read_text(encoding="utf-8")
+    )
+    for metadata in [campaign_metadata, lane_metadata]:
+        assert metadata["campaign_id"] == "campaign-1"
+        assert metadata["research_generation_id"] == "generation-2025-06"
+        assert metadata["level_c_protocol_id"] == "sha256:" + "c" * 64
+        assert metadata["cutoff_key"] == "A"
+        assert metadata["expected_seed_plan_sha256"] == runtime.expected_seed_plan_sha256
+        assert metadata["play_hand_seed_plan_sha256"] == runtime.expected_seed_plan_sha256
+        assert metadata["formal_historical_level_c"] is True
+
+
+@pytest.mark.parametrize(
+    ("initial_status", "target_runs", "expected_reason"),
+    [
+        ("stopped", 1, "historical_campaign_stopped"),
+        ("completed", 2, "historical_campaign_incomplete"),
+    ],
+)
+def test_historical_campaign_finalization_rejects_stopped_or_partial_promotion(
+    tmp_path: Path,
+    initial_status: str,
+    target_runs: int,
+    expected_reason: str,
+) -> None:
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="lane-1",
+        run_dir=tmp_path / "lane",
+        terminal=True,
+        run_promoted=True,
+    )
+    runtime = lab.PlayHandLabRuntimeConfig(
+        as_of_date="2025-06-30T00:00:00Z",
+        campaign_mode="finite",
+        target_runs=target_runs,
+    )
+
+    status, reason = lab._finalize_historical_campaign_status(
+        initial_status,
+        lanes=[lane],
+        runtime=runtime,
+    )
+
+    assert status == "failed"
+    assert reason == expected_reason
+    assert lane.run_promoted is False
+    assert lane.tombstone_reason == expected_reason
+    assert lane.current_phase == "incomplete"
+
+
+def test_historical_campaign_completion_accepts_terminal_research_rejections(
+    tmp_path: Path,
+) -> None:
+    lanes = [
+        lab.LabLaneState(
+            lane_id="lane_000",
+            lane_index=0,
+            run_id="lane-0",
+            run_dir=tmp_path / "lane-0",
+            terminal=True,
+            task_ids=["task-0"],
+            completed_task_ids={"task-0"},
+            tombstone_reason="validation_12mo_failed",
+        ),
+        lab.LabLaneState(
+            lane_id="lane_001",
+            lane_index=1,
+            run_id="lane-1",
+            run_dir=tmp_path / "lane-1",
+            terminal=True,
+            task_ids=["task-1"],
+            completed_task_ids={"task-1"},
+            tombstone_reason="final_36mo_failed",
+        ),
+        lab.LabLaneState(
+            lane_id="lane_002",
+            lane_index=2,
+            run_id="lane-2",
+            run_dir=tmp_path / "lane-2",
+            terminal=True,
+            task_ids=["task-2"],
+            completed_task_ids={"task-2"},
+            tombstone_reason="no_signal",
+        ),
+        lab.LabLaneState(
+            lane_id="lane_003",
+            lane_index=3,
+            run_id="lane-3",
+            run_dir=tmp_path / "lane-3",
+            terminal=True,
+            task_ids=["task-3"],
+            completed_task_ids={"task-3"},
+            tombstone_reason="no-valid-cell",
+        ),
+        lab.LabLaneState(
+            lane_id="lane_004",
+            lane_index=4,
+            run_id="lane-4",
+            run_dir=tmp_path / "lane-4",
+            terminal=True,
+            task_ids=["task-4"],
+            completed_task_ids={"task-4"},
+            tombstone_reason="nonviable",
+        ),
+    ]
+    runtime = lab.PlayHandLabRuntimeConfig(
+        as_of_date="2025-06-30T00:00:00Z",
+        campaign_mode="finite",
+        target_runs=len(lanes),
+    )
+
+    status, reason = lab._finalize_historical_campaign_status(
+        "completed",
+        lanes=lanes,
+        runtime=runtime,
+    )
+
+    assert status == "completed"
+    assert reason is None
+    assert not any(lane.run_promoted for lane in lanes)
+
+
+@pytest.mark.parametrize(
+    ("terminal", "completed", "failed", "tombstone_reason"),
+    [
+        (False, set(), set(), None),
+        (True, set(), {"task-0"}, "lab_stage_worker_failed"),
+    ],
+    ids=["incomplete", "infrastructure-failed"],
+)
+def test_historical_campaign_completion_rejects_incomplete_or_failed_lanes(
+    tmp_path: Path,
+    terminal: bool,
+    completed: set[str],
+    failed: set[str],
+    tombstone_reason: str | None,
+) -> None:
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="lane-0",
+        run_dir=tmp_path / "lane-0",
+        terminal=terminal,
+        task_ids=["task-0"],
+        completed_task_ids=completed,
+        failed_task_ids=failed,
+        tombstone_reason=tombstone_reason,
+    )
+    runtime = lab.PlayHandLabRuntimeConfig(
+        as_of_date="2025-06-30T00:00:00Z",
+        campaign_mode="finite",
+        target_runs=1,
+    )
+
+    status, reason = lab._finalize_historical_campaign_status(
+        "completed",
+        lanes=[lane],
+        runtime=runtime,
+    )
+
+    assert status == "failed"
+    assert reason == "historical_campaign_incomplete"
 
 
 def test_normalize_runtime_defaults_to_random_screen_and_validation_rung() -> None:
@@ -779,6 +1201,98 @@ def test_seed_indicators_reject_unscaffoldable_pinned_ids(tmp_path: Path) -> Non
         )
 
 
+def test_historical_seed_indicators_reject_undersized_plan_without_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    undersized_plan = {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {
+            "single": {
+                "recipe_sampling_weight": 1.0,
+                "pair_menu": [{"anchor_id": "RSI", "pair_sampling_weight": 1.0}],
+                "slot_menus": {},
+            }
+        },
+    }
+    seed_plan_path = _write_historical_seed_plan(tmp_path, undersized_plan)
+    runtime = _level_c_runtime(
+        tmp_path,
+        seed_plan_path=seed_plan_path,
+        expected_seed_plan_sha256=lab._file_sha256(seed_plan_path),
+        min_indicators=2,
+        max_indicators=2,
+    )
+
+    def unexpected_seed_hand(*_args, **_kwargs):
+        raise AssertionError("historical seed selection must not call _seed_hand")
+
+    monkeypatch.setattr(lab, "_seed_hand", unexpected_seed_hand)
+    with pytest.raises(RuntimeError, match="smaller than --min-indicators"):
+        lab._seed_indicators(
+            config=_test_config(tmp_path),
+            cli=_IndicatorIndexCli(["RSI", "ADX", "MACD", "SMA"]),
+            campaign_ctx=_campaign_ctx(tmp_path),
+            runtime=runtime,
+        )
+
+
+def test_historical_lane_deal_uses_seed_plan_when_atlas_fraction_allows_exploration(
+    tmp_path: Path,
+) -> None:
+    fallback_plan = _historical_seed_plan()
+    fallback_plan["sampling_policy"] = {"guided_prior_fraction": 0.0}
+    runtime = _level_c_runtime(
+        tmp_path,
+        seed_plan_payload=fallback_plan,
+        min_indicators=1,
+        max_indicators=1,
+    )
+
+    indicators, seed_plan, seed_plan_path = lab._seed_indicators(
+        config=_test_config(tmp_path),
+        cli=_IndicatorIndexCli(["RSI", "ADX"]),
+        campaign_ctx=_campaign_ctx(tmp_path),
+        runtime=runtime,
+    )
+
+    deal = lab._deal_lane(
+        config=_test_config(tmp_path),
+        runtime=runtime,
+        seed_indicators=indicators,
+        seed_plan=seed_plan,
+        rng=random.Random(7),
+    )
+
+    assert seed_plan_path == runtime.seed_plan_path
+    assert deal["indicator_deal"]["source"] == "play_hand_seed_plan"
+
+
+def test_historical_lane_deal_rejects_role_balanced_fill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _level_c_runtime(tmp_path, min_indicators=1, max_indicators=1)
+    monkeypatch.setattr(
+        lab,
+        "deal_seed_plan_indicators",
+        lambda *_args, **_kwargs: {
+            "source": "play_hand_seed_plan",
+            "selected_slots": ["role_balanced_fill"],
+            "indicators": [lab.SeedIndicator("RSI")],
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="rejects fallback indicator deals"):
+        lab._deal_lane(
+            config=_test_config(tmp_path),
+            runtime=runtime,
+            seed_indicators=[lab.SeedIndicator("RSI")],
+            seed_plan=_historical_seed_plan(),
+            rng=random.Random(7),
+        )
+
+
 def test_deep_replay_dry_run_uses_real_scaffold_for_profile_validation(
     tmp_path: Path,
     monkeypatch,
@@ -942,6 +1456,121 @@ def test_fixed_as_of_date_bounds_screen_validation_and_scrutiny(tmp_path: Path) 
     assert scrutiny["analysis_window_start"] == "2022-06-30T00:00:00Z"
     assert validation["evidence_plan"]["selection_data_end"] == validation["analysis_window_end"]
     assert scrutiny["evidence_plan"]["selection_data_end"] == scrutiny["analysis_window_end"]
+    assert validation["lookback_months"] is None
+    assert scrutiny["lookback_months"] is None
+    assert validation["evidence_plan"]["data_availability_cutoff"] == runtime.as_of_date
+    assert scrutiny["evidence_plan"]["data_availability_cutoff"] == runtime.as_of_date
+    assert scrutiny["evidence_plan"]["evidence_role"] == "training"
+
+
+def test_historical_replay_and_sweep_tasks_require_explicit_bounds_and_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    profile_payload = _profile_payload()["profile"]
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="run-1",
+        run_dir=tmp_path / "run-1",
+        profile_path=profile_path,
+        profile_payload=profile_payload,
+        profile_ref="lab-inline:run-1:lane_000",
+        instruments=["EURUSD"],
+        timeframe="M5",
+    )
+    runtime = lab.PlayHandLabRuntimeConfig(
+        as_of_date="2025-06-30T00:00:00Z",
+        lake_manifest_sha256="sha256:" + "b" * 64,
+        worker_contract_hash="sha256:" + "a" * 64,
+    )
+    axis_texts = ["indicator[0].talib.timeperiod=7,14"]
+    axis_plan = SimpleNamespace(
+        axes=axis_texts,
+        selected_permutations=2,
+        event_payload=lambda: {"selected_axes": axis_texts},
+    )
+    monkeypatch.setattr(lab, "plan_sweep_axes", lambda *args, **kwargs: axis_plan)
+
+    with pytest.raises(ValueError, match="require explicit analysis window bounds"):
+        lab._deep_replay_job_payload(
+            task_id="missing-bounds",
+            lane=lane,
+            runtime=runtime,
+            reward_matrix=None,
+            worker_contract_hash=runtime.worker_contract_hash,
+        )
+    with pytest.raises(ValueError, match="require explicit analysis window bounds"):
+        lab._sweep_definition_payload(
+            lane=lane,
+            runtime=runtime,
+            reward_matrix=None,
+            axes=[],
+            instruments=["EURUSD"],
+            profile_ref=lane.profile_ref,
+            profile_payload=profile_payload,
+            lookback_months=3,
+            analysis_window_start=None,
+            analysis_window_end=None,
+            mode="deterministic",
+        )
+
+    def assert_historical_evidence(payload: dict) -> None:
+        evidence_plan = payload["evidence_plan"]
+        assert payload["analysis_window_start"]
+        assert payload["analysis_window_end"] == runtime.as_of_date
+        assert payload["lookback_months"] is None
+        assert evidence_plan["evidence_role"] == "training"
+        assert evidence_plan["selection_data_end"] == runtime.as_of_date
+        assert evidence_plan["data_availability_cutoff"] == runtime.as_of_date
+
+    for phase, months in [
+        ("baseline_3mo", 3),
+        ("instrument_scout_EURUSD_12mo", 12),
+        ("validation_12mo", 12),
+        ("final_36mo", 36),
+    ]:
+        start, end = lab._runtime_as_of_window(runtime, months)
+        task = lab._make_deep_replay_task(
+            lane,
+            phase=phase,
+            runtime=runtime,
+            reward_matrix=None,
+            worker_contract_hash=runtime.worker_contract_hash,
+            profile_payload=profile_payload,
+            profile_path=profile_path,
+            profile_ref=lane.profile_ref,
+            instruments=["EURUSD"],
+            timeframe="M5",
+            lookback_months=months,
+            analysis_window_start=start,
+            analysis_window_end=end,
+        )
+        assert_historical_evidence(task["payload"])
+
+    for phase in ["lookback_timing", "coarse_probe", "coarse_expand", "focused"]:
+        start, end = lab._runtime_as_of_window(runtime, 3)
+        tasks = lab._make_sweep_shard_tasks(
+            lane,
+            phase=phase,
+            runtime=runtime,
+            reward_matrix=None,
+            worker_contract_hash=runtime.worker_contract_hash,
+            profile_payload=profile_payload,
+            profile_path=profile_path,
+            profile_ref=lane.profile_ref,
+            instruments=["EURUSD"],
+            lookback_months=3,
+            axis_texts=axis_texts,
+            mode="deterministic",
+            analysis_window_start=start,
+            analysis_window_end=end,
+        )
+        assert tasks
+        for task in tasks:
+            assert_historical_evidence(task["payload"]["definition"])
 
 
 def test_historical_execution_receipt_must_match_plan() -> None:
