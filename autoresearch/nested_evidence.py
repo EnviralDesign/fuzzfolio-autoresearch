@@ -120,12 +120,13 @@ def freeze_nested_outer_test(
     test_end: Any,
     test_horizon_months: int,
 ) -> NestedEvidenceFold:
-    train_end = datetime.fromisoformat(
+    train_end_exclusive = datetime.fromisoformat(
         fold.train_plan.analysis_window_end.replace("Z", "+00:00")
     )
     normalized_test_start = canonical_timestamp(test_start)
     parsed_test_start = datetime.fromisoformat(normalized_test_start.replace("Z", "+00:00"))
-    minimum_test_start = train_end.date() + timedelta(days=fold.embargo_days + 1)
+    train_end_inclusive = train_end_exclusive.date() - timedelta(days=1)
+    minimum_test_start = train_end_inclusive + timedelta(days=fold.embargo_days + 1)
     if parsed_test_start.date() < minimum_test_start:
         raise ValueError(
             "outer test must start after the configured train-window embargo"

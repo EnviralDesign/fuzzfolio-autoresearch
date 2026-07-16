@@ -702,25 +702,31 @@ def temporal_folds(
 ) -> list[dict[str, Any]]:
     overall_start = date.fromisoformat(start[:10])
     overall_end = date.fromisoformat(end[:10])
-    cursor = overall_start
+    embargo = max(0, embargo_days)
+    train_start = overall_start
+    test_start: date | None = None
     rows: list[dict[str, Any]] = []
     while True:
-        train_end = add_months(cursor, train_months) - timedelta(days=1)
-        test_start = train_end + timedelta(days=max(0, embargo_days) + 1)
+        if test_start is None:
+            train_end = add_months(train_start, train_months) - timedelta(days=1)
+            test_start = train_end + timedelta(days=embargo + 1)
+        else:
+            test_start = add_months(test_start, step_months)
+            train_end = test_start - timedelta(days=embargo + 1)
+            train_start = add_months(train_end + timedelta(days=1), -train_months)
         test_end = add_months(test_start, test_months) - timedelta(days=1)
         if test_end > overall_end:
             break
         rows.append(
             {
                 "fold_id": f"fold-{len(rows) + 1:02d}",
-                "train_start": cursor.isoformat(),
+                "train_start": train_start.isoformat(),
                 "train_end": train_end.isoformat(),
                 "test_start": test_start.isoformat(),
                 "test_end": test_end.isoformat(),
-                "embargo_days": max(0, embargo_days),
+                "embargo_days": embargo,
             }
         )
-        cursor = add_months(cursor, step_months)
     return rows
 
 
@@ -1114,6 +1120,60 @@ def run_temporal_validation(
     return folds, results
 
 
+def _flat_outer_no_signal_curve_path(
+    *,
+    root: Path,
+    fold_id: str,
+    attempt_id: str,
+    fold: dict[str, Any],
+    terminal_outcome: dict[str, Any],
+) -> str:
+    """Persist a deterministic zero-return OOS curve for selected no-signal members."""
+    test_start = str(fold.get("test_start") or "").strip()
+    test_end = str(fold.get("test_end") or test_start).strip() or test_start
+    points = [
+        {
+            "date": test_start,
+            "equity_r": 0.0,
+            "open_trade_count": 0,
+            "closed_trade_count": 0,
+        }
+    ]
+    if test_end and test_end != test_start:
+        points.append(
+            {
+                "date": test_end,
+                "equity_r": 0.0,
+                "open_trade_count": 0,
+                "closed_trade_count": 0,
+            }
+        )
+    path = (
+        root
+        / str(fold_id)
+        / "outer-terminal-flat-curves"
+        / f"{slug(attempt_id)}-{payload_hash(terminal_outcome)[:12]}.json"
+    )
+    write_json_atomic(
+        path,
+        {
+            "schema": "autoresearch-nested-flat-outer-no-signal-curve-v1",
+            "attempt_id": attempt_id,
+            "fold_id": fold_id,
+            "terminal_outcome": terminal_outcome,
+            "curve": {
+                "period_granularity": "day",
+                "downsampled": False,
+                "point_count": len(points),
+                "returned_point_count": len(points),
+                "points": points,
+            },
+        },
+        compact=True,
+    )
+    return str(path)
+
+
 def run_nested_cell_temporal_validation(
     *,
     rows: list[dict[str, Any]],
@@ -1148,8 +1208,17 @@ def run_nested_cell_temporal_validation(
         for record in fold_report.get("records") or []:
             attempt_id = str(record.get("attempt_id") or "")
             base = base_by_id.get(attempt_id)
-            if base is None or record.get("outer_validation_status") != "valid":
+            if base is None:
                 continue
+            train_stage_status = str(record.get("train_validation_status") or "valid")
+            if train_stage_status == "nonviable":
+                continue
+            outer_stage_status = str(record.get("outer_validation_status") or "")
+            if outer_stage_status not in {"valid", "nonviable"}:
+                raise PortfolioResearchError(
+                    f"Nested fold {fold_id} has non-terminal outer evidence "
+                    f"for {attempt_id}: {outer_stage_status or 'missing'}"
+                )
             receipt = dict(record.get("cell_receipt") or {})
             receipt_by_id[attempt_id] = receipt
             outer_plan = dict(record.get("outer_test_plan") or {})
@@ -1219,7 +1288,18 @@ def run_nested_cell_temporal_validation(
                 {
                     **common,
                     "full_backtest_result_path_36m": record.get("train_result_path"),
-                    "full_backtest_calendar_curve_path_36m": record.get("outer_curve_path"),
+                    "full_backtest_calendar_curve_path_36m": (
+                        _flat_outer_no_signal_curve_path(
+                            root=root,
+                            fold_id=fold_id,
+                            attempt_id=attempt_id,
+                            fold=fold,
+                            terminal_outcome=dict(record.get("outer_terminal_outcome") or {}),
+                        )
+                        if outer_stage_status == "nonviable"
+                        else record.get("outer_curve_path")
+                    ),
+                    "outer_validation_status": outer_stage_status,
                 }
             )
         if not train_rows:

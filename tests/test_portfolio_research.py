@@ -14,6 +14,7 @@ from autoresearch.portfolio_optimizer import (
 )
 from autoresearch.portfolio_research import (
     PortfolioResearchError,
+    add_months,
     apply_behavioral_cluster_deduplication,
     analyze_campaign,
     build_consensus_evidence,
@@ -217,6 +218,101 @@ def test_temporal_folds_apply_month_geometry_and_embargo() -> None:
     ]
 
 
+def test_temporal_folds_keep_equal_step_outer_tests_contiguous() -> None:
+    folds = temporal_folds(
+        start="2021-06-29",
+        end="2026-07-13",
+        train_months=36,
+        test_months=6,
+        step_months=6,
+        embargo_days=15,
+    )
+
+    assert folds == [
+        {
+            "fold_id": "fold-01",
+            "train_start": "2021-06-29",
+            "train_end": "2024-06-28",
+            "test_start": "2024-07-14",
+            "test_end": "2025-01-13",
+            "embargo_days": 15,
+        },
+        {
+            "fold_id": "fold-02",
+            "train_start": "2021-12-30",
+            "train_end": "2024-12-29",
+            "test_start": "2025-01-14",
+            "test_end": "2025-07-13",
+            "embargo_days": 15,
+        },
+        {
+            "fold_id": "fold-03",
+            "train_start": "2022-06-29",
+            "train_end": "2025-06-28",
+            "test_start": "2025-07-14",
+            "test_end": "2026-01-13",
+            "embargo_days": 15,
+        },
+        {
+            "fold_id": "fold-04",
+            "train_start": "2022-12-30",
+            "train_end": "2025-12-29",
+            "test_start": "2026-01-14",
+            "test_end": "2026-07-13",
+            "embargo_days": 15,
+        },
+    ]
+    assert folds[-1]["test_end"] == "2026-07-13"
+    for left, right in zip(folds, folds[1:]):
+        assert date.fromisoformat(right["test_start"]) == date.fromisoformat(
+            left["test_end"]
+        ) + timedelta(days=1)
+    for fold in folds:
+        train_start = date.fromisoformat(fold["train_start"])
+        train_end = date.fromisoformat(fold["train_end"])
+        test_start = date.fromisoformat(fold["test_start"])
+        assert add_months(train_start, 36) - timedelta(days=1) == train_end
+        assert (test_start - train_end).days - 1 == 15
+
+
+def test_temporal_folds_handle_leap_and_year_end_contiguity() -> None:
+    leap_folds = temporal_folds(
+        start="2019-02-14",
+        end="2021-02-28",
+        train_months=12,
+        test_months=6,
+        step_months=6,
+        embargo_days=15,
+    )
+    assert [(row["test_start"], row["test_end"]) for row in leap_folds] == [
+        ("2020-02-29", "2020-08-28"),
+        ("2020-08-29", "2021-02-27"),
+    ]
+
+    year_end_folds = temporal_folds(
+        start="2021-12-16",
+        end="2023-04-30",
+        train_months=12,
+        test_months=2,
+        step_months=2,
+        embargo_days=15,
+    )
+    assert [(row["test_start"], row["test_end"]) for row in year_end_folds] == [
+        ("2022-12-31", "2023-02-27"),
+        ("2023-02-28", "2023-04-27"),
+    ]
+    for folds in (leap_folds, year_end_folds):
+        for left, right in zip(folds, folds[1:]):
+            assert date.fromisoformat(right["test_start"]) == date.fromisoformat(
+                left["test_end"]
+            ) + timedelta(days=1)
+        for fold in folds:
+            assert (
+                date.fromisoformat(fold["test_start"])
+                - date.fromisoformat(fold["train_end"])
+            ).days - 1 == 15
+
+
 def test_nested_cell_validation_selects_on_train_and_scores_outer_only(
     tmp_path: Path,
 ) -> None:
@@ -330,6 +426,82 @@ def test_nested_cell_validation_selects_on_train_and_scores_outer_only(
     assert rejected[0]["status"] == "no_defensible_consensus"
     assert rejected[0]["selected_attempt_ids"] == []
     assert "test_metrics" not in rejected[0]
+
+
+def test_nested_cell_validation_keeps_outer_no_signal_member_flat(
+    tmp_path: Path,
+) -> None:
+    train_points = [
+        ((date(2023, 1, 1) + timedelta(days=index)).isoformat(), index / 100.0)
+        for index in range(730)
+    ]
+    row = _row(tmp_path, "nested-flat", "EURUSD", train_points)
+    suite = _suite(temporal_enabled=True)
+    suite["portfolio"]["sizes"] = [1]
+    suite["portfolio"]["base_optimizer_args"].update(
+        {"candidate_limit": -1, "min_score": 0.0}
+    )
+    suite["temporal_validation"].update(
+        {
+            "train_months": 12,
+            "test_months": 3,
+            "step_months": 3,
+            "seeds": [17],
+            "inner_validation": {
+                "train_months": 6,
+                "test_months": 3,
+                "step_months": 3,
+                "embargo_days": 1,
+                "minimum_units": 2,
+            },
+        }
+    )
+    receipt = {
+        "execution_cell": {"stop_loss_percent": 0.1, "reward_multiple": 2.0}
+    }
+    fold_reports = [
+        {
+            "fold": {
+                "fold_id": "fold-01",
+                "train_start": "2023-01-01",
+                "train_end": "2024-12-31",
+                "test_start": "2025-01-01",
+                "test_end": "2025-06-30",
+                "embargo_days": 1,
+            },
+            "records": [
+                {
+                    "attempt_id": "nested-flat",
+                    "train_validation_status": "valid",
+                    "outer_validation_status": "nonviable",
+                    "outer_terminal_outcome": {
+                        "status": "nonviable",
+                        "outcome": "no_valid_cell",
+                    },
+                    "train_result_path": row["full_backtest_result_path_36m"],
+                    "train_curve_path": row[
+                        "full_backtest_calendar_curve_path_36m"
+                    ],
+                    "cell_receipt": receipt,
+                }
+            ],
+        }
+    ]
+
+    results = run_nested_cell_temporal_validation(
+        rows=[row],
+        fold_reports=fold_reports,
+        suite=suite,
+        account={},
+        root=tmp_path / "nested-flat-validation",
+        backend="python",
+    )
+
+    assert len(results) == 1
+    assert results[0]["selected_attempt_ids"] == ["nested-flat"]
+    assert results[0]["test_metrics"]["final_r"] == pytest.approx(0.0)
+    frozen = json.loads(Path(results[0]["frozen_portfolio_path"]).read_text(encoding="utf-8"))
+    assert frozen["selected_attempt_ids"] == ["nested-flat"]
 
 
 def test_stability_domains_keep_full_window_and_temporal_evidence_separate(
