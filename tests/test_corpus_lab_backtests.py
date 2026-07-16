@@ -729,7 +729,6 @@ def test_run_lab_full_backtests_fixed_cell_outer_result_does_not_store_matrix_ce
     tracked_cell = {
         "reward_multiple": 3.0,
         "stop_loss_percent": 0.2,
-        "take_profit_percent": 0.6,
     }
     receipt = {
         "schema_version": "autoresearch-frozen-execution-cell-v1",
@@ -781,6 +780,7 @@ def test_run_lab_full_backtests_fixed_cell_outer_result_does_not_store_matrix_ce
                 },
                 "tracked_cell_result": {
                     **tracked_cell,
+                    "take_profit_percent": 0.6,
                     "resolved_trades": 12,
                     "expectancy_r": 0.42,
                 },

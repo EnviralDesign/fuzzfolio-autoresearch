@@ -14775,15 +14775,11 @@ def _cell_float(cell: Any, key: str) -> float | None:
 def _normalize_execution_cell(cell: Any) -> dict[str, float] | None:
     stop_loss = _cell_float(cell, "stop_loss_percent")
     reward_multiple = _cell_float(cell, "reward_multiple")
-    take_profit = _cell_float(cell, "take_profit_percent")
     if stop_loss is None or reward_multiple is None:
         return None
-    if take_profit is None:
-        take_profit = stop_loss * reward_multiple
     return {
         "reward_multiple": float(reward_multiple),
         "stop_loss_percent": float(stop_loss),
-        "take_profit_percent": float(take_profit),
     }
 
 
