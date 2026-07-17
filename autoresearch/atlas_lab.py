@@ -133,6 +133,7 @@ ATLAS_LAB_DURABLE_STAGES = (
 DEFAULT_ATLAS_LAB_ACTIVE_PROBES = 128
 DEFAULT_ATLAS_LAB_ENQUEUE_CHUNK = 256
 DEFAULT_ATLAS_LAB_RESULT_BATCH_SIZE = 250
+DEFAULT_ATLAS_LAB_RESULT_DRAIN_BATCH_CAP = 64
 DEFAULT_ATLAS_LAB_MAX_RESULTS_PER_CYCLE = 1000
 DEFAULT_ATLAS_LAB_MAX_DRAIN_SECONDS = 0.5
 DEFAULT_ATLAS_LAB_POLL_INTERVAL_SECONDS = 0.25
@@ -2167,6 +2168,16 @@ def _metric_delta(snapshot: dict[str, Any] | None, baseline: dict[str, int], key
     return max(int(metrics.get(key, 0)) - int(baseline.get(key, 0)), 0)
 
 
+def _atlas_result_drain_limit(runtime: AtlasLabRuntimeConfig) -> int:
+    return max(
+        1,
+        min(
+            int(runtime.result_batch_size),
+            int(DEFAULT_ATLAS_LAB_RESULT_DRAIN_BATCH_CAP),
+        ),
+    )
+
+
 def _print_probe_barrier(
     *,
     spec: ProbeRunSpec,
@@ -2321,7 +2332,7 @@ def run_probe_spec_via_gateway(
         cycle_results = 0
         while cycle_results < max(int(runtime.max_results_per_cycle), int(runtime.result_batch_size)):
             limit = min(
-                max(int(runtime.result_batch_size), 1),
+                _atlas_result_drain_limit(runtime),
                 max(int(runtime.max_results_per_cycle), 1) - cycle_results,
             )
             result_batch = _read_gateway_results(gateway, limit=limit)
@@ -2422,6 +2433,7 @@ def run_probe_spec_via_gateway(
                     release_state(state)
                     ack_ids.append(lease_id)
             _ack_gateway_results(gateway, ack_ids)
+            enqueue_more()
             cycle_results += len(result_batch)
             if len(result_batch) < limit:
                 break
@@ -2935,7 +2947,7 @@ def build_signal_atlas_via_gateway(
         cycle_results = 0
         while cycle_results < max(int(runtime.max_results_per_cycle), int(runtime.result_batch_size)):
             limit = min(
-                max(int(runtime.result_batch_size), 1),
+                _atlas_result_drain_limit(runtime),
                 max(int(runtime.max_results_per_cycle), 1) - cycle_results,
             )
             result_batch = _read_gateway_results(gateway, limit=limit)
@@ -2977,6 +2989,7 @@ def build_signal_atlas_via_gateway(
                 persist_row(row)
                 ack_ids.append(lease_id)
             _ack_gateway_results(gateway, ack_ids)
+            enqueue_more()
             cycle_results += len(result_batch)
             if len(result_batch) < limit:
                 break

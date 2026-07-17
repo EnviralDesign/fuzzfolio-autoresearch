@@ -2258,6 +2258,145 @@ def test_historical_signal_gateway_worker_failure_fails_closed(
     assert not (tmp_path / "signal-atlas" / "signal-atlas.json").exists()
 
 
+def test_signal_atlas_drains_capped_batches_and_refills_between_batches(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    indicator_dir = tmp_path / "indicator-atlas"
+    indicator_dir.mkdir()
+    indicator_ids = [f"IND_{index:03d}" for index in range(130)]
+    (indicator_dir / "indicator-atlas.json").write_text(
+        json.dumps(
+            {
+                "indicators": [
+                    {
+                        "id": indicator_id,
+                        "signal_role": "trigger",
+                        "strategy_role": "trigger",
+                        "static_prior_score": 75.0,
+                        "static_prior_bucket": "candidate",
+                    }
+                    for indicator_id in indicator_ids
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "autoresearch.atlas_lab.load_indicator_catalog",
+        lambda **kwargs: (
+            {
+                "indicators": [
+                    {
+                        "meta": {"id": indicator_id},
+                        "config": {"label": indicator_id, "timeframe": "M1"},
+                    }
+                    for indicator_id in indicator_ids
+                ]
+            },
+            tmp_path,
+            tmp_path / "catalog.json",
+        ),
+    )
+
+    class ChunkRecordingSignalGateway:
+        def __init__(self) -> None:
+            self.gateway_id = "chunk-recording-signal-gateway"
+            self.results: list[dict[str, Any]] = []
+            self.events: list[str] = []
+            self.read_limits: list[int] = []
+            self.acked: list[str] = []
+            self._lease_counter = itertools.count(1)
+
+        def snapshot(self) -> dict[str, Any]:
+            return {
+                "gateway_id": self.gateway_id,
+                "worker_slots": 128,
+                "busy_slots": min(len(self.results), 128),
+                "queued_tasks": 0,
+                "result_backlog": len(self.results),
+                "metrics": {"results_dropped": 0},
+            }
+
+        def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+            self.events.append(f"enqueue:{len(tasks)}")
+            for task in tasks:
+                payload = task["payload"]
+                evidence_plan = payload.get("evidence_plan") or {}
+                self.results.append(
+                    {
+                        "task_id": task["task_id"],
+                        "lease_id": f"lease-{next(self._lease_counter)}",
+                        "status": "success",
+                        "result": {
+                            "status": "success",
+                            "result": {
+                                "raw": {
+                                    "data": {
+                                        "timestamp": [
+                                            "2026-01-01T00:00:00Z",
+                                            "2026-01-01T00:01:00Z",
+                                        ],
+                                        "close": [1.0, 1.1],
+                                        "high": [1.1, 1.2],
+                                        "low": [0.9, 1.0],
+                                        "long_score": [0.0, 1.0],
+                                        "short_score": [1.0, 0.0],
+                                    }
+                                },
+                                "execution_evidence": {
+                                    "plan_id": evidence_plan["plan_id"],
+                                    "profile_snapshot_sha256": evidence_plan["profile_snapshot_sha256"],
+                                    "execution_cell_sha256": evidence_plan["execution_cell_sha256"],
+                                    "observed_lake_manifest_sha256": evidence_plan["lake_manifest_sha256"],
+                                },
+                            },
+                        },
+                    }
+                )
+            return {"status": "accepted", "enqueued": len(tasks)}
+
+        def read_results(self, *, limit: int) -> list[dict[str, Any]]:
+            self.read_limits.append(limit)
+            self.events.append(f"read:{limit}")
+            batch = self.results[:limit]
+            self.results = self.results[limit:]
+            return batch
+
+        def ack_results(self, lease_ids: list[str]) -> int:
+            self.events.append(f"ack:{len(lease_ids)}")
+            self.acked.extend(lease_ids)
+            return len(lease_ids)
+
+    gateway = ChunkRecordingSignalGateway()
+    result = build_signal_atlas_via_gateway(
+        config,
+        indicator_atlas_dir=indicator_dir,
+        out_dir=tmp_path / "signal-atlas",
+        signal_role="trigger",
+        instruments=["EURUSD"],
+        timeframes=["M1"],
+        max_indicators=None,
+        gateway=gateway,
+        runtime=AtlasLabRuntimeConfig(
+            active_probes=128,
+            result_batch_size=250,
+            max_results_per_cycle=1000,
+            max_drain_seconds=0,
+            as_of_date="2026-07-14T00:00:00Z",
+            lake_manifest_sha256="sha256:" + "f" * 64,
+        ),
+        worker_contract_hash="contract123",
+    )
+
+    assert result.summary["result_counts"]["successful_calls"] == 130
+    assert max(gateway.read_limits) == 64
+    assert gateway.events[:4] == ["enqueue:128", "read:64", "ack:64", "enqueue:2"]
+    assert len(gateway.acked) == 130
+
+
 def test_run_probe_spec_via_gateway_reads_timing_queue_rows(
     tmp_path: Path,
     monkeypatch,
