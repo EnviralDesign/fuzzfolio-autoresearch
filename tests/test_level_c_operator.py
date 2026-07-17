@@ -14,11 +14,13 @@ from autoresearch.instrument_universe import universe_provenance
 from autoresearch.level_c_operator import (
     LevelCOperatorError,
     build_level_c_execution_plan,
+    build_profile_model_source_lock,
     create_level_c_execution_plan,
     executor_arguments_from_plan,
     load_level_c_execution_plan,
     validate_level_c_execution_plan,
     validate_executor_runtime_binding,
+    validate_profile_model_source_lock,
 )
 from autoresearch.atlas_lab import AtlasLabRuntimeConfig, run_atlas_lab
 from autoresearch.play_hand_lab import PlayHandLabRuntimeConfig, cmd_play_hand_lab
@@ -182,6 +184,7 @@ def test_builds_exact_declarative_arguments_from_one_cutoff(tmp_path: Path) -> N
     assert plan["playhand_arguments"]["strict_scoring"] is True
     assert plan["atlas_arguments"]["signal_atlas_executor"] == "gateway"
     assert plan["atlas_arguments"]["publish"] is False
+    assert plan["atlas_arguments"]["include_detail"] is True
     for arguments in (plan["atlas_arguments"], plan["playhand_arguments"]):
         assert arguments["source_snapshot_sha256"] == _hash("b")
         assert arguments["universe_id"] == universe_provenance()["universe_id"]
@@ -189,6 +192,9 @@ def test_builds_exact_declarative_arguments_from_one_cutoff(tmp_path: Path) -> N
     assert plan["bound_contract"]["runtime_policy_lock"]["policy_lock_sha256"].startswith(
         "sha256:"
     )
+    assert plan["bound_contract"]["profile_model_source_lock"][
+        "source_lock_sha256"
+    ].startswith("sha256:")
 
 
 def test_one_authoritative_plan_drives_atlas_and_playhand_executors(tmp_path: Path) -> None:
@@ -312,6 +318,7 @@ def test_runtime_binding_compares_every_plan_bound_field(tmp_path: Path) -> None
     [
         ("atlas", "signal_lookback_months", 12),
         ("atlas", "discovery_cluster_max_recipes", 999),
+        ("atlas", "include_detail", False),
         ("playhand", "validation_months", 24),
         ("playhand", "screen_anchor_mode", "now"),
     ],
@@ -331,6 +338,30 @@ def test_formal_runtime_rejects_research_semantic_mutations(
         observed["phases"] = loaded["atlas_phases"]
     with pytest.raises(LevelCOperatorError, match=field):
         validate_executor_runtime_binding(plan_path, executor=executor, observed=observed)
+
+
+def test_profile_model_source_lock_rejects_changed_or_unexpected_root(tmp_path: Path) -> None:
+    config = load_config()
+    source_root = Path(
+        config.fuzzfolio.workspace_root or config.repo_root.parent / "Trading-Dashboard"
+    )
+    expected = build_profile_model_source_lock(source_root)
+    assert validate_profile_model_source_lock(expected, source_root) == expected
+
+    alternate = tmp_path / "Trading-Dashboard"
+    for relative in expected["source_files"]:
+        source = source_root / relative
+        target = alternate / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+    assert validate_profile_model_source_lock(expected, alternate) == expected
+
+    changed = alternate / next(iter(expected["source_files"]))
+    changed.write_text(changed.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
+    with pytest.raises(LevelCOperatorError, match="differs"):
+        validate_profile_model_source_lock(expected, alternate)
+    with pytest.raises(LevelCOperatorError, match="missing"):
+        validate_profile_model_source_lock(expected, tmp_path / "unexpected-root")
 
 
 @pytest.mark.parametrize("field", [

@@ -348,6 +348,7 @@ def test_cmd_play_hand_lab_uses_explicit_historical_campaign_id_for_exact_path(
             {"generation": {"active_runs_root": str(fake_config.runs_root)}},
         ),
     )
+    monkeypatch.setattr(lab, "validate_profile_model_source_lock", lambda *_args, **_kwargs: {})
     monkeypatch.setattr(lab, "_write_campaign_metadata", stop_after_metadata)
 
     with pytest.raises(StopAfterCampaignSetup):

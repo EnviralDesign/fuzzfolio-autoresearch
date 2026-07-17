@@ -38,7 +38,11 @@ from .ledger import (
     write_attempts,
     write_run_metadata,
 )
-from .level_c_operator import validate_executor_runtime_binding
+from .level_c_operator import (
+    PROFILE_MODEL_SOURCE_FILES,
+    validate_executor_runtime_binding,
+    validate_profile_model_source_lock,
+)
 from .play_hand import (
     DEFAULT_INSTRUMENT_POOL,
     INSTRUMENT_SCOUT_DEFAULT_MAX_SELECTED,
@@ -1154,9 +1158,26 @@ def _load_fuzzfolio_profile_models(
     root = _ensure_trading_dashboard_python_paths(config=config, runtime=runtime)
     shared_python = root / "shared" / "python"
     try:
+        from fuzzfolio_core.models import common as common_module
+        from fuzzfolio_core.models import indicator as indicator_module
+        from fuzzfolio_core.models import scoringprofile as scoringprofile_module
         from fuzzfolio_core.models.scoringprofile import ScoringProfile, StoredScoringProfile
     except Exception as exc:
         raise RuntimeError(f"Could not load FuzzFolio profile models from {shared_python}: {exc}") from exc
+    loaded_modules = {
+        "common.py": common_module,
+        "indicator.py": indicator_module,
+        "scoringprofile.py": scoringprofile_module,
+    }
+    for relative in PROFILE_MODEL_SOURCE_FILES:
+        expected_path = (root / relative).resolve(strict=False)
+        module = loaded_modules[expected_path.name]
+        observed_path = Path(str(getattr(module, "__file__", ""))).resolve(strict=False)
+        if observed_path != expected_path:
+            raise RuntimeError(
+                f"Loaded FuzzFolio profile model source mismatch: expected {expected_path}, "
+                f"observed {observed_path}"
+            )
     return ScoringProfile, StoredScoringProfile
 
 
@@ -5103,6 +5124,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         ).resolve(strict=False)
         if config.runs_root.resolve(strict=False) != authoritative_root:
             raise ValueError("Historical PlayHand config runs_root conflicts with authoritative execution plan.")
+        bound_contract = authoritative_plan.get("bound_contract") or {}
+        validate_profile_model_source_lock(
+            bound_contract.get("profile_model_source_lock") or {},
+            _trading_dashboard_root(config=config, runtime=runtime),
+        )
     cli = FuzzfolioCli(config.fuzzfolio)
     gateway = LabGatewayClient(base_url=runtime.gateway_url, token=runtime.gateway_token)
     worker_contract_hash = (

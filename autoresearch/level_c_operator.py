@@ -37,7 +37,13 @@ from .runtime_policy_lock import (
 )
 
 
-LEVEL_C_EXECUTION_PLAN_SCHEMA = "autoresearch-level-c-execution-plan-v1"
+LEVEL_C_EXECUTION_PLAN_SCHEMA = "autoresearch-level-c-execution-plan-v2"
+PROFILE_MODEL_SOURCE_LOCK_SCHEMA = "fuzzfolio-profile-model-source-lock-v1"
+PROFILE_MODEL_SOURCE_FILES = (
+    "shared/python/fuzzfolio_core/fuzzfolio_core/models/common.py",
+    "shared/python/fuzzfolio_core/fuzzfolio_core/models/indicator.py",
+    "shared/python/fuzzfolio_core/fuzzfolio_core/models/scoringprofile.py",
+)
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _CUTOFF_KEYS = frozenset({"A", "B", "C", "D"})
@@ -80,7 +86,6 @@ _ATLAS_OPERATIONAL_ARGUMENTS = frozenset(
         "enqueue_chunk_size",
         "gateway_token",
         "gateway_url",
-        "include_detail",
         "json_output",
         "log_interval_seconds",
         "max_attempts",
@@ -140,6 +145,47 @@ def _semantic_arguments(values: Mapping[str, Any], *, executor: str) -> dict[str
         for key, value in sorted(values.items())
         if key not in operational
     }
+
+
+def _configured_trading_dashboard_root(config: Any) -> Path:
+    fuzzfolio = getattr(config, "fuzzfolio", None)
+    configured = getattr(fuzzfolio, "workspace_root", None)
+    if configured:
+        return Path(configured).expanduser().resolve(strict=False)
+    repo_root = Path(getattr(config, "repo_root")).resolve(strict=False)
+    return (repo_root.parent / "Trading-Dashboard").resolve(strict=False)
+
+
+def build_profile_model_source_lock(root: Path | str) -> dict[str, Any]:
+    source_root = Path(root).expanduser().resolve(strict=False)
+    files: dict[str, str] = {}
+    for relative in PROFILE_MODEL_SOURCE_FILES:
+        path = source_root / Path(relative)
+        if not path.is_file():
+            raise LevelCOperatorError(f"profile-model source file is missing: {path}")
+        files[relative] = _sha256_bytes(path.read_bytes())
+    payload: dict[str, Any] = {
+        "schema_version": PROFILE_MODEL_SOURCE_LOCK_SCHEMA,
+        "source_files": files,
+    }
+    payload["source_lock_sha256"] = canonical_sha256(payload)
+    return payload
+
+
+def validate_profile_model_source_lock(
+    expected: Mapping[str, Any], root: Path | str
+) -> dict[str, Any]:
+    supplied = dict(expected)
+    if supplied.get("schema_version") != PROFILE_MODEL_SOURCE_LOCK_SCHEMA:
+        raise LevelCOperatorError("profile-model source lock schema mismatch")
+    expected_identity = str(supplied.pop("source_lock_sha256", ""))
+    if expected_identity != canonical_sha256(supplied):
+        raise LevelCOperatorError("profile-model source lock identity mismatch")
+    supplied["source_lock_sha256"] = expected_identity
+    live = build_profile_model_source_lock(root)
+    if live != supplied:
+        raise LevelCOperatorError("live profile-model source differs from the frozen execution plan")
+    return live
 
 
 class LevelCOperatorError(RuntimeError):
@@ -321,9 +367,13 @@ def build_level_c_execution_plan(
         protocol_path, expected_manifest_id=authority["protocol_manifest_id"]
     )
     _validate_protocol_binding(protocol, generation, generation_sha256)
+    runtime_config = load_config()
     runtime_policy_lock = build_runtime_policy_lock(
-        load_config(),
+        runtime_config,
         worker_contract_sha256=str(protocol["worker_contract_sha256"]),
+    )
+    profile_model_source_lock = build_profile_model_source_lock(
+        _configured_trading_dashboard_root(runtime_config)
     )
     live_policy_identities = policy_lock_provenance(runtime_policy_lock)
     mismatched_policies = [
@@ -429,6 +479,7 @@ def build_level_c_execution_plan(
             "no_global_priors": True,
             "no_outer_feedback": True,
             "runtime_policy_lock": runtime_policy_lock,
+            "profile_model_source_lock": profile_model_source_lock,
         },
         "atlas_arguments": _semantic_arguments(atlas_values, executor="atlas"),
         "atlas_phases": ["full"],
