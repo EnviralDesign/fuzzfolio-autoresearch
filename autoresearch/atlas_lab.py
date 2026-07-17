@@ -471,6 +471,7 @@ class ProbeState:
     replay_request: dict[str, Any]
     aggregate_task_id: str
     detail_task_id: str | None = None
+    detail_result_received: bool = False
     score: AttemptScore | None = None
     snapshot: dict[str, Any] | None = None
     execution_evidence: dict[str, Any] | None = None
@@ -1191,6 +1192,14 @@ def make_deep_replay_task(
     }
 
 
+def _detail_task_id_for_state(state: ProbeState) -> str:
+    return (
+        f"{state.aggregate_task_id.removesuffix('-aggregate')}-detail"
+        if state.aggregate_task_id
+        else f"{state.probe_id}-detail"
+    )
+
+
 def _best_cell_from_snapshot(snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(snapshot, dict):
         return None
@@ -1216,11 +1225,7 @@ def make_deep_replay_detail_task(
     reward = _safe_float(cell.get("reward_multiple"))
     if stop_loss is None or reward is None:
         return None
-    task_id = (
-        f"{state.aggregate_task_id.removesuffix('-aggregate')}-detail"
-        if state.aggregate_task_id
-        else f"{state.probe_id}-detail"
-    )
+    task_id = _detail_task_id_for_state(state)
     state.detail_task_id = task_id
     request = {
         **state.replay_request,
@@ -1731,6 +1736,15 @@ def _raise_historical_probe_failure(
     )
 
 
+def _gateway_result_sort_key(lab_result: dict[str, Any]) -> tuple[int, str]:
+    task_id = str(lab_result.get("task_id") or "")
+    if task_id.endswith("-aggregate"):
+        return (0, task_id)
+    if task_id.endswith("-detail"):
+        return (1, task_id)
+    return (2, task_id)
+
+
 def _validate_historical_probe_summary(
     *,
     spec: ProbeRunSpec,
@@ -2045,6 +2059,9 @@ def run_probe_spec_via_gateway(
                 continue
             active[state.probe_id] = state
             task_to_probe[state.aggregate_task_id] = state
+            if runtime.include_detail:
+                state.detail_task_id = _detail_task_id_for_state(state)
+                task_to_probe[state.detail_task_id] = state
             chunk.append(make_deep_replay_task(state=state, runtime=runtime))
         _enqueue_gateway_tasks_with_retries(gateway, chunk, allow_preserved_results=True)
 
@@ -2060,12 +2077,19 @@ def run_probe_spec_via_gateway(
             result_batch = _read_gateway_results(gateway, limit=limit)
             if not result_batch:
                 break
+            result_batch.sort(key=_gateway_result_sort_key)
+            result_task_ids = {str(result.get("task_id") or "") for result in result_batch}
             ack_ids: list[str] = []
             for lab_result in result_batch:
                 task_id = str(lab_result.get("task_id") or "")
                 state = task_to_probe.get(task_id)
                 lease_id = str(lab_result.get("lease_id") or "")
                 if state is None:
+                    if runtime.as_of_date:
+                        raise RuntimeError(
+                            f"Historical {spec.kind} Atlas received unbound gateway result for {task_id!r}; "
+                            "refusing to ack without a matching deterministic probe task."
+                        )
                     ack_ids.append(lease_id)
                     continue
                 try:
@@ -2124,14 +2148,21 @@ def run_probe_spec_via_gateway(
                                 raise RuntimeError("Atlas aggregate did not produce a detail-capable best cell.")
                             persist_finished(state, status="ok")
                             release_state(state)
+                        elif state.detail_result_received or (state.output_dir / "best-cell-path-detail.json").exists():
+                            persist_finished(state, status="ok")
+                            release_state(state)
+                        elif detail_task["task_id"] in result_task_ids:
+                            release_aggregate_task(state)
                         else:
                             task_to_probe[detail_task["task_id"]] = state
                             _enqueue_gateway_tasks_with_retries(gateway, [detail_task])
                             release_aggregate_task(state)
                     elif task_id == state.detail_task_id:
                         _materialize_detail_result(state=state, lab_result=lab_result)
-                        persist_finished(state, status="ok")
-                        release_state(state)
+                        state.detail_result_received = True
+                        if state.snapshot is not None:
+                            persist_finished(state, status="ok")
+                            release_state(state)
                     ack_ids.append(lease_id)
                 except Exception as exc:
                     if runtime.as_of_date:

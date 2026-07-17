@@ -850,6 +850,89 @@ class PreservedNoSignalAggregateGateway(NoSignalAggregateSuccessGateway):
         }
 
 
+class PreservedAggregateAndDetailGateway(FakeGateway):
+    def snapshot(self) -> dict[str, Any]:
+        payload = super().snapshot()
+        payload["metrics"] = {"results_dropped": 0, "duplicate_task_enqueues": len(self.enqueued_tasks)}
+        return payload
+
+    def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        self.enqueued_tasks.extend(tasks)
+        if not self.results:
+            for task in tasks:
+                payload = task["payload"]
+                evidence_plan = payload.get("evidence_plan") or {}
+                execution_evidence = {
+                    "plan_id": evidence_plan["plan_id"],
+                    "profile_snapshot_sha256": evidence_plan["profile_snapshot_sha256"],
+                    "execution_cell_sha256": evidence_plan["execution_cell_sha256"],
+                    "observed_lake_manifest_sha256": evidence_plan["lake_manifest_sha256"],
+                }
+                detail_task_id = task["task_id"].removesuffix("-aggregate") + "-detail"
+                self.results.append(
+                    {
+                        "task_id": detail_task_id,
+                        "lease_id": f"lease-{next(self._lease_counter)}",
+                        "worker_id": "preserved-worker",
+                        "lane_id": task["lane_id"],
+                        "attempt_id": task["attempt_id"],
+                        "status": "success",
+                        "result": {
+                            "status": "success",
+                            "result": {
+                                "cell_detail": {
+                                    "basis": "selected_cell_detail",
+                                    "stop_loss_percent": 0.02,
+                                    "reward_multiple": 2.0,
+                                    "points": [],
+                                }
+                            },
+                        },
+                    }
+                )
+                self.results.append(
+                    {
+                        "task_id": task["task_id"],
+                        "lease_id": f"lease-{next(self._lease_counter)}",
+                        "worker_id": "preserved-worker",
+                        "lane_id": task["lane_id"],
+                        "attempt_id": task["attempt_id"],
+                        "status": "success",
+                        "result": {
+                            "status": "success",
+                            "request": payload,
+                            "execution_evidence": execution_evidence,
+                            "result": {
+                                "aggregate": {
+                                    "score_lab": {
+                                        "version": "score_lab_v2_5_3",
+                                        "score": 72.5,
+                                        "combiner": "canonical",
+                                    },
+                                    "quality_score": {"score": 72.5},
+                                    "best_cell": {
+                                        "stop_loss_percent": 0.02,
+                                        "reward_multiple": 2.0,
+                                        "avg_net_r_per_closed_trade": 0.4,
+                                        "resolved_trades": 18,
+                                        "win_rate": 0.61,
+                                        "profit_factor": 1.8,
+                                    },
+                                    "behavior_summary": {"signal_count": 44},
+                                }
+                            },
+                        },
+                    }
+                )
+        return {
+            "status": "accepted",
+            "submitted": len(tasks),
+            "accepted": 0,
+            "enqueued": 0,
+            "rejected": len(tasks),
+        }
+
+
 class MixedNoBestAggregateSuccessGateway(NoSignalAggregateSuccessGateway):
     def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
         self.enqueued_tasks.extend(tasks)
@@ -1261,6 +1344,59 @@ def test_historical_probe_resume_accepts_preserved_duplicate_aggregate_result(
     rows = list(csv.DictReader((source_dir / "anchor-pair-probe-results.csv").open(encoding="utf-8")))
     assert rows[0]["terminal_outcome"] == "no_valid_cell"
     assert gateway.acked == ["lease-1"]
+
+
+def test_historical_probe_resume_binds_preserved_detail_result_before_aggregate(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    source_dir, result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+
+    def fake_score_artifact(self, artifact_dir: Path) -> dict[str, Any]:
+        return {
+            "best": {
+                "score_lab": {
+                    "version": "score_lab_v2_5_3",
+                    "score": 72.5,
+                    "combiner": "canonical",
+                },
+                "trades": 18,
+            }
+        }
+
+    monkeypatch.setattr(FuzzfolioCli, "score_artifact", fake_score_artifact)
+
+    gateway = PreservedAggregateAndDetailGateway()
+    outcome = run_probe_spec_via_gateway(
+        config,
+        spec=ProbeRunSpec(
+            kind="anchor_pair",
+            source_dir=source_dir,
+            atlas_filename="anchor-pair-atlas.json",
+            results_filename="anchor-pair-probe-results.csv",
+            summary_filename="anchor-pair-probe-summary.json",
+            manifest_schema="anchor_pair_run_manifest_v1",
+            result_fieldnames=_probe_results_fieldnames,
+            row_builder=_result_row_from_score,
+        ),
+        gateway=gateway,
+        runtime=AtlasLabRuntimeConfig(
+            active_probes=1,
+            result_batch_size=10,
+            as_of_date="2025-06-30T00:00:00Z",
+            lake_manifest_sha256="sha256:" + "e" * 64,
+        ),
+        worker_contract_hash="contract123",
+    )
+
+    assert outcome.summary["result_counts"]["status_counts"] == {"ok": 1}
+    rows = list(csv.DictReader((source_dir / "anchor-pair-probe-results.csv").open(encoding="utf-8")))
+    assert len(rows) == 1
+    assert rows[0]["status"] == "ok"
+    assert (result_dir / "best-cell-path-detail.json").exists()
+    assert gateway.acked == ["lease-2", "lease-1"]
+    assert [task["task_kind"] for task in gateway.enqueued_tasks] == ["deep_replay"]
 
 
 def test_historical_probe_missing_best_cell_without_terminal_fails_closed(
