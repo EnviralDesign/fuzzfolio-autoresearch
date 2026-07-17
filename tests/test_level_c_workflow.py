@@ -262,8 +262,11 @@ def _archive_generation_cutover(
     *,
     archive_id: str,
     new_generation_id: str,
+    prior_generation_id: str | None = None,
 ) -> dict[str, object]:
     provenance: dict[str, object] = {"actor": "level-c-workflow-test"}
+    if prior_generation_id is not None:
+        provenance["prior_generation_id"] = prior_generation_id
     preview = service.dry_run(archive_id, new_generation_id, provenance=provenance)
     marker = tmp_path / f"{archive_id}.quiesced.json"
     marker.write_text(
@@ -323,13 +326,18 @@ def test_bootstrap_accepts_archive_generation_handoff_state(
 ) -> None:
     config, active, _, arguments, _ = _bootstrap_fixture(tmp_path, monkeypatch)
     archive_id = "rejected-level-c-v1-worker-contract-20260717"
+    prior_generation_id = str(arguments["new_generation_id"])
+    successor_generation_id = "level-c-generation-002"
 
     _archive_generation_cutover(
         GenerationArchiveService(active),
         tmp_path,
         archive_id=archive_id,
-        new_generation_id=str(arguments["new_generation_id"]),
+        new_generation_id=successor_generation_id,
+        prior_generation_id=prior_generation_id,
     )
+    arguments = dict(arguments)
+    arguments["new_generation_id"] = successor_generation_id
 
     handoff_manifest = json.loads(
         (active / "generation-manifest.json").read_text(encoding="utf-8")
@@ -344,9 +352,13 @@ def test_bootstrap_accepts_archive_generation_handoff_state(
 
     assert "bootstrap_id" in result
     assert generation["new_generation_id"] == arguments["new_generation_id"]
+    assert generation["archive_generation_handoff"]["prior_generation_id"] == prior_generation_id
+    assert generation["archive_generation_handoff"]["successor_generation_id"] == successor_generation_id
     assert generation["archive_generation_handoff"]["archive_linkage"]["archive_id"] == archive_id
     assert generation["archive_generation_handoff"]["provenance"]["actor"] == "level-c-workflow-test"
-    assert audit_level_c(config=config, active_runs_root=active)["status"] == "valid"
+    audit = audit_level_c(config=config, active_runs_root=active)
+    assert audit["status"] == "valid"
+    assert audit["archive_generation_handoff"]["prior_generation_id"] == prior_generation_id
 
 
 def test_bootstrap_rejects_invalid_archive_generation_handoff_state(
@@ -354,12 +366,17 @@ def test_bootstrap_rejects_invalid_archive_generation_handoff_state(
 ) -> None:
     _, active, _, arguments, _ = _bootstrap_fixture(tmp_path, monkeypatch)
     archive_id = "rejected-level-c-v1-worker-contract-20260717"
+    prior_generation_id = str(arguments["new_generation_id"])
+    successor_generation_id = "level-c-generation-002"
     _archive_generation_cutover(
         GenerationArchiveService(active),
         tmp_path,
         archive_id=archive_id,
-        new_generation_id=str(arguments["new_generation_id"]),
+        new_generation_id=successor_generation_id,
+        prior_generation_id=prior_generation_id,
     )
+    arguments = dict(arguments)
+    arguments["new_generation_id"] = successor_generation_id
     generation_path = active / "generation-manifest.json"
     original = json.loads(generation_path.read_text(encoding="utf-8"))
 
@@ -374,6 +391,22 @@ def test_bootstrap_rejects_invalid_archive_generation_handoff_state(
     no_linkage.pop("archive_linkage")
     generation_path.write_text(json.dumps(no_linkage, sort_keys=True), encoding="utf-8")
     with pytest.raises(LevelCWorkflowError, match="archive_linkage"):
+        bootstrap_level_c(**arguments)
+
+    generation_path.write_text(json.dumps(original, sort_keys=True), encoding="utf-8")
+    no_prior = dict(original)
+    no_prior["provenance"] = dict(no_prior["provenance"])
+    no_prior["provenance"].pop("prior_generation_id")
+    generation_path.write_text(json.dumps(no_prior, sort_keys=True), encoding="utf-8")
+    with pytest.raises(LevelCWorkflowError, match="prior_generation_id"):
+        bootstrap_level_c(**arguments)
+
+    generation_path.write_text(json.dumps(original, sort_keys=True), encoding="utf-8")
+    wrong_prior = dict(original)
+    wrong_prior["provenance"] = dict(wrong_prior["provenance"])
+    wrong_prior["provenance"]["prior_generation_id"] = "level-c-other"
+    generation_path.write_text(json.dumps(wrong_prior, sort_keys=True), encoding="utf-8")
+    with pytest.raises(LevelCWorkflowError, match="prior_generation_id"):
         bootstrap_level_c(**arguments)
 
     generation_path.write_text(json.dumps(original, sort_keys=True), encoding="utf-8")
@@ -429,6 +462,14 @@ def test_bootstrap_rejects_semantic_controls_catalog_and_report_mismatches(
     )
     with pytest.raises(LevelCWorkflowError, match="archive context"):
         bootstrap_level_c(**context_args)
+
+    _, _, _, generation_args, _ = _bootstrap_fixture(tmp_path / "generation-context", monkeypatch)
+    _rewrite_controls(
+        generation_args,
+        lambda identity: identity["archive_context"].update({"new_research_generation_id": "level-c-v2"}),
+    )
+    with pytest.raises(LevelCWorkflowError, match="archive context"):
+        bootstrap_level_c(**generation_args)
 
     _, _, _, exclusion_args, _ = _bootstrap_fixture(tmp_path / "exclusion", monkeypatch)
     _rewrite_controls(

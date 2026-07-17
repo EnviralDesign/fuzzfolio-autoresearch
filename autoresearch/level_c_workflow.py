@@ -10,6 +10,7 @@ import hashlib
 import argparse
 import json
 import os
+import re
 import sqlite3
 import tempfile
 from dataclasses import fields
@@ -53,6 +54,7 @@ STAGE_RECEIPT_SCHEMA = "autoresearch-level-c-stage-receipt-v1"
 DEVELOPMENT_POLICY_SCHEMA = "autoresearch-level-c-development-policy-v1"
 AUDIT_SCHEMA = "autoresearch-level-c-audit-v1"
 CONTROL_RELATIVE = Path("derived") / "level-c" / "control"
+_GENERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 STAGES = (
     "atlas",
     "playhand",
@@ -80,6 +82,13 @@ class LevelCWorkflowError(RuntimeError):
 
 def _sha256_bytes(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
+def _require_generation_id(value: Any, *, label: str) -> str:
+    token = str(value or "").strip()
+    if not _GENERATION_ID_RE.fullmatch(token):
+        raise LevelCWorkflowError(f"{label} must be a safe non-empty generation identity")
+    return token
 
 
 def _file_sha256(path: Path) -> str:
@@ -266,10 +275,38 @@ def _archive_generation_handoff(active_root: Path, new_generation_id: str) -> di
         raise LevelCWorkflowError("archive-generation handoff archive manifest conflicts with linkage")
     if manifest.get("source_runs_root") != linkage.get("archived_runs_root"):
         raise LevelCWorkflowError("archive-generation handoff source root conflicts with linkage")
+    provenance = dict(manifest.get("provenance") or {})
+    prior_generation_id = _require_generation_id(
+        provenance.get("prior_generation_id"),
+        label="archive-generation handoff prior_generation_id",
+    )
+    if prior_generation_id == str(new_generation_id):
+        raise LevelCWorkflowError("archive-generation handoff prior_generation_id must differ from successor generation")
+    archive_provenance = archive_manifest.get("provenance")
+    if not isinstance(archive_provenance, Mapping) or archive_provenance.get("prior_generation_id") != prior_generation_id:
+        raise LevelCWorkflowError("archive-generation handoff prior_generation_id conflicts with archive manifest")
+    archived_root = Path(str(linkage.get("archived_runs_root") or "")).expanduser().resolve(strict=True)
+    archived_generation_path = archived_root / GENERATION_MANIFEST_NAME
+    if not archived_generation_path.is_file() or archived_generation_path.is_symlink():
+        raise LevelCWorkflowError("archive-generation handoff archived prior generation manifest is missing")
+    archived_generation = _load_json(
+        archived_generation_path, label="archive-generation archived prior generation manifest"
+    )
+    if archived_generation.get("new_generation_id") != prior_generation_id:
+        raise LevelCWorkflowError("archive-generation handoff archive does not prove the prior generation")
+    inventory_generation = (
+        archive_manifest.get("verified_archived_inventory", {})
+        .get("critical_artifacts", {})
+        .get(GENERATION_MANIFEST_NAME)
+    )
+    if not isinstance(inventory_generation, Mapping) or inventory_generation.get("sha256") != _file_sha256(archived_generation_path).split(":", 1)[1]:
+        raise LevelCWorkflowError("archive-generation handoff archived prior generation hash is not verified")
     return {
         "manifest_sha256": _sha256_bytes(raw),
         "archive_linkage": dict(linkage),
-        "provenance": dict(manifest.get("provenance") or {}),
+        "prior_generation_id": prior_generation_id,
+        "successor_generation_id": str(new_generation_id),
+        "provenance": provenance,
     }
 
 
@@ -388,7 +425,7 @@ def _validate_legacy_controls(
     path: Path,
     archive_root: Path,
     archive_id: str,
-    new_generation_id: str,
+    controls_generation_id: str,
     catalog_path: Path,
     catalog_sha256: str,
     nested_report_path: Path,
@@ -404,6 +441,9 @@ def _validate_legacy_controls(
         or not isinstance(integrity, dict)
     ):
         raise LevelCWorkflowError("legacy controls schema is invalid")
+    controls_generation_id = _require_generation_id(
+        controls_generation_id, label="legacy controls expected generation"
+    )
     identity_hash = _sha256_bytes(
         json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
     )
@@ -421,7 +461,7 @@ def _validate_legacy_controls(
     )
     if (
         context.get("archive_id") != archive_id
-        or context.get("new_research_generation_id") != new_generation_id
+        or context.get("new_research_generation_id") != controls_generation_id
         or projected_root != archive_root
         or context.get("archive_relative_base") != archive_root.name
         or context.get("reference_only") is not True
@@ -641,11 +681,14 @@ def bootstrap_level_c(
     if controls_observed_hash != controls_expected_hash:
         raise LevelCWorkflowError("legacy_controls hash mismatch")
     controls_payload = _load_json(controls_path, label="legacy controls")
+    controls_generation_id = str(new_generation_id)
+    if archive_generation_handoff is not None:
+        controls_generation_id = str(archive_generation_handoff["prior_generation_id"])
     controls_validation = _validate_legacy_controls(
         path=controls_path,
         archive_root=archive,
         archive_id=str(archive_id),
-        new_generation_id=str(new_generation_id),
+        controls_generation_id=controls_generation_id,
         catalog_path=archived_attempt_catalog,
         catalog_sha256=verified["archived_attempt_catalog"]["sha256"],
         nested_report_path=completed_nested_report,
@@ -1318,6 +1361,7 @@ def audit_level_c(
     generation_path = active_root / GENERATION_MANIFEST_NAME
     if _file_sha256(generation_path) != bootstrap.get("generation_manifest_sha256"):
         raise LevelCWorkflowError("generation manifest drift")
+    generation_manifest = _load_json(generation_path, label="generation manifest")
     protocol = load_level_c_protocol(paths["protocol"])
     authority = load_level_c_protocol_authority(
         paths["authority"], generation_manifest_path=generation_path, protocol_path=paths["protocol"]
@@ -1423,6 +1467,8 @@ def audit_level_c(
         "development_policy_sha256": policy_result,
         "no_validation_feedback": True,
     }
+    if "archive_generation_handoff" in generation_manifest:
+        identity["archive_generation_handoff"] = generation_manifest["archive_generation_handoff"]
     return {**identity, "audit_sha256": canonical_sha256(identity)}
 
 
