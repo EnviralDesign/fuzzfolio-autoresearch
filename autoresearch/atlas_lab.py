@@ -1412,6 +1412,43 @@ def _positive_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) > 0.0
 
 
+def _numeric_nonpositive(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) <= 0.0
+
+
+def _validate_probe_execution_evidence(
+    *,
+    receipt: Any,
+    expected_plan: dict[str, Any],
+    context: str,
+) -> dict[str, Any] | None:
+    if not expected_plan.get("lake_manifest_sha256"):
+        return None
+    if not isinstance(receipt, dict):
+        raise RuntimeError(f"Historical Atlas {context} omitted execution_evidence")
+    expected_receipt = {
+        "plan_id": expected_plan.get("plan_id"),
+        "profile_snapshot_sha256": expected_plan.get("profile_snapshot_sha256"),
+        "execution_cell_sha256": expected_plan.get("execution_cell_sha256"),
+        "observed_lake_manifest_sha256": expected_plan.get("lake_manifest_sha256"),
+    }
+    for key, value in expected_receipt.items():
+        if receipt.get(key) != value:
+            raise RuntimeError(
+                f"Historical Atlas {context} receipt {key} mismatch: "
+                f"expected {value!r}, observed {receipt.get(key)!r}"
+            )
+    return dict(receipt)
+
+
+def _matrix_cells_from_aggregate(aggregate: dict[str, Any]) -> list[dict[str, Any]]:
+    matrix = aggregate.get("matrix")
+    rows = matrix.get("rows") if isinstance(matrix, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return []
+    return [cell for row in rows if isinstance(row, list) for cell in row if isinstance(cell, dict)]
+
+
 def _validated_no_signal_aggregate_for_probe(
     *,
     result_payload: dict[str, Any],
@@ -1432,11 +1469,7 @@ def _validated_no_signal_aggregate_for_probe(
     if not (_positive_number(loaded_bar_count) or _positive_number(filtered_bar_count)):
         return None
 
-    matrix = aggregate.get("matrix")
-    rows = matrix.get("rows") if isinstance(matrix, dict) else None
-    if not isinstance(rows, list) or not rows:
-        return None
-    cells = [cell for row in rows if isinstance(row, list) for cell in row if isinstance(cell, dict)]
+    cells = _matrix_cells_from_aggregate(aggregate)
     if not cells:
         return None
     zero_fields = ("total_signals", "resolved_trades", "unresolved", "wins", "losses")
@@ -1457,29 +1490,136 @@ def _validated_no_signal_aggregate_for_probe(
 
     expected_plan = state.replay_request.get("evidence_plan")
     expected_plan = expected_plan if isinstance(expected_plan, dict) else {}
-    receipt = result_payload.get("execution_evidence")
-    if expected_plan.get("lake_manifest_sha256"):
-        if not isinstance(receipt, dict):
-            raise RuntimeError("Historical Atlas no-signal aggregate omitted execution_evidence")
-        expected_receipt = {
-            "plan_id": expected_plan.get("plan_id"),
-            "profile_snapshot_sha256": expected_plan.get("profile_snapshot_sha256"),
-            "execution_cell_sha256": expected_plan.get("execution_cell_sha256"),
-            "observed_lake_manifest_sha256": expected_plan.get("lake_manifest_sha256"),
-        }
-        for key, value in expected_receipt.items():
-            if receipt.get(key) != value:
-                raise RuntimeError(
-                    f"Historical Atlas no-signal aggregate receipt {key} mismatch: "
-                    f"expected {value!r}, observed {receipt.get(key)!r}"
-                )
-        state.execution_evidence = dict(receipt)
+    receipt = _validate_probe_execution_evidence(
+        receipt=result_payload.get("execution_evidence"),
+        expected_plan=expected_plan,
+        context="no-signal aggregate",
+    )
+    if receipt is not None:
+        state.execution_evidence = receipt
 
     diagnostics = {
         "reason": "aggregate_no_signal",
         "signal_count": aggregate.get("signal_count"),
         "resolved_trade_count_max": aggregate.get("resolved_trade_count_max"),
         "matrix_cell_count": len(cells),
+        "market_data_window": market_data_window,
+        "behavior_summary": {
+            key: behavior.get(key)
+            for key in (
+                "bars_with_signal_count",
+                "long_signal_count",
+                "short_signal_count",
+                "signal_density",
+                "signal_coverage_ratio",
+            )
+            if key in behavior
+        },
+    }
+    state.terminal_outcome = {
+        "schema": "fuzzfolio-replay-terminal-result-v1",
+        "status": "nonviable",
+        "outcome": "no_valid_cell",
+        "diagnostics": diagnostics,
+    }
+    state.error = None
+    return state.terminal_outcome
+
+
+def _validated_no_positive_cell_aggregate_for_probe(
+    *,
+    result_payload: dict[str, Any],
+    state: ProbeState,
+) -> dict[str, Any] | None:
+    """Classify a no-best aggregate as nonviable only when every matrix cell is nonpositive."""
+
+    nested = result_payload.get("result") if isinstance(result_payload.get("result"), dict) else {}
+    aggregate = nested.get("aggregate") if isinstance(nested.get("aggregate"), dict) else {}
+    if not aggregate or aggregate.get("best_cell") or aggregate.get("recommended_cell"):
+        return None
+
+    market_data_window = aggregate.get("market_data_window")
+    if not isinstance(market_data_window, dict):
+        return None
+    loaded_bar_count = market_data_window.get("loaded_bar_count")
+    filtered_bar_count = market_data_window.get("filtered_bar_count")
+    if not (_positive_number(loaded_bar_count) or _positive_number(filtered_bar_count)):
+        return None
+
+    cells = _matrix_cells_from_aggregate(aggregate)
+    if not cells:
+        return None
+    if not _positive_number(aggregate.get("signal_count")):
+        return None
+    if not _positive_number(aggregate.get("resolved_trade_count_max")):
+        return None
+    if any(not _numeric_zero(cell.get("unresolved")) for cell in cells):
+        return None
+    if not any(_positive_number(cell.get("resolved_trades")) for cell in cells):
+        return None
+    for cell in cells:
+        resolved_trades = cell.get("resolved_trades")
+        if _positive_number(resolved_trades):
+            expectancy = cell.get("avg_net_r_per_closed_trade")
+            if not _numeric_nonpositive(expectancy):
+                return None
+
+    matrix_summary = aggregate.get("matrix_summary")
+    if not isinstance(matrix_summary, dict):
+        return None
+    total_cell_count = matrix_summary.get("total_cell_count")
+    if total_cell_count is not None and int(float(total_cell_count)) != len(cells):
+        return None
+    if not _numeric_zero(matrix_summary.get("positive_cell_count")):
+        return None
+    if not _numeric_zero(matrix_summary.get("positive_cell_ratio")):
+        return None
+    row_positive_counts = matrix_summary.get("row_positive_counts")
+    if not isinstance(row_positive_counts, list) or any(not _numeric_zero(value) for value in row_positive_counts):
+        return None
+    reward_summaries = matrix_summary.get("reward_column_summaries")
+    if isinstance(reward_summaries, list):
+        for summary in reward_summaries:
+            if isinstance(summary, dict) and not _numeric_zero(summary.get("positive_row_ratio")):
+                return None
+    for summary_key in ("normal_r_best_cell", "robust_cell"):
+        summary_cell = matrix_summary.get(summary_key)
+        if isinstance(summary_cell, dict):
+            if not _numeric_nonpositive(summary_cell.get("avg_net_r_per_closed_trade")):
+                return None
+            for positive_key in (
+                "positive_instrument_count",
+                "positive_neighbor_count",
+                "neighborhood_positive_count",
+            ):
+                if not _numeric_zero(summary_cell.get(positive_key)):
+                    return None
+            for positive_ratio_key in (
+                "positive_neighbor_ratio",
+                "neighborhood_positive_ratio",
+            ):
+                if not _numeric_zero(summary_cell.get(positive_ratio_key)):
+                    return None
+
+    expected_plan = state.replay_request.get("evidence_plan")
+    expected_plan = expected_plan if isinstance(expected_plan, dict) else {}
+    receipt = _validate_probe_execution_evidence(
+        receipt=result_payload.get("execution_evidence"),
+        expected_plan=expected_plan,
+        context="no-positive-cell aggregate",
+    )
+    if receipt is not None:
+        state.execution_evidence = receipt
+
+    behavior = aggregate.get("behavior_summary")
+    behavior = behavior if isinstance(behavior, dict) else {}
+    diagnostics = {
+        "reason": "aggregate_no_positive_cell",
+        "signal_count": aggregate.get("signal_count"),
+        "resolved_trade_count_max": aggregate.get("resolved_trade_count_max"),
+        "matrix_cell_count": len(cells),
+        "positive_cell_count": matrix_summary.get("positive_cell_count"),
+        "positive_cell_ratio": matrix_summary.get("positive_cell_ratio"),
         "market_data_window": market_data_window,
         "behavior_summary": {
             key: behavior.get(key)
@@ -1518,6 +1658,11 @@ def _materialize_aggregate_result(
     result_payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
     if terminal_outcome is None:
         terminal_outcome = _validated_no_signal_aggregate_for_probe(
+            result_payload=result_payload,
+            state=state,
+        )
+    if terminal_outcome is None:
+        terminal_outcome = _validated_no_positive_cell_aggregate_for_probe(
             result_payload=result_payload,
             state=state,
         )

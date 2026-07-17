@@ -799,6 +799,103 @@ def _zero_signal_aggregate(*, total_signals: int = 0, resolved_trades: int = 0) 
     }
 
 
+def _no_positive_cell_aggregate() -> dict[str, Any]:
+    aggregate = _zero_signal_aggregate(total_signals=2, resolved_trades=2)
+    aggregate["behavior_summary"] = {
+        "eligible_bar_count": 195614,
+        "bars_with_signal_count": 2,
+        "long_signal_count": 2,
+        "short_signal_count": 0,
+        "signal_density": 1.0224217080577054e-05,
+        "signal_coverage_ratio": 1.0224217080577054e-05,
+    }
+    aggregate["matrix"]["rows"] = [
+        [
+            {
+                "stop_loss_percent": 0.02,
+                "reward_multiple": 0.5,
+                "take_profit_percent": 0.01,
+                "total_signals": 2,
+                "resolved_trades": 2,
+                "unresolved": 0,
+                "wins": 0,
+                "losses": 2,
+                "avg_net_r_per_closed_trade": -1.1,
+                "profit_factor": 0.0,
+                "win_rate": 0.0,
+            },
+            {
+                "stop_loss_percent": 0.02,
+                "reward_multiple": 1.0,
+                "take_profit_percent": 0.02,
+                "total_signals": 2,
+                "resolved_trades": 2,
+                "unresolved": 0,
+                "wins": 0,
+                "losses": 2,
+                "avg_net_r_per_closed_trade": -1.1,
+                "profit_factor": 0.0,
+                "win_rate": 0.0,
+            },
+        ]
+    ]
+    aggregate["matrix_summary"] = {
+        "total_cell_count": 2,
+        "positive_cell_count": 0,
+        "positive_cell_ratio": 0.0,
+        "row_positive_counts": [0],
+        "reward_column_summaries": [
+            {"reward_multiple": 0.5, "positive_row_ratio": 0.0, "avg_expectancy_r": -1.1},
+            {"reward_multiple": 1.0, "positive_row_ratio": 0.0, "avg_expectancy_r": -1.1},
+        ],
+        "normal_r_best_cell": {
+            "stop_loss_percent": 0.5,
+            "reward_multiple": 1.0,
+            "avg_net_r_per_closed_trade": -1.1,
+            "resolved_trades": 2,
+            "positive_instrument_count": 0,
+            "positive_neighbor_count": 0,
+            "positive_neighbor_ratio": 0.0,
+            "neighborhood_positive_count": 0,
+            "neighborhood_positive_ratio": 0.0,
+        },
+        "robust_cell": {
+            "stop_loss_percent": 0.5,
+            "reward_multiple": 0.5,
+            "avg_net_r_per_closed_trade": -1.1,
+            "resolved_trades": 2,
+            "positive_instrument_count": 0,
+            "positive_neighbor_count": 0,
+            "positive_neighbor_ratio": 0.0,
+            "neighborhood_positive_count": 0,
+            "neighborhood_positive_ratio": 0.0,
+        },
+    }
+    return aggregate
+
+
+def _positive_no_best_cell_aggregate() -> dict[str, Any]:
+    aggregate = _no_positive_cell_aggregate()
+    aggregate["matrix"]["rows"][0][1]["wins"] = 1
+    aggregate["matrix"]["rows"][0][1]["losses"] = 1
+    aggregate["matrix"]["rows"][0][1]["avg_net_r_per_closed_trade"] = 1.8
+    aggregate["matrix"]["rows"][0][1]["profit_factor"] = 4.0
+    aggregate["matrix"]["rows"][0][1]["win_rate"] = 0.5
+    aggregate["matrix_summary"]["positive_cell_count"] = 1
+    aggregate["matrix_summary"]["positive_cell_ratio"] = 0.5
+    aggregate["matrix_summary"]["row_positive_counts"] = [1]
+    aggregate["matrix_summary"]["reward_column_summaries"][1]["positive_row_ratio"] = 1.0
+    aggregate["matrix_summary"]["reward_column_summaries"][1]["avg_expectancy_r"] = 1.8
+    aggregate["matrix_summary"]["normal_r_best_cell"]["avg_net_r_per_closed_trade"] = 1.8
+    aggregate["matrix_summary"]["normal_r_best_cell"]["positive_instrument_count"] = 1
+    aggregate["matrix_summary"]["normal_r_best_cell"]["positive_neighbor_count"] = 1
+    aggregate["matrix_summary"]["normal_r_best_cell"]["positive_neighbor_ratio"] = 1.0
+    aggregate["matrix_summary"]["normal_r_best_cell"]["neighborhood_positive_count"] = 1
+    aggregate["matrix_summary"]["normal_r_best_cell"]["neighborhood_positive_ratio"] = 1.0
+    aggregate["matrix_summary"]["robust_cell"] = dict(aggregate["matrix_summary"]["normal_r_best_cell"])
+    return aggregate
+
+
 class NoSignalAggregateSuccessGateway(FakeGateway):
     def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
         self.enqueued_tasks.extend(tasks)
@@ -825,6 +922,70 @@ class NoSignalAggregateSuccessGateway(FakeGateway):
                         "request": payload,
                         "execution_evidence": execution_evidence,
                         "result": {"aggregate": _zero_signal_aggregate()},
+                    },
+                }
+            )
+        return {"status": "accepted", "enqueued": len(tasks)}
+
+
+class NoPositiveAggregateSuccessGateway(NoSignalAggregateSuccessGateway):
+    def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        self.enqueued_tasks.extend(tasks)
+        for task in tasks:
+            payload = task["payload"]
+            evidence_plan = payload.get("evidence_plan") or {}
+            execution_evidence = {
+                "plan_id": evidence_plan["plan_id"],
+                "profile_snapshot_sha256": evidence_plan["profile_snapshot_sha256"],
+                "execution_cell_sha256": evidence_plan["execution_cell_sha256"],
+                "observed_lake_manifest_sha256": evidence_plan["lake_manifest_sha256"],
+            }
+            self.results.append(
+                {
+                    "task_id": task["task_id"],
+                    "lease_id": f"lease-{next(self._lease_counter)}",
+                    "worker_id": "no-positive-worker",
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "success",
+                    "result": {
+                        "status": "success",
+                        "status_detail": "Deep replay completed.",
+                        "request": payload,
+                        "execution_evidence": execution_evidence,
+                        "result": {"aggregate": _no_positive_cell_aggregate()},
+                    },
+                }
+            )
+        return {"status": "accepted", "enqueued": len(tasks)}
+
+
+class PositiveNoBestAggregateSuccessGateway(NoSignalAggregateSuccessGateway):
+    def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        self.enqueued_tasks.extend(tasks)
+        for task in tasks:
+            payload = task["payload"]
+            evidence_plan = payload.get("evidence_plan") or {}
+            execution_evidence = {
+                "plan_id": evidence_plan["plan_id"],
+                "profile_snapshot_sha256": evidence_plan["profile_snapshot_sha256"],
+                "execution_cell_sha256": evidence_plan["execution_cell_sha256"],
+                "observed_lake_manifest_sha256": evidence_plan["lake_manifest_sha256"],
+            }
+            self.results.append(
+                {
+                    "task_id": task["task_id"],
+                    "lease_id": f"lease-{next(self._lease_counter)}",
+                    "worker_id": "positive-no-best-worker",
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "success",
+                    "result": {
+                        "status": "success",
+                        "status_detail": "Deep replay completed.",
+                        "request": payload,
+                        "execution_evidence": execution_evidence,
+                        "result": {"aggregate": _positive_no_best_cell_aggregate()},
                     },
                 }
             )
@@ -1309,6 +1470,51 @@ def test_historical_probe_no_signal_success_aggregate_continues_as_nonviable(
     assert not any(task["task_kind"] == "deep_replay_detail" for task in gateway.enqueued_tasks)
 
 
+def test_historical_probe_no_positive_cell_success_aggregate_continues_as_nonviable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    source_dir, result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+    monkeypatch.setattr(FuzzfolioCli, "score_artifact", lambda *args, **kwargs: {})
+
+    gateway = NoPositiveAggregateSuccessGateway()
+    outcome = run_probe_spec_via_gateway(
+        config,
+        spec=ProbeRunSpec(
+            kind="anchor_pair",
+            source_dir=source_dir,
+            atlas_filename="anchor-pair-atlas.json",
+            results_filename="anchor-pair-probe-results.csv",
+            summary_filename="anchor-pair-probe-summary.json",
+            manifest_schema="anchor_pair_run_manifest_v1",
+            result_fieldnames=_probe_results_fieldnames,
+            row_builder=_result_row_from_score,
+        ),
+        gateway=gateway,
+        runtime=AtlasLabRuntimeConfig(
+            active_probes=1,
+            result_batch_size=10,
+            as_of_date="2025-06-30T00:00:00Z",
+            lake_manifest_sha256="sha256:" + "e" * 64,
+        ),
+        worker_contract_hash="contract123",
+    )
+
+    assert outcome.summary["result_counts"]["completed"] == 1
+    assert outcome.summary["result_counts"]["scored"] == 0
+    assert outcome.summary["result_counts"]["status_counts"] == {"nonviable": 1}
+    rows = list(csv.DictReader((source_dir / "anchor-pair-probe-results.csv").open(encoding="utf-8")))
+    assert rows[0]["status"] == "nonviable"
+    assert rows[0]["terminal_outcome"] == "no_valid_cell"
+    terminal_reason = json.loads(rows[0]["terminal_reason"])
+    assert terminal_reason["reason"] == "aggregate_no_positive_cell"
+    assert terminal_reason["matrix_cell_count"] == 2
+    assert terminal_reason["positive_cell_count"] == 0
+    assert (result_dir / "execution-evidence.json").exists()
+    assert not any(task["task_kind"] == "deep_replay_detail" for task in gateway.enqueued_tasks)
+
+
 def test_historical_probe_resume_accepts_preserved_duplicate_aggregate_result(
     tmp_path: Path,
     monkeypatch,
@@ -1456,6 +1662,41 @@ def test_historical_probe_mixed_no_best_success_fails_closed(
                 row_builder=_result_row_from_score,
             ),
             gateway=MixedNoBestAggregateSuccessGateway(),
+            runtime=AtlasLabRuntimeConfig(
+                active_probes=1,
+                result_batch_size=10,
+                as_of_date="2025-06-30T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "e" * 64,
+            ),
+            worker_contract_hash="contract123",
+        )
+
+    assert not (source_dir / "anchor-pair-probe-results.csv").exists()
+    assert not (source_dir / "anchor-pair-probe-summary.json").exists()
+
+
+def test_historical_probe_positive_no_best_success_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    source_dir, _result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+    monkeypatch.setattr(FuzzfolioCli, "score_artifact", lambda *args, **kwargs: {})
+
+    with pytest.raises(RuntimeError, match="detail-capable best cell"):
+        run_probe_spec_via_gateway(
+            config,
+            spec=ProbeRunSpec(
+                kind="anchor_pair",
+                source_dir=source_dir,
+                atlas_filename="anchor-pair-atlas.json",
+                results_filename="anchor-pair-probe-results.csv",
+                summary_filename="anchor-pair-probe-summary.json",
+                manifest_schema="anchor_pair_run_manifest_v1",
+                result_fieldnames=_probe_results_fieldnames,
+                row_builder=_result_row_from_score,
+            ),
+            gateway=PositiveNoBestAggregateSuccessGateway(),
             runtime=AtlasLabRuntimeConfig(
                 active_probes=1,
                 result_batch_size=10,
