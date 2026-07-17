@@ -5,9 +5,11 @@ import hashlib
 import json
 import calendar
 import math
+import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -618,6 +620,42 @@ def _safe_stage_summary(name: str, result: Any | None) -> dict[str, Any]:
 
 def _write_json(path: Path, payload: Any) -> None:
     atomic_write_json(path, _json_safe(payload))
+
+
+def _write_large_scratch_json(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write large stage-scratch JSON without per-file fsync/canonicalization."""
+
+    target = Path(path).resolve(strict=False)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=target.name + ".", suffix=".tmp", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            check_circular=False,
+        ).encode("utf-8")
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _signal_raw_stage_payload(raw: dict[str, Any]) -> dict[str, Any]:
+    data = _as_dict(raw.get("data"))
+    if not data:
+        return raw
+    retained = {
+        key: data[key]
+        for key in ("timestamp", "close", "high", "low", "long_score", "short_score")
+        if key in data
+    }
+    return {"data": retained}
 
 
 def _stage_artifact_files(*roots: Path) -> list[Path]:
@@ -2683,7 +2721,7 @@ def _row_from_signal_result(
                 raise RuntimeError(
                     f"Historical signal receipt {key} mismatch: expected {value!r}, observed {execution_evidence.get(key)!r}"
                 )
-    _write_json(raw_path, raw)
+    _write_large_scratch_json(raw_path, _signal_raw_stage_payload(raw))
     metrics = compute_signal_metrics(
         _numeric_signal_series(data.get("long_score")),
         _numeric_signal_series(data.get("short_score")),

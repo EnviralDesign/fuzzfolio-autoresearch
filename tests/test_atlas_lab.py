@@ -264,9 +264,11 @@ def test_historical_signal_result_preserves_observed_lake_receipt(tmp_path: Path
                     "execution_evidence": receipt,
                     "raw": {
                         "data": {
+                            "open": [1.0, 2.0],
                             "long_score": [0.0, 1.0],
                             "short_score": [0.0, 0.0],
                             "timestamp": [1, 2],
+                            "volume": [],
                         }
                     },
                 }
@@ -277,6 +279,12 @@ def test_historical_signal_result_preserves_observed_lake_receipt(tmp_path: Path
 
     assert row["evidence_plan_id"] == plan["plan_id"]
     assert row["observed_lake_manifest_sha256"] == plan["lake_manifest_sha256"]
+    raw_text = (tmp_path / "raw.json").read_text(encoding="utf-8")
+    assert "\n" not in raw_text
+    raw_payload = json.loads(raw_text)
+    assert raw_payload["data"]["long_score"] == [0.0, 1.0]
+    assert "open" not in raw_payload["data"]
+    assert "volume" not in raw_payload["data"]
 
 
 def test_historical_atlas_rejects_unbounded_signal_executor(tmp_path: Path) -> None:
