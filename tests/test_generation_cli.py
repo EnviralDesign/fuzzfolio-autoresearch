@@ -134,6 +134,41 @@ def test_cli_apply_requires_then_uses_the_exact_reviewed_preview_identity(tmp_pa
     assert (runs_root / GENERATION_MANIFEST_NAME).is_file()
 
 
+def test_cli_apply_does_not_run_a_redundant_preview(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    calls = {"dry_run": 0, "cutover": 0}
+
+    class FakeService:
+        def __init__(self, runs_root: Path) -> None:
+            self.runs_root = runs_root
+
+        def dry_run(self, *args: object, **kwargs: object) -> dict[str, object]:
+            calls["dry_run"] += 1
+            raise AssertionError("apply must not perform a redundant dry run")
+
+        def cutover(self, *args: object, **kwargs: object) -> dict[str, object]:
+            calls["cutover"] += 1
+            return {"resumed": False, "already_complete": False, "manifest": {"state": "complete"}}
+
+    runs_root = tmp_path / "runs"
+    _configure_runs_root(monkeypatch, runs_root)
+    monkeypatch.setattr(generation_cli, "GenerationArchiveService", FakeService)
+    provenance = _provenance()
+    provenance["reviewed_inventory_identity"] = "1" * 64
+    provenance["cutover_quiescence"] = {
+        "marker_path": str(tmp_path / "writers-quiesced.json"),
+        "marker_sha256": "2" * 64,
+    }
+    provenance_path = tmp_path / "provenance.json"
+    provenance_path.write_text(json.dumps(provenance), encoding="utf-8")
+
+    assert ar_main.main(_invoke(tmp_path, provenance_path, "--apply")) == 0
+    payload = _json_output(capsys)
+    assert payload["dry_run"] is False
+    assert calls == {"dry_run": 0, "cutover": 1}
+
+
 def test_archive_generation_rejects_malformed_provenance(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     _configure_runs_root(monkeypatch, _runs_root(tmp_path))
     provenance_path = tmp_path / "provenance.json"

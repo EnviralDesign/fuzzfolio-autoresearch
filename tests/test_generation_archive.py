@@ -4,6 +4,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,67 @@ def test_apply_rejects_stale_quiescence_marker(tmp_path: Path) -> None:
 
     with pytest.raises(GenerationArchiveError, match="freshness window"):
         service.cutover("archive-001", "generation-002", provenance=provenance)
+
+
+def test_apply_accepts_fresh_admission_marker_after_long_inventory_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeDatetime:
+        current = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            if tz is None:
+                return cls.current.replace(tzinfo=None)
+            return cls.current.astimezone(tz)
+
+        @classmethod
+        def fromisoformat(cls, value: str) -> datetime:
+            return datetime.fromisoformat(value)
+
+    service = _service(tmp_path)
+    monkeypatch.setattr(generation_archive, "datetime", FakeDatetime)
+    provenance = _apply_provenance(service, tmp_path)
+    advanced = False
+
+    def advance_after_admission(path: Path, bytes_read: int) -> None:
+        nonlocal advanced
+        if bytes_read and not advanced and generation_archive._is_within(path, service.runs_root):
+            advanced = True
+            FakeDatetime.current = FakeDatetime.current + timedelta(minutes=10)
+
+    monkeypatch.setattr(generation_archive, "_inventory_read_hook", advance_after_admission)
+
+    result = service.cutover("archive-001", "generation-002", provenance=provenance)
+
+    assert advanced is True
+    assert result["manifest"]["state"] == "complete"
+
+
+def test_apply_rejects_stale_quiescence_at_operation_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeDatetime:
+        current = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            if tz is None:
+                return cls.current.replace(tzinfo=None)
+            return cls.current.astimezone(tz)
+
+        @classmethod
+        def fromisoformat(cls, value: str) -> datetime:
+            return datetime.fromisoformat(value)
+
+    service = _service(tmp_path)
+    monkeypatch.setattr(generation_archive, "datetime", FakeDatetime)
+    provenance = _apply_provenance(service, tmp_path)
+    FakeDatetime.current = FakeDatetime.current + timedelta(minutes=6)
+
+    with pytest.raises(GenerationArchiveError, match="freshness window"):
+        service.cutover("archive-001", "generation-002", provenance=provenance)
+    assert not (tmp_path / "runs_archive" / "archive-001").exists()
 
 
 def test_inventory_identity_detects_same_size_same_mtime_substitution(tmp_path: Path) -> None:

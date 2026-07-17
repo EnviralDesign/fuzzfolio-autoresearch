@@ -581,6 +581,12 @@ class GenerationArchiveService:
         if age < timedelta(0) or age > QUIESCENCE_MAX_AGE:
             raise GenerationArchiveError("quiescence marker issued_at is outside the strict freshness window")
 
+    def _reviewed_inventory_identity(self, provenance: Mapping[str, Any]) -> str:
+        identity = provenance.get("reviewed_inventory_identity")
+        if not isinstance(identity, str) or not _SHA256.fullmatch(identity):
+            raise GenerationArchiveError("apply requires a lowercase reviewed_inventory_identity from the reviewed preview")
+        return identity
+
     def _quiescence(self, provenance: Mapping[str, Any], archive_id: str, generation_id: str, inventory_identity: str) -> dict[str, Any]:
         if provenance.get("reviewed_inventory_identity") != inventory_identity:
             raise GenerationArchiveError("active inventory differs from the pinned reviewed preview; provenance.reviewed_inventory_identity must match exactly")
@@ -603,7 +609,7 @@ class GenerationArchiveService:
             "new_generation_id": generation_id, "inventory_identity": inventory_identity,
         }
         if any(payload.get(key) != value for key, value in required.items()):
-            raise GenerationArchiveError("quiescence marker does not prove this exact cutover and reviewed inventory")
+            raise GenerationArchiveError("quiescence marker does not prove this exact cutover and reviewed_inventory_identity")
         if not isinstance(payload.get("issuer_id"), str) or not payload["issuer_id"].strip():
             raise GenerationArchiveError("quiescence marker requires a non-empty issuer_id")
         if not isinstance(payload.get("nonce"), str) or not _NONCE.fullmatch(payload["nonce"]):
@@ -692,10 +698,17 @@ class GenerationArchiveService:
             raise GenerationArchiveError(f"archive destination already exists without durable intent: {archive_dir}")
         if not self.runs_root.exists():
             raise GenerationArchiveError("active runs root is missing without durable cutover state")
-        inventory = build_inventory(self.runs_root, critical_artifacts=critical_artifacts)
-        quiescence = self._quiescence(provenance, archive_id, generation_id, _inventory_identity(inventory))
-        self._assert_same_volume()
+        reviewed_identity = self._reviewed_inventory_identity(provenance)
+        quiescence = self._quiescence(provenance, archive_id, generation_id, reviewed_identity)
+        if not self.archive_root.exists():
+            _durable_mkdir(self.archive_root)
+        elif not self.archive_root.is_dir() or self.archive_root.is_symlink():
+            raise GenerationArchiveError("archive root is not a real directory")
         quiescence = self._consume_quiescence(quiescence)
+        inventory = build_inventory(self.runs_root, critical_artifacts=critical_artifacts)
+        if _inventory_identity(inventory) != reviewed_identity:
+            raise GenerationArchiveError("active inventory differs from the pinned reviewed preview; refusing prepare")
+        self._assert_same_volume()
         manifest = self._prepared_manifest(archive_id, generation_id, inventory, provenance, quiescence)
         self._write_intent(archive_id, manifest)
         _durable_mkdir(archive_dir)
@@ -836,9 +849,7 @@ class GenerationArchiveService:
             source_exists, destination_exists = self.runs_root.exists(), destination.exists()
             resumed = not source_exists or destination_exists
             if source_exists and not destination_exists:
-                quiescence = self._quiescence(provenance, archive_id, new_generation_id, identity)
-                if manifest.get("quiescence") != self._consume_quiescence(quiescence):
-                    raise GenerationArchiveError("quiescence proof conflicts with the durable prepared archive manifest")
+                self._recorded_quiescence(manifest, provenance)
                 current = build_inventory(self.runs_root, critical_artifacts=critical_artifacts)
                 if _inventory_identity(current) != identity:
                     raise GenerationArchiveError("active inventory differs from pinned reviewed preview; refusing rename")

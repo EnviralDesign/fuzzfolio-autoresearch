@@ -144,12 +144,6 @@ def cmd_archive_generation(
     try:
         provenance = _load_provenance(provenance_json)
         service = GenerationArchiveService(load_config().runs_root)
-        plan = service.dry_run(
-            archive_id,
-            new_generation_id,
-            provenance=provenance,
-            critical_artifacts=critical_artifacts,
-        )
     except (GenerationArchiveError, ValueError) as exc:
         _emit(
             {
@@ -165,8 +159,8 @@ def cmd_archive_generation(
     missing_fields = _missing_required_provenance_fields(provenance)
     if missing_fields:
         payload = {
-            **plan,
             "command": "archive-generation",
+            "dry_run": True,
             "ready": False,
             "requested_apply": apply,
             "missing_required_provenance_fields": missing_fields,
@@ -203,6 +197,24 @@ def cmd_archive_generation(
             return 1
 
     if not apply:
+        try:
+            plan = service.dry_run(
+                archive_id,
+                new_generation_id,
+                provenance=provenance,
+                critical_artifacts=critical_artifacts,
+            )
+        except (GenerationArchiveError, ValueError) as exc:
+            _emit(
+                {
+                    "command": "archive-generation",
+                    "error": str(exc),
+                    "dry_run": True,
+                    "requested_apply": False,
+                },
+                as_json=as_json,
+            )
+            return 1
         payload = {
             **plan,
             "command": "archive-generation",
