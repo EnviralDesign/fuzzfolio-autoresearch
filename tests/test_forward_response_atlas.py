@@ -6,9 +6,11 @@ from types import SimpleNamespace
 from autoresearch.forward_response_atlas import (
     _ForwardEventAccumulator,
     _accumulator_rows,
+    _combined_direction_rows,
     _grouped_summaries,
     build_forward_response_atlas,
     compute_forward_event_records,
+    iter_forward_event_records,
     summarize_forward_events,
 )
 
@@ -111,6 +113,74 @@ def test_forward_event_accumulator_matches_list_summary() -> None:
     assert _accumulator_rows(
         grouped, ("indicator_id", "direction", "horizon_bars"), min_events=1
     ) == _grouped_summaries(events, ("indicator_id", "direction", "horizon_bars"), min_events=1)
+
+
+def test_combined_direction_rows_match_explicit_both_accumulator() -> None:
+    events = [
+        {
+            "indicator_id": "RSI",
+            "direction": "long",
+            "horizon_bars": 3,
+            "forward_return_pct": 0.2,
+            "mfe_pct": 0.5,
+            "mae_pct": 0.1,
+            "mfe_minus_mae_pct": 0.4,
+            "mfe_gt_mae": True,
+            "volatility_normalized_return": 0.7,
+        },
+        {
+            "indicator_id": "RSI",
+            "direction": "short",
+            "horizon_bars": 3,
+            "forward_return_pct": -0.1,
+            "mfe_pct": 0.1,
+            "mae_pct": 0.3,
+            "mfe_minus_mae_pct": -0.2,
+            "mfe_gt_mae": False,
+            "volatility_normalized_return": None,
+        },
+        {
+            "indicator_id": "RSI",
+            "direction": "short",
+            "horizon_bars": 3,
+            "forward_return_pct": 0.4,
+            "mfe_pct": 0.6,
+            "mae_pct": 0.2,
+            "mfe_minus_mae_pct": 0.4,
+            "mfe_gt_mae": True,
+            "volatility_normalized_return": 0.9,
+        },
+    ]
+    directional = {}
+    explicit_both = _ForwardEventAccumulator()
+    for event in events:
+        key = (event["indicator_id"], event["direction"], event["horizon_bars"])
+        directional.setdefault(key, _ForwardEventAccumulator()).add(event)
+        explicit_both.add(event)
+
+    rows = _combined_direction_rows(directional, min_events=1)
+
+    assert rows == [
+        {
+            "indicator_id": "RSI",
+            "horizon_bars": 3,
+            "direction": "both",
+            **explicit_both.summary(min_events=1),
+        }
+    ]
+
+
+def test_iter_forward_event_records_matches_list_wrapper() -> None:
+    kwargs = {
+        "close": [100, 100, 104, 106, 108],
+        "high": [100, 101, 105, 107, 110],
+        "low": [99, 99, 99, 105, 106],
+        "long_score": [0, 1, 0, 0, 1],
+        "short_score": [0, 0, 1, 0, 0],
+        "horizons": [1, 2],
+    }
+
+    assert list(iter_forward_event_records(**kwargs)) == compute_forward_event_records(**kwargs)
 
 
 def test_build_forward_response_atlas_reduces_raw_cells_without_retaining_events(tmp_path) -> None:

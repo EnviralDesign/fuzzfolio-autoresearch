@@ -8,8 +8,9 @@ from array import array
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from itertools import chain
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from .config import AppConfig
 from .signal_atlas import DEFAULT_SIGNAL_ATLAS_DIRNAME
@@ -106,6 +107,10 @@ def _percentile(values: Iterable[float], percentile: float) -> float | None:
     clean = sorted(float(value) for value in values if math.isfinite(float(value)))
     if not clean:
         return None
+    return _percentile_sorted(clean, percentile)
+
+
+def _percentile_sorted(clean: Sequence[float], percentile: float) -> float:
     if len(clean) == 1:
         return round(clean[0], 6)
     rank = (len(clean) - 1) * max(0.0, min(1.0, percentile))
@@ -115,6 +120,22 @@ def _percentile(values: Iterable[float], percentile: float) -> float | None:
         return round(clean[lower], 6)
     weight = rank - lower
     return round(clean[lower] * (1.0 - weight) + clean[upper] * weight, 6)
+
+
+def _series_stats(values: Iterable[float], *, percentiles: Iterable[float] = ()) -> dict[str, float | None]:
+    clean = [float(value) for value in values if math.isfinite(float(value))]
+    if not clean:
+        stats: dict[str, float | None] = {"mean": None}
+        for percentile in percentiles:
+            stats[f"p{int(percentile * 100):02d}"] = None
+        return stats
+    stats = {"mean": round(float(statistics.fmean(clean)), 6)}
+    requested_percentiles = tuple(percentiles)
+    if requested_percentiles:
+        clean.sort()
+        for percentile in requested_percentiles:
+            stats[f"p{int(percentile * 100):02d}"] = _percentile_sorted(clean, percentile)
+    return stats
 
 
 def _stddev(values: list[float]) -> float | None:
@@ -187,7 +208,7 @@ def _extract_chronological_series(payload: dict[str, Any]) -> dict[str, list[Any
     }
 
 
-def compute_forward_event_records(
+def iter_forward_event_records(
     close: list[float],
     high: list[float],
     low: list[float],
@@ -197,13 +218,12 @@ def compute_forward_event_records(
     horizons: Iterable[int] = DEFAULT_FORWARD_HORIZONS,
     vol_lookback: int = DEFAULT_VOL_LOOKBACK,
     threshold: float = SIGNAL_EPSILON,
-) -> list[dict[str, Any]]:
+) -> Iterator[dict[str, Any]]:
     horizon_values = sorted({max(1, int(value)) for value in horizons})
     bars = min(len(close), len(high), len(low), len(long_score), len(short_score))
     close = close[:bars]
     high = high[:bars]
     low = low[:bars]
-    event_records: list[dict[str, Any]] = []
 
     directions = (
         ("long", 1.0, long_score),
@@ -220,19 +240,22 @@ def compute_forward_event_records(
                 event_index,
                 vol_lookback,
             )
+            window_end = event_index
+            max_high = -math.inf
+            min_low = math.inf
             for horizon in horizon_values:
                 future_index = event_index + horizon
                 if future_index >= bars:
-                    continue
-                future_highs = high[event_index + 1 : future_index + 1]
-                future_lows = low[event_index + 1 : future_index + 1]
-                if not future_highs or not future_lows:
-                    continue
+                    break
+                # Horizons are sorted; extend the event window incrementally instead
+                # of slicing and rescanning high/low for every horizon.
+                for window_index in range(window_end + 1, future_index + 1):
+                    max_high = max(max_high, high[window_index])
+                    min_low = min(min_low, low[window_index])
+                window_end = future_index
                 future_close = close[future_index]
                 raw_forward_pct = ((future_close - entry_close) / entry_close) * 100.0
                 directional_forward_pct = raw_forward_pct * direction_multiplier
-                max_high = max(future_highs)
-                min_low = min(future_lows)
                 if direction_label == "long":
                     mfe_pct = max(0.0, ((max_high - entry_close) / entry_close) * 100.0)
                     mae_pct = max(0.0, ((entry_close - min_low) / entry_close) * 100.0)
@@ -244,26 +267,48 @@ def compute_forward_event_records(
                     vol_norm = directional_forward_pct / (
                         pre_event_volatility_pct * math.sqrt(float(horizon))
                     )
-                event_records.append(
-                    {
-                        "direction": direction_label,
-                        "event_index": event_index,
-                        "horizon_bars": horizon,
-                        "entry_close": round(entry_close, 8),
-                        "future_close": round(future_close, 8),
-                        "forward_return_pct": round(directional_forward_pct, 6),
-                        "raw_forward_return_pct": round(raw_forward_pct, 6),
-                        "mfe_pct": round(mfe_pct, 6),
-                        "mae_pct": round(mae_pct, 6),
-                        "mfe_minus_mae_pct": round(mfe_pct - mae_pct, 6),
-                        "mfe_gt_mae": mfe_pct > mae_pct,
-                        "pre_event_volatility_pct": pre_event_volatility_pct,
-                        "volatility_normalized_return": round(vol_norm, 6)
-                        if vol_norm is not None and math.isfinite(vol_norm)
-                        else None,
-                    }
-                )
-    return event_records
+                yield {
+                    "direction": direction_label,
+                    "event_index": event_index,
+                    "horizon_bars": horizon,
+                    "entry_close": round(entry_close, 8),
+                    "future_close": round(future_close, 8),
+                    "forward_return_pct": round(directional_forward_pct, 6),
+                    "raw_forward_return_pct": round(raw_forward_pct, 6),
+                    "mfe_pct": round(mfe_pct, 6),
+                    "mae_pct": round(mae_pct, 6),
+                    "mfe_minus_mae_pct": round(mfe_pct - mae_pct, 6),
+                    "mfe_gt_mae": mfe_pct > mae_pct,
+                    "pre_event_volatility_pct": pre_event_volatility_pct,
+                    "volatility_normalized_return": round(vol_norm, 6)
+                    if vol_norm is not None and math.isfinite(vol_norm)
+                    else None,
+                }
+
+
+def compute_forward_event_records(
+    close: list[float],
+    high: list[float],
+    low: list[float],
+    long_score: list[float],
+    short_score: list[float],
+    *,
+    horizons: Iterable[int] = DEFAULT_FORWARD_HORIZONS,
+    vol_lookback: int = DEFAULT_VOL_LOOKBACK,
+    threshold: float = SIGNAL_EPSILON,
+) -> list[dict[str, Any]]:
+    return list(
+        iter_forward_event_records(
+            close,
+            high,
+            low,
+            long_score,
+            short_score,
+            horizons=horizons,
+            vol_lookback=vol_lookback,
+            threshold=threshold,
+        )
+    )
 
 
 def _response_bucket(summary: dict[str, Any], *, min_events: int) -> str:
@@ -403,37 +448,69 @@ class _ForwardEventAccumulator:
             self.vol_norm_values.append(float(vol_norm))
 
     def summary(self, *, min_events: int = DEFAULT_MIN_EVENTS) -> dict[str, Any]:
-        sample_count = self.sample_count
-        if sample_count <= 0:
-            return {
-                "status": "no_events",
-                "sample_count": 0,
-                "response_bucket": "no_events",
-                "forward_response_score": 0.0,
-            }
-        summary = {
-            "status": "ok",
-            "sample_count": sample_count,
-            "win_count": self.win_count,
-            "loss_count": self.loss_count,
-            "win_rate_pct": _rate(self.win_count, sample_count),
-            "mean_forward_return_pct": _mean(self.returns),
-            "median_forward_return_pct": _median(self.returns),
-            "p25_forward_return_pct": _percentile(self.returns, 0.25),
-            "p75_forward_return_pct": _percentile(self.returns, 0.75),
-            "mean_mfe_pct": _mean(self.mfe_values),
-            "median_mfe_pct": _median(self.mfe_values),
-            "mean_mae_pct": _mean(self.mae_values),
-            "median_mae_pct": _median(self.mae_values),
-            "mean_mfe_minus_mae_pct": _mean(self.edge_values),
-            "median_mfe_minus_mae_pct": _median(self.edge_values),
-            "mfe_gt_mae_rate_pct": _rate(self.mfe_win_count, sample_count),
-            "mean_volatility_normalized_return": _mean(self.vol_norm_values),
-            "median_volatility_normalized_return": _median(self.vol_norm_values),
+        return _summarize_accumulators((self,), min_events=min_events)
+
+
+def _summarize_accumulators(
+    accumulators: Iterable[_ForwardEventAccumulator],
+    *,
+    min_events: int = DEFAULT_MIN_EVENTS,
+) -> dict[str, Any]:
+    parts = tuple(accumulators)
+    sample_count = sum(part.sample_count for part in parts)
+    if sample_count <= 0:
+        return {
+            "status": "no_events",
+            "sample_count": 0,
+            "response_bucket": "no_events",
+            "forward_response_score": 0.0,
         }
-        summary["response_bucket"] = _response_bucket(summary, min_events=min_events)
-        summary["forward_response_score"] = _forward_response_score(summary, min_events=min_events)
-        return summary
+    returns = _series_stats(
+        chain.from_iterable(part.returns for part in parts),
+        percentiles=(0.25, 0.50, 0.75),
+    )
+    mfe = _series_stats(
+        chain.from_iterable(part.mfe_values for part in parts),
+        percentiles=(0.50,),
+    )
+    mae = _series_stats(
+        chain.from_iterable(part.mae_values for part in parts),
+        percentiles=(0.50,),
+    )
+    edge = _series_stats(
+        chain.from_iterable(part.edge_values for part in parts),
+        percentiles=(0.50,),
+    )
+    vol_norm = _series_stats(
+        chain.from_iterable(part.vol_norm_values for part in parts),
+        percentiles=(0.50,),
+    )
+    win_count = sum(part.win_count for part in parts)
+    loss_count = sum(part.loss_count for part in parts)
+    mfe_win_count = sum(part.mfe_win_count for part in parts)
+    summary = {
+        "status": "ok",
+        "sample_count": sample_count,
+        "win_count": win_count,
+        "loss_count": loss_count,
+        "win_rate_pct": _rate(win_count, sample_count),
+        "mean_forward_return_pct": returns["mean"],
+        "median_forward_return_pct": returns["p50"],
+        "p25_forward_return_pct": returns["p25"],
+        "p75_forward_return_pct": returns["p75"],
+        "mean_mfe_pct": mfe["mean"],
+        "median_mfe_pct": mfe["p50"],
+        "mean_mae_pct": mae["mean"],
+        "median_mae_pct": mae["p50"],
+        "mean_mfe_minus_mae_pct": edge["mean"],
+        "median_mfe_minus_mae_pct": edge["p50"],
+        "mfe_gt_mae_rate_pct": _rate(mfe_win_count, sample_count),
+        "mean_volatility_normalized_return": vol_norm["mean"],
+        "median_volatility_normalized_return": vol_norm["p50"],
+    }
+    summary["response_bucket"] = _response_bucket(summary, min_events=min_events)
+    summary["forward_response_score"] = _forward_response_score(summary, min_events=min_events)
+    return summary
 
 
 def _grouped_summaries(
@@ -469,6 +546,33 @@ def _accumulator_rows(
             continue
         rows.append(row)
     rows.sort(key=lambda row: tuple(str(row.get(key) or "") for key in keys))
+    return rows
+
+
+def _combined_direction_rows(
+    grouped: dict[tuple[Any, ...], _ForwardEventAccumulator],
+    *,
+    min_events: int,
+) -> list[dict[str, Any]]:
+    by_indicator_horizon: dict[tuple[Any, Any], list[_ForwardEventAccumulator]] = defaultdict(list)
+    for key_values, accumulator in grouped.items():
+        indicator_id, _direction, horizon = key_values
+        by_indicator_horizon[(indicator_id, horizon)].append(accumulator)
+    rows: list[dict[str, Any]] = []
+    for (indicator_id, horizon), accumulators in by_indicator_horizon.items():
+        row = {
+            "indicator_id": indicator_id,
+            "horizon_bars": horizon,
+            "direction": "both",
+        }
+        row.update(_summarize_accumulators(accumulators, min_events=min_events))
+        rows.append(row)
+    rows.sort(
+        key=lambda row: (
+            str(row.get("indicator_id") or ""),
+            int(row.get("horizon_bars") or 0),
+        )
+    )
     return rows
 
 
@@ -705,9 +809,6 @@ def build_forward_response_atlas(
     indicator_direction_groups: dict[tuple[Any, ...], _ForwardEventAccumulator] = defaultdict(
         _ForwardEventAccumulator
     )
-    indicator_both_groups: dict[tuple[Any, ...], _ForwardEventAccumulator] = defaultdict(
-        _ForwardEventAccumulator
-    )
     for signal_row in signal_rows:
         raw_path = Path(str(signal_row.get("raw_path") or ""))
         if not raw_path.is_absolute():
@@ -724,7 +825,14 @@ def build_forward_response_atlas(
             )
             continue
         series = _extract_chronological_series(_as_dict(_load_json(raw_path)))
-        events = compute_forward_event_records(
+        indicator_id = _clean_upper(signal_row.get("indicator_id"))
+        instrument = _clean_upper(signal_row.get("instrument"))
+        timeframe = _clean_upper(signal_row.get("timeframe"))
+        cell_groups: dict[tuple[Any, ...], _ForwardEventAccumulator] = defaultdict(
+            _ForwardEventAccumulator
+        )
+        cell_event_count = 0
+        for event in iter_forward_event_records(
             series["close"],
             series["high"],
             series["low"],
@@ -733,21 +841,14 @@ def build_forward_response_atlas(
             horizons=horizon_values,
             vol_lookback=vol_lookback,
             threshold=threshold,
-        )
-        indicator_id = _clean_upper(signal_row.get("indicator_id"))
-        instrument = _clean_upper(signal_row.get("instrument"))
-        timeframe = _clean_upper(signal_row.get("timeframe"))
-        if events:
-            cell_groups: dict[tuple[Any, ...], _ForwardEventAccumulator] = defaultdict(
-                _ForwardEventAccumulator
-            )
-            for event in events:
-                event_horizon_records += 1
-                direction = event["direction"]
-                horizon = event["horizon_bars"]
-                cell_groups[(indicator_id, instrument, timeframe, direction, horizon)].add(event)
-                indicator_direction_groups[(indicator_id, direction, horizon)].add(event)
-                indicator_both_groups[(indicator_id, horizon)].add(event)
+        ):
+            cell_event_count += 1
+            event_horizon_records += 1
+            direction = event["direction"]
+            horizon = event["horizon_bars"]
+            cell_groups[(indicator_id, instrument, timeframe, direction, horizon)].add(event)
+            indicator_direction_groups[(indicator_id, direction, horizon)].add(event)
+        if cell_event_count:
             cell_rollups.extend(
                 _accumulator_rows(
                     cell_groups,
@@ -771,13 +872,10 @@ def build_forward_response_atlas(
         ("indicator_id", "direction", "horizon_bars"),
         min_events=min_events,
     )
-    indicator_both_rows = _accumulator_rows(
-        indicator_both_groups,
-        ("indicator_id", "horizon_bars"),
+    indicator_both_rows = _combined_direction_rows(
+        indicator_direction_groups,
         min_events=min_events,
     )
-    for row in indicator_both_rows:
-        row["direction"] = "both"
     indicator_rollups = [*indicator_both_rows, *indicator_direction_rows]
     indicator_rollups.sort(
         key=lambda row: (
