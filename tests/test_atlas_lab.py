@@ -831,6 +831,25 @@ class NoSignalAggregateSuccessGateway(FakeGateway):
         return {"status": "accepted", "enqueued": len(tasks)}
 
 
+class PreservedNoSignalAggregateGateway(NoSignalAggregateSuccessGateway):
+    def snapshot(self) -> dict[str, Any]:
+        payload = super().snapshot()
+        payload["metrics"] = {"results_dropped": 0, "duplicate_task_enqueues": len(self.enqueued_tasks)}
+        return payload
+
+    def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        if not self.results:
+            super().enqueue_tasks(tasks)
+        self.enqueued_tasks.extend(tasks)
+        return {
+            "status": "accepted",
+            "submitted": len(tasks),
+            "accepted": 0,
+            "enqueued": 0,
+            "rejected": len(tasks),
+        }
+
+
 class MixedNoBestAggregateSuccessGateway(NoSignalAggregateSuccessGateway):
     def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
         self.enqueued_tasks.extend(tasks)
@@ -1205,6 +1224,43 @@ def test_historical_probe_no_signal_success_aggregate_continues_as_nonviable(
     assert terminal_reason["market_data_window"]["filtered_bar_count"] == 14717
     assert (result_dir / "execution-evidence.json").exists()
     assert not any(task["task_kind"] == "deep_replay_detail" for task in gateway.enqueued_tasks)
+
+
+def test_historical_probe_resume_accepts_preserved_duplicate_aggregate_result(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    source_dir, _result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+    monkeypatch.setattr(FuzzfolioCli, "score_artifact", lambda *args, **kwargs: {})
+
+    gateway = PreservedNoSignalAggregateGateway()
+    outcome = run_probe_spec_via_gateway(
+        config,
+        spec=ProbeRunSpec(
+            kind="anchor_pair",
+            source_dir=source_dir,
+            atlas_filename="anchor-pair-atlas.json",
+            results_filename="anchor-pair-probe-results.csv",
+            summary_filename="anchor-pair-probe-summary.json",
+            manifest_schema="anchor_pair_run_manifest_v1",
+            result_fieldnames=_probe_results_fieldnames,
+            row_builder=_result_row_from_score,
+        ),
+        gateway=gateway,
+        runtime=AtlasLabRuntimeConfig(
+            active_probes=1,
+            result_batch_size=10,
+            as_of_date="2025-06-30T00:00:00Z",
+            lake_manifest_sha256="sha256:" + "e" * 64,
+        ),
+        worker_contract_hash="contract123",
+    )
+
+    assert outcome.summary["result_counts"]["status_counts"] == {"nonviable": 1}
+    rows = list(csv.DictReader((source_dir / "anchor-pair-probe-results.csv").open(encoding="utf-8")))
+    assert rows[0]["terminal_outcome"] == "no_valid_cell"
+    assert gateway.acked == ["lease-1"]
 
 
 def test_historical_probe_missing_best_cell_without_terminal_fails_closed(

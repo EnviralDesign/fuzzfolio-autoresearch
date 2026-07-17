@@ -1852,6 +1852,7 @@ def _enqueue_gateway_tasks_with_retries(
     *,
     attempts: int = 5,
     retry_base_seconds: float = 1.0,
+    allow_preserved_results: bool = False,
 ) -> None:
     if not tasks:
         return
@@ -1862,6 +1863,14 @@ def _enqueue_gateway_tasks_with_retries(
                 accepted = response.get("accepted", response.get("enqueued"))
                 if accepted is not None and int(accepted) != len(tasks):
                     rejected = response.get("rejected")
+                    accepted_count = int(accepted)
+                    rejected_count = int(rejected) if rejected is not None else len(tasks) - accepted_count
+                    if allow_preserved_results and accepted_count == 0 and rejected_count == len(tasks):
+                        snapshot = _gateway_snapshot_with_retries(gateway)
+                        result_backlog = int(snapshot.get("result_backlog") or 0)
+                        duplicate_enqueues = int(_gateway_metrics(snapshot).get("duplicate_task_enqueues") or 0)
+                        if result_backlog >= len(tasks) and duplicate_enqueues >= len(tasks):
+                            return
                     raise RuntimeError(
                         "Atlas gateway accepted "
                         f"{accepted} of {len(tasks)} task(s)"
@@ -2037,7 +2046,7 @@ def run_probe_spec_via_gateway(
             active[state.probe_id] = state
             task_to_probe[state.aggregate_task_id] = state
             chunk.append(make_deep_replay_task(state=state, runtime=runtime))
-        _enqueue_gateway_tasks_with_retries(gateway, chunk)
+        _enqueue_gateway_tasks_with_retries(gateway, chunk, allow_preserved_results=True)
 
     enqueue_more()
     while completed < len(queue_rows):
