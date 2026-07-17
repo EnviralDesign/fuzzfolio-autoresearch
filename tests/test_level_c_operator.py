@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from autoresearch.config import load_config
 from autoresearch.evidence_plan import canonical_sha256
 from autoresearch.generation_archive import GENERATION_SCHEMA_NAME, GENERATION_SCHEMA_VERSION
 from autoresearch.instrument_universe import universe_provenance
@@ -195,6 +196,13 @@ def test_builds_exact_declarative_arguments_from_one_cutoff(tmp_path: Path) -> N
     assert plan["bound_contract"]["profile_model_source_lock"][
         "source_lock_sha256"
     ].startswith("sha256:")
+    runtime_config = load_config()
+    expected_root = (
+        Path(runtime_config.fuzzfolio.workspace_root)
+        if runtime_config.fuzzfolio.workspace_root
+        else runtime_config.repo_root.parent / "Trading-Dashboard"
+    ).resolve()
+    assert Path(plan["bound_contract"]["profile_model_source_root"]) == expected_root
 
 
 def test_one_authoritative_plan_drives_atlas_and_playhand_executors(tmp_path: Path) -> None:

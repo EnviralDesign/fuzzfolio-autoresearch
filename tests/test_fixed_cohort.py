@@ -174,22 +174,27 @@ def test_attempt_cohort_conflict_is_rejected_and_nested_identity_records_manifes
                 "attempt_id": "alpha",
                 "run_id": "run-alpha",
                 "is_canonical_attempt": True,
-            },
-            {
-                "attempt_id": "outside-cohort",
-                "run_id": "run-outside",
-                "is_canonical_attempt": True,
-            },
+            }
         ]
         if kwargs["attempt_ids"] == ["alpha"]
         else (_ for _ in ()).throw(AssertionError("cohort filter was not applied")),
     )
     monkeypatch.setattr(ar_main, "load_run_metadata", lambda _path: {})
     import autoresearch.portfolio_research as portfolio_research
+    import autoresearch.nested_pipeline as nested_pipeline
+
+    monkeypatch.setattr(nested_pipeline, "iter_catalog_rows", ar_main.iter_catalog_rows)
+    monkeypatch.setattr(nested_pipeline, "load_run_metadata", lambda _path: {})
 
     monkeypatch.setattr(portfolio_research, "load_research_suite", lambda *_args: ({}, {}))
+    monkeypatch.setattr(nested_pipeline, "load_research_suite", lambda *_args: ({}, {}))
     monkeypatch.setattr(
         portfolio_research,
+        "temporal_folds",
+        lambda **_kwargs: [{"fold_id": "fold-1", "train_start": "2024-01-01", "train_end": "2024-12-31"}],
+    )
+    monkeypatch.setattr(
+        nested_pipeline,
         "temporal_folds",
         lambda **_kwargs: [{"fold_id": "fold-1", "train_start": "2024-01-01", "train_end": "2024-12-31"}],
     )

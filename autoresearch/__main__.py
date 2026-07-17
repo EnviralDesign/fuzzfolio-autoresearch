@@ -15106,266 +15106,41 @@ def cmd_nested_evidence(
     as_json: bool,
     attempt_cohort: Path | None = None,
 ) -> int:
-    from autoresearch.nested_gateway import run_nested_gateway_fold
-    from autoresearch.portfolio_research import (
-        load_research_suite,
-        run_nested_cell_temporal_validation,
-        temporal_folds,
-    )
+    from autoresearch.nested_pipeline import prepare_nested_pipeline, run_nested_pipeline
 
     config = load_config()
-    attempt_ids, cohort = _resolve_attempt_cohort(
-        attempt_cohort=attempt_cohort, attempt_ids=attempt_ids
-    )
-    cohort_manifest_id = str((cohort or {}).get("manifest_id") or "") or None
-    evidence_campaign_plan_id = (
-        f"{campaign_id}:attempt-cohort:{cohort_manifest_id}"
-        if cohort_manifest_id
-        else str(campaign_id)
-    )
-    suite_path = (
-        suite_config_path.resolve()
-        if suite_config_path is not None
-        else config.repo_root / "portfolio.research-suites.json"
-    )
-    _suite_document, suite = load_research_suite(suite_path, suite_name)
-    folds = temporal_folds(
+    context = prepare_nested_pipeline(
+        config=config,
+        campaign_id=campaign_id,
+        suite_name=suite_name,
+        suite_config_path=suite_config_path,
+        run_ids=run_ids,
+        attempt_ids=attempt_ids,
+        scope=scope,
         start=start,
         end=end,
-        train_months=int(train_months),
-        test_months=int(test_months),
-        step_months=int(step_months),
-        embargo_days=int(embargo_days),
-    )
-    if not folds:
-        raise SystemExit("Nested fold geometry does not fit the requested range.")
-    wanted_ids = {
-        str(attempt_id).strip()
-        for attempt_id in (attempt_ids or [])
-        if str(attempt_id).strip()
-    }
-    catalog_rows = list(
-        iter_catalog_rows(
-            config,
-            run_ids=run_ids,
-            attempt_ids=sorted(wanted_ids) if wanted_ids else None,
-        )
-    )
-    if wanted_ids:
-        catalog_rows = [
-            row
-            for row in catalog_rows
-            if str(row.get("attempt_id") or "") in wanted_ids
-        ]
-    resolved_scope = str(scope or "canonical").strip().lower()
-    items = []
-    for row in catalog_rows:
-        if resolved_scope == "canonical" and not (
-            bool(row.get("is_canonical_attempt"))
-            or bool(row.get("is_canonical_playhand_attempt"))
-        ):
-            continue
-        run_id = str(row.get("run_id") or "").strip()
-        run_dir = config.runs_root / run_id
-        items.append((run_dir, dict(row), row, load_run_metadata(run_dir)))
-    if not items:
-        raise SystemExit("No attempts matched the nested evidence scope.")
-    campaign_root = config.derived_root / "nested-evidence" / str(campaign_id)
-    inner_config = dict((suite.get("temporal_validation") or {}).get("inner_validation") or {})
-    inner_geometry = []
-    for outer_fold in folds:
-        outer_start = date.fromisoformat(str(outer_fold["train_start"])[:10])
-        outer_end = date.fromisoformat(str(outer_fold["train_end"])[:10])
-        total_months = max(
-            1,
-            (outer_end.year - outer_start.year) * 12
-            + outer_end.month
-            - outer_start.month,
-        )
-        inner_folds = temporal_folds(
-            start=str(outer_fold["train_start"]),
-            end=str(outer_fold["train_end"]),
-            train_months=int(inner_config.get("train_months") or max(1, total_months // 2)),
-            test_months=int(inner_config.get("test_months") or max(1, total_months // 6)),
-            step_months=int(
-                inner_config.get("step_months")
-                or inner_config.get("test_months")
-                or max(1, total_months // 6)
-            ),
-            embargo_days=int(
-                inner_config.get("embargo_days", outer_fold.get("embargo_days") or 0)
-            ),
-        )
-        inner_geometry.append(
-            {
-                "outer_fold_id": outer_fold["fold_id"],
-                "inner_fold_count": len(inner_folds),
-                "inner_folds": inner_folds,
-            }
-        )
-    preview = {
-        "status": "dry_run" if dry_run else "pending",
-        "campaign_id": campaign_id,
-        "evidence_campaign_plan_id": evidence_campaign_plan_id,
-        "attempt_cohort_manifest_id": cohort_manifest_id,
-        "attempt_cohort_path": str(attempt_cohort) if attempt_cohort else None,
-        "suite": suite_name,
-        "suite_config": str(suite_path),
-        "campaign_root": str(campaign_root),
-        "scope": resolved_scope,
-        "attempt_count": len(items),
-        "fold_count": len(folds),
-        "planned_train_jobs": len(items) * len(folds),
-        "planned_outer_jobs": len(items) * len(folds),
-        "selection_basis": selection_basis,
-        "optimizer_backend": optimizer_backend,
-        "folds": folds,
-        "inner_validation": inner_geometry,
-    }
-    if dry_run:
-        print(json.dumps(preview, ensure_ascii=True, indent=2))
-        return 0
-    resolved_lake_manifest_sha256 = str(lake_manifest_sha256 or "").strip() or None
-    resolved_lake_url = str(
-        lake_url or os.environ.get("REMOTE_MARKET_DATA_LAKE_BASE_URL") or ""
-    ).strip()
-    if resolved_lake_manifest_sha256 is None and resolved_lake_url:
-        import requests
-
-        headers = (
-            {"Authorization": f"Bearer {lake_token}"}
-            if str(lake_token or "").strip()
-            else {}
-        )
-        response = requests.get(
-            f"{resolved_lake_url.rstrip('/')}/api/lake/manifest",
-            headers=headers,
-            timeout=30,
-        )
-        response.raise_for_status()
-        manifest_payload = response.json()
-        resolved_lake_manifest_sha256 = str(
-            (manifest_payload or {}).get("coverage_sha256") or ""
-        ).strip() or None
-    if resolved_lake_manifest_sha256 is None:
-        raise SystemExit(
-            "Nested evidence requires the promoted lake coverage identity. Provide "
-            "--lake-manifest-sha256 or --lake-url after deploying the updated lake."
-        )
-    lab_config = resolve_lab_backtest_config(
+        train_months=train_months,
+        test_months=test_months,
+        step_months=step_months,
+        embargo_days=embargo_days,
+        selection_basis=selection_basis,
+        max_workers=max_workers,
         gateway_url=gateway_url,
         gateway_token=gateway_token,
+        lake_manifest_sha256=lake_manifest_sha256,
+        lake_url=lake_url,
+        lake_token=lake_token,
         trading_dashboard_root=trading_dashboard_root,
-        deadline_seconds=3600,
-        result_batch_size=max(25, int(max_workers) * 2),
+        optimizer_backend=optimizer_backend,
+        attempt_cohort=attempt_cohort,
+        dry_run=dry_run,
     )
-    train_fold_results = []
-    for fold in folds:
-        train_fold_results.append(
-            run_nested_gateway_fold(
-                config=config,
-                items=items,
-                fold=fold,
-                campaign_plan_id=evidence_campaign_plan_id,
-                campaign_root=campaign_root,
-                lab_config=lab_config,
-                max_workers=max(1, int(max_workers)),
-                train_horizon_months=int(train_months),
-                test_horizon_months=int(test_months),
-                selection_basis=selection_basis,
-                lake_manifest_sha256=resolved_lake_manifest_sha256,
-                submit_outer=False,
-                emit=(lambda message: print(message, file=sys.stderr, flush=True)),
-            )
-        )
-    failed = [
-        row for row in train_fold_results if row.get("status") != "cells_frozen"
-    ]
-    account = _resolve_optimizer_account_spec(
-        config=config,
-        account_config_path=str(suite.get("account_config") or "").strip() or None,
-        account_preset=str(suite.get("account_preset") or "").strip() or None,
-        fallback={},
-    )
-    scoped_ids = {
-        str(item[1].get("attempt_id") or "") for item in items
-    }
-    scoped_rows = [
-        row
-        for row in catalog_rows
-        if str(row.get("attempt_id") or "") in scoped_ids
-    ]
-    frozen_portfolio_results = (
-        run_nested_cell_temporal_validation(
-            rows=scoped_rows,
-            fold_reports=train_fold_results,
-            suite=suite,
-            account=account,
-            root=campaign_root / "portfolio-validation",
-            backend=optimizer_backend,
-            freeze_only=True,
-        )
-        if not failed
-        else []
-    )
-    selected_by_fold: dict[str, set[str]] = {}
-    for result in frozen_portfolio_results:
-        fold_id = str((result.get("fold") or {}).get("fold_id") or "")
-        selected_by_fold.setdefault(fold_id, set()).update(
-            str(attempt_id)
-            for attempt_id in result.get("selected_attempt_ids") or []
-        )
-    fold_results = []
-    if not failed:
-        for fold in folds:
-            fold_results.append(
-                run_nested_gateway_fold(
-                    config=config,
-                    items=items,
-                    fold=fold,
-                    campaign_plan_id=evidence_campaign_plan_id,
-                    campaign_root=campaign_root,
-                    lab_config=lab_config,
-                    max_workers=max(1, int(max_workers)),
-                    train_horizon_months=int(train_months),
-                    test_horizon_months=int(test_months),
-                    selection_basis=selection_basis,
-                    lake_manifest_sha256=resolved_lake_manifest_sha256,
-                    submit_outer=True,
-                    outer_selected_attempt_ids=selected_by_fold.get(
-                        str(fold.get("fold_id") or ""), set()
-                    ),
-                    emit=(lambda message: print(message, file=sys.stderr, flush=True)),
-                )
-            )
-        failed = [row for row in fold_results if row.get("status") != "complete"]
-    nested_portfolio_results = (
-        run_nested_cell_temporal_validation(
-            rows=scoped_rows,
-            fold_reports=fold_results,
-            suite=suite,
-            account=account,
-            root=campaign_root / "portfolio-validation",
-            backend=optimizer_backend,
-        )
-        if fold_results and not failed
-        else []
-    )
-    payload = {
-        **preview,
-        "status": "failed" if failed else "complete",
-        "fold_results": fold_results,
-        "portfolio_result_count": len(nested_portfolio_results),
-        "portfolio_results_path": str(
-            campaign_root
-            / "portfolio-validation"
-            / "nested-temporal-results.json"
-        ),
-    }
-    write_json(campaign_root / "nested-evidence-report.json", payload)
+    if dry_run:
+        print(json.dumps({**context.preview, "status": "dry_run"}, ensure_ascii=True, indent=2))
+        return 0
+    payload = run_nested_pipeline(context)
     print(json.dumps(payload, ensure_ascii=True, indent=2))
-    return 1 if failed else 0
-
+    return 0
 
 def cmd_build_portfolio_risk_sizing(
     *,

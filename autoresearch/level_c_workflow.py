@@ -10,6 +10,7 @@ import hashlib
 import argparse
 import json
 import os
+import sqlite3
 import tempfile
 from dataclasses import fields
 from datetime import datetime
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .atlas_lab import AtlasLabRuntimeConfig, run_atlas_lab
+from .catalog_index import CATALOG_INDEX_SCHEMA_VERSION
 from .config import AppConfig, load_config
 from .evidence_plan import canonical_json, canonical_sha256
 from .generation_archive import (
@@ -209,6 +211,277 @@ def _relative_archived_file(path: Path, archive_root: Path, *, label: str) -> st
     return relative.as_posix()
 
 
+def _sha256_token(value: Any) -> str:
+    token = str(value or "").strip().lower()
+    return token if token.startswith("sha256:") else f"sha256:{token}"
+
+
+def _validate_attempt_catalog(path: Path) -> dict[str, Any]:
+    source = path.resolve(strict=True)
+    with source.open("rb") as handle:
+        header = handle.read(16)
+    if header != b"SQLite format 3\x00":
+        raise LevelCWorkflowError("archived attempt catalog has an invalid SQLite header")
+    try:
+        connection = sqlite3.connect(f"{source.as_uri()}?mode=ro&immutable=1", uri=True)
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            required = {"metadata", "run_signatures", "attempt_rows"}
+            if not required.issubset(tables):
+                raise LevelCWorkflowError(
+                    "archived attempt catalog is missing required tables: "
+                    + ", ".join(sorted(required - tables))
+                )
+            attempt_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(attempt_rows)").fetchall()
+            }
+            required_attempt_columns = {
+                "run_id",
+                "row_key",
+                "row_index",
+                "attempt_id",
+                "is_tombstoned",
+                "has_full_backtest_36m",
+                "row_json",
+                "updated_at",
+            }
+            signature_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(run_signatures)"
+                ).fetchall()
+            }
+            if not required_attempt_columns.issubset(attempt_columns) or not {
+                "run_id",
+                "signature_json",
+                "row_count",
+                "updated_at",
+            }.issubset(signature_columns):
+                raise LevelCWorkflowError("archived attempt catalog schema is incompatible")
+            metadata = dict(
+                connection.execute(
+                    "SELECT key, value FROM metadata WHERE key IN ('schema_version', 'index_signature')"
+                ).fetchall()
+            )
+            if str(metadata.get("schema_version") or "") != str(
+                CATALOG_INDEX_SCHEMA_VERSION
+            ):
+                raise LevelCWorkflowError("archived attempt catalog schema version differs")
+        finally:
+            connection.close()
+    except (sqlite3.Error, OSError) as exc:
+        raise LevelCWorkflowError("archived attempt catalog is not immutably readable") from exc
+    return {
+        "schema_version": str(CATALOG_INDEX_SCHEMA_VERSION),
+        "required_tables": ["attempt_rows", "metadata", "run_signatures"],
+    }
+
+
+def _validate_legacy_controls(
+    *,
+    path: Path,
+    archive_root: Path,
+    archive_id: str,
+    new_generation_id: str,
+    catalog_path: Path,
+    catalog_sha256: str,
+    nested_report_path: Path,
+    nested_report_sha256: str,
+) -> dict[str, Any]:
+    controls = _load_json(path, label="legacy controls")
+    identity = controls.get("identity")
+    integrity = controls.get("integrity")
+    if (
+        controls.get("schema") != "legacy-controls-manifest-v1"
+        or not isinstance(identity, dict)
+        or identity.get("schema") != "legacy-controls-manifest-v1"
+        or not isinstance(integrity, dict)
+    ):
+        raise LevelCWorkflowError("legacy controls schema is invalid")
+    identity_hash = _sha256_bytes(
+        json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    )
+    if (
+        integrity.get("identity_hash_algorithm") != "sha256"
+        or integrity.get("self_hash") != identity_hash
+        or integrity.get("manifest_id") != identity_hash
+    ):
+        raise LevelCWorkflowError("legacy controls self identity is invalid")
+    context = identity.get("archive_context")
+    if not isinstance(context, dict):
+        raise LevelCWorkflowError("legacy controls archive context is missing")
+    projected_root = Path(str(context.get("projected_archived_runs_root") or "")).resolve(
+        strict=False
+    )
+    if (
+        context.get("archive_id") != archive_id
+        or context.get("new_research_generation_id") != new_generation_id
+        or projected_root != archive_root
+        or context.get("archive_relative_base") != archive_root.name
+        or context.get("reference_only") is not True
+    ):
+        raise LevelCWorkflowError("legacy controls archive context differs from bootstrap")
+    expected_exclusion = {
+        "active_seeding": "excluded",
+        "active_candidate_scans": "excluded",
+        "active_selection": "excluded",
+        "active_optimizer_candidates": "excluded",
+        "empirical_priors": "excluded",
+        "permitted_use": "post_campaign_comparison_only",
+        "copy_profiles": False,
+        "edit_active_runs": False,
+    }
+    exclusion = identity.get("exclusion_contract")
+    if not isinstance(exclusion, dict) or any(
+        exclusion.get(key) != value for key, value in expected_exclusion.items()
+    ):
+        raise LevelCWorkflowError("legacy controls exclusion contract is invalid")
+    sources = identity.get("source_artifacts")
+    if not isinstance(sources, dict):
+        raise LevelCWorkflowError("legacy controls source artifacts are missing")
+    expected_sources = {
+        "exact_catalog_database": (catalog_path, catalog_sha256),
+        "nested_evidence_report": (nested_report_path, nested_report_sha256),
+    }
+    if set(sources) != set(expected_sources):
+        raise LevelCWorkflowError("legacy controls source artifact set differs")
+    verified_sources: dict[str, dict[str, str]] = {}
+    for key, (actual_path, actual_hash) in expected_sources.items():
+        record = sources.get(key)
+        if not isinstance(record, dict):
+            raise LevelCWorkflowError(f"legacy controls source artifact is missing: {key}")
+        relative = Path(str(record.get("archive_relative_path") or ""))
+        projected = Path(str(record.get("projected_archived_path") or "")).resolve(
+            strict=False
+        )
+        expected_path = (archive_root / relative).resolve(strict=False)
+        actual_relative = actual_path.resolve(strict=True).relative_to(archive_root)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != actual_relative.as_posix()
+            or projected != expected_path
+            or actual_path.resolve(strict=True) != expected_path.resolve(strict=True)
+            or _sha256_token(record.get("sha256")) != actual_hash
+        ):
+            raise LevelCWorkflowError(f"legacy controls source artifact differs: {key}")
+        verified_sources[key] = {
+            "relative_path": relative.as_posix(),
+            "sha256": actual_hash,
+        }
+    return {
+        "manifest_id": identity_hash,
+        "control_set_id": str(identity.get("control_set_id") or ""),
+        "verified_sources": verified_sources,
+    }
+
+
+def _validate_completed_nested_report(
+    report: Mapping[str, Any], *, report_path: Path, controls: Mapping[str, Any]
+) -> dict[str, Any]:
+    identity = controls.get("identity") if isinstance(controls, Mapping) else None
+    categories = identity.get("categories") if isinstance(identity, Mapping) else None
+    campaign_controls = (
+        categories.get("campaign_controls") if isinstance(categories, Mapping) else None
+    )
+    expected = campaign_controls.get("nested") if isinstance(campaign_controls, Mapping) else None
+    if not isinstance(expected, Mapping):
+        raise LevelCWorkflowError("legacy controls nested campaign contract is missing")
+    folds = report.get("fold_results")
+    if (
+        report.get("status") != "complete"
+        or report.get("campaign_id") != expected.get("campaign_id")
+        or report.get("evidence_campaign_plan_id")
+        != expected.get("evidence_campaign_plan_id")
+        or report.get("attempt_cohort_manifest_id")
+        != expected.get("attempt_cohort_manifest_id")
+        or int(report.get("attempt_count") or 0) != int(expected.get("attempt_count") or 0)
+        or int(report.get("portfolio_result_count") or 0)
+        != int(expected.get("portfolio_result_count") or 0)
+        or report.get("selection_basis") != expected.get("selection_basis")
+        or not isinstance(folds, list)
+        or len(folds) != int(expected.get("fold_count") or 0)
+    ):
+        raise LevelCWorkflowError("completed nested report campaign semantics differ")
+    prior_test_end: datetime | None = None
+    geometry: list[dict[str, Any]] = []
+    expected_attempts: set[str] | None = None
+    for index, row in enumerate(folds, start=1):
+        fold = row.get("fold") if isinstance(row, Mapping) else None
+        if not isinstance(fold, Mapping) or row.get("status") != "complete":
+            raise LevelCWorkflowError("completed nested report contains an incomplete fold")
+        train_start = datetime.fromisoformat(str(fold.get("train_start"))[:10])
+        train_end = datetime.fromisoformat(str(fold.get("train_end"))[:10])
+        test_start = datetime.fromisoformat(str(fold.get("test_start"))[:10])
+        test_end = datetime.fromisoformat(str(fold.get("test_end"))[:10])
+        train_months = (train_end.year - train_start.year) * 12 + train_end.month - train_start.month
+        test_months = (test_end.year - test_start.year) * 12 + test_end.month - test_start.month
+        if (
+            str(fold.get("fold_id") or "") != f"fold-{index:02d}"
+            or int(fold.get("embargo_days") or -1) != 15
+            or train_months != 36
+            or test_months != 6
+            or test_start <= train_end
+            or (prior_test_end is not None and test_start <= prior_test_end)
+        ):
+            raise LevelCWorkflowError("completed nested report fold geometry is invalid")
+        records = row.get("records")
+        if not isinstance(records, list) or len(records) != int(
+            expected.get("attempt_count") or 0
+        ):
+            raise LevelCWorkflowError("completed nested report strategy accounting differs")
+        attempt_ids = [str(record.get("attempt_id") or "") for record in records]
+        if any(not value for value in attempt_ids) or len(set(attempt_ids)) != len(
+            attempt_ids
+        ):
+            raise LevelCWorkflowError("completed nested report attempt membership is invalid")
+        observed_attempts = set(attempt_ids)
+        if expected_attempts is None:
+            expected_attempts = observed_attempts
+        elif observed_attempts != expected_attempts:
+            raise LevelCWorkflowError("completed nested report fold membership differs")
+        train_nonviable = sum(
+            record.get("train_validation_status") == "nonviable" for record in records
+        )
+        outer_nonviable = sum(
+            record.get("outer_validation_status") == "nonviable" for record in records
+        )
+        if (
+            any(
+                record.get("train_validation_status") not in {"valid", "nonviable"}
+                for record in records
+            )
+            or train_nonviable != int(row.get("train_nonviable_count") or 0)
+            or outer_nonviable != int(row.get("outer_nonviable_count") or 0)
+            or int(row.get("outer_failed_count") or 0) != 0
+        ):
+            raise LevelCWorkflowError("completed nested report terminal accounting differs")
+        prior_test_end = test_end
+        geometry.append(dict(fold))
+    portfolio_path = (
+        report_path.parent / "portfolio-validation" / "nested-temporal-results.json"
+    )
+    try:
+        portfolio_results = json.loads(portfolio_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LevelCWorkflowError("completed nested portfolio artifact is invalid") from exc
+    if not isinstance(portfolio_results, list) or len(portfolio_results) != int(
+        expected.get("portfolio_result_count") or 0
+    ):
+        raise LevelCWorkflowError("completed nested portfolio accounting differs")
+    return {
+        "campaign_id": report["campaign_id"],
+        "fold_geometry": geometry,
+        "attempt_count": len(expected_attempts or set()),
+        "portfolio_result_count": len(portfolio_results),
+    }
+
+
 def bootstrap_level_c(
     *,
     config: AppConfig,
@@ -242,7 +515,6 @@ def bootstrap_level_c(
     paths = _control_paths(active_root)
     named_files = {
         "archived_attempt_catalog": (archived_attempt_catalog, archived_attempt_catalog_sha256),
-        "legacy_controls": (legacy_controls, legacy_controls_sha256),
         "completed_nested_report": (completed_nested_report, completed_nested_report_sha256),
     }
     verified: dict[str, dict[str, str]] = {}
@@ -255,9 +527,36 @@ def bootstrap_level_c(
             "relative_path": _relative_archived_file(path, archive, label=name),
             "sha256": observed,
         }
+    controls_path = legacy_controls.expanduser().resolve(strict=True)
+    controls_expected_hash = _require_sha256(
+        legacy_controls_sha256, label="legacy_controls sha256"
+    )
+    controls_observed_hash = _file_sha256(controls_path)
+    if controls_observed_hash != controls_expected_hash:
+        raise LevelCWorkflowError("legacy_controls hash mismatch")
+    controls_payload = _load_json(controls_path, label="legacy controls")
+    controls_validation = _validate_legacy_controls(
+        path=controls_path,
+        archive_root=archive,
+        archive_id=str(archive_id),
+        new_generation_id=str(new_generation_id),
+        catalog_path=archived_attempt_catalog,
+        catalog_sha256=verified["archived_attempt_catalog"]["sha256"],
+        nested_report_path=completed_nested_report,
+        nested_report_sha256=verified["completed_nested_report"]["sha256"],
+    )
+    catalog_validation = _validate_attempt_catalog(archived_attempt_catalog)
+    verified["legacy_controls"] = {
+        "path": str(controls_path),
+        "sha256": controls_observed_hash,
+        "manifest_id": controls_validation["manifest_id"],
+    }
     nested_report = _load_json(completed_nested_report, label="completed nested report")
-    if str(nested_report.get("status") or "").lower() != "complete":
-        raise LevelCWorkflowError("archived nested report is not complete")
+    report_validation = _validate_completed_nested_report(
+        nested_report,
+        report_path=completed_nested_report.resolve(strict=True),
+        controls=controls_payload,
+    )
     cutoff_plans = build_initial_four_cutoff_plans(
         completed_nested_report, global_seed=int(global_seed)
     )
@@ -275,6 +574,8 @@ def bootstrap_level_c(
         "archived_runs_root": str(archive),
         "archive_prepared_at": prepared_at,
         "verified_artifacts": verified,
+        "attempt_catalog_validation": catalog_validation,
+        "completed_nested_report_validation": report_validation,
     }
     archive_receipt = {
         **archive_identity,
@@ -466,20 +767,77 @@ def _month_span(start: str, end: str) -> int:
     return max(1, (right.year - left.year) * 12 + right.month - left.month)
 
 
-def _validate_nested_report(report_path: Path, *, selected_only: bool) -> dict[str, Any]:
+def _validate_nested_report(
+    report_path: Path,
+    *,
+    selected_only: bool,
+    expected_attempt_ids: set[str] | None = None,
+) -> dict[str, Any]:
     report = _load_json(report_path, label="nested evidence report")
     if report.get("status") != "complete":
         raise LevelCWorkflowError("nested evidence report is not complete")
     portfolio_results: list[dict[str, Any]] = []
+    membership = report.get("membership")
+    fold_results = report.get("fold_results") or []
+    if expected_attempt_ids is not None:
+        if not isinstance(membership, dict):
+            raise LevelCWorkflowError("nested report membership contract is missing")
+        requested = membership.get("requested_attempt_ids")
+        if (
+            not isinstance(requested, list)
+            or len(requested) != len(set(requested))
+            or set(requested) != expected_attempt_ids
+        ):
+            raise LevelCWorkflowError("nested requested membership differs from frozen cohort")
+        eligible_by_fold = membership.get("training_eligible_attempt_ids_by_fold") or {}
+        terminal_by_fold = membership.get("training_terminal_attempt_ids_by_fold") or {}
+        selected_by_fold = membership.get("selected_attempt_ids_by_fold") or {}
+        outer_by_fold = membership.get("outer_terminal_attempt_ids_by_fold") or {}
+        expected_fold_ids = {
+            str((row.get("fold") or {}).get("fold_id") or "")
+            for row in fold_results
+            if isinstance(row, Mapping)
+        }
+        if (
+            not expected_fold_ids
+            or "" in expected_fold_ids
+            or set(eligible_by_fold) != expected_fold_ids
+            or set(terminal_by_fold) != expected_fold_ids
+            or set(selected_by_fold) != expected_fold_ids
+            or set(outer_by_fold) != expected_fold_ids
+        ):
+            raise LevelCWorkflowError("nested membership fold sets are incomplete")
+        for fold_id in expected_fold_ids:
+            eligible = list(eligible_by_fold.get(fold_id) or [])
+            terminal = list(terminal_by_fold.get(fold_id) or [])
+            if (
+                len(eligible) != len(set(eligible))
+                or len(terminal) != len(set(terminal))
+                or set(eligible) & set(terminal)
+                or set(eligible) | set(terminal) != expected_attempt_ids
+            ):
+                raise LevelCWorkflowError("nested training membership is incomplete")
+            selected = list(selected_by_fold.get(fold_id) or [])
+            outer = list(outer_by_fold.get(fold_id) or [])
+            if (
+                len(selected) != len(set(selected))
+                or len(outer) != len(set(outer))
+                or set(selected) != set(outer)
+                or not set(selected).issubset(set(eligible))
+            ):
+                raise LevelCWorkflowError("nested selected/outer membership differs")
     portfolio_path_value = str(report.get("portfolio_results_path") or "").strip()
     if portfolio_path_value:
-        portfolio_payload = json.loads(Path(portfolio_path_value).read_text(encoding="utf-8"))
+        portfolio_path = Path(portfolio_path_value)
+        if _file_sha256(portfolio_path) != report.get("portfolio_results_sha256"):
+            raise LevelCWorkflowError("nested portfolio results artifact drift")
+        portfolio_payload = json.loads(portfolio_path.read_text(encoding="utf-8"))
         if not isinstance(portfolio_payload, list) or not all(
             isinstance(row, dict) for row in portfolio_payload
         ):
             raise LevelCWorkflowError("nested portfolio results are malformed")
         portfolio_results = portfolio_payload
-    for fold_result in report.get("fold_results") or []:
+    for fold_result in fold_results:
         if fold_result.get("status") != "complete" or int(
             fold_result.get("outer_failed_count") or 0
         ):
@@ -619,47 +977,66 @@ def _default_stage_handler(
         }
         _create_or_verify(terminal_path, terminal)
         return "no_candidate", [terminal_path]
-    if stage == "training_evidence" and not report_path.exists():
-        from .__main__ import cmd_nested_evidence
+    from .nested_pipeline import (
+        prepare_nested_pipeline,
+        run_nested_final_report_phase,
+        run_nested_frozen_cells_phase,
+        run_nested_frozen_portfolio_phase,
+        run_nested_selected_outer_phase,
+        run_nested_training_phase,
+    )
 
-        geometry = plan["cutoff"]["geometry"]
-        exit_code = cmd_nested_evidence(
-            campaign_id=nested_campaign_id,
-            suite_name=str(workflow["suite_name"]),
-            suite_config_path=None,
-            run_ids=None,
-            attempt_ids=None,
-            scope="all",
-            start=geometry["training_start"],
-            end=geometry["outer_test_end"],
-            train_months=_month_span(geometry["training_start"], geometry["training_end"]),
-            test_months=_month_span(geometry["outer_test_start"], geometry["outer_test_end"]),
-            step_months=_month_span(geometry["outer_test_start"], geometry["outer_test_end"]),
-            embargo_days=int(geometry["embargo_days"]),
-            selection_basis=str(workflow["selection_basis"]),
-            max_workers=max(1, int(nested_max_workers)),
-            gateway_url=gateway_url,
-            gateway_token=gateway_token,
-            lake_url=None,
-            lake_token=None,
-            lake_manifest_sha256=plan["atlas_arguments"]["lake_manifest_sha256"],
-            trading_dashboard_root=trading_dashboard_root,
-            optimizer_backend=str(workflow["optimizer_backend"]),
-            dry_run=False,
-            as_json=True,
-            attempt_cohort=cohort_path,
+    geometry = plan["cutoff"]["geometry"]
+    context = prepare_nested_pipeline(
+        config=config,
+        campaign_id=nested_campaign_id,
+        suite_name=str(workflow["suite_name"]),
+        suite_config_path=config.repo_root / str(workflow["suite_config_relative_path"]),
+        run_ids=None,
+        attempt_ids=None,
+        scope="all",
+        start=geometry["training_start"],
+        end=geometry["outer_test_end"],
+        train_months=_month_span(geometry["training_start"], geometry["training_end"]),
+        test_months=_month_span(geometry["outer_test_start"], geometry["outer_test_end"]),
+        step_months=_month_span(geometry["outer_test_start"], geometry["outer_test_end"]),
+        embargo_days=int(geometry["embargo_days"]),
+        selection_basis=str(workflow["selection_basis"]),
+        max_workers=max(1, int(nested_max_workers)),
+        gateway_url=gateway_url,
+        gateway_token=gateway_token,
+        lake_manifest_sha256=plan["atlas_arguments"]["lake_manifest_sha256"],
+        trading_dashboard_root=trading_dashboard_root,
+        optimizer_backend=str(workflow["optimizer_backend"]),
+        attempt_cohort=cohort_path,
+        execution_plan_id=plan["plan_id"],
+        bound_worker_contract_hash=plan["bound_contract"]["worker_contract_sha256"],
+        bound_trading_dashboard_root=Path(
+            plan["bound_contract"]["profile_model_source_root"]
+        ),
+        profile_model_source_lock=plan["bound_contract"]["profile_model_source_lock"],
+    )
+    handlers = {
+        "training_evidence": run_nested_training_phase,
+        "frozen_cells": run_nested_frozen_cells_phase,
+        "frozen_portfolio": run_nested_frozen_portfolio_phase,
+        "selected_outer": run_nested_selected_outer_phase,
+        "final_report": run_nested_final_report_phase,
+    }
+    phase_path = handlers[stage](context)
+    phase = _load_json(phase_path, label=f"nested {stage} phase")
+    if stage == "frozen_portfolio" and phase.get("status") == "no_consensus":
+        return "no_consensus", [phase_path]
+    if stage == "final_report":
+        _validate_nested_report(
+            report_path,
+            selected_only=True,
+            expected_attempt_ids={
+                str(row.get("attempt_id") or "") for row in cohort.get("candidates") or []
+            },
         )
-        if exit_code != 0:
-            raise LevelCWorkflowError("nested evidence pipeline failed")
-    report = _validate_nested_report(report_path, selected_only=stage in {"selected_outer", "final_report"})
-    if stage == "frozen_portfolio":
-        if int(report.get("portfolio_result_count") or 0) == 0:
-            return "no_consensus", [report_path]
-        portfolio_path = Path(str(report.get("portfolio_results_path") or ""))
-        if not portfolio_path.is_file():
-            raise LevelCWorkflowError("train-only frozen portfolio artifact is missing")
-        return "complete", [report_path, portfolio_path]
-    return "complete", [report_path]
+        return "complete", [phase_path, report_path]
+    return "complete", [phase_path]
 
 
 def _development_policy(active_root: Path, plans: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
@@ -820,7 +1197,11 @@ def audit_level_c(
         raise LevelCWorkflowError("archive linkage receipt drift")
     archive_root = Path(str(archive_receipt.get("archived_runs_root") or "")).resolve(strict=True)
     for artifact in (archive_receipt.get("verified_artifacts") or {}).values():
-        source = archive_root / str(artifact.get("relative_path") or "")
+        source = (
+            Path(str(artifact.get("path"))).resolve(strict=True)
+            if artifact.get("path")
+            else archive_root / str(artifact.get("relative_path") or "")
+        )
         if _file_sha256(source) != artifact.get("sha256"):
             raise LevelCWorkflowError(f"archived bootstrap artifact drift: {source}")
     generation_path = active_root / GENERATION_MANIFEST_NAME
@@ -887,6 +1268,13 @@ def audit_level_c(
             _validate_nested_report(
                 active_root / "derived" / "nested-evidence" / nested_id / "nested-evidence-report.json",
                 selected_only=True,
+                expected_attempt_ids={
+                    str(row.get("attempt_id") or "")
+                    for row in validate_level_c_cohort(
+                        Path(plan["expected_artifacts"]["frozen_cohort"]["resolved_path"])
+                    ).get("candidates")
+                    or []
+                },
             )
         cutoff_results[key] = {"stages": stages, "terminal_outcome": terminal}
     policy_result = None

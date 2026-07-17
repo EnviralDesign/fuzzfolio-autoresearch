@@ -282,10 +282,13 @@ def run_nested_gateway_fold(
     test_horizon_months: int,
     selection_basis: Literal["best_cell", "recommended_cell", "robust_cell"] = "recommended_cell",
     lake_manifest_sha256: str | None = None,
+    freeze_cells: bool = True,
     submit_outer: bool = True,
     outer_selected_attempt_ids: set[str] | list[str] | tuple[str, ...] | None = None,
     emit: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
+    if submit_outer and not freeze_cells:
+        raise ValueError("nested outer submission requires frozen execution cells")
     fold_id = str(fold.get("fold_id") or "").strip()
     if not fold_id:
         raise ValueError("nested fold requires fold_id")
@@ -358,6 +361,24 @@ def run_nested_gateway_fold(
         failed_train = [row for row in train_results if row.get("status") == "failed"]
         if failed_train:
             raise RuntimeError(f"Nested train stage failed for {len(failed_train)} strategies")
+
+    if not freeze_cells:
+        payload = {
+            "campaign_plan_id": campaign_plan_id,
+            "fold": fold,
+            "selection_basis": selection_basis,
+            "strategy_count": len(planned),
+            "requested_attempt_ids": sorted(item_attempt_ids),
+            "train_reused_count": len(planned) - len(train_pending),
+            "train_calculated_count": sum(
+                row.get("status") == "calculated" for row in train_results
+            ),
+            "train_terminal_count": len(train_results),
+            "status": "training_complete",
+            "state_path": str(state_path),
+        }
+        _write_state(state_path, payload)
+        return payload
 
     outer_tasks: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
     fold_records: list[dict[str, Any]] = []
@@ -614,3 +635,30 @@ def run_nested_gateway_fold(
     if failed_outer:
         raise RuntimeError(f"Nested outer stage failed for {len(failed_outer)} strategies")
     return payload
+
+
+def run_nested_gateway_training_fold(**kwargs: Any) -> dict[str, Any]:
+    return run_nested_gateway_fold(
+        **kwargs,
+        freeze_cells=False,
+        submit_outer=False,
+    )
+
+
+def freeze_nested_gateway_cells_fold(**kwargs: Any) -> dict[str, Any]:
+    return run_nested_gateway_fold(
+        **kwargs,
+        freeze_cells=True,
+        submit_outer=False,
+    )
+
+
+def run_nested_gateway_selected_outer_fold(
+    *, outer_selected_attempt_ids: set[str] | list[str] | tuple[str, ...], **kwargs: Any
+) -> dict[str, Any]:
+    return run_nested_gateway_fold(
+        **kwargs,
+        freeze_cells=True,
+        submit_outer=True,
+        outer_selected_attempt_ids=outer_selected_attempt_ids,
+    )

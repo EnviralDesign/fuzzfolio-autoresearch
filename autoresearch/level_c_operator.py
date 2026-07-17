@@ -409,9 +409,8 @@ def build_level_c_execution_plan(
         runtime_config,
         worker_contract_sha256=str(protocol["worker_contract_sha256"]),
     )
-    profile_model_source_lock = build_profile_model_source_lock(
-        _configured_trading_dashboard_root(runtime_config)
-    )
+    profile_model_source_root = _configured_trading_dashboard_root(runtime_config)
+    profile_model_source_lock = build_profile_model_source_lock(profile_model_source_root)
     live_policy_identities = policy_lock_provenance(runtime_policy_lock)
     mismatched_policies = [
         field
@@ -516,6 +515,7 @@ def build_level_c_execution_plan(
             "no_global_priors": True,
             "no_outer_feedback": True,
             "runtime_policy_lock": runtime_policy_lock,
+            "profile_model_source_root": str(profile_model_source_root),
             "profile_model_source_lock": profile_model_source_lock,
         },
         "atlas_arguments": _semantic_arguments(atlas_values, executor="atlas"),

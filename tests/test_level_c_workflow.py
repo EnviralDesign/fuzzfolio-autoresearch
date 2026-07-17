@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import pytest
 
 from autoresearch.__main__ import build_parser
 from autoresearch.config import load_config
+from autoresearch.catalog_index import CATALOG_INDEX_SCHEMA_VERSION
 from autoresearch.instrument_universe import universe_provenance
 from autoresearch.level_c_workflow import (
     STAGES,
@@ -30,6 +32,7 @@ def _fixed_hash(character: str) -> str:
 
 
 def _nested_report(path: Path) -> Path:
+    attempt_ids = [f"attempt-{index:03d}" for index in range(443)]
     geometry = [
         ("2021-06-29", "2024-06-28", "2024-07-14", "2025-01-13"),
         ("2021-12-30", "2024-12-29", "2025-01-14", "2025-07-13"),
@@ -45,7 +48,20 @@ def _nested_report(path: Path) -> Path:
                 "test_start": test_start,
                 "test_end": test_end,
                 "embargo_days": 15,
-            }
+            },
+            "status": "complete",
+            "strategy_count": len(attempt_ids),
+            "train_nonviable_count": 0,
+            "outer_nonviable_count": 0,
+            "outer_failed_count": 0,
+            "records": [
+                {
+                    "attempt_id": attempt_id,
+                    "train_validation_status": "valid",
+                    "outer_validation_status": "valid",
+                }
+                for attempt_id in attempt_ids
+            ],
         }
         for index, (train_start, train_end, test_start, test_end) in enumerate(
             geometry, start=1
@@ -56,11 +72,22 @@ def _nested_report(path: Path) -> Path:
             {
                 "status": "complete",
                 "campaign_id": "archived-completed-nested",
+                "evidence_campaign_plan_id": "archived-plan-id",
+                "attempt_cohort_manifest_id": _fixed_hash("9"),
+                "attempt_count": 443,
+                "fold_count": 4,
+                "portfolio_result_count": 24,
+                "selection_basis": "recommended_cell",
                 "completed_at": "2026-07-16T12:00:00Z",
                 "fold_results": folds,
             }
         ),
         encoding="utf-8",
+    )
+    portfolio_path = path.parent / "portfolio-validation" / "nested-temporal-results.json"
+    portfolio_path.parent.mkdir(parents=True, exist_ok=True)
+    portfolio_path.write_text(
+        json.dumps([{"variant": index} for index in range(24)]), encoding="utf-8"
     )
     return path
 
@@ -70,10 +97,104 @@ def _bootstrap_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     archive = tmp_path / "archived-runs"
     archive.mkdir(parents=True)
     catalog = archive / "attempt-catalog.sqlite"
-    catalog.write_bytes(b"fixture catalog")
-    controls = archive / "legacy-controls.json"
-    controls.write_text('{"status":"frozen"}', encoding="utf-8")
+    connection = sqlite3.connect(catalog)
+    connection.executescript(
+        """
+        CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE run_signatures (
+            run_id TEXT PRIMARY KEY,
+            signature_json TEXT NOT NULL,
+            row_count INTEGER NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE attempt_rows (
+            run_id TEXT NOT NULL,
+            row_key TEXT NOT NULL,
+            row_index INTEGER NOT NULL,
+            attempt_id TEXT NOT NULL,
+            is_tombstoned INTEGER NOT NULL,
+            has_full_backtest_36m INTEGER NOT NULL,
+            row_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (run_id, row_key)
+        );
+        """
+    )
+    connection.execute(
+        "INSERT INTO metadata(key, value) VALUES ('schema_version', ?)",
+        (str(CATALOG_INDEX_SCHEMA_VERSION),),
+    )
+    connection.commit()
+    connection.close()
     report = _nested_report(archive / "nested-evidence-report.json")
+    controls = tmp_path / "legacy-controls.json"
+    identity = {
+        "control_set_id": "legacy-controls-fixture",
+        "schema": "legacy-controls-manifest-v1",
+        "created_at_utc": "2026-07-16T12:00:00Z",
+        "archive_context": {
+            "archive_id": "manual-atomic-archive-001",
+            "new_research_generation_id": "level-c-generation-001",
+            "pre_cutover_runs_root": str(tmp_path / "old-runs"),
+            "projected_archived_runs_root": str(archive.resolve()),
+            "archive_relative_base": archive.name,
+            "reference_only": True,
+        },
+        "exclusion_contract": {
+            "active_seeding": "excluded",
+            "active_candidate_scans": "excluded",
+            "active_selection": "excluded",
+            "active_optimizer_candidates": "excluded",
+            "empirical_priors": "excluded",
+            "permitted_use": "post_campaign_comparison_only",
+            "copy_profiles": False,
+            "edit_active_runs": False,
+            "enforcement_note": "fixture",
+        },
+        "source_artifacts": {
+            "exact_catalog_database": {
+                "archive_relative_path": catalog.relative_to(archive).as_posix(),
+                "projected_archived_path": str(catalog.resolve()),
+                "sha256": _sha256(catalog).split(":", 1)[1],
+            },
+            "nested_evidence_report": {
+                "archive_relative_path": report.relative_to(archive).as_posix(),
+                "projected_archived_path": str(report.resolve()),
+                "sha256": _sha256(report).split(":", 1)[1],
+            },
+        },
+        "categories": {
+            "campaign_controls": {
+                "nested": {
+                    "campaign_id": "archived-completed-nested",
+                    "evidence_campaign_plan_id": "archived-plan-id",
+                    "attempt_cohort_manifest_id": _fixed_hash("9"),
+                    "attempt_count": 443,
+                    "fold_count": 4,
+                    "portfolio_result_count": 24,
+                    "selection_basis": "recommended_cell",
+                }
+            }
+        },
+    }
+    identity_hash = _fixed_hash("0")
+    identity_hash = "sha256:" + hashlib.sha256(
+        json.dumps(identity, ensure_ascii=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    controls.write_text(
+        json.dumps(
+            {
+                "schema": "legacy-controls-manifest-v1",
+                "integrity": {
+                    "identity_hash_algorithm": "sha256",
+                    "self_hash": identity_hash,
+                    "manifest_id": identity_hash,
+                },
+                "identity": identity,
+            }
+        ),
+        encoding="utf-8",
+    )
     base_config = load_config()
     (tmp_path / "portfolio.research-suites.json").write_bytes(
         (base_config.repo_root / "portfolio.research-suites.json").read_bytes()
@@ -111,6 +232,21 @@ def _bootstrap_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     }
     result = bootstrap_level_c(**arguments)
     return config, active, archive, arguments, result
+
+
+def _rewrite_controls(arguments: dict, mutate) -> None:
+    path = arguments["legacy_controls"]
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    mutate(payload["identity"])
+    identity_hash = "sha256:" + hashlib.sha256(
+        json.dumps(
+            payload["identity"], ensure_ascii=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    payload["integrity"]["self_hash"] = identity_hash
+    payload["integrity"]["manifest_id"] = identity_hash
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    arguments["legacy_controls_sha256"] = _sha256(path)
 
 
 def test_bootstrap_is_exact_idempotent_and_does_not_inventory_archive(
@@ -157,6 +293,118 @@ def test_bootstrap_rejects_source_drift_and_ambiguous_partial_state(
     partial_args["active_runs_root"] = active
     with pytest.raises(LevelCWorkflowError, match="ambiguous bootstrap partial state"):
         bootstrap_level_c(**partial_args)
+
+
+def test_bootstrap_rejects_semantic_controls_catalog_and_report_mismatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, _, _, context_args, _ = _bootstrap_fixture(tmp_path / "context", monkeypatch)
+    _rewrite_controls(
+        context_args,
+        lambda identity: identity["archive_context"].update({"archive_id": "wrong"}),
+    )
+    with pytest.raises(LevelCWorkflowError, match="archive context"):
+        bootstrap_level_c(**context_args)
+
+    _, _, _, exclusion_args, _ = _bootstrap_fixture(tmp_path / "exclusion", monkeypatch)
+    _rewrite_controls(
+        exclusion_args,
+        lambda identity: identity["exclusion_contract"].update(
+            {"active_selection": "allowed"}
+        ),
+    )
+    with pytest.raises(LevelCWorkflowError, match="exclusion contract"):
+        bootstrap_level_c(**exclusion_args)
+
+    _, _, _, source_args, _ = _bootstrap_fixture(tmp_path / "source", monkeypatch)
+    _rewrite_controls(
+        source_args,
+        lambda identity: identity["source_artifacts"]["exact_catalog_database"].update(
+            {"sha256": "0" * 64}
+        ),
+    )
+    with pytest.raises(LevelCWorkflowError, match="source artifact differs"):
+        bootstrap_level_c(**source_args)
+
+    _, _, _, catalog_args, _ = _bootstrap_fixture(tmp_path / "catalog", monkeypatch)
+    catalog_args["archived_attempt_catalog"].write_bytes(b"not sqlite")
+    catalog_args["archived_attempt_catalog_sha256"] = _sha256(
+        catalog_args["archived_attempt_catalog"]
+    )
+    _rewrite_controls(
+        catalog_args,
+        lambda identity: identity["source_artifacts"]["exact_catalog_database"].update(
+            {
+                "sha256": catalog_args["archived_attempt_catalog_sha256"].split(":", 1)[1]
+            }
+        ),
+    )
+    with pytest.raises(LevelCWorkflowError, match="SQLite header"):
+        bootstrap_level_c(**catalog_args)
+
+    _, _, _, schema_args, _ = _bootstrap_fixture(tmp_path / "catalog-schema", monkeypatch)
+    connection = sqlite3.connect(schema_args["archived_attempt_catalog"])
+    connection.execute("DROP TABLE attempt_rows")
+    connection.execute(
+        "CREATE TABLE attempt_rows (run_id TEXT NOT NULL, attempt_id TEXT NOT NULL)"
+    )
+    connection.commit()
+    connection.close()
+    schema_args["archived_attempt_catalog_sha256"] = _sha256(
+        schema_args["archived_attempt_catalog"]
+    )
+    _rewrite_controls(
+        schema_args,
+        lambda identity: identity["source_artifacts"]["exact_catalog_database"].update(
+            {"sha256": schema_args["archived_attempt_catalog_sha256"].split(":", 1)[1]}
+        ),
+    )
+    with pytest.raises(LevelCWorkflowError, match="schema is incompatible"):
+        bootstrap_level_c(**schema_args)
+
+    _, _, _, report_args, _ = _bootstrap_fixture(tmp_path / "report", monkeypatch)
+    report = json.loads(report_args["completed_nested_report"].read_text(encoding="utf-8"))
+    report["campaign_id"] = "wrong-campaign"
+    report_args["completed_nested_report"].write_text(json.dumps(report), encoding="utf-8")
+    report_args["completed_nested_report_sha256"] = _sha256(
+        report_args["completed_nested_report"]
+    )
+    _rewrite_controls(
+        report_args,
+        lambda identity: identity["source_artifacts"]["nested_evidence_report"].update(
+            {
+                "sha256": report_args["completed_nested_report_sha256"].split(":", 1)[1]
+            }
+        ),
+    )
+    with pytest.raises(LevelCWorkflowError, match="campaign semantics"):
+        bootstrap_level_c(**report_args)
+
+    _, _, _, accounting_args, _ = _bootstrap_fixture(
+        tmp_path / "report-accounting", monkeypatch
+    )
+    report = json.loads(
+        accounting_args["completed_nested_report"].read_text(encoding="utf-8")
+    )
+    report["fold_results"][0]["records"] = []
+    accounting_args["completed_nested_report"].write_text(
+        json.dumps(report), encoding="utf-8"
+    )
+    accounting_args["completed_nested_report_sha256"] = _sha256(
+        accounting_args["completed_nested_report"]
+    )
+    _rewrite_controls(
+        accounting_args,
+        lambda identity: identity["source_artifacts"]["nested_evidence_report"].update(
+            {
+                "sha256": accounting_args["completed_nested_report_sha256"].split(
+                    ":", 1
+                )[1]
+            }
+        ),
+    )
+    with pytest.raises(LevelCWorkflowError, match="strategy accounting"):
+        bootstrap_level_c(**accounting_args)
 
 
 def test_runner_recovers_exactly_once_across_every_stage_boundary(
