@@ -18,6 +18,7 @@ from autoresearch.atlas_lab import (
     _deep_replay_request_from_probe,
     _enqueue_gateway_tasks_with_retries,
     _make_signal_atlas_cell_task,
+    _probe_artifact_roots,
     _row_from_signal_result,
     _run_durable_atlas_stage,
     _validate_historical_probe_summary,
@@ -1119,7 +1120,7 @@ def test_durable_probe_stage_does_not_complete_on_formal_worker_failure(
 ) -> None:
     config = _config(tmp_path)
     source_dir, _result_dir = _write_anchor_pair_probe_fixture(tmp_path)
-    run_root = tmp_path / "runs" / "derived" / "atlas-runs" / "unit"
+    run_root = source_dir.parent
     journal = DurableExecutionJournal(
         run_root / "execution-journal.json",
         execution_id="unit-execution",
@@ -1160,6 +1161,87 @@ def test_durable_probe_stage_does_not_complete_on_formal_worker_failure(
     task_id = canonical_sha256({"execution": "unit-execution", "stage": "05-anchor-pair-probes"})
     assert journal.load()["tasks"][task_id]["status"] == "pending"
     assert journal.terminal(task_id) is None
+
+
+def test_pending_probe_stage_quarantines_probe_outputs_without_moving_inputs(
+    tmp_path: Path,
+) -> None:
+    source_dir, _result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+    spec = ProbeRunSpec(
+        kind="anchor_pair",
+        source_dir=source_dir,
+        atlas_filename="anchor-pair-atlas.json",
+        results_filename="anchor-pair-probe-results.csv",
+        summary_filename="anchor-pair-probe-summary.json",
+        manifest_schema="anchor_pair_run_manifest_v1",
+        result_fieldnames=_probe_results_fieldnames,
+        row_builder=_result_row_from_score,
+    )
+    run_root = source_dir.parent
+    journal = DurableExecutionJournal(
+        run_root / "execution-journal.json",
+        execution_id="unit-execution",
+        lineage={},
+    )
+    stage = "05-anchor-pair-probes"
+    task_id = canonical_sha256({"execution": "unit-execution", "stage": stage})
+    journal.register(task_id, {"stage": stage})
+
+    stale_probe_dir = source_dir / "probe-results" / "probe-1"
+    stale_probe_dir.mkdir(parents=True, exist_ok=True)
+    (stale_probe_dir / "sensitivity-response.json").write_text(
+        json.dumps({"status": "stale"}),
+        encoding="utf-8",
+    )
+    (source_dir / "anchor-pair-probe-results.csv").write_text("status\nstale\n", encoding="utf-8")
+    (source_dir / "anchor-pair-probe-summary.json").write_text(
+        json.dumps({"status": "stale"}),
+        encoding="utf-8",
+    )
+    (source_dir / "missing-manifest").mkdir()
+    (source_dir / "missing-manifest" / "stale.json").write_text("{}", encoding="utf-8")
+
+    def action() -> dict[str, Any]:
+        assert (source_dir / "anchor-pair-atlas.json").exists()
+        assert (source_dir / "profiles" / "probe-1.json").exists()
+        assert not (source_dir / "probe-results").exists()
+        assert not (source_dir / "anchor-pair-probe-results.csv").exists()
+        assert not (source_dir / "anchor-pair-probe-summary.json").exists()
+        fresh_dir = source_dir / "probe-results" / "probe-1"
+        fresh_dir.mkdir(parents=True)
+        (fresh_dir / "sensitivity-response.json").write_text(
+            json.dumps({"status": "fresh"}),
+            encoding="utf-8",
+        )
+        (source_dir / "anchor-pair-probe-results.csv").write_text("status\nok\n", encoding="utf-8")
+        (source_dir / "anchor-pair-probe-summary.json").write_text(
+            json.dumps({"status": "fresh"}),
+            encoding="utf-8",
+        )
+        return {"ok": True}
+
+    result, reused = _run_durable_atlas_stage(
+        journal=journal,
+        run_root=run_root,
+        stage=stage,
+        payload={"stage": stage},
+        artifact_roots=_probe_artifact_roots(spec),
+        action=action,
+    )
+
+    assert result == {"ok": True}
+    assert reused is False
+    assert journal.terminal(task_id) is not None
+    assert (source_dir / "anchor-pair-atlas.json").exists()
+    assert (source_dir / "profiles" / "probe-1.json").exists()
+    partial_roots = list((run_root / "partial-stages").glob(f"{stage}-*"))
+    assert partial_roots
+    moved_names = {path.name for path in partial_roots[0].iterdir()}
+    assert "00-anchor-pair-probe-results.csv" in moved_names
+    assert "01-anchor-pair-probe-summary.json" in moved_names
+    assert "02-probe-results" in moved_names
+    assert "04-missing-manifest" in moved_names
+    assert not any("profiles" in name for name in moved_names)
 
 
 def test_audit_or_rewind_atlas_lab_stages_marks_boundary_forward_pending(tmp_path: Path) -> None:

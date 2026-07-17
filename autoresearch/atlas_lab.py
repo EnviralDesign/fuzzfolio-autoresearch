@@ -634,6 +634,7 @@ def _probe_artifact_roots(spec: ProbeRunSpec) -> tuple[Path, ...]:
     return (
         spec.source_dir / spec.results_filename,
         spec.source_dir / spec.summary_filename,
+        spec.source_dir / "probe-results",
         spec.source_dir / "results",
         spec.source_dir / "missing-manifest",
     )
