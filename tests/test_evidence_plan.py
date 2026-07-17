@@ -7,12 +7,20 @@ from pydantic import ValidationError
 
 from autoresearch.evidence_plan import (
     build_replay_evidence_plan,
+    canonical_timestamp,
     enforce_replay_evidence_plan,
     validate_replay_evidence_plan,
 )
 
 
 PROFILE = {"name": "frozen", "notificationThreshold": 73, "indicators": []}
+
+
+def test_canonical_timestamp_accepts_dotnet_fractional_precision() -> None:
+    assert (
+        canonical_timestamp("2026-07-16T21:37:06.8387337Z")
+        == "2026-07-16T21:37:06.838733Z"
+    )
 
 
 def _plan():

@@ -46,7 +46,7 @@ PROFILE_MODEL_SOURCE_FILES = (
 )
 LEVEL_C_PORTFOLIO_SUITE = "darwin-master-v1"
 LEVEL_C_SELECTION_BASIS = "recommended_cell"
-LEVEL_C_OPTIMIZER_BACKEND = "python"
+LEVEL_C_OPTIMIZER_BACKEND = "pyo3"
 LEVEL_C_SUITE_CONFIG = "portfolio.research-suites.json"
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")

@@ -349,8 +349,8 @@ def _validate_legacy_controls(
         "exact_catalog_database": (catalog_path, catalog_sha256),
         "nested_evidence_report": (nested_report_path, nested_report_sha256),
     }
-    if set(sources) != set(expected_sources):
-        raise LevelCWorkflowError("legacy controls source artifact set differs")
+    if not set(expected_sources).issubset(sources):
+        raise LevelCWorkflowError("legacy controls required source artifacts are missing")
     verified_sources: dict[str, dict[str, str]] = {}
     for key, (actual_path, actual_hash) in expected_sources.items():
         record = sources.get(key)
@@ -564,10 +564,11 @@ def bootstrap_level_c(
         nested_report.get("completed_at")
         or nested_report.get("generated_at")
         or nested_report.get("created_at")
+        or (controls_payload.get("identity") or {}).get("created_at_utc")
         or ""
     ).strip()
     if not prepared_at:
-        raise LevelCWorkflowError("completed nested report has no stable completion timestamp")
+        raise LevelCWorkflowError("archive evidence has no stable preparation timestamp")
     archive_identity = {
         "schema_version": BOOTSTRAP_RECEIPT_SCHEMA,
         "archive_id": str(archive_id),

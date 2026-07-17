@@ -78,7 +78,6 @@ def _nested_report(path: Path) -> Path:
                 "fold_count": 4,
                 "portfolio_result_count": 24,
                 "selection_basis": "recommended_cell",
-                "completed_at": "2026-07-16T12:00:00Z",
                 "fold_results": folds,
             }
         ),
@@ -161,6 +160,13 @@ def _bootstrap_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 "archive_relative_path": report.relative_to(archive).as_posix(),
                 "projected_archived_path": str(report.resolve()),
                 "sha256": _sha256(report).split(":", 1)[1],
+            },
+            # The real controls manifest also carries frozen benchmark references.
+            # Bootstrap authenticates them through the manifest self-hash while
+            # deeply validating only its two explicit archive inputs.
+            "legacy_benchmark_reference": {
+                "path": str(tmp_path / "external-benchmark.json"),
+                "sha256": "f" * 64,
             },
         },
         "categories": {
@@ -263,7 +269,7 @@ def test_bootstrap_is_exact_idempotent_and_does_not_inventory_archive(
         "suite_config_relative_path": "portfolio.research-suites.json",
         "suite_config_sha256": _sha256(tmp_path / "portfolio.research-suites.json"),
         "selection_basis": "recommended_cell",
-        "optimizer_backend": "python",
+        "optimizer_backend": "pyo3",
     }
     assert set(first["execution_plans"]) == set("ABCD")
     assert audit_level_c(config=config, active_runs_root=active)["status"] == "valid"
