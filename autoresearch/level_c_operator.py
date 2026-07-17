@@ -13,6 +13,7 @@ import json
 import os
 import re
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -70,6 +71,75 @@ _PROVENANCE_IDENTITIES = (
 _HASH_IDENTITIES = frozenset(
     field for field in _PROVENANCE_IDENTITIES if field.endswith("_sha256")
 )
+
+_ATLAS_OPERATIONAL_ARGUMENTS = frozenset(
+    {
+        "active_probes",
+        "compact_probe_artifacts",
+        "deadline_seconds",
+        "enqueue_chunk_size",
+        "gateway_token",
+        "gateway_url",
+        "include_detail",
+        "json_output",
+        "log_interval_seconds",
+        "max_attempts",
+        "max_drain_seconds",
+        "max_results_per_cycle",
+        "poll_interval_seconds",
+        "result_batch_size",
+        "resume",
+        "task_attempt_id",
+        "trading_dashboard_root",
+    }
+)
+_PLAYHAND_OPERATIONAL_ARGUMENTS = frozenset(
+    {
+        "active_runs",
+        "barrier_interval_seconds",
+        "barrier_lane_limit",
+        "deadline_seconds",
+        "enqueue_failure_limit",
+        "enqueue_retry_base_seconds",
+        "gateway_token",
+        "gateway_url",
+        "json_output",
+        "lanes",
+        "log_mode",
+        "max_attempts",
+        "max_drain_seconds",
+        "max_results_per_cycle",
+        "max_wait_seconds",
+        "poll_interval_seconds",
+        "result_batch_size",
+        "result_read_failure_limit",
+        "resume",
+        "retain_raw_lab_artifacts",
+        "terminal_lane_retention",
+        "trading_dashboard_root",
+    }
+)
+
+
+def _canonical_argument_value(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value.expanduser().resolve(strict=False))
+    if isinstance(value, Mapping):
+        return {str(key): _canonical_argument_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_argument_value(item) for item in value]
+    return value
+
+
+def _semantic_arguments(values: Mapping[str, Any], *, executor: str) -> dict[str, Any]:
+    operational = (
+        _ATLAS_OPERATIONAL_ARGUMENTS if executor == "atlas" else _PLAYHAND_OPERATIONAL_ARGUMENTS
+    )
+    return {
+        key: _canonical_argument_value(value)
+        for key, value in sorted(values.items())
+        if key not in operational
+    }
 
 
 class LevelCOperatorError(RuntimeError):
@@ -294,6 +364,33 @@ def build_level_c_execution_plan(
         "universe_manifest_sha256": protocol["universe_manifest_sha256"],
         "worker_contract_hash": protocol["worker_contract_sha256"],
     }
+    # Imports remain local because both executors import this module at runtime.
+    from .atlas_lab import AtlasLabRuntimeConfig
+    from .play_hand_lab import PlayHandLabRuntimeConfig
+
+    atlas_values = asdict(AtlasLabRuntimeConfig())
+    atlas_values.update(
+        {
+            **common,
+            "run_id": cutoff["atlas_run_id"],
+            "signal_atlas_executor": "gateway",
+            "publish": False,
+        }
+    )
+    playhand_values = asdict(PlayHandLabRuntimeConfig())
+    playhand_values.update(
+        {
+            **common,
+            "campaign_id": cutoff["playhand_campaign_id"],
+            "seed": cutoff["seed"],
+            "campaign_mode": "finite",
+            "task_mode": "deep_replay",
+            "pipeline_mode": "play_hand",
+            "strict_scoring": True,
+            "seed_plan_path": seed_plan_path,
+            "target_runs": 4,
+        }
+    )
     payload: dict[str, Any] = {
         "schema_version": LEVEL_C_EXECUTION_PLAN_SCHEMA,
         "execution_mode": "declarative-only",
@@ -333,22 +430,9 @@ def build_level_c_execution_plan(
             "no_outer_feedback": True,
             "runtime_policy_lock": runtime_policy_lock,
         },
-        "atlas_arguments": {
-            **common,
-            "run_id": cutoff["atlas_run_id"],
-            "signal_atlas_executor": "gateway",
-            "publish": False,
-        },
-        "playhand_arguments": {
-            **common,
-            "campaign_id": cutoff["playhand_campaign_id"],
-            "seed": cutoff["seed"],
-            "campaign_mode": "finite",
-            "task_mode": "deep_replay",
-            "pipeline_mode": "play_hand",
-            "strict_scoring": True,
-            "seed_plan_path": seed_plan_path,
-        },
+        "atlas_arguments": _semantic_arguments(atlas_values, executor="atlas"),
+        "atlas_phases": ["full"],
+        "playhand_arguments": _semantic_arguments(playhand_values, executor="playhand"),
         "playhand_deferred_binding": {
             "argument": "expected_seed_plan_sha256",
             "source_path": str(
@@ -428,7 +512,11 @@ def load_level_c_execution_plan(
     )
 
 
-def load_authoritative_level_c_execution_plan(path: Path | str) -> dict[str, Any]:
+def load_authoritative_level_c_execution_plan(
+    path: Path | str,
+    *,
+    config: Any | None = None,
+) -> dict[str, Any]:
     """Load a plan and re-derive it from the exact sources named by that plan."""
     preliminary = load_level_c_execution_plan(path)
     generation = _require_mapping(
@@ -449,7 +537,7 @@ def load_authoritative_level_c_execution_plan(path: Path | str) -> dict[str, Any
     )
     validate_runtime_policy_lock(
         lock,
-        load_config(),
+        config or load_config(),
         worker_contract_sha256=str(bound.get("worker_contract_sha256") or ""),
     )
     return plan
@@ -459,9 +547,10 @@ def executor_arguments_from_plan(
     path: Path | str,
     *,
     executor: str,
+    config: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return one executor's arguments after authoritative source revalidation."""
-    plan = load_authoritative_level_c_execution_plan(path)
+    plan = load_authoritative_level_c_execution_plan(path, config=config)
     token = str(executor or "").strip().lower()
     if token not in {"atlas", "playhand"}:
         raise LevelCOperatorError("executor must be atlas or playhand")
@@ -503,6 +592,7 @@ def validate_executor_runtime_binding(
     *,
     executor: str,
     observed: Mapping[str, Any],
+    config: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Fail closed unless a callable executor exactly matches its authority plan.
 
@@ -510,9 +600,11 @@ def validate_executor_runtime_binding(
     field that the plan does bind, including deferred Atlas provenance, is
     compared here so programmatic callers cannot bypass the CLI boundary.
     """
-    expected, plan = executor_arguments_from_plan(path, executor=executor)
-    actual = dict(observed)
-    path_fields = {"execution_plan_path", "seed_plan_path"}
+    expected, plan = executor_arguments_from_plan(path, executor=executor, config=config)
+    if str(executor).strip().lower() == "atlas":
+        expected["phases"] = list(plan.get("atlas_phases") or [])
+    actual = {key: _canonical_argument_value(value) for key, value in observed.items()}
+    path_fields = {"execution_plan_path", "seed_plan_path", "profile_path"}
     conflicts: list[str] = []
     for field, expected_value in expected.items():
         actual_value = actual.get(field)
@@ -525,6 +617,14 @@ def validate_executor_runtime_binding(
             )
         if actual_value != expected_value:
             conflicts.append(field)
+    operational = (
+        _ATLAS_OPERATIONAL_ARGUMENTS
+        if str(executor).strip().lower() == "atlas"
+        else _PLAYHAND_OPERATIONAL_ARGUMENTS
+    )
+    conflicts.extend(
+        field for field in actual if field not in expected and field not in operational
+    )
     if conflicts:
         raise LevelCOperatorError(
             f"formal {executor} runtime conflicts with authoritative execution plan: "

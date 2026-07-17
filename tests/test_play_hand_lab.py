@@ -1736,7 +1736,7 @@ def test_play_hand_lab_validation_failure_tombstones_before_final(tmp_path: Path
     assert "final_36mo" not in lane.phase_task_ids
 
 
-def test_missing_validation_score_is_typed_research_nonviability(tmp_path: Path) -> None:
+def test_missing_validation_score_is_typed_infrastructure_failure(tmp_path: Path) -> None:
     fake_config = _test_config(tmp_path)
     lane_dir = fake_config.runs_root / "lane-missing-score"
     lane_dir.mkdir(parents=True)
@@ -1775,8 +1775,41 @@ def test_missing_validation_score_is_typed_research_nonviability(tmp_path: Path)
         worker_contract_hash=str(runtime.worker_contract_hash),
         recorded={"phase": phase, "score": None, "status": "success"},
     ) == []
-    assert lane.terminal_outcome_category == lab.TERMINAL_OUTCOME_RESEARCH_NONVIABLE
-    assert lab._historical_lane_has_legitimate_terminal_outcome(lane)
+    assert lane.terminal_outcome_category == lab.TERMINAL_OUTCOME_INFRASTRUCTURE_FAILURE
+    assert lane.tombstone_reason == "canonical_score_missing"
+    assert not lab._historical_lane_has_legitimate_terminal_outcome(lane)
+
+
+def test_validated_no_valid_cell_is_typed_research_nonviability() -> None:
+    plan = {
+        "plan_id": "sha256:" + "1" * 64,
+        "profile_snapshot_sha256": "sha256:" + "2" * 64,
+        "execution_cell_sha256": None,
+        "lake_manifest_sha256": "sha256:" + "3" * 64,
+    }
+    terminal = {
+        "schema": "fuzzfolio-replay-terminal-result-v1",
+        "status": "nonviable",
+        "outcome": "no_valid_cell",
+        "diagnostics": {
+            "signal_count": 0,
+            "resolved_trade_count_max": 0,
+            "market_data_window": {"filtered_bar_count": 100},
+        },
+        "execution_evidence": {
+            "plan_id": plan["plan_id"],
+            "profile_snapshot_sha256": plan["profile_snapshot_sha256"],
+            "execution_cell_sha256": None,
+            "observed_lake_manifest_sha256": plan["lake_manifest_sha256"],
+        },
+    }
+    result = {"status": "failed", "result": {"terminal_result": terminal}}
+    assert lab._validated_no_valid_cell_terminal(result, plan) == terminal
+
+    malformed = json.loads(json.dumps(result))
+    malformed["result"]["terminal_result"]["diagnostics"]["signal_count"] = 1
+    with pytest.raises(lab.DurableExecutionError, match="canonical diagnostics"):
+        lab._validated_no_valid_cell_terminal(malformed, plan)
 
 
 class _DurabilityFakeCli:

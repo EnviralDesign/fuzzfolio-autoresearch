@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import fields, replace
 from pathlib import Path
 from typing import Any
 
@@ -718,8 +719,7 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
             )
         elif args.as_of_date:
             raise ValueError("Formal historical PlayHand requires --execution-plan.")
-        return cmd_play_hand_lab(
-            PlayHandLabRuntimeConfig(
+        runtime = PlayHandLabRuntimeConfig(
                 gateway_url=args.gateway_url,
                 gateway_token=args.gateway_token,
                 campaign_mode=plan_arguments.get("campaign_mode", args.mode),
@@ -792,7 +792,21 @@ def dispatch_play_hand_lab_command(args: Any, *, console: Console) -> int | None
                 worker_contract_schema=args.worker_contract_schema,
                 trading_dashboard_root=args.trading_dashboard_root,
             )
-        )
+        if plan_arguments:
+            runtime_fields = {field.name for field in fields(PlayHandLabRuntimeConfig)}
+            overrides = {
+                key: value for key, value in plan_arguments.items() if key in runtime_fields
+            }
+            for path_field in (
+                "execution_plan_path",
+                "profile_path",
+                "seed_plan_path",
+                "trading_dashboard_root",
+            ):
+                if overrides.get(path_field) is not None:
+                    overrides[path_field] = Path(str(overrides[path_field]))
+            runtime = replace(runtime, **overrides)
+        return cmd_play_hand_lab(runtime)
     if args.command in PLAY_HAND_LAB_IN_PROCESS_SIM_COMMANDS:
         result = cmd_play_hand_lab_sim(
             workers=args.workers,

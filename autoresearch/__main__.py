@@ -18357,6 +18357,7 @@ def cmd_atlas_lab(
         "source_snapshot_sha256": source_snapshot_sha256,
         "universe_id": universe_id,
         "universe_manifest_sha256": universe_manifest_sha256,
+        "worker_contract_hash": worker_contract_hash,
     }
     if execution_plan is not None:
         conflicts = sorted(key for key, value in formal_values.items() if value is not None)
@@ -18368,6 +18369,7 @@ def cmd_atlas_lab(
         from autoresearch.level_c_operator import executor_arguments_from_plan
 
         plan_arguments, _plan = executor_arguments_from_plan(execution_plan, executor="atlas")
+        phases = list(_plan.get("atlas_phases") or [])
     elif as_of_date:
         raise ValueError("Formal historical Atlas requires --execution-plan.")
     runtime = AtlasLabRuntimeConfig(
@@ -18375,7 +18377,7 @@ def cmd_atlas_lab(
         gateway_token=gateway_token,
         trading_dashboard_root=trading_dashboard_root,
         atlas_profile=atlas_profile,
-        worker_contract_hash=worker_contract_hash,
+        worker_contract_hash=plan_arguments.get("worker_contract_hash", worker_contract_hash),
         active_probes=max(1, int(active_probes)),
         enqueue_chunk_size=max(1, int(enqueue_chunk_size)),
         result_batch_size=max(1, int(result_batch_size)),

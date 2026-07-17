@@ -297,14 +297,40 @@ def test_runtime_binding_compares_every_plan_bound_field(tmp_path: Path) -> None
     validate_executor_runtime_binding(
         plan_path,
         executor="atlas",
-        observed=arguments,
+        observed={**arguments, "phases": ["full"]},
     )
     with pytest.raises(LevelCOperatorError, match="lake_manifest_sha256"):
         validate_executor_runtime_binding(
             plan_path,
             executor="atlas",
-            observed={**arguments, "lake_manifest_sha256": _hash("9")},
+            observed={**arguments, "phases": ["full"], "lake_manifest_sha256": _hash("9")},
         )
+
+
+@pytest.mark.parametrize(
+    ("executor", "field", "replacement"),
+    [
+        ("atlas", "signal_lookback_months", 12),
+        ("atlas", "discovery_cluster_max_recipes", 999),
+        ("playhand", "validation_months", 24),
+        ("playhand", "screen_anchor_mode", "now"),
+    ],
+)
+def test_formal_runtime_rejects_research_semantic_mutations(
+    tmp_path: Path, executor: str, field: str, replacement: object
+) -> None:
+    root, protocol_path, authority_path, _ = _bound_sources(tmp_path)
+    plan = build_level_c_execution_plan(root, protocol_path, authority_path, "A")
+    plan_path = tmp_path / "execution-plan.json"
+    create_level_c_execution_plan(plan_path, plan)
+    if executor == "playhand":
+        _materialize_plan_seed(plan)
+    arguments, loaded = executor_arguments_from_plan(plan_path, executor=executor)
+    observed = {**arguments, field: replacement}
+    if executor == "atlas":
+        observed["phases"] = loaded["atlas_phases"]
+    with pytest.raises(LevelCOperatorError, match=field):
+        validate_executor_runtime_binding(plan_path, executor=executor, observed=observed)
 
 
 @pytest.mark.parametrize("field", [

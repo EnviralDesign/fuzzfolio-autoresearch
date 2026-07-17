@@ -58,6 +58,8 @@ def test_historical_cli_forwards_formal_identity_and_normalizes(tmp_path: Path, 
                 "task_mode": "deep_replay",
                 "pipeline_mode": "play_hand",
                 "strict_scoring": True,
+                "target_runs": 7,
+                "validation_months": 18,
             },
             {},
         ),
@@ -83,6 +85,8 @@ def test_historical_cli_forwards_formal_identity_and_normalizes(tmp_path: Path, 
     assert runtime.level_c_protocol_id == "sha256:" + "c" * 64
     assert runtime.cutoff_key == "A"
     assert runtime.expected_seed_plan_sha256 == expected_seed_plan_sha256
+    assert runtime.target_runs == 7
+    assert runtime.validation_months == 18
 
 
 def test_exploratory_cli_leaves_campaign_id_unset_for_auto_id() -> None:

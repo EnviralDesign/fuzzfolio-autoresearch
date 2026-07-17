@@ -1438,3 +1438,67 @@ def test_atlas_lab_cli_json_includes_pipeline_summaries(
     assert exit_code == 0
     assert payload["pipeline_summaries"][0]["stage"] == "discovery_cluster"
     assert payload["pipeline_summaries"][0]["summary"]["result_counts"]["discovered_recipes"] == 12
+
+
+def test_formal_atlas_cli_constructs_runtime_from_authority_plan(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from autoresearch import __main__ as cli
+    from autoresearch import level_c_operator
+
+    plan_path = tmp_path / "execution-plan.json"
+    plan_path.write_text("{}", encoding="utf-8")
+    contract = "sha256:" + "a" * 64
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(cli, "load_config", lambda: _config(tmp_path))
+    monkeypatch.setattr(
+        level_c_operator,
+        "executor_arguments_from_plan",
+        lambda *_args, **_kwargs: (
+            {
+                "run_id": "formal-atlas",
+                "as_of_date": "2026-01-01",
+                "worker_contract_hash": contract,
+                "signal_atlas_executor": "gateway",
+                "publish": False,
+                "execution_plan_path": str(plan_path.resolve()),
+                "execution_plan_id": "sha256:" + "b" * 64,
+            },
+            {"atlas_phases": ["full"]},
+        ),
+    )
+
+    def fake_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            run_id="formal-atlas",
+            run_root=tmp_path,
+            status="completed",
+            summary_path=tmp_path / "summary.json",
+            published_manifest_path=None,
+            probe_summaries=[],
+            pipeline_summaries=[],
+        )
+
+    monkeypatch.setattr(cli, "run_atlas_lab", fake_run)
+    assert cli.cmd_atlas_lab(
+        run_id=None, gateway_url=None, gateway_token=None, trading_dashboard_root=None,
+        atlas_profile="standard", worker_contract_hash=None, phases=None, active_probes=1,
+        enqueue_chunk_size=1, result_batch_size=1, max_results_per_cycle=1,
+        max_drain_seconds=0.1, poll_interval_seconds=0.1, deadline_seconds=60,
+        max_attempts=1, log_interval_seconds=1, limit=None, signal_max_indicators=None,
+        signal_instrument_limit=None, signal_timeframe_limit=None, as_of_date=None,
+        execution_plan=plan_path, discovery_queue="full",
+        discovery_cluster_min_similarity=0.5, discovery_cluster_min_shared_partners=1,
+        discovery_cluster_max_recipes=32,
+        discovery_validation_confidence="high_candidate,promising_candidate",
+        discovery_validation_instruments=None, discovery_validation_timeframes=None,
+        discovery_validation_max_recipes=8, discovery_validation_max_pairs_per_recipe=8,
+        discovery_validation_first_member_limit=6, discovery_validation_second_member_limit=6,
+        discovery_validation_diversity_penalty_scale=18.0, force=False,
+        include_detail=True, compact_probe_artifacts=True, strict_parity=True,
+        publish=False, as_json=True,
+    ) == 0
+    runtime = captured["runtime"]
+    assert runtime.worker_contract_hash == contract
+    assert captured["phases"] == ["full"]

@@ -407,6 +407,39 @@ def test_outer_submissions_are_exactly_the_frozen_selection_union(
     } == selected
 
 
+@pytest.mark.parametrize(
+    "selected",
+    [["attempt-one", "attempt-one"], ["attempt-unknown"]],
+)
+def test_nested_gateway_rejects_ambiguous_or_unknown_selection(
+    tmp_path: Path, selected: list[str]
+) -> None:
+    run_dir, attempt = _attempt_fixture(
+        tmp_path, run_id="run-one", attempt_id="attempt-one"
+    )
+    with pytest.raises(ValueError, match="duplicate|unknown"):
+        run_nested_gateway_fold(
+            config=SimpleNamespace(research=SimpleNamespace(quality_score_preset="profile_drop")),
+            items=[(run_dir, attempt, {"attempt_id": "attempt-one"}, {})],
+            fold={
+                "fold_id": "fold-01",
+                "train_start": "2022-01-01",
+                "train_end": "2024-12-31",
+                "test_start": "2025-01-16",
+                "test_end": "2025-06-30",
+                "embargo_days": 15,
+            },
+            campaign_plan_id="nested:invalid-selection",
+            campaign_root=tmp_path / "campaign-invalid",
+            lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+            max_workers=1,
+            train_horizon_months=36,
+            test_horizon_months=6,
+            submit_outer=True,
+            outer_selected_attempt_ids=selected,
+        )
+
+
 def test_nested_gateway_preserves_no_signal_stage_semantics(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -509,6 +542,21 @@ def test_nested_gateway_preserves_no_signal_stage_semantics(
         records["attempt-outer-nonviable"]["outer_terminal_outcome"]["outcome"]
         == "no_valid_cell"
     )
+
+    with pytest.raises(ValueError, match="training-ineligible"):
+        run_nested_gateway_fold(
+            config=config,
+            items=items,
+            fold=fold,
+            campaign_plan_id="nested:no-signal-test",
+            campaign_root=tmp_path / "campaign",
+            lab_config=lab_config,
+            max_workers=2,
+            train_horizon_months=36,
+            test_horizon_months=6,
+            lake_manifest_sha256="sha256:" + "a" * 64,
+            outer_selected_attempt_ids={"attempt-train-nonviable"},
+        )
 
     monkeypatch.setattr(
         "autoresearch.nested_gateway._run_train_tasks",

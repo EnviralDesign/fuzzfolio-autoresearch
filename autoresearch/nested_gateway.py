@@ -283,7 +283,7 @@ def run_nested_gateway_fold(
     selection_basis: Literal["best_cell", "recommended_cell", "robust_cell"] = "recommended_cell",
     lake_manifest_sha256: str | None = None,
     submit_outer: bool = True,
-    outer_selected_attempt_ids: set[str] | None = None,
+    outer_selected_attempt_ids: set[str] | list[str] | tuple[str, ...] | None = None,
     emit: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     fold_id = str(fold.get("fold_id") or "").strip()
@@ -295,6 +295,23 @@ def run_nested_gateway_fold(
     test_end = _window_end(fold["test_end"])
     embargo_days = int(fold.get("embargo_days") or 0)
     state_path = Path(campaign_root) / fold_id / "nested-state.json"
+
+    item_attempt_ids = [str(item[1].get("attempt_id") or "") for item in items]
+    if any(not attempt_id for attempt_id in item_attempt_ids):
+        raise ValueError("nested items require non-empty attempt_id values")
+    if len(set(item_attempt_ids)) != len(item_attempt_ids):
+        raise ValueError("nested items contain duplicate or ambiguous attempt_id values")
+    selected_values = (
+        list(outer_selected_attempt_ids) if outer_selected_attempt_ids is not None else None
+    )
+    if selected_values is not None and len(set(selected_values)) != len(selected_values):
+        raise ValueError("outer selection contains duplicate or ambiguous attempt IDs")
+    selected_ids = set(selected_values) if selected_values is not None else None
+    unknown_selected = (selected_ids or set()) - set(item_attempt_ids)
+    if unknown_selected:
+        raise ValueError(
+            "outer selection contains unknown attempt IDs: " + ", ".join(sorted(unknown_selected))
+        )
 
     planned: list[tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any], NestedEvidenceFold]] = []
     train_pending: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -355,6 +372,11 @@ def run_nested_gateway_fold(
             train_fold.train_plan,
         )
         if train_outcome is not None:
+            attempt_id = str(attempt.get("attempt_id") or "")
+            if selected_ids is not None and attempt_id in selected_ids:
+                raise ValueError(
+                    f"outer selection contains training-ineligible attempt ID: {attempt_id}"
+                )
             fold_records.append(
                 {
                     "run_id": run_dir.name,
@@ -389,8 +411,8 @@ def run_nested_gateway_fold(
             raise RuntimeError("Nested fold did not freeze outer evidence")
         attempt_id = str(attempt.get("attempt_id") or "")
         selected_for_outer = (
-            outer_selected_attempt_ids is None
-            or attempt_id in outer_selected_attempt_ids
+            selected_ids is None
+            or attempt_id in selected_ids
         )
         if not submit_outer:
             outer_stage_status = "pending_selection"
@@ -466,6 +488,21 @@ def run_nested_gateway_fold(
         )
         outer_tasks.append((attempt, task, frozen_fold.model_dump(mode="json")))
 
+    eligible_ids = {
+        str(record.get("attempt_id") or "")
+        for record in fold_records
+        if record.get("train_validation_status") == "valid"
+    }
+    required_outer_ids = eligible_ids if selected_ids is None else selected_ids
+    planned_outer_ids = {
+        str(record.get("attempt_id") or "")
+        for record in fold_records
+        if record.get("outer_test_plan")
+        and str(record.get("attempt_id") or "") in required_outer_ids
+    }
+    if submit_outer and planned_outer_ids != required_outer_ids:
+        raise RuntimeError("outer submission set does not exactly match frozen selection")
+
     _write_state(
         state_path,
         {
@@ -512,8 +549,8 @@ def run_nested_gateway_fold(
         if not record.get("outer_test_plan"):
             continue
         if (
-            outer_selected_attempt_ids is not None
-            and str(record.get("attempt_id") or "") not in outer_selected_attempt_ids
+            selected_ids is not None
+            and str(record.get("attempt_id") or "") not in selected_ids
         ):
             continue
         outer_plan = validate_replay_evidence_plan(record["outer_test_plan"])
@@ -532,13 +569,21 @@ def run_nested_gateway_fold(
         if outer_outcome is not None:
             record["outer_terminal_outcome"] = outer_outcome
     final_status = "failed" if failed_outer else "complete"
+    processed_outer_ids = {
+        str(record.get("attempt_id") or "")
+        for record in fold_records
+        if record.get("outer_validation_status") in {"valid", "nonviable"}
+        and str(record.get("attempt_id") or "") in required_outer_ids
+    }
+    if not failed_outer and processed_outer_ids != required_outer_ids:
+        raise RuntimeError("outer result set does not exactly match frozen selection")
     outer_eligible_count = sum(
         1
         for record in fold_records
         if record.get("outer_test_plan")
         and (
-            outer_selected_attempt_ids is None
-            or str(record.get("attempt_id") or "") in outer_selected_attempt_ids
+            selected_ids is None
+            or str(record.get("attempt_id") or "") in selected_ids
         )
     )
     payload = {

@@ -2422,7 +2422,11 @@ def run_atlas_lab(
     profile = atlas_profile_config(runtime.atlas_profile)
     build_profile = effective_atlas_build_profile(profile, runtime)
     paths = build_atlas_lab_paths(config, run_id=run_id)
+    if runtime.as_of_date and phases is not None and not phases:
+        raise ValueError("Historical Atlas phases may not be empty.")
     selected_phases = set(phases or ["full"])
+    if runtime.as_of_date and (runtime.publish or "publish" in selected_phases):
+        raise ValueError("Historical Atlas may not publish from a formal execution phase.")
     run_full = "full" in selected_phases
     historical_build = bool(runtime.as_of_date) and (run_full or "build" in selected_phases)
     historical_lineage = _historical_lineage(runtime)
@@ -2453,8 +2457,10 @@ def run_atlas_lab(
             observed={
                 **asdict(runtime),
                 "run_id": run_id,
+                "phases": sorted(selected_phases),
                 "execution_plan_path": runtime.execution_plan_path,
             },
+            config=config,
         )
         authoritative_root = Path(
             str((authoritative_plan.get("generation") or {}).get("active_runs_root") or "")

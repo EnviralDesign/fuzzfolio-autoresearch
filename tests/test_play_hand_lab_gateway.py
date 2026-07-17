@@ -22,6 +22,7 @@ from autoresearch.play_hand_lab_gateway import (
     HttpSaturationSimulationConfig,
     run_websocket_saturation_simulation_sync,
 )
+from autoresearch.play_hand_lab import _worker_result_identity
 
 
 def test_lab_gateway_defaults_are_cloud_tolerant() -> None:
@@ -82,6 +83,23 @@ def test_lab_gateway_claim_complete_and_duplicate_completion() -> None:
     assert snapshot["retained_task_count"] == 0
     assert snapshot["metrics"]["terminal_tasks_pruned"] == 1
     assert snapshot["worker_busy_rate"] == 0.0
+
+
+def test_result_identity_survives_ack_failure_and_redelivery() -> None:
+    gateway = PlayHandLabGateway()
+    gateway.enqueue(LabTask(task_id="task-redeliver", lane_id="lane-1", attempt_id="attempt-1"))
+    gateway.register_worker("worker-1")
+    claim = gateway.claim("worker-1")
+    gateway.complete("worker-1", claim["lease_id"], result={"score": 12.5})
+
+    first = gateway.read_results(limit=1)[0]
+    assert gateway.ack_results(["not-the-delivered-lease"]) == 0
+    second = gateway.read_results(limit=1)[0]
+    assert first["accepted_at_wall"] != ""
+    assert _worker_result_identity(first) == _worker_result_identity(second)
+
+    changed = {**second, "result": {"score": 99.0}}
+    assert _worker_result_identity(changed) != _worker_result_identity(second)
 
 
 def test_lab_gateway_failed_completion_counts_as_failed_task() -> None:

@@ -152,6 +152,19 @@ TERMINAL_OUTCOME_PROMOTED = "promoted"
 TERMINAL_OUTCOME_RESEARCH_NONVIABLE = "research_nonviable"
 TERMINAL_OUTCOME_INFRASTRUCTURE_FAILURE = "infrastructure_failure"
 TERMINAL_OUTCOME_INCOMPLETE = "incomplete"
+_WORKER_RESULT_DELIVERY_FIELDS = frozenset(
+    {"accepted_at", "accepted_at_wall", "delivery_id", "delivered_at", "lease_id", "read_at"}
+)
+
+
+def _worker_result_identity(lab_result: dict[str, Any]) -> str:
+    return canonical_sha256(
+        {
+            key: value
+            for key, value in lab_result.items()
+            if key not in _WORKER_RESULT_DELIVERY_FIELDS
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -3084,7 +3097,7 @@ def _terminal_receipt_for_result(
     return _validate_task_result_receipt(
         artifact_dir / "task-result-receipt.json",
         task_id=task_id,
-        worker_result_sha256=canonical_sha256(lab_result),
+        worker_result_sha256=_worker_result_identity(lab_result),
     )
 
 
@@ -3109,7 +3122,7 @@ def _record_lab_result(
     execution_evidence = _validated_execution_evidence(result_payload, evidence_plan)
     artifact_key = canonical_sha256({"task_id": task_id})[-20:]
     artifact_dir = (lane_ctx.evals_dir / f"eval_lab_{phase}_{artifact_key}").resolve()
-    result_identity = canonical_sha256(lab_result)
+    result_identity = _worker_result_identity(lab_result)
     matches = [
         row
         for row in load_attempts(lane_ctx.attempts_path)
@@ -3358,6 +3371,37 @@ def _is_failed_lab_result(lab_result: dict[str, Any]) -> bool:
     return status in {"failed", "error"} or worker_status in {"failed", "error"}
 
 
+def _validated_no_valid_cell_terminal(
+    lab_result: dict[str, Any], evidence_plan: dict[str, Any]
+) -> dict[str, Any] | None:
+    payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
+    worker_result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    terminal = worker_result.get("terminal_result")
+    if not isinstance(terminal, dict) or terminal.get("outcome") != "no_valid_cell":
+        return None
+    if (
+        terminal.get("schema") != "fuzzfolio-replay-terminal-result-v1"
+        or terminal.get("status") != "nonviable"
+    ):
+        raise DurableExecutionError("malformed no_valid_cell terminal result")
+    diagnostics = terminal.get("diagnostics")
+    market_window = diagnostics.get("market_data_window") if isinstance(diagnostics, dict) else None
+    try:
+        filtered_bar_count = int(market_window.get("filtered_bar_count") or 0)
+    except (AttributeError, TypeError, ValueError):
+        filtered_bar_count = 0
+    if (
+        not isinstance(diagnostics, dict)
+        or diagnostics.get("signal_count") != 0
+        or diagnostics.get("resolved_trade_count_max") != 0
+        or not isinstance(market_window, dict)
+        or filtered_bar_count <= 0
+    ):
+        raise DurableExecutionError("no_valid_cell terminal result lacks canonical diagnostics")
+    _validated_execution_evidence(terminal, evidence_plan)
+    return terminal
+
+
 def _record_lab_failure(
     *,
     config: AppConfig,
@@ -3366,6 +3410,7 @@ def _record_lab_failure(
     runtime: PlayHandLabRuntimeConfig,
     lab_result: dict[str, Any],
     reward_matrix: dict[str, Any] | None,
+    terminal_outcome: dict[str, Any] | None = None,
     render_progress: bool = True,
 ) -> dict[str, Any]:
     task_id = str(lab_result.get("task_id") or "")
@@ -3374,9 +3419,12 @@ def _record_lab_failure(
     task_kind = str(task_spec.get("task_kind") or runtime.task_mode)
     result_payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
     error = str(result_payload.get("error") or lab_result.get("error") or "lab_worker_failed")
+    is_nonviable = terminal_outcome is not None
+    record_status = "nonviable" if is_nonviable else "failed"
+    score_basis = "worker_no_valid_cell" if is_nonviable else "lab_worker_failed"
     artifact_key = canonical_sha256({"task_id": task_id})[-20:]
     artifact_dir = (lane_ctx.evals_dir / f"eval_lab_failed_{artifact_key}").resolve()
-    result_identity = canonical_sha256(lab_result)
+    result_identity = _worker_result_identity(lab_result)
     matches = [
         row
         for row in load_attempts(lane_ctx.attempts_path)
@@ -3412,8 +3460,8 @@ def _record_lab_failure(
             "attempt_id": row.get("attempt_id"),
             "artifact_dir": str(artifact_dir),
             "score": None,
-            "score_basis": "lab_worker_failed",
-            "status": "failed",
+            "score_basis": score_basis,
+            "status": record_status,
             "phase": phase,
             "task_kind": task_kind,
         }
@@ -3432,12 +3480,13 @@ def _record_lab_failure(
     if runtime.retain_raw_lab_artifacts:
         _write_json(artifact_dir / "lab-result.json", lab_result)
     _write_json(
-        artifact_dir / "lab-failure.json",
+        artifact_dir / ("lab-terminal-result.json" if is_nonviable else "lab-failure.json"),
         {
             "task_id": task_id,
             "lane_id": lane.lane_id,
-            "status": "failed",
+            "status": record_status,
             "error": error[:1000],
+            "terminal_result": terminal_outcome,
             "worker_id": lab_result.get("worker_id"),
             "worker_lease_id": lab_result.get("lease_id"),
         },
@@ -3447,9 +3496,9 @@ def _record_lab_failure(
     attempt_score = AttemptScore(
         primary_score=None,
         composite_score=None,
-        score_basis="lab_worker_failed",
+        score_basis=score_basis,
         metrics={},
-        best_summary={"status": "failed", "error": error[:500], "task_id": task_id},
+        best_summary={"status": record_status, "error": error[:500], "task_id": task_id},
     )
     record = make_attempt_record(
         config,
@@ -3486,11 +3535,13 @@ def _record_lab_failure(
             if isinstance(reward_matrix, dict)
             else None
         ),
-        job_status="failed",
+        job_status=record_status,
         runner=PLAY_HAND_RUNNER,
         attempt_role=play_hand_role,
-        attempt_decision="failed_candidate",
-        attempt_decision_reasons=["play_hand_lab_worker_failed"],
+        attempt_decision=("nonviable_candidate" if is_nonviable else "failed_candidate"),
+        attempt_decision_reasons=(
+            ["worker_no_valid_cell"] if is_nonviable else ["play_hand_lab_worker_failed"]
+        ),
         strategy_family_id=lane.run_id,
         canonical_attempt_id=None,
         is_canonical_attempt=False,
@@ -3508,8 +3559,9 @@ def _record_lab_failure(
             "worker_id": lab_result.get("worker_id"),
             "worker_lease_id": lab_result.get("lease_id"),
             "lab_worker_result_sha256": result_identity,
-            "run_status": "failed",
-            "lab_failure": {"error": error[:1000]},
+            "run_status": record_status,
+            "lab_terminal_outcome": terminal_outcome,
+            "lab_failure": None if is_nonviable else {"error": error[:1000]},
         }
     )
     attempts.append(row)
@@ -3524,7 +3576,7 @@ def _record_lab_failure(
     _append_event(
         lane_ctx,
         "lab_result",
-        "failed",
+        record_status,
         task_id=task_id,
         lane_id=lane.lane_id,
         task_phase=phase,
@@ -3540,8 +3592,8 @@ def _record_lab_failure(
         "attempt_id": record.attempt_id,
         "artifact_dir": str(artifact_dir),
         "score": None,
-        "score_basis": "lab_worker_failed",
-        "status": "failed",
+        "score_basis": score_basis,
+        "status": record_status,
         "phase": phase,
         "task_kind": task_kind,
     }
@@ -3993,11 +4045,29 @@ def _advance_lane_after_result(
     lane.phase_results.setdefault(phase, []).append(recorded)
     if not _phase_terminal(lane, phase):
         return []
+    if any(row.get("status") == "nonviable" for row in lane.phase_results.get(phase, [])):
+        _mark_lane_tombstoned(
+            lane,
+            lane_ctx=lane_ctx,
+            reason="worker_no_valid_cell",
+            outcome_category=TERMINAL_OUTCOME_RESEARCH_NONVIABLE,
+            reasons=[phase],
+        )
+        return []
     if _phase_failed(lane, phase):
         _mark_lane_tombstoned(
             lane,
             lane_ctx=lane_ctx,
             reason="lab_stage_worker_failed",
+            outcome_category=TERMINAL_OUTCOME_INFRASTRUCTURE_FAILURE,
+            reasons=[phase],
+        )
+        return []
+    if recorded.get("score") is None:
+        _mark_lane_tombstoned(
+            lane,
+            lane_ctx=lane_ctx,
+            reason="canonical_score_missing",
             outcome_category=TERMINAL_OUTCOME_INFRASTRUCTURE_FAILURE,
             reasons=[phase],
         )
@@ -5026,6 +5096,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 **asdict(runtime),
                 "execution_plan_path": runtime.execution_plan_path,
             },
+            config=config,
         )
         authoritative_root = Path(
             str((authoritative_plan.get("generation") or {}).get("active_runs_root") or "")
@@ -5398,11 +5469,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         )
         for task in new_tasks:
             journal.register(str(task["task_id"]), task)
+        _lane_allocation_checkpoint("after_task_registration")
         for lane in new_lanes:
             if lane.lane_index in reserved_lane_indices:
                 reserved_lane_indices.remove(lane.lane_index)
         persist_campaign_state()
-        _lane_allocation_checkpoint("after_task_registration")
         _lane_allocation_checkpoint("before_gateway_enqueue")
         enqueue_result = _enqueue_gateway_tasks_with_retries(
             gateway,
@@ -5553,6 +5624,14 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         persist_campaign_state()
         _lane_allocation_checkpoint("after_lane_registration")
         enqueue_lanes(sorted(recovered_lanes, key=lambda lane: lane.lane_index))
+        recovered_task_ids = {
+            task_id for lane in recovered_lanes for task_id in lane.task_ids
+        }
+        resume_tasks_to_enqueue = [
+            task
+            for task in resume_tasks_to_enqueue
+            if str(task.get("task_id") or "") not in recovered_task_ids
+        ]
 
     gateway_metric_baseline: dict[str, int] = {}
     try:
@@ -5734,13 +5813,13 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     if isinstance(terminal_receipt, dict)
                     else None,
                     task_id=task_id,
-                    worker_result_sha256=canonical_sha256(lab_result),
+                    worker_result_sha256=_worker_result_identity(lab_result),
                 )
                 recorded = dict(stored["recorded_result"])
                 local = _validate_task_result_receipt(
                     Path(str(recorded.get("artifact_dir") or "")) / "task-result-receipt.json",
                     task_id=task_id,
-                    worker_result_sha256=canonical_sha256(lab_result),
+                    worker_result_sha256=_worker_result_identity(lab_result),
                 )
                 if local != stored:
                     raise DurableExecutionError(
@@ -5751,7 +5830,27 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             recorded_successfully = False
             new_stage_tasks: list[dict[str, Any]] = []
             try:
-                if _is_failed_lab_result(lab_result):
+                task_spec = lane.task_specs.get(task_id, {})
+                evidence_plan = (
+                    task_spec.get("evidence_plan")
+                    if isinstance(task_spec.get("evidence_plan"), dict)
+                    else {}
+                )
+                terminal_outcome = _validated_no_valid_cell_terminal(lab_result, evidence_plan)
+                if terminal_outcome is not None:
+                    recorded = _record_lab_failure(
+                        config=config,
+                        lane_ctx=lane_contexts[lane.run_id],
+                        lane=lane,
+                        runtime=runtime,
+                        lab_result=lab_result,
+                        reward_matrix=reward_matrix,
+                        terminal_outcome=terminal_outcome,
+                        render_progress=False,
+                    )
+                    mark_progress_dirty(lane)
+                    lane.completed_task_ids.add(task_id)
+                elif _is_failed_lab_result(lab_result):
                     recorded = _record_lab_failure(
                         config=config,
                         lane_ctx=lane_contexts[lane.run_id],
@@ -5778,6 +5877,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     if recorded.get("status") == "failed":
                         lane.failed_task_ids.add(task_id)
                     else:
+                        if runtime.task_mode == "deep_replay" and recorded.get("score") is None:
+                            raise DurableExecutionError(
+                                f"task {task_id} lacks a canonical score and validated terminal outcome"
+                            )
                         lane.completed_task_ids.add(task_id)
                 _refresh_lane_phase_result_counts(lane, task_id=task_id)
                 new_stage_tasks = _advance_lane_after_result(
