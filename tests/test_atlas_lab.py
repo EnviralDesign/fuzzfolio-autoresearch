@@ -13,12 +13,15 @@ from autoresearch.atlas_lab import (
     AtlasLabRuntimeConfig,
     DEFAULT_ATLAS_PROFILE,
     ProbeRunSpec,
+    _formal_task_profile_payload,
     _compact_sensitivity_snapshot_for_atlas,
     _deep_replay_request_from_probe,
     _enqueue_gateway_tasks_with_retries,
     _make_signal_atlas_cell_task,
     _row_from_signal_result,
     _run_durable_atlas_stage,
+    _validate_historical_probe_summary,
+    audit_or_rewind_atlas_lab_stages,
     _stamp_historical_recipe_prior_lineage,
     atlas_profile_config,
     build_signal_atlas_via_gateway,
@@ -26,7 +29,7 @@ from autoresearch.atlas_lab import (
     run_atlas_lab,
     run_probe_spec_via_gateway,
 )
-from autoresearch.durable_execution import DurableExecutionError, DurableExecutionJournal
+from autoresearch.durable_execution import DurableExecutionError, DurableExecutionJournal, artifact_receipt
 from autoresearch.anchor_pair_atlas import (
     _probe_results_fieldnames,
     _result_row_from_score,
@@ -632,6 +635,81 @@ class FakeGateway:
         return len(lease_ids)
 
 
+class FailedProbeGateway(FakeGateway):
+    def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        self.enqueued_tasks.extend(tasks)
+        for task in tasks:
+            self.results.append(
+                {
+                    "task_id": task["task_id"],
+                    "lease_id": f"lease-{next(self._lease_counter)}",
+                    "worker_id": "failed-worker",
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "failed",
+                    "result": {
+                        "status": "failed",
+                        "error": "EvidencePlanValidationError: profile mismatch",
+                    },
+                }
+            )
+        return {"status": "accepted", "enqueued": len(tasks)}
+
+
+def _write_anchor_pair_probe_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    source_dir = tmp_path / "runs" / "derived" / "atlas-runs" / "test" / "anchor-pair-atlas"
+    profile_dir = source_dir / "profiles"
+    result_dir = source_dir / "probe-results" / "probe-1"
+    profile_dir.mkdir(parents=True)
+    profile_path = profile_dir / "probe-1.json"
+    profile_path.write_text(json.dumps(_profile_doc()), encoding="utf-8")
+    atlas_payload = {
+        "queue_rows": [
+            {
+                "probe_id": "probe-1",
+                "queue_rank": 1,
+                "anchor_type": "trend",
+                "anchor_id": "ANCHOR",
+                "trigger_id": "TRIGGER",
+                "probe_timeframe": "M5",
+                "pair_prior_score": 80,
+                "pair_prior_bucket": "probe_now",
+                "instruments": "EURUSD",
+            }
+        ],
+        "run_manifest": {
+            "probes": [
+                {
+                    "probe_id": "probe-1",
+                    "profile_path": str(profile_path),
+                    "output_dir": str(result_dir),
+                    "sensitivity_basket_args": [
+                        "sensitivity-basket",
+                        "--profile-ref",
+                        "<PROFILE_ID>",
+                        "--timeframe",
+                        "M5",
+                        "--lookback-months",
+                        "12",
+                        "--as-of-date",
+                        "2025-06-30T00:00:00Z",
+                        "--instrument",
+                        "EURUSD",
+                        "--quality-score-preset",
+                        "profile-drop",
+                        "--execution-cost-mode",
+                        "research-conservative",
+                        "--output-dir",
+                        str(result_dir),
+                    ],
+                }
+            ]
+        },
+    }
+    (source_dir / "anchor-pair-atlas.json").write_text(json.dumps(atlas_payload), encoding="utf-8")
+    return source_dir, result_dir
+
+
 def test_run_probe_spec_via_gateway_writes_scoreable_bundle(
     tmp_path: Path,
     monkeypatch,
@@ -737,6 +815,10 @@ def test_run_probe_spec_via_gateway_writes_scoreable_bundle(
     assert aggregate_task["task_id"].startswith("test-anchor_pair-")
     assert aggregate_task["task_id"].endswith("-probe-1-aggregate")
     assert aggregate_task["payload"]["job_id"] == aggregate_task["task_id"]
+    inline_profile = aggregate_task["payload"]["inline_profile_snapshot"]
+    evidence_plan = aggregate_task["payload"]["evidence_plan"]
+    assert inline_profile["notificationThreshold"] == 83.0
+    assert evidence_plan["profile_snapshot_sha256"] == canonical_sha256(inline_profile)
     detail_task = gateway.enqueued_tasks[1]
     assert detail_task["task_id"].startswith("test-anchor_pair-")
     assert detail_task["task_id"].endswith("-probe-1-detail")
@@ -753,6 +835,199 @@ def test_run_probe_spec_via_gateway_writes_scoreable_bundle(
     assert len(results_csv) == 1
     assert results_csv[0]["evidence_plan_id"]
     assert results_csv[0]["observed_lake_manifest_sha256"] == "sha256:" + "e" * 64
+
+
+def test_formal_probe_profile_payload_matches_evidence_plan_hash() -> None:
+    runtime = AtlasLabRuntimeConfig(
+        as_of_date="2025-06-30T00:00:00Z",
+        lake_manifest_sha256="sha256:" + "e" * 64,
+    )
+    profile_payload = _formal_task_profile_payload(_profile_doc()["profile"], runtime=runtime)
+
+    request = _deep_replay_request_from_probe(
+        probe_id="probe-1",
+        profile_payload=profile_payload,
+        manifest_probe={
+            "sensitivity_basket_args": [
+                "sensitivity-basket",
+                "--timeframe",
+                "M5",
+                "--lookback-months",
+                "12",
+                "--as-of-date",
+                "2025-06-30T00:00:00Z",
+                "--instrument",
+                "EURUSD",
+                "--output-dir",
+                "out",
+            ]
+        },
+        row={"probe_timeframe": "M5", "instruments": "EURUSD"},
+        runtime=runtime,
+        worker_contract_hash="contract123",
+    )
+
+    assert request["inline_profile_snapshot"]["notificationThreshold"] == 83.0
+    assert request["evidence_plan"]["profile_snapshot_sha256"] == canonical_sha256(
+        request["inline_profile_snapshot"]
+    )
+
+
+def test_historical_probe_worker_failure_fails_closed_without_stage_artifacts(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    source_dir, _result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+    monkeypatch.setattr(FuzzfolioCli, "score_artifact", lambda *args, **kwargs: {})
+
+    with pytest.raises(RuntimeError, match="Historical anchor_pair Atlas worker/result failed"):
+        run_probe_spec_via_gateway(
+            config,
+            spec=ProbeRunSpec(
+                kind="anchor_pair",
+                source_dir=source_dir,
+                atlas_filename="anchor-pair-atlas.json",
+                results_filename="anchor-pair-probe-results.csv",
+                summary_filename="anchor-pair-probe-summary.json",
+                manifest_schema="anchor_pair_run_manifest_v1",
+                result_fieldnames=_probe_results_fieldnames,
+                row_builder=_result_row_from_score,
+            ),
+            gateway=FailedProbeGateway(),
+            runtime=AtlasLabRuntimeConfig(
+                active_probes=1,
+                result_batch_size=10,
+                as_of_date="2025-06-30T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "e" * 64,
+            ),
+            worker_contract_hash="contract123",
+        )
+
+    assert not (source_dir / "anchor-pair-probe-results.csv").exists()
+    assert not (source_dir / "anchor-pair-probe-summary.json").exists()
+
+
+def test_historical_probe_summary_rejects_terminal_all_failed_reuse() -> None:
+    with pytest.raises(RuntimeError, match="invalid accounting"):
+        _validate_historical_probe_summary(
+            spec=ProbeRunSpec(
+                kind="anchor_pair",
+                source_dir=Path("unused"),
+                atlas_filename="anchor-pair-atlas.json",
+                results_filename="anchor-pair-probe-results.csv",
+                summary_filename="anchor-pair-probe-summary.json",
+                manifest_schema="anchor_pair_run_manifest_v1",
+                result_fieldnames=_probe_results_fieldnames,
+                row_builder=_result_row_from_score,
+            ),
+            summary={
+                "result_counts": {
+                    "selected": 48,
+                    "completed": 48,
+                    "scored": 0,
+                    "status_counts": {"failed": 48},
+                }
+            },
+        )
+
+
+def test_durable_probe_stage_does_not_complete_on_formal_worker_failure(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    source_dir, _result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+    run_root = tmp_path / "runs" / "derived" / "atlas-runs" / "unit"
+    journal = DurableExecutionJournal(
+        run_root / "execution-journal.json",
+        execution_id="unit-execution",
+        lineage={},
+    )
+    monkeypatch.setattr(FuzzfolioCli, "score_artifact", lambda *args, **kwargs: {})
+
+    with pytest.raises(RuntimeError, match="Historical anchor_pair Atlas worker/result failed"):
+        _run_durable_atlas_stage(
+            journal=journal,
+            run_root=run_root,
+            stage="05-anchor-pair-probes",
+            payload={"stage": "05-anchor-pair-probes"},
+            artifact_roots=(source_dir,),
+            action=lambda: run_probe_spec_via_gateway(
+                config,
+                spec=ProbeRunSpec(
+                    kind="anchor_pair",
+                    source_dir=source_dir,
+                    atlas_filename="anchor-pair-atlas.json",
+                    results_filename="anchor-pair-probe-results.csv",
+                    summary_filename="anchor-pair-probe-summary.json",
+                    manifest_schema="anchor_pair_run_manifest_v1",
+                    result_fieldnames=_probe_results_fieldnames,
+                    row_builder=_result_row_from_score,
+                ),
+                gateway=FailedProbeGateway(),
+                runtime=AtlasLabRuntimeConfig(
+                    active_probes=1,
+                    result_batch_size=10,
+                    as_of_date="2025-06-30T00:00:00Z",
+                    lake_manifest_sha256="sha256:" + "e" * 64,
+                ),
+                worker_contract_hash="contract123",
+            ),
+        )
+
+    task_id = canonical_sha256({"execution": "unit-execution", "stage": "05-anchor-pair-probes"})
+    assert journal.load()["tasks"][task_id]["status"] == "pending"
+    assert journal.terminal(task_id) is None
+
+
+def test_audit_or_rewind_atlas_lab_stages_marks_boundary_forward_pending(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs" / "derived" / "atlas-runs" / "unit"
+    journal = DurableExecutionJournal(
+        run_root / "execution-journal.json",
+        execution_id="unit-execution",
+        lineage={},
+    )
+    for stage in ["04-anchor-pair-atlas", "05-anchor-pair-probes", "06-anchor-pair-timing-atlas"]:
+        task_id = canonical_sha256({"execution": "unit-execution", "stage": stage})
+        journal.register(task_id, {"stage": stage})
+        artifact_dir = run_root / stage
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = artifact_dir / "artifact.json"
+        artifact_path.write_text(json.dumps({"stage": stage}), encoding="utf-8")
+        receipt = artifact_receipt([artifact_path], root=run_root)
+        journal.complete(task_id, {"stage": stage, "artifact_receipt": receipt})
+
+    dry_run = audit_or_rewind_atlas_lab_stages(
+        run_root=run_root,
+        execution_id="unit-execution",
+        from_stage="05-anchor-pair-probes",
+        apply=False,
+    )
+    assert [row["stage"] for row in dry_run["rewound"]] == [
+        "05-anchor-pair-probes",
+        "06-anchor-pair-timing-atlas",
+    ]
+
+    applied = audit_or_rewind_atlas_lab_stages(
+        run_root=run_root,
+        execution_id="unit-execution",
+        from_stage="05-anchor-pair-probes",
+        apply=True,
+    )
+    assert len(applied["rewound"]) == 2
+    assert journal.terminal(canonical_sha256({"execution": "unit-execution", "stage": "04-anchor-pair-atlas"}))
+    reopened = DurableExecutionJournal(
+        run_root / "execution-journal.json",
+        execution_id="unit-execution",
+        lineage={},
+    )
+    assert reopened.terminal(
+        canonical_sha256({"execution": "unit-execution", "stage": "05-anchor-pair-probes"})
+    ) is None
+    assert reopened.terminal(
+        canonical_sha256({"execution": "unit-execution", "stage": "06-anchor-pair-timing-atlas"})
+    ) is None
 
 
 def test_historical_runtime_cutoff_rejects_mismatched_probe_manifest_cutoff() -> None:
@@ -1616,3 +1891,26 @@ def test_formal_atlas_cli_constructs_runtime_from_authority_plan(
     runtime = captured["runtime"]
     assert runtime.worker_contract_hash == contract
     assert captured["phases"] == ["full"]
+
+
+def test_rewind_atlas_lab_stages_cli_arguments_parse(tmp_path: Path) -> None:
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "rewind-atlas-lab-stages",
+            "--run-root",
+            str(tmp_path),
+            "--execution-id",
+            "unit-execution",
+            "--from-stage",
+            "05-anchor-pair-probes",
+            "--json",
+        ]
+    )
+
+    assert args.command == "rewind-atlas-lab-stages"
+    assert args.run_root == tmp_path
+    assert args.execution_id == "unit-execution"
+    assert args.from_stage == "05-anchor-pair-probes"
+    assert args.apply is False
+    assert args.json is True

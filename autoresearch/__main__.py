@@ -348,6 +348,7 @@ if __package__ in {None, ""}:
         ATLAS_PROFILE_CONFIGS,
         AtlasLabRuntimeConfig,
         DEFAULT_ATLAS_PROFILE,
+        audit_or_rewind_atlas_lab_stages,
         run_atlas_lab,
     )
     from autoresearch.discovery_recipe_validation import (
@@ -654,6 +655,7 @@ else:
         ATLAS_PROFILE_CONFIGS,
         AtlasLabRuntimeConfig,
         DEFAULT_ATLAS_PROFILE,
+        audit_or_rewind_atlas_lab_stages,
         run_atlas_lab,
     )
     from .discovery_recipe_validation import (
@@ -779,6 +781,7 @@ PUBLIC_CLI_COMMANDS = {
     "render-portfolio-profile-drops",
     "cleanup-incomplete-playhand-runs",
     "cleanup-atlas-artifacts",
+    "rewind-atlas-lab-stages",
     "cleanup-playhand-lab-raw-artifacts",
     "archive-retired-universe",
     "compact-retired-universe-archive",
@@ -3209,6 +3212,38 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         help="How many matched/kept entries to include in the JSON preview.",
     )
     cleanup_atlas.add_argument(
+        "--json", action="store_true", help="Print machine-readable JSON."
+    )
+    atlas_rewind = subparsers.add_parser(
+        "rewind-atlas-lab-stages",
+        help=(
+            "Audit or rewind an Atlas lab durable journal from a named stage forward. "
+            "This updates only the journal when --apply is used; stage-owned artifact "
+            "roots are quarantined by the stage runner on resume."
+        ),
+    )
+    atlas_rewind.add_argument(
+        "--run-root",
+        type=Path,
+        required=True,
+        help="Atlas lab run root containing execution-journal.json.",
+    )
+    atlas_rewind.add_argument(
+        "--execution-id",
+        required=True,
+        help="Expected execution_id from the Atlas lab journal.",
+    )
+    atlas_rewind.add_argument(
+        "--from-stage",
+        required=True,
+        help="Durable stage name to rewind from, for example 05-anchor-pair-probes.",
+    )
+    atlas_rewind.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually mark terminal stages from --from-stage onward pending.",
+    )
+    atlas_rewind.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
     lab_raw_cleanup = subparsers.add_parser(
@@ -20449,6 +20484,23 @@ def main(argv: list[str] | None = None) -> int:
             preview=int(args.preview),
             as_json=bool(args.json),
         )
+    if args.command == "rewind-atlas-lab-stages":
+        payload = audit_or_rewind_atlas_lab_stages(
+            run_root=args.run_root,
+            execution_id=str(args.execution_id),
+            from_stage=str(args.from_stage),
+            apply=bool(args.apply),
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            action = "rewound" if args.apply else "would rewind"
+            count = len(payload.get("rewound") or [])
+            print(
+                f"Atlas lab stage audit complete: {action} {count} terminal stage(s) "
+                f"from {args.from_stage}."
+            )
+        return 0
     if args.command == "cleanup-playhand-lab-raw-artifacts":
         return cmd_cleanup_playhand_lab_raw_artifacts(
             run_ids=args.run_id,

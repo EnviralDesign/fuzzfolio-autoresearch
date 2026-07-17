@@ -110,6 +110,24 @@ from .signal_atlas import (
 ATLAS_LAB_RUNS_DIRNAME = "atlas-runs"
 ATLAS_LAB_RUN_SCHEMA_VERSION = "atlas_lab_run_v1"
 ATLAS_LAB_RUNNER = "atlas_lab_v1"
+ATLAS_LAB_DURABLE_STAGES = (
+    "01-indicator-atlas",
+    "02-signal-atlas",
+    "03-forward-response-atlas",
+    "04-anchor-pair-atlas",
+    "05-anchor-pair-probes",
+    "06-anchor-pair-timing-atlas",
+    "07-anchor-pair-timing-probes",
+    "08-recipe-priors",
+    "09-discovery-pair-atlas",
+    "10-discovery-pair-probes",
+    "11-discovery-cluster-atlas",
+    "12-discovery-recipe-validation-atlas",
+    "13-discovery-recipe-validation-probes",
+    "14-discovery-recipe-scrutiny-atlas",
+    "15-discovery-recipe-scrutiny-probes",
+    "16-final-recipe-priors",
+)
 DEFAULT_ATLAS_LAB_ACTIVE_PROBES = 128
 DEFAULT_ATLAS_LAB_ENQUEUE_CHUNK = 256
 DEFAULT_ATLAS_LAB_RESULT_BATCH_SIZE = 250
@@ -659,6 +677,77 @@ def _run_durable_atlas_stage(
     return result, False
 
 
+def audit_or_rewind_atlas_lab_stages(
+    *,
+    run_root: Path,
+    execution_id: str,
+    from_stage: str,
+    apply: bool = False,
+) -> dict[str, Any]:
+    resolved_run_root = Path(run_root).expanduser().resolve(strict=False)
+    journal_path = resolved_run_root / "execution-journal.json"
+    if not journal_path.is_file():
+        raise FileNotFoundError(f"Atlas lab execution journal not found: {journal_path}")
+    if from_stage not in ATLAS_LAB_DURABLE_STAGES:
+        raise ValueError(f"Unknown Atlas stage {from_stage!r}")
+    payload = _load_json(journal_path)
+    if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), dict):
+        raise DurableExecutionError("Atlas lab journal is malformed")
+    if str(payload.get("execution_id") or "") != str(execution_id):
+        raise DurableExecutionError("Atlas lab journal execution_id mismatch")
+    stage_index = ATLAS_LAB_DURABLE_STAGES.index(from_stage)
+    tasks = payload["tasks"]
+    inspected: list[dict[str, Any]] = []
+    rewound: list[dict[str, Any]] = []
+    for stage in ATLAS_LAB_DURABLE_STAGES[stage_index:]:
+        task_id = canonical_sha256({"execution": execution_id, "stage": stage})
+        task = tasks.get(task_id)
+        if not isinstance(task, dict):
+            inspected.append({"stage": stage, "task_id": task_id, "status": "missing"})
+            continue
+        status = str(task.get("status") or "unknown")
+        receipt_payload = _as_dict(_as_dict(task.get("terminal_receipt")).get("payload"))
+        artifact = _as_dict(receipt_payload.get("artifact_receipt"))
+        artifact_valid = None
+        if artifact:
+            try:
+                validate_artifact_receipt(artifact)
+                artifact_valid = True
+            except DurableExecutionError:
+                artifact_valid = False
+        record = {
+            "stage": stage,
+            "task_id": task_id,
+            "status": status,
+            "artifact_valid": artifact_valid,
+        }
+        inspected.append(record)
+        if status == "terminal":
+            rewound.append(record)
+            if apply:
+                task["status"] = "pending"
+                task["terminal_receipt"] = None
+    if apply and rewound:
+        payload["journal_identity"] = DurableExecutionJournal._identity(payload)
+        atomic_write_json(journal_path, payload)
+    return {
+        "schema_version": "atlas_lab_stage_rewind_report_v1",
+        "run_root": str(resolved_run_root),
+        "journal_path": str(journal_path),
+        "execution_id": str(execution_id),
+        "from_stage": from_stage,
+        "apply": bool(apply),
+        "inspected": inspected,
+        "rewound": rewound,
+        "next_resume_behavior": (
+            "Rewound stages are pending. On --resume, each owning stage will quarantine "
+            "existing artifacts under partial-stages before rebuilding."
+            if apply
+            else "Dry run only. Pass --apply to mark terminal stage receipts pending."
+        ),
+    }
+
+
 def _load_json(path: Path) -> Any:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -805,6 +894,23 @@ def _profile_payload_from_doc(path: Path) -> dict[str, Any]:
     profile = payload.get("profile")
     if isinstance(profile, dict):
         return dict(profile)
+    return payload
+
+
+def _formal_task_profile_payload(
+    profile_payload: dict[str, Any],
+    *,
+    runtime: AtlasLabRuntimeConfig,
+) -> dict[str, Any]:
+    """Return the exact profile payload formal tasks both hash and send.
+
+    Evidence plans normalize profile snapshots before hashing.  Formal gateway
+    tasks must send that same canonical payload, otherwise worker-side evidence
+    validation correctly rejects the job.
+    """
+    payload = dict(profile_payload)
+    if runtime.as_of_date:
+        return normalize_evidence_profile_snapshot(payload)
     return payload
 
 
@@ -1355,7 +1461,10 @@ def _make_probe_state(
         config.repo_root,
         manifest_probe.get("output_dir") or row.get("result_dir") or (spec.source_dir / "results" / probe_id),
     )
-    profile_payload = _profile_payload_from_doc(profile_path)
+    profile_payload = _formal_task_profile_payload(
+        _profile_payload_from_doc(profile_path),
+        runtime=runtime,
+    )
     replay_request = _deep_replay_request_from_probe(
         probe_id=probe_id,
         profile_payload=profile_payload,
@@ -1408,6 +1517,50 @@ def _result_row(
             "observed_lake_manifest_sha256"
         )
     return row
+
+
+def _raise_historical_probe_failure(
+    *,
+    spec: ProbeRunSpec,
+    task_id: str,
+    error: str,
+) -> None:
+    raise RuntimeError(
+        f"Historical {spec.kind} Atlas worker/result failed for {task_id}: {error}"
+    )
+
+
+def _validate_historical_probe_summary(
+    *,
+    spec: ProbeRunSpec,
+    summary: dict[str, Any],
+) -> None:
+    counts = _as_dict(summary.get("result_counts"))
+    selected = int(counts.get("selected") or 0)
+    completed = int(counts.get("completed") or 0)
+    scored = int(counts.get("scored") or 0)
+    status_counts = _as_dict(counts.get("status_counts"))
+    failed = sum(
+        int(value or 0)
+        for key, value in status_counts.items()
+        if str(key).lower() not in {"ok", "skipped_existing"}
+    )
+    if selected and (completed != selected or failed or scored <= 0):
+        raise RuntimeError(
+            f"Historical {spec.kind} Atlas probe stage produced invalid accounting: "
+            f"selected={selected}, completed={completed}, scored={scored}, "
+            f"status_counts={status_counts}"
+        )
+
+
+def _validate_historical_probe_outcome(
+    *,
+    spec: ProbeRunSpec,
+    outcome: ProbeRunOutcome | None,
+) -> None:
+    if outcome is None:
+        return
+    _validate_historical_probe_summary(spec=spec, summary=outcome.summary)
 
 
 def _existing_result_row(
@@ -1704,7 +1857,14 @@ def run_probe_spec_via_gateway(
                     worker_result = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
                     worker_status = str(worker_result.get("status") or "").lower()
                     if status in {"failed", "error"} or worker_status in {"failed", "error"}:
-                        raise RuntimeError(str(worker_result.get("error") or "atlas lab worker failed"))
+                        error_text = str(worker_result.get("error") or "atlas lab worker failed")
+                        if runtime.as_of_date:
+                            _raise_historical_probe_failure(
+                                spec=spec,
+                                task_id=task_id,
+                                error=error_text,
+                            )
+                        raise RuntimeError(error_text)
                     if task_id == state.aggregate_task_id:
                         _materialize_aggregate_result(
                             state=state,
@@ -1737,6 +1897,8 @@ def run_probe_spec_via_gateway(
                         release_state(state)
                     ack_ids.append(lease_id)
                 except Exception as exc:
+                    if runtime.as_of_date:
+                        raise
                     state.error = str(exc)[:500]
                     persist_finished(state, status="failed", error=state.error)
                     release_state(state)
@@ -1780,13 +1942,24 @@ def run_probe_spec_via_gateway(
     results_csv_path = spec.source_dir / spec.results_filename
     summary_path = spec.source_dir / spec.summary_filename
     fieldnames = _probe_result_fieldnames(spec, results)
-    _write_csv(results_csv_path, results, fieldnames)
     scored = [row for row in results if row.get("composite_score") not in (None, "")]
     scored.sort(key=lambda row: float(row.get("composite_score") or 0.0), reverse=True)
     status_counts: dict[str, int] = {}
     for row in results:
         status = _clean_token(row.get("status")) or "unknown"
         status_counts[status] = status_counts.get(status, 0) + 1
+    if runtime.as_of_date:
+        failed = sum(
+            count
+            for status, count in status_counts.items()
+            if str(status).lower() not in {"ok", "skipped_existing"}
+        )
+        if failed or (queue_rows and not scored):
+            raise RuntimeError(
+                f"Historical {spec.kind} Atlas probe stage cannot complete with "
+                f"failed={failed}, scored={len(scored)}, selected={len(queue_rows)}"
+            )
+    _write_csv(results_csv_path, results, fieldnames)
     summary = {
         "schema_version": f"{spec.kind}_atlas_lab_results_v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -2567,12 +2740,16 @@ def run_atlas_lab(
 
     def record_probe(outcome: ProbeRunOutcome | None, spec: ProbeRunSpec) -> None:
         if outcome is not None:
+            if runtime.as_of_date:
+                _validate_historical_probe_outcome(spec=spec, outcome=outcome)
             probe_summaries.append(outcome.summary)
             return
         summary_path = spec.source_dir / spec.summary_filename
         summary = _load_json(summary_path)
         if not isinstance(summary, dict):
             raise DurableExecutionError(f"Reused Atlas probe summary is invalid: {summary_path}")
+        if runtime.as_of_date:
+            _validate_historical_probe_summary(spec=spec, summary=summary)
         probe_summaries.append(summary)
 
     def build_final_priors() -> Any:
