@@ -9,6 +9,7 @@ import pytest
 
 from autoresearch import __main__ as ar_main
 from autoresearch import generation_cli
+from autoresearch.__main__ import build_parser
 from autoresearch.generation_archive import GENERATION_MANIFEST_NAME, GenerationArchiveService, utc_now
 
 
@@ -81,6 +82,21 @@ def _add_quiescence(
 
 def _invoke(tmp_path: Path, provenance_path: Path, *extra: str) -> list[str]:
     return ["archive-generation", "--archive-id", "archive-001", "--new-generation-id", "generation-002", "--provenance-json", str(provenance_path), *extra, "--json"]
+
+
+def test_archive_generation_is_registered_as_direct_script() -> None:
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert 'archive-generation = "autoresearch.__main__:main"' in pyproject
+
+
+def test_archive_generation_cli_help() -> None:
+    parser = build_parser()
+
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["archive-generation", "--help"])
+
+    assert exc.value.code == 0
 
 
 def test_archive_generation_defaults_to_non_mutating_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
