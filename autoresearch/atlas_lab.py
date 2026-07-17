@@ -1404,6 +1404,68 @@ def _validated_no_valid_cell_terminal_for_probe(
     return state.terminal_outcome
 
 
+def _validated_aggregate_terminal_for_probe(
+    *,
+    result_payload: dict[str, Any],
+    state: ProbeState,
+) -> dict[str, Any] | None:
+    nested = result_payload.get("result") if isinstance(result_payload.get("result"), dict) else {}
+    aggregate = nested.get("aggregate") if isinstance(nested.get("aggregate"), dict) else {}
+    terminal = aggregate.get("terminal_outcome") if isinstance(aggregate, dict) else None
+    if not isinstance(terminal, dict):
+        return None
+    if terminal.get("outcome") != "no_valid_cell":
+        raise RuntimeError(
+            f"Historical Atlas aggregate {state.probe_id} returned unsupported terminal outcome: "
+            f"{terminal.get('outcome')!r}"
+        )
+    if (
+        terminal.get("schema") != "fuzzfolio-replay-terminal-result-v1"
+        or terminal.get("status") != "nonviable"
+    ):
+        raise RuntimeError(
+            f"Historical Atlas aggregate {state.probe_id} returned malformed terminal outcome"
+        )
+    diagnostics = terminal.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise RuntimeError(
+            f"Historical Atlas aggregate {state.probe_id} returned terminal outcome without diagnostics"
+        )
+    reason = diagnostics.get("reason")
+    if reason not in {
+        "aggregate_no_signal",
+        "aggregate_insufficient_best_cell_trade_support",
+        "aggregate_no_detail_capable_best_cell",
+    }:
+        raise RuntimeError(
+            f"Historical Atlas aggregate {state.probe_id} returned unsupported terminal reason: {reason!r}"
+        )
+    if reason == "aggregate_insufficient_best_cell_trade_support":
+        minimum = diagnostics.get("minimum_resolved_trades_for_best_cell")
+        resolved = diagnostics.get("resolved_trade_count_max")
+        if not (_positive_number(minimum) and isinstance(resolved, (int, float)) and float(resolved) < float(minimum)):
+            raise RuntimeError(
+                f"Historical Atlas aggregate {state.probe_id} returned invalid insufficient-support diagnostics"
+            )
+    expected_plan = state.replay_request.get("evidence_plan")
+    expected_plan = expected_plan if isinstance(expected_plan, dict) else {}
+    receipt = _validate_probe_execution_evidence(
+        receipt=result_payload.get("execution_evidence"),
+        expected_plan=expected_plan,
+        context="aggregate terminal outcome",
+    )
+    if receipt is not None:
+        state.execution_evidence = receipt
+    state.terminal_outcome = {
+        "schema": terminal.get("schema"),
+        "status": terminal.get("status"),
+        "outcome": terminal.get("outcome"),
+        "diagnostics": diagnostics,
+    }
+    state.error = None
+    return state.terminal_outcome
+
+
 def _numeric_zero(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) == 0.0
 
@@ -1656,6 +1718,11 @@ def _materialize_aggregate_result(
         state=state,
     )
     result_payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
+    if terminal_outcome is None:
+        terminal_outcome = _validated_aggregate_terminal_for_probe(
+            result_payload=result_payload,
+            state=state,
+        )
     if terminal_outcome is None:
         terminal_outcome = _validated_no_signal_aggregate_for_probe(
             result_payload=result_payload,
