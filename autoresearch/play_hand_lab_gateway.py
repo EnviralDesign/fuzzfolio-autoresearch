@@ -27,6 +27,11 @@ from websockets.asyncio.client import connect as websocket_connect
 
 from .play_hand_lab_auth import load_lab_gateway_token
 
+try:  # pragma: no cover - exercised when optional C extension is installed.
+    import orjson as _orjson
+except Exception:  # pragma: no cover - stdlib fallback for unusual environments.
+    _orjson = None
+
 
 TaskStatus = Literal["queued", "leased", "completed", "failed"]
 ClaimStatus = Literal["leased", "no_work"]
@@ -43,6 +48,19 @@ LAB_DEEP_REPLAY_QUEUE = "QUEUE:deep_replay_jobs"
 LAB_DEEP_REPLAY_DETAIL_QUEUE = "QUEUE:deep_replay_detail_jobs"
 LAB_SWEEP_SHARD_QUEUE = "QUEUE:sweep_shard_jobs"
 logger = logging.getLogger(__name__)
+
+
+def _json_dumps_bytes(payload: Any, *, sort_keys: bool = False) -> bytes:
+    if _orjson is not None:
+        option = _orjson.OPT_SORT_KEYS if sort_keys else 0
+        return _orjson.dumps(payload, option=option)
+    return json.dumps(payload, separators=(",", ":"), sort_keys=sort_keys).encode("utf-8")
+
+
+def _json_loads_bytes(raw: bytes) -> Any:
+    if _orjson is not None:
+        return _orjson.loads(raw)
+    return json.loads(raw.decode("utf-8"))
 
 
 def _now() -> float:
@@ -367,7 +385,7 @@ class LabResult:
 
 def _json_payload_size_bytes(payload: Any) -> int:
     try:
-        raw = json.dumps(payload, separators=(",", ":"), sort_keys=False).encode("utf-8")
+        raw = _json_dumps_bytes(payload)
     except Exception:
         raw = repr(payload).encode("utf-8", errors="replace")
     return len(raw)
@@ -1373,7 +1391,7 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
             return None
         try:
             body = self.rfile.read(length) if length else b"{}"
-            parsed = json.loads(body.decode("utf-8"))
+            parsed = _json_loads_bytes(body)
         except Exception:
             self._write_json({"error": "invalid_json"}, status=HTTPStatus.BAD_REQUEST)
             return None
@@ -1383,7 +1401,7 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
         return parsed
 
     def _write_json(self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
-        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        body = _json_dumps_bytes(payload, sort_keys=True)
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1621,7 +1639,7 @@ class LabGatewayAsgiApp:
                     if raw_payload is not None and len(str(raw_payload).encode("utf-8")) > self.max_body_bytes:
                         await send({"type": "websocket.close", "code": 1009})
                         return
-                    payload = json.loads(str(raw_payload or "{}"))
+                    payload = _json_loads_bytes(str(raw_payload or "{}").encode("utf-8"))
                     if not isinstance(payload, dict):
                         raise ValueError("json_object_required")
                     if str(payload.get("type") or "") == "register":
@@ -1632,7 +1650,7 @@ class LabGatewayAsgiApp:
                 await send(
                     {
                         "type": "websocket.send",
-                        "text": json.dumps(response, separators=(",", ":"), sort_keys=True),
+                        "text": _json_dumps_bytes(response, sort_keys=True).decode("utf-8"),
                     }
                 )
         except Exception as exc:
@@ -1780,13 +1798,13 @@ class LabGatewayAsgiApp:
                 break
         if not chunks:
             return {}
-        parsed = json.loads(b"".join(chunks).decode("utf-8"))
+        parsed = _json_loads_bytes(b"".join(chunks))
         if not isinstance(parsed, dict):
             raise ValueError("json_object_required")
         return parsed
 
     async def _send_json(self, send: Any, payload: dict[str, Any], *, status: int = 200) -> None:
-        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        body = _json_dumps_bytes(payload, sort_keys=True)
         await send(
             {
                 "type": "http.response.start",
@@ -2253,8 +2271,8 @@ async def run_websocket_saturation_simulation(config: WebSocketSaturationSimulat
                 stop.set()
 
     async def send_message(websocket: Any, payload: dict[str, Any]) -> dict[str, Any]:
-        await websocket.send(json.dumps(payload, separators=(",", ":"), sort_keys=True))
-        response = json.loads(await websocket.recv())
+        await websocket.send(_json_dumps_bytes(payload, sort_keys=True).decode("utf-8"))
+        response = _json_loads_bytes(str(await websocket.recv()).encode("utf-8"))
         return response if isinstance(response, dict) else {}
 
     async def worker(index: int) -> None:

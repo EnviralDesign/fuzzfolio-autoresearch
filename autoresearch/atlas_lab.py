@@ -18,6 +18,11 @@ from typing import Any, Callable, Literal
 
 import requests
 
+try:  # pragma: no cover - exercised when optional C extension is installed.
+    import orjson as _orjson
+except Exception:  # pragma: no cover - stdlib fallback for unusual environments.
+    _orjson = None
+
 from .anchor_pair_atlas import (
     DEFAULT_ANCHOR_PAIR_DIRNAME,
     DEFAULT_ANCHOR_PAIR_TIMING_DIRNAME,
@@ -633,12 +638,15 @@ def _write_large_scratch_json(path: Path, payload: dict[str, Any]) -> None:
     )
     temporary = Path(temporary_name)
     try:
-        encoded = json.dumps(
-            payload,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            check_circular=False,
-        ).encode("utf-8")
+        if _orjson is not None:
+            encoded = _orjson.dumps(payload)
+        else:
+            encoded = json.dumps(
+                payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                check_circular=False,
+            ).encode("utf-8")
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(encoded)
             handle.flush()

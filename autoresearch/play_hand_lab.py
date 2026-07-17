@@ -19,6 +19,11 @@ from typing import Any, Literal
 import requests
 from rich.console import Console
 
+try:  # pragma: no cover - exercised when optional C extension is installed.
+    import orjson as _orjson
+except Exception:  # pragma: no cover - stdlib fallback for unusual environments.
+    _orjson = None
+
 from .play_hand_lab_auth import load_lab_gateway_token
 from .config import AppConfig, load_config
 from .fuzzfolio import CliError, FuzzfolioCli
@@ -430,6 +435,12 @@ def _lane_allocation_checkpoint(_name: str) -> None:
     """No-op seam used by crash/restart tests around durable lane allocation."""
 
 
+def _response_json_payload(response: requests.Response) -> Any:
+    if _orjson is not None:
+        return _orjson.loads(response.content)
+    return response.json()
+
+
 class LabGatewayClient:
     def __init__(self, *, base_url: str, token: str | None = None, timeout_seconds: float = 30.0) -> None:
         self.base_url = str(base_url or DEFAULT_LAB_GATEWAY_URL).rstrip("/")
@@ -446,7 +457,7 @@ class LabGatewayClient:
     def health(self) -> dict[str, Any]:
         response = self.session.get(f"{self.base_url}/healthz", timeout=self.timeout_seconds)
         response.raise_for_status()
-        payload = response.json()
+        payload = _response_json_payload(response)
         return payload if isinstance(payload, dict) else {}
 
     def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -457,7 +468,7 @@ class LabGatewayClient:
             timeout=self.timeout_seconds,
         )
         response.raise_for_status()
-        payload = response.json()
+        payload = _response_json_payload(response)
         return payload if isinstance(payload, dict) else {}
 
     def snapshot(self) -> dict[str, Any]:
@@ -467,7 +478,7 @@ class LabGatewayClient:
             timeout=self.timeout_seconds,
         )
         response.raise_for_status()
-        payload = response.json()
+        payload = _response_json_payload(response)
         return payload if isinstance(payload, dict) else {}
 
     def read_results(self, *, limit: int) -> list[dict[str, Any]]:
@@ -478,7 +489,7 @@ class LabGatewayClient:
             timeout=self.timeout_seconds,
         )
         response.raise_for_status()
-        payload = response.json()
+        payload = _response_json_payload(response)
         if not isinstance(payload, dict):
             return []
         results = payload.get("results")
@@ -492,7 +503,7 @@ class LabGatewayClient:
             timeout=self.timeout_seconds,
         )
         response.raise_for_status()
-        payload = response.json()
+        payload = _response_json_payload(response)
         if not isinstance(payload, dict):
             return 0
         return int(payload.get("acked") or 0)
