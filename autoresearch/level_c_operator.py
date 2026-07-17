@@ -44,8 +44,13 @@ PROFILE_MODEL_SOURCE_FILES = (
     "shared/python/fuzzfolio_core/fuzzfolio_core/models/indicator.py",
     "shared/python/fuzzfolio_core/fuzzfolio_core/models/scoringprofile.py",
 )
+LEVEL_C_PORTFOLIO_SUITE = "darwin-master-v1"
+LEVEL_C_SELECTION_BASIS = "recommended_cell"
+LEVEL_C_OPTIMIZER_BACKEND = "python"
+LEVEL_C_SUITE_CONFIG = "portfolio.research-suites.json"
 _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_WORKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _CUTOFF_KEYS = frozenset({"A", "B", "C", "D"})
 _GEOMETRY_FIELDS = (
     "selection_start",
@@ -196,6 +201,29 @@ def _sha256_bytes(value: bytes) -> str:
     return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
+def _workflow_arguments(config: Any) -> dict[str, Any]:
+    suite_path = Path(config.repo_root) / LEVEL_C_SUITE_CONFIG
+    try:
+        raw = suite_path.read_bytes()
+        document = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LevelCOperatorError(f"Level C suite config is unreadable: {suite_path}") from exc
+    suites = document.get("research_suites") if isinstance(document, Mapping) else None
+    if not isinstance(suites, Mapping) or not isinstance(
+        suites.get(LEVEL_C_PORTFOLIO_SUITE), Mapping
+    ):
+        raise LevelCOperatorError(
+            f"Level C suite config is missing {LEVEL_C_PORTFOLIO_SUITE}"
+        )
+    return {
+        "suite_name": LEVEL_C_PORTFOLIO_SUITE,
+        "suite_config_relative_path": LEVEL_C_SUITE_CONFIG,
+        "suite_config_sha256": _sha256_bytes(raw),
+        "selection_basis": LEVEL_C_SELECTION_BASIS,
+        "optimizer_backend": LEVEL_C_OPTIMIZER_BACKEND,
+    }
+
+
 def _require_mapping(value: Any, *, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise LevelCOperatorError(f"{label} must be a JSON object")
@@ -206,6 +234,13 @@ def _require_identifier(value: Any, *, label: str) -> str:
     token = str(value or "").strip()
     if not _SAFE_ID_RE.fullmatch(token):
         raise LevelCOperatorError(f"{label} must be a safe identifier")
+    return token
+
+
+def _require_worker_image(value: Any, *, label: str) -> str:
+    token = str(value or "").strip()
+    if not _WORKER_IMAGE_RE.fullmatch(token) or ".." in token:
+        raise LevelCOperatorError(f"{label} must be a safe OCI image reference")
     return token
 
 
@@ -273,6 +308,8 @@ def _load_generation_manifest(active_runs_root: Path) -> tuple[dict[str, Any], s
         value = provenance.get(field)
         if field in _HASH_IDENTITIES:
             _require_sha256(value, label=f"generation provenance.{field}")
+        elif field == "worker_image":
+            _require_worker_image(value, label=f"generation provenance.{field}")
         else:
             _require_identifier(value, label=f"generation provenance.{field}")
     return manifest, _sha256_bytes(raw)
@@ -494,6 +531,7 @@ def build_level_c_execution_plan(
             "source_path_tokens": ["artifact_sha256", "play-hand-seed-plan.json"],
             "required_before_execution": True,
         },
+        "workflow_arguments": _workflow_arguments(runtime_config),
     }
     payload["plan_id"] = _plan_identity(payload)
     return payload

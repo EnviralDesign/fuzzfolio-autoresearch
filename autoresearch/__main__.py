@@ -728,6 +728,9 @@ _install_safe_std_streams()
 
 
 PUBLIC_CLI_COMMANDS = {
+    "level-c-bootstrap",
+    "level-c-run-cutoff",
+    "level-c-audit",
     "doctor",
     "test-providers",
     "play-hand",
@@ -841,6 +844,9 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         prog=prog,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    from .level_c_workflow import add_level_c_cli
+
+    add_level_c_cli(subparsers)
 
     doctor = subparsers.add_parser(
         "doctor", help="Verify config, CLI, auth, and seed prompt."
@@ -19889,6 +19895,11 @@ def main(argv: list[str] | None = None) -> int:
         )
     parser = build_parser(prog="uv run" if direct_command else None)
     args = parser.parse_args(_argv_for_invocation(argv))
+    from .level_c_workflow import dispatch_level_c_cli
+
+    level_c_result = dispatch_level_c_cli(args)
+    if level_c_result is not None:
+        return level_c_result
     if args.command == "doctor":
         return cmd_doctor()
     if args.command == "test-providers":

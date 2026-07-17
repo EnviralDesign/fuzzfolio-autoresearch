@@ -22,6 +22,7 @@ LEVEL_C_PROTOCOL_SCHEMA = "autoresearch-level-c-protocol-v1"
 LEVEL_C_PROTOCOL_AUTHORITY_SCHEMA = "autoresearch-level-c-protocol-authority-v1"
 _SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
 _SAFE_IDENTIFIER_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+_WORKER_IMAGE_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$"
 _INITIAL_CUTOFF_KEYS = ("A", "B", "C", "D")
 _MUTABLE_PATH_TOKENS = ("global", "prior", "mutable", "latest", "current")
 
@@ -74,6 +75,15 @@ def _safe_identifier(value: Any, *, label: str) -> str:
 
     if not re.fullmatch(_SAFE_IDENTIFIER_PATTERN, token):
         raise ValueError(f"{label} must be a safe identifier")
+    return token
+
+
+def _worker_image_reference(value: Any) -> str:
+    token = str(value or "").strip()
+    import re
+
+    if not re.fullmatch(_WORKER_IMAGE_PATTERN, token) or ".." in token:
+        raise ValueError("worker_image must be a safe OCI image reference")
     return token
 
 
@@ -266,7 +276,6 @@ class LevelCProtocol(BaseModel):
         "research_generation_id",
         "universe_id",
         "worker_contract_id",
-        "worker_image",
         "engine_id",
         "scoring_policy_id",
         "cost_policy_id",
@@ -274,6 +283,11 @@ class LevelCProtocol(BaseModel):
     @classmethod
     def _validate_protocol_ids(cls, value: str, info: Any) -> str:
         return _safe_identifier(value, label=info.field_name)
+
+    @field_validator("worker_image")
+    @classmethod
+    def _validate_worker_image(cls, value: str) -> str:
+        return _worker_image_reference(value)
 
     @model_validator(mode="after")
     def _validate_contract(self) -> "LevelCProtocol":

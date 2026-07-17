@@ -22,6 +22,9 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
+level-c-bootstrap = "autoresearch.__main__:main"
+level-c-run-cutoff = "autoresearch.__main__:main"
+level-c-audit = "autoresearch.__main__:main"
 doctor = "autoresearch.__main__:main"
 test-providers = "autoresearch.__main__:main"
 play-hand = "autoresearch.__main__:main"
