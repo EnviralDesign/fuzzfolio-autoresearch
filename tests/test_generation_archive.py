@@ -32,6 +32,35 @@ def _runs_root(tmp_path: Path) -> Path:
     return root
 
 
+def _formal_level_c_root(tmp_path: Path) -> Path:
+    root = tmp_path / "runs"
+    control = root / "derived" / "level-c" / "control"
+    control.mkdir(parents=True)
+    (root / GENERATION_MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "schema_name": "autoresearch.generation.manifest",
+                "schema_version": 1,
+                "new_generation_id": "level-c-v1",
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    for name in (
+        "archive-linkage.json",
+        "bootstrap-result.json",
+        "protocol.json",
+        "protocol-authority.json",
+        "execution-plan-A.json",
+        "execution-plan-B.json",
+        "execution-plan-C.json",
+        "execution-plan-D.json",
+    ):
+        (control / name).write_text(json.dumps({"artifact": name}, sort_keys=True), encoding="utf-8")
+    return root
+
+
 def _service(tmp_path: Path) -> GenerationArchiveService:
     return GenerationArchiveService(_runs_root(tmp_path))
 
@@ -259,6 +288,41 @@ def test_required_critical_artifacts_never_skip_missing_paths(tmp_path: Path) ->
         build_inventory(root)
     with pytest.raises(GenerationArchiveError, match="required critical artifact is missing"):
         build_inventory(root, critical_artifacts=["derived/not-there.json"])
+
+
+def test_formal_level_c_generation_without_attempt_catalog_can_archive(tmp_path: Path) -> None:
+    root = _formal_level_c_root(tmp_path)
+    service = GenerationArchiveService(root)
+
+    preview = service.dry_run("level-c-v1-old", "level-c-v2", provenance={"actor": "test"})
+
+    assert preview["inventory"]["critical_artifact_source"] == "formal_level_c_defaults"
+    assert "derived/attempt-catalog.sqlite" not in preview["inventory"]["critical_artifacts"]
+    assert "derived/level-c/control/execution-plan-A.json" in preview["inventory"]["critical_artifacts"]
+
+    provenance = _apply_provenance(
+        service,
+        tmp_path,
+        archive_id="level-c-v1-old",
+        generation_id="level-c-v2",
+        provenance={"actor": "test"},
+    )
+    result = service.cutover("level-c-v1-old", "level-c-v2", provenance=provenance)
+
+    archived = tmp_path / "runs_archive" / "level-c-v1-old" / "runs"
+    assert result["manifest"]["state"] == "complete"
+    assert (archived / "derived" / "level-c" / "control" / "execution-plan-D.json").is_file()
+    assert not (archived / "derived" / "attempt-catalog.sqlite").exists()
+    assert result["manifest"]["inventory"]["critical_artifact_source"] == "formal_level_c_defaults"
+
+
+def test_corpus_generation_archive_still_requires_attempt_catalog(tmp_path: Path) -> None:
+    root = _runs_root(tmp_path)
+    (root / "derived" / "attempt-catalog.sqlite").unlink()
+    service = GenerationArchiveService(root)
+
+    with pytest.raises(GenerationArchiveError, match="derived/attempt-catalog.sqlite"):
+        service.dry_run("archive-001", "generation-002", provenance={"actor": "test"})
 
 
 def test_caller_critical_additions_cannot_disable_mandatory_artifacts(tmp_path: Path) -> None:

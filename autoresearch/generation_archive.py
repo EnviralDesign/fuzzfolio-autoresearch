@@ -46,6 +46,18 @@ _LOCK_NAME = ".generation-cutover.lock"
 _DEFAULT_CRITICAL = (
     "derived/attempt-catalog.sqlite",
 )
+_FORMAL_LEVEL_C_CONTROL_DIR = "derived/level-c/control"
+_FORMAL_LEVEL_C_CRITICAL = (
+    GENERATION_MANIFEST_NAME,
+    f"{_FORMAL_LEVEL_C_CONTROL_DIR}/archive-linkage.json",
+    f"{_FORMAL_LEVEL_C_CONTROL_DIR}/bootstrap-result.json",
+    f"{_FORMAL_LEVEL_C_CONTROL_DIR}/protocol.json",
+    f"{_FORMAL_LEVEL_C_CONTROL_DIR}/protocol-authority.json",
+    f"{_FORMAL_LEVEL_C_CONTROL_DIR}/execution-plan-A.json",
+    f"{_FORMAL_LEVEL_C_CONTROL_DIR}/execution-plan-B.json",
+    f"{_FORMAL_LEVEL_C_CONTROL_DIR}/execution-plan-C.json",
+    f"{_FORMAL_LEVEL_C_CONTROL_DIR}/execution-plan-D.json",
+)
 DEFAULT_CRITICAL_ARTIFACT_ALLOWLIST = _DEFAULT_CRITICAL
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -247,16 +259,41 @@ def _require_relative_artifact(value: Path | str, root: Path) -> tuple[str, Path
     return candidate.relative_to(root).as_posix(), candidate
 
 
+def _is_formal_level_c_generation(root: Path) -> bool:
+    control = root / _FORMAL_LEVEL_C_CONTROL_DIR
+    if not control.exists():
+        return False
+    if not control.is_dir() or control.is_symlink():
+        raise GenerationArchiveError("formal Level C control path must be a real directory")
+    manifest_path = root / GENERATION_MANIFEST_NAME
+    if not manifest_path.exists():
+        raise GenerationArchiveError("formal Level C control exists without generation-manifest.json")
+    manifest = _read_json(manifest_path, label="generation manifest")
+    generation_id = str(manifest.get("new_generation_id") or "")
+    if not generation_id.startswith("level-c"):
+        raise GenerationArchiveError("formal Level C control exists without a level-c generation manifest")
+    return True
+
+
+def _default_critical_artifacts(root: Path) -> tuple[tuple[str, ...], str]:
+    """Return mandatory evidence anchors for the detected generation shape."""
+
+    if _is_formal_level_c_generation(root):
+        return _FORMAL_LEVEL_C_CRITICAL, "formal_level_c_defaults"
+    return _DEFAULT_CRITICAL, "mandatory_defaults"
+
+
 def _normalize_critical_artifacts(
     root: Path, critical_artifacts: Mapping[str, str] | Iterable[str | Path] | None,
 ) -> tuple[dict[str, str | None], str]:
-    result = {item: None for item in _DEFAULT_CRITICAL}
+    defaults, default_source = _default_critical_artifacts(root)
+    result = {item: None for item in defaults}
     additions = 0
-    source = "mandatory_defaults"
+    source = default_source
     if critical_artifacts is None:
         return result, source
     if isinstance(critical_artifacts, Mapping):
-        source = "mandatory_defaults_plus_caller_hashes"
+        source = f"{default_source}_plus_caller_hashes"
         for item, expected in critical_artifacts.items():
             relative, _ = _require_relative_artifact(item, root)
             if not isinstance(expected, str) or not _SHA256.fullmatch(expected.lower()):
@@ -265,13 +302,13 @@ def _normalize_critical_artifacts(
                 result[relative] = expected.lower()
                 additions += 1
     else:
-        source = "mandatory_defaults_plus_caller_allowlist"
+        source = f"{default_source}_plus_caller_allowlist"
         for item in critical_artifacts:
             relative, _ = _require_relative_artifact(item, root)
             if relative not in result:
                 result[relative] = None
                 additions += 1
-    return result, source if additions else "mandatory_defaults"
+    return result, source if additions else default_source
 
 
 def _scan_tree(root: Path, requested: Mapping[str, str | None]) -> tuple[dict[str, int | str], dict[str, dict[str, Any]]]:
@@ -680,11 +717,17 @@ class GenerationArchiveService:
                 raise GenerationArchiveError("archive manifest critical artifact inventory is malformed")
             expected[relative] = str(details["sha256"])
         source = inventory.get("critical_artifact_source")
-        if source == "mandatory_defaults":
+        if source in {"mandatory_defaults", "formal_level_c_defaults"}:
             return build_inventory(destination)
-        if source == "mandatory_defaults_plus_caller_allowlist":
+        if source in {
+            "mandatory_defaults_plus_caller_allowlist",
+            "formal_level_c_defaults_plus_caller_allowlist",
+        }:
             return build_inventory(destination, critical_artifacts=tuple(expected))
-        if source == "mandatory_defaults_plus_caller_hashes":
+        if source in {
+            "mandatory_defaults_plus_caller_hashes",
+            "formal_level_c_defaults_plus_caller_hashes",
+        }:
             return build_inventory(destination, critical_artifacts=expected)
         raise GenerationArchiveError("archive manifest critical artifact source is malformed")
 
