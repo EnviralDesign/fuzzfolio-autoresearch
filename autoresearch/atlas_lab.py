@@ -77,7 +77,12 @@ from .play_hand_lab import (
 from .instrument_universe import research_eligible_instruments, universe_provenance
 from .level_c_operator import validate_executor_runtime_binding
 from .play_hand_lab_auth import load_lab_gateway_token
-from .evidence_plan import build_replay_evidence_plan, canonical_sha256, canonical_timestamp
+from .evidence_plan import (
+    build_replay_evidence_plan,
+    canonical_sha256,
+    canonical_timestamp,
+    normalize_evidence_profile_snapshot,
+)
 from .recipe_priors import DEFAULT_RECIPE_PRIORS_DIRNAME, build_recipe_priors
 from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapshot
 from .signal_atlas import (
@@ -1924,7 +1929,9 @@ def _make_signal_atlas_cell_task(
     analysis_window_start = None
     analysis_window_end = None
     evidence_plan = None
+    task_profile_payload = dict(profile_payload)
     if runtime.as_of_date:
+        task_profile_payload = normalize_evidence_profile_snapshot(task_profile_payload)
         analysis_window_start, analysis_window_end = _analysis_window_from_as_of(
             runtime.as_of_date,
             max(int(runtime.signal_lookback_months), 1),
@@ -1936,7 +1943,7 @@ def _make_signal_atlas_cell_task(
             analysis_window_start=analysis_window_start,
             analysis_window_end=analysis_window_end,
             requested_horizon_months=max(int(runtime.signal_lookback_months), 1),
-            profile_snapshot=profile_payload,
+            profile_snapshot=task_profile_payload,
             lake_manifest_sha256=runtime.lake_manifest_sha256,
             data_availability_cutoff=analysis_window_end,
         )
@@ -1944,7 +1951,7 @@ def _make_signal_atlas_cell_task(
         "task_id": task_id,
         "indicator_id": indicator_id,
         "profile_id": profile_id,
-        "inline_profile_snapshot": profile_payload,
+        "inline_profile_snapshot": task_profile_payload,
         "instrument": instrument,
         "timeframe": timeframe,
         "bar_limit": int(bar_limit),
@@ -1953,8 +1960,8 @@ def _make_signal_atlas_cell_task(
         "analysis_window_start": analysis_window_start,
         "analysis_window_end": analysis_window_end,
         "evidence_plan": evidence_plan.model_dump(mode="json") if evidence_plan else None,
-        "alert_threshold": _safe_float(profile_payload.get("notificationThreshold")) or 80.0,
-        "direction_mode": _clean_token(profile_payload.get("directionMode")) or "both",
+        "alert_threshold": _safe_float(task_profile_payload.get("notificationThreshold")) or 80.0,
+        "direction_mode": _clean_token(task_profile_payload.get("directionMode")) or "both",
         "required_worker_contract_hash": worker_contract_hash,
         "required_worker_contract_schema": runtime.worker_contract_schema,
         "required_capabilities": ["signal_atlas_cell"],
@@ -1965,7 +1972,7 @@ def _make_signal_atlas_cell_task(
         "attempt_id": task_id,
         "task_kind": "signal_atlas_cell",
         "payload": payload,
-        "resolved_profile_snapshot": profile_payload,
+        "resolved_profile_snapshot": task_profile_payload,
         "required_worker_capabilities": [
             "signal_atlas_cell",
             PLAY_HAND_LAB_WORKER_PROTOCOL_CAPABILITY,
@@ -2251,13 +2258,22 @@ def build_signal_atlas_via_gateway(
                     worker_state = _as_dict(lab_result.get("result"))
                     worker_status = str(worker_state.get("status") or "").lower()
                     if status in {"failed", "error"} or worker_status in {"failed", "error"}:
-                        raise RuntimeError(str(worker_state.get("error") or "signal atlas worker failed"))
+                        error_text = str(worker_state.get("error") or "signal atlas worker failed")
+                        if runtime.as_of_date:
+                            raise RuntimeError(
+                                f"Historical signal atlas worker failed for {task_id}: {error_text}"
+                            )
+                        raise RuntimeError(error_text)
                     row = _row_from_signal_result(
                         base_row=row,
                         lab_result=lab_result,
                         raw_path=Path(state["raw_path"]),
                     )
                 except Exception as exc:
+                    if runtime.as_of_date:
+                        raise RuntimeError(
+                            f"Historical signal atlas result invalid for {task_id}: {exc}"
+                        ) from exc
                     row["status"] = "failed"
                     row["error_type"] = _signal_error_type(str(exc))
                     row["error"] = str(exc)[:500]

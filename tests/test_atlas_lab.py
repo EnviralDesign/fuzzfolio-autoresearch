@@ -21,6 +21,7 @@ from autoresearch.atlas_lab import (
     _run_durable_atlas_stage,
     _stamp_historical_recipe_prior_lineage,
     atlas_profile_config,
+    build_signal_atlas_via_gateway,
     effective_atlas_build_profile,
     run_atlas_lab,
     run_probe_spec_via_gateway,
@@ -44,6 +45,7 @@ from autoresearch.config import (
 from autoresearch.fuzzfolio import FuzzfolioCli
 from autoresearch.instrument_universe import universe_provenance
 from autoresearch.__main__ import build_parser
+from autoresearch.evidence_plan import canonical_sha256
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -221,6 +223,11 @@ def test_signal_atlas_cell_task_is_bounded_in_historical_mode() -> None:
     assert payload["analysis_window_end"] == "2025-06-30T00:00:00Z"
     assert payload["evidence_plan"]["selection_data_end"] == "2025-06-30T00:00:00Z"
     assert payload["evidence_plan"]["lake_manifest_sha256"] == "sha256:" + "b" * 64
+    assert payload["inline_profile_snapshot"]["notificationThreshold"] == 83.0
+    assert task["resolved_profile_snapshot"] == payload["inline_profile_snapshot"]
+    assert payload["evidence_plan"]["profile_snapshot_sha256"] == canonical_sha256(
+        payload["inline_profile_snapshot"]
+    )
 
 
 def test_historical_signal_result_preserves_observed_lake_receipt(tmp_path: Path) -> None:
@@ -854,6 +861,113 @@ def test_enqueue_gateway_tasks_rejects_partial_acceptance() -> None:
             PartialGateway(),
             [{"task_id": "a"}, {"task_id": "b"}],
         )
+
+
+def test_historical_signal_gateway_worker_failure_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    indicator_dir = tmp_path / "indicator-atlas"
+    indicator_dir.mkdir()
+    (indicator_dir / "indicator-atlas.json").write_text(
+        json.dumps(
+            {
+                "indicators": [
+                    {
+                        "id": "RSI",
+                        "signal_role": "trigger",
+                        "strategy_role": "trigger",
+                        "static_prior_score": 75.0,
+                        "static_prior_bucket": "candidate",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        "autoresearch.atlas_lab.load_indicator_catalog",
+        lambda **kwargs: (
+            {
+                "indicators": [
+                    {
+                        "meta": {"id": "RSI"},
+                        "config": {"label": "RSI", "timeframe": "M5"},
+                    }
+                ]
+            },
+            tmp_path,
+            tmp_path / "catalog.json",
+        ),
+    )
+
+    class FailedSignalGateway:
+        def __init__(self) -> None:
+            self.enqueued_tasks: list[dict[str, Any]] = []
+            self.results: list[dict[str, Any]] = []
+
+        def snapshot(self) -> dict[str, Any]:
+            return {
+                "gateway_id": "failed-signal-gateway",
+                "worker_slots": 1,
+                "busy_slots": 0,
+                "queued_tasks": 0,
+                "result_backlog": len(self.results),
+                "metrics": {"results_dropped": 0},
+            }
+
+        def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+            self.enqueued_tasks.extend(tasks)
+            for task in tasks:
+                self.results.append(
+                    {
+                        "task_id": task["task_id"],
+                        "lease_id": f"lease-{len(self.results) + 1}",
+                        "status": "failed",
+                        "result": {
+                            "status": "failed",
+                            "error": (
+                                "EvidencePlanValidationError: Resolved profile "
+                                "snapshot SHA-256 does not match the evidence plan."
+                            ),
+                        },
+                    }
+                )
+            return {"status": "accepted", "enqueued": len(tasks)}
+
+        def read_results(self, *, limit: int) -> list[dict[str, Any]]:
+            batch = self.results[:limit]
+            self.results = self.results[limit:]
+            return batch
+
+        def ack_results(self, lease_ids: list[str]) -> int:
+            return len(lease_ids)
+
+    gateway = FailedSignalGateway()
+    with pytest.raises(RuntimeError, match="Historical signal atlas.*EvidencePlanValidationError"):
+        build_signal_atlas_via_gateway(
+            config,
+            indicator_atlas_dir=indicator_dir,
+            out_dir=tmp_path / "signal-atlas",
+            signal_role="trigger",
+            instruments=["EURUSD"],
+            timeframes=["M5"],
+            max_indicators=1,
+            gateway=gateway,
+            runtime=AtlasLabRuntimeConfig(
+                active_probes=1,
+                result_batch_size=1,
+                max_results_per_cycle=1,
+                as_of_date="2025-06-30T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "f" * 64,
+            ),
+            worker_contract_hash="contract123",
+        )
+
+    assert len(gateway.enqueued_tasks) == 1
+    assert not (tmp_path / "signal-atlas" / "signal-atlas.json").exists()
 
 
 def test_run_probe_spec_via_gateway_reads_timing_queue_rows(
