@@ -737,6 +737,136 @@ class MissingBestCellSuccessGateway(FakeGateway):
         return {"status": "accepted", "enqueued": len(tasks)}
 
 
+def _zero_signal_aggregate(*, total_signals: int = 0, resolved_trades: int = 0) -> dict[str, Any]:
+    return {
+        "best_cell": None,
+        "recommended_cell": None,
+        "signal_count": total_signals,
+        "resolved_trade_count_max": resolved_trades,
+        "instrument_count": 36,
+        "market_data_window": {
+            "loaded_bar_count": 14717,
+            "filtered_bar_count": 14717,
+            "instrument_window_count": 36,
+            "requested_window_start": "2024-03-29T00:00:00+00:00",
+            "requested_window_end": "2024-06-29T00:00:00+00:00",
+        },
+        "behavior_summary": {
+            "eligible_bar_count": 671083,
+            "bars_with_signal_count": total_signals,
+            "long_signal_count": 0,
+            "short_signal_count": 0,
+            "signal_density": 0.0,
+            "signal_coverage_ratio": 0.0,
+        },
+        "matrix": {
+            "geometry": {
+                "sl_rows": 1,
+                "reward_columns": 1,
+                "sl_start_percent": 0.02,
+                "reward_start_r": 1.0,
+            },
+            "rows": [
+                [
+                    {
+                        "stop_loss_percent": 0.02,
+                        "reward_multiple": 1.0,
+                        "take_profit_percent": 0.02,
+                        "total_signals": total_signals,
+                        "resolved_trades": resolved_trades,
+                        "unresolved": 0,
+                        "wins": 0,
+                        "losses": 0,
+                        "avg_net_r_per_closed_trade": None,
+                        "profit_factor": None,
+                        "win_rate": None,
+                    }
+                ]
+            ],
+        },
+        "matrix_summary": {
+            "total_cell_count": 1,
+            "positive_cell_count": 0,
+            "positive_cell_ratio": 0.0,
+            "robust_cell": None,
+        },
+        "score_lab": {
+            "version": "score_lab_v2_5_3",
+            "score": 0.0,
+            "status": "canonical",
+        },
+        "quality_score": None,
+    }
+
+
+class NoSignalAggregateSuccessGateway(FakeGateway):
+    def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        self.enqueued_tasks.extend(tasks)
+        for task in tasks:
+            payload = task["payload"]
+            evidence_plan = payload.get("evidence_plan") or {}
+            execution_evidence = {
+                "plan_id": evidence_plan["plan_id"],
+                "profile_snapshot_sha256": evidence_plan["profile_snapshot_sha256"],
+                "execution_cell_sha256": evidence_plan["execution_cell_sha256"],
+                "observed_lake_manifest_sha256": evidence_plan["lake_manifest_sha256"],
+            }
+            self.results.append(
+                {
+                    "task_id": task["task_id"],
+                    "lease_id": f"lease-{next(self._lease_counter)}",
+                    "worker_id": "zero-signal-worker",
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "success",
+                    "result": {
+                        "status": "success",
+                        "status_detail": "Deep replay completed.",
+                        "request": payload,
+                        "execution_evidence": execution_evidence,
+                        "result": {"aggregate": _zero_signal_aggregate()},
+                    },
+                }
+            )
+        return {"status": "accepted", "enqueued": len(tasks)}
+
+
+class MixedNoBestAggregateSuccessGateway(NoSignalAggregateSuccessGateway):
+    def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        self.enqueued_tasks.extend(tasks)
+        for task in tasks:
+            payload = task["payload"]
+            evidence_plan = payload.get("evidence_plan") or {}
+            execution_evidence = {
+                "plan_id": evidence_plan["plan_id"],
+                "profile_snapshot_sha256": evidence_plan["profile_snapshot_sha256"],
+                "execution_cell_sha256": evidence_plan["execution_cell_sha256"],
+                "observed_lake_manifest_sha256": evidence_plan["lake_manifest_sha256"],
+            }
+            self.results.append(
+                {
+                    "task_id": task["task_id"],
+                    "lease_id": f"lease-{next(self._lease_counter)}",
+                    "worker_id": "mixed-worker",
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "success",
+                    "result": {
+                        "status": "success",
+                        "request": payload,
+                        "execution_evidence": execution_evidence,
+                        "result": {
+                            "aggregate": _zero_signal_aggregate(
+                                total_signals=3,
+                                resolved_trades=0,
+                            )
+                        },
+                    },
+                }
+            )
+        return {"status": "accepted", "enqueued": len(tasks)}
+
+
 def _write_anchor_pair_probe_fixture(tmp_path: Path) -> tuple[Path, Path]:
     source_dir = tmp_path / "runs" / "derived" / "atlas-runs" / "test" / "anchor-pair-atlas"
     profile_dir = source_dir / "profiles"
@@ -1032,6 +1162,51 @@ def test_historical_probe_no_valid_cell_terminal_continues_as_nonviable(
     assert not any(task["task_kind"] == "deep_replay_detail" for task in gateway.enqueued_tasks)
 
 
+def test_historical_probe_no_signal_success_aggregate_continues_as_nonviable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    source_dir, result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+    monkeypatch.setattr(FuzzfolioCli, "score_artifact", lambda *args, **kwargs: {})
+
+    gateway = NoSignalAggregateSuccessGateway()
+    outcome = run_probe_spec_via_gateway(
+        config,
+        spec=ProbeRunSpec(
+            kind="anchor_pair",
+            source_dir=source_dir,
+            atlas_filename="anchor-pair-atlas.json",
+            results_filename="anchor-pair-probe-results.csv",
+            summary_filename="anchor-pair-probe-summary.json",
+            manifest_schema="anchor_pair_run_manifest_v1",
+            result_fieldnames=_probe_results_fieldnames,
+            row_builder=_result_row_from_score,
+        ),
+        gateway=gateway,
+        runtime=AtlasLabRuntimeConfig(
+            active_probes=1,
+            result_batch_size=10,
+            as_of_date="2025-06-30T00:00:00Z",
+            lake_manifest_sha256="sha256:" + "e" * 64,
+        ),
+        worker_contract_hash="contract123",
+    )
+
+    assert outcome.summary["result_counts"]["completed"] == 1
+    assert outcome.summary["result_counts"]["scored"] == 0
+    assert outcome.summary["result_counts"]["status_counts"] == {"nonviable": 1}
+    rows = list(csv.DictReader((source_dir / "anchor-pair-probe-results.csv").open(encoding="utf-8")))
+    assert rows[0]["status"] == "nonviable"
+    assert rows[0]["terminal_outcome"] == "no_valid_cell"
+    terminal_reason = json.loads(rows[0]["terminal_reason"])
+    assert terminal_reason["reason"] == "aggregate_no_signal"
+    assert terminal_reason["matrix_cell_count"] == 1
+    assert terminal_reason["market_data_window"]["filtered_bar_count"] == 14717
+    assert (result_dir / "execution-evidence.json").exists()
+    assert not any(task["task_kind"] == "deep_replay_detail" for task in gateway.enqueued_tasks)
+
+
 def test_historical_probe_missing_best_cell_without_terminal_fails_closed(
     tmp_path: Path,
     monkeypatch,
@@ -1054,6 +1229,41 @@ def test_historical_probe_missing_best_cell_without_terminal_fails_closed(
                 row_builder=_result_row_from_score,
             ),
             gateway=MissingBestCellSuccessGateway(),
+            runtime=AtlasLabRuntimeConfig(
+                active_probes=1,
+                result_batch_size=10,
+                as_of_date="2025-06-30T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "e" * 64,
+            ),
+            worker_contract_hash="contract123",
+        )
+
+    assert not (source_dir / "anchor-pair-probe-results.csv").exists()
+    assert not (source_dir / "anchor-pair-probe-summary.json").exists()
+
+
+def test_historical_probe_mixed_no_best_success_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    source_dir, _result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+    monkeypatch.setattr(FuzzfolioCli, "score_artifact", lambda *args, **kwargs: {})
+
+    with pytest.raises(RuntimeError, match="detail-capable best cell"):
+        run_probe_spec_via_gateway(
+            config,
+            spec=ProbeRunSpec(
+                kind="anchor_pair",
+                source_dir=source_dir,
+                atlas_filename="anchor-pair-atlas.json",
+                results_filename="anchor-pair-probe-results.csv",
+                summary_filename="anchor-pair-probe-summary.json",
+                manifest_schema="anchor_pair_run_manifest_v1",
+                result_fieldnames=_probe_results_fieldnames,
+                row_builder=_result_row_from_score,
+            ),
+            gateway=MixedNoBestAggregateSuccessGateway(),
             runtime=AtlasLabRuntimeConfig(
                 active_probes=1,
                 result_batch_size=10,

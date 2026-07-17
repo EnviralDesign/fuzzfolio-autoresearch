@@ -1399,6 +1399,105 @@ def _validated_no_valid_cell_terminal_for_probe(
     return state.terminal_outcome
 
 
+def _numeric_zero(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) == 0.0
+
+
+def _positive_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and float(value) > 0.0
+
+
+def _validated_no_signal_aggregate_for_probe(
+    *,
+    result_payload: dict[str, Any],
+    state: ProbeState,
+) -> dict[str, Any] | None:
+    """Classify a successful aggregate as nonviable only when zero-signal evidence is explicit."""
+
+    nested = result_payload.get("result") if isinstance(result_payload.get("result"), dict) else {}
+    aggregate = nested.get("aggregate") if isinstance(nested.get("aggregate"), dict) else {}
+    if not aggregate or aggregate.get("best_cell") or aggregate.get("recommended_cell"):
+        return None
+
+    market_data_window = aggregate.get("market_data_window")
+    if not isinstance(market_data_window, dict):
+        return None
+    loaded_bar_count = market_data_window.get("loaded_bar_count")
+    filtered_bar_count = market_data_window.get("filtered_bar_count")
+    if not (_positive_number(loaded_bar_count) or _positive_number(filtered_bar_count)):
+        return None
+
+    matrix = aggregate.get("matrix")
+    rows = matrix.get("rows") if isinstance(matrix, dict) else None
+    if not isinstance(rows, list) or not rows:
+        return None
+    cells = [cell for row in rows if isinstance(row, list) for cell in row if isinstance(cell, dict)]
+    if not cells:
+        return None
+    zero_fields = ("total_signals", "resolved_trades", "unresolved", "wins", "losses")
+    if any(not all(_numeric_zero(cell.get(field)) for field in zero_fields) for cell in cells):
+        return None
+
+    behavior = aggregate.get("behavior_summary")
+    behavior = behavior if isinstance(behavior, dict) else {}
+    explicit_zero_fields = {
+        "signal_count": aggregate.get("signal_count"),
+        "resolved_trade_count_max": aggregate.get("resolved_trade_count_max"),
+        "bars_with_signal_count": behavior.get("bars_with_signal_count"),
+        "long_signal_count": behavior.get("long_signal_count"),
+        "short_signal_count": behavior.get("short_signal_count"),
+    }
+    if any(not _numeric_zero(value) for value in explicit_zero_fields.values()):
+        return None
+
+    expected_plan = state.replay_request.get("evidence_plan")
+    expected_plan = expected_plan if isinstance(expected_plan, dict) else {}
+    receipt = result_payload.get("execution_evidence")
+    if expected_plan.get("lake_manifest_sha256"):
+        if not isinstance(receipt, dict):
+            raise RuntimeError("Historical Atlas no-signal aggregate omitted execution_evidence")
+        expected_receipt = {
+            "plan_id": expected_plan.get("plan_id"),
+            "profile_snapshot_sha256": expected_plan.get("profile_snapshot_sha256"),
+            "execution_cell_sha256": expected_plan.get("execution_cell_sha256"),
+            "observed_lake_manifest_sha256": expected_plan.get("lake_manifest_sha256"),
+        }
+        for key, value in expected_receipt.items():
+            if receipt.get(key) != value:
+                raise RuntimeError(
+                    f"Historical Atlas no-signal aggregate receipt {key} mismatch: "
+                    f"expected {value!r}, observed {receipt.get(key)!r}"
+                )
+        state.execution_evidence = dict(receipt)
+
+    diagnostics = {
+        "reason": "aggregate_no_signal",
+        "signal_count": aggregate.get("signal_count"),
+        "resolved_trade_count_max": aggregate.get("resolved_trade_count_max"),
+        "matrix_cell_count": len(cells),
+        "market_data_window": market_data_window,
+        "behavior_summary": {
+            key: behavior.get(key)
+            for key in (
+                "bars_with_signal_count",
+                "long_signal_count",
+                "short_signal_count",
+                "signal_density",
+                "signal_coverage_ratio",
+            )
+            if key in behavior
+        },
+    }
+    state.terminal_outcome = {
+        "schema": "fuzzfolio-replay-terminal-result-v1",
+        "status": "nonviable",
+        "outcome": "no_valid_cell",
+        "diagnostics": diagnostics,
+    }
+    state.error = None
+    return state.terminal_outcome
+
+
 def _materialize_aggregate_result(
     *,
     state: ProbeState,
@@ -1412,6 +1511,11 @@ def _materialize_aggregate_result(
         state=state,
     )
     result_payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
+    if terminal_outcome is None:
+        terminal_outcome = _validated_no_signal_aggregate_for_probe(
+            result_payload=result_payload,
+            state=state,
+        )
     expected_plan = state.replay_request.get("evidence_plan")
     expected_plan = expected_plan if isinstance(expected_plan, dict) else {}
     receipt = result_payload.get("execution_evidence")
