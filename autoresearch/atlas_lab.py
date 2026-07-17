@@ -474,6 +474,7 @@ class ProbeState:
     score: AttemptScore | None = None
     snapshot: dict[str, Any] | None = None
     execution_evidence: dict[str, Any] | None = None
+    terminal_outcome: dict[str, Any] | None = None
     status: str = "queued"
     error: str | None = None
 
@@ -818,6 +819,8 @@ def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) ->
 _HISTORICAL_PROBE_RESULT_FIELDNAMES = (
     "evidence_plan_id",
     "observed_lake_manifest_sha256",
+    "terminal_outcome",
+    "terminal_reason",
 )
 
 
@@ -1329,6 +1332,72 @@ def _attempt_score_from_sensitivity_snapshot(snapshot: dict[str, Any] | None) ->
     return build_attempt_score({"best": aggregate}, snapshot)
 
 
+def _historical_execution_evidence_from_terminal(
+    terminal: dict[str, Any],
+    expected_plan: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not expected_plan.get("lake_manifest_sha256"):
+        return None
+    receipt = terminal.get("execution_evidence")
+    if not isinstance(receipt, dict):
+        raise RuntimeError("Historical Atlas terminal result omitted execution_evidence")
+    expected_receipt = {
+        "plan_id": expected_plan.get("plan_id"),
+        "profile_snapshot_sha256": expected_plan.get("profile_snapshot_sha256"),
+        "execution_cell_sha256": expected_plan.get("execution_cell_sha256"),
+        "observed_lake_manifest_sha256": expected_plan.get("lake_manifest_sha256"),
+    }
+    for key, value in expected_receipt.items():
+        if receipt.get(key) != value:
+            raise RuntimeError(
+                f"Historical Atlas terminal receipt {key} mismatch: "
+                f"expected {value!r}, observed {receipt.get(key)!r}"
+            )
+    return dict(receipt)
+
+
+def _validated_no_valid_cell_terminal_for_probe(
+    *,
+    lab_result: dict[str, Any],
+    state: ProbeState,
+) -> dict[str, Any] | None:
+    result_payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
+    nested = result_payload.get("result") if isinstance(result_payload.get("result"), dict) else {}
+    terminal = result_payload.get("terminal_result") or nested.get("terminal_result")
+    if not isinstance(terminal, dict):
+        return None
+    if terminal.get("outcome") != "no_valid_cell":
+        raise RuntimeError(
+            f"Historical Atlas probe {state.probe_id} returned unsupported terminal outcome: "
+            f"{terminal.get('outcome')!r}"
+        )
+    if (
+        terminal.get("schema") != "fuzzfolio-replay-terminal-result-v1"
+        or terminal.get("status") != "nonviable"
+    ):
+        raise RuntimeError(
+            f"Historical Atlas probe {state.probe_id} returned malformed no_valid_cell terminal result"
+        )
+    diagnostics = terminal.get("diagnostics")
+    if not isinstance(diagnostics, dict):
+        raise RuntimeError(
+            f"Historical Atlas probe {state.probe_id} returned no_valid_cell without diagnostics"
+        )
+    expected_plan = state.replay_request.get("evidence_plan")
+    expected_plan = expected_plan if isinstance(expected_plan, dict) else {}
+    receipt = _historical_execution_evidence_from_terminal(terminal, expected_plan)
+    if receipt is not None:
+        state.execution_evidence = receipt
+    state.terminal_outcome = {
+        "schema": terminal.get("schema"),
+        "status": terminal.get("status"),
+        "outcome": terminal.get("outcome"),
+        "diagnostics": diagnostics,
+    }
+    state.error = None
+    return state.terminal_outcome
+
+
 def _materialize_aggregate_result(
     *,
     state: ProbeState,
@@ -1337,11 +1406,15 @@ def _materialize_aggregate_result(
     strict: bool,
     compact_artifacts: bool,
 ) -> None:
+    terminal_outcome = _validated_no_valid_cell_terminal_for_probe(
+        lab_result=lab_result,
+        state=state,
+    )
     result_payload = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
     expected_plan = state.replay_request.get("evidence_plan")
     expected_plan = expected_plan if isinstance(expected_plan, dict) else {}
     receipt = result_payload.get("execution_evidence")
-    if expected_plan.get("lake_manifest_sha256"):
+    if expected_plan.get("lake_manifest_sha256") and terminal_outcome is None:
         if not isinstance(receipt, dict):
             raise RuntimeError("Historical Atlas probe omitted execution_evidence")
         expected_receipt = {
@@ -1373,6 +1446,20 @@ def _materialize_aggregate_result(
     request_payload = result_payload.get("request") if isinstance(result_payload.get("request"), dict) else None
     if isinstance(request_payload, dict) and not compact_artifacts:
         _write_json(state.output_dir / "deep-replay-job.json", {"request": request_payload, **result_payload})
+    if terminal_outcome is not None:
+        state.score = None
+        state.snapshot = {
+            "status": "nonviable",
+            "terminal_outcome": state.terminal_outcome,
+            "execution_evidence": state.execution_evidence,
+        }
+        if compact_artifacts:
+            _write_json(state.output_dir / "sensitivity-response.json", state.snapshot)
+            try:
+                (state.output_dir / "deep-replay-job.json").unlink(missing_ok=True)
+            except OSError:
+                pass
+        return
     try:
         snapshot = load_sensitivity_snapshot(state.output_dir)
         try:
@@ -1516,6 +1603,15 @@ def _result_row(
         row["observed_lake_manifest_sha256"] = state.execution_evidence.get(
             "observed_lake_manifest_sha256"
         )
+    if state.terminal_outcome is not None:
+        row["terminal_outcome"] = str(state.terminal_outcome.get("outcome") or "")
+        diagnostics = state.terminal_outcome.get("diagnostics")
+        row["terminal_reason"] = json.dumps(
+            diagnostics if isinstance(diagnostics, dict) else {},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     return row
 
 
@@ -1540,12 +1636,18 @@ def _validate_historical_probe_summary(
     completed = int(counts.get("completed") or 0)
     scored = int(counts.get("scored") or 0)
     status_counts = _as_dict(counts.get("status_counts"))
+    accepted_terminal_statuses = {"ok", "skipped_existing", "nonviable"}
     failed = sum(
         int(value or 0)
         for key, value in status_counts.items()
-        if str(key).lower() not in {"ok", "skipped_existing"}
+        if str(key).lower() not in accepted_terminal_statuses
     )
-    if selected and (completed != selected or failed or scored <= 0):
+    accepted_terminal = sum(
+        int(value or 0)
+        for key, value in status_counts.items()
+        if str(key).lower() in accepted_terminal_statuses
+    )
+    if selected and (completed != selected or failed or accepted_terminal != selected):
         raise RuntimeError(
             f"Historical {spec.kind} Atlas probe stage produced invalid accounting: "
             f"selected={selected}, completed={completed}, scored={scored}, "
@@ -1857,6 +1959,22 @@ def run_probe_spec_via_gateway(
                     worker_result = lab_result.get("result") if isinstance(lab_result.get("result"), dict) else {}
                     worker_status = str(worker_result.get("status") or "").lower()
                     if status in {"failed", "error"} or worker_status in {"failed", "error"}:
+                        terminal_outcome = _validated_no_valid_cell_terminal_for_probe(
+                            lab_result=lab_result,
+                            state=state,
+                        )
+                        if terminal_outcome is not None and task_id == state.aggregate_task_id:
+                            _materialize_aggregate_result(
+                                state=state,
+                                lab_result=lab_result,
+                                cli=cli,
+                                strict=runtime.strict_parity,
+                                compact_artifacts=runtime.compact_probe_artifacts,
+                            )
+                            persist_finished(state, status="nonviable")
+                            release_state(state)
+                            ack_ids.append(lease_id)
+                            continue
                         error_text = str(worker_result.get("error") or "atlas lab worker failed")
                         if runtime.as_of_date:
                             _raise_historical_probe_failure(
@@ -1884,6 +2002,11 @@ def run_probe_spec_via_gateway(
                         )
                         if detail_task is None:
                             if runtime.include_detail and runtime.strict_parity:
+                                if state.terminal_outcome is not None:
+                                    persist_finished(state, status="nonviable")
+                                    release_state(state)
+                                    ack_ids.append(lease_id)
+                                    continue
                                 raise RuntimeError("Atlas aggregate did not produce a detail-capable best cell.")
                             persist_finished(state, status="ok")
                             release_state(state)
@@ -1949,12 +2072,18 @@ def run_probe_spec_via_gateway(
         status = _clean_token(row.get("status")) or "unknown"
         status_counts[status] = status_counts.get(status, 0) + 1
     if runtime.as_of_date:
+        accepted_terminal_statuses = {"ok", "skipped_existing", "nonviable"}
         failed = sum(
             count
             for status, count in status_counts.items()
-            if str(status).lower() not in {"ok", "skipped_existing"}
+            if str(status).lower() not in accepted_terminal_statuses
         )
-        if failed or (queue_rows and not scored):
+        accepted_terminal = sum(
+            count
+            for status, count in status_counts.items()
+            if str(status).lower() in accepted_terminal_statuses
+        )
+        if failed or accepted_terminal != len(queue_rows):
             raise RuntimeError(
                 f"Historical {spec.kind} Atlas probe stage cannot complete with "
                 f"failed={failed}, scored={len(scored)}, selected={len(queue_rows)}"

@@ -656,6 +656,86 @@ class FailedProbeGateway(FakeGateway):
         return {"status": "accepted", "enqueued": len(tasks)}
 
 
+class NoValidCellProbeGateway(FakeGateway):
+    def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        self.enqueued_tasks.extend(tasks)
+        for task in tasks:
+            payload = task["payload"]
+            evidence_plan = payload.get("evidence_plan") or {}
+            execution_evidence = {
+                "plan_id": evidence_plan["plan_id"],
+                "profile_snapshot_sha256": evidence_plan["profile_snapshot_sha256"],
+                "execution_cell_sha256": evidence_plan["execution_cell_sha256"],
+                "observed_lake_manifest_sha256": evidence_plan["lake_manifest_sha256"],
+            }
+            terminal_result = {
+                "schema": "fuzzfolio-replay-terminal-result-v1",
+                "status": "nonviable",
+                "outcome": "no_valid_cell",
+                "diagnostics": {
+                    "signal_count": 2,
+                    "resolved_trade_count_max": 1,
+                    "market_data_window": {"filtered_bar_count": 1200},
+                    "analysis_notes": ["no viable matrix cell"],
+                },
+                "execution_evidence": execution_evidence,
+                "worker_timing": {"schema": "fuzzfolio-replay-worker-timing-v1"},
+            }
+            self.results.append(
+                {
+                    "task_id": task["task_id"],
+                    "lease_id": f"lease-{next(self._lease_counter)}",
+                    "worker_id": "nonviable-worker",
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "failed",
+                    "result": {
+                        "status": "failed",
+                        "error": "FullBacktestNoValidCellError: no best cell",
+                        "terminal_result": terminal_result,
+                    },
+                }
+            )
+        return {"status": "accepted", "enqueued": len(tasks)}
+
+
+class MissingBestCellSuccessGateway(FakeGateway):
+    def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        self.enqueued_tasks.extend(tasks)
+        for task in tasks:
+            payload = task["payload"]
+            evidence_plan = payload.get("evidence_plan") or {}
+            execution_evidence = {
+                "plan_id": evidence_plan["plan_id"],
+                "profile_snapshot_sha256": evidence_plan["profile_snapshot_sha256"],
+                "execution_cell_sha256": evidence_plan["execution_cell_sha256"],
+                "observed_lake_manifest_sha256": evidence_plan["lake_manifest_sha256"],
+            }
+            self.results.append(
+                {
+                    "task_id": task["task_id"],
+                    "lease_id": f"lease-{next(self._lease_counter)}",
+                    "worker_id": "malformed-worker",
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "success",
+                    "result": {
+                        "status": "success",
+                        "request": payload,
+                        "execution_evidence": execution_evidence,
+                        "result": {
+                            "aggregate": {
+                                "score_lab": {"version": "score_lab_v2_5_3", "score": 0},
+                                "quality_score": {"score": 0},
+                                "behavior_summary": {"signal_count": 2},
+                            }
+                        },
+                    },
+                }
+            )
+        return {"status": "accepted", "enqueued": len(tasks)}
+
+
 def _write_anchor_pair_probe_fixture(tmp_path: Path) -> tuple[Path, Path]:
     source_dir = tmp_path / "runs" / "derived" / "atlas-runs" / "test" / "anchor-pair-atlas"
     profile_dir = source_dir / "profiles"
@@ -908,6 +988,84 @@ def test_historical_probe_worker_failure_fails_closed_without_stage_artifacts(
     assert not (source_dir / "anchor-pair-probe-summary.json").exists()
 
 
+def test_historical_probe_no_valid_cell_terminal_continues_as_nonviable(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    source_dir, result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+    monkeypatch.setattr(FuzzfolioCli, "score_artifact", lambda *args, **kwargs: {})
+
+    gateway = NoValidCellProbeGateway()
+    outcome = run_probe_spec_via_gateway(
+        config,
+        spec=ProbeRunSpec(
+            kind="anchor_pair",
+            source_dir=source_dir,
+            atlas_filename="anchor-pair-atlas.json",
+            results_filename="anchor-pair-probe-results.csv",
+            summary_filename="anchor-pair-probe-summary.json",
+            manifest_schema="anchor_pair_run_manifest_v1",
+            result_fieldnames=_probe_results_fieldnames,
+            row_builder=_result_row_from_score,
+        ),
+        gateway=gateway,
+        runtime=AtlasLabRuntimeConfig(
+            active_probes=1,
+            result_batch_size=10,
+            as_of_date="2025-06-30T00:00:00Z",
+            lake_manifest_sha256="sha256:" + "e" * 64,
+        ),
+        worker_contract_hash="contract123",
+    )
+
+    assert outcome.summary["result_counts"]["completed"] == 1
+    assert outcome.summary["result_counts"]["scored"] == 0
+    assert outcome.summary["result_counts"]["status_counts"] == {"nonviable": 1}
+    rows = list(csv.DictReader((source_dir / "anchor-pair-probe-results.csv").open(encoding="utf-8")))
+    assert rows[0]["status"] == "nonviable"
+    assert rows[0]["terminal_outcome"] == "no_valid_cell"
+    assert rows[0]["evidence_plan_id"]
+    assert "no viable matrix cell" in rows[0]["terminal_reason"]
+    assert (result_dir / "execution-evidence.json").exists()
+    assert not any(task["task_kind"] == "deep_replay_detail" for task in gateway.enqueued_tasks)
+
+
+def test_historical_probe_missing_best_cell_without_terminal_fails_closed(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    source_dir, _result_dir = _write_anchor_pair_probe_fixture(tmp_path)
+    monkeypatch.setattr(FuzzfolioCli, "score_artifact", lambda *args, **kwargs: {})
+
+    with pytest.raises(RuntimeError, match="detail-capable best cell"):
+        run_probe_spec_via_gateway(
+            config,
+            spec=ProbeRunSpec(
+                kind="anchor_pair",
+                source_dir=source_dir,
+                atlas_filename="anchor-pair-atlas.json",
+                results_filename="anchor-pair-probe-results.csv",
+                summary_filename="anchor-pair-probe-summary.json",
+                manifest_schema="anchor_pair_run_manifest_v1",
+                result_fieldnames=_probe_results_fieldnames,
+                row_builder=_result_row_from_score,
+            ),
+            gateway=MissingBestCellSuccessGateway(),
+            runtime=AtlasLabRuntimeConfig(
+                active_probes=1,
+                result_batch_size=10,
+                as_of_date="2025-06-30T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "e" * 64,
+            ),
+            worker_contract_hash="contract123",
+        )
+
+    assert not (source_dir / "anchor-pair-probe-results.csv").exists()
+    assert not (source_dir / "anchor-pair-probe-summary.json").exists()
+
+
 def test_historical_probe_summary_rejects_terminal_all_failed_reuse() -> None:
     with pytest.raises(RuntimeError, match="invalid accounting"):
         _validate_historical_probe_summary(
@@ -930,6 +1088,29 @@ def test_historical_probe_summary_rejects_terminal_all_failed_reuse() -> None:
                 }
             },
         )
+
+
+def test_historical_probe_summary_accepts_terminal_all_nonviable_reuse() -> None:
+    _validate_historical_probe_summary(
+        spec=ProbeRunSpec(
+            kind="anchor_pair",
+            source_dir=Path("unused"),
+            atlas_filename="anchor-pair-atlas.json",
+            results_filename="anchor-pair-probe-results.csv",
+            summary_filename="anchor-pair-probe-summary.json",
+            manifest_schema="anchor_pair_run_manifest_v1",
+            result_fieldnames=_probe_results_fieldnames,
+            row_builder=_result_row_from_score,
+        ),
+        summary={
+            "result_counts": {
+                "selected": 48,
+                "completed": 48,
+                "scored": 0,
+                "status_counts": {"nonviable": 48},
+            }
+        },
+    )
 
 
 def test_durable_probe_stage_does_not_complete_on_formal_worker_failure(
