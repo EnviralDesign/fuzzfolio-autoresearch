@@ -789,6 +789,9 @@ class PlayHandLabGateway:
         retryable: bool = True,
         retry_after_seconds: float | None = None,
         terminal_result: dict[str, Any] | None = None,
+        error_type: str | None = None,
+        error_module: str | None = None,
+        error_repr: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             now = _now()
@@ -841,6 +844,9 @@ class PlayHandLabGateway:
                     "retryable": bool(retryable),
                     "attempt_number": task.attempt_number,
                     "retry_after_seconds": _parse_positive_float(retry_after_seconds),
+                    **({"error_type": str(error_type)} if error_type else {}),
+                    **({"error_module": str(error_module)} if error_module else {}),
+                    **({"error_repr": str(error_repr)} if error_repr else {}),
                     **(
                         {"terminal_result": dict(terminal_result)}
                         if isinstance(terminal_result, dict)
@@ -1320,6 +1326,21 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
                     error=str(payload.get("error") or "worker_failed"),
                     retryable=_parse_bool(payload.get("retryable"), default=True),
                     retry_after_seconds=_parse_positive_float(payload.get("retry_after_seconds")),
+                    error_type=(
+                        str(payload["error_type"])
+                        if payload.get("error_type") is not None
+                        else None
+                    ),
+                    error_module=(
+                        str(payload["error_module"])
+                        if payload.get("error_module") is not None
+                        else None
+                    ),
+                    error_repr=(
+                        str(payload["error_repr"])
+                        if payload.get("error_repr") is not None
+                        else None
+                    ),
                     terminal_result=(
                         dict(payload["terminal_result"])
                         if isinstance(payload.get("terminal_result"), dict)
@@ -1526,6 +1547,21 @@ class LabGatewayAsgiApp:
                         error=str(payload.get("error") or "worker_failed"),
                         retryable=_parse_bool(payload.get("retryable"), default=True),
                         retry_after_seconds=_parse_positive_float(payload.get("retry_after_seconds")),
+                        error_type=(
+                            str(payload["error_type"])
+                            if payload.get("error_type") is not None
+                            else None
+                        ),
+                        error_module=(
+                            str(payload["error_module"])
+                            if payload.get("error_module") is not None
+                            else None
+                        ),
+                        error_repr=(
+                            str(payload["error_repr"])
+                            if payload.get("error_repr") is not None
+                            else None
+                        ),
                         terminal_result=(
                             dict(payload["terminal_result"])
                             if isinstance(payload.get("terminal_result"), dict)
@@ -1697,6 +1733,21 @@ class LabGatewayAsgiApp:
                 error=str(payload.get("error") or "worker_failed"),
                 retryable=_parse_bool(payload.get("retryable"), default=True),
                 retry_after_seconds=_parse_positive_float(payload.get("retry_after_seconds")),
+                error_type=(
+                    str(payload["error_type"])
+                    if payload.get("error_type") is not None
+                    else None
+                ),
+                error_module=(
+                    str(payload["error_module"])
+                    if payload.get("error_module") is not None
+                    else None
+                ),
+                error_repr=(
+                    str(payload["error_repr"])
+                    if payload.get("error_repr") is not None
+                    else None
+                ),
                 terminal_result=(
                     dict(payload["terminal_result"])
                     if isinstance(payload.get("terminal_result"), dict)

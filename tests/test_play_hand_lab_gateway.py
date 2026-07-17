@@ -237,6 +237,9 @@ def test_lab_gateway_requeues_retryable_failure_until_cap() -> None:
         error="temporary",
         retryable=True,
         terminal_result=terminal_result,
+        error_type="RuntimeError",
+        error_module="builtins",
+        error_repr="RuntimeError('temporary')",
     )
     assert failed_final["status"] == "failed"
 
@@ -247,6 +250,9 @@ def test_lab_gateway_requeues_retryable_failure_until_cap() -> None:
     assert len(results) == 1
     assert results[0]["status"] == "failed"
     assert results[0]["result"]["error"] == "temporary"
+    assert results[0]["result"]["error_type"] == "RuntimeError"
+    assert results[0]["result"]["error_module"] == "builtins"
+    assert results[0]["result"]["error_repr"] == "RuntimeError('temporary')"
     assert results[0]["result"]["terminal_result"] == terminal_result
 
 
