@@ -4,11 +4,12 @@ import csv
 import json
 import math
 import statistics
+from array import array
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .config import AppConfig
 from .signal_atlas import DEFAULT_SIGNAL_ATLAS_DIRNAME
@@ -355,6 +356,86 @@ def summarize_forward_events(
     return summary
 
 
+class _ForwardEventAccumulator:
+    """Compact exact reducer for forward-response event summaries."""
+
+    __slots__ = (
+        "sample_count",
+        "win_count",
+        "loss_count",
+        "mfe_win_count",
+        "returns",
+        "mfe_values",
+        "mae_values",
+        "edge_values",
+        "vol_norm_values",
+    )
+
+    def __init__(self) -> None:
+        self.sample_count = 0
+        self.win_count = 0
+        self.loss_count = 0
+        self.mfe_win_count = 0
+        self.returns = array("d")
+        self.mfe_values = array("d")
+        self.mae_values = array("d")
+        self.edge_values = array("d")
+        self.vol_norm_values = array("d")
+
+    def add(self, record: dict[str, Any]) -> None:
+        forward_return = float(record["forward_return_pct"])
+        mfe = float(record["mfe_pct"])
+        mae = float(record["mae_pct"])
+        edge = float(record["mfe_minus_mae_pct"])
+        self.sample_count += 1
+        if forward_return > 0:
+            self.win_count += 1
+        elif forward_return < 0:
+            self.loss_count += 1
+        if bool(record.get("mfe_gt_mae")):
+            self.mfe_win_count += 1
+        self.returns.append(forward_return)
+        self.mfe_values.append(mfe)
+        self.mae_values.append(mae)
+        self.edge_values.append(edge)
+        vol_norm = record.get("volatility_normalized_return")
+        if vol_norm is not None:
+            self.vol_norm_values.append(float(vol_norm))
+
+    def summary(self, *, min_events: int = DEFAULT_MIN_EVENTS) -> dict[str, Any]:
+        sample_count = self.sample_count
+        if sample_count <= 0:
+            return {
+                "status": "no_events",
+                "sample_count": 0,
+                "response_bucket": "no_events",
+                "forward_response_score": 0.0,
+            }
+        summary = {
+            "status": "ok",
+            "sample_count": sample_count,
+            "win_count": self.win_count,
+            "loss_count": self.loss_count,
+            "win_rate_pct": _rate(self.win_count, sample_count),
+            "mean_forward_return_pct": _mean(self.returns),
+            "median_forward_return_pct": _median(self.returns),
+            "p25_forward_return_pct": _percentile(self.returns, 0.25),
+            "p75_forward_return_pct": _percentile(self.returns, 0.75),
+            "mean_mfe_pct": _mean(self.mfe_values),
+            "median_mfe_pct": _median(self.mfe_values),
+            "mean_mae_pct": _mean(self.mae_values),
+            "median_mae_pct": _median(self.mae_values),
+            "mean_mfe_minus_mae_pct": _mean(self.edge_values),
+            "median_mfe_minus_mae_pct": _median(self.edge_values),
+            "mfe_gt_mae_rate_pct": _rate(self.mfe_win_count, sample_count),
+            "mean_volatility_normalized_return": _mean(self.vol_norm_values),
+            "median_volatility_normalized_return": _median(self.vol_norm_values),
+        }
+        summary["response_bucket"] = _response_bucket(summary, min_events=min_events)
+        summary["forward_response_score"] = _forward_response_score(summary, min_events=min_events)
+        return summary
+
+
 def _grouped_summaries(
     event_records: list[dict[str, Any]],
     keys: tuple[str, ...],
@@ -368,6 +449,24 @@ def _grouped_summaries(
     for key_values, records in grouped.items():
         row = {key: key_values[index] for index, key in enumerate(keys)}
         row.update(summarize_forward_events(records, min_events=min_events))
+        rows.append(row)
+    rows.sort(key=lambda row: tuple(str(row.get(key) or "") for key in keys))
+    return rows
+
+
+def _accumulator_rows(
+    grouped: dict[tuple[Any, ...], _ForwardEventAccumulator],
+    keys: tuple[str, ...],
+    *,
+    min_events: int,
+    row_filter: Callable[[dict[str, Any]], bool] | None = None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key_values, accumulator in grouped.items():
+        row = {key: key_values[index] for index, key in enumerate(keys)}
+        row.update(accumulator.summary(min_events=min_events))
+        if row_filter is not None and not row_filter(row):
+            continue
         rows.append(row)
     rows.sort(key=lambda row: tuple(str(row.get(key) or "") for key in keys))
     return rows
@@ -600,9 +699,15 @@ def build_forward_response_atlas(
     ]
     signal_selection = _as_dict(signal_summary.get("selection"))
 
-    all_events: list[dict[str, Any]] = []
     cell_rollups: list[dict[str, Any]] = []
     no_event_cells: list[dict[str, Any]] = []
+    event_horizon_records = 0
+    indicator_direction_groups: dict[tuple[Any, ...], _ForwardEventAccumulator] = defaultdict(
+        _ForwardEventAccumulator
+    )
+    indicator_both_groups: dict[tuple[Any, ...], _ForwardEventAccumulator] = defaultdict(
+        _ForwardEventAccumulator
+    )
     for signal_row in signal_rows:
         raw_path = Path(str(signal_row.get("raw_path") or ""))
         if not raw_path.is_absolute():
@@ -632,15 +737,20 @@ def build_forward_response_atlas(
         indicator_id = _clean_upper(signal_row.get("indicator_id"))
         instrument = _clean_upper(signal_row.get("instrument"))
         timeframe = _clean_upper(signal_row.get("timeframe"))
-        for event in events:
-            event["indicator_id"] = indicator_id
-            event["instrument"] = instrument
-            event["timeframe"] = timeframe
         if events:
-            all_events.extend(events)
+            cell_groups: dict[tuple[Any, ...], _ForwardEventAccumulator] = defaultdict(
+                _ForwardEventAccumulator
+            )
+            for event in events:
+                event_horizon_records += 1
+                direction = event["direction"]
+                horizon = event["horizon_bars"]
+                cell_groups[(indicator_id, instrument, timeframe, direction, horizon)].add(event)
+                indicator_direction_groups[(indicator_id, direction, horizon)].add(event)
+                indicator_both_groups[(indicator_id, horizon)].add(event)
             cell_rollups.extend(
-                _grouped_summaries(
-                    events,
+                _accumulator_rows(
+                    cell_groups,
                     ("indicator_id", "instrument", "timeframe", "direction", "horizon_bars"),
                     min_events=min_events,
                 )
@@ -656,13 +766,13 @@ def build_forward_response_atlas(
                 }
             )
 
-    indicator_direction_rows = _grouped_summaries(
-        all_events,
+    indicator_direction_rows = _accumulator_rows(
+        indicator_direction_groups,
         ("indicator_id", "direction", "horizon_bars"),
         min_events=min_events,
     )
-    indicator_both_rows = _grouped_summaries(
-        all_events,
+    indicator_both_rows = _accumulator_rows(
+        indicator_both_groups,
         ("indicator_id", "horizon_bars"),
         min_events=min_events,
     )
@@ -711,7 +821,7 @@ def build_forward_response_atlas(
             "threshold": threshold,
         },
         "result_counts": {
-            "event_horizon_records": len(all_events),
+            "event_horizon_records": event_horizon_records,
             "cell_rollup_rows": len(cell_rollups),
             "indicator_rollup_rows": len(indicator_rollups),
             "no_event_cells": len(no_event_cells),
