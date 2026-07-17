@@ -22,6 +22,8 @@ from .catalog_index import CATALOG_INDEX_SCHEMA_VERSION
 from .config import AppConfig, load_config
 from .evidence_plan import canonical_json, canonical_sha256
 from .generation_archive import (
+    ARCHIVE_SCHEMA_NAME,
+    ARCHIVE_SCHEMA_VERSION,
     GENERATION_MANIFEST_NAME,
     GENERATION_SCHEMA_NAME,
     GENERATION_SCHEMA_VERSION,
@@ -179,11 +181,31 @@ def _assert_bootstrap_root(active_root: Path) -> None:
                     raise LevelCWorkflowError("bootstrap control root contains ambiguous partial data")
 
 
-def _assert_bootstrap_partial_order(active_root: Path) -> None:
+def _assert_bootstrap_partial_order(
+    active_root: Path, *, allow_archive_generation_handoff: bool = False
+) -> None:
     paths = _control_paths(active_root)
+    generation_path = active_root / GENERATION_MANIFEST_NAME
+    if (
+        allow_archive_generation_handoff
+        and generation_path.exists()
+        and not paths["archive_receipt"].exists()
+    ):
+        downstream = [
+            paths["protocol"],
+            paths["authority"],
+            *(paths["control"] / f"execution-plan-{key}.json" for key in "ABCD"),
+            paths["bootstrap"],
+        ]
+        for path in downstream:
+            if path.exists() or path.is_symlink():
+                raise LevelCWorkflowError(
+                    f"ambiguous bootstrap partial state: {path.name} exists after a missing predecessor"
+                )
+        return
     ordered = [
         paths["archive_receipt"],
-        active_root / GENERATION_MANIFEST_NAME,
+        generation_path,
         paths["protocol"],
         paths["authority"],
         *(paths["control"] / f"execution-plan-{key}.json" for key in "ABCD"),
@@ -198,6 +220,84 @@ def _assert_bootstrap_partial_order(active_root: Path) -> None:
             raise LevelCWorkflowError(
                 f"ambiguous bootstrap partial state: {path.name} exists after a missing predecessor"
             )
+
+
+def _archive_generation_handoff(active_root: Path, new_generation_id: str) -> dict[str, Any] | None:
+    path = active_root / GENERATION_MANIFEST_NAME
+    paths = _control_paths(active_root)
+    if not path.exists() and not path.is_symlink():
+        return None
+    if paths["archive_receipt"].exists() or paths["archive_receipt"].is_symlink():
+        return None
+    if not path.is_file() or path.is_symlink():
+        raise LevelCWorkflowError("archive-generation handoff manifest is not a real file")
+    raw = path.read_bytes()
+    manifest = _load_json(path, label="archive-generation handoff manifest")
+    if (
+        manifest.get("schema_name") != GENERATION_SCHEMA_NAME
+        or manifest.get("schema_version") != GENERATION_SCHEMA_VERSION
+    ):
+        raise LevelCWorkflowError("archive-generation handoff manifest schema is unsupported")
+    if manifest.get("new_generation_id") != str(new_generation_id):
+        raise LevelCWorkflowError("archive-generation handoff generation does not match requested generation")
+    recorded_destination = Path(str(manifest.get("destination_runs_root") or "")).expanduser().resolve(strict=False)
+    if recorded_destination != active_root.resolve(strict=False):
+        raise LevelCWorkflowError("archive-generation handoff destination root does not match active runs root")
+    linkage = manifest.get("archive_linkage")
+    if not isinstance(linkage, Mapping):
+        raise LevelCWorkflowError("archive-generation handoff archive_linkage is missing")
+    archive_manifest_path = Path(str(linkage.get("archive_manifest_path") or "")).expanduser()
+    if not archive_manifest_path.is_file() or archive_manifest_path.is_symlink():
+        raise LevelCWorkflowError("archive-generation handoff archive manifest is missing")
+    archive_manifest = _load_json(archive_manifest_path, label="archive-generation archive manifest")
+    if (
+        archive_manifest.get("schema_name") != ARCHIVE_SCHEMA_NAME
+        or archive_manifest.get("schema_version") != ARCHIVE_SCHEMA_VERSION
+        or archive_manifest.get("state") != "complete"
+    ):
+        raise LevelCWorkflowError("archive-generation handoff archive manifest is not complete")
+    if (
+        archive_manifest.get("archive_id") != linkage.get("archive_id")
+        or archive_manifest.get("new_generation_id") != str(new_generation_id)
+        or archive_manifest.get("destination_runs_root") != linkage.get("archived_runs_root")
+        or archive_manifest.get("prepared_at") != linkage.get("archive_prepared_at")
+        or not isinstance(archive_manifest.get("verified_archived_inventory"), Mapping)
+    ):
+        raise LevelCWorkflowError("archive-generation handoff archive manifest conflicts with linkage")
+    if manifest.get("source_runs_root") != linkage.get("archived_runs_root"):
+        raise LevelCWorkflowError("archive-generation handoff source root conflicts with linkage")
+    return {
+        "manifest_sha256": _sha256_bytes(raw),
+        "archive_linkage": dict(linkage),
+        "provenance": dict(manifest.get("provenance") or {}),
+    }
+
+
+def _create_or_replace_archive_handoff_generation_manifest(
+    path: Path, payload: Mapping[str, Any], handoff: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    normalized = dict(payload)
+    encoded = canonical_json(normalized).encode("utf-8")
+    if not path.exists() and not path.is_symlink():
+        return _create_or_verify(path, normalized)
+    if not path.is_file() or path.is_symlink():
+        raise LevelCWorkflowError(f"immutable artifact drift: {path}")
+    existing = path.read_bytes()
+    if existing == encoded:
+        return normalized
+    if not isinstance(handoff, Mapping) or _sha256_bytes(existing) != handoff.get("manifest_sha256"):
+        raise LevelCWorkflowError(f"immutable artifact drift: {path}")
+    descriptor, temporary_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return normalized
 
 
 def _relative_archived_file(path: Path, archive_root: Path, *, label: str) -> str:
@@ -511,7 +611,13 @@ def bootstrap_level_c(
     if not archive.is_dir() or archive.is_symlink():
         raise LevelCWorkflowError("archive root must be a real directory")
     _assert_bootstrap_root(active_root)
-    _assert_bootstrap_partial_order(active_root)
+    archive_generation_handoff = _archive_generation_handoff(
+        active_root, str(new_generation_id)
+    )
+    _assert_bootstrap_partial_order(
+        active_root,
+        allow_archive_generation_handoff=archive_generation_handoff is not None,
+    )
     paths = _control_paths(active_root)
     named_files = {
         "archived_attempt_catalog": (archived_attempt_catalog, archived_attempt_catalog_sha256),
@@ -621,8 +727,12 @@ def bootstrap_level_c(
         "restore_instructions": [],
         "provenance": provenance,
     }
+    if archive_generation_handoff is not None:
+        generation["archive_generation_handoff"] = archive_generation_handoff
     generation_path = active_root / GENERATION_MANIFEST_NAME
-    _create_or_verify(generation_path, generation)
+    _create_or_replace_archive_handoff_generation_manifest(
+        generation_path, generation, archive_generation_handoff
+    )
     generation_sha256 = _file_sha256(generation_path)
     source_coverage_end = max(plan["outer_test_end"] for plan in cutoff_plans)
     protocol_identity = {

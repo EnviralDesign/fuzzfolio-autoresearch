@@ -11,6 +11,7 @@ import pytest
 from autoresearch.__main__ import build_parser
 from autoresearch.config import load_config
 from autoresearch.catalog_index import CATALOG_INDEX_SCHEMA_VERSION
+from autoresearch.generation_archive import GenerationArchiveService, utc_now
 from autoresearch.instrument_universe import universe_provenance
 from autoresearch.level_c_workflow import (
     STAGES,
@@ -255,6 +256,48 @@ def _rewrite_controls(arguments: dict, mutate) -> None:
     arguments["legacy_controls_sha256"] = _sha256(path)
 
 
+def _archive_generation_cutover(
+    service: GenerationArchiveService,
+    tmp_path: Path,
+    *,
+    archive_id: str,
+    new_generation_id: str,
+) -> dict[str, object]:
+    provenance: dict[str, object] = {"actor": "level-c-workflow-test"}
+    preview = service.dry_run(archive_id, new_generation_id, provenance=provenance)
+    marker = tmp_path / f"{archive_id}.quiesced.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "schema_name": "autoresearch.generation.quiescence",
+                "schema_version": 1,
+                "state": "quiesced",
+                "writer_scope": "all-writers-stopped",
+                "runs_root": str(service.runs_root),
+                "archive_root": str(service.archive_root),
+                "archive_id": archive_id,
+                "new_generation_id": new_generation_id,
+                "inventory_identity": preview["inventory_identity"],
+                "issuer_id": "level-c-workflow-test",
+                "nonce": hashlib.sha256(
+                    f"{archive_id}:{new_generation_id}".encode("utf-8")
+                ).hexdigest(),
+                "issued_at": utc_now(),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    provenance["reviewed_inventory_identity"] = preview["inventory_identity"]
+    provenance["cutover_quiescence"] = {
+        "marker_path": str(marker),
+        "marker_sha256": hashlib.sha256(marker.read_bytes()).hexdigest(),
+    }
+    return service.cutover(
+        archive_id, new_generation_id, provenance=provenance
+    )
+
+
 def test_bootstrap_is_exact_idempotent_and_does_not_inventory_archive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -273,6 +316,81 @@ def test_bootstrap_is_exact_idempotent_and_does_not_inventory_archive(
     }
     assert set(first["execution_plans"]) == set("ABCD")
     assert audit_level_c(config=config, active_runs_root=active)["status"] == "valid"
+
+
+def test_bootstrap_accepts_archive_generation_handoff_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, active, _, arguments, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    archive_id = "rejected-level-c-v1-worker-contract-20260717"
+
+    _archive_generation_cutover(
+        GenerationArchiveService(active),
+        tmp_path,
+        archive_id=archive_id,
+        new_generation_id=str(arguments["new_generation_id"]),
+    )
+
+    handoff_manifest = json.loads(
+        (active / "generation-manifest.json").read_text(encoding="utf-8")
+    )
+    assert handoff_manifest["archive_linkage"]["archive_id"] == archive_id
+    assert list((active / "derived").iterdir()) == []
+
+    result = bootstrap_level_c(**arguments)
+    generation = json.loads(
+        (active / "generation-manifest.json").read_text(encoding="utf-8")
+    )
+
+    assert "bootstrap_id" in result
+    assert generation["new_generation_id"] == arguments["new_generation_id"]
+    assert generation["archive_generation_handoff"]["archive_linkage"]["archive_id"] == archive_id
+    assert generation["archive_generation_handoff"]["provenance"]["actor"] == "level-c-workflow-test"
+    assert audit_level_c(config=config, active_runs_root=active)["status"] == "valid"
+
+
+def test_bootstrap_rejects_invalid_archive_generation_handoff_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, active, _, arguments, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    archive_id = "rejected-level-c-v1-worker-contract-20260717"
+    _archive_generation_cutover(
+        GenerationArchiveService(active),
+        tmp_path,
+        archive_id=archive_id,
+        new_generation_id=str(arguments["new_generation_id"]),
+    )
+    generation_path = active / "generation-manifest.json"
+    original = json.loads(generation_path.read_text(encoding="utf-8"))
+
+    mismatched = dict(original)
+    mismatched["new_generation_id"] = "level-c-wrong"
+    generation_path.write_text(json.dumps(mismatched, sort_keys=True), encoding="utf-8")
+    with pytest.raises(LevelCWorkflowError, match="requested generation"):
+        bootstrap_level_c(**arguments)
+
+    generation_path.write_text(json.dumps(original, sort_keys=True), encoding="utf-8")
+    no_linkage = dict(original)
+    no_linkage.pop("archive_linkage")
+    generation_path.write_text(json.dumps(no_linkage, sort_keys=True), encoding="utf-8")
+    with pytest.raises(LevelCWorkflowError, match="archive_linkage"):
+        bootstrap_level_c(**arguments)
+
+    generation_path.write_text(json.dumps(original, sort_keys=True), encoding="utf-8")
+    archive_manifest = Path(original["archive_linkage"]["archive_manifest_path"])
+    archive_payload = json.loads(archive_manifest.read_text(encoding="utf-8"))
+    archive_payload["state"] = "prepared"
+    archive_manifest.write_text(json.dumps(archive_payload, sort_keys=True), encoding="utf-8")
+    with pytest.raises(LevelCWorkflowError, match="not complete"):
+        bootstrap_level_c(**arguments)
+
+    archive_payload["state"] = "complete"
+    archive_manifest.write_text(json.dumps(archive_payload, sort_keys=True), encoding="utf-8")
+    protocol = active / "derived" / "level-c" / "control" / "protocol.json"
+    protocol.parent.mkdir(parents=True)
+    protocol.write_text("{}", encoding="utf-8")
+    with pytest.raises(LevelCWorkflowError, match="ambiguous bootstrap partial state"):
+        bootstrap_level_c(**arguments)
 
 
 def test_bootstrap_rejects_source_drift_and_ambiguous_partial_state(
