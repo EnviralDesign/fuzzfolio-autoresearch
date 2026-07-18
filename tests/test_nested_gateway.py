@@ -307,6 +307,134 @@ def test_formal_nested_train_materializes_only_under_campaign_root(
     assert source_tree_after == source_tree_before
 
 
+def test_formal_nested_train_reissues_after_legacy_target_unbound_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, source_attempt = _attempt_fixture(
+        tmp_path,
+        run_id="source-lane",
+        attempt_id="attempt-source",
+    )
+    source_tree_before = {
+        path.relative_to(run_dir).as_posix(): path.read_bytes()
+        for path in run_dir.rglob("*")
+        if path.is_file()
+    }
+    campaign_root = tmp_path / "nested-campaign"
+    materialization_root = campaign_root / "attempt-evidence"
+    nested_artifact_dir = materialization_root / canonical_sha256(
+        {"attempt_id": "attempt-source"}
+    ).removeprefix("sha256:")
+    nested_artifact_dir.mkdir(parents=True)
+    attempt = {
+        **source_attempt,
+        "artifact_dir": str(nested_artifact_dir),
+        "_nested_source_artifact_dir": source_attempt["artifact_dir"],
+        "_nested_materialization_root": str(materialization_root),
+    }
+    submitted: list[dict] = []
+
+    class GatewayWithLegacyTerminal:
+        task: dict | None = None
+        returned = False
+        acked: list[str] = []
+        retained_terminal_task_ids: set[str] = set()
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            _ = limit
+            if self.__class__.task is None or self.__class__.returned:
+                return []
+            self.__class__.returned = True
+            return [_worker_result(self.__class__.task, tracked=False)]
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            assert len(tasks) == 1
+            task = tasks[0]
+            legacy_task_id = (
+                "nested:nested:formal-recovery:fold-01:attempt-source:train:"
+                f"{task['payload']['evidence_plan']['plan_id'][-16:]}"
+            )
+            self.__class__.retained_terminal_task_ids.add(legacy_task_id)
+            if task["task_id"] in self.__class__.retained_terminal_task_ids:
+                return {"accepted": 0}
+            assert task["task_id"] != legacy_task_id
+            assert ":target:" in task["task_id"]
+            self.__class__.task = task
+            submitted.extend(tasks)
+            return {"accepted": 1}
+
+        def ack_results(self, lease_ids: list[str]) -> None:
+            self.__class__.acked.extend(lease_ids)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(ng, "LabGatewayClient", GatewayWithLegacyTerminal)
+    result = run_nested_gateway_fold(
+        config=SimpleNamespace(research=SimpleNamespace(quality_score_preset="profile_drop")),
+        items=[(run_dir, attempt, dict(attempt), {})],
+        fold={
+            "fold_id": "fold-01",
+            "train_start": "2022-01-01",
+            "train_end": "2024-12-31",
+            "test_start": "2025-01-16",
+            "test_end": "2025-06-30",
+            "embargo_days": 15,
+        },
+        campaign_plan_id="nested:formal-recovery",
+        campaign_root=campaign_root,
+        lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+        max_workers=1,
+        train_horizon_months=36,
+        test_horizon_months=6,
+        lake_manifest_sha256="sha256:" + "a" * 64,
+        freeze_cells=True,
+        submit_outer=False,
+    )
+
+    assert result["status"] == "cells_frozen"
+    assert result["train_calculated_count"] == 1
+    assert len(submitted) == 1
+    legacy_task_id = (
+        "nested:nested:formal-recovery:fold-01:attempt-source:train:"
+        f"{submitted[0]['payload']['evidence_plan']['plan_id'][-16:]}"
+    )
+    assert legacy_task_id in GatewayWithLegacyTerminal.retained_terminal_task_ids
+    assert (
+        ng._nested_train_task_id(
+            campaign_plan_id="nested:formal-recovery",
+            fold_id="fold-01",
+            attempt=attempt,
+            evidence_plan_id=submitted[0]["payload"]["evidence_plan"]["plan_id"],
+        )
+        == submitted[0]["task_id"]
+    )
+    legacy_attempt = dict(attempt)
+    legacy_attempt.pop("_nested_materialization_root")
+    assert (
+        ng._nested_train_task_id(
+            campaign_plan_id="nested:formal-recovery",
+            fold_id="fold-01",
+            attempt=legacy_attempt,
+            evidence_plan_id=submitted[0]["payload"]["evidence_plan"]["plan_id"],
+        )
+        == legacy_task_id
+    )
+    assert GatewayWithLegacyTerminal.acked == [
+        f"lease-{submitted[0]['task_id']}"
+    ]
+    assert list(nested_artifact_dir.rglob("result.json"))
+    source_tree_after = {
+        path.relative_to(run_dir).as_posix(): path.read_bytes()
+        for path in run_dir.rglob("*")
+        if path.is_file()
+    }
+    assert source_tree_after == source_tree_before
+
+
 def test_formal_nested_rejects_source_lane_as_materialization_target(
     tmp_path: Path,
 ) -> None:

@@ -96,6 +96,33 @@ def _validate_nested_materialization_target(
         raise RuntimeError("formal nested artifact directory is not campaign-owned")
 
 
+def _nested_train_task_id(
+    *,
+    campaign_plan_id: str,
+    fold_id: str,
+    attempt: dict[str, Any],
+    evidence_plan_id: str,
+) -> str:
+    """Bind formal replay delivery identity to its nested-owned evidence target."""
+    attempt_id = str(attempt.get("attempt_id") or "").strip()
+    base = (
+        f"nested:{campaign_plan_id}:{fold_id}:{attempt_id}:train:"
+        f"{evidence_plan_id[-16:]}"
+    )
+    materialization_root = attempt.get("_nested_materialization_root")
+    if materialization_root is None:
+        return base
+    artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+    target_identity = canonical_sha256(
+        {
+            "schema": "nested-owned-materialization-task-v1",
+            "artifact_dir": str(artifact_dir),
+            "evidence_plan_id": evidence_plan_id,
+        }
+    ).removeprefix("sha256:")
+    return f"{base}:target:{target_identity[-16:]}"
+
+
 def _materialize_nested_lab_result(
     *,
     attempt: dict[str, Any],
@@ -390,10 +417,11 @@ def run_nested_gateway_fold(
                 attempt=attempt,
                 run_metadata=run_metadata,
                 lab_config=lab_config,
-                task_id=(
-                    f"nested:{campaign_plan_id}:{fold_id}:"
-                    f"{attempt.get('attempt_id')}:train:"
-                    f"{train_fold.train_plan.plan_id[-16:]}"
+                task_id=_nested_train_task_id(
+                    campaign_plan_id=campaign_plan_id,
+                    fold_id=fold_id,
+                    attempt=attempt,
+                    evidence_plan_id=train_fold.train_plan.plan_id,
                 ),
                 evidence_plan=train_fold.train_plan,
                 profile_snapshot_override=_profile_for_attempt(attempt),
