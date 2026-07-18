@@ -19,10 +19,11 @@ from autoresearch.nested_pipeline import (
     run_nested_frozen_portfolio_phase,
     run_nested_selected_outer_phase,
     run_nested_training_phase,
+    run_nested_pipeline,
 )
 
 
-def _context(tmp_path: Path) -> NestedPipelineContext:
+def _context(tmp_path: Path, *, formal_level_c: bool = False) -> NestedPipelineContext:
     config = SimpleNamespace(
         repo_root=tmp_path,
         runs_root=tmp_path / "runs",
@@ -40,6 +41,22 @@ def _context(tmp_path: Path) -> NestedPipelineContext:
         {"attempt_id": "attempt-a", "run_id": "run-a"},
         {"attempt_id": "attempt-b", "run_id": "run-b"},
     )
+    items = tuple(
+        (
+            config.runs_root / row["run_id"],
+            {
+                **row,
+                **(
+                    {"_worker_ready_profile_snapshot": {"notificationThreshold": 80.0}}
+                    if formal_level_c
+                    else {}
+                ),
+            },
+            dict(row),
+            {},
+        )
+        for row in rows
+    )
     return NestedPipelineContext(
         config=config,
         campaign_id="phase-test",
@@ -52,9 +69,7 @@ def _context(tmp_path: Path) -> NestedPipelineContext:
         cohort_path=None,
         cohort_manifest_id="sha256:" + "b" * 64,
         requested_attempt_ids=("attempt-a", "attempt-b"),
-        items=tuple(
-            (config.runs_root / row["run_id"], dict(row), dict(row), {}) for row in rows
-        ),
+        items=items,
         catalog_rows=rows,
         folds=(fold,),
         train_months=36,
@@ -70,6 +85,7 @@ def _context(tmp_path: Path) -> NestedPipelineContext:
             "fold_count": 1,
             "selection_basis": "recommended_cell",
         },
+        is_formal_level_c=formal_level_c,
     )
 
 
@@ -249,6 +265,119 @@ def test_frozen_portfolio_treats_empty_variant_results_as_no_consensus(
     phase = json.loads(phase_path.read_text(encoding="utf-8"))
     assert phase["status"] == "no_consensus"
     assert phase["selected_attempt_ids_by_fold"] == {"fold-01": []}
+
+
+def test_frozen_portfolio_records_receipt_backed_no_candidate_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = _context(tmp_path, formal_level_c=True)
+    monkeypatch.setattr(
+        pipeline,
+        "run_nested_gateway_training_fold",
+        lambda **_kwargs: {
+            "status": "training_complete",
+            "fold": context.folds[0],
+            "requested_attempt_ids": ["attempt-a", "attempt-b"],
+        },
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "freeze_nested_gateway_cells_fold",
+        lambda **_kwargs: {
+            "status": "cells_frozen",
+            "fold": context.folds[0],
+            "records": [
+                {"attempt_id": attempt_id, "train_validation_status": "valid"}
+                for attempt_id in ("attempt-a", "attempt-b")
+            ],
+        },
+    )
+    captured: dict[str, object] = {}
+
+    def no_candidate(*, root: Path, **kwargs):
+        captured.update(kwargs)
+        result = [
+            {
+                "fold": {"fold_id": "fold-01"},
+                "status": "no_eligible_training_candidates",
+                "outcome": "no_candidate",
+                "selected_attempt_ids": [],
+                "train_rejections": {"score_below_min": 2},
+            }
+        ]
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "nested-temporal-results.json").write_text(
+            json.dumps(result, separators=(",", ":")), encoding="utf-8"
+        )
+        return result
+
+    monkeypatch.setattr(pipeline, "run_nested_cell_temporal_validation", no_candidate)
+    run_nested_training_phase(context)
+    run_nested_frozen_cells_phase(context)
+    phase_path = run_nested_frozen_portfolio_phase(context)
+
+    phase = json.loads(phase_path.read_text(encoding="utf-8"))
+    assert captured["freeze_only"] is True
+    assert isinstance(captured["formal_binding"], dict)
+    assert phase["status"] == "no_candidate"
+    assert phase["outcome"] == "no_candidate"
+    assert phase["selected_attempt_ids_by_fold"] == {"fold-01": []}
+    assert phase["portfolio_result_count"] == 1
+
+
+def test_formal_no_candidate_stops_before_outer_submission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    context = _context(tmp_path, formal_level_c=True)
+    monkeypatch.setattr(
+        pipeline,
+        "run_nested_gateway_training_fold",
+        lambda **_kwargs: {
+            "status": "training_complete",
+            "fold": context.folds[0],
+            "requested_attempt_ids": ["attempt-a", "attempt-b"],
+        },
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "freeze_nested_gateway_cells_fold",
+        lambda **_kwargs: {
+            "status": "cells_frozen",
+            "fold": context.folds[0],
+            "records": [
+                {"attempt_id": attempt_id, "train_validation_status": "valid"}
+                for attempt_id in ("attempt-a", "attempt-b")
+            ],
+        },
+    )
+
+    def no_candidate(*, root: Path, **_kwargs):
+        result = [
+            {
+                "fold": {"fold_id": "fold-01"},
+                "status": "no_eligible_training_candidates",
+                "outcome": "no_candidate",
+                "selected_attempt_ids": [],
+            }
+        ]
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "nested-temporal-results.json").write_text(
+            json.dumps(result, separators=(",", ":")), encoding="utf-8"
+        )
+        return result
+
+    monkeypatch.setattr(pipeline, "run_nested_cell_temporal_validation", no_candidate)
+    monkeypatch.setattr(
+        pipeline,
+        "run_nested_gateway_selected_outer_fold",
+        lambda **_kwargs: pytest.fail("formal no-candidate must not submit outer replay"),
+    )
+
+    result = run_nested_pipeline(context)
+
+    assert result["status"] == "non_promotable"
+    assert result["outcome"] == "no_candidate"
+    assert not (context.campaign_root / "phases" / "selected-outer.json").exists()
 
 
 def _prepare_config(tmp_path: Path):

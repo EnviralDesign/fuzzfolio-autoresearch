@@ -859,6 +859,44 @@ def test_zero_candidate_cutoff_is_cleanly_terminal(
     assert called == ["atlas", "playhand", "frozen_cohort"]
 
 
+def test_nested_portfolio_no_candidate_is_cleanly_terminal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, active, _, _, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    called: list[str] = []
+
+    def handler(stage: str, **_kwargs):
+        called.append(stage)
+        artifact = active / "derived" / "level-c" / f"nested-{stage}.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text("{}", encoding="utf-8")
+        outcome = "no_candidate" if stage == "frozen_portfolio" else "complete"
+        return outcome, [artifact]
+
+    result = run_level_c_cutoff(
+        config=config,
+        active_runs_root=active,
+        cutoff="A",
+        resume=True,
+        stage_handlers={stage: handler for stage in STAGES},
+    )
+
+    assert result["status"] == "non_promotable"
+    assert called == [
+        "atlas",
+        "playhand",
+        "frozen_cohort",
+        "training_evidence",
+        "frozen_cells",
+        "frozen_portfolio",
+    ]
+    receipt = json.loads(
+        _stage_receipt_path(active, "A", "frozen_portfolio").read_text(encoding="utf-8")
+    )
+    assert receipt["outcome"] == "no_candidate"
+    assert not _stage_receipt_path(active, "A", "selected_outer").exists()
+
+
 def test_audit_is_non_mutating(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config, active, _, _, _ = _bootstrap_fixture(tmp_path, monkeypatch)
     before = {

@@ -15,6 +15,8 @@ from pathlib import Path
 from statistics import NormalDist
 from typing import Any, Callable, Iterable
 
+from .evidence_plan import validate_replay_evidence_plan
+from .nested_evidence import FrozenExecutionCellReceipt
 from .portfolio_optimizer import (
     OptimizerCandidate,
     PortfolioOptimizerSpec,
@@ -73,6 +75,246 @@ def file_sha256(path: Path) -> str | None:
         return digest.hexdigest()
     except OSError:
         return None
+
+
+def _validate_formal_nested_receipt(
+    *,
+    fold_id: str,
+    fold: dict[str, Any],
+    attempt_id: str,
+    receipt_payload: dict[str, Any],
+    train_plan_payload: dict[str, Any],
+    outer_plan_payload: dict[str, Any],
+    formal_binding: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify the frozen cell binds the exact train and outer replay plans."""
+    try:
+        receipt = FrozenExecutionCellReceipt.model_validate(receipt_payload)
+        train_plan = validate_replay_evidence_plan(train_plan_payload)
+        outer_plan = validate_replay_evidence_plan(outer_plan_payload)
+    except (TypeError, ValueError) as exc:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} has an invalid frozen cell receipt for {attempt_id}: {exc}"
+        ) from exc
+    for field in ("stop_loss_percent", "reward_multiple"):
+        try:
+            value = float(receipt.execution_cell[field])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PortfolioResearchError(
+                f"Nested fold {fold_id} frozen cell receipt lacks {field} for {attempt_id}"
+            ) from exc
+        if not math.isfinite(value) or value <= 0.0:
+            raise PortfolioResearchError(
+                f"Nested fold {fold_id} frozen cell receipt has invalid {field} for {attempt_id}"
+            )
+    if receipt.fold_id != fold_id:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} frozen cell receipt binds another fold for {attempt_id}"
+        )
+    if receipt.campaign_plan_id != train_plan.campaign_plan_id:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} frozen cell receipt campaign differs from train plan for {attempt_id}"
+        )
+    if outer_plan.campaign_plan_id != train_plan.campaign_plan_id:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} outer plan campaign differs from train plan for {attempt_id}"
+        )
+    if train_plan.evidence_role != "cell_selection" or outer_plan.evidence_role != "outer_test":
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} has incorrect train/outer evidence roles for {attempt_id}"
+        )
+    if receipt.train_evidence_plan_id != train_plan.plan_id:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} frozen cell receipt differs from train plan for {attempt_id}"
+        )
+    if receipt.profile_snapshot_sha256 != train_plan.profile_snapshot_sha256:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} frozen cell receipt profile differs from train plan for {attempt_id}"
+        )
+    if outer_plan.profile_snapshot_sha256 != train_plan.profile_snapshot_sha256:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} outer plan profile differs from train plan for {attempt_id}"
+        )
+    if (
+        receipt.lake_manifest_sha256 != train_plan.lake_manifest_sha256
+        or outer_plan.lake_manifest_sha256 != train_plan.lake_manifest_sha256
+    ):
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} frozen cell receipt lake differs from replay plans for {attempt_id}"
+        )
+    if outer_plan.execution_cell_sha256 != receipt.execution_cell_sha256:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} outer plan is not bound to the frozen cell for {attempt_id}"
+        )
+    expected_campaign = str(formal_binding.get("campaign_plan_id") or "")
+    expected_lake = str(formal_binding.get("lake_manifest_sha256") or "")
+    formal_campaign_id = str(formal_binding.get("campaign_id") or "")
+    formal_cohort_manifest_id = str(formal_binding.get("cohort_manifest_id") or "")
+    formal_execution_plan_id = str(formal_binding.get("execution_plan_id") or "")
+    expected_profiles = formal_binding.get("profile_snapshot_sha256_by_attempt_id")
+    expected_profile = (
+        str(expected_profiles.get(attempt_id) or "")
+        if isinstance(expected_profiles, dict)
+        else ""
+    )
+    if (
+        not expected_campaign
+        or not expected_lake
+        or not expected_profile
+        or not formal_campaign_id
+        or not formal_cohort_manifest_id
+        or not formal_execution_plan_id
+    ):
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} formal binding is incomplete for {attempt_id}"
+        )
+    expected_composed_campaign = (
+        f"{formal_campaign_id}:attempt-cohort:{formal_cohort_manifest_id}:"
+        f"execution-plan:{formal_execution_plan_id}"
+    )
+    if expected_campaign != expected_composed_campaign:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} formal campaign binding is inconsistent for {attempt_id}"
+        )
+    if (
+        receipt.campaign_plan_id != expected_campaign
+        or train_plan.campaign_plan_id != expected_campaign
+        or outer_plan.campaign_plan_id != expected_campaign
+    ):
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} replay plans differ from the formal campaign for {attempt_id}"
+        )
+    if (
+        receipt.profile_snapshot_sha256 != expected_profile
+        or train_plan.profile_snapshot_sha256 != expected_profile
+        or outer_plan.profile_snapshot_sha256 != expected_profile
+    ):
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} replay plans differ from the formal profile for {attempt_id}"
+        )
+    if (
+        receipt.lake_manifest_sha256 != expected_lake
+        or train_plan.lake_manifest_sha256 != expected_lake
+        or outer_plan.lake_manifest_sha256 != expected_lake
+    ):
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} replay plans differ from the formal lake for {attempt_id}"
+        )
+    try:
+        train_start = date.fromisoformat(str(fold["train_start"])[:10])
+        train_end = date.fromisoformat(str(fold["train_end"])[:10]) + timedelta(days=1)
+        test_start = date.fromisoformat(str(fold["test_start"])[:10])
+        test_end = date.fromisoformat(str(fold["test_end"])[:10]) + timedelta(days=1)
+        train_months = int(formal_binding["train_months"])
+        test_months = int(formal_binding["test_months"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} formal geometry is invalid for {attempt_id}"
+        ) from exc
+    utc = lambda value: f"{value.isoformat()}T00:00:00Z"
+    if (
+        train_plan.analysis_window_start != utc(train_start)
+        or train_plan.analysis_window_end != utc(train_end)
+        or train_plan.selection_data_end != utc(train_end)
+        or train_plan.requested_horizon_months != train_months
+        or outer_plan.analysis_window_start != utc(test_start)
+        or outer_plan.analysis_window_end != utc(test_end)
+        or outer_plan.selection_data_end != utc(train_end)
+        or outer_plan.requested_horizon_months != test_months
+    ):
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} replay plan geometry differs from the formal fold for {attempt_id}"
+        )
+    return receipt.model_dump(mode="json")
+
+
+def _validate_formal_nested_train_evidence(
+    *,
+    fold_id: str,
+    attempt_id: str,
+    train_result_payload: dict[str, Any],
+    train_curve_path: Path,
+) -> tuple[dict[str, Any], float]:
+    """Reject malformed train evidence before policy eligibility can filter it."""
+    aggregate = (train_result_payload.get("data") or {}).get("aggregate")
+    if not isinstance(aggregate, dict):
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} train result lacks an aggregate for {attempt_id}"
+        )
+    score_lab = aggregate.get("score_lab")
+    try:
+        score = float((score_lab or {}).get("score"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} train result lacks a bounded score for {attempt_id}"
+        ) from exc
+    if not math.isfinite(score):
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} train result has a non-finite score for {attempt_id}"
+        )
+    metrics = aggregate.get("best_cell_path_metrics")
+    try:
+        avg_hold = float((metrics or {}).get("avg_holding_hours"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} train result lacks holding metrics for {attempt_id}"
+        ) from exc
+    if not math.isfinite(avg_hold):
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} train result has non-finite holding metrics for {attempt_id}"
+        )
+    for field in ("p90_holding_hours", "max_holding_hours", "path_quality"):
+        value = (metrics or {}).get(field)
+        if value is None:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError) as exc:
+            raise PortfolioResearchError(
+                f"Nested fold {fold_id} train result has malformed {field} for {attempt_id}"
+            ) from exc
+        if not math.isfinite(numeric):
+            raise PortfolioResearchError(
+                f"Nested fold {fold_id} train result has non-finite {field} for {attempt_id}"
+            )
+    try:
+        curve_payload = json.loads(train_curve_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} cannot read bounded train curve for {attempt_id}: {exc}"
+        ) from exc
+    points = ((curve_payload.get("curve") or {}).get("points") or [])
+    if not isinstance(points, list) or not points:
+        raise PortfolioResearchError(
+            f"Nested fold {fold_id} train evidence has an empty calendar curve for {attempt_id}"
+        )
+    for point in points:
+        if not isinstance(point, dict):
+            raise PortfolioResearchError(
+                f"Nested fold {fold_id} train evidence has a malformed calendar curve for {attempt_id}"
+            )
+        try:
+            date.fromisoformat(str(point.get("date") or "")[:10])
+            equity = float(point.get("equity_r"))
+            open_trades = float(point.get("open_trade_count"))
+            closed_trades = float(point.get("closed_trade_count"))
+        except (TypeError, ValueError) as exc:
+            raise PortfolioResearchError(
+                f"Nested fold {fold_id} train evidence has a malformed calendar curve for {attempt_id}"
+            ) from exc
+        if (
+            not math.isfinite(equity)
+            or not math.isfinite(open_trades)
+            or not math.isfinite(closed_trades)
+            or open_trades < 0
+            or closed_trades < 0
+            or not open_trades.is_integer()
+            or not closed_trades.is_integer()
+        ):
+            raise PortfolioResearchError(
+                f"Nested fold {fold_id} train evidence has a non-finite calendar curve for {attempt_id}"
+            )
+    return aggregate, score
 
 
 def validate_artifact_manifest(
@@ -1183,8 +1425,15 @@ def run_nested_cell_temporal_validation(
     root: Path,
     backend: str,
     freeze_only: bool = False,
+    formal_binding: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build train-only inner consensus, then score its frozen portfolio on outer curves."""
+    """Build train-only inner consensus, then score its frozen portfolio on outer curves.
+
+    ``formal_binding`` is supplied only by the formal Level C freeze boundary.
+    It turns a fully receipt-backed training set that the optimizer rejects in
+    its entirety into a typed non-promotable result. Missing or malformed
+    evidence remains a hard error.
+    """
     root.mkdir(parents=True, exist_ok=True)
     base_by_id = {
         str(row.get("attempt_id") or ""): row
@@ -1198,6 +1447,11 @@ def run_nested_cell_temporal_validation(
     seeds = [int(item) for item in temporal.get("seeds") or [29]]
     policy = dict(suite.get("selection_policy") or {})
     inner_config = dict(temporal.get("inner_validation") or {})
+    formal_terminal = formal_binding is not None
+    if formal_terminal and not freeze_only:
+        raise PortfolioResearchError(
+            "formal nested terminal handling is only valid at the frozen-portfolio boundary"
+        )
     results: list[dict[str, Any]] = []
     for fold_report in fold_reports:
         fold = dict(fold_report.get("fold") or {})
@@ -1225,10 +1479,23 @@ def run_nested_cell_temporal_validation(
                     f"Nested fold {fold_id} has non-terminal outer evidence "
                     f"for {attempt_id}: {outer_stage_status or 'missing'}"
                 )
-            receipt = dict(record.get("cell_receipt") or {})
-            receipt_by_id[attempt_id] = receipt
             outer_plan = dict(record.get("outer_test_plan") or {})
             train_plan = dict(record.get("train_plan") or {})
+            receipt_payload = dict(record.get("cell_receipt") or {})
+            receipt = (
+                _validate_formal_nested_receipt(
+                    fold_id=fold_id,
+                    fold=fold,
+                    attempt_id=attempt_id,
+                    receipt_payload=receipt_payload,
+                    train_plan_payload=train_plan,
+                    outer_plan_payload=outer_plan,
+                    formal_binding=formal_binding,
+                )
+                if formal_terminal
+                else receipt_payload
+            )
+            receipt_by_id[attempt_id] = receipt
             evidence_identity_by_id[attempt_id] = {
                 "train_evidence_plan_id": train_plan.get("plan_id"),
                 "outer_evidence_plan_id": outer_plan.get("plan_id"),
@@ -1241,22 +1508,30 @@ def run_nested_cell_temporal_validation(
                 raise PortfolioResearchError(
                     f"Nested fold {fold_id} cannot read bounded train result for {attempt_id}: {exc}"
                 ) from exc
-            train_aggregate = (
-                (train_result_payload.get("data") or {}).get("aggregate")
-                if isinstance(train_result_payload, dict)
-                else None
-            )
-            train_score = (
-                (train_aggregate.get("score_lab") or {}).get("score")
-                if isinstance(train_aggregate, dict)
-                else None
-            )
-            try:
-                bounded_train_score = float(train_score)
-            except (TypeError, ValueError) as exc:
+            if not isinstance(train_result_payload, dict):
                 raise PortfolioResearchError(
-                    f"Nested fold {fold_id} train result lacks a bounded score for {attempt_id}"
-                ) from exc
+                    f"Nested fold {fold_id} train result is malformed for {attempt_id}"
+                )
+            if formal_terminal:
+                train_aggregate, bounded_train_score = _validate_formal_nested_train_evidence(
+                    fold_id=fold_id,
+                    attempt_id=attempt_id,
+                    train_result_payload=train_result_payload,
+                    train_curve_path=Path(str(record.get("train_curve_path") or "")),
+                )
+            else:
+                train_aggregate = (train_result_payload.get("data") or {}).get("aggregate")
+                train_score = (
+                    (train_aggregate.get("score_lab") or {}).get("score")
+                    if isinstance(train_aggregate, dict)
+                    else None
+                )
+                try:
+                    bounded_train_score = float(train_score)
+                except (TypeError, ValueError) as exc:
+                    raise PortfolioResearchError(
+                        f"Nested fold {fold_id} train result lacks a bounded score for {attempt_id}"
+                    ) from exc
             bounded_trade_count = int(
                 (train_aggregate or {}).get("resolved_trade_count_max")
                 or (train_aggregate or {}).get("signal_count")
@@ -1311,22 +1586,23 @@ def run_nested_cell_temporal_validation(
                 )
         if not train_rows:
             raise PortfolioResearchError(f"Nested fold {fold_id} has no valid evidence rows")
+        inner_base_spec = build_experiment_spec(
+            suite,
+            {
+                "experiment_id": "nested-inner-base",
+                "portfolio_size": max(sizes),
+                "objective": objectives[0],
+                "random_seed": seeds[0],
+                "candidate_limit": -1,
+                "risk_weight_multiplier": 1.0,
+                "diversification_profile": {"name": "nested-inner-base"},
+            },
+            account=account,
+            name_prefix=f"nested-{fold_id}",
+        )
         train_candidates, train_rejections = build_optimizer_candidates(
             train_rows,
-            build_experiment_spec(
-                suite,
-                {
-                    "experiment_id": "nested-inner-base",
-                    "portfolio_size": max(sizes),
-                    "objective": objectives[0],
-                    "random_seed": seeds[0],
-                    "candidate_limit": -1,
-                    "risk_weight_multiplier": 1.0,
-                    "diversification_profile": {"name": "nested-inner-base"},
-                },
-                account=account,
-                name_prefix=f"nested-{fold_id}",
-            ),
+            inner_base_spec,
         )
         outer_candidates, outer_rejections = (
             ([], [])
@@ -1379,6 +1655,53 @@ def run_nested_cell_temporal_validation(
                 f"Nested fold {fold_id} produced {len(inner_folds)} inner folds; "
                 f"at least {minimum_inner_units} are required"
             )
+        if not train_candidates:
+            evidence_failures = sorted(
+                reason
+                for reason in train_rejections
+                if reason in {
+                    "invalid_or_missing_full_backtest",
+                    "missing_source_calendar_curve",
+                    "empty_calendar_curve",
+                    "missing_hold_metrics",
+                }
+                or reason.startswith("full_backtest_")
+            )
+            if evidence_failures:
+                raise PortfolioResearchError(
+                    f"Nested fold {fold_id} has malformed training evidence: "
+                    + ", ".join(evidence_failures)
+                )
+            if not formal_terminal or not train_rejections:
+                raise PortfolioResearchError(
+                    f"Nested fold {fold_id} has no optimizer-eligible training candidates"
+                )
+            terminal = {
+                "fold": fold,
+                "experiment_id": payload_hash(
+                    {
+                        "fold_id": fold_id,
+                        "kind": "no_eligible_training_candidates",
+                        "train_evidence_plan_ids": {
+                            attempt_id: identity.get("train_evidence_plan_id")
+                            for attempt_id, identity in sorted(evidence_identity_by_id.items())
+                        },
+                    }
+                )[:16],
+                "evidence_level": "level_b_train_selected_cell",
+                "status": "no_eligible_training_candidates",
+                "outcome": "no_candidate",
+                "selected_attempt_ids": [],
+                "training_valid_evidence_count": len(train_rows),
+                "optimizer_candidate_count": 0,
+                "optimizer_min_score": inner_base_spec.min_score,
+                "inner_fold_count": len(inner_folds),
+                "train_rejections": train_rejections,
+            }
+            terminal_path = root / fold_id / terminal["experiment_id"] / "freeze-result.json"
+            write_json_atomic(terminal_path, terminal, compact=True)
+            results.append(terminal)
+            continue
         inner_results: list[dict[str, Any]] = []
         for inner_fold in inner_folds:
             inner_train_candidates = slice_candidates(

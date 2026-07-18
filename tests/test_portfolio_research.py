@@ -12,6 +12,8 @@ from autoresearch.portfolio_optimizer import (
     build_optimizer_candidates,
     objective_weights_for_spec,
 )
+from autoresearch.evidence_plan import build_replay_evidence_plan
+from autoresearch.nested_evidence import FrozenExecutionCellReceipt
 from autoresearch.portfolio_research import (
     PortfolioResearchError,
     add_months,
@@ -502,6 +504,194 @@ def test_nested_cell_validation_keeps_outer_no_signal_member_flat(
     assert results[0]["test_metrics"]["final_r"] == pytest.approx(0.0)
     frozen = json.loads(Path(results[0]["frozen_portfolio_path"]).read_text(encoding="utf-8"))
     assert frozen["selected_attempt_ids"] == ["nested-flat"]
+
+
+def test_nested_cell_validation_emits_receipt_backed_no_candidate_terminal(
+    tmp_path: Path,
+) -> None:
+    train_points = [
+        ((date(2023, 1, 1) + timedelta(days=index)).isoformat(), index / 100.0)
+        for index in range(730)
+    ]
+    row = _row(tmp_path, "nested-no-candidate", "EURUSD", train_points)
+    train_result_path = Path(row["full_backtest_result_path_36m"])
+    train_result = json.loads(train_result_path.read_text(encoding="utf-8"))
+    train_result["data"]["aggregate"]["score_lab"]["score"] = 0.0
+    train_result_path.write_text(json.dumps(train_result), encoding="utf-8")
+    suite = _suite(temporal_enabled=True)
+    suite["portfolio"]["sizes"] = [1]
+    suite["portfolio"]["base_optimizer_args"].update(
+        {"candidate_limit": -1, "min_score": 50.0}
+    )
+    suite["temporal_validation"].update(
+        {
+            "seeds": [17],
+            "inner_validation": {
+                "train_months": 6,
+                "test_months": 3,
+                "step_months": 3,
+                "embargo_days": 1,
+                "minimum_units": 2,
+            },
+        }
+    )
+    fold = {
+        "fold_id": "fold-01",
+        "train_start": "2023-01-01",
+        "train_end": "2024-12-31",
+        "test_start": "2025-01-16",
+        "test_end": "2025-07-15",
+        "embargo_days": 1,
+    }
+    profile_snapshot = {"notificationThreshold": 80.0, "indicators": []}
+    cohort_manifest_id = "sha256:" + "e" * 64
+    execution_plan_id = "sha256:" + "f" * 64
+    train_plan = build_replay_evidence_plan(
+        campaign_plan_id=(
+            f"formal-nested:attempt-cohort:{cohort_manifest_id}:"
+            f"execution-plan:{execution_plan_id}"
+        ),
+        evidence_role="cell_selection",
+        selection_data_end="2025-01-01T00:00:00Z",
+        analysis_window_start="2023-01-01T00:00:00Z",
+        analysis_window_end="2025-01-01T00:00:00Z",
+        requested_horizon_months=24,
+        profile_snapshot=profile_snapshot,
+        lake_manifest_sha256="sha256:" + "d" * 64,
+    )
+    cell = {"stop_loss_percent": 0.1, "reward_multiple": 2.0}
+    receipt = FrozenExecutionCellReceipt(
+        campaign_plan_id=str(train_plan.campaign_plan_id),
+        fold_id="fold-01",
+        profile_snapshot_sha256=train_plan.profile_snapshot_sha256,
+        train_evidence_plan_id=train_plan.plan_id,
+        selection_basis="recommended_cell",
+        execution_cell=cell,
+        execution_cell_sha256="sha256:" + hashlib.sha256(
+            json.dumps(cell, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+        lake_manifest_sha256=train_plan.lake_manifest_sha256,
+    )
+    outer_plan = build_replay_evidence_plan(
+        campaign_plan_id=train_plan.campaign_plan_id,
+        evidence_role="outer_test",
+        selection_data_end=train_plan.analysis_window_end,
+        analysis_window_start="2025-01-16T00:00:00Z",
+        analysis_window_end="2025-07-16T00:00:00Z",
+        requested_horizon_months=6,
+        profile_snapshot=profile_snapshot,
+        execution_cell_sha256=receipt.execution_cell_sha256,
+        lake_manifest_sha256=train_plan.lake_manifest_sha256,
+    )
+    record = {
+        "attempt_id": "nested-no-candidate",
+        "train_validation_status": "valid",
+        "outer_validation_status": "pending_selection",
+        "train_result_path": row["full_backtest_result_path_36m"],
+        "train_curve_path": row["full_backtest_calendar_curve_path_36m"],
+        "train_plan": train_plan.model_dump(mode="json"),
+        "outer_test_plan": outer_plan.model_dump(mode="json"),
+        "cell_receipt": receipt.model_dump(mode="json"),
+    }
+    formal_binding = {
+        "campaign_id": "formal-nested",
+        "campaign_plan_id": train_plan.campaign_plan_id,
+        "cohort_manifest_id": cohort_manifest_id,
+        "execution_plan_id": execution_plan_id,
+        "lake_manifest_sha256": train_plan.lake_manifest_sha256,
+        "train_months": 24,
+        "test_months": 6,
+        "profile_snapshot_sha256_by_attempt_id": {
+            "nested-no-candidate": train_plan.profile_snapshot_sha256,
+        },
+    }
+
+    results = run_nested_cell_temporal_validation(
+        rows=[row],
+        fold_reports=[{"fold": fold, "records": [record]}],
+        suite=suite,
+        account={},
+        root=tmp_path / "nested-no-candidate",
+        backend="python",
+        freeze_only=True,
+        formal_binding=formal_binding,
+    )
+
+    assert len(results) == 1
+    terminal = results[0]
+    assert terminal["status"] == "no_eligible_training_candidates"
+    assert terminal["outcome"] == "no_candidate"
+    assert terminal["selected_attempt_ids"] == []
+    assert terminal["training_valid_evidence_count"] == 1
+    assert terminal["optimizer_candidate_count"] == 0
+    assert terminal["optimizer_min_score"] == 50.0
+    assert terminal["train_rejections"] == {"score_below_min": 1}
+    persisted = json.loads(
+        (tmp_path / "nested-no-candidate" / "nested-temporal-results.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert persisted == results
+
+    malformed = {**record, "cell_receipt": {}}
+    with pytest.raises(PortfolioResearchError, match="invalid frozen cell receipt"):
+        run_nested_cell_temporal_validation(
+            rows=[row],
+            fold_reports=[{"fold": fold, "records": [malformed]}],
+            suite=suite,
+            account={},
+            root=tmp_path / "nested-malformed-no-candidate",
+            backend="python",
+            freeze_only=True,
+            formal_binding=formal_binding,
+        )
+
+    wrong_fold = {
+        **record,
+        "cell_receipt": {**record["cell_receipt"], "fold_id": "fold-other"},
+    }
+    with pytest.raises(PortfolioResearchError, match="binds another fold"):
+        run_nested_cell_temporal_validation(
+            rows=[row],
+            fold_reports=[{"fold": fold, "records": [wrong_fold]}],
+            suite=suite,
+            account={},
+            root=tmp_path / "nested-wrong-receipt-fold",
+            backend="python",
+            freeze_only=True,
+            formal_binding=formal_binding,
+        )
+
+    wrong_campaign = {
+        **formal_binding,
+        "campaign_plan_id": "another-campaign",
+    }
+    with pytest.raises(PortfolioResearchError, match="formal campaign binding is inconsistent"):
+        run_nested_cell_temporal_validation(
+            rows=[row],
+            fold_reports=[{"fold": fold, "records": [record]}],
+            suite=suite,
+            account={},
+            root=tmp_path / "nested-wrong-formal-campaign",
+            backend="python",
+            freeze_only=True,
+            formal_binding=wrong_campaign,
+        )
+
+    malformed_hold = json.loads(train_result_path.read_text(encoding="utf-8"))
+    malformed_hold["data"]["aggregate"]["best_cell_path_metrics"] = {}
+    train_result_path.write_text(json.dumps(malformed_hold), encoding="utf-8")
+    with pytest.raises(PortfolioResearchError, match="lacks holding metrics"):
+        run_nested_cell_temporal_validation(
+            rows=[row],
+            fold_reports=[{"fold": fold, "records": [record]}],
+            suite=suite,
+            account={},
+            root=tmp_path / "nested-low-score-malformed-hold",
+            backend="python",
+            freeze_only=True,
+            formal_binding=formal_binding,
+        )
 
 
 def test_stability_domains_keep_full_window_and_temporal_evidence_separate(

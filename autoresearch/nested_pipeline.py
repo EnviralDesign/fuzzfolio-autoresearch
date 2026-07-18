@@ -84,6 +84,7 @@ class NestedPipelineContext:
     lake_manifest_sha256: str
     lab_config: LabBacktestConfig
     preview: dict[str, Any]
+    is_formal_level_c: bool = False
 
 
 def _sha256_file(path: Path) -> str:
@@ -810,6 +811,7 @@ def prepare_nested_pipeline(
         lake_manifest_sha256=resolved_lake_manifest,
         lab_config=lab_config,
         preview=preview,
+        is_formal_level_c=is_level_c_cohort and execution_plan_id is not None,
     )
 
 
@@ -926,6 +928,29 @@ def run_nested_frozen_portfolio_phase(context: NestedPipelineContext) -> Path:
         return reused
     cells = _load_phase(context, "frozen-cells")
     reports = list(cells.get("fold_reports") or [])
+    formal_binding = None
+    if context.is_formal_level_c:
+        profile_snapshot_sha256_by_attempt_id: dict[str, str] = {}
+        for _, attempt, _, _ in context.items:
+            attempt_id = str(attempt.get("attempt_id") or "")
+            profile_snapshot = attempt.get("_worker_ready_profile_snapshot")
+            if not attempt_id or not isinstance(profile_snapshot, dict):
+                raise NestedPipelineError(
+                    "formal nested portfolio is missing a frozen worker-ready profile"
+                )
+            profile_snapshot_sha256_by_attempt_id[attempt_id] = canonical_sha256(
+                normalize_evidence_profile_snapshot(profile_snapshot)
+            )
+        formal_binding = {
+            "campaign_id": context.campaign_id,
+            "campaign_plan_id": context.campaign_plan_id,
+            "cohort_manifest_id": context.cohort_manifest_id,
+            "execution_plan_id": context.execution_plan_id,
+            "lake_manifest_sha256": context.lake_manifest_sha256,
+            "train_months": context.train_months,
+            "test_months": context.test_months,
+            "profile_snapshot_sha256_by_attempt_id": profile_snapshot_sha256_by_attempt_id,
+        }
     results = run_nested_cell_temporal_validation(
         rows=list(context.catalog_rows),
         fold_reports=reports,
@@ -934,6 +959,7 @@ def run_nested_frozen_portfolio_phase(context: NestedPipelineContext) -> Path:
         root=context.campaign_root / "portfolio-validation" / "frozen",
         backend=context.optimizer_backend,
         freeze_only=True,
+        formal_binding=formal_binding,
     )
     selected_sets: dict[str, set[str]] = {
         str(fold.get("fold_id") or ""): set() for fold in context.folds
@@ -956,12 +982,23 @@ def run_nested_frozen_portfolio_phase(context: NestedPipelineContext) -> Path:
         / "frozen"
         / "nested-temporal-results.json"
     )
+    no_candidate = bool(results) and all(
+        str(result.get("outcome") or "") == "no_candidate" for result in results
+    )
     _, path = _write_phase(
         context,
         "frozen-portfolio",
         {
-            "status": "complete" if any(selected.values()) else "no_consensus",
+            "status": (
+                "complete"
+                if any(selected.values())
+                else "no_candidate"
+                if no_candidate
+                else "no_consensus"
+            ),
+            "outcome": "no_candidate" if no_candidate else None,
             "selected_attempt_ids_by_fold": selected,
+            "portfolio_result_count": len(results),
             "portfolio_results_path": str(results_path),
             "portfolio_results_sha256": _sha256_file(results_path),
         },
@@ -1084,6 +1121,19 @@ def run_nested_pipeline(context: NestedPipelineContext) -> dict[str, Any]:
     run_nested_training_phase(context)
     run_nested_frozen_cells_phase(context)
     run_nested_frozen_portfolio_phase(context)
+    frozen_portfolio = _load_phase(context, "frozen-portfolio")
+    if context.is_formal_level_c and frozen_portfolio.get("status") in {
+        "no_candidate",
+        "no_consensus",
+    }:
+        return {
+            **context.preview,
+            "status": "non_promotable",
+            "outcome": frozen_portfolio["status"],
+            "frozen_portfolio_phase": str(
+                context.campaign_root / "phases" / "frozen-portfolio.json"
+            ),
+        }
     run_nested_selected_outer_phase(context)
     run_nested_final_report_phase(context)
     return json.loads(

@@ -1278,8 +1278,11 @@ def _default_stage_handler(
     }
     phase_path = handlers[stage](context)
     phase = _load_json(phase_path, label=f"nested {stage} phase")
-    if stage == "frozen_portfolio" and phase.get("status") == "no_consensus":
-        return "no_consensus", [phase_path]
+    if stage == "frozen_portfolio" and phase.get("status") in {
+        "no_candidate",
+        "no_consensus",
+    }:
+        return str(phase["status"]), [phase_path]
     if stage == "final_report":
         _validate_nested_report(
             report_path,
