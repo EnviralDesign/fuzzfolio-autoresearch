@@ -18,6 +18,17 @@ class DurableExecutionError(RuntimeError):
     """Raised when durable execution state is missing, partial, or conflicting."""
 
 
+def _canonical_snapshot(payload: Mapping[str, Any], *, label: str) -> dict[str, Any]:
+    """Detach journal inputs from caller-owned nested data before persistence."""
+    try:
+        snapshot = json.loads(canonical_json(dict(payload)))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise DurableExecutionError(f"{label} is not canonical JSON") from exc
+    if not isinstance(snapshot, dict):
+        raise DurableExecutionError(f"{label} must be a JSON object")
+    return snapshot
+
+
 def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     """Replace one JSON file atomically after flushing its bytes to disk."""
     target = Path(path).resolve(strict=False)
@@ -92,7 +103,7 @@ class DurableExecutionJournal:
     def __init__(self, path: Path, *, execution_id: str, lineage: Mapping[str, Any]):
         self.path = Path(path).resolve(strict=False)
         self.execution_id = str(execution_id)
-        self.lineage = dict(lineage)
+        self.lineage = _canonical_snapshot(lineage, label="execution journal lineage")
 
     def _new_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -140,7 +151,8 @@ class DurableExecutionJournal:
         journal = self.load(create=True)
         tasks = journal["tasks"]
         task_key = str(task_id)
-        payload_sha256 = canonical_sha256(dict(payload))
+        task_payload = _canonical_snapshot(payload, label="execution journal task payload")
+        payload_sha256 = canonical_sha256(task_payload)
         existing = tasks.get(task_key)
         if existing is not None:
             if existing.get("payload_sha256") != payload_sha256:
@@ -149,7 +161,7 @@ class DurableExecutionJournal:
         tasks[task_key] = {
             "task_id": task_key,
             "payload_sha256": payload_sha256,
-            "payload": dict(payload),
+            "payload": task_payload,
             "status": "pending",
             "terminal_receipt": None,
         }
@@ -161,7 +173,7 @@ class DurableExecutionJournal:
         task = journal["tasks"].get(str(task_id))
         if not isinstance(task, dict):
             raise DurableExecutionError(f"terminal receipt references unknown task: {task_id}")
-        terminal = dict(receipt)
+        terminal = _canonical_snapshot(receipt, label="execution journal terminal receipt")
         terminal_sha256 = canonical_sha256(terminal)
         if task.get("status") == "terminal":
             existing = task.get("terminal_receipt")

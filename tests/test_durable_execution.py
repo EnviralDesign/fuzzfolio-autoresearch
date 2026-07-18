@@ -49,6 +49,31 @@ def test_journal_fails_closed_on_payload_or_lineage_mismatch(tmp_path: Path) -> 
         ).load()
 
 
+def test_journal_owns_nested_task_and_terminal_payloads(tmp_path: Path) -> None:
+    journal = DurableExecutionJournal(
+        tmp_path / "journal.json",
+        execution_id="plan-1",
+        lineage={"cutoff": "A", "nested": {"version": 1}},
+    )
+    task = {"nested": {"value": "registered"}}
+    terminal = {"status": "calculated", "evidence": {"value": "terminal"}}
+
+    journal.register("task-1", task)
+    task["nested"]["value"] = "caller-mutated"
+    journal.complete("task-1", terminal)
+    terminal["evidence"]["value"] = "caller-mutated"
+
+    resumed = DurableExecutionJournal(
+        tmp_path / "journal.json",
+        execution_id="plan-1",
+        lineage={"cutoff": "A", "nested": {"version": 1}},
+    )
+    assert resumed.unresolved() == []
+    task_receipt = resumed.terminal("task-1")
+    assert task_receipt is not None
+    assert task_receipt["terminal_receipt"]["payload"]["evidence"]["value"] == "terminal"
+
+
 def test_artifact_receipt_rejects_partial_or_mutated_artifact(tmp_path: Path) -> None:
     artifact = tmp_path / "stage" / "result.json"
     artifact.parent.mkdir()

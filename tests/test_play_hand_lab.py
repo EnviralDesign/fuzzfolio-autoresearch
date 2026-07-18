@@ -1869,6 +1869,7 @@ class _DurabilityFakeCli:
 class _DurabilityFakeGateway:
     enqueued_task_ids: list[str] = []
     contradictory_duplicate = False
+    mutate_enqueued_payload = False
 
     def __init__(self, **_kwargs) -> None:
         self.results: list[dict] = []
@@ -1880,6 +1881,10 @@ class _DurabilityFakeGateway:
         for task in tasks:
             task_id = str(task["task_id"])
             self.enqueued_task_ids.append(task_id)
+            if self.mutate_enqueued_payload:
+                nested_payload = task.get("payload")
+                if isinstance(nested_payload, dict):
+                    nested_payload["gateway_observation"] = {"mutated_after_enqueue": True}
             result = {
                 "task_id": task_id,
                 "lane_id": task["lane_id"],
@@ -2019,6 +2024,27 @@ def test_process_result_batch_rejects_contradictory_terminal_duplicate(
         lab.cmd_play_hand_lab(
             _durability_runtime(profile_path, campaign_id="contradictory-duplicate")
         )
+
+
+def test_playhand_transition_and_resume_survive_gateway_payload_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    config = _test_config(tmp_path)
+    _DurabilityFakeGateway.enqueued_task_ids = []
+    _DurabilityFakeGateway.contradictory_duplicate = False
+    monkeypatch.setattr(_DurabilityFakeGateway, "mutate_enqueued_payload", True)
+    monkeypatch.setattr(lab, "load_config", lambda: config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", _DurabilityFakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", _DurabilityFakeGateway)
+
+    campaign_id = "gateway-payload-mutation"
+    assert lab.cmd_play_hand_lab(_durability_runtime(profile_path, campaign_id=campaign_id)) == 0
+    assert lab.cmd_play_hand_lab(
+        _durability_runtime(profile_path, campaign_id=campaign_id, resume=True)
+    ) == 0
 
 
 def test_deep_replay_rejects_duplicate_tasks_per_lane() -> None:
