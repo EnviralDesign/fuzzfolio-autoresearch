@@ -939,6 +939,29 @@ def _runtime_from_plan(cls: type, arguments: Mapping[str, Any], **operational: A
     return cls(**values)
 
 
+def _playhand_stage_resume_mode(*, campaign_root: Path, cutoff_resume: bool) -> bool:
+    """Scope resume to the durable PlayHand campaign, not its Level C predecessor."""
+    root = Path(campaign_root)
+    journal_path = root / "play-hand-lab-execution-journal.json"
+    if not root.exists():
+        # A cutoff may resume after Atlas completed while this downstream campaign
+        # has never started. PlayHand must create its first durable journal then.
+        return False
+    if not root.is_dir() or root.is_symlink():
+        raise LevelCWorkflowError("PlayHand campaign path is not a regular directory")
+    if not journal_path.is_file() or journal_path.is_symlink():
+        raise LevelCWorkflowError(
+            "existing PlayHand campaign is missing its durable execution journal"
+        )
+    if not cutoff_resume:
+        raise LevelCWorkflowError(
+            "existing PlayHand campaign requires Level C cutoff --resume"
+        )
+    # cmd_play_hand_lab owns strict journal lineage/state validation. Supplying
+    # resume=True here guarantees it loads rather than creates that journal.
+    return True
+
+
 def _month_span(start: str, end: str) -> int:
     left = datetime.fromisoformat(start.replace("Z", "+00:00"))
     right = datetime.fromisoformat(end.replace("Z", "+00:00"))
@@ -1107,6 +1130,11 @@ def _default_stage_handler(
         return "complete", [result.summary_path]
     if stage == "playhand":
         arguments, _ = executor_arguments_from_plan(plan_path, executor="playhand", config=config)
+        campaign_root = Path(expected["playhand_campaign"]["resolved_path"])
+        playhand_resume = _playhand_stage_resume_mode(
+            campaign_root=campaign_root,
+            cutoff_resume=resume,
+        )
         runtime = _runtime_from_plan(
             PlayHandLabRuntimeConfig,
             arguments,
@@ -1115,11 +1143,10 @@ def _default_stage_handler(
             gateway_token=gateway_token,
             active_runs=playhand_active_runs,
             trading_dashboard_root=trading_dashboard_root,
-            resume=resume,
+            resume=playhand_resume,
         )
         if cmd_play_hand_lab(runtime) != 0:
             raise LevelCWorkflowError("finite PlayHand coordinator failed")
-        campaign_root = Path(expected["playhand_campaign"]["resolved_path"])
         summary = campaign_root / "play-hand-lab-summary.json"
         if not summary.is_file():
             alternatives = list(campaign_root.glob("*summary*.json"))

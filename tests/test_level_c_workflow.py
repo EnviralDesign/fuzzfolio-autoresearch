@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from autoresearch import level_c_workflow as workflow
 from autoresearch.__main__ import build_parser
 from autoresearch.config import load_config
 from autoresearch.catalog_index import CATALOG_INDEX_SCHEMA_VERSION
@@ -625,6 +626,82 @@ def test_runner_recovers_exactly_once_across_every_stage_boundary(
         stage_handlers={stage: lambda **_kwargs: pytest.fail("completed stage reran") for stage in STAGES},
     )
     assert resumed["completed_stages"] == list(STAGES)
+
+
+def test_resumed_cutoff_creates_never_started_playhand_campaign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, active, _, _, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    plan_path = active / "derived" / "level-c" / "control" / "execution-plan-A.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    campaign_root = Path(plan["expected_artifacts"]["playhand_campaign"]["resolved_path"])
+    captured: dict[str, object] = {}
+    arguments = dict(plan["playhand_arguments"])
+    arguments.update(
+        {
+            "execution_plan_path": str(plan_path),
+            "execution_plan_id": plan["plan_id"],
+        }
+    )
+
+    monkeypatch.setattr(
+        workflow,
+        "executor_arguments_from_plan",
+        lambda *_args, **_kwargs: (arguments, plan),
+    )
+
+    def fake_playhand(runtime) -> int:
+        captured["resume"] = runtime.resume
+        campaign_root.mkdir(parents=True, exist_ok=True)
+        (campaign_root / "play-hand-lab-summary.json").write_text("{}", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(workflow, "cmd_play_hand_lab", fake_playhand)
+
+    outcome, artifacts = workflow._default_stage_handler(
+        "playhand",
+        config=config,
+        active_root=active,
+        cutoff="A",
+        plan_path=plan_path,
+        plan=plan,
+        resume=True,
+        gateway_url=None,
+        gateway_token=None,
+        atlas_active_probes=None,
+        playhand_active_runs=None,
+        nested_max_workers=1,
+        trading_dashboard_root=None,
+    )
+
+    assert outcome == "complete"
+    assert captured["resume"] is False
+    assert artifacts == [campaign_root / "play-hand-lab-summary.json"]
+
+
+def test_playhand_stage_existing_campaign_requires_its_own_strict_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, active, _, _, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    plan = json.loads(
+        (active / "derived" / "level-c" / "control" / "execution-plan-A.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    campaign_root = Path(plan["expected_artifacts"]["playhand_campaign"]["resolved_path"])
+    campaign_root.mkdir(parents=True)
+
+    with pytest.raises(LevelCWorkflowError, match="missing its durable execution journal"):
+        workflow._playhand_stage_resume_mode(campaign_root=campaign_root, cutoff_resume=True)
+
+    journal_path = campaign_root / "play-hand-lab-execution-journal.json"
+    journal_path.write_text("{}", encoding="utf-8")
+    assert workflow._playhand_stage_resume_mode(
+        campaign_root=campaign_root,
+        cutoff_resume=True,
+    )
+    with pytest.raises(LevelCWorkflowError, match="requires Level C cutoff --resume"):
+        workflow._playhand_stage_resume_mode(campaign_root=campaign_root, cutoff_resume=False)
 
 
 def test_runner_fails_closed_on_mutated_stage_artifact(

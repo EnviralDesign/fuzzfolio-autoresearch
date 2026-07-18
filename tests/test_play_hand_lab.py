@@ -398,6 +398,54 @@ def test_historical_campaign_path_accepts_resume_with_matching_durable_state(tmp
     lab._reject_existing_historical_campaign_path(campaign_dir, runtime=runtime)
 
 
+def test_historical_campaign_resume_rejects_mismatched_journal_without_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_config = _test_config(tmp_path)
+    runtime = _level_c_runtime(tmp_path, resume=True)
+    campaign_dir = (
+        fake_config.runs_root
+        / "derived"
+        / lab.PLAY_HAND_LAB_CAMPAIGNS_DIR
+        / str(runtime.campaign_id)
+    )
+    campaign_dir.mkdir(parents=True)
+    (campaign_dir / "run-metadata.json").write_text(
+        json.dumps(lab._historical_campaign_lineage(runtime)),
+        encoding="utf-8",
+    )
+    (campaign_dir / "play-hand-lab-state.json").write_text("{}", encoding="utf-8")
+    journal_path = campaign_dir / "play-hand-lab-execution-journal.json"
+    lab.DurableExecutionJournal(
+        journal_path,
+        execution_id="different-plan",
+        lineage={"different": "lineage"},
+    ).load(create=True)
+    original_journal = journal_path.read_bytes()
+
+    class FakeCli:
+        def __init__(self, _config) -> None:
+            pass
+
+    monkeypatch.setattr(lab, "load_config", lambda: fake_config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", FakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        lab,
+        "validate_executor_runtime_binding",
+        lambda *_args, **_kwargs: (
+            {},
+            {"generation": {"active_runs_root": str(fake_config.runs_root)}},
+        ),
+    )
+    monkeypatch.setattr(lab, "validate_profile_model_source_lock", lambda *_args, **_kwargs: {})
+
+    with pytest.raises(lab.DurableExecutionError, match="execution journal lineage mismatch"):
+        lab.cmd_play_hand_lab(runtime)
+
+    assert journal_path.read_bytes() == original_journal
+
+
 def test_level_c_lineage_and_seed_hash_are_persisted_in_campaign_and_lane_metadata(
     tmp_path: Path,
 ) -> None:
