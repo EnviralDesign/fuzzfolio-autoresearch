@@ -146,6 +146,34 @@ def _canonical_argument_value(value: Any) -> Any:
     return value
 
 
+def _effective_playhand_plan_arguments(arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Materialize deterministic PlayHand defaults before formal comparison.
+
+    ``PlayHandLabRuntimeConfig`` resolves a null permutation cap from the
+    frozen sweep-budget tier before it validates the formal runtime.  The plan
+    boundary must apply that same pure resolution first, otherwise a genuine
+    plan-derived runtime looks like an override.
+    """
+    effective = dict(arguments)
+    from .play_hand import resolve_sweep_budget
+
+    resolution = resolve_sweep_budget(
+        sweep_budget=effective.get("sweep_budget"),
+        max_sweep_permutations=effective.get("max_sweep_permutations"),
+    )
+    effective["max_sweep_permutations"] = int(resolution["value"])
+    # Runtime first resolves the cap, then normalizes the emitted label through
+    # the explicit-cap branch. Keep the plan-bound comparison byte-for-byte on
+    # that same effective representation.
+    effective["sweep_budget"] = str(
+        resolve_sweep_budget(
+            sweep_budget=effective.get("sweep_budget"),
+            max_sweep_permutations=effective["max_sweep_permutations"],
+        )["label"]
+    )
+    return effective
+
+
 def _semantic_arguments(values: Mapping[str, Any], *, executor: str) -> dict[str, Any]:
     operational = (
         _ATLAS_OPERATIONAL_ARGUMENTS if executor == "atlas" else _PLAYHAND_OPERATIONAL_ARGUMENTS
@@ -717,6 +745,8 @@ def executor_arguments_from_plan(
         raise LevelCOperatorError("executor must be atlas or playhand")
     arguments = dict(plan[f"{token}_arguments"])
     if token == "playhand":
+        arguments = _effective_playhand_plan_arguments(arguments)
+    if token == "playhand":
         deferred = _require_mapping(
             plan.get("playhand_deferred_binding"),
             label="execution plan playhand_deferred_binding",
@@ -783,7 +813,11 @@ def validate_executor_runtime_binding(
     for field, expected_value in expected.items():
         actual_value = actual.get(field)
         if field in path_fields:
-            expected_value = str(Path(str(expected_value)).expanduser().resolve(strict=False))
+            expected_value = (
+                str(Path(str(expected_value)).expanduser().resolve(strict=False))
+                if expected_value is not None
+                else None
+            )
             actual_value = (
                 str(Path(str(actual_value)).expanduser().resolve(strict=False))
                 if actual_value is not None

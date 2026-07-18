@@ -4,6 +4,7 @@ import hashlib
 import inspect
 import json
 from copy import deepcopy
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -24,7 +25,11 @@ from autoresearch.level_c_operator import (
     validate_profile_model_source_lock,
 )
 from autoresearch.atlas_lab import AtlasLabRuntimeConfig, run_atlas_lab
-from autoresearch.play_hand_lab import PlayHandLabRuntimeConfig, cmd_play_hand_lab
+from autoresearch.play_hand_lab import (
+    PlayHandLabRuntimeConfig,
+    _normalize_runtime,
+    cmd_play_hand_lab,
+)
 from autoresearch.level_c_protocol import (
     LevelCProtocolError,
     create_level_c_protocol,
@@ -235,6 +240,44 @@ def test_one_authoritative_plan_drives_atlas_and_playhand_executors(tmp_path: Pa
     assert set(inspect.signature(build_level_c_execution_plan).parameters) == {
         "active_runs_root", "protocol_path", "authority_path", "cutoff_key"
     }
+
+
+def test_plan_derived_playhand_runtime_validates_after_normalization_and_rejects_overrides(
+    tmp_path: Path,
+) -> None:
+    root, protocol_path, authority_path, _ = _bound_sources(tmp_path)
+    plan = build_level_c_execution_plan(root, protocol_path, authority_path, "C")
+    plan_path = tmp_path / "execution-plan.json"
+    create_level_c_execution_plan(plan_path, plan)
+    _materialize_plan_seed(plan)
+
+    arguments, _ = executor_arguments_from_plan(plan_path, executor="playhand")
+    runtime = _normalize_runtime(PlayHandLabRuntimeConfig(**arguments))
+    assert runtime.max_sweep_permutations == arguments["max_sweep_permutations"]
+    assert runtime.profile_path is None
+    validate_executor_runtime_binding(
+        plan_path,
+        executor="playhand",
+        observed=asdict(runtime),
+    )
+
+    changed_cap = asdict(runtime)
+    changed_cap["max_sweep_permutations"] = int(runtime.max_sweep_permutations or 0) + 1
+    with pytest.raises(LevelCOperatorError, match="max_sweep_permutations"):
+        validate_executor_runtime_binding(
+            plan_path,
+            executor="playhand",
+            observed=changed_cap,
+        )
+
+    changed_profile = asdict(runtime)
+    changed_profile["profile_path"] = tmp_path / "independent-profile.json"
+    with pytest.raises(LevelCOperatorError, match="profile_path"):
+        validate_executor_runtime_binding(
+            plan_path,
+            executor="playhand",
+            observed=changed_profile,
+        )
 
 
 def test_legacy_atlas_lab_runs_plan_binds_only_to_matching_canonical_receipt(
