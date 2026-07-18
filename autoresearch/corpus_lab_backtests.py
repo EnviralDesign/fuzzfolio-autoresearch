@@ -249,6 +249,17 @@ def _profile_snapshot_from_file(profile_path: Path | None) -> dict[str, Any]:
 
 def _request_payload_from_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
     artifact_dir = Path(str(attempt.get("artifact_dir") or "")).resolve()
+    # Formal nested evidence writes into a campaign-owned directory.  Its replay
+    # request remains immutable source evidence, explicitly recorded by the
+    # nested planner rather than copied into the new output tree.
+    nested_source_raw = str(attempt.get("_nested_source_artifact_dir") or "").strip()
+    if nested_source_raw:
+        nested_source_path = Path(nested_source_raw)
+        if not nested_source_path.is_dir() or nested_source_path.is_symlink():
+            raise RuntimeError(
+                "Nested source artifact directory is missing or not a regular directory"
+            )
+        artifact_dir = nested_source_path.resolve()
     payload = _load_json(artifact_dir / "deep-replay-job.json")
     request = payload.get("request") if isinstance(payload.get("request"), dict) else {}
     return dict(request) if isinstance(request, dict) else {}

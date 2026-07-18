@@ -232,6 +232,203 @@ def test_nested_gateway_date_only_end_is_half_open_midnight() -> None:
     assert _window_end("2026-07-14T00:00:00Z") == "2026-07-14T00:00:00Z"
 
 
+def test_formal_nested_train_materializes_only_under_campaign_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir, source_attempt = _attempt_fixture(
+        tmp_path,
+        run_id="source-lane",
+        attempt_id="attempt-source",
+    )
+    source_root = run_dir
+    source_tree_before = {
+        path.relative_to(source_root).as_posix(): path.read_bytes()
+        for path in source_root.rglob("*")
+        if path.is_file()
+    }
+    campaign_root = tmp_path / "nested-campaign"
+    materialization_root = campaign_root / "attempt-evidence"
+    nested_artifact_dir = materialization_root / canonical_sha256(
+        {"attempt_id": "attempt-source"}
+    ).removeprefix("sha256:")
+    nested_artifact_dir.mkdir(parents=True)
+    attempt = {
+        **source_attempt,
+        "artifact_dir": str(nested_artifact_dir),
+        "_nested_source_artifact_dir": source_attempt["artifact_dir"],
+        "_nested_materialization_root": str(materialization_root),
+    }
+
+    def fake_train(*, tasks, **_kwargs):
+        results = []
+        for task_attempt, task in tasks:
+            results.append(
+                {
+                    "status": "calculated",
+                    **materialize_full_backtest_lab_result(
+                        attempt=task_attempt,
+                        task=task,
+                        lab_result=_worker_result(task, tracked=False),
+                    ),
+                }
+            )
+        return results
+
+    monkeypatch.setattr(ng, "_run_train_tasks", fake_train)
+    result = run_nested_gateway_fold(
+        config=SimpleNamespace(research=SimpleNamespace(quality_score_preset="profile_drop")),
+        items=[(run_dir, attempt, dict(attempt), {})],
+        fold={
+            "fold_id": "fold-01",
+            "train_start": "2022-01-01",
+            "train_end": "2024-12-31",
+            "test_start": "2025-01-16",
+            "test_end": "2025-06-30",
+            "embargo_days": 15,
+        },
+        campaign_plan_id="nested:formal-isolation",
+        campaign_root=campaign_root,
+        lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+        max_workers=1,
+        train_horizon_months=36,
+        test_horizon_months=6,
+        lake_manifest_sha256="sha256:" + "a" * 64,
+        freeze_cells=False,
+        submit_outer=False,
+    )
+
+    assert result["status"] == "training_complete"
+    assert list(nested_artifact_dir.rglob("result.json"))
+    source_tree_after = {
+        path.relative_to(source_root).as_posix(): path.read_bytes()
+        for path in source_root.rglob("*")
+        if path.is_file()
+    }
+    assert source_tree_after == source_tree_before
+
+
+def test_formal_nested_rejects_source_lane_as_materialization_target(
+    tmp_path: Path,
+) -> None:
+    run_dir, attempt = _attempt_fixture(
+        tmp_path,
+        run_id="source-lane",
+        attempt_id="attempt-source",
+    )
+    campaign_root = tmp_path / "nested-campaign"
+    attempt["_nested_materialization_root"] = str(campaign_root / "attempt-evidence")
+
+    with pytest.raises(RuntimeError, match="not campaign-owned"):
+        run_nested_gateway_fold(
+            config=SimpleNamespace(research=SimpleNamespace(quality_score_preset="profile_drop")),
+            items=[(run_dir, attempt, dict(attempt), {})],
+            fold={
+                "fold_id": "fold-01",
+                "train_start": "2022-01-01",
+                "train_end": "2024-12-31",
+                "test_start": "2025-01-16",
+                "test_end": "2025-06-30",
+                "embargo_days": 15,
+            },
+            campaign_plan_id="nested:formal-isolation",
+            campaign_root=campaign_root,
+            lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+            max_workers=1,
+            train_horizon_months=36,
+            test_horizon_months=6,
+            lake_manifest_sha256="sha256:" + "a" * 64,
+            freeze_cells=False,
+            submit_outer=False,
+        )
+
+
+def test_formal_nested_rejects_non_deterministic_materialization_target(
+    tmp_path: Path,
+) -> None:
+    run_dir, source_attempt = _attempt_fixture(
+        tmp_path,
+        run_id="source-lane",
+        attempt_id="attempt-source",
+    )
+    campaign_root = tmp_path / "nested-campaign"
+    materialization_root = campaign_root / "attempt-evidence"
+    unexpected_target = materialization_root / "not-the-attempt-hash"
+    unexpected_target.mkdir(parents=True)
+    attempt = {
+        **source_attempt,
+        "artifact_dir": str(unexpected_target),
+        "_nested_source_artifact_dir": source_attempt["artifact_dir"],
+        "_nested_materialization_root": str(materialization_root),
+    }
+
+    with pytest.raises(RuntimeError, match="not campaign-owned"):
+        run_nested_gateway_fold(
+            config=SimpleNamespace(research=SimpleNamespace(quality_score_preset="profile_drop")),
+            items=[(run_dir, attempt, dict(attempt), {})],
+            fold={
+                "fold_id": "fold-01",
+                "train_start": "2022-01-01",
+                "train_end": "2024-12-31",
+                "test_start": "2025-01-16",
+                "test_end": "2025-06-30",
+                "embargo_days": 15,
+            },
+            campaign_plan_id="nested:formal-isolation",
+            campaign_root=campaign_root,
+            lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+            max_workers=1,
+            train_horizon_months=36,
+            test_horizon_months=6,
+            lake_manifest_sha256="sha256:" + "a" * 64,
+            freeze_cells=False,
+            submit_outer=False,
+        )
+
+
+def test_formal_nested_rejects_symbolic_link_source_request(
+    tmp_path: Path,
+) -> None:
+    run_dir, source_attempt = _attempt_fixture(
+        tmp_path,
+        run_id="source-lane",
+        attempt_id="attempt-source",
+    )
+    source_link = tmp_path / "linked-source"
+    try:
+        source_link.symlink_to(
+            Path(source_attempt["artifact_dir"]), target_is_directory=True
+        )
+    except OSError:
+        pytest.skip("symbolic links are unavailable in this test environment")
+    campaign_root = tmp_path / "nested-campaign"
+    materialization_root = campaign_root / "attempt-evidence"
+    nested_artifact_dir = materialization_root / canonical_sha256(
+        {"attempt_id": "attempt-source"}
+    ).removeprefix("sha256:")
+    nested_artifact_dir.mkdir(parents=True)
+    attempt = {
+        **source_attempt,
+        "artifact_dir": str(nested_artifact_dir),
+        "_nested_source_artifact_dir": str(source_link),
+        "_nested_materialization_root": str(materialization_root),
+    }
+
+    with pytest.raises(RuntimeError, match="source artifact directory"):
+        build_full_backtest_lab_task(
+            config=SimpleNamespace(
+                research=SimpleNamespace(quality_score_preset="profile_drop")
+            ),
+            run_dir=run_dir,
+            attempt=attempt,
+            run_metadata={},
+            lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+            evidence_window_start="2022-01-01T00:00:00Z",
+            evidence_window_end="2024-12-31T00:00:00Z",
+            evidence_role="training",
+            lake_manifest_sha256="sha256:" + "a" * 64,
+        )
+
+
 def test_nested_gateway_fold_is_redacted_and_resumable(
     tmp_path: Path, monkeypatch
 ) -> None:

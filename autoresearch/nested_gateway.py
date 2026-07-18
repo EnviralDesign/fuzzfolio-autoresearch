@@ -19,7 +19,7 @@ from .evidence_artifacts import (
     evidence_artifact_paths,
     validate_evidence_artifact_bundle,
 )
-from .evidence_plan import validate_replay_evidence_plan
+from .evidence_plan import canonical_sha256, validate_replay_evidence_plan
 from .nested_evidence import (
     NestedEvidenceFold,
     build_nested_train_fold,
@@ -54,6 +54,46 @@ def _no_valid_cell_outcome(validation: dict[str, Any]) -> dict[str, Any] | None:
 
 def _validation_stage_status(validation: dict[str, Any]) -> str:
     return "nonviable" if _no_valid_cell_outcome(validation) else str(validation.get("status") or "")
+
+
+def _validate_nested_materialization_target(
+    *, attempt: dict[str, Any], campaign_root: Path
+) -> None:
+    """Formal callers mark an attempt so replay evidence cannot write into source lanes."""
+    raw_root = attempt.get("_nested_materialization_root")
+    if raw_root is None:
+        return
+    raw_campaign_root = Path(campaign_root)
+    raw_expected_root = raw_campaign_root / "attempt-evidence"
+    raw_root_path = Path(str(raw_root))
+    raw_artifact_dir = Path(str(attempt.get("artifact_dir") or ""))
+    if any(
+        path.is_symlink()
+        for path in (
+            raw_campaign_root,
+            raw_expected_root,
+            raw_root_path,
+            raw_artifact_dir,
+        )
+    ):
+        raise RuntimeError("formal nested artifact directory uses a symbolic link")
+    root = raw_root_path.resolve()
+    artifact_dir = raw_artifact_dir.resolve()
+    expected_root = raw_expected_root.resolve()
+    attempt_id = str(attempt.get("attempt_id") or "").strip()
+    expected_target = expected_root / canonical_sha256(
+        {"attempt_id": attempt_id}
+    ).removeprefix("sha256:")
+    try:
+        root.relative_to(expected_root)
+    except ValueError as exc:
+        raise RuntimeError("formal nested artifact directory escapes its campaign root") from exc
+    if (
+        not attempt_id
+        or root != expected_root
+        or artifact_dir != expected_target
+    ):
+        raise RuntimeError("formal nested artifact directory is not campaign-owned")
 
 
 def _materialize_nested_lab_result(
@@ -308,6 +348,11 @@ def run_nested_gateway_fold(
         raise ValueError("nested items require non-empty attempt_id values")
     if len(set(item_attempt_ids)) != len(item_attempt_ids):
         raise ValueError("nested items contain duplicate or ambiguous attempt_id values")
+    for _run_dir, attempt, _row, _run_metadata in items:
+        _validate_nested_materialization_target(
+            attempt=attempt,
+            campaign_root=Path(campaign_root),
+        )
     selected_values = (
         list(outer_selected_attempt_ids) if outer_selected_attempt_ids is not None else None
     )

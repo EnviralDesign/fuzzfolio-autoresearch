@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -252,6 +253,45 @@ def _path_within(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _level_c_campaign_root(*, config: AppConfig, campaign_id: str) -> Path:
+    token = str(campaign_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?", token):
+        raise NestedPipelineError("nested campaign ID must be a safe single path component")
+    raw_base = config.derived_root / "nested-evidence"
+    if raw_base.exists() and (not raw_base.is_dir() or raw_base.is_symlink()):
+        raise NestedPipelineError("nested evidence root is not a regular directory")
+    raw_campaign_root = raw_base / token
+    if raw_campaign_root.exists() and (
+        not raw_campaign_root.is_dir() or raw_campaign_root.is_symlink()
+    ):
+        raise NestedPipelineError("nested campaign root is not a regular directory")
+    base = raw_base.resolve()
+    campaign_root = raw_campaign_root.resolve()
+    if campaign_root.parent != base:
+        raise NestedPipelineError("nested campaign root escapes the derived evidence root")
+    return campaign_root
+
+
+def _level_c_nested_artifact_dir(
+    *, campaign_root: Path, attempt_id: str, create: bool
+) -> Path:
+    """Resolve a deterministic, nested-owned evidence root for one source attempt."""
+    token = canonical_sha256({"attempt_id": attempt_id}).removeprefix("sha256:")
+    root = campaign_root / "attempt-evidence"
+    if root.exists() and (not root.is_dir() or root.is_symlink()):
+        raise NestedPipelineError("nested evidence root is not a regular directory")
+    if create:
+        root.mkdir(parents=True, exist_ok=True)
+    target = root / token
+    if target.exists() and (not target.is_dir() or target.is_symlink()):
+        raise NestedPipelineError("nested attempt evidence root is not a regular directory")
+    if create:
+        target.mkdir(parents=True, exist_ok=True)
+    if not _path_within(target, root):
+        raise NestedPipelineError("nested attempt evidence root escapes the campaign")
+    return target
 
 
 def _resolve_level_c_recorded_path(
@@ -656,6 +696,18 @@ def prepare_nested_pipeline(
                 )
             worker_ready_profiles[attempt_id] = dict(worker_ready_profile)
 
+    cohort_manifest_id = str((cohort or {}).get("manifest_id") or "") or None
+    campaign_plan_id = str(campaign_id)
+    if cohort_manifest_id:
+        campaign_plan_id += f":attempt-cohort:{cohort_manifest_id}"
+    if execution_plan_id:
+        campaign_plan_id += f":execution-plan:{execution_plan_id}"
+    campaign_root = (
+        _level_c_campaign_root(config=config, campaign_id=str(campaign_id))
+        if is_level_c_cohort
+        else config.derived_root / "nested-evidence" / str(campaign_id)
+    )
+
     def materialize_item(
         row: dict[str, Any],
     ) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
@@ -664,19 +716,35 @@ def prepare_nested_pipeline(
         if attempt_id in worker_ready_profiles:
             attempt["_worker_ready_profile_snapshot"] = worker_ready_profiles[attempt_id]
         run_dir = config.runs_root / str(row["run_id"])
-        return run_dir, attempt, dict(row), load_run_metadata(run_dir)
+        if is_level_c_cohort:
+            source_artifact_raw = Path(str(attempt.get("artifact_dir") or ""))
+            if not source_artifact_raw.is_dir() or source_artifact_raw.is_symlink():
+                raise NestedPipelineError(
+                    f"Level C source artifact directory is invalid: {attempt_id}"
+                )
+            source_artifact_dir = source_artifact_raw.resolve()
+            if _path_within(campaign_root, run_dir) or _path_within(
+                run_dir, campaign_root
+            ):
+                raise NestedPipelineError(
+                    f"Level C nested evidence overlaps frozen source evidence: {attempt_id}"
+                )
+            nested_artifact_dir = _level_c_nested_artifact_dir(
+                campaign_root=campaign_root,
+                attempt_id=attempt_id,
+                create=not dry_run,
+            )
+            attempt["_nested_source_artifact_dir"] = str(source_artifact_dir)
+            attempt["_nested_materialization_root"] = str(
+                (campaign_root / "attempt-evidence").resolve()
+            )
+            attempt["artifact_dir"] = str(nested_artifact_dir)
+        return run_dir, attempt, dict(attempt), load_run_metadata(run_dir)
 
     items = tuple(
         materialize_item(row)
         for row in resolved_rows
     )
-    cohort_manifest_id = str((cohort or {}).get("manifest_id") or "") or None
-    campaign_plan_id = str(campaign_id)
-    if cohort_manifest_id:
-        campaign_plan_id += f":attempt-cohort:{cohort_manifest_id}"
-    if execution_plan_id:
-        campaign_plan_id += f":execution-plan:{execution_plan_id}"
-    campaign_root = config.derived_root / "nested-evidence" / str(campaign_id)
     inner_config = dict((suite.get("temporal_validation") or {}).get("inner_validation") or {})
     inner_geometry = []
     for outer_fold in folds:
@@ -711,6 +779,11 @@ def prepare_nested_pipeline(
         "optimizer_backend": optimizer_backend,
         "worker_contract_hash": effective_contract,
         "input_resolution": input_resolution,
+        "materialization_root": (
+            str((campaign_root / "attempt-evidence").resolve())
+            if is_level_c_cohort
+            else None
+        ),
         "folds": folds,
         "inner_validation": inner_geometry,
     }
@@ -727,7 +800,7 @@ def prepare_nested_pipeline(
         cohort_manifest_id=cohort_manifest_id,
         requested_attempt_ids=tuple(requested),
         items=items,
-        catalog_rows=tuple(resolved_rows),
+        catalog_rows=tuple(dict(item[1]) for item in items),
         folds=tuple(folds),
         train_months=int(train_months),
         test_months=int(test_months),

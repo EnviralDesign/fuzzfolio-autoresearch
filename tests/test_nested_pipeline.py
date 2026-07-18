@@ -351,6 +351,54 @@ def test_prepare_uses_configured_root_when_cli_root_is_omitted(
     assert context.execution_plan_id in context.campaign_plan_id
 
 
+def test_prepare_keeps_source_artifact_dir_for_non_level_c_cohorts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = "sha256:" + "c" * 64
+    source_artifact_dir = tmp_path / "runs" / "run-a" / "evals" / "source"
+    source_artifact_dir.mkdir(parents=True)
+    _patch_prepare_dependencies(
+        monkeypatch,
+        rows=[
+            {
+                "attempt_id": "attempt-a",
+                "run_id": "run-a",
+                "artifact_dir": str(source_artifact_dir),
+            }
+        ],
+        live_contract=contract,
+    )
+
+    context = _prepare(tmp_path, monkeypatch)
+
+    assert Path(context.items[0][1]["artifact_dir"]) == source_artifact_dir
+    assert "_nested_materialization_root" not in context.items[0][1]
+
+
+def test_level_c_campaign_root_rejects_unsafe_campaign_id(tmp_path: Path) -> None:
+    with pytest.raises(NestedPipelineError, match="safe single path component"):
+        pipeline._level_c_campaign_root(
+            config=_prepare_config(tmp_path),
+            campaign_id="../frozen-source",
+        )
+
+
+def test_prepare_preserves_legacy_campaign_path_for_non_level_c_cohort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_prepare_dependencies(
+        monkeypatch,
+        rows=[{"attempt_id": "attempt-a", "run_id": "run-a"}],
+        live_contract="sha256:" + "c" * 64,
+    )
+
+    context = _prepare(tmp_path, monkeypatch, campaign_id="legacy/child")
+
+    assert context.campaign_root == (
+        tmp_path / "runs" / "derived" / "nested-evidence" / "legacy" / "child"
+    )
+
+
 def test_prepare_passes_worker_ready_resolver_to_level_c_cohort(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -502,11 +550,46 @@ def test_prepare_materializes_worker_ready_profile_for_level_c_cohort(
         ),
     )
 
+    dry_context = _prepare(
+        tmp_path,
+        monkeypatch,
+        campaign_id="dry-run-campaign",
+        dry_run=True,
+    )
+    assert not dry_context.campaign_root.exists()
+
+    with monkeypatch.context() as isolated:
+        isolated.setattr(
+            pipeline,
+            "_level_c_campaign_root",
+            lambda **_kwargs: lane / "nested-output",
+        )
+        with pytest.raises(NestedPipelineError, match="overlaps frozen source evidence"):
+            _prepare(tmp_path, isolated, campaign_id="overlap-campaign")
+
+    source_tree_before = {
+        path.relative_to(lane).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in lane.rglob("*")
+        if path.is_file()
+    }
     context = _prepare(tmp_path, monkeypatch)
 
     assert context.items[0][1]["_worker_ready_profile_snapshot"] == worker_ready_profile
     assert context.catalog_rows[0]["is_canonical_attempt"] is True
     assert context.preview["input_resolution"] == "level_c_frozen_playhand_evidence"
+    assert Path(context.items[0][1]["_nested_source_artifact_dir"]) == artifact_dir
+    assert Path(context.items[0][1]["artifact_dir"]).is_relative_to(context.campaign_root)
+    assert (
+        Path(context.items[0][1]["artifact_dir"]).parent
+        == context.campaign_root / "attempt-evidence"
+    )
+    assert context.catalog_rows[0]["artifact_dir"] == context.items[0][1]["artifact_dir"]
+    source_tree_after = {
+        path.relative_to(lane).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in lane.rglob("*")
+        if path.is_file()
+    }
+    assert source_tree_after == source_tree_before
 
 
 def test_prepare_rejects_worker_contract_drift_and_missing_cohort_member(
