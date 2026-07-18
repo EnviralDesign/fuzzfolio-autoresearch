@@ -9,6 +9,7 @@ import pytest
 
 import autoresearch.nested_pipeline as pipeline
 from autoresearch.corpus_lab_backtests import LabBacktestConfig
+from autoresearch.evidence_plan import build_replay_evidence_plan
 from autoresearch.nested_pipeline import (
     NestedPipelineContext,
     NestedPipelineError,
@@ -381,7 +382,9 @@ def test_prepare_materializes_worker_ready_profile_for_level_c_cohort(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     contract = "sha256:" + "c" * 64
-    profile = tmp_path / "runs" / "run-a" / "profile.json"
+    run_root = tmp_path / "runs"
+    lane = run_root / "run-a"
+    profile = lane / "profile.json"
     profile.parent.mkdir(parents=True, exist_ok=True)
     authoring_profile = {
         "format": "fuzzfolio.scoring-profile",
@@ -391,12 +394,82 @@ def test_prepare_materializes_worker_ready_profile_for_level_c_cohort(
     worker_ready_profile = {"name": "Bounded", "notificationThreshold": 80.0}
     profile.write_text(json.dumps(authoring_profile), encoding="utf-8")
     profile_sha256 = "sha256:" + hashlib.sha256(profile.read_bytes()).hexdigest()
-    row = {
+    plan = build_replay_evidence_plan(
+        campaign_plan_id="playhand-lab:run-a",
+        evidence_role="training",
+        selection_data_end="2024-12-30T00:00:00Z",
+        analysis_window_start="2021-12-30T00:00:00Z",
+        analysis_window_end="2024-12-30T00:00:00Z",
+        requested_horizon_months=36,
+        profile_snapshot=worker_ready_profile,
+        lake_manifest_sha256="sha256:" + "a" * 64,
+    )
+    artifact_dir = lane / "evals" / "final"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "deep-replay-job.json").write_text(
+        json.dumps({"request": {"instruments": ["EURUSD"], "timeframe": "M5"}}),
+        encoding="utf-8",
+    )
+    attempt = {
         "attempt_id": "attempt-a",
         "run_id": "run-a",
+        "runner": "play_hand_v1",
+        "play_hand_stage": "final_36mo",
         "profile_path": str(profile),
+        "artifact_dir": str(artifact_dir),
+        "evidence_plan_id": plan.plan_id,
+        "evidence_plan": plan.model_dump(mode="json"),
+        "execution_evidence": {
+            "plan_id": plan.plan_id,
+            "profile_snapshot_sha256": plan.profile_snapshot_sha256,
+            "execution_cell_sha256": plan.execution_cell_sha256,
+            "observed_lake_manifest_sha256": plan.lake_manifest_sha256,
+        },
     }
-    _patch_prepare_dependencies(monkeypatch, rows=[row], live_contract=contract)
+    (lane / "attempts.jsonl").write_text(json.dumps(attempt) + "\n", encoding="utf-8")
+    (lane / "run-metadata.json").write_text(
+        json.dumps(
+            {
+                "run_id": "run-a",
+                "canonical_attempt_id": "attempt-a",
+                "parent_campaign_id": "campaign-a",
+                "lab_campaign_id": "campaign-a",
+                "as_of_date": "2024-12-30T00:00:00Z",
+                "lake_manifest_sha256": plan.lake_manifest_sha256,
+                "terminal": True,
+                "failed_task_count": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline, "load_research_suite", lambda *_args: ({}, {}))
+    monkeypatch.setattr(
+        pipeline,
+        "temporal_folds",
+        lambda **_kwargs: [
+            {
+                "fold_id": "fold-01",
+                "train_start": "2021-01-01",
+                "train_end": "2023-12-31",
+                "test_start": "2024-01-16",
+                "test_end": "2024-07-15",
+                "embargo_days": 15,
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "iter_catalog_rows",
+        lambda *_args, **_kwargs: pytest.fail("Level C must not read the mutable catalog"),
+    )
+    monkeypatch.setattr(pipeline, "_resolve_account", lambda *_args: {})
+    monkeypatch.setattr(pipeline, "validate_profile_model_source_lock", lambda *_args: {})
+    monkeypatch.setattr(pipeline, "_live_worker_contract", lambda _root: contract)
+    monkeypatch.setattr(
+        pipeline,
+        "resolve_lab_backtest_config",
+        lambda **kwargs: LabBacktestConfig(worker_contract_hash=kwargs["worker_contract_hash"]),
+    )
     monkeypatch.setattr(
         pipeline,
         "_cohort_attempts",
@@ -405,12 +478,17 @@ def test_prepare_materializes_worker_ready_profile_for_level_c_cohort(
             {
                 "schema": pipeline.LEVEL_C_COHORT_SCHEMA,
                 "manifest_id": "cohort",
+                "runs_root": str(run_root),
+                "playhand_campaign_id": "campaign-a",
+                "as_of_date": "2024-12-30T00:00:00Z",
+                "lake_manifest_sha256": plan.lake_manifest_sha256,
                 "candidates": [
                     {
                         "attempt_id": "attempt-a",
                         "run_id": "run-a",
                         "profile_path_relative_to_runs_root": "run-a/profile.json",
                         "profile_sha256": profile_sha256,
+                        "discovery_evidence_plan_id": plan.plan_id,
                     }
                 ],
             },
@@ -427,6 +505,8 @@ def test_prepare_materializes_worker_ready_profile_for_level_c_cohort(
     context = _prepare(tmp_path, monkeypatch)
 
     assert context.items[0][1]["_worker_ready_profile_snapshot"] == worker_ready_profile
+    assert context.catalog_rows[0]["is_canonical_attempt"] is True
+    assert context.preview["input_resolution"] == "level_c_frozen_playhand_evidence"
 
 
 def test_prepare_rejects_worker_contract_drift_and_missing_cohort_member(
@@ -470,37 +550,12 @@ def test_prepare_rejects_alternate_trading_dashboard_root(
 def test_prepare_binds_level_c_cohort_run_and_profile_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    profile = tmp_path / "runs" / "run-a" / "profile.json"
-    profile.parent.mkdir(parents=True, exist_ok=True)
-    profile.write_text('{"profile":"frozen"}', encoding="utf-8")
-    profile_sha256 = "sha256:" + hashlib.sha256(profile.read_bytes()).hexdigest()
-    row = {
-        "attempt_id": "attempt-a",
-        "run_id": "run-b",
-        "profile_path": str(profile),
-    }
-    _patch_prepare_dependencies(
-        monkeypatch, rows=[row], live_contract="sha256:" + "c" * 64
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "_cohort_attempts",
-        lambda _path, _root, **_kwargs: (
-            ["attempt-a"],
-            {
-                "schema": pipeline.LEVEL_C_COHORT_SCHEMA,
-                "manifest_id": "cohort",
-                "candidates": [
-                    {
-                        "attempt_id": "attempt-a",
-                        "run_id": "run-a",
-                        "profile_path_relative_to_runs_root": "run-a/profile.json",
-                        "profile_sha256": profile_sha256,
-                    }
-                ],
-            },
-        ),
-    )
-
-    with pytest.raises(NestedPipelineError, match="catalog identity differs"):
+    # The direct Level C resolver must reject an attempt whose lane identity no
+    # longer matches the cohort, rather than falling back to a catalog row.
+    test_prepare_materializes_worker_ready_profile_for_level_c_cohort(tmp_path, monkeypatch)
+    attempt_path = tmp_path / "runs" / "run-a" / "attempts.jsonl"
+    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+    attempt["run_id"] = "run-b"
+    attempt_path.write_text(json.dumps(attempt) + "\n", encoding="utf-8")
+    with pytest.raises(NestedPipelineError, match="canonical attempt identity differs"):
         _prepare(tmp_path, monkeypatch)

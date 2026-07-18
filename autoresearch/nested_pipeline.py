@@ -13,13 +13,18 @@ from typing import Any, Mapping
 from .catalog_index import iter_catalog_rows
 from .config import AppConfig
 from .corpus_lab_backtests import LabBacktestConfig, resolve_lab_backtest_config
-from .evidence_plan import canonical_json, canonical_sha256
+from .evidence_plan import (
+    canonical_json,
+    canonical_sha256,
+    normalize_evidence_profile_snapshot,
+    validate_replay_evidence_plan,
+)
 from .fixed_cohort import (
     FIXED_COHORT_SCHEMA,
     fixed_cohort_attempt_ids,
     validate_fixed_corpus_cohort,
 )
-from .ledger import load_run_metadata
+from .ledger import load_attempts, load_run_metadata
 from .level_c import (
     LEVEL_C_COHORT_SCHEMA,
     ProfileSnapshotResolver,
@@ -241,6 +246,210 @@ def _worker_ready_profile_snapshot_resolver(
     return resolve
 
 
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_level_c_recorded_path(
+    value: Any,
+    *,
+    recorded_runs_root: Path,
+    active_runs_root: Path,
+    label: str,
+) -> Path:
+    """Rebase a cohort-attested in-tree path into the active generation root."""
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        raise NestedPipelineError(f"{label} is missing")
+    raw = Path(raw_value).expanduser()
+    if raw.is_absolute():
+        try:
+            relative = raw.resolve(strict=False).relative_to(
+                recorded_runs_root.resolve(strict=False)
+            )
+        except ValueError as exc:
+            raise NestedPipelineError(
+                f"{label} escapes the recorded generation runs root: {raw}"
+            ) from exc
+    else:
+        if any(part == ".." for part in raw.parts) or str(raw) in {"", "."}:
+            raise NestedPipelineError(f"{label} must be an in-tree path")
+        relative = raw
+    resolved = (active_runs_root.resolve() / relative).resolve(strict=False)
+    if not _path_within(resolved, active_runs_root):
+        raise NestedPipelineError(f"{label} escapes the active generation runs root")
+    return resolved
+
+
+def _resolve_level_c_cohort_rows(
+    *,
+    cohort: Mapping[str, Any],
+    runs_root: Path,
+    requested_attempt_ids: list[str],
+    profile_snapshot_resolver: ProfileSnapshotResolver,
+) -> list[dict[str, Any]]:
+    """Resolve frozen Level C PlayHand candidates without a mutable corpus index.
+
+    A fresh formal PlayHand campaign is intentionally not added to the legacy corpus
+    catalog. The validated Level C cohort is the authority for its exact lane and
+    canonical attempt; this function revalidates that narrow evidence path before
+    returning catalog-shaped rows for the existing nested executor.
+    """
+    recorded_runs_root_value = str(cohort.get("runs_root") or "").strip()
+    if not recorded_runs_root_value:
+        raise NestedPipelineError("Level C cohort omitted its recorded runs root")
+    recorded_runs_root = Path(recorded_runs_root_value).expanduser()
+    active_runs_root = runs_root.expanduser().resolve()
+    candidates = list(cohort.get("candidates") or [])
+    by_id = {
+        str(candidate.get("attempt_id") or ""): candidate
+        for candidate in candidates
+        if isinstance(candidate, Mapping) and str(candidate.get("attempt_id") or "")
+    }
+    if set(by_id) != set(requested_attempt_ids) or len(by_id) != len(candidates):
+        raise NestedPipelineError("Level C cohort candidate membership is ambiguous")
+
+    rows: list[dict[str, Any]] = []
+    for attempt_id in requested_attempt_ids:
+        candidate = by_id[attempt_id]
+        run_id = str(candidate.get("run_id") or "").strip()
+        if not run_id or Path(run_id).name != run_id:
+            raise NestedPipelineError(
+                f"frozen cohort candidate has an unsafe run identity: {attempt_id}"
+            )
+        run_dir = _resolve_level_c_recorded_path(
+            run_id,
+            recorded_runs_root=recorded_runs_root,
+            active_runs_root=active_runs_root,
+            label=f"frozen cohort lane root {attempt_id}",
+        )
+        if not run_dir.is_dir() or run_dir.is_symlink():
+            raise NestedPipelineError(f"frozen cohort lane root is invalid: {attempt_id}")
+        metadata = load_run_metadata(run_dir)
+        campaign_id = str(cohort.get("playhand_campaign_id") or "")
+        if (
+            str(metadata.get("run_id") or "") != run_id
+            or str(metadata.get("canonical_attempt_id") or "") != attempt_id
+            or str(metadata.get("parent_campaign_id") or "") != campaign_id
+            or str(metadata.get("lab_campaign_id") or "") != campaign_id
+            or str(metadata.get("as_of_date") or "") != str(cohort.get("as_of_date") or "")
+            or str(metadata.get("lake_manifest_sha256") or "")
+            != str(cohort.get("lake_manifest_sha256") or "")
+            or metadata.get("terminal") is not True
+            or int(metadata.get("failed_task_count") or 0) != 0
+        ):
+            raise NestedPipelineError(
+                f"frozen cohort lane metadata differs: {attempt_id}"
+            )
+        matches = [
+            row
+            for row in load_attempts(run_dir / "attempts.jsonl")
+            if str(row.get("attempt_id") or "") == attempt_id
+        ]
+        if len(matches) != 1:
+            raise NestedPipelineError(
+                f"frozen cohort canonical attempt is missing or ambiguous: {attempt_id}"
+            )
+        attempt = dict(matches[0])
+        if (
+            str(attempt.get("run_id") or "") != run_id
+            or str(attempt.get("runner") or "") != "play_hand_v1"
+            or str(attempt.get("play_hand_stage") or "") != "final_36mo"
+        ):
+            raise NestedPipelineError(
+                f"frozen cohort canonical attempt identity differs: {attempt_id}"
+            )
+        expected_profile = _resolve_level_c_recorded_path(
+            candidate.get("profile_path_relative_to_runs_root"),
+            recorded_runs_root=recorded_runs_root,
+            active_runs_root=active_runs_root,
+            label=f"frozen cohort profile {attempt_id}",
+        )
+        recorded_profile = _resolve_level_c_recorded_path(
+            attempt.get("profile_path"),
+            recorded_runs_root=recorded_runs_root,
+            active_runs_root=active_runs_root,
+            label=f"frozen cohort canonical attempt profile {attempt_id}",
+        )
+        if (
+            recorded_profile != expected_profile
+            or not expected_profile.is_file()
+            or expected_profile.is_symlink()
+            or not _path_within(expected_profile, run_dir)
+            or _sha256_file(expected_profile) != str(candidate.get("profile_sha256") or "")
+        ):
+            raise NestedPipelineError(
+                f"frozen cohort profile identity differs: {attempt_id}"
+            )
+        try:
+            authoring_profile = json.loads(expected_profile.read_text(encoding="utf-8"))
+            plan = validate_replay_evidence_plan(attempt.get("evidence_plan"))
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise NestedPipelineError(
+                f"frozen cohort canonical evidence is invalid: {attempt_id}"
+            ) from exc
+        if not isinstance(authoring_profile, dict):
+            raise NestedPipelineError(f"frozen cohort profile is not an object: {attempt_id}")
+        try:
+            worker_ready_profile = profile_snapshot_resolver(authoring_profile)
+        except Exception as exc:
+            raise NestedPipelineError(
+                f"frozen cohort worker-ready profile could not be resolved: {attempt_id}"
+            ) from exc
+        if not isinstance(worker_ready_profile, dict) or (
+            canonical_sha256(normalize_evidence_profile_snapshot(worker_ready_profile))
+            != plan.profile_snapshot_sha256
+        ):
+            raise NestedPipelineError(
+                f"frozen cohort worker-ready profile differs from evidence: {attempt_id}"
+            )
+        receipt = attempt.get("execution_evidence")
+        if (
+            plan.plan_id != str(candidate.get("discovery_evidence_plan_id") or "")
+            or str(attempt.get("evidence_plan_id") or "") != plan.plan_id
+            or not isinstance(receipt, Mapping)
+            or receipt.get("plan_id") != plan.plan_id
+            or receipt.get("profile_snapshot_sha256") != plan.profile_snapshot_sha256
+            or receipt.get("execution_cell_sha256") != plan.execution_cell_sha256
+            or receipt.get("observed_lake_manifest_sha256") != plan.lake_manifest_sha256
+        ):
+            raise NestedPipelineError(
+                f"frozen cohort execution evidence differs: {attempt_id}"
+            )
+        artifact_dir = _resolve_level_c_recorded_path(
+            attempt.get("artifact_dir"),
+            recorded_runs_root=recorded_runs_root,
+            active_runs_root=active_runs_root,
+            label=f"frozen cohort canonical attempt artifact {attempt_id}",
+        )
+        if (
+            not artifact_dir.is_dir()
+            or artifact_dir.is_symlink()
+            or not _path_within(artifact_dir, run_dir)
+            or not (artifact_dir / "deep-replay-job.json").is_file()
+        ):
+            raise NestedPipelineError(
+                f"frozen cohort canonical attempt artifact is invalid: {attempt_id}"
+            )
+        attempt.update(
+            {
+                "profile_path": str(expected_profile),
+                "artifact_dir": str(artifact_dir),
+                # The lane metadata, not a mutable catalog flag, attests canonicality.
+                "is_canonical_attempt": True,
+                "is_canonical_playhand_attempt": True,
+                "_worker_ready_profile_snapshot": dict(worker_ready_profile),
+                "_nested_input_source": "level_c_frozen_playhand_evidence",
+            }
+        )
+        rows.append(attempt)
+    return rows
+
+
 def prepare_nested_pipeline(
     *,
     config: AppConfig,
@@ -353,40 +562,56 @@ def prepare_nested_pipeline(
     )
     if not folds:
         raise NestedPipelineError("nested fold geometry does not fit the requested range")
-    rows = list(
-        iter_catalog_rows(
-            config,
-            run_ids=run_ids,
-            attempt_ids=sorted(requested) if requested else None,
-        )
-    )
-    if str(scope or "canonical").lower() == "canonical":
-        rows = [
-            row
-            for row in rows
-            if row.get("is_canonical_attempt") or row.get("is_canonical_playhand_attempt")
-        ]
-    if not requested:
-        requested = [str(row.get("attempt_id") or "") for row in rows]
-        if not requested:
-            raise NestedPipelineError("no attempts matched the nested evidence scope")
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in rows:
-        grouped.setdefault(str(row.get("attempt_id") or ""), []).append(dict(row))
-    missing = sorted(set(requested) - set(grouped))
-    ambiguous = sorted(key for key, values in grouped.items() if len(values) != 1)
-    extra = sorted(set(grouped) - set(requested))
-    if missing or ambiguous or extra:
-        raise NestedPipelineError(
-            f"frozen cohort catalog resolution failed: missing={missing}, ambiguous={ambiguous}, extra={extra}"
-        )
-    resolved_rows = [grouped[attempt_id][0] for attempt_id in requested]
+    is_level_c_cohort = cohort is not None and cohort.get("schema") == LEVEL_C_COHORT_SCHEMA
     worker_ready_profiles: dict[str, dict[str, Any]] = {}
-    if cohort is not None and cohort.get("schema") == LEVEL_C_COHORT_SCHEMA:
+    if is_level_c_cohort:
         if profile_snapshot_resolver is None:
             raise NestedPipelineError(
                 "Level C nested evidence requires the plan-bound profile snapshot resolver"
             )
+        resolved_rows = _resolve_level_c_cohort_rows(
+            cohort=cohort,
+            runs_root=config.runs_root,
+            requested_attempt_ids=requested,
+            profile_snapshot_resolver=profile_snapshot_resolver,
+        )
+        worker_ready_profiles = {
+            str(row["attempt_id"]): dict(row["_worker_ready_profile_snapshot"])
+            for row in resolved_rows
+        }
+        input_resolution = "level_c_frozen_playhand_evidence"
+    else:
+        rows = list(
+            iter_catalog_rows(
+                config,
+                run_ids=run_ids,
+                attempt_ids=sorted(requested) if requested else None,
+            )
+        )
+        if str(scope or "canonical").lower() == "canonical":
+            rows = [
+                row
+                for row in rows
+                if row.get("is_canonical_attempt") or row.get("is_canonical_playhand_attempt")
+            ]
+        if not requested:
+            requested = [str(row.get("attempt_id") or "") for row in rows]
+            if not requested:
+                raise NestedPipelineError("no attempts matched the nested evidence scope")
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(str(row.get("attempt_id") or ""), []).append(dict(row))
+        missing = sorted(set(requested) - set(grouped))
+        ambiguous = sorted(key for key, values in grouped.items() if len(values) != 1)
+        extra = sorted(set(grouped) - set(requested))
+        if missing or ambiguous or extra:
+            raise NestedPipelineError(
+                f"frozen cohort catalog resolution failed: missing={missing}, ambiguous={ambiguous}, extra={extra}"
+            )
+        resolved_rows = [grouped[attempt_id][0] for attempt_id in requested]
+        input_resolution = "attempt_catalog"
+
+    if is_level_c_cohort:
         candidates = {
             str(candidate.get("attempt_id") or ""): candidate
             for candidate in cohort.get("candidates") or []
@@ -485,6 +710,7 @@ def prepare_nested_pipeline(
         "selection_basis": selection_basis,
         "optimizer_backend": optimizer_backend,
         "worker_contract_hash": effective_contract,
+        "input_resolution": input_resolution,
         "folds": folds,
         "inner_validation": inner_geometry,
     }
