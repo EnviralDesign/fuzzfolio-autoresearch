@@ -56,7 +56,7 @@ from .runtime_policy_lock import build_runtime_policy_lock, policy_lock_provenan
 
 BOOTSTRAP_RECEIPT_SCHEMA = "autoresearch-level-c-bootstrap-receipt-v1"
 STAGE_RECEIPT_SCHEMA = "autoresearch-level-c-stage-receipt-v1"
-DEVELOPMENT_POLICY_SCHEMA = "autoresearch-level-c-development-policy-v1"
+DEVELOPMENT_POLICY_SCHEMA = "autoresearch-level-c-development-policy-v2"
 AUDIT_SCHEMA = "autoresearch-level-c-audit-v1"
 CONTROL_RELATIVE = Path("derived") / "level-c" / "control"
 _GENERATION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -895,6 +895,51 @@ def _validate_stage_receipt(path: Path, *, plan_id: str, stage: str) -> dict[str
     return payload
 
 
+def _validated_terminal_development_prefix(
+    active_root: Path, *, cutoff: str, plan: Mapping[str, Any]
+) -> dict[str, str]:
+    """Return the single receipt that terminally closes a development cutoff."""
+    _assert_stage_receipt_prefix(active_root, cutoff)
+    receipts: list[tuple[str, dict[str, Any]]] = []
+    for stage in STAGES:
+        receipt_path = _stage_receipt_path(active_root, cutoff, stage)
+        if not receipt_path.exists():
+            break
+        receipts.append(
+            (
+                stage,
+                _validate_stage_receipt(
+                    receipt_path,
+                    plan_id=str(plan["plan_id"]),
+                    stage=stage,
+                ),
+            )
+        )
+    if not receipts:
+        raise LevelCWorkflowError(
+            f"development cutoff {cutoff} has no validated terminal receipt"
+        )
+    for index, (stage, receipt) in enumerate(receipts):
+        if receipt.get("outcome") in NON_PROMOTABLE_OUTCOMES and index != len(receipts) - 1:
+            raise LevelCWorkflowError(
+                f"development cutoff {cutoff} has receipts after non-promotable {stage}"
+            )
+    terminal_stage, terminal_receipt = receipts[-1]
+    terminal_outcome = str(terminal_receipt.get("outcome") or "")
+    if not (
+        terminal_outcome in NON_PROMOTABLE_OUTCOMES
+        or (terminal_stage == "final_report" and terminal_outcome == "complete")
+    ):
+        raise LevelCWorkflowError(
+            f"development cutoff {cutoff} does not have a validated terminal prefix"
+        )
+    return {
+        "stage": terminal_stage,
+        "outcome": terminal_outcome,
+        "receipt_sha256": str(terminal_receipt["receipt_sha256"]),
+    }
+
+
 def _validate_atlas_stage_root(
     plan: Mapping[str, Any],
     *,
@@ -1297,25 +1342,64 @@ def _default_stage_handler(
 
 def _development_policy(active_root: Path, plans: Mapping[str, dict[str, Any]]) -> dict[str, Any]:
     paths = _control_paths(active_root)
-    receipts = {}
-    for key in "AB":
-        receipt = _validate_stage_receipt(
-            _stage_receipt_path(active_root, key, "final_report"),
-            plan_id=plans[key]["plan_id"],
-            stage="final_report",
+    terminals = {
+        key: _validated_terminal_development_prefix(
+            active_root,
+            cutoff=key,
+            plan=plans[key],
         )
-        receipts[key] = receipt["receipt_sha256"]
+        for key in "AB"
+    }
     workflow = _operator_semantics(plans["A"])
     if _operator_semantics(plans["B"]) != workflow:
         raise LevelCWorkflowError("development cutoff workflow semantics differ")
     identity = {
         "schema_version": DEVELOPMENT_POLICY_SCHEMA,
-        "development_cutoffs": receipts,
+        "development_cutoffs": terminals,
         "workflow_arguments": workflow,
         "no_validation_feedback": True,
     }
     payload = {**identity, "policy_sha256": canonical_sha256(identity)}
     return _create_or_verify(paths["development_policy"], payload)
+
+
+def _validate_development_policy(
+    active_root: Path,
+    *,
+    plans: Mapping[str, dict[str, Any]],
+    workflow: Mapping[str, Any],
+) -> dict[str, Any]:
+    paths = _control_paths(active_root)
+    policy = _load_json(paths["development_policy"], label="development policy")
+    identity = {field: value for field, value in policy.items() if field != "policy_sha256"}
+    recorded = policy.get("development_cutoffs")
+    if (
+        set(policy)
+        != {
+            "schema_version",
+            "development_cutoffs",
+            "workflow_arguments",
+            "no_validation_feedback",
+            "policy_sha256",
+        }
+        or policy.get("schema_version") != DEVELOPMENT_POLICY_SCHEMA
+        or policy.get("policy_sha256") != canonical_sha256(identity)
+        or not isinstance(recorded, Mapping)
+        or set(recorded.keys()) != {"A", "B"}
+        or policy.get("no_validation_feedback") is not True
+    ):
+        raise LevelCWorkflowError("frozen development policy is invalid")
+    if policy.get("workflow_arguments") != dict(workflow):
+        raise LevelCWorkflowError("frozen development policy semantics differ")
+    for key in "AB":
+        expected = _validated_terminal_development_prefix(
+            active_root,
+            cutoff=key,
+            plan=plans[key],
+        )
+        if recorded.get(key) != expected:
+            raise LevelCWorkflowError("frozen development policy receipt drift")
+    return policy
 
 
 def run_level_c_cutoff(
@@ -1352,26 +1436,18 @@ def run_level_c_cutoff(
         for token in "ABCD"
     }
     _assert_stage_receipt_prefix(active_root, key)
+    if key == "B" and paths["development_policy"].exists():
+        _validate_development_policy(
+            active_root,
+            plans=plans,
+            workflow=workflow,
+        )
     if key in "CD":
-        policy = _load_json(paths["development_policy"], label="development policy")
-        identity = {field: value for field, value in policy.items() if field != "policy_sha256"}
-        if (
-            policy.get("schema_version") != DEVELOPMENT_POLICY_SCHEMA
-            or policy.get("policy_sha256") != canonical_sha256(identity)
-            or set((policy.get("development_cutoffs") or {}).keys()) != {"A", "B"}
-            or policy.get("no_validation_feedback") is not True
-        ):
-            raise LevelCWorkflowError("frozen development policy is invalid")
-        if policy.get("workflow_arguments") != workflow:
-            raise LevelCWorkflowError("frozen development policy semantics differ")
-        for development_key in "AB":
-            receipt = _validate_stage_receipt(
-                _stage_receipt_path(active_root, development_key, "final_report"),
-                plan_id=plans[development_key]["plan_id"],
-                stage="final_report",
-            )
-            if policy["development_cutoffs"].get(development_key) != receipt["receipt_sha256"]:
-                raise LevelCWorkflowError("frozen development policy receipt drift")
+        _validate_development_policy(
+            active_root,
+            plans=plans,
+            workflow=workflow,
+        )
     handlers = dict(stage_handlers or {})
     completed: list[str] = []
     for stage in STAGES:
@@ -1425,7 +1501,7 @@ def run_level_c_cutoff(
         completed.append(stage)
         if normalized_outcome in NON_PROMOTABLE_OUTCOMES:
             break
-    if key == "B" and completed and completed[-1] == "final_report":
+    if key == "B" and completed:
         _development_policy(active_root, plans)
     return {
         "status": "complete" if completed and completed[-1] == "final_report" else "non_promotable",
@@ -1551,30 +1627,24 @@ def audit_level_c(
             )
         cutoff_results[key] = {"stages": stages, "terminal_outcome": terminal}
     policy_result = None
+    policy_required = str(cutoff or "").upper() in {"C", "D"} or any(
+        _stage_receipt_path(active_root, key, "atlas").exists() for key in "CD"
+    )
     if paths["development_policy"].exists():
-        policy = _load_json(paths["development_policy"], label="development policy")
-        identity = {field: value for field, value in policy.items() if field != "policy_sha256"}
-        if policy.get("policy_sha256") != canonical_sha256(identity):
-            raise LevelCWorkflowError("development policy drift")
-        if set((policy.get("development_cutoffs") or {}).keys()) != {"A", "B"}:
-            raise LevelCWorkflowError("development policy contains validation feedback")
-        if policy.get("workflow_arguments") != bootstrap.get("operator_semantics"):
-            raise LevelCWorkflowError("development policy workflow semantics drift")
         all_plans = {
             key: load_authoritative_level_c_execution_plan(
                 paths["control"] / f"execution-plan-{key}.json", config=config
             )
             for key in "AB"
         }
-        for key, plan in all_plans.items():
-            receipt = _validate_stage_receipt(
-                _stage_receipt_path(active_root, key, "final_report"),
-                plan_id=plan["plan_id"],
-                stage="final_report",
-            )
-            if policy["development_cutoffs"].get(key) != receipt["receipt_sha256"]:
-                raise LevelCWorkflowError("development policy receipt drift")
+        policy = _validate_development_policy(
+            active_root,
+            plans=all_plans,
+            workflow=bootstrap.get("operator_semantics") or {},
+        )
         policy_result = policy["policy_sha256"]
+    elif policy_required:
+        raise LevelCWorkflowError("validation cutoff audit requires a frozen development policy")
     identity = {
         "schema_version": AUDIT_SCHEMA,
         "status": "valid",

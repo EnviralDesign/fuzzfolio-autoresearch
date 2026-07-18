@@ -897,6 +897,253 @@ def test_nested_portfolio_no_candidate_is_cleanly_terminal(
     assert not _stage_receipt_path(active, "A", "selected_outer").exists()
 
 
+def _terminal_stage_handlers(
+    active: Path,
+    *,
+    terminal_stages: dict[str, tuple[str, str]],
+    called: list[tuple[str, str]],
+):
+    def handler(stage: str, **kwargs):
+        cutoff = str(kwargs["cutoff"])
+        called.append((cutoff, stage))
+        artifact = active / "derived" / "level-c" / f"{cutoff}-{stage}.json"
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact.write_text(json.dumps({"cutoff": cutoff, "stage": stage}), encoding="utf-8")
+        terminal = terminal_stages.get(cutoff)
+        if terminal == (stage, "no_candidate"):
+            return "no_candidate", [artifact]
+        return ("candidates_frozen" if stage == "frozen_cohort" else "complete"), [artifact]
+
+    return {stage: handler for stage in STAGES}
+
+
+def test_development_policy_freezes_nonpromotable_prefixes_and_b_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, active, _, _, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    called: list[tuple[str, str]] = []
+    handlers = _terminal_stage_handlers(
+        active,
+        terminal_stages={
+            "A": ("frozen_cohort", "no_candidate"),
+            "B": ("frozen_portfolio", "no_candidate"),
+        },
+        called=called,
+    )
+    assert run_level_c_cutoff(
+        config=config,
+        active_runs_root=active,
+        cutoff="A",
+        resume=True,
+        stage_handlers=handlers,
+    )["status"] == "non_promotable"
+    result = run_level_c_cutoff(
+        config=config,
+        active_runs_root=active,
+        cutoff="B",
+        resume=True,
+        stage_handlers=handlers,
+    )
+    assert result["status"] == "non_promotable"
+    policy_path = active / "derived" / "level-c" / "control" / "development-policy.json"
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    assert policy["schema_version"] == "autoresearch-level-c-development-policy-v2"
+    assert policy["development_cutoffs"] == {
+        "A": {
+            "stage": "frozen_cohort",
+            "outcome": "no_candidate",
+            "receipt_sha256": json.loads(
+                _stage_receipt_path(active, "A", "frozen_cohort").read_text(encoding="utf-8")
+            )["receipt_sha256"],
+        },
+        "B": {
+            "stage": "frozen_portfolio",
+            "outcome": "no_candidate",
+            "receipt_sha256": json.loads(
+                _stage_receipt_path(active, "B", "frozen_portfolio").read_text(encoding="utf-8")
+            )["receipt_sha256"],
+        },
+    }
+    assert policy["no_validation_feedback"] is True
+
+    policy_path.unlink()
+    replayed: list[str] = []
+    resumed = run_level_c_cutoff(
+        config=config,
+        active_runs_root=active,
+        cutoff="B",
+        resume=True,
+        stage_handlers={
+            stage: lambda **_kwargs: (replayed.append(stage), pytest.fail("stage replayed"))
+            for stage in STAGES
+        },
+    )
+    assert resumed["status"] == "non_promotable"
+    assert replayed == []
+    assert policy_path.is_file()
+
+    _stage_receipt_path(active, "B", "frozen_portfolio").unlink()
+    with pytest.raises(LevelCWorkflowError, match="validated terminal prefix"):
+        run_level_c_cutoff(
+            config=config,
+            active_runs_root=active,
+            cutoff="B",
+            resume=True,
+            stage_handlers={
+                stage: lambda **_kwargs: pytest.fail("stage replayed after policy drift")
+                for stage in STAGES
+            },
+        )
+
+
+def test_development_policy_final_report_compatibility_and_no_feedback_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, active, _, _, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    called: list[tuple[str, str]] = []
+    handlers = _terminal_stage_handlers(active, terminal_stages={}, called=called)
+
+    for cutoff in "CD":
+        with pytest.raises(LevelCWorkflowError, match="development policy"):
+            run_level_c_cutoff(
+                config=config,
+                active_runs_root=active,
+                cutoff=cutoff,
+                resume=True,
+                stage_handlers=handlers,
+            )
+        with pytest.raises(LevelCWorkflowError, match="development policy"):
+            audit_level_c(config=config, active_runs_root=active, cutoff=cutoff)
+    for cutoff in "AB":
+        assert run_level_c_cutoff(
+            config=config,
+            active_runs_root=active,
+            cutoff=cutoff,
+            resume=True,
+            stage_handlers=handlers,
+        )["status"] == "complete"
+    policy_path = active / "derived" / "level-c" / "control" / "development-policy.json"
+    before = policy_path.read_bytes()
+    policy = json.loads(before)
+    assert {
+        key: (value["stage"], value["outcome"])
+        for key, value in policy["development_cutoffs"].items()
+    } == {"A": ("final_report", "complete"), "B": ("final_report", "complete")}
+
+    policy["validation_feedback"] = {"C": "forbidden"}
+    identity = {key: value for key, value in policy.items() if key != "policy_sha256"}
+    policy["policy_sha256"] = workflow.canonical_sha256(identity)
+    policy_path.write_text(json.dumps(policy, sort_keys=True), encoding="utf-8")
+    for cutoff in "CD":
+        with pytest.raises(LevelCWorkflowError, match="frozen development policy is invalid"):
+            run_level_c_cutoff(
+                config=config,
+                active_runs_root=active,
+                cutoff=cutoff,
+                resume=True,
+                stage_handlers=handlers,
+            )
+    policy_path.write_bytes(before)
+
+    assert run_level_c_cutoff(
+        config=config,
+        active_runs_root=active,
+        cutoff="C",
+        resume=True,
+        stage_handlers=handlers,
+    )["status"] == "complete"
+    assert policy_path.read_bytes() == before
+    assert set(json.loads(policy_path.read_text(encoding="utf-8"))["development_cutoffs"]) == {
+        "A",
+        "B",
+    }
+
+
+def test_development_policy_rejects_incomplete_prefix_gap_and_terminal_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, active, _, _, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    plans = {
+        cutoff: workflow.load_authoritative_level_c_execution_plan(
+            active / "derived" / "level-c" / "control" / f"execution-plan-{cutoff}.json",
+            config=config,
+        )
+        for cutoff in "AB"
+    }
+    artifact = active / "derived" / "level-c" / "incomplete.json"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text("{}", encoding="utf-8")
+    workflow._write_stage_receipt(
+        active_root=active,
+        cutoff="A",
+        stage="atlas",
+        plan_id=plans["A"]["plan_id"],
+        outcome="complete",
+        artifacts=[artifact],
+    )
+    with pytest.raises(LevelCWorkflowError, match="validated terminal prefix"):
+        workflow._development_policy(active, plans)
+
+    gap = _stage_receipt_path(active, "A", "frozen_cohort")
+    workflow._write_stage_receipt(
+        active_root=active,
+        cutoff="A",
+        stage="frozen_cohort",
+        plan_id=plans["A"]["plan_id"],
+        outcome="no_candidate",
+        artifacts=[artifact],
+    )
+    assert gap.is_file()
+    with pytest.raises(LevelCWorkflowError, match="missing predecessor"):
+        workflow._development_policy(active, plans)
+
+    config, active, _, _, _ = _bootstrap_fixture(tmp_path / "drift", monkeypatch)
+    called: list[tuple[str, str]] = []
+    handlers = _terminal_stage_handlers(
+        active,
+        terminal_stages={
+            "A": ("frozen_cohort", "no_candidate"),
+            "B": ("frozen_portfolio", "no_candidate"),
+        },
+        called=called,
+    )
+    for cutoff in "AB":
+        run_level_c_cutoff(
+            config=config,
+            active_runs_root=active,
+            cutoff=cutoff,
+            resume=True,
+            stage_handlers=handlers,
+        )
+    policy_path = active / "derived" / "level-c" / "control" / "development-policy.json"
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    policy["development_cutoffs"]["B"]["stage"] = "final_report"
+    identity = {key: value for key, value in policy.items() if key != "policy_sha256"}
+    policy["policy_sha256"] = workflow.canonical_sha256(identity)
+    policy_path.write_text(json.dumps(policy, sort_keys=True), encoding="utf-8")
+    with pytest.raises(LevelCWorkflowError, match="receipt drift"):
+        run_level_c_cutoff(
+            config=config,
+            active_runs_root=active,
+            cutoff="D",
+            resume=True,
+            stage_handlers=handlers,
+    )
+    monkeypatch.setattr(workflow, "_validate_atlas_stage_root", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        workflow,
+        "_level_c_profile_snapshot_resolver",
+        lambda **_kwargs: (lambda profile: profile),
+    )
+    monkeypatch.setattr(
+        workflow,
+        "validate_level_c_cohort",
+        lambda *_args, **_kwargs: {"candidate_count": 0, "candidates": []},
+    )
+    with pytest.raises(LevelCWorkflowError, match="receipt drift"):
+        audit_level_c(config=config, active_runs_root=active, cutoff="B")
+
+
 def test_audit_is_non_mutating(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config, active, _, _, _ = _bootstrap_fixture(tmp_path, monkeypatch)
     before = {
