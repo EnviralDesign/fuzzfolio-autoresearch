@@ -547,7 +547,10 @@ def build_initial_four_cutoff_plans(
         cutoff_campaign_id = f"{campaign_base}-{key.lower()}-{digest}"
         cohort_id = f"level-c-{key.lower()}-{digest}"
         artifact_locations = {
-            "atlas_run": f"derived/atlas-lab-runs/{atlas_run_id}",
+            # AtlasLab persists every run beneath ``derived/atlas-runs``.  This
+            # path is a formal execution input, not a display label: PlayHand
+            # later reads the seed and lineage receipts from this exact root.
+            "atlas_run": f"derived/atlas-runs/{atlas_run_id}",
             "playhand_campaign": f"derived/play-hand-lab-campaigns/{cutoff_campaign_id}",
             "frozen_cohort": f"derived/level-c-cohorts/{cohort_id}.json",
             "campaign_receipt": f"derived/level-c-campaigns/{cohort_id}/campaign-state.json",

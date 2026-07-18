@@ -180,6 +180,9 @@ def test_initial_cutoffs_are_derived_from_nested_report(tmp_path: Path) -> None:
         "frozen_cohort",
         "campaign_receipt",
     }
+    assert plans[0]["expected_artifact_locations"]["atlas_run"] == (
+        f"derived/atlas-runs/{plans[0]['atlas_run_id']}"
+    )
     assert all(
         "nested" not in location
         for plan in plans

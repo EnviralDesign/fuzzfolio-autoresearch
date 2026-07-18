@@ -39,6 +39,7 @@ def _hash(character: str) -> str:
 
 
 def _cutoff(key: str, role: str) -> dict[str, object]:
+    atlas_run_id = f"atlas-{key.lower()}"
     payload: dict[str, object] = {
         "cutoff_key": key,
         "role": role,
@@ -51,12 +52,12 @@ def _cutoff(key: str, role: str) -> dict[str, object]:
         "embargo_days": 15,
         "outer_test_start": f"2025-0{ord(key) - 64}-18T00:00:00Z",
         "outer_test_end": f"2025-0{ord(key) - 64}-21T00:00:00Z",
-        "atlas_run_id": f"atlas-{key.lower()}",
+        "atlas_run_id": atlas_run_id,
         "playhand_campaign_id": f"playhand-{key.lower()}",
         "cohort_id": f"cohort-{key.lower()}",
         "seed": 100 + ord(key),
         "expected_artifact_locations": {
-            "atlas_run": f"derived/atlas/{key.lower()}",
+            "atlas_run": f"derived/atlas-runs/{atlas_run_id}",
             "playhand_campaign": f"derived/playhand/{key.lower()}",
         },
     }
@@ -215,16 +216,8 @@ def test_one_authoritative_plan_drives_atlas_and_playhand_executors(tmp_path: Pa
     assert atlas_args["run_id"] == "atlas-c"
     assert atlas_args["execution_plan_id"] == atlas_plan["plan_id"]
 
-    seed_path = Path(plan["playhand_arguments"]["seed_plan_path"])
-    seed_path.parent.mkdir(parents=True, exist_ok=True)
-    seed_path.write_text('{"recipes":{},"sampling_policy":{}}', encoding="utf-8")
+    seed_path = _materialize_plan_seed(plan)
     seed_sha256 = "sha256:" + hashlib.sha256(seed_path.read_bytes()).hexdigest()
-    (seed_path.parent / "level-c-lineage.json").write_text(
-        json.dumps(
-            {"artifact_sha256": {"play-hand-seed-plan.json": seed_sha256}}
-        ),
-        encoding="utf-8",
-    )
 
     playhand_args, playhand_plan = executor_arguments_from_plan(
         plan_path, executor="playhand"
@@ -237,22 +230,82 @@ def test_one_authoritative_plan_drives_atlas_and_playhand_executors(tmp_path: Pa
     assert plan["cutoff"]["geometry"]["embargo_days"] == 15
     assert plan["cutoff"]["geometry"]["outer_test_end"] == "2025-03-21T00:00:00Z"
     assert plan["playhand_deferred_binding"]["required_before_execution"] is True
-    assert plan["expected_artifacts"]["atlas_run"]["relative_path"] == "derived/atlas/c"
+    assert plan["expected_artifacts"]["atlas_run"]["relative_path"] == "derived/atlas-runs/atlas-c"
     assert Path(plan["expected_artifacts"]["atlas_run"]["resolved_path"]).is_relative_to(root)
     assert set(inspect.signature(build_level_c_execution_plan).parameters) == {
         "active_runs_root", "protocol_path", "authority_path", "cutoff_key"
     }
 
 
-def _materialize_plan_seed(plan: dict[str, object]) -> None:
-    seed_path = Path(plan["playhand_arguments"]["seed_plan_path"])
+def test_legacy_atlas_lab_runs_plan_binds_only_to_matching_canonical_receipt(
+    tmp_path: Path,
+) -> None:
+    root, protocol_path, authority_path, generation = _bound_sources(tmp_path)
+
+    def legacy_alias(protocol: dict[str, object]) -> None:
+        cutoff = protocol["cutoff_plans"][2]
+        cutoff["expected_artifact_locations"]["atlas_run"] = "derived/atlas-lab-runs/atlas-c"
+
+    _rewrite_bound_protocol(root, protocol_path, authority_path, generation, legacy_alias)
+    plan = build_level_c_execution_plan(root, protocol_path, authority_path, "C")
+    plan_path = tmp_path / "execution-plan.json"
+    create_level_c_execution_plan(plan_path, plan)
+    canonical_seed_path = _materialize_plan_seed(plan)
+
+    arguments, _ = executor_arguments_from_plan(plan_path, executor="playhand")
+
+    assert plan["expected_artifacts"]["atlas_run"]["relative_path"] == "derived/atlas-lab-runs/atlas-c"
+    assert Path(arguments["seed_plan_path"]) == canonical_seed_path
+
+
+def test_playhand_rejects_wrong_or_missing_formal_atlas_lineage(tmp_path: Path) -> None:
+    root, protocol_path, authority_path, generation = _bound_sources(tmp_path)
+
+    def wrong_root(protocol: dict[str, object]) -> None:
+        cutoff = protocol["cutoff_plans"][2]
+        cutoff["expected_artifact_locations"]["atlas_run"] = "derived/atlas-runs/not-atlas-c"
+
+    _rewrite_bound_protocol(root, protocol_path, authority_path, generation, wrong_root)
+    wrong_plan = build_level_c_execution_plan(root, protocol_path, authority_path, "C")
+    wrong_path = tmp_path / "wrong-execution-plan.json"
+    create_level_c_execution_plan(wrong_path, wrong_plan)
+    _materialize_plan_seed(wrong_plan)
+    with pytest.raises(LevelCOperatorError, match="does not match its formal run id"):
+        executor_arguments_from_plan(wrong_path, executor="playhand")
+
+    _rewrite_bound_protocol(
+        root,
+        protocol_path,
+        authority_path,
+        generation,
+        lambda _protocol: None,
+    )
+    plan = build_level_c_execution_plan(root, protocol_path, authority_path, "C")
+    plan_path = tmp_path / "missing-lineage-execution-plan.json"
+    create_level_c_execution_plan(plan_path, plan)
+    seed_path = _materialize_plan_seed(plan)
+    (seed_path.parent / "level-c-lineage.json").unlink()
+    with pytest.raises(LevelCOperatorError, match="deferred Atlas binding is unreadable"):
+        executor_arguments_from_plan(plan_path, executor="playhand")
+
+
+def _materialize_plan_seed(plan: dict[str, object]) -> Path:
+    root = Path(str(plan["generation"]["active_runs_root"]))
+    run_id = str(plan["cutoff"]["atlas_run_id"])
+    seed_path = root / "derived" / "atlas-runs" / run_id / "recipe-priors" / "play-hand-seed-plan.json"
     seed_path.parent.mkdir(parents=True, exist_ok=True)
     seed_path.write_text('{"recipes":{},"sampling_policy":{}}', encoding="utf-8")
     seed_sha256 = "sha256:" + hashlib.sha256(seed_path.read_bytes()).hexdigest()
     (seed_path.parent / "level-c-lineage.json").write_text(
-        json.dumps({"artifact_sha256": {"play-hand-seed-plan.json": seed_sha256}}),
+        json.dumps(
+            {
+                "historical_lineage": {"execution_plan_id": plan["plan_id"]},
+                "artifact_sha256": {"play-hand-seed-plan.json": seed_sha256},
+            }
+        ),
         encoding="utf-8",
     )
+    return seed_path
 
 
 def test_programmatic_atlas_executor_rejects_lineage_and_worker_contract_bypass(

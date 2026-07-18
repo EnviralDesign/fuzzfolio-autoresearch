@@ -36,6 +36,7 @@ from .level_c_operator import (
     create_level_c_execution_plan,
     executor_arguments_from_plan,
     load_authoritative_level_c_execution_plan,
+    resolve_level_c_atlas_run_root,
 )
 from .level_c_protocol import (
     LEVEL_C_PROTOCOL_SCHEMA,
@@ -890,6 +891,29 @@ def _validate_stage_receipt(path: Path, *, plan_id: str, stage: str) -> dict[str
     return payload
 
 
+def _validate_atlas_stage_root(
+    plan: Mapping[str, Any],
+    *,
+    run_root: Path | None = None,
+    summary_path: Path | None = None,
+    receipt: Mapping[str, Any] | None = None,
+) -> None:
+    """Require Level C Atlas execution and receipts to name the canonical root."""
+    expected_root = resolve_level_c_atlas_run_root(plan, require_lineage=True).resolve()
+    expected_summary = (expected_root / "atlas-lab-summary.json").resolve(strict=True)
+    if run_root is not None and run_root.resolve(strict=True) != expected_root:
+        raise LevelCWorkflowError("Atlas run root differs from the authoritative execution plan")
+    if summary_path is not None and summary_path.resolve(strict=True) != expected_summary:
+        raise LevelCWorkflowError("Atlas summary path differs from the authoritative execution plan")
+    if receipt is not None:
+        artifacts = receipt.get("artifacts") if isinstance(receipt, Mapping) else None
+        if not isinstance(artifacts, list) or len(artifacts) != 1:
+            raise LevelCWorkflowError("Atlas stage receipt must contain exactly one summary artifact")
+        recorded = Path(str(artifacts[0].get("path") or "")).resolve(strict=True)
+        if recorded != expected_summary:
+            raise LevelCWorkflowError("Atlas stage receipt artifact is outside the authoritative Atlas root")
+
+
 def _write_stage_receipt(
     *, active_root: Path, cutoff: str, stage: str, plan_id: str, outcome: str, artifacts: list[Path]
 ) -> dict[str, Any]:
@@ -1075,6 +1099,11 @@ def _default_stage_handler(
         )
         if result.status != "completed":
             raise LevelCWorkflowError(f"Atlas ended with status {result.status}")
+        _validate_atlas_stage_root(
+            plan,
+            run_root=result.run_root,
+            summary_path=result.summary_path,
+        )
         return "complete", [result.summary_path]
     if stage == "playhand":
         arguments, _ = executor_arguments_from_plan(plan_path, executor="playhand", config=config)
@@ -1105,7 +1134,7 @@ def _default_stage_handler(
         else:
             cohort = freeze_level_c_cohort(
                 runs_root=active_root,
-                atlas_run_root=Path(expected["atlas_run"]["resolved_path"]),
+                atlas_run_root=resolve_level_c_atlas_run_root(plan, require_lineage=True),
                 playhand_campaign_id=plan["cutoff"]["playhand_campaign_id"],
                 as_of_date=plan["cutoff"]["geometry"]["selection_end"],
                 lake_manifest_sha256=plan["atlas_arguments"]["lake_manifest_sha256"],
@@ -1280,6 +1309,8 @@ def run_level_c_cutoff(
             receipt = _validate_stage_receipt(
                 receipt_path, plan_id=plan["plan_id"], stage=stage
             )
+            if stage == "atlas" and stage not in handlers:
+                _validate_atlas_stage_root(plan, receipt=receipt)
             completed.append(stage)
             if receipt.get("outcome") in NON_PROMOTABLE_OUTCOMES:
                 break
@@ -1411,6 +1442,8 @@ def audit_level_c(
             receipt = _validate_stage_receipt(
                 receipt_path, plan_id=plan["plan_id"], stage=stage
             )
+            if stage == "atlas":
+                _validate_atlas_stage_root(plan, receipt=receipt)
             stages.append(stage)
             terminal = receipt.get("outcome")
         if "frozen_cohort" in stages:

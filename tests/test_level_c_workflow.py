@@ -16,6 +16,7 @@ from autoresearch.instrument_universe import universe_provenance
 from autoresearch.level_c_workflow import (
     STAGES,
     LevelCWorkflowError,
+    _validate_atlas_stage_root,
     _stage_receipt_path,
     audit_level_c,
     bootstrap_level_c,
@@ -665,6 +666,38 @@ def test_runner_fails_closed_on_mutated_stage_artifact(
             resume=True,
             stage_handlers={stage: complete for stage in STAGES},
         )
+
+
+def test_atlas_stage_root_requires_the_canonical_summary_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _config, active, _, _, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    plan = json.loads(
+        (active / "derived" / "level-c" / "control" / "execution-plan-A.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    atlas_root = active / "derived" / "atlas-runs" / str(plan["cutoff"]["atlas_run_id"])
+    lineage_path = atlas_root / "recipe-priors" / "level-c-lineage.json"
+    lineage_path.parent.mkdir(parents=True)
+    lineage_path.write_text(
+        json.dumps({"historical_lineage": {"execution_plan_id": plan["plan_id"]}}),
+        encoding="utf-8",
+    )
+    summary = atlas_root / "atlas-lab-summary.json"
+    summary.write_text("{}", encoding="utf-8")
+
+    _validate_atlas_stage_root(
+        plan,
+        run_root=atlas_root,
+        summary_path=summary,
+        receipt={"artifacts": [{"path": str(summary)}]},
+    )
+    outside = active / "derived" / "atlas-lab-runs" / "wrong" / "atlas-lab-summary.json"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("{}", encoding="utf-8")
+    with pytest.raises(LevelCWorkflowError, match="outside the authoritative Atlas root"):
+        _validate_atlas_stage_root(plan, receipt={"artifacts": [{"path": str(outside)}]})
 
 
 def test_runner_rejects_changed_portfolio_suite_after_bootstrap(

@@ -52,6 +52,11 @@ _SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _WORKER_IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 _CUTOFF_KEYS = frozenset({"A", "B", "C", "D"})
+_ATLAS_RUNS_RELATIVE_ROOT = Path("derived") / "atlas-runs"
+# v2 protocols accidentally used this spelling even though AtlasLab has
+# always written to ``derived/atlas-runs``.  It is accepted only as the exact
+# legacy alias for the plan's own run id, then resolved to the real root.
+_LEGACY_ATLAS_RUNS_RELATIVE_ROOT = Path("derived") / "atlas-lab-runs"
 _GEOMETRY_FIELDS = (
     "selection_start",
     "selection_end",
@@ -372,6 +377,73 @@ def _resolve_expected_artifacts(
     return resolved
 
 
+def _atlas_run_relative_path(run_id: Any) -> str:
+    token = _require_identifier(run_id, label="Level C Atlas run id")
+    return (_ATLAS_RUNS_RELATIVE_ROOT / token).as_posix()
+
+
+def _legacy_atlas_run_relative_path(run_id: Any) -> str:
+    token = _require_identifier(run_id, label="Level C Atlas run id")
+    return (_LEGACY_ATLAS_RUNS_RELATIVE_ROOT / token).as_posix()
+
+
+def resolve_level_c_atlas_run_root(
+    plan: Mapping[str, Any],
+    *,
+    require_lineage: bool = False,
+) -> Path:
+    """Resolve the one real Atlas root bound to an execution plan.
+
+    New plans must name the AtlasLab-native location.  The one historical
+    ``atlas-lab-runs`` spelling is a narrowly constrained compatibility alias:
+    it may name only the plan's own run id and never becomes an alternate
+    artifact root.  Once PlayHand needs the Atlas output, its lineage receipt
+    must attest the same execution plan before the canonical root is used.
+    """
+    supplied = dict(_require_mapping(plan, label="Level C execution plan"))
+    generation = _require_mapping(supplied.get("generation"), label="execution plan generation")
+    active_root = _active_runs_root(str(generation.get("active_runs_root") or ""))
+    cutoff = _require_mapping(supplied.get("cutoff"), label="execution plan cutoff")
+    run_id = _require_identifier(cutoff.get("atlas_run_id"), label="execution plan atlas_run_id")
+    expected = _require_mapping(
+        supplied.get("expected_artifacts"), label="execution plan expected_artifacts"
+    )
+    atlas = _require_mapping(expected.get("atlas_run"), label="execution plan atlas_run")
+    declared_relative = str(atlas.get("relative_path") or "").strip().replace("\\", "/")
+    canonical_relative = _atlas_run_relative_path(run_id)
+    legacy_relative = _legacy_atlas_run_relative_path(run_id)
+    if declared_relative not in {canonical_relative, legacy_relative}:
+        raise LevelCOperatorError(
+            "execution plan Atlas artifact location does not match its formal run id"
+        )
+    declared_root = (active_root / Path(declared_relative)).resolve(strict=False)
+    recorded_root = Path(str(atlas.get("resolved_path") or "")).expanduser().resolve(strict=False)
+    if declared_root != recorded_root or not _path_within(declared_root, active_root):
+        raise LevelCOperatorError("execution plan Atlas artifact root is inconsistent")
+    canonical_root = (active_root / _ATLAS_RUNS_RELATIVE_ROOT / run_id).resolve(strict=False)
+    if not _path_within(canonical_root, active_root):
+        raise LevelCOperatorError("execution plan Atlas artifact root escapes active runs root")
+    if not require_lineage:
+        return canonical_root
+
+    lineage_path = canonical_root / "recipe-priors" / "level-c-lineage.json"
+    try:
+        lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise LevelCOperatorError(
+            f"PlayHand deferred Atlas binding is unreadable: {lineage_path}"
+        ) from exc
+    historical_lineage = _require_mapping(
+        _require_mapping(lineage, label="Atlas lineage receipt").get("historical_lineage"),
+        label="Atlas lineage receipt historical_lineage",
+    )
+    if historical_lineage.get("execution_plan_id") != supplied.get("plan_id"):
+        raise LevelCOperatorError(
+            "PlayHand deferred Atlas lineage does not match the execution plan"
+        )
+    return canonical_root
+
+
 def _plan_identity(payload: Mapping[str, Any]) -> str:
     identity = dict(payload)
     identity.pop("plan_id", None)
@@ -649,7 +721,19 @@ def executor_arguments_from_plan(
             plan.get("playhand_deferred_binding"),
             label="execution plan playhand_deferred_binding",
         )
+        expected = _require_mapping(
+            plan.get("expected_artifacts"), label="execution plan expected_artifacts"
+        )
+        atlas = _require_mapping(expected.get("atlas_run"), label="execution plan atlas_run")
+        declared_root = Path(str(atlas.get("resolved_path") or "")).resolve(strict=False)
+        declared_lineage_path = declared_root / "recipe-priors" / "level-c-lineage.json"
         source_path = Path(str(deferred.get("source_path") or "")).resolve(strict=False)
+        if source_path != declared_lineage_path:
+            raise LevelCOperatorError(
+                "PlayHand deferred Atlas binding path does not match the execution plan"
+            )
+        atlas_root = resolve_level_c_atlas_run_root(plan, require_lineage=True)
+        source_path = atlas_root / "recipe-priors" / "level-c-lineage.json"
         try:
             source = json.loads(source_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -667,9 +751,10 @@ def executor_arguments_from_plan(
         expected_sha256 = _require_sha256(
             current, label="PlayHand expected seed plan sha256"
         )
-        seed_path = Path(str(arguments.get("seed_plan_path") or "")).resolve(strict=False)
+        seed_path = atlas_root / "recipe-priors" / "play-hand-seed-plan.json"
         if not seed_path.is_file() or _sha256_bytes(seed_path.read_bytes()) != expected_sha256:
             raise LevelCOperatorError("PlayHand seed plan does not match its Atlas lineage receipt")
+        arguments["seed_plan_path"] = str(seed_path)
         arguments[str(deferred.get("argument") or "expected_seed_plan_sha256")] = expected_sha256
     arguments["execution_plan_path"] = str(Path(path).resolve(strict=True))
     arguments["execution_plan_id"] = plan["plan_id"]
