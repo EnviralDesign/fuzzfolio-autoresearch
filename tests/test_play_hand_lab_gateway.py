@@ -102,6 +102,66 @@ def test_result_identity_survives_ack_failure_and_redelivery() -> None:
     assert _worker_result_identity(changed) != _worker_result_identity(second)
 
 
+def test_result_identity_excludes_worker_and_replay_timing_telemetry() -> None:
+    first = {
+        "task_id": "task-identity",
+        "attempt_id": "attempt-1",
+        "lane_id": "lane-1",
+        "status": "success",
+        "worker_id": "worker-a",
+        "lease_id": "lease-a",
+        "accepted_at": 10.0,
+        "result": {
+            "job_id": "job-a",
+            "worker_id": "worker-a",
+            "worker_lease_id": "lease-a",
+            "requested_at": "2026-07-18T00:00:00Z",
+            "started_at": "2026-07-18T00:00:01Z",
+            "completed_at": "2026-07-18T00:00:05Z",
+            "duration_seconds": 4.0,
+            "lake_cache": {"elapsed_seconds": 1.2},
+            "request": {"evidence_plan_id": "plan-1"},
+            "execution_evidence": {"receipt_sha256": "sha256:receipt"},
+            "result": {
+                "aggregate": {"score_lab": {"score": 12.5}},
+                "performance": {"total_compute_seconds": 4.0},
+            },
+        },
+    }
+    redelivered = {
+        **first,
+        "worker_id": "worker-b",
+        "lease_id": "lease-b",
+        "accepted_at": 22.0,
+        "result": {
+            **first["result"],
+            "job_id": "job-b",
+            "worker_id": "worker-b",
+            "worker_lease_id": "lease-b",
+            "requested_at": "2026-07-18T00:01:00Z",
+            "started_at": "2026-07-18T00:01:01Z",
+            "completed_at": "2026-07-18T00:01:09Z",
+            "duration_seconds": 8.0,
+            "lake_cache": {"elapsed_seconds": 2.8},
+            "result": {
+                "aggregate": {"score_lab": {"score": 12.5}},
+                "performance": {"total_compute_seconds": 8.0},
+            },
+        },
+    }
+
+    assert _worker_result_identity(first) == _worker_result_identity(redelivered)
+
+    changed_evidence = {
+        **redelivered,
+        "result": {
+            **redelivered["result"],
+            "result": {"aggregate": {"score_lab": {"score": 13.0}}},
+        },
+    }
+    assert _worker_result_identity(first) != _worker_result_identity(changed_evidence)
+
+
 def test_lab_gateway_failed_completion_counts_as_failed_task() -> None:
     gateway = PlayHandLabGateway()
     gateway.enqueue(LabTask(task_id="task-1", lane_id="lane-1", attempt_id="attempt-1"))

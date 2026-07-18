@@ -162,18 +162,86 @@ TERMINAL_OUTCOME_RESEARCH_NONVIABLE = "research_nonviable"
 TERMINAL_OUTCOME_INFRASTRUCTURE_FAILURE = "infrastructure_failure"
 TERMINAL_OUTCOME_INCOMPLETE = "incomplete"
 _WORKER_RESULT_DELIVERY_FIELDS = frozenset(
-    {"accepted_at", "accepted_at_wall", "delivery_id", "delivered_at", "lease_id", "read_at"}
+    {
+        "accepted_at",
+        "accepted_at_wall",
+        "delivery_id",
+        "delivered_at",
+        "lease_id",
+        "read_at",
+        "worker_id",
+    }
+)
+_WORKER_RESULT_RUNTIME_FIELDS = frozenset(
+    {
+        "client_origin",
+        "completed_at",
+        "current_step",
+        "current_step_started_at",
+        "duration_seconds",
+        "expires_at",
+        "heartbeat_at",
+        "job_id",
+        "lake_cache",
+        "promoted_at",
+        "promoted_from_job_id",
+        "requested_at",
+        "requested_by_user_id",
+        "retention_behavior",
+        "retention_reason",
+        "retention_ttl_seconds",
+        "source_client_origin",
+        "source_kind",
+        "started_at",
+        "steps_completed",
+        "subprocess_progress",
+        "total_steps",
+        "worker_id",
+        "worker_lease_id",
+        "worker_pool",
+        "worker_queue_name",
+        "worker_transport",
+        "workspace_attempt_id",
+        "workspace_id",
+    }
 )
 
 
+def _worker_result_identity_payload(lab_result: dict[str, Any]) -> dict[str, Any]:
+    """Return the replay-evidence projection used for duplicate-result checks.
+
+    A gateway can redeliver one completed task through a different lease or worker,
+    and retries naturally produce fresh cache and performance timing telemetry.  None
+    of those values changes the replay evidence.  The inner result remains intact
+    except for its performance section, so a changed score, aggregate, execution
+    receipt, request, or terminal detail still conflicts fail-closed.
+    """
+
+    payload = {
+        key: value
+        for key, value in lab_result.items()
+        if key not in _WORKER_RESULT_DELIVERY_FIELDS
+    }
+    worker_result = payload.get("result")
+    if not isinstance(worker_result, dict):
+        return payload
+
+    normalized_worker_result = {
+        key: value
+        for key, value in worker_result.items()
+        if key not in _WORKER_RESULT_RUNTIME_FIELDS
+    }
+    replay_result = normalized_worker_result.get("result")
+    if isinstance(replay_result, dict) and "performance" in replay_result:
+        normalized_replay_result = dict(replay_result)
+        normalized_replay_result.pop("performance", None)
+        normalized_worker_result["result"] = normalized_replay_result
+    payload["result"] = normalized_worker_result
+    return payload
+
+
 def _worker_result_identity(lab_result: dict[str, Any]) -> str:
-    return canonical_sha256(
-        {
-            key: value
-            for key, value in lab_result.items()
-            if key not in _WORKER_RESULT_DELIVERY_FIELDS
-        }
-    )
+    return canonical_sha256(_worker_result_identity_payload(lab_result))
 
 
 @dataclass(frozen=True)
