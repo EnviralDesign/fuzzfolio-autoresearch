@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import threading
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1131,6 +1132,124 @@ def test_rank_sweep_permutations_accepts_compact_summary_results() -> None:
     assert payload["best"]["child_job_id"] == "child-0"
     assert payload["best"]["score"] == 12.5
     assert [item["score"] for item in payload["ranked"]] == [12.5, 9.0]
+
+
+def test_validated_sweep_shard_accepts_scoreless_summary_and_rejects_malformed() -> None:
+    task_spec = {
+        "sweep_id": "sweep-1",
+        "shard_id": "sweep-1-shard-0001",
+        "permutation_start": 8,
+        "permutation_count": 2,
+        "params_by_index": {"8": {"alpha": 8}, "9": {"alpha": 9}},
+        "result_detail": "summary",
+    }
+    worker_result = {
+        "result": {
+            "sweep_id": "sweep-1",
+            "shard_id": "sweep-1-shard-0001",
+            "status": "success",
+            "started_at": "2026-07-18T00:00:00Z",
+            "completed_at": "2026-07-18T00:00:01Z",
+            "result_detail": "summary",
+            "permutation_results": [
+                {
+                    "permutation_index": index,
+                    "child_job_id": f"sweep-1-{index:06d}",
+                    "status": "success",
+                    "parameters": {"alpha": index},
+                    "result_detail": "summary",
+                    "result": {
+                        "result_detail": "summary",
+                        "full_result_omitted": True,
+                        "warnings": ["no score for this permutation"],
+                    },
+                }
+                for index in (8, 9)
+            ],
+            "failed_permutations": [],
+        }
+    }
+
+    validated = lab._validated_sweep_shard_payload(
+        worker_result=worker_result,
+        task_spec=task_spec,
+    )
+    ranked = lab._rank_sweep_permutations(
+        phase="lookback_timing",
+        shard_results=[validated],
+    )
+    assert ranked["best"] is None
+    assert ranked["outcome"] == "no_scored_permutation"
+    assert ranked["permutation_indices"] == [8, 9]
+
+    malformed = json.loads(json.dumps(worker_result))
+    malformed["result"]["permutation_results"][0]["child_job_id"] = "wrong-child"
+    with pytest.raises(lab.DurableExecutionError, match="child_job_id"):
+        lab._validated_sweep_shard_payload(worker_result=malformed, task_spec=task_spec)
+
+
+def test_sweep_merge_is_order_independent_and_requires_all_shard_receipts() -> None:
+    def shard(
+        shard_id: str,
+        entries: list[tuple[int, float | None]],
+    ) -> dict:
+        return lab._rank_sweep_permutations(
+            phase="lookback_timing",
+            shard_results=[
+                {
+                    "sweep_id": "sweep-1",
+                    "shard_id": shard_id,
+                    "permutation_results": [
+                        {
+                            "permutation_index": index,
+                            "child_job_id": f"sweep-1-{index:06d}",
+                            "status": "success",
+                            "parameters": {"alpha": index},
+                            "result": (
+                                {"aggregate": {"score_lab": {"score": score}}}
+                                if score is not None
+                                else {"result_detail": "summary", "full_result_omitted": True}
+                            ),
+                        }
+                        for index, score in entries
+                    ],
+                    "failed_permutations": [],
+                }
+            ],
+        )
+
+    scored = shard("sweep-1-shard-0000", [(0, 72.0), (1, 68.0)])
+    scoreless = shard("sweep-1-shard-0001", [(2, None), (3, None)])
+    expected = {
+        "sweep-1-shard-0000": {0, 1},
+        "sweep-1-shard-0001": {2, 3},
+    }
+    merged = lab._merge_sweep_payloads(
+        "lookback_timing",
+        [scoreless, scored],
+        expected_sweep_id="sweep-1",
+        expected_shards=expected,
+    )
+    assert merged["outcome"] == "scored"
+    assert merged["best"]["permutation_index"] == 0
+    assert [item["permutation_index"] for item in merged["ranked"]] == [0, 1, 2, 3]
+
+    all_nonviable = lab._merge_sweep_payloads(
+        "lookback_timing",
+        [scoreless, shard("sweep-1-shard-0000", [(0, None), (1, None)])],
+        expected_sweep_id="sweep-1",
+        expected_shards=expected,
+    )
+    assert all_nonviable["best"] is None
+    assert all_nonviable["outcome"] == "no_scored_permutation"
+
+    with pytest.raises(lab.DurableExecutionError, match="missing one or more shard"):
+        lab._merge_sweep_payloads(
+            "lookback_timing",
+            [scored],
+            expected_sweep_id="sweep-1",
+            expected_shards=expected,
+        )
 
 
 class _IndicatorIndexCli:
@@ -3340,18 +3459,30 @@ def test_play_hand_lab_pipeline_promotes_good_lane_with_sweep_shards(
             for index, task in enumerate(tasks):
                 task_kind = str(task.get("task_kind"))
                 if task_kind == "sweep_shard":
-                    params_by_index = dict((task.get("payload") or {}).get("params_by_index") or {})
+                    task_payload = task.get("payload") or {}
+                    params_by_index = dict(task_payload.get("params_by_index") or {})
                     permutation_results = []
                     for raw_index, params in params_by_index.items():
                         permutation_index = int(raw_index)
-                        score = self._score_for_task(task, offset=permutation_index % 3)
+                        score = None
+                        if not str(task_payload.get("shard_id") or "").endswith("-0001"):
+                            score = self._score_for_task(task, offset=permutation_index % 3)
                         permutation_results.append(
                             {
                                 "permutation_index": permutation_index,
-                                "child_job_id": f"{task['task_id']}-{permutation_index}",
+                                "child_job_id": f"{task_payload['sweep_id']}-{permutation_index:06d}",
                                 "status": "success",
                                 "parameters": dict(params),
-                                "result": {"aggregate": {"score_lab": {"score": score}}},
+                                "result_detail": "summary",
+                                "result": (
+                                    {"result_detail": "summary", "aggregate": {"score_lab": {"score": score}}}
+                                    if score is not None
+                                    else {
+                                        "result_detail": "summary",
+                                        "full_result_omitted": True,
+                                        "warnings": ["scoreless intermediate shard entry"],
+                                    }
+                                ),
                                 "completed_at": "2026-06-20T00:00:00Z",
                             }
                         )
@@ -3364,6 +3495,7 @@ def test_play_hand_lab_pipeline_promotes_good_lane_with_sweep_shards(
                             "status": "success",
                             "started_at": "2026-06-20T00:00:00Z",
                             "completed_at": "2026-06-20T00:00:01Z",
+                            "result_detail": "summary",
                             "permutation_results": permutation_results,
                             "failed_permutations": [],
                             "worker_attribution": {},
@@ -3376,17 +3508,20 @@ def test_play_hand_lab_pipeline_promotes_good_lane_with_sweep_shards(
                         "status": "success",
                         "result": {"aggregate": {"score_lab": {"score": score}}},
                     }
-                self.results.append(
-                    {
-                        "task_id": task["task_id"],
-                        "lane_id": task["lane_id"],
-                        "attempt_id": task["attempt_id"],
-                        "status": "success",
-                        "worker_id": "fake-worker",
-                        "lease_id": f"lease-{start + index}",
-                        "result": worker_result,
-                    }
-                )
+                envelope = {
+                    "task_id": task["task_id"],
+                    "lane_id": task["lane_id"],
+                    "attempt_id": task["attempt_id"],
+                    "status": "success",
+                    "worker_id": "fake-worker",
+                    "lease_id": f"lease-{start + index}",
+                    "result": worker_result,
+                }
+                self.results.append(envelope)
+                if task_kind == "sweep_shard" and str((task.get("payload") or {}).get("shard_id") or "").endswith("-0001"):
+                    duplicate = json.loads(json.dumps(envelope))
+                    duplicate["lease_id"] = f"lease-{start + index}-redelivery"
+                    self.results.append(duplicate)
             return {"enqueued": len(tasks)}
 
         def read_results(self, *, limit: int) -> list[dict]:
@@ -3433,24 +3568,24 @@ def test_play_hand_lab_pipeline_promotes_good_lane_with_sweep_shards(
     monkeypatch.setattr(lab, "_worker_ready_profile_snapshot", lambda profile, **_kwargs: profile)
     monkeypatch.setattr(lab, "_score_lab_artifact", fake_score_lab_artifact)
 
-    exit_code = lab.cmd_play_hand_lab(
-        lab.PlayHandLabRuntimeConfig(
-            gateway_url="http://127.0.0.1:8799",
-            task_mode="deep_replay",
-            pipeline_mode="play_hand",
-            target_runs=1,
-            active_runs=1,
-            profile_path=profile_path,
-            max_sweep_permutations=4,
-            coarse_probe_budget=2,
-            sweep_shard_size=2,
-            instrument_scout_size=1,
-            instrument_scout_max_selected=1,
-            poll_interval_seconds=0.01,
-            max_wait_seconds=5.0,
-            worker_contract_hash="sha256:" + "a" * 64,
-        )
+    runtime = lab.PlayHandLabRuntimeConfig(
+        campaign_id="sweep-shard-redelivery",
+        gateway_url="http://127.0.0.1:8799",
+        task_mode="deep_replay",
+        pipeline_mode="play_hand",
+        target_runs=1,
+        active_runs=1,
+        profile_path=profile_path,
+        max_sweep_permutations=4,
+        coarse_probe_budget=2,
+        sweep_shard_size=2,
+        instrument_scout_size=1,
+        instrument_scout_max_selected=1,
+        poll_interval_seconds=0.01,
+        max_wait_seconds=5.0,
+        worker_contract_hash="sha256:" + "a" * 64,
     )
+    exit_code = lab.cmd_play_hand_lab(runtime)
 
     assert exit_code == 0
     assert any("sweep_shard" in batch for batch in FakeGateway.enqueue_batches)
@@ -3480,6 +3615,8 @@ def test_play_hand_lab_pipeline_promotes_good_lane_with_sweep_shards(
         "final_36mo",
     } <= set(metadata["play_hand_phase_scores"])
     assert any(attempt["lab_task_kind"] == "sweep_shard" for attempt in attempts)
+    sweep_attempts = [attempt for attempt in attempts if attempt["lab_task_kind"] == "sweep_shard"]
+    assert len({attempt["lab_campaign_task_id"] for attempt in sweep_attempts}) == len(sweep_attempts)
     assert any(
         attempt["play_hand_phase"] == "validation_12mo"
         and attempt["requested_horizon_months"] == 12
@@ -3490,3 +3627,6 @@ def test_play_hand_lab_pipeline_promotes_good_lane_with_sweep_shards(
         and attempt["requested_horizon_months"] == 36
         for attempt in attempts
     )
+    initial_enqueue_batches = len(FakeGateway.enqueue_batches)
+    assert lab.cmd_play_hand_lab(replace(runtime, resume=True)) == 0
+    assert len(FakeGateway.enqueue_batches) == initial_enqueue_batches

@@ -2446,6 +2446,108 @@ def _sweep_payload_from_worker_result(worker_result: dict[str, Any]) -> dict[str
     return payload if isinstance(payload, dict) else {}
 
 
+def _sweep_permutation_index(value: Any, *, context: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise DurableExecutionError(f"{context} is missing a valid permutation_index") from exc
+
+
+def _sweep_rank_key(item: dict[str, Any]) -> tuple[int, float, int, str]:
+    score = _as_float(item.get("fitness_value"))
+    index = _sweep_permutation_index(item.get("permutation_index"), context="sweep rank")
+    return (
+        0 if score is not None else 1,
+        -(score if score is not None else 0.0),
+        index,
+        str(item.get("child_job_id") or ""),
+    )
+
+
+def _validated_sweep_shard_payload(
+    *,
+    worker_result: dict[str, Any],
+    task_spec: dict[str, Any],
+) -> dict[str, Any]:
+    """Bind one worker shard result to its pre-persisted deterministic task spec."""
+    payload = _sweep_payload_from_worker_result(worker_result)
+    expected_sweep_id = str(task_spec.get("sweep_id") or "")
+    expected_shard_id = str(task_spec.get("shard_id") or "")
+    if not expected_sweep_id or not expected_shard_id:
+        raise DurableExecutionError("sweep shard task is missing authoritative sweep identity")
+    if payload.get("sweep_id") != expected_sweep_id:
+        raise DurableExecutionError("sweep shard result sweep_id does not match task spec")
+    if payload.get("shard_id") != expected_shard_id:
+        raise DurableExecutionError("sweep shard result shard_id does not match task spec")
+    if payload.get("status") != "success":
+        raise DurableExecutionError("successful sweep task returned a non-success shard result")
+    expected_detail = str(task_spec.get("result_detail") or "summary")
+    if payload.get("result_detail") != expected_detail:
+        raise DurableExecutionError("sweep shard result_detail does not match task spec")
+    if not isinstance(payload.get("started_at"), str) or not isinstance(payload.get("completed_at"), str):
+        raise DurableExecutionError("sweep shard result is missing lifecycle timestamps")
+    permutation_results = payload.get("permutation_results")
+    failed_permutations = payload.get("failed_permutations")
+    if not isinstance(permutation_results, list) or not isinstance(failed_permutations, list):
+        raise DurableExecutionError("sweep shard result is missing canonical permutation collections")
+
+    start = _sweep_permutation_index(
+        task_spec.get("permutation_start"), context="sweep shard task spec"
+    )
+    count = _sweep_permutation_index(
+        task_spec.get("permutation_count"), context="sweep shard task spec"
+    )
+    if count <= 0:
+        raise DurableExecutionError("sweep shard task spec has an invalid permutation_count")
+    expected_indices = set(range(start, start + count))
+    raw_expected_params = task_spec.get("params_by_index")
+    if not isinstance(raw_expected_params, dict):
+        raise DurableExecutionError("sweep shard task spec is missing params_by_index")
+    expected_params: dict[int, dict[str, Any]] = {}
+    for raw_index, raw_params in raw_expected_params.items():
+        index = _sweep_permutation_index(raw_index, context="sweep shard task params")
+        if not isinstance(raw_params, dict):
+            raise DurableExecutionError("sweep shard task params are malformed")
+        expected_params[index] = dict(raw_params)
+    if set(expected_params) != expected_indices:
+        raise DurableExecutionError("sweep shard task params do not cover its planned permutations")
+
+    seen_indices: set[int] = set()
+
+    def validate_entry(entry: Any, *, collection: str, status: str) -> None:
+        if not isinstance(entry, dict):
+            raise DurableExecutionError(f"sweep shard {collection} entry is malformed")
+        index = _sweep_permutation_index(entry.get("permutation_index"), context=f"sweep shard {collection}")
+        if index not in expected_indices or index in seen_indices:
+            raise DurableExecutionError("sweep shard result has duplicate or unexpected permutation evidence")
+        seen_indices.add(index)
+        if entry.get("status") != status:
+            raise DurableExecutionError(f"sweep shard {collection} entry has an invalid status")
+        expected_child_job_id = f"{expected_sweep_id}-{index:06d}"
+        if entry.get("child_job_id") != expected_child_job_id:
+            raise DurableExecutionError("sweep shard result child_job_id does not match task spec")
+        params = entry.get("parameters")
+        if not isinstance(params, dict) or canonical_sha256(params) != canonical_sha256(expected_params[index]):
+            raise DurableExecutionError("sweep shard result parameters do not match task spec")
+        if status == "success":
+            result = entry.get("result")
+            if not isinstance(result, dict):
+                raise DurableExecutionError("successful sweep shard entry is missing replay evidence")
+            if entry.get("result_detail") != expected_detail or result.get("result_detail") != expected_detail:
+                raise DurableExecutionError("sweep shard entry result_detail does not match task spec")
+        elif not str(entry.get("error") or "").strip():
+            raise DurableExecutionError("failed sweep shard entry is missing an error")
+
+    for entry in permutation_results:
+        validate_entry(entry, collection="permutation_results", status="success")
+    for entry in failed_permutations:
+        validate_entry(entry, collection="failed_permutations", status="error")
+    if seen_indices != expected_indices:
+        raise DurableExecutionError("sweep shard result does not cover every planned permutation")
+
+    return dict(payload)
+
+
 def _parameter_importance_from_ranked(ranked: list[dict[str, Any]]) -> list[dict[str, Any]]:
     scored = [
         item
@@ -2496,18 +2598,35 @@ def _rank_sweep_permutations(
 ) -> dict[str, Any]:
     ranked: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    source_sweep_id: str | None = None
+    source_shard_id: str | None = None
+    permutation_indices: list[int] = []
     for shard_result in shard_results:
         payload = _sweep_payload_from_worker_result(shard_result)
+        sweep_id = str(payload.get("sweep_id") or "")
+        shard_id = str(payload.get("shard_id") or "")
+        if source_sweep_id is None:
+            source_sweep_id = sweep_id or None
+        elif sweep_id and sweep_id != source_sweep_id:
+            raise DurableExecutionError("sweep rank received mixed sweep identities")
+        if source_shard_id is None:
+            source_shard_id = shard_id or None
+        elif shard_id and shard_id != source_shard_id:
+            raise DurableExecutionError("sweep rank received mixed shard identities")
         for item in payload.get("permutation_results") or []:
             if not isinstance(item, dict):
                 continue
+            permutation_index = _sweep_permutation_index(
+                item.get("permutation_index"), context="sweep permutation result"
+            )
+            permutation_indices.append(permutation_index)
             result_payload = item.get("result") if isinstance(item.get("result"), dict) else {}
             score = _score_from_replay_payload(result_payload)
             if score is None:
                 score = _score_from_replay_payload(item)
             ranked.append(
                 {
-                    "permutation_index": item.get("permutation_index"),
+                    "permutation_index": permutation_index,
                     "child_job_id": item.get("child_job_id"),
                     "status": item.get("status"),
                     "parameters": dict(item.get("parameters") or {}),
@@ -2519,18 +2638,27 @@ def _rank_sweep_permutations(
             )
         for item in payload.get("failed_permutations") or []:
             if isinstance(item, dict):
+                permutation_indices.append(
+                    _sweep_permutation_index(
+                        item.get("permutation_index"), context="failed sweep permutation"
+                    )
+                )
                 failed.append(dict(item))
-    ranked.sort(
+    ranked.sort(key=_sweep_rank_key)
+    failed.sort(
         key=lambda item: (
-            _as_float(item.get("fitness_value")) is not None,
-            _as_float(item.get("fitness_value")) or float("-inf"),
-        ),
-        reverse=True,
+            _sweep_permutation_index(item.get("permutation_index"), context="failed sweep permutation"),
+            str(item.get("child_job_id") or ""),
+        )
     )
-    best = ranked[0] if ranked else None
+    scored = [item for item in ranked if _as_float(item.get("fitness_value")) is not None]
+    best = scored[0] if scored else None
     return {
-        "sweep_id": f"lab-{phase}",
+        "sweep_id": source_sweep_id or f"lab-{phase}",
+        "shard_id": source_shard_id,
         "mode": "lab_sweep_shard",
+        "permutation_indices": sorted(permutation_indices),
+        "outcome": "scored" if best is not None else "no_scored_permutation",
         "ranked_permutations": ranked,
         "ranked": ranked,
         "best": best,
@@ -2539,32 +2667,99 @@ def _rank_sweep_permutations(
     }
 
 
-def _merge_sweep_payloads(phase: str, payloads: list[dict[str, Any]]) -> dict[str, Any]:
+def _merge_sweep_payloads(
+    phase: str,
+    payloads: list[dict[str, Any]],
+    *,
+    expected_sweep_id: str | None = None,
+    expected_shards: dict[str, set[int]] | None = None,
+) -> dict[str, Any]:
     ranked: list[dict[str, Any]] = []
     failed: list[dict[str, Any]] = []
+    seen_shards: set[str] = set()
+    seen_indices: set[int] = set()
     for payload in payloads:
+        sweep_id = str(payload.get("sweep_id") or "")
+        shard_id = str(payload.get("shard_id") or "")
+        if expected_sweep_id and sweep_id != expected_sweep_id:
+            raise DurableExecutionError("sweep merge received an unexpected sweep identity")
+        if expected_shards is not None:
+            if shard_id not in expected_shards or shard_id in seen_shards:
+                raise DurableExecutionError("sweep merge received an unexpected or duplicate shard")
+            payload_indices = {
+                _sweep_permutation_index(index, context="sweep shard receipt")
+                for index in (payload.get("permutation_indices") or [])
+            }
+            if payload_indices != expected_shards[shard_id]:
+                raise DurableExecutionError("sweep shard receipt does not cover its planned permutations")
+            seen_shards.add(shard_id)
         for item in payload.get("ranked_permutations") or payload.get("ranked") or []:
             if isinstance(item, dict):
+                index = _sweep_permutation_index(item.get("permutation_index"), context="sweep merge")
+                if index in seen_indices:
+                    raise DurableExecutionError("sweep merge received duplicate permutation evidence")
+                seen_indices.add(index)
                 ranked.append(dict(item))
         for item in payload.get("failed_permutations") or []:
             if isinstance(item, dict):
+                index = _sweep_permutation_index(item.get("permutation_index"), context="failed sweep merge")
+                if index in seen_indices:
+                    raise DurableExecutionError("sweep merge received duplicate permutation evidence")
+                seen_indices.add(index)
                 failed.append(dict(item))
-    ranked.sort(
+    if expected_shards is not None:
+        if seen_shards != set(expected_shards):
+            raise DurableExecutionError("sweep merge is missing one or more shard receipts")
+        expected_indices = set().union(*expected_shards.values()) if expected_shards else set()
+        if seen_indices != expected_indices:
+            raise DurableExecutionError("sweep merge is missing one or more permutation receipts")
+    ranked.sort(key=_sweep_rank_key)
+    failed.sort(
         key=lambda item: (
-            _as_float(item.get("fitness_value")) is not None,
-            _as_float(item.get("fitness_value")) or float("-inf"),
-        ),
-        reverse=True,
+            _sweep_permutation_index(item.get("permutation_index"), context="failed sweep merge"),
+            str(item.get("child_job_id") or ""),
+        )
     )
+    scored = [item for item in ranked if _as_float(item.get("fitness_value")) is not None]
     return {
-        "sweep_id": f"lab-{phase}",
+        "sweep_id": expected_sweep_id or f"lab-{phase}",
         "mode": "lab_sweep_shard",
         "ranked_permutations": ranked,
         "ranked": ranked,
-        "best": ranked[0] if ranked else None,
+        "best": scored[0] if scored else None,
         "failed_permutations": failed,
+        "outcome": "scored" if scored else "no_scored_permutation",
         "parameter_importance": _parameter_importance_from_ranked(ranked),
     }
+
+
+def _expected_sweep_shards(lane: LabLaneState, *, phase: str) -> tuple[str, dict[str, set[int]]]:
+    expected_sweep_id: str | None = None
+    expected_shards: dict[str, set[int]] = {}
+    for task_id in lane.phase_task_ids.get(phase) or []:
+        spec = lane.task_specs.get(task_id)
+        if not isinstance(spec, dict) or spec.get("task_kind") != "sweep_shard":
+            raise DurableExecutionError("sweep phase contains a non-sweep task spec")
+        sweep_id = str(spec.get("sweep_id") or "")
+        shard_id = str(spec.get("shard_id") or "")
+        if not sweep_id or not shard_id:
+            raise DurableExecutionError("sweep phase task is missing deterministic shard identity")
+        if expected_sweep_id is None:
+            expected_sweep_id = sweep_id
+        elif expected_sweep_id != sweep_id:
+            raise DurableExecutionError("sweep phase contains mixed sweep identities")
+        start = _sweep_permutation_index(
+            spec.get("permutation_start"), context="sweep phase task spec"
+        )
+        count = _sweep_permutation_index(
+            spec.get("permutation_count"), context="sweep phase task spec"
+        )
+        if count <= 0 or shard_id in expected_shards:
+            raise DurableExecutionError("sweep phase task graph is malformed")
+        expected_shards[shard_id] = set(range(start, start + count))
+    if expected_sweep_id is None or not expected_shards:
+        raise DurableExecutionError("sweep phase is missing deterministic shard tasks")
+    return expected_sweep_id, expected_shards
 
 
 def _deep_replay_job_payload(
@@ -2923,6 +3118,7 @@ def _make_sweep_shard_tasks(
                 "permutation_start": start,
                 "permutation_count": len(chunk),
                 "params_by_index": params_by_index,
+                "result_detail": "summary",
             },
         )
         tasks.append(
@@ -3314,12 +3510,16 @@ def _record_lab_result(
             strict=runtime.strict_scoring,
         )
     elif task_kind == "sweep_shard":
+        validated_shard_payload = _validated_sweep_shard_payload(
+            worker_result=result_payload,
+            task_spec=task_spec,
+        )
         sweep_payload = _rank_sweep_permutations(
             phase=phase,
-            shard_results=[result_payload],
+            shard_results=[validated_shard_payload],
         )
         if runtime.retain_raw_lab_artifacts:
-            _write_json(artifact_dir / "sweep-shard-result.json", _sweep_payload_from_worker_result(result_payload))
+            _write_json(artifact_dir / "sweep-shard-result.json", validated_shard_payload)
         _write_json(artifact_dir / "sweep-results.json", sweep_payload)
         score = _as_float((sweep_payload.get("best") or {}).get("score"))
         attempt_score = AttemptScore(
@@ -3819,6 +4019,8 @@ def _materialize_sweep_winner(
     if not isinstance(best, dict):
         ranked = sweep_payload.get("ranked_permutations") or sweep_payload.get("ranked") or []
         best = ranked[0] if isinstance(ranked, list) and ranked and isinstance(ranked[0], dict) else {}
+    if _as_float(best.get("score")) is None:
+        return None
     parameters = best.get("parameters") if isinstance(best.get("parameters"), dict) else {}
     if not parameters or lane.incumbent_profile_path is None:
         return None
@@ -4163,7 +4365,7 @@ def _advance_lane_after_result(
             reasons=[phase],
         )
         return []
-    if recorded.get("score") is None:
+    if phase not in {"lookback_timing", "coarse", "coarse_probe", "coarse_expand", "focused"} and recorded.get("score") is None:
         _mark_lane_tombstoned(
             lane,
             lane_ctx=lane_ctx,
@@ -4172,7 +4374,6 @@ def _advance_lane_after_result(
             reasons=[phase],
         )
         return []
-
     if phase == "baseline_3mo":
         score = _as_float(recorded.get("score"))
         lane.incumbent_score = score
@@ -4218,6 +4419,7 @@ def _advance_lane_after_result(
         return tasks
 
     if phase in {"lookback_timing", "coarse", "coarse_probe", "coarse_expand", "focused"}:
+        expected_sweep_id, expected_shards = _expected_sweep_shards(lane, phase=phase)
         payload = _merge_sweep_payloads(
             phase,
             [
@@ -4225,6 +4427,8 @@ def _advance_lane_after_result(
                 for result in lane.phase_results.get(phase, [])
                 if isinstance(result.get("sweep_payload"), dict)
             ],
+            expected_sweep_id=expected_sweep_id,
+            expected_shards=expected_shards,
         )
         payload["source_phase"] = phase
         lane.last_sweep_payload = payload
@@ -4238,7 +4442,12 @@ def _advance_lane_after_result(
             sweep_payload=payload,
         )
         if not materialized:
-            _append_phase_row(lane, phase=phase.replace("_", " "), status="skipped", detail="no sweep winner")
+            _append_phase_row(
+                lane,
+                phase=phase.replace("_", " "),
+                status="nonviable",
+                detail=str(payload.get("outcome") or "no_scored_permutation"),
+            )
             _write_stage_metadata(lane, lane_ctx)
             if phase == "lookback_timing":
                 return _enqueue_coarse_stage(
@@ -5982,7 +6191,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     if recorded.get("status") == "failed":
                         lane.failed_task_ids.add(task_id)
                     else:
-                        if runtime.task_mode == "deep_replay" and recorded.get("score") is None:
+                        if (
+                            runtime.task_mode == "deep_replay"
+                            and task_spec.get("task_kind") != "sweep_shard"
+                            and recorded.get("score") is None
+                        ):
                             raise DurableExecutionError(
                                 f"task {task_id} lacks a canonical score and validated terminal outcome"
                             )
