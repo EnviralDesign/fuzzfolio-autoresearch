@@ -1252,6 +1252,93 @@ def test_sweep_merge_is_order_independent_and_requires_all_shard_receipts() -> N
         )
 
 
+def test_phase_sweep_merge_buckets_multi_parent_receipts_and_rebinds_legacy_shards(
+    tmp_path: Path,
+) -> None:
+    phase = "lookback_timing"
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="multi-parent",
+        run_dir=tmp_path / "lane",
+    )
+
+    def add_task(sweep_id: str, shard_index: int, permutation_index: int) -> str:
+        shard_id = f"{sweep_id}-shard-{shard_index:04d}"
+        task_id = f"task-{sweep_id}-{shard_index:04d}"
+        lane.phase_task_ids.setdefault(phase, []).append(task_id)
+        lane.task_specs[task_id] = {
+            "task_kind": "sweep_shard",
+            "sweep_id": sweep_id,
+            "shard_id": shard_id,
+            "permutation_start": permutation_index,
+            "permutation_count": 1,
+            "params_by_index": {str(permutation_index): {"alpha": permutation_index}},
+        }
+        return task_id
+
+    a0 = add_task("parent-a", 0, 0)
+    a1 = add_task("parent-a", 1, 1)
+    b0 = add_task("parent-b", 0, 0)
+    b1 = add_task("parent-b", 1, 1)
+
+    def recorded(task_id: str, score: float | None, *, legacy: bool = False) -> dict:
+        spec = lane.task_specs[task_id]
+        sweep_id = str(spec["sweep_id"])
+        index = int(spec["permutation_start"])
+        entry = {
+            "permutation_index": index,
+            "child_job_id": f"{sweep_id}-{index:06d}",
+            "status": "success",
+            "parameters": {"alpha": index},
+            "score": score,
+            "fitness_value": score,
+        }
+        payload = {
+            "sweep_id": f"lab-{phase}" if legacy else sweep_id,
+            "mode": "lab_sweep_shard",
+            "ranked_permutations": [entry],
+            "ranked": [entry],
+            "failed_permutations": [],
+        }
+        if not legacy:
+            payload.update(
+                {
+                    "shard_id": spec["shard_id"],
+                    "permutation_indices": [index],
+                }
+            )
+        return {"task_id": task_id, "phase": phase, "sweep_payload": payload}
+
+    # This is deliberately out of delivery order. a1 models a receipt written
+    # before parent/shard identity was persisted, then rebound to its task spec.
+    persisted_rows = [
+        recorded(b1, 88.0),
+        recorded(a1, None, legacy=True),
+        recorded(b0, 91.0),
+        recorded(a0, 70.0),
+    ]
+    lane.phase_results[phase] = persisted_rows[:-1]
+    with pytest.raises(lab.DurableExecutionError, match="missing or has duplicate shard receipts"):
+        lab._merge_phase_sweep_receipts(lane, phase=phase)
+
+    # The final exact shard arrives after restart; already-terminal receipts are
+    # reused rather than recreated, and delivery order is irrelevant.
+    lane.phase_results[phase] = persisted_rows
+
+    merged = lab._merge_phase_sweep_receipts(lane, phase=phase)
+    assert [item["sweep_id"] for item in merged["parent_sweeps"]] == ["parent-a", "parent-b"]
+    assert merged["best"]["child_job_id"] == "parent-b-000000"
+    assert merged["best"]["score"] == 91.0
+    assert lab._merge_phase_sweep_receipts(lane, phase=phase) == merged
+
+    cross_parent = json.loads(json.dumps(lane.phase_results[phase]))
+    cross_parent[0]["sweep_payload"]["sweep_id"] = "other-parent"
+    lane.phase_results[phase] = cross_parent
+    with pytest.raises(lab.DurableExecutionError, match="identity does not match task spec"):
+        lab._merge_phase_sweep_receipts(lane, phase=phase)
+
+
 class _IndicatorIndexCli:
     def __init__(self, ids: list[str]):
         self.ids = ids
