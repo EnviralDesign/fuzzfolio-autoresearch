@@ -82,6 +82,12 @@ def _require_equal(label: str, observed: Any, expected: Any) -> None:
         )
 
 
+def _require_nonnegative_int(label: str, value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise LevelCCohortError(f"{label} must be a non-negative integer")
+    return int(value)
+
+
 def _require_sha256_identity(label: str, value: Any) -> str:
     identity = str(value or "").strip()
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", identity):
@@ -134,6 +140,10 @@ def _require_historical_lineage(
     }
     if not lineage["universe_id"]:
         raise LevelCCohortError(f"{label} universe_id is missing")
+    if "execution_plan_id" in payload:
+        lineage["execution_plan_id"] = _require_sha256_identity(
+            f"{label} execution_plan_id", payload.get("execution_plan_id")
+        )
     _require_equal(f"{label} as_of_date", lineage["as_of_date"], cutoff)
     _require_equal(
         f"{label} lake identity", lineage["lake_manifest_sha256"], lake_manifest_sha256
@@ -146,6 +156,168 @@ def _require_playhand_lineage(
 ) -> None:
     for field in ("research_generation_id", "level_c_protocol_id", "cutoff_key"):
         _require_equal(f"{label} {field}", payload.get(field), lineage[field])
+    if "execution_plan_id" in lineage:
+        _require_equal(
+            f"{label} execution_plan_id",
+            payload.get("execution_plan_id"),
+            lineage["execution_plan_id"],
+        )
+
+
+def _validated_playhand_summary_lane_ids(
+    campaign_summary: dict[str, Any], *, target_runs: int, layout: str
+) -> set[str]:
+    """Validate the untruncated finite lane receipt set and return its run ids.
+
+    The current PlayHand campaign summary deliberately emits one receipt per
+    retained lane and no longer duplicates that derived count in a separate
+    ``terminal_lanes`` field.  Formal Level C evidence therefore derives the
+    terminal count from these receipts, while still cross-checking the legacy
+    field when a historical summary contains it.
+    """
+    retained_lane_count = _require_nonnegative_int(
+        "PlayHand campaign retained lane count", campaign_summary.get("retained_lane_count")
+    )
+    pruned_lane_count = _require_nonnegative_int(
+        "PlayHand campaign pruned lane count", campaign_summary.get("pruned_lane_count")
+    )
+    if retained_lane_count + pruned_lane_count != target_runs:
+        raise LevelCCohortError("PlayHand campaign retained/pruned lane accounting is invalid")
+    if layout == "playhand_lab_v2":
+        if pruned_lane_count != 0 or campaign_summary.get("lanes_truncated") is True:
+            raise LevelCCohortError(
+                "Formal PlayHand campaign summary must retain an exact, untruncated lane receipt set"
+            )
+        if "lanes_truncated" in campaign_summary and not isinstance(
+            campaign_summary.get("lanes_truncated"), bool
+        ):
+            raise LevelCCohortError("PlayHand campaign summary lanes_truncated is malformed")
+
+    summary_lanes = campaign_summary.get("lanes")
+    if not isinstance(summary_lanes, list):
+        raise LevelCCohortError("PlayHand campaign summary lane receipts are missing")
+    if len(summary_lanes) != retained_lane_count:
+        raise LevelCCohortError("PlayHand campaign summary lane receipt count is invalid")
+
+    summary_run_ids: set[str] = set()
+    terminal_count = 0
+    for row in summary_lanes:
+        if not isinstance(row, dict):
+            raise LevelCCohortError("PlayHand campaign summary contains an invalid lane receipt")
+        run_id = str(row.get("run_id") or "").strip()
+        if not run_id or run_id in summary_run_ids:
+            raise LevelCCohortError("PlayHand campaign summary lane receipts are ambiguous")
+        if row.get("terminal") is not True:
+            raise LevelCCohortError("PlayHand campaign summary contains a non-terminal lane")
+        if _require_nonnegative_int(
+            f"PlayHand campaign summary lane {run_id} failed task count",
+            row.get("failed_task_count"),
+        ) != 0:
+            raise LevelCCohortError("PlayHand campaign summary contains a failed lane")
+        summary_run_ids.add(run_id)
+        terminal_count += 1
+
+    if layout == "playhand_lab_v2":
+        if terminal_count != target_runs:
+            raise LevelCCohortError("PlayHand campaign summary terminal lane accounting is invalid")
+    else:
+        _require_equal(
+            "PlayHand campaign summary terminal lanes",
+            _require_nonnegative_int(
+                "PlayHand campaign summary terminal lanes",
+                campaign_summary.get("terminal_lanes"),
+            ),
+            target_runs,
+        )
+        if terminal_count + pruned_lane_count != target_runs:
+            raise LevelCCohortError("PlayHand campaign summary terminal lane accounting is invalid")
+    if layout == "playhand_lab_v2" and "terminal_lanes" in campaign_summary:
+        _require_equal(
+            "PlayHand campaign summary terminal lanes",
+            _require_nonnegative_int(
+                "PlayHand campaign summary terminal lanes",
+                campaign_summary.get("terminal_lanes"),
+            ),
+            terminal_count,
+        )
+    return summary_run_ids
+
+
+def _validate_playhand_finite_task_accounting(
+    campaign_metadata: dict[str, Any], campaign_summary: dict[str, Any]
+) -> None:
+    """Require summary and durable campaign counters to describe the same run."""
+    summary_total = _require_nonnegative_int(
+        "PlayHand campaign summary total tasks", campaign_summary.get("total_tasks")
+    )
+    summary_completed = _require_nonnegative_int(
+        "PlayHand campaign summary completed tasks", campaign_summary.get("completed_tasks")
+    )
+    summary_failed = _require_nonnegative_int(
+        "PlayHand campaign summary failed tasks", campaign_summary.get("failed_tasks")
+    )
+    if summary_total != summary_completed + summary_failed:
+        raise LevelCCohortError("PlayHand campaign summary task accounting is invalid")
+    _require_equal("PlayHand campaign summary failed tasks", summary_failed, 0)
+    for summary_field, metadata_field in (
+        ("total_tasks", "total_task_count"),
+        ("completed_tasks", "completed_task_count"),
+        ("failed_tasks", "failed_task_count"),
+    ):
+        _require_equal(
+            f"PlayHand campaign {metadata_field}",
+            _require_nonnegative_int(
+                f"PlayHand campaign {metadata_field}", campaign_metadata.get(metadata_field)
+            ),
+            _require_nonnegative_int(
+                f"PlayHand campaign summary {summary_field}", campaign_summary.get(summary_field)
+            ),
+        )
+    if "recorded_result_count" in campaign_summary:
+        _require_equal(
+            "PlayHand campaign summary recorded result count",
+            _require_nonnegative_int(
+                "PlayHand campaign summary recorded result count",
+                campaign_summary.get("recorded_result_count"),
+            ),
+            summary_completed + summary_failed,
+        )
+    summary_lanes = campaign_summary.get("lanes")
+    if not isinstance(summary_lanes, list):
+        raise LevelCCohortError("PlayHand campaign summary lane receipts are missing")
+    receipt_completed = 0
+    receipt_failed = 0
+    for row in summary_lanes:
+        if not isinstance(row, dict):
+            raise LevelCCohortError("PlayHand campaign summary contains an invalid lane receipt")
+        run_id = str(row.get("run_id") or "").strip() or "<unknown>"
+        completed = _require_nonnegative_int(
+            f"PlayHand campaign summary lane {run_id} completed task count",
+            row.get("completed_task_count"),
+        )
+        failed = _require_nonnegative_int(
+            f"PlayHand campaign summary lane {run_id} failed task count",
+            row.get("failed_task_count"),
+        )
+        task_ids = row.get("task_ids")
+        if not isinstance(task_ids, list) or any(
+            not isinstance(task_id, str) or not task_id for task_id in task_ids
+        ):
+            raise LevelCCohortError(
+                f"PlayHand campaign summary lane {run_id} task receipts are missing"
+            )
+        if len(set(task_ids)) != len(task_ids) or len(task_ids) != completed + failed:
+            raise LevelCCohortError(
+                f"PlayHand campaign summary lane {run_id} task receipt accounting is invalid"
+            )
+        receipt_completed += completed
+        receipt_failed += failed
+    _require_equal(
+        "PlayHand campaign summary completed task receipts", receipt_completed, summary_completed
+    )
+    _require_equal(
+        "PlayHand campaign summary failed task receipts", receipt_failed, summary_failed
+    )
 
 
 def _path_is_within(path: Path, root: Path) -> bool:
@@ -441,15 +613,10 @@ def _validate_campaign(
         campaign_summary.get("lane_count"),
         target_runs,
     )
-    _require_equal(
-        "PlayHand campaign summary terminal lanes",
-        campaign_summary.get("terminal_lanes"),
-        target_runs,
-    )
-    _require_equal(
-        "PlayHand campaign summary failed tasks",
-        campaign_summary.get("failed_tasks"),
-        0,
+    if layout == "playhand_lab_v2":
+        _validate_playhand_finite_task_accounting(campaign_metadata, campaign_summary)
+    _validated_playhand_summary_lane_ids(
+        campaign_summary, target_runs=target_runs, layout=layout
     )
     atlas_seed_plan = atlas_root / "recipe-priors" / "play-hand-seed-plan.json"
     recorded_seed_plan = _rebase_recorded_runs_path(
@@ -558,12 +725,27 @@ def _discover_candidates(
     lane_roots: list[Path] = []
     lane_indexes: set[int] = set()
     lane_run_ids: set[str] = set()
+    summary_run_ids = _validated_playhand_summary_lane_ids(
+        campaign_summary, target_runs=target_runs, layout=layout
+    )
     for run_dir in list_run_dirs(runs_root):
+        if layout == "playhand_lab_v2" and run_dir.name not in summary_run_ids:
+            if any(
+                run_dir.name.startswith(f"{run_id}.corrupt-")
+                for run_id in summary_run_ids
+            ):
+                # Explicit forensic quarantine from a failed pre-journal run.
+                # It is not part of the immutable current campaign receipt set.
+                continue
         metadata = load_run_metadata(run_dir)
         parent_campaign_id = str(metadata.get("parent_campaign_id") or "")
         lab_campaign_id = str(metadata.get("lab_campaign_id") or "")
         if campaign_id not in {parent_campaign_id, lab_campaign_id}:
             continue
+        if layout == "playhand_lab_v2" and run_dir.name not in summary_run_ids:
+            raise LevelCCohortError(
+                f"PlayHand campaign contains an unexpected non-summary lane root: {run_dir.name}"
+            )
         if layout == "playhand_lab_v2":
             _require_equal(f"PlayHand lane {run_dir.name} schema", metadata.get("schema_version"), PLAYHAND_V2_LANE_SCHEMA)
             _require_equal(f"PlayHand lane {run_dir.name} runner", metadata.get("generated_by_runner"), PLAYHAND_V2_RUNNER)
@@ -742,32 +924,8 @@ def _discover_candidates(
         )
     if layout == "playhand_lab_v2" and lane_indexes != set(range(target_runs)):
         raise LevelCCohortError("PlayHand campaign lane index accounting is incomplete")
-    summary_lanes = campaign_summary.get("lanes")
-    if not isinstance(summary_lanes, list):
-        raise LevelCCohortError("PlayHand campaign summary lane receipts are missing")
-    summary_run_ids: set[str] = set()
-    for row in summary_lanes:
-        if not isinstance(row, dict):
-            raise LevelCCohortError("PlayHand campaign summary contains an invalid lane receipt")
-        run_id = str(row.get("run_id") or "").strip()
-        if not run_id or run_id in summary_run_ids or run_id not in lane_run_ids:
-            raise LevelCCohortError("PlayHand campaign summary lane receipts do not match evidence")
-        if row.get("terminal") is not True or int(row.get("failed_task_count") or 0) != 0:
-            raise LevelCCohortError("PlayHand campaign summary contains a non-terminal lane")
-        summary_run_ids.add(run_id)
-    retained_lane_count = campaign_summary.get("retained_lane_count")
-    pruned_lane_count = campaign_summary.get("pruned_lane_count")
-    if (
-        isinstance(retained_lane_count, bool)
-        or not isinstance(retained_lane_count, int)
-        or isinstance(pruned_lane_count, bool)
-        or not isinstance(pruned_lane_count, int)
-        or retained_lane_count < 0
-        or pruned_lane_count < 0
-        or retained_lane_count + pruned_lane_count != target_runs
-        or len(summary_run_ids) != retained_lane_count
-    ):
-        raise LevelCCohortError("PlayHand campaign retained/pruned lane accounting is invalid")
+    if lane_run_ids != summary_run_ids:
+        raise LevelCCohortError("PlayHand campaign summary lane receipts do not match evidence")
     return sorted(candidates, key=lambda row: row["attempt_id"]), lane_roots
 
 

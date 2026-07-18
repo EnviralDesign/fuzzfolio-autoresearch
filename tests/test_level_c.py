@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import shutil
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, str, str]:
         "source_snapshot_sha256": "sha256:" + "c" * 64,
         "universe_id": universe["universe_id"],
         "universe_manifest_sha256": universe["universe_hash"],
+        "execution_plan_id": "sha256:" + "d" * 64,
     }
     runs_root = tmp_path / "runs"
     atlas_root = runs_root / "derived" / "atlas-runs" / "atlas-1"
@@ -109,13 +111,21 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, str, str]:
                 "lane_count": 1,
                 "retained_lane_count": 1,
                 "pruned_lane_count": 0,
-                "terminal_lanes": 1,
+                "lanes_truncated": False,
+                "total_tasks": 1,
+                "completed_tasks": 1,
                 "failed_tasks": 0,
+                "recorded_result_count": 1,
                 "lanes": [
                     {
                         "run_id": "lane-1",
+                        "run_dir": str((runs_root / "lane-1").resolve()),
+                        "task_ids": ["lane-1-task-00001"],
+                        "completed_task_count": 1,
                         "terminal": True,
                         "failed_task_count": 0,
+                        "run_promoted": True,
+                        "terminal_outcome_category": "promoted",
                     }
                 ],
             }
@@ -135,12 +145,15 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, str, str]:
             "target_runs": 1,
             "formal_historical_level_c": True,
             "failed_task_count": 0,
+            "total_task_count": 1,
+            "completed_task_count": 1,
             "historical_completion_failure_reason": None,
             "as_of_date": cutoff,
             "lake_manifest_sha256": lake,
             "research_generation_id": lineage["research_generation_id"],
             "level_c_protocol_id": lineage["level_c_protocol_id"],
             "cutoff_key": lineage["cutoff_key"],
+            "execution_plan_id": lineage["execution_plan_id"],
             "play_hand_seed_plan_path": str(atlas_seed_plan.resolve()),
             "play_hand_seed_plan_sha256": "sha256:"
             + hashlib.sha256(atlas_seed_plan.read_bytes()).hexdigest(),
@@ -185,6 +198,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, str, str]:
             "research_generation_id": lineage["research_generation_id"],
             "level_c_protocol_id": lineage["level_c_protocol_id"],
             "cutoff_key": lineage["cutoff_key"],
+            "execution_plan_id": lineage["execution_plan_id"],
         },
     )
     (lane_root / "attempts.jsonl").write_text(
@@ -246,6 +260,97 @@ def _make_fixture_no_signal(runs_root: Path) -> None:
     lane_metadata["failed_task_count"] = 0
     lane_metadata["tombstone_reason"] = "no_signal"
     lane_metadata_path.write_text(json.dumps(lane_metadata), encoding="utf-8")
+    summary_path = (
+        runs_root
+        / "derived"
+        / "play-hand-lab-campaigns"
+        / "playhand-campaign-1"
+        / "play-hand-lab-campaign-summary.json"
+    )
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["lanes"][0].update(
+        {
+            "run_promoted": False,
+            "terminal_outcome_category": "research_nonviable",
+            "tombstone_reason": "no_signal",
+        }
+    )
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+
+def _campaign_summary_path(runs_root: Path) -> Path:
+    return (
+        runs_root
+        / "derived"
+        / "play-hand-lab-campaigns"
+        / "playhand-campaign-1"
+        / "play-hand-lab-campaign-summary.json"
+    )
+
+
+def _add_tombstoned_fixture_lane(runs_root: Path) -> None:
+    campaign_root = runs_root / "derived" / "play-hand-lab-campaigns" / "playhand-campaign-1"
+    first_lane = runs_root / "lane-1"
+    second_lane = runs_root / "lane-2"
+    shutil.copytree(first_lane, second_lane)
+    metadata_path = second_lane / "run-metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(
+        {
+            "run_id": "lane-2",
+            "run_status": "tombstoned",
+            "terminal": True,
+            "failed_task_count": 0,
+            "canonical_attempt_id": None,
+            "lab_lane_index": 1,
+            "campaign_dir": str(campaign_root.resolve()),
+            "tombstone_reason": "validation_score_below_45",
+            "terminal_outcome_category": "research_nonviable",
+            "run_promoted": False,
+        }
+    )
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    summary_path = _campaign_summary_path(runs_root)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary.update(
+        {
+            "target_runs": 2,
+            "lane_count": 2,
+            "retained_lane_count": 2,
+            "pruned_lane_count": 0,
+            "total_tasks": 2,
+            "completed_tasks": 2,
+            "failed_tasks": 0,
+            "recorded_result_count": 2,
+        }
+    )
+    summary["lanes"].append(
+        {
+            "run_id": "lane-2",
+            "run_dir": str(second_lane.resolve()),
+            "task_ids": ["lane-2-task-00001"],
+            "completed_task_count": 1,
+            "terminal": True,
+            "failed_task_count": 0,
+            "run_promoted": False,
+            "terminal_outcome_category": "research_nonviable",
+            "tombstone_reason": "validation_score_below_45",
+        }
+    )
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    campaign_metadata_path = campaign_root / "run-metadata.json"
+    campaign_metadata = json.loads(campaign_metadata_path.read_text(encoding="utf-8"))
+    campaign_metadata.update(
+        {
+            "target_runs": 2,
+            "total_task_count": 2,
+            "completed_task_count": 2,
+            "failed_task_count": 0,
+        }
+    )
+    campaign_metadata_path.write_text(json.dumps(campaign_metadata), encoding="utf-8")
 
 
 def test_freeze_and_validate_level_c_cohort(tmp_path: Path) -> None:
@@ -306,6 +411,186 @@ def test_level_c_cohort_freezes_and_validates_audible_no_defensible_candidates(
     )
     assert bound == []
     assert rejected == [{"attempt_id": "not-a-candidate", "reason": "outside_frozen_cohort"}]
+
+
+def test_level_c_cohort_accepts_current_all_tombstoned_summary_shape(
+    tmp_path: Path,
+) -> None:
+    runs_root, atlas_root, cutoff, lake = _fixture(tmp_path)
+    _make_fixture_no_signal(runs_root)
+    summary_path = _campaign_summary_path(runs_root)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert "terminal_lanes" not in summary
+    output = runs_root / "derived" / "level-c-cohorts" / "all-tombstoned.json"
+
+    payload = freeze_level_c_cohort(
+        runs_root=runs_root,
+        atlas_run_root=atlas_root,
+        playhand_campaign_id="playhand-campaign-1",
+        as_of_date=cutoff,
+        lake_manifest_sha256=lake,
+        output_path=output,
+        cohort_id="all-tombstoned",
+    )
+
+    assert payload["candidate_count"] == 0
+    assert payload["outcome"] == "no_defensible_candidates"
+    assert validate_level_c_cohort(output)["outcome"] == "no_defensible_candidates"
+
+
+def test_level_c_cohort_preserves_mixed_promoted_and_nonviable_lanes(
+    tmp_path: Path,
+) -> None:
+    runs_root, atlas_root, cutoff, lake = _fixture(tmp_path)
+    _add_tombstoned_fixture_lane(runs_root)
+    output = runs_root / "derived" / "level-c-cohorts" / "mixed.json"
+
+    payload = freeze_level_c_cohort(
+        runs_root=runs_root,
+        atlas_run_root=atlas_root,
+        playhand_campaign_id="playhand-campaign-1",
+        as_of_date=cutoff,
+        lake_manifest_sha256=lake,
+        output_path=output,
+        cohort_id="mixed",
+    )
+
+    assert payload["outcome"] == "candidates_frozen"
+    assert [row["attempt_id"] for row in payload["candidates"]] == [
+        "lane-1-attempt-00001"
+    ]
+
+
+def test_level_c_cohort_rejects_malformed_current_summary_task_accounting(
+    tmp_path: Path,
+) -> None:
+    runs_root, atlas_root, cutoff, lake = _fixture(tmp_path)
+    summary_path = _campaign_summary_path(runs_root)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary["completed_tasks"] = 0
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+
+    with pytest.raises(LevelCCohortError, match="summary task accounting is invalid"):
+        freeze_level_c_cohort(
+            runs_root=runs_root,
+            atlas_run_root=atlas_root,
+            playhand_campaign_id="playhand-campaign-1",
+            as_of_date=cutoff,
+            lake_manifest_sha256=lake,
+            output_path=runs_root / "derived" / "level-c-cohorts" / "malformed.json",
+            cohort_id="malformed",
+        )
+
+
+def test_level_c_cohort_ignores_explicit_forensic_lane_quarantine(
+    tmp_path: Path,
+) -> None:
+    runs_root, atlas_root, cutoff, lake = _fixture(tmp_path)
+    shutil.copytree(
+        runs_root / "lane-1",
+        runs_root / "lane-1.corrupt-legacy-result-identity-20260718T000000Z",
+    )
+    output = runs_root / "derived" / "level-c-cohorts" / "quarantine-safe.json"
+
+    payload = freeze_level_c_cohort(
+        runs_root=runs_root,
+        atlas_run_root=atlas_root,
+        playhand_campaign_id="playhand-campaign-1",
+        as_of_date=cutoff,
+        lake_manifest_sha256=lake,
+        output_path=output,
+        cohort_id="quarantine-safe",
+    )
+
+    assert payload["candidate_count"] == 1
+
+
+def test_level_c_cohort_ignores_malformed_explicit_forensic_lane_quarantine(
+    tmp_path: Path,
+) -> None:
+    runs_root, atlas_root, cutoff, lake = _fixture(tmp_path)
+    quarantine = runs_root / "lane-1.corrupt-legacy-result-identity-20260718T000000Z"
+    quarantine.mkdir()
+    (quarantine / "run-metadata.json").write_text("not-json", encoding="utf-8")
+    output = runs_root / "derived" / "level-c-cohorts" / "malformed-quarantine.json"
+
+    payload = freeze_level_c_cohort(
+        runs_root=runs_root,
+        atlas_run_root=atlas_root,
+        playhand_campaign_id="playhand-campaign-1",
+        as_of_date=cutoff,
+        lake_manifest_sha256=lake,
+        output_path=output,
+        cohort_id="malformed-quarantine",
+    )
+
+    assert payload["candidate_count"] == 1
+
+
+def test_level_c_cohort_rejects_summary_and_metadata_counts_that_disagree_with_receipts(
+    tmp_path: Path,
+) -> None:
+    runs_root, atlas_root, cutoff, lake = _fixture(tmp_path)
+    summary_path = _campaign_summary_path(runs_root)
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary.update({"total_tasks": 0, "completed_tasks": 0, "recorded_result_count": 0})
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    campaign_metadata_path = summary_path.parent / "run-metadata.json"
+    campaign_metadata = json.loads(campaign_metadata_path.read_text(encoding="utf-8"))
+    campaign_metadata.update({"total_task_count": 0, "completed_task_count": 0})
+    campaign_metadata_path.write_text(json.dumps(campaign_metadata), encoding="utf-8")
+
+    with pytest.raises(LevelCCohortError, match="completed task receipts mismatch"):
+        freeze_level_c_cohort(
+            runs_root=runs_root,
+            atlas_run_root=atlas_root,
+            playhand_campaign_id="playhand-campaign-1",
+            as_of_date=cutoff,
+            lake_manifest_sha256=lake,
+            output_path=runs_root / "derived" / "level-c-cohorts" / "receipt-mismatch.json",
+            cohort_id="receipt-mismatch",
+        )
+
+
+def test_level_c_legacy_summary_without_v2_task_counters_remains_valid(
+    tmp_path: Path,
+) -> None:
+    runs_root, atlas_root, cutoff, lake = _fixture(tmp_path)
+    campaign_id = "playhand-campaign-1"
+    v2_root = runs_root / "derived" / "play-hand-lab-campaigns" / campaign_id
+    legacy_root = runs_root / campaign_id
+    v2_root.rename(legacy_root)
+    summary_path = legacy_root / "play-hand-lab-campaign-summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary.pop("lanes_truncated")
+    summary.pop("total_tasks")
+    summary.pop("completed_tasks")
+    summary.pop("recorded_result_count")
+    summary["terminal_lanes"] = 1
+    summary_path.write_text(json.dumps(summary), encoding="utf-8")
+    campaign_metadata_path = legacy_root / "run-metadata.json"
+    campaign_metadata = json.loads(campaign_metadata_path.read_text(encoding="utf-8"))
+    campaign_metadata.pop("total_task_count")
+    campaign_metadata.pop("completed_task_count")
+    campaign_metadata["summary_path"] = str(summary_path.resolve())
+    campaign_metadata_path.write_text(json.dumps(campaign_metadata), encoding="utf-8")
+    lane_metadata_path = runs_root / "lane-1" / "run-metadata.json"
+    lane_metadata = json.loads(lane_metadata_path.read_text(encoding="utf-8"))
+    lane_metadata["campaign_dir"] = str(legacy_root.resolve())
+    lane_metadata_path.write_text(json.dumps(lane_metadata), encoding="utf-8")
+
+    payload = freeze_level_c_cohort(
+        runs_root=runs_root,
+        atlas_run_root=atlas_root,
+        playhand_campaign_id=campaign_id,
+        as_of_date=cutoff,
+        lake_manifest_sha256=lake,
+        output_path=runs_root / "derived" / "level-c-cohorts" / "legacy.json",
+        cohort_id="legacy",
+    )
+
+    assert payload["candidate_count"] == 1
+    assert payload["playhand_campaign_layout"] == "legacy_top_level"
 
 
 def test_level_c_cohort_rejects_tampered_no_defensible_candidate_outcome(
