@@ -679,6 +679,43 @@ def test_resumed_cutoff_creates_never_started_playhand_campaign(
     assert artifacts == [campaign_root / "play-hand-lab-summary.json"]
 
 
+def test_level_c_profile_snapshot_resolver_uses_plan_bound_worker_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, active, _, _, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    plan_path = active / "derived" / "level-c" / "control" / "execution-plan-A.json"
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    arguments = dict(plan["playhand_arguments"])
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        workflow,
+        "executor_arguments_from_plan",
+        lambda *_args, **_kwargs: (arguments, plan),
+    )
+
+    def worker_ready(profile_payload, *, config, runtime):
+        captured["payload"] = profile_payload
+        captured["config"] = config
+        captured["runtime"] = runtime
+        return {"resolved": True, "notificationThreshold": 80.0}
+
+    monkeypatch.setattr(workflow, "_worker_ready_profile_snapshot", worker_ready)
+    resolver = workflow._level_c_profile_snapshot_resolver(
+        config=config,
+        plan_path=plan_path,
+        plan=plan,
+    )
+
+    authoring = {"format": "fuzzfolio.scoring-profile", "profile": {"name": "Bounded"}}
+    assert resolver(authoring) == {"resolved": True, "notificationThreshold": 80.0}
+    assert captured["payload"] == authoring
+    assert captured["config"] is config
+    assert getattr(captured["runtime"], "trading_dashboard_root") == Path(
+        plan["bound_contract"]["profile_model_source_root"]
+    )
+
+
 def test_playhand_stage_existing_campaign_requires_its_own_strict_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

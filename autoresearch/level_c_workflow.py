@@ -46,7 +46,11 @@ from .level_c_protocol import (
     load_level_c_protocol,
     load_level_c_protocol_authority,
 )
-from .play_hand_lab import PlayHandLabRuntimeConfig, cmd_play_hand_lab
+from .play_hand_lab import (
+    PlayHandLabRuntimeConfig,
+    _worker_ready_profile_snapshot,
+    cmd_play_hand_lab,
+)
 from .runtime_policy_lock import build_runtime_policy_lock, policy_lock_provenance
 
 
@@ -962,6 +966,29 @@ def _playhand_stage_resume_mode(*, campaign_root: Path, cutoff_resume: bool) -> 
     return True
 
 
+def _level_c_profile_snapshot_resolver(
+    *, config: AppConfig, plan_path: Path, plan: Mapping[str, Any]
+) -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """Reconstruct the plan-bound profile snapshot sent to deep-replay workers."""
+    arguments, _ = executor_arguments_from_plan(plan_path, executor="playhand", config=config)
+    bound_root = Path(str(plan["bound_contract"]["profile_model_source_root"]))
+    runtime = _runtime_from_plan(
+        PlayHandLabRuntimeConfig,
+        arguments,
+        execution_plan_path=plan_path,
+        trading_dashboard_root=bound_root,
+    )
+
+    def resolve(profile_payload: dict[str, Any]) -> dict[str, Any]:
+        return _worker_ready_profile_snapshot(
+            profile_payload,
+            config=config,
+            runtime=runtime,
+        )
+
+    return resolve
+
+
 def _month_span(start: str, end: str) -> int:
     left = datetime.fromisoformat(start.replace("Z", "+00:00"))
     right = datetime.fromisoformat(end.replace("Z", "+00:00"))
@@ -1156,8 +1183,16 @@ def _default_stage_handler(
         return "complete", [summary]
     if stage == "frozen_cohort":
         cohort_path = Path(expected["frozen_cohort"]["resolved_path"])
+        profile_snapshot_resolver = _level_c_profile_snapshot_resolver(
+            config=config,
+            plan_path=plan_path,
+            plan=plan,
+        )
         if cohort_path.exists():
-            cohort = validate_level_c_cohort(cohort_path)
+            cohort = validate_level_c_cohort(
+                cohort_path,
+                profile_snapshot_resolver=profile_snapshot_resolver,
+            )
         else:
             cohort = freeze_level_c_cohort(
                 runs_root=active_root,
@@ -1167,12 +1202,20 @@ def _default_stage_handler(
                 lake_manifest_sha256=plan["atlas_arguments"]["lake_manifest_sha256"],
                 output_path=cohort_path,
                 cohort_id=plan["cutoff"]["cohort_id"],
+                profile_snapshot_resolver=profile_snapshot_resolver,
             )
         outcome = str(cohort.get("outcome") or "")
         return outcome, [cohort_path]
 
     cohort_path = Path(expected["frozen_cohort"]["resolved_path"])
-    cohort = validate_level_c_cohort(cohort_path)
+    cohort = validate_level_c_cohort(
+        cohort_path,
+        profile_snapshot_resolver=_level_c_profile_snapshot_resolver(
+            config=config,
+            plan_path=plan_path,
+            plan=plan,
+        ),
+    )
     workflow = _operator_semantics(plan)
     nested_campaign_id = f"{plan['cutoff']['cohort_id']}-nested"
     nested_root = active_root / "derived" / "nested-evidence" / nested_campaign_id
@@ -1475,7 +1518,14 @@ def audit_level_c(
             terminal = receipt.get("outcome")
         if "frozen_cohort" in stages:
             cohort_path = Path(plan["expected_artifacts"]["frozen_cohort"]["resolved_path"])
-            cohort = validate_level_c_cohort(cohort_path)
+            cohort = validate_level_c_cohort(
+                cohort_path,
+                profile_snapshot_resolver=_level_c_profile_snapshot_resolver(
+                    config=config,
+                    plan_path=paths["control"] / f"execution-plan-{key}.json",
+                    plan=plan,
+                ),
+            )
             if int(cohort.get("candidate_count") or 0) != len(cohort.get("candidates") or []):
                 raise LevelCWorkflowError("frozen cohort accounting mismatch")
         if "selected_outer" in stages:
@@ -1486,7 +1536,12 @@ def audit_level_c(
                 expected_attempt_ids={
                     str(row.get("attempt_id") or "")
                     for row in validate_level_c_cohort(
-                        Path(plan["expected_artifacts"]["frozen_cohort"]["resolved_path"])
+                        Path(plan["expected_artifacts"]["frozen_cohort"]["resolved_path"]),
+                        profile_snapshot_resolver=_level_c_profile_snapshot_resolver(
+                            config=config,
+                            plan_path=paths["control"] / f"execution-plan-{key}.json",
+                            plan=plan,
+                        ),
                     ).get("candidates")
                     or []
                 },

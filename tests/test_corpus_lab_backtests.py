@@ -17,7 +17,7 @@ from autoresearch.corpus_lab_backtests import (
     materialize_no_valid_cell_lab_result,
     run_lab_full_backtests,
 )
-from autoresearch.evidence_plan import build_execution_cell_sha256
+from autoresearch.evidence_plan import build_execution_cell_sha256, build_replay_evidence_plan
 from autoresearch.evidence_artifacts import (
     discover_evidence_artifact_bundles,
     evidence_artifact_paths,
@@ -143,6 +143,77 @@ def test_build_full_backtest_lab_task_unwraps_portable_profile(tmp_path: Path) -
     assert payload["matrix"]["reward_columns"] == 8
     assert payload["options"]["quality_score_preset"] == "profile_drop"
     assert payload["required_capabilities"] == ["deep_replay", "full_backtest_cache"]
+
+
+def test_build_full_backtest_lab_task_binds_explicit_worker_ready_snapshot(
+    tmp_path: Path,
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "final"
+    profile_path = run_dir / "profiles" / "profile.json"
+    artifact_dir.mkdir(parents=True)
+    _write_json(
+        profile_path,
+        {
+            "format": "fuzzfolio.scoring-profile",
+            "formatVersion": 1,
+            "profile": {
+                "name": "Authoring wrapper",
+                "instruments": ["EURUSD"],
+                "notificationThreshold": 80,
+            },
+        },
+    )
+    _write_json(
+        artifact_dir / "deep-replay-job.json",
+        {"request": {"instruments": ["EURUSD"], "timeframe": "M5"}},
+    )
+    worker_ready_profile = {
+        "name": "Worker-ready",
+        "instruments": ["EURUSD"],
+        "notificationThreshold": 80.0,
+        "executionConfig": None,
+    }
+    plan = build_replay_evidence_plan(
+        campaign_plan_id="nested:profile-bound",
+        evidence_role="training",
+        selection_data_end="2025-01-01T00:00:00Z",
+        analysis_window_start="2022-01-01T00:00:00Z",
+        analysis_window_end="2025-01-01T00:00:00Z",
+        requested_horizon_months=36,
+        profile_snapshot=worker_ready_profile,
+        lake_manifest_sha256="sha256:" + "a" * 64,
+        data_availability_cutoff="2025-01-01T00:00:00Z",
+    )
+    attempt = {
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": str(profile_path),
+    }
+    config = SimpleNamespace(research=SimpleNamespace(quality_score_preset="profile_drop"))
+
+    task = build_full_backtest_lab_task(
+        config=config,
+        run_dir=run_dir,
+        attempt=attempt,
+        run_metadata={},
+        lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+        evidence_plan=plan,
+        profile_snapshot_override=worker_ready_profile,
+    )
+
+    assert task["payload"]["inline_profile_snapshot"] == worker_ready_profile
+    assert task["payload"]["evidence_plan"]["profile_snapshot_sha256"] == plan.profile_snapshot_sha256
+    with pytest.raises(RuntimeError, match="does not match the evidence plan"):
+        build_full_backtest_lab_task(
+            config=config,
+            run_dir=run_dir,
+            attempt=attempt,
+            run_metadata={},
+            lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+            evidence_plan=plan,
+            profile_snapshot_override={**worker_ready_profile, "name": "drifted"},
+        )
 
 
 @pytest.mark.parametrize(

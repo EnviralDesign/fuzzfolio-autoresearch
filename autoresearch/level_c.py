@@ -5,7 +5,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from .evidence_plan import (
     canonical_sha256,
@@ -31,8 +31,38 @@ class LevelCCohortError(RuntimeError):
     pass
 
 
+ProfileSnapshotResolver = Callable[[dict[str, Any]], dict[str, Any]]
+
+
 def _canonical_json(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+
+def _profile_snapshot_identity(
+    profile_payload: dict[str, Any],
+    *,
+    label: str,
+    profile_snapshot_resolver: ProfileSnapshotResolver | None,
+) -> str:
+    """Hash the exact profile representation that the evidence plan executed."""
+    try:
+        snapshot = (
+            profile_snapshot_resolver(profile_payload)
+            if profile_snapshot_resolver is not None
+            else profile_payload
+        )
+    except Exception as exc:
+        raise LevelCCohortError(
+            f"{label} worker-ready profile snapshot could not be resolved"
+        ) from exc
+    if not isinstance(snapshot, dict):
+        raise LevelCCohortError(
+            f"{label} worker-ready profile snapshot is not an object"
+        )
+    try:
+        return canonical_sha256(normalize_evidence_profile_snapshot(snapshot))
+    except ValueError as exc:
+        raise LevelCCohortError(f"{label} profile snapshot is invalid") from exc
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -720,6 +750,7 @@ def _discover_candidates(
     lineage: dict[str, str],
     target_runs: int,
     campaign_summary: dict[str, Any],
+    profile_snapshot_resolver: ProfileSnapshotResolver | None = None,
 ) -> tuple[list[dict[str, Any]], list[Path]]:
     candidates: list[dict[str, Any]] = []
     lane_roots: list[Path] = []
@@ -895,8 +926,10 @@ def _discover_candidates(
             raise LevelCCohortError(
                 f"Canonical attempt profile is invalid: {canonical_attempt_id}"
             ) from exc
-        profile_identity = canonical_sha256(
-            normalize_evidence_profile_snapshot(profile_payload)
+        profile_identity = _profile_snapshot_identity(
+            profile_payload,
+            label=f"canonical attempt {canonical_attempt_id}",
+            profile_snapshot_resolver=profile_snapshot_resolver,
         )
         _require_equal(
             f"canonical attempt {canonical_attempt_id} profile snapshot",
@@ -964,6 +997,7 @@ def freeze_level_c_cohort(
     lake_manifest_sha256: str,
     output_path: Path,
     cohort_id: str,
+    profile_snapshot_resolver: ProfileSnapshotResolver | None = None,
 ) -> dict[str, Any]:
     cutoff = canonical_timestamp(as_of_date)
     lake_identity = _require_sha256_identity("lake_manifest_sha256", lake_manifest_sha256)
@@ -1002,6 +1036,7 @@ def freeze_level_c_cohort(
         lineage=lineage,
         target_runs=int(campaign_metadata["target_runs"]),
         campaign_summary=campaign_summary,
+        profile_snapshot_resolver=profile_snapshot_resolver,
     )
 
     artifact_sha256 = _hash_tree(atlas_root, namespace="atlas")
@@ -1053,7 +1088,10 @@ def freeze_level_c_cohort(
 
 
 def validate_level_c_cohort(
-    path: Path, *, relocated_runs_root: Path | None = None
+    path: Path,
+    *,
+    relocated_runs_root: Path | None = None,
+    profile_snapshot_resolver: ProfileSnapshotResolver | None = None,
 ) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -1115,6 +1153,7 @@ def validate_level_c_cohort(
         lineage=lineage,
         target_runs=int(campaign_metadata["target_runs"]),
         campaign_summary=campaign_summary,
+        profile_snapshot_resolver=profile_snapshot_resolver,
     )
     _require_equal("Frozen Level C candidates", payload.get("candidates"), live_candidates)
     live_outcome, live_outcome_reason = _frozen_cohort_outcome(live_candidates)

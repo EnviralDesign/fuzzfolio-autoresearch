@@ -20,7 +20,11 @@ from .fixed_cohort import (
     validate_fixed_corpus_cohort,
 )
 from .ledger import load_run_metadata
-from .level_c import LEVEL_C_COHORT_SCHEMA, validate_level_c_cohort
+from .level_c import (
+    LEVEL_C_COHORT_SCHEMA,
+    ProfileSnapshotResolver,
+    validate_level_c_cohort,
+)
 from .level_c_operator import validate_profile_model_source_lock
 from .nested_gateway import (
     freeze_nested_gateway_cells_fold,
@@ -33,6 +37,7 @@ from .portfolio_research import (
     run_nested_cell_temporal_validation,
     temporal_folds,
 )
+from .play_hand_lab import PlayHandLabRuntimeConfig, _worker_ready_profile_snapshot
 
 
 NESTED_PHASE_SCHEMA = "autoresearch-nested-evidence-phase-v1"
@@ -155,14 +160,23 @@ def _write_phase(
     return _create_or_verify(path, payload), path
 
 
-def _cohort_attempts(path: Path, runs_root: Path) -> tuple[list[str], dict[str, Any]]:
+def _cohort_attempts(
+    path: Path,
+    runs_root: Path,
+    *,
+    profile_snapshot_resolver: ProfileSnapshotResolver | None = None,
+) -> tuple[list[str], dict[str, Any]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise NestedPipelineError(f"attempt cohort is invalid: {path}") from exc
     schema = raw.get("schema") if isinstance(raw, dict) else None
     if schema == LEVEL_C_COHORT_SCHEMA:
-        cohort = validate_level_c_cohort(path, relocated_runs_root=runs_root)
+        cohort = validate_level_c_cohort(
+            path,
+            relocated_runs_root=runs_root,
+            profile_snapshot_resolver=profile_snapshot_resolver,
+        )
         candidates = cohort.get("candidates") or []
         attempt_ids = [str(row.get("attempt_id") or "") for row in candidates]
     elif schema == FIXED_COHORT_SCHEMA:
@@ -207,6 +221,24 @@ def _live_worker_contract(root: Path) -> str:
         return str(build_replay_worker_contract(repo_root=root).contract_hash)
     except Exception as exc:
         raise NestedPipelineError(f"could not resolve live replay worker contract: {exc}") from exc
+
+
+def _worker_ready_profile_snapshot_resolver(
+    *, config: AppConfig, trading_dashboard_root: Path
+) -> ProfileSnapshotResolver:
+    runtime = PlayHandLabRuntimeConfig(
+        task_mode="deep_replay",
+        trading_dashboard_root=trading_dashboard_root,
+    )
+
+    def resolve(profile_payload: dict[str, Any]) -> dict[str, Any]:
+        return _worker_ready_profile_snapshot(
+            profile_payload,
+            config=config,
+            runtime=runtime,
+        )
+
+    return resolve
 
 
 def prepare_nested_pipeline(
@@ -262,8 +294,48 @@ def prepare_nested_pipeline(
     cohort: dict[str, Any] | None = None
     cohort_ids: list[str] | None = None
     cohort_path = attempt_cohort.resolve() if attempt_cohort is not None else None
+    if dry_run and not hasattr(config, "fuzzfolio"):
+        effective_contract = bound_worker_contract_hash or "dry-run-unresolved"
+        lab_config = LabBacktestConfig(worker_contract_hash=effective_contract)
+        profile_snapshot_resolver = None
+    else:
+        configured_root = _configured_dashboard_root(config)
+        plan_root = (
+            bound_trading_dashboard_root.expanduser().resolve()
+            if bound_trading_dashboard_root is not None
+            else configured_root
+        )
+        effective_root = (
+            trading_dashboard_root.expanduser().resolve()
+            if trading_dashboard_root
+            else configured_root
+        )
+        if configured_root != plan_root or effective_root != plan_root:
+            raise NestedPipelineError("alternate Trading-Dashboard root is not permitted")
+        if profile_model_source_lock is not None:
+            validate_profile_model_source_lock(profile_model_source_lock, effective_root)
+        live_contract = _live_worker_contract(effective_root)
+        if bound_worker_contract_hash and live_contract != bound_worker_contract_hash:
+            raise NestedPipelineError("live replay worker contract differs from authority plan")
+        effective_contract = bound_worker_contract_hash or live_contract
+        profile_snapshot_resolver = _worker_ready_profile_snapshot_resolver(
+            config=config,
+            trading_dashboard_root=effective_root,
+        )
+        lab_config = resolve_lab_backtest_config(
+            gateway_url=gateway_url,
+            gateway_token=gateway_token,
+            trading_dashboard_root=effective_root,
+            worker_contract_hash=effective_contract,
+            deadline_seconds=3600,
+            result_batch_size=max(25, int(max_workers) * 2),
+        )
     if cohort_path is not None:
-        cohort_ids, cohort = _cohort_attempts(cohort_path, config.runs_root)
+        cohort_ids, cohort = _cohort_attempts(
+            cohort_path,
+            config.runs_root,
+            profile_snapshot_resolver=profile_snapshot_resolver,
+        )
         if explicit and set(explicit) != set(cohort_ids):
             raise NestedPipelineError("explicit attempt IDs differ from the frozen cohort")
     requested = cohort_ids or explicit
@@ -309,7 +381,12 @@ def prepare_nested_pipeline(
             f"frozen cohort catalog resolution failed: missing={missing}, ambiguous={ambiguous}, extra={extra}"
         )
     resolved_rows = [grouped[attempt_id][0] for attempt_id in requested]
+    worker_ready_profiles: dict[str, dict[str, Any]] = {}
     if cohort is not None and cohort.get("schema") == LEVEL_C_COHORT_SCHEMA:
+        if profile_snapshot_resolver is None:
+            raise NestedPipelineError(
+                "Level C nested evidence requires the plan-bound profile snapshot resolver"
+            )
         candidates = {
             str(candidate.get("attempt_id") or ""): candidate
             for candidate in cohort.get("candidates") or []
@@ -332,46 +409,42 @@ def prepare_nested_pipeline(
                 raise NestedPipelineError(
                     f"frozen cohort catalog identity differs: {attempt_id}"
                 )
+            try:
+                authoring_profile = json.loads(expected_profile.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise NestedPipelineError(
+                    f"frozen cohort profile is unreadable: {attempt_id}"
+                ) from exc
+            if not isinstance(authoring_profile, dict):
+                raise NestedPipelineError(
+                    f"frozen cohort profile is not an object: {attempt_id}"
+                )
+            try:
+                worker_ready_profile = profile_snapshot_resolver(authoring_profile)
+            except Exception as exc:
+                raise NestedPipelineError(
+                    f"frozen cohort worker-ready profile could not be resolved: {attempt_id}"
+                ) from exc
+            if not isinstance(worker_ready_profile, dict):
+                raise NestedPipelineError(
+                    f"frozen cohort worker-ready profile is not an object: {attempt_id}"
+                )
+            worker_ready_profiles[attempt_id] = dict(worker_ready_profile)
+
+    def materialize_item(
+        row: dict[str, Any],
+    ) -> tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        attempt = dict(row)
+        attempt_id = str(attempt.get("attempt_id") or "")
+        if attempt_id in worker_ready_profiles:
+            attempt["_worker_ready_profile_snapshot"] = worker_ready_profiles[attempt_id]
+        run_dir = config.runs_root / str(row["run_id"])
+        return run_dir, attempt, dict(row), load_run_metadata(run_dir)
+
     items = tuple(
-        (
-            config.runs_root / str(row["run_id"]),
-            dict(row),
-            dict(row),
-            load_run_metadata(config.runs_root / str(row["run_id"])),
-        )
+        materialize_item(row)
         for row in resolved_rows
     )
-    if dry_run and not hasattr(config, "fuzzfolio"):
-        effective_contract = bound_worker_contract_hash or "dry-run-unresolved"
-        lab_config = LabBacktestConfig(worker_contract_hash=effective_contract)
-    else:
-        configured_root = _configured_dashboard_root(config)
-        plan_root = (
-            bound_trading_dashboard_root.expanduser().resolve()
-            if bound_trading_dashboard_root is not None
-            else configured_root
-        )
-        effective_root = (
-            trading_dashboard_root.expanduser().resolve()
-            if trading_dashboard_root
-            else configured_root
-        )
-        if configured_root != plan_root or effective_root != plan_root:
-            raise NestedPipelineError("alternate Trading-Dashboard root is not permitted")
-        if profile_model_source_lock is not None:
-            validate_profile_model_source_lock(profile_model_source_lock, effective_root)
-        live_contract = _live_worker_contract(effective_root)
-        if bound_worker_contract_hash and live_contract != bound_worker_contract_hash:
-            raise NestedPipelineError("live replay worker contract differs from authority plan")
-        effective_contract = bound_worker_contract_hash or live_contract
-        lab_config = resolve_lab_backtest_config(
-            gateway_url=gateway_url,
-            gateway_token=gateway_token,
-            trading_dashboard_root=effective_root,
-            worker_contract_hash=effective_contract,
-            deadline_seconds=3600,
-            result_batch_size=max(25, int(max_workers) * 2),
-        )
     cohort_manifest_id = str((cohort or {}).get("manifest_id") or "") or None
     campaign_plan_id = str(campaign_id)
     if cohort_manifest_id:

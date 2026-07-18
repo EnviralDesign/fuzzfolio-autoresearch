@@ -266,7 +266,9 @@ def _patch_prepare_dependencies(
     live_contract: str,
 ) -> None:
     monkeypatch.setattr(
-        pipeline, "_cohort_attempts", lambda _path, _root: (["attempt-a"], {"manifest_id": "cohort"})
+        pipeline,
+        "_cohort_attempts",
+        lambda _path, _root, **_kwargs: (["attempt-a"], {"manifest_id": "cohort"}),
     )
     monkeypatch.setattr(pipeline, "load_research_suite", lambda *_args: ({}, {}))
     monkeypatch.setattr(
@@ -348,6 +350,85 @@ def test_prepare_uses_configured_root_when_cli_root_is_omitted(
     assert context.execution_plan_id in context.campaign_plan_id
 
 
+def test_prepare_passes_worker_ready_resolver_to_level_c_cohort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = "sha256:" + "c" * 64
+    _patch_prepare_dependencies(
+        monkeypatch,
+        rows=[{"attempt_id": "attempt-a", "run_id": "run-a"}],
+        live_contract=contract,
+    )
+    expected_resolver = object()
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        pipeline,
+        "_worker_ready_profile_snapshot_resolver",
+        lambda **_kwargs: expected_resolver,
+    )
+
+    def cohort_attempts(_path, _runs_root, *, profile_snapshot_resolver=None):
+        captured["resolver"] = profile_snapshot_resolver
+        return ["attempt-a"], {"manifest_id": "cohort"}
+
+    monkeypatch.setattr(pipeline, "_cohort_attempts", cohort_attempts)
+    _prepare(tmp_path, monkeypatch)
+
+    assert captured["resolver"] is expected_resolver
+
+
+def test_prepare_materializes_worker_ready_profile_for_level_c_cohort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    contract = "sha256:" + "c" * 64
+    profile = tmp_path / "runs" / "run-a" / "profile.json"
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    authoring_profile = {
+        "format": "fuzzfolio.scoring-profile",
+        "formatVersion": 1,
+        "profile": {"name": "Bounded", "notificationThreshold": 80},
+    }
+    worker_ready_profile = {"name": "Bounded", "notificationThreshold": 80.0}
+    profile.write_text(json.dumps(authoring_profile), encoding="utf-8")
+    profile_sha256 = "sha256:" + hashlib.sha256(profile.read_bytes()).hexdigest()
+    row = {
+        "attempt_id": "attempt-a",
+        "run_id": "run-a",
+        "profile_path": str(profile),
+    }
+    _patch_prepare_dependencies(monkeypatch, rows=[row], live_contract=contract)
+    monkeypatch.setattr(
+        pipeline,
+        "_cohort_attempts",
+        lambda _path, _root, **_kwargs: (
+            ["attempt-a"],
+            {
+                "schema": pipeline.LEVEL_C_COHORT_SCHEMA,
+                "manifest_id": "cohort",
+                "candidates": [
+                    {
+                        "attempt_id": "attempt-a",
+                        "run_id": "run-a",
+                        "profile_path_relative_to_runs_root": "run-a/profile.json",
+                        "profile_sha256": profile_sha256,
+                    }
+                ],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_worker_ready_profile_snapshot_resolver",
+        lambda **_kwargs: lambda payload: (
+            worker_ready_profile if payload == authoring_profile else pytest.fail("wrong profile")
+        ),
+    )
+
+    context = _prepare(tmp_path, monkeypatch)
+
+    assert context.items[0][1]["_worker_ready_profile_snapshot"] == worker_ready_profile
+
+
 def test_prepare_rejects_worker_contract_drift_and_missing_cohort_member(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -404,7 +485,7 @@ def test_prepare_binds_level_c_cohort_run_and_profile_identity(
     monkeypatch.setattr(
         pipeline,
         "_cohort_attempts",
-        lambda _path, _root: (
+        lambda _path, _root, **_kwargs: (
             ["attempt-a"],
             {
                 "schema": pipeline.LEVEL_C_COHORT_SCHEMA,

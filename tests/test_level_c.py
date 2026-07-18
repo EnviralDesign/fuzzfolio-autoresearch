@@ -242,6 +242,48 @@ def _artifact_hashes_for_fixture(runs_root: Path, atlas_root: Path) -> dict[str,
     return hashes
 
 
+def _replace_fixture_profile_with_authoring_wrapper(
+    runs_root: Path,
+    *,
+    cutoff: str,
+    lake_manifest_sha256: str,
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Model the PlayHand authoring file and its distinct worker-ready snapshot."""
+    profile_path = runs_root / "lane-1" / "profile.json"
+    authoring_profile: dict[str, object] = {
+        "format": "fuzzfolio.scoring-profile",
+        "formatVersion": 1,
+        "profile": {"name": "Bounded", "notificationThreshold": 80},
+    }
+    worker_ready_profile: dict[str, object] = {
+        "name": "Bounded",
+        "notificationThreshold": 80,
+    }
+    profile_path.write_text(json.dumps(authoring_profile), encoding="utf-8")
+    plan = build_replay_evidence_plan(
+        campaign_plan_id="playhand-lab:lane-1",
+        evidence_role="training",
+        selection_data_end=cutoff,
+        analysis_window_start="2022-06-30T00:00:00Z",
+        analysis_window_end=cutoff,
+        requested_horizon_months=36,
+        profile_snapshot=worker_ready_profile,
+        lake_manifest_sha256=lake_manifest_sha256,
+        data_availability_cutoff=cutoff,
+    )
+    attempts_path = runs_root / "lane-1" / "attempts.jsonl"
+    attempt = json.loads(attempts_path.read_text(encoding="utf-8"))
+    attempt["evidence_plan"] = plan.model_dump(mode="json")
+    attempt["execution_evidence"] = {
+        "plan_id": plan.plan_id,
+        "profile_snapshot_sha256": plan.profile_snapshot_sha256,
+        "execution_cell_sha256": plan.execution_cell_sha256,
+        "observed_lake_manifest_sha256": lake_manifest_sha256,
+    }
+    attempts_path.write_text(json.dumps(attempt) + "\n", encoding="utf-8")
+    return authoring_profile, worker_ready_profile
+
+
 def _rewrite_manifest_id(payload: dict[str, object]) -> None:
     identity = {key: value for key, value in payload.items() if key != "manifest_id"}
     payload["manifest_id"] = "sha256:" + hashlib.sha256(
@@ -381,6 +423,61 @@ def test_freeze_and_validate_level_c_cohort(tmp_path: Path) -> None:
     assert payload["historical_lineage"]["cutoff_key"] == "A"
     assert payload["candidates"][0]["attempt_id"] == "lane-1-attempt-00001"
     assert validate_level_c_cohort(output)["manifest_id"] == payload["manifest_id"]
+
+
+def test_level_c_cohort_uses_worker_ready_profile_snapshot_for_authoring_wrapper(
+    tmp_path: Path,
+) -> None:
+    runs_root, atlas_root, cutoff, lake = _fixture(tmp_path)
+    authoring_profile, worker_ready_profile = _replace_fixture_profile_with_authoring_wrapper(
+        runs_root,
+        cutoff=cutoff,
+        lake_manifest_sha256=lake,
+    )
+    output = runs_root / "derived" / "level-c-cohorts" / "worker-ready-wrapper.json"
+
+    with pytest.raises(LevelCCohortError, match="profile snapshot mismatch"):
+        freeze_level_c_cohort(
+            runs_root=runs_root,
+            atlas_run_root=atlas_root,
+            playhand_campaign_id="playhand-campaign-1",
+            as_of_date=cutoff,
+            lake_manifest_sha256=lake,
+            output_path=output,
+            cohort_id="worker-ready-wrapper",
+        )
+
+    def resolver(payload: dict[str, object]) -> dict[str, object]:
+        assert payload == authoring_profile
+        return worker_ready_profile
+
+    payload = freeze_level_c_cohort(
+        runs_root=runs_root,
+        atlas_run_root=atlas_root,
+        playhand_campaign_id="playhand-campaign-1",
+        as_of_date=cutoff,
+        lake_manifest_sha256=lake,
+        output_path=output,
+        cohort_id="worker-ready-wrapper",
+        profile_snapshot_resolver=resolver,
+    )
+    assert payload["candidate_count"] == 1
+    assert (
+        validate_level_c_cohort(
+            output,
+            profile_snapshot_resolver=resolver,
+        )["manifest_id"]
+        == payload["manifest_id"]
+    )
+
+    with pytest.raises(LevelCCohortError, match="profile snapshot mismatch"):
+        validate_level_c_cohort(
+            output,
+            profile_snapshot_resolver=lambda _payload: {
+                **worker_ready_profile,
+                "name": "drifted",
+            },
+        )
 
 
 def test_level_c_cohort_freezes_and_validates_audible_no_defensible_candidates(

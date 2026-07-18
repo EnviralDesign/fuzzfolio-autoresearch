@@ -13,6 +13,7 @@ from autoresearch.corpus_lab_backtests import (
     materialize_no_valid_cell_lab_result,
     materialize_outer_test_lab_result,
 )
+from autoresearch.evidence_plan import canonical_sha256, normalize_evidence_profile_snapshot
 from autoresearch.nested_gateway import _window_end, run_nested_gateway_fold
 from autoresearch import nested_gateway as ng
 
@@ -154,6 +155,76 @@ def _attempt_fixture(
         "artifact_dir": str(artifact_dir),
         "profile_path": str(profile_path),
     }
+
+
+def test_nested_gateway_uses_worker_ready_snapshot_for_train_plan_and_task(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir, attempt = _attempt_fixture(
+        tmp_path,
+        run_id="run-worker-ready",
+        attempt_id="attempt-worker-ready",
+    )
+    authoring_profile = {
+        "format": "fuzzfolio.scoring-profile",
+        "formatVersion": 1,
+        "profile": {
+            "name": "Authoring wrapper",
+            "instruments": ["EURUSD"],
+            "notificationThreshold": 73,
+            "indicators": [],
+        },
+    }
+    worker_ready_profile = {
+        "name": "Worker-ready",
+        "instruments": ["EURUSD"],
+        "notificationThreshold": 73.0,
+        "indicators": [],
+        "executionConfig": None,
+    }
+    Path(str(attempt["profile_path"])).write_text(
+        json.dumps(authoring_profile), encoding="utf-8"
+    )
+    attempt["_worker_ready_profile_snapshot"] = worker_ready_profile
+    captured: list[dict] = []
+
+    def fake_train(*, tasks, **_kwargs):
+        captured.extend(task for _attempt, task in tasks)
+        return []
+
+    monkeypatch.setattr("autoresearch.nested_gateway._run_train_tasks", fake_train)
+    result = run_nested_gateway_fold(
+        config=SimpleNamespace(research=SimpleNamespace(quality_score_preset="profile_drop")),
+        items=[(run_dir, attempt, dict(attempt), {})],
+        fold={
+            "fold_id": "fold-01",
+            "train_start": "2022-01-01",
+            "train_end": "2024-12-31",
+            "test_start": "2025-01-16",
+            "test_end": "2025-06-30",
+            "embargo_days": 15,
+        },
+        campaign_plan_id="nested:worker-ready",
+        campaign_root=tmp_path / "campaign",
+        lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+        max_workers=1,
+        train_horizon_months=36,
+        test_horizon_months=6,
+        lake_manifest_sha256="sha256:" + "a" * 64,
+        freeze_cells=False,
+        submit_outer=False,
+    )
+
+    assert result["status"] == "training_complete"
+    assert len(captured) == 1
+    task = captured[0]
+    assert task["payload"]["inline_profile_snapshot"] == worker_ready_profile
+    assert task["payload"]["evidence_plan"]["profile_snapshot_sha256"] == canonical_sha256(
+        normalize_evidence_profile_snapshot(worker_ready_profile)
+    )
+    assert task["payload"]["evidence_plan"]["profile_snapshot_sha256"] != canonical_sha256(
+        normalize_evidence_profile_snapshot(authoring_profile)
+    )
 
 
 def test_nested_gateway_date_only_end_is_half_open_midnight() -> None:

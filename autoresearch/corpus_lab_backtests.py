@@ -28,6 +28,8 @@ from .evidence_plan import (
     ReplayEvidencePlan,
     build_execution_cell_sha256,
     build_replay_evidence_plan,
+    canonical_sha256,
+    normalize_evidence_profile_snapshot,
     subtract_calendar_months,
     validate_replay_evidence_plan,
 )
@@ -301,6 +303,7 @@ def build_full_backtest_lab_task(
     campaign_plan_id: str | None = None,
     lake_manifest_sha256: str | None = None,
     evidence_plan: ReplayEvidencePlan | dict[str, Any] | None = None,
+    profile_snapshot_override: dict[str, Any] | None = None,
     tracked_cell: dict[str, float] | None = None,
     task_id: str | None = None,
 ) -> dict[str, Any]:
@@ -310,7 +313,12 @@ def build_full_backtest_lab_task(
         raise RuntimeError(f"Artifact directory does not exist: {artifact_dir}")
     profile_path_raw = str(attempt.get("profile_path") or "").strip()
     profile_path = Path(profile_path_raw).resolve() if profile_path_raw else None
-    profile_snapshot = _profile_snapshot_from_file(profile_path)
+    if profile_snapshot_override is not None:
+        if not isinstance(profile_snapshot_override, dict):
+            raise RuntimeError("Explicit profile snapshot override must be an object")
+        profile_snapshot = dict(profile_snapshot_override)
+    else:
+        profile_snapshot = _profile_snapshot_from_file(profile_path)
     profile_threshold = profile_snapshot.get("notificationThreshold")
     try:
         effective_alert_threshold = float(
@@ -368,6 +376,15 @@ def build_full_backtest_lab_task(
         )
     else:
         resolved_evidence_plan = validate_replay_evidence_plan(evidence_plan)
+        observed_profile_sha256 = canonical_sha256(
+            normalize_evidence_profile_snapshot(profile_snapshot)
+        )
+        if observed_profile_sha256 != resolved_evidence_plan.profile_snapshot_sha256:
+            raise RuntimeError(
+                "Explicit profile snapshot does not match the evidence plan: "
+                f"expected {resolved_evidence_plan.profile_snapshot_sha256}, "
+                f"observed {observed_profile_sha256}"
+            )
     if resolved_evidence_plan.execution_cell_sha256 is not None:
         if not isinstance(tracked_cell, dict):
             raise RuntimeError("Evidence plan requires a frozen tracked cell")

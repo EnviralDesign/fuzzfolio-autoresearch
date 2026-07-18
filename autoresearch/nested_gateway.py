@@ -108,8 +108,12 @@ def _write_state(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _profile_for_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
-    profile_path = Path(str(attempt.get("profile_path") or "")).resolve()
-    profile = _profile_snapshot_from_file(profile_path)
+    resolved_snapshot = attempt.get("_worker_ready_profile_snapshot")
+    if isinstance(resolved_snapshot, dict):
+        profile = dict(resolved_snapshot)
+    else:
+        profile_path = Path(str(attempt.get("profile_path") or "")).resolve()
+        profile = _profile_snapshot_from_file(profile_path)
     profile["notificationThreshold"] = float(
         profile.get("notificationThreshold")
         if profile.get("notificationThreshold") is not None
@@ -347,6 +351,7 @@ def run_nested_gateway_fold(
                     f"{train_fold.train_plan.plan_id[-16:]}"
                 ),
                 evidence_plan=train_fold.train_plan,
+                profile_snapshot_override=_profile_for_attempt(attempt),
             )
             train_pending.append((attempt, train_task))
 
@@ -505,6 +510,7 @@ def run_nested_gateway_fold(
                 f"{attempt.get('attempt_id')}:{outer_plan.plan_id[-16:]}"
             ),
             evidence_plan=outer_plan,
+            profile_snapshot_override=_profile_for_attempt(attempt),
             tracked_cell=frozen_fold.cell_receipt.execution_cell,
         )
         outer_tasks.append((attempt, task, frozen_fold.model_dump(mode="json")))
