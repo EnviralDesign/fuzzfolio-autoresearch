@@ -881,6 +881,14 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     legacy_comparison.add_argument("--lake-url")
     legacy_comparison.add_argument("--lake-token")
     legacy_comparison.add_argument("--max-workers", type=int, default=1)
+    legacy_comparison.add_argument(
+        "--canary-task-count",
+        type=int,
+        help=(
+            "Execute only a deterministic sibling-root canary from the immutable "
+            "full comparison plan. Requires --execute."
+        ),
+    )
     legacy_comparison.add_argument("--json", action="store_true")
 
     doctor = subparsers.add_parser(
@@ -19745,6 +19753,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "plan-legacy-fixed-cell-comparison":
         if args.dry_run and args.execute:
             parser.error("--dry-run and --execute cannot be used together")
+        if args.canary_task_count is not None and not args.execute:
+            parser.error("--canary-task-count requires --execute")
         from .legacy_fixed_cell import (
             execute_legacy_fixed_comparison,
             format_legacy_fixed_preflight,
@@ -19773,6 +19783,7 @@ def main(argv: list[str] | None = None) -> int:
                 lake_url=args.lake_url,
                 lake_token=args.lake_token,
                 max_workers=args.max_workers,
+                canary_task_count=args.canary_task_count,
             )
         if args.json:
             print(json.dumps(payload, ensure_ascii=True, sort_keys=True))

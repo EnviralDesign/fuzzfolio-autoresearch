@@ -442,7 +442,11 @@ def test_execute_submits_the_exact_planned_evidence_payloads(
 
     def capture_run(**kwargs: object) -> tuple[list[dict[str, object]], int, int]:
         captured.update(kwargs)
-        return [], 452, 0
+        items = kwargs["items"]
+        return [
+            {"attempt_id": attempt["attempt_id"], "status": "calculated"}
+            for _run_dir, attempt, _row, _metadata in items
+        ], len(items), 0
 
     monkeypatch.setattr(legacy, "run_lab_full_backtests", capture_run)
     monkeypatch.setattr(
@@ -463,6 +467,69 @@ def test_execute_submits_the_exact_planned_evidence_payloads(
     assert captured["campaign_plan_id"] == prepared.plan["execution_plan_id"]
     assert captured["evidence_plans_by_attempt_id"] == prepared.evidence_plans_by_attempt_id
     assert captured["task_ids_by_attempt_id"] == prepared.task_ids_by_attempt_id
+    assert Path(result["report_path"]).is_file()
+
+
+def test_canary_uses_sibling_output_root_and_distinct_delivery_ids(
+    comparison_environment: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared = _prepare(comparison_environment, monkeypatch)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        legacy,
+        "_verify_live_lake_identity",
+        lambda **_kwargs: legacy.REQUIRED_LAKE_SEMANTIC_SHA256,
+    )
+    monkeypatch.setattr(
+        legacy,
+        "resolve_lab_backtest_config",
+        lambda **_kwargs: legacy.LabBacktestConfig(
+            gateway_url="https://gateway.invalid",
+            worker_contract_hash=legacy.REQUIRED_WORKER_CONTRACT_SHA256,
+        ),
+    )
+
+    def capture_run(**kwargs: object) -> tuple[list[dict[str, object]], int, int]:
+        captured.update(kwargs)
+        items = kwargs["items"]
+        return [
+            {"attempt_id": attempt["attempt_id"], "status": "calculated"}
+            for _run_dir, attempt, _row, _metadata in items
+        ], len(items), 0
+
+    monkeypatch.setattr(legacy, "run_lab_full_backtests", capture_run)
+    result = legacy.execute_legacy_fixed_comparison(
+        prepared=prepared,
+        config=comparison_environment["config"],
+        trading_dashboard_root=comparison_environment["dashboard_root"],
+        canary_task_count=2,
+    )
+
+    canary_root = prepared.output_root.with_name(f"{prepared.comparison_id}-canary-2")
+    assert result["plan_id"] == prepared.plan["plan_id"]
+    assert result["parent_plan_id"] == prepared.plan["plan_id"]
+    assert result["execution_plan_id"] != prepared.plan["plan_id"]
+    assert len(captured["items"]) == 2
+    assert captured["campaign_plan_id"] == prepared.plan["execution_plan_id"]
+    canary_task_ids = captured["task_ids_by_attempt_id"]
+    assert set(canary_task_ids).issubset(prepared.task_ids_by_attempt_id)
+    assert all(
+        canary_task_ids[attempt_id] != prepared.task_ids_by_attempt_id[attempt_id]
+        for attempt_id in canary_task_ids
+    )
+    assert all(
+        Path(attempt["artifact_dir"]).is_relative_to(canary_root)
+        for _run_dir, attempt, _row, _metadata in captured["items"]
+    )
+    assert Path(result["report_path"]).is_file()
+    report = json.loads(Path(result["report_path"]).read_text(encoding="utf-8"))
+    assert report["parent_plan_id"] == prepared.plan["plan_id"]
+    assert report["task_accounting"] == {
+        "selected": 2,
+        "calculated": 2,
+        "nonviable": 0,
+        "failed": 0,
+    }
 
 
 def test_execute_rejects_nested_output_symlink_before_materialization(
@@ -616,9 +683,12 @@ def test_cli_registers_comparison_only_command() -> None:
             "dashboard",
             "--comparison-id",
             "legacy-pre-tail-36m-v1",
-            "--dry-run",
+            "--execute",
+            "--canary-task-count",
+            "2",
         ]
     )
     assert args.command == "plan-legacy-fixed-cell-comparison"
-    assert args.dry_run is True
-    assert args.execute is False
+    assert args.dry_run is False
+    assert args.execute is True
+    assert args.canary_task_count == 2

@@ -43,6 +43,12 @@ LEGACY_FIXED_COMPARISON_PLAN_SCHEMA = "autoresearch-legacy-fixed-comparison-plan
 LEGACY_FIXED_COMPARISON_PREFLIGHT_SCHEMA = (
     "autoresearch-legacy-fixed-comparison-preflight-v1"
 )
+LEGACY_FIXED_COMPARISON_CANARY_PLAN_SCHEMA = (
+    "autoresearch-legacy-fixed-comparison-canary-plan-v1"
+)
+LEGACY_FIXED_COMPARISON_EXECUTION_REPORT_SCHEMA = (
+    "autoresearch-legacy-fixed-comparison-execution-report-v1"
+)
 LEGACY_COMPARISON_ROLE = "outer_test"
 COMPARISON_RELATIVE_ROOT = Path("legacy-fixed-cell-comparisons")
 WINDOW_START = "2023-01-14T00:00:00Z"
@@ -1071,6 +1077,191 @@ def write_legacy_fixed_comparison_plan(
     }
 
 
+def prepare_legacy_fixed_comparison_canary(
+    *,
+    parent: PreparedLegacyFixedComparison,
+    task_count: int,
+) -> PreparedLegacyFixedComparison:
+    """Derive a sibling-root canary with distinct delivery IDs from a full plan.
+
+    The evidence plans and frozen cells remain exactly those of the immutable
+    parent. Only gateway delivery IDs and output destinations change so a
+    canary cannot collide with the later complete comparison.
+    """
+
+    if task_count < 1:
+        raise LegacyFixedComparisonError("comparison canary must select at least one task")
+    parent_tasks = parent.plan.get("tasks")
+    if not isinstance(parent_tasks, list) or len(parent_tasks) < task_count:
+        raise LegacyFixedComparisonError("comparison canary task count exceeds parent plan")
+    parent_plan_id = str(parent.plan.get("plan_id") or "")
+    parent_execution_plan_id = str(parent.plan.get("execution_plan_id") or "")
+    if not _SHA256_RE.fullmatch(parent_plan_id) or not _SHA256_RE.fullmatch(
+        parent_execution_plan_id
+    ):
+        raise LegacyFixedComparisonError("comparison canary parent identity is invalid")
+
+    canary_id = _require_safe_id(
+        f"{parent.comparison_id}-canary-{task_count}", label="comparison canary ID"
+    )
+    output_root = parent.output_root.with_name(canary_id)
+    _assert_output_isolated(
+        output_root=output_root, archive_runs_root=parent.archive_runs_root
+    )
+    selected_tasks = parent_tasks[:task_count]
+    items_by_attempt = {
+        str(attempt.get("attempt_id") or ""): (run_dir, attempt, row, metadata)
+        for run_dir, attempt, row, metadata in parent.items
+    }
+    if len(items_by_attempt) != len(parent.items):
+        raise LegacyFixedComparisonError("comparison parent has ambiguous attempt items")
+
+    selected_items: list[tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]] = []
+    selected_receipts: dict[str, dict[str, Any]] = {}
+    selected_evidence_plans: dict[str, dict[str, Any]] = {}
+    delivery_task_ids: dict[str, str] = {}
+    canary_tasks: list[dict[str, Any]] = []
+    for parent_task in selected_tasks:
+        if not isinstance(parent_task, dict):
+            raise LegacyFixedComparisonError("comparison canary parent task is malformed")
+        attempt_id = str(parent_task.get("attempt_id") or "")
+        parent_task_id = str(parent_task.get("task_id") or "")
+        if not attempt_id or not parent_task_id:
+            raise LegacyFixedComparisonError("comparison canary parent task identity is missing")
+        source_item = items_by_attempt.get(attempt_id)
+        receipt = parent.cell_receipts_by_attempt_id.get(attempt_id)
+        evidence_plan = parent.evidence_plans_by_attempt_id.get(attempt_id)
+        if source_item is None or receipt is None or evidence_plan is None:
+            raise LegacyFixedComparisonError(
+                f"comparison canary parent task is incomplete: {attempt_id}"
+            )
+        run_dir, source_attempt, row, metadata = source_item
+        source_artifact_dir = Path(str(source_attempt.get("artifact_dir") or "")).absolute()
+        try:
+            artifact_relative = source_artifact_dir.relative_to(parent.output_root.absolute())
+        except ValueError as exc:
+            raise LegacyFixedComparisonError(
+                f"comparison canary parent output escapes its root: {attempt_id}"
+            ) from exc
+        clone_attempt = dict(source_attempt)
+        clone_attempt["artifact_dir"] = str(output_root / artifact_relative)
+        delivery_task_id = (
+            "legacy-fixed-comparison-canary-"
+            + canonical_sha256(
+                {
+                    "schema": LEGACY_FIXED_COMPARISON_CANARY_PLAN_SCHEMA,
+                    "parent_plan_id": parent_plan_id,
+                    "parent_task_id": parent_task_id,
+                    "attempt_id": attempt_id,
+                }
+            ).removeprefix("sha256:")
+        )
+        if attempt_id in delivery_task_ids:
+            raise LegacyFixedComparisonError("comparison canary selected a duplicate attempt")
+        selected_items.append((run_dir, clone_attempt, dict(row), dict(metadata)))
+        selected_receipts[attempt_id] = dict(receipt)
+        selected_evidence_plans[attempt_id] = dict(evidence_plan)
+        delivery_task_ids[attempt_id] = delivery_task_id
+        canary_tasks.append(
+            {
+                "attempt_id": attempt_id,
+                "parent_task_id": parent_task_id,
+                "delivery_task_id": delivery_task_id,
+                "evidence_plan_id": str(evidence_plan.get("plan_id") or ""),
+                "execution_cell_sha256": str(
+                    receipt.get("execution_cell_sha256") or ""
+                ),
+                "output_artifact_dir": artifact_relative.as_posix(),
+            }
+        )
+
+    canary_descriptor = {
+        "schema": LEGACY_FIXED_COMPARISON_CANARY_PLAN_SCHEMA,
+        "comparison_id": canary_id,
+        "parent_comparison_id": parent.comparison_id,
+        "parent_plan_id": parent_plan_id,
+        "parent_execution_plan_id": parent_execution_plan_id,
+        "analysis_window_start": parent.plan.get("analysis_window_start"),
+        "analysis_window_end": parent.plan.get("analysis_window_end"),
+        "requested_horizon_months": parent.plan.get("requested_horizon_months"),
+        "evidence_role": parent.plan.get("evidence_role"),
+        "authority": parent.plan.get("authority"),
+        "tasks": canary_tasks,
+        "archive_read_only": True,
+    }
+    canary_plan = {
+        "plan_id": canonical_sha256(canary_descriptor),
+        **canary_descriptor,
+        "preflight": {
+            "schema": LEGACY_FIXED_COMPARISON_PREFLIGHT_SCHEMA,
+            "plan_id": canonical_sha256(canary_descriptor),
+            "task_count": len(selected_items),
+            "parent_plan_id": parent_plan_id,
+            "archive_read_only": True,
+            "enqueued": False,
+        },
+    }
+    return PreparedLegacyFixedComparison(
+        plan=canary_plan,
+        output_root=output_root,
+        legacy_controls=parent.legacy_controls,
+        archive_runs_root=parent.archive_runs_root,
+        authority_execution_plan=parent.authority_execution_plan,
+        comparison_id=canary_id,
+        items=selected_items,
+        cell_receipts_by_attempt_id=selected_receipts,
+        evidence_plans_by_attempt_id=selected_evidence_plans,
+        task_ids_by_attempt_id=delivery_task_ids,
+    )
+
+
+def _write_execution_report(
+    *,
+    prepared: PreparedLegacyFixedComparison,
+    results: list[dict[str, Any]],
+    calculated: int,
+    parent_plan_id: str | None,
+) -> Path:
+    if len(results) != len(prepared.items):
+        raise LegacyFixedComparisonError("comparison result accounting is incomplete")
+    status_counts: dict[str, int] = {}
+    for result in results:
+        status = str(result.get("status") or "")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    allowed_statuses = {"calculated", "nonviable"}
+    if set(status_counts) - allowed_statuses:
+        raise LegacyFixedComparisonError("comparison result has an unknown terminal status")
+    if calculated != status_counts.get("calculated", 0):
+        raise LegacyFixedComparisonError("comparison calculated accounting differs")
+    if sum(status_counts.values()) != len(prepared.items):
+        raise LegacyFixedComparisonError("comparison terminal accounting differs")
+    report = {
+        "schema": LEGACY_FIXED_COMPARISON_EXECUTION_REPORT_SCHEMA,
+        "status": "complete",
+        "plan_id": prepared.plan["plan_id"],
+        "parent_plan_id": parent_plan_id,
+        "comparison_id": prepared.comparison_id,
+        "analysis_window_start": prepared.plan.get("analysis_window_start"),
+        "analysis_window_end": prepared.plan.get("analysis_window_end"),
+        "authority": prepared.plan.get("authority"),
+        "task_accounting": {
+            "selected": len(prepared.items),
+            "calculated": calculated,
+            "nonviable": status_counts.get("nonviable", 0),
+            "failed": 0,
+        },
+        "results": results,
+    }
+    report_path = prepared.output_root / "execution-report.json"
+    _assert_owned_output_path(
+        output_path=report_path,
+        output_root=prepared.output_root,
+        archive_runs_root=prepared.archive_runs_root,
+    )
+    write_immutable_json(report_path, report)
+    return report_path
+
+
 def execute_legacy_fixed_comparison(
     *,
     prepared: PreparedLegacyFixedComparison,
@@ -1081,6 +1272,7 @@ def execute_legacy_fixed_comparison(
     lake_url: str | None = None,
     lake_token: str | None = None,
     max_workers: int = 1,
+    canary_task_count: int | None = None,
 ) -> dict[str, Any]:
     """Execute a previously prepared plan; callers must opt in explicitly."""
 
@@ -1096,13 +1288,22 @@ def execute_legacy_fixed_comparison(
         raise LegacyFixedComparisonError(
             "comparison source, authority, or plan identity differs before enqueue"
         )
+    execution_prepared = revalidated
+    parent_plan_id: str | None = None
+    if canary_task_count is not None:
+        execution_prepared = prepare_legacy_fixed_comparison_canary(
+            parent=revalidated,
+            task_count=int(canary_task_count),
+        )
+        write_legacy_fixed_comparison_plan(execution_prepared)
+        parent_plan_id = str(revalidated.plan["plan_id"])
     _verify_live_lake_identity(lake_url=lake_url, lake_token=lake_token)
-    for _run_dir, attempt, _row, _metadata in revalidated.items:
+    for _run_dir, attempt, _row, _metadata in execution_prepared.items:
         artifact_dir = Path(str(attempt["artifact_dir"]))
         _assert_owned_output_path(
             output_path=artifact_dir,
-            output_root=revalidated.output_root,
-            archive_runs_root=revalidated.archive_runs_root,
+            output_root=execution_prepared.output_root,
+            archive_runs_root=execution_prepared.archive_runs_root,
         )
         artifact_dir.mkdir(parents=True, exist_ok=True)
     live_lab = resolve_lab_backtest_config(
@@ -1122,9 +1323,16 @@ def execute_legacy_fixed_comparison(
         poll_interval_seconds=live_lab.poll_interval_seconds,
         result_batch_size=live_lab.result_batch_size,
     )
+    campaign_plan_id = str(
+        execution_prepared.plan.get("parent_execution_plan_id")
+        or execution_prepared.plan.get("execution_plan_id")
+        or ""
+    )
+    if not _SHA256_RE.fullmatch(campaign_plan_id):
+        raise LegacyFixedComparisonError("comparison execution plan identity is invalid")
     results, calculated, failed = run_lab_full_backtests(
         config=config,
-        items=revalidated.items,
+        items=execution_prepared.items,
         lab_config=lab_config,
         max_workers=max(1, int(max_workers)),
         requested_horizon_months=36,
@@ -1132,21 +1340,30 @@ def execute_legacy_fixed_comparison(
         evidence_window_end=WINDOW_END,
         evidence_role=LEGACY_COMPARISON_ROLE,
         selection_data_end=WINDOW_END,
-        campaign_plan_id=revalidated.plan["execution_plan_id"],
+        campaign_plan_id=campaign_plan_id,
         lake_manifest_sha256=REQUIRED_LAKE_SEMANTIC_SHA256,
-        cell_receipts_by_attempt_id=revalidated.cell_receipts_by_attempt_id,
-        evidence_plans_by_attempt_id=revalidated.evidence_plans_by_attempt_id,
-        task_ids_by_attempt_id=revalidated.task_ids_by_attempt_id,
+        cell_receipts_by_attempt_id=execution_prepared.cell_receipts_by_attempt_id,
+        evidence_plans_by_attempt_id=execution_prepared.evidence_plans_by_attempt_id,
+        task_ids_by_attempt_id=execution_prepared.task_ids_by_attempt_id,
     )
     if failed:
         raise LegacyFixedComparisonError(
             f"legacy comparison has {failed} failed fixed-cell replays"
         )
+    report_path = _write_execution_report(
+        prepared=execution_prepared,
+        results=results,
+        calculated=calculated,
+        parent_plan_id=parent_plan_id,
+    )
     return {
         "plan_id": revalidated.plan["plan_id"],
+        "execution_plan_id": execution_prepared.plan["plan_id"],
+        "parent_plan_id": parent_plan_id,
         "calculated": calculated,
         "failed": failed,
         "results": results,
+        "report_path": str(report_path),
     }
 
 
