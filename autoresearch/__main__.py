@@ -733,6 +733,7 @@ PUBLIC_CLI_COMMANDS = {
     "level-c-bootstrap",
     "level-c-run-cutoff",
     "level-c-audit",
+    "plan-legacy-fixed-cell-comparison",
     "doctor",
     "test-providers",
     "play-hand",
@@ -850,6 +851,37 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     from .level_c_workflow import add_level_c_cli
 
     add_level_c_cli(subparsers)
+
+    legacy_comparison = subparsers.add_parser(
+        "plan-legacy-fixed-cell-comparison",
+        help=(
+            "Create an immutable, current-authority fixed-cell replay plan from "
+            "the archived legacy benchmark."
+        ),
+    )
+    legacy_comparison.add_argument("--legacy-controls", type=Path, required=True)
+    legacy_comparison.add_argument("--archive-runs-root", type=Path, required=True)
+    legacy_comparison.add_argument(
+        "--authority-execution-plan", type=Path, required=True
+    )
+    legacy_comparison.add_argument("--trading-dashboard-root", type=Path, required=True)
+    legacy_comparison.add_argument("--comparison-id", required=True)
+    legacy_comparison.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate and print the plan without writing or enqueueing work.",
+    )
+    legacy_comparison.add_argument(
+        "--execute",
+        action="store_true",
+        help="Explicitly enqueue the prepared fixed-cell comparison after validation.",
+    )
+    legacy_comparison.add_argument("--gateway-url")
+    legacy_comparison.add_argument("--gateway-token")
+    legacy_comparison.add_argument("--lake-url")
+    legacy_comparison.add_argument("--lake-token")
+    legacy_comparison.add_argument("--max-workers", type=int, default=1)
+    legacy_comparison.add_argument("--json", action="store_true")
 
     doctor = subparsers.add_parser(
         "doctor", help="Verify config, CLI, auth, and seed prompt."
@@ -19710,6 +19742,49 @@ def main(argv: list[str] | None = None) -> int:
     level_c_result = dispatch_level_c_cli(args)
     if level_c_result is not None:
         return level_c_result
+    if args.command == "plan-legacy-fixed-cell-comparison":
+        if args.dry_run and args.execute:
+            parser.error("--dry-run and --execute cannot be used together")
+        from .legacy_fixed_cell import (
+            execute_legacy_fixed_comparison,
+            format_legacy_fixed_preflight,
+            prepare_legacy_fixed_comparison,
+            write_legacy_fixed_comparison_plan,
+        )
+
+        prepared = prepare_legacy_fixed_comparison(
+            config=load_config(),
+            legacy_controls=args.legacy_controls,
+            archive_runs_root=args.archive_runs_root,
+            authority_execution_plan=args.authority_execution_plan,
+            trading_dashboard_root=args.trading_dashboard_root,
+            comparison_id=args.comparison_id,
+        )
+        payload = format_legacy_fixed_preflight(prepared)
+        if not args.dry_run:
+            payload["written"] = write_legacy_fixed_comparison_plan(prepared)
+        if args.execute:
+            payload["execution"] = execute_legacy_fixed_comparison(
+                prepared=prepared,
+                config=load_config(),
+                trading_dashboard_root=args.trading_dashboard_root,
+                gateway_url=args.gateway_url,
+                gateway_token=args.gateway_token,
+                lake_url=args.lake_url,
+                lake_token=args.lake_token,
+                max_workers=args.max_workers,
+            )
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+        else:
+            print(
+                "Legacy fixed-cell comparison preflight: "
+                f"tasks={payload['task_count']} unresolved={payload['unresolved_source_count']}"
+            )
+            print(f"Plan: {payload['plan_id']}")
+            if payload.get("written"):
+                print(f"Plan path: {payload['written']['plan_path']}")
+        return 0
     if args.command == "doctor":
         return cmd_doctor()
     if args.command == "test-providers":

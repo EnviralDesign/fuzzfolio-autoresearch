@@ -8,7 +8,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from .dashboard import (
     FULL_BACKTEST_CALENDAR_CURVE_FILENAME,
@@ -960,6 +960,8 @@ def run_lab_full_backtests(
     campaign_plan_id: str | None = None,
     lake_manifest_sha256: str | None = None,
     cell_receipts_by_attempt_id: dict[str, FrozenExecutionCellReceipt | dict[str, Any]] | None = None,
+    evidence_plans_by_attempt_id: Mapping[str, dict[str, Any]] | None = None,
+    task_ids_by_attempt_id: Mapping[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     _ = force_rebuild
     pending_items = list(items)
@@ -1006,11 +1008,13 @@ def run_lab_full_backtests(
                         selection_data_end=selection_data_end,
                         campaign_plan_id=campaign_plan_id,
                         lake_manifest_sha256=lake_manifest_sha256,
+                        evidence_plan=(evidence_plans_by_attempt_id or {}).get(attempt_id),
                         tracked_cell=(
                             cell_receipt.execution_cell
                             if isinstance(cell_receipt, FrozenExecutionCellReceipt)
                             else None
                         ),
+                        task_id=(task_ids_by_attempt_id or {}).get(attempt_id),
                     )
                 except Exception as exc:
                     failed += 1

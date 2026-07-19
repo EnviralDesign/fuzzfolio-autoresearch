@@ -809,6 +809,23 @@ def test_run_lab_full_backtests_counts_fixed_cell_outer_no_valid_cell_as_nonviab
         "source": {"kind": "test"},
         "lake_manifest_sha256": "sha256:" + "a" * 64,
     }
+    config = SimpleNamespace(research=SimpleNamespace(quality_score_preset="profile_drop"))
+    planned_task = build_full_backtest_lab_task(
+        config=config,
+        run_dir=run_dir,
+        attempt=attempt,
+        run_metadata={},
+        lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+        evidence_window_start="2021-07-14T00:00:00Z",
+        evidence_window_end="2023-07-14T00:00:00Z",
+        requested_horizon_months=24,
+        evidence_role="outer_test",
+        selection_data_end="2026-07-14T00:00:00Z",
+        campaign_plan_id="planned-comparison-plan",
+        lake_manifest_sha256="sha256:" + "a" * 64,
+        tracked_cell=tracked_cell,
+        task_id="planned-fixed-cell-task",
+    )
 
     class FakeGateway:
         task: dict | None = None
@@ -862,9 +879,7 @@ def test_run_lab_full_backtests_counts_fixed_cell_outer_no_valid_cell_as_nonviab
     )
 
     results, calculated, failed = run_lab_full_backtests(
-        config=SimpleNamespace(
-            research=SimpleNamespace(quality_score_preset="profile_drop")
-        ),
+        config=config,
         items=[(run_dir, attempt, row, {})],
         lab_config=LabBacktestConfig(
             worker_contract_hash="sha256:test",
@@ -876,9 +891,13 @@ def test_run_lab_full_backtests_counts_fixed_cell_outer_no_valid_cell_as_nonviab
         evidence_window_end="2023-07-14T00:00:00Z",
         evidence_role="outer_test",
         selection_data_end="2026-07-14T00:00:00Z",
-        campaign_plan_id="retrospective-fixed:test",
+        campaign_plan_id="different-unplanned-campaign",
         lake_manifest_sha256="sha256:" + "a" * 64,
         cell_receipts_by_attempt_id={"attempt-a": receipt},
+        evidence_plans_by_attempt_id={
+            "attempt-a": planned_task["payload"]["evidence_plan"]
+        },
+        task_ids_by_attempt_id={"attempt-a": "planned-fixed-cell-task"},
     )
 
     assert calculated == 1
@@ -947,6 +966,26 @@ def test_run_lab_full_backtests_fixed_cell_outer_result_does_not_store_matrix_ce
         "source": {"kind": "test"},
         "lake_manifest_sha256": "sha256:" + "a" * 64,
     }
+
+    # The persisted comparison plan must win over ambient runtime arguments.
+    planned_task = build_full_backtest_lab_task(
+        config=SimpleNamespace(
+            research=SimpleNamespace(quality_score_preset="profile_drop")
+        ),
+        run_dir=run_dir,
+        attempt=attempt,
+        run_metadata={},
+        lab_config=LabBacktestConfig(worker_contract_hash="sha256:test"),
+        evidence_window_start="2021-07-14T00:00:00Z",
+        evidence_window_end="2023-07-14T00:00:00Z",
+        requested_horizon_months=24,
+        evidence_role="outer_test",
+        selection_data_end="2026-07-14T00:00:00Z",
+        campaign_plan_id="planned-comparison-plan",
+        lake_manifest_sha256="sha256:" + "a" * 64,
+        tracked_cell=tracked_cell,
+        task_id="planned-fixed-cell-task",
+    )
 
     class FakeGateway:
         task: dict | None = None
@@ -1060,6 +1099,10 @@ def test_run_lab_full_backtests_fixed_cell_outer_result_does_not_store_matrix_ce
         campaign_plan_id="retrospective-fixed:test",
         lake_manifest_sha256="sha256:" + "a" * 64,
         cell_receipts_by_attempt_id={"attempt-a": receipt},
+        evidence_plans_by_attempt_id={
+            "attempt-a": planned_task["payload"]["evidence_plan"]
+        },
+        task_ids_by_attempt_id={"attempt-a": "planned-fixed-cell-task"},
     )
 
     assert calculated == 1
@@ -1073,6 +1116,11 @@ def test_run_lab_full_backtests_fixed_cell_outer_result_does_not_store_matrix_ce
     assert "matrix_summary" not in aggregate
     assert "score_lab" not in aggregate
     assert FakeGateway.acked == ["lease-1"]
+    assert FakeGateway.task["task_id"] == "planned-fixed-cell-task"
+    assert (
+        FakeGateway.task["payload"]["evidence_plan"]
+        == planned_task["payload"]["evidence_plan"]
+    )
 
     validation = ct.validate_full_backtest_artifacts(
         attempt,
