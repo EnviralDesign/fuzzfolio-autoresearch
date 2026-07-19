@@ -658,6 +658,25 @@ def test_canary_uses_sibling_output_root_and_distinct_delivery_ids(
     }
 
 
+def test_targeted_canary_selects_only_replayable_requested_attempts(
+    comparison_environment: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared = _prepare(comparison_environment, monkeypatch)
+    selected = ["cohort-042", "external-00"]
+    canary = legacy.prepare_legacy_fixed_comparison_canary(
+        parent=prepared,
+        task_count=2,
+        attempt_ids=selected,
+    )
+    assert [task["attempt_id"] for task in canary.plan["tasks"]] == selected
+    with pytest.raises(legacy.LegacyFixedComparisonError, match="unknown or unresolved"):
+        legacy.prepare_legacy_fixed_comparison_canary(
+            parent=prepared,
+            task_count=2,
+            attempt_ids=["cohort-042", "missing-00"],
+        )
+
+
 def test_execute_rejects_nested_output_symlink_before_materialization(
     comparison_environment: dict[str, object], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -812,9 +831,14 @@ def test_cli_registers_comparison_only_command() -> None:
             "--execute",
             "--canary-task-count",
             "2",
+            "--canary-attempt-id",
+            "manual-a",
+            "--canary-attempt-id",
+            "manual-b",
         ]
     )
     assert args.command == "plan-legacy-fixed-cell-comparison"
     assert args.dry_run is False
     assert args.execute is True
     assert args.canary_task_count == 2
+    assert args.canary_attempt_id == ["manual-a", "manual-b"]

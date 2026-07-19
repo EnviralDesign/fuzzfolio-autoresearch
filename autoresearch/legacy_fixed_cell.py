@@ -1180,6 +1180,7 @@ def prepare_legacy_fixed_comparison_canary(
     *,
     parent: PreparedLegacyFixedComparison,
     task_count: int,
+    attempt_ids: list[str] | None = None,
 ) -> PreparedLegacyFixedComparison:
     """Derive a sibling-root canary with distinct delivery IDs from a full plan.
 
@@ -1207,7 +1208,28 @@ def prepare_legacy_fixed_comparison_canary(
     _assert_output_isolated(
         output_root=output_root, archive_runs_root=parent.archive_runs_root
     )
-    selected_tasks = parent_tasks[:task_count]
+    requested_attempt_ids = [str(value or "").strip() for value in (attempt_ids or [])]
+    if requested_attempt_ids:
+        if (
+            len(requested_attempt_ids) != task_count
+            or not all(requested_attempt_ids)
+            or len(set(requested_attempt_ids)) != len(requested_attempt_ids)
+        ):
+            raise LegacyFixedComparisonError(
+                "targeted comparison canary IDs must be unique and match task count"
+            )
+        requested_set = set(requested_attempt_ids)
+        selected_tasks = [
+            task
+            for task in parent_tasks
+            if str(task.get("attempt_id") or "") in requested_set
+        ]
+        if len(selected_tasks) != task_count:
+            raise LegacyFixedComparisonError(
+                "targeted comparison canary includes an unknown or unresolved attempt"
+            )
+    else:
+        selected_tasks = parent_tasks[:task_count]
     items_by_attempt = {
         str(attempt.get("attempt_id") or ""): (run_dir, attempt, row, metadata)
         for run_dir, attempt, row, metadata in parent.items
@@ -1428,6 +1450,7 @@ def execute_legacy_fixed_comparison(
     lake_token: str | None = None,
     max_workers: int = 1,
     canary_task_count: int | None = None,
+    canary_attempt_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Execute a previously prepared plan; callers must opt in explicitly."""
 
@@ -1449,6 +1472,7 @@ def execute_legacy_fixed_comparison(
         execution_prepared = prepare_legacy_fixed_comparison_canary(
             parent=revalidated,
             task_count=int(canary_task_count),
+            attempt_ids=canary_attempt_ids,
         )
         write_legacy_fixed_comparison_plan(execution_prepared)
         parent_plan_id = str(revalidated.plan["plan_id"])

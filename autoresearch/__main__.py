@@ -889,6 +889,14 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
             "full comparison plan. Requires --execute."
         ),
     )
+    legacy_comparison.add_argument(
+        "--canary-attempt-id",
+        action="append",
+        help=(
+            "Select an exact replayable attempt for the isolated canary. Repeat once "
+            "per canary task; requires --canary-task-count."
+        ),
+    )
     legacy_comparison.add_argument("--json", action="store_true")
 
     doctor = subparsers.add_parser(
@@ -19753,8 +19761,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "plan-legacy-fixed-cell-comparison":
         if args.dry_run and args.execute:
             parser.error("--dry-run and --execute cannot be used together")
-        if args.canary_task_count is not None and not args.execute:
-            parser.error("--canary-task-count requires --execute")
+        if (
+            (args.canary_task_count is not None or args.canary_attempt_id)
+            and not args.execute
+        ):
+            parser.error("--canary-task-count and --canary-attempt-id require --execute")
+        if args.canary_attempt_id and args.canary_task_count is None:
+            parser.error("--canary-attempt-id requires --canary-task-count")
         from .legacy_fixed_cell import (
             execute_legacy_fixed_comparison,
             format_legacy_fixed_preflight,
@@ -19784,6 +19797,7 @@ def main(argv: list[str] | None = None) -> int:
                 lake_token=args.lake_token,
                 max_workers=args.max_workers,
                 canary_task_count=args.canary_task_count,
+                canary_attempt_ids=args.canary_attempt_id,
             )
         if args.json:
             print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
