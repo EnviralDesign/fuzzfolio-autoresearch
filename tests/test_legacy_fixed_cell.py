@@ -33,11 +33,13 @@ def _archive_files(root: Path) -> dict[str, str]:
     }
 
 
-def _profile(attempt_id: str) -> dict[str, object]:
+def _profile(
+    attempt_id: str, *, instruments: list[str] | None = None
+) -> dict[str, object]:
     return {
         "profile": {
             "name": attempt_id,
-            "instruments": ["EURUSD"],
+            "instruments": instruments or ["EURUSD"],
             "directionMode": "both",
             "notificationThreshold": 80,
             "indicators": [],
@@ -47,6 +49,16 @@ def _profile(attempt_id: str) -> dict[str, object]:
 
 def _result() -> dict[str, object]:
     return {"data": {"aggregate": {"matrix_summary": {"robust_cell": CELL}}}}
+
+
+def _deep_replay_job() -> dict[str, object]:
+    return {
+        "request": {
+            "instruments": ["EURUSD"],
+            "timeframe": "M15",
+            "matrix": {"sl_rows": 25, "reward_columns": 8},
+        }
+    }
 
 
 def _authority(tag: str = "current") -> dict[str, object]:
@@ -97,6 +109,7 @@ def comparison_environment(tmp_path: Path) -> dict[str, object]:
         _write_json(result, _result())
         _write_json(curve, {"curve": []})
         _write_json(detail, {"cell": CELL})
+        _write_json(result.parent / "deep-replay-job.json", _deep_replay_job())
         _write_json(archive_root / run_id / "run-metadata.json", {})
         candidates.append(
             {
@@ -129,7 +142,11 @@ def comparison_environment(tmp_path: Path) -> dict[str, object]:
         profile_old = legacy_root / run_id / "profiles" / "profile.json"
         profile = archive_root / profile_old.relative_to(legacy_root)
         evidence = archive_root / run_id / "evals" / "final"
-        _write_json(profile, _profile(attempt_id))
+        instruments = {
+            "external-02": ["US500"],
+            "external-03": ["JP225"],
+        }.get(attempt_id)
+        _write_json(profile, _profile(attempt_id, instruments=instruments))
         _write_json(evidence / "full-backtest-36mo-result.json", _result())
         _write_json(
             evidence / "full-backtest-36mo-recommended-cell-path-detail.json",
@@ -143,6 +160,7 @@ def comparison_environment(tmp_path: Path) -> dict[str, object]:
                 "source_profile_path": str(profile_old),
             },
         )
+        _write_json(evidence / "deep-replay-job.json", _deep_replay_job())
         _write_json(archive_root / run_id / "run-metadata.json", {})
         catalog_rows.append(
             (
@@ -320,8 +338,16 @@ def comparison_environment(tmp_path: Path) -> dict[str, object]:
         "controls_path": controls_path,
         "authority_plan": authority_plan,
         "dashboard_root": dashboard_root,
-        "config": SimpleNamespace(derived_root=derived_root),
+        "config": SimpleNamespace(
+            derived_root=derived_root,
+            research=SimpleNamespace(quality_score_preset="default"),
+        ),
         "first_profile": archive_root / run_ids[cohort_ids[0]] / "profiles" / "profile.json",
+        "first_deep_replay_job": archive_root
+        / run_ids[cohort_ids[0]]
+        / "evals"
+        / "final"
+        / "deep-replay-job.json",
         "june_membership": membership_paths["june"],
     }
 
@@ -345,22 +371,36 @@ def test_prepares_exact_fixed_cell_comparison_without_archive_writes(
     before = _archive_files(archive_root)
     prepared = _prepare(comparison_environment, monkeypatch)
     repeated = _prepare(comparison_environment, monkeypatch)
+    v2 = legacy.prepare_legacy_fixed_comparison(
+        config=comparison_environment["config"],
+        legacy_controls=comparison_environment["controls_path"],
+        archive_runs_root=comparison_environment["archive_root"],
+        authority_execution_plan=comparison_environment["authority_plan"],
+        trading_dashboard_root=comparison_environment["dashboard_root"],
+        comparison_id="legacy-pre-tail-36m-v2",
+    )
 
     assert prepared.plan["plan_id"] == repeated.plan["plan_id"]
+    assert prepared.plan["plan_id"] != v2.plan["plan_id"]
+    assert set(prepared.task_ids_by_attempt_id.values()).isdisjoint(
+        v2.task_ids_by_attempt_id.values()
+    )
     assert prepared.plan["preflight"] == {
         "schema": legacy.LEGACY_FIXED_COMPARISON_PREFLIGHT_SCHEMA,
         "plan_id": prepared.plan["plan_id"],
-        "task_count": 452,
+        "task_count": 450,
         "cohort_task_count": 443,
-        "out_of_cohort_task_count": 9,
+        "out_of_cohort_task_count": 7,
         "unresolved_source_count": 3,
+        "unresolved_current_universe_count": 2,
+        "unresolved_terminal_count": 5,
         "june_resolved_count": 27,
-        "july_resolved_count": 30,
+        "july_resolved_count": 28,
         "overlap_resolved_count": 6,
         "archive_read_only": True,
         "enqueued": False,
     }
-    assert len(prepared.items) == len(prepared.cell_receipts_by_attempt_id) == 452
+    assert len(prepared.items) == len(prepared.cell_receipts_by_attempt_id) == 450
     assert all(
         task["evidence_plan"]["analysis_window_start"] == legacy.WINDOW_START
         and task["evidence_plan"]["analysis_window_end"] == legacy.WINDOW_END
@@ -370,9 +410,24 @@ def test_prepares_exact_fixed_cell_comparison_without_archive_writes(
         for task in prepared.plan["tasks"]
     )
     assert [row["status"] for row in prepared.plan["terminal_outcomes"]] == [
+        "unresolved_current_universe",
+        "unresolved_current_universe",
         "unresolved_source",
         "unresolved_source",
         "unresolved_source",
+    ]
+    universe_terminals = [
+        row
+        for row in prepared.plan["terminal_outcomes"]
+        if row["status"] == "unresolved_current_universe"
+    ]
+    assert [row["attempt_id"] for row in universe_terminals] == [
+        "external-02",
+        "external-03",
+    ]
+    assert [row["ineligible_instruments"] for row in universe_terminals] == [
+        ["US500"],
+        ["JP225"],
     ]
     assert all(
         str(attempt["artifact_dir"]).startswith(str(prepared.output_root))
@@ -393,6 +448,21 @@ def test_rejects_hash_drift_in_frozen_sources(
         _prepare(comparison_environment, monkeypatch)
 
 
+def test_rejects_attested_deep_replay_request_drift(
+    comparison_environment: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared = _prepare(comparison_environment, monkeypatch)
+    comparison_environment["first_deep_replay_job"].write_text(
+        json.dumps({"request": {"timeframe": "H4"}}), encoding="utf-8"
+    )
+    drifted = _prepare(comparison_environment, monkeypatch)
+    assert drifted.plan["plan_id"] != prepared.plan["plan_id"]
+    assert (
+        drifted.plan["tasks"][0]["legacy_source"]["deep_replay_request_sha256"]
+        != prepared.plan["tasks"][0]["legacy_source"]["deep_replay_request_sha256"]
+    )
+
+
 def test_rejects_membership_hash_drift(
     comparison_environment: dict[str, object], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -407,7 +477,7 @@ def test_catalog_reads_are_immutable_and_ignore_unbound_sqlite_sidecars(
     catalog = comparison_environment["archive_root"] / "derived" / "attempt-catalog.sqlite"
     catalog.with_name(f"{catalog.name}-wal").write_bytes(b"unbound WAL")
     prepared = _prepare(comparison_environment, monkeypatch)
-    assert len(prepared.items) == 452
+    assert len(prepared.items) == 450
 
 
 def test_execute_revalidates_current_authority_before_creating_outputs(
@@ -463,11 +533,67 @@ def test_execute_submits_the_exact_planned_evidence_payloads(
         trading_dashboard_root=comparison_environment["dashboard_root"],
     )
 
-    assert result["calculated"] == 452
+    assert result["calculated"] == 450
     assert captured["campaign_plan_id"] == prepared.plan["execution_plan_id"]
     assert captured["evidence_plans_by_attempt_id"] == prepared.evidence_plans_by_attempt_id
     assert captured["task_ids_by_attempt_id"] == prepared.task_ids_by_attempt_id
+    assert set(captured["prebuilt_tasks_by_attempt_id"]) == set(
+        prepared.task_ids_by_attempt_id
+    )
+    assert all(
+        captured["prebuilt_tasks_by_attempt_id"][attempt_id]["task_id"]
+        == prepared.task_ids_by_attempt_id[attempt_id]
+        for attempt_id in prepared.task_ids_by_attempt_id
+    )
+    assert all(
+        Path(attempt["_nested_source_artifact_dir"]).is_relative_to(
+            comparison_environment["archive_root"]
+        )
+        for _run_dir, attempt, _row, _metadata in captured["items"]
+    )
     assert Path(result["report_path"]).is_file()
+
+
+def test_pre_enqueue_validation_blocks_all_gateway_submission(
+    comparison_environment: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prepared = _prepare(comparison_environment, monkeypatch)
+    called = False
+    monkeypatch.setattr(
+        legacy,
+        "_verify_live_lake_identity",
+        lambda **_kwargs: legacy.REQUIRED_LAKE_SEMANTIC_SHA256,
+    )
+    monkeypatch.setattr(
+        legacy,
+        "resolve_lab_backtest_config",
+        lambda **_kwargs: legacy.LabBacktestConfig(
+            gateway_url="https://gateway.invalid",
+            worker_contract_hash=legacy.REQUIRED_WORKER_CONTRACT_SHA256,
+        ),
+    )
+    monkeypatch.setattr(
+        legacy,
+        "build_full_backtest_lab_task",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("manual source invalid")),
+    )
+
+    def unexpected_run(**_kwargs: object) -> tuple[list[dict[str, object]], int, int]:
+        nonlocal called
+        called = True
+        return [], 0, 0
+
+    monkeypatch.setattr(legacy, "run_lab_full_backtests", unexpected_run)
+    with pytest.raises(
+        legacy.LegacyFixedComparisonError,
+        match="pre-enqueue task construction failed: cohort-000",
+    ):
+        legacy.execute_legacy_fixed_comparison(
+            prepared=prepared,
+            config=comparison_environment["config"],
+            trading_dashboard_root=comparison_environment["dashboard_root"],
+        )
+    assert not called
 
 
 def test_canary_uses_sibling_output_root_and_distinct_delivery_ids(

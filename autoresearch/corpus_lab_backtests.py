@@ -962,6 +962,7 @@ def run_lab_full_backtests(
     cell_receipts_by_attempt_id: dict[str, FrozenExecutionCellReceipt | dict[str, Any]] | None = None,
     evidence_plans_by_attempt_id: Mapping[str, dict[str, Any]] | None = None,
     task_ids_by_attempt_id: Mapping[str, str] | None = None,
+    prebuilt_tasks_by_attempt_id: Mapping[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     _ = force_rebuild
     pending_items = list(items)
@@ -994,28 +995,44 @@ def run_lab_full_backtests(
                     else cell_receipt_raw
                 )
                 try:
-                    task = build_full_backtest_lab_task(
-                        config=config,
-                        run_dir=run_dir,
-                        attempt=attempt,
-                        run_metadata=run_metadata,
-                        lab_config=lab_config,
-                        batch_id=batch_id,
-                        evidence_window_start=evidence_window_start,
-                        evidence_window_end=frozen_evidence_window_end,
-                        requested_horizon_months=requested_horizon_months,
-                        evidence_role=evidence_role,
-                        selection_data_end=selection_data_end,
-                        campaign_plan_id=campaign_plan_id,
-                        lake_manifest_sha256=lake_manifest_sha256,
-                        evidence_plan=(evidence_plans_by_attempt_id or {}).get(attempt_id),
-                        tracked_cell=(
-                            cell_receipt.execution_cell
-                            if isinstance(cell_receipt, FrozenExecutionCellReceipt)
-                            else None
-                        ),
-                        task_id=(task_ids_by_attempt_id or {}).get(attempt_id),
-                    )
+                    prebuilt_task = (prebuilt_tasks_by_attempt_id or {}).get(attempt_id)
+                    if prebuilt_task is not None:
+                        if not isinstance(prebuilt_task, dict):
+                            raise RuntimeError(
+                                f"Prebuilt lab task is invalid for attempt {attempt_id}"
+                            )
+                        task = prebuilt_task
+                        expected_task_id = (task_ids_by_attempt_id or {}).get(attempt_id)
+                        if (
+                            expected_task_id is not None
+                            and str(task.get("task_id") or "") != expected_task_id
+                        ):
+                            raise RuntimeError(
+                                f"Prebuilt lab task identity differs for attempt {attempt_id}"
+                            )
+                    else:
+                        task = build_full_backtest_lab_task(
+                            config=config,
+                            run_dir=run_dir,
+                            attempt=attempt,
+                            run_metadata=run_metadata,
+                            lab_config=lab_config,
+                            batch_id=batch_id,
+                            evidence_window_start=evidence_window_start,
+                            evidence_window_end=frozen_evidence_window_end,
+                            requested_horizon_months=requested_horizon_months,
+                            evidence_role=evidence_role,
+                            selection_data_end=selection_data_end,
+                            campaign_plan_id=campaign_plan_id,
+                            lake_manifest_sha256=lake_manifest_sha256,
+                            evidence_plan=(evidence_plans_by_attempt_id or {}).get(attempt_id),
+                            tracked_cell=(
+                                cell_receipt.execution_cell
+                                if isinstance(cell_receipt, FrozenExecutionCellReceipt)
+                                else None
+                            ),
+                            task_id=(task_ids_by_attempt_id or {}).get(attempt_id),
+                        )
                 except Exception as exc:
                     failed += 1
                     entry = {

@@ -660,6 +660,75 @@ def test_run_lab_full_backtests_skips_missing_profile(tmp_path: Path, monkeypatc
     assert FakeGateway.enqueued == []
 
 
+def test_run_lab_full_backtests_submits_prebuilt_task_without_rereading_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    run_dir = tmp_path / "runs" / "run-a"
+    artifact_dir = run_dir / "evals" / "final"
+    artifact_dir.mkdir(parents=True)
+    attempt = {
+        "attempt_id": "attempt-a",
+        "artifact_dir": str(artifact_dir),
+        "profile_path": None,
+    }
+    row = {"attempt_id": "attempt-a", "run_id": "run-a", "candidate_name": "final"}
+    prebuilt_task = {"task_id": "prebuilt-task", "payload": {"immutable": True}}
+
+    class FakeGateway:
+        task: dict | None = None
+        returned = False
+        acked: list[str] = []
+
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def read_results(self, *, limit: int) -> list[dict]:
+            _ = limit
+            if self.task is None or self.returned:
+                return []
+            self.__class__.returned = True
+            return [
+                {
+                    "task_id": self.task["task_id"],
+                    "lease_id": "lease-1",
+                    "status": "failed",
+                    "result": {"error": "expected worker terminal"},
+                }
+            ]
+
+        def enqueue_tasks(self, tasks: list[dict]) -> dict:
+            assert tasks == [prebuilt_task]
+            assert tasks[0] is prebuilt_task
+            self.__class__.task = tasks[0]
+            return {"accepted": len(tasks)}
+
+        def ack_results(self, lease_ids: list[str]) -> None:
+            self.__class__.acked.extend(lease_ids)
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("autoresearch.corpus_lab_backtests.LabGatewayClient", FakeGateway)
+    monkeypatch.setattr(
+        "autoresearch.corpus_lab_backtests.build_full_backtest_lab_task",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not rebuild task")),
+    )
+
+    results, calculated, failed = run_lab_full_backtests(
+        config=SimpleNamespace(research=SimpleNamespace(quality_score_preset="default")),
+        items=[(run_dir, attempt, row, {})],
+        lab_config=LabBacktestConfig(poll_interval_seconds=0.01),
+        max_workers=1,
+        task_ids_by_attempt_id={"attempt-a": "prebuilt-task"},
+        prebuilt_tasks_by_attempt_id={"attempt-a": prebuilt_task},
+    )
+
+    assert calculated == 0
+    assert failed == 1
+    assert results[0]["error"] == "expected worker terminal"
+    assert FakeGateway.acked == ["lease-1"]
+
+
 def test_run_lab_full_backtests_counts_no_valid_cell_as_nonviable_evidence(
     tmp_path: Path,
     monkeypatch,

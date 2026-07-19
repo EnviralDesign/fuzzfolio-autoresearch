@@ -20,6 +20,7 @@ from typing import Any, Mapping
 
 from .corpus_lab_backtests import (
     LabBacktestConfig,
+    build_full_backtest_lab_task,
     resolve_lab_backtest_config,
     run_lab_full_backtests,
 )
@@ -37,11 +38,12 @@ from .level_c_operator import (
 )
 from .nested_evidence import FrozenExecutionCellReceipt
 from .runtime_policy_lock import build_runtime_policy_lock, policy_lock_provenance
+from .instrument_universe import research_eligibility_report, universe_provenance
 
 
-LEGACY_FIXED_COMPARISON_PLAN_SCHEMA = "autoresearch-legacy-fixed-comparison-plan-v1"
+LEGACY_FIXED_COMPARISON_PLAN_SCHEMA = "autoresearch-legacy-fixed-comparison-plan-v2"
 LEGACY_FIXED_COMPARISON_PREFLIGHT_SCHEMA = (
-    "autoresearch-legacy-fixed-comparison-preflight-v1"
+    "autoresearch-legacy-fixed-comparison-preflight-v2"
 )
 LEGACY_FIXED_COMPARISON_CANARY_PLAN_SCHEMA = (
     "autoresearch-legacy-fixed-comparison-canary-plan-v1"
@@ -371,6 +373,16 @@ def _receipt_from_source(
         raise LegacyFixedComparisonError(
             f"source cell is ambiguous or differs from its frozen result: {attempt_id}"
         )
+    replay_job_path = result_path.parent / "deep-replay-job.json"
+    replay_job_sha256 = _require_file_sha256(
+        replay_job_path, label=f"source deep replay job {attempt_id}"
+    )
+    replay_job = _load_json(replay_job_path, label=f"source deep replay job {attempt_id}")
+    replay_request = replay_job.get("request")
+    if not isinstance(replay_request, dict):
+        raise LegacyFixedComparisonError(
+            f"source deep replay request is missing: {attempt_id}"
+        )
     source_record: dict[str, Any] = {
         "kind": source_kind,
         "attempt_id": attempt_id,
@@ -380,6 +392,11 @@ def _receipt_from_source(
         "result_sha256": result_sha256,
         "detail_path": _relative_to_archive(detail_path, archive_runs_root),
         "detail_sha256": detail_sha256,
+        "deep_replay_job_path": _relative_to_archive(
+            replay_job_path, archive_runs_root
+        ),
+        "deep_replay_job_sha256": replay_job_sha256,
+        "deep_replay_request_sha256": canonical_sha256(replay_request),
         "selection_basis": selection_basis,
         "execution_cell_sha256": build_execution_cell_sha256(selected_cell),
     }
@@ -396,6 +413,35 @@ def _receipt_from_source(
         lake_manifest_sha256=lake_manifest_sha256,
     )
     return normalized_profile, receipt.model_dump(mode="json")
+
+
+def _current_universe_terminal(
+    *,
+    attempt_id: str,
+    profile_snapshot: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    memberships_for_attempt: list[str],
+    membership_source: str,
+) -> dict[str, Any] | None:
+    """Return a typed terminal only when current authority excludes the profile."""
+
+    source = _require_mapping(receipt.get("source"), label=f"source receipt {attempt_id}")
+    report = research_eligibility_report(profile_snapshot.get("instruments"))
+    if report["is_eligible"]:
+        return None
+    return {
+        "attempt_id": attempt_id,
+        "status": "unresolved_current_universe",
+        "reason_code": "current_authority_ineligible_instrument",
+        "memberships": memberships_for_attempt,
+        "membership_source": membership_source,
+        "instruments": report["instruments"],
+        "ineligible_instruments": report["ineligible"],
+        "unknown_instruments": report["unknown"],
+        "lifecycle": report["lifecycle"],
+        "current_universe": universe_provenance(),
+        "legacy_source": source,
+    }
 
 
 def _load_authority(
@@ -766,6 +812,33 @@ def prepare_legacy_fixed_comparison(
             {"attempt_id": attempt_id}
         ).removeprefix("sha256:")
         catalog_attempt["artifact_dir"] = str(clone_artifact_dir)
+        source_replay_job = archive_runs_root / str(
+            source_record.get("deep_replay_job_path") or ""
+        )
+        if source_replay_job.name != "deep-replay-job.json":
+            raise LegacyFixedComparisonError(
+                f"source replay request path is invalid: {attempt_id}"
+            )
+        _validate_hash(
+            source_replay_job,
+            source_record.get("deep_replay_job_sha256"),
+            label=f"source deep replay job {attempt_id}",
+        )
+        source_replay_job_payload = _load_json(
+            source_replay_job, label=f"source deep replay job {attempt_id}"
+        )
+        source_replay_request = source_replay_job_payload.get("request")
+        if (
+            not isinstance(source_replay_request, dict)
+            or canonical_sha256(source_replay_request)
+            != str(source_record.get("deep_replay_request_sha256") or "")
+        ):
+            raise LegacyFixedComparisonError(
+                f"source deep replay request differs from attested receipt: {attempt_id}"
+            )
+        # Outputs remain comparison-owned.  The archived request is used only as a
+        # read-only task-construction input, just as formal nested evidence does.
+        catalog_attempt["_nested_source_artifact_dir"] = str(source_replay_job.parent)
         catalog_attempt["profile_path"] = str(
             archive_runs_root / str(source_record["profile_path"])
         )
@@ -863,6 +936,13 @@ def prepare_legacy_fixed_comparison(
                 "candidate_snapshot_sha256": snapshot_sha256,
             },
         )
+        cohort_eligibility = research_eligibility_report(
+            profile_snapshot.get("instruments")
+        )
+        if not cohort_eligibility["is_eligible"]:
+            raise LegacyFixedComparisonError(
+                f"frozen cohort source is outside the current authority universe: {attempt_id}"
+            )
         append_task(
             attempt_id=attempt_id,
             run_id=str(catalog_rows[attempt_id].get("run_id") or ""),
@@ -984,6 +1064,19 @@ def prepare_legacy_fixed_comparison(
                 "catalog_row_sha256": canonical_sha256(catalog_attempt),
             },
         )
+        memberships_for_attempt = sorted(
+            name for name, values in memberships.items() if attempt_id in values
+        )
+        universe_terminal = _current_universe_terminal(
+            attempt_id=attempt_id,
+            profile_snapshot=profile_snapshot,
+            receipt=receipt,
+            memberships_for_attempt=memberships_for_attempt,
+            membership_source=selected["membership_source"],
+        )
+        if universe_terminal is not None:
+            unresolved.append(universe_terminal)
+            continue
         append_task(
             attempt_id=attempt_id,
             run_id=catalog_run_id,
@@ -991,22 +1084,20 @@ def prepare_legacy_fixed_comparison(
             profile_snapshot=profile_snapshot,
             receipt=receipt,
             source_record=receipt["source"],
-            memberships_for_attempt=sorted(
-                name for name, values in memberships.items() if attempt_id in values
-            ),
+            memberships_for_attempt=memberships_for_attempt,
         )
 
     expected_unresolved = out_of_cohort_members - task_attempt_ids
     if {row["attempt_id"] for row in unresolved} != expected_unresolved:
         raise LegacyFixedComparisonError("legacy comparison unresolved accounting differs")
     if (
-        len(tasks) != 452
+        len(tasks) != 450
         or len(cohort_ids) != 443
-        or len(task_attempt_ids - set(cohort_ids)) != 9
-        or len(unresolved) != 3
+        or len(task_attempt_ids - set(cohort_ids)) != 7
+        or len(unresolved) != 5
     ):
         raise LegacyFixedComparisonError(
-            "legacy comparison must resolve 452 tasks and exactly 3 unresolved sources"
+            "legacy comparison must resolve 450 tasks and exactly 5 terminal sources"
         )
     identity_payload = {
         **comparison_descriptor,
@@ -1021,7 +1112,15 @@ def prepare_legacy_fixed_comparison(
         "task_count": len(tasks),
         "cohort_task_count": len(cohort_ids),
         "out_of_cohort_task_count": len(tasks) - len(cohort_ids),
-        "unresolved_source_count": len(unresolved),
+        "unresolved_source_count": sum(
+            1 for row in unresolved if row.get("status") == "unresolved_source"
+        ),
+        "unresolved_current_universe_count": sum(
+            1
+            for row in unresolved
+            if row.get("status") == "unresolved_current_universe"
+        ),
+        "unresolved_terminal_count": len(unresolved),
         "june_resolved_count": sum(
             1 for attempt_id in memberships["june"] if attempt_id in task_attempt_ids
         ),
@@ -1262,6 +1361,62 @@ def _write_execution_report(
     return report_path
 
 
+def _validate_pre_enqueue_task_construction(
+    *,
+    prepared: PreparedLegacyFixedComparison,
+    config: Any,
+    lab_config: LabBacktestConfig,
+    campaign_plan_id: str,
+) -> dict[str, dict[str, Any]]:
+    """Build every exact worker payload before a comparison can enqueue any task."""
+
+    prebuilt_tasks: dict[str, dict[str, Any]] = {}
+    for run_dir, attempt, _row, run_metadata in prepared.items:
+        attempt_id = str(attempt.get("attempt_id") or "")
+        receipt_raw = prepared.cell_receipts_by_attempt_id.get(attempt_id)
+        evidence_plan = prepared.evidence_plans_by_attempt_id.get(attempt_id)
+        expected_task_id = prepared.task_ids_by_attempt_id.get(attempt_id)
+        if not isinstance(receipt_raw, dict) or not isinstance(evidence_plan, dict):
+            raise LegacyFixedComparisonError(
+                f"comparison task is missing frozen evidence inputs: {attempt_id}"
+            )
+        try:
+            receipt = FrozenExecutionCellReceipt.model_validate(receipt_raw)
+            task = build_full_backtest_lab_task(
+                config=config,
+                run_dir=run_dir,
+                attempt=attempt,
+                run_metadata=run_metadata,
+                lab_config=lab_config,
+                batch_id="legacy-fixed-comparison-preenqueue",
+                evidence_window_start=WINDOW_START,
+                evidence_window_end=WINDOW_END,
+                requested_horizon_months=36,
+                evidence_role=LEGACY_COMPARISON_ROLE,
+                selection_data_end=WINDOW_END,
+                campaign_plan_id=campaign_plan_id,
+                lake_manifest_sha256=REQUIRED_LAKE_SEMANTIC_SHA256,
+                evidence_plan=evidence_plan,
+                tracked_cell=receipt.execution_cell,
+                task_id=expected_task_id,
+            )
+        except Exception as exc:
+            raise LegacyFixedComparisonError(
+                "comparison pre-enqueue task construction failed: "
+                f"{attempt_id}: {exc}"
+            ) from exc
+        if str(task.get("task_id") or "") != expected_task_id:
+            raise LegacyFixedComparisonError(
+                f"comparison task identity differs during pre-enqueue validation: {attempt_id}"
+            )
+        prebuilt_tasks[attempt_id] = task
+    if set(prebuilt_tasks) != set(prepared.task_ids_by_attempt_id):
+        raise LegacyFixedComparisonError(
+            "comparison pre-enqueue task accounting differs from the immutable plan"
+        )
+    return prebuilt_tasks
+
+
 def execute_legacy_fixed_comparison(
     *,
     prepared: PreparedLegacyFixedComparison,
@@ -1330,6 +1485,12 @@ def execute_legacy_fixed_comparison(
     )
     if not _SHA256_RE.fullmatch(campaign_plan_id):
         raise LegacyFixedComparisonError("comparison execution plan identity is invalid")
+    prebuilt_tasks = _validate_pre_enqueue_task_construction(
+        prepared=execution_prepared,
+        config=config,
+        lab_config=lab_config,
+        campaign_plan_id=campaign_plan_id,
+    )
     results, calculated, failed = run_lab_full_backtests(
         config=config,
         items=execution_prepared.items,
@@ -1345,6 +1506,7 @@ def execute_legacy_fixed_comparison(
         cell_receipts_by_attempt_id=execution_prepared.cell_receipts_by_attempt_id,
         evidence_plans_by_attempt_id=execution_prepared.evidence_plans_by_attempt_id,
         task_ids_by_attempt_id=execution_prepared.task_ids_by_attempt_id,
+        prebuilt_tasks_by_attempt_id=prebuilt_tasks,
     )
     if failed:
         raise LegacyFixedComparisonError(
