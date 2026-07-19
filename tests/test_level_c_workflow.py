@@ -363,6 +363,83 @@ def test_bootstrap_accepts_archive_generation_handoff_state(
     assert audit["archive_generation_handoff"]["prior_generation_id"] == prior_generation_id
 
 
+def test_bootstrap_accepts_chained_handoff_bound_to_original_legacy_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, active, _, arguments, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    first_successor = "level-c-generation-002"
+    second_successor = "level-c-generation-003"
+
+    _archive_generation_cutover(
+        GenerationArchiveService(active),
+        tmp_path,
+        archive_id="archive-generation-001",
+        new_generation_id=first_successor,
+        prior_generation_id=str(arguments["new_generation_id"]),
+    )
+    first_arguments = dict(arguments)
+    first_arguments["new_generation_id"] = first_successor
+    bootstrap_level_c(**first_arguments)
+
+    _archive_generation_cutover(
+        GenerationArchiveService(active),
+        tmp_path,
+        archive_id="archive-generation-002",
+        new_generation_id=second_successor,
+        prior_generation_id=first_successor,
+    )
+    second_arguments = dict(arguments)
+    second_arguments["new_generation_id"] = second_successor
+
+    result = bootstrap_level_c(**second_arguments)
+
+    assert result["bootstrap_id"]
+    assert audit_level_c(config=config, active_runs_root=active)["status"] == "valid"
+
+
+def test_bootstrap_rejects_chained_handoff_with_unverified_parent_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, active, _, arguments, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    first_successor = "level-c-generation-002"
+    second_successor = "level-c-generation-003"
+
+    _archive_generation_cutover(
+        GenerationArchiveService(active),
+        tmp_path,
+        archive_id="archive-generation-001",
+        new_generation_id=first_successor,
+        prior_generation_id=str(arguments["new_generation_id"]),
+    )
+    first_arguments = dict(arguments)
+    first_arguments["new_generation_id"] = first_successor
+    bootstrap_level_c(**first_arguments)
+
+    _archive_generation_cutover(
+        GenerationArchiveService(active),
+        tmp_path,
+        archive_id="archive-generation-002",
+        new_generation_id=second_successor,
+        prior_generation_id=first_successor,
+    )
+    archived_control = (
+        tmp_path
+        / "runs_archive"
+        / "archive-generation-002"
+        / "runs"
+        / "derived"
+        / "level-c"
+        / "control"
+        / "archive-linkage.json"
+    )
+    archived_control.write_text("{}", encoding="utf-8")
+    second_arguments = dict(arguments)
+    second_arguments["new_generation_id"] = second_successor
+
+    with pytest.raises(LevelCWorkflowError, match="control linkage hash"):
+        bootstrap_level_c(**second_arguments)
+
+
 def test_bootstrap_rejects_invalid_archive_generation_handoff_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

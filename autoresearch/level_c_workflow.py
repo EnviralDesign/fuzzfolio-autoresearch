@@ -315,6 +315,59 @@ def _archive_generation_handoff(active_root: Path, new_generation_id: str) -> di
     }
 
 
+def _validate_handoff_legacy_control_lineage(
+    *,
+    handoff: Mapping[str, Any],
+    archive_root: Path,
+    archive_id: str,
+    legacy_controls_sha256: str,
+    legacy_controls_manifest_id: str,
+) -> None:
+    """Prove a successor reuses the exact controls authenticated by its parent."""
+    linkage = handoff.get("archive_linkage")
+    if not isinstance(linkage, Mapping):
+        raise LevelCWorkflowError("archive-generation handoff control lineage is missing")
+    archive_manifest_path = Path(str(linkage.get("archive_manifest_path") or "")).expanduser()
+    archive_manifest = _load_json(
+        archive_manifest_path, label="archive-generation archive manifest"
+    )
+    archived_root = Path(str(linkage.get("archived_runs_root") or "")).expanduser().resolve(
+        strict=True
+    )
+    control_receipt = archived_root / CONTROL_RELATIVE / "archive-linkage.json"
+    inventory = archive_manifest.get("verified_archived_inventory")
+    critical = inventory.get("critical_artifacts") if isinstance(inventory, Mapping) else None
+    recorded = (
+        critical.get((CONTROL_RELATIVE / "archive-linkage.json").as_posix())
+        if isinstance(critical, Mapping)
+        else None
+    )
+    if (
+        not isinstance(recorded, Mapping)
+        or recorded.get("sha256")
+        != _file_sha256(control_receipt).split(":", 1)[1]
+    ):
+        raise LevelCWorkflowError(
+            "archive-generation handoff archived control linkage hash is not verified"
+        )
+    receipt = _load_json(control_receipt, label="archived Level C control linkage")
+    verified = receipt.get("verified_artifacts")
+    legacy = verified.get("legacy_controls") if isinstance(verified, Mapping) else None
+    if (
+        receipt.get("archive_id") != str(archive_id)
+        or Path(str(receipt.get("archived_runs_root") or "")).expanduser().resolve(
+            strict=False
+        )
+        != archive_root.resolve(strict=False)
+        or not isinstance(legacy, Mapping)
+        or legacy.get("sha256") != legacy_controls_sha256
+        or legacy.get("manifest_id") != legacy_controls_manifest_id
+    ):
+        raise LevelCWorkflowError(
+            "archive-generation handoff does not prove the supplied legacy controls"
+        )
+
+
 def _create_or_replace_archive_handoff_generation_manifest(
     path: Path, payload: Mapping[str, Any], handoff: Mapping[str, Any] | None
 ) -> dict[str, Any]:
@@ -688,7 +741,13 @@ def bootstrap_level_c(
     controls_payload = _load_json(controls_path, label="legacy controls")
     controls_generation_id = str(new_generation_id)
     if archive_generation_handoff is not None:
-        controls_generation_id = str(archive_generation_handoff["prior_generation_id"])
+        context = (controls_payload.get("identity") or {}).get("archive_context")
+        if not isinstance(context, Mapping):
+            raise LevelCWorkflowError("legacy controls archive context is missing")
+        controls_generation_id = _require_generation_id(
+            context.get("new_research_generation_id"),
+            label="legacy controls archived generation",
+        )
     controls_validation = _validate_legacy_controls(
         path=controls_path,
         archive_root=archive,
@@ -699,6 +758,14 @@ def bootstrap_level_c(
         nested_report_path=completed_nested_report,
         nested_report_sha256=verified["completed_nested_report"]["sha256"],
     )
+    if archive_generation_handoff is not None:
+        _validate_handoff_legacy_control_lineage(
+            handoff=archive_generation_handoff,
+            archive_root=archive,
+            archive_id=str(archive_id),
+            legacy_controls_sha256=controls_observed_hash,
+            legacy_controls_manifest_id=controls_validation["manifest_id"],
+        )
     catalog_validation = _validate_attempt_catalog(archived_attempt_catalog)
     verified["legacy_controls"] = {
         "path": str(controls_path),
