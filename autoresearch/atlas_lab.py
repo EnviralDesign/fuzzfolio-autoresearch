@@ -2126,6 +2126,7 @@ def _enqueue_gateway_tasks_with_retries(
     attempts: int = 5,
     retry_base_seconds: float = 1.0,
     allow_preserved_results: bool = False,
+    allow_preserved_tasks: bool = False,
 ) -> None:
     if not tasks:
         return
@@ -2138,11 +2139,18 @@ def _enqueue_gateway_tasks_with_retries(
                     rejected = response.get("rejected")
                     accepted_count = int(accepted)
                     rejected_count = int(rejected) if rejected is not None else len(tasks) - accepted_count
-                    if allow_preserved_results and accepted_count == 0 and rejected_count == len(tasks):
+                    if (
+                        (allow_preserved_results or allow_preserved_tasks)
+                        and accepted_count == 0
+                        and rejected_count == len(tasks)
+                    ):
                         snapshot = _gateway_snapshot_with_retries(gateway)
                         result_backlog = int(snapshot.get("result_backlog") or 0)
+                        live_tasks = int(snapshot.get("live_tasks") or 0)
                         duplicate_enqueues = int(_gateway_metrics(snapshot).get("duplicate_task_enqueues") or 0)
-                        if result_backlog >= len(tasks) and duplicate_enqueues >= len(tasks):
+                        preserved_results = allow_preserved_results and result_backlog >= len(tasks)
+                        preserved_tasks = allow_preserved_tasks and live_tasks >= len(tasks)
+                        if (preserved_results or preserved_tasks) and duplicate_enqueues >= len(tasks):
                             return
                     raise RuntimeError(
                         "Atlas gateway accepted "
@@ -2953,6 +2961,7 @@ def build_signal_atlas_via_gateway(
                 gateway,
                 chunk,
                 allow_preserved_results=True,
+                allow_preserved_tasks=True,
             )
 
     enqueue_more()

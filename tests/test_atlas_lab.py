@@ -2151,6 +2151,29 @@ def test_enqueue_gateway_tasks_rejects_partial_acceptance() -> None:
         )
 
 
+def test_enqueue_gateway_tasks_accepts_preserved_live_tasks() -> None:
+    class PreservedTaskGateway:
+        def __init__(self) -> None:
+            self.task_count = 0
+
+        def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+            self.task_count = len(tasks)
+            return {"status": "accepted", "accepted": 0, "rejected": len(tasks)}
+
+        def snapshot(self) -> dict[str, Any]:
+            return {
+                "live_tasks": self.task_count,
+                "result_backlog": 0,
+                "metrics": {"duplicate_task_enqueues": self.task_count},
+            }
+
+    _enqueue_gateway_tasks_with_retries(
+        PreservedTaskGateway(),
+        [{"task_id": "a"}, {"task_id": "b"}],
+        allow_preserved_tasks=True,
+    )
+
+
 def test_historical_signal_gateway_worker_failure_fails_closed(
     tmp_path: Path,
     monkeypatch,
