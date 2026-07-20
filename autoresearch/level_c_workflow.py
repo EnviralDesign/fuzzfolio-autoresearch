@@ -29,6 +29,11 @@ from .generation_archive import (
     GENERATION_SCHEMA_NAME,
     GENERATION_SCHEMA_VERSION,
 )
+from .archive_relocation import (
+    ArchiveRelocationError,
+    resolve_archive_path,
+    resolve_archive_runs_root,
+)
 from .level_c import freeze_level_c_cohort, validate_level_c_cohort
 from .level_c_operator import (
     build_level_c_execution_plan,
@@ -260,7 +265,16 @@ def _archive_generation_handoff(active_root: Path, new_generation_id: str) -> di
     linkage = manifest.get("archive_linkage")
     if not isinstance(linkage, Mapping):
         raise LevelCWorkflowError("archive-generation handoff archive_linkage is missing")
-    archive_manifest_path = Path(str(linkage.get("archive_manifest_path") or "")).expanduser()
+    archive_id = str(linkage.get("archive_id") or "")
+    try:
+        archive_manifest_path = resolve_archive_path(
+            str(linkage.get("archive_manifest_path") or ""), archive_id=archive_id
+        )
+        archived_root = resolve_archive_runs_root(
+            str(linkage.get("archived_runs_root") or ""), archive_id=archive_id
+        )
+    except ArchiveRelocationError as exc:
+        raise LevelCWorkflowError("archive-generation handoff relocation is invalid") from exc
     if not archive_manifest_path.is_file() or archive_manifest_path.is_symlink():
         raise LevelCWorkflowError("archive-generation handoff archive manifest is missing")
     archive_manifest = _load_json(archive_manifest_path, label="archive-generation archive manifest")
@@ -290,7 +304,6 @@ def _archive_generation_handoff(active_root: Path, new_generation_id: str) -> di
     archive_provenance = archive_manifest.get("provenance")
     if not isinstance(archive_provenance, Mapping) or archive_provenance.get("prior_generation_id") != prior_generation_id:
         raise LevelCWorkflowError("archive-generation handoff prior_generation_id conflicts with archive manifest")
-    archived_root = Path(str(linkage.get("archived_runs_root") or "")).expanduser().resolve(strict=True)
     archived_generation_path = archived_root / GENERATION_MANIFEST_NAME
     if not archived_generation_path.is_file() or archived_generation_path.is_symlink():
         raise LevelCWorkflowError("archive-generation handoff archived prior generation manifest is missing")
@@ -327,12 +340,17 @@ def _validate_handoff_legacy_control_lineage(
     linkage = handoff.get("archive_linkage")
     if not isinstance(linkage, Mapping):
         raise LevelCWorkflowError("archive-generation handoff control lineage is missing")
-    archive_manifest_path = Path(str(linkage.get("archive_manifest_path") or "")).expanduser()
+    try:
+        archive_manifest_path = resolve_archive_path(
+            str(linkage.get("archive_manifest_path") or ""), archive_id=str(linkage.get("archive_id") or "")
+        )
+        archived_root = resolve_archive_runs_root(
+            str(linkage.get("archived_runs_root") or ""), archive_id=str(linkage.get("archive_id") or "")
+        )
+    except ArchiveRelocationError as exc:
+        raise LevelCWorkflowError("archive-generation handoff relocation is invalid") from exc
     archive_manifest = _load_json(
         archive_manifest_path, label="archive-generation archive manifest"
-    )
-    archived_root = Path(str(linkage.get("archived_runs_root") or "")).expanduser().resolve(
-        strict=True
     )
     control_receipt = archived_root / CONTROL_RELATIVE / "archive-linkage.json"
     inventory = archive_manifest.get("verified_archived_inventory")
@@ -482,6 +500,7 @@ def _validate_legacy_controls(
     *,
     path: Path,
     archive_root: Path,
+    recorded_archive_root: Path,
     archive_id: str,
     controls_generation_id: str,
     catalog_path: Path,
@@ -520,8 +539,8 @@ def _validate_legacy_controls(
     if (
         context.get("archive_id") != archive_id
         or context.get("new_research_generation_id") != controls_generation_id
-        or projected_root != archive_root
-        or context.get("archive_relative_base") != archive_root.name
+        or projected_root != recorded_archive_root
+        or context.get("archive_relative_base") != recorded_archive_root.name
         or context.get("reference_only") is not True
     ):
         raise LevelCWorkflowError("legacy controls archive context differs from bootstrap")
@@ -559,11 +578,12 @@ def _validate_legacy_controls(
             strict=False
         )
         expected_path = (archive_root / relative).resolve(strict=False)
+        expected_recorded_path = (recorded_archive_root / relative).resolve(strict=False)
         actual_relative = actual_path.resolve(strict=True).relative_to(archive_root)
         if (
             relative.is_absolute()
             or relative.as_posix() != actual_relative.as_posix()
-            or projected != expected_path
+            or projected != expected_recorded_path
             or actual_path.resolve(strict=True) != expected_path.resolve(strict=True)
             or _sha256_token(record.get("sha256")) != actual_hash
         ):
@@ -705,9 +725,18 @@ def bootstrap_level_c(
     active_root = active_runs_root.expanduser().resolve(strict=False)
     if active_root != config.runs_root.resolve(strict=False):
         raise LevelCWorkflowError("active runs root must match the configured runs root")
-    archive = archive_root.expanduser().resolve(strict=True)
-    if not archive.is_dir() or archive.is_symlink():
-        raise LevelCWorkflowError("archive root must be a real directory")
+    recorded_archive = archive_root.expanduser().resolve(strict=False)
+    try:
+        archive = resolve_archive_runs_root(archive_root, archive_id=str(archive_id))
+        archived_attempt_catalog = resolve_archive_path(
+            archived_attempt_catalog, archive_id=str(archive_id)
+        )
+        legacy_controls = resolve_archive_path(legacy_controls, archive_id=str(archive_id))
+        completed_nested_report = resolve_archive_path(
+            completed_nested_report, archive_id=str(archive_id)
+        )
+    except ArchiveRelocationError as exc:
+        raise LevelCWorkflowError("archive root relocation is invalid") from exc
     _assert_bootstrap_root(active_root)
     archive_generation_handoff = _archive_generation_handoff(
         active_root, str(new_generation_id)
@@ -751,6 +780,7 @@ def bootstrap_level_c(
     controls_validation = _validate_legacy_controls(
         path=controls_path,
         archive_root=archive,
+        recorded_archive_root=recorded_archive,
         archive_id=str(archive_id),
         controls_generation_id=controls_generation_id,
         catalog_path=archived_attempt_catalog,
@@ -761,7 +791,7 @@ def bootstrap_level_c(
     if archive_generation_handoff is not None:
         _validate_handoff_legacy_control_lineage(
             handoff=archive_generation_handoff,
-            archive_root=archive,
+            archive_root=recorded_archive,
             archive_id=str(archive_id),
             legacy_controls_sha256=controls_observed_hash,
             legacy_controls_manifest_id=controls_validation["manifest_id"],
@@ -793,7 +823,7 @@ def bootstrap_level_c(
     archive_identity = {
         "schema_version": BOOTSTRAP_RECEIPT_SCHEMA,
         "archive_id": str(archive_id),
-        "archived_runs_root": str(archive),
+        "archived_runs_root": str(recorded_archive),
         "archive_prepared_at": prepared_at,
         "verified_artifacts": verified,
         "attempt_catalog_validation": catalog_validation,
@@ -830,10 +860,10 @@ def bootstrap_level_c(
         "archive_linkage": {
             "archive_id": str(archive_id),
             "archive_manifest_path": str(paths["archive_receipt"]),
-            "archived_runs_root": str(archive),
+            "archived_runs_root": str(recorded_archive),
             "archive_prepared_at": prepared_at,
         },
-        "source_runs_root": str(archive),
+        "source_runs_root": str(recorded_archive),
         "destination_runs_root": str(active_root),
         "archived_inventory": {
             "kind": "manual-atomic-archive-linkage",
@@ -1596,10 +1626,16 @@ def audit_level_c(
     }
     if archive_receipt.get("receipt_sha256") != canonical_sha256(archive_identity):
         raise LevelCWorkflowError("archive linkage receipt drift")
-    archive_root = Path(str(archive_receipt.get("archived_runs_root") or "")).resolve(strict=True)
+    archive_id = str(archive_receipt.get("archive_id") or "")
+    try:
+        archive_root = resolve_archive_runs_root(
+            str(archive_receipt.get("archived_runs_root") or ""), archive_id=archive_id
+        )
+    except ArchiveRelocationError as exc:
+        raise LevelCWorkflowError("archived bootstrap relocation is invalid") from exc
     for artifact in (archive_receipt.get("verified_artifacts") or {}).values():
         source = (
-            Path(str(artifact.get("path"))).resolve(strict=True)
+            resolve_archive_path(str(artifact.get("path")), archive_id=archive_id)
             if artifact.get("path")
             else archive_root / str(artifact.get("relative_path") or "")
         )

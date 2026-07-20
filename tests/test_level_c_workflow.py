@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -12,7 +13,18 @@ from autoresearch import level_c_workflow as workflow
 from autoresearch.__main__ import build_parser
 from autoresearch.config import load_config
 from autoresearch.catalog_index import CATALOG_INDEX_SCHEMA_VERSION
-from autoresearch.generation_archive import GenerationArchiveService, utc_now
+from autoresearch import archive_relocation, generation_archive
+from autoresearch.archive_relocation import (
+    preflight_archive_relocation,
+    register_archive_relocation,
+)
+from autoresearch.generation_archive import (
+    ARCHIVE_SCHEMA_NAME,
+    ARCHIVE_SCHEMA_VERSION,
+    GenerationArchiveService,
+    build_inventory,
+    utc_now,
+)
 from autoresearch.instrument_universe import universe_provenance
 from autoresearch.level_c_workflow import (
     STAGES,
@@ -96,7 +108,12 @@ def _nested_report(path: Path) -> Path:
 
 def _bootstrap_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     active = tmp_path / "runs"
-    archive = tmp_path / "archived-runs"
+    archive = (
+        tmp_path
+        / "runs_archive"
+        / "manual-atomic-archive-001"
+        / "runs"
+    )
     archive.mkdir(parents=True)
     catalog = archive / "attempt-catalog.sqlite"
     connection = sqlite3.connect(catalog)
@@ -303,6 +320,57 @@ def _archive_generation_cutover(
     )
 
 
+def _write_complete_relocation_manifest(archive_root: Path, archive_id: str) -> None:
+    required_catalog = archive_root / "derived" / "attempt-catalog.sqlite"
+    if not required_catalog.exists():
+        required_catalog.parent.mkdir(parents=True)
+        shutil.copyfile(archive_root / "attempt-catalog.sqlite", required_catalog)
+    inventory = build_inventory(archive_root)
+    (archive_root.parent / "archive-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_name": ARCHIVE_SCHEMA_NAME,
+                "schema_version": ARCHIVE_SCHEMA_VERSION,
+                "state": "complete",
+                "archive_id": archive_id,
+                "archive_root": str(archive_root.parent.parent.resolve()),
+                "destination_runs_root": str(archive_root.resolve()),
+                "verified_archived_inventory": inventory,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _relocate_archive(
+    *, archive_root: Path, archive_id: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    _write_complete_relocation_manifest(archive_root, archive_id)
+    original_archive_root = archive_root.parent.parent
+    destination_archive_root = tmp_path / "unraid" / "runs_archive"
+    destination_archive_root.mkdir(parents=True)
+    destination_directory = destination_archive_root / archive_id
+    shutil.copytree(archive_root.parent, destination_directory, copy_function=shutil.copy2)
+    receipts = tmp_path / "relocation-receipts"
+    monkeypatch.setattr(archive_relocation, "DEFAULT_RELOCATION_RECEIPTS_ROOT", receipts)
+    preflight_report = receipts / f"{archive_id}.preflight.json"
+    preflight_archive_relocation(
+        archive_id=archive_id,
+        original_archive_root=original_archive_root,
+        destination_archive_root=destination_archive_root,
+        report_path=preflight_report,
+    )
+    shutil.rmtree(archive_root.parent)
+    register_archive_relocation(
+        archive_id=archive_id,
+        original_archive_root=original_archive_root,
+        destination_archive_root=destination_archive_root,
+        preflight_report=preflight_report,
+    )
+    return destination_directory / "runs"
+
+
 def test_bootstrap_is_exact_idempotent_and_does_not_inventory_archive(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -321,6 +389,52 @@ def test_bootstrap_is_exact_idempotent_and_does_not_inventory_archive(
     }
     assert set(first["execution_plans"]) == set("ABCD")
     assert audit_level_c(config=config, active_runs_root=active)["status"] == "valid"
+
+
+def test_audit_resolves_verified_relocated_archive_without_changing_plan_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, active, archive, arguments, first = _bootstrap_fixture(tmp_path, monkeypatch)
+    expected_plan_ids = {
+        key: value["plan_id"] for key, value in first["execution_plans"].items()
+    }
+    moved_runs = _relocate_archive(
+        archive_root=archive,
+        archive_id="manual-atomic-archive-001",
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+    )
+    old_registry = Path(archive_relocation.DEFAULT_RELOCATION_RECEIPTS_ROOT)
+    moved_registry = tmp_path / "repo-moved" / "archive-relocation-receipts"
+    moved_registry.parent.mkdir()
+    shutil.move(str(old_registry), str(moved_registry))
+    monkeypatch.setattr(
+        archive_relocation, "DEFAULT_RELOCATION_RECEIPTS_ROOT", moved_registry
+    )
+    monkeypatch.setattr(
+        archive_relocation,
+        "_build_content_inventory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("audit must not scan")),
+    )
+    monkeypatch.setattr(
+        generation_archive,
+        "build_inventory",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("audit must not inventory")),
+    )
+
+    audit = audit_level_c(config=config, active_runs_root=active)
+
+    assert audit["status"] == "valid"
+    assert bootstrap_level_c(**arguments) == first
+    assert {
+        key: json.loads(
+            (active / "derived" / "level-c" / "control" / f"execution-plan-{key}.json").read_text(
+                encoding="utf-8"
+            )
+        )["plan_id"]
+        for key in "ABCD"
+    } == expected_plan_ids
+    assert moved_runs.is_dir()
 
 
 def test_bootstrap_accepts_archive_generation_handoff_state(
@@ -361,6 +475,54 @@ def test_bootstrap_accepts_archive_generation_handoff_state(
     audit = audit_level_c(config=config, active_runs_root=active)
     assert audit["status"] == "valid"
     assert audit["archive_generation_handoff"]["prior_generation_id"] == prior_generation_id
+
+
+def test_bootstrap_handoff_resolves_a_verified_relocated_parent_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, active, _, arguments, _ = _bootstrap_fixture(tmp_path, monkeypatch)
+    archive_id = "archive-generation-relocated-001"
+    successor_generation_id = "level-c-generation-002"
+    _archive_generation_cutover(
+        GenerationArchiveService(active),
+        tmp_path,
+        archive_id=archive_id,
+        new_generation_id=successor_generation_id,
+        prior_generation_id=str(arguments["new_generation_id"]),
+    )
+    original_archive_root = active.parent / "runs_archive"
+    destination_archive_root = tmp_path / "unraid" / "runs_archive"
+    destination_archive_root.mkdir(parents=True)
+    shutil.copytree(
+        original_archive_root / archive_id,
+        destination_archive_root / archive_id,
+        copy_function=shutil.copy2,
+    )
+    receipts = tmp_path / "relocation-receipts"
+    monkeypatch.setattr(
+        archive_relocation, "DEFAULT_RELOCATION_RECEIPTS_ROOT", receipts
+    )
+    preflight_report = receipts / f"{archive_id}.preflight.json"
+    preflight_archive_relocation(
+        archive_id=archive_id,
+        original_archive_root=original_archive_root,
+        destination_archive_root=destination_archive_root,
+        report_path=preflight_report,
+    )
+    shutil.rmtree(original_archive_root / archive_id)
+    register_archive_relocation(
+        archive_id=archive_id,
+        original_archive_root=original_archive_root,
+        destination_archive_root=destination_archive_root,
+        preflight_report=preflight_report,
+    )
+
+    successor_arguments = dict(arguments)
+    successor_arguments["new_generation_id"] = successor_generation_id
+    result = bootstrap_level_c(**successor_arguments)
+
+    assert result["bootstrap_id"]
+    assert audit_level_c(config=config, active_runs_root=active)["status"] == "valid"
 
 
 def test_bootstrap_accepts_chained_handoff_bound_to_original_legacy_controls(

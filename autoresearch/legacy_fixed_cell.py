@@ -39,6 +39,11 @@ from .level_c_operator import (
 from .nested_evidence import FrozenExecutionCellReceipt
 from .runtime_policy_lock import build_runtime_policy_lock, policy_lock_provenance
 from .instrument_universe import research_eligibility_report, universe_provenance
+from .archive_relocation import (
+    ArchiveRelocationError,
+    resolve_archive_path,
+    resolve_archive_runs_root,
+)
 
 
 LEGACY_FIXED_COMPARISON_PLAN_SCHEMA = "autoresearch-legacy-fixed-comparison-plan-v2"
@@ -77,6 +82,8 @@ class PreparedLegacyFixedComparison:
     output_root: Path
     legacy_controls: Path
     archive_runs_root: Path
+    recorded_archive_runs_root: Path
+    archive_id: str | None
     authority_execution_plan: Path
     comparison_id: str
     items: list[tuple[Path, dict[str, Any], dict[str, Any], dict[str, Any]]]
@@ -200,7 +207,7 @@ def _relative_to_archive(path: Path, archive_runs_root: Path) -> str:
 
 
 def _validate_controls(
-    controls_path: Path, archive_runs_root: Path
+    controls_path: Path, archive_runs_root: Path, *, recorded_archive_runs_root: Path
 ) -> tuple[dict[str, Any], dict[str, Any], Path]:
     controls = _load_json(controls_path, label="legacy controls")
     identity = _require_mapping(controls.get("identity"), label="legacy controls identity")
@@ -227,7 +234,7 @@ def _validate_controls(
     )
     if (
         not legacy_root
-        or projected != archive_runs_root
+        or projected != recorded_archive_runs_root
         or context.get("reference_only") is not True
     ):
         raise LegacyFixedComparisonError("legacy controls archive context differs")
@@ -254,6 +261,7 @@ def _source_file(
     sources: Mapping[str, Any],
     key: str,
     archive_runs_root: Path,
+    recorded_archive_runs_root: Path,
 ) -> Path:
     record = _require_mapping(sources.get(key), label=f"legacy source {key}")
     relative = Path(str(record.get("archive_relative_path") or ""))
@@ -267,7 +275,7 @@ def _source_file(
     projected = Path(str(record.get("projected_archived_path") or "")).resolve(
         strict=False
     )
-    if path != projected:
+    if projected != (recorded_archive_runs_root / relative).resolve(strict=False):
         raise LegacyFixedComparisonError(f"legacy source {key} projected path differs")
     _validate_hash(path, record.get("sha256"), label=f"legacy source {key}")
     return path
@@ -522,6 +530,7 @@ def _selected_memberships(
     identity: Mapping[str, Any],
     sources: Mapping[str, Any],
     archive_runs_root: Path,
+    recorded_archive_runs_root: Path,
 ) -> tuple[dict[str, set[str]], dict[str, dict[str, str]]]:
     categories = _require_mapping(identity.get("categories"), label="legacy categories")
     counts = _require_mapping(identity.get("counts"), label="legacy membership counts")
@@ -541,7 +550,12 @@ def _selected_memberships(
         expected_count = int(counts.get(f"{name}_membership") or 0)
         if expected_count != len(normalized):
             raise LegacyFixedComparisonError(f"{name} membership count differs from controls")
-        path = _source_file(sources=sources, key=source_key, archive_runs_root=archive_runs_root)
+        path = _source_file(
+            sources=sources,
+            key=source_key,
+            archive_runs_root=archive_runs_root,
+            recorded_archive_runs_root=recorded_archive_runs_root,
+        )
         try:
             rows = list(csv.DictReader(path.open("r", encoding="utf-8", newline="")))
         except OSError as exc:
@@ -663,24 +677,68 @@ def prepare_legacy_fixed_comparison(
     authority_execution_plan: Path,
     trading_dashboard_root: Path,
     comparison_id: str,
+    archive_id: str | None = None,
 ) -> PreparedLegacyFixedComparison:
     """Validate every frozen source and build a deterministic, non-enqueuing plan."""
 
     comparison_id = _require_safe_id(comparison_id, label="comparison ID")
-    archive_runs_root = archive_runs_root.resolve(strict=True)
-    controls_path = legacy_controls.resolve(strict=True)
+    recorded_archive_runs_root = archive_runs_root.resolve(strict=False)
+    if archive_id is None:
+        initial_controls = _load_json(
+            legacy_controls.resolve(strict=True), label="legacy controls"
+        )
+        initial_identity = _require_mapping(
+            initial_controls.get("identity"), label="legacy controls identity"
+        )
+        initial_context = _require_mapping(
+            initial_identity.get("archive_context"), label="archive context"
+        )
+        recorded_archive_id = str(initial_context.get("archive_id") or "").strip()
+        archive_id = (
+            _require_safe_id(recorded_archive_id, label="archive ID")
+            if recorded_archive_id
+            else None
+        )
+    else:
+        archive_id = _require_safe_id(archive_id, label="archive ID")
+    if archive_id is None:
+        archive_runs_root = archive_runs_root.resolve(strict=True)
+        controls_path = legacy_controls.resolve(strict=True)
+    else:
+        try:
+            archive_runs_root = resolve_archive_runs_root(
+                recorded_archive_runs_root, archive_id=archive_id
+            )
+            controls_path = resolve_archive_path(legacy_controls, archive_id=archive_id).resolve(
+                strict=True
+            )
+        except ArchiveRelocationError as exc:
+            raise LegacyFixedComparisonError("archive relocation is invalid") from exc
     authority_path = authority_execution_plan.resolve(strict=True)
     trading_dashboard_root = trading_dashboard_root.resolve(strict=True)
-    controls, identity, legacy_runs_root = _validate_controls(controls_path, archive_runs_root)
+    controls, identity, legacy_runs_root = _validate_controls(
+        controls_path,
+        archive_runs_root,
+        recorded_archive_runs_root=recorded_archive_runs_root,
+    )
     sources = _require_mapping(identity.get("source_artifacts"), label="legacy sources")
     catalog_path = _source_file(
-        sources=sources, key="exact_catalog_database", archive_runs_root=archive_runs_root
+        sources=sources,
+        key="exact_catalog_database",
+        archive_runs_root=archive_runs_root,
+        recorded_archive_runs_root=recorded_archive_runs_root,
     )
     cohort_path = _source_file(
-        sources=sources, key="fixed_cohort_manifest", archive_runs_root=archive_runs_root
+        sources=sources,
+        key="fixed_cohort_manifest",
+        archive_runs_root=archive_runs_root,
+        recorded_archive_runs_root=recorded_archive_runs_root,
     )
     nested_report_path = _source_file(
-        sources=sources, key="nested_evidence_report", archive_runs_root=archive_runs_root
+        sources=sources,
+        key="nested_evidence_report",
+        archive_runs_root=archive_runs_root,
+        recorded_archive_runs_root=recorded_archive_runs_root,
     )
     nested_report = _load_json(nested_report_path, label="archived nested report")
     if nested_report.get("status") != "complete":
@@ -710,7 +768,10 @@ def prepare_legacy_fixed_comparison(
     ):
         raise LegacyFixedComparisonError("archived fixed cohort identity differs")
     memberships, selected_rows = _selected_memberships(
-        identity=identity, sources=sources, archive_runs_root=archive_runs_root
+        identity=identity,
+        sources=sources,
+        archive_runs_root=archive_runs_root,
+        recorded_archive_runs_root=recorded_archive_runs_root,
     )
     membership_union = memberships["june"] | memberships["july"]
     out_of_cohort_members = membership_union - set(cohort_ids)
@@ -1141,6 +1202,8 @@ def prepare_legacy_fixed_comparison(
         output_root=output_root,
         legacy_controls=controls_path,
         archive_runs_root=archive_runs_root,
+        recorded_archive_runs_root=recorded_archive_runs_root,
+        archive_id=archive_id,
         authority_execution_plan=authority_path,
         comparison_id=comparison_id,
         items=items,
@@ -1327,6 +1390,8 @@ def prepare_legacy_fixed_comparison_canary(
         output_root=output_root,
         legacy_controls=parent.legacy_controls,
         archive_runs_root=parent.archive_runs_root,
+        recorded_archive_runs_root=parent.recorded_archive_runs_root,
+        archive_id=parent.archive_id,
         authority_execution_plan=parent.authority_execution_plan,
         comparison_id=canary_id,
         items=selected_items,
@@ -1457,10 +1522,11 @@ def execute_legacy_fixed_comparison(
     revalidated = prepare_legacy_fixed_comparison(
         config=config,
         legacy_controls=prepared.legacy_controls,
-        archive_runs_root=prepared.archive_runs_root,
+        archive_runs_root=prepared.recorded_archive_runs_root,
         authority_execution_plan=prepared.authority_execution_plan,
         trading_dashboard_root=trading_dashboard_root,
         comparison_id=prepared.comparison_id,
+        archive_id=prepared.archive_id,
     )
     if revalidated.plan != prepared.plan:
         raise LegacyFixedComparisonError(

@@ -46,6 +46,7 @@ wheels/
 /scratch_snapshot.txt
 /.codex-harness
 /runs_archive
+/archive-relocation-receipts/
 /.tmp
 /codex-home
 /.playwright-cli

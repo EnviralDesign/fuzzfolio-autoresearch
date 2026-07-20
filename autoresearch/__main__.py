@@ -787,6 +787,7 @@ PUBLIC_CLI_COMMANDS = {
     "archive-retired-universe",
     "compact-retired-universe-archive",
     "archive-generation",
+    "register-archive-relocation",
     "restore-generation-plan",
     "compact-runs-json",
     "dashboard",
@@ -866,6 +867,10 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     )
     legacy_comparison.add_argument("--trading-dashboard-root", type=Path, required=True)
     legacy_comparison.add_argument("--comparison-id", required=True)
+    legacy_comparison.add_argument(
+        "--archive-id",
+        help="Required when the archived controls or runs root has been relocated.",
+    )
     legacy_comparison.add_argument(
         "--dry-run",
         action="store_true",
@@ -3115,6 +3120,41 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     archive_generation.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
+    relocation = subparsers.add_parser(
+        "register-archive-relocation",
+        help="Verify a moved complete archive and persist an immutable relocation receipt.",
+    )
+    relocation.add_argument("--archive-id", required=True, help="Stable completed archive id.")
+    relocation.add_argument(
+        "--archive-root",
+        type=Path,
+        required=True,
+        help="Original archive base root recorded in archive-manifest.json.",
+    )
+    relocation.add_argument(
+        "--destination-archive-root",
+        type=Path,
+        required=True,
+        help="New archive base root containing <archive-id>/runs.",
+    )
+    relocation.add_argument(
+        "--preflight-report",
+        type=Path,
+        required=True,
+        help="Immutable report path within the default relocation registry, used by both steps.",
+    )
+    relocation_mode = relocation.add_mutually_exclusive_group(required=True)
+    relocation_mode.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Scan both copies and write the immutable external preflight report.",
+    )
+    relocation_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Require source absence, rescan destination, and publish the final receipt.",
+    )
+    relocation.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
     restore_generation_plan = subparsers.add_parser(
         "restore-generation-plan",
         help="Show a non-mutating restore plan for a complete generation archive.",
@@ -19782,6 +19822,7 @@ def main(argv: list[str] | None = None) -> int:
             authority_execution_plan=args.authority_execution_plan,
             trading_dashboard_root=args.trading_dashboard_root,
             comparison_id=args.comparison_id,
+            archive_id=args.archive_id,
         )
         payload = format_legacy_fixed_preflight(prepared)
         if not args.dry_run:
@@ -20570,6 +20611,34 @@ def main(argv: list[str] | None = None) -> int:
             apply=bool(args.apply),
             as_json=bool(args.json),
         )
+    if args.command == "register-archive-relocation":
+        from .archive_relocation import (
+            preflight_archive_relocation,
+            register_archive_relocation,
+        )
+
+        if args.preflight:
+            payload = preflight_archive_relocation(
+                archive_id=str(args.archive_id),
+                original_archive_root=args.archive_root,
+                destination_archive_root=args.destination_archive_root,
+                report_path=args.preflight_report,
+            )
+        else:
+            payload = register_archive_relocation(
+                archive_id=str(args.archive_id),
+                original_archive_root=args.archive_root,
+                destination_archive_root=args.destination_archive_root,
+                preflight_report=args.preflight_report,
+            )
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+        else:
+            if args.preflight:
+                print("Archive relocation preflight passed; no receipt was published.")
+            else:
+                print(f"Archive relocation registered: {payload['receipt_path']}")
+        return 0
     if args.command == "restore-generation-plan":
         return cmd_restore_generation_plan(
             archive_id=str(args.archive_id),

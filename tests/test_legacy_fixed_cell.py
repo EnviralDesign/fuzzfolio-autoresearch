@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import shutil
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +12,16 @@ import pytest
 
 from autoresearch import __main__ as ar_main
 from autoresearch import legacy_fixed_cell as legacy
+from autoresearch import archive_relocation
+from autoresearch.archive_relocation import (
+    preflight_archive_relocation,
+    register_archive_relocation,
+)
+from autoresearch.generation_archive import (
+    ARCHIVE_SCHEMA_NAME,
+    ARCHIVE_SCHEMA_VERSION,
+    build_inventory,
+)
 
 
 CELL = {"stop_loss_percent": 0.5, "reward_multiple": 2.0}
@@ -83,11 +94,11 @@ def _authority(tag: str = "current") -> dict[str, object]:
 @pytest.fixture
 def comparison_environment(tmp_path: Path) -> dict[str, object]:
     legacy_root = tmp_path / "legacy-runs"
-    archive_root = tmp_path / "archive-runs"
+    archive_root = tmp_path / "original-runs-archive" / "legacy-fixed-archive-001" / "runs"
     derived_root = tmp_path / "active-runs" / "derived"
     dashboard_root = tmp_path / "trading-dashboard"
     dashboard_root.mkdir(parents=True)
-    archive_root.mkdir()
+    archive_root.mkdir(parents=True)
 
     cohort_ids = [f"cohort-{index:03d}" for index in range(443)]
     external_ids = [f"external-{index:02d}" for index in range(9)]
@@ -438,6 +449,71 @@ def test_prepares_exact_fixed_cell_comparison_without_archive_writes(
     written = legacy.write_legacy_fixed_comparison_plan(prepared)
     assert Path(written["plan_path"]).is_file()
     assert _archive_files(archive_root) == before
+
+
+def test_relocated_archive_keeps_legacy_plan_and_task_ids_stable(
+    comparison_environment: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive_id = "legacy-fixed-archive-001"
+    archive_root = comparison_environment["archive_root"]
+    baseline = _prepare(comparison_environment, monkeypatch)
+    original_archive_root = archive_root.parent.parent
+    archive_directory = archive_root.parent
+    inventory = build_inventory(archive_root)
+    (archive_directory / "archive-manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_name": ARCHIVE_SCHEMA_NAME,
+                "schema_version": ARCHIVE_SCHEMA_VERSION,
+                "state": "complete",
+                "archive_id": archive_id,
+                "archive_root": str(original_archive_root.resolve()),
+                "destination_runs_root": str(archive_root.resolve()),
+                "verified_archived_inventory": inventory,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    destination_archive_root = archive_root.parents[2] / "unraid-runs-archive"
+    destination_archive_root.mkdir()
+    destination_directory = destination_archive_root / archive_id
+    shutil.copytree(archive_directory, destination_directory, copy_function=shutil.copy2)
+    receipts = archive_root.parents[2] / "relocation-receipts"
+    monkeypatch.setattr(
+        archive_relocation,
+        "DEFAULT_RELOCATION_RECEIPTS_ROOT",
+        receipts,
+    )
+    preflight_report = receipts / f"{archive_id}.preflight.json"
+    preflight_archive_relocation(
+        archive_id=archive_id,
+        original_archive_root=original_archive_root,
+        destination_archive_root=destination_archive_root,
+        report_path=preflight_report,
+    )
+    shutil.rmtree(archive_directory)
+    register_archive_relocation(
+        archive_id=archive_id,
+        original_archive_root=original_archive_root,
+        destination_archive_root=destination_archive_root,
+        preflight_report=preflight_report,
+    )
+    before = _archive_files(destination_directory / "runs")
+
+    relocated = legacy.prepare_legacy_fixed_comparison(
+        config=comparison_environment["config"],
+        legacy_controls=comparison_environment["controls_path"],
+        archive_runs_root=archive_root,
+        authority_execution_plan=comparison_environment["authority_plan"],
+        trading_dashboard_root=comparison_environment["dashboard_root"],
+        comparison_id="legacy-pre-tail-36m-v1",
+        archive_id=archive_id,
+    )
+
+    assert relocated.plan["plan_id"] == baseline.plan["plan_id"]
+    assert relocated.task_ids_by_attempt_id == baseline.task_ids_by_attempt_id
+    assert _archive_files(destination_directory / "runs") == before
 
 
 def test_rejects_hash_drift_in_frozen_sources(
