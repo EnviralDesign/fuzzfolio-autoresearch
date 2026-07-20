@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
+
+import autoresearch.forward_response_atlas as forward_response_atlas
 from autoresearch.forward_response_atlas import (
     _ForwardEventAccumulator,
     _accumulator_rows,
@@ -113,6 +116,58 @@ def test_forward_event_accumulator_matches_list_summary() -> None:
     assert _accumulator_rows(
         grouped, ("indicator_id", "direction", "horizon_bars"), min_events=1
     ) == _grouped_summaries(events, ("indicator_id", "direction", "horizon_bars"), min_events=1)
+
+
+def test_spooled_forward_event_accumulator_preserves_exact_summary() -> None:
+    events = [
+        {
+            "forward_return_pct": (index % 9 - 4) / 10.0,
+            "mfe_pct": (index % 7) / 10.0,
+            "mae_pct": (index % 5) / 10.0,
+            "mfe_minus_mae_pct": ((index % 7) - (index % 5)) / 10.0,
+            "mfe_gt_mae": index % 3 != 0,
+            "volatility_normalized_return": None if index % 4 == 0 else (index % 11) / 10.0,
+        }
+        for index in range(37)
+    ]
+    accumulator = _ForwardEventAccumulator(spill_to_disk=True, spill_threshold_bytes=1)
+    try:
+        for event in events:
+            accumulator.add(event)
+
+        assert accumulator.summary(min_events=1) == summarize_forward_events(events, min_events=1)
+    finally:
+        accumulator.close()
+
+
+def test_spooled_forward_event_accumulator_does_not_advance_counts_on_write_error() -> None:
+    class FailingSpool:
+        def write(self, _payload) -> None:
+            raise OSError("disk full")
+
+        def close(self) -> None:
+            pass
+
+    accumulator = _ForwardEventAccumulator(spill_to_disk=True)
+    accumulator.close()
+    accumulator._spool = FailingSpool()
+    with pytest.raises(OSError, match="disk full"):
+        accumulator.add(
+            {
+                "forward_return_pct": 0.2,
+                "mfe_pct": 0.5,
+                "mae_pct": 0.1,
+                "mfe_minus_mae_pct": 0.4,
+                "mfe_gt_mae": True,
+                "volatility_normalized_return": 0.7,
+            }
+        )
+
+    assert accumulator.sample_count == 0
+    assert accumulator.win_count == 0
+    assert accumulator.loss_count == 0
+    assert accumulator.mfe_win_count == 0
+    accumulator.close()
 
 
 def test_combined_direction_rows_match_explicit_both_accumulator() -> None:
@@ -238,3 +293,58 @@ def test_build_forward_response_atlas_reduces_raw_cells_without_retaining_events
     assert result.summary["result_counts"]["cell_rollup_rows"] == 1
     assert result.summary["result_counts"]["indicator_rollup_rows"] == 2
     assert result.summary["priors"][0]["indicator_id"] == "RSI"
+
+
+def test_build_forward_response_atlas_closes_global_spools_on_ingestion_error(tmp_path, monkeypatch) -> None:
+    signal_dir = tmp_path / "signal-atlas"
+    raw_dir = signal_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    valid_raw_path = raw_dir / "valid.json"
+    valid_raw_path.write_text(
+        json.dumps(
+            {
+                "data": {
+                    "timestamp": ["t3", "t2", "t1", "t0"],
+                    "close": [106, 104, 100, 100],
+                    "high": [107, 105, 101, 100],
+                    "low": [105, 99, 99, 99],
+                    "long_score": [0, 0, 1, 0],
+                    "short_score": [0, 0, 0, 0],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    invalid_raw_path = raw_dir / "invalid.json"
+    invalid_raw_path.write_text("not-json", encoding="utf-8")
+    (signal_dir / "signal-atlas.json").write_text(
+        json.dumps(
+            {
+                "summary": {"selection": {"indicator_ids": ["RSI"]}},
+                "rows": [
+                    {"indicator_id": "RSI", "instrument": "EURUSD", "timeframe": "M5", "status": "ok", "raw_path": str(valid_raw_path)},
+                    {"indicator_id": "RSI", "instrument": "EURUSD", "timeframe": "M15", "status": "ok", "raw_path": str(invalid_raw_path)},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    closed = []
+    original_close = _ForwardEventAccumulator.close
+
+    def track_close(self) -> None:
+        closed.append(self)
+        original_close(self)
+
+    monkeypatch.setattr(forward_response_atlas._ForwardEventAccumulator, "close", track_close)
+
+    with pytest.raises(json.JSONDecodeError):
+        build_forward_response_atlas(
+            SimpleNamespace(repo_root=tmp_path, derived_root=tmp_path / "derived"),
+            signal_atlas_dir=signal_dir,
+            out_dir=tmp_path / "forward",
+            horizons=[2],
+            min_events=1,
+        )
+
+    assert closed

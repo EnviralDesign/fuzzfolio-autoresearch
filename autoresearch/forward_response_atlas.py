@@ -4,6 +4,8 @@ import csv
 import json
 import math
 import statistics
+import struct
+import tempfile
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass
@@ -22,6 +24,11 @@ DEFAULT_FORWARD_HORIZONS = (1, 3, 6, 12, 24)
 DEFAULT_VOL_LOOKBACK = 48
 DEFAULT_MIN_EVENTS = 30
 SIGNAL_EPSILON = 1e-9
+_FORWARD_EVENT_METRICS = 5
+_FORWARD_EVENT_RECORD = struct.Struct("<5d")
+# The global indicator rollups need exact order statistics.  Keep their raw
+# series out of the coordinator heap while retaining exact double precision.
+_GLOBAL_REDUCER_SPOOL_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -414,13 +421,27 @@ class _ForwardEventAccumulator:
         "mae_values",
         "edge_values",
         "vol_norm_values",
+        "_spool",
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        spill_to_disk: bool = False,
+        spill_threshold_bytes: int = _GLOBAL_REDUCER_SPOOL_BYTES,
+    ) -> None:
         self.sample_count = 0
         self.win_count = 0
         self.loss_count = 0
         self.mfe_win_count = 0
+        self._spool = (
+            tempfile.SpooledTemporaryFile(
+                max_size=max(_FORWARD_EVENT_RECORD.size, int(spill_threshold_bytes)),
+                mode="w+b",
+            )
+            if spill_to_disk
+            else None
+        )
         self.returns = array("d")
         self.mfe_values = array("d")
         self.mae_values = array("d")
@@ -432,6 +453,24 @@ class _ForwardEventAccumulator:
         mfe = float(record["mfe_pct"])
         mae = float(record["mae_pct"])
         edge = float(record["mfe_minus_mae_pct"])
+        vol_norm = record.get("volatility_normalized_return")
+        if self._spool is not None:
+            payload = _FORWARD_EVENT_RECORD.pack(
+                forward_return,
+                mfe,
+                mae,
+                edge,
+                float(vol_norm) if vol_norm is not None else math.nan,
+            )
+            if self._spool.write(payload) != len(payload):
+                raise OSError("Forward-response reducer spool write was incomplete")
+        else:
+            self.returns.append(forward_return)
+            self.mfe_values.append(mfe)
+            self.mae_values.append(mae)
+            self.edge_values.append(edge)
+            if vol_norm is not None:
+                self.vol_norm_values.append(float(vol_norm))
         self.sample_count += 1
         if forward_return > 0:
             self.win_count += 1
@@ -439,13 +478,35 @@ class _ForwardEventAccumulator:
             self.loss_count += 1
         if bool(record.get("mfe_gt_mae")):
             self.mfe_win_count += 1
-        self.returns.append(forward_return)
-        self.mfe_values.append(mfe)
-        self.mae_values.append(mae)
-        self.edge_values.append(edge)
-        vol_norm = record.get("volatility_normalized_return")
-        if vol_norm is not None:
-            self.vol_norm_values.append(float(vol_norm))
+
+    def iter_metric_values(self, metric_index: int) -> Iterator[float]:
+        if not 0 <= metric_index < _FORWARD_EVENT_METRICS:
+            raise ValueError(f"Unknown forward-response metric index: {metric_index}")
+        if self._spool is None:
+            series = (
+                self.returns,
+                self.mfe_values,
+                self.mae_values,
+                self.edge_values,
+                self.vol_norm_values,
+            )[metric_index]
+            yield from series
+            return
+
+        self._spool.flush()
+        previous_position = self._spool.tell()
+        self._spool.seek(0)
+        try:
+            while chunk := self._spool.read(_FORWARD_EVENT_RECORD.size * 8192):
+                for row in _FORWARD_EVENT_RECORD.iter_unpack(chunk):
+                    yield row[metric_index]
+        finally:
+            self._spool.seek(previous_position)
+
+    def close(self) -> None:
+        if self._spool is not None:
+            self._spool.close()
+            self._spool = None
 
     def summary(self, *, min_events: int = DEFAULT_MIN_EVENTS) -> dict[str, Any]:
         return _summarize_accumulators((self,), min_events=min_events)
@@ -466,23 +527,23 @@ def _summarize_accumulators(
             "forward_response_score": 0.0,
         }
     returns = _series_stats(
-        chain.from_iterable(part.returns for part in parts),
+        chain.from_iterable(part.iter_metric_values(0) for part in parts),
         percentiles=(0.25, 0.50, 0.75),
     )
     mfe = _series_stats(
-        chain.from_iterable(part.mfe_values for part in parts),
+        chain.from_iterable(part.iter_metric_values(1) for part in parts),
         percentiles=(0.50,),
     )
     mae = _series_stats(
-        chain.from_iterable(part.mae_values for part in parts),
+        chain.from_iterable(part.iter_metric_values(2) for part in parts),
         percentiles=(0.50,),
     )
     edge = _series_stats(
-        chain.from_iterable(part.edge_values for part in parts),
+        chain.from_iterable(part.iter_metric_values(3) for part in parts),
         percentiles=(0.50,),
     )
     vol_norm = _series_stats(
-        chain.from_iterable(part.vol_norm_values for part in parts),
+        chain.from_iterable(part.iter_metric_values(4) for part in parts),
         percentiles=(0.50,),
     )
     win_count = sum(part.win_count for part in parts)
@@ -807,75 +868,79 @@ def build_forward_response_atlas(
     no_event_cells: list[dict[str, Any]] = []
     event_horizon_records = 0
     indicator_direction_groups: dict[tuple[Any, ...], _ForwardEventAccumulator] = defaultdict(
-        _ForwardEventAccumulator
+        lambda: _ForwardEventAccumulator(spill_to_disk=True)
     )
-    for signal_row in signal_rows:
-        raw_path = Path(str(signal_row.get("raw_path") or ""))
-        if not raw_path.is_absolute():
-            raw_path = (config.repo_root / raw_path).resolve()
-        if not raw_path.exists():
-            no_event_cells.append(
-                {
-                    "indicator_id": _clean_upper(signal_row.get("indicator_id")),
-                    "instrument": _clean_upper(signal_row.get("instrument")),
-                    "timeframe": _clean_upper(signal_row.get("timeframe")),
-                    "status": "missing_raw",
-                    "raw_path": str(raw_path),
-                }
-            )
-            continue
-        series = _extract_chronological_series(_as_dict(_load_json(raw_path)))
-        indicator_id = _clean_upper(signal_row.get("indicator_id"))
-        instrument = _clean_upper(signal_row.get("instrument"))
-        timeframe = _clean_upper(signal_row.get("timeframe"))
-        cell_groups: dict[tuple[Any, ...], _ForwardEventAccumulator] = defaultdict(
-            _ForwardEventAccumulator
-        )
-        cell_event_count = 0
-        for event in iter_forward_event_records(
-            series["close"],
-            series["high"],
-            series["low"],
-            series["long_score"],
-            series["short_score"],
-            horizons=horizon_values,
-            vol_lookback=vol_lookback,
-            threshold=threshold,
-        ):
-            cell_event_count += 1
-            event_horizon_records += 1
-            direction = event["direction"]
-            horizon = event["horizon_bars"]
-            cell_groups[(indicator_id, instrument, timeframe, direction, horizon)].add(event)
-            indicator_direction_groups[(indicator_id, direction, horizon)].add(event)
-        if cell_event_count:
-            cell_rollups.extend(
-                _accumulator_rows(
-                    cell_groups,
-                    ("indicator_id", "instrument", "timeframe", "direction", "horizon_bars"),
-                    min_events=min_events,
+    try:
+        for signal_row in signal_rows:
+            raw_path = Path(str(signal_row.get("raw_path") or ""))
+            if not raw_path.is_absolute():
+                raw_path = (config.repo_root / raw_path).resolve()
+            if not raw_path.exists():
+                no_event_cells.append(
+                    {
+                        "indicator_id": _clean_upper(signal_row.get("indicator_id")),
+                        "instrument": _clean_upper(signal_row.get("instrument")),
+                        "timeframe": _clean_upper(signal_row.get("timeframe")),
+                        "status": "missing_raw",
+                        "raw_path": str(raw_path),
+                    }
                 )
+                continue
+            series = _extract_chronological_series(_as_dict(_load_json(raw_path)))
+            indicator_id = _clean_upper(signal_row.get("indicator_id"))
+            instrument = _clean_upper(signal_row.get("instrument"))
+            timeframe = _clean_upper(signal_row.get("timeframe"))
+            cell_groups: dict[tuple[Any, ...], _ForwardEventAccumulator] = defaultdict(
+                _ForwardEventAccumulator
             )
-        else:
-            no_event_cells.append(
-                {
-                    "indicator_id": indicator_id,
-                    "instrument": instrument,
-                    "timeframe": timeframe,
-                    "status": "no_events",
-                    "raw_path": str(raw_path),
-                }
-            )
+            cell_event_count = 0
+            for event in iter_forward_event_records(
+                series["close"],
+                series["high"],
+                series["low"],
+                series["long_score"],
+                series["short_score"],
+                horizons=horizon_values,
+                vol_lookback=vol_lookback,
+                threshold=threshold,
+            ):
+                direction = event["direction"]
+                horizon = event["horizon_bars"]
+                cell_groups[(indicator_id, instrument, timeframe, direction, horizon)].add(event)
+                indicator_direction_groups[(indicator_id, direction, horizon)].add(event)
+                cell_event_count += 1
+                event_horizon_records += 1
+            if cell_event_count:
+                cell_rollups.extend(
+                    _accumulator_rows(
+                        cell_groups,
+                        ("indicator_id", "instrument", "timeframe", "direction", "horizon_bars"),
+                        min_events=min_events,
+                    )
+                )
+            else:
+                no_event_cells.append(
+                    {
+                        "indicator_id": indicator_id,
+                        "instrument": instrument,
+                        "timeframe": timeframe,
+                        "status": "no_events",
+                        "raw_path": str(raw_path),
+                    }
+                )
 
-    indicator_direction_rows = _accumulator_rows(
-        indicator_direction_groups,
-        ("indicator_id", "direction", "horizon_bars"),
-        min_events=min_events,
-    )
-    indicator_both_rows = _combined_direction_rows(
-        indicator_direction_groups,
-        min_events=min_events,
-    )
+        indicator_direction_rows = _accumulator_rows(
+            indicator_direction_groups,
+            ("indicator_id", "direction", "horizon_bars"),
+            min_events=min_events,
+        )
+        indicator_both_rows = _combined_direction_rows(
+            indicator_direction_groups,
+            min_events=min_events,
+        )
+    finally:
+        for accumulator in indicator_direction_groups.values():
+            accumulator.close()
     indicator_rollups = [*indicator_both_rows, *indicator_direction_rows]
     indicator_rollups.sort(
         key=lambda row: (
