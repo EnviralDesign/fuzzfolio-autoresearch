@@ -2258,6 +2258,133 @@ def test_historical_signal_gateway_worker_failure_fails_closed(
     assert not (tmp_path / "signal-atlas" / "signal-atlas.json").exists()
 
 
+def test_historical_signal_atlas_resume_consumes_preserved_gateway_result(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    indicator_dir = tmp_path / "indicator-atlas"
+    indicator_dir.mkdir()
+    (indicator_dir / "indicator-atlas.json").write_text(
+        json.dumps(
+            {
+                "indicators": [
+                    {
+                        "id": "RSI",
+                        "signal_role": "trigger",
+                        "strategy_role": "trigger",
+                        "static_prior_score": 75.0,
+                        "static_prior_bucket": "candidate",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "autoresearch.atlas_lab.load_indicator_catalog",
+        lambda **kwargs: (
+            {
+                "indicators": [
+                    {
+                        "meta": {"id": "RSI"},
+                        "config": {"label": "RSI", "timeframe": "M5"},
+                    }
+                ]
+            },
+            tmp_path,
+            tmp_path / "catalog.json",
+        ),
+    )
+
+    class PreservedSignalGateway:
+        def __init__(self) -> None:
+            self.results: list[dict[str, Any]] = []
+            self.enqueue_calls = 0
+            self.acked: list[str] = []
+
+        def snapshot(self) -> dict[str, Any]:
+            return {
+                "gateway_id": "preserved-signal-gateway",
+                "worker_slots": 0,
+                "busy_slots": 0,
+                "queued_tasks": 0,
+                "result_backlog": len(self.results),
+                "metrics": {
+                    "results_dropped": 0,
+                    "duplicate_task_enqueues": self.enqueue_calls,
+                },
+            }
+
+        def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+            self.enqueue_calls += len(tasks)
+            for task in tasks:
+                plan = task["payload"]["evidence_plan"]
+                self.results.append(
+                    {
+                        "task_id": task["task_id"],
+                        "lease_id": f"preserved-{task['task_id']}",
+                        "status": "success",
+                        "result": {
+                            "status": "success",
+                            "result": {
+                                "raw": {
+                                    "data": {
+                                        "timestamp": ["2026-01-01T00:00:00Z"],
+                                        "close": [1.0],
+                                        "high": [1.1],
+                                        "low": [0.9],
+                                        "long_score": [1.0],
+                                        "short_score": [0.0],
+                                    }
+                                },
+                                "execution_evidence": {
+                                    "plan_id": plan["plan_id"],
+                                    "profile_snapshot_sha256": plan["profile_snapshot_sha256"],
+                                    "execution_cell_sha256": plan["execution_cell_sha256"],
+                                    "observed_lake_manifest_sha256": plan["lake_manifest_sha256"],
+                                },
+                            },
+                        },
+                    }
+                )
+            return {"status": "accepted", "accepted": 0, "rejected": len(tasks)}
+
+        def read_results(self, *, limit: int) -> list[dict[str, Any]]:
+            batch = self.results[:limit]
+            self.results = self.results[limit:]
+            return batch
+
+        def ack_results(self, lease_ids: list[str]) -> int:
+            self.acked.extend(lease_ids)
+            return len(lease_ids)
+
+    gateway = PreservedSignalGateway()
+    result = build_signal_atlas_via_gateway(
+        config,
+        indicator_atlas_dir=indicator_dir,
+        out_dir=tmp_path / "signal-atlas",
+        signal_role="trigger",
+        instruments=["EURUSD"],
+        timeframes=["M5"],
+        max_indicators=1,
+        gateway=gateway,
+        runtime=AtlasLabRuntimeConfig(
+            active_probes=1,
+            result_batch_size=1,
+            max_results_per_cycle=1,
+            max_drain_seconds=0,
+            as_of_date="2026-07-14T00:00:00Z",
+            lake_manifest_sha256="sha256:" + "f" * 64,
+        ),
+        worker_contract_hash="contract123",
+    )
+
+    assert result.summary["result_counts"]["successful_calls"] == 1
+    assert len(gateway.acked) == 1
+    assert gateway.acked[0].startswith("preserved-atlas-signal-")
+
+
 def test_signal_atlas_drains_capped_batches_and_refills_between_batches(
     tmp_path: Path,
     monkeypatch,

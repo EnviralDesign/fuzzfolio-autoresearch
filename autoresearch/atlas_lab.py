@@ -2947,7 +2947,13 @@ def build_signal_atlas_via_gateway(
             active[str(state["task_id"])] = state
             chunk.append(task)
         if chunk:
-            _enqueue_gateway_tasks_with_retries(gateway, chunk)
+            # A resumed historical signal stage can meet tasks that the durable
+            # gateway still owns alongside their unacknowledged results.
+            _enqueue_gateway_tasks_with_retries(
+                gateway,
+                chunk,
+                allow_preserved_results=True,
+            )
 
     enqueue_more()
     while completed < total_calls:
