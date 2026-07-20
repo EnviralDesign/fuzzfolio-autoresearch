@@ -2973,6 +2973,11 @@ def build_signal_atlas_via_gateway(
                 lease_id = str(lab_result.get("lease_id") or "")
                 state = active.pop(task_id, None)
                 if state is None:
+                    if runtime.as_of_date:
+                        raise RuntimeError(
+                            "Historical signal atlas received an unknown or "
+                            f"uncheckpointed gateway result for {task_id}"
+                        )
                     ack_ids.append(lease_id)
                     continue
                 row = dict(state["base_row"])

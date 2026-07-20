@@ -2385,6 +2385,105 @@ def test_historical_signal_atlas_resume_consumes_preserved_gateway_result(
     assert gateway.acked[0].startswith("preserved-atlas-signal-")
 
 
+def test_historical_signal_atlas_rejects_uncheckpointed_gateway_result(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+    indicator_dir = tmp_path / "indicator-atlas"
+    indicator_dir.mkdir()
+    (indicator_dir / "indicator-atlas.json").write_text(
+        json.dumps(
+            {
+                "indicators": [
+                    {
+                        "id": "RSI",
+                        "signal_role": "trigger",
+                        "strategy_role": "trigger",
+                        "static_prior_score": 75.0,
+                        "static_prior_bucket": "candidate",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "autoresearch.atlas_lab.load_indicator_catalog",
+        lambda **kwargs: (
+            {
+                "indicators": [
+                    {
+                        "meta": {"id": "RSI"},
+                        "config": {"label": "RSI", "timeframe": "M5"},
+                    }
+                ]
+            },
+            tmp_path,
+            tmp_path / "catalog.json",
+        ),
+    )
+
+    class UncheckpointedSignalGateway:
+        def __init__(self) -> None:
+            self.results: list[dict[str, Any]] = []
+            self.acked: list[str] = []
+
+        def snapshot(self) -> dict[str, Any]:
+            return {
+                "gateway_id": "uncheckpointed-signal-gateway",
+                "worker_slots": 0,
+                "busy_slots": 0,
+                "queued_tasks": 0,
+                "result_backlog": len(self.results),
+                "metrics": {"results_dropped": 0},
+            }
+
+        def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+            self.results.append(
+                {
+                    "task_id": "unexpected-task",
+                    "lease_id": "unexpected-lease",
+                    "status": "success",
+                    "result": {"status": "success", "result": {}},
+                }
+            )
+            return {"status": "accepted", "enqueued": len(tasks)}
+
+        def read_results(self, *, limit: int) -> list[dict[str, Any]]:
+            batch = self.results[:limit]
+            self.results = self.results[limit:]
+            return batch
+
+        def ack_results(self, lease_ids: list[str]) -> int:
+            self.acked.extend(lease_ids)
+            return len(lease_ids)
+
+    gateway = UncheckpointedSignalGateway()
+    with pytest.raises(RuntimeError, match="unknown or uncheckpointed"):
+        build_signal_atlas_via_gateway(
+            config,
+            indicator_atlas_dir=indicator_dir,
+            out_dir=tmp_path / "signal-atlas",
+            signal_role="trigger",
+            instruments=["EURUSD"],
+            timeframes=["M5"],
+            max_indicators=1,
+            gateway=gateway,
+            runtime=AtlasLabRuntimeConfig(
+                active_probes=1,
+                result_batch_size=1,
+                max_results_per_cycle=1,
+                max_drain_seconds=0,
+                as_of_date="2026-07-14T00:00:00Z",
+                lake_manifest_sha256="sha256:" + "f" * 64,
+            ),
+            worker_contract_hash="contract123",
+        )
+
+    assert gateway.acked == []
+
+
 def test_signal_atlas_drains_capped_batches_and_refills_between_batches(
     tmp_path: Path,
     monkeypatch,
