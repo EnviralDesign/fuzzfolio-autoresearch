@@ -12,7 +12,6 @@ $gatewayUrl = "http://127.0.0.1:8799"
 $logRoot = Join-Path $repoRoot ".tmp\manual-level-c-d"
 $cPlanPath = Join-Path $runsRoot "derived\level-c\control\execution-plan-C.json"
 $dPlanPath = Join-Path $runsRoot "derived\level-c\control\execution-plan-D.json"
-$dStageRoot = Join-Path $runsRoot "derived\level-c\campaigns\D\stages"
 
 function Invoke-UvLogged {
     param(
@@ -29,16 +28,19 @@ function Invoke-UvLogged {
     }
 }
 
-function Assert-NoCutoffRunner {
+function Assert-NoAtlasRunner {
     param([Parameter(Mandatory)] [ValidateSet("C", "D")] [string]$Cutoff)
 
-    $pattern = "level-c-run-cutoff.*--cutoff\s+$Cutoff(?:\s|$)"
+    $planName = "execution-plan-$Cutoff.json"
     $matches = @(Get-CimInstance Win32_Process | Where-Object {
-        $_.CommandLine -and $_.CommandLine -match $pattern
+        $_.Name -match "python|uv" -and
+        $_.CommandLine -and
+        $_.CommandLine -match "atlas-lab" -and
+        $_.CommandLine -match [regex]::Escape($planName)
     })
     if ($matches.Count -gt 0) {
         $pids = ($matches | ForEach-Object ProcessId) -join ", "
-        throw "Cutoff $Cutoff already has a local runner (PID $pids)."
+        throw "Atlas cutoff $Cutoff already has a local runner (PID $pids)."
     }
 }
 
@@ -73,67 +75,64 @@ try {
         }
     }
 
-    Assert-NoCutoffRunner -Cutoff C
-    Assert-NoCutoffRunner -Cutoff D
+    Assert-NoAtlasRunner -Cutoff C
+    Assert-NoAtlasRunner -Cutoff D
     $cPlan = Get-Content -Raw -LiteralPath $cPlanPath | ConvertFrom-Json
-    $cCohortPath = [string]$cPlan.expected_artifacts.frozen_cohort.resolved_path
-    if (-not (Test-Path -LiteralPath $cCohortPath -PathType Leaf)) {
-        throw "Cutoff C is not terminal: frozen cohort is absent at $cCohortPath"
+    $cAtlasRoot = [string]$cPlan.expected_artifacts.atlas_run.resolved_path
+    $cSummaryPath = Join-Path $cAtlasRoot "atlas-lab-summary.json"
+    if (-not (Test-Path -LiteralPath $cSummaryPath -PathType Leaf)) {
+        throw "Atlas cutoff C is not terminal: summary is absent at $cSummaryPath"
     }
-    Invoke-UvLogged -Name "preflight-cutoff-c-audit" -Arguments @(
-        "run", "level-c-audit",
-        "--active-runs-root", $runsRoot,
-        "--cutoff", "C",
+    $cSummary = Get-Content -Raw -LiteralPath $cSummaryPath | ConvertFrom-Json
+    if ([string]$cSummary.status -ne "completed") {
+        throw "Atlas cutoff C summary is not completed."
+    }
+    Invoke-UvLogged -Name "preflight-atlas-c-receipt-verification" -Arguments @(
+        "run", "atlas-lab",
+        "--execution-plan", $cPlanPath,
+        "--resume",
+        "--gateway-url", $gatewayUrl,
+        "--active-probes", "512",
+        "--trading-dashboard-root", $tradingDashboardRoot,
         "--json"
     )
 
     Ensure-LabGateway
 
     $plan = Get-Content -Raw -LiteralPath $dPlanPath | ConvertFrom-Json
-    $dRoots = @(
-        [string]$plan.expected_artifacts.atlas_run.resolved_path,
-        [string]$plan.expected_artifacts.playhand_campaign.resolved_path,
-        [string]$plan.expected_artifacts.campaign_receipt.resolved_path,
-        [string]$plan.expected_artifacts.frozen_cohort.resolved_path
-    )
-    $resume = (Test-Path -LiteralPath $dStageRoot) -or
-        (@($dRoots | Where-Object { $_ -and (Test-Path -LiteralPath $_) }).Count -gt 0)
+    $dAtlasRoot = [string]$plan.expected_artifacts.atlas_run.resolved_path
+    $resume = Test-Path -LiteralPath $dAtlasRoot
 
     $runArguments = @(
-        "run", "level-c-run-cutoff",
-        "--active-runs-root", $runsRoot,
-        "--cutoff", "D",
+        "run", "atlas-lab",
+        "--execution-plan", $dPlanPath,
         "--gateway-url", $gatewayUrl,
-        "--atlas-active-probes", "512",
-        "--playhand-active-runs", "256",
-        "--nested-max-workers", "128",
+        "--active-probes", "512",
         "--trading-dashboard-root", $tradingDashboardRoot,
         "--json"
     )
     if ($resume) {
         $runArguments += "--resume"
-        Write-Host "Detected existing cutoff D state; strict resume is enabled."
+        Write-Host "Detected existing Atlas D state; strict resume is enabled."
     } else {
-        Write-Host "Cutoff D is fresh; starting without --resume."
+        Write-Host "Atlas D is fresh; starting without --resume."
     }
 
     Write-Host "Start CLI-only Vast workers only after the gateway shows real queued work."
     Write-Host "Keep this terminal open until D exits."
-    Invoke-UvLogged -Name "cutoff-d" -Arguments $runArguments
+    Invoke-UvLogged -Name "atlas-d" -Arguments $runArguments
 
-    Invoke-UvLogged -Name "cutoff-d-audit" -Arguments @(
-        "run", "level-c-audit",
-        "--active-runs-root", $runsRoot,
-        "--cutoff", "D",
-        "--json"
-    )
-    Invoke-UvLogged -Name "level-c-final-audit" -Arguments @(
-        "run", "level-c-audit",
-        "--active-runs-root", $runsRoot,
+    Invoke-UvLogged -Name "atlas-d-receipt-verification" -Arguments @(
+        "run", "atlas-lab",
+        "--execution-plan", $dPlanPath,
+        "--resume",
+        "--gateway-url", $gatewayUrl,
+        "--active-probes", "512",
+        "--trading-dashboard-root", $tradingDashboardRoot,
         "--json"
     )
 
-    Write-Host "Cutoff D and the final Level C audit completed successfully."
+    Write-Host "Atlas D and strict receipt verification completed successfully."
     Write-Host "Destroy any remaining Vast instances, then continue with the Phase 2 prior comparison gate."
 } finally {
     Pop-Location
