@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -20,6 +21,146 @@ from .playhand_outcome_priors import DEFAULT_PLAYHAND_OUTCOME_PRIORS_DIRNAME
 
 
 SCHEMA_VERSION = "empirical_recipe_priors_v1"
+CAMPAIGN_POLICY_SCHEMA_VERSION = "phase3_campaign_policy_manifest_v1"
+POLICY_HONEST_SEED_PLAN_SCHEMA_VERSION = "play_hand_seed_plan_v2"
+LEGACY_SEED_PLAN_SCHEMA_VERSION = "play_hand_seed_plan_v1"
+CAMPAIGN_POLICY_SHA256_PREFIX = "sha256:"
+CAMPAIGN_POLICY_LANES = ("guided", "uncertain", "wild")
+CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS = (
+    "family",
+    "recipe",
+    "instrument",
+    "timeframe",
+    "indicator",
+)
+CAMPAIGN_POLICY_CANDIDATE_IDENTITY_ATTRIBUTE_ORDER = (
+    "recipe_id",
+    "canonical_pair_family_id",
+    "instrument",
+    "timeframe",
+    "indicator_ids",
+)
+CAMPAIGN_POLICY_NEGATIVE_EXPIRY_BASIS = "source_atlas_generation_run_sequence"
+CAMPAIGN_POLICY_NEGATIVE_EXPIRY_TTL_FIELD = "expires_after_atlas_runs"
+CAMPAIGN_POLICY_NEGATIVE_EXPIRY_BOUNDARY = "anchor_run_sequence_plus_ttl_inclusive"
+CAMPAIGN_POLICY_NEGATIVE_EXPIRY_GENERATION_MISMATCH = "expired"
+CAMPAIGN_POLICY_LANE_MENU_CONTRACT: dict[str, dict[str, Any]] = {
+    "guided": {
+        "recipe_sources": frozenset(
+            {"curated_recipe_prior", "discovery_recipe_validation"}
+        ),
+        "slot_sampling_lanes": frozenset({"high_prior", "medium_prior"}),
+        "pair_sampling_lanes": frozenset({"positive_pair"}),
+        "allow_generation_eligible_fallback": False,
+    },
+    "uncertain": {
+        "recipe_sources": frozenset(
+            {"curated_recipe_prior", "discovery_recipe_validation"}
+        ),
+        "slot_sampling_lanes": frozenset({"uncertain_prior"}),
+        "pair_sampling_lanes": frozenset({"near_miss_pair"}),
+        "allow_generation_eligible_fallback": False,
+    },
+    "wild": {
+        "recipe_sources": frozenset({"curated_recipe_prior"}),
+        "slot_sampling_lanes": frozenset({"wild_exploration"}),
+        "pair_sampling_lanes": frozenset({"low_pair"}),
+        "allow_generation_eligible_fallback": True,
+    },
+}
+CAMPAIGN_POLICY_EXECUTION: dict[str, Any] = {
+    "allocation_algorithm": "hamilton_largest_remainder",
+    "allocation_algorithm_version": "v1",
+    "quota_basis": "campaign_lane_budget_times_lane_fraction",
+    "quota_rounding": "floor_then_descending_fractional_remainder",
+    "lane_tie_break_order": ["guided", "uncertain", "wild"],
+    "candidate_tie_break_order": [
+        "recipe_id",
+        "canonical_pair_family_id",
+        "instrument",
+        "timeframe",
+        "indicator_ids",
+        "candidate_id",
+    ],
+    "candidate_tie_break_direction": "ascending_lexicographic",
+    "candidate_evaluation_order": (
+        "lane_order_then_ascending_lexicographic_candidate_tie_break_order"
+    ),
+    "random_tie_break": "forbidden",
+}
+CAMPAIGN_POLICY_CANDIDATE_IDENTITY: dict[str, Any] = {
+    "algorithm": "sha256_canonical_candidate_attributes",
+    "algorithm_version": "v1",
+    "input_attribute_order": list(CAMPAIGN_POLICY_CANDIDATE_IDENTITY_ATTRIBUTE_ORDER),
+    "canonical_payload_keys": [
+        "candidate_identity_version",
+        *CAMPAIGN_POLICY_CANDIDATE_IDENTITY_ATTRIBUTE_ORDER,
+    ],
+    "scalar_normalization": "typed_absent_blank_or_stringify_strip_uppercase_value",
+    "scalar_representation": {
+        "absent": {"kind": "absent"},
+        "blank": {"kind": "blank"},
+        "value": {"kind": "value", "value": "UPPERCASE_NORMALIZED_STRING"},
+    },
+    "indicator_ids_normalization": (
+        "typed_presence_values_deduplicate_by_canonical_json_sort_ascending"
+    ),
+    "indicator_ids_representation": {
+        "absent": {"state": "absent", "values": []},
+        "present": {"state": "present", "values": "SORTED_UNIQUE_TYPED_SCALARS"},
+    },
+    "canonical_serialization": "json_sort_keys_compact_utf8",
+    "output_format": "sha256:<lowercase_hex>",
+}
+CAMPAIGN_POLICY_DIVERSITY_ENFORCEMENT: dict[str, Any] = {
+    "denominator_attribute": "target_runs",
+    "denominator_definition": "total planned campaign deals across all lanes",
+    "cap_limit_formula": "floor(target_runs * max_share)",
+    "cap_count_rounding": "floor",
+    "cap_count_unit": "selected_deal_containing_normalized_attribute",
+    "indicator_count_unit": "one_charge_per_distinct_normalized_indicator_id_per_deal",
+    "missing_attribute_handling": "typed_absent_or_blank_attribute_is_present_and_counted",
+    "candidate_acceptance": "all_caps_checked_atomically_before_acceptance",
+    "candidate_conflict_result": "reject_candidate_and_report_all_conflicts",
+    "conflict_report_order": list(CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS),
+    "lane_capacity": "fixed_allocated_lane_quota_no_cross_lane_borrowing",
+    "lane_exhaustion_result_type": "policy_lane_exhausted",
+    "lane_exhaustion_condition": (
+        "allocated_lane_quota_unfilled_after_all_eligible_candidates_are_rejected_or_exhausted"
+    ),
+}
+CAMPAIGN_POLICY_DIVERSITY_ATTRIBUTE_CONTRACT: dict[str, dict[str, str]] = {
+    "family": {
+        "candidate_attribute": "canonical_pair_family_id",
+        "source_path": "recipes.<recipe_id>.pair_menu[].canonical_pair_family_id",
+        "definition": "recipe_id plus timeframe plus unordered indicator-pair identity",
+        "aggregation": "one_charge_per_selected_deal",
+    },
+    "recipe": {
+        "candidate_attribute": "recipe_id",
+        "source_path": "recipes.<recipe_id> dictionary key",
+        "definition": "the selected recipe dictionary key",
+        "aggregation": "one_charge_per_selected_deal",
+    },
+    "instrument": {
+        "candidate_attribute": "instrument",
+        "source_path": "runtime_candidate.instrument",
+        "definition": "the resolved instrument for the selected candidate",
+        "aggregation": "one_charge_per_selected_deal",
+    },
+    "timeframe": {
+        "candidate_attribute": "timeframe",
+        "source_path": "runtime_candidate.timeframe",
+        "definition": "the resolved timeframe for the selected candidate",
+        "aggregation": "one_charge_per_selected_deal",
+    },
+    "indicator": {
+        "candidate_attribute": "indicator_ids",
+        "source_path": "recipes.<recipe_id>.slot_menus[].indicator_id",
+        "definition": "every indicator_id in the selected candidate deal",
+        "aggregation": "one_charge_per_indicator_id_in_selected_deal",
+    },
+}
 DEFAULT_RECIPE_PRIORS_DIRNAME = "recipe-priors"
 DEFAULT_DISCOVERY_RECIPE_VALIDATION_DIRNAME = "discovery-recipe-validation-atlas"
 DEFAULT_DISCOVERY_RECIPE_SCRUTINY_DIRNAME = "discovery-recipe-scrutiny-atlas"
@@ -77,6 +218,751 @@ TEMPLATE_CONFIG_KEYS = (
     "useFormingBar",
     "scale",
 )
+
+
+class CampaignPolicyValidationError(ValueError):
+    """Raised when a Phase 3 campaign policy cannot be safely consumed."""
+
+
+def _require_exact_keys(value: dict[str, Any], expected: set[str], *, path: str) -> None:
+    actual = set(value)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        details: list[str] = []
+        if missing:
+            details.append(f"missing={missing}")
+        if unexpected:
+            details.append(f"unexpected={unexpected}")
+        raise CampaignPolicyValidationError(f"{path} has invalid keys ({', '.join(details)})")
+
+
+def _require_policy_token(value: Any, *, path: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise CampaignPolicyValidationError(f"{path} must be a non-empty string")
+    return value.strip()
+
+
+def _require_policy_sequence(value: Any, *, path: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CampaignPolicyValidationError(f"{path} must be a non-negative integer")
+    return value
+
+
+def _require_policy_fraction(value: Any, *, path: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CampaignPolicyValidationError(f"{path} must be a finite number")
+    fraction = float(value)
+    if not math.isfinite(fraction) or fraction <= 0.0 or fraction > 1.0:
+        raise CampaignPolicyValidationError(f"{path} must be greater than 0 and at most 1")
+    return fraction
+
+
+def _require_policy_string_list(
+    value: Any,
+    *,
+    path: str,
+    allowed: set[str] | None = None,
+) -> list[str]:
+    if not isinstance(value, list) or not value:
+        raise CampaignPolicyValidationError(f"{path} must be a non-empty list")
+    tokens = [_require_policy_token(item, path=path) for item in value]
+    if len(set(tokens)) != len(tokens):
+        raise CampaignPolicyValidationError(f"{path} must not contain duplicates")
+    if allowed is not None:
+        unsupported = sorted(set(tokens) - allowed)
+        if unsupported:
+            raise CampaignPolicyValidationError(
+                f"{path} contains unsupported values: {unsupported}"
+            )
+    return tokens
+
+
+def _normalize_lane_eligible_menus(
+    value: Any,
+    *,
+    lane: str,
+    path: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise CampaignPolicyValidationError(f"{path} must be an object")
+    _require_exact_keys(
+        value,
+        {
+            "recipe_sources",
+            "slot_sampling_lanes",
+            "pair_sampling_lanes",
+            "allow_generation_eligible_fallback",
+        },
+        path=path,
+    )
+    contract = CAMPAIGN_POLICY_LANE_MENU_CONTRACT[lane]
+    normalized: dict[str, Any] = {}
+    for field in ("recipe_sources", "slot_sampling_lanes", "pair_sampling_lanes"):
+        tokens = _require_policy_string_list(
+            value.get(field),
+            path=f"{path}.{field}",
+            allowed=set(contract[field]),
+        )
+        if set(tokens) != contract[field]:
+            raise CampaignPolicyValidationError(
+                f"{path}.{field} must exactly match the {lane} lane contract"
+            )
+        normalized[field] = tokens
+    allow_fallback = value.get("allow_generation_eligible_fallback")
+    if not isinstance(allow_fallback, bool):
+        raise CampaignPolicyValidationError(
+            f"{path}.allow_generation_eligible_fallback must be a boolean"
+        )
+    if allow_fallback != contract["allow_generation_eligible_fallback"]:
+        raise CampaignPolicyValidationError(
+            f"{path}.allow_generation_eligible_fallback must exactly match the {lane} "
+            "lane contract"
+        )
+    normalized["allow_generation_eligible_fallback"] = allow_fallback
+    return normalized
+
+
+def _normalize_campaign_candidate_scalar(value: Any) -> dict[str, str]:
+    if value is None:
+        return {"kind": "absent"}
+    normalized = str(value).strip().upper()
+    if not normalized:
+        return {"kind": "blank"}
+    return {"kind": "value", "value": normalized}
+
+
+def _canonical_campaign_candidate_scalar_key(value: dict[str, str]) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def canonical_campaign_candidate_attributes(candidate: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the exact candidate attributes that participate in candidate_id."""
+    if not isinstance(candidate, dict):
+        raise CampaignPolicyValidationError("campaign candidate must be an object")
+    raw_indicators = candidate.get("indicator_ids")
+    if raw_indicators is None:
+        indicator_ids: dict[str, Any] = {"state": "absent", "values": []}
+    elif isinstance(raw_indicators, (list, tuple, set, frozenset)):
+        normalized_values: dict[str, dict[str, str]] = {}
+        for value in raw_indicators:
+            normalized_value = _normalize_campaign_candidate_scalar(value)
+            normalized_values[
+                _canonical_campaign_candidate_scalar_key(normalized_value)
+            ] = normalized_value
+        indicator_ids = {
+            "state": "present",
+            "values": [normalized_values[key] for key in sorted(normalized_values)],
+        }
+    else:
+        normalized_value = _normalize_campaign_candidate_scalar(raw_indicators)
+        indicator_ids = {"state": "present", "values": [normalized_value]}
+    return {
+        "recipe_id": _normalize_campaign_candidate_scalar(candidate.get("recipe_id")),
+        "canonical_pair_family_id": _normalize_campaign_candidate_scalar(
+            candidate.get("canonical_pair_family_id")
+        ),
+        "instrument": _normalize_campaign_candidate_scalar(candidate.get("instrument")),
+        "timeframe": _normalize_campaign_candidate_scalar(candidate.get("timeframe")),
+        "indicator_ids": indicator_ids,
+    }
+
+
+def canonical_campaign_candidate_id(candidate: dict[str, Any]) -> str:
+    """Return the digest identity declared by the policy manifest's v1 contract."""
+    payload = {
+        "candidate_identity_version": CAMPAIGN_POLICY_CANDIDATE_IDENTITY[
+            "algorithm_version"
+        ],
+        **canonical_campaign_candidate_attributes(candidate),
+    }
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return CAMPAIGN_POLICY_SHA256_PREFIX + hashlib.sha256(
+        serialized.encode("utf-8")
+    ).hexdigest()
+
+
+def ordered_campaign_policy_conflicts(conflicts: list[str] | tuple[str, ...] | set[str]) -> list[str]:
+    """Normalize a simultaneous-cap conflict set into the manifest's report order."""
+    normalized = {
+        _require_policy_token(value, path="campaign policy conflict")
+        for value in conflicts
+    }
+    unsupported = normalized - set(CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS)
+    if unsupported:
+        raise CampaignPolicyValidationError(
+            f"campaign policy conflicts contain unsupported dimensions: {sorted(unsupported)}"
+        )
+    return [
+        dimension
+        for dimension in CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS
+        if dimension in normalized
+    ]
+
+
+def _validate_campaign_policy_manifest_fields(
+    manifest: dict[str, Any],
+    *,
+    require_manifest_hash: bool,
+) -> None:
+    if not isinstance(manifest, dict):
+        raise CampaignPolicyValidationError("campaign policy manifest must be an object")
+    expected_root_keys = {
+        "schema_version",
+        "lanes",
+        "diversity_targets",
+        "negative_prior_expiry",
+        "execution",
+        "candidate_identity",
+        "diversity_attribute_contract",
+        "diversity_enforcement",
+        "manifest_sha256",
+    }
+    _require_exact_keys(manifest, expected_root_keys, path="campaign policy manifest")
+    if manifest.get("schema_version") != CAMPAIGN_POLICY_SCHEMA_VERSION:
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest has an unsupported schema_version"
+        )
+
+    lanes = manifest.get("lanes")
+    if not isinstance(lanes, dict):
+        raise CampaignPolicyValidationError("campaign policy manifest.lanes must be an object")
+    _require_exact_keys(lanes, set(CAMPAIGN_POLICY_LANES), path="campaign policy manifest.lanes")
+    lane_total = 0.0
+    for lane in CAMPAIGN_POLICY_LANES:
+        lane_payload = lanes.get(lane)
+        if not isinstance(lane_payload, dict):
+            raise CampaignPolicyValidationError(
+                f"campaign policy manifest.lanes.{lane} must be an object"
+            )
+        _require_exact_keys(
+            lane_payload,
+            {"fraction", "eligible_menus"},
+            path=f"campaign policy manifest.lanes.{lane}",
+        )
+        lane_total += _require_policy_fraction(
+            lane_payload.get("fraction"),
+            path=f"campaign policy manifest.lanes.{lane}.fraction",
+        )
+        _normalize_lane_eligible_menus(
+            lane_payload.get("eligible_menus"),
+            lane=lane,
+            path=f"campaign policy manifest.lanes.{lane}.eligible_menus",
+        )
+    if not math.isclose(lane_total, 1.0, rel_tol=0.0, abs_tol=1e-9):
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest lane fractions must sum to exactly 1"
+        )
+
+    diversity_targets = manifest.get("diversity_targets")
+    if not isinstance(diversity_targets, dict):
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest.diversity_targets must be an object"
+        )
+    _require_exact_keys(
+        diversity_targets,
+        set(CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS),
+        path="campaign policy manifest.diversity_targets",
+    )
+    diversity_caps: dict[str, float] = {}
+    for dimension in CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS:
+        target = diversity_targets.get(dimension)
+        if not isinstance(target, dict):
+            raise CampaignPolicyValidationError(
+                f"campaign policy manifest.diversity_targets.{dimension} must be an object"
+            )
+        _require_exact_keys(
+            target,
+            {"max_share"},
+            path=f"campaign policy manifest.diversity_targets.{dimension}",
+        )
+        diversity_caps[dimension] = _require_policy_fraction(
+            target.get("max_share"),
+            path=f"campaign policy manifest.diversity_targets.{dimension}.max_share",
+        )
+    if diversity_caps["family"] > diversity_caps["recipe"]:
+        raise CampaignPolicyValidationError(
+            "campaign policy family cap cannot exceed the recipe cap"
+        )
+    if diversity_caps["indicator"] > diversity_caps["recipe"]:
+        raise CampaignPolicyValidationError(
+            "campaign policy indicator cap cannot exceed the recipe cap"
+        )
+
+    execution = manifest.get("execution")
+    if not isinstance(execution, dict):
+        raise CampaignPolicyValidationError("campaign policy manifest.execution must be an object")
+    _require_exact_keys(
+        execution,
+        set(CAMPAIGN_POLICY_EXECUTION),
+        path="campaign policy manifest.execution",
+    )
+    if execution != CAMPAIGN_POLICY_EXECUTION:
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest.execution must match the declared deterministic "
+            "allocation contract"
+        )
+
+    candidate_identity = manifest.get("candidate_identity")
+    if not isinstance(candidate_identity, dict):
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest.candidate_identity must be an object"
+        )
+    _require_exact_keys(
+        candidate_identity,
+        set(CAMPAIGN_POLICY_CANDIDATE_IDENTITY),
+        path="campaign policy manifest.candidate_identity",
+    )
+    if candidate_identity != CAMPAIGN_POLICY_CANDIDATE_IDENTITY:
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest.candidate_identity must match the declared "
+            "canonical candidate_id contract"
+        )
+
+    diversity_attribute_contract = manifest.get("diversity_attribute_contract")
+    if not isinstance(diversity_attribute_contract, dict):
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest.diversity_attribute_contract must be an object"
+        )
+    _require_exact_keys(
+        diversity_attribute_contract,
+        set(CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS),
+        path="campaign policy manifest.diversity_attribute_contract",
+    )
+    for dimension in CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS:
+        attribute = diversity_attribute_contract.get(dimension)
+        expected_attribute = CAMPAIGN_POLICY_DIVERSITY_ATTRIBUTE_CONTRACT[dimension]
+        if not isinstance(attribute, dict):
+            raise CampaignPolicyValidationError(
+                "campaign policy manifest.diversity_attribute_contract."
+                f"{dimension} must be an object"
+            )
+        _require_exact_keys(
+            attribute,
+            set(expected_attribute),
+            path=(
+                "campaign policy manifest.diversity_attribute_contract."
+                f"{dimension}"
+            ),
+        )
+        if attribute != expected_attribute:
+            raise CampaignPolicyValidationError(
+                "campaign policy manifest.diversity_attribute_contract."
+                f"{dimension} must match the required attribute contract"
+            )
+
+    diversity_enforcement = manifest.get("diversity_enforcement")
+    if not isinstance(diversity_enforcement, dict):
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest.diversity_enforcement must be an object"
+        )
+    _require_exact_keys(
+        diversity_enforcement,
+        set(CAMPAIGN_POLICY_DIVERSITY_ENFORCEMENT),
+        path="campaign policy manifest.diversity_enforcement",
+    )
+    if diversity_enforcement != CAMPAIGN_POLICY_DIVERSITY_ENFORCEMENT:
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest.diversity_enforcement must match the declared "
+            "cap enforcement contract"
+        )
+
+    expiry = manifest.get("negative_prior_expiry")
+    if not isinstance(expiry, dict):
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest.negative_prior_expiry must be an object"
+        )
+    _require_exact_keys(
+        expiry,
+        {
+            "basis",
+            "anchor",
+            "ttl_field",
+            "active_through",
+            "on_generation_mismatch",
+        },
+        path="campaign policy manifest.negative_prior_expiry",
+    )
+    if expiry.get("basis") != CAMPAIGN_POLICY_NEGATIVE_EXPIRY_BASIS:
+        raise CampaignPolicyValidationError("campaign policy has an unsupported negative expiry basis")
+    if expiry.get("ttl_field") != CAMPAIGN_POLICY_NEGATIVE_EXPIRY_TTL_FIELD:
+        raise CampaignPolicyValidationError("campaign policy has an unsupported negative expiry ttl field")
+    if expiry.get("active_through") != CAMPAIGN_POLICY_NEGATIVE_EXPIRY_BOUNDARY:
+        raise CampaignPolicyValidationError("campaign policy has an unsupported negative expiry boundary")
+    if expiry.get("on_generation_mismatch") != CAMPAIGN_POLICY_NEGATIVE_EXPIRY_GENERATION_MISMATCH:
+        raise CampaignPolicyValidationError(
+            "campaign policy must expire negatives on an Atlas generation mismatch"
+        )
+    anchor = expiry.get("anchor")
+    if not isinstance(anchor, dict):
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest.negative_prior_expiry.anchor must be an object"
+        )
+    _require_exact_keys(
+        anchor,
+        {"generation", "run_sequence"},
+        path="campaign policy manifest.negative_prior_expiry.anchor",
+    )
+    _require_policy_token(
+        anchor.get("generation"),
+        path="campaign policy manifest.negative_prior_expiry.anchor.generation",
+    )
+    _require_policy_sequence(
+        anchor.get("run_sequence"),
+        path="campaign policy manifest.negative_prior_expiry.anchor.run_sequence",
+    )
+
+    manifest_hash = manifest.get("manifest_sha256")
+    if require_manifest_hash:
+        if not isinstance(manifest_hash, str) or not manifest_hash.startswith(
+            CAMPAIGN_POLICY_SHA256_PREFIX
+        ):
+            raise CampaignPolicyValidationError(
+                "campaign policy manifest.manifest_sha256 must be a sha256 digest"
+            )
+    elif manifest_hash is not None and not isinstance(manifest_hash, str):
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest.manifest_sha256 must be a string or null"
+        )
+
+
+def _canonical_campaign_policy_payload(manifest: dict[str, Any]) -> dict[str, Any]:
+    lanes = manifest["lanes"]
+    diversity_targets = manifest["diversity_targets"]
+    expiry = manifest["negative_prior_expiry"]
+    normalized_menus = {
+        lane: _normalize_lane_eligible_menus(
+            lanes[lane]["eligible_menus"],
+            lane=lane,
+            path=f"campaign policy manifest.lanes.{lane}.eligible_menus",
+        )
+        for lane in CAMPAIGN_POLICY_LANES
+    }
+    return {
+        "schema_version": CAMPAIGN_POLICY_SCHEMA_VERSION,
+        "lanes": {
+            lane: {
+                "fraction": float(lanes[lane]["fraction"]),
+                "eligible_menus": {
+                    "recipe_sources": sorted(normalized_menus[lane]["recipe_sources"]),
+                    "slot_sampling_lanes": sorted(
+                        normalized_menus[lane]["slot_sampling_lanes"]
+                    ),
+                    "pair_sampling_lanes": sorted(
+                        normalized_menus[lane]["pair_sampling_lanes"]
+                    ),
+                    "allow_generation_eligible_fallback": normalized_menus[lane][
+                        "allow_generation_eligible_fallback"
+                    ],
+                },
+            }
+            for lane in CAMPAIGN_POLICY_LANES
+        },
+        "diversity_targets": {
+            dimension: {"max_share": float(diversity_targets[dimension]["max_share"])}
+            for dimension in CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS
+        },
+        "execution": CAMPAIGN_POLICY_EXECUTION,
+        "candidate_identity": CAMPAIGN_POLICY_CANDIDATE_IDENTITY,
+        "diversity_attribute_contract": CAMPAIGN_POLICY_DIVERSITY_ATTRIBUTE_CONTRACT,
+        "diversity_enforcement": CAMPAIGN_POLICY_DIVERSITY_ENFORCEMENT,
+        "negative_prior_expiry": {
+            "basis": CAMPAIGN_POLICY_NEGATIVE_EXPIRY_BASIS,
+            "anchor": {
+                "generation": expiry["anchor"]["generation"].strip(),
+                "run_sequence": expiry["anchor"]["run_sequence"],
+            },
+            "ttl_field": CAMPAIGN_POLICY_NEGATIVE_EXPIRY_TTL_FIELD,
+            "active_through": CAMPAIGN_POLICY_NEGATIVE_EXPIRY_BOUNDARY,
+            "on_generation_mismatch": CAMPAIGN_POLICY_NEGATIVE_EXPIRY_GENERATION_MISMATCH,
+        },
+    }
+
+
+def canonical_campaign_policy_json(manifest: dict[str, Any]) -> str:
+    """Return the canonical unsigned JSON used to identify a policy manifest."""
+    _validate_campaign_policy_manifest_fields(manifest, require_manifest_hash=False)
+    try:
+        return json.dumps(
+            _canonical_campaign_policy_payload(manifest),
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest cannot be canonically serialized"
+        ) from exc
+
+
+def campaign_policy_sha256(manifest: dict[str, Any]) -> str:
+    return CAMPAIGN_POLICY_SHA256_PREFIX + hashlib.sha256(
+        canonical_campaign_policy_json(manifest).encode("utf-8")
+    ).hexdigest()
+
+
+def validate_campaign_policy_manifest(
+    manifest: dict[str, Any],
+    *,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless the complete policy schema and its digest are valid."""
+    _validate_campaign_policy_manifest_fields(manifest, require_manifest_hash=True)
+    actual_sha256 = campaign_policy_sha256(manifest)
+    if manifest.get("manifest_sha256") != actual_sha256:
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest_sha256 does not match canonical policy content"
+        )
+    if expected_sha256 is not None and expected_sha256 != actual_sha256:
+        raise CampaignPolicyValidationError(
+            "campaign policy manifest_sha256 does not match the expected digest"
+        )
+    canonical_manifest = json.loads(canonical_campaign_policy_json(manifest))
+    canonical_manifest["manifest_sha256"] = actual_sha256
+    return canonical_manifest
+
+
+def campaign_diversity_cap_count(
+    policy_manifest: dict[str, Any],
+    *,
+    dimension: str,
+    target_runs: int,
+) -> int:
+    """Return the floor-rounded deal cap declared for one diversity dimension."""
+    manifest = validate_campaign_policy_manifest(policy_manifest)
+    normalized_dimension = _require_policy_token(
+        dimension,
+        path="campaign diversity dimension",
+    )
+    if normalized_dimension not in CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS:
+        raise CampaignPolicyValidationError(
+            f"unsupported campaign diversity dimension: {normalized_dimension}"
+        )
+    denominator = _require_policy_sequence(target_runs, path="target_runs")
+    max_share = _require_policy_fraction(
+        manifest["diversity_targets"][normalized_dimension]["max_share"],
+        path=(
+            "campaign policy manifest.diversity_targets."
+            f"{normalized_dimension}.max_share"
+        ),
+    )
+    return math.floor(denominator * max_share)
+
+
+def build_campaign_policy_manifest(
+    *,
+    lane_fractions: dict[str, Any],
+    lane_eligible_menus: dict[str, Any],
+    diversity_max_shares: dict[str, Any],
+    source_atlas_generation: str,
+    source_atlas_run_sequence: int,
+) -> dict[str, Any]:
+    """Build an explicit, deterministic Phase 3 policy manifest."""
+    if not isinstance(lane_fractions, dict):
+        raise CampaignPolicyValidationError("lane_fractions must be an object")
+    _require_exact_keys(
+        lane_fractions,
+        set(CAMPAIGN_POLICY_LANES),
+        path="lane_fractions",
+    )
+    if not isinstance(lane_eligible_menus, dict):
+        raise CampaignPolicyValidationError("lane_eligible_menus must be an object")
+    _require_exact_keys(
+        lane_eligible_menus,
+        set(CAMPAIGN_POLICY_LANES),
+        path="lane_eligible_menus",
+    )
+    if not isinstance(diversity_max_shares, dict):
+        raise CampaignPolicyValidationError("diversity_max_shares must be an object")
+    _require_exact_keys(
+        diversity_max_shares,
+        set(CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS),
+        path="diversity_max_shares",
+    )
+    manifest = {
+        "schema_version": CAMPAIGN_POLICY_SCHEMA_VERSION,
+        "lanes": {
+            lane: {
+                "fraction": lane_fractions.get(lane),
+                "eligible_menus": lane_eligible_menus.get(lane),
+            }
+            for lane in CAMPAIGN_POLICY_LANES
+        },
+        "diversity_targets": {
+            dimension: {"max_share": diversity_max_shares.get(dimension)}
+            for dimension in CAMPAIGN_POLICY_DIVERSITY_DIMENSIONS
+        },
+        "execution": CAMPAIGN_POLICY_EXECUTION,
+        "candidate_identity": CAMPAIGN_POLICY_CANDIDATE_IDENTITY,
+        "diversity_attribute_contract": CAMPAIGN_POLICY_DIVERSITY_ATTRIBUTE_CONTRACT,
+        "diversity_enforcement": CAMPAIGN_POLICY_DIVERSITY_ENFORCEMENT,
+        "negative_prior_expiry": {
+            "basis": CAMPAIGN_POLICY_NEGATIVE_EXPIRY_BASIS,
+            "anchor": {
+                "generation": source_atlas_generation,
+                "run_sequence": source_atlas_run_sequence,
+            },
+            "ttl_field": CAMPAIGN_POLICY_NEGATIVE_EXPIRY_TTL_FIELD,
+            "active_through": CAMPAIGN_POLICY_NEGATIVE_EXPIRY_BOUNDARY,
+            "on_generation_mismatch": CAMPAIGN_POLICY_NEGATIVE_EXPIRY_GENERATION_MISMATCH,
+        },
+        "manifest_sha256": None,
+    }
+    _validate_campaign_policy_manifest_fields(manifest, require_manifest_hash=False)
+    manifest["manifest_sha256"] = campaign_policy_sha256(manifest)
+    return validate_campaign_policy_manifest(manifest)
+
+
+def negative_prior_expiry_status(
+    negative_prior: dict[str, Any],
+    policy_manifest: dict[str, Any],
+    *,
+    current_atlas_generation: str,
+    current_atlas_run_sequence: int,
+) -> str:
+    """Classify a negative prior without applying it outside its local lifecycle."""
+    if not isinstance(negative_prior, dict):
+        raise CampaignPolicyValidationError("negative prior must be an object")
+    manifest = validate_campaign_policy_manifest(policy_manifest)
+    ttl = _require_policy_sequence(
+        negative_prior.get(CAMPAIGN_POLICY_NEGATIVE_EXPIRY_TTL_FIELD),
+        path=f"negative prior.{CAMPAIGN_POLICY_NEGATIVE_EXPIRY_TTL_FIELD}",
+    )
+    if ttl <= 0:
+        raise CampaignPolicyValidationError(
+            "negative prior.expires_after_atlas_runs must be greater than zero"
+        )
+    generation = _require_policy_token(
+        current_atlas_generation,
+        path="current_atlas_generation",
+    )
+    run_sequence = _require_policy_sequence(
+        current_atlas_run_sequence,
+        path="current_atlas_run_sequence",
+    )
+    anchor = manifest["negative_prior_expiry"]["anchor"]
+    if generation != anchor["generation"]:
+        return "expired_generation_mismatch"
+    if run_sequence < anchor["run_sequence"]:
+        return "not_yet_active"
+    if run_sequence > anchor["run_sequence"] + ttl:
+        return "expired_run_sequence"
+    return "active"
+
+
+def is_negative_prior_active(
+    negative_prior: dict[str, Any],
+    policy_manifest: dict[str, Any],
+    *,
+    current_atlas_generation: str,
+    current_atlas_run_sequence: int,
+) -> bool:
+    return (
+        negative_prior_expiry_status(
+            negative_prior,
+            policy_manifest,
+            current_atlas_generation=current_atlas_generation,
+            current_atlas_run_sequence=current_atlas_run_sequence,
+        )
+        == "active"
+    )
+
+
+def validate_seed_plan_campaign_policy(
+    seed_plan: dict[str, Any],
+    *,
+    expected_policy_sha256: str | None = None,
+) -> dict[str, Any] | None:
+    """Validate an explicit v2 policy or return None for a supported legacy plan."""
+    if not isinstance(seed_plan, dict):
+        raise CampaignPolicyValidationError("seed plan must be an object")
+    schema_version = seed_plan.get("schema_version")
+    if schema_version in (None, LEGACY_SEED_PLAN_SCHEMA_VERSION):
+        if expected_policy_sha256 is not None:
+            raise CampaignPolicyValidationError(
+                "legacy seed plans do not carry a campaign policy manifest"
+            )
+        return None
+    if schema_version != POLICY_HONEST_SEED_PLAN_SCHEMA_VERSION:
+        raise CampaignPolicyValidationError("seed plan has an unsupported schema_version")
+    manifest = seed_plan.get("campaign_policy_manifest")
+    if not isinstance(manifest, dict):
+        raise CampaignPolicyValidationError(
+            "policy-honest seed plans require campaign_policy_manifest"
+        )
+    plan_sha256 = seed_plan.get("campaign_policy_sha256")
+    if not isinstance(plan_sha256, str):
+        raise CampaignPolicyValidationError(
+            "policy-honest seed plans require campaign_policy_sha256"
+        )
+    policy = validate_campaign_policy_manifest(
+        manifest,
+        expected_sha256=(
+            plan_sha256 if expected_policy_sha256 is None else expected_policy_sha256
+        ),
+    )
+    if plan_sha256 != policy["manifest_sha256"]:
+        raise CampaignPolicyValidationError(
+            "seed plan campaign_policy_sha256 does not match its policy manifest"
+        )
+    sampling_policy = seed_plan.get("sampling_policy")
+    if not isinstance(sampling_policy, dict):
+        raise CampaignPolicyValidationError("policy-honest seed plans require sampling_policy")
+    fraction_fields = {
+        "guided": "guided_prior_fraction",
+        "uncertain": "uncertain_prior_fraction",
+        "wild": "wild_exploration_fraction",
+    }
+    for lane, field in fraction_fields.items():
+        fraction = _require_policy_fraction(
+            sampling_policy.get(field),
+            path=f"seed plan sampling_policy.{field}",
+        )
+        if not math.isclose(
+            fraction,
+            policy["lanes"][lane]["fraction"],
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise CampaignPolicyValidationError(
+                f"seed plan sampling_policy.{field} does not match campaign policy"
+            )
+    return policy
+
+
+def _attach_campaign_policy_to_seed_plan(
+    seed_plan: dict[str, Any],
+    campaign_policy_manifest: dict[str, Any],
+) -> dict[str, Any]:
+    policy = validate_campaign_policy_manifest(campaign_policy_manifest)
+    sampling_policy = dict(_as_dict(seed_plan.get("sampling_policy")))
+    sampling_policy.update(
+        {
+            "guided_prior_fraction": policy["lanes"]["guided"]["fraction"],
+            "uncertain_prior_fraction": policy["lanes"]["uncertain"]["fraction"],
+            "wild_exploration_fraction": policy["lanes"]["wild"]["fraction"],
+        }
+    )
+    attached = dict(seed_plan)
+    attached["schema_version"] = POLICY_HONEST_SEED_PLAN_SCHEMA_VERSION
+    attached["sampling_policy"] = sampling_policy
+    attached["campaign_policy_manifest"] = policy
+    attached["campaign_policy_sha256"] = policy["manifest_sha256"]
+    validate_seed_plan_campaign_policy(attached)
+    return attached
 
 
 @dataclass(frozen=True)
@@ -1625,6 +2511,7 @@ def build_recipe_prior_artifacts(
     discovery_validation_results: list[dict[str, Any]] | None = None,
     discovery_validation_profile_dir: Path | list[Path] | tuple[Path, ...] | None = None,
     playhand_outcome_priors: dict[str, Any] | None = None,
+    campaign_policy_manifest: dict[str, Any] | None = None,
     max_slot_candidates: int = DEFAULT_MAX_SLOT_CANDIDATES,
     max_pair_candidates: int = DEFAULT_MAX_PAIR_CANDIDATES,
 ) -> tuple[
@@ -1812,7 +2699,7 @@ def build_recipe_prior_artifacts(
         outcome_priors=playhand_outcome_priors,
     )
     seed_plan = {
-        "schema_version": "play_hand_seed_plan_v1",
+        "schema_version": LEGACY_SEED_PLAN_SCHEMA_VERSION,
         "feature_schema_version": "atlas_feature_vector_v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "sampling_policy": sampling_policy,
@@ -1865,6 +2752,11 @@ def build_recipe_prior_artifacts(
             for recipe_name, recipe_payload in recipes.items()
         },
     }
+    if campaign_policy_manifest is not None:
+        seed_plan = _attach_campaign_policy_to_seed_plan(
+            seed_plan,
+            campaign_policy_manifest,
+        )
     lane_counts: dict[str, int] = {}
     for row in slot_rows:
         lane = _clean_token(row.get("sampling_lane")) or "unknown"
@@ -1914,6 +2806,14 @@ def build_recipe_prior_artifacts(
         },
         "top_pairs": pair_priors[:20],
     }
+    if campaign_policy_manifest is not None:
+        summary["campaign_policy"] = {
+            "schema_version": seed_plan["campaign_policy_manifest"]["schema_version"],
+            "manifest_sha256": seed_plan["campaign_policy_sha256"],
+            "negative_prior_expiry": seed_plan["campaign_policy_manifest"][
+                "negative_prior_expiry"
+            ],
+        }
     payload = {
         "schema_version": SCHEMA_VERSION,
         "feature_schema_version": "atlas_feature_vector_v1",
@@ -1930,6 +2830,9 @@ def build_recipe_prior_artifacts(
         "retention_failures": retention_failure_rows,
         "summary": summary,
     }
+    if campaign_policy_manifest is not None:
+        payload["campaign_policy_manifest"] = seed_plan["campaign_policy_manifest"]
+        payload["campaign_policy_sha256"] = seed_plan["campaign_policy_sha256"]
     return (
         payload,
         slot_rows,
@@ -2113,6 +3016,7 @@ def build_recipe_priors(
     discovery_recipe_scrutiny_dir: Path | None = None,
     playhand_outcome_priors_dir: Path | None = None,
     include_playhand_outcome_priors: bool = False,
+    campaign_policy_manifest: dict[str, Any] | None = None,
     out_dir: Path | None = None,
     max_slot_candidates: int = DEFAULT_MAX_SLOT_CANDIDATES,
     max_pair_candidates: int = DEFAULT_MAX_PAIR_CANDIDATES,
@@ -2221,6 +3125,7 @@ def build_recipe_priors(
             discovery_scrutiny_dir / "profiles",
         ],
         playhand_outcome_priors=playhand_outcome_priors,
+        campaign_policy_manifest=campaign_policy_manifest,
         max_slot_candidates=max(1, int(max_slot_candidates)),
         max_pair_candidates=max(1, int(max_pair_candidates)),
     )

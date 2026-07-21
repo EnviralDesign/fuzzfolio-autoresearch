@@ -6,6 +6,7 @@ import concurrent.futures
 import hashlib
 import itertools
 import json
+import math
 import os
 import random
 import re
@@ -100,6 +101,13 @@ from .play_hand import (
 )
 from .playhand_health import build_play_hand_evidence, build_play_hand_health
 from .plotting import render_progress_artifacts
+from .recipe_priors import (
+    campaign_diversity_cap_count,
+    canonical_campaign_candidate_attributes,
+    canonical_campaign_candidate_id,
+    ordered_campaign_policy_conflicts,
+    validate_seed_plan_campaign_policy,
+)
 from .scoring import AttemptScore, build_attempt_score, load_sensitivity_snapshot
 
 
@@ -138,6 +146,9 @@ DEFAULT_LAB_LOG_MODE = "barrier"
 DEFAULT_LAB_BARRIER_INTERVAL_SECONDS = 5.0
 DEFAULT_LAB_BARRIER_LANE_LIMIT = 24
 DEFAULT_LAB_SWEEP_SHARD_SIZE = 8
+POLICY_HONEST_LAB_STATE_SCHEMA_VERSION = "play-hand-policy-runtime-v1"
+POLICY_EXHAUSTION_OUTCOME = "policy_lane_exhausted"
+POLICY_CANDIDATE_FALLBACK_ATTEMPTS = 64
 DEFAULT_LAB_SCRUTINY_MONTHS = 36
 DEFAULT_LAB_VALIDATION_MONTHS = 12
 DEFAULT_LAB_VALIDATION_MIN_SCORE = 45.0
@@ -290,6 +301,17 @@ class PlayHandLabRuntimeConfig:
     universe_id: str | None = None
     universe_manifest_sha256: str | None = None
     expected_seed_plan_sha256: str | None = None
+    current_atlas_generation: str | None = None
+    current_atlas_run_sequence: int | None = None
+    formal_authority_kind: Literal["level_c", "phase3"] | None = None
+    phase3_authority_path: Path | None = None
+    phase2_capsule_root: Path | None = None
+    campaign_policy_manifest_path: Path | None = None
+    phase3_authority_id: str | None = None
+    phase3_authority_sha256: str | None = None
+    campaign_policy_manifest_sha256: str | None = None
+    campaign_policy_source_file_sha256: str | None = None
+    operator_launch_worker_image: str | None = None
     execution_plan_path: Path | None = None
     execution_plan_id: str | None = None
     resume: bool = False
@@ -369,6 +391,7 @@ class LabLaneState:
     final_attempt_id: str | None = None
     best_score: float | None = None
     best_attempt_id: str | None = None
+    policy_assignment: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -380,6 +403,7 @@ class LabCampaignHistory:
     pruned_promoted_lane_count: int = 0
     pruned_tombstoned_lane_count: int = 0
     best_score: float | None = None
+    campaign_policy_state: dict[str, Any] | None = None
 
 
 def _lane_state_payload(lane: LabLaneState) -> dict[str, Any]:
@@ -432,6 +456,9 @@ def _campaign_state_lineage(runtime: PlayHandLabRuntimeConfig, campaign_id: str)
     }
     return {
         "campaign_id": campaign_id,
+        "formal_authority_kind": runtime.formal_authority_kind,
+        "phase3_authority_id": runtime.phase3_authority_id,
+        "phase3_authority_sha256": runtime.phase3_authority_sha256,
         "execution_plan_id": runtime.execution_plan_id,
         "research_generation_id": runtime.research_generation_id,
         "level_c_protocol_id": runtime.level_c_protocol_id,
@@ -456,6 +483,8 @@ def _write_campaign_state(
     recorded_result_count: int,
     reserved_lane_indices: list[int] | None = None,
 ) -> None:
+    history_payload = asdict(history)
+    policy_state = history_payload.pop("campaign_policy_state", None)
     atomic_write_json(
         path,
         {
@@ -464,7 +493,8 @@ def _write_campaign_state(
             "next_lane_index": int(next_lane_index),
             "reserved_lane_indices": sorted({int(item) for item in reserved_lane_indices or []}),
             "recorded_result_count": int(recorded_result_count),
-            "history": asdict(history),
+            "history": history_payload,
+            "campaign_policy_state": policy_state,
             "lanes": [_lane_state_payload(lane) for lane in lanes],
         },
     )
@@ -490,6 +520,11 @@ def _load_campaign_state(
         if isinstance(item, dict)
     ]
     history = LabCampaignHistory(**dict(payload.get("history") or {}))
+    policy_state = payload.get("campaign_policy_state")
+    if policy_state is not None:
+        if not isinstance(policy_state, dict):
+            raise DurableExecutionError("PlayHand durable campaign policy state is invalid")
+        history.campaign_policy_state = dict(policy_state)
     return (
         lanes,
         history,
@@ -501,6 +536,549 @@ def _load_campaign_state(
 
 def _lane_allocation_checkpoint(_name: str) -> None:
     """No-op seam used by crash/restart tests around durable lane allocation."""
+
+
+def _policy_lane_counts(
+    campaign_policy: dict[str, Any],
+    *,
+    campaign_size: int,
+) -> tuple[dict[str, int], list[str]]:
+    """Apply the manifest's Hamilton allocation contract without local policy rules."""
+    execution = campaign_policy.get("execution")
+    lanes = campaign_policy.get("lanes")
+    if not isinstance(execution, dict) or not isinstance(lanes, dict):
+        raise DurableExecutionError("validated campaign policy is missing allocation fields")
+    lane_order = [str(item) for item in execution.get("lane_tie_break_order") or []]
+    if not lane_order or set(lane_order) != {"guided", "uncertain", "wild"}:
+        raise DurableExecutionError("validated campaign policy has no deterministic lane order")
+    if campaign_size <= 0:
+        raise DurableExecutionError("policy-honest campaigns require a positive finite lane budget")
+    raw_quotas = {
+        lane: float(campaign_size) * float((lanes.get(lane) or {}).get("fraction"))
+        for lane in lane_order
+    }
+    counts = {lane: int(math.floor(raw_quotas[lane])) for lane in lane_order}
+    remaining = campaign_size - sum(counts.values())
+    tie_order = {lane: index for index, lane in enumerate(lane_order)}
+    remainders = sorted(
+        lane_order,
+        key=lambda lane: (-(raw_quotas[lane] - counts[lane]), tie_order[lane]),
+    )
+    for lane in remainders[:remaining]:
+        counts[lane] += 1
+    lane_plan = [
+        lane
+        for lane in lane_order
+        for _ in range(counts[lane])
+    ]
+    if len(lane_plan) != campaign_size:
+        raise DurableExecutionError("policy lane allocation did not consume the campaign budget")
+    return counts, lane_plan
+
+
+def _new_campaign_policy_state(
+    campaign_policy: dict[str, Any] | None,
+    *,
+    runtime: PlayHandLabRuntimeConfig,
+) -> dict[str, Any] | None:
+    if campaign_policy is None:
+        return None
+    if runtime.campaign_mode != "finite" or runtime.target_runs is None:
+        raise DurableExecutionError(
+            "policy-honest v2 seed plans require a finite campaign with explicit target_runs"
+        )
+    planned_lane_counts, lane_plan = _policy_lane_counts(
+        campaign_policy,
+        campaign_size=int(runtime.target_runs),
+    )
+    attribute_contract = campaign_policy.get("diversity_attribute_contract")
+    candidate_identity = campaign_policy.get("candidate_identity")
+    diversity_enforcement = campaign_policy.get("diversity_enforcement")
+    if (
+        not isinstance(attribute_contract, dict)
+        or not isinstance(candidate_identity, dict)
+        or not isinstance(diversity_enforcement, dict)
+    ):
+        raise DurableExecutionError("validated campaign policy is missing diversity fields")
+    dimensions = ("family", "recipe", "instrument", "timeframe", "indicator")
+    cap_limits = {
+        dimension: campaign_diversity_cap_count(
+            campaign_policy,
+            dimension=dimension,
+            target_runs=int(runtime.target_runs),
+        )
+        for dimension in dimensions
+    }
+    negative_prior_runtime = _policy_negative_prior_runtime(
+        campaign_policy,
+        runtime=runtime,
+    )
+    return {
+        "schema_version": POLICY_HONEST_LAB_STATE_SCHEMA_VERSION,
+        "policy_manifest_sha256": campaign_policy.get("manifest_sha256"),
+        "execution": copy.deepcopy(campaign_policy.get("execution")),
+        "candidate_identity": copy.deepcopy(candidate_identity),
+        "diversity_attribute_contract": copy.deepcopy(attribute_contract),
+        "diversity_enforcement": copy.deepcopy(diversity_enforcement),
+        "negative_prior_runtime": negative_prior_runtime,
+        "campaign_size": int(runtime.target_runs),
+        "planned_lane_counts": planned_lane_counts,
+        "lane_plan": lane_plan,
+        "cap_limits": cap_limits,
+        "assigned_lane_counts": {lane: 0 for lane in planned_lane_counts},
+        "used_lane_counts": {lane: 0 for lane in planned_lane_counts},
+        "exhausted_lane_counts": {lane: 0 for lane in planned_lane_counts},
+        "accounting": {dimension: {} for dimension in dimensions},
+        "exhaustion_outcomes": {},
+    }
+
+
+def _campaign_policy_state(
+    campaign_policy: dict[str, Any] | None,
+    *,
+    runtime: PlayHandLabRuntimeConfig,
+    persisted: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    expected = _new_campaign_policy_state(campaign_policy, runtime=runtime)
+    if expected is None:
+        if persisted is not None:
+            raise DurableExecutionError(
+                "durable campaign has policy-honest state but the seed plan is legacy"
+            )
+        return None
+    if persisted is None:
+        return expected
+    required_identity = (
+        "schema_version",
+        "policy_manifest_sha256",
+        "execution",
+        "candidate_identity",
+        "diversity_attribute_contract",
+        "diversity_enforcement",
+        "negative_prior_runtime",
+        "campaign_size",
+        "planned_lane_counts",
+        "lane_plan",
+        "cap_limits",
+    )
+    if any(persisted.get(key) != expected.get(key) for key in required_identity):
+        raise DurableExecutionError(
+            "PlayHand durable campaign policy state does not match the v2 seed-plan policy"
+        )
+    for key in ("assigned_lane_counts", "used_lane_counts", "exhausted_lane_counts", "accounting"):
+        if not isinstance(persisted.get(key), dict):
+            raise DurableExecutionError(f"PlayHand durable campaign policy state is missing {key}")
+    return copy.deepcopy(persisted)
+
+
+def _policy_negative_prior_runtime(
+    campaign_policy: dict[str, Any],
+    *,
+    runtime: PlayHandLabRuntimeConfig,
+) -> dict[str, Any]:
+    generation = str(runtime.current_atlas_generation or "").strip()
+    run_sequence = runtime.current_atlas_run_sequence
+    supplied = bool(generation) or run_sequence is not None
+    if supplied:
+        if not generation:
+            raise DurableExecutionError(
+                "policy-honest current Atlas generation is missing"
+            )
+        if (
+            isinstance(run_sequence, bool)
+            or not isinstance(run_sequence, int)
+            or run_sequence < 0
+        ):
+            raise DurableExecutionError(
+                "policy-honest current Atlas run sequence is invalid"
+            )
+        return {
+            "current_atlas_generation": generation,
+            "current_atlas_run_sequence": run_sequence,
+            "binding_source": "runtime_authority",
+        }
+    if runtime.as_of_date:
+        raise DurableExecutionError(
+            "formal policy-honest v2 requires plan-bound current Atlas generation and run sequence"
+        )
+    expiry = campaign_policy.get("negative_prior_expiry")
+    anchor = expiry.get("anchor") if isinstance(expiry, dict) else None
+    if not isinstance(anchor, dict):
+        raise DurableExecutionError("validated campaign policy has no negative-prior anchor")
+    return {
+        "current_atlas_generation": anchor.get("generation"),
+        "current_atlas_run_sequence": anchor.get("run_sequence"),
+        "binding_source": "policy_anchor_exploratory_compatibility",
+    }
+
+
+def _policy_lane_for_index(policy_state: dict[str, Any], lane_index: int) -> str:
+    lane_plan = policy_state.get("lane_plan")
+    if not isinstance(lane_plan, list) or lane_index < 0 or lane_index >= len(lane_plan):
+        raise DurableExecutionError(f"policy lane index is outside the finite campaign: {lane_index}")
+    lane = str(lane_plan[lane_index])
+    if lane not in {"guided", "uncertain", "wild"}:
+        raise DurableExecutionError(f"policy lane plan contains an invalid lane: {lane}")
+    return lane
+
+
+def _policy_candidate_attributes(
+    deal: dict[str, Any],
+    *,
+    policy_state: dict[str, Any],
+) -> dict[str, Any] | None:
+    indicator_deal = deal.get("indicator_deal") if isinstance(deal, dict) else None
+    indicator_deal = indicator_deal if isinstance(indicator_deal, dict) else {}
+    pair = indicator_deal.get("pair")
+    pair = pair if isinstance(pair, dict) else {}
+    contract = policy_state.get("diversity_attribute_contract")
+    if not isinstance(contract, dict):
+        raise DurableExecutionError("policy state has no diversity attribute contract")
+    expected_dimensions = {"family", "recipe", "instrument", "timeframe", "indicator"}
+    if set(contract) != expected_dimensions or any(
+        not isinstance(contract.get(dimension), dict)
+        or not str((contract.get(dimension) or {}).get("candidate_attribute") or "")
+        for dimension in expected_dimensions
+    ):
+        raise DurableExecutionError("policy state diversity attribute contract is unsupported")
+
+    raw_indicators = indicator_deal.get("indicators")
+    if isinstance(raw_indicators, (list, tuple, set, frozenset)):
+        indicator_ids: Any = [
+            (
+                item.id
+                if isinstance(item, SeedIndicator)
+                else (
+                    item.get("id") or item.get("indicator_id")
+                    if isinstance(item, dict)
+                    else item
+                )
+            )
+            for item in raw_indicators
+        ]
+    else:
+        indicator_ids = raw_indicators
+    raw_candidate = {
+        "recipe_id": indicator_deal.get("recipe"),
+        "canonical_pair_family_id": pair.get("canonical_pair_family_id"),
+        "instrument": deal.get("primary_instrument"),
+        "timeframe": deal.get("timeframe"),
+        "indicator_ids": indicator_ids,
+    }
+    # recipe_priors owns typed missing/blank/value normalization and identity.
+    attributes = canonical_campaign_candidate_attributes(raw_candidate)
+    attributes["candidate_id"] = canonical_campaign_candidate_id(raw_candidate)
+    return attributes
+
+
+def _policy_attribute_accounting_key(value: Any) -> str:
+    """Encode a helper-normalized JSON value for a durable count map key."""
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise DurableExecutionError("policy candidate attribute is not canonical JSON") from exc
+
+
+def _policy_dimension_charge_values(
+    attributes: dict[str, Any],
+    *,
+    dimension: str,
+    contract: dict[str, Any],
+) -> list[Any]:
+    contract_entry = contract.get(dimension)
+    if not isinstance(contract_entry, dict):
+        raise DurableExecutionError(f"policy state has no {dimension} attribute contract")
+    attribute_name = str(contract_entry.get("candidate_attribute") or "")
+    if attribute_name not in attributes:
+        raise DurableExecutionError(
+            f"policy candidate is missing {dimension} source attribute"
+        )
+    value = attributes[attribute_name]
+    if dimension != "indicator":
+        return [value]
+    if not isinstance(value, dict):
+        raise DurableExecutionError("policy candidate indicator attribute is invalid")
+    indicator_values = value.get("values")
+    if value.get("state") == "present" and isinstance(indicator_values, list) and indicator_values:
+        return indicator_values
+    # Typed absent and explicitly empty indicator lists must not evade accounting.
+    return [value]
+
+
+def _policy_candidate_sort_key(
+    attributes: dict[str, Any],
+    *,
+    policy_state: dict[str, Any],
+) -> tuple[str, ...]:
+    execution = policy_state.get("execution")
+    if not isinstance(execution, dict):
+        raise DurableExecutionError("policy state has no execution contract")
+    order = execution.get("candidate_tie_break_order")
+    if not isinstance(order, list):
+        raise DurableExecutionError("policy state has no candidate tie-break order")
+    values = {
+        field: (
+            str(attributes.get(field) or "")
+            if field == "candidate_id"
+            else _policy_attribute_accounting_key(attributes.get(field))
+        )
+        for field in order
+    }
+    return tuple(values.get(str(field), "") for field in order)
+
+
+def _policy_cap_decision(
+    policy_state: dict[str, Any],
+    attributes: dict[str, Any],
+) -> dict[str, Any]:
+    accounting = policy_state.get("accounting")
+    cap_limits = policy_state.get("cap_limits")
+    contract = policy_state.get("diversity_attribute_contract")
+    if (
+        not isinstance(accounting, dict)
+        or not isinstance(cap_limits, dict)
+        or not isinstance(contract, dict)
+    ):
+        raise DurableExecutionError("policy state has no cap accounting")
+    blocked_by_dimension: dict[str, list[dict[str, Any]]] = {}
+    charges: dict[str, list[dict[str, Any]]] = {}
+    for dimension in ("family", "recipe", "instrument", "timeframe", "indicator"):
+        values = _policy_dimension_charge_values(
+            attributes,
+            dimension=dimension,
+            contract=contract,
+        )
+        charges[dimension] = [
+            {
+                "accounting_key": _policy_attribute_accounting_key(value),
+                "attribute": copy.deepcopy(value),
+            }
+            for value in values
+        ]
+        counts = accounting.get(dimension)
+        if not isinstance(counts, dict):
+            raise DurableExecutionError(f"policy state has no {dimension} accounting")
+        limit = int(cap_limits.get(dimension) or 0)
+        for charge in charges[dimension]:
+            accounting_key = str(charge["accounting_key"])
+            current = int(counts.get(accounting_key) or 0)
+            if current + 1 > limit:
+                blocked_by_dimension.setdefault(dimension, []).append(
+                    {
+                        "dimension": dimension,
+                        "attribute": copy.deepcopy(charge["attribute"]),
+                        "accounting_key": accounting_key,
+                        "current_count": current,
+                        "cap_limit": limit,
+                    }
+                )
+    blocked = [
+        conflict
+        for dimension in ordered_campaign_policy_conflicts(set(blocked_by_dimension))
+        for conflict in blocked_by_dimension[dimension]
+    ]
+    return {
+        "outcome": "accepted" if not blocked else "cap_blocked",
+        "charges": charges,
+        "blocked": blocked,
+    }
+
+
+def _record_policy_assignment(
+    policy_state: dict[str, Any],
+    *,
+    lane: str,
+    cap_decision: dict[str, Any] | None,
+    exhaustion_outcome: str | None = None,
+) -> None:
+    assigned = policy_state.get("assigned_lane_counts")
+    used = policy_state.get("used_lane_counts")
+    exhausted = policy_state.get("exhausted_lane_counts")
+    if not isinstance(assigned, dict) or not isinstance(used, dict) or not isinstance(exhausted, dict):
+        raise DurableExecutionError("policy state has no lane counters")
+    assigned[lane] = int(assigned.get(lane) or 0) + 1
+    if cap_decision is None or cap_decision.get("outcome") != "accepted":
+        exhausted[lane] = int(exhausted.get(lane) or 0) + 1
+        outcomes = policy_state.setdefault("exhaustion_outcomes", {})
+        if not isinstance(outcomes, dict):
+            raise DurableExecutionError("policy state exhaustion outcomes are invalid")
+        outcome = exhaustion_outcome or POLICY_EXHAUSTION_OUTCOME
+        outcomes[outcome] = int(outcomes.get(outcome) or 0) + 1
+        return
+    used[lane] = int(used.get(lane) or 0) + 1
+    accounting = policy_state.get("accounting")
+    if not isinstance(accounting, dict):
+        raise DurableExecutionError("policy state has no accounting")
+    for dimension, values in (cap_decision.get("charges") or {}).items():
+        counts = accounting.get(dimension)
+        if not isinstance(counts, dict):
+            raise DurableExecutionError(f"policy state has no {dimension} accounting")
+        for charge in values:
+            if not isinstance(charge, dict):
+                raise DurableExecutionError("policy cap decision has invalid charge metadata")
+            accounting_key = str(charge.get("accounting_key") or "")
+            if not accounting_key:
+                raise DurableExecutionError("policy cap decision has no accounting key")
+            counts[accounting_key] = int(counts.get(accounting_key) or 0) + 1
+
+
+def _recompute_campaign_policy_state_from_durable_lanes(
+    policy_state: dict[str, Any],
+    *,
+    lanes: list[LabLaneState],
+    unresolved_tasks: list[dict[str, Any]],
+    pruned_lane_count: int,
+) -> dict[str, Any]:
+    """Rebuild mutable policy accounting and reject contradictory durable evidence."""
+    if pruned_lane_count:
+        raise DurableExecutionError(
+            "policy-honest resume cannot verify pruned lane assignments"
+        )
+    rebuilt = copy.deepcopy(policy_state)
+    lane_plan = rebuilt.get("lane_plan")
+    planned = rebuilt.get("planned_lane_counts")
+    if not isinstance(lane_plan, list) or not isinstance(planned, dict):
+        raise DurableExecutionError("policy state has no durable lane allocation")
+    dimensions = ("family", "recipe", "instrument", "timeframe", "indicator")
+    rebuilt["assigned_lane_counts"] = {lane: 0 for lane in planned}
+    rebuilt["used_lane_counts"] = {lane: 0 for lane in planned}
+    rebuilt["exhausted_lane_counts"] = {lane: 0 for lane in planned}
+    rebuilt["accounting"] = {dimension: {} for dimension in dimensions}
+    rebuilt["exhaustion_outcomes"] = {}
+
+    lanes_by_task: dict[str, LabLaneState] = {}
+    seen_lane_indices: set[int] = set()
+    for lane in sorted(lanes, key=lambda item: item.lane_index):
+        if lane.lane_index in seen_lane_indices:
+            raise DurableExecutionError(
+                f"duplicate durable policy lane index: {lane.lane_index}"
+            )
+        seen_lane_indices.add(lane.lane_index)
+        expected_lane = _policy_lane_for_index(rebuilt, lane.lane_index)
+        assignment = lane.policy_assignment
+        if not isinstance(assignment, dict) or not assignment:
+            raise DurableExecutionError(
+                f"durable policy lane has no assignment: {lane.lane_id}"
+            )
+        if (
+            assignment.get("policy_lane") != expected_lane
+            or assignment.get("policy_manifest_sha256")
+            != rebuilt.get("policy_manifest_sha256")
+        ):
+            raise DurableExecutionError(
+                f"durable policy lane assignment mismatch: {lane.lane_id}"
+            )
+        allocation = assignment.get("allocation")
+        execution = rebuilt.get("execution")
+        expected_allocation = {
+            "lane_index": lane.lane_index,
+            "planned_lane_count": planned.get(expected_lane),
+            "algorithm": (execution or {}).get("allocation_algorithm"),
+            "algorithm_version": (execution or {}).get("allocation_algorithm_version"),
+            "lane_tie_break_order": (execution or {}).get("lane_tie_break_order"),
+            "candidate_tie_break_order": (execution or {}).get(
+                "candidate_tie_break_order"
+            ),
+        }
+        if not isinstance(execution, dict) or allocation != expected_allocation:
+            raise DurableExecutionError(
+                f"durable policy lane allocation mismatch: {lane.lane_id}"
+            )
+        if assignment.get("negative_prior_runtime") != rebuilt.get(
+            "negative_prior_runtime"
+        ):
+            raise DurableExecutionError(
+                f"durable policy negative-prior binding mismatch: {lane.lane_id}"
+            )
+        lane_metadata = load_run_metadata(lane.run_dir)
+        if lane_metadata.get("policy_assignment") != assignment:
+            raise DurableExecutionError(
+                f"durable lane metadata policy assignment mismatch: {lane.lane_id}"
+            )
+
+        outcome = str(assignment.get("policy_outcome_type") or "")
+        cap_decision = assignment.get("cap_decision")
+        if outcome == "policy_lane_selected":
+            attributes = assignment.get("candidate_attributes")
+            if not isinstance(attributes, dict) or not isinstance(cap_decision, dict):
+                raise DurableExecutionError(
+                    f"durable selected policy lane has incomplete accounting: {lane.lane_id}"
+                )
+            recomputed_cap_decision = _policy_cap_decision(rebuilt, attributes)
+            if (
+                recomputed_cap_decision.get("outcome") != "accepted"
+                or cap_decision != recomputed_cap_decision
+            ):
+                raise DurableExecutionError(
+                    f"durable policy cap decision mismatch: {lane.lane_id}"
+                )
+            _record_policy_assignment(
+                rebuilt,
+                lane=expected_lane,
+                cap_decision=recomputed_cap_decision,
+            )
+        elif outcome in {POLICY_EXHAUSTION_OUTCOME, "policy_cap_exhausted"}:
+            if cap_decision is not None or lane.task_ids or not lane.terminal:
+                raise DurableExecutionError(
+                    f"durable exhausted policy lane is contradictory: {lane.lane_id}"
+                )
+            _record_policy_assignment(
+                rebuilt,
+                lane=expected_lane,
+                cap_decision=None,
+                exhaustion_outcome=outcome,
+            )
+        else:
+            raise DurableExecutionError(
+                f"durable policy lane has unsupported outcome: {lane.lane_id}"
+            )
+        if int(rebuilt["assigned_lane_counts"].get(expected_lane) or 0) > int(
+            planned.get(expected_lane) or 0
+        ):
+            raise DurableExecutionError(
+                f"durable policy lane quota exceeded: {expected_lane}"
+            )
+
+        for task_id in lane.task_ids:
+            task_spec = lane.task_specs.get(task_id)
+            if not isinstance(task_spec, dict):
+                raise DurableExecutionError(
+                    f"durable policy lane has no task spec: {task_id}"
+                )
+            if task_spec.get("policy_assignment") != assignment:
+                raise DurableExecutionError(
+                    f"durable task policy assignment mismatch: {task_id}"
+                )
+            if task_id in lanes_by_task:
+                raise DurableExecutionError(f"duplicate durable policy task id: {task_id}")
+            lanes_by_task[task_id] = lane
+
+    for task in unresolved_tasks:
+        task_id = str(task.get("task_id") or "")
+        lane = lanes_by_task.get(task_id)
+        if lane is None or task.get("policy_assignment") != lane.policy_assignment:
+            raise DurableExecutionError(
+                f"durable journal task policy assignment mismatch: {task_id or '<missing>'}"
+            )
+
+    mutable_fields = (
+        "assigned_lane_counts",
+        "used_lane_counts",
+        "exhausted_lane_counts",
+        "accounting",
+        "exhaustion_outcomes",
+    )
+    if any(policy_state.get(field) != rebuilt.get(field) for field in mutable_fields):
+        raise DurableExecutionError(
+            "durable campaign policy counters do not match persisted lane assignments"
+        )
+    return rebuilt
 
 
 def _response_json_payload(response: requests.Response) -> Any:
@@ -715,9 +1293,147 @@ def _load_exact_historical_seed_plan(
     return payload, path, actual_sha256
 
 
+def _is_phase3_formal_runtime(runtime: PlayHandLabRuntimeConfig) -> bool:
+    return str(runtime.formal_authority_kind or "").strip().lower() == "phase3"
+
+
+def _phase3_authority_runtime_arguments(
+    runtime: PlayHandLabRuntimeConfig,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Re-resolve the alternate Phase 3 authority before a formal call runs."""
+    if (
+        runtime.phase3_authority_path is None
+        or runtime.phase2_capsule_root is None
+        or runtime.campaign_policy_manifest_path is None
+    ):
+        raise ValueError(
+            "Phase 3 PlayHand requires authority, capsule, and campaign-policy paths."
+        )
+    from .phase3_authority import (
+        Phase3AuthorityError,
+        resolve_phase3_playhand_runtime_arguments,
+    )
+
+    try:
+        arguments = resolve_phase3_playhand_runtime_arguments(
+            authority_path=runtime.phase3_authority_path,
+            phase2_capsule_root=runtime.phase2_capsule_root,
+            policy_manifest_path=runtime.campaign_policy_manifest_path,
+        )
+        authority_path = Path(runtime.phase3_authority_path).expanduser().resolve(strict=True)
+        authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, Phase3AuthorityError) as exc:
+        raise ValueError(f"Phase 3 PlayHand authority validation failed: {exc}") from exc
+    if not isinstance(authority, dict):
+        raise ValueError("Phase 3 PlayHand authority must be a JSON object.")
+    return arguments, authority
+
+
+def _validate_phase3_runtime_contract(
+    runtime: PlayHandLabRuntimeConfig,
+) -> dict[str, str]:
+    """Validate the Phase 3 authority without treating it as a Level C plan."""
+    arguments, authority = _phase3_authority_runtime_arguments(runtime)
+    if arguments.get("formal_authority_kind") != "phase3":
+        raise ValueError("Phase 3 authority does not declare the Phase 3 formal runtime.")
+    authority_id = str(authority.get("authority_id") or "").strip()
+    if not _is_exact_sha256(authority_id):
+        raise ValueError("Phase 3 authority has no exact authority_id.")
+    if runtime.phase3_authority_id != authority_id:
+        raise ValueError("Phase 3 authority identity differs from the runtime binding.")
+    authority_path = Path(runtime.phase3_authority_path).expanduser().resolve(strict=True)
+    authority_sha256 = _file_sha256(authority_path)
+    if runtime.phase3_authority_sha256 != authority_sha256:
+        raise ValueError("Phase 3 authority file digest differs from the runtime binding.")
+    expected_fields = (
+        "campaign_mode",
+        "task_mode",
+        "pipeline_mode",
+        "target_runs",
+        "campaign_id",
+        "seed",
+        "as_of_date",
+        "expected_seed_plan_sha256",
+        "lake_manifest_sha256",
+        "source_snapshot_sha256",
+        "universe_id",
+        "universe_manifest_sha256",
+        "worker_contract_hash",
+        "operator_launch_worker_image",
+        "current_atlas_generation",
+        "current_atlas_run_sequence",
+        "campaign_policy_manifest_sha256",
+        "campaign_policy_source_file_sha256",
+        "tasks_per_lane",
+        "timeframe",
+        "instrument",
+        "instrument_pool",
+        "instrument_pool_preset",
+        "indicator",
+        "profile_path",
+        "min_indicators",
+        "max_indicators",
+        "lookback_months",
+        "bar_limit",
+        "max_reward_r",
+        "sweep_budget",
+        "max_sweep_permutations",
+        "sweep_shard_size",
+        "early_exit_mode",
+        "coarse_halving_mode",
+        "coarse_probe_budget",
+        "validation_months",
+        "validation_min_score",
+        "scrutiny_months",
+        "final_min_score",
+        "screen_anchor_mode",
+        "screen_anchor_envelope_months",
+        "instrument_scout_size",
+        "instrument_scout_max_selected",
+        "deadline_seconds",
+        "max_attempts",
+        "strict_scoring",
+        "retain_raw_lab_artifacts",
+        "worker_contract_schema",
+    )
+    conflicts = [
+        field_name
+        for field_name in expected_fields
+        if getattr(runtime, field_name) != arguments.get(field_name)
+    ]
+    if conflicts:
+        raise ValueError(
+            "Phase 3 PlayHand runtime conflicts with immutable authority: "
+            + ", ".join(conflicts)
+        )
+    if runtime.seed_plan_path is None:
+        raise ValueError("Phase 3 PlayHand requires the authority-bound seed-plan path.")
+    if Path(runtime.seed_plan_path).expanduser().resolve(strict=True) != Path(
+        str(arguments.get("seed_plan_path") or "")
+    ).expanduser().resolve(strict=True):
+        raise ValueError("Phase 3 PlayHand seed-plan path differs from immutable authority.")
+    if runtime.level_c_protocol_id != authority_id or runtime.execution_plan_id != authority_id:
+        raise ValueError("Phase 3 PlayHand durable authority identifiers differ from immutable authority.")
+    if runtime.cutoff_key != "P3":
+        raise ValueError("Phase 3 PlayHand requires cutoff_key=P3.")
+    if runtime.research_generation_id != arguments.get("current_atlas_generation"):
+        raise ValueError("Phase 3 PlayHand research generation differs from immutable authority.")
+    return {
+        "campaign_id": str(arguments["campaign_id"]),
+        "research_generation_id": str(arguments["current_atlas_generation"]),
+        "level_c_protocol_id": authority_id,
+        "cutoff_key": "P3",
+        "seed_plan_sha256": str(arguments["expected_seed_plan_sha256"]),
+    }
+
+
 def _validate_historical_runtime_contract(
     runtime: PlayHandLabRuntimeConfig,
 ) -> dict[str, str]:
+    if _is_phase3_formal_runtime(runtime):
+        return _validate_phase3_runtime_contract(runtime)
+    if runtime.formal_authority_kind is not None:
+        raise ValueError("Historical PlayHand formal_authority_kind must be level_c or phase3.")
     if not _is_exact_sha256(runtime.lake_manifest_sha256):
         raise ValueError("Historical PlayHand requires an exact lake_manifest_sha256.")
     if str(runtime.campaign_mode or "").strip().lower() != "finite":
@@ -763,10 +1479,16 @@ def _validate_historical_runtime_contract(
     cutoff_key = str(runtime.cutoff_key or "").strip()
     if cutoff_key not in {"A", "B", "C", "D"}:
         raise ValueError("Historical PlayHand requires cutoff_key to be one of A, B, C, or D.")
-    _seed_plan, _seed_plan_path, seed_plan_sha256 = _load_exact_historical_seed_plan(
+    seed_plan, _seed_plan_path, seed_plan_sha256 = _load_exact_historical_seed_plan(
         runtime.seed_plan_path,
         expected_sha256=str(runtime.expected_seed_plan_sha256).strip(),
     )
+    campaign_policy = validate_seed_plan_campaign_policy(seed_plan)
+    if campaign_policy is not None:
+        try:
+            _policy_negative_prior_runtime(campaign_policy, runtime=runtime)
+        except DurableExecutionError as exc:
+            raise ValueError(str(exc)) from exc
     return {
         "campaign_id": campaign_id,
         "research_generation_id": research_generation_id,
@@ -781,6 +1503,9 @@ def _historical_lineage_payload(runtime: PlayHandLabRuntimeConfig) -> dict[str, 
         return None
     return {
         "campaign_id": str(runtime.campaign_id),
+        "formal_authority_kind": str(runtime.formal_authority_kind or "level_c"),
+        "phase3_authority_id": str(runtime.phase3_authority_id or ""),
+        "phase3_authority_sha256": str(runtime.phase3_authority_sha256 or ""),
         "research_generation_id": str(runtime.research_generation_id),
         "level_c_protocol_id": str(runtime.level_c_protocol_id),
         "cutoff_key": str(runtime.cutoff_key),
@@ -991,6 +1716,62 @@ def _normalize_runtime(runtime: PlayHandLabRuntimeConfig) -> PlayHandLabRuntimeC
                 if runtime.expected_seed_plan_sha256
                 else None
             )
+        ),
+        current_atlas_generation=(
+            str(runtime.current_atlas_generation).strip()
+            if runtime.current_atlas_generation
+            else None
+        ),
+        current_atlas_run_sequence=(
+            int(runtime.current_atlas_run_sequence)
+            if runtime.current_atlas_run_sequence is not None
+            and not isinstance(runtime.current_atlas_run_sequence, bool)
+            else runtime.current_atlas_run_sequence
+        ),
+        formal_authority_kind=(
+            str(runtime.formal_authority_kind).strip().lower()
+            if runtime.formal_authority_kind
+            else None
+        ),
+        phase3_authority_path=(
+            Path(runtime.phase3_authority_path).expanduser().resolve()
+            if runtime.phase3_authority_path
+            else None
+        ),
+        phase2_capsule_root=(
+            Path(runtime.phase2_capsule_root).expanduser().resolve()
+            if runtime.phase2_capsule_root
+            else None
+        ),
+        campaign_policy_manifest_path=(
+            Path(runtime.campaign_policy_manifest_path).expanduser().resolve()
+            if runtime.campaign_policy_manifest_path
+            else None
+        ),
+        phase3_authority_id=(
+            str(runtime.phase3_authority_id).strip()
+            if runtime.phase3_authority_id
+            else None
+        ),
+        phase3_authority_sha256=(
+            str(runtime.phase3_authority_sha256).strip()
+            if runtime.phase3_authority_sha256
+            else None
+        ),
+        campaign_policy_manifest_sha256=(
+            str(runtime.campaign_policy_manifest_sha256).strip()
+            if runtime.campaign_policy_manifest_sha256
+            else None
+        ),
+        campaign_policy_source_file_sha256=(
+            str(runtime.campaign_policy_source_file_sha256).strip()
+            if runtime.campaign_policy_source_file_sha256
+            else None
+        ),
+        operator_launch_worker_image=(
+            str(runtime.operator_launch_worker_image).strip()
+            if runtime.operator_launch_worker_image
+            else None
         ),
         source_snapshot_sha256=(
             str(runtime.source_snapshot_sha256).strip()
@@ -1297,6 +2078,9 @@ def _campaign_run_id() -> str:
 def _historical_campaign_lineage(runtime: PlayHandLabRuntimeConfig) -> dict[str, Any]:
     return {
         "campaign_id": runtime.campaign_id,
+        "formal_authority_kind": runtime.formal_authority_kind or "level_c",
+        "phase3_authority_id": runtime.phase3_authority_id or "",
+        "phase3_authority_sha256": runtime.phase3_authority_sha256 or "",
         "as_of_date": runtime.as_of_date,
         "lake_manifest_sha256": runtime.lake_manifest_sha256,
         "research_generation_id": runtime.research_generation_id,
@@ -1463,6 +2247,10 @@ def _write_campaign_metadata(
             "screen_anchor_mode": runtime.screen_anchor_mode,
             "screen_anchor_envelope_months": runtime.screen_anchor_envelope_months,
             "as_of_date": runtime.as_of_date,
+            "formal_authority_kind": runtime.formal_authority_kind or "level_c",
+            "phase3_authority_id": runtime.phase3_authority_id or "",
+            "phase3_authority_sha256": runtime.phase3_authority_sha256 or "",
+            "operator_launch_worker_image": runtime.operator_launch_worker_image,
             "lake_manifest_sha256": runtime.lake_manifest_sha256,
             "research_generation_id": runtime.research_generation_id,
             "level_c_protocol_id": runtime.level_c_protocol_id,
@@ -1614,6 +2402,7 @@ def _seed_indicators(
     cli: FuzzfolioCli,
     campaign_ctx: PlayHandContext,
     runtime: PlayHandLabRuntimeConfig,
+    emit_events: bool = True,
 ) -> tuple[list[SeedIndicator], dict[str, Any] | None, Path | None]:
     if runtime.as_of_date:
         seed_plan, seed_plan_path, _seed_plan_sha256 = _load_exact_historical_seed_plan(
@@ -1622,6 +2411,10 @@ def _seed_indicators(
         )
     else:
         seed_plan, seed_plan_path = _load_play_hand_seed_plan(config, runtime.seed_plan_path)
+    if isinstance(seed_plan, dict):
+        # v2 plans carry their policy digest in-band. The shared validator is
+        # intentionally the sole schema/digest authority; v1 returns None.
+        validate_seed_plan_campaign_policy(seed_plan)
     pinned = [SeedIndicator(id=item) for item in runtime.indicator or []]
     scaffoldable_indicator_ids: set[str] | None = None
     if runtime.profile_path is None:
@@ -1639,7 +2432,7 @@ def _seed_indicators(
             indicators,
             scaffoldable_indicator_ids=scaffoldable_indicator_ids,
         )
-        if invalid:
+        if invalid and emit_events:
             _append_event(
                 campaign_ctx,
                 "seed_indicators",
@@ -1687,23 +2480,25 @@ def _seed_indicators(
         valid, _invalid = scaffoldable_pool(seed_plan_candidates, source="seed_plan")
         if len(valid) >= runtime.min_indicators:
             return valid, seed_plan, seed_plan_path
-        _append_event(
-            campaign_ctx,
-            "seed_indicators",
-            "seed_plan_pool_too_small",
-            valid_count=len(valid),
-            min_indicators=runtime.min_indicators,
-        )
+        if emit_events:
+            _append_event(
+                campaign_ctx,
+                "seed_indicators",
+                "seed_plan_pool_too_small",
+                valid_count=len(valid),
+                min_indicators=runtime.min_indicators,
+            )
     try:
         seeded = _seed_hand(config, cli, campaign_ctx.run_dir)
     except Exception as exc:
-        _append_event(
-            campaign_ctx,
-            "seed_hand",
-            "fallback",
-            error=str(exc)[:500],
-            fallback_indicators=["RSI", "MACD", "SMA"],
-        )
+        if emit_events:
+            _append_event(
+                campaign_ctx,
+                "seed_hand",
+                "fallback",
+                error=str(exc)[:500],
+                fallback_indicators=["RSI", "MACD", "SMA"],
+            )
         seeded = [SeedIndicator("RSI"), SeedIndicator("MACD"), SeedIndicator("SMA")]
     valid, _invalid = scaffoldable_pool(seeded or [], source="seed_prompt")
     if len(valid) >= runtime.min_indicators:
@@ -1727,6 +2522,8 @@ def _deal_lane(
     seed_indicators: list[SeedIndicator],
     seed_plan: dict[str, Any] | None,
     rng: random.Random,
+    policy_lane: str | None = None,
+    negative_prior_runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     seed_indicators = [indicator for item in seed_indicators if (indicator := _coerce_seed_indicator(item))]
     shuffled = list(seed_indicators)
@@ -1744,10 +2541,16 @@ def _deal_lane(
         max_indicators=runtime.max_indicators,
         rng=rng,
     )
+    campaign_policy = (
+        validate_seed_plan_campaign_policy(seed_plan)
+        if isinstance(seed_plan, dict)
+        else None
+    )
     deal_seed_plan = seed_plan
-    if runtime.as_of_date and isinstance(seed_plan, dict):
+    if runtime.as_of_date and isinstance(seed_plan, dict) and campaign_policy is None:
         # Formal runs use the frozen plan's guided distribution only. Atlas's
-        # exploration fraction would otherwise select a generic fallback.
+        # legacy exploration fraction would otherwise select a generic fallback.
+        # Policy-honest v2 plans carry their own deterministic lane assignment.
         sampling_policy = seed_plan.get("sampling_policy")
         deal_seed_plan = {
             **seed_plan,
@@ -1762,9 +2565,11 @@ def _deal_lane(
         seed_plan=deal_seed_plan,
         rng=rng,
         seed_plan_candidates=seed_plan_candidates,
+        policy_lane=policy_lane,
+        negative_prior_runtime=negative_prior_runtime,
     )
     dealt_entries = list(indicator_deal.get("indicators") or [])
-    if runtime.as_of_date:
+    if runtime.as_of_date and campaign_policy is None:
         selected_slots = [str(slot) for slot in indicator_deal.get("selected_slots") or []]
         if (
             indicator_deal.get("source") != "play_hand_seed_plan"
@@ -1804,6 +2609,146 @@ def _deal_lane(
         "dealt": [indicator.id for indicator in dealt_entries],
         "instrument_deal": instrument_deal,
         "instruments": list(instrument_deal["instruments"]),
+        "primary_instrument": instrument_deal.get("primary_instrument"),
+        "timeframe": str(runtime.timeframe).strip().upper(),
+    }
+
+
+def _select_policy_lane_deal(
+    *,
+    config: AppConfig,
+    runtime: PlayHandLabRuntimeConfig,
+    seed_indicators: list[SeedIndicator],
+    seed_plan: dict[str, Any],
+    lane_index: int,
+    policy_state: dict[str, Any],
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Choose a cap-compliant candidate from one preassigned v2 lane."""
+    policy_lane = _policy_lane_for_index(policy_state, lane_index)
+    candidate_rows: list[tuple[tuple[str, ...], dict[str, Any], dict[str, Any], int]] = []
+    candidate_attempts: list[dict[str, Any]] = []
+    seen_candidates: set[str] = set()
+    negative_prior_runtime = policy_state.get("negative_prior_runtime")
+    if not isinstance(negative_prior_runtime, dict):
+        raise DurableExecutionError("policy state has no negative-prior runtime binding")
+    for attempt in range(POLICY_CANDIDATE_FALLBACK_ATTEMPTS):
+        candidate_rng = random.Random(
+            f"play-hand-lab-policy:{runtime.seed}:{lane_index}:candidate:{attempt}"
+        )
+        deal = _deal_lane(
+            config=config,
+            runtime=runtime,
+            seed_indicators=seed_indicators,
+            seed_plan=seed_plan,
+            rng=candidate_rng,
+            policy_lane=policy_lane,
+            negative_prior_runtime=negative_prior_runtime,
+        )
+        indicator_deal = deal.get("indicator_deal") if isinstance(deal, dict) else None
+        indicator_deal = indicator_deal if isinstance(indicator_deal, dict) else {}
+        if indicator_deal.get("policy_outcome_type") == POLICY_EXHAUSTION_OUTCOME:
+            candidate_attempts.append(
+                {
+                    "attempt": attempt,
+                    "outcome": POLICY_EXHAUSTION_OUTCOME,
+                    "negative_prior_decisions": copy.deepcopy(
+                        indicator_deal.get("negative_prior_decisions") or []
+                    ),
+                }
+            )
+            continue
+        attributes = _policy_candidate_attributes(deal, policy_state=policy_state)
+        if attributes is None:
+            candidate_attempts.append(
+                {
+                    "attempt": attempt,
+                    "outcome": str(
+                        (deal.get("indicator_deal") or {}).get("policy_outcome_type")
+                        or "policy_candidate_attribute_missing"
+                    ),
+                    "negative_prior_decisions": copy.deepcopy(
+                        (deal.get("indicator_deal") or {}).get("negative_prior_decisions")
+                        or []
+                    ),
+                }
+            )
+            continue
+        candidate_id = str(attributes["candidate_id"])
+        if candidate_id in seen_candidates:
+            continue
+        seen_candidates.add(candidate_id)
+        candidate_rows.append(
+            (
+                _policy_candidate_sort_key(attributes, policy_state=policy_state),
+                deal,
+                attributes,
+                attempt,
+            )
+        )
+    candidate_rows.sort(key=lambda row: row[0])
+    for sort_key, deal, attributes, attempt in candidate_rows:
+        cap_decision = _policy_cap_decision(policy_state, attributes)
+        candidate_attempts.append(
+            {
+                "attempt": attempt,
+                "candidate_id": attributes["candidate_id"],
+                "candidate_tie_break_key": list(sort_key),
+                "cap_decision": copy.deepcopy(cap_decision),
+                "negative_prior_decisions": copy.deepcopy(
+                    (deal.get("indicator_deal") or {}).get("negative_prior_decisions")
+                    or []
+                ),
+            }
+        )
+        if cap_decision["outcome"] == "accepted":
+            execution = policy_state.get("execution") or {}
+            return deal, {
+                "policy_lane": policy_lane,
+                "policy_manifest_sha256": policy_state.get("policy_manifest_sha256"),
+                "policy_outcome_type": "policy_lane_selected",
+                "allocation": {
+                    "lane_index": lane_index,
+                    "planned_lane_count": (policy_state.get("planned_lane_counts") or {}).get(
+                        policy_lane
+                    ),
+                    "algorithm": execution.get("allocation_algorithm"),
+                    "algorithm_version": execution.get("allocation_algorithm_version"),
+                    "lane_tie_break_order": execution.get("lane_tie_break_order"),
+                    "candidate_tie_break_order": execution.get("candidate_tie_break_order"),
+                },
+                "candidate_attributes": attributes,
+                "cap_decision": cap_decision,
+                "candidate_fallback_decisions": candidate_attempts,
+                "negative_prior_decisions": copy.deepcopy(
+                    (deal.get("indicator_deal") or {}).get("negative_prior_decisions") or []
+                ),
+                "negative_prior_runtime": copy.deepcopy(negative_prior_runtime),
+            }
+    exhaustion_outcome = (
+        "policy_cap_exhausted" if candidate_rows else POLICY_EXHAUSTION_OUTCOME
+    )
+    execution = policy_state.get("execution") or {}
+    return None, {
+        "policy_lane": policy_lane,
+        "policy_manifest_sha256": policy_state.get("policy_manifest_sha256"),
+        "policy_outcome_type": exhaustion_outcome,
+        "allocation": {
+            "lane_index": lane_index,
+            "planned_lane_count": (policy_state.get("planned_lane_counts") or {}).get(
+                policy_lane
+            ),
+            "algorithm": execution.get("allocation_algorithm"),
+            "algorithm_version": execution.get("allocation_algorithm_version"),
+            "lane_tie_break_order": execution.get("lane_tie_break_order"),
+            "candidate_tie_break_order": execution.get("candidate_tie_break_order"),
+        },
+        "candidate_fallback_decisions": candidate_attempts,
+        "negative_prior_decisions": [
+            decision
+            for candidate in candidate_attempts
+            for decision in candidate.get("negative_prior_decisions") or []
+        ],
+        "negative_prior_runtime": copy.deepcopy(negative_prior_runtime),
     }
 
 
@@ -1840,6 +2785,10 @@ def _indicator_deal_metadata(indicator_deal: dict[str, Any] | None) -> dict[str,
         "family_policy": deal.get("family_policy"),
         "policy_target_count": deal.get("policy_target_count"),
         "selected_slots": deal.get("selected_slots"),
+        "policy_lane": deal.get("policy_lane"),
+        "policy_manifest_sha256": deal.get("policy_manifest_sha256"),
+        "policy_outcome_type": deal.get("policy_outcome_type"),
+        "negative_prior_decisions": deal.get("negative_prior_decisions"),
     }
     return {
         "indicator_deal": payload,
@@ -1856,6 +2805,10 @@ def _indicator_deal_metadata(indicator_deal: dict[str, Any] | None) -> dict[str,
         "dealt_pair_family_policy": payload["family_policy"],
         "dealt_policy_target_count": payload["policy_target_count"],
         "dealt_recipe_slots": payload["selected_slots"],
+        "policy_lane": payload["policy_lane"],
+        "policy_manifest_sha256": payload["policy_manifest_sha256"],
+        "policy_outcome_type": payload["policy_outcome_type"],
+        "negative_prior_decisions": payload["negative_prior_decisions"],
     }
 
 
@@ -3059,6 +4012,7 @@ def _deep_replay_job_payload(
         "required_worker_contract_hash": worker_contract_hash,
         "required_worker_contract_schema": runtime.worker_contract_schema,
         "required_capabilities": ["deep_replay"],
+        "policy_assignment": copy.deepcopy(lane.policy_assignment),
     }
     lineage = _historical_lineage_payload(runtime)
     if lineage:
@@ -3144,10 +4098,11 @@ def _make_deep_replay_task(
             "instruments": list(instruments),
             "timeframe": timeframe,
             "lookback_months": lookback_months,
-            "analysis_window_start": analysis_window_start,
-            "analysis_window_end": analysis_window_end,
-            "evidence_plan": payload.get("evidence_plan"),
-        },
+                "analysis_window_start": analysis_window_start,
+                "analysis_window_end": analysis_window_end,
+                "evidence_plan": payload.get("evidence_plan"),
+                "policy_assignment": copy.deepcopy(lane.policy_assignment),
+            },
     )
     return {
         "task_id": task_id,
@@ -3223,6 +4178,7 @@ def _sweep_definition_payload(
             "commission_bps": 0.5,
         },
         "evidence_plan": evidence_payload,
+        "policy_assignment": copy.deepcopy(lane.policy_assignment),
     }
     lineage = _historical_lineage_payload(runtime)
     if lineage:
@@ -3312,6 +4268,7 @@ def _make_sweep_shard_tasks(
             "required_worker_contract_schema": runtime.worker_contract_schema,
             "required_capabilities": ["deep_replay", "sweep_shard"],
             "result_detail": "summary",
+            "policy_assignment": copy.deepcopy(lane.policy_assignment),
         }
         _register_task_spec(
             lane,
@@ -3342,6 +4299,7 @@ def _make_sweep_shard_tasks(
                 "permutation_count": len(chunk),
                 "params_by_index": params_by_index,
                 "result_detail": "summary",
+                "policy_assignment": copy.deepcopy(lane.policy_assignment),
             },
         )
         tasks.append(
@@ -3372,6 +4330,8 @@ def _build_tasks(
 ) -> list[dict[str, Any]]:
     tasks: list[dict[str, Any]] = []
     for lane in lanes:
+        if lane.terminal:
+            continue
         if (
             runtime.task_mode == "deep_replay"
             and runtime.pipeline_mode == PLAY_HAND_LAB_PLAY_HAND_PIPELINE
@@ -3412,6 +4372,7 @@ def _build_tasks(
                     "task_kind": "fake_compute",
                     "work_seconds": runtime.fake_work_seconds,
                     "required_capabilities": required_worker_capabilities,
+                    "policy_assignment": copy.deepcopy(lane.policy_assignment),
                 }
             else:
                 if not worker_contract_hash:
@@ -3439,6 +4400,7 @@ def _build_tasks(
                     "instruments": list(lane.instruments),
                     "timeframe": lane.timeframe,
                     "lookback_months": runtime.lookback_months,
+                    "policy_assignment": copy.deepcopy(lane.policy_assignment),
                 },
             )
             tasks.append(
@@ -3690,6 +4652,9 @@ def _record_lab_result(
                 "analysis_window_end": task_spec.get("analysis_window_end"),
                 "evidence_plan_id": evidence_plan.get("plan_id"),
                 "evidence_role": evidence_plan.get("evidence_role"),
+                "policy_assignment": copy.deepcopy(
+                    task_spec.get("policy_assignment") or lane.policy_assignment
+                ),
                 "sweep_payload": (
                     _load_json(artifact_dir / "sweep-results.json")
                     if task_kind == "sweep_shard" and (artifact_dir / "sweep-results.json").is_file()
@@ -3829,6 +4794,9 @@ def _record_lab_result(
             "worker_lease_id": lab_result.get("lease_id"),
             "lab_worker_result_sha256": result_identity,
             "run_status": "failed" if score_warning else "screened",
+            "policy_assignment": copy.deepcopy(
+                task_spec.get("policy_assignment") or lane.policy_assignment
+            ),
         }
     )
     if score_warning:
@@ -3876,6 +4844,9 @@ def _record_lab_result(
         "analysis_window_end": task_spec.get("analysis_window_end"),
         "evidence_plan_id": evidence_plan.get("plan_id"),
         "evidence_role": evidence_plan.get("evidence_role"),
+        "policy_assignment": copy.deepcopy(
+            task_spec.get("policy_assignment") or lane.policy_assignment
+        ),
         "sweep_payload": sweep_payload if task_kind == "sweep_shard" else None,
     }
     _write_task_result_receipt(
@@ -5605,31 +6576,85 @@ def _finalize_historical_campaign_status(
     return "failed", reason
 
 
+def preflight_play_hand_lab(runtime: PlayHandLabRuntimeConfig) -> dict[str, Any]:
+    """Validate a PlayHand launch without creating state or enqueueing work."""
+    runtime = _normalize_runtime(runtime)
+    config = load_config()
+    cli = FuzzfolioCli(config.fuzzfolio)
+    gateway = LabGatewayClient(base_url=runtime.gateway_url, token=runtime.gateway_token)
+    worker_contract_hash = (
+        str(runtime.worker_contract_hash)
+        if runtime.as_of_date
+        else _resolve_worker_contract_hash(config=config, runtime=runtime)
+    )
+    campaign_id = runtime.campaign_id or _campaign_run_id()
+    campaign_dir = _derived_campaign_root(config) / campaign_id
+    if runtime.as_of_date:
+        _reject_existing_historical_campaign_path(campaign_dir, runtime=runtime)
+
+    health = gateway.health()
+    if not health.get("ok"):
+        raise RuntimeError(f"Lab gateway health check failed: {health}")
+
+    campaign_ctx = _campaign_context(
+        config=config,
+        cli=cli,
+        campaign_id=campaign_id,
+        campaign_dir=campaign_dir,
+        runtime=runtime,
+    )
+    seed_indicators, seed_plan, seed_plan_path = _seed_indicators(
+        config=config,
+        cli=cli,
+        campaign_ctx=campaign_ctx,
+        runtime=runtime,
+        emit_events=False,
+    )
+    if runtime.as_of_date and (seed_plan is None or seed_plan_path is None):
+        raise RuntimeError("Historical PlayHand did not load its frozen Atlas seed plan.")
+    campaign_policy = (
+        validate_seed_plan_campaign_policy(seed_plan)
+        if isinstance(seed_plan, dict)
+        else None
+    )
+    play_hand_reward_matrix(runtime.max_reward_r)
+    return {
+        "campaign_id": campaign_id,
+        "campaign_dir": str(campaign_dir),
+        "gateway_ok": True,
+        "seed_indicator_count": len(seed_indicators),
+        "seed_plan_path": str(seed_plan_path) if seed_plan_path else None,
+        "worker_contract_hash": worker_contract_hash,
+        "campaign_policy_bound": campaign_policy is not None,
+    }
+
+
 def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     runtime = _normalize_runtime(runtime or PlayHandLabRuntimeConfig())
     config = load_config()
     if runtime.as_of_date:
-        if runtime.execution_plan_path is None:
-            raise ValueError("Historical PlayHand requires one authoritative execution plan.")
-        _expected_arguments, authoritative_plan = validate_executor_runtime_binding(
-            runtime.execution_plan_path,
-            executor="playhand",
-            observed={
-                **asdict(runtime),
-                "execution_plan_path": runtime.execution_plan_path,
-            },
-            config=config,
-        )
-        authoritative_root = Path(
-            str((authoritative_plan.get("generation") or {}).get("active_runs_root") or "")
-        ).resolve(strict=False)
-        if config.runs_root.resolve(strict=False) != authoritative_root:
-            raise ValueError("Historical PlayHand config runs_root conflicts with authoritative execution plan.")
-        bound_contract = authoritative_plan.get("bound_contract") or {}
-        validate_profile_model_source_lock(
-            bound_contract.get("profile_model_source_lock") or {},
-            _trading_dashboard_root(config=config, runtime=runtime),
-        )
+        if not _is_phase3_formal_runtime(runtime):
+            if runtime.execution_plan_path is None:
+                raise ValueError("Historical PlayHand requires one authoritative execution plan.")
+            _expected_arguments, authoritative_plan = validate_executor_runtime_binding(
+                runtime.execution_plan_path,
+                executor="playhand",
+                observed={
+                    **asdict(runtime),
+                    "execution_plan_path": runtime.execution_plan_path,
+                },
+                config=config,
+            )
+            authoritative_root = Path(
+                str((authoritative_plan.get("generation") or {}).get("active_runs_root") or "")
+            ).resolve(strict=False)
+            if config.runs_root.resolve(strict=False) != authoritative_root:
+                raise ValueError("Historical PlayHand config runs_root conflicts with authoritative execution plan.")
+            bound_contract = authoritative_plan.get("bound_contract") or {}
+            validate_profile_model_source_lock(
+                bound_contract.get("profile_model_source_lock") or {},
+                _trading_dashboard_root(config=config, runtime=runtime),
+            )
     cli = FuzzfolioCli(config.fuzzfolio)
     gateway = LabGatewayClient(base_url=runtime.gateway_url, token=runtime.gateway_token)
     worker_contract_hash = (
@@ -5722,6 +6747,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             extra={"failed_reason": "seed_indicator_preflight_failed", "error": str(exc)[:1000]},
         )
         raise
+    campaign_policy = (
+        validate_seed_plan_campaign_policy(seed_plan)
+        if isinstance(seed_plan, dict)
+        else None
+    )
     reward_matrix = play_hand_reward_matrix(runtime.max_reward_r)
     lanes: list[LabLaneState] = []
     tasks: list[dict[str, Any]] = []
@@ -5754,6 +6784,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             for task_id in lane.task_ids:
                 lanes_by_task[task_id] = lane
         tasks = [dict(item["payload"]) for item in journal.unresolved()]
+    history.campaign_policy_state = _campaign_policy_state(
+        campaign_policy,
+        runtime=runtime,
+        persisted=history.campaign_policy_state,
+    )
 
     def persist_campaign_state() -> None:
         _write_campaign_state(
@@ -5792,6 +6827,12 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     raise DurableExecutionError(
                         f"journal and artifact receipts conflict for task {task_id}"
                     )
+                if history.campaign_policy_state is not None and recorded.get(
+                    "policy_assignment"
+                ) != lane.policy_assignment:
+                    raise DurableExecutionError(
+                        f"terminal receipt policy assignment mismatch: {task_id}"
+                    )
                 if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
                     continue
                 if recorded.get("status") == "failed":
@@ -5819,6 +6860,15 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 if candidate.lane_id == str(task.get("lane_id") or "")
             )
             lanes_by_task[str(task["task_id"])] = lane
+        if history.campaign_policy_state is not None:
+            history.campaign_policy_state = (
+                _recompute_campaign_policy_state_from_durable_lanes(
+                    history.campaign_policy_state,
+                    lanes=lanes,
+                    unresolved_tasks=tasks,
+                    pruned_lane_count=history.pruned_lane_count,
+                )
+            )
         persist_campaign_state()
 
     def enqueue_chunk_run_limit() -> int:
@@ -5859,14 +6909,65 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             run_id=run_id,
             run_dir=run_dir,
         )
-        lane_rng = random.Random(f"play-hand-lab:{runtime.seed}:{lane_index}")
-        deal = _deal_lane(
-            config=config,
-            runtime=runtime,
-            seed_indicators=seed_indicators,
-            seed_plan=seed_plan,
-            rng=lane_rng,
-        )
+        policy_state = history.campaign_policy_state
+        if policy_state is not None:
+            if not isinstance(seed_plan, dict):
+                raise DurableExecutionError("policy-honest campaign is missing its v2 seed plan")
+            deal, lane.policy_assignment = _select_policy_lane_deal(
+                config=config,
+                runtime=runtime,
+                seed_indicators=seed_indicators,
+                seed_plan=seed_plan,
+                lane_index=lane_index,
+                policy_state=policy_state,
+            )
+            policy_lane = str(lane.policy_assignment["policy_lane"])
+            if deal is None:
+                _record_policy_assignment(
+                    policy_state,
+                    lane=policy_lane,
+                    cap_decision=None,
+                    exhaustion_outcome=str(lane.policy_assignment["policy_outcome_type"]),
+                )
+                lane.terminal = True
+                lane.tombstone_reason = str(lane.policy_assignment["policy_outcome_type"])
+                lane.tombstone_reasons.append(lane.tombstone_reason)
+                lane.terminal_outcome_category = POLICY_EXHAUSTION_OUTCOME
+                _set_lane_phase(
+                    lane,
+                    POLICY_EXHAUSTION_OUTCOME,
+                    event="policy_lane_exhausted",
+                    policy_assignment=copy.deepcopy(lane.policy_assignment),
+                )
+                _write_lane_metadata(
+                    lane,
+                    campaign_ctx=campaign_ctx,
+                    runtime=runtime,
+                    status=POLICY_EXHAUSTION_OUTCOME,
+                    started_at=started_at,
+                    extra={
+                        "policy_assignment": copy.deepcopy(lane.policy_assignment),
+                        "campaign_policy_accounting": copy.deepcopy(policy_state),
+                    },
+                )
+                _append_event(
+                    campaign_ctx,
+                    lane_id,
+                    POLICY_EXHAUSTION_OUTCOME,
+                    lane_run_id=run_id,
+                    policy_assignment=copy.deepcopy(lane.policy_assignment),
+                )
+                return lane, lane_ctx
+            lane_rng = random.Random(f"play-hand-lab:{runtime.seed}:{lane_index}:profile")
+        else:
+            lane_rng = random.Random(f"play-hand-lab:{runtime.seed}:{lane_index}")
+            deal = _deal_lane(
+                config=config,
+                runtime=runtime,
+                seed_indicators=seed_indicators,
+                seed_plan=seed_plan,
+                rng=lane_rng,
+            )
         _prepare_lane_profile(
             lane_ctx,
             runtime=runtime,
@@ -5875,6 +6976,12 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             deal=deal,
             rng=lane_rng,
         )
+        if policy_state is not None:
+            _record_policy_assignment(
+                policy_state,
+                lane=str(lane.policy_assignment["policy_lane"]),
+                cap_decision=dict(lane.policy_assignment["cap_decision"]),
+            )
         _sample_lane_screen_anchor(lane, runtime)
         _write_lane_metadata(
             lane,
@@ -5894,6 +7001,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 "reward_matrix": reward_matrix,
                 "required_worker_contract_hash": worker_contract_hash,
                 "required_worker_contract_schema": runtime.worker_contract_schema,
+                "policy_assignment": copy.deepcopy(lane.policy_assignment),
+                "campaign_policy_accounting": (
+                    copy.deepcopy(policy_state) if policy_state is not None else None
+                ),
             },
         )
         _append_event(
@@ -5907,6 +7018,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             timeframe=lane.timeframe,
             screen_analysis_window_start=lane.screen_analysis_window_start,
             screen_analysis_window_end=lane.screen_analysis_window_end,
+            policy_assignment=copy.deepcopy(lane.policy_assignment),
         )
         return lane, lane_ctx
 
@@ -5922,8 +7034,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     def prepare_lanes(start_index: int, count: int) -> list[LabLaneState]:
         if count <= 0:
             return []
-        if count == 1:
-            return [prepare_lane(start_index)]
+        if count == 1 or history.campaign_policy_state is not None:
+            # Cap accounting is a mutable campaign-level reservation. Keep v2
+            # preparation ordered so a crash can only recover the same lane.
+            return [prepare_lane(start_index + offset) for offset in range(count)]
         prepared: list[tuple[int, LabLaneState, PlayHandContext]] = []
         max_workers = lane_prepare_worker_count(count)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:

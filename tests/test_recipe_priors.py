@@ -1,10 +1,23 @@
 from __future__ import annotations
 
+import pytest
+
 from autoresearch.recipe_priors import (
+    CampaignPolicyValidationError,
+    build_campaign_policy_manifest,
     build_recipe_prior_artifacts,
     build_timing_evidence,
+    campaign_diversity_cap_count,
+    canonical_campaign_candidate_attributes,
+    canonical_campaign_candidate_id,
+    canonical_campaign_policy_json,
+    is_negative_prior_active,
+    negative_prior_expiry_status,
+    ordered_campaign_policy_conflicts,
     score_slot_candidate,
     timing_policy_for,
+    validate_campaign_policy_manifest,
+    validate_seed_plan_campaign_policy,
 )
 
 
@@ -23,6 +36,57 @@ def _indicator(
         "generation_eligible": "True",
         "static_prior_score": str(static_score),
     }
+
+
+def _phase3_policy_manifest(
+    *,
+    lane_fractions: dict[str, float] | None = None,
+    diversity_max_shares: dict[str, float] | None = None,
+    lane_eligible_menus: dict[str, object] | None = None,
+    source_atlas_generation: str = "atlas-generation-2026-07-21",
+    source_atlas_run_sequence: int = 41,
+) -> dict[str, object]:
+    return build_campaign_policy_manifest(
+        lane_fractions=lane_fractions
+        or {"guided": 0.60, "uncertain": 0.25, "wild": 0.15},
+        lane_eligible_menus=lane_eligible_menus
+        or {
+            "guided": {
+                "recipe_sources": [
+                    "discovery_recipe_validation",
+                    "curated_recipe_prior",
+                ],
+                "slot_sampling_lanes": ["medium_prior", "high_prior"],
+                "pair_sampling_lanes": ["positive_pair"],
+                "allow_generation_eligible_fallback": False,
+            },
+            "uncertain": {
+                "recipe_sources": [
+                    "curated_recipe_prior",
+                    "discovery_recipe_validation",
+                ],
+                "slot_sampling_lanes": ["uncertain_prior"],
+                "pair_sampling_lanes": ["near_miss_pair"],
+                "allow_generation_eligible_fallback": False,
+            },
+            "wild": {
+                "recipe_sources": ["curated_recipe_prior"],
+                "slot_sampling_lanes": ["wild_exploration"],
+                "pair_sampling_lanes": ["low_pair"],
+                "allow_generation_eligible_fallback": True,
+            },
+        },
+        diversity_max_shares=diversity_max_shares
+        or {
+            "family": 0.05,
+            "recipe": 0.30,
+            "instrument": 0.10,
+            "timeframe": 0.60,
+            "indicator": 0.15,
+        },
+        source_atlas_generation=source_atlas_generation,
+        source_atlas_run_sequence=source_atlas_run_sequence,
+    )
 
 
 def test_timing_policy_allows_only_material_nonfragile_variants() -> None:
@@ -762,3 +826,428 @@ def test_build_recipe_prior_artifacts_tiers_sampling_policy_by_distinct_36m_fami
         "curated_recipe_prior": 0.40,
     }
     assert broad_seed_plan["sampling_policy"]["maturity"] == "broad_36m_retention"
+
+
+def test_campaign_policy_manifest_has_deterministic_canonical_identity() -> None:
+    first = _phase3_policy_manifest()
+    second = _phase3_policy_manifest()
+    changed_anchor = _phase3_policy_manifest(source_atlas_run_sequence=42)
+    tampered = {
+        **first,
+        "negative_prior_expiry": {
+            **first["negative_prior_expiry"],
+            "anchor": {
+                **first["negative_prior_expiry"]["anchor"],
+                "run_sequence": 42,
+            },
+        },
+    }
+
+    assert first == second
+    assert canonical_campaign_policy_json(first) == canonical_campaign_policy_json(second)
+    assert first["manifest_sha256"] == second["manifest_sha256"]
+    assert first["manifest_sha256"] != changed_anchor["manifest_sha256"]
+    assert validate_campaign_policy_manifest(first) == first
+    with pytest.raises(CampaignPolicyValidationError, match="does not match canonical"):
+        validate_campaign_policy_manifest(tampered)
+
+
+def test_campaign_policy_manifest_normalizes_whitespace_menu_tokens_before_export() -> None:
+    baseline = _phase3_policy_manifest()
+    whitespace_menus = {
+        lane: {
+            **baseline["lanes"][lane]["eligible_menus"],
+            "recipe_sources": [
+                f"  {source}  "
+                for source in baseline["lanes"][lane]["eligible_menus"][
+                    "recipe_sources"
+                ]
+            ],
+            "slot_sampling_lanes": [
+                f"  {sampling_lane}  "
+                for sampling_lane in baseline["lanes"][lane]["eligible_menus"][
+                    "slot_sampling_lanes"
+                ]
+            ],
+            "pair_sampling_lanes": [
+                f"  {sampling_lane}  "
+                for sampling_lane in baseline["lanes"][lane]["eligible_menus"][
+                    "pair_sampling_lanes"
+                ]
+            ],
+        }
+        for lane in ("guided", "uncertain", "wild")
+    }
+
+    normalized = _phase3_policy_manifest(lane_eligible_menus=whitespace_menus)
+
+    assert normalized == baseline
+    assert all(
+        token == token.strip()
+        for lane in normalized["lanes"].values()
+        for menu_name in ("recipe_sources", "slot_sampling_lanes", "pair_sampling_lanes")
+        for token in lane["eligible_menus"][menu_name]
+    )
+
+
+@pytest.mark.parametrize(
+    ("lane", "field", "replacement"),
+    [
+        ("guided", "pair_sampling_lanes", ["near_miss_pair"]),
+        ("uncertain", "pair_sampling_lanes", ["low_pair"]),
+        ("wild", "recipe_sources", ["discovery_recipe_validation"]),
+        ("wild", "slot_sampling_lanes", ["uncertain_prior"]),
+    ],
+)
+def test_campaign_policy_manifest_rejects_cross_lane_menu_sources(
+    lane: str,
+    field: str,
+    replacement: list[str],
+) -> None:
+    baseline = _phase3_policy_manifest()
+    menus = {
+        menu_lane: dict(baseline["lanes"][menu_lane]["eligible_menus"])
+        for menu_lane in ("guided", "uncertain", "wild")
+    }
+    menus[lane][field] = replacement
+
+    with pytest.raises(CampaignPolicyValidationError, match="unsupported values"):
+        _phase3_policy_manifest(lane_eligible_menus=menus)
+
+
+def test_campaign_policy_manifest_binds_deterministic_allocation_metadata() -> None:
+    policy = _phase3_policy_manifest()
+    execution = policy["execution"]
+    tampered = {
+        **policy,
+        "execution": {
+            **execution,
+            "allocation_algorithm_version": "v2",
+        },
+    }
+
+    assert execution == {
+        "allocation_algorithm": "hamilton_largest_remainder",
+        "allocation_algorithm_version": "v1",
+        "quota_basis": "campaign_lane_budget_times_lane_fraction",
+        "quota_rounding": "floor_then_descending_fractional_remainder",
+        "lane_tie_break_order": ["guided", "uncertain", "wild"],
+        "candidate_tie_break_order": [
+            "recipe_id",
+            "canonical_pair_family_id",
+            "instrument",
+            "timeframe",
+            "indicator_ids",
+            "candidate_id",
+        ],
+        "candidate_tie_break_direction": "ascending_lexicographic",
+        "candidate_evaluation_order": (
+            "lane_order_then_ascending_lexicographic_candidate_tie_break_order"
+        ),
+        "random_tie_break": "forbidden",
+    }
+    assert "seed" not in execution
+    with pytest.raises(CampaignPolicyValidationError, match="deterministic allocation"):
+        validate_campaign_policy_manifest(tampered)
+
+
+def test_campaign_candidate_id_normalizes_scalars_and_multi_indicators() -> None:
+    noisy_candidate = {
+        "recipe_id": " discovered_recipe_001 ",
+        "canonical_pair_family_id": " discovered_recipe_001|m5|rsi+willr ",
+        "instrument": " eurusd ",
+        "timeframe": " m5 ",
+        "indicator_ids": [" willr ", "RSI", "rsi", "", None, "WILLR"],
+    }
+    normalized_candidate = {
+        "recipe_id": {"kind": "value", "value": "DISCOVERED_RECIPE_001"},
+        "canonical_pair_family_id": {
+            "kind": "value",
+            "value": "DISCOVERED_RECIPE_001|M5|RSI+WILLR",
+        },
+        "instrument": {"kind": "value", "value": "EURUSD"},
+        "timeframe": {"kind": "value", "value": "M5"},
+        "indicator_ids": {
+            "state": "present",
+            "values": [
+                {"kind": "absent"},
+                {"kind": "blank"},
+                {"kind": "value", "value": "RSI"},
+                {"kind": "value", "value": "WILLR"},
+            ],
+        },
+    }
+    equivalent_candidate = {
+        "recipe_id": "DISCOVERED_RECIPE_001",
+        "canonical_pair_family_id": "DISCOVERED_RECIPE_001|M5|RSI+WILLR",
+        "instrument": "EURUSD",
+        "timeframe": "M5",
+        "indicator_ids": [None, "", "RSI", "WILLR"],
+    }
+
+    assert canonical_campaign_candidate_attributes(noisy_candidate) == normalized_candidate
+    assert canonical_campaign_candidate_id(noisy_candidate) == canonical_campaign_candidate_id(
+        equivalent_candidate
+    )
+
+
+def test_campaign_candidate_id_normalizes_missing_attributes_explicitly() -> None:
+    missing_attributes = canonical_campaign_candidate_attributes({"indicator_ids": []})
+    policy = _phase3_policy_manifest()
+    tampered = {
+        **policy,
+        "candidate_identity": {
+            **policy["candidate_identity"],
+            "scalar_normalization": "in_band_missing_sentinel",
+        },
+    }
+
+    assert missing_attributes == {
+        "recipe_id": {"kind": "absent"},
+        "canonical_pair_family_id": {"kind": "absent"},
+        "instrument": {"kind": "absent"},
+        "timeframe": {"kind": "absent"},
+        "indicator_ids": {"state": "present", "values": []},
+    }
+    assert canonical_campaign_candidate_id({}) == canonical_campaign_candidate_id(
+        {"indicator_ids": None}
+    )
+    assert "missing_value" not in policy["candidate_identity"]
+    assert policy["candidate_identity"]["scalar_representation"]["absent"] == {
+        "kind": "absent"
+    }
+    with pytest.raises(CampaignPolicyValidationError, match="canonical candidate_id contract"):
+        validate_campaign_policy_manifest(tampered)
+
+
+def test_campaign_candidate_id_keeps_absent_blank_and_literal_values_distinct() -> None:
+    common_candidate = {
+        "canonical_pair_family_id": "family",
+        "instrument": "EURUSD",
+        "timeframe": "M5",
+    }
+    scalar_variants = [
+        common_candidate,
+        {**common_candidate, "recipe_id": "  "},
+        {**common_candidate, "recipe_id": "<MISSING>"},
+        {**common_candidate, "recipe_id": "ordinary"},
+    ]
+    indicator_variants = [
+        {**common_candidate, "recipe_id": "recipe", "indicator_ids": None},
+        {**common_candidate, "recipe_id": "recipe", "indicator_ids": [""]},
+        {**common_candidate, "recipe_id": "recipe", "indicator_ids": ["<MISSING>"]},
+        {**common_candidate, "recipe_id": "recipe", "indicator_ids": ["ordinary"]},
+    ]
+
+    assert len({canonical_campaign_candidate_id(candidate) for candidate in scalar_variants}) == 4
+    assert len({canonical_campaign_candidate_id(candidate) for candidate in indicator_variants}) == 4
+    assert canonical_campaign_candidate_attributes(scalar_variants[0])["recipe_id"] == {
+        "kind": "absent"
+    }
+    assert canonical_campaign_candidate_attributes(scalar_variants[1])["recipe_id"] == {
+        "kind": "blank"
+    }
+    assert canonical_campaign_candidate_attributes(scalar_variants[2])["recipe_id"] == {
+        "kind": "value",
+        "value": "<MISSING>",
+    }
+    assert canonical_campaign_candidate_attributes(indicator_variants[0])["indicator_ids"] == {
+        "state": "absent",
+        "values": [],
+    }
+    assert canonical_campaign_candidate_attributes(indicator_variants[1])["indicator_ids"] == {
+        "state": "present",
+        "values": [{"kind": "blank"}],
+    }
+    assert canonical_campaign_candidate_attributes(indicator_variants[2])["indicator_ids"] == {
+        "state": "present",
+        "values": [{"kind": "value", "value": "<MISSING>"}],
+    }
+
+
+def test_campaign_policy_manifest_binds_cap_denominator_and_floor_rounding() -> None:
+    policy = _phase3_policy_manifest()
+    enforcement = policy["diversity_enforcement"]
+
+    assert enforcement["denominator_attribute"] == "target_runs"
+    assert enforcement["denominator_definition"] == "total planned campaign deals across all lanes"
+    assert enforcement["cap_limit_formula"] == "floor(target_runs * max_share)"
+    assert campaign_diversity_cap_count(policy, dimension="family", target_runs=19) == 0
+    assert campaign_diversity_cap_count(policy, dimension="family", target_runs=20) == 1
+    assert campaign_diversity_cap_count(policy, dimension="indicator", target_runs=13) == 1
+
+
+def test_campaign_policy_manifest_orders_simultaneous_conflicts_atomically() -> None:
+    policy = _phase3_policy_manifest()
+    enforcement = policy["diversity_enforcement"]
+
+    assert ordered_campaign_policy_conflicts({"indicator", "family", "timeframe"}) == [
+        "family",
+        "timeframe",
+        "indicator",
+    ]
+    assert enforcement["candidate_acceptance"] == "all_caps_checked_atomically_before_acceptance"
+    assert enforcement["candidate_conflict_result"] == "reject_candidate_and_report_all_conflicts"
+    assert enforcement["conflict_report_order"] == [
+        "family",
+        "recipe",
+        "instrument",
+        "timeframe",
+        "indicator",
+    ]
+
+
+def test_campaign_policy_manifest_binds_lane_exhaustion_without_cross_lane_borrowing() -> None:
+    policy = _phase3_policy_manifest()
+    enforcement = policy["diversity_enforcement"]
+    tampered = {
+        **policy,
+        "diversity_enforcement": {
+            **enforcement,
+            "lane_exhaustion_result_type": "lane_exhausted",
+        },
+    }
+
+    assert enforcement["lane_capacity"] == "fixed_allocated_lane_quota_no_cross_lane_borrowing"
+    assert enforcement["lane_exhaustion_result_type"] == "policy_lane_exhausted"
+    assert "allocated_lane_quota_unfilled" in enforcement["lane_exhaustion_condition"]
+    with pytest.raises(CampaignPolicyValidationError, match="cap enforcement contract"):
+        validate_campaign_policy_manifest(tampered)
+
+
+def test_campaign_policy_manifest_requires_each_diversity_attribute_contract() -> None:
+    policy = _phase3_policy_manifest()
+    contract = policy["diversity_attribute_contract"]
+    tampered = {
+        **policy,
+        "diversity_attribute_contract": {
+            **contract,
+            "instrument": {
+                **contract["instrument"],
+                "source_path": "recipes.<recipe_id>.pair_menu[].instrument",
+            },
+        },
+    }
+
+    assert set(contract) == {"family", "recipe", "instrument", "timeframe", "indicator"}
+    assert contract["family"]["candidate_attribute"] == "canonical_pair_family_id"
+    assert contract["instrument"]["source_path"] == "runtime_candidate.instrument"
+    assert contract["timeframe"]["definition"] == "the resolved timeframe for the selected candidate"
+    assert contract["indicator"]["aggregation"] == "one_charge_per_indicator_id_in_selected_deal"
+    with pytest.raises(CampaignPolicyValidationError, match="required attribute contract"):
+        validate_campaign_policy_manifest(tampered)
+
+
+@pytest.mark.parametrize(
+    ("lane_fractions", "diversity_max_shares", "message"),
+    [
+        (
+            {"guided": 0.55, "uncertain": 0.25, "wild": 0.15},
+            None,
+            "must sum to exactly 1",
+        ),
+        (
+            None,
+            {
+                "family": 1.01,
+                "recipe": 1.01,
+                "instrument": 0.10,
+                "timeframe": 0.60,
+                "indicator": 0.15,
+            },
+            "greater than 0 and at most 1",
+        ),
+    ],
+)
+def test_campaign_policy_manifest_rejects_invalid_quotas_and_caps(
+    lane_fractions: dict[str, float] | None,
+    diversity_max_shares: dict[str, float] | None,
+    message: str,
+) -> None:
+    with pytest.raises(CampaignPolicyValidationError, match=message):
+        _phase3_policy_manifest(
+            lane_fractions=lane_fractions,
+            diversity_max_shares=diversity_max_shares,
+        )
+
+
+def test_negative_prior_expiry_is_active_through_the_anchor_ttl_boundary() -> None:
+    policy = _phase3_policy_manifest(source_atlas_run_sequence=41)
+    negative_prior = {"expires_after_atlas_runs": 3}
+
+    assert (
+        negative_prior_expiry_status(
+            negative_prior,
+            policy,
+            current_atlas_generation="atlas-generation-2026-07-21",
+            current_atlas_run_sequence=40,
+        )
+        == "not_yet_active"
+    )
+    assert is_negative_prior_active(
+        negative_prior,
+        policy,
+        current_atlas_generation="atlas-generation-2026-07-21",
+        current_atlas_run_sequence=44,
+    )
+    assert (
+        negative_prior_expiry_status(
+            negative_prior,
+            policy,
+            current_atlas_generation="atlas-generation-2026-07-21",
+            current_atlas_run_sequence=45,
+        )
+        == "expired_run_sequence"
+    )
+    assert (
+        negative_prior_expiry_status(
+            negative_prior,
+            policy,
+            current_atlas_generation="different-generation",
+            current_atlas_run_sequence=41,
+        )
+        == "expired_generation_mismatch"
+    )
+
+
+def test_seed_plan_campaign_policy_preserves_legacy_and_requires_explicit_v2_manifest() -> None:
+    legacy_seed_plan = {
+        "sampling_policy": {"guided_prior_fraction": 1.0},
+        "recipes": {},
+    }
+    assert validate_seed_plan_campaign_policy(legacy_seed_plan) is None
+
+    policy = _phase3_policy_manifest()
+    (
+        payload,
+        _slot_rows,
+        _pair_rows,
+        _negative_pairs,
+        _negative_clusters,
+        _retention_failures,
+        seed_plan,
+        summary,
+    ) = build_recipe_prior_artifacts(
+        indicator_rows=[
+            _indicator("CONTEXT_A", signal_role="context", strategy_role="trend"),
+            _indicator("SETUP_A", signal_role="setup", strategy_role="mean-reversion"),
+            _indicator("TRIGGER_A", signal_role="trigger", strategy_role="mean-reversion"),
+        ],
+        static_slot_scores={},
+        signal_rollups={},
+        forward_priors={},
+        pair_results=[],
+        timing_results=[],
+        campaign_policy_manifest=policy,
+        max_slot_candidates=5,
+        max_pair_candidates=5,
+    )
+
+    assert seed_plan["schema_version"] == "play_hand_seed_plan_v2"
+    assert seed_plan["campaign_policy_sha256"] == policy["manifest_sha256"]
+    assert seed_plan["sampling_policy"]["guided_prior_fraction"] == 0.60
+    assert validate_seed_plan_campaign_policy(seed_plan) == policy
+    with pytest.raises(CampaignPolicyValidationError, match="expected digest"):
+        validate_seed_plan_campaign_policy(seed_plan, expected_policy_sha256="")
+    assert payload["campaign_policy_sha256"] == policy["manifest_sha256"]
+    assert summary["campaign_policy"]["manifest_sha256"] == policy["manifest_sha256"]

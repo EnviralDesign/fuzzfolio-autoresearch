@@ -782,6 +782,9 @@ PUBLIC_CLI_COMMANDS = {
     "render-portfolio-profile-drops",
     "cleanup-incomplete-playhand-runs",
     "cleanup-atlas-artifacts",
+    "phase2-atlas-capsule",
+    "phase3-playhand-authority",
+    "phase3-playhand",
     "rewind-atlas-lab-stages",
     "cleanup-playhand-lab-raw-artifacts",
     "archive-retired-universe",
@@ -903,6 +906,57 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
         ),
     )
     legacy_comparison.add_argument("--json", action="store_true")
+
+    phase3_authority = subparsers.add_parser(
+        "phase3-playhand-authority",
+        help=(
+            "Build, dry-run, or audit the immutable A/B-only Phase 3 PlayHand "
+            "authority from the verified Phase 2 Atlas capsule."
+        ),
+    )
+    phase3_authority.add_argument("--phase2-capsule-root", type=Path, required=True)
+    phase3_authority.add_argument("--policy-manifest", type=Path, required=True)
+    phase3_authority.add_argument("--authority-id")
+    phase3_authority.add_argument("--target-runs", type=int)
+    phase3_authority.add_argument("--out-dir", type=Path)
+    phase3_authority.add_argument("--authority-path", type=Path)
+    phase3_authority.add_argument("--dry-run", action="store_true")
+    phase3_authority.add_argument("--audit", action="store_true")
+    phase3_authority.add_argument(
+        "--runtime-arguments",
+        action="store_true",
+        help="Audit and emit the exact immutable Phase 3 PlayHand semantic arguments.",
+    )
+    phase3_authority.add_argument("--json", action="store_true")
+
+    phase3_playhand = subparsers.add_parser(
+        "phase3-playhand",
+        help="Run the authority-bound finite Phase 3 PlayHand coordinator.",
+    )
+    phase3_playhand.add_argument("--authority-path", type=Path, required=True)
+    phase3_playhand.add_argument("--phase2-capsule-root", type=Path, required=True)
+    phase3_playhand.add_argument("--policy-manifest", type=Path, required=True)
+    launch_mode = phase3_playhand.add_mutually_exclusive_group(required=True)
+    launch_mode.add_argument("--fresh", action="store_true")
+    launch_mode.add_argument("--resume", action="store_true")
+    phase3_playhand.add_argument("--gateway-url", default="http://127.0.0.1:8799")
+    phase3_playhand.add_argument("--gateway-token", default=None)
+    phase3_playhand.add_argument("--active-runs", type=int, default=None)
+    phase3_playhand.add_argument("--poll-interval-seconds", type=float, default=1.0)
+    phase3_playhand.add_argument("--max-wait-seconds", type=float, default=3600.0)
+    phase3_playhand.add_argument("--result-batch-size", type=int, default=25)
+    phase3_playhand.add_argument("--max-results-per-cycle", type=int, default=200)
+    phase3_playhand.add_argument("--max-drain-seconds", type=float, default=2.0)
+    phase3_playhand.add_argument("--result-read-failure-limit", type=int, default=5)
+    phase3_playhand.add_argument("--enqueue-failure-limit", type=int, default=3)
+    phase3_playhand.add_argument("--enqueue-retry-base-seconds", type=float, default=1.0)
+    phase3_playhand.add_argument("--terminal-lane-retention", type=int, default=128)
+    phase3_playhand.add_argument("--trading-dashboard-root", type=Path, default=None)
+    phase3_playhand.add_argument("--dry-run", action="store_true")
+    phase3_playhand.add_argument("--log-mode", choices=["barrier", "stream", "quiet"], default="barrier")
+    phase3_playhand.add_argument("--barrier-interval-seconds", type=float, default=5.0)
+    phase3_playhand.add_argument("--barrier-lane-limit", type=int, default=24)
+    phase3_playhand.add_argument("--json", action="store_true")
 
     doctor = subparsers.add_parser(
         "doctor", help="Verify config, CLI, auth, and seed prompt."
@@ -3302,6 +3356,9 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     cleanup_atlas.add_argument(
         "--json", action="store_true", help="Print machine-readable JSON."
     )
+    from autoresearch.phase2_atlas_capsule import add_phase2_atlas_capsule_parser
+
+    add_phase2_atlas_capsule_parser(subparsers)
     atlas_rewind = subparsers.add_parser(
         "rewind-atlas-lab-stages",
         help=(
@@ -20653,6 +20710,36 @@ def main(argv: list[str] | None = None) -> int:
             preview=int(args.preview),
             as_json=bool(args.json),
         )
+    if args.command == "phase2-atlas-capsule":
+        from autoresearch.phase2_atlas_capsule import cmd_phase2_atlas_capsule
+
+        return cmd_phase2_atlas_capsule(args)
+    if args.command == "phase3-playhand-authority":
+        from autoresearch.phase3_authority import cmd_phase3_playhand_authority
+
+        if args.audit or args.runtime_arguments:
+            if args.authority_path is None:
+                parser.error(
+                    "phase3-playhand-authority --audit/--runtime-arguments requires --authority-path"
+                )
+        else:
+            if not args.authority_id:
+                parser.error("phase3-playhand-authority requires --authority-id")
+            if args.target_runs is None:
+                parser.error("phase3-playhand-authority requires --target-runs")
+            if not args.dry_run and args.out_dir is None:
+                parser.error("phase3-playhand-authority requires --out-dir unless --dry-run is used")
+        try:
+            return cmd_phase3_playhand_authority(args)
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.command == "phase3-playhand":
+        from autoresearch.phase3_playhand import Phase3PlayHandError, cmd_phase3_playhand
+
+        try:
+            return cmd_phase3_playhand(args)
+        except (Phase3PlayHandError, ValueError) as exc:
+            parser.error(str(exc))
     if args.command == "rewind-atlas-lab-stages":
         payload = audit_or_rewind_atlas_lab_stages(
             run_root=args.run_root,

@@ -409,6 +409,9 @@ Jobs run one at a time through the same direct `uv run finalize-corpus` and `uv 
 
 ## Do Not Delete
 
+For the completed Phase 2 Atlas roots, use the manifest-first, no-delete
+[authority capsule operator guide](z_docs/phase2-atlas-capsule-operator.md).
+
 The cleanup commands and docs assume these folders are part of the current working corpus:
 
 - `runs/`

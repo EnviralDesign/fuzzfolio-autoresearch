@@ -40,6 +40,10 @@ from .instrument_universe import (
 )
 from .playhand_health import build_play_hand_evidence, build_play_hand_health
 from .plotting import render_progress_artifacts
+from .recipe_priors import (
+    negative_prior_expiry_status,
+    validate_seed_plan_campaign_policy,
+)
 from .scoring import build_attempt_score, load_sensitivity_snapshot
 
 
@@ -878,6 +882,64 @@ def _negative_pair_ids(row: dict[str, Any]) -> tuple[str, str] | None:
     return tuple(sorted((first_id, second_id)))
 
 
+def _seed_plan_campaign_policy(seed_plan: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the validated v2 policy, keeping legacy seed plans on their old path."""
+    if not isinstance(seed_plan, dict):
+        return None
+    return validate_seed_plan_campaign_policy(seed_plan)
+
+
+def _seed_plan_active_negative_rows(
+    seed_plan: dict[str, Any] | None,
+    *,
+    campaign_policy: dict[str, Any] | None,
+    negative_prior_runtime: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Filter v2 negatives before any hard block or soft penalty is calculated."""
+    rows = [
+        row
+        for row in (seed_plan or {}).get("negative_pairs") or []
+        if isinstance(row, dict)
+    ]
+    if campaign_policy is None:
+        return rows, [
+            {
+                "pair": _negative_pair_ids(row),
+                "expiry_status": "legacy_unversioned",
+                "applied": True,
+            }
+            for row in rows
+        ]
+
+    expiry = _seed_plan_dict(campaign_policy.get("negative_prior_expiry"))
+    anchor = _seed_plan_dict(expiry.get("anchor"))
+    runtime = _seed_plan_dict(negative_prior_runtime)
+    current_generation = runtime.get("current_atlas_generation", anchor.get("generation"))
+    current_run_sequence = runtime.get(
+        "current_atlas_run_sequence", anchor.get("run_sequence")
+    )
+    active_rows: list[dict[str, Any]] = []
+    decisions: list[dict[str, Any]] = []
+    for row in rows:
+        status = negative_prior_expiry_status(
+            row,
+            campaign_policy,
+            current_atlas_generation=str(current_generation or ""),
+            current_atlas_run_sequence=current_run_sequence,
+        )
+        applied = status == "active"
+        if applied:
+            active_rows.append(row)
+        decisions.append(
+            {
+                "pair": _negative_pair_ids(row),
+                "expiry_status": status,
+                "applied": applied,
+            }
+        )
+    return active_rows, decisions
+
+
 def _seed_plan_negative_reason_multiplier(row: dict[str, Any]) -> float:
     reason = str(
         row.get("negative_reason_category")
@@ -905,13 +967,14 @@ def _seed_plan_negative_reason_multiplier(row: dict[str, Any]) -> float:
 
 def _seed_plan_soft_negative_pair_multipliers(
     seed_plan: dict[str, Any] | None,
+    *,
+    negative_rows: list[dict[str, Any]] | None = None,
 ) -> dict[tuple[str, str], float]:
     if not _seed_plan_uses_atlas_features(seed_plan):
         return {}
     multipliers: dict[tuple[str, str], float] = {}
-    for row in seed_plan.get("negative_pairs") or []:
-        if not isinstance(row, dict):
-            continue
+    rows = negative_rows if negative_rows is not None else seed_plan.get("negative_pairs") or []
+    for row in rows:
         if bool(row.get("is_hard_block")):
             continue
         pair_ids = _negative_pair_ids(row)
@@ -922,13 +985,16 @@ def _seed_plan_soft_negative_pair_multipliers(
     return multipliers
 
 
-def _seed_plan_hard_negative_pair_keys(seed_plan: dict[str, Any] | None) -> set[tuple[str, str]]:
+def _seed_plan_hard_negative_pair_keys(
+    seed_plan: dict[str, Any] | None,
+    *,
+    negative_rows: list[dict[str, Any]] | None = None,
+) -> set[tuple[str, str]]:
     if not isinstance(seed_plan, dict):
         return set()
     keys: set[tuple[str, str]] = set()
-    for row in seed_plan.get("negative_pairs") or []:
-        if not isinstance(row, dict):
-            continue
+    rows = negative_rows if negative_rows is not None else seed_plan.get("negative_pairs") or []
+    for row in rows:
         if _seed_plan_uses_atlas_features(seed_plan) and not bool(row.get("is_hard_block")):
             continue
         if (
@@ -1031,6 +1097,55 @@ def _seed_plan_guided_recipe_source_mix(policy: dict[str, Any]) -> dict[str, flo
         if source_name and source_weight > 0.0:
             mix[source_name] = source_weight
     return mix
+
+
+def _seed_plan_policy_lane(
+    campaign_policy: dict[str, Any],
+    *,
+    rng: random.Random,
+) -> str:
+    """Choose one v2 lane for non-campaign callers using the manifest fractions."""
+    threshold = rng.random()
+    running = 0.0
+    lanes = campaign_policy.get("lanes")
+    execution = campaign_policy.get("execution")
+    if not isinstance(lanes, dict) or not isinstance(execution, dict):
+        raise ValueError("validated campaign policy is missing lanes")
+    lane_order = [str(lane) for lane in execution.get("lane_tie_break_order") or []]
+    if not lane_order or set(lane_order) != {"guided", "uncertain", "wild"}:
+        raise ValueError("validated campaign policy is missing lane tie-break order")
+    for lane_name in lane_order:
+        lane = _seed_plan_dict(lanes.get(lane_name))
+        running += _seed_plan_float(lane.get("fraction"))
+        if threshold < running:
+            return lane_name
+    return lane_order[-1]
+
+
+def _seed_plan_lane_recipe_has_eligible_entries(
+    recipe_payload: dict[str, Any],
+    *,
+    eligible_menus: dict[str, Any],
+) -> bool:
+    pair_lanes = {
+        str(value)
+        for value in eligible_menus.get("pair_sampling_lanes") or []
+    }
+    slot_lanes = {
+        str(value)
+        for value in eligible_menus.get("slot_sampling_lanes") or []
+    }
+    if any(
+        isinstance(row, dict) and str(row.get("pair_sampling_lane") or "") in pair_lanes
+        for row in recipe_payload.get("pair_menu") or []
+    ):
+        return True
+    slot_menus = recipe_payload.get("slot_menus")
+    return isinstance(slot_menus, dict) and any(
+        isinstance(row, dict) and str(row.get("sampling_lane") or "") in slot_lanes
+        for rows in slot_menus.values()
+        for row in (rows if isinstance(rows, list) else [])
+    )
 
 
 def _seed_pair_family_policy(pair: dict[str, Any] | None) -> dict[str, Any]:
@@ -1141,6 +1256,8 @@ def deal_seed_plan_indicators(
     seed_plan: dict[str, Any] | None,
     rng: random.Random,
     seed_plan_candidates: list[SeedIndicator] | None = None,
+    policy_lane: str | None = None,
+    negative_prior_runtime: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     fallback_indicators = list(indicators)
     guided_indicators = _merge_seed_indicator_candidates(
@@ -1161,6 +1278,44 @@ def deal_seed_plan_indicators(
             source="role_balanced",
             reason="missing_seed_plan",
         )
+    campaign_policy = _seed_plan_campaign_policy(seed_plan)
+    resolved_policy_lane: str | None = None
+    eligible_menus: dict[str, Any] | None = None
+    if campaign_policy is not None:
+        policy_lanes = campaign_policy.get("lanes")
+        if not isinstance(policy_lanes, dict):
+            raise ValueError("validated campaign policy is missing lanes")
+        resolved_policy_lane = policy_lane or _seed_plan_policy_lane(
+            campaign_policy,
+            rng=rng,
+        )
+        if resolved_policy_lane not in policy_lanes:
+            raise ValueError(f"unsupported campaign policy lane: {resolved_policy_lane}")
+        eligible_menus = _seed_plan_dict(
+            _seed_plan_dict(policy_lanes.get(resolved_policy_lane)).get("eligible_menus")
+        )
+
+    def policy_exhaustion(reason: str) -> dict[str, Any]:
+        return {
+            **_fallback_indicator_deal(
+                fallback_indicators,
+                target_count=target_count,
+                source="policy_lane_exhausted",
+                reason=reason,
+            ),
+            "policy_lane": resolved_policy_lane,
+            "policy_manifest_sha256": (
+                campaign_policy.get("manifest_sha256") if campaign_policy else None
+            ),
+            "policy_outcome_type": "policy_lane_exhausted",
+            "negative_prior_decisions": negative_prior_decisions,
+        }
+
+    active_negative_rows, negative_prior_decisions = _seed_plan_active_negative_rows(
+        seed_plan,
+        campaign_policy=campaign_policy,
+        negative_prior_runtime=negative_prior_runtime,
+    )
     by_id = {indicator.id.upper(): indicator for indicator in guided_indicators}
     if not by_id:
         return _fallback_indicator_deal(
@@ -1171,7 +1326,7 @@ def deal_seed_plan_indicators(
         )
     policy = seed_plan.get("sampling_policy") if isinstance(seed_plan.get("sampling_policy"), dict) else {}
     guided_fraction = min(1.0, max(0.0, _seed_plan_float(policy.get("guided_prior_fraction"), 0.8)))
-    if rng.random() > guided_fraction:
+    if campaign_policy is None and rng.random() > guided_fraction:
         return _fallback_indicator_deal(
             fallback_indicators,
             target_count=target_count,
@@ -1191,6 +1346,35 @@ def deal_seed_plan_indicators(
         for name, payload in recipes.items()
         if isinstance(payload, dict) and _seed_plan_recipe_weight(payload, seed_plan=seed_plan) > 0.0
     ]
+    if eligible_menus is not None:
+        allowed_sources = {
+            str(source) for source in eligible_menus.get("recipe_sources") or []
+        }
+        recipe_items = [
+            item
+            for item in recipe_items
+            if str(item[1].get("source") or "") in allowed_sources
+            and _seed_plan_lane_recipe_has_eligible_entries(
+                item[1],
+                eligible_menus=eligible_menus,
+            )
+        ]
+        if not recipe_items:
+            if bool(eligible_menus.get("allow_generation_eligible_fallback")):
+                fallback = _fallback_indicator_deal(
+                    fallback_indicators,
+                    target_count=target_count,
+                    source="policy_lane_wild_fallback",
+                    reason="policy_lane_no_eligible_menu",
+                )
+                return {
+                    **fallback,
+                    "policy_lane": resolved_policy_lane,
+                    "policy_manifest_sha256": campaign_policy.get("manifest_sha256"),
+                    "policy_outcome_type": "wild_generation_eligible_fallback",
+                    "negative_prior_decisions": negative_prior_decisions,
+                }
+            return policy_exhaustion("policy_lane_no_eligible_menu")
     recipe_source_mix = _seed_plan_guided_recipe_source_mix(policy)
     recipe_source_bucket: str | None = None
     recipe_source_bucket_matched = False
@@ -1233,8 +1417,14 @@ def deal_seed_plan_indicators(
     selected_family_policy: dict[str, Any] = {}
     policy_target_count = target_count
     role_balanced_fill_limit: int | None = None
-    negative_pair_keys = _seed_plan_hard_negative_pair_keys(seed_plan)
-    soft_negative_pair_multipliers = _seed_plan_soft_negative_pair_multipliers(seed_plan)
+    negative_pair_keys = _seed_plan_hard_negative_pair_keys(
+        seed_plan,
+        negative_rows=active_negative_rows,
+    )
+    soft_negative_pair_multipliers = _seed_plan_soft_negative_pair_multipliers(
+        seed_plan,
+        negative_rows=active_negative_rows,
+    )
 
     def negative_pair_multiplier_for(indicator_id: Any) -> float:
         clean_id = _seed_plan_upper(indicator_id)
@@ -1303,6 +1493,16 @@ def deal_seed_plan_indicators(
 
     pair_menu = recipe_payload.get("pair_menu")
     if target_count >= 2 and isinstance(pair_menu, list) and pair_menu:
+        if eligible_menus is not None:
+            allowed_pair_lanes = {
+                str(value) for value in eligible_menus.get("pair_sampling_lanes") or []
+            }
+            pair_menu = [
+                row
+                for row in pair_menu
+                if isinstance(row, dict)
+                and str(row.get("pair_sampling_lane") or "") in allowed_pair_lanes
+            ]
         pair = _weighted_seed_plan_choice(
             [row for row in pair_menu if isinstance(row, dict)],
             rng=rng,
@@ -1346,6 +1546,7 @@ def deal_seed_plan_indicators(
                     "probe_timeframe": pair.get("probe_timeframe"),
                     "pair_sampling_score": pair.get("pair_sampling_score"),
                     "pair_sampling_weight": pair.get("pair_sampling_weight"),
+                    "pair_sampling_lane": pair.get("pair_sampling_lane"),
                     "effective_pair_sampling_weight": pair_effective_weight,
                     "composite_score": pair.get("composite_score"),
                     "retention_bucket": pair.get("retention_bucket"),
@@ -1387,6 +1588,16 @@ def deal_seed_plan_indicators(
             if len(selected_ids) >= policy_target_count:
                 break
             rows = [row for row in list(slot_menus.get(slot_name) or []) if isinstance(row, dict)]
+            if eligible_menus is not None:
+                allowed_slot_lanes = {
+                    str(value)
+                    for value in eligible_menus.get("slot_sampling_lanes") or []
+                }
+                rows = [
+                    row
+                    for row in rows
+                    if str(row.get("sampling_lane") or "") in allowed_slot_lanes
+                ]
             rows = [row for row in rows if _seed_plan_upper(row.get("indicator_id")) not in selected_ids]
             candidate = _weighted_seed_plan_choice(
                 rows,
@@ -1408,7 +1619,10 @@ def deal_seed_plan_indicators(
                     ),
                 )
 
-    if len(selected_ids) < target_count:
+    if len(selected_ids) < target_count and (
+        eligible_menus is None
+        or bool(eligible_menus.get("allow_generation_eligible_fallback"))
+    ):
         role_balanced_added = 0
         remaining = [
             indicator
@@ -1440,6 +1654,19 @@ def deal_seed_plan_indicators(
             ):
                 role_balanced_added += 1
 
+    if eligible_menus is not None and len(selected_ids) < target_count:
+        if bool(eligible_menus.get("allow_generation_eligible_fallback")) and selected_ids:
+            # The wild lane may return a smaller catalog-backed hand only when
+            # every remaining fill candidate is excluded by an active negative.
+            pass
+        elif selected_pair is not None and len(selected_ids) >= 2:
+            # Pair menus are a complete eligible candidate under the v2
+            # contract. Do not manufacture a cross-lane fill merely because
+            # the requested hand happened to be larger than the pair.
+            policy_target_count = len(selected_ids)
+        else:
+            return policy_exhaustion("policy_lane_eligible_menu_undersupplied")
+
     selected = [by_id[indicator_id] for indicator_id in selected_ids if indicator_id in by_id]
     if not selected:
         return _fallback_indicator_deal(
@@ -1450,7 +1677,11 @@ def deal_seed_plan_indicators(
         )
     return {
         "source": "play_hand_seed_plan",
-        "reason": "guided_recipe_weighted_selection",
+        "reason": (
+            "policy_lane_weighted_selection"
+            if resolved_policy_lane is not None
+            else "guided_recipe_weighted_selection"
+        ),
         "indicators": selected[:target_count],
         "recipe": recipe_name,
         "recipe_source": recipe_payload.get("source"),
@@ -1463,6 +1694,14 @@ def deal_seed_plan_indicators(
         "family_policy": selected_family_policy,
         "policy_target_count": policy_target_count,
         "selected_slots": selected_slots,
+        "policy_lane": resolved_policy_lane,
+        "policy_manifest_sha256": (
+            campaign_policy.get("manifest_sha256") if campaign_policy else None
+        ),
+        "policy_outcome_type": (
+            "policy_lane_selected" if resolved_policy_lane is not None else None
+        ),
+        "negative_prior_decisions": negative_prior_decisions,
     }
 
 

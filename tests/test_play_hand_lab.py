@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import random
 import threading
@@ -12,6 +13,7 @@ import requests
 
 from autoresearch import play_hand_lab as lab
 from autoresearch.instrument_universe import universe_provenance
+from autoresearch.recipe_priors import build_campaign_policy_manifest
 
 
 def _profile_payload() -> dict:
@@ -78,6 +80,114 @@ def _historical_seed_plan() -> dict:
                 ],
                 "slot_menus": {},
             }
+        },
+    }
+
+
+def _policy_honest_manifest(
+    *,
+    diversity_max_shares: dict[str, float] | None = None,
+) -> dict:
+    return build_campaign_policy_manifest(
+        lane_fractions={"guided": 0.60, "uncertain": 0.25, "wild": 0.15},
+        lane_eligible_menus={
+            "guided": {
+                "recipe_sources": [
+                    "curated_recipe_prior",
+                    "discovery_recipe_validation",
+                ],
+                "slot_sampling_lanes": ["high_prior", "medium_prior"],
+                "pair_sampling_lanes": ["positive_pair"],
+                "allow_generation_eligible_fallback": False,
+            },
+            "uncertain": {
+                "recipe_sources": [
+                    "curated_recipe_prior",
+                    "discovery_recipe_validation",
+                ],
+                "slot_sampling_lanes": ["uncertain_prior"],
+                "pair_sampling_lanes": ["near_miss_pair"],
+                "allow_generation_eligible_fallback": False,
+            },
+            "wild": {
+                "recipe_sources": ["curated_recipe_prior"],
+                "slot_sampling_lanes": ["wild_exploration"],
+                "pair_sampling_lanes": ["low_pair"],
+                "allow_generation_eligible_fallback": True,
+            },
+        },
+        diversity_max_shares=diversity_max_shares
+        or {
+            "family": 1.0,
+            "recipe": 1.0,
+            "instrument": 1.0,
+            "timeframe": 1.0,
+            "indicator": 1.0,
+        },
+        source_atlas_generation="atlas-generation-test",
+        source_atlas_run_sequence=7,
+    )
+
+
+def _policy_honest_seed_plan(
+    *,
+    policy: dict | None = None,
+    family_id: str = "family-rsi-adx-m5",
+) -> dict:
+    policy = policy or _policy_honest_manifest()
+    return {
+        "schema_version": "play_hand_seed_plan_v2",
+        "sampling_policy": {
+            "guided_prior_fraction": policy["lanes"]["guided"]["fraction"],
+            "uncertain_prior_fraction": policy["lanes"]["uncertain"]["fraction"],
+            "wild_exploration_fraction": policy["lanes"]["wild"]["fraction"],
+        },
+        "campaign_policy_manifest": policy,
+        "campaign_policy_sha256": policy["manifest_sha256"],
+        "negative_pairs": [],
+        "recipes": {
+            "guided_recipe": {
+                "source": "curated_recipe_prior",
+                "recipe_sampling_weight": 1.0,
+                "pair_menu": [
+                    {
+                        "anchor_id": "RSI",
+                        "trigger_id": "ADX",
+                        "pair_sampling_lane": "positive_pair",
+                        "pair_sampling_weight": 1.0,
+                        "canonical_pair_family_id": family_id,
+                    }
+                ],
+                "slot_menus": {},
+            },
+            "uncertain_recipe": {
+                "source": "curated_recipe_prior",
+                "recipe_sampling_weight": 1.0,
+                "pair_menu": [
+                    {
+                        "anchor_id": "MACD",
+                        "trigger_id": "SMA",
+                        "pair_sampling_lane": "near_miss_pair",
+                        "pair_sampling_weight": 1.0,
+                        "canonical_pair_family_id": "family-macd-sma-m5",
+                    }
+                ],
+                "slot_menus": {},
+            },
+            "wild_recipe": {
+                "source": "curated_recipe_prior",
+                "recipe_sampling_weight": 1.0,
+                "pair_menu": [
+                    {
+                        "anchor_id": "RSI",
+                        "trigger_id": "MACD",
+                        "pair_sampling_lane": "low_pair",
+                        "pair_sampling_weight": 1.0,
+                        "canonical_pair_family_id": "family-rsi-macd-m5",
+                    }
+                ],
+                "slot_menus": {},
+            },
         },
     }
 
@@ -305,6 +415,255 @@ def test_durable_campaign_state_rejects_semantic_runtime_drift(tmp_path: Path) -
             state_path,
             runtime=changed,
             campaign_id=str(runtime.campaign_id),
+        )
+
+
+def test_policy_honest_state_uses_exact_hamilton_lane_allocation() -> None:
+    runtime = lab.PlayHandLabRuntimeConfig(
+        campaign_mode="finite",
+        target_runs=20,
+        active_runs=20,
+    )
+    state = lab._new_campaign_policy_state(
+        _policy_honest_manifest(),
+        runtime=runtime,
+    )
+
+    assert state is not None
+    assert state["planned_lane_counts"] == {
+        "guided": 12,
+        "uncertain": 5,
+        "wild": 3,
+    }
+    assert state["lane_plan"] == (["guided"] * 12) + (["uncertain"] * 5) + (["wild"] * 3)
+    assert state["used_lane_counts"] == {"guided": 0, "uncertain": 0, "wild": 0}
+
+
+def test_policy_honest_cap_accounting_preserves_typed_missing_values() -> None:
+    runtime = lab.PlayHandLabRuntimeConfig(
+        campaign_mode="finite",
+        target_runs=3,
+        active_runs=3,
+    )
+    state = lab._new_campaign_policy_state(_policy_honest_manifest(), runtime=runtime)
+    assert state is not None
+
+    attributes_by_recipe_value = []
+    for recipe_value in (None, "", "<MISSING>"):
+        attributes = lab._policy_candidate_attributes(
+            {
+                "indicator_deal": {
+                    "recipe": recipe_value,
+                    "pair": {"canonical_pair_family_id": "FAMILY-A"},
+                    "indicators": ["RSI"],
+                },
+                "primary_instrument": "EURUSD",
+                "timeframe": "M5",
+            },
+            policy_state=state,
+        )
+        assert attributes is not None
+        decision = lab._policy_cap_decision(state, attributes)
+        assert decision["outcome"] == "accepted"
+        lab._record_policy_assignment(
+            state,
+            lane="guided",
+            cap_decision=decision,
+        )
+        attributes_by_recipe_value.append(attributes)
+
+    assert [item["recipe_id"] for item in attributes_by_recipe_value] == [
+        {"kind": "absent"},
+        {"kind": "blank"},
+        {"kind": "value", "value": "<MISSING>"},
+    ]
+    assert len({item["candidate_id"] for item in attributes_by_recipe_value}) == 3
+    assert len(state["accounting"]["recipe"]) == 3
+
+
+def test_policy_honest_caps_fail_closed_after_same_lane_fallbacks(tmp_path: Path) -> None:
+    policy = _policy_honest_manifest(
+        diversity_max_shares={
+            "family": 0.25,
+            "recipe": 1.0,
+            "instrument": 1.0,
+            "timeframe": 1.0,
+            "indicator": 0.25,
+        }
+    )
+    runtime = lab.PlayHandLabRuntimeConfig(
+        campaign_mode="finite",
+        target_runs=4,
+        active_runs=4,
+        min_indicators=2,
+        max_indicators=2,
+        instrument=["EURUSD"],
+        seed=19,
+    )
+    state = lab._new_campaign_policy_state(policy, runtime=runtime)
+    assert state is not None
+    seed_plan = _policy_honest_seed_plan(policy=policy)
+    indicators = [lab.SeedIndicator("RSI"), lab.SeedIndicator("ADX"), lab.SeedIndicator("MACD"), lab.SeedIndicator("SMA")]
+
+    deal, first_assignment = lab._select_policy_lane_deal(
+        config=_test_config(tmp_path),
+        runtime=runtime,
+        seed_indicators=indicators,
+        seed_plan=seed_plan,
+        lane_index=0,
+        policy_state=state,
+    )
+    assert deal is not None
+    assert first_assignment["policy_lane"] == "guided"
+    assert first_assignment["cap_decision"]["outcome"] == "accepted"
+    lab._record_policy_assignment(
+        state,
+        lane="guided",
+        cap_decision=first_assignment["cap_decision"],
+    )
+
+    exhausted_deal, exhausted_assignment = lab._select_policy_lane_deal(
+        config=_test_config(tmp_path),
+        runtime=runtime,
+        seed_indicators=indicators,
+        seed_plan=seed_plan,
+        lane_index=1,
+        policy_state=state,
+    )
+    assert exhausted_deal is None
+    assert exhausted_assignment["policy_lane"] == "guided"
+    assert exhausted_assignment["policy_outcome_type"] == "policy_cap_exhausted"
+    assert all(
+        decision["cap_decision"]["outcome"] == "cap_blocked"
+        for decision in exhausted_assignment["candidate_fallback_decisions"]
+    )
+
+
+def test_policy_honest_lane_exhaustion_never_borrows_another_lane(tmp_path: Path) -> None:
+    policy = _policy_honest_manifest()
+    runtime = lab.PlayHandLabRuntimeConfig(
+        campaign_mode="finite",
+        target_runs=4,
+        active_runs=4,
+        min_indicators=2,
+        max_indicators=2,
+        instrument=["EURUSD"],
+        seed=23,
+    )
+    state = lab._new_campaign_policy_state(policy, runtime=runtime)
+    assert state is not None
+    seed_plan = _policy_honest_seed_plan(policy=policy)
+    seed_plan["recipes"] = {}
+
+    deal, assignment = lab._select_policy_lane_deal(
+        config=_test_config(tmp_path),
+        runtime=runtime,
+        seed_indicators=[lab.SeedIndicator("RSI"), lab.SeedIndicator("ADX")],
+        seed_plan=seed_plan,
+        lane_index=0,
+        policy_state=state,
+    )
+
+    assert deal is None
+    assert assignment["policy_lane"] == "guided"
+    assert assignment["policy_outcome_type"] == lab.POLICY_EXHAUSTION_OUTCOME
+    assert {
+        decision["outcome"] for decision in assignment["candidate_fallback_decisions"]
+    } == {lab.POLICY_EXHAUSTION_OUTCOME}
+
+
+def test_policy_honest_lane_selection_uses_current_atlas_expiry_binding(
+    tmp_path: Path,
+) -> None:
+    policy = _policy_honest_manifest()
+    runtime = lab.PlayHandLabRuntimeConfig(
+        campaign_mode="finite",
+        target_runs=4,
+        active_runs=4,
+        min_indicators=2,
+        max_indicators=2,
+        instrument=["EURUSD"],
+        seed=29,
+        current_atlas_generation="atlas-generation-test",
+        current_atlas_run_sequence=9,
+    )
+    state = lab._new_campaign_policy_state(policy, runtime=runtime)
+    assert state is not None
+    seed_plan = _policy_honest_seed_plan(policy=policy)
+    seed_plan["negative_pairs"] = [
+        {
+            "first_indicator_id": "RSI",
+            "second_indicator_id": "ADX",
+            "is_hard_block": True,
+            "expires_after_atlas_runs": 1,
+        }
+    ]
+
+    deal, assignment = lab._select_policy_lane_deal(
+        config=_test_config(tmp_path),
+        runtime=runtime,
+        seed_indicators=[lab.SeedIndicator("RSI"), lab.SeedIndicator("ADX")],
+        seed_plan=seed_plan,
+        lane_index=0,
+        policy_state=state,
+    )
+
+    assert deal is not None
+    assert assignment["negative_prior_runtime"] == {
+        "current_atlas_generation": "atlas-generation-test",
+        "current_atlas_run_sequence": 9,
+        "binding_source": "runtime_authority",
+    }
+    assert assignment["negative_prior_decisions"] == [
+        {
+            "pair": ("ADX", "RSI"),
+            "expiry_status": "expired_run_sequence",
+            "applied": False,
+        }
+    ]
+
+
+def test_formal_policy_honest_runtime_requires_current_atlas_binding(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match="plan-bound current Atlas generation and run sequence",
+    ):
+        lab._normalize_runtime(
+            _level_c_runtime(
+                tmp_path,
+                seed_plan_payload=_policy_honest_seed_plan(),
+            )
+        )
+
+    bound = lab._normalize_runtime(
+        _level_c_runtime(
+            tmp_path,
+            seed_plan_payload=_policy_honest_seed_plan(),
+            current_atlas_generation="atlas-generation-test",
+            current_atlas_run_sequence=9,
+        )
+    )
+    assert bound.current_atlas_generation == "atlas-generation-test"
+    assert bound.current_atlas_run_sequence == 9
+
+
+def test_seed_indicators_rejects_policy_honest_digest_mismatch(tmp_path: Path) -> None:
+    seed_plan = _policy_honest_seed_plan()
+    seed_plan["campaign_policy_sha256"] = "sha256:" + "0" * 64
+    seed_plan_path = tmp_path / "tampered-v2-seed-plan.json"
+    seed_plan_path.write_text(json.dumps(seed_plan), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="does not match"):
+        lab._seed_indicators(
+            config=_test_config(tmp_path),
+            cli=object(),
+            campaign_ctx=_campaign_ctx(tmp_path),
+            runtime=lab.PlayHandLabRuntimeConfig(
+                profile_path=tmp_path / "profile.json",
+                seed_plan_path=seed_plan_path,
+            ),
         )
 
 
@@ -1535,7 +1894,7 @@ def test_historical_seed_indicators_reject_undersized_plan_without_fallback(
         )
 
 
-def test_historical_lane_deal_uses_seed_plan_when_atlas_fraction_allows_exploration(
+def test_historical_v1_lane_deal_keeps_formal_guided_override(
     tmp_path: Path,
 ) -> None:
     fallback_plan = _historical_seed_plan()
@@ -1564,6 +1923,37 @@ def test_historical_lane_deal_uses_seed_plan_when_atlas_fraction_allows_explorat
 
     assert seed_plan_path == runtime.seed_plan_path
     assert deal["indicator_deal"]["source"] == "play_hand_seed_plan"
+    assert deal["indicator_deal"].get("policy_lane") is None
+    assert deal["indicator_deal"].get("policy_outcome_type") is None
+
+
+def test_historical_v2_lane_deal_keeps_the_assigned_uncertain_lane(tmp_path: Path) -> None:
+    seed_plan_payload = _policy_honest_seed_plan()
+    runtime = _level_c_runtime(
+        tmp_path,
+        seed_plan_payload=seed_plan_payload,
+        min_indicators=2,
+        max_indicators=2,
+        instrument=["EURUSD"],
+    )
+    indicators, seed_plan, _seed_plan_path = lab._seed_indicators(
+        config=_test_config(tmp_path),
+        cli=_IndicatorIndexCli(["RSI", "ADX", "MACD", "SMA"]),
+        campaign_ctx=_campaign_ctx(tmp_path),
+        runtime=runtime,
+    )
+
+    deal = lab._deal_lane(
+        config=_test_config(tmp_path),
+        runtime=runtime,
+        seed_indicators=indicators,
+        seed_plan=seed_plan,
+        rng=random.Random(7),
+        policy_lane="uncertain",
+    )
+
+    assert deal["indicator_deal"]["policy_lane"] == "uncertain"
+    assert deal["indicator_deal"]["pair"]["canonical_pair_family_id"] == "family-macd-sma-m5"
 
 
 def test_historical_lane_deal_rejects_role_balanced_fill(
@@ -2183,6 +2573,136 @@ def test_lane_index_crash_boundaries_resume_exactly_once(
     ) == 0
     assert len(_DurabilityFakeGateway.enqueued_task_ids) == 1
     assert len(set(_DurabilityFakeGateway.enqueued_task_ids)) == 1
+
+
+def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    seed_plan_path = tmp_path / "policy-honest-seed-plan.json"
+    seed_plan_path.write_text(json.dumps(_policy_honest_seed_plan()), encoding="utf-8")
+    config = _test_config(tmp_path)
+    _DurabilityFakeGateway.enqueued_task_ids = []
+    _DurabilityFakeGateway.contradictory_duplicate = False
+    monkeypatch.setattr(lab, "load_config", lambda: config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", _DurabilityFakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", _DurabilityFakeGateway)
+
+    def runtime(*, resume: bool) -> lab.PlayHandLabRuntimeConfig:
+        return lab.PlayHandLabRuntimeConfig(
+            campaign_id="policy-crash-resume",
+            campaign_mode="finite",
+            target_runs=4,
+            active_runs=4,
+            task_mode="fake_compute",
+            pipeline_mode="screen",
+            tasks_per_lane=1,
+            profile_path=profile_path,
+            seed_plan_path=seed_plan_path,
+            indicator=["RSI", "ADX", "MACD", "SMA"],
+            min_indicators=2,
+            max_indicators=2,
+            instrument=["EURUSD"],
+            seed=23,
+            fake_work_seconds=0.0,
+            poll_interval_seconds=0.01,
+            max_wait_seconds=1.0,
+            resume=resume,
+        )
+
+    monkeypatch.setattr(
+        lab,
+        "_lane_allocation_checkpoint",
+        lambda name: (_ for _ in ()).throw(RuntimeError("crash:after_lane_registration"))
+        if name == "after_lane_registration"
+        else None,
+    )
+    with pytest.raises(RuntimeError, match="crash:after_lane_registration"):
+        lab.cmd_play_hand_lab(runtime(resume=False))
+
+    state_path = (
+        config.derived_root
+        / "play-hand-lab-campaigns"
+        / "policy-crash-resume"
+        / "play-hand-lab-state.json"
+    )
+    before_resume = json.loads(state_path.read_text(encoding="utf-8"))
+    policy_before = before_resume["campaign_policy_state"]
+    assert policy_before["planned_lane_counts"] == {
+        "guided": 2,
+        "uncertain": 1,
+        "wild": 1,
+    }
+    assert policy_before["used_lane_counts"] == policy_before["planned_lane_counts"]
+    assignments_before = [lane["policy_assignment"] for lane in before_resume["lanes"]]
+
+    monkeypatch.setattr(lab, "_lane_allocation_checkpoint", lambda _name: None)
+    assert lab.cmd_play_hand_lab(runtime(resume=True)) == 0
+
+    after_resume = json.loads(state_path.read_text(encoding="utf-8"))
+    assert [lane["policy_assignment"] for lane in after_resume["lanes"]] == assignments_before
+    assert after_resume["campaign_policy_state"]["used_lane_counts"] == policy_before[
+        "used_lane_counts"
+    ]
+    for lane_payload in after_resume["lanes"]:
+        task_specs = lane_payload["task_specs"]
+        assert task_specs
+        assert all(
+            spec["policy_assignment"] == lane_payload["policy_assignment"]
+            for spec in task_specs.values()
+        )
+        attempts = lab.load_attempts(
+            Path(lane_payload["run_dir"]) / "attempts.jsonl"
+        )
+        assert len(attempts) == 1
+        assert attempts[0]["policy_assignment"] == lane_payload["policy_assignment"]
+    assert len(_DurabilityFakeGateway.enqueued_task_ids) == 4
+    assert len(set(_DurabilityFakeGateway.enqueued_task_ids)) == 4
+
+    for damage in ("counter", "task_assignment"):
+        tampered = copy.deepcopy(after_resume)
+        if damage == "counter":
+            tampered["campaign_policy_state"]["used_lane_counts"]["guided"] += 1
+            expected_error = "policy counters do not match persisted lane assignments"
+        else:
+            first_lane = tampered["lanes"][0]
+            first_task = next(iter(first_lane["task_specs"].values()))
+            first_task["policy_assignment"]["policy_lane"] = "wild"
+            expected_error = "task policy assignment mismatch"
+        state_path.write_text(json.dumps(tampered), encoding="utf-8")
+        with pytest.raises(lab.DurableExecutionError, match=expected_error):
+            lab.cmd_play_hand_lab(runtime(resume=True))
+
+    state_path.write_text(json.dumps(after_resume), encoding="utf-8")
+    validate_payload = lab._validate_task_result_receipt_payload
+    validate_file = lab._validate_task_result_receipt
+
+    def conflicting_terminal_receipt(validator, *args, **kwargs):
+        receipt = copy.deepcopy(validator(*args, **kwargs))
+        receipt["recorded_result"]["policy_assignment"]["policy_lane"] = "wild"
+        return receipt
+
+    monkeypatch.setattr(
+        lab,
+        "_validate_task_result_receipt_payload",
+        lambda *args, **kwargs: conflicting_terminal_receipt(
+            validate_payload, *args, **kwargs
+        ),
+    )
+    monkeypatch.setattr(
+        lab,
+        "_validate_task_result_receipt",
+        lambda *args, **kwargs: conflicting_terminal_receipt(
+            validate_file, *args, **kwargs
+        ),
+    )
+    with pytest.raises(
+        lab.DurableExecutionError,
+        match="terminal receipt policy assignment mismatch",
+    ):
+        lab.cmd_play_hand_lab(runtime(resume=True))
 
 
 @pytest.mark.parametrize("damage", ["mutate", "delete"])

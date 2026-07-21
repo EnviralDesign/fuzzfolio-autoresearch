@@ -1,0 +1,166 @@
+{
+  "candidate_identity": {
+    "algorithm": "sha256_canonical_candidate_attributes",
+    "algorithm_version": "v1",
+    "canonical_payload_keys": [
+      "candidate_identity_version",
+      "recipe_id",
+      "canonical_pair_family_id",
+      "instrument",
+      "timeframe",
+      "indicator_ids"
+    ],
+    "canonical_serialization": "json_sort_keys_compact_utf8",
+    "indicator_ids_normalization": "typed_presence_values_deduplicate_by_canonical_json_sort_ascending",
+    "indicator_ids_representation": {
+      "absent": {
+        "state": "absent",
+        "values": []
+      },
+      "present": {
+        "state": "present",
+        "values": "SORTED_UNIQUE_TYPED_SCALARS"
+      }
+    },
+    "input_attribute_order": [
+      "recipe_id",
+      "canonical_pair_family_id",
+      "instrument",
+      "timeframe",
+      "indicator_ids"
+    ],
+    "output_format": "sha256:<lowercase_hex>",
+    "scalar_normalization": "typed_absent_blank_or_stringify_strip_uppercase_value",
+    "scalar_representation": {
+      "absent": {
+        "kind": "absent"
+      },
+      "blank": {
+        "kind": "blank"
+      },
+      "value": {
+        "kind": "value",
+        "value": "UPPERCASE_NORMALIZED_STRING"
+      }
+    }
+  },
+  "diversity_attribute_contract": {
+    "family": {
+      "aggregation": "one_charge_per_selected_deal",
+      "candidate_attribute": "canonical_pair_family_id",
+      "definition": "recipe_id plus timeframe plus unordered indicator-pair identity",
+      "source_path": "recipes.<recipe_id>.pair_menu[].canonical_pair_family_id"
+    },
+    "indicator": {
+      "aggregation": "one_charge_per_indicator_id_in_selected_deal",
+      "candidate_attribute": "indicator_ids",
+      "definition": "every indicator_id in the selected candidate deal",
+      "source_path": "recipes.<recipe_id>.slot_menus[].indicator_id"
+    },
+    "instrument": {
+      "aggregation": "one_charge_per_selected_deal",
+      "candidate_attribute": "instrument",
+      "definition": "the resolved instrument for the selected candidate",
+      "source_path": "runtime_candidate.instrument"
+    },
+    "recipe": {
+      "aggregation": "one_charge_per_selected_deal",
+      "candidate_attribute": "recipe_id",
+      "definition": "the selected recipe dictionary key",
+      "source_path": "recipes.<recipe_id> dictionary key"
+    },
+    "timeframe": {
+      "aggregation": "one_charge_per_selected_deal",
+      "candidate_attribute": "timeframe",
+      "definition": "the resolved timeframe for the selected candidate",
+      "source_path": "runtime_candidate.timeframe"
+    }
+  },
+  "diversity_enforcement": {
+    "candidate_acceptance": "all_caps_checked_atomically_before_acceptance",
+    "candidate_conflict_result": "reject_candidate_and_report_all_conflicts",
+    "cap_count_rounding": "floor",
+    "cap_count_unit": "selected_deal_containing_normalized_attribute",
+    "cap_limit_formula": "floor(target_runs * max_share)",
+    "conflict_report_order": [
+      "family",
+      "recipe",
+      "instrument",
+      "timeframe",
+      "indicator"
+    ],
+    "denominator_attribute": "target_runs",
+    "denominator_definition": "total planned campaign deals across all lanes",
+    "indicator_count_unit": "one_charge_per_distinct_normalized_indicator_id_per_deal",
+    "lane_capacity": "fixed_allocated_lane_quota_no_cross_lane_borrowing",
+    "lane_exhaustion_condition": "allocated_lane_quota_unfilled_after_all_eligible_candidates_are_rejected_or_exhausted",
+    "lane_exhaustion_result_type": "policy_lane_exhausted",
+    "missing_attribute_handling": "typed_absent_or_blank_attribute_is_present_and_counted"
+  },
+  "diversity_targets": {
+    "family": { "max_share": 0.05 },
+    "indicator": { "max_share": 0.15 },
+    "instrument": { "max_share": 0.1 },
+    "recipe": { "max_share": 0.3 },
+    "timeframe": { "max_share": 0.6 }
+  },
+  "execution": {
+    "allocation_algorithm": "hamilton_largest_remainder",
+    "allocation_algorithm_version": "v1",
+    "candidate_evaluation_order": "lane_order_then_ascending_lexicographic_candidate_tie_break_order",
+    "candidate_tie_break_direction": "ascending_lexicographic",
+    "candidate_tie_break_order": [
+      "recipe_id",
+      "canonical_pair_family_id",
+      "instrument",
+      "timeframe",
+      "indicator_ids",
+      "candidate_id"
+    ],
+    "lane_tie_break_order": ["guided", "uncertain", "wild"],
+    "quota_basis": "campaign_lane_budget_times_lane_fraction",
+    "quota_rounding": "floor_then_descending_fractional_remainder",
+    "random_tie_break": "forbidden"
+  },
+  "lanes": {
+    "guided": {
+      "eligible_menus": {
+        "allow_generation_eligible_fallback": false,
+        "pair_sampling_lanes": ["positive_pair"],
+        "recipe_sources": ["curated_recipe_prior", "discovery_recipe_validation"],
+        "slot_sampling_lanes": ["high_prior", "medium_prior"]
+      },
+      "fraction": 0.6
+    },
+    "uncertain": {
+      "eligible_menus": {
+        "allow_generation_eligible_fallback": false,
+        "pair_sampling_lanes": ["near_miss_pair"],
+        "recipe_sources": ["curated_recipe_prior", "discovery_recipe_validation"],
+        "slot_sampling_lanes": ["uncertain_prior"]
+      },
+      "fraction": 0.25
+    },
+    "wild": {
+      "eligible_menus": {
+        "allow_generation_eligible_fallback": true,
+        "pair_sampling_lanes": ["low_pair"],
+        "recipe_sources": ["curated_recipe_prior"],
+        "slot_sampling_lanes": ["wild_exploration"]
+      },
+      "fraction": 0.15
+    }
+  },
+  "manifest_sha256": "sha256:23a555a52f6d7d2a94dd19b283de203a90c8b2e6017d6b4ec05f82454408b89e",
+  "negative_prior_expiry": {
+    "active_through": "anchor_run_sequence_plus_ttl_inclusive",
+    "anchor": {
+      "generation": "level-c-v3-phase2-rich-priors",
+      "run_sequence": 4
+    },
+    "basis": "source_atlas_generation_run_sequence",
+    "on_generation_mismatch": "expired",
+    "ttl_field": "expires_after_atlas_runs"
+  },
+  "schema_version": "phase3_campaign_policy_manifest_v1"
+}

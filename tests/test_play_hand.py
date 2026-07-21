@@ -57,6 +57,48 @@ from autoresearch.play_hand import (
     resolve_sweep_budget,
 )
 from autoresearch.ledger import load_attempts, write_attempts
+from autoresearch.recipe_priors import build_campaign_policy_manifest
+
+
+def _policy_honest_manifest() -> dict:
+    return build_campaign_policy_manifest(
+        lane_fractions={"guided": 0.60, "uncertain": 0.25, "wild": 0.15},
+        lane_eligible_menus={
+            "guided": {
+                "recipe_sources": [
+                    "curated_recipe_prior",
+                    "discovery_recipe_validation",
+                ],
+                "slot_sampling_lanes": ["high_prior", "medium_prior"],
+                "pair_sampling_lanes": ["positive_pair"],
+                "allow_generation_eligible_fallback": False,
+            },
+            "uncertain": {
+                "recipe_sources": [
+                    "curated_recipe_prior",
+                    "discovery_recipe_validation",
+                ],
+                "slot_sampling_lanes": ["uncertain_prior"],
+                "pair_sampling_lanes": ["near_miss_pair"],
+                "allow_generation_eligible_fallback": False,
+            },
+            "wild": {
+                "recipe_sources": ["curated_recipe_prior"],
+                "slot_sampling_lanes": ["wild_exploration"],
+                "pair_sampling_lanes": ["low_pair"],
+                "allow_generation_eligible_fallback": True,
+            },
+        },
+        diversity_max_shares={
+            "family": 1.0,
+            "recipe": 1.0,
+            "instrument": 1.0,
+            "timeframe": 1.0,
+            "indicator": 1.0,
+        },
+        source_atlas_generation="atlas-generation-test",
+        source_atlas_run_sequence=7,
+    )
 
 
 def _family_policy_seed_plan(policy: str) -> dict[str, object]:
@@ -621,6 +663,86 @@ def test_deal_seed_plan_indicators_applies_negative_guard_to_role_balanced_fill(
         "SECOND_A",
         "GOOD_FILL",
     ]
+
+
+def test_policy_honest_negative_expiry_is_consumed_before_hard_exclusion() -> None:
+    policy = _policy_honest_manifest()
+    seed_plan = {
+        "schema_version": "play_hand_seed_plan_v2",
+        "sampling_policy": {
+            "guided_prior_fraction": 0.60,
+            "uncertain_prior_fraction": 0.25,
+            "wild_exploration_fraction": 0.15,
+        },
+        "campaign_policy_manifest": policy,
+        "campaign_policy_sha256": policy["manifest_sha256"],
+        "negative_pairs": [
+            {
+                "first_indicator_id": "FIRST_A",
+                "second_indicator_id": "BAD_FILL",
+                "negative_reason": "positive_discovery_collapsed",
+                "negative_weight": 1.5,
+                "is_hard_block": True,
+                "expires_after_atlas_runs": 1,
+            }
+        ],
+        "recipes": {
+            "guided_recipe": {
+                "source": "curated_recipe_prior",
+                "pair_menu": [
+                    {
+                        "anchor_id": "FIRST_A",
+                        "trigger_id": "SECOND_A",
+                        "pair_sampling_lane": "low_pair",
+                        "pair_sampling_weight": 1.0,
+                    }
+                ],
+                "slot_menus": {},
+            }
+        },
+    }
+    indicators = [
+        play_hand_mod.SeedIndicator("FIRST_A", "setup", "event", "mid-setup"),
+        play_hand_mod.SeedIndicator("SECOND_A", "trigger", "event", "entry"),
+        play_hand_mod.SeedIndicator("BAD_FILL", "trigger", "event", "entry"),
+        play_hand_mod.SeedIndicator("GOOD_FILL", "trigger", "event", "entry"),
+    ]
+
+    active = deal_seed_plan_indicators(
+        indicators,
+        target_count=3,
+        seed_plan=seed_plan,
+        rng=random.Random(7),
+        policy_lane="wild",
+        negative_prior_runtime={
+            "current_atlas_generation": "atlas-generation-test",
+            "current_atlas_run_sequence": 8,
+        },
+    )
+    expired = deal_seed_plan_indicators(
+        indicators,
+        target_count=3,
+        seed_plan=seed_plan,
+        rng=random.Random(7),
+        policy_lane="wild",
+        negative_prior_runtime={
+            "current_atlas_generation": "atlas-generation-test",
+            "current_atlas_run_sequence": 9,
+        },
+    )
+
+    assert [indicator.id for indicator in active["indicators"]] == [
+        "FIRST_A",
+        "SECOND_A",
+        "GOOD_FILL",
+    ]
+    assert active["negative_prior_decisions"][0]["expiry_status"] == "active"
+    assert [indicator.id for indicator in expired["indicators"]] == [
+        "FIRST_A",
+        "SECOND_A",
+        "BAD_FILL",
+    ]
+    assert expired["negative_prior_decisions"][0]["expiry_status"] == "expired_run_sequence"
 
 
 def test_deal_seed_plan_indicators_treats_atlas_negative_pairs_as_soft_penalties() -> None:
