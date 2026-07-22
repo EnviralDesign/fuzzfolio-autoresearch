@@ -2741,6 +2741,27 @@ def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
     assert len(_DurabilityFakeGateway.enqueued_task_ids) == 4
     assert len(set(_DurabilityFakeGateway.enqueued_task_ids)) == 4
 
+    compacted = copy.deepcopy(after_resume)
+    for lane_payload in compacted["lanes"]:
+        if not lane_payload.get("terminal"):
+            continue
+        lane_payload["profile_payload"] = None
+        lane_payload["incumbent_profile_payload"] = None
+        lane_payload["last_sweep_payload"] = None
+        lane_payload["instrument_scout_result"] = None
+        lane_payload["task_specs"] = {}
+        lane_payload["phase_rows"] = []
+        lane_payload["phase_results"] = {}
+    state_path.write_text(json.dumps(compacted), encoding="utf-8")
+
+    assert lab.cmd_play_hand_lab(runtime(resume=True)) == 0
+    compacted_after_resume = json.loads(state_path.read_text(encoding="utf-8"))
+    assert all(
+        lane_payload["task_specs"] == {}
+        for lane_payload in compacted_after_resume["lanes"]
+        if lane_payload.get("terminal")
+    )
+
     for damage in ("counter", "task_assignment"):
         tampered = copy.deepcopy(after_resume)
         if damage == "counter":

@@ -948,6 +948,7 @@ def _recompute_campaign_policy_state_from_durable_lanes(
     *,
     lanes: list[LabLaneState],
     unresolved_tasks: list[dict[str, Any]],
+    durable_tasks_by_id: Mapping[str, Any],
     pruned_lane_count: int,
 ) -> dict[str, Any]:
     """Rebuild mutable policy accounting and reject contradictory durable evidence."""
@@ -1062,6 +1063,21 @@ def _recompute_campaign_policy_state_from_durable_lanes(
 
         for task_id in lane.task_ids:
             task_spec = lane.task_specs.get(task_id)
+            if not isinstance(task_spec, dict):
+                durable_task = durable_tasks_by_id.get(task_id)
+                if not isinstance(durable_task, dict):
+                    raise DurableExecutionError(
+                        f"durable policy lane has no task spec: {task_id}"
+                    )
+                task_spec = durable_task.get("payload")
+                if (
+                    not isinstance(task_spec, dict)
+                    or str(task_spec.get("task_id") or "") != task_id
+                    or str(task_spec.get("lane_id") or "") != lane.lane_id
+                ):
+                    raise DurableExecutionError(
+                        f"durable policy lane has no task spec: {task_id}"
+                    )
             if not isinstance(task_spec, dict):
                 raise DurableExecutionError(
                     f"durable policy lane has no task spec: {task_id}"
@@ -4669,7 +4685,12 @@ def _validate_phase3_legacy_follow_on_receipt_migration(
         task_id=task_id,
         required=True,
     )
-    if migration["derived_tasks_sha256"] != canonical_sha256(validated):
+    raw_graph_sha256 = canonical_sha256(derived_tasks)
+    normalized_graph_sha256 = canonical_sha256(validated)
+    if migration["derived_tasks_sha256"] not in {
+        raw_graph_sha256,
+        normalized_graph_sha256,
+    }:
         raise DurableExecutionError(
             f"legacy follow-on receipt migration task graph conflicts for task {task_id}"
         )
@@ -7236,11 +7257,17 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             )
             lanes_by_task[str(task["task_id"])] = lane
         if history.campaign_policy_state is not None:
+            durable_tasks_by_id = {
+                str(task_id): task
+                for task_id, task in (journal.load().get("tasks") or {}).items()
+                if isinstance(task, dict)
+            }
             history.campaign_policy_state = (
                 _recompute_campaign_policy_state_from_durable_lanes(
                     history.campaign_policy_state,
                     lanes=lanes,
                     unresolved_tasks=tasks,
+                    durable_tasks_by_id=durable_tasks_by_id,
                     pruned_lane_count=history.pruned_lane_count,
                 )
             )
