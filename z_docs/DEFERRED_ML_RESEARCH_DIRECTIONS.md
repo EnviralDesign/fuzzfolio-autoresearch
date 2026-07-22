@@ -7,6 +7,10 @@ predeclared 10,000-lane boundary and the resulting corpus has been frozen and
 audited. This document records research directions; it authorizes no ML model,
 tail access, campaign-policy change, or deployment.
 
+The broader long-term concept of a constrained temporal strategy language and
+an inspectable learning architect is documented in
+`STRATEGY_LANGUAGE_AND_LEARNING_ARCHITECT_VISION.md`.
+
 ## Why Revisit ML Now
 
 Fuzzfolio now has infrastructure that earlier ML experiments lacked:
@@ -72,4 +76,3 @@ After the 10,000-lane forensic report, run a prospective candidate-ranking or
 regime-discovery experiment. Freeze its training data and decision rule, then
 compare it against the existing PlayHand policy on a subsequent campaign. Do
 not use the reserved Phase 3 outer tail for model construction or iteration.
-
