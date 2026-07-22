@@ -419,6 +419,31 @@ def test_durable_campaign_state_rejects_semantic_runtime_drift(tmp_path: Path) -
         )
 
 
+def test_durable_campaign_state_allows_operational_concurrency_change(tmp_path: Path) -> None:
+    runtime = lab._normalize_runtime(_level_c_runtime(tmp_path, target_runs=2, active_runs=2))
+    state_path = tmp_path / "state.json"
+    lab._write_campaign_state(
+        state_path,
+        runtime=runtime,
+        campaign_id=str(runtime.campaign_id),
+        lanes=[],
+        history=lab.LabCampaignHistory(),
+        next_lane_index=0,
+        recorded_result_count=0,
+    )
+
+    changed = lab.replace(runtime, active_runs=1)
+    _lanes, _history, next_lane_index, _reserved, recorded_result_count = (
+        lab._load_campaign_state(
+            state_path,
+            runtime=changed,
+            campaign_id=str(runtime.campaign_id),
+        )
+    )
+    assert next_lane_index == 0
+    assert recorded_result_count == 0
+
+
 def test_policy_honest_state_uses_exact_hamilton_lane_allocation() -> None:
     runtime = lab.PlayHandLabRuntimeConfig(
         campaign_mode="finite",

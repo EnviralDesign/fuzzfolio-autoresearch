@@ -609,6 +609,7 @@ def _campaign_state_lineage(runtime: PlayHandLabRuntimeConfig, campaign_id: str)
         not in {
             "gateway_url",
             "gateway_token",
+            "active_runs",
             "poll_interval_seconds",
             "max_wait_seconds",
             "result_batch_size",
