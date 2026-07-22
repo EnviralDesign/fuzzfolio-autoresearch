@@ -3030,6 +3030,163 @@ def test_phase3_resume_reconstructs_followup_after_record_before_ack_crash(
     assert journal["tasks"][derived_task_id]["status"] == "terminal"
 
 
+def _legacy_phase3_follow_on_receipt_fixture(tmp_path: Path) -> tuple[
+    Path,
+    dict,
+    dict,
+    dict,
+    list[dict],
+]:
+    task_id = "phase3-lane-00023-task-00001-baseline_3mo"
+    artifact_dir = tmp_path / "evals" / "eval_lab_baseline_3mo_fixture"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "result.json").write_text('{"status":"success"}', encoding="utf-8")
+    lab_result = {
+        "task_id": task_id,
+        "worker_id": "legacy-worker",
+        "lease_id": "legacy-lease",
+        "result": {"status": "success", "result": {"task_id": task_id}},
+    }
+    worker_result_sha256 = lab._worker_result_identity(lab_result)
+    policy_assignment = {"policy_lane": "guided", "policy_outcome_type": "selected"}
+    recorded = {
+        "task_id": task_id,
+        "attempt_id": "phase3-lane-00023-attempt-00001",
+        "artifact_dir": str(artifact_dir.resolve()),
+        "score": 55.5022,
+        "score_basis": "score_lab_v2_5_3",
+        "status": "success",
+        "phase": "baseline_3mo",
+        "task_kind": "deep_replay",
+        "profile_path": str(tmp_path / "profiles" / "lane_023_base.json"),
+        "profile_ref": "lab-inline:phase3-lane-00023:lane_023",
+        "instruments": ["AUDCHF"],
+        "timeframe": "M15",
+        "lookback_months": 3,
+        "analysis_window_start": "2025-10-14T00:00:00Z",
+        "analysis_window_end": "2026-01-14T00:00:00Z",
+        "evidence_plan_id": "sha256:evidence",
+        "evidence_role": "training",
+        "policy_assignment": policy_assignment,
+    }
+    recovered_row = {
+        "attempt_id": recorded["attempt_id"],
+        "artifact_dir": recorded["artifact_dir"],
+        "composite_score": recorded["score"],
+        "score_basis": recorded["score_basis"],
+        "lab_scoring_warning": None,
+        "play_hand_phase": recorded["phase"],
+        "lab_task_kind": recorded["task_kind"],
+        "profile_path": recorded["profile_path"],
+        "profile_ref": recorded["profile_ref"],
+        "play_hand_selected_instruments": recorded["instruments"],
+        "effective_timeframe": recorded["timeframe"],
+        "requested_horizon_months": recorded["lookback_months"],
+        "analysis_window_start": recorded["analysis_window_start"],
+        "analysis_window_end": recorded["analysis_window_end"],
+        "evidence_plan_id": recorded["evidence_plan_id"],
+        "evidence_role": recorded["evidence_role"],
+        "policy_assignment": policy_assignment,
+        "lab_worker_result_sha256": worker_result_sha256,
+    }
+    derived_tasks = [
+        {
+            "task_id": "phase3-lane-00023-task-00002-lookback_timing-shard-0000",
+            "attempt_id": "phase3-lane-00023-task-00002-lookback_timing-shard-0000",
+            "payload": {"task_id": "phase3-lane-00023-task-00002-lookback_timing-shard-0000"},
+        }
+    ]
+    receipt_path = artifact_dir / "task-result-receipt.json"
+    lab._write_task_result_receipt(
+        receipt_path,
+        task_id=task_id,
+        worker_result_sha256=worker_result_sha256,
+        recorded_result=recorded,
+    )
+    legacy = json.loads(receipt_path.read_text(encoding="utf-8"))
+    legacy["derived_tasks"] = copy.deepcopy(derived_tasks)
+    # This is the exact interrupted predecessor shape: derived work was added
+    # after the original v2 receipt hash had been computed.
+    receipt_path.write_text(json.dumps(legacy, sort_keys=True), encoding="utf-8")
+    return receipt_path, lab_result, recorded, recovered_row, derived_tasks
+
+
+def test_phase3_legacy_follow_on_receipt_migrates_only_after_exact_proof(
+    tmp_path: Path,
+) -> None:
+    receipt_path, lab_result, recorded, recovered_row, derived_tasks = (
+        _legacy_phase3_follow_on_receipt_fixture(tmp_path)
+    )
+
+    proven = lab._legacy_phase3_receipt_recorded_result(
+        receipt_path,
+        task_id=recorded["task_id"],
+        worker_result_sha256=recovered_row["lab_worker_result_sha256"],
+        recovered_row=recovered_row,
+    )
+    assert proven == recorded
+
+    migrated = lab._terminal_receipt_for_result(
+        proven,
+        lab_result,
+        derived_tasks=derived_tasks,
+        allow_legacy_phase3_receipt_migration=True,
+    )
+    assert migrated["derived_tasks"] == derived_tasks
+    assert migrated["compatibility_migration"]["schema_version"] == (
+        lab.PHASE3_LEGACY_FOLLOW_ON_RECEIPT_MIGRATION_SCHEMA
+    )
+    assert lab._validate_task_result_receipt(
+        receipt_path,
+        task_id=recorded["task_id"],
+        worker_result_sha256=recovered_row["lab_worker_result_sha256"],
+    ) == migrated
+
+    # A crash after the durable upgrade but before ACK can only revalidate it;
+    # it cannot derive a second or altered follow-on graph.
+    assert lab._terminal_receipt_for_result(
+        proven,
+        lab_result,
+        derived_tasks=derived_tasks,
+        allow_legacy_phase3_receipt_migration=True,
+    ) == migrated
+
+
+def test_phase3_legacy_follow_on_receipt_rejects_any_evidence_or_graph_drift(
+    tmp_path: Path,
+) -> None:
+    receipt_path, lab_result, recorded, recovered_row, derived_tasks = (
+        _legacy_phase3_follow_on_receipt_fixture(tmp_path)
+    )
+    legacy = json.loads(receipt_path.read_text(encoding="utf-8"))
+    legacy["recorded_result"]["score"] = 999.0
+    receipt_path.write_text(json.dumps(legacy, sort_keys=True), encoding="utf-8")
+    with pytest.raises(lab.DurableExecutionError, match="receipt evidence conflicts"):
+        lab._legacy_phase3_receipt_recorded_result(
+            receipt_path,
+            task_id=recorded["task_id"],
+            worker_result_sha256=recovered_row["lab_worker_result_sha256"],
+            recovered_row=recovered_row,
+        )
+
+    legacy["recorded_result"]["score"] = recorded["score"]
+    legacy["derived_tasks"][0]["payload"]["task_id"] = "different-derived-task"
+    receipt_path.write_text(json.dumps(legacy, sort_keys=True), encoding="utf-8")
+    proven = lab._legacy_phase3_receipt_recorded_result(
+        receipt_path,
+        task_id=recorded["task_id"],
+        worker_result_sha256=recovered_row["lab_worker_result_sha256"],
+        recovered_row=recovered_row,
+    )
+    with pytest.raises(lab.DurableExecutionError, match="follow-on graph conflicts"):
+        lab._terminal_receipt_for_result(
+            proven,
+            lab_result,
+            derived_tasks=derived_tasks,
+            allow_legacy_phase3_receipt_migration=True,
+        )
+
+
 @pytest.mark.parametrize("damage", ["mutate", "delete"])
 def test_resume_revalidates_terminal_artifacts(
     tmp_path: Path,

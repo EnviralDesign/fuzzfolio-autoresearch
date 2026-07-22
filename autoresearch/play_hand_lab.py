@@ -4518,6 +4518,9 @@ def _validated_execution_evidence(
 
 
 TASK_RESULT_RECEIPT_SCHEMA = "play-hand-lab-task-result-receipt-v2"
+PHASE3_LEGACY_FOLLOW_ON_RECEIPT_MIGRATION_SCHEMA = (
+    "phase3-retained-follow-on-receipt-migration-v1"
+)
 
 
 def _task_artifact_receipt(artifact_dir: Path) -> dict[str, Any]:
@@ -4569,6 +4572,13 @@ def _validate_task_result_receipt_payload(
         raise DurableExecutionError(f"task result receipt conflicts for task {task_id}")
     if worker_result_sha256 is not None and supplied.get("worker_result_sha256") != worker_result_sha256:
         raise DurableExecutionError(f"worker result identity conflicts for task {task_id}")
+    migration = supplied.get("compatibility_migration")
+    if migration is not None:
+        _validate_phase3_legacy_follow_on_receipt_migration(
+            migration,
+            task_id=task_id,
+            derived_tasks=supplied.get("derived_tasks"),
+        )
     validate_artifact_receipt(supplied["artifact_receipt"])
     supplied["receipt_sha256"] = receipt_sha256
     return supplied
@@ -4587,20 +4597,204 @@ def _validate_task_result_receipt(
     )
 
 
+def _validate_phase3_legacy_follow_on_receipt_migration(
+    migration: Any,
+    *,
+    task_id: str,
+    derived_tasks: Any,
+) -> None:
+    if not isinstance(migration, dict) or set(migration) != {
+        "schema_version",
+        "legacy_receipt_sha256",
+        "legacy_payload_sha256",
+        "derived_tasks_sha256",
+    }:
+        raise DurableExecutionError(
+            f"legacy follow-on receipt migration is malformed for task {task_id}"
+        )
+    if migration.get("schema_version") != PHASE3_LEGACY_FOLLOW_ON_RECEIPT_MIGRATION_SCHEMA:
+        raise DurableExecutionError(
+            f"legacy follow-on receipt migration schema conflicts for task {task_id}"
+        )
+    for key in (
+        "legacy_receipt_sha256",
+        "legacy_payload_sha256",
+        "derived_tasks_sha256",
+    ):
+        if not isinstance(migration.get(key), str) or not str(migration[key]).startswith("sha256:"):
+            raise DurableExecutionError(
+                f"legacy follow-on receipt migration identity is malformed for task {task_id}"
+            )
+    validated = _validated_receipt_derived_tasks(
+        {"derived_tasks": derived_tasks},
+        task_id=task_id,
+        required=True,
+    )
+    if migration["derived_tasks_sha256"] != canonical_sha256(validated):
+        raise DurableExecutionError(
+            f"legacy follow-on receipt migration task graph conflicts for task {task_id}"
+        )
+
+
+def _legacy_phase3_receipt_recorded_result(
+    receipt_path: Path,
+    *,
+    task_id: str,
+    worker_result_sha256: str,
+    recovered_row: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Admit only the pre-follow-on-binding receipt shape for a Phase 3 replay."""
+    raw = _load_json(receipt_path)
+    if not isinstance(raw, dict):
+        raise DurableExecutionError(f"task result receipt is unreadable: {task_id}")
+    if set(raw) != {
+        "schema_version",
+        "task_id",
+        "worker_result_sha256",
+        "artifact_receipt",
+        "recorded_result",
+        "derived_tasks",
+        "receipt_sha256",
+    }:
+        raise DurableExecutionError(
+            f"legacy Phase 3 receipt shape conflicts for task {task_id}"
+        )
+    unsigned = dict(raw)
+    legacy_receipt_sha256 = str(unsigned.pop("receipt_sha256", ""))
+    if (
+        raw.get("schema_version") != TASK_RESULT_RECEIPT_SCHEMA
+        or raw.get("task_id") != task_id
+        or raw.get("worker_result_sha256") != worker_result_sha256
+        or not isinstance(raw.get("recorded_result"), dict)
+        or not isinstance(raw.get("artifact_receipt"), dict)
+        or not isinstance(raw.get("derived_tasks"), list)
+        or not legacy_receipt_sha256.startswith("sha256:")
+        or legacy_receipt_sha256 == canonical_sha256(unsigned)
+    ):
+        raise DurableExecutionError(
+            f"legacy Phase 3 receipt cannot be proven for task {task_id}"
+        )
+    _validated_receipt_derived_tasks(raw, task_id=task_id, required=True)
+    validate_artifact_receipt(raw["artifact_receipt"])
+    recorded = dict(raw["recorded_result"])
+    expected = {
+        "task_id": task_id,
+        "attempt_id": recovered_row.get("attempt_id"),
+        "artifact_dir": str(Path(str(recovered_row.get("artifact_dir") or "")).resolve(strict=False)),
+        "score": recovered_row.get("composite_score"),
+        "score_basis": recovered_row.get("score_basis"),
+        "status": "failed" if recovered_row.get("lab_scoring_warning") else "success",
+        "phase": recovered_row.get("play_hand_phase"),
+        "task_kind": recovered_row.get("lab_task_kind"),
+        "profile_path": recovered_row.get("profile_path"),
+        "profile_ref": recovered_row.get("profile_ref"),
+        "instruments": list(recovered_row.get("play_hand_selected_instruments") or []),
+        "timeframe": recovered_row.get("effective_timeframe"),
+        "lookback_months": recovered_row.get("requested_horizon_months"),
+        "analysis_window_start": recovered_row.get("analysis_window_start"),
+        "analysis_window_end": recovered_row.get("analysis_window_end"),
+        "evidence_plan_id": recovered_row.get("evidence_plan_id"),
+        "evidence_role": recovered_row.get("evidence_role"),
+        "policy_assignment": recovered_row.get("policy_assignment"),
+    }
+    for key, value in expected.items():
+        if recorded.get(key) != value:
+            raise DurableExecutionError(
+                f"legacy Phase 3 receipt evidence conflicts for task {task_id}: {key}"
+            )
+    return recorded
+
+
+def _upgrade_legacy_phase3_follow_on_receipt(
+    receipt_path: Path,
+    *,
+    task_id: str,
+    worker_result_sha256: str,
+    recorded_result: Mapping[str, Any],
+    derived_tasks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    raw = _load_json(receipt_path)
+    if not isinstance(raw, dict):
+        raise DurableExecutionError(f"task result receipt is unreadable: {task_id}")
+    provisional = dict(raw)
+    legacy_receipt_sha256 = str(provisional.pop("receipt_sha256", ""))
+    expected_keys = {
+        "schema_version",
+        "task_id",
+        "worker_result_sha256",
+        "artifact_receipt",
+        "recorded_result",
+        "derived_tasks",
+    }
+    if (
+        set(provisional) != expected_keys
+        or provisional.get("schema_version") != TASK_RESULT_RECEIPT_SCHEMA
+        or provisional.get("task_id") != task_id
+        or provisional.get("worker_result_sha256") != worker_result_sha256
+        or provisional.get("recorded_result") != dict(recorded_result)
+        or not legacy_receipt_sha256.startswith("sha256:")
+        or legacy_receipt_sha256 == canonical_sha256(provisional)
+    ):
+        raise DurableExecutionError(
+            f"legacy Phase 3 receipt cannot be migrated for task {task_id}"
+        )
+    validate_artifact_receipt(provisional["artifact_receipt"])
+    stored_tasks = _validated_receipt_derived_tasks(
+        provisional,
+        task_id=task_id,
+        required=True,
+    )
+    canonical_tasks = _validated_receipt_derived_tasks(
+        {"derived_tasks": derived_tasks},
+        task_id=task_id,
+        required=True,
+    )
+    if stored_tasks != canonical_tasks:
+        raise DurableExecutionError(
+            f"legacy Phase 3 follow-on graph conflicts for task {task_id}"
+        )
+    provisional["compatibility_migration"] = {
+        "schema_version": PHASE3_LEGACY_FOLLOW_ON_RECEIPT_MIGRATION_SCHEMA,
+        "legacy_receipt_sha256": legacy_receipt_sha256,
+        "legacy_payload_sha256": canonical_sha256(provisional),
+        "derived_tasks_sha256": canonical_sha256(canonical_tasks),
+    }
+    provisional["receipt_sha256"] = canonical_sha256(provisional)
+    atomic_write_json(receipt_path, provisional)
+    return _validate_task_result_receipt(
+        receipt_path,
+        task_id=task_id,
+        worker_result_sha256=worker_result_sha256,
+    )
+
+
 def _terminal_receipt_for_result(
     recorded: dict[str, Any],
     lab_result: dict[str, Any],
     *,
     derived_tasks: list[dict[str, Any]] | None = None,
+    allow_legacy_phase3_receipt_migration: bool = False,
 ) -> dict[str, Any]:
     task_id = str(lab_result.get("task_id") or "")
     artifact_dir = Path(str(recorded.get("artifact_dir") or "")).resolve(strict=False)
     receipt_path = artifact_dir / "task-result-receipt.json"
-    receipt = _validate_task_result_receipt(
-        receipt_path,
-        task_id=task_id,
-        worker_result_sha256=_worker_result_identity(lab_result),
-    )
+    worker_result_sha256 = _worker_result_identity(lab_result)
+    try:
+        receipt = _validate_task_result_receipt(
+            receipt_path,
+            task_id=task_id,
+            worker_result_sha256=worker_result_sha256,
+        )
+    except DurableExecutionError:
+        if not allow_legacy_phase3_receipt_migration or derived_tasks is None:
+            raise
+        return _upgrade_legacy_phase3_follow_on_receipt(
+            receipt_path,
+            task_id=task_id,
+            worker_result_sha256=worker_result_sha256,
+            recorded_result=recorded,
+            derived_tasks=derived_tasks,
+        )
     if derived_tasks is None:
         return receipt
     canonical_tasks = _validated_receipt_derived_tasks(
@@ -4660,6 +4854,7 @@ def _record_lab_result(
     lab_result: dict[str, Any],
     reward_matrix: dict[str, Any] | None,
     render_progress: bool = True,
+    allow_legacy_phase3_receipt_migration: bool = False,
 ) -> dict[str, Any]:
     task_id = str(lab_result.get("task_id") or "")
     task_spec = lane.task_specs.get(task_id, {})
@@ -4694,12 +4889,22 @@ def _record_lab_result(
             )
     receipt_path = artifact_dir / "task-result-receipt.json"
     if receipt_path.is_file():
-        receipt = _validate_task_result_receipt(
-            receipt_path,
-            task_id=task_id,
-            worker_result_sha256=result_identity,
-        )
-        return dict(receipt["recorded_result"])
+        try:
+            receipt = _validate_task_result_receipt(
+                receipt_path,
+                task_id=task_id,
+                worker_result_sha256=result_identity,
+            )
+            return dict(receipt["recorded_result"])
+        except DurableExecutionError:
+            if not allow_legacy_phase3_receipt_migration or recovered_row is None:
+                raise
+            return _legacy_phase3_receipt_recorded_result(
+                receipt_path,
+                task_id=task_id,
+                worker_result_sha256=result_identity,
+                recovered_row=recovered_row,
+            )
     if recovered_row is not None:
         row = recovered_row
         recorded = {
@@ -7599,6 +7804,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                         lab_result=lab_result,
                         reward_matrix=reward_matrix,
                         render_progress=False,
+                        allow_legacy_phase3_receipt_migration=defer_enqueues,
                     )
                     mark_progress_dirty(lane)
                     if recorded.get("status") == "failed":
@@ -7631,6 +7837,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                         recorded,
                         lab_result,
                         derived_tasks=new_stage_tasks if defer_enqueues else None,
+                        allow_legacy_phase3_receipt_migration=defer_enqueues,
                     ),
                 )
                 if defer_enqueues:
