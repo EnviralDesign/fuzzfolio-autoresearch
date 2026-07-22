@@ -7061,7 +7061,8 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         execution_id=str(runtime.execution_plan_id or campaign_id),
         lineage=_campaign_state_lineage(runtime, campaign_id),
     )
-    journal.load(create=not bool(runtime.resume))
+    journal_payload = journal.load(create=not bool(runtime.resume))
+    durable_tasks_by_id = journal_payload["tasks"]
     _write_campaign_metadata(campaign_ctx, runtime=runtime, status="starting", started_at=started_at)
     _append_event(
         campaign_ctx,
@@ -7156,7 +7157,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             lane_contexts[lane.run_id] = lane_ctx
             for task_id in lane.task_ids:
                 lanes_by_task[task_id] = lane
-        tasks = [dict(item["payload"]) for item in journal.unresolved()]
+        tasks = [
+            dict(item["payload"])
+            for _task_id, item in sorted(durable_tasks_by_id.items())
+            if isinstance(item, dict) and item.get("status") != "terminal"
+        ]
     history.campaign_policy_state = _campaign_policy_state(
         campaign_policy,
         runtime=runtime,
@@ -7179,7 +7184,9 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         recovered_tasks: list[dict[str, Any]] = []
         for lane in lanes:
             for task_id in list(lane.task_ids):
-                terminal = journal.terminal(task_id)
+                terminal = durable_tasks_by_id.get(task_id)
+                if not isinstance(terminal, dict) or terminal.get("status") != "terminal":
+                    terminal = None
                 if terminal is None:
                     if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
                         raise DurableExecutionError(
@@ -7244,7 +7251,8 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     else recomputed_tasks
                 )
         for task in recovered_tasks:
-            journal.register(str(task["task_id"]), task)
+            task_id = str(task["task_id"])
+            durable_tasks_by_id[task_id] = journal.register(task_id, task)
             if not any(
                 str(existing.get("task_id") or "") == str(task["task_id"])
                 for existing in tasks
@@ -7257,11 +7265,6 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             )
             lanes_by_task[str(task["task_id"])] = lane
         if history.campaign_policy_state is not None:
-            durable_tasks_by_id = {
-                str(task_id): task
-                for task_id, task in (journal.load().get("tasks") or {}).items()
-                if isinstance(task, dict)
-            }
             history.campaign_policy_state = (
                 _recompute_campaign_policy_state_from_durable_lanes(
                     history.campaign_policy_state,
