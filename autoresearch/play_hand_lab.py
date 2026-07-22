@@ -7257,7 +7257,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 if (
                     not isinstance(existing_durable_task, dict)
                     or existing_durable_task.get("payload_sha256")
-                    != canonical_sha256(task)
+                    != journal.task_payload_sha256(task)
                 ):
                     raise DurableExecutionError(
                         f"task payload conflicts with durable graph: {task_id}"

@@ -163,12 +163,20 @@ class DurableExecutionJournal:
         atomic_write_json(self.path, payload)
         return payload
 
+    @staticmethod
+    def task_payload_sha256(payload: Mapping[str, Any]) -> str:
+        task_payload = _canonical_snapshot(
+            payload,
+            label="execution journal task payload",
+        )
+        return canonical_sha256(task_payload)
+
     def register(self, task_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         journal = self.load(create=True)
         tasks = journal["tasks"]
         task_key = str(task_id)
         task_payload = _canonical_snapshot(payload, label="execution journal task payload")
-        payload_sha256 = canonical_sha256(task_payload)
+        payload_sha256 = self.task_payload_sha256(task_payload)
         existing = tasks.get(task_key)
         if existing is not None:
             if existing.get("payload_sha256") != payload_sha256:

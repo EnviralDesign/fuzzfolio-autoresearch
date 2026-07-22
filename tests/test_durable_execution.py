@@ -75,6 +75,28 @@ def test_journal_fails_closed_on_payload_or_lineage_mismatch(tmp_path: Path) -> 
         ).load()
 
 
+def test_task_payload_sha256_matches_json_normalized_registered_payload(
+    tmp_path: Path,
+) -> None:
+    journal = DurableExecutionJournal(
+        tmp_path / "journal.json",
+        execution_id="plan-1",
+        lineage={"cutoff": "A"},
+    )
+    payload = {
+        "phase": "coarse_probe",
+        "params_by_index": {0: {"alpha": 1}, 1: {"alpha": 2}},
+    }
+
+    registered = journal.register("task-1", payload)
+
+    assert registered["payload_sha256"] == journal.task_payload_sha256(payload)
+    assert registered["payload"]["params_by_index"] == {
+        "0": {"alpha": 1},
+        "1": {"alpha": 2},
+    }
+
+
 def test_journal_owns_nested_task_and_terminal_payloads(tmp_path: Path) -> None:
     journal = DurableExecutionJournal(
         tmp_path / "journal.json",
