@@ -5,12 +5,38 @@ from pathlib import Path
 
 import pytest
 
+import autoresearch.durable_execution as durable_execution
+
 from autoresearch.durable_execution import (
     DurableExecutionError,
     DurableExecutionJournal,
     artifact_receipt,
     validate_artifact_receipt,
 )
+
+
+def test_atomic_write_retries_transient_windows_replace_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "journal.json"
+    real_replace = durable_execution.os.replace
+    attempts = 0
+
+    def transient_replace(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError(5, "Access is denied", str(destination))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(durable_execution.os, "replace", transient_replace)
+    monkeypatch.setattr(durable_execution.time, "sleep", lambda _seconds: None)
+
+    durable_execution.atomic_write_json(target, {"status": "complete"})
+
+    assert attempts == 3
+    assert json.loads(target.read_text(encoding="utf-8")) == {"status": "complete"}
+    assert list(tmp_path.glob("*.tmp")) == []
 
 
 def test_journal_replays_unresolved_work_and_accepts_identical_terminal_duplicate(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -12,6 +13,8 @@ from .evidence_plan import canonical_json, canonical_sha256
 
 
 JOURNAL_SCHEMA = "autoresearch-durable-execution-v1"
+ATOMIC_REPLACE_ATTEMPTS = 8
+ATOMIC_REPLACE_RETRY_SECONDS = 0.025
 
 
 class DurableExecutionError(RuntimeError):
@@ -42,7 +45,14 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write(canonical_json(dict(payload)).encode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, target)
+        for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+            try:
+                os.replace(temporary, target)
+                break
+            except PermissionError:
+                if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(ATOMIC_REPLACE_RETRY_SECONDS * (2**attempt))
     finally:
         temporary.unlink(missing_ok=True)
 
