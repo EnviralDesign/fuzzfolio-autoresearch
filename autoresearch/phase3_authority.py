@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -24,6 +25,7 @@ from .recipe_priors import (
     validate_seed_plan_campaign_policy,
 )
 from .play_hand import DEFAULT_INSTRUMENT_POOL
+from .runtime_policy_lock import build_runtime_policy_lock, policy_lock_provenance
 
 
 PHASE3_AUTHORITY_SCHEMA_VERSION = "phase3_playhand_authority_v2"
@@ -413,6 +415,58 @@ def _shared_authority_contract(plans: Mapping[str, Mapping[str, Any]]) -> dict[s
     return copy.deepcopy(contracts["A"])
 
 
+def _live_execution_contract(
+    phase2_contract: Mapping[str, Any],
+    *,
+    worker_image: str,
+    trading_dashboard_root: Path | str | None,
+) -> dict[str, Any]:
+    """Rebind execution only; Phase 2 remains immutable selection provenance."""
+    from .config import load_config
+    from .level_c_operator import (
+        _configured_trading_dashboard_root,
+        build_profile_model_source_lock,
+    )
+
+    config = load_config()
+    root = (
+        Path(trading_dashboard_root).expanduser().resolve(strict=True)
+        if trading_dashboard_root is not None
+        else _configured_trading_dashboard_root(config).resolve(strict=True)
+    )
+    shared_python = root / "shared" / "python"
+    for package_root in reversed(
+        [shared_python / "fuzzfolio_core", shared_python / "fuzzfolio_data", shared_python]
+    ):
+        if package_root.exists() and str(package_root) not in sys.path:
+            sys.path.insert(0, str(package_root))
+    try:
+        from fuzzfolio_core.contracts.worker_contract import build_replay_worker_contract
+    except Exception as exc:
+        raise Phase3AuthorityError(
+            f"could not load replay worker contract builder from {shared_python}: {exc}"
+        ) from exc
+    worker_contract = build_replay_worker_contract(repo_root=root)
+    runtime_lock = build_runtime_policy_lock(
+        config,
+        worker_contract_sha256=worker_contract.contract_hash,
+    )
+    identities = policy_lock_provenance(runtime_lock)
+    rebound = copy.deepcopy(dict(phase2_contract))
+    rebound.update(identities)
+    rebound.update(
+        {
+            "worker_contract_id": worker_contract.schema_version,
+            "worker_contract_sha256": worker_contract.contract_hash,
+            "worker_image": _require_string(worker_image, label="execution worker image"),
+            "runtime_policy_lock": runtime_lock,
+            "profile_model_source_root": str(root),
+            "profile_model_source_lock": build_profile_model_source_lock(root),
+        }
+    )
+    return rebound
+
+
 def _verify_capsule_manifest(capsule_root: Path) -> tuple[dict[str, Any], str]:
     manifest_path = _require_under(capsule_root / PHASE2_CAPSULE_MANIFEST_NAME, capsule_root, label="Phase 2 capsule manifest")
     manifest = _load_object(manifest_path, label="Phase 2 capsule manifest")
@@ -558,6 +612,8 @@ def build_phase3_authority_payload(
     policy_manifest_path: Path | str,
     authority_id: str,
     target_runs: int,
+    execution_worker_image: str | None = None,
+    trading_dashboard_root: Path | str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Rebuild deterministic Phase 3 authority content without writing files."""
     capsule_root = Path(phase2_capsule_root).expanduser().resolve(strict=True)
@@ -590,7 +646,16 @@ def build_phase3_authority_payload(
         execution_plan_hashes[cutoff] = plan_hash
 
     common_lineage = _validate_common_lineage(records, plans)
-    bound_contract = _shared_authority_contract(plans)
+    phase2_bound_contract = _shared_authority_contract(plans)
+    bound_contract = (
+        _live_execution_contract(
+            phase2_bound_contract,
+            worker_image=execution_worker_image,
+            trading_dashboard_root=trading_dashboard_root,
+        )
+        if execution_worker_image
+        else phase2_bound_contract
+    )
     worker_contract_sha256 = _require_sha256(
         bound_contract.get("worker_contract_sha256"), label="bound worker contract"
     )
@@ -637,6 +702,19 @@ def build_phase3_authority_payload(
             "capsule_identity_sha256": _require_string(capsule_manifest.get("capsule_identity_sha256"), label="capsule identity"),
             "manifest_sha256": capsule_manifest_sha256,
         },
+        **(
+            {
+                "execution_rebinding": {
+                    "mode": "current_contract_with_phase2_selection_provenance",
+                    "phase2_selection_contract_sha256": _canonical_digest(
+                        phase2_bound_contract
+                    ),
+                    "operator_launch_worker_image": operator_launch_worker_image,
+                }
+            }
+            if execution_worker_image
+            else {}
+        ),
         "development_construction": {
             "allowed_cutoffs": list(DEVELOPMENT_CUTOFFS),
             "selection_inputs": {
@@ -785,6 +863,8 @@ def create_phase3_authority(
     authority_id: str,
     target_runs: int,
     out_dir: Path | str,
+    execution_worker_image: str | None = None,
+    trading_dashboard_root: Path | str | None = None,
 ) -> Phase3AuthorityBuildResult:
     """Create a new immutable authority directory. Existing output never merges."""
     target = Path(out_dir).expanduser()
@@ -796,6 +876,8 @@ def create_phase3_authority(
         policy_manifest_path=policy_manifest_path,
         authority_id=authority_id,
         target_runs=target_runs,
+        execution_worker_image=execution_worker_image,
+        trading_dashboard_root=trading_dashboard_root,
     )
     target.mkdir(parents=True, exist_ok=False)
     try:
@@ -827,12 +909,30 @@ def validate_phase3_authority(
     if authority.get("schema_version") != PHASE3_AUTHORITY_SCHEMA_VERSION:
         raise Phase3AuthorityError("Phase 3 authority has an unsupported schema")
     authority_id = _require_string(authority.get("authority_name"), label="authority_name")
+    rebinding = authority.get("execution_rebinding")
+    execution_worker_image = None
+    trading_dashboard_root = None
+    if rebinding is not None:
+        rebinding = _require_mapping(rebinding, label="Phase 3 execution rebinding")
+        if rebinding.get("mode") != "current_contract_with_phase2_selection_provenance":
+            raise Phase3AuthorityError("Phase 3 execution rebinding mode is invalid")
+        execution_worker_image = _require_string(
+            rebinding.get("operator_launch_worker_image"),
+            label="Phase 3 execution worker image",
+        )
+        bound = _require_mapping(authority.get("bound_contract"), label="bound contract")
+        trading_dashboard_root = _require_string(
+            bound.get("profile_model_source_root"),
+            label="Phase 3 profile-model source root",
+        )
     campaign = _require_mapping(authority.get("campaign"), label="campaign")
     expected, seed_plan, report = build_phase3_authority_payload(
         phase2_capsule_root=phase2_capsule_root,
         policy_manifest_path=policy_manifest_path,
         authority_id=authority_id,
         target_runs=_require_positive_int(campaign.get("target_runs"), label="campaign.target_runs"),
+        execution_worker_image=execution_worker_image,
+        trading_dashboard_root=trading_dashboard_root,
     )
     if authority != expected:
         raise Phase3AuthorityError("Phase 3 authority differs from its rederived inputs")
@@ -878,6 +978,8 @@ def cmd_phase3_playhand_authority(args: argparse.Namespace) -> int:
             policy_manifest_path=args.policy_manifest,
             authority_id=args.authority_id,
             target_runs=args.target_runs,
+            execution_worker_image=args.execution_worker_image,
+            trading_dashboard_root=args.trading_dashboard_root,
         )
         payload = {"status": "dry_run_valid", "authority": authority, "report": report}
     else:
@@ -887,6 +989,8 @@ def cmd_phase3_playhand_authority(args: argparse.Namespace) -> int:
             authority_id=args.authority_id,
             target_runs=args.target_runs,
             out_dir=args.out_dir,
+            execution_worker_image=args.execution_worker_image,
+            trading_dashboard_root=args.trading_dashboard_root,
         )
         payload = {
             "status": "created",

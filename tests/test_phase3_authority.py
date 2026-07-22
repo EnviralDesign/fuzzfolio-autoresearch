@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from autoresearch import phase3_authority as phase3_authority_module
+
 from autoresearch.phase3_authority import (
     PHASE3_AUTHORITY_FILENAME,
     Phase3AuthorityError,
@@ -236,7 +238,6 @@ def test_create_and_audit_fail_closed_on_source_policy_and_seed_drift(tmp_path: 
             phase2_capsule_root=capsule,
             policy_manifest_path=policy_path,
         )
-
     _write_json(policy_path, _policy())
     source_seed_path = capsule / "atlas-roots" / "A" / "recipe-priors" / "play-hand-seed-plan.json"
     source_seed = json.loads(source_seed_path.read_text(encoding="utf-8"))
@@ -264,6 +265,49 @@ def test_create_and_audit_fail_closed_on_source_policy_and_seed_drift(tmp_path: 
             policy_manifest_path=policy_path,
         )
 
+
+def test_phase3_can_rebind_execution_without_rewriting_phase2_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    capsule, policy_path = _make_capsule(tmp_path)
+    current_contract = "sha256:" + "f" * 64
+
+    def _rebind(phase2_contract, *, worker_image, trading_dashboard_root):
+        rebound = dict(phase2_contract)
+        rebound.update(
+            {
+                "worker_contract_sha256": current_contract,
+                "worker_image": worker_image,
+                "profile_model_source_root": str(trading_dashboard_root),
+            }
+        )
+        return rebound
+
+    monkeypatch.setattr(phase3_authority_module, "_live_execution_contract", _rebind)
+    result = create_phase3_authority(
+        phase2_capsule_root=capsule,
+        policy_manifest_path=policy_path,
+        authority_id="phase3-current-execution",
+        target_runs=12,
+        out_dir=tmp_path / "authority-rebound",
+        execution_worker_image="registry/worker:sha-current",
+        trading_dashboard_root=tmp_path / "dashboard",
+    )
+
+    authority = result.authority
+    assert authority["bound_contract"]["worker_contract_sha256"] == current_contract
+    assert authority["playhand_runtime_arguments"]["worker_contract_hash"] == current_contract
+    assert authority["execution_rebinding"]["operator_launch_worker_image"] == (
+        "registry/worker:sha-current"
+    )
+    assert authority["execution_rebinding"]["phase2_selection_contract_sha256"].startswith(
+        "sha256:"
+    )
+    assert validate_phase3_authority(
+        authority_path=result.authority_path,
+        phase2_capsule_root=capsule,
+        policy_manifest_path=policy_path,
+    )["status"] == "valid"
 
 def test_rejects_nonfinite_target_and_inconsistent_phase2_contract(tmp_path: Path) -> None:
     capsule, policy_path = _make_capsule(tmp_path)

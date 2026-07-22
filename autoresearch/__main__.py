@@ -920,6 +920,14 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     phase3_authority.add_argument("--target-runs", type=int)
     phase3_authority.add_argument("--out-dir", type=Path)
     phase3_authority.add_argument("--authority-path", type=Path)
+    phase3_authority.add_argument(
+        "--execution-worker-image",
+        help=(
+            "Bind a new Phase 3 authority to this exact worker image and the live "
+            "worker contract while retaining Phase 2 as selection provenance."
+        ),
+    )
+    phase3_authority.add_argument("--trading-dashboard-root", type=Path)
     phase3_authority.add_argument("--dry-run", action="store_true")
     phase3_authority.add_argument("--audit", action="store_true")
     phase3_authority.add_argument(
