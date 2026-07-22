@@ -4,7 +4,7 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .config import AppConfig
 from .instrument_universe import universe_provenance
@@ -147,6 +147,12 @@ def append_attempt(path: Path, record: AttemptRecord) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(asdict(record), ensure_ascii=True) + "\n")
+
+
+def append_attempt_row(path: Path, row: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(dict(row), ensure_ascii=True) + "\n")
 
 
 def write_attempts(path: Path, attempts: list[dict[str, Any]]) -> None:

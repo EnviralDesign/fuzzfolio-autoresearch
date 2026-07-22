@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .evidence_plan import canonical_sha256
+from .durable_execution import (
+    DurableExecutionError,
+    DurableExecutionJournal,
+    V1_JOURNAL_SCHEMA,
+)
 
 
 CAPSULE_MANIFEST_NAME = "phase2-atlas-authority-capsule-manifest.json"
@@ -192,6 +197,61 @@ def _validate_successful_terminal_receipt(receipt: object, *, task_id: object, r
         raise CapsuleError(f"terminal artifact receipt is malformed at {task_id}: {root}")
 
 
+def _load_execution_journal_tasks(root: Path) -> dict[str, Any]:
+    journal_path = root / "execution-journal.json"
+    try:
+        text = journal_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CapsuleError(f"invalid execution journal: {journal_path}") from exc
+
+    try:
+        whole = json.loads(text)
+    except json.JSONDecodeError:
+        whole = None
+
+    if isinstance(whole, dict) and whole.get("schema_version") == V1_JOURNAL_SCHEMA:
+        journal_identity = whole.get("journal_identity")
+        journal_payload = dict(whole)
+        journal_payload.pop("journal_identity", None)
+        if journal_identity != canonical_sha256(journal_payload):
+            raise CapsuleError(f"execution journal identity is invalid: {root}")
+        tasks = whole.get("tasks")
+        if not isinstance(tasks, dict) or not tasks:
+            raise CapsuleError(f"execution journal has no durable tasks: {root}")
+        return tasks
+
+    header: dict[str, Any] | None = None
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            first = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CapsuleError(f"execution journal schema is invalid: {root}") from exc
+        if isinstance(first, dict):
+            header = first
+        break
+    if (
+        header is None
+        or header.get("record_type") != "header"
+        or not isinstance(header.get("execution_id"), str)
+        or not isinstance(header.get("lineage"), dict)
+    ):
+        raise CapsuleError(f"execution journal schema is invalid: {root}")
+    try:
+        journal = DurableExecutionJournal(
+            journal_path,
+            execution_id=str(header["execution_id"]),
+            lineage=header["lineage"],
+        ).load()
+    except DurableExecutionError as exc:
+        raise CapsuleError(f"execution journal schema is invalid: {root}") from exc
+    tasks = journal.get("tasks")
+    if not isinstance(tasks, dict) or not tasks:
+        raise CapsuleError(f"execution journal has no durable tasks: {root}")
+    return tasks
+
+
 def _validate_completed_root(root: Path, atlas_runs_root: Path) -> str:
     _require_under(root, atlas_runs_root, label="Atlas root")
     if not root.is_dir():
@@ -206,17 +266,7 @@ def _validate_completed_root(root: Path, atlas_runs_root: Path) -> str:
     if not isinstance(lineage, dict) or not isinstance(lineage.get("cutoff_key"), str):
         raise CapsuleError(f"Atlas root is missing historical cutoff authority: {root}")
     cutoff = lineage["cutoff_key"].upper()
-    journal = _load_json(root / "execution-journal.json", label="execution journal")
-    if journal.get("schema_version") != "autoresearch-durable-execution-v1":
-        raise CapsuleError(f"execution journal schema is invalid: {root}")
-    journal_identity = journal.get("journal_identity")
-    journal_payload = dict(journal)
-    journal_payload.pop("journal_identity", None)
-    if journal_identity != canonical_sha256(journal_payload):
-        raise CapsuleError(f"execution journal identity is invalid: {root}")
-    tasks = journal.get("tasks")
-    if not isinstance(tasks, dict) or not tasks:
-        raise CapsuleError(f"execution journal has no durable tasks: {root}")
+    tasks = _load_execution_journal_tasks(root)
     for task_id, task in tasks.items():
         if not isinstance(task, dict) or task.get("status") != "terminal":
             raise CapsuleError(f"execution journal is active or incomplete at {task_id}: {root}")

@@ -992,6 +992,46 @@ def _row_select_sql(
     return sql, params
 
 
+def iter_playhand_run_ids(config: Any) -> Iterator[str]:
+    """Yield distinct PlayHand ``run_id`` values from the attempt catalog.
+
+    Uses the existing catalog DB only (no refresh). Returns an empty iterator when
+    the DB is missing, empty, or unreadable — including older schemas that lack
+    ``attempt_rows`` or the ``runner`` column.
+    """
+    db_path = _catalog_db_path(config)
+    try:
+        if not db_path.is_file() or db_path.stat().st_size <= 0:
+            return
+    except OSError:
+        return
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+    except sqlite3.Error:
+        return
+    try:
+        try:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT run_id
+                FROM attempt_rows
+                WHERE runner = 'play_hand_v1'
+                   OR run_id LIKE '%-playhand-v1'
+                ORDER BY run_id ASC
+                """
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return
+    finally:
+        conn.close()
+
+    for (run_id,) in rows:
+        text = str(run_id or "").strip()
+        if text:
+            yield text
+
+
 def iter_catalog_rows(
     config: Any,
     *,

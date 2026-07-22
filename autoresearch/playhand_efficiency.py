@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .catalog_index import iter_playhand_run_ids
+from .config import AppConfig
 from .ledger import (
     attempts_path_for_run_dir,
     list_run_dirs,
@@ -331,9 +333,37 @@ def _select_run_dirs(
     *,
     limit: int | None,
     run_ids: list[str] | None,
+    config: AppConfig | None = None,
 ) -> list[tuple[Path, dict[str, Any]]]:
     wanted_ids = {str(run_id).strip() for run_id in (run_ids or []) if str(run_id).strip()}
     matched: list[tuple[Path, dict[str, Any]]] = []
+
+    catalog_run_ids: list[str] | None = None
+    if config is not None:
+        catalog_run_ids = list(iter_playhand_run_ids(config))
+        if not catalog_run_ids:
+            catalog_run_ids = None
+
+    if catalog_run_ids is not None:
+        candidate_ids = [
+            run_id
+            for run_id in catalog_run_ids
+            if not wanted_ids or run_id in wanted_ids
+        ]
+        if limit is not None and limit <= 0:
+            return []
+        if limit is not None and limit > 0 and len(candidate_ids) > limit:
+            candidate_ids = candidate_ids[-limit:]
+        for run_id in candidate_ids:
+            run_dir = runs_root / run_id
+            if not run_dir.is_dir():
+                continue
+            metadata = load_run_metadata(run_dir)
+            if not _is_playhand_run(run_dir, metadata):
+                continue
+            matched.append((run_dir, metadata))
+        return matched
+
     for run_dir in list_run_dirs(runs_root):
         if wanted_ids and run_dir.name not in wanted_ids:
             continue
@@ -353,8 +383,14 @@ def build_playhand_efficiency_report(
     *,
     limit: int | None = 200,
     run_ids: list[str] | None = None,
+    config: AppConfig | None = None,
 ) -> dict[str, Any]:
-    matched = _select_run_dirs(runs_root, limit=limit, run_ids=run_ids)
+    matched = _select_run_dirs(
+        runs_root,
+        limit=limit,
+        run_ids=run_ids,
+        config=config,
+    )
     rows: list[dict[str, Any]] = []
     status_counts: Counter[str] = Counter()
     selected_branch_counts: Counter[str] = Counter()

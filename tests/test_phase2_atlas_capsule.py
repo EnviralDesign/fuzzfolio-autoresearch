@@ -7,6 +7,7 @@ import pytest
 
 from autoresearch import __main__ as ar_main
 import autoresearch.phase2_atlas_capsule as capsule_module
+from autoresearch.durable_execution import DurableExecutionJournal
 from autoresearch.evidence_plan import canonical_sha256
 from autoresearch.phase2_atlas_capsule import CapsuleError, cleanup_preview, create_capsule_plan, verify_capsule
 
@@ -105,6 +106,32 @@ def test_dry_run_is_deterministic_and_does_not_write(tmp_path: Path, capsys: pyt
     assert payload["ready"] is True
     assert {item["cutoff"] for item in payload["manifest"]["cutoffs"]} == set("ABCD")
     assert sorted(path.relative_to(repo).as_posix() for path in repo.rglob("*")) == before
+
+
+def test_accepts_v2_jsonl_execution_journal(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    repo, roots, capsule_root, _ = _fixture(tmp_path)
+    root = roots[0]
+    journal_path = root / "execution-journal.json"
+    journal_path.unlink()
+    journal = DurableExecutionJournal(
+        journal_path,
+        execution_id="phase2-fixture-v2",
+        lineage={"cutoff_key": "A"},
+    )
+    artifact_receipt: dict[str, object] = {
+        "root": str(root),
+        "files": {"indicator-atlas/indicator-atlas-summary.json": "sha256:" + "a" * 64},
+    }
+    artifact_receipt["receipt_sha256"] = canonical_sha256(artifact_receipt)
+    terminal_payload = {"stage": "01-indicator-atlas", "artifact_receipt": artifact_receipt}
+    journal.register("stage", {"stage": "01-indicator-atlas"})
+    journal.complete("stage", terminal_payload)
+
+    assert ar_main.main(
+        _args(repo, roots, capsule_root, "--mode", "dry-run", "--destination", str(capsule_root / "phase2-v2"))
+    ) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ready"] is True
 
 
 def test_build_copy_verify_and_cleanup_preview_never_delete(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

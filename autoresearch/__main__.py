@@ -1269,7 +1269,10 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
 
     play_hand_massive = subparsers.add_parser(
         "play-hand-massive",
-        help="Run a backlog-oriented multi-lane PlayHand campaign.",
+        help=(
+            "Deprecated/retired: use play-hand-lab "
+            "(alias play-hand-massive-v2) instead."
+        ),
     )
     play_hand_massive.add_argument(
         "--lanes",
@@ -19165,6 +19168,7 @@ def cmd_build_playhand_efficiency_report(
         config.runs_root,
         limit=resolved_limit,
         run_ids=run_ids,
+        config=config,
     )
     target_dir = output_dir or config.derived_root / DEFAULT_PLAYHAND_EFFICIENCY_DIRNAME
     paths = write_playhand_efficiency_report(report, target_dir)
@@ -19957,47 +19961,13 @@ def main(argv: list[str] | None = None) -> int:
             resource_trace=bool(args.resource_trace),
         )
     if args.command == "play-hand-massive":
-        return cmd_play_hand_massive(
-            lanes=args.lanes,
-            active_lanes=args.active_lanes,
-            instrument=args.instrument,
-            instrument_pool=args.instrument_pool,
-            timeframe=args.timeframe,
-            sweep_budget=args.sweep_budget,
-            max_sweep_permutations=args.max_sweep_permutations,
-            max_reward_r=args.max_reward_r,
-            min_indicators=args.min_indicators,
-            max_indicators=args.max_indicators,
-            seed=args.seed,
-            screen_months=args.screen_months,
-            coarse_mode=args.coarse_mode,
-            focused=bool(args.focused),
-            baseline_floor=args.baseline_floor,
-            job_timeout_seconds=args.job_timeout_seconds,
-            sweep_timeout_seconds=args.sweep_timeout_seconds,
-            keep_cloud_profiles=bool(args.keep_cloud_profiles),
-            adaptive_lanes=bool(args.adaptive_lanes),
-            adaptive_fail_open=bool(args.adaptive_fail_open),
-            min_active_lanes=args.min_active_lanes,
-            target_worker_slots_per_lane=args.target_worker_slots_per_lane,
-            scaffold_active_lanes=args.scaffold_active_lanes,
-            adaptive_shard_size=bool(args.adaptive_shard_size),
-            min_sweep_shard_size=args.min_sweep_shard_size,
-            max_sweep_shard_size=args.max_sweep_shard_size,
-            target_shards_per_worker_slot=args.target_shards_per_worker_slot,
-            staged_campaign=bool(args.staged_campaign),
-            remote_token_budget_multiplier=args.remote_token_budget_multiplier,
-            max_no_worker_wait_seconds=args.max_no_worker_wait_seconds,
-            gateway_url=args.gateway_url,
-            gateway_token=args.gateway_token,
-            gateway_pool=args.gateway_pool,
-            telemetry_interval_seconds=args.telemetry_interval_seconds,
-            dry_run=bool(args.dry_run),
-            as_json=bool(args.json),
-            repeat=bool(args.repeat),
-            repeat_delay_seconds=args.repeat_delay_seconds,
-            repeat_max_campaigns=args.repeat_max_campaigns,
+        print(
+            "error: play-hand-massive (v1) is retired. "
+            "Use play-hand-lab (alias play-hand-massive-v2) instead.",
+            file=sys.stderr,
+            flush=True,
         )
+        return 2
     play_hand_lab_exit = dispatch_play_hand_lab_command(args, console=console)
     if play_hand_lab_exit is not None:
         return play_hand_lab_exit

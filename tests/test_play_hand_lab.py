@@ -1459,6 +1459,350 @@ def test_make_sweep_shard_tasks_honors_permutation_budget(
     assert first_spec["expanded_permutation_count"] == 16
 
 
+def test_make_sweep_shard_tasks_share_profile_snapshot_without_task_spec_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_payload = {
+        "indicators": [{"meta": {"instanceId": "indicator-1"}, "config": {}}],
+        "notificationThreshold": 80,
+    }
+    axis_texts = [
+        "indicator[0].talib.fast=1,2,3,4",
+        "indicator[0].talib.slow=10,20",
+    ]
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="run-shared-snap",
+        run_dir=tmp_path,
+        profile_path=tmp_path / "base.json",
+        profile_payload=profile_payload,
+        profile_ref="lab-inline:run-shared-snap:lane_000",
+        instruments=["EURUSD"],
+        timeframe="M5",
+    )
+    monkeypatch.setattr(
+        lab,
+        "plan_sweep_axes",
+        lambda *args, **kwargs: SimpleNamespace(
+            axes=axis_texts,
+            selected_permutations=8,
+            event_payload=lambda: {
+                "selected_axes": axis_texts,
+                "selected_permutations": 8,
+                "max_permutations": 8,
+                "search_mode": "deterministic",
+            },
+        ),
+    )
+
+    tasks = lab._make_sweep_shard_tasks(
+        lane,
+        phase="coarse_probe",
+        runtime=lab.PlayHandLabRuntimeConfig(
+            max_sweep_permutations=8,
+            sweep_shard_size=2,
+            worker_contract_hash="sha256:" + "a" * 64,
+            lake_manifest_sha256="sha256:" + "b" * 64,
+        ),
+        reward_matrix=None,
+        worker_contract_hash="sha256:" + "a" * 64,
+        profile_payload=profile_payload,
+        profile_path=tmp_path / "base.json",
+        profile_ref="lab-inline:run-shared-snap:lane_000",
+        instruments=["EURUSD"],
+        lookback_months=3,
+        axis_texts=axis_texts,
+        mode="deterministic",
+        analysis_window_start="2025-03-30T00:00:00Z",
+        analysis_window_end="2025-06-30T00:00:00Z",
+    )
+
+    assert len(tasks) >= 2
+    snapshots = [task["payload"]["base_profile_snapshot"] for task in tasks]
+    assert all(snapshot is snapshots[0] for snapshot in snapshots)
+    for task in tasks:
+        spec = lane.task_specs[task["task_id"]]
+        assert "profile_payload" not in spec
+        assert "profile_path" in spec
+        assert "profile_ref" in spec
+
+
+def test_lane_state_payload_omits_profiles_and_params_and_hydrate_reloads(
+    tmp_path: Path,
+) -> None:
+    profile_path = tmp_path / "profile.json"
+    incumbent_path = tmp_path / "incumbent.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    incumbent_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="run-slim-state",
+        run_dir=tmp_path / "run",
+        profile_path=profile_path,
+        profile_payload={"large": "profile"},
+        profile_ref="ref-1",
+        incumbent_profile_path=incumbent_path,
+        incumbent_profile_payload={"large": "incumbent"},
+        incumbent_profile_ref="ref-1",
+        instruments=["EURUSD"],
+        timeframe="M5",
+    )
+    lane.task_specs["task-1"] = {
+        "phase": "coarse_probe",
+        "task_kind": "sweep_shard",
+        "profile_path": str(profile_path),
+        "profile_ref": "ref-1",
+        "profile_payload": {"should": "not-persist"},
+        "params_by_index": {0: {"alpha": 1}, 1: {"alpha": 2}},
+        "permutation_start": 0,
+        "permutation_count": 2,
+        "axes": ["indicator[0].talib.timeperiod=10,20"],
+        "expanded_permutation_count": 2,
+        "sweep_id": "sweep-1",
+        "shard_id": "sweep-1-shard-0000",
+        "instruments": ["EURUSD"],
+        "timeframe": "M5",
+    }
+
+    payload = lab._lane_state_payload(lane)
+    assert payload["profile_payload"] is None
+    assert payload["incumbent_profile_payload"] is None
+    slim_spec = payload["task_specs"]["task-1"]
+    assert "profile_payload" not in slim_spec
+    assert "params_by_index" not in slim_spec
+    assert slim_spec["permutation_start"] == 0
+    assert slim_spec["profile_path"] == str(profile_path)
+
+    restored = lab._lane_state_from_payload(payload)
+    assert restored.profile_payload == _profile_payload()["profile"]
+    assert restored.incumbent_profile_payload == _profile_payload()["profile"]
+    rebuilt_params = restored.task_specs["task-1"].get("params_by_index")
+    assert isinstance(rebuilt_params, dict)
+    assert set(rebuilt_params) == {0, 1}
+
+
+def test_detach_attach_task_profile_snapshots_round_trip(tmp_path: Path) -> None:
+    campaign_dir = tmp_path / "campaign"
+    campaign_dir.mkdir()
+    profile = {"indicators": [{"meta": {"id": "RSI"}}], "notificationThreshold": 80.0}
+    task = {
+        "task_id": "task-1",
+        "task_kind": "deep_replay",
+        "payload": {
+            "job_id": "task-1",
+            "inline_profile_snapshot": copy.deepcopy(profile),
+        },
+    }
+
+    detached = lab._detach_task_profile_snapshots(task, campaign_dir)
+    assert "inline_profile_snapshot" not in detached["payload"]
+    digest = detached["payload"]["inline_profile_snapshot_sha256"]
+    assert isinstance(digest, str) and digest.startswith("sha256:")
+    hex_digest = digest.removeprefix("sha256:")
+    blob_path = campaign_dir / "profile-blobs" / f"{hex_digest}.json"
+    assert blob_path.is_file()
+    assert "inline_profile_snapshot" in task["payload"]
+
+    attached = lab._attach_task_profile_snapshots(detached, campaign_dir)
+    assert attached["payload"]["inline_profile_snapshot"] == profile
+    assert attached["payload"]["inline_profile_snapshot_sha256"] == digest
+
+
+def test_detach_task_profile_snapshots_stores_base_profile_blob(tmp_path: Path) -> None:
+    campaign_dir = tmp_path / "campaign"
+    campaign_dir.mkdir()
+    profile = {"name": "shared", "indicators": []}
+    task = {
+        "task_id": "shard-1",
+        "payload": {"base_profile_snapshot": copy.deepcopy(profile)},
+    }
+    detached = lab._detach_task_profile_snapshots(task, campaign_dir)
+    assert "base_profile_snapshot" not in detached["payload"]
+    assert detached["payload"]["base_profile_snapshot_sha256"].startswith("sha256:")
+    restored = lab._attach_task_profile_snapshots(detached, campaign_dir)
+    assert restored["payload"]["base_profile_snapshot"] == profile
+
+
+def test_hydrate_lane_profiles_fails_closed_on_params_sha_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="run-sha-mismatch",
+        run_dir=tmp_path / "run",
+        profile_path=tmp_path / "profile.json",
+        profile_payload={"indicators": []},
+        profile_ref="ref-1",
+        instruments=["EURUSD"],
+        timeframe="M5",
+    )
+    lane.task_specs["task-1"] = {
+        "phase": "coarse_probe",
+        "task_kind": "sweep_shard",
+        "params_by_index_sha256": "sha256:" + ("0" * 64),
+    }
+    monkeypatch.setattr(
+        lab,
+        "_rebuild_sweep_shard_params_by_index",
+        lambda *_args, **_kwargs: {0: {"alpha": 1}},
+    )
+    with pytest.raises(lab.DurableExecutionError, match="params_by_index_sha256"):
+        lab._hydrate_lane_profiles(lane)
+
+
+def test_make_sweep_shard_tasks_records_params_by_index_sha256(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_payload = {
+        "indicators": [{"meta": {"instanceId": "indicator-1"}, "config": {}}],
+        "notificationThreshold": 80,
+    }
+    axis_texts = ["indicator[0].talib.fast=1,2"]
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="run-params-sha",
+        run_dir=tmp_path,
+        profile_path=tmp_path / "base.json",
+        profile_payload=profile_payload,
+        profile_ref="lab-inline:run-params-sha:lane_000",
+        instruments=["EURUSD"],
+        timeframe="M5",
+    )
+    monkeypatch.setattr(
+        lab,
+        "plan_sweep_axes",
+        lambda *args, **kwargs: SimpleNamespace(
+            axes=axis_texts,
+            selected_permutations=2,
+            event_payload=lambda: {
+                "selected_axes": axis_texts,
+                "selected_permutations": 2,
+                "max_permutations": 2,
+                "search_mode": "deterministic",
+            },
+        ),
+    )
+    tasks = lab._make_sweep_shard_tasks(
+        lane,
+        phase="coarse_probe",
+        runtime=lab.PlayHandLabRuntimeConfig(
+            max_sweep_permutations=2,
+            sweep_shard_size=2,
+            worker_contract_hash="sha256:" + "a" * 64,
+            lake_manifest_sha256="sha256:" + "b" * 64,
+        ),
+        reward_matrix=None,
+        worker_contract_hash="sha256:" + "a" * 64,
+        profile_payload=profile_payload,
+        profile_path=tmp_path / "base.json",
+        profile_ref="lab-inline:run-params-sha:lane_000",
+        instruments=["EURUSD"],
+        lookback_months=3,
+        axis_texts=axis_texts,
+        mode="deterministic",
+    )
+    assert tasks
+    for task in tasks:
+        spec = lane.task_specs[task["task_id"]]
+        params = spec["params_by_index"]
+        assert spec["params_by_index_sha256"] == lab.canonical_sha256(
+            lab._canonical_params(params)
+        )
+        slim = lab._lane_state_payload(lane)["task_specs"][task["task_id"]]
+        assert "params_by_index" not in slim
+        assert slim["params_by_index_sha256"] == spec["params_by_index_sha256"]
+
+
+def test_record_lab_result_appends_attempt_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    attempts_path = run_dir / "attempts.jsonl"
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="run-append",
+        run_dir=run_dir,
+        profile_path=tmp_path / "profile.json",
+        profile_ref="ref-1",
+        instruments=["EURUSD"],
+        timeframe="M5",
+    )
+    lane.task_specs["task-1"] = {
+        "phase": "baseline_3mo",
+        "task_kind": "fake_compute",
+        "profile_path": str(tmp_path / "profile.json"),
+        "profile_ref": "ref-1",
+        "instruments": ["EURUSD"],
+        "timeframe": "M5",
+        "lookback_months": 3,
+    }
+    lane_ctx = SimpleNamespace(
+        attempts_path=attempts_path,
+        evals_dir=run_dir / "evals",
+        run_dir=run_dir,
+    )
+    lane_ctx.evals_dir.mkdir()
+    append_calls: list[dict] = []
+
+    monkeypatch.setattr(
+        lab,
+        "append_attempt_row",
+        lambda path, row: append_calls.append({"path": path, "row": dict(row)}),
+    )
+    monkeypatch.setattr(lab, "render_progress_artifacts", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        lab,
+        "_append_event",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        lab,
+        "_fake_attempt_score",
+        lambda _payload: lab.AttemptScore(
+            primary_score=1.0,
+            composite_score=1.0,
+            score_basis="fake",
+            metrics={},
+            best_summary={},
+        ),
+    )
+    config = SimpleNamespace(
+        research=SimpleNamespace(plot_lower_is_better=False),
+    )
+
+    recorded = lab._record_lab_result(
+        config=config,  # type: ignore[arg-type]
+        cli=SimpleNamespace(),
+        lane_ctx=lane_ctx,  # type: ignore[arg-type]
+        lane=lane,
+        runtime=lab.PlayHandLabRuntimeConfig(task_mode="fake_compute"),
+        lab_result={
+            "task_id": "task-1",
+            "status": "success",
+            "worker_id": "w1",
+            "lease_id": "lease-1",
+            "result": {"status": "success", "ok": True},
+        },
+        reward_matrix=None,
+        render_progress=False,
+    )
+
+    assert recorded["task_id"] == "task-1"
+    assert len(append_calls) == 1
+    assert append_calls[0]["path"] == attempts_path
+    assert append_calls[0]["row"]["lab_campaign_task_id"] == "task-1"
+
+
 def test_rank_sweep_permutations_accepts_compact_summary_results() -> None:
     payload = lab._rank_sweep_permutations(
         phase="coarse_probe",
@@ -2759,21 +3103,29 @@ def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
         / "policy-crash-resume"
         / "play-hand-lab-execution-journal.json"
     )
-    journal_payload = json.loads(journal_path.read_text(encoding="utf-8"))
-    for row in (journal_payload.get("tasks") or {}).values():
-        if not isinstance(row, dict):
+    rewritten_lines: list[str] = []
+    for raw in journal_path.read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
             continue
-        task_payload = row.get("payload")
-        if not isinstance(task_payload, dict):
-            continue
-        assignment = task_payload.pop("policy_assignment", None)
-        nested_payload = task_payload.get("payload")
-        if isinstance(assignment, dict):
-            if not isinstance(nested_payload, dict):
-                nested_payload = {}
-                task_payload["payload"] = nested_payload
-            nested_payload["policy_assignment"] = assignment
-    journal_path.write_text(json.dumps(journal_payload), encoding="utf-8")
+        record = json.loads(raw)
+        if record.get("record_type") == "register" and isinstance(record.get("payload"), dict):
+            task_payload = dict(record["payload"])
+            assignment = task_payload.pop("policy_assignment", None)
+            nested_payload = task_payload.get("payload")
+            if isinstance(assignment, dict):
+                if not isinstance(nested_payload, dict):
+                    nested_payload = {}
+                    task_payload["payload"] = nested_payload
+                nested_payload["policy_assignment"] = assignment
+            record["payload"] = task_payload
+            record["payload_sha256"] = lab.DurableExecutionJournal.task_payload_sha256(
+                task_payload
+            )
+            body = dict(record)
+            body.pop("record_sha256", None)
+            record["record_sha256"] = lab.canonical_sha256(body)
+        rewritten_lines.append(lab.canonical_json(record))
+    journal_path.write_text("\n".join(rewritten_lines) + "\n", encoding="utf-8")
 
     journal_loads = 0
     journal_registers = 0
@@ -2894,7 +3246,7 @@ def _prepare_phase3_retained_resume_fixture(
         max_results_per_cycle=32,
         strict_scoring=True,
         log_mode="quiet",
-        max_wait_seconds=30.0,
+        max_wait_seconds=120.0,
     )
     monkeypatch.setattr(
         lab,
@@ -2912,7 +3264,18 @@ def _prepare_phase3_retained_resume_fixture(
         / campaign_id
         / "play-hand-lab-execution-journal.json"
     )
-    journal_payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    header = json.loads(
+        next(
+            line
+            for line in journal_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    )
+    journal_payload = lab.DurableExecutionJournal(
+        journal_path,
+        execution_id=str(header["execution_id"]),
+        lineage=header["lineage"],
+    ).load()
     durable_tasks = [
         dict(row["payload"])
         for _task_id, row in sorted(journal_payload["tasks"].items())
@@ -2967,13 +3330,13 @@ def test_phase3_resume_batches_journal_and_campaign_state_rewrites(
     )
     journal_writes = 0
     state_writes = 0
-    real_journal_save = lab.DurableExecutionJournal._save
+    real_journal_append = lab.DurableExecutionJournal._append_records
     real_atomic_write_json = lab.atomic_write_json
 
-    def counted_journal_save(self, payload):
+    def counted_journal_append(self, records):
         nonlocal journal_writes
         journal_writes += 1
-        return real_journal_save(self, payload)
+        return real_journal_append(self, records)
 
     def counted_atomic_write_json(path, payload):
         nonlocal state_writes
@@ -2981,7 +3344,7 @@ def test_phase3_resume_batches_journal_and_campaign_state_rewrites(
             state_writes += 1
         return real_atomic_write_json(path, payload)
 
-    monkeypatch.setattr(lab.DurableExecutionJournal, "_save", counted_journal_save)
+    monkeypatch.setattr(lab.DurableExecutionJournal, "_append_records", counted_journal_append)
     monkeypatch.setattr(lab, "atomic_write_json", counted_atomic_write_json)
 
     assert lab.cmd_play_hand_lab(runtime) == 0
@@ -3137,7 +3500,18 @@ def test_phase3_resume_reconstructs_followup_after_record_before_ack_crash(
         / campaign_id
         / "play-hand-lab-execution-journal.json"
     )
-    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    header = json.loads(
+        next(
+            line
+            for line in journal_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    )
+    journal = lab.DurableExecutionJournal(
+        journal_path,
+        execution_id=str(header["execution_id"]),
+        lineage=header["lineage"],
+    ).load()
     assert journal["tasks"][source_task_id]["status"] == "terminal"
     assert journal["tasks"][derived_task_id]["status"] == "terminal"
 

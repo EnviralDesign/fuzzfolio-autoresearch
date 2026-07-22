@@ -1404,6 +1404,7 @@ def test_cmd_play_hand_early_exit_enforce_tombstones_after_baseline(
         lookback_months,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         eval_calls.append(phase)
         if phase != "baseline_3mo":
@@ -1482,6 +1483,7 @@ def test_cmd_play_hand_early_exit_enforce_tombstones_after_weak_lookback(
         max_permutations,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         if phase != "lookback_timing":
             raise AssertionError(f"{phase} should be skipped by early exit")
@@ -1516,6 +1518,7 @@ def test_cmd_play_hand_early_exit_enforce_tombstones_after_weak_lookback(
         lookback_months,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         eval_calls.append(phase)
         scores = {
@@ -1592,6 +1595,7 @@ def test_cmd_play_hand_early_exit_enforce_skips_scout_but_keeps_final_scrutiny(
         max_permutations,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         return {
             "artifact_dir": str(ctx.evals_dir / phase),
@@ -1624,6 +1628,7 @@ def test_cmd_play_hand_early_exit_enforce_skips_scout_but_keeps_final_scrutiny(
         lookback_months,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         eval_calls.append(phase)
         scores = {
@@ -1707,6 +1712,7 @@ def test_cmd_play_hand_coarse_halving_no_expand_skips_expensive_stages(
         max_permutations,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         if phase in {"coarse_expand", "focused"}:
             raise AssertionError(f"{phase} should be skipped")
@@ -1752,6 +1758,7 @@ def test_cmd_play_hand_coarse_halving_no_expand_skips_expensive_stages(
         lookback_months,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         eval_calls.append(
             {
@@ -1898,6 +1905,7 @@ def test_cmd_play_hand_coarse_halving_expand_runs_remaining_work(
         max_permutations,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         sweep_calls.append(
             {
@@ -1946,6 +1954,7 @@ def test_cmd_play_hand_coarse_halving_expand_runs_remaining_work(
         lookback_months,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         eval_calls.append({"phase": phase, "profile_ref": profile_ref})
         scores = {
@@ -1980,6 +1989,7 @@ def test_cmd_play_hand_coarse_halving_expand_runs_remaining_work(
         max_selected,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         scout_calls.append({"profile_ref": profile_ref, "enabled": enabled})
         return {
@@ -2109,6 +2119,7 @@ def test_cmd_play_hand_family_policy_template_locked_enforce_skips_mutation(
         lookback_months,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         eval_calls.append(phase)
         scores = {
@@ -2232,6 +2243,7 @@ def test_cmd_play_hand_family_policy_template_guarded_enforce_benchmarks_exact(
         max_permutations,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         sweep_calls.append(phase)
         score = 56.0 if phase == "coarse_probe" else 66.0
@@ -2268,6 +2280,7 @@ def test_cmd_play_hand_family_policy_template_guarded_enforce_benchmarks_exact(
         lookback_months,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         eval_calls.append(phase)
         scores = {
@@ -2417,6 +2430,7 @@ def test_cmd_play_hand_early_exit_enforce_suppresses_terminal_when_exact_templat
         max_permutations,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         if phase != "lookback_timing":
             raise AssertionError(f"{phase} should be the only mutation sweep")
@@ -2452,6 +2466,7 @@ def test_cmd_play_hand_early_exit_enforce_suppresses_terminal_when_exact_templat
         lookback_months,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         eval_calls.append(phase)
         scores = {
@@ -2555,6 +2570,7 @@ def test_cmd_play_hand_family_policy_report_keeps_mutation_flow(
         max_permutations,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         sweep_calls.append(phase)
         return {
@@ -2588,6 +2604,7 @@ def test_cmd_play_hand_family_policy_report_keeps_mutation_flow(
         lookback_months,
         reward_matrix=None,
         as_of_date=None,
+        **_kwargs,
     ):
         eval_calls.append(phase)
         scores = {
@@ -3849,3 +3866,40 @@ def test_materialize_profile_variant_applies_config_and_talib_params(tmp_path: P
     assert indicators[0]["config"]["lookbackBars"] == 3
     assert indicators[1]["config"]["talibConfig"][0]["value"] == 28
     assert payload["profile"]["name"].endswith("[top]")
+
+
+def test_flush_progress_artifacts_batches_until_dirty(tmp_path: Path, monkeypatch) -> None:
+    render_calls: list[list[dict]] = []
+
+    def fake_render(attempts, primary_output_path, **_kwargs):
+        render_calls.append(list(attempts))
+
+    monkeypatch.setattr(play_hand_mod, "render_progress_artifacts", fake_render)
+
+    ctx = PlayHandContext(
+        config=SimpleNamespace(research=SimpleNamespace(plot_lower_is_better=False)),
+        cli=None,
+        run_id="run-progress",
+        run_dir=tmp_path,
+        profiles_dir=tmp_path / "profiles",
+        evals_dir=tmp_path / "evals",
+        attempts_path=tmp_path / "attempts.jsonl",
+        events_path=tmp_path / "events.jsonl",
+        summary_path=tmp_path / "summary.json",
+    )
+
+    play_hand_mod._flush_progress_artifacts(ctx)
+    assert render_calls == []
+
+    ctx.progress_dirty = True
+    ctx.cached_attempts = [{"attempt_id": "a1"}, {"attempt_id": "a2"}]
+    play_hand_mod._flush_progress_artifacts(ctx)
+    assert len(render_calls) == 1
+    assert [row["attempt_id"] for row in render_calls[0]] == ["a1", "a2"]
+    assert ctx.progress_dirty is False
+
+    play_hand_mod._flush_progress_artifacts(ctx)
+    assert len(render_calls) == 1
+
+    play_hand_mod._flush_progress_artifacts(ctx, force=True)
+    assert len(render_calls) == 2

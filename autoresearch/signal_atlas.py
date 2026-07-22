@@ -481,6 +481,9 @@ def _simulate_signal(
     cli.run(args, timeout_seconds=timeout_seconds)
     payload = _load_json(out_path)
     data = _data_payload(payload)
+    from .forward_response_atlas import write_forward_event_sidecar
+
+    write_forward_event_sidecar(out_path, payload if isinstance(payload, dict) else {"data": data})
     return compute_signal_metrics(
         _numeric_series(data.get("long_score")),
         _numeric_series(data.get("short_score")),

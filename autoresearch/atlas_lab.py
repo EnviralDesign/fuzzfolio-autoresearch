@@ -14,7 +14,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, Mapping
 
 import requests
 
@@ -66,6 +66,8 @@ from .discovery_recipe_validation import (
 from .durable_execution import (
     DurableExecutionError,
     DurableExecutionJournal,
+    V1_JOURNAL_SCHEMA,
+    V1_RETIRED_MESSAGE,
     artifact_receipt,
     atomic_write_json,
     validate_artifact_receipt,
@@ -73,6 +75,7 @@ from .durable_execution import (
 from .forward_response_atlas import (
     DEFAULT_FORWARD_RESPONSE_DIRNAME,
     build_forward_response_atlas,
+    write_forward_event_sidecar,
 )
 from .fuzzfolio import FuzzfolioCli
 from .indicator_atlas import DEFAULT_ATLAS_DIRNAME, build_indicator_atlas
@@ -668,13 +671,19 @@ def _signal_raw_stage_payload(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _stage_artifact_files(*roots: Path) -> list[Path]:
+    # Scratch signal raw/ trees are debug/fallback only; exclude from durable receipts.
     files: list[Path] = []
     for root in roots:
         resolved = Path(root).resolve(strict=False)
         if resolved.is_file():
-            files.append(resolved)
+            if "raw" not in resolved.parts:
+                files.append(resolved)
         elif resolved.is_dir():
-            files.extend(path for path in resolved.rglob("*") if path.is_file())
+            files.extend(
+                path
+                for path in resolved.rglob("*")
+                if path.is_file() and "raw" not in path.parts
+            )
     return files
 
 
@@ -740,15 +749,51 @@ def audit_or_rewind_atlas_lab_stages(
         raise FileNotFoundError(f"Atlas lab execution journal not found: {journal_path}")
     if from_stage not in ATLAS_LAB_DURABLE_STAGES:
         raise ValueError(f"Unknown Atlas stage {from_stage!r}")
-    payload = _load_json(journal_path)
-    if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), dict):
+    try:
+        text = journal_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise DurableExecutionError(f"Atlas lab journal is unreadable: {journal_path}") from exc
+    header: dict[str, Any] | None = None
+    first_line_error: json.JSONDecodeError | None = None
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            first = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            first_line_error = exc
+            break
+        if isinstance(first, dict):
+            header = first
+        break
+    if header is None or header.get("record_type") != "header":
+        try:
+            whole = json.loads(text)
+        except json.JSONDecodeError:
+            whole = None
+        if isinstance(whole, dict) and whole.get("schema_version") == V1_JOURNAL_SCHEMA:
+            raise DurableExecutionError(V1_RETIRED_MESSAGE)
+        if first_line_error is not None:
+            raise DurableExecutionError("Atlas lab journal is malformed") from first_line_error
         raise DurableExecutionError("Atlas lab journal is malformed")
-    if str(payload.get("execution_id") or "") != str(execution_id):
+    lineage = header.get("lineage")
+    if not isinstance(lineage, Mapping):
+        raise DurableExecutionError("Atlas lab journal is malformed")
+    if str(header.get("execution_id") or "") != str(execution_id):
         raise DurableExecutionError("Atlas lab journal execution_id mismatch")
+    journal = DurableExecutionJournal(
+        journal_path,
+        execution_id=str(execution_id),
+        lineage=lineage,
+    )
+    payload = journal.load()
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, dict):
+        raise DurableExecutionError("Atlas lab journal is malformed")
     stage_index = ATLAS_LAB_DURABLE_STAGES.index(from_stage)
-    tasks = payload["tasks"]
     inspected: list[dict[str, Any]] = []
     rewound: list[dict[str, Any]] = []
+    revoke_task_ids: list[str] = []
     for stage in ATLAS_LAB_DURABLE_STAGES[stage_index:]:
         task_id = canonical_sha256({"execution": execution_id, "stage": stage})
         task = tasks.get(task_id)
@@ -775,11 +820,9 @@ def audit_or_rewind_atlas_lab_stages(
         if status == "terminal":
             rewound.append(record)
             if apply:
-                task["status"] = "pending"
-                task["terminal_receipt"] = None
-    if apply and rewound:
-        payload["journal_identity"] = DurableExecutionJournal._identity(payload)
-        atomic_write_json(journal_path, payload)
+                revoke_task_ids.append(task_id)
+    if apply and revoke_task_ids:
+        journal.apply_batch(revocations=revoke_task_ids)
     return {
         "schema_version": "atlas_lab_stage_rewind_report_v1",
         "run_root": str(resolved_run_root),
@@ -2749,7 +2792,9 @@ def _row_from_signal_result(
                 raise RuntimeError(
                     f"Historical signal receipt {key} mismatch: expected {value!r}, observed {execution_evidence.get(key)!r}"
                 )
-    _write_large_scratch_json(raw_path, _signal_raw_stage_payload(raw))
+    stage_payload = _signal_raw_stage_payload(raw)
+    _write_large_scratch_json(raw_path, stage_payload)
+    write_forward_event_sidecar(raw_path, stage_payload)
     metrics = compute_signal_metrics(
         _numeric_signal_series(data.get("long_score")),
         _numeric_signal_series(data.get("short_score")),

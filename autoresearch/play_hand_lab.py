@@ -37,11 +37,11 @@ from .durable_execution import (
     validate_artifact_receipt,
 )
 from .ledger import (
+    append_attempt_row,
     attempts_path_for_run_dir,
     load_attempts,
     load_run_metadata,
     make_attempt_record,
-    write_attempts,
     write_run_metadata,
 )
 from .level_c_operator import (
@@ -406,6 +406,77 @@ class LabCampaignHistory:
     campaign_policy_state: dict[str, Any] | None = None
 
 
+_TASK_SPEC_STATE_OMIT_KEYS = frozenset({"profile_payload", "params_by_index"})
+_PROFILE_SNAPSHOT_KEYS = (
+    ("base_profile_snapshot", "base_profile_snapshot_sha256"),
+    ("inline_profile_snapshot", "inline_profile_snapshot_sha256"),
+)
+
+
+def _canonical_params(params_by_index: Mapping[Any, Any]) -> dict[str, Any]:
+    """Normalize params_by_index keys to strings for content hashing."""
+    return {str(key): value for key, value in params_by_index.items()}
+
+
+def _store_profile_blob(campaign_dir: Path, profile: Mapping[str, Any]) -> str:
+    digest = canonical_sha256(dict(profile))
+    hex_digest = digest.removeprefix("sha256:")
+    blob_dir = Path(campaign_dir) / "profile-blobs"
+    blob_path = blob_dir / f"{hex_digest}.json"
+    if not blob_path.is_file():
+        atomic_write_json(blob_path, dict(profile))
+    return digest
+
+
+def _load_profile_blob(campaign_dir: Path, digest: str) -> dict[str, Any]:
+    token = str(digest or "").strip()
+    hex_digest = token.removeprefix("sha256:")
+    if not hex_digest:
+        raise DurableExecutionError("profile blob digest is required")
+    blob_path = Path(campaign_dir) / "profile-blobs" / f"{hex_digest}.json"
+    if not blob_path.is_file():
+        raise DurableExecutionError(f"profile blob missing: {blob_path}")
+    try:
+        payload = json.loads(blob_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise DurableExecutionError(f"profile blob unreadable: {blob_path}") from exc
+    if not isinstance(payload, dict):
+        raise DurableExecutionError(f"profile blob must be a JSON object: {blob_path}")
+    return payload
+
+
+def _profile_snapshot_containers(task: dict[str, Any]) -> list[dict[str, Any]]:
+    containers = [task]
+    nested = task.get("payload")
+    if isinstance(nested, dict):
+        containers.append(nested)
+    return containers
+
+
+def _detach_task_profile_snapshots(task: dict[str, Any], campaign_dir: Path) -> dict[str, Any]:
+    detached = copy.deepcopy(task)
+    for container in _profile_snapshot_containers(detached):
+        for snapshot_key, sha_key in _PROFILE_SNAPSHOT_KEYS:
+            value = container.get(snapshot_key)
+            if isinstance(value, dict) and value:
+                container[sha_key] = _store_profile_blob(campaign_dir, value)
+                del container[snapshot_key]
+    return detached
+
+
+def _attach_task_profile_snapshots(task: dict[str, Any], campaign_dir: Path) -> dict[str, Any]:
+    attached = copy.deepcopy(task)
+    for container in _profile_snapshot_containers(attached):
+        for snapshot_key, sha_key in _PROFILE_SNAPSHOT_KEYS:
+            existing = container.get(snapshot_key)
+            if isinstance(existing, dict) and existing:
+                continue
+            digest = container.get(sha_key)
+            if isinstance(digest, str) and digest.strip():
+                container[snapshot_key] = _load_profile_blob(campaign_dir, digest)
+    return attached
+
+
 def _lane_state_payload(lane: LabLaneState) -> dict[str, Any]:
     payload = asdict(lane)
     for key in ("run_dir", "profile_path", "incumbent_profile_path"):
@@ -413,7 +484,107 @@ def _lane_state_payload(lane: LabLaneState) -> dict[str, Any]:
         payload[key] = str(value) if value is not None else None
     for key in ("completed_task_ids", "failed_task_ids"):
         payload[key] = sorted(getattr(lane, key))
+    # Profiles reload from disk on resume; omit heavy copies from durable state.
+    payload["profile_payload"] = None
+    payload["incumbent_profile_payload"] = None
+    slim_specs: dict[str, dict[str, Any]] = {}
+    for task_id, spec in (payload.get("task_specs") or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        slim_specs[str(task_id)] = {
+            key: value
+            for key, value in spec.items()
+            if key not in _TASK_SPEC_STATE_OMIT_KEYS
+        }
+    payload["task_specs"] = slim_specs
     return payload
+
+
+def _rebuild_sweep_shard_params_by_index(
+    lane: LabLaneState,
+    task_spec: Mapping[str, Any],
+) -> dict[int, dict[str, Any]] | None:
+    """Rebuild params_by_index omitted from durable state using axes + profile."""
+    if str(task_spec.get("task_kind") or "") != "sweep_shard":
+        return None
+    existing = task_spec.get("params_by_index")
+    if isinstance(existing, dict):
+        return {
+            _sweep_permutation_index(index, context="persisted sweep task params"): dict(params)
+            for index, params in existing.items()
+            if isinstance(params, dict)
+        }
+    axis_texts = task_spec.get("axes")
+    if not isinstance(axis_texts, list) or not axis_texts:
+        return None
+    profile_payload = lane.incumbent_profile_payload or lane.profile_payload or {}
+    sweep_axes = [
+        axis
+        for axis_text in axis_texts
+        if isinstance(axis_text, str)
+        and (axis := _axis_to_sweep_axis(profile_payload, axis_text)) is not None
+    ]
+    if not sweep_axes:
+        return None
+    expanded_count = task_spec.get("expanded_permutation_count")
+    try:
+        max_permutations = int(expanded_count) if expanded_count is not None else None
+    except (TypeError, ValueError):
+        max_permutations = None
+    if max_permutations is None:
+        axis_plan = task_spec.get("axis_plan")
+        if isinstance(axis_plan, dict) and axis_plan.get("max_permutations") is not None:
+            try:
+                max_permutations = int(axis_plan["max_permutations"])
+            except (TypeError, ValueError):
+                max_permutations = None
+    params = _expand_sweep_params(sweep_axes, max_permutations=max_permutations)
+    if not params:
+        return None
+    start = _sweep_permutation_index(
+        task_spec.get("permutation_start"), context="persisted sweep task spec"
+    )
+    count = _sweep_permutation_index(
+        task_spec.get("permutation_count"), context="persisted sweep task spec"
+    )
+    if count <= 0 or start < 0 or start + count > len(params):
+        return None
+    chunk = params[start : start + count]
+    return {start + offset: dict(param) for offset, param in enumerate(chunk)}
+
+
+def _hydrate_lane_profiles(lane: LabLaneState) -> None:
+    """Reload lane profile payloads from disk and restore slimmed sweep params."""
+    if lane.profile_payload is None and lane.profile_path is not None and lane.profile_path.is_file():
+        lane.profile_payload = _inner_profile_payload(_load_json(lane.profile_path))
+    if (
+        lane.incumbent_profile_payload is None
+        and lane.incumbent_profile_path is not None
+        and lane.incumbent_profile_path.is_file()
+    ):
+        lane.incumbent_profile_payload = _inner_profile_payload(
+            _load_json(lane.incumbent_profile_path)
+        )
+    for task_spec in lane.task_specs.values():
+        if not isinstance(task_spec, dict):
+            continue
+        if str(task_spec.get("task_kind") or "") != "sweep_shard":
+            continue
+        if isinstance(task_spec.get("params_by_index"), dict):
+            continue
+        try:
+            rebuilt = _rebuild_sweep_shard_params_by_index(lane, task_spec)
+        except DurableExecutionError:
+            continue
+        if rebuilt is not None:
+            expected_sha = task_spec.get("params_by_index_sha256")
+            if isinstance(expected_sha, str) and expected_sha:
+                observed_sha = canonical_sha256(_canonical_params(rebuilt))
+                if observed_sha != expected_sha:
+                    raise DurableExecutionError(
+                        "rebuilt params_by_index does not match params_by_index_sha256"
+                    )
+            task_spec["params_by_index"] = rebuilt
 
 
 def _lane_state_from_payload(payload: dict[str, Any]) -> LabLaneState:
@@ -423,7 +594,9 @@ def _lane_state_from_payload(payload: dict[str, Any]) -> LabLaneState:
         values[key] = Path(str(values[key])).resolve(strict=False) if values.get(key) else None
     for key in ("completed_task_ids", "failed_task_ids"):
         values[key] = {str(item) for item in values.get(key) or []}
-    return LabLaneState(**values)
+    lane = LabLaneState(**values)
+    _hydrate_lane_profiles(lane)
+    return lane
 
 
 def _campaign_state_lineage(runtime: PlayHandLabRuntimeConfig, campaign_id: str) -> dict[str, Any]:
@@ -4128,7 +4301,6 @@ def _make_deep_replay_task(
         spec={
             "profile_path": str(profile_path.resolve()) if profile_path else None,
             "profile_ref": profile_ref,
-            "profile_payload": _copy_profile_payload(profile_payload),
             "instruments": list(instruments),
             "timeframe": timeframe,
             "lookback_months": lookback_months,
@@ -4137,7 +4309,7 @@ def _make_deep_replay_task(
                 "evidence_plan": payload.get("evidence_plan"),
                 "policy_assignment": copy.deepcopy(lane.policy_assignment),
             },
-    )
+        )
     return {
         "task_id": task_id,
         "lane_id": lane.lane_id,
@@ -4276,11 +4448,13 @@ def _make_sweep_shard_tasks(
     )
     tasks: list[dict[str, Any]] = []
     shard_size = max(int(runtime.sweep_shard_size), 1)
+    shared_snapshot = _copy_profile_payload(profile_payload)
     for shard_index, start in enumerate(range(0, len(params), shard_size)):
         chunk = params[start : start + shard_size]
         task_id = f"{lane.run_id}-task-{len(lane.task_ids) + 1:05d}-{phase}-shard-{shard_index:04d}"
         shard_id = f"{sweep_id}-shard-{shard_index:04d}"
         params_by_index = {start + offset: param for offset, param in enumerate(chunk)}
+        params_by_index_sha256 = canonical_sha256(_canonical_params(params_by_index))
         payload = {
             "schema_version": "sweep-shard-job-v1",
             "shard_id": shard_id,
@@ -4292,7 +4466,7 @@ def _make_sweep_shard_tasks(
             "client_origin": PLAY_HAND_LAB_RUNNER,
             "definition": definition,
             "evidence_plan": definition.get("evidence_plan"),
-            "base_profile_snapshot": _copy_profile_payload(profile_payload),
+            "base_profile_snapshot": shared_snapshot,
             "permutation_start": start,
             "permutation_count": len(chunk),
             "permutation_indices": list(params_by_index),
@@ -4314,7 +4488,6 @@ def _make_sweep_shard_tasks(
                 "shard_id": shard_id,
                 "profile_path": str(profile_path.resolve()),
                 "profile_ref": profile_ref,
-                "profile_payload": _copy_profile_payload(profile_payload),
                 "instruments": list(instruments),
                 "timeframe": lane.incumbent_timeframe or lane.timeframe,
                 "lookback_months": lookback_months,
@@ -4332,6 +4505,7 @@ def _make_sweep_shard_tasks(
                 "permutation_start": start,
                 "permutation_count": len(chunk),
                 "params_by_index": params_by_index,
+                "params_by_index_sha256": params_by_index_sha256,
                 "result_detail": "summary",
                 "policy_assignment": copy.deepcopy(lane.policy_assignment),
             },
@@ -4430,7 +4604,6 @@ def _build_tasks(
                 spec={
                     "profile_path": str(lane.profile_path.resolve()) if lane.profile_path else None,
                     "profile_ref": lane.profile_ref,
-                    "profile_payload": _copy_profile_payload(lane.profile_payload),
                     "instruments": list(lane.instruments),
                     "timeframe": lane.timeframe,
                     "lookback_months": runtime.lookback_months,
@@ -4955,9 +5128,10 @@ def _record_lab_result(
     artifact_key = canonical_sha256({"task_id": task_id})[-20:]
     artifact_dir = (lane_ctx.evals_dir / f"eval_lab_{phase}_{artifact_key}").resolve()
     result_identity = _worker_result_identity(lab_result)
+    attempts = load_attempts(lane_ctx.attempts_path)
     matches = [
         row
-        for row in load_attempts(lane_ctx.attempts_path)
+        for row in attempts
         if str(row.get("lab_campaign_task_id") or "") == task_id
     ]
     if len(matches) > 1:
@@ -5081,7 +5255,6 @@ def _record_lab_result(
     else:
         _write_json(artifact_dir / "fake-result.json", dict(result_payload))
         attempt_score = _fake_attempt_score(result_payload)
-    attempts = load_attempts(lane_ctx.attempts_path)
     play_hand_role = (
         _play_hand_role_for_phase(phase)
         if task_kind in {"deep_replay", "sweep_shard"}
@@ -5162,14 +5335,14 @@ def _record_lab_result(
     )
     if score_warning:
         row["lab_scoring_warning"] = score_warning
-    attempts.append(row)
-    write_attempts(lane_ctx.attempts_path, attempts)
+    append_attempt_row(lane_ctx.attempts_path, row)
     if record.composite_score is not None and (
         lane.best_score is None or record.composite_score > lane.best_score
     ):
         lane.best_score = record.composite_score
         lane.best_attempt_id = record.attempt_id
     if render_progress:
+        attempts.append(row)
         render_progress_artifacts(
             attempts,
             lane.run_dir / "progress.png",
@@ -5280,9 +5453,10 @@ def _record_lab_failure(
     artifact_key = canonical_sha256({"task_id": task_id})[-20:]
     artifact_dir = (lane_ctx.evals_dir / f"eval_lab_failed_{artifact_key}").resolve()
     result_identity = _worker_result_identity(lab_result)
+    attempts = load_attempts(lane_ctx.attempts_path)
     matches = [
         row
-        for row in load_attempts(lane_ctx.attempts_path)
+        for row in attempts
         if str(row.get("lab_campaign_task_id") or "") == task_id
     ]
     if len(matches) > 1:
@@ -5346,7 +5520,6 @@ def _record_lab_failure(
             "worker_lease_id": lab_result.get("lease_id"),
         },
     )
-    attempts = load_attempts(lane_ctx.attempts_path)
     play_hand_role = "lab_replay" if runtime.task_mode == "deep_replay" else "lab_smoke"
     attempt_score = AttemptScore(
         primary_score=None,
@@ -5419,9 +5592,9 @@ def _record_lab_failure(
             "lab_failure": None if is_nonviable else {"error": error[:1000]},
         }
     )
-    attempts.append(row)
-    write_attempts(lane_ctx.attempts_path, attempts)
+    append_attempt_row(lane_ctx.attempts_path, row)
     if render_progress:
+        attempts.append(row)
         render_progress_artifacts(
             attempts,
             lane.run_dir / "progress.png",
@@ -7158,7 +7331,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             for task_id in lane.task_ids:
                 lanes_by_task[task_id] = lane
         tasks = [
-            dict(item["payload"])
+            _attach_task_profile_snapshots(dict(item["payload"]), campaign_dir)
             for _task_id, item in sorted(durable_tasks_by_id.items())
             if isinstance(item, dict) and item.get("status") != "terminal"
         ]
@@ -7185,8 +7358,12 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         registrations: list[tuple[str, dict[str, Any]]] | None = None,
         completions: list[tuple[str, dict[str, Any]]] | None = None,
     ) -> None:
+        detached_registrations = [
+            (task_id, _detach_task_profile_snapshots(task, campaign_dir))
+            for task_id, task in (registrations or ())
+        ]
         updated = journal.apply_batch(
-            registrations=registrations or (),
+            registrations=detached_registrations,
             completions=completions or (),
         )
         durable_tasks_by_id.clear()
@@ -7266,11 +7443,12 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         for task in recovered_tasks:
             task_id = str(task["task_id"])
             existing_durable_task = durable_tasks_by_id.get(task_id)
+            detached_task = _detach_task_profile_snapshots(task, campaign_dir)
             if existing_durable_task is not None:
                 if (
                     not isinstance(existing_durable_task, dict)
                     or existing_durable_task.get("payload_sha256")
-                    != journal.task_payload_sha256(task)
+                    != journal.task_payload_sha256(detached_task)
                 ):
                     raise DurableExecutionError(
                         f"task payload conflicts with durable graph: {task_id}"
@@ -8110,7 +8288,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             process_result_batch(retained_batch, defer_enqueues=True)
 
     resume_tasks_to_enqueue = (
-        [dict(item["payload"]) for item in journal.unresolved()]
+        [
+            _attach_task_profile_snapshots(dict(item["payload"]), campaign_dir)
+            for item in journal.unresolved()
+        ]
         if runtime.resume
         else []
     )

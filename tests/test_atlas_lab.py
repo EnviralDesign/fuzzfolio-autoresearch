@@ -21,6 +21,7 @@ from autoresearch.atlas_lab import (
     _probe_artifact_roots,
     _row_from_signal_result,
     _run_durable_atlas_stage,
+    _stage_artifact_files,
     _validate_historical_probe_summary,
     audit_or_rewind_atlas_lab_stages,
     _stamp_historical_recipe_prior_lineage,
@@ -30,7 +31,14 @@ from autoresearch.atlas_lab import (
     run_atlas_lab,
     run_probe_spec_via_gateway,
 )
-from autoresearch.durable_execution import DurableExecutionError, DurableExecutionJournal, artifact_receipt
+from autoresearch.durable_execution import (
+    DurableExecutionError,
+    DurableExecutionJournal,
+    V1_JOURNAL_SCHEMA,
+    V1_RETIRED_MESSAGE,
+    artifact_receipt,
+)
+from autoresearch.evidence_plan import canonical_sha256
 from autoresearch.anchor_pair_atlas import (
     _probe_results_fieldnames,
     _result_row_from_score,
@@ -49,7 +57,6 @@ from autoresearch.config import (
 from autoresearch.fuzzfolio import FuzzfolioCli
 from autoresearch.instrument_universe import universe_provenance
 from autoresearch.__main__ import build_parser
-from autoresearch.evidence_plan import canonical_sha256
 
 
 def _config(tmp_path: Path) -> AppConfig:
@@ -285,9 +292,24 @@ def test_historical_signal_result_preserves_observed_lake_receipt(tmp_path: Path
     assert raw_payload["data"]["long_score"] == [0.0, 1.0]
     assert "open" not in raw_payload["data"]
     assert "volume" not in raw_payload["data"]
+    sidecar = tmp_path / "raw.forward-events.jsonl"
+    assert sidecar.is_file()
 
 
-def test_historical_atlas_rejects_unbounded_signal_executor(tmp_path: Path) -> None:
+def test_stage_artifact_files_excludes_raw_directory(tmp_path: Path) -> None:
+    root = tmp_path / "signal-atlas"
+    raw_dir = root / "raw"
+    raw_dir.mkdir(parents=True)
+    (raw_dir / "cell.json").write_text("{}", encoding="utf-8")
+    (raw_dir / "cell.forward-events.jsonl").write_text("{}\n", encoding="utf-8")
+    (root / "signal-atlas.json").write_text("{}", encoding="utf-8")
+    (root / "summary.json").write_text("{}", encoding="utf-8")
+
+    files = _stage_artifact_files(root)
+
+    names = {path.name for path in files}
+    assert names == {"signal-atlas.json", "summary.json"}
+    assert all("raw" not in path.parts for path in files)
     with pytest.raises(ValueError, match="requires signal_atlas_executor='gateway'"):
         run_atlas_lab(
             _config(tmp_path),
@@ -2041,6 +2063,31 @@ def test_audit_or_rewind_atlas_lab_stages_marks_boundary_forward_pending(tmp_pat
     assert reopened.terminal(
         canonical_sha256({"execution": "unit-execution", "stage": "06-anchor-pair-timing-atlas"})
     ) is None
+
+
+def test_audit_or_rewind_atlas_lab_stages_rejects_v1_journal(tmp_path: Path) -> None:
+    run_root = tmp_path / "runs" / "derived" / "atlas-runs" / "v1-unit"
+    run_root.mkdir(parents=True)
+    payload = {
+        "schema_version": V1_JOURNAL_SCHEMA,
+        "execution_id": "unit-execution",
+        "lineage": {},
+        "tasks": {},
+    }
+    payload["journal_identity"] = canonical_sha256(
+        {key: value for key, value in payload.items() if key != "journal_identity"}
+    )
+    (run_root / "execution-journal.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+    with pytest.raises(DurableExecutionError, match="retired v1 whole-file format") as excinfo:
+        audit_or_rewind_atlas_lab_stages(
+            run_root=run_root,
+            execution_id="unit-execution",
+            from_stage="01-indicator-atlas",
+        )
+    assert str(excinfo.value) == V1_RETIRED_MESSAGE
 
 
 def test_historical_runtime_cutoff_rejects_mismatched_probe_manifest_cutoff() -> None:

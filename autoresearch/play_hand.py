@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import atexit
 import copy
-import inspect
 import json
 import math
 import os
@@ -14,7 +13,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -422,6 +421,8 @@ class PlayHandContext:
     resource_trace_local: Any = field(default_factory=threading.local, repr=False)
     event_print_mode: str = "stream"
     event_formatter: Any = field(default=None, repr=False)
+    progress_dirty: bool = False
+    cached_attempts: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -3916,12 +3917,11 @@ def _evaluate_profile(
             play_hand_instrument=_play_hand_instrument_for_phase(phase),
         )
         append_attempt(ctx.attempts_path, record)
-        render_progress_artifacts(
-            load_attempts(ctx.attempts_path),
-            ctx.run_dir / "progress.png",
-            run_metadata_path=ctx.run_dir / "run-metadata.json",
-            lower_is_better=ctx.config.research.plot_lower_is_better,
-        )
+        ctx.progress_dirty = True
+        if ctx.cached_attempts is None:
+            ctx.cached_attempts = load_attempts(ctx.attempts_path)
+        else:
+            ctx.cached_attempts.append(asdict(record))
         _append_event(
             ctx,
             phase,
@@ -3942,6 +3942,31 @@ def _evaluate_profile(
         "profile_ref": profile_ref,
         "profile_path": str(profile_path),
     }
+
+
+def _flush_progress_artifacts(ctx: PlayHandContext, *, force: bool = False) -> None:
+    if not force and not ctx.progress_dirty:
+        return
+    with ctx.io_lock:
+        if not force and not ctx.progress_dirty:
+            return
+        attempts = (
+            list(ctx.cached_attempts)
+            if ctx.cached_attempts is not None
+            else load_attempts(ctx.attempts_path)
+        )
+        # force=True re-renders after metadata updates even when dirty was already
+        # cleared, but skip empty ledgers (e.g. early exit before any evaluation).
+        if not attempts and not ctx.progress_dirty:
+            ctx.progress_dirty = False
+            return
+        render_progress_artifacts(
+            attempts,
+            ctx.run_dir / "progress.png",
+            run_metadata_path=ctx.run_dir / "run-metadata.json",
+            lower_is_better=ctx.config.research.plot_lower_is_better,
+        )
+        ctx.progress_dirty = False
 
 
 def _as_float(value: Any) -> float | None:
@@ -3985,15 +4010,6 @@ def _evaluate_profile_trace_kwargs(
     resource_trace_role: str,
     resource_trace_parent_span_id: int | None,
 ) -> dict[str, Any]:
-    try:
-        parameters = inspect.signature(_evaluate_profile).parameters
-    except (TypeError, ValueError):
-        return {
-            "resource_trace_role": resource_trace_role,
-            "resource_trace_parent_span_id": resource_trace_parent_span_id,
-        }
-    if "resource_trace_role" not in parameters:
-        return {}
     return {
         "resource_trace_role": resource_trace_role,
         "resource_trace_parent_span_id": resource_trace_parent_span_id,
@@ -6698,6 +6714,7 @@ def cmd_play_hand(
             "cloud_profile_cleanup": cloud_profile_cleanup,
             "resource_trace": resource_trace_summary,
         }
+        _flush_progress_artifacts(ctx, force=True)
         _write_json(ctx.summary_path, summary)
         if as_json:
             print(json.dumps(summary, ensure_ascii=True, indent=2))
@@ -7262,6 +7279,8 @@ def cmd_play_hand(
             ),
         )
 
+    _flush_progress_artifacts(ctx)
+
     lookback_axes = (
         [] if skip_mutation_pipeline else build_timing_axes(_load_json(current_profile_path))
     )
@@ -7365,6 +7384,8 @@ def cmd_play_hand(
                 selected_timeframe=current_evaluation_timeframe,
                 selected_instruments=list(instruments),
             )
+
+    _flush_progress_artifacts(ctx)
 
     current_profile_payload = _load_json(current_profile_path)
     coarse_axes = build_coarse_axes(current_profile_payload)
@@ -7634,6 +7655,8 @@ def cmd_play_hand(
         _append_event(ctx, "coarse", "skipped", stage=stages["coarse"], reason="no numeric talib axes found")
         _report_early_exit("after_coarse_top", "coarse")
 
+    _flush_progress_artifacts(ctx)
+
     focused_axes = (
         build_focused_axes(_parameter_importance(last_sweep_payload or {}), last_sweep_axes)
         if last_sweep_payload and not skip_focused_and_scout and not skip_mutation_pipeline
@@ -7736,6 +7759,8 @@ def cmd_play_hand(
         _append_event(ctx, "focused", "skipped", stage=stages["focused"], reason="no high-impact axes available from previous sweep")
         _report_early_exit("after_focused_top", "focused")
 
+    _flush_progress_artifacts(ctx)
+
     scout_early_exit = _report_early_exit("before_instrument_scout", "instrument_scout")
     skip_scout_for_early_exit = bool(
         scout_early_exit and scout_early_exit.get("skip_instrument_scout")
@@ -7835,6 +7860,8 @@ def cmd_play_hand(
             "detail": scout_detail,
         }
     )
+
+    _flush_progress_artifacts(ctx)
 
     _report_early_exit("before_final_scrutiny", "scrutiny")
     mutated_scrutiny: dict[str, Any] | None = None
@@ -8089,6 +8116,7 @@ def cmd_play_hand(
         stage=stages["scrutiny"],
         **attempt_metadata_summary,
     )
+    _flush_progress_artifacts(ctx)
     for branch in final_branch_candidates:
         branch_outcome = branch.get("outcome") if isinstance(branch.get("outcome"), dict) else {}
         branch_name = str(branch.get("branch") or "")
@@ -8314,6 +8342,7 @@ def cmd_play_hand(
         "cloud_profile_cleanup": cloud_profile_cleanup,
         "resource_trace": resource_trace_summary,
     }
+    _flush_progress_artifacts(ctx, force=True)
     _write_json(ctx.summary_path, summary)
     if as_json:
         print(json.dumps(summary, ensure_ascii=True, indent=2))

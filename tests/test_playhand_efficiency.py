@@ -230,3 +230,46 @@ def test_build_parser_accepts_playhand_efficiency_report_defaults() -> None:
     assert args.run_id == ["run-a"]
     assert args.all_runs is True
     assert args.json is True
+
+
+def test_build_playhand_efficiency_report_uses_catalog_run_ids(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runs_root = tmp_path / "runs"
+    selected_id = "20260101T000000000000Z-playhand-v1"
+    ignored_id = "20260101T010000000000Z-playhand-v1"
+    _write_run(
+        runs_root,
+        selected_id,
+        {"run_status": "promoted", "selected_final_branch": "mutated"},
+    )
+    _write_run(
+        runs_root,
+        ignored_id,
+        {"run_status": "tombstoned", "selected_final_branch": "early_exit"},
+    )
+
+    fake_config = type(
+        "FakeConfig",
+        (),
+        {
+            "runs_root": runs_root,
+            "derived_root": tmp_path / "derived",
+            "attempt_catalog_sqlite_path": tmp_path / "derived" / "attempt-catalog.sqlite",
+        },
+    )()
+
+    monkeypatch.setattr(
+        "autoresearch.playhand_efficiency.iter_playhand_run_ids",
+        lambda _config: iter([selected_id]),
+    )
+
+    report = build_playhand_efficiency_report(
+        runs_root,
+        limit=None,
+        config=fake_config,  # type: ignore[arg-type]
+    )
+
+    assert report["summary"]["run_count"] == 1
+    assert report["rows"][0]["run_id"] == selected_id

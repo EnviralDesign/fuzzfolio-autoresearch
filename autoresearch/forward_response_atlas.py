@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from itertools import chain
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from .config import AppConfig
 from .signal_atlas import DEFAULT_SIGNAL_ATLAS_DIRNAME
@@ -316,6 +316,47 @@ def compute_forward_event_records(
             threshold=threshold,
         )
     )
+
+
+def forward_event_sidecar_path(raw_path: Path) -> Path:
+    path = Path(raw_path)
+    return path.with_name(f"{path.stem}.forward-events.jsonl")
+
+
+def write_forward_event_sidecar(raw_path: Path, series: Mapping[str, Any]) -> Path:
+    """Write default-horizon forward events as JSONL beside a signal raw JSON file.
+
+    ``series`` is a raw signal payload (or its ``data`` mapping) accepted by
+    ``_extract_chronological_series``.
+    """
+    chrono = _extract_chronological_series(dict(series))
+    target = forward_event_sidecar_path(raw_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8") as handle:
+        for event in iter_forward_event_records(
+            chrono["close"],
+            chrono["high"],
+            chrono["low"],
+            chrono["long_score"],
+            chrono["short_score"],
+            horizons=DEFAULT_FORWARD_HORIZONS,
+            vol_lookback=DEFAULT_VOL_LOOKBACK,
+            threshold=SIGNAL_EPSILON,
+        ):
+            handle.write(json.dumps(event, ensure_ascii=True, separators=(",", ":")))
+            handle.write("\n")
+    return target
+
+
+def iter_forward_events_from_sidecar(sidecar_path: Path) -> Iterator[dict[str, Any]]:
+    with Path(sidecar_path).open(encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text:
+                continue
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                yield payload
 
 
 def _response_bucket(summary: dict[str, Any], *, min_events: int) -> str:
@@ -886,7 +927,6 @@ def build_forward_response_atlas(
                     }
                 )
                 continue
-            series = _extract_chronological_series(_as_dict(_load_json(raw_path)))
             indicator_id = _clean_upper(signal_row.get("indicator_id"))
             instrument = _clean_upper(signal_row.get("instrument"))
             timeframe = _clean_upper(signal_row.get("timeframe"))
@@ -894,16 +934,24 @@ def build_forward_response_atlas(
                 _ForwardEventAccumulator
             )
             cell_event_count = 0
-            for event in iter_forward_event_records(
-                series["close"],
-                series["high"],
-                series["low"],
-                series["long_score"],
-                series["short_score"],
-                horizons=horizon_values,
-                vol_lookback=vol_lookback,
-                threshold=threshold,
-            ):
+            sidecar_path = forward_event_sidecar_path(raw_path)
+            if sidecar_path.exists():
+                event_iter: Iterator[dict[str, Any]] = iter_forward_events_from_sidecar(
+                    sidecar_path
+                )
+            else:
+                series = _extract_chronological_series(_as_dict(_load_json(raw_path)))
+                event_iter = iter_forward_event_records(
+                    series["close"],
+                    series["high"],
+                    series["low"],
+                    series["long_score"],
+                    series["short_score"],
+                    horizons=horizon_values,
+                    vol_lookback=vol_lookback,
+                    threshold=threshold,
+                )
+            for event in event_iter:
                 direction = event["direction"]
                 horizon = event["horizon_bars"]
                 cell_groups[(indicator_id, instrument, timeframe, direction, horizon)].add(event)

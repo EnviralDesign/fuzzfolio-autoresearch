@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import autoresearch.forward_response_atlas as forward_response_atlas
 from autoresearch.forward_response_atlas import (
+    DEFAULT_FORWARD_HORIZONS,
     _ForwardEventAccumulator,
     _accumulator_rows,
     _combined_direction_rows,
     _grouped_summaries,
     build_forward_response_atlas,
     compute_forward_event_records,
+    forward_event_sidecar_path,
     iter_forward_event_records,
     summarize_forward_events,
+    write_forward_event_sidecar,
 )
 
 
@@ -348,3 +352,152 @@ def test_build_forward_response_atlas_closes_global_spools_on_ingestion_error(tm
         )
 
     assert closed
+
+
+def test_write_forward_event_sidecar_uses_raw_stem(tmp_path) -> None:
+    raw_path = tmp_path / "rsi-m5-eurusd.json"
+    payload = {
+        "data": {
+            "timestamp": ["t3", "t2", "t1", "t0"],
+            "close": [106, 104, 100, 100],
+            "high": [107, 105, 101, 100],
+            "low": [105, 99, 99, 99],
+            "long_score": [0, 0, 1, 0],
+            "short_score": [0, 0, 0, 0],
+        }
+    }
+    sidecar = write_forward_event_sidecar(raw_path, payload)
+    assert sidecar == forward_event_sidecar_path(raw_path)
+    assert sidecar.name == "rsi-m5-eurusd.forward-events.jsonl"
+    lines = [json.loads(line) for line in sidecar.read_text(encoding="utf-8").splitlines() if line]
+    assert lines
+    assert {event["horizon_bars"] for event in lines}.issubset(set(DEFAULT_FORWARD_HORIZONS))
+    assert all(event["direction"] == "long" for event in lines)
+
+
+def test_build_forward_response_atlas_prefers_sidecar_over_raw(tmp_path, monkeypatch) -> None:
+    signal_dir = tmp_path / "signal-atlas"
+    raw_dir = signal_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    raw_path = raw_dir / "rsi-m5-eurusd.json"
+    raw_path.write_text(
+        json.dumps(
+            {
+                "data": {
+                    "timestamp": ["t3", "t2", "t1", "t0"],
+                    "close": [106, 104, 100, 100],
+                    "high": [107, 105, 101, 100],
+                    "low": [105, 99, 99, 99],
+                    "long_score": [0, 0, 1, 0],
+                    "short_score": [0, 0, 0, 0],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    sidecar_event = {
+        "direction": "long",
+        "event_index": 1,
+        "horizon_bars": 2,
+        "entry_close": 100.0,
+        "future_close": 104.0,
+        "forward_return_pct": 4.0,
+        "raw_forward_return_pct": 4.0,
+        "mfe_pct": 5.0,
+        "mae_pct": 1.0,
+        "mfe_minus_mae_pct": 4.0,
+        "mfe_gt_mae": True,
+        "pre_event_volatility_pct": None,
+        "volatility_normalized_return": None,
+    }
+    forward_event_sidecar_path(raw_path).write_text(
+        json.dumps(sidecar_event, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    (signal_dir / "signal-atlas.json").write_text(
+        json.dumps(
+            {
+                "summary": {"selection": {"indicator_ids": ["RSI"]}},
+                "rows": [
+                    {
+                        "indicator_id": "RSI",
+                        "instrument": "EURUSD",
+                        "timeframe": "M5",
+                        "status": "ok",
+                        "raw_path": str(raw_path),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_load_raw_json(path):
+        resolved = Path(path).resolve()
+        if resolved == raw_path.resolve():
+            raise AssertionError(f"raw JSON should not be loaded when sidecar exists: {path}")
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(forward_response_atlas, "_load_json", fail_load_raw_json)
+
+    result = build_forward_response_atlas(
+        SimpleNamespace(repo_root=tmp_path, derived_root=tmp_path / "derived"),
+        signal_atlas_dir=signal_dir,
+        out_dir=tmp_path / "forward",
+        horizons=[2],
+        min_events=1,
+    )
+
+    assert result.summary["result_counts"]["event_horizon_records"] == 1
+    assert result.summary["result_counts"]["cell_rollup_rows"] == 1
+
+
+def test_build_forward_response_atlas_falls_back_without_sidecar(tmp_path) -> None:
+    signal_dir = tmp_path / "signal-atlas"
+    raw_dir = signal_dir / "raw"
+    raw_dir.mkdir(parents=True)
+    raw_path = raw_dir / "rsi-m5-eurusd.json"
+    raw_path.write_text(
+        json.dumps(
+            {
+                "data": {
+                    "timestamp": ["t3", "t2", "t1", "t0"],
+                    "close": [106, 104, 100, 100],
+                    "high": [107, 105, 101, 100],
+                    "low": [105, 99, 99, 99],
+                    "long_score": [0, 0, 1, 0],
+                    "short_score": [0, 0, 0, 0],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert not forward_event_sidecar_path(raw_path).exists()
+    (signal_dir / "signal-atlas.json").write_text(
+        json.dumps(
+            {
+                "summary": {"selection": {"indicator_ids": ["RSI"]}},
+                "rows": [
+                    {
+                        "indicator_id": "RSI",
+                        "instrument": "EURUSD",
+                        "timeframe": "M5",
+                        "status": "ok",
+                        "raw_path": str(raw_path),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = build_forward_response_atlas(
+        SimpleNamespace(repo_root=tmp_path, derived_root=tmp_path / "derived"),
+        signal_atlas_dir=signal_dir,
+        out_dir=tmp_path / "forward-fallback",
+        horizons=[2],
+        min_events=1,
+    )
+
+    assert result.summary["result_counts"]["event_horizon_records"] == 1
+    assert result.summary["result_counts"]["cell_rollup_rows"] == 1
