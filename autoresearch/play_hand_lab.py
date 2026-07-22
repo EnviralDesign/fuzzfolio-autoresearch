@@ -7180,6 +7180,18 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             recorded_result_count=recorded_result_count,
         )
 
+    def apply_journal_batch(
+        *,
+        registrations: list[tuple[str, dict[str, Any]]] | None = None,
+        completions: list[tuple[str, dict[str, Any]]] | None = None,
+    ) -> None:
+        updated = journal.apply_batch(
+            registrations=registrations or (),
+            completions=completions or (),
+        )
+        durable_tasks_by_id.clear()
+        durable_tasks_by_id.update(updated["tasks"])
+
     if runtime.resume:
         recovered_tasks: list[dict[str, Any]] = []
         for lane in lanes:
@@ -7250,6 +7262,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     if receipt_derived_tasks is not None
                     else recomputed_tasks
                 )
+        recovered_registrations: list[tuple[str, dict[str, Any]]] = []
         for task in recovered_tasks:
             task_id = str(task["task_id"])
             existing_durable_task = durable_tasks_by_id.get(task_id)
@@ -7263,7 +7276,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                         f"task payload conflicts with durable graph: {task_id}"
                     )
             else:
-                durable_tasks_by_id[task_id] = journal.register(task_id, task)
+                recovered_registrations.append((task_id, task))
             if not any(
                 str(existing.get("task_id") or "") == str(task["task_id"])
                 for existing in tasks
@@ -7275,6 +7288,8 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 if candidate.lane_id == str(task.get("lane_id") or "")
             )
             lanes_by_task[str(task["task_id"])] = lane
+        if recovered_registrations:
+            apply_journal_batch(registrations=recovered_registrations)
         if history.campaign_policy_state is not None:
             history.campaign_policy_state = (
                 _recompute_campaign_policy_state_from_durable_lanes(
@@ -7524,8 +7539,9 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             reward_matrix=reward_matrix,
             worker_contract_hash=worker_contract_hash,
         )
-        for task in new_tasks:
-            journal.register(str(task["task_id"]), task)
+        apply_journal_batch(
+            registrations=[(str(task["task_id"]), task) for task in new_tasks]
+        )
         _lane_allocation_checkpoint("after_task_registration")
         for lane in new_lanes:
             if lane.lane_index in reserved_lane_indices:
@@ -7573,12 +7589,21 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             },
         )
 
-    def enqueue_existing_tasks(new_tasks: list[dict[str, Any]], *, reason: str) -> None:
+    def enqueue_existing_tasks(
+        new_tasks: list[dict[str, Any]],
+        *,
+        reason: str,
+        journal_registered: bool = False,
+        state_persisted: bool = False,
+    ) -> None:
         if not new_tasks:
             return
-        for task in new_tasks:
-            journal.register(str(task["task_id"]), task)
-        persist_campaign_state()
+        if not journal_registered:
+            apply_journal_batch(
+                registrations=[(str(task["task_id"]), task) for task in new_tasks]
+            )
+        if not state_persisted:
+            persist_campaign_state()
         enqueue_result = _enqueue_gateway_tasks_with_retries(
             gateway,
             campaign_ctx,
@@ -7587,7 +7612,12 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             failure_limit=runtime.enqueue_failure_limit,
             retry_base_seconds=runtime.enqueue_retry_base_seconds,
         )
-        tasks.extend(new_tasks)
+        existing_task_ids = {str(task.get("task_id") or "") for task in tasks}
+        tasks.extend(
+            task
+            for task in new_tasks
+            if str(task.get("task_id") or "") not in existing_task_ids
+        )
         for task in new_tasks:
             task_id = str(task.get("task_id") or "")
             lane_id = str(task.get("lane_id") or "")
@@ -7823,6 +7853,11 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         nonlocal recorded_result_count
         ack_lease_ids: list[str] = []
         deferred_tasks: list[dict[str, Any]] = []
+        deferred_tasks_by_reason: dict[str, list[dict[str, Any]]] = {}
+        pending_completions: list[tuple[str, dict[str, Any]]] = []
+        pending_completion_receipts_by_task: dict[str, dict[str, Any]] = {}
+        pending_registrations: list[tuple[str, dict[str, Any]]] = []
+        touched_lanes: dict[str, LabLaneState] = {}
         for lab_result in result_batch:
             task_id = str(lab_result.get("task_id") or "")
             lane = lanes_by_task.get(task_id)
@@ -7842,11 +7877,16 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 ack_lease_ids.append(lease_id)
                 continue
             if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
-                terminal = journal.terminal(task_id)
+                pending_receipt = pending_completion_receipts_by_task.get(task_id)
+                terminal = durable_tasks_by_id.get(task_id)
                 terminal_receipt = (
-                    (terminal or {}).get("terminal_receipt")
-                    if isinstance(terminal, dict)
-                    else None
+                    {"payload": pending_receipt}
+                    if pending_receipt is not None
+                    else (
+                        (terminal or {}).get("terminal_receipt")
+                        if isinstance(terminal, dict)
+                        else None
+                    )
                 )
                 stored = _validate_task_result_receipt_payload(
                     (terminal_receipt or {}).get("payload")
@@ -7939,27 +7979,18 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 )
                 recorded_result_count += 1
                 _add_recorded_result_sample(recorded_results, recorded)
-                journal.complete(
-                    task_id,
-                    _terminal_receipt_for_result(
-                        recorded,
-                        lab_result,
-                        derived_tasks=new_stage_tasks if defer_enqueues else None,
-                        allow_legacy_phase3_receipt_migration=defer_enqueues,
-                    ),
+                terminal_receipt_payload = _terminal_receipt_for_result(
+                    recorded,
+                    lab_result,
+                    derived_tasks=new_stage_tasks if defer_enqueues else None,
+                    allow_legacy_phase3_receipt_migration=defer_enqueues,
                 )
-                if defer_enqueues:
-                    _result_consumption_checkpoint("after_source_terminal_receipt")
-                    for derived_task in new_stage_tasks:
-                        journal.register(str(derived_task["task_id"]), derived_task)
-                        if not any(
-                            str(existing.get("task_id") or "")
-                            == str(derived_task["task_id"])
-                            for existing in tasks
-                        ):
-                            tasks.append(derived_task)
-                        lanes_by_task[str(derived_task["task_id"])] = lane
-                    _result_consumption_checkpoint("after_derived_task_registration")
+                pending_completions.append((task_id, terminal_receipt_payload))
+                pending_completion_receipts_by_task[task_id] = terminal_receipt_payload
+                pending_registrations.extend(
+                    (str(derived_task["task_id"]), derived_task)
+                    for derived_task in new_stage_tasks
+                )
                 recorded_successfully = True
             except Exception as exc:
                 _append_event(
@@ -7997,29 +8028,49 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 _add_recorded_result_sample(recorded_results, recorded)
                 lane.failed_task_ids.add(task_id)
                 _refresh_lane_phase_result_counts(lane, task_id=task_id)
-                journal.complete(
-                    task_id,
-                    _terminal_receipt_for_result(
-                        recorded,
-                        failure_result,
-                        derived_tasks=[] if defer_enqueues else None,
-                    ),
+                terminal_receipt_payload = _terminal_receipt_for_result(
+                    recorded,
+                    failure_result,
+                    derived_tasks=[] if defer_enqueues else None,
                 )
-                if defer_enqueues:
-                    _result_consumption_checkpoint("after_source_terminal_receipt")
-                    _result_consumption_checkpoint("after_derived_task_registration")
+                pending_completions.append((task_id, terminal_receipt_payload))
+                pending_completion_receipts_by_task[task_id] = terminal_receipt_payload
             ack_lease_ids.append(lease_id)
-            if new_stage_tasks and defer_enqueues:
+            touched_lanes[lane.run_id] = lane
+            if new_stage_tasks:
                 deferred_tasks.extend(new_stage_tasks)
-            elif new_stage_tasks:
-                enqueue_existing_tasks(new_stage_tasks, reason=f"stage:{_task_phase(lane, task_id)}")
-            _write_lane_metadata(
-                lane,
-                campaign_ctx=campaign_ctx,
-                runtime=runtime,
-                status=lane_run_status(lane),
-                started_at=started_at,
+                reason = f"stage:{_task_phase(lane, task_id)}"
+                deferred_tasks_by_reason.setdefault(reason, []).extend(new_stage_tasks)
+
+        if pending_completions or pending_registrations:
+            apply_journal_batch(
+                registrations=pending_registrations,
+                completions=pending_completions,
             )
+            if defer_enqueues:
+                _result_consumption_checkpoint("after_source_terminal_receipt")
+                _result_consumption_checkpoint("after_derived_task_registration")
+            for task in deferred_tasks:
+                task_id = str(task["task_id"])
+                if not any(
+                    str(existing.get("task_id") or "") == task_id
+                    for existing in tasks
+                ):
+                    tasks.append(task)
+                lane = next(
+                    candidate
+                    for candidate in lanes
+                    if candidate.lane_id == str(task.get("lane_id") or "")
+                )
+                lanes_by_task[task_id] = lane
+            for lane in touched_lanes.values():
+                _write_lane_metadata(
+                    lane,
+                    campaign_ctx=campaign_ctx,
+                    runtime=runtime,
+                    status=lane_run_status(lane),
+                    started_at=started_at,
+                )
             persist_campaign_state()
             if defer_enqueues:
                 _result_consumption_checkpoint("before_result_ack")
@@ -8035,12 +8086,19 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 raise DurableExecutionError(
                     "retained Phase 3 results could not be acknowledged before enqueue"
                 )
+        if not defer_enqueues:
+            for reason, new_tasks in deferred_tasks_by_reason.items():
+                enqueue_existing_tasks(
+                    new_tasks,
+                    reason=reason,
+                    journal_registered=True,
+                    state_persisted=True,
+                )
         prune_terminal_lane_history()
         if not defer_enqueues:
             create_and_enqueue_more()
         return deferred_tasks
 
-    deferred_resume_tasks: list[dict[str, Any]] = []
     if runtime.resume and _is_phase3_formal_runtime(runtime):
         while True:
             retained_batch = _read_gateway_results(
@@ -8049,24 +8107,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             )
             if not retained_batch:
                 break
-            deferred_resume_tasks.extend(
-                process_result_batch(retained_batch, defer_enqueues=True)
-            )
-        for task in deferred_resume_tasks:
-            journal.register(str(task["task_id"]), task)
-            if not any(
-                str(existing.get("task_id") or "") == str(task["task_id"])
-                for existing in tasks
-            ):
-                tasks.append(task)
-            lane = next(
-                candidate
-                for candidate in lanes
-                if candidate.lane_id == str(task.get("lane_id") or "")
-            )
-            lanes_by_task[str(task["task_id"])] = lane
-        if deferred_resume_tasks:
-            persist_campaign_state()
+            process_result_batch(retained_batch, defer_enqueues=True)
 
     resume_tasks_to_enqueue = (
         [dict(item["payload"]) for item in journal.unresolved()]

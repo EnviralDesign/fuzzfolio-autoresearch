@@ -2952,6 +2952,46 @@ def test_phase3_resume_drains_retained_results_before_any_enqueue(
     )
 
 
+def test_phase3_resume_batches_journal_and_campaign_state_rewrites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retained_count = 79
+    batch_size = 16
+    runtime, _durable_tasks = _prepare_phase3_retained_resume_fixture(
+        tmp_path,
+        monkeypatch,
+        campaign_id="phase3-retained-batched-writes",
+        target_runs=retained_count,
+        retained_count=retained_count,
+    )
+    journal_writes = 0
+    state_writes = 0
+    real_journal_save = lab.DurableExecutionJournal._save
+    real_atomic_write_json = lab.atomic_write_json
+
+    def counted_journal_save(self, payload):
+        nonlocal journal_writes
+        journal_writes += 1
+        return real_journal_save(self, payload)
+
+    def counted_atomic_write_json(path, payload):
+        nonlocal state_writes
+        if Path(path).name == "play-hand-lab-state.json":
+            state_writes += 1
+        return real_atomic_write_json(path, payload)
+
+    monkeypatch.setattr(lab.DurableExecutionJournal, "_save", counted_journal_save)
+    monkeypatch.setattr(lab, "atomic_write_json", counted_atomic_write_json)
+
+    assert lab.cmd_play_hand_lab(runtime) == 0
+
+    expected_batches = (retained_count + batch_size - 1) // batch_size
+    assert journal_writes == expected_batches
+    assert state_writes == expected_batches + 1  # one validated resume snapshot
+    assert _RetainedResumeGateway.acked_count == retained_count
+
+
 def test_phase3_resume_result_failure_prevents_enqueue(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -172,45 +172,82 @@ class DurableExecutionJournal:
         return canonical_sha256(task_payload)
 
     def register(self, task_id: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-        journal = self.load(create=True)
-        tasks = journal["tasks"]
         task_key = str(task_id)
-        task_payload = _canonical_snapshot(payload, label="execution journal task payload")
-        payload_sha256 = self.task_payload_sha256(task_payload)
-        existing = tasks.get(task_key)
-        if existing is not None:
-            if existing.get("payload_sha256") != payload_sha256:
-                raise DurableExecutionError(f"task payload conflicts with durable graph: {task_key}")
-            return dict(existing)
-        tasks[task_key] = {
-            "task_id": task_key,
-            "payload_sha256": payload_sha256,
-            "payload": task_payload,
-            "status": "pending",
-            "terminal_receipt": None,
-        }
-        self._save(journal)
-        return dict(tasks[task_key])
+        journal = self.apply_batch(registrations=[(task_key, payload)])
+        return dict(journal["tasks"][task_key])
 
     def complete(self, task_id: str, receipt: Mapping[str, Any]) -> dict[str, Any]:
-        journal = self.load()
-        task = journal["tasks"].get(str(task_id))
-        if not isinstance(task, dict):
-            raise DurableExecutionError(f"terminal receipt references unknown task: {task_id}")
-        terminal = _canonical_snapshot(receipt, label="execution journal terminal receipt")
-        terminal_sha256 = canonical_sha256(terminal)
-        if task.get("status") == "terminal":
-            existing = task.get("terminal_receipt")
-            if not isinstance(existing, dict) or existing.get("receipt_sha256") != terminal_sha256:
-                raise DurableExecutionError(f"conflicting duplicate terminal receipt: {task_id}")
-            return dict(task)
-        task["status"] = "terminal"
-        task["terminal_receipt"] = {
-            "receipt_sha256": terminal_sha256,
-            "payload": terminal,
-        }
-        self._save(journal)
-        return dict(task)
+        task_key = str(task_id)
+        journal = self.apply_batch(completions=[(task_key, receipt)])
+        return dict(journal["tasks"][task_key])
+
+    def apply_batch(
+        self,
+        *,
+        registrations: Iterable[tuple[str, Mapping[str, Any]]] = (),
+        completions: Iterable[tuple[str, Mapping[str, Any]]] = (),
+    ) -> dict[str, Any]:
+        """Apply task registrations and terminal receipts with one atomic rewrite."""
+
+        registration_rows = list(registrations)
+        completion_rows = list(completions)
+        journal = self.load(create=bool(registration_rows))
+        tasks = journal["tasks"]
+        changed = False
+
+        for raw_task_id, payload in registration_rows:
+            task_key = str(raw_task_id)
+            task_payload = _canonical_snapshot(
+                payload,
+                label="execution journal task payload",
+            )
+            payload_sha256 = self.task_payload_sha256(task_payload)
+            existing = tasks.get(task_key)
+            if existing is not None:
+                if existing.get("payload_sha256") != payload_sha256:
+                    raise DurableExecutionError(
+                        f"task payload conflicts with durable graph: {task_key}"
+                    )
+                continue
+            tasks[task_key] = {
+                "task_id": task_key,
+                "payload_sha256": payload_sha256,
+                "payload": task_payload,
+                "status": "pending",
+                "terminal_receipt": None,
+            }
+            changed = True
+
+        for raw_task_id, receipt in completion_rows:
+            task_key = str(raw_task_id)
+            task = tasks.get(task_key)
+            if not isinstance(task, dict):
+                raise DurableExecutionError(
+                    f"terminal receipt references unknown task: {task_key}"
+                )
+            terminal = _canonical_snapshot(
+                receipt,
+                label="execution journal terminal receipt",
+            )
+            terminal_sha256 = canonical_sha256(terminal)
+            if task.get("status") == "terminal":
+                existing = task.get("terminal_receipt")
+                if (
+                    not isinstance(existing, dict)
+                    or existing.get("receipt_sha256") != terminal_sha256
+                ):
+                    raise DurableExecutionError(
+                        f"conflicting duplicate terminal receipt: {task_key}"
+                    )
+                continue
+            task["status"] = "terminal"
+            task["terminal_receipt"] = {
+                "receipt_sha256": terminal_sha256,
+                "payload": terminal,
+            }
+            changed = True
+
+        return self._save(journal) if changed else journal
 
     def unresolved(self) -> list[dict[str, Any]]:
         journal = self.load()

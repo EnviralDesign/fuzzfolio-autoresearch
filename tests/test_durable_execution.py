@@ -122,6 +122,68 @@ def test_journal_owns_nested_task_and_terminal_payloads(tmp_path: Path) -> None:
     assert task_receipt["terminal_receipt"]["payload"]["evidence"]["value"] == "terminal"
 
 
+def test_journal_applies_registrations_and_completions_with_one_rewrite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal = DurableExecutionJournal(
+        tmp_path / "journal.json",
+        execution_id="plan-1",
+        lineage={"cutoff": "A"},
+    )
+    journal.load(create=True)
+    writes = 0
+    real_atomic_write_json = durable_execution.atomic_write_json
+
+    def counted_atomic_write_json(path: Path, payload: dict) -> None:
+        nonlocal writes
+        writes += 1
+        real_atomic_write_json(path, payload)
+
+    monkeypatch.setattr(
+        durable_execution,
+        "atomic_write_json",
+        counted_atomic_write_json,
+    )
+
+    updated = journal.apply_batch(
+        registrations=[
+            ("task-1", {"value": 1}),
+            ("task-2", {"value": 2}),
+        ],
+        completions=[("task-1", {"status": "calculated"})],
+    )
+
+    assert writes == 1
+    assert updated["tasks"]["task-1"]["status"] == "terminal"
+    assert updated["tasks"]["task-2"]["status"] == "pending"
+
+    journal.apply_batch(
+        registrations=[("task-1", {"value": 1})],
+        completions=[("task-1", {"status": "calculated"})],
+    )
+    assert writes == 1
+
+
+def test_journal_batch_conflict_does_not_persist_partial_changes(tmp_path: Path) -> None:
+    path = tmp_path / "journal.json"
+    journal = DurableExecutionJournal(
+        path,
+        execution_id="plan-1",
+        lineage={"cutoff": "A"},
+    )
+    journal.register("task-1", {"value": 1})
+    before = path.read_bytes()
+
+    with pytest.raises(DurableExecutionError, match="unknown task"):
+        journal.apply_batch(
+            registrations=[("task-2", {"value": 2})],
+            completions=[("missing-task", {"status": "calculated"})],
+        )
+
+    assert path.read_bytes() == before
+
+
 def test_artifact_receipt_rejects_partial_or_mutated_artifact(tmp_path: Path) -> None:
     artifact = tmp_path / "stage" / "result.json"
     artifact.parent.mkdir()
