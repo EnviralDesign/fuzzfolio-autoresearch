@@ -15,7 +15,7 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 import requests
 from rich.console import Console
@@ -538,6 +538,10 @@ def _lane_allocation_checkpoint(_name: str) -> None:
     """No-op seam used by crash/restart tests around durable lane allocation."""
 
 
+def _result_consumption_checkpoint(_name: str) -> None:
+    """No-op seam used by crash/restart tests around result consumption."""
+
+
 def _policy_lane_counts(
     campaign_policy: dict[str, Any],
     *,
@@ -928,6 +932,17 @@ def _record_policy_assignment(
             counts[accounting_key] = int(counts.get(accounting_key) or 0) + 1
 
 
+def _durable_task_policy_assignment(task: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Read the assignment from either a task spec or its LabTask envelope."""
+    assignment = task.get("policy_assignment")
+    if isinstance(assignment, dict):
+        return assignment
+    payload = task.get("payload")
+    if isinstance(payload, dict) and isinstance(payload.get("policy_assignment"), dict):
+        return dict(payload["policy_assignment"])
+    return None
+
+
 def _recompute_campaign_policy_state_from_durable_lanes(
     policy_state: dict[str, Any],
     *,
@@ -1062,7 +1077,10 @@ def _recompute_campaign_policy_state_from_durable_lanes(
     for task in unresolved_tasks:
         task_id = str(task.get("task_id") or "")
         lane = lanes_by_task.get(task_id)
-        if lane is None or task.get("policy_assignment") != lane.policy_assignment:
+        if (
+            lane is None
+            or _durable_task_policy_assignment(task) != lane.policy_assignment
+        ):
             raise DurableExecutionError(
                 f"durable journal task policy assignment mismatch: {task_id or '<missing>'}"
             )
@@ -4572,14 +4590,64 @@ def _validate_task_result_receipt(
 def _terminal_receipt_for_result(
     recorded: dict[str, Any],
     lab_result: dict[str, Any],
+    *,
+    derived_tasks: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     task_id = str(lab_result.get("task_id") or "")
     artifact_dir = Path(str(recorded.get("artifact_dir") or "")).resolve(strict=False)
-    return _validate_task_result_receipt(
-        artifact_dir / "task-result-receipt.json",
+    receipt_path = artifact_dir / "task-result-receipt.json"
+    receipt = _validate_task_result_receipt(
+        receipt_path,
         task_id=task_id,
         worker_result_sha256=_worker_result_identity(lab_result),
     )
+    if derived_tasks is None:
+        return receipt
+    canonical_tasks = _validated_receipt_derived_tasks(
+        {"derived_tasks": derived_tasks},
+        task_id=task_id,
+        required=True,
+    )
+    existing = receipt.get("derived_tasks")
+    if existing is not None and existing != canonical_tasks:
+        raise DurableExecutionError(
+            f"derived task receipt conflicts for source task {task_id}"
+        )
+    receipt["derived_tasks"] = canonical_tasks
+    unsigned = dict(receipt)
+    unsigned.pop("receipt_sha256", None)
+    receipt["receipt_sha256"] = canonical_sha256(unsigned)
+    atomic_write_json(receipt_path, receipt)
+    return _validate_task_result_receipt(
+        receipt_path,
+        task_id=task_id,
+        worker_result_sha256=_worker_result_identity(lab_result),
+    )
+
+
+def _validated_receipt_derived_tasks(
+    receipt: Mapping[str, Any],
+    *,
+    task_id: str,
+    required: bool = False,
+) -> list[dict[str, Any]] | None:
+    raw = receipt.get("derived_tasks")
+    if raw is None:
+        if required:
+            raw = []
+        else:
+            return None
+    if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+        raise DurableExecutionError(
+            f"derived task receipt is malformed for source task {task_id}"
+        )
+    tasks = [copy.deepcopy(item) for item in raw]
+    derived_ids = [str(item.get("task_id") or "") for item in tasks]
+    if any(not derived_id for derived_id in derived_ids) or len(set(derived_ids)) != len(derived_ids):
+        raise DurableExecutionError(
+            f"derived task receipt has invalid task identities for source task {task_id}"
+        )
+    return tasks
 
 
 def _record_lab_result(
@@ -5926,11 +5994,16 @@ def _read_gateway_results(gateway: Any, *, limit: int) -> list[dict[str, Any]]:
     return gateway.drain_results(limit=limit)
 
 
-def _ack_gateway_results(gateway: Any, lease_ids: list[str]) -> bool:
+def _ack_gateway_results(gateway: Any, lease_ids: list[str]) -> int | None:
     acker = getattr(gateway, "ack_results", None)
     if callable(acker):
-        acker(lease_ids)
-    return True
+        acknowledged = acker(lease_ids)
+        if acknowledged is None:
+            return None
+        if isinstance(acknowledged, bool) or not isinstance(acknowledged, int):
+            raise DurableExecutionError("gateway returned an invalid acknowledgement count")
+        return acknowledged
+    return None
 
 
 def _safe_ack_gateway_results(
@@ -5939,9 +6012,16 @@ def _safe_ack_gateway_results(
     *,
     lease_ids: list[str],
     task_id: str,
+    require_exact_count: bool = False,
 ) -> bool:
     try:
-        return _ack_gateway_results(gateway, lease_ids)
+        acknowledged = _ack_gateway_results(gateway, lease_ids)
+        if require_exact_count and acknowledged != len(lease_ids):
+            raise DurableExecutionError(
+                "gateway acknowledgement count mismatch: "
+                f"expected {len(lease_ids)}, observed {acknowledged!r}"
+            )
+        return True
     except Exception as exc:
         _append_event(
             campaign_ctx,
@@ -6833,27 +6913,50 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     raise DurableExecutionError(
                         f"terminal receipt policy assignment mismatch: {task_id}"
                     )
-                if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
+                receipt_derived_tasks = _validated_receipt_derived_tasks(
+                    receipt_payload,
+                    task_id=task_id,
+                )
+                already_terminal = (
+                    task_id in lane.completed_task_ids or task_id in lane.failed_task_ids
+                )
+                if already_terminal:
+                    if receipt_derived_tasks:
+                        recovered_tasks.extend(receipt_derived_tasks)
                     continue
                 if recorded.get("status") == "failed":
                     lane.failed_task_ids.add(task_id)
                 else:
                     lane.completed_task_ids.add(task_id)
                 _refresh_lane_phase_result_counts(lane, task_id=task_id)
-                recovered_tasks.extend(
-                    _advance_lane_after_result(
-                        config=config,
-                        lane_ctx=lane_contexts[lane.run_id],
-                        lane=lane,
-                        runtime=runtime,
-                        reward_matrix=reward_matrix,
-                        worker_contract_hash=worker_contract_hash,
-                        recorded=recorded,
+                recomputed_tasks = _advance_lane_after_result(
+                    config=config,
+                    lane_ctx=lane_contexts[lane.run_id],
+                    lane=lane,
+                    runtime=runtime,
+                    reward_matrix=reward_matrix,
+                    worker_contract_hash=worker_contract_hash,
+                    recorded=recorded,
+                )
+                if (
+                    receipt_derived_tasks is not None
+                    and receipt_derived_tasks != recomputed_tasks
+                ):
+                    raise DurableExecutionError(
+                        f"derived task receipt conflicts with recovered transition: {task_id}"
                     )
+                recovered_tasks.extend(
+                    receipt_derived_tasks
+                    if receipt_derived_tasks is not None
+                    else recomputed_tasks
                 )
         for task in recovered_tasks:
             journal.register(str(task["task_id"]), task)
-            tasks.append(task)
+            if not any(
+                str(existing.get("task_id") or "") == str(task["task_id"])
+                for existing in tasks
+            ):
+                tasks.append(task)
             lane = next(
                 candidate
                 for candidate in lanes
@@ -7248,32 +7351,6 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             print(json.dumps(summary, ensure_ascii=True, sort_keys=True))
         return 0
 
-    resume_tasks_to_enqueue = list(tasks) if runtime.resume else []
-    if runtime.resume and reserved_lane_indices:
-        existing_indices = {lane.lane_index for lane in lanes}
-        missing_indices = [
-            lane_index
-            for lane_index in reserved_lane_indices
-            if lane_index not in existing_indices
-        ]
-        recovered_lanes = [prepare_lane(lane_index) for lane_index in missing_indices]
-        recovered_lanes.extend(
-            lane
-            for lane in lanes
-            if lane.lane_index in reserved_lane_indices and lane not in recovered_lanes
-        )
-        persist_campaign_state()
-        _lane_allocation_checkpoint("after_lane_registration")
-        enqueue_lanes(sorted(recovered_lanes, key=lambda lane: lane.lane_index))
-        recovered_task_ids = {
-            task_id for lane in recovered_lanes for task_id in lane.task_ids
-        }
-        resume_tasks_to_enqueue = [
-            task
-            for task in resume_tasks_to_enqueue
-            if str(task.get("task_id") or "") not in recovered_task_ids
-        ]
-
     gateway_metric_baseline: dict[str, int] = {}
     try:
         baseline_snapshot = gateway.snapshot()
@@ -7425,9 +7502,14 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             flush=True,
         )
 
-    def process_result_batch(result_batch: list[dict[str, Any]]) -> None:
+    def process_result_batch(
+        result_batch: list[dict[str, Any]],
+        *,
+        defer_enqueues: bool = False,
+    ) -> list[dict[str, Any]]:
         nonlocal recorded_result_count
         ack_lease_ids: list[str] = []
+        deferred_tasks: list[dict[str, Any]] = []
         for lab_result in result_batch:
             task_id = str(lab_result.get("task_id") or "")
             lane = lanes_by_task.get(task_id)
@@ -7440,6 +7522,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     task_id=task_id,
                     lease_id=lease_id,
                 )
+                if defer_enqueues:
+                    raise DurableExecutionError(
+                        f"retained Phase 3 result references unknown task: {task_id or '<missing>'}"
+                    )
                 ack_lease_ids.append(lease_id)
                 continue
             if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
@@ -7541,8 +7627,24 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 _add_recorded_result_sample(recorded_results, recorded)
                 journal.complete(
                     task_id,
-                    _terminal_receipt_for_result(recorded, lab_result),
+                    _terminal_receipt_for_result(
+                        recorded,
+                        lab_result,
+                        derived_tasks=new_stage_tasks if defer_enqueues else None,
+                    ),
                 )
+                if defer_enqueues:
+                    _result_consumption_checkpoint("after_source_terminal_receipt")
+                    for derived_task in new_stage_tasks:
+                        journal.register(str(derived_task["task_id"]), derived_task)
+                        if not any(
+                            str(existing.get("task_id") or "")
+                            == str(derived_task["task_id"])
+                            for existing in tasks
+                        ):
+                            tasks.append(derived_task)
+                        lanes_by_task[str(derived_task["task_id"])] = lane
+                    _result_consumption_checkpoint("after_derived_task_registration")
                 recorded_successfully = True
             except Exception as exc:
                 _append_event(
@@ -7582,10 +7684,19 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 _refresh_lane_phase_result_counts(lane, task_id=task_id)
                 journal.complete(
                     task_id,
-                    _terminal_receipt_for_result(recorded, failure_result),
+                    _terminal_receipt_for_result(
+                        recorded,
+                        failure_result,
+                        derived_tasks=[] if defer_enqueues else None,
+                    ),
                 )
+                if defer_enqueues:
+                    _result_consumption_checkpoint("after_source_terminal_receipt")
+                    _result_consumption_checkpoint("after_derived_task_registration")
             ack_lease_ids.append(lease_id)
-            if new_stage_tasks:
+            if new_stage_tasks and defer_enqueues:
+                deferred_tasks.extend(new_stage_tasks)
+            elif new_stage_tasks:
                 enqueue_existing_tasks(new_stage_tasks, reason=f"stage:{_task_phase(lane, task_id)}")
             _write_lane_metadata(
                 lane,
@@ -7595,15 +7706,89 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 started_at=started_at,
             )
             persist_campaign_state()
+            if defer_enqueues:
+                _result_consumption_checkpoint("before_result_ack")
         if ack_lease_ids:
-            _safe_ack_gateway_results(
+            acked = _safe_ack_gateway_results(
                 gateway,
                 campaign_ctx,
                 lease_ids=ack_lease_ids,
                 task_id="batch",
+                require_exact_count=defer_enqueues,
             )
+            if defer_enqueues and not acked:
+                raise DurableExecutionError(
+                    "retained Phase 3 results could not be acknowledged before enqueue"
+                )
         prune_terminal_lane_history()
-        create_and_enqueue_more()
+        if not defer_enqueues:
+            create_and_enqueue_more()
+        return deferred_tasks
+
+    deferred_resume_tasks: list[dict[str, Any]] = []
+    if runtime.resume and _is_phase3_formal_runtime(runtime):
+        while True:
+            retained_batch = _read_gateway_results(
+                gateway,
+                limit=runtime.result_batch_size,
+            )
+            if not retained_batch:
+                break
+            deferred_resume_tasks.extend(
+                process_result_batch(retained_batch, defer_enqueues=True)
+            )
+        for task in deferred_resume_tasks:
+            journal.register(str(task["task_id"]), task)
+            if not any(
+                str(existing.get("task_id") or "") == str(task["task_id"])
+                for existing in tasks
+            ):
+                tasks.append(task)
+            lane = next(
+                candidate
+                for candidate in lanes
+                if candidate.lane_id == str(task.get("lane_id") or "")
+            )
+            lanes_by_task[str(task["task_id"])] = lane
+        if deferred_resume_tasks:
+            persist_campaign_state()
+
+    resume_tasks_to_enqueue = (
+        [dict(item["payload"]) for item in journal.unresolved()]
+        if runtime.resume
+        else []
+    )
+    if runtime.resume and reserved_lane_indices:
+        existing_indices = {lane.lane_index for lane in lanes}
+        missing_indices = [
+            lane_index
+            for lane_index in reserved_lane_indices
+            if lane_index not in existing_indices
+        ]
+        recovered_lanes = [prepare_lane(lane_index) for lane_index in missing_indices]
+        recovered_lanes.extend(
+            lane
+            for lane in lanes
+            if lane.lane_index in reserved_lane_indices and lane not in recovered_lanes
+        )
+        persist_campaign_state()
+        _lane_allocation_checkpoint("after_lane_registration")
+        enqueue_lanes(sorted(recovered_lanes, key=lambda lane: lane.lane_index))
+        recovered_task_ids = {
+            task_id for lane in recovered_lanes for task_id in lane.task_ids
+        }
+        resume_tasks_to_enqueue = [
+            task
+            for task in resume_tasks_to_enqueue
+            if str(task.get("task_id") or "") not in recovered_task_ids
+        ]
+
+    if runtime.resume and _is_phase3_formal_runtime(runtime):
+        deadline = (
+            None
+            if runtime.campaign_mode == "continuous"
+            else time.monotonic() + runtime.max_wait_seconds
+        )
 
     try:
         if runtime.resume and resume_tasks_to_enqueue:

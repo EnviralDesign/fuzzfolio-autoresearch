@@ -2514,6 +2514,86 @@ class _DurabilityFakeGateway:
         return {"ok": True, "queued_tasks": len(self.results), "completed_tasks": 0, "metrics": {}}
 
 
+class _RetainedResumeGateway:
+    results: list[dict] = []
+    queued_count = 0
+    acked_count = 0
+    ack_limit: int | None = None
+    enqueue_observations: list[dict[str, int]] = []
+
+    def __init__(self, **_kwargs) -> None:
+        pass
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.results = []
+        cls.queued_count = 0
+        cls.acked_count = 0
+        cls.ack_limit = None
+        cls.enqueue_observations = []
+
+    @staticmethod
+    def _result(task: dict, sequence: int) -> dict:
+        task_id = str(task["task_id"])
+        return {
+            "task_id": task_id,
+            "lane_id": task["lane_id"],
+            "attempt_id": task["attempt_id"],
+            "status": "success",
+            "worker_id": "retained-resume-worker",
+            "lease_id": f"retained-lease-{sequence:05d}",
+            "result": {"status": "success", "result": {"task_id": task_id}},
+        }
+
+    def health(self) -> dict:
+        return {"ok": True}
+
+    def enqueue_tasks(self, tasks: list[dict]) -> dict:
+        type(self).enqueue_observations.append(
+            {
+                "result_backlog": len(type(self).results),
+                "acked": type(self).acked_count,
+                "task_count": len(tasks),
+            }
+        )
+        start = type(self).acked_count + len(type(self).results)
+        type(self).results.extend(
+            self._result(task, start + offset + 1)
+            for offset, task in enumerate(tasks)
+        )
+        type(self).queued_count = max(type(self).queued_count - len(tasks), 0)
+        return {"enqueued": len(tasks)}
+
+    def read_results(self, *, limit: int) -> list[dict]:
+        return type(self).results[:limit]
+
+    def ack_results(self, lease_ids: list[str]) -> int:
+        accepted_ids = (
+            lease_ids[: type(self).ack_limit]
+            if type(self).ack_limit is not None
+            else lease_ids
+        )
+        requested = set(accepted_ids)
+        before = len(type(self).results)
+        type(self).results = [
+            row for row in type(self).results if row.get("lease_id") not in requested
+        ]
+        acknowledged = before - len(type(self).results)
+        type(self).acked_count += acknowledged
+        return acknowledged
+
+    def snapshot(self) -> dict:
+        return {
+            "ok": True,
+            "gateway_id": "retained-resume-gateway",
+            "queued_tasks": type(self).queued_count,
+            "completed_tasks": type(self).acked_count,
+            "result_backlog": len(type(self).results),
+            "worker_slots": 64,
+            "metrics": {"results_acked": type(self).acked_count},
+        }
+
+
 def _durability_runtime(profile_path: Path, *, campaign_id: str, resume: bool = False):
     return lab.PlayHandLabRuntimeConfig(
         campaign_id=campaign_id,
@@ -2703,6 +2783,251 @@ def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
         match="terminal receipt policy assignment mismatch",
     ):
         lab.cmd_play_hand_lab(runtime(resume=True))
+
+
+def test_durable_task_policy_assignment_reads_lab_task_envelope() -> None:
+    assignment = {"policy_lane": "guided", "policy_outcome_type": "policy_lane_selected"}
+    assert lab._durable_task_policy_assignment(
+        {"task_id": "task-1", "policy_assignment": assignment}
+    ) == assignment
+    assert lab._durable_task_policy_assignment(
+        {"task_id": "task-1", "payload": {"policy_assignment": assignment}}
+    ) == assignment
+    assert lab._durable_task_policy_assignment({"task_id": "task-1", "payload": {}}) is None
+
+
+def _prepare_phase3_retained_resume_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    campaign_id: str,
+    target_runs: int = 128,
+    retained_count: int = 79,
+) -> tuple[lab.PlayHandLabRuntimeConfig, list[dict]]:
+    profile_path = tmp_path / f"{campaign_id}-profile.json"
+    profile_path.write_text(json.dumps(_profile_payload()), encoding="utf-8")
+    config = _test_config(tmp_path)
+    _RetainedResumeGateway.reset()
+    monkeypatch.setenv("PLAY_HAND_LAB_PREPARE_WORKERS", "2")
+    monkeypatch.setattr(lab, "load_config", lambda: config)
+    monkeypatch.setattr(lab, "FuzzfolioCli", _DurabilityFakeCli)
+    monkeypatch.setattr(lab, "LabGatewayClient", _RetainedResumeGateway)
+
+    runtime = replace(
+        _durability_runtime(profile_path, campaign_id=campaign_id),
+        target_runs=target_runs,
+        active_runs=target_runs,
+        formal_authority_kind="phase3",
+        result_batch_size=16,
+        max_results_per_cycle=32,
+        strict_scoring=True,
+        log_mode="quiet",
+        max_wait_seconds=30.0,
+    )
+    monkeypatch.setattr(
+        lab,
+        "_lane_allocation_checkpoint",
+        lambda name: (_ for _ in ()).throw(RuntimeError("stop-before-enqueue"))
+        if name == "before_gateway_enqueue"
+        else None,
+    )
+    with pytest.raises(RuntimeError, match="stop-before-enqueue"):
+        lab.cmd_play_hand_lab(runtime)
+
+    journal_path = (
+        config.derived_root
+        / "play-hand-lab-campaigns"
+        / campaign_id
+        / "play-hand-lab-execution-journal.json"
+    )
+    journal_payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    durable_tasks = [
+        dict(row["payload"])
+        for _task_id, row in sorted(journal_payload["tasks"].items())
+    ]
+    assert len(durable_tasks) == target_runs
+    _RetainedResumeGateway.results = [
+        _RetainedResumeGateway._result(task, index + 1)
+        for index, task in enumerate(durable_tasks[:retained_count])
+    ]
+    _RetainedResumeGateway.queued_count = target_runs - retained_count
+    monkeypatch.setattr(lab, "_lane_allocation_checkpoint", lambda _name: None)
+    return replace(runtime, resume=True), durable_tasks
+
+
+def test_phase3_resume_drains_retained_results_before_any_enqueue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _durable_tasks = _prepare_phase3_retained_resume_fixture(
+        tmp_path,
+        monkeypatch,
+        campaign_id="phase3-retained-ordering",
+    )
+
+    assert lab.cmd_play_hand_lab(runtime) == 0
+
+    assert _RetainedResumeGateway.enqueue_observations
+    assert _RetainedResumeGateway.enqueue_observations[0] == {
+        "result_backlog": 0,
+        "acked": 79,
+        "task_count": 49,
+    }
+    assert _RetainedResumeGateway.acked_count == 128
+    assert all(
+        observation["result_backlog"] == 0 and observation["acked"] >= 79
+        for observation in _RetainedResumeGateway.enqueue_observations
+    )
+
+
+def test_phase3_resume_result_failure_prevents_enqueue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _durable_tasks = _prepare_phase3_retained_resume_fixture(
+        tmp_path,
+        monkeypatch,
+        campaign_id="phase3-retained-failure",
+    )
+    monkeypatch.setattr(
+        lab,
+        "_record_lab_result",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            lab.DurableExecutionError("retained result validation failed")
+        ),
+    )
+
+    with pytest.raises(lab.DurableExecutionError, match="retained result validation failed"):
+        lab.cmd_play_hand_lab(runtime)
+
+    assert _RetainedResumeGateway.enqueue_observations == []
+    assert _RetainedResumeGateway.acked_count == 0
+
+
+def test_phase3_resume_unknown_retained_result_fails_without_ack_or_enqueue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime, _durable_tasks = _prepare_phase3_retained_resume_fixture(
+        tmp_path,
+        monkeypatch,
+        campaign_id="phase3-retained-unknown",
+    )
+    _RetainedResumeGateway.results.insert(
+        0,
+        {
+            "task_id": "unknown-retained-task",
+            "lane_id": "unknown-lane",
+            "attempt_id": "unknown-attempt",
+            "status": "success",
+            "worker_id": "retained-resume-worker",
+            "lease_id": "unknown-retained-lease",
+            "result": {"status": "success", "result": {}},
+        },
+    )
+
+    with pytest.raises(lab.DurableExecutionError, match="references unknown task"):
+        lab.cmd_play_hand_lab(runtime)
+
+    assert _RetainedResumeGateway.enqueue_observations == []
+    assert _RetainedResumeGateway.acked_count == 0
+    assert _RetainedResumeGateway.results[0]["task_id"] == "unknown-retained-task"
+
+
+@pytest.mark.parametrize("ack_limit", [0, 15])
+def test_phase3_resume_partial_ack_blocks_enqueue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ack_limit: int,
+) -> None:
+    runtime, _durable_tasks = _prepare_phase3_retained_resume_fixture(
+        tmp_path,
+        monkeypatch,
+        campaign_id="phase3-retained-partial-ack",
+    )
+    _RetainedResumeGateway.ack_limit = ack_limit
+
+    with pytest.raises(lab.DurableExecutionError, match="could not be acknowledged"):
+        lab.cmd_play_hand_lab(runtime)
+
+    assert _RetainedResumeGateway.enqueue_observations == []
+    assert _RetainedResumeGateway.acked_count == ack_limit
+    assert len(_RetainedResumeGateway.results) == 79 - ack_limit
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "after_source_terminal_receipt",
+        "after_derived_task_registration",
+        "before_result_ack",
+    ],
+)
+def test_phase3_resume_reconstructs_followup_after_record_before_ack_crash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+) -> None:
+    campaign_id = f"phase3-retained-followup-{checkpoint}"
+    runtime, durable_tasks = _prepare_phase3_retained_resume_fixture(
+        tmp_path,
+        monkeypatch,
+        campaign_id=campaign_id,
+        target_runs=1,
+        retained_count=1,
+    )
+    source_task = copy.deepcopy(durable_tasks[0])
+    source_task_id = str(source_task["task_id"])
+    derived_task_id = f"{source_task_id}-derived"
+
+    def advance_with_one_followup(*, lane, recorded, **_kwargs):
+        if str(recorded.get("task_id") or "") != source_task_id:
+            return []
+        derived = copy.deepcopy(source_task)
+        derived["task_id"] = derived_task_id
+        derived["attempt_id"] = derived_task_id
+        derived["payload"]["task_id"] = derived_task_id
+        derived["payload"]["attempt_id"] = derived_task_id
+        if derived_task_id not in lane.task_ids:
+            lane.task_ids.append(derived_task_id)
+        lane.task_specs[derived_task_id] = copy.deepcopy(derived["payload"])
+        return [derived]
+
+    monkeypatch.setattr(lab, "_advance_lane_after_result", advance_with_one_followup)
+    monkeypatch.setattr(
+        lab,
+        "_result_consumption_checkpoint",
+        lambda name: (_ for _ in ()).throw(RuntimeError(f"crash:{checkpoint}"))
+        if name == checkpoint
+        else None,
+    )
+
+    with pytest.raises(RuntimeError, match=f"crash:{checkpoint}"):
+        lab.cmd_play_hand_lab(runtime)
+
+    assert _RetainedResumeGateway.acked_count == 0
+    assert _RetainedResumeGateway.enqueue_observations == []
+    monkeypatch.setattr(lab, "_result_consumption_checkpoint", lambda _name: None)
+
+    assert lab.cmd_play_hand_lab(runtime) == 0
+
+    assert _RetainedResumeGateway.enqueue_observations[0] == {
+        "result_backlog": 0,
+        "acked": 1,
+        "task_count": 1,
+    }
+    assert _RetainedResumeGateway.acked_count == 2
+    journal_path = (
+        tmp_path
+        / "runs"
+        / "derived"
+        / "play-hand-lab-campaigns"
+        / campaign_id
+        / "play-hand-lab-execution-journal.json"
+    )
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    assert journal["tasks"][source_task_id]["status"] == "terminal"
+    assert journal["tasks"][derived_task_id]["status"] == "terminal"
 
 
 @pytest.mark.parametrize("damage", ["mutate", "delete"])
