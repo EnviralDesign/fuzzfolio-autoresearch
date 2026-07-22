@@ -7252,7 +7252,18 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 )
         for task in recovered_tasks:
             task_id = str(task["task_id"])
-            durable_tasks_by_id[task_id] = journal.register(task_id, task)
+            existing_durable_task = durable_tasks_by_id.get(task_id)
+            if existing_durable_task is not None:
+                if (
+                    not isinstance(existing_durable_task, dict)
+                    or existing_durable_task.get("payload_sha256")
+                    != canonical_sha256(task)
+                ):
+                    raise DurableExecutionError(
+                        f"task payload conflicts with durable graph: {task_id}"
+                    )
+            else:
+                durable_tasks_by_id[task_id] = journal.register(task_id, task)
             if not any(
                 str(existing.get("task_id") or "") == str(task["task_id"])
                 for existing in tasks

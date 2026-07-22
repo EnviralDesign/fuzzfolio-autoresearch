@@ -2776,12 +2776,19 @@ def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
     journal_path.write_text(json.dumps(journal_payload), encoding="utf-8")
 
     journal_loads = 0
+    journal_registers = 0
     real_journal_load = lab.DurableExecutionJournal.load
+    real_journal_register = lab.DurableExecutionJournal.register
 
     def counted_journal_load(self, *args, **kwargs):
         nonlocal journal_loads
         journal_loads += 1
         return real_journal_load(self, *args, **kwargs)
+
+    def counted_journal_register(self, *args, **kwargs):
+        nonlocal journal_registers
+        journal_registers += 1
+        return real_journal_register(self, *args, **kwargs)
 
     with monkeypatch.context() as resume_patch:
         resume_patch.setattr(
@@ -2789,10 +2796,16 @@ def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
             "load",
             counted_journal_load,
         )
+        resume_patch.setattr(
+            lab.DurableExecutionJournal,
+            "register",
+            counted_journal_register,
+        )
         assert lab.cmd_play_hand_lab(runtime(resume=True)) == 0
-    # One load validates the resume snapshot; at most one additional load may
-    # service gateway duplicate handling. The count must not scale with tasks.
+    # Existing recovered tasks must be checked against the validated snapshot
+    # rather than re-registering (and reloading) once per task.
     assert journal_loads <= 2
+    assert journal_registers == 0
     compacted_after_resume = json.loads(state_path.read_text(encoding="utf-8"))
     assert all(
         lane_payload["task_specs"] == {}
