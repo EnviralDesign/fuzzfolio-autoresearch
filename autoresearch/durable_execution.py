@@ -13,8 +13,9 @@ from .evidence_plan import canonical_json, canonical_sha256
 
 
 JOURNAL_SCHEMA = "autoresearch-durable-execution-v1"
-ATOMIC_REPLACE_ATTEMPTS = 8
+ATOMIC_REPLACE_ATTEMPTS = 64
 ATOMIC_REPLACE_RETRY_SECONDS = 0.025
+ATOMIC_REPLACE_MAX_RETRY_SECONDS = 0.5
 
 
 class DurableExecutionError(RuntimeError):
@@ -52,7 +53,12 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             except PermissionError:
                 if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
                     raise
-                time.sleep(ATOMIC_REPLACE_RETRY_SECONDS * (2**attempt))
+                time.sleep(
+                    min(
+                        ATOMIC_REPLACE_RETRY_SECONDS * (2**attempt),
+                        ATOMIC_REPLACE_MAX_RETRY_SECONDS,
+                    )
+                )
     finally:
         temporary.unlink(missing_ok=True)
 
