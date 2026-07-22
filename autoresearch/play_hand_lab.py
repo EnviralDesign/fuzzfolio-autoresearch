@@ -1082,7 +1082,7 @@ def _recompute_campaign_policy_state_from_durable_lanes(
                 raise DurableExecutionError(
                     f"durable policy lane has no task spec: {task_id}"
                 )
-            if task_spec.get("policy_assignment") != assignment:
+            if _durable_task_policy_assignment(task_spec) != assignment:
                 raise DurableExecutionError(
                     f"durable task policy assignment mismatch: {task_id}"
                 )

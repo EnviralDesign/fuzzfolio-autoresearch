@@ -2753,6 +2753,27 @@ def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
         lane_payload["phase_rows"] = []
         lane_payload["phase_results"] = {}
     state_path.write_text(json.dumps(compacted), encoding="utf-8")
+    journal_path = (
+        config.derived_root
+        / "play-hand-lab-campaigns"
+        / "policy-crash-resume"
+        / "play-hand-lab-execution-journal.json"
+    )
+    journal_payload = json.loads(journal_path.read_text(encoding="utf-8"))
+    for row in (journal_payload.get("tasks") or {}).values():
+        if not isinstance(row, dict):
+            continue
+        task_payload = row.get("payload")
+        if not isinstance(task_payload, dict):
+            continue
+        assignment = task_payload.pop("policy_assignment", None)
+        nested_payload = task_payload.get("payload")
+        if isinstance(assignment, dict):
+            if not isinstance(nested_payload, dict):
+                nested_payload = {}
+                task_payload["payload"] = nested_payload
+            nested_payload["policy_assignment"] = assignment
+    journal_path.write_text(json.dumps(journal_payload), encoding="utf-8")
 
     assert lab.cmd_play_hand_lab(runtime(resume=True)) == 0
     compacted_after_resume = json.loads(state_path.read_text(encoding="utf-8"))
