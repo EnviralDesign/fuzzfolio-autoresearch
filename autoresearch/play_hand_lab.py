@@ -28,7 +28,7 @@ except Exception:  # pragma: no cover - stdlib fallback for unusual environments
 from .play_hand_lab_auth import load_lab_gateway_token
 from .config import AppConfig, load_config
 from .fuzzfolio import CliError, FuzzfolioCli
-from .evidence_plan import build_replay_evidence_plan, canonical_sha256
+from .evidence_plan import build_replay_evidence_plan, canonical_json, canonical_sha256
 from .durable_execution import (
     DurableExecutionError,
     DurableExecutionJournal,
@@ -4547,9 +4547,42 @@ def _write_task_result_receipt(
         "artifact_receipt": _task_artifact_receipt(path.parent),
         "recorded_result": recorded_result,
     }
-    payload["receipt_sha256"] = canonical_sha256(payload)
-    atomic_write_json(path, payload)
-    return payload
+    return _persist_task_result_receipt(
+        path,
+        payload,
+        task_id=task_id,
+        worker_result_sha256=worker_result_sha256,
+    )
+
+
+def _seal_task_result_receipt(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Detach and seal one receipt from its caller-owned nested objects."""
+    unsigned = dict(payload)
+    unsigned.pop("receipt_sha256", None)
+    try:
+        canonical = json.loads(canonical_json(unsigned))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise DurableExecutionError("task result receipt is not canonical JSON") from exc
+    if not isinstance(canonical, dict):
+        raise DurableExecutionError("task result receipt must be a JSON object")
+    canonical["receipt_sha256"] = canonical_sha256(canonical)
+    return canonical
+
+
+def _persist_task_result_receipt(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    task_id: str,
+    worker_result_sha256: str,
+) -> dict[str, Any]:
+    sealed = _seal_task_result_receipt(payload)
+    atomic_write_json(path, sealed)
+    return _validate_task_result_receipt(
+        path,
+        task_id=task_id,
+        worker_result_sha256=worker_result_sha256,
+    )
 
 
 def _validate_task_result_receipt_payload(
@@ -4578,6 +4611,12 @@ def _validate_task_result_receipt_payload(
             migration,
             task_id=task_id,
             derived_tasks=supplied.get("derived_tasks"),
+        )
+    if "derived_tasks" in supplied:
+        supplied["derived_tasks"] = _validated_receipt_derived_tasks(
+            supplied,
+            task_id=task_id,
+            required=False,
         )
     validate_artifact_receipt(supplied["artifact_receipt"])
     supplied["receipt_sha256"] = receipt_sha256
@@ -4759,10 +4798,9 @@ def _upgrade_legacy_phase3_follow_on_receipt(
         "legacy_payload_sha256": canonical_sha256(provisional),
         "derived_tasks_sha256": canonical_sha256(canonical_tasks),
     }
-    provisional["receipt_sha256"] = canonical_sha256(provisional)
-    atomic_write_json(receipt_path, provisional)
-    return _validate_task_result_receipt(
+    return _persist_task_result_receipt(
         receipt_path,
+        provisional,
         task_id=task_id,
         worker_result_sha256=worker_result_sha256,
     )
@@ -4807,13 +4845,11 @@ def _terminal_receipt_for_result(
         raise DurableExecutionError(
             f"derived task receipt conflicts for source task {task_id}"
         )
-    receipt["derived_tasks"] = canonical_tasks
-    unsigned = dict(receipt)
-    unsigned.pop("receipt_sha256", None)
-    receipt["receipt_sha256"] = canonical_sha256(unsigned)
-    atomic_write_json(receipt_path, receipt)
-    return _validate_task_result_receipt(
+    updated = copy.deepcopy(receipt)
+    updated["derived_tasks"] = canonical_tasks
+    return _persist_task_result_receipt(
         receipt_path,
+        updated,
         task_id=task_id,
         worker_result_sha256=_worker_result_identity(lab_result),
     )
@@ -4835,13 +4871,44 @@ def _validated_receipt_derived_tasks(
         raise DurableExecutionError(
             f"derived task receipt is malformed for source task {task_id}"
         )
-    tasks = [copy.deepcopy(item) for item in raw]
+    tasks = [
+        _normalize_derived_task_receipt_item(copy.deepcopy(item), task_id=task_id)
+        for item in raw
+    ]
     derived_ids = [str(item.get("task_id") or "") for item in tasks]
     if any(not derived_id for derived_id in derived_ids) or len(set(derived_ids)) != len(derived_ids):
         raise DurableExecutionError(
             f"derived task receipt has invalid task identities for source task {task_id}"
         )
     return tasks
+
+
+def _normalize_derived_task_receipt_item(
+    task: dict[str, Any],
+    *,
+    task_id: str,
+) -> dict[str, Any]:
+    payload = task.get("payload")
+    if not isinstance(payload, dict):
+        return task
+    params_by_index = payload.get("params_by_index")
+    if not isinstance(params_by_index, dict):
+        return task
+    if not all(
+        isinstance(index, int) or (isinstance(index, str) and index.isdecimal())
+        for index in params_by_index
+    ):
+        return task
+    normalized: dict[int, Any] = {}
+    for raw_index, params in params_by_index.items():
+        index = int(raw_index)
+        if index in normalized:
+            raise DurableExecutionError(
+                f"derived task receipt has conflicting params_by_index keys for source task {task_id}"
+            )
+        normalized[index] = params
+    payload["params_by_index"] = normalized
+    return task
 
 
 def _record_lab_result(

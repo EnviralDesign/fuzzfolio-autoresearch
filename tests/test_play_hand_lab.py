@@ -3152,6 +3152,125 @@ def test_phase3_legacy_follow_on_receipt_migrates_only_after_exact_proof(
     ) == migrated
 
 
+def test_task_result_receipt_sealing_detaches_nested_inputs(tmp_path: Path) -> None:
+    task_id = "phase3-lane-00024-task-00001-baseline_3mo"
+    artifact_dir = tmp_path / "evals" / "eval_lab_baseline_3mo_detached"
+    artifact_dir.mkdir(parents=True)
+    (artifact_dir / "result.json").write_text('{"status":"success"}', encoding="utf-8")
+    recorded = {
+        "task_id": task_id,
+        "artifact_dir": str(artifact_dir.resolve()),
+        "policy_assignment": {"policy_lane": "guided"},
+    }
+    worker_result_sha256 = "sha256:" + "a" * 64
+
+    receipt = lab._write_task_result_receipt(
+        artifact_dir / "task-result-receipt.json",
+        task_id=task_id,
+        worker_result_sha256=worker_result_sha256,
+        recorded_result=recorded,
+    )
+    recorded["policy_assignment"]["policy_lane"] = "mutated"
+
+    assert receipt["recorded_result"]["policy_assignment"]["policy_lane"] == "guided"
+    assert lab._validate_task_result_receipt(
+        artifact_dir / "task-result-receipt.json",
+        task_id=task_id,
+        worker_result_sha256=worker_result_sha256,
+    ) == receipt
+
+
+def test_task_result_receipt_follow_on_update_is_resealed(tmp_path: Path) -> None:
+    receipt_path, lab_result, recorded, _recovered_row, derived_tasks = (
+        _legacy_phase3_follow_on_receipt_fixture(tmp_path)
+    )
+    initial = json.loads(receipt_path.read_text(encoding="utf-8"))
+    initial.pop("derived_tasks")
+    initial.pop("receipt_sha256")
+    lab._persist_task_result_receipt(
+        receipt_path,
+        initial,
+        task_id=recorded["task_id"],
+        worker_result_sha256=lab._worker_result_identity(lab_result),
+    )
+
+    updated = lab._terminal_receipt_for_result(
+        recorded,
+        lab_result,
+        derived_tasks=derived_tasks,
+        allow_legacy_phase3_receipt_migration=True,
+    )
+    derived_tasks[0]["payload"]["task_id"] = "mutated-after-persist"
+
+    assert updated["derived_tasks"][0]["payload"]["task_id"].endswith("shard-0000")
+    assert lab._validate_task_result_receipt(
+        receipt_path,
+        task_id=recorded["task_id"],
+        worker_result_sha256=lab._worker_result_identity(lab_result),
+    ) == updated
+
+
+def test_phase3_legacy_follow_on_receipt_normalizes_json_object_param_keys(
+    tmp_path: Path,
+) -> None:
+    receipt_path, lab_result, recorded, recovered_row, _derived_tasks = (
+        _legacy_phase3_follow_on_receipt_fixture(tmp_path)
+    )
+    derived_tasks = [
+        {
+            "task_id": "phase3-lane-00023-task-00002-lookback_timing-shard-0000",
+            "attempt_id": "phase3-lane-00023-task-00002-lookback_timing-shard-0000",
+            "payload": {
+                "task_id": "phase3-lane-00023-task-00002-lookback_timing-shard-0000",
+                "permutation_start": 0,
+                "permutation_count": 2,
+                "permutation_indices": [0, 1],
+                "params_by_index": {
+                    0: {"alpha": 0.0, "beta": 1},
+                    1: {"alpha": 1.0, "beta": 2},
+                },
+            },
+        },
+        {
+            "task_id": "phase3-lane-00023-task-00003-lookback_timing-shard-0001",
+            "attempt_id": "phase3-lane-00023-task-00003-lookback_timing-shard-0001",
+            "payload": {
+                "task_id": "phase3-lane-00023-task-00003-lookback_timing-shard-0001",
+                "permutation_start": 2,
+                "permutation_count": 2,
+                "permutation_indices": [2, 3],
+                "params_by_index": {
+                    2: {"alpha": 2.0, "beta": 3},
+                    3: {"alpha": 3.0, "beta": 4},
+                },
+            },
+        },
+    ]
+    legacy = json.loads(receipt_path.read_text(encoding="utf-8"))
+    legacy["derived_tasks"] = copy.deepcopy(derived_tasks)
+    receipt_path.write_text(json.dumps(legacy, sort_keys=True), encoding="utf-8")
+
+    proven = lab._legacy_phase3_receipt_recorded_result(
+        receipt_path,
+        task_id=recorded["task_id"],
+        worker_result_sha256=recovered_row["lab_worker_result_sha256"],
+        recovered_row=recovered_row,
+    )
+    migrated = lab._terminal_receipt_for_result(
+        proven,
+        lab_result,
+        derived_tasks=derived_tasks,
+        allow_legacy_phase3_receipt_migration=True,
+    )
+
+    assert migrated["derived_tasks"] == derived_tasks
+    assert lab._validate_task_result_receipt(
+        receipt_path,
+        task_id=recorded["task_id"],
+        worker_result_sha256=recovered_row["lab_worker_result_sha256"],
+    )["derived_tasks"] == derived_tasks
+
+
 def test_phase3_legacy_follow_on_receipt_rejects_any_evidence_or_graph_drift(
     tmp_path: Path,
 ) -> None:
