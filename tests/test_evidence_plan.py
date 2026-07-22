@@ -11,6 +11,7 @@ from autoresearch.evidence_plan import (
     enforce_replay_evidence_plan,
     validate_replay_evidence_plan,
 )
+from autoresearch.lake_window import LakeWindowBinding, LakeWindowRequest
 
 
 PROFILE = {"name": "frozen", "notificationThreshold": 73, "indicators": []}
@@ -147,3 +148,35 @@ def test_enforcement_accepts_exact_frozen_request() -> None:
     )
 
     assert resolved.plan_id == plan.plan_id
+
+
+def test_v2_plan_binds_window_and_preserves_global_manifest_only_as_provenance() -> None:
+    request = LakeWindowRequest(
+        pairs=["EURUSD"],
+        timeframes=["M5"],
+        data_start="2023-07-08T00:00:00Z",
+        data_end="2026-07-09T00:00:00Z",
+    )
+    binding = LakeWindowBinding(
+        request=request,
+        window_semantic_sha256="sha256:" + "a" * 64,
+        attestation_sha256="sha256:" + "b" * 64,
+        legacy_selection_manifest_sha256="sha256:" + "d" * 64,
+    )
+    plan = build_replay_evidence_plan(
+        campaign_plan_id="campaign:v2",
+        evidence_role="training",
+        selection_data_end="2026-07-09T00:00:00Z",
+        analysis_window_start="2023-07-08T00:00:00Z",
+        analysis_window_end="2026-07-09T00:00:00Z",
+        requested_horizon_months=36,
+        profile_snapshot=PROFILE,
+        lake_window_binding=binding,
+        data_availability_cutoff="2026-07-09T00:00:00Z",
+    )
+
+    assert plan.schema_version == "fuzzfolio.replay-evidence-plan.v2"
+    assert plan.lake_manifest_sha256 is None
+    assert plan.lake_window_binding == binding
+    assert "lake_manifest_sha256" not in plan.identity_payload()
+    assert validate_replay_evidence_plan(plan.model_dump(mode="json")) == plan

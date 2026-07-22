@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import re
 from calendar import monthrange
 from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .lake_window import LakeWindowBinding
 
-EVIDENCE_PLAN_SCHEMA = "fuzzfolio.replay-evidence-plan.v1"
+
+REPLAY_EVIDENCE_PLAN_SCHEMA_V1 = "fuzzfolio.replay-evidence-plan.v1"
+REPLAY_EVIDENCE_PLAN_SCHEMA_V2 = "fuzzfolio.replay-evidence-plan.v2"
+EVIDENCE_PLAN_SCHEMA = REPLAY_EVIDENCE_PLAN_SCHEMA_V1
 CoveragePolicy = Literal["require_complete", "allow_truncated"]
 SELECTION_CONSUMING_ROLES = frozenset(
     {
@@ -84,8 +89,11 @@ def subtract_calendar_months(value: Any, months: int) -> str:
 class ReplayEvidencePlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["fuzzfolio.replay-evidence-plan.v1"] = EVIDENCE_PLAN_SCHEMA
-    plan_id: str = Field(..., min_length=1)
+    schema_version: Literal[
+        "fuzzfolio.replay-evidence-plan.v1",
+        "fuzzfolio.replay-evidence-plan.v2",
+    ] = EVIDENCE_PLAN_SCHEMA
+    plan_id: str = Field(..., pattern=r"^sha256:[0-9a-f]{64}$")
     campaign_plan_id: str | None = None
     evidence_role: str = Field(..., min_length=1)
     selection_data_end: str
@@ -99,6 +107,7 @@ class ReplayEvidencePlan(BaseModel):
     lake_manifest_sha256: str | None = Field(
         default=None, pattern=r"^sha256:[0-9a-f]{64}$"
     )
+    lake_window_binding: LakeWindowBinding | None = None
     data_availability_cutoff: str | None = None
     coverage_policy: CoveragePolicy = "require_complete"
 
@@ -122,7 +131,12 @@ class ReplayEvidencePlan(BaseModel):
         return token
 
     def identity_payload(self) -> dict[str, Any]:
-        return self.model_dump(mode="json", exclude={"plan_id"})
+        exclude = {"plan_id"}
+        if self.schema_version == REPLAY_EVIDENCE_PLAN_SCHEMA_V1:
+            exclude.add("lake_window_binding")
+        else:
+            exclude.add("lake_manifest_sha256")
+        return self.model_dump(mode="json", exclude=exclude)
 
     def expected_plan_id(self) -> str:
         return canonical_sha256(self.identity_payload())
@@ -139,10 +153,18 @@ class ReplayEvidencePlan(BaseModel):
                 "selection-consuming evidence cannot extend beyond selection_data_end"
             )
         expected = self.expected_plan_id()
-        if self.plan_id != expected:
+        if not hmac.compare_digest(self.plan_id, expected):
             raise ValueError(
                 f"evidence plan hash mismatch: expected {expected}, received {self.plan_id}"
             )
+        if self.schema_version == REPLAY_EVIDENCE_PLAN_SCHEMA_V1:
+            if self.lake_window_binding is not None:
+                raise ValueError("v1 evidence plan must not include lake_window_binding")
+        else:
+            if self.lake_window_binding is None:
+                raise ValueError("v2 evidence plan requires lake_window_binding")
+            if self.lake_manifest_sha256 is not None:
+                raise ValueError("v2 evidence plan must not include lake_manifest_sha256")
         return self
 
 
@@ -157,21 +179,40 @@ def build_replay_evidence_plan(
     campaign_plan_id: str | None = None,
     execution_cell_sha256: str | None = None,
     lake_manifest_sha256: str | None = None,
+    lake_window_binding: LakeWindowBinding | Mapping[str, Any] | None = None,
     data_availability_cutoff: Any | None = None,
     coverage_policy: CoveragePolicy = "require_complete",
 ) -> ReplayEvidencePlan:
-    normalized_profile_snapshot = normalize_evidence_profile_snapshot(profile_snapshot)
+    if lake_manifest_sha256 is not None and lake_window_binding is not None:
+        raise ValueError("provide lake_manifest_sha256 or lake_window_binding, not both")
+    binding = (
+        lake_window_binding
+        if isinstance(lake_window_binding, LakeWindowBinding)
+        else LakeWindowBinding.model_validate(dict(lake_window_binding))
+        if lake_window_binding is not None
+        else None
+    )
+    # Preserve v1 plan IDs exactly. V2 matches the shared worker contract and
+    # hashes the submitted snapshot byte-semantically without legacy defaulting.
+    identity_profile_snapshot = (
+        profile_snapshot
+        if binding is not None
+        else normalize_evidence_profile_snapshot(profile_snapshot)
+    )
     normalized_payload = {
-        "schema_version": EVIDENCE_PLAN_SCHEMA,
+        "schema_version": (
+            REPLAY_EVIDENCE_PLAN_SCHEMA_V2
+            if binding is not None
+            else REPLAY_EVIDENCE_PLAN_SCHEMA_V1
+        ),
         "campaign_plan_id": campaign_plan_id,
         "evidence_role": str(evidence_role).strip().lower().replace("-", "_"),
         "selection_data_end": canonical_timestamp(selection_data_end),
         "analysis_window_start": canonical_timestamp(analysis_window_start),
         "analysis_window_end": canonical_timestamp(analysis_window_end),
         "requested_horizon_months": int(requested_horizon_months),
-        "profile_snapshot_sha256": canonical_sha256(normalized_profile_snapshot),
+        "profile_snapshot_sha256": canonical_sha256(identity_profile_snapshot),
         "execution_cell_sha256": execution_cell_sha256,
-        "lake_manifest_sha256": lake_manifest_sha256,
         "data_availability_cutoff": (
             canonical_timestamp(data_availability_cutoff)
             if data_availability_cutoff is not None
@@ -179,8 +220,16 @@ def build_replay_evidence_plan(
         ),
         "coverage_policy": coverage_policy,
     }
+    if binding is not None:
+        normalized_payload["lake_window_binding"] = binding.model_dump(mode="json")
+    else:
+        normalized_payload["lake_manifest_sha256"] = lake_manifest_sha256
     return ReplayEvidencePlan.model_validate(
-        {"plan_id": canonical_sha256(normalized_payload), **normalized_payload}
+        {
+            "plan_id": canonical_sha256(normalized_payload),
+            **normalized_payload,
+            **({"lake_manifest_sha256": None} if binding is not None else {}),
+        }
     )
 
 
@@ -207,7 +256,9 @@ def enforce_replay_evidence_plan(
     if canonical_timestamp(analysis_window_end) != resolved.analysis_window_end:
         raise ValueError("analysis_window_end does not match evidence plan")
     observed_profile = canonical_sha256(
-        normalize_evidence_profile_snapshot(profile_snapshot)
+        profile_snapshot
+        if resolved.schema_version == REPLAY_EVIDENCE_PLAN_SCHEMA_V2
+        else normalize_evidence_profile_snapshot(profile_snapshot)
     )
     if observed_profile != resolved.profile_snapshot_sha256:
         raise ValueError(

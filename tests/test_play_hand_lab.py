@@ -13,6 +13,7 @@ import requests
 
 from autoresearch import play_hand_lab as lab
 from autoresearch.instrument_universe import universe_provenance
+from autoresearch.lake_window import LakeWindowBinding
 from autoresearch.recipe_priors import build_campaign_policy_manifest
 
 
@@ -2441,7 +2442,20 @@ def test_deep_replay_tasks_are_self_contained_and_contract_pinned(tmp_path: Path
     assert lane.task_specs[task["task_id"]]["analysis_window_end"] == payload["analysis_window_end"]
 
 
-def test_fixed_as_of_date_bounds_screen_validation_and_scrutiny(tmp_path: Path) -> None:
+def _fake_window_binding(request, *, legacy_selection_manifest_sha256, **_kwargs):
+    return LakeWindowBinding(
+        request=request,
+        window_semantic_sha256="sha256:" + "d" * 64,
+        attestation_sha256="sha256:" + "e" * 64,
+        creation_global_coverage_sha256="sha256:" + "f" * 64,
+        legacy_selection_manifest_sha256=legacy_selection_manifest_sha256,
+    )
+
+
+def test_fixed_as_of_date_bounds_screen_validation_and_scrutiny(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(lab, "resolve_lake_window_binding", _fake_window_binding)
     lane = lab.LabLaneState(
         lane_id="lane_000",
         lane_index=0,
@@ -2525,6 +2539,7 @@ def test_historical_replay_and_sweep_tasks_require_explicit_bounds_and_evidence(
         event_payload=lambda: {"selected_axes": axis_texts},
     )
     monkeypatch.setattr(lab, "plan_sweep_axes", lambda *args, **kwargs: axis_plan)
+    monkeypatch.setattr(lab, "resolve_lake_window_binding", _fake_window_binding)
 
     with pytest.raises(ValueError, match="require explicit analysis window bounds"):
         lab._deep_replay_job_payload(
@@ -2557,6 +2572,12 @@ def test_historical_replay_and_sweep_tasks_require_explicit_bounds_and_evidence(
         assert evidence_plan["evidence_role"] == "training"
         assert evidence_plan["selection_data_end"] == runtime.as_of_date
         assert evidence_plan["data_availability_cutoff"] == runtime.as_of_date
+        assert evidence_plan["schema_version"] == "fuzzfolio.replay-evidence-plan.v2"
+        assert evidence_plan["lake_manifest_sha256"] is None
+        assert (
+            evidence_plan["lake_window_binding"]["legacy_selection_manifest_sha256"]
+            == runtime.lake_manifest_sha256
+        )
 
     for phase, months in [
         ("baseline_3mo", 3),
@@ -2624,6 +2645,48 @@ def test_historical_execution_receipt_must_match_plan() -> None:
     ) == receipt
     with pytest.raises(RuntimeError, match="omitted execution_evidence"):
         lab._validated_execution_evidence({}, plan)
+
+
+def test_historical_v2_execution_receipt_validates_window_identity() -> None:
+    request = {
+        "schema_version": "fuzzfolio.market-data-window-request.v1",
+        "dataset": "bars",
+        "pairs": ["EURUSD"],
+        "timeframes": ["M5"],
+        "data_start": "2023-01-01T00:00:00Z",
+        "data_end": "2026-01-01T00:00:00Z",
+        "coverage_policy": "require_complete",
+    }
+    plan = {
+        "plan_id": "sha256:" + "a" * 64,
+        "profile_snapshot_sha256": "sha256:" + "b" * 64,
+        "execution_cell_sha256": None,
+        "lake_manifest_sha256": None,
+        "lake_window_binding": {
+            "request": request,
+            "window_semantic_sha256": "sha256:" + "c" * 64,
+            "semantic_contract_id": "fuzzfolio.canonical-bars.semantic-digest.v2",
+            "attestation_sha256": "sha256:" + "d" * 64,
+        },
+    }
+    receipt = {
+        "plan_id": plan["plan_id"],
+        "profile_snapshot_sha256": plan["profile_snapshot_sha256"],
+        "execution_cell_sha256": None,
+        "expected_window_semantic_sha256": "sha256:" + "c" * 64,
+        "observed_window_semantic_sha256": "sha256:" + "c" * 64,
+        "semantic_contract_id": "fuzzfolio.canonical-bars.semantic-digest.v2",
+        "expected_attestation_sha256": "sha256:" + "d" * 64,
+        "lake_window_request": request,
+    }
+
+    assert lab._validated_execution_evidence(
+        {"execution_evidence": receipt}, plan
+    ) == receipt
+    mutated = dict(receipt)
+    mutated["observed_window_semantic_sha256"] = "sha256:" + "e" * 64
+    with pytest.raises(RuntimeError, match="observed_window_semantic_sha256 mismatch"):
+        lab._validated_execution_evidence({"execution_evidence": mutated}, plan)
 
 
 def test_fake_compute_tasks_require_lab_protocol_capability(tmp_path: Path) -> None:

@@ -29,6 +29,8 @@ from .play_hand_lab_auth import load_lab_gateway_token
 from .config import AppConfig, load_config
 from .fuzzfolio import CliError, FuzzfolioCli
 from .evidence_plan import build_replay_evidence_plan, canonical_json, canonical_sha256
+from .lake_window import resolve_replay_lake_window_request
+from .lake_window_client import resolve_lake_window_binding
 from .durable_execution import (
     DurableExecutionError,
     DurableExecutionJournal,
@@ -1749,6 +1751,17 @@ def _require_historical_task_evidence(
     if payload.get("data_availability_cutoff") != runtime.as_of_date:
         raise ValueError(
             "Historical PlayHand evidence data_availability_cutoff must equal as_of_date."
+        )
+    binding = payload.get("lake_window_binding")
+    if payload.get("schema_version") != "fuzzfolio.replay-evidence-plan.v2" or not isinstance(
+        binding, dict
+    ):
+        raise ValueError("Historical PlayHand tasks require a v2 lake window binding.")
+    if payload.get("lake_manifest_sha256") is not None:
+        raise ValueError("Historical PlayHand v2 evidence must not use global lake authority.")
+    if binding.get("legacy_selection_manifest_sha256") != runtime.lake_manifest_sha256:
+        raise ValueError(
+            "Historical PlayHand lake binding must retain the frozen selection manifest as provenance."
         )
 
 
@@ -4165,6 +4178,19 @@ def _deep_replay_job_payload(
         raise ValueError("Evidence-bound replay requires both analysis window bounds.")
     evidence_plan = None
     if analysis_window_start and analysis_window_end:
+        lake_window_binding = None
+        if runtime.as_of_date:
+            lake_window_request = resolve_replay_lake_window_request(
+                pairs=list(instruments or lane.instruments),
+                base_timeframe=str(timeframe or lane.timeframe),
+                profile_snapshot=profile_payload,
+                analysis_window_start=analysis_window_start,
+                analysis_window_end=analysis_window_end,
+            )
+            lake_window_binding = resolve_lake_window_binding(
+                lake_window_request,
+                legacy_selection_manifest_sha256=runtime.lake_manifest_sha256,
+            )
         evidence_plan = build_replay_evidence_plan(
             campaign_plan_id=f"playhand-lab:{lane.run_id}",
             evidence_role="training",
@@ -4173,7 +4199,8 @@ def _deep_replay_job_payload(
             analysis_window_end=analysis_window_end,
             requested_horizon_months=int(lookback_months or runtime.lookback_months),
             profile_snapshot=profile_payload,
-            lake_manifest_sha256=runtime.lake_manifest_sha256,
+            lake_manifest_sha256=(None if lake_window_binding else runtime.lake_manifest_sha256),
+            lake_window_binding=lake_window_binding,
             data_availability_cutoff=(
                 runtime.as_of_date if runtime.as_of_date else analysis_window_end
             ),
@@ -4340,6 +4367,19 @@ def _sweep_definition_payload(
         raise ValueError("Evidence-bound sweep requires both analysis window bounds.")
     evidence_plan = None
     if analysis_window_start and analysis_window_end:
+        lake_window_binding = None
+        if runtime.as_of_date:
+            lake_window_request = resolve_replay_lake_window_request(
+                pairs=instruments,
+                base_timeframe=lane.timeframe,
+                profile_snapshot=profile_payload,
+                analysis_window_start=analysis_window_start,
+                analysis_window_end=analysis_window_end,
+            )
+            lake_window_binding = resolve_lake_window_binding(
+                lake_window_request,
+                legacy_selection_manifest_sha256=runtime.lake_manifest_sha256,
+            )
         evidence_plan = build_replay_evidence_plan(
             campaign_plan_id=f"playhand-lab:{lane.run_id}",
             evidence_role="training",
@@ -4348,7 +4388,8 @@ def _sweep_definition_payload(
             analysis_window_end=analysis_window_end,
             requested_horizon_months=int(lookback_months),
             profile_snapshot=profile_payload,
-            lake_manifest_sha256=runtime.lake_manifest_sha256,
+            lake_manifest_sha256=(None if lake_window_binding else runtime.lake_manifest_sha256),
+            lake_window_binding=lake_window_binding,
             data_availability_cutoff=(
                 runtime.as_of_date if runtime.as_of_date else analysis_window_end
             ),
@@ -4688,7 +4729,8 @@ def _validated_execution_evidence(
     receipt = result_payload.get("execution_evidence") or nested.get(
         "execution_evidence"
     )
-    if not evidence_plan.get("lake_manifest_sha256") and not isinstance(receipt, dict):
+    binding = evidence_plan.get("lake_window_binding")
+    if not evidence_plan.get("lake_manifest_sha256") and not isinstance(binding, dict):
         return None
     if not isinstance(receipt, dict):
         raise RuntimeError("Evidence-bound historical result omitted execution_evidence")
@@ -4696,8 +4738,28 @@ def _validated_execution_evidence(
         "plan_id": evidence_plan.get("plan_id"),
         "profile_snapshot_sha256": evidence_plan.get("profile_snapshot_sha256"),
         "execution_cell_sha256": evidence_plan.get("execution_cell_sha256"),
-        "observed_lake_manifest_sha256": evidence_plan.get("lake_manifest_sha256"),
     }
+    if isinstance(binding, dict):
+        expected.update(
+            {
+                "expected_window_semantic_sha256": binding.get(
+                    "window_semantic_sha256"
+                ),
+                "observed_window_semantic_sha256": binding.get(
+                    "window_semantic_sha256"
+                ),
+                "semantic_contract_id": binding.get("semantic_contract_id"),
+                "lake_window_request": binding.get("request"),
+            }
+        )
+        if binding.get("attestation_sha256"):
+            expected["expected_attestation_sha256"] = binding.get(
+                "attestation_sha256"
+            )
+    else:
+        expected["observed_lake_manifest_sha256"] = evidence_plan.get(
+            "lake_manifest_sha256"
+        )
     for key, value in expected.items():
         if receipt.get(key) != value:
             raise RuntimeError(
