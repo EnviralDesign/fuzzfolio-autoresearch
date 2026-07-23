@@ -1,0 +1,44 @@
+name: PlayHand enqueue regression tests
+
+"on":
+  pull_request:
+    paths:
+      - "autoresearch/__init__.py"
+      - "autoresearch/play_hand_lab.py"
+      - "autoresearch/play_hand_lab_enqueue.py"
+      - "autoresearch/play_hand_lab_entrypoint.py"
+      - "tests/test_play_hand_lab_enqueue.py"
+      - "tests/test_play_hand_lab_entrypoint.py"
+      - "tests/test_package_enqueue_bootstrap.py"
+      - "pyproject.toml"
+      - ".github/workflows/playhand-enqueue-tests.yml"
+  push:
+    branches: [master]
+    paths:
+      - "autoresearch/__init__.py"
+      - "autoresearch/play_hand_lab.py"
+      - "autoresearch/play_hand_lab_enqueue.py"
+      - "autoresearch/play_hand_lab_entrypoint.py"
+      - "tests/test_play_hand_lab_enqueue.py"
+      - "tests/test_play_hand_lab_entrypoint.py"
+      - "tests/test_package_enqueue_bootstrap.py"
+      - "pyproject.toml"
+      - ".github/workflows/playhand-enqueue-tests.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install project
+        run: python -m pip install -e . pytest
+      - name: Run enqueue regression suite
+        run: >-
+          python -m pytest -q
+          tests/test_play_hand_lab_enqueue.py
+          tests/test_play_hand_lab_entrypoint.py
+          tests/test_package_enqueue_bootstrap.py
