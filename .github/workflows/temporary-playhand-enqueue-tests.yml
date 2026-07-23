@@ -1,6 +1,9 @@
 name: Temporary PlayHand enqueue validation
 
 on:
+  push:
+    branches:
+      - agent/fix-playhand-resume-enqueue
   pull_request:
     branches: [master]
 
