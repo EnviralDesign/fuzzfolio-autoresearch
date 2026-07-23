@@ -1616,6 +1616,75 @@ def test_historical_sweep_freezes_non_m5_lane_timeframe_into_bound_snapshot(
     assert "M30" in payload["evidence_plan"]["lake_window_binding"]["request"]["timeframes"]
 
 
+def test_historical_sweep_rebinds_to_accepted_incumbent_timeframe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile_payload = {
+        "indicators": [
+            {
+                "meta": {"instanceId": "indicator-1"},
+                "config": {"isActive": True, "timeframe": "H1", "lookbackBars": 1},
+            }
+        ],
+        "notificationThreshold": 80,
+    }
+    axis_texts = ["indicator[0].config.lookbackBars=1,2"]
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="run-rebound-h1",
+        run_dir=tmp_path,
+        profile_path=tmp_path / "base.json",
+        profile_payload=profile_payload,
+        profile_ref="lab-inline:run-rebound-h1:lane_000",
+        instruments=["EURUSD"],
+        timeframe="M30",
+        incumbent_profile_path=tmp_path / "accepted.json",
+        incumbent_profile_payload=profile_payload,
+        incumbent_profile_ref="lab-inline:run-rebound-h1:lane_000:lookback_timing",
+        incumbent_timeframe="H1",
+    )
+    monkeypatch.setattr(
+        lab,
+        "plan_sweep_axes",
+        lambda *args, **kwargs: SimpleNamespace(
+            axes=axis_texts,
+            selected_permutations=2,
+            event_payload=lambda: {"selected_axes": axis_texts},
+        ),
+    )
+    monkeypatch.setattr(lab, "resolve_lake_window_binding", _fake_window_binding)
+
+    tasks = lab._make_sweep_shard_tasks(
+        lane,
+        phase="coarse_probe",
+        runtime=lab.PlayHandLabRuntimeConfig(
+            as_of_date="2025-06-30T00:00:00Z",
+            max_sweep_permutations=2,
+            sweep_shard_size=2,
+            worker_contract_hash="sha256:" + "a" * 64,
+            lake_manifest_sha256="sha256:" + "b" * 64,
+        ),
+        reward_matrix=None,
+        worker_contract_hash="sha256:" + "a" * 64,
+        profile_payload=profile_payload,
+        profile_path=lane.incumbent_profile_path,
+        profile_ref=lane.incumbent_profile_ref,
+        instruments=["EURUSD"],
+        lookback_months=3,
+        axis_texts=axis_texts,
+        mode="evolutionary",
+        analysis_window_start="2025-03-30T00:00:00Z",
+        analysis_window_end="2025-06-30T00:00:00Z",
+    )
+
+    assert tasks
+    payload = tasks[0]["payload"]
+    assert payload["base_profile_snapshot"]["timeframe"] == "H1"
+    assert payload["evidence_plan"]["lake_window_binding"]["request"]["timeframes"] == ["H1"]
+
+
 def test_lane_state_payload_omits_profiles_and_params_and_hydrate_reloads(
     tmp_path: Path,
 ) -> None:

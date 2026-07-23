@@ -4372,7 +4372,11 @@ def _sweep_definition_payload(
         if runtime.as_of_date:
             lake_window_request = resolve_replay_lake_window_request(
                 pairs=instruments,
-                base_timeframe=lane.timeframe,
+                base_timeframe=str(
+                    profile_payload.get("timeframe")
+                    or lane.incumbent_timeframe
+                    or lane.timeframe
+                ),
                 profile_snapshot=profile_payload,
                 analysis_window_start=analysis_window_start,
                 analysis_window_end=analysis_window_end,
