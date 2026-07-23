@@ -1,5 +1,9 @@
 # FuzzFolio Strategy Language and Learning Architect Vision
 
+> Canonical FuzzFolio documentation now lives in
+> `C:\repos\Trading-Dashboard\z_docs\strategy-language-and-learning\`.
+> This AutoResearch document remains the original research-side vision note.
+
 ## Status
 
 This document records a possible future direction for FuzzFolio. It is not an
