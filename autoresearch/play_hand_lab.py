@@ -4456,9 +4456,17 @@ def _make_sweep_shard_tasks(
 ) -> list[dict[str, Any]]:
     if not axis_texts:
         return []
+    # Sweep workers construct each child replay's base timeframe from the
+    # shared profile snapshot. Most scoring profiles do not carry a top-level
+    # timeframe, so freeze the lane's actual execution timeframe into that
+    # snapshot before deriving the evidence-bound lake window.
+    shared_snapshot = _copy_profile_payload(profile_payload)
+    shared_snapshot["timeframe"] = str(
+        lane.incumbent_timeframe or lane.timeframe
+    ).strip().upper()
     axis_plan = plan_sweep_axes(
         axis_texts,
-        profile_payload=profile_payload,
+        profile_payload=shared_snapshot,
         phase=phase,
         max_permutations=int(runtime.max_sweep_permutations or PLAY_HAND_SWEEP_PERMUTATION_LIMIT),
         search_mode=mode,
@@ -4466,7 +4474,7 @@ def _make_sweep_shard_tasks(
     sweep_axes = [
         axis
         for axis_text in axis_plan.axes
-        if (axis := _axis_to_sweep_axis(profile_payload, axis_text)) is not None
+        if (axis := _axis_to_sweep_axis(shared_snapshot, axis_text)) is not None
     ]
     params = _expand_sweep_params(
         sweep_axes,
@@ -4482,7 +4490,7 @@ def _make_sweep_shard_tasks(
         axes=sweep_axes,
         instruments=instruments,
         profile_ref=profile_ref,
-        profile_payload=profile_payload,
+        profile_payload=shared_snapshot,
         lookback_months=lookback_months,
         analysis_window_start=analysis_window_start,
         analysis_window_end=analysis_window_end,
@@ -4490,7 +4498,6 @@ def _make_sweep_shard_tasks(
     )
     tasks: list[dict[str, Any]] = []
     shard_size = max(int(runtime.sweep_shard_size), 1)
-    shared_snapshot = _copy_profile_payload(profile_payload)
     for shard_index, start in enumerate(range(0, len(params), shard_size)):
         chunk = params[start : start + shard_size]
         task_id = f"{lane.run_id}-task-{len(lane.task_ids) + 1:05d}-{phase}-shard-{shard_index:04d}"
