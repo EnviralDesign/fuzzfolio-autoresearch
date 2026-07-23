@@ -1685,7 +1685,7 @@ def test_historical_sweep_rebinds_to_accepted_incumbent_timeframe(
     assert payload["evidence_plan"]["lake_window_binding"]["request"]["timeframes"] == ["H1"]
 
 
-def test_lane_state_payload_omits_profiles_and_params_and_hydrate_reloads(
+def test_lane_state_payload_omits_task_specs_and_hydrates_unresolved_work(
     tmp_path: Path,
 ) -> None:
     profile_path = tmp_path / "profile.json"
@@ -1723,21 +1723,104 @@ def test_lane_state_payload_omits_profiles_and_params_and_hydrate_reloads(
         "timeframe": "M5",
     }
 
+    lane.task_ids = ["task-1"]
+    lane.phase_task_ids = {"coarse_probe": ["task-1"]}
     payload = lab._lane_state_payload(lane)
     assert payload["profile_payload"] is None
     assert payload["incumbent_profile_payload"] is None
-    slim_spec = payload["task_specs"]["task-1"]
-    assert "profile_payload" not in slim_spec
-    assert "params_by_index" not in slim_spec
-    assert slim_spec["permutation_start"] == 0
-    assert slim_spec["profile_path"] == str(profile_path)
+    assert payload["task_specs"] == {}
 
     restored = lab._lane_state_from_payload(payload)
     assert restored.profile_payload == _profile_payload()["profile"]
     assert restored.incumbent_profile_payload == _profile_payload()["profile"]
+    durable_task = {
+        "payload": {
+            "task_id": "task-1",
+            "lane_id": "lane_000",
+            "task_kind": "sweep_shard",
+            "payload": {
+                "policy_assignment": {},
+                "sweep_id": "sweep-1",
+                "shard_id": "sweep-1-shard-0000",
+                "definition": {
+                    "axes": [
+                        {
+                            "target": "talib_param",
+                            "indicator_instance_id": "test-rsi",
+                            "param_key": "timeperiod",
+                            "values": [10, 20],
+                        }
+                    ],
+                    "base_profile_id": "ref-1",
+                    "instruments": ["EURUSD"],
+                    "lookback_months": 3,
+                },
+                "permutation_start": 0,
+                "permutation_count": 2,
+                "params_by_index": {"0": {"alpha": 1}, "1": {"alpha": 2}},
+                "result_detail": "summary",
+            },
+        }
+    }
+    lab._hydrate_unresolved_lane_task_specs([restored], {"task-1": durable_task})
     rebuilt_params = restored.task_specs["task-1"].get("params_by_index")
     assert isinstance(rebuilt_params, dict)
-    assert set(rebuilt_params) == {0, 1}
+    assert set(rebuilt_params) == {"0", "1"}
+    assert restored.task_specs["task-1"]["axes"] == [
+        "indicator[0].talib.timeperiod=10,20"
+    ]
+    assert restored.task_specs["task-1"]["axis_key_map"] == {
+        "test-rsi.timeperiod": "indicator[0].talib.timeperiod"
+    }
+
+    restored.task_specs.clear()
+    restored.completed_task_ids.add("task-1")
+    restored.phase_task_ids["coarse_probe"].append("task-2")
+    lab._hydrate_unresolved_lane_task_specs([restored], {"task-1": durable_task})
+    # A terminal shard remains materialized while its parent phase is incomplete,
+    # so a later retained shard can merge the exact declared sweep graph.
+    assert restored.task_specs["task-1"]["task_kind"] == "sweep_shard"
+
+
+def test_recover_unresolved_journal_task_graph_restores_checkpoint_gap(
+    tmp_path: Path,
+) -> None:
+    lane = lab.LabLaneState(
+        lane_id="lane_000",
+        lane_index=0,
+        run_id="run-recovery",
+        run_dir=tmp_path / "run",
+        instruments=["EURUSD"],
+        timeframe="M5",
+        policy_assignment={"policy_lane": "guided"},
+    )
+    task_id = "run-recovery-task-00001-baseline_3mo"
+    durable_task = {
+        "status": "pending",
+        "payload": {
+            "task_id": task_id,
+            "lane_id": "lane_000",
+            "task_kind": "deep_replay",
+            "payload": {
+                "policy_assignment": {"policy_lane": "guided"},
+                "profile_id": "profile-1",
+                "instruments": ["EURUSD"],
+                "timeframe": "M5",
+                "lookback_months": 3,
+                "evidence_plan": {"plan_id": "plan-1"},
+            },
+        },
+    }
+
+    lab._recover_unresolved_journal_task_graph([lane], {task_id: durable_task})
+
+    assert lane.task_ids == [task_id]
+    assert lane.phase_task_ids == {"baseline_3mo": [task_id]}
+    assert lane.phase_task_counts == {"baseline_3mo": 1}
+    assert lane.task_specs[task_id]["phase"] == "baseline_3mo"
+    assert lab._durable_task_policy_assignment(durable_task["payload"]) == {
+        "policy_lane": "guided"
+    }
 
 
 def test_detach_attach_task_profile_snapshots_round_trip(tmp_path: Path) -> None:
@@ -1871,9 +1954,7 @@ def test_make_sweep_shard_tasks_records_params_by_index_sha256(
         assert spec["params_by_index_sha256"] == lab.canonical_sha256(
             lab._canonical_params(params)
         )
-        slim = lab._lane_state_payload(lane)["task_specs"][task["task_id"]]
-        assert "params_by_index" not in slim
-        assert slim["params_by_index_sha256"] == spec["params_by_index_sha256"]
+        assert lab._lane_state_payload(lane)["task_specs"] == {}
 
 
 def test_record_lab_result_appends_attempt_row(
@@ -3289,12 +3370,7 @@ def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
         "used_lane_counts"
     ]
     for lane_payload in after_resume["lanes"]:
-        task_specs = lane_payload["task_specs"]
-        assert task_specs
-        assert all(
-            spec["policy_assignment"] == lane_payload["policy_assignment"]
-            for spec in task_specs.values()
-        )
+        assert lane_payload["task_specs"] == {}
         attempts = lab.load_attempts(
             Path(lane_payload["run_dir"]) / "attempts.jsonl"
         )
@@ -3390,14 +3466,17 @@ def test_policy_honest_resume_after_crash_preserves_assignments_and_counters(
             expected_error = "policy counters do not match persisted lane assignments"
         else:
             first_lane = tampered["lanes"][0]
-            first_task = next(iter(first_lane["task_specs"].values()))
-            first_task["policy_assignment"]["policy_lane"] = "wild"
-            expected_error = "task policy assignment mismatch"
+            first_lane["policy_assignment"]["policy_lane"] = "wild"
+            # Terminal receipt validation detects this state/journal policy drift
+            # before the later campaign-policy recomputation.
+            expected_error = "terminal receipt policy assignment mismatch"
         state_path.write_text(json.dumps(tampered), encoding="utf-8")
         with pytest.raises(lab.DurableExecutionError, match=expected_error):
             lab.cmd_play_hand_lab(runtime(resume=True))
 
-    state_path.write_text(json.dumps(after_resume), encoding="utf-8")
+    receipt_gap = copy.deepcopy(after_resume)
+    receipt_gap["lanes"][0]["completed_task_ids"] = []
+    state_path.write_text(json.dumps(receipt_gap), encoding="utf-8")
     validate_payload = lab._validate_task_result_receipt_payload
     validate_file = lab._validate_task_result_receipt
 
@@ -3569,7 +3648,8 @@ def test_phase3_resume_batches_journal_and_campaign_state_rewrites(
 
     expected_batches = (retained_count + batch_size - 1) // batch_size
     assert journal_writes == expected_batches
-    assert state_writes == expected_batches + 1  # one validated resume snapshot
+    # One validated recovery snapshot plus the one-time compact-state migration.
+    assert state_writes == expected_batches + 2
     assert _RetainedResumeGateway.acked_count == retained_count
 
 

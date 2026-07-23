@@ -408,7 +408,6 @@ class LabCampaignHistory:
     campaign_policy_state: dict[str, Any] | None = None
 
 
-_TASK_SPEC_STATE_OMIT_KEYS = frozenset({"profile_payload", "params_by_index"})
 _PROFILE_SNAPSHOT_KEYS = (
     ("base_profile_snapshot", "base_profile_snapshot_sha256"),
     ("inline_profile_snapshot", "inline_profile_snapshot_sha256"),
@@ -489,16 +488,12 @@ def _lane_state_payload(lane: LabLaneState) -> dict[str, Any]:
     # Profiles reload from disk on resume; omit heavy copies from durable state.
     payload["profile_payload"] = None
     payload["incumbent_profile_payload"] = None
-    slim_specs: dict[str, dict[str, Any]] = {}
-    for task_id, spec in (payload.get("task_specs") or {}).items():
-        if not isinstance(spec, dict):
-            continue
-        slim_specs[str(task_id)] = {
-            key: value
-            for key, value in spec.items()
-            if key not in _TASK_SPEC_STATE_OMIT_KEYS
-        }
-    payload["task_specs"] = slim_specs
+    # Task payloads are already durably registered in the execution journal.
+    # Persisting their full derived specs here duplicates large sweep plans for
+    # every active lane and turns each result batch into a campaign-sized JSON
+    # rewrite.  Phase/task ids retain the graph; resume rehydrates only task
+    # specs whose terminal state has not already been recorded.
+    payload["task_specs"] = {}
     return payload
 
 
@@ -587,6 +582,222 @@ def _hydrate_lane_profiles(lane: LabLaneState) -> None:
                         "rebuilt params_by_index does not match params_by_index_sha256"
                     )
             task_spec["params_by_index"] = rebuilt
+
+
+def _task_phase_from_persisted_lane(lane: LabLaneState, task_id: str) -> str | None:
+    for phase, task_ids in lane.phase_task_ids.items():
+        if task_id in task_ids:
+            return str(phase)
+    prefix = f"{lane.run_id}-task-"
+    if task_id.startswith(prefix):
+        sequence, separator, phase = task_id[len(prefix) :].partition("-")
+        if separator and sequence.isdigit() and phase:
+            return phase
+    return None
+
+
+def _sweep_axes_to_text(
+    lane: LabLaneState,
+    axes: list[dict[str, Any]],
+    *,
+    task_id: str,
+) -> tuple[list[str], dict[str, str]]:
+    """Recover planner-facing axis text from the worker-safe sweep contract."""
+    source = lane.incumbent_profile_payload or lane.profile_payload or {}
+    profile = source.get("profile") if isinstance(source.get("profile"), dict) else source
+    indicators = profile.get("indicators") if isinstance(profile, dict) else None
+    if not isinstance(indicators, list):
+        raise DurableExecutionError(f"durable sweep task has no profile axes: {task_id}")
+    indices: dict[str, int] = {}
+    for index, indicator in enumerate(indicators):
+        meta = indicator.get("meta") if isinstance(indicator, dict) else None
+        instance_id = str((meta or {}).get("instanceId") or "").strip()
+        if instance_id:
+            indices[instance_id] = index
+    texts: list[str] = []
+    axis_key_map: dict[str, str] = {}
+    for axis in axes:
+        if not isinstance(axis, dict):
+            raise DurableExecutionError(f"durable sweep axis is malformed: {task_id}")
+        target = str(axis.get("target") or "")
+        section = "talib" if target == "talib_param" else "config" if target == "config_field" else ""
+        instance_id = str(axis.get("indicator_instance_id") or "").strip()
+        param_key = str(axis.get("param_key") or "").strip()
+        values = axis.get("values")
+        index = indices.get(instance_id)
+        if not section or index is None or not param_key or not isinstance(values, list) or not values:
+            raise DurableExecutionError(f"durable sweep axis cannot be rebound: {task_id}")
+        rendered_values = ",".join(
+            str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+            for value in values
+        )
+        text = f"indicator[{index}].{section}.{param_key}={rendered_values}"
+        texts.append(text)
+        axis_key_map[_sweep_axis_key(axis)] = text.partition("=")[0]
+    return texts, axis_key_map
+
+
+def _task_spec_from_durable_payload(
+    lane: LabLaneState,
+    *,
+    task_id: str,
+    durable_task: Mapping[str, Any],
+    phase: str | None = None,
+) -> dict[str, Any]:
+    """Rebuild the mutable task view from the authoritative journal payload."""
+    envelope = durable_task.get("payload")
+    if not isinstance(envelope, dict):
+        raise DurableExecutionError(f"durable task payload is missing: {task_id}")
+    if (
+        str(envelope.get("task_id") or "") != task_id
+        or str(envelope.get("lane_id") or "") != lane.lane_id
+    ):
+        raise DurableExecutionError(f"durable task payload identity mismatch: {task_id}")
+    phase = phase or _task_phase_from_persisted_lane(lane, task_id)
+    if not phase:
+        raise DurableExecutionError(f"durable task has no persisted phase: {task_id}")
+    task_kind = str(envelope.get("task_kind") or "")
+    if not task_kind:
+        raise DurableExecutionError(f"durable task has no kind: {task_id}")
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        raise DurableExecutionError(f"durable task job payload is missing: {task_id}")
+    policy_assignment = payload.get("policy_assignment")
+    if policy_assignment != lane.policy_assignment:
+        raise DurableExecutionError(f"durable task policy assignment mismatch: {task_id}")
+    spec: dict[str, Any] = {
+        "phase": phase,
+        "task_kind": task_kind,
+        "policy_assignment": copy.deepcopy(policy_assignment),
+    }
+    if task_kind != "sweep_shard":
+        spec.update(
+            {
+                "profile_ref": payload.get("profile_id"),
+                "instruments": list(payload.get("instruments") or lane.instruments),
+                "timeframe": str(payload.get("timeframe") or lane.timeframe),
+                "lookback_months": payload.get("lookback_months"),
+                "analysis_window_start": payload.get("analysis_window_start"),
+                "analysis_window_end": payload.get("analysis_window_end"),
+                "evidence_plan": payload.get("evidence_plan"),
+            }
+        )
+        return spec
+
+    definition = payload.get("definition")
+    if not isinstance(definition, dict):
+        raise DurableExecutionError(f"durable sweep task has no definition: {task_id}")
+    axes = definition.get("axes")
+    if not isinstance(axes, list) or not all(isinstance(axis, dict) for axis in axes):
+        raise DurableExecutionError(f"durable sweep task has invalid axes: {task_id}")
+    axis_texts, axis_key_map = _sweep_axes_to_text(
+        lane,
+        list(axes),
+        task_id=task_id,
+    )
+    params_by_index = payload.get("params_by_index")
+    if not isinstance(params_by_index, dict):
+        raise DurableExecutionError(f"durable sweep task has no params: {task_id}")
+    spec.update(
+        {
+            "sweep_id": payload.get("sweep_id"),
+            "shard_id": payload.get("shard_id"),
+            "profile_ref": definition.get("base_profile_id"),
+            "instruments": list(definition.get("instruments") or lane.instruments),
+            "timeframe": lane.incumbent_timeframe or lane.timeframe,
+            "lookback_months": definition.get("lookback_months"),
+            "analysis_window_start": definition.get("analysis_window_start"),
+            "analysis_window_end": definition.get("analysis_window_end"),
+            "evidence_plan": payload.get("evidence_plan"),
+            "axes": axis_texts,
+            "axis_key_map": axis_key_map,
+            "permutation_start": payload.get("permutation_start"),
+            "permutation_count": payload.get("permutation_count"),
+            "params_by_index": _canonical_params(params_by_index),
+            "params_by_index_sha256": canonical_sha256(_canonical_params(params_by_index)),
+            "result_detail": payload.get("result_detail"),
+        }
+    )
+    return spec
+
+
+def _hydrate_unresolved_lane_task_specs(
+    lanes: list[LabLaneState],
+    durable_tasks_by_id: Mapping[str, Any],
+) -> None:
+    """Restore task specs needed for recovery or an unfinished phase merge."""
+    for lane in lanes:
+        for task_id in lane.task_ids:
+            if task_id in lane.task_specs:
+                continue
+            phase = _task_phase_from_persisted_lane(lane, task_id)
+            if not phase:
+                raise DurableExecutionError(f"durable task has no persisted phase: {task_id}")
+            task_is_terminal = (
+                task_id in lane.completed_task_ids or task_id in lane.failed_task_ids
+            )
+            # A terminal task from a completed phase is historical-only.  A
+            # terminal shard in an unfinished phase is still required to merge
+            # its parent sweep with later retained results.
+            if task_is_terminal and _phase_terminal(lane, phase):
+                continue
+            durable_task = durable_tasks_by_id.get(task_id)
+            if not isinstance(durable_task, dict):
+                raise DurableExecutionError(f"durable task is missing: {task_id}")
+            lane.task_specs[task_id] = _task_spec_from_durable_payload(
+                lane,
+                task_id=task_id,
+                durable_task=durable_task,
+            )
+
+
+def _recover_unresolved_journal_task_graph(
+    lanes: list[LabLaneState],
+    durable_tasks_by_id: Mapping[str, Any],
+) -> None:
+    """Restore a graph checkpoint lost after durable registration but before state write.
+
+    A registered journal payload is authoritative.  We only reconstruct a missing
+    lane edge when its task and policy binding identify one existing lane exactly.
+    """
+    lanes_by_id = {lane.lane_id: lane for lane in lanes}
+    for task_id, durable_task in durable_tasks_by_id.items():
+        if not isinstance(durable_task, dict) or durable_task.get("status") == "terminal":
+            continue
+        envelope = durable_task.get("payload")
+        if not isinstance(envelope, dict):
+            raise DurableExecutionError(f"durable task payload is missing: {task_id}")
+        lane = lanes_by_id.get(str(envelope.get("lane_id") or ""))
+        if lane is None:
+            raise DurableExecutionError(f"durable task references unknown lane: {task_id}")
+        if _durable_task_policy_assignment(envelope) != lane.policy_assignment:
+            raise DurableExecutionError(
+                f"durable task policy assignment mismatch: {task_id}"
+            )
+        if task_id in lane.task_ids:
+            continue
+        phase = _task_phase_from_persisted_lane(lane, str(task_id))
+        if not phase and str(envelope.get("task_kind") or "") == "fake_compute":
+            # Legacy fake-compute tasks use the bare deterministic task number.
+            # Their only executable stage is the generic lab phase.
+            phase = "lab"
+        if not phase:
+            raise DurableExecutionError(f"durable task has no recoverable phase: {task_id}")
+        spec = _task_spec_from_durable_payload(
+            lane,
+            task_id=str(task_id),
+            durable_task=durable_task,
+            phase=phase,
+        )
+        lane.task_ids.append(str(task_id))
+        phase_task_ids = lane.phase_task_ids.setdefault(phase, [])
+        if task_id in phase_task_ids:
+            raise DurableExecutionError(
+                f"durable task graph is contradictory for lane: {task_id}"
+            )
+        phase_task_ids.append(str(task_id))
+        lane.phase_task_counts[phase] = len(phase_task_ids)
+        lane.task_specs[str(task_id)] = spec
 
 
 def _lane_state_from_payload(payload: dict[str, Any]) -> LabLaneState:
@@ -1110,12 +1321,17 @@ def _record_policy_assignment(
 
 def _durable_task_policy_assignment(task: Mapping[str, Any]) -> dict[str, Any] | None:
     """Read the assignment from either a task spec or its LabTask envelope."""
-    assignment = task.get("policy_assignment")
-    if isinstance(assignment, dict):
-        return assignment
-    payload = task.get("payload")
-    if isinstance(payload, dict) and isinstance(payload.get("policy_assignment"), dict):
-        return dict(payload["policy_assignment"])
+    current: Mapping[str, Any] = task
+    # Journal entries wrap the LabTask envelope, which itself wraps the replay
+    # payload.  Direct task specs and both envelope layers are valid callers.
+    for _ in range(3):
+        assignment = current.get("policy_assignment")
+        if isinstance(assignment, dict):
+            return dict(assignment)
+        payload = current.get("payload")
+        if not isinstance(payload, dict):
+            break
+        current = payload
     return None
 
 
@@ -6673,6 +6889,25 @@ def _compact_terminal_lane_state(lane: LabLaneState) -> None:
     lane.phase_results.clear()
 
 
+def _release_completed_phase_payload(lane: LabLaneState, phase: str) -> None:
+    """Drop replay payload copies once their phase transition is durable."""
+    if not _phase_terminal(lane, phase):
+        return
+    lane.phase_results.pop(phase, None)
+    for task_id in lane.phase_task_ids.get(phase) or []:
+        lane.task_specs.pop(task_id, None)
+    if phase in {"lookback_timing", "coarse", "coarse_probe", "coarse_expand", "focused"}:
+        lane.last_sweep_payload = None
+        lane.last_sweep_axes = []
+
+
+def _release_stale_phase_payloads(lane: LabLaneState) -> None:
+    """Apply the same bounded active-lane shape when resuming legacy state."""
+    for phase in list(lane.phase_results):
+        if phase != lane.current_phase and _phase_terminal(lane, phase):
+            _release_completed_phase_payload(lane, phase)
+
+
 def _campaign_gateway_snapshot(
     snapshot: dict[str, Any] | None,
     *,
@@ -7404,6 +7639,25 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             lane_contexts[lane.run_id] = lane_ctx
             for task_id in lane.task_ids:
                 lanes_by_task[task_id] = lane
+        _recover_unresolved_journal_task_graph(lanes, durable_tasks_by_id)
+        # A crash after journal registration but before the reservation checkpoint
+        # leaves both records behind.  The recovered graph is sufficient evidence
+        # that the index has already been allocated; keeping the reservation would
+        # build a second task on resume.
+        recovered_reserved_indices = {
+            lane.lane_index for lane in lanes if lane.task_ids
+        }
+        if recovered_reserved_indices:
+            reserved_lane_indices = [
+                lane_index
+                for lane_index in reserved_lane_indices
+                if lane_index not in recovered_reserved_indices
+            ]
+        lanes_by_task.clear()
+        for lane in lanes:
+            for task_id in lane.task_ids:
+                lanes_by_task[task_id] = lane
+        _hydrate_unresolved_lane_task_specs(lanes, durable_tasks_by_id)
         tasks = [
             _attach_task_profile_snapshots(dict(item["payload"]), campaign_dir)
             for _task_id, item in sorted(durable_tasks_by_id.items())
@@ -7450,11 +7704,20 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 terminal = durable_tasks_by_id.get(task_id)
                 if not isinstance(terminal, dict) or terminal.get("status") != "terminal":
                     terminal = None
+                already_terminal = (
+                    task_id in lane.completed_task_ids or task_id in lane.failed_task_ids
+                )
                 if terminal is None:
-                    if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids:
+                    if already_terminal:
                         raise DurableExecutionError(
                             f"campaign state marks task terminal without a journal receipt: {task_id}"
                         )
+                    continue
+                # Formal Phase 3 seals the task payload and terminal receipt in its
+                # journal.  Re-reading every historical local receipt there made
+                # restart time grow linearly with campaign history.  Other modes
+                # retain the legacy artifact revalidation below.
+                if already_terminal and _is_phase3_formal_runtime(runtime):
                     continue
                 terminal_receipt = terminal.get("terminal_receipt") or {}
                 receipt_payload = _validate_task_result_receipt_payload(
@@ -7479,9 +7742,6 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 receipt_derived_tasks = _validated_receipt_derived_tasks(
                     receipt_payload,
                     task_id=task_id,
-                )
-                already_terminal = (
-                    task_id in lane.completed_task_ids or task_id in lane.failed_task_ids
                 )
                 if already_terminal:
                     if receipt_derived_tasks:
@@ -7552,6 +7812,8 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     pruned_lane_count=history.pruned_lane_count,
                 )
             )
+        for lane in lanes:
+            _release_stale_phase_payloads(lane)
         persist_campaign_state()
 
     def enqueue_chunk_run_limit() -> int:
@@ -8072,6 +8334,12 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         for task_id in pruned_task_ids:
             lanes_by_task.pop(task_id, None)
 
+    def compact_terminal_lane_payloads() -> None:
+        """Shrink terminal lane payloads without changing retention membership."""
+        for lane in lanes:
+            if terminal_lane_ready_for_retention(lane):
+                _compact_terminal_lane_state(lane)
+
     def emit_barrier_snapshot(*, force: bool = False, status: str | None = None) -> None:
         nonlocal barrier_index, last_barrier_at
         if runtime.log_mode != "barrier":
@@ -8163,6 +8431,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             new_stage_tasks: list[dict[str, Any]] = []
             try:
                 task_spec = lane.task_specs.get(task_id, {})
+                task_phase = str(task_spec.get("phase") or runtime.task_mode)
                 evidence_plan = (
                     task_spec.get("evidence_plan")
                     if isinstance(task_spec.get("evidence_plan"), dict)
@@ -8229,6 +8498,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     worker_contract_hash=worker_contract_hash,
                     recorded=recorded,
                 )
+                if _phase_terminal(lane, task_phase) and (
+                    lane.terminal or lane.current_phase != task_phase
+                ):
+                    _release_completed_phase_payload(lane, task_phase)
                 recorded_result_count += 1
                 _add_recorded_result_sample(recorded_results, recorded)
                 terminal_receipt_payload = _terminal_receipt_for_result(
@@ -8291,7 +8564,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             touched_lanes[lane.run_id] = lane
             if new_stage_tasks:
                 deferred_tasks.extend(new_stage_tasks)
-                reason = f"stage:{_task_phase(lane, task_id)}"
+                reason = f"stage:{task_phase}"
                 deferred_tasks_by_reason.setdefault(reason, []).extend(new_stage_tasks)
 
         if pending_completions or pending_registrations:
@@ -8323,6 +8596,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     status=lane_run_status(lane),
                     started_at=started_at,
                 )
+            compact_terminal_lane_payloads()
             persist_campaign_state()
             if defer_enqueues:
                 _result_consumption_checkpoint("before_result_ack")
@@ -8346,10 +8620,16 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     journal_registered=True,
                     state_persisted=True,
                 )
-        prune_terminal_lane_history()
         if not defer_enqueues:
             create_and_enqueue_more()
+        prune_terminal_lane_history()
         return deferred_tasks
+
+    if runtime.resume:
+        # Rewrite the legacy, oversized state projection before draining retained
+        # gateway results.  The journal remains the source of task payload truth.
+        compact_terminal_lane_payloads()
+        persist_campaign_state()
 
     if runtime.resume and _is_phase3_formal_runtime(runtime):
         while True:
