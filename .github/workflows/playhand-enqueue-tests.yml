@@ -9,6 +9,7 @@ name: PlayHand enqueue and memory regression tests
       - "autoresearch/play_hand_lab_entrypoint.py"
       - "autoresearch/play_hand_lab_memory.py"
       - "autoresearch/durable_execution.py"
+      - "tests/test_durable_execution.py"
       - "tests/test_play_hand_lab_enqueue.py"
       - "tests/test_play_hand_lab_entrypoint.py"
       - "tests/test_play_hand_lab_memory.py"
@@ -24,6 +25,7 @@ name: PlayHand enqueue and memory regression tests
       - "autoresearch/play_hand_lab_entrypoint.py"
       - "autoresearch/play_hand_lab_memory.py"
       - "autoresearch/durable_execution.py"
+      - "tests/test_durable_execution.py"
       - "tests/test_play_hand_lab_enqueue.py"
       - "tests/test_play_hand_lab_entrypoint.py"
       - "tests/test_play_hand_lab_memory.py"
@@ -42,9 +44,10 @@ jobs:
           cache: pip
       - name: Install project
         run: python -m pip install -e . pytest
-      - name: Run enqueue and memory regression suite
+      - name: Run enqueue, memory, and journal regression suite
         run: >-
           python -m pytest -q
+          tests/test_durable_execution.py
           tests/test_play_hand_lab_enqueue.py
           tests/test_play_hand_lab_entrypoint.py
           tests/test_play_hand_lab_memory.py
