@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -16,8 +19,19 @@ from .lake_window import (
     LakeWindowRequest,
 )
 
+
+logger = logging.getLogger(__name__)
+
 _CACHE: dict[str, LakeWindowBinding] = {}
 _CACHE_LOCK = threading.Lock()
+
+LAKE_WINDOW_RETRY_MAX_SECONDS_ENV = "FUZZFOLIO_LAKE_WINDOW_RETRY_MAX_SECONDS"
+LAKE_WINDOW_RETRY_BASE_SECONDS_ENV = "FUZZFOLIO_LAKE_WINDOW_RETRY_BASE_SECONDS"
+LAKE_WINDOW_RETRY_MAX_DELAY_SECONDS_ENV = "FUZZFOLIO_LAKE_WINDOW_RETRY_MAX_DELAY_SECONDS"
+DEFAULT_LAKE_WINDOW_RETRY_MAX_SECONDS = 2 * 60 * 60.0
+DEFAULT_LAKE_WINDOW_RETRY_BASE_SECONDS = 2.0
+DEFAULT_LAKE_WINDOW_RETRY_MAX_DELAY_SECONDS = 30.0
+_RETRYABLE_HTTP_STATUS_CODES = frozenset({425, 429, 502, 503, 504})
 
 
 def _lake_credentials() -> tuple[str, str]:
@@ -111,6 +125,63 @@ def _verify_receipt(receipt: dict[str, Any], request: LakeWindowRequest) -> None
         raise RuntimeError("lake window attestation receipt SHA-256 is invalid")
 
 
+def _env_nonnegative_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return max(float(default), 0.0)
+    try:
+        return max(float(raw), 0.0)
+    except (TypeError, ValueError):
+        return max(float(default), 0.0)
+
+
+def _response_detail(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+    except (ValueError, json.JSONDecodeError):
+        return response.text[:500]
+    if isinstance(payload, dict) and payload.get("detail") is not None:
+        return str(payload["detail"])[:500]
+    return response.text[:500]
+
+
+def _retryable_attestation_response(response: httpx.Response) -> bool:
+    status = int(response.status_code)
+    if status in _RETRYABLE_HTTP_STATUS_CODES:
+        return True
+    if status != 409:
+        return False
+    detail = _response_detail(response).lower()
+    return (
+        "retryable" in detail
+        or "lake mutation" in detail
+        or "stable-read snapshot changed" in detail
+    )
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    raw = str(response.headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(raw)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max((parsed - datetime.now(timezone.utc)).total_seconds(), 0.0)
+
+
+def _retry_backoff_seconds(attempt: int, *, base_seconds: float, max_delay_seconds: float) -> float:
+    if base_seconds <= 0 or max_delay_seconds <= 0:
+        return 0.0
+    exponent = min(max(int(attempt) - 1, 0), 16)
+    return min(base_seconds * (2**exponent), max_delay_seconds)
+
+
 def resolve_lake_window_binding(
     request: LakeWindowRequest,
     *,
@@ -139,18 +210,83 @@ def resolve_lake_window_binding(
 
     endpoint = f"{base_url}/api/lake/window-attestations/resolve"
     headers = {"Authorization": f"Bearer {token}"}
+    retry_max_seconds = _env_nonnegative_float(
+        LAKE_WINDOW_RETRY_MAX_SECONDS_ENV,
+        DEFAULT_LAKE_WINDOW_RETRY_MAX_SECONDS,
+    )
+    retry_base_seconds = _env_nonnegative_float(
+        LAKE_WINDOW_RETRY_BASE_SECONDS_ENV,
+        DEFAULT_LAKE_WINDOW_RETRY_BASE_SECONDS,
+    )
+    retry_max_delay_seconds = _env_nonnegative_float(
+        LAKE_WINDOW_RETRY_MAX_DELAY_SECONDS_ENV,
+        DEFAULT_LAKE_WINDOW_RETRY_MAX_DELAY_SECONDS,
+    )
+    retry_started = time.monotonic()
     response: httpx.Response | None = None
-    for attempt in range(3):
-        response = httpx.post(
-            endpoint,
-            headers=headers,
-            json=request_payload,
-            timeout=httpx.Timeout(timeout_seconds),
+    attempt = 0
+
+    while True:
+        attempt += 1
+        transport_error: httpx.TransportError | None = None
+        try:
+            response = httpx.post(
+                endpoint,
+                headers=headers,
+                json=request_payload,
+                timeout=httpx.Timeout(timeout_seconds),
+            )
+        except httpx.TransportError as exc:
+            transport_error = exc
+            retryable = True
+            detail = f"{type(exc).__name__}: {exc}"
+            status_text = "transport_error"
+        else:
+            retryable = _retryable_attestation_response(response)
+            detail = _response_detail(response)
+            status_text = str(response.status_code)
+            if not retryable:
+                break
+
+        elapsed = max(time.monotonic() - retry_started, 0.0)
+        if retry_max_seconds <= 0 or elapsed >= retry_max_seconds:
+            message = (
+                "lake window attestation retry deadline exceeded "
+                f"after {attempt} attempt(s) and {elapsed:.1f}s "
+                f"(status={status_text}): {detail}"
+            )
+            if transport_error is not None:
+                raise RuntimeError(message) from transport_error
+            raise RuntimeError(message)
+
+        retry_after = (
+            _retry_after_seconds(response)
+            if response is not None and transport_error is None
+            else None
         )
-        if response.status_code != 409:
-            break
-        if attempt < 2:
-            time.sleep(1.0 + attempt)
+        delay = (
+            retry_after
+            if retry_after is not None
+            else _retry_backoff_seconds(
+                attempt,
+                base_seconds=retry_base_seconds,
+                max_delay_seconds=retry_max_delay_seconds,
+            )
+        )
+        remaining = max(retry_max_seconds - elapsed, 0.0)
+        delay = min(max(delay, 0.0), remaining)
+        logger.warning(
+            "lake_window_attestation_retry attempt=%s status=%s delay_seconds=%.1f "
+            "elapsed_seconds=%.1f detail=%s",
+            attempt,
+            status_text,
+            delay,
+            elapsed,
+            detail,
+        )
+        if delay > 0:
+            time.sleep(delay)
+
     assert response is not None
     try:
         response.raise_for_status()
