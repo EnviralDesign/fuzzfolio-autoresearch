@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from autoresearch import play_hand_lab
+from autoresearch import play_hand_lab_enqueue
 from autoresearch.durable_execution import DurableExecutionJournal
 
 
@@ -12,6 +14,17 @@ def _journal(tmp_path: Path) -> DurableExecutionJournal:
         execution_id="phase3-memory-test",
         lineage={"campaign_id": "phase3-memory-test"},
     )
+
+
+class _AcceptingGateway:
+    def enqueue_tasks(self, tasks: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "status": "accepted",
+            "submitted": len(tasks),
+            "accepted": len(tasks),
+            "enqueued": len(tasks),
+            "rejected": 0,
+        }
 
 
 def test_unresolved_compacts_only_the_in_memory_terminal_cache(tmp_path: Path) -> None:
@@ -124,3 +137,35 @@ def test_attached_resume_tasks_share_heavy_immutable_payloads(tmp_path: Path) ->
     assert first["payload"]["params_by_index"] is second["payload"]["params_by_index"]
     first["payload"]["local_only"] = True
     assert "local_only" not in second["payload"]
+
+
+def test_successful_resume_enqueue_releases_only_the_transient_input_list() -> None:
+    tasks = [{"task_id": "resume-001"}, {"task_id": "resume-002"}]
+
+    result = play_hand_lab_enqueue.enqueue_gateway_tasks_with_retries(
+        _AcceptingGateway(),
+        object(),
+        tasks,
+        reason="resume_unresolved",
+        failure_limit=1,
+        retry_base_seconds=0,
+    )
+
+    assert result["accepted"] == 2
+    assert tasks == []
+
+
+def test_normal_enqueue_keeps_the_callers_task_list_intact() -> None:
+    tasks = [{"task_id": "lane-001"}, {"task_id": "lane-002"}]
+
+    result = play_hand_lab_enqueue.enqueue_gateway_tasks_with_retries(
+        _AcceptingGateway(),
+        object(),
+        tasks,
+        reason="lane_top_up",
+        failure_limit=1,
+        retry_base_seconds=0,
+    )
+
+    assert result["accepted"] == 2
+    assert [task["task_id"] for task in tasks] == ["lane-001", "lane-002"]
