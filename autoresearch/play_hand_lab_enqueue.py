@@ -57,7 +57,7 @@ def enqueue_gateway_tasks_with_retries(
     """Enqueue tasks in bounded, 413-adaptive batches.
 
     Resume can contain hundreds of unresolved tasks whose restored profile snapshots
-    make one combined request larger than the gateway body limit.  Start with a
+    make one combined request larger than the gateway body limit. Start with a
     conservative task-count bound, then bisect only the batch rejected with 413.
     Gateway task ids are idempotent, so a later retry after partial success is safe.
     """
@@ -138,14 +138,20 @@ def enqueue_gateway_tasks_with_retries(
                 aggregate["batch_count"] += 1
                 break
 
+    if reason == "resume_unresolved":
+        from .play_hand_lab_memory import release_resume_enqueue_memory
+
+        release_resume_enqueue_memory(tasks)
     return aggregate
 
 
 def install_bounded_gateway_enqueue() -> None:
-    """Install bounded enqueueing into the PlayHand coordinator command module."""
+    """Install bounded enqueueing and memory bounds into the coordinator."""
     from . import play_hand_lab
+    from .play_hand_lab_memory import install_play_hand_lab_memory_bounds
 
     play_hand_lab._enqueue_gateway_tasks_with_retries = enqueue_gateway_tasks_with_retries
+    install_play_hand_lab_memory_bounds()
 
 
 __all__ = [
