@@ -66,6 +66,19 @@ def track_live_task_payloads(tasks: Iterable[dict[str, Any]]) -> None:
             _TRACKED_TASK_PAYLOADS.setdefault(task_id, {})[id(task)] = task
 
 
+def _track_unrepresented_task_payloads(tasks: Iterable[dict[str, Any]]) -> None:
+    """Track recovery copies only when no canonical live envelope is already known."""
+
+    with _LOCK:
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            task_id = _task_key(task)
+            if not task_id or task_id in _TRACKED_TASK_PAYLOADS:
+                continue
+            _TRACKED_TASK_PAYLOADS[task_id] = {id(task): task}
+
+
 def _untrack_task_payloads(tasks: Iterable[dict[str, Any]]) -> None:
     with _LOCK:
         for task in tasks:
@@ -306,7 +319,7 @@ def install_play_hand_lab_memory_bounds() -> None:
         ) -> list[dict[str, Any]] | None:
             tasks = _ORIGINAL_VALIDATED_RECEIPT_DERIVED_TASKS(*args, **kwargs)
             if tasks:
-                track_live_task_payloads(tasks)
+                _track_unrepresented_task_payloads(tasks)
             return tasks
 
         def bounded_unresolved(journal: DurableExecutionJournal) -> list[dict[str, Any]]:
