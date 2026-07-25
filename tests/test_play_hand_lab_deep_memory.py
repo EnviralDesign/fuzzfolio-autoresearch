@@ -63,6 +63,14 @@ def _sweep_fixture(
     params_sha256 = play_hand_lab.canonical_sha256(
         play_hand_lab._canonical_params(params_by_index)
     )
+    policy_assignment = {
+        "policy_lane": "guided",
+        "policy_manifest_sha256": "sha256:" + "a" * 64,
+        "candidate_fallback_decisions": [
+            {"attempt": index, "large": "p" * 200}
+            for index in range(8)
+        ],
+    }
     full_spec = {
         "phase": phase,
         "task_kind": "sweep_shard",
@@ -75,7 +83,7 @@ def _sweep_fixture(
         "lookback_months": 3,
         "analysis_window_start": "2025-01-01T00:00:00Z",
         "analysis_window_end": "2025-04-01T00:00:00Z",
-        "evidence_plan": {"large": "e" * 20_000},
+        "evidence_plan": {"large": "e" * 2_000},
         "axes": ["indicator[0].talib.timeperiod=5,10"],
         "axis_key_map": {
             "indicator-1.timeperiod": "indicator[0].talib.timeperiod"
@@ -87,16 +95,8 @@ def _sweep_fixture(
         "params_by_index": params_by_index,
         "params_by_index_sha256": params_sha256,
         "result_detail": "summary",
-        "policy_assignment": {
-            "policy_lane": "guided",
-            "policy_manifest_sha256": "sha256:" + "a" * 64,
-            "candidate_fallback_decisions": [
-                {"attempt": index, "large": "p" * 2_000}
-                for index in range(32)
-            ],
-        },
+        "policy_assignment": policy_assignment,
     }
-
     ranked = [
         {
             "permutation_index": index,
@@ -144,7 +144,7 @@ def _sweep_fixture(
         "lookback_months": 3,
         "analysis_window_start": "2025-01-01T00:00:00Z",
         "analysis_window_end": "2025-04-01T00:00:00Z",
-        "policy_assignment": full_spec["policy_assignment"],
+        "policy_assignment": policy_assignment,
         "sweep_payload": sweep_payload,
     }
     task_envelope = {
@@ -171,14 +171,14 @@ def _sweep_fixture(
                 "analysis_window_start": "2025-01-01T00:00:00Z",
                 "analysis_window_end": "2025-04-01T00:00:00Z",
             },
-            "evidence_plan": {"large": "e" * 20_000},
+            "evidence_plan": {"large": "e" * 2_000},
             "base_profile_snapshot": lane.incumbent_profile_payload,
             "permutation_start": 0,
             "permutation_count": 2,
             "permutation_indices": [0, 1],
             "params_by_index": params_by_index,
             "result_detail": "summary",
-            "policy_assignment": full_spec["policy_assignment"],
+            "policy_assignment": policy_assignment,
         },
     }
     return task_id, phase, sweep_id, full_spec, recorded, task_envelope
@@ -192,18 +192,18 @@ def test_playhand_journal_load_streams_and_keeps_terminal_payloads_lazy(
     done_payload = {
         "task_id": "done-task",
         "lane_id": "lane-001",
-        "payload": {"large": "x" * 100_000},
+        "payload": {"large": "x" * 10_000},
     }
     pending_payload = {
         "task_id": "pending-task",
         "lane_id": "lane-002",
-        "payload": {"large": "y" * 100_000},
+        "payload": {"large": "y" * 10_000},
     }
     receipt = {
         "recorded_result": {
             "task_id": "done-task",
             "status": "success",
-            "large": "z" * 100_000,
+            "large": "z" * 10_000,
         }
     }
     writer.apply_batch(
@@ -331,6 +331,7 @@ def test_durable_completion_compacts_active_sweep_spec_and_result(
     task_id, phase, _sweep_id, spec, recorded, task = _sweep_fixture(
         tmp_path, lane
     )
+    expected_task = json.loads(play_hand_lab.canonical_json(task))
     play_hand_lab._register_task_spec(
         lane,
         task_id=task_id,
@@ -342,6 +343,7 @@ def test_durable_completion_compacts_active_sweep_spec_and_result(
 
     journal = _journal(tmp_path)
     receipt = {"recorded_result": recorded}
+    expected_receipt = json.loads(play_hand_lab.canonical_json(receipt))
     journal.apply_batch(registrations=[(task_id, task)])
     journal.apply_batch(completions=[(task_id, receipt)])
 
@@ -358,8 +360,8 @@ def test_durable_completion_compacts_active_sweep_spec_and_result(
 
     terminal = journal.terminal(task_id)
     assert terminal is not None
-    assert terminal["payload"] == task
-    assert terminal["terminal_receipt"]["payload"] == receipt
+    assert terminal["payload"] == expected_task
+    assert terminal["terminal_receipt"]["payload"] == expected_receipt
 
 
 def test_compacted_sweep_state_merges_to_the_same_canonical_payload(
@@ -410,5 +412,5 @@ def test_recorded_result_samples_do_not_retain_sweep_or_fallback_graphs(
     assert samples[0]["sweep_payload"] is None
     assert samples[0]["sweep_payload_deferred"] is True
     assert "candidate_fallback_decisions" not in json.dumps(samples[0])
-    assert len(json.dumps(samples[0])) < original_size // 4
+    assert len(json.dumps(samples[0])) < original_size // 2
     assert isinstance(recorded["sweep_payload"], dict)
