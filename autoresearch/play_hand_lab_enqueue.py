@@ -159,9 +159,13 @@ def install_bounded_gateway_enqueue() -> None:
         install_play_hand_lab_duplicate_result_recovery,
     )
     from .play_hand_lab_memory import install_play_hand_lab_memory_bounds
+    from .play_hand_lab_memory_deep import (
+        install_play_hand_lab_deep_memory_bounds,
+    )
 
     play_hand_lab._enqueue_gateway_tasks_with_retries = enqueue_gateway_tasks_with_retries
     install_play_hand_lab_memory_bounds()
+    install_play_hand_lab_deep_memory_bounds()
     install_play_hand_lab_duplicate_result_recovery()
 
 
