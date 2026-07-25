@@ -160,7 +160,8 @@ def enqueue_gateway_tasks_with_retries(
         if isinstance(task.get("payload"), dict)
     ]
     released_copies = release_checkpointed_task_payloads(task_ids)
-    aggregate["released_task_payload_copies"] = released_copies
+    if released_copies:
+        aggregate["released_task_payload_copies"] = released_copies
 
     if reason == "resume_unresolved":
         from .play_hand_lab_memory import release_resume_enqueue_memory
