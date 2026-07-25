@@ -26,6 +26,9 @@ _TASK_STUB_KEYS = (
 
 _ORIGINAL_LOAD_PROFILE_BLOB: Any = None
 _ORIGINAL_ATTACH_TASK_PROFILE_SNAPSHOTS: Any = None
+_ORIGINAL_MAKE_DEEP_REPLAY_TASK: Any = None
+_ORIGINAL_MAKE_SWEEP_SHARD_TASKS: Any = None
+_ORIGINAL_BUILD_TASKS: Any = None
 _ORIGINAL_JOURNAL_UNRESOLVED: Any = None
 _ORIGINAL_JOURNAL_TERMINAL: Any = None
 _ORIGINAL_JOURNAL_APPLY_BATCH: Any = None
@@ -47,9 +50,9 @@ def track_live_task_payloads(tasks: Iterable[dict[str, Any]]) -> None:
     """Track executable task envelopes without changing their serialized content.
 
     The coordinator's global task list is useful for live-task bookkeeping, but the
-    full worker envelopes can be very large.  Keep references only until the journal
+    full worker envelopes can be very large. Keep references only until the journal
     has durably recorded completion, then replace every tracked copy with a tiny
-    identity stub.  Tracking itself is content-neutral and idempotent.
+    identity stub. Tracking itself is content-neutral and idempotent.
     """
 
     with _LOCK:
@@ -85,8 +88,8 @@ def _compact_task_envelope(task: dict[str, Any]) -> None:
 def release_checkpointed_task_payloads(task_ids: Iterable[str]) -> int:
     """Release full task envelopes after their terminal journal append succeeds.
 
-    The durable journal and lane graph remain authoritative.  This only compacts
-    process-local copies held by the coordinator's global task projection.  Repeated
+    The durable journal and lane graph remain authoritative. This only compacts
+    process-local copies held by the coordinator's global task projection. Repeated
     calls are safe, and unrelated live tasks are left untouched.
     """
 
@@ -255,6 +258,9 @@ def install_play_hand_lab_memory_bounds() -> None:
     global _INSTALLED
     global _ORIGINAL_LOAD_PROFILE_BLOB
     global _ORIGINAL_ATTACH_TASK_PROFILE_SNAPSHOTS
+    global _ORIGINAL_MAKE_DEEP_REPLAY_TASK
+    global _ORIGINAL_MAKE_SWEEP_SHARD_TASKS
+    global _ORIGINAL_BUILD_TASKS
     global _ORIGINAL_JOURNAL_UNRESOLVED
     global _ORIGINAL_JOURNAL_TERMINAL
     global _ORIGINAL_JOURNAL_APPLY_BATCH
@@ -267,9 +273,27 @@ def install_play_hand_lab_memory_bounds() -> None:
 
         _ORIGINAL_LOAD_PROFILE_BLOB = play_hand_lab._load_profile_blob
         _ORIGINAL_ATTACH_TASK_PROFILE_SNAPSHOTS = play_hand_lab._attach_task_profile_snapshots
+        _ORIGINAL_MAKE_DEEP_REPLAY_TASK = play_hand_lab._make_deep_replay_task
+        _ORIGINAL_MAKE_SWEEP_SHARD_TASKS = play_hand_lab._make_sweep_shard_tasks
+        _ORIGINAL_BUILD_TASKS = play_hand_lab._build_tasks
         _ORIGINAL_JOURNAL_UNRESOLVED = DurableExecutionJournal.unresolved
         _ORIGINAL_JOURNAL_TERMINAL = DurableExecutionJournal.terminal
         _ORIGINAL_JOURNAL_APPLY_BATCH = DurableExecutionJournal.apply_batch
+
+        def tracked_make_deep_replay_task(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            task = _ORIGINAL_MAKE_DEEP_REPLAY_TASK(*args, **kwargs)
+            track_live_task_payloads([task])
+            return task
+
+        def tracked_make_sweep_shard_tasks(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            tasks = _ORIGINAL_MAKE_SWEEP_SHARD_TASKS(*args, **kwargs)
+            track_live_task_payloads(tasks)
+            return tasks
+
+        def tracked_build_tasks(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+            tasks = _ORIGINAL_BUILD_TASKS(*args, **kwargs)
+            track_live_task_payloads(tasks)
+            return tasks
 
         def bounded_unresolved(journal: DurableExecutionJournal) -> list[dict[str, Any]]:
             unresolved = _ORIGINAL_JOURNAL_UNRESOLVED(journal)
@@ -328,6 +352,9 @@ def install_play_hand_lab_memory_bounds() -> None:
 
         play_hand_lab._load_profile_blob = _cached_load_profile_blob
         play_hand_lab._attach_task_profile_snapshots = _cached_attach_task_profile_snapshots
+        play_hand_lab._make_deep_replay_task = tracked_make_deep_replay_task
+        play_hand_lab._make_sweep_shard_tasks = tracked_make_sweep_shard_tasks
+        play_hand_lab._build_tasks = tracked_build_tasks
         DurableExecutionJournal.unresolved = bounded_unresolved
         DurableExecutionJournal.terminal = bounded_terminal
         DurableExecutionJournal.apply_batch = bounded_apply_batch
