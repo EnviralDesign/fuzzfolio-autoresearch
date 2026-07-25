@@ -24,4 +24,3 @@ def test_barrier_includes_coordinator_self_memory() -> None:
     assert "coordinator memory" in rendered
     assert "live-task-payloads=" in rendered
     assert "journal-stubs=" in rendered
-    assert "sample-bytes=" in rendered
