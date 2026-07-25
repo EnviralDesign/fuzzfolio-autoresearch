@@ -66,16 +66,20 @@ jobs:
           cache: pip
       - name: Install project
         run: python -m pip install -e . pytest
-      - name: Run existing coordinator resilience regressions
+      - name: Run durable journal regressions
+        run: python -m pytest -q tests/test_durable_execution.py
+      - name: Run lake retry regressions
+        run: python -m pytest -q tests/test_lake_window_client.py
+      - name: Run duplicate-result regressions
+        run: python -m pytest -q tests/test_play_hand_lab_duplicate_results.py
+      - name: Run enqueue and bootstrap regressions
         run: >-
           python -m pytest -q
-          tests/test_durable_execution.py
-          tests/test_lake_window_client.py
-          tests/test_play_hand_lab_duplicate_results.py
           tests/test_play_hand_lab_enqueue.py
           tests/test_play_hand_lab_entrypoint.py
-          tests/test_play_hand_lab_memory.py
           tests/test_package_enqueue_bootstrap.py
+      - name: Run base memory regressions
+        run: python -m pytest -q tests/test_play_hand_lab_memory.py
       - name: Run deep memory behavior regressions
         run: >-
           python -m pytest -q
