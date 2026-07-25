@@ -50,37 +50,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Normalize deep-memory regression expectation
-        if: github.event_name == 'pull_request' && github.head_ref == 'agent/deep-playhand-memory-pass'
-        run: |
-          git fetch origin "${GITHUB_HEAD_REF}:${GITHUB_HEAD_REF}"
-          git checkout "${GITHUB_HEAD_REF}"
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("tests/test_play_hand_lab_deep_memory.py")
-          text = path.read_text(encoding="utf-8")
-          old = '''    receipt = {"recorded_result": recorded}
-              journal.apply_batch(registrations=[(task_id, task)])'''
-          new = '''    receipt = {"recorded_result": recorded}
-              expected_task = json.loads(play_hand_lab.canonical_json(task))
-              journal.apply_batch(registrations=[(task_id, task)])'''
-          if old in text:
-              text = text.replace(old, new, 1)
-          text = text.replace(
-              '    assert terminal["payload"] == task\n',
-              '    assert terminal["payload"] == expected_task\n',
-              1,
-          )
-          path.write_text(text, encoding="utf-8")
-          PY
-          if ! git diff --quiet -- tests/test_play_hand_lab_deep_memory.py; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add tests/test_play_hand_lab_deep_memory.py
-            git commit -m "Fix canonical journal payload regression assertion"
-            git push origin "HEAD:${GITHUB_HEAD_REF}"
-          fi
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
