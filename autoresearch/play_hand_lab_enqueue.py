@@ -64,6 +64,13 @@ def enqueue_gateway_tasks_with_retries(
     if not tasks:
         return {}
 
+    from .play_hand_lab_memory import track_live_task_payloads
+
+    # The caller later retains these same task envelopes in its live-task projection.
+    # Track them before transport without mutating their payload or identity; the
+    # journal completion hook will compact the exact objects after durable completion.
+    track_live_task_payloads(tasks)
+
     max_failures = max(int(failure_limit), 1)
     retry_base = max(float(retry_base_seconds), 0.0)
     batch_limit = _enqueue_batch_task_limit()
