@@ -5,6 +5,7 @@ from typing import Any
 
 from autoresearch import play_hand_lab
 from autoresearch import play_hand_lab_enqueue
+from autoresearch import play_hand_lab_memory
 from autoresearch.durable_execution import DurableExecutionJournal
 
 
@@ -137,6 +138,7 @@ def test_attached_resume_tasks_share_heavy_immutable_payloads(tmp_path: Path) ->
     assert first["payload"]["params_by_index"] is second["payload"]["params_by_index"]
     first["payload"]["local_only"] = True
     assert "local_only" not in second["payload"]
+    assert play_hand_lab_memory.release_checkpointed_task_payloads(["resume-task-001"]) == 2
 
 
 def test_successful_resume_enqueue_releases_only_the_transient_input_list() -> None:
@@ -169,3 +171,98 @@ def test_normal_enqueue_keeps_the_callers_task_list_intact() -> None:
 
     assert result["accepted"] == 2
     assert [task["task_id"] for task in tasks] == ["lane-001", "lane-002"]
+    assert play_hand_lab_memory.release_checkpointed_task_payloads(
+        ["lane-001", "lane-002"]
+    ) == 2
+
+
+def test_checkpointed_payload_release_is_scoped_and_idempotent() -> None:
+    completed = {
+        "task_id": "steady-done",
+        "lane_id": "lane-010",
+        "attempt_id": "attempt-done",
+        "task_kind": "sweep_shard",
+        "phase": "focused",
+        "payload": {
+            "inline_profile_snapshot": {"large": "x" * 20_000},
+            "params_by_index": {"0": {"large": "y" * 20_000}},
+        },
+    }
+    live = {
+        "task_id": "steady-live",
+        "lane_id": "lane-010",
+        "payload": {"large": "z" * 20_000},
+    }
+    live_before = {"task_id": live["task_id"], "lane_id": live["lane_id"], "payload": dict(live["payload"])}
+    play_hand_lab_memory.track_live_task_payloads([completed, live])
+
+    assert play_hand_lab_memory.release_checkpointed_task_payloads(["steady-done"]) == 1
+    assert completed == {
+        "task_id": "steady-done",
+        "lane_id": "lane-010",
+        "attempt_id": "attempt-done",
+        "task_kind": "sweep_shard",
+        "phase": "focused",
+    }
+    assert live == live_before
+    assert play_hand_lab_memory.release_checkpointed_task_payloads(["steady-done"]) == 0
+    assert play_hand_lab_memory.release_checkpointed_task_payloads(["steady-live"]) == 1
+
+
+def test_resume_transient_copy_is_untracked_without_compacting_global_copy() -> None:
+    global_task = {
+        "task_id": "resume-shared",
+        "lane_id": "lane-020",
+        "payload": {"large": "g" * 10_000},
+    }
+    transient_task = {
+        "task_id": "resume-shared",
+        "lane_id": "lane-020",
+        "payload": {"large": "t" * 10_000},
+    }
+    transient_list = [transient_task]
+    play_hand_lab_memory.track_live_task_payloads([global_task, transient_task])
+
+    play_hand_lab_memory.release_resume_enqueue_memory(transient_list)
+
+    assert transient_list == []
+    assert "payload" in transient_task
+    assert play_hand_lab_memory.release_checkpointed_task_payloads(["resume-shared"]) == 1
+    assert "payload" not in global_task
+    assert "payload" in transient_task
+
+
+def test_journal_completion_compacts_the_tracked_worker_envelope(tmp_path: Path) -> None:
+    journal = _journal(tmp_path)
+    task = {
+        "task_id": "steady-journal-task",
+        "lane_id": "lane-030",
+        "attempt_id": "attempt-030",
+        "task_kind": "sweep_shard",
+        "phase": "coarse",
+        "payload": {
+            "profile": {"large": "p" * 25_000},
+            "params_by_index": {"0": {"large": "q" * 25_000}},
+        },
+    }
+    receipt = {"recorded_result": {"status": "success"}}
+    play_hand_lab_memory.track_live_task_payloads([task])
+
+    journal.apply_batch(registrations=[(task["task_id"], task)])
+    disk_after_registration = journal.path.read_text(encoding="utf-8")
+    assert "params_by_index" in disk_after_registration
+
+    journal.apply_batch(completions=[(task["task_id"], receipt)])
+
+    assert task == {
+        "task_id": "steady-journal-task",
+        "lane_id": "lane-030",
+        "attempt_id": "attempt-030",
+        "task_kind": "sweep_shard",
+        "phase": "coarse",
+    }
+    disk_after_completion = journal.path.read_text(encoding="utf-8")
+    assert "params_by_index" in disk_after_completion
+    restored = journal.terminal("steady-journal-task")
+    assert restored is not None
+    assert restored["payload"]["payload"]["params_by_index"]["0"]["large"]
