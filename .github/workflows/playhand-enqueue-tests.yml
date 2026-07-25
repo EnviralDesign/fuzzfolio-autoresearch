@@ -8,10 +8,12 @@ name: PlayHand resilience regression tests
       - "autoresearch/play_hand_lab_enqueue.py"
       - "autoresearch/play_hand_lab_entrypoint.py"
       - "autoresearch/play_hand_lab_memory.py"
+      - "autoresearch/play_hand_lab_duplicate_results.py"
       - "autoresearch/durable_execution.py"
       - "autoresearch/lake_window_client.py"
       - "tests/test_durable_execution.py"
       - "tests/test_lake_window_client.py"
+      - "tests/test_play_hand_lab_duplicate_results.py"
       - "tests/test_play_hand_lab_enqueue.py"
       - "tests/test_play_hand_lab_entrypoint.py"
       - "tests/test_play_hand_lab_memory.py"
@@ -26,10 +28,12 @@ name: PlayHand resilience regression tests
       - "autoresearch/play_hand_lab_enqueue.py"
       - "autoresearch/play_hand_lab_entrypoint.py"
       - "autoresearch/play_hand_lab_memory.py"
+      - "autoresearch/play_hand_lab_duplicate_results.py"
       - "autoresearch/durable_execution.py"
       - "autoresearch/lake_window_client.py"
       - "tests/test_durable_execution.py"
       - "tests/test_lake_window_client.py"
+      - "tests/test_play_hand_lab_duplicate_results.py"
       - "tests/test_play_hand_lab_enqueue.py"
       - "tests/test_play_hand_lab_entrypoint.py"
       - "tests/test_play_hand_lab_memory.py"
@@ -53,6 +57,7 @@ jobs:
           python -m pytest -q
           tests/test_durable_execution.py
           tests/test_lake_window_client.py
+          tests/test_play_hand_lab_duplicate_results.py
           tests/test_play_hand_lab_enqueue.py
           tests/test_play_hand_lab_entrypoint.py
           tests/test_play_hand_lab_memory.py

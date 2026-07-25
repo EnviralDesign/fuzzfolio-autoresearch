@@ -146,12 +146,16 @@ def enqueue_gateway_tasks_with_retries(
 
 
 def install_bounded_gateway_enqueue() -> None:
-    """Install bounded enqueueing and memory bounds into the coordinator."""
+    """Install coordinator enqueue, memory, and duplicate-result safeguards."""
     from . import play_hand_lab
+    from .play_hand_lab_duplicate_results import (
+        install_play_hand_lab_duplicate_result_recovery,
+    )
     from .play_hand_lab_memory import install_play_hand_lab_memory_bounds
 
     play_hand_lab._enqueue_gateway_tasks_with_retries = enqueue_gateway_tasks_with_retries
     install_play_hand_lab_memory_bounds()
+    install_play_hand_lab_duplicate_result_recovery()
 
 
 __all__ = [
