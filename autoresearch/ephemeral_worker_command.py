@@ -100,13 +100,19 @@ def add_generate_ephemeral_worker_command_parser(
     parser.add_argument("--json-redacted", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     image_policy = parser.add_mutually_exclusive_group()
-    image_policy.add_argument("--keep-image", dest="keep_image", action="store_true")
+    image_policy.add_argument(
+        "--keep-image",
+        dest="keep_image",
+        action="store_true",
+        help="Preserve the worker image at cleanup even if it was pulled for this session.",
+    )
     image_policy.add_argument(
         "--remove-image-when-safe",
         dest="keep_image",
         action="store_false",
+        help="Delete the session-pulled worker image at cleanup when safe (default).",
     )
-    parser.set_defaults(keep_image=True)
+    parser.set_defaults(keep_image=False)
 
 
 def apply_profile_defaults(args: argparse.Namespace) -> argparse.Namespace:
@@ -199,12 +205,13 @@ def build_launch_command(
     if bootstrap_url:
         # Single-line paste: download exact bytes to a local file, then invoke it.
         # Avoids multiline backtick breakage and irm/scriptblock (no MyCommand.Path).
+        # Trailing exit closes a dedicated paste window after cleanup ("leave no trace").
         workers_flag = (
             "-Workers auto"
             if workers == "auto"
             else f"-Workers {_ps_quote(workers_arg)}"
         )
-        keep = " -KeepImage" if keep_image else ""
+        keep = " -KeepImage" if keep_image else " -RemoveImage"
         return (
             "$p=Join-Path $env:LOCALAPPDATA 'Fuzzfolio\\EphemeralWorkers\\_bootstrap\\"
             "ephemeral_worker_session.ps1'; "
@@ -213,7 +220,8 @@ def build_launch_command(
             f"& $p -EnrollmentUrl {_ps_quote(enrollment_url)} "
             f"-EnrollmentToken {_ps_quote(enrollment_token)} "
             f"-Duration {_ps_quote(duration)} {workers_flag} "
-            f"-MaxWorkers {max_workers}{keep}"
+            f"-MaxWorkers {max_workers}{keep}; "
+            "exit $LASTEXITCODE"
         )
 
     parts = [
@@ -226,7 +234,10 @@ def build_launch_command(
     ]
     if keep_image:
         parts.append("-KeepImage")
-    return " ".join(parts)
+    else:
+        parts.append("-RemoveImage")
+    # Close dedicated paste hosts after cleanup; harmless if already exiting.
+    return " ".join(parts) + "; exit $LASTEXITCODE"
 
 
 def build_redacted_launch_command(command: str, enrollment_token: str) -> str:

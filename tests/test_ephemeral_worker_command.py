@@ -53,7 +53,7 @@ def _args(**overrides) -> argparse.Namespace:
         "print_command": False,
         "json_redacted": True,
         "dry_run": False,
-        "keep_image": True,
+        "keep_image": False,
     }
     payload.update(overrides)
     return argparse.Namespace(**payload)
@@ -70,7 +70,7 @@ def test_build_launch_command_local_smoke_shape() -> None:
         duration="3m",
         workers=1,
         max_workers=2,
-        keep_image=True,
+        keep_image=False,
         local_bootstrap_script=Path(
             r"C:\repos\Trading-Dashboard\backend\app\resources\ephemeral_worker_session.ps1"
         ),
@@ -83,7 +83,7 @@ def test_build_launch_command_local_smoke_shape() -> None:
     assert '-Duration "3m"' in command
     assert '-Workers "1"' in command
     assert "-MaxWorkers 2" in command
-    assert command.endswith("-KeepImage")
+    assert command.endswith("-RemoveImage; exit $LASTEXITCODE")
 
 
 def test_build_launch_command_bootstrap_url_uses_irm_form() -> None:
@@ -104,6 +104,8 @@ def test_build_launch_command_bootstrap_url_uses_irm_form() -> None:
     assert "-Workers auto" in command
     assert "\n" not in command
     assert "-KeepImage" not in command
+    assert "-RemoveImage" in command
+    assert command.endswith("; exit $LASTEXITCODE")
 
 
 def test_apply_profile_defaults_wan_uses_irm_urls() -> None:
@@ -189,11 +191,11 @@ def test_build_mint_request_includes_authority_binding() -> None:
         script_sha256="sha256:" + ("0" * 64),
         minimum_free_disk_gb=5.0,
         registration_timeout_seconds=300,
-        remove_image_when_safe=False,
+        remove_image_when_safe=True,
     )
     assert request["authority_id"] == binding["authority_id"]
     assert request["minimum_free_disk_gb"] == 5.0
-    assert request["remove_image_when_safe"] is False
+    assert request["remove_image_when_safe"] is True
 
 
 def test_dry_run_validates_authority_and_redacts_without_mint(
