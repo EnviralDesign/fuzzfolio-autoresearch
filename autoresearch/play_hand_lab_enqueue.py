@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import time
 from collections import deque
@@ -60,15 +61,23 @@ def enqueue_gateway_tasks_with_retries(
     make one combined request larger than the gateway body limit. Start with a
     conservative task-count bound, then bisect only the batch rejected with 413.
     Gateway task ids are idempotent, so a later retry after partial success is safe.
+
+    Once every batch has been accepted (or rejected as an existing duplicate), the
+    coordinator no longer needs to retain the executable worker envelope. The gateway
+    and append-only journal are authoritative, while the lane keeps the compact task
+    spec needed to consume the result. Compact all tracked process-local copies at
+    that point instead of waiting for the task or its entire lane to finish.
     """
     if not tasks:
         return {}
 
-    from .play_hand_lab_memory import track_live_task_payloads
+    from .play_hand_lab_memory import (
+        release_checkpointed_task_payloads,
+        track_live_task_payloads,
+    )
 
     # The caller later retains these same task envelopes in its live-task projection.
-    # Track them before transport without mutating their payload or identity; the
-    # journal completion hook will compact the exact objects after durable completion.
+    # Track them before transport without mutating their payload or identity.
     track_live_task_payloads(tasks)
 
     max_failures = max(int(failure_limit), 1)
@@ -145,24 +154,39 @@ def enqueue_gateway_tasks_with_retries(
                 aggregate["batch_count"] += 1
                 break
 
+    task_ids = [
+        str(task.get("task_id") or "")
+        for task in tasks
+        if isinstance(task.get("payload"), dict)
+    ]
+    released_copies = release_checkpointed_task_payloads(task_ids)
+    if released_copies:
+        aggregate["released_task_payload_copies"] = released_copies
+
     if reason == "resume_unresolved":
         from .play_hand_lab_memory import release_resume_enqueue_memory
 
         release_resume_enqueue_memory(tasks)
+    elif released_copies:
+        # Most payloads are acyclic, but a bounded collection after a large top-up
+        # makes stale cycles and detached canonical snapshots promptly reclaimable.
+        gc.collect()
     return aggregate
 
 
 def install_bounded_gateway_enqueue() -> None:
-    """Install coordinator enqueue, memory, and duplicate-result safeguards."""
+    """Install coordinator transport, memory, and duplicate-result safeguards."""
     from . import play_hand_lab
     from .play_hand_lab_duplicate_results import (
         install_play_hand_lab_duplicate_result_recovery,
     )
     from .play_hand_lab_memory import install_play_hand_lab_memory_bounds
+    from .play_hand_lab_memory_deep import install_play_hand_lab_deep_memory_bounds
 
     play_hand_lab._enqueue_gateway_tasks_with_retries = enqueue_gateway_tasks_with_retries
     install_play_hand_lab_memory_bounds()
     install_play_hand_lab_duplicate_result_recovery()
+    install_play_hand_lab_deep_memory_bounds()
 
 
 __all__ = [
