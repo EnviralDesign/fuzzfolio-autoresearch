@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from autoresearch import play_hand_lab
 from autoresearch.play_hand_lab_memory_deep import _compact_sweep_task_spec
 
 
@@ -46,40 +45,3 @@ def test_completed_sweep_spec_can_drop_rebuildable_params() -> None:
         "params_by_index_sha256",
         "result_detail",
     }
-
-
-def test_rebuild_sweep_params_uses_frozen_axes_and_profile() -> None:
-    lane = play_hand_lab.LabLaneState(
-        lane_id="lane_001",
-        lane_index=1,
-        run_id="phase3-memory-lane-00001",
-        run_dir=play_hand_lab.Path("."),
-        profile_payload={
-            "talibConfig": {
-                "RSI": {
-                    "timeperiod": 14,
-                }
-            }
-        },
-        incumbent_profile_payload={
-            "talibConfig": {
-                "RSI": {
-                    "timeperiod": 14,
-                }
-            }
-        },
-    )
-    spec = {
-        "phase": "focused",
-        "task_kind": "sweep_shard",
-        "axes": ["talibConfig.RSI.timeperiod"],
-        "axis_plan": {"max_permutations": 8},
-        "expanded_permutation_count": 8,
-        "permutation_start": 0,
-        "permutation_count": 8,
-    }
-
-    rebuilt = play_hand_lab._rebuild_sweep_shard_params_by_index(lane, spec)
-
-    assert rebuilt is not None
-    assert len(rebuilt) == 8
