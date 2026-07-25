@@ -62,6 +62,7 @@ _COMPLETED_SWEEP_SPEC_KEYS = (
     "expanded_permutation_count",
     "permutation_start",
     "permutation_count",
+    "params_by_index",
     "params_by_index_sha256",
 )
 _RECORDED_RESULT_SAMPLE_KEYS = (
