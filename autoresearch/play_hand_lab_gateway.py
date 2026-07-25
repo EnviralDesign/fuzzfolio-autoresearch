@@ -25,6 +25,16 @@ import requests
 import httpx
 from websockets.asyncio.client import connect as websocket_connect
 
+from .ephemeral_worker_sessions import (
+    AuthPrincipal,
+    EphemeralSessionError,
+    EphemeralSessionRegistry,
+    LakeCredentialsMissing,
+    ephemeral_ws_message_allowed,
+    is_loopback_client,
+    principal_allows_http,
+    resolve_auth_principal,
+)
 from .play_hand_lab_auth import load_lab_gateway_token
 
 try:  # pragma: no cover - exercised when optional C extension is installed.
@@ -263,6 +273,7 @@ class LabWorker:
     progress: dict[str, Any] | None = None
     contract_hash: str | None = None
     capabilities: set[str] = field(default_factory=set)
+    session_id: str | None = None
 
     def to_payload(
         self,
@@ -288,6 +299,8 @@ class LabWorker:
             "online": not is_stale,
             "stale": is_stale,
         }
+        if self.session_id:
+            payload["session_id"] = self.session_id
         if self.progress is not None:
             payload["progress"] = dict(self.progress)
         if self.contract_hash:
@@ -462,10 +475,16 @@ class WebSocketSaturationSimulationConfig:
 
 
 class PlayHandLabGateway:
-    def __init__(self, config: LabGatewayConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: LabGatewayConfig | None = None,
+        *,
+        ephemeral_sessions: EphemeralSessionRegistry | None = None,
+    ) -> None:
         self.config = config or LabGatewayConfig()
         self.gateway_id = str(uuid4())
         self.started_at_wall = _wall_time_iso()
+        self.ephemeral_sessions = ephemeral_sessions or EphemeralSessionRegistry()
         self._lock = threading.RLock()
         self._pending: deque[str] = deque()
         self._tasks: dict[str, LabTask] = {}
@@ -533,6 +552,7 @@ class PlayHandLabGateway:
         instance_id: str | None = None,
         contract_hash: str | None = None,
         capabilities: list[str] | set[str] | tuple[str, ...] | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         now = _now()
         with self._lock:
@@ -543,6 +563,7 @@ class PlayHandLabGateway:
                     pool=pool,
                     instance_id=str(instance_id) if instance_id else None,
                     slots=max(int(slots), 1),
+                    session_id=str(session_id) if session_id else None,
                 )
                 self._workers[worker_id] = worker
             elif instance_id and worker.instance_id and str(instance_id) != worker.instance_id:
@@ -564,11 +585,40 @@ class PlayHandLabGateway:
             worker.slots = max(int(slots), 1)
             worker.heartbeat_at = now
             worker.status_detail = "registered"
+            if session_id:
+                worker.session_id = str(session_id)
             if contract_hash:
                 worker.contract_hash = str(contract_hash)
             if capabilities is not None:
                 worker.capabilities = {str(item) for item in capabilities if str(item)}
             return worker.to_payload(now)
+
+    def session_worker_counts(
+        self,
+        session_id: str,
+        *,
+        expected_contract: str | None = None,
+    ) -> dict[str, int]:
+        with self._lock:
+            workers = [
+                worker
+                for worker in self._workers.values()
+                if worker.session_id == session_id
+            ]
+            compatible = 0
+            busy = 0
+            for worker in workers:
+                if expected_contract and worker.contract_hash == expected_contract:
+                    compatible += 1
+                elif not expected_contract and worker.contract_hash:
+                    compatible += 1
+                if worker.active_lease_ids:
+                    busy += 1
+            return {
+                "registered_workers": len(workers),
+                "compatible_workers": compatible,
+                "busy_workers": busy,
+            }
 
     def heartbeat_worker(
         self,
@@ -1209,13 +1259,25 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/healthz":
+        path = parsed.path.rstrip("/") or "/"
+        if path == "/healthz":
             self._write_json({"ok": True})
             return
-        if parsed.path == "/snapshot":
-            if not self._authorized():
-                self._write_json({"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
-                return
+
+        principal = self._resolve_principal()
+        if principal is None:
+            self._write_json({"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
+            return
+        if not principal_allows_http(principal, "GET", path):
+            self._write_json({"error": "forbidden"}, status=HTTPStatus.FORBIDDEN)
+            return
+
+        status_match = _ephemeral_session_route(path, action="status")
+        if status_match is not None:
+            self._handle_ephemeral_status(principal, status_match)
+            return
+
+        if path == "/snapshot":
             query = parse_qs(parsed.query)
             include_workers = str(query.get("include_workers", ["false"])[0]).lower() in {
                 "1",
@@ -1224,10 +1286,7 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
             }
             self._write_json(self.server.gateway.snapshot(include_workers=include_workers))
             return
-        if parsed.path == "/results":
-            if not self._authorized():
-                self._write_json({"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
-                return
+        if path == "/results":
             query = parse_qs(parsed.query)
             raw_limit = query.get("limit", [None])[0]
             limit = int(raw_limit) if raw_limit not in {None, ""} else None
@@ -1236,26 +1295,39 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
         self._write_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
-        if not self._authorized():
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+
+        if path == "/ephemeral-sessions/redeem":
+            payload = self._read_json()
+            if payload is None:
+                return
+            self._handle_ephemeral_redeem(payload)
+            return
+
+        principal = self._resolve_principal()
+        if principal is None:
             self._write_json({"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
             return
+        if not principal_allows_http(principal, "POST", path):
+            self._write_json({"error": "forbidden"}, status=HTTPStatus.FORBIDDEN)
+            return
+
         payload = self._read_json()
         if payload is None:
             return
 
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
+        if path == "/admin/ephemeral-sessions":
+            self._handle_ephemeral_mint(principal, payload)
+            return
+
+        revoke_match = _ephemeral_session_route(path, action="revoke")
+        if revoke_match is not None:
+            self._handle_ephemeral_revoke(principal, revoke_match)
+            return
+
         if path == "/register":
-            contract_hash, capabilities = _worker_contract_fields(payload)
-            worker = self.server.gateway.register_worker(
-                worker_id=str(payload.get("worker_id") or ""),
-                pool=str(payload.get("pool") or "lab"),
-                slots=int(payload.get("slots") or 1),
-                instance_id=_worker_instance_id(payload),
-                contract_hash=contract_hash,
-                capabilities=capabilities,
-            )
-            self._write_json({"status": "registered", "worker": worker})
+            self._handle_register(principal, payload)
             return
         if path == "/heartbeat":
             ok = self.server.gateway.heartbeat_worker(
@@ -1371,13 +1443,102 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
 
         self._write_json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
-    def _authorized(self) -> bool:
-        token = self.server.token
-        if not token:
-            return True
-        header = self.headers.get("Authorization", "")
-        expected = f"Bearer {token}"
-        return hmac.compare_digest(header, expected)
+    def _resolve_principal(self) -> AuthPrincipal | None:
+        return resolve_auth_principal(
+            self.headers.get("Authorization"),
+            durable_token=self.server.token,
+            registry=self.server.gateway.ephemeral_sessions,
+        )
+
+    def _handle_register(self, principal: AuthPrincipal, payload: dict[str, Any]) -> None:
+        contract_hash, capabilities = _worker_contract_fields(payload)
+        pool = str(payload.get("pool") or "lab")
+        session_id: str | None = None
+        if principal.is_ephemeral:
+            try:
+                session = self.server.gateway.ephemeral_sessions.validate_ephemeral_registration(
+                    principal,
+                    pool=pool,
+                    contract_hash=contract_hash,
+                    capabilities=capabilities,
+                )
+            except EphemeralSessionError as exc:
+                self._write_json({"error": exc.code}, status=_http_status(exc.http_status))
+                return
+            session_id = session.session_id
+        worker = self.server.gateway.register_worker(
+            worker_id=str(payload.get("worker_id") or ""),
+            pool=pool,
+            slots=int(payload.get("slots") or 1),
+            instance_id=_worker_instance_id(payload),
+            contract_hash=contract_hash,
+            capabilities=capabilities,
+            session_id=session_id,
+        )
+        self._write_json({"status": "registered", "worker": worker})
+
+    def _handle_ephemeral_mint(self, principal: AuthPrincipal, payload: dict[str, Any]) -> None:
+        if not principal.is_durable:
+            self._write_json({"error": "forbidden"}, status=HTTPStatus.FORBIDDEN)
+            return
+        client_host = str(self.client_address[0] if self.client_address else "")
+        if not is_loopback_client(client_host):
+            self._write_json({"error": "loopback_required"}, status=HTTPStatus.FORBIDDEN)
+            return
+        try:
+            result = self.server.gateway.ephemeral_sessions.mint(payload)
+        except EphemeralSessionError as exc:
+            self._write_json({"error": exc.code}, status=_http_status(exc.http_status))
+            return
+        self._write_json(result)
+
+    def _handle_ephemeral_redeem(self, payload: dict[str, Any]) -> None:
+        try:
+            result = self.server.gateway.ephemeral_sessions.redeem(payload)
+        except LakeCredentialsMissing as exc:
+            self._write_json(
+                {"error": exc.code},
+                status=HTTPStatus.SERVICE_UNAVAILABLE,
+                cache_control="no-store",
+            )
+            return
+        except EphemeralSessionError as exc:
+            self._write_json(
+                {"error": exc.code},
+                status=_http_status(exc.http_status),
+                cache_control="no-store",
+            )
+            return
+        self._write_json(result, cache_control="no-store")
+
+    def _handle_ephemeral_status(self, principal: AuthPrincipal, session_id: str) -> None:
+        session = self.server.gateway.ephemeral_sessions.get_session(session_id)
+        counts = (
+            self.server.gateway.session_worker_counts(
+                session_id,
+                expected_contract=session.expected_contract if session else None,
+            )
+            if session is not None
+            else None
+        )
+        try:
+            result = self.server.gateway.ephemeral_sessions.status(
+                session_id,
+                principal=principal,
+                worker_counts=counts,
+            )
+        except EphemeralSessionError as exc:
+            self._write_json({"error": exc.code}, status=_http_status(exc.http_status))
+            return
+        self._write_json(result)
+
+    def _handle_ephemeral_revoke(self, principal: AuthPrincipal, session_id: str) -> None:
+        try:
+            result = self.server.gateway.ephemeral_sessions.revoke(session_id, principal=principal)
+        except EphemeralSessionError as exc:
+            self._write_json({"error": exc.code}, status=_http_status(exc.http_status))
+            return
+        self._write_json(result)
 
     def _read_json(self) -> dict[str, Any] | None:
         raw_length = self.headers.get("Content-Length")
@@ -1400,13 +1561,35 @@ class LabGatewayRequestHandler(BaseHTTPRequestHandler):
             return None
         return parsed
 
-    def _write_json(self, payload: dict[str, Any], *, status: HTTPStatus = HTTPStatus.OK) -> None:
+    def _write_json(
+        self,
+        payload: dict[str, Any],
+        *,
+        status: HTTPStatus = HTTPStatus.OK,
+        cache_control: str | None = None,
+    ) -> None:
         body = _json_dumps_bytes(payload, sort_keys=True)
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        if cache_control:
+            self.send_header("Cache-Control", cache_control)
         self.end_headers()
         self.wfile.write(body)
+
+
+def _http_status(code: int, *, default: HTTPStatus = HTTPStatus.BAD_REQUEST) -> HTTPStatus:
+    try:
+        return HTTPStatus(int(code))
+    except ValueError:
+        return default
+
+
+def _ephemeral_session_route(path: str, *, action: str) -> str | None:
+    parts = [part for part in str(path or "").split("/") if part]
+    if len(parts) == 3 and parts[0] == "ephemeral-sessions" and parts[2] == action:
+        return parts[1]
+    return None
 
 
 def build_lab_gateway_http_server(
@@ -1445,15 +1628,69 @@ class LabGatewayAsgiApp:
             bytes(key).decode("latin-1").lower(): bytes(value).decode("latin-1")
             for key, value in scope.get("headers", [])
         }
+        client = scope.get("client")
+        client_host = str(client[0]) if isinstance(client, (list, tuple)) and client else ""
 
         if method == "GET" and path == "/healthz":
             await self._send_json(send, {"ok": True})
             return
-        if not self._authorized(headers.get("authorization")):
+
+        if method == "POST" and path == "/ephemeral-sessions/redeem":
+            try:
+                payload = await self._read_json(receive)
+                result = self.gateway.ephemeral_sessions.redeem(payload)
+                await self._send_json(send, result, cache_control="no-store")
+            except LakeCredentialsMissing as exc:
+                await self._send_json(
+                    send,
+                    {"error": exc.code},
+                    status=503,
+                    cache_control="no-store",
+                )
+            except EphemeralSessionError as exc:
+                await self._send_json(
+                    send,
+                    {"error": exc.code},
+                    status=int(exc.http_status),
+                    cache_control="no-store",
+                )
+            except json.JSONDecodeError:
+                await self._send_json(send, {"error": "invalid_json"}, status=400, cache_control="no-store")
+            except ValueError as exc:
+                status = 413 if str(exc) == "body_too_large" else 400
+                await self._send_json(send, {"error": str(exc)}, status=status, cache_control="no-store")
+            return
+
+        principal = self._resolve_principal(headers.get("authorization"))
+        if principal is None:
             await self._send_json(send, {"error": "unauthorized"}, status=401)
+            return
+        if not principal_allows_http(principal, method, path):
+            await self._send_json(send, {"error": "forbidden"}, status=403)
             return
 
         try:
+            status_match = _ephemeral_session_route(path, action="status")
+            if method == "GET" and status_match is not None:
+                session = self.gateway.ephemeral_sessions.get_session(status_match)
+                counts = (
+                    self.gateway.session_worker_counts(
+                        status_match,
+                        expected_contract=session.expected_contract if session else None,
+                    )
+                    if session is not None
+                    else None
+                )
+                await self._send_json(
+                    send,
+                    self.gateway.ephemeral_sessions.status(
+                        status_match,
+                        principal=principal,
+                        worker_counts=counts,
+                    ),
+                )
+                return
+
             if method == "GET" and path == "/snapshot":
                 include_workers = str(query.get("include_workers", ["false"])[0]).lower() in {"1", "true", "yes"}
                 await self._send_json(send, self.gateway.snapshot(include_workers=include_workers))
@@ -1465,6 +1702,24 @@ class LabGatewayAsgiApp:
                 return
 
             payload = await self._read_json(receive)
+            if method == "POST" and path == "/admin/ephemeral-sessions":
+                if not principal.is_durable:
+                    await self._send_json(send, {"error": "forbidden"}, status=403)
+                    return
+                if not is_loopback_client(client_host):
+                    await self._send_json(send, {"error": "loopback_required"}, status=403)
+                    return
+                await self._send_json(send, self.gateway.ephemeral_sessions.mint(payload))
+                return
+
+            revoke_match = _ephemeral_session_route(path, action="revoke")
+            if method == "POST" and revoke_match is not None:
+                await self._send_json(
+                    send,
+                    self.gateway.ephemeral_sessions.revoke(revoke_match, principal=principal),
+                )
+                return
+
             if method == "POST" and path == "/tasks":
                 raw_tasks = payload.get("tasks")
                 if isinstance(raw_tasks, list):
@@ -1490,16 +1745,7 @@ class LabGatewayAsgiApp:
                 await self._send_json(send, {"status": "acked", "acked": acked})
                 return
             if method == "POST" and path == "/register":
-                contract_hash, capabilities = _worker_contract_fields(payload)
-                worker = self.gateway.register_worker(
-                    worker_id=str(payload.get("worker_id") or ""),
-                    pool=str(payload.get("pool") or "lab"),
-                    slots=int(payload.get("slots") or 1),
-                    instance_id=_worker_instance_id(payload),
-                    contract_hash=contract_hash,
-                    capabilities=capabilities,
-                )
-                await self._send_json(send, {"status": "registered", "worker": worker})
+                await self._send_json(send, self._register_http(principal, payload))
                 return
             if method == "POST" and path == "/heartbeat":
                 ok = self.gateway.heartbeat_worker(
@@ -1591,6 +1837,8 @@ class LabGatewayAsgiApp:
                     return
 
             await self._send_json(send, {"error": "not_found"}, status=404)
+        except EphemeralSessionError as exc:
+            await self._send_json(send, {"error": exc.code}, status=int(exc.http_status))
         except json.JSONDecodeError:
             await self._send_json(send, {"error": "invalid_json"}, status=400)
         except ValueError as exc:
@@ -1608,7 +1856,8 @@ class LabGatewayAsgiApp:
         if path != "/ws":
             await send({"type": "websocket.close", "code": 1008})
             return
-        if not self._authorized(headers.get("authorization")):
+        principal = self._resolve_principal(headers.get("authorization"))
+        if principal is None:
             await send({"type": "websocket.close", "code": 1008})
             return
         await send({"type": "websocket.accept"})
@@ -1644,7 +1893,7 @@ class LabGatewayAsgiApp:
                         raise ValueError("json_object_required")
                     if str(payload.get("type") or "") == "register":
                         websocket_worker_id = str(payload.get("worker_id") or "") or websocket_worker_id
-                    response = self._handle_worker_message(payload)
+                    response = self._handle_worker_message(payload, principal=principal)
                 except Exception as exc:
                     response = {"type": "error", "error": str(exc)}
                 await send(
@@ -1688,12 +1937,51 @@ class LabGatewayAsgiApp:
                 # the same worker_id. Keep leases alive until normal stale
                 # lifecycle cleanup decides the worker is gone.
 
-    def _handle_worker_message(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _register_http(self, principal: AuthPrincipal, payload: dict[str, Any]) -> dict[str, Any]:
+        contract_hash, capabilities = _worker_contract_fields(payload)
+        pool = str(payload.get("pool") or "lab")
+        session_id: str | None = None
+        if principal.is_ephemeral:
+            session = self.gateway.ephemeral_sessions.validate_ephemeral_registration(
+                principal,
+                pool=pool,
+                contract_hash=contract_hash,
+                capabilities=capabilities,
+            )
+            session_id = session.session_id
+        worker = self.gateway.register_worker(
+            worker_id=str(payload.get("worker_id") or ""),
+            pool=pool,
+            slots=int(payload.get("slots") or 1),
+            instance_id=_worker_instance_id(payload),
+            contract_hash=contract_hash,
+            capabilities=capabilities,
+            session_id=session_id,
+        )
+        return {"status": "registered", "worker": worker}
+
+    def _handle_worker_message(
+        self,
+        payload: dict[str, Any],
+        *,
+        principal: AuthPrincipal,
+    ) -> dict[str, Any]:
         message_type = str(payload.get("type") or "")
+        if principal.is_ephemeral and not ephemeral_ws_message_allowed(message_type):
+            return {"type": "error", "error": "forbidden"}
         worker_id = str(payload.get("worker_id") or "")
         pool = str(payload.get("pool") or "lab")
         if message_type == "register":
             contract_hash, capabilities = _worker_contract_fields(payload)
+            session_id: str | None = None
+            if principal.is_ephemeral:
+                session = self.gateway.ephemeral_sessions.validate_ephemeral_registration(
+                    principal,
+                    pool=pool,
+                    contract_hash=contract_hash,
+                    capabilities=capabilities,
+                )
+                session_id = session.session_id
             worker = self.gateway.register_worker(
                 worker_id=worker_id,
                 pool=pool,
@@ -1701,6 +1989,7 @@ class LabGatewayAsgiApp:
                 instance_id=_worker_instance_id(payload),
                 contract_hash=contract_hash,
                 capabilities=capabilities,
+                session_id=session_id,
             )
             return {"type": "registered", "status": "registered", "worker": worker}
         if message_type == "heartbeat":
@@ -1776,10 +2065,12 @@ class LabGatewayAsgiApp:
             return result
         return {"type": "error", "error": f"unsupported_message_type:{message_type}"}
 
-    def _authorized(self, authorization: str | None) -> bool:
-        if not self.token:
-            return True
-        return hmac.compare_digest(str(authorization or ""), f"Bearer {self.token}")
+    def _resolve_principal(self, authorization: str | None) -> AuthPrincipal | None:
+        return resolve_auth_principal(
+            authorization,
+            durable_token=self.token,
+            registry=self.gateway.ephemeral_sessions,
+        )
 
     async def _read_json(self, receive: Any) -> dict[str, Any]:
         chunks: list[bytes] = []
@@ -1803,16 +2094,26 @@ class LabGatewayAsgiApp:
             raise ValueError("json_object_required")
         return parsed
 
-    async def _send_json(self, send: Any, payload: dict[str, Any], *, status: int = 200) -> None:
+    async def _send_json(
+        self,
+        send: Any,
+        payload: dict[str, Any],
+        *,
+        status: int = 200,
+        cache_control: str | None = None,
+    ) -> None:
         body = _json_dumps_bytes(payload, sort_keys=True)
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ]
+        if cache_control:
+            headers.append((b"cache-control", cache_control.encode("ascii")))
         await send(
             {
                 "type": "http.response.start",
                 "status": int(status),
-                "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode("ascii")),
-                ],
+                "headers": headers,
             }
         )
         await send({"type": "http.response.body", "body": body})

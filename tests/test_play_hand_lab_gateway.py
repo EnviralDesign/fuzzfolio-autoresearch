@@ -1537,3 +1537,212 @@ def test_build_parser_accepts_play_hand_massive_v2_aliases() -> None:
     assert args.target_completions == 500
     assert args.work_seconds == 0.01
     assert args.json is True
+
+
+def _ephemeral_mint_payload() -> dict:
+    return {
+        "authority_id": "sha256:" + ("b" * 64),
+        "image": "lucasmorgan/fuzzfolio-replay-worker:sha-235b61f62fc0",
+        "expected_worker_contract": "sha256:" + ("a" * 64),
+        "required_capabilities": ["playhand_lab_protocol:playhand-lab-worker-v1"],
+        "duration_seconds": 180,
+        "workers": 1,
+        "max_workers": 2,
+        "enrollment_ttl_seconds": 1200,
+        "cleanup_grace_seconds": 600,
+        "public_gateway_url": "http://host.docker.internal:8799",
+        "enrollment_url": "http://127.0.0.1:8799/ephemeral-sessions/redeem",
+        "script_sha256": "sha256:" + ("c" * 64),
+        "minimum_free_disk_gb": 10,
+        "registration_timeout_seconds": 300,
+        "status_interval_seconds": 15,
+        "remove_image_when_safe": False,
+    }
+
+
+def _start_http_gateway(*, token: str = "secret"):
+    from autoresearch.ephemeral_worker_sessions import EphemeralSessionRegistry
+
+    gateway = PlayHandLabGateway(
+        ephemeral_sessions=EphemeralSessionRegistry(
+            lake_credentials_loader=lambda: ("https://lake.example/", "lake-secret"),
+        )
+    )
+    server = build_lab_gateway_http_server(
+        host="127.0.0.1",
+        port=0,
+        token=token,
+        gateway=gateway,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    return gateway, server, thread, f"http://{host}:{port}"
+
+
+def test_ephemeral_mint_redeem_register_and_auth_matrix() -> None:
+    gateway, server, thread, base_url = _start_http_gateway()
+    durable = {"Authorization": "Bearer secret"}
+    try:
+        mint = requests.post(
+            f"{base_url}/admin/ephemeral-sessions",
+            json=_ephemeral_mint_payload(),
+            headers=durable,
+            timeout=5,
+        )
+        assert mint.status_code == 200
+        minted = mint.json()
+        assert minted["session_id"].startswith("ews-")
+        assert minted["enrollment_token"]
+
+        redeem = requests.post(
+            f"{base_url}/ephemeral-sessions/redeem",
+            json={
+                "enrollment_token": minted["enrollment_token"],
+                "client_nonce": "n1",
+                "script_sha256": _ephemeral_mint_payload()["script_sha256"],
+            },
+            timeout=5,
+        )
+        assert redeem.status_code == 200
+        assert redeem.headers.get("Cache-Control") == "no-store"
+        manifest = redeem.json()
+        assert manifest["schema_version"] == 1
+        worker_token = manifest["worker"]["gateway_token"]
+        ephemeral = {"Authorization": f"Bearer {worker_token}"}
+
+        # Ephemeral must not touch coordinator/admin surfaces.
+        for path, method in (
+            ("/snapshot", requests.get),
+            ("/results", requests.get),
+            ("/tasks", requests.post),
+            ("/results/ack", requests.post),
+            ("/admin/ephemeral-sessions", requests.post),
+        ):
+            kwargs = {"headers": ephemeral, "timeout": 5}
+            if method is requests.post:
+                kwargs["json"] = {}
+            response = method(f"{base_url}{path}", **kwargs)
+            assert response.status_code in {401, 403}, path
+
+        register = requests.post(
+            f"{base_url}/register",
+            json={
+                "worker_id": "ephemeral-worker-1",
+                "pool": minted["pool"],
+                "contract_hash": minted["expected_worker_contract"],
+                "capabilities": ["playhand_lab_protocol:playhand-lab-worker-v1"],
+            },
+            headers=ephemeral,
+            timeout=5,
+        )
+        assert register.status_code == 200
+        assert register.json()["worker"]["session_id"] == minted["session_id"]
+        assert gateway._workers["ephemeral-worker-1"].session_id == minted["session_id"]
+
+        status = requests.get(
+            f"{base_url}/ephemeral-sessions/{minted['session_id']}/status",
+            headers=ephemeral,
+            timeout=5,
+        )
+        assert status.status_code == 200
+        body = status.json()
+        assert body["registered_workers"] == 1
+        assert body["compatible_workers"] == 1
+        assert "queued_tasks" not in body
+
+        revoke = requests.post(
+            f"{base_url}/ephemeral-sessions/{minted['session_id']}/revoke",
+            headers=ephemeral,
+            timeout=5,
+        )
+        assert revoke.status_code == 200
+        denied = requests.post(
+            f"{base_url}/register",
+            json={
+                "worker_id": "ephemeral-worker-2",
+                "pool": minted["pool"],
+                "contract_hash": minted["expected_worker_contract"],
+                "capabilities": ["playhand_lab_protocol:playhand-lab-worker-v1"],
+            },
+            headers=ephemeral,
+            timeout=5,
+        )
+        assert denied.status_code == 401
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_durable_token_still_registers_and_claims() -> None:
+    gateway, server, thread, base_url = _start_http_gateway()
+    headers = {"Authorization": "Bearer secret"}
+    try:
+        assert requests.post(
+            f"{base_url}/tasks",
+            json={"task_id": "task-durable", "lane_id": "lane-1", "attempt_id": "attempt-1"},
+            headers=headers,
+            timeout=5,
+        ).json()["accepted"] == 1
+        assert requests.post(
+            f"{base_url}/register",
+            json={"worker_id": "durable-worker"},
+            headers=headers,
+            timeout=5,
+        ).json()["status"] == "registered"
+        claim = requests.post(
+            f"{base_url}/claim",
+            json={"worker_id": "durable-worker"},
+            headers=headers,
+            timeout=5,
+        ).json()
+        assert claim["status"] == "leased"
+        assert gateway.snapshot()["active_leases"] == 1
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_ephemeral_redeem_missing_lake_credentials_returns_503() -> None:
+    from autoresearch.ephemeral_worker_sessions import EphemeralSessionRegistry
+
+    gateway = PlayHandLabGateway(
+        ephemeral_sessions=EphemeralSessionRegistry(
+            lake_credentials_loader=lambda: ("", ""),
+        )
+    )
+    server = build_lab_gateway_http_server(
+        host="127.0.0.1",
+        port=0,
+        token="secret",
+        gateway=gateway,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address
+    base_url = f"http://{host}:{port}"
+    durable = {"Authorization": "Bearer secret"}
+    try:
+        minted = requests.post(
+            f"{base_url}/admin/ephemeral-sessions",
+            json=_ephemeral_mint_payload(),
+            headers=durable,
+            timeout=5,
+        ).json()
+        redeem = requests.post(
+            f"{base_url}/ephemeral-sessions/redeem",
+            json={
+                "enrollment_token": minted["enrollment_token"],
+                "script_sha256": _ephemeral_mint_payload()["script_sha256"],
+            },
+            timeout=5,
+        )
+        assert redeem.status_code == 503
+        assert redeem.json()["error"] == "lake_credentials_unavailable"
+        assert "lake-secret" not in redeem.text
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

@@ -18,6 +18,10 @@ CAPSULE_PATH = (
     "phase2-atlas-authority-capsule-20260721"
 )
 POLICY_PATH = "C:\\repos\\fuzzfolio-autoresearch\\configs\\phase3-campaign-policy.json"
+EPHEMERAL_AUTHORITY_PATH = (
+    "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\phase3-authorities\\"
+    "phase3-darwin-rich-ab-v3\\phase3-playhand-authority.json"
+)
 
 
 def _config() -> dict[str, object]:
@@ -55,6 +59,7 @@ def test_process_manager_groups_reference_unique_processes() -> None:
         "Safe Maintenance Preview",
         "Historical Evidence (Advanced)",
         "Atlas Manual (Advanced)",
+        "Ephemeral Workers (Manual)",
     }
 
 
@@ -134,5 +139,52 @@ def test_all_configured_commands_use_direct_venv_wrappers() -> None:
 
     for process in config["processes"]:
         command = str(process["command"])
+        if command.startswith("uv run "):
+            continue
         assert command.startswith(VENV_PREFIX)
         assert "uv run" not in command
+
+
+def test_ephemeral_worker_generator_entries_are_safe_smoke_commands() -> None:
+    config = _config()
+    processes = _processes(config)
+    ephemeral = _group(config, "Ephemeral Workers (Manual)")
+    ephemeral_processes = [
+        processes[process_id] for process_id in ephemeral["process_ids"]
+    ]
+
+    assert [process["name"] for process in ephemeral_processes] == [
+        "Generate Ephemeral Windows Workers - 3m Smoke",
+        "Generate Ephemeral Windows Workers - 5m Smoke",
+        "Generate Ephemeral Windows Workers - 2h",
+        "Generate Ephemeral Windows Workers - Local Smoke File",
+    ]
+
+    for process in ephemeral_processes:
+        command = str(process["command"])
+        assert command.startswith("uv run generate-ephemeral-worker-command ")
+        assert "--copy" in command
+        assert "--json-redacted" in command
+        assert "--print-command" not in command
+        assert EPHEMERAL_AUTHORITY_PATH in command
+        assert Path(EPHEMERAL_AUTHORITY_PATH).is_file()
+        assert process["auto_restart"] is False
+        assert process["respond_to_start_all"] is False
+        assert process["respond_to_stop_all"] is False
+        lowered = command.lower()
+        assert "bearer " not in lowered
+        assert "enrollmenttoken" not in lowered.replace("-", "").replace("_", "")
+        assert "gatewaytoken" not in lowered.replace("-", "").replace("_", "")
+
+    wan_commands = [
+        str(process["command"])
+        for process in ephemeral_processes
+        if "Local Smoke File" not in str(process["name"])
+    ]
+    assert all("--local-smoke" not in command for command in wan_commands)
+    local_cmd = next(
+        str(p["command"])
+        for p in ephemeral_processes
+        if p["name"] == "Generate Ephemeral Windows Workers - Local Smoke File"
+    )
+    assert "--local-smoke" in local_cmd

@@ -796,6 +796,7 @@ PUBLIC_CLI_COMMANDS = {
     "dashboard",
     "record-attempt",
     "nuke-deep-caches",
+    "generate-ephemeral-worker-command",
 }
 
 
@@ -965,6 +966,12 @@ def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
     phase3_playhand.add_argument("--barrier-interval-seconds", type=float, default=5.0)
     phase3_playhand.add_argument("--barrier-lane-limit", type=int, default=24)
     phase3_playhand.add_argument("--json", action="store_true")
+
+    from autoresearch.ephemeral_worker_command import (
+        add_generate_ephemeral_worker_command_parser,
+    )
+
+    add_generate_ephemeral_worker_command_parser(subparsers)
 
     doctor = subparsers.add_parser(
         "doctor", help="Verify config, CLI, auth, and seed prompt."
@@ -20692,6 +20699,16 @@ def main(argv: list[str] | None = None) -> int:
         from autoresearch.phase2_atlas_capsule import cmd_phase2_atlas_capsule
 
         return cmd_phase2_atlas_capsule(args)
+    if args.command == "generate-ephemeral-worker-command":
+        from autoresearch.ephemeral_worker_command import run_generate_ephemeral_worker_command
+        from autoresearch.ephemeral_worker_sessions import EphemeralSessionError
+
+        try:
+            return run_generate_ephemeral_worker_command(args)
+        except EphemeralSessionError as exc:
+            parser.error(exc.code)
+        except RuntimeError as exc:
+            parser.error(str(exc))
     if args.command == "phase3-playhand-authority":
         from autoresearch.phase3_authority import cmd_phase3_playhand_authority
 
