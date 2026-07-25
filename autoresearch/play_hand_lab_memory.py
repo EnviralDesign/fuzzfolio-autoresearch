@@ -29,6 +29,7 @@ _ORIGINAL_ATTACH_TASK_PROFILE_SNAPSHOTS: Any = None
 _ORIGINAL_MAKE_DEEP_REPLAY_TASK: Any = None
 _ORIGINAL_MAKE_SWEEP_SHARD_TASKS: Any = None
 _ORIGINAL_BUILD_TASKS: Any = None
+_ORIGINAL_VALIDATED_RECEIPT_DERIVED_TASKS: Any = None
 _ORIGINAL_JOURNAL_UNRESOLVED: Any = None
 _ORIGINAL_JOURNAL_TERMINAL: Any = None
 _ORIGINAL_JOURNAL_APPLY_BATCH: Any = None
@@ -261,6 +262,7 @@ def install_play_hand_lab_memory_bounds() -> None:
     global _ORIGINAL_MAKE_DEEP_REPLAY_TASK
     global _ORIGINAL_MAKE_SWEEP_SHARD_TASKS
     global _ORIGINAL_BUILD_TASKS
+    global _ORIGINAL_VALIDATED_RECEIPT_DERIVED_TASKS
     global _ORIGINAL_JOURNAL_UNRESOLVED
     global _ORIGINAL_JOURNAL_TERMINAL
     global _ORIGINAL_JOURNAL_APPLY_BATCH
@@ -276,6 +278,9 @@ def install_play_hand_lab_memory_bounds() -> None:
         _ORIGINAL_MAKE_DEEP_REPLAY_TASK = play_hand_lab._make_deep_replay_task
         _ORIGINAL_MAKE_SWEEP_SHARD_TASKS = play_hand_lab._make_sweep_shard_tasks
         _ORIGINAL_BUILD_TASKS = play_hand_lab._build_tasks
+        _ORIGINAL_VALIDATED_RECEIPT_DERIVED_TASKS = (
+            play_hand_lab._validated_receipt_derived_tasks
+        )
         _ORIGINAL_JOURNAL_UNRESOLVED = DurableExecutionJournal.unresolved
         _ORIGINAL_JOURNAL_TERMINAL = DurableExecutionJournal.terminal
         _ORIGINAL_JOURNAL_APPLY_BATCH = DurableExecutionJournal.apply_batch
@@ -293,6 +298,15 @@ def install_play_hand_lab_memory_bounds() -> None:
         def tracked_build_tasks(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
             tasks = _ORIGINAL_BUILD_TASKS(*args, **kwargs)
             track_live_task_payloads(tasks)
+            return tasks
+
+        def tracked_validated_receipt_derived_tasks(
+            *args: Any,
+            **kwargs: Any,
+        ) -> list[dict[str, Any]] | None:
+            tasks = _ORIGINAL_VALIDATED_RECEIPT_DERIVED_TASKS(*args, **kwargs)
+            if tasks:
+                track_live_task_payloads(tasks)
             return tasks
 
         def bounded_unresolved(journal: DurableExecutionJournal) -> list[dict[str, Any]]:
@@ -355,6 +369,9 @@ def install_play_hand_lab_memory_bounds() -> None:
         play_hand_lab._make_deep_replay_task = tracked_make_deep_replay_task
         play_hand_lab._make_sweep_shard_tasks = tracked_make_sweep_shard_tasks
         play_hand_lab._build_tasks = tracked_build_tasks
+        play_hand_lab._validated_receipt_derived_tasks = (
+            tracked_validated_receipt_derived_tasks
+        )
         DurableExecutionJournal.unresolved = bounded_unresolved
         DurableExecutionJournal.terminal = bounded_terminal
         DurableExecutionJournal.apply_batch = bounded_apply_batch
