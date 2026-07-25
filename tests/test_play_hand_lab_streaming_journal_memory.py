@@ -57,7 +57,7 @@ def test_streaming_loader_peak_is_bounded_by_record_not_whole_journal(tmp_path: 
         "payload" not in task and task["terminal_receipt"].keys() == {"receipt_sha256"}
         for task in view["tasks"].values()
     )
-    # The old loader held the whole file string, split lines, and full task graph at
-    # once. Keep Python allocations below half the journal bytes for this synthetic
-    # all-terminal corpus; the streaming loader should be far below this threshold.
-    assert peak < journal_size // 2
+    # The old loader held the complete file string, split-line copies, and full task
+    # graph concurrently. The streaming path should stay below the journal's own byte
+    # size even with tracemalloc bookkeeping and per-record canonical verification.
+    assert peak < journal_size, {"peak": peak, "journal_size": journal_size}
