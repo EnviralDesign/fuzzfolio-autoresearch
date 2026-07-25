@@ -73,3 +73,10 @@ jobs:
               exit 1
             }
           cat pytest.log
+      - name: Upload pytest log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playhand-pytest-log
+          path: pytest.log
+          if-no-files-found: ignore
