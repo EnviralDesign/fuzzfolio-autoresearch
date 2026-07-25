@@ -16,6 +16,7 @@ name: PlayHand resilience regression tests
       - "tests/test_lake_window_client.py"
       - "tests/test_play_hand_lab_deep_memory.py"
       - "tests/test_play_hand_lab_memory_diagnostics.py"
+      - "tests/test_play_hand_lab_memory_installation.py"
       - "tests/test_play_hand_lab_duplicate_results.py"
       - "tests/test_play_hand_lab_enqueue.py"
       - "tests/test_play_hand_lab_entrypoint.py"
@@ -39,6 +40,7 @@ name: PlayHand resilience regression tests
       - "tests/test_lake_window_client.py"
       - "tests/test_play_hand_lab_deep_memory.py"
       - "tests/test_play_hand_lab_memory_diagnostics.py"
+      - "tests/test_play_hand_lab_memory_installation.py"
       - "tests/test_play_hand_lab_duplicate_results.py"
       - "tests/test_play_hand_lab_enqueue.py"
       - "tests/test_play_hand_lab_entrypoint.py"
@@ -65,6 +67,7 @@ jobs:
           tests/test_lake_window_client.py
           tests/test_play_hand_lab_deep_memory.py
           tests/test_play_hand_lab_memory_diagnostics.py
+          tests/test_play_hand_lab_memory_installation.py
           tests/test_play_hand_lab_duplicate_results.py
           tests/test_play_hand_lab_enqueue.py
           tests/test_play_hand_lab_entrypoint.py
