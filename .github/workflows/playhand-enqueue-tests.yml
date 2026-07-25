@@ -55,15 +55,21 @@ jobs:
           python-version: "3.12"
           cache: pip
       - name: Install project
-        run: python -m pip install -e . pytest
+        run: python -m pip install -q -e . pytest
       - name: Run coordinator resilience regression suite
-        run: >-
-          python -m pytest -q
-          tests/test_durable_execution.py
-          tests/test_lake_window_client.py
-          tests/test_play_hand_lab_deep_memory.py
-          tests/test_play_hand_lab_duplicate_results.py
-          tests/test_play_hand_lab_enqueue.py
-          tests/test_play_hand_lab_entrypoint.py
-          tests/test_play_hand_lab_memory.py
-          tests/test_package_enqueue_bootstrap.py
+        run: |
+          set -o pipefail
+          python -m pytest -q \
+            tests/test_durable_execution.py \
+            tests/test_lake_window_client.py \
+            tests/test_play_hand_lab_deep_memory.py \
+            tests/test_play_hand_lab_duplicate_results.py \
+            tests/test_play_hand_lab_enqueue.py \
+            tests/test_play_hand_lab_entrypoint.py \
+            tests/test_play_hand_lab_memory.py \
+            tests/test_package_enqueue_bootstrap.py \
+            > pytest.log 2>&1 || {
+              tail -n 250 pytest.log
+              exit 1
+            }
+          cat pytest.log
