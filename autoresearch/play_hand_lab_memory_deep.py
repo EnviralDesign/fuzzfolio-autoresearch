@@ -27,6 +27,7 @@ _RECORDED_SWEEP_SAMPLE_COUNT = 0
 _RECORDED_SAMPLE_APPROX_BYTES = 0
 
 _ORIGINAL_JOURNAL_LOAD_FROM_DISK: Any = None
+_ORIGINAL_JOURNAL_LOAD: Any = None
 _ORIGINAL_ADD_RECORDED_RESULT_SAMPLE: Any = None
 _ORIGINAL_FORMAT_LAB_BARRIER_SNAPSHOT: Any = None
 _ORIGINAL_VALIDATE_TASK_RESULT_RECEIPT_PAYLOAD: Any = None
@@ -118,7 +119,13 @@ def _restore_register_payload(
         restored = _ORIGINAL_READ_TASK_RECORD_FROM_DISK(journal, str(task_id))
         if not isinstance(restored, dict) or not isinstance(restored.get("payload"), dict):
             raise DurableExecutionError(f"durable task payload is missing: {task_id}")
-        return dict(restored["payload"])
+        payload = dict(restored["payload"])
+        if (
+            expected_payload_sha256
+            and journal.task_payload_sha256(payload) != expected_payload_sha256
+        ):
+            raise DurableExecutionError(f"durable task payload conflicts: {task_id}")
+        return payload
     record = _read_record_at_offset(journal.path, int(offset))
     payload = record.get("payload")
     payload_sha256 = str(record.get("payload_sha256") or "")
@@ -359,6 +366,53 @@ def _compact_sweep_task_spec(spec: dict[str, Any]) -> None:
     spec.update(compacted)
 
 
+def _restore_sealed_sweep_params(
+    play_hand_lab: Any,
+    lane: Any,
+    task_id: str,
+    spec: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Restore a compacted shard from its sealed registration when available."""
+    journal = _ACTIVE_PLAY_HAND_JOURNAL
+    tasks = getattr(journal, "_tasks", None) if journal is not None else None
+    durable_task = tasks.get(str(task_id)) if isinstance(tasks, dict) else None
+    if not isinstance(durable_task, dict):
+        return None
+
+    expected_payload_sha256 = durable_task.get("payload_sha256")
+    if not isinstance(expected_payload_sha256, str) or not expected_payload_sha256:
+        raise DurableExecutionError(f"durable sweep task has no payload identity: {task_id}")
+    envelope = _restore_register_payload(
+        journal,
+        str(task_id),
+        expected_payload_sha256=expected_payload_sha256,
+    )
+    if (
+        str(envelope.get("task_id") or "") != str(task_id)
+        or str(envelope.get("lane_id") or "") != str(lane.lane_id)
+        or str(envelope.get("task_kind") or "") != "sweep_shard"
+    ):
+        raise DurableExecutionError(f"durable sweep task identity mismatch: {task_id}")
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        raise DurableExecutionError(f"durable sweep task has no params: {task_id}")
+    for key in ("sweep_id", "shard_id"):
+        expected = spec.get(key)
+        if expected is not None and payload.get(key) != expected:
+            raise DurableExecutionError(f"durable sweep task identity mismatch: {task_id}")
+    params_by_index = payload.get("params_by_index")
+    if not isinstance(params_by_index, dict):
+        raise DurableExecutionError(f"durable sweep task has no params: {task_id}")
+    canonical_params = play_hand_lab._canonical_params(params_by_index)
+    expected_sha = spec.get("params_by_index_sha256")
+    if not isinstance(expected_sha, str) or not expected_sha:
+        raise DurableExecutionError(f"durable sweep task has no params identity: {task_id}")
+    observed_sha = canonical_sha256(canonical_params)
+    if observed_sha != expected_sha:
+        raise DurableExecutionError(f"sealed sweep params conflict with task identity: {task_id}")
+    return canonical_params
+
+
 def _restore_sweep_params(play_hand_lab: Any, lane: Any, phase: str) -> list[str]:
     restored: list[str] = []
     for task_id in lane.phase_task_ids.get(phase) or []:
@@ -367,18 +421,25 @@ def _restore_sweep_params(play_hand_lab: Any, lane: Any, phase: str) -> list[str
             continue
         if isinstance(spec.get("params_by_index"), dict):
             continue
-        rebuilt = play_hand_lab._rebuild_sweep_shard_params_by_index(lane, spec)
-        if rebuilt is None:
+        restored_params = _restore_sealed_sweep_params(
+            play_hand_lab,
+            lane,
+            str(task_id),
+            spec,
+        )
+        if restored_params is None:
+            restored_params = play_hand_lab._rebuild_sweep_shard_params_by_index(lane, spec)
+        if restored_params is None:
             raise DurableExecutionError(
                 f"persisted sweep task is missing reconstructable params: {task_id}"
             )
         expected_sha = spec.get("params_by_index_sha256")
-        observed_sha = canonical_sha256(play_hand_lab._canonical_params(rebuilt))
+        observed_sha = canonical_sha256(play_hand_lab._canonical_params(restored_params))
         if isinstance(expected_sha, str) and expected_sha and observed_sha != expected_sha:
             raise DurableExecutionError(
                 f"rebuilt sweep params conflict with task identity: {task_id}"
             )
-        spec["params_by_index"] = rebuilt
+        spec["params_by_index"] = restored_params
         restored.append(str(task_id))
     return restored
 
@@ -510,6 +571,7 @@ def install_play_hand_lab_deep_memory_bounds() -> None:
 
     global _INSTALLED
     global _ORIGINAL_JOURNAL_LOAD_FROM_DISK
+    global _ORIGINAL_JOURNAL_LOAD
     global _ORIGINAL_ADD_RECORDED_RESULT_SAMPLE
     global _ORIGINAL_FORMAT_LAB_BARRIER_SNAPSHOT
     global _ORIGINAL_VALIDATE_TASK_RESULT_RECEIPT_PAYLOAD
@@ -525,6 +587,7 @@ def install_play_hand_lab_deep_memory_bounds() -> None:
         from . import play_hand_lab
 
         _ORIGINAL_JOURNAL_LOAD_FROM_DISK = DurableExecutionJournal._load_from_disk
+        _ORIGINAL_JOURNAL_LOAD = DurableExecutionJournal.load
         _ORIGINAL_READ_TASK_RECORD_FROM_DISK = (
             base_memory._read_task_record_from_disk
         )
@@ -545,6 +608,13 @@ def install_play_hand_lab_deep_memory_bounds() -> None:
             if not _is_play_hand_journal(journal):
                 return _ORIGINAL_JOURNAL_LOAD_FROM_DISK(journal)
             return _load_play_hand_journal_streaming(journal)
+
+        def load(journal: DurableExecutionJournal, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            global _ACTIVE_PLAY_HAND_JOURNAL
+            result = _ORIGINAL_JOURNAL_LOAD(journal, *args, **kwargs)
+            if _is_play_hand_journal(journal):
+                _ACTIVE_PLAY_HAND_JOURNAL = journal
+            return result
 
         def validate_task_result_receipt_payload(
             receipt: Any,
@@ -694,6 +764,7 @@ def install_play_hand_lab_deep_memory_bounds() -> None:
             return "\n".join(lines)
 
         DurableExecutionJournal._load_from_disk = load_from_disk
+        DurableExecutionJournal.load = load
         base_memory._read_task_record_from_disk = _full_terminal_task_from_offsets
         play_hand_lab._validate_task_result_receipt_payload = (
             validate_task_result_receipt_payload

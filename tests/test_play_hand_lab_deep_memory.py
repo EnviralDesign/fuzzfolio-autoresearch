@@ -4,10 +4,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from autoresearch import play_hand_lab
 from autoresearch import play_hand_lab_enqueue
 from autoresearch import play_hand_lab_memory_deep
-from autoresearch.durable_execution import DurableExecutionJournal
+from autoresearch.durable_execution import DurableExecutionError, DurableExecutionJournal
+from autoresearch.evidence_plan import canonical_sha256
 
 
 class _AcceptingGateway:
@@ -209,3 +212,154 @@ def test_compacted_terminal_sweep_spec_omits_policy_assignment() -> None:
     assert "policy_assignment" not in spec
     assert "params_by_index" not in spec
     assert "large_transient_payload" not in spec
+
+
+def _sealed_terminal_sweep_journal(tmp_path: Path) -> tuple[DurableExecutionJournal, dict[str, Any]]:
+    task_id = "phase3-lane-00001-task-00001-coarse_probe-shard-0000"
+    params_by_index = {
+        "0": {"indicator[0].talib.timeperiod": 8},
+        "1": {"indicator[0].talib.timeperiod": 14},
+    }
+    envelope = {
+        "task_id": task_id,
+        "lane_id": "lane_0001",
+        "task_kind": "sweep_shard",
+        "payload": {
+            "sweep_id": "lane-00001-coarse-probe",
+            "shard_id": "lane-00001-coarse-probe-shard-0000",
+            "params_by_index": params_by_index,
+        },
+    }
+    journal = _journal(tmp_path / "play-hand-lab-execution-journal.json")
+    journal.apply_batch(
+        registrations=[(task_id, envelope)],
+        completions=[(task_id, {"recorded_result": {"status": "success"}})],
+    )
+    reader = _journal(journal.path)
+    reader.load()
+    return reader, envelope
+
+
+def test_compacted_sweep_merge_restores_sealed_register_params(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal, envelope = _sealed_terminal_sweep_journal(tmp_path)
+    task_id = str(envelope["task_id"])
+    params_by_index = envelope["payload"]["params_by_index"]
+    spec = {
+        "task_kind": "sweep_shard",
+        "sweep_id": envelope["payload"]["sweep_id"],
+        "shard_id": envelope["payload"]["shard_id"],
+        "params_by_index_sha256": canonical_sha256(params_by_index),
+    }
+
+    class _Lane:
+        lane_id = "lane_0001"
+        phase_task_ids = {"coarse_probe": [task_id]}
+        task_specs = {task_id: spec}
+
+    monkeypatch.setattr(play_hand_lab_memory_deep, "_ACTIVE_PLAY_HAND_JOURNAL", journal)
+    monkeypatch.setattr(
+        play_hand_lab,
+        "_rebuild_sweep_shard_params_by_index",
+        lambda *_args: pytest.fail("sealed task should not be recomputed from mutable lane state"),
+    )
+
+    restored = play_hand_lab_memory_deep._restore_sweep_params(
+        play_hand_lab,
+        _Lane(),
+        "coarse_probe",
+    )
+
+    assert restored == [task_id]
+    assert spec["params_by_index"] == params_by_index
+
+
+def test_compacted_sweep_merge_rejects_sealed_param_hash_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal, envelope = _sealed_terminal_sweep_journal(tmp_path)
+    task_id = str(envelope["task_id"])
+    spec = {
+        "task_kind": "sweep_shard",
+        "sweep_id": envelope["payload"]["sweep_id"],
+        "shard_id": envelope["payload"]["shard_id"],
+        "params_by_index_sha256": "sha256:" + "0" * 64,
+    }
+
+    class _Lane:
+        lane_id = "lane_0001"
+        phase_task_ids = {"coarse_probe": [task_id]}
+        task_specs = {task_id: spec}
+
+    monkeypatch.setattr(play_hand_lab_memory_deep, "_ACTIVE_PLAY_HAND_JOURNAL", journal)
+
+    with pytest.raises(DurableExecutionError, match="sealed sweep params conflict"):
+        play_hand_lab_memory_deep._restore_sweep_params(
+            play_hand_lab,
+            _Lane(),
+            "coarse_probe",
+        )
+
+
+def test_compacted_sweep_merge_requires_a_sealed_param_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal, envelope = _sealed_terminal_sweep_journal(tmp_path)
+    task_id = str(envelope["task_id"])
+    spec = {
+        "task_kind": "sweep_shard",
+        "sweep_id": envelope["payload"]["sweep_id"],
+        "shard_id": envelope["payload"]["shard_id"],
+    }
+
+    class _Lane:
+        lane_id = "lane_0001"
+        phase_task_ids = {"coarse_probe": [task_id]}
+        task_specs = {task_id: spec}
+
+    monkeypatch.setattr(play_hand_lab_memory_deep, "_ACTIVE_PLAY_HAND_JOURNAL", journal)
+
+    with pytest.raises(DurableExecutionError, match="no params identity"):
+        play_hand_lab_memory_deep._restore_sweep_params(
+            play_hand_lab,
+            _Lane(),
+            "coarse_probe",
+        )
+
+
+def test_compacted_sweep_merge_falls_back_only_when_task_is_not_in_active_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    journal, _envelope = _sealed_terminal_sweep_journal(tmp_path)
+    task_id = "different-campaign-lane-00001-task-00001-coarse_probe-shard-0000"
+    rebuilt = {"0": {"indicator[0].talib.timeperiod": 8}}
+    spec = {
+        "task_kind": "sweep_shard",
+        "params_by_index_sha256": canonical_sha256(rebuilt),
+    }
+
+    class _Lane:
+        lane_id = "lane_0001"
+        phase_task_ids = {"coarse_probe": [task_id]}
+        task_specs = {task_id: spec}
+
+    monkeypatch.setattr(play_hand_lab_memory_deep, "_ACTIVE_PLAY_HAND_JOURNAL", journal)
+    monkeypatch.setattr(
+        play_hand_lab,
+        "_rebuild_sweep_shard_params_by_index",
+        lambda *_args: rebuilt,
+    )
+
+    restored = play_hand_lab_memory_deep._restore_sweep_params(
+        play_hand_lab,
+        _Lane(),
+        "coarse_probe",
+    )
+
+    assert restored == [task_id]
+    assert spec["params_by_index"] == rebuilt
