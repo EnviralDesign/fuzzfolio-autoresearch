@@ -76,8 +76,6 @@ def enqueue_gateway_tasks_with_retries(
         track_live_task_payloads,
     )
 
-    # The caller later retains these same task envelopes in its live-task projection.
-    # Track them before transport without mutating their payload or identity.
     track_live_task_payloads(tasks)
 
     max_failures = max(int(failure_limit), 1)
@@ -168,29 +166,33 @@ def enqueue_gateway_tasks_with_retries(
 
         release_resume_enqueue_memory(tasks)
     elif released_copies:
-        # Most payloads are acyclic, but a bounded collection after a large top-up
-        # makes stale cycles and detached canonical snapshots promptly reclaimable.
         gc.collect()
     return aggregate
 
 
 def install_bounded_gateway_enqueue() -> None:
-    """Install coordinator transport, memory, and duplicate-result safeguards."""
+    """Install coordinator transport, memory, recovery, and throughput safeguards."""
     from . import play_hand_lab
     from .play_hand_lab_duplicate_results import (
         install_play_hand_lab_duplicate_result_recovery,
+    )
+    from .play_hand_lab_gateway_runtime import (
+        install_play_hand_gateway_runtime_bounds,
     )
     from .play_hand_lab_memory import install_play_hand_lab_memory_bounds
     from .play_hand_lab_memory_deep import install_play_hand_lab_deep_memory_bounds
     from .play_hand_lab_policy_resume import (
         install_play_hand_policy_resume_recovery,
     )
+    from .play_hand_lab_throughput import install_play_hand_throughput_bounds
 
     play_hand_lab._enqueue_gateway_tasks_with_retries = enqueue_gateway_tasks_with_retries
     install_play_hand_lab_memory_bounds()
     install_play_hand_lab_duplicate_result_recovery()
     install_play_hand_lab_deep_memory_bounds()
     install_play_hand_policy_resume_recovery()
+    install_play_hand_throughput_bounds()
+    install_play_hand_gateway_runtime_bounds()
 
 
 __all__ = [
