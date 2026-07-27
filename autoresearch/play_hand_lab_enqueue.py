@@ -55,19 +55,7 @@ def enqueue_gateway_tasks_with_retries(
     failure_limit: int,
     retry_base_seconds: float,
 ) -> dict[str, Any]:
-    """Enqueue tasks in bounded, 413-adaptive batches.
-
-    Resume can contain hundreds of unresolved tasks whose restored profile snapshots
-    make one combined request larger than the gateway body limit. Start with a
-    conservative task-count bound, then bisect only the batch rejected with 413.
-    Gateway task ids are idempotent, so a later retry after partial success is safe.
-
-    Once every batch has been accepted (or rejected as an existing duplicate), the
-    coordinator no longer needs to retain the executable worker envelope. The gateway
-    and append-only journal are authoritative, while the lane keeps the compact task
-    spec needed to consume the result. Compact all tracked process-local copies at
-    that point instead of waiting for the task or its entire lane to finish.
-    """
+    """Enqueue tasks in bounded, 413-adaptive batches."""
     if not tasks:
         return {}
 
@@ -77,7 +65,6 @@ def enqueue_gateway_tasks_with_retries(
     )
 
     track_live_task_payloads(tasks)
-
     max_failures = max(int(failure_limit), 1)
     retry_base = max(float(retry_base_seconds), 0.0)
     batch_limit = _enqueue_batch_task_limit()
@@ -113,7 +100,6 @@ def enqueue_gateway_tasks_with_retries(
                             error=str(exc)[:1000],
                         )
                         raise
-
                     split_at = len(batch) // 2
                     left = batch[:split_at]
                     right = batch[split_at:]
@@ -171,7 +157,7 @@ def enqueue_gateway_tasks_with_retries(
 
 
 def install_bounded_gateway_enqueue() -> None:
-    """Install coordinator transport, memory, recovery, and throughput safeguards."""
+    """Install the one default coordinator and gateway runtime path."""
     from . import play_hand_lab
     from .play_hand_lab_duplicate_results import (
         install_play_hand_lab_duplicate_result_recovery,
@@ -181,17 +167,15 @@ def install_bounded_gateway_enqueue() -> None:
     )
     from .play_hand_lab_memory import install_play_hand_lab_memory_bounds
     from .play_hand_lab_memory_deep import install_play_hand_lab_deep_memory_bounds
-    from .play_hand_lab_policy_resume import (
-        install_play_hand_policy_resume_recovery,
-    )
+    from .play_hand_lab_startup import install_play_hand_startup_bounds
     from .play_hand_lab_throughput import install_play_hand_throughput_bounds
 
     play_hand_lab._enqueue_gateway_tasks_with_retries = enqueue_gateway_tasks_with_retries
     install_play_hand_lab_memory_bounds()
     install_play_hand_lab_duplicate_result_recovery()
     install_play_hand_lab_deep_memory_bounds()
-    install_play_hand_policy_resume_recovery()
     install_play_hand_throughput_bounds()
+    install_play_hand_startup_bounds()
     install_play_hand_gateway_runtime_bounds()
 
 
