@@ -6,6 +6,11 @@ name: Apply final PlayHand drain reductions
     paths:
       - "tools/apply_playhand_final.py"
       - ".github/workflows/apply-playhand-drain-final.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "tools/apply_playhand_final.py"
+      - ".github/workflows/apply-playhand-drain-final.yml"
 
 permissions:
   contents: write
@@ -38,6 +43,7 @@ jobs:
           tests/test_play_hand_lab_result_fastpath.py
           tests/test_play_hand_lab_memory_deep.py
       - name: Commit generated patch
+        if: github.event_name == 'push'
         run: |
           git config user.name "OpenAI"
           git config user.email "noreply@openai.com"
