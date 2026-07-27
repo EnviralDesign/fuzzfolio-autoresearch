@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import time
+from types import MappingProxyType
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -158,6 +159,19 @@ class DurableExecutionJournal:
         if self._header_sha256 is not None:
             view["journal_identity"] = self._header_sha256
         return view
+
+    def _task_mapping(self) -> Mapping[str, Any]:
+        """Return the warm task map for trusted in-process coordinator reads.
+
+        Coordinators that already own this journal can use the mapping without
+        rebuilding a shallow copy of every historical task after each batch.
+        It intentionally remains private: public load/apply views stay detached
+        snapshots, so external callers cannot treat this as a mutable journal
+        API.
+        """
+        if self._tasks is None:
+            raise DurableExecutionError("execution journal cache is not loaded")
+        return MappingProxyType(self._tasks)
 
     def _build_header(self) -> dict[str, Any]:
         header: dict[str, Any] = {

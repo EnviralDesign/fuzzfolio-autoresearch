@@ -35,6 +35,28 @@ def test_attempt_cache_survives_append_without_reparsing(tmp_path: Path) -> None
     assert after["attempt_cache_hits"] >= before["attempt_cache_hits"] + 2
 
 
+def test_attempt_cache_evicts_historical_ledgers_by_lru_budget(
+    tmp_path: Path, monkeypatch
+) -> None:
+    first_path = tmp_path / "first.jsonl"
+    second_path = tmp_path / "second.jsonl"
+    throughput._ORIGINAL_APPEND_ATTEMPT_ROW(first_path, {"attempt_id": "first"})
+    throughput._ORIGINAL_APPEND_ATTEMPT_ROW(second_path, {"attempt_id": "second"})
+    monkeypatch.setattr(throughput, "_ATTEMPT_CACHE_MAX_ENTRIES", 1)
+    monkeypatch.setattr(throughput, "_ATTEMPT_CACHE_MAX_SOURCE_BYTES", 1_000_000)
+    with throughput._LOCK:
+        throughput._ATTEMPT_CACHE.clear()
+        throughput._ATTEMPT_CACHE_SOURCE_BYTES = 0
+
+    ledger.load_attempts(first_path)
+    ledger.load_attempts(second_path)
+
+    diagnostics = throughput.throughput_diagnostics()
+    assert diagnostics["attempt_cache_entries"] == 1
+    assert diagnostics["attempt_cache_source_bytes"] == second_path.stat().st_size
+    assert diagnostics["attempt_cache_evictions"] >= 1
+
+
 def test_pending_sweep_receipt_stores_artifact_reference_not_ranked_payload(
     tmp_path: Path,
 ) -> None:

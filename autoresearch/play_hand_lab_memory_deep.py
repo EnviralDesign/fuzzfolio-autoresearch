@@ -74,7 +74,6 @@ _RECORDED_SAMPLE_KEYS = (
     "analysis_window_end",
     "evidence_plan_id",
     "evidence_role",
-    "policy_assignment",
 )
 
 

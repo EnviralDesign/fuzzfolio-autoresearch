@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -23,14 +24,22 @@ _ORIGINAL_WRITE_LANE_METADATA: Any = None
 _ORIGINAL_RENDER_LANE_PROGRESS: Any = None
 _ORIGINAL_FORMAT_BARRIER: Any = None
 
-# path -> ((mtime_ns, size), immutable-ish parsed rows)
-_ATTEMPT_CACHE: dict[str, tuple[tuple[int, int], list[dict[str, Any]]]] = {}
+# Attempt ledgers can be tens of megabytes each. The coordinator needs recent
+# active ledgers, not the complete historical corpus in RAM.
+_ATTEMPT_CACHE_MAX_ENTRIES = 32
+_ATTEMPT_CACHE_MAX_SOURCE_BYTES = 128 * 1024 * 1024
+# path -> ((mtime_ns, size), parsed rows, source bytes)
+_ATTEMPT_CACHE: OrderedDict[
+    str, tuple[tuple[int, int], list[dict[str, Any]], int]
+] = OrderedDict()
+_ATTEMPT_CACHE_SOURCE_BYTES = 0
 _STATE_LAST_WRITE_AT: dict[str, float] = {}
 _STATE_LAST_SHAPE: dict[str, tuple[int, tuple[int, ...], int]] = {}
 _LANE_LAST_WRITE_AT: dict[str, float] = {}
 _COUNTERS: dict[str, int] = {
     "attempt_cache_hits": 0,
     "attempt_cache_misses": 0,
+    "attempt_cache_evictions": 0,
     "campaign_state_writes": 0,
     "campaign_state_writes_skipped": 0,
     "lane_metadata_writes": 0,
@@ -52,6 +61,38 @@ def _file_signature(path: Path | str) -> tuple[int, int]:
     return (int(stat.st_mtime_ns), int(stat.st_size))
 
 
+def _remove_attempt_cache_entry(key: str) -> None:
+    global _ATTEMPT_CACHE_SOURCE_BYTES
+    removed = _ATTEMPT_CACHE.pop(key, None)
+    if removed is not None:
+        _ATTEMPT_CACHE_SOURCE_BYTES = max(
+            0,
+            _ATTEMPT_CACHE_SOURCE_BYTES - int(removed[2]),
+        )
+
+
+def _store_attempt_cache_entry(
+    key: str,
+    signature: tuple[int, int],
+    rows: list[dict[str, Any]],
+) -> None:
+    global _ATTEMPT_CACHE_SOURCE_BYTES
+    _remove_attempt_cache_entry(key)
+    source_bytes = max(int(signature[1]), 0)
+    _ATTEMPT_CACHE[key] = (signature, rows, source_bytes)
+    _ATTEMPT_CACHE_SOURCE_BYTES += source_bytes
+    while _ATTEMPT_CACHE and (
+        len(_ATTEMPT_CACHE) > _ATTEMPT_CACHE_MAX_ENTRIES
+        or _ATTEMPT_CACHE_SOURCE_BYTES > _ATTEMPT_CACHE_MAX_SOURCE_BYTES
+    ):
+        _evicted_key, entry = _ATTEMPT_CACHE.popitem(last=False)
+        _ATTEMPT_CACHE_SOURCE_BYTES = max(
+            0,
+            _ATTEMPT_CACHE_SOURCE_BYTES - int(entry[2]),
+        )
+        _COUNTERS["attempt_cache_evictions"] += 1
+
+
 def _counter(name: str, amount: int = 1) -> None:
     with _LOCK:
         _COUNTERS[name] = int(_COUNTERS.get(name, 0)) + int(amount)
@@ -59,7 +100,10 @@ def _counter(name: str, amount: int = 1) -> None:
 
 def throughput_diagnostics() -> dict[str, int]:
     with _LOCK:
-        return dict(_COUNTERS)
+        diagnostics = dict(_COUNTERS)
+        diagnostics["attempt_cache_entries"] = len(_ATTEMPT_CACHE)
+        diagnostics["attempt_cache_source_bytes"] = _ATTEMPT_CACHE_SOURCE_BYTES
+        return diagnostics
 
 
 def _phase3_runtime(runtime: Any) -> bool:
@@ -112,12 +156,15 @@ def _cached_load_attempts(path: Path) -> list[dict[str, Any]]:
     with _LOCK:
         cached = _ATTEMPT_CACHE.get(key)
         if cached is not None and cached[0] == signature:
+            _ATTEMPT_CACHE.move_to_end(key)
             _COUNTERS["attempt_cache_hits"] += 1
             return [dict(row) for row in cached[1]]
+        if cached is not None:
+            _remove_attempt_cache_entry(key)
     rows = _ORIGINAL_LOAD_ATTEMPTS(path)
     snapshot = [dict(row) for row in rows]
     with _LOCK:
-        _ATTEMPT_CACHE[key] = (signature, snapshot)
+        _store_attempt_cache_entry(key, signature, snapshot)
         _COUNTERS["attempt_cache_misses"] += 1
     return [dict(row) for row in snapshot]
 
@@ -130,10 +177,10 @@ def _cached_append_attempt_row(path: Path, row: Mapping[str, Any]) -> None:
     with _LOCK:
         cached = _ATTEMPT_CACHE.get(key)
         if cached is not None and cached[0] == before:
-            updated = [*cached[1], dict(row)]
-            _ATTEMPT_CACHE[key] = (after, updated)
+            cached[1].append(dict(row))
+            _store_attempt_cache_entry(key, after, cached[1])
         else:
-            _ATTEMPT_CACHE.pop(key, None)
+            _remove_attempt_cache_entry(key)
 
 
 def _without_ranked_alias(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -363,7 +410,9 @@ def install_play_hand_throughput_bounds() -> None:
                 f"{diagnostics['campaign_state_writes_skipped']} metadata-skips="
                 f"{diagnostics['lane_metadata_writes_skipped']} plot-skips="
                 f"{diagnostics['progress_renders_skipped']} compact-sweeps="
-                f"{diagnostics['sweep_receipts_compacted']}"
+                f"{diagnostics['sweep_receipts_compacted']} attempt-cache="
+                f"{diagnostics['attempt_cache_entries']}@"
+                f"{diagnostics['attempt_cache_source_bytes'] // (1024 * 1024)}MB"
             )
             lines = rendered.splitlines()
             if lines:

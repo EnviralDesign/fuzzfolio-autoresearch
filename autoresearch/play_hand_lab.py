@@ -12,10 +12,10 @@ import random
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 import requests
 from rich.console import Console
@@ -479,9 +479,15 @@ def _attach_task_profile_snapshots(task: dict[str, Any], campaign_dir: Path) -> 
 
 
 def _lane_state_payload(lane: LabLaneState) -> dict[str, Any]:
-    payload = asdict(lane)
+    # The state writer serializes this mapping immediately. Projecting fields
+    # directly avoids an asdict() deep copy of every historical terminal lane
+    # before the JSON encoder writes the same values to disk.
+    payload = {
+        descriptor.name: getattr(lane, descriptor.name)
+        for descriptor in fields(lane)
+    }
     for key in ("run_dir", "profile_path", "incumbent_profile_path"):
-        value = payload.get(key)
+        value = getattr(lane, key)
         payload[key] = str(value) if value is not None else None
     for key in ("completed_task_ids", "failed_task_ids"):
         payload[key] = sorted(getattr(lane, key))
@@ -5335,7 +5341,10 @@ def _terminal_receipt_for_result(
         raise DurableExecutionError(
             f"derived task receipt conflicts for source task {task_id}"
         )
-    updated = copy.deepcopy(receipt)
+    # _persist_task_result_receipt canonicalizes and seals its own snapshot.
+    # Only this top-level field changes, so copying the full receipt here
+    # duplicates large recorded-result payloads for every completion.
+    updated = dict(receipt)
     updated["derived_tasks"] = canonical_tasks
     return _persist_task_result_receipt(
         receipt_path,
@@ -6893,6 +6902,12 @@ def _compact_terminal_lane_state(lane: LabLaneState) -> None:
     lane.task_specs.clear()
     lane.phase_rows.clear()
     lane.phase_results.clear()
+    # The canonical lane-level assignment remains required for strict resume.
+    # Lifecycle events are audit narration and previously retained another full
+    # copy of that assignment for every terminal lane.
+    for event in lane.phase_lifecycle_events:
+        if isinstance(event, dict):
+            event.pop("policy_assignment", None)
 
 
 def _release_completed_phase_payload(lane: LabLaneState, phase: str) -> None:
@@ -7549,8 +7564,8 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         execution_id=str(runtime.execution_plan_id or campaign_id),
         lineage=_campaign_state_lineage(runtime, campaign_id),
     )
-    journal_payload = journal.load(create=not bool(runtime.resume))
-    durable_tasks_by_id = journal_payload["tasks"]
+    journal.load(create=not bool(runtime.resume))
+    durable_tasks_by_id = journal._task_mapping()
     _write_campaign_metadata(campaign_ctx, runtime=runtime, status="starting", started_at=started_at)
     _append_event(
         campaign_ctx,
@@ -7618,6 +7633,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     lanes: list[LabLaneState] = []
     tasks: list[dict[str, Any]] = []
     lanes_by_task: dict[str, LabLaneState] = {}
+    lanes_by_id: dict[str, LabLaneState] = {}
     lane_contexts: dict[str, PlayHandContext] = {}
     history = LabCampaignHistory()
     target_runs = runtime.target_runs if runtime.campaign_mode == "finite" else None
@@ -7633,6 +7649,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             campaign_id=campaign_id,
         )
         for lane in lanes:
+            lanes_by_id[lane.lane_id] = lane
             lane_cli = FuzzfolioCli(config.fuzzfolio)
             lane_ctx = _new_context(
                 config=config,
@@ -7669,6 +7686,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             for _task_id, item in sorted(durable_tasks_by_id.items())
             if isinstance(item, dict) and item.get("status") != "terminal"
         ]
+    task_ids_in_tasks = {str(task.get("task_id") or "") for task in tasks}
     history.campaign_policy_state = _campaign_policy_state(
         campaign_policy,
         runtime=runtime,
@@ -7696,12 +7714,10 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             (task_id, _detach_task_profile_snapshots(task, campaign_dir))
             for task_id, task in (registrations or ())
         ]
-        updated = journal.apply_batch(
+        journal.apply_batch(
             registrations=detached_registrations,
             completions=completions or (),
         )
-        durable_tasks_by_id.clear()
-        durable_tasks_by_id.update(updated["tasks"])
 
     if runtime.resume:
         recovered_tasks: list[dict[str, Any]] = []
@@ -7795,16 +7811,15 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     )
             else:
                 recovered_registrations.append((task_id, task))
-            if not any(
-                str(existing.get("task_id") or "") == str(task["task_id"])
-                for existing in tasks
-            ):
+            if task_id not in task_ids_in_tasks:
                 tasks.append(task)
-            lane = next(
-                candidate
-                for candidate in lanes
-                if candidate.lane_id == str(task.get("lane_id") or "")
-            )
+                task_ids_in_tasks.add(task_id)
+            lane_id = str(task.get("lane_id") or "")
+            lane = lanes_by_id.get(lane_id)
+            if lane is None:
+                raise DurableExecutionError(
+                    f"recovered task references unknown lane: {task_id}"
+                )
             lanes_by_task[str(task["task_id"])] = lane
         if recovered_registrations:
             apply_journal_batch(registrations=recovered_registrations)
@@ -7975,6 +7990,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
 
     def register_lane(lane: LabLaneState, lane_ctx: PlayHandContext) -> None:
         lanes.append(lane)
+        lanes_by_id[lane.lane_id] = lane
         lane_contexts[lane.run_id] = lane_ctx
 
     def prepare_lane(lane_index: int) -> LabLaneState:
@@ -8077,6 +8093,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             retry_base_seconds=runtime.enqueue_retry_base_seconds,
         )
         tasks.extend(new_tasks)
+        task_ids_in_tasks.update(str(task.get("task_id") or "") for task in new_tasks)
         for lane in new_lanes:
             for task_id in lane.task_ids:
                 lanes_by_task[task_id] = lane
@@ -8118,6 +8135,12 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     ) -> None:
         if not new_tasks:
             return
+        for task in new_tasks:
+            lane_id = str(task.get("lane_id") or "")
+            if lane_id not in lanes_by_id:
+                raise DurableExecutionError(
+                    f"new task references unknown lane: {task.get('task_id')}"
+                )
         if not journal_registered:
             apply_journal_batch(
                 registrations=[(str(task["task_id"]), task) for task in new_tasks]
@@ -8132,17 +8155,20 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             failure_limit=runtime.enqueue_failure_limit,
             retry_base_seconds=runtime.enqueue_retry_base_seconds,
         )
-        existing_task_ids = {str(task.get("task_id") or "") for task in tasks}
-        tasks.extend(
+        tasks_to_add = [
             task
             for task in new_tasks
-            if str(task.get("task_id") or "") not in existing_task_ids
+            if str(task.get("task_id") or "") not in task_ids_in_tasks
+        ]
+        tasks.extend(tasks_to_add)
+        task_ids_in_tasks.update(
+            str(task.get("task_id") or "") for task in tasks_to_add
         )
         for task in new_tasks:
             task_id = str(task.get("task_id") or "")
             lane_id = str(task.get("lane_id") or "")
-            lane = next((candidate for candidate in lanes if candidate.lane_id == lane_id), None)
-            if task_id and lane is not None:
+            lane = lanes_by_id[lane_id]
+            if task_id:
                 lanes_by_task[task_id] = lane
         _append_event(
             campaign_ctx,
@@ -8268,6 +8294,12 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     def terminal_lane_ready_for_retention(lane: LabLaneState) -> bool:
         return bool(lane.task_ids) and (lane.terminal or lane_terminal_count(lane) >= len(lane.task_ids))
 
+    retained_terminal_lanes = {
+        lane.run_id: lane
+        for lane in lanes
+        if terminal_lane_ready_for_retention(lane)
+    }
+
     def render_before_prune(lane: LabLaneState) -> None:
         if lane.run_id not in dirty_progress_run_ids:
             return
@@ -8287,12 +8319,22 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             )
         dirty_progress_run_ids.discard(lane.run_id)
 
-    def prune_terminal_lane_history() -> None:
+    def prune_terminal_lane_history(
+        candidates: Iterable[LabLaneState] | None = None,
+    ) -> None:
         retention = max(int(runtime.terminal_lane_retention), 0)
-        terminal_lanes = [lane for lane in lanes if terminal_lane_ready_for_retention(lane)]
+        candidate_lanes = lanes if candidates is None else candidates
+        newly_terminal_lanes: list[LabLaneState] = []
+        for lane in candidate_lanes:
+            if (
+                terminal_lane_ready_for_retention(lane)
+                and lane.run_id not in retained_terminal_lanes
+            ):
+                retained_terminal_lanes[lane.run_id] = lane
+                newly_terminal_lanes.append(lane)
         terminal_task_ids = {
             task_id
-            for lane in terminal_lanes
+            for lane in newly_terminal_lanes
             for task_id in lane.task_ids
             if task_id in lane.completed_task_ids or task_id in lane.failed_task_ids
         }
@@ -8302,14 +8344,18 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 for task in tasks
                 if str(task.get("task_id") or "") not in terminal_task_ids
             ]
-        for lane in terminal_lanes:
+            task_ids_in_tasks.difference_update(terminal_task_ids)
+        for lane in newly_terminal_lanes:
             _compact_terminal_lane_state(lane)
-        overflow = len(terminal_lanes) - retention
+        overflow = len(retained_terminal_lanes) - retention
         if overflow <= 0:
             return
         prune_ids = {
             lane.run_id
-            for lane in sorted(terminal_lanes, key=lambda candidate: candidate.lane_index)[:overflow]
+            for lane in sorted(
+                retained_terminal_lanes.values(),
+                key=lambda candidate: candidate.lane_index,
+            )[:overflow]
         }
         retained_lanes: list[LabLaneState] = []
         pruned_task_ids: set[str] = set()
@@ -8333,16 +8379,21 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     else max(history.best_score, lane.best_score)
                 )
             pruned_task_ids.update(lane.task_ids)
+            retained_terminal_lanes.pop(lane.run_id, None)
+            lanes_by_id.pop(lane.lane_id, None)
             lane_contexts.pop(lane.run_id, None)
             dirty_progress_run_ids.discard(lane.run_id)
         if len(retained_lanes) != len(lanes):
             lanes[:] = retained_lanes
         for task_id in pruned_task_ids:
             lanes_by_task.pop(task_id, None)
+        task_ids_in_tasks.difference_update(pruned_task_ids)
 
-    def compact_terminal_lane_payloads() -> None:
+    def compact_terminal_lane_payloads(
+        candidates: Iterable[LabLaneState] | None = None,
+    ) -> None:
         """Shrink terminal lane payloads without changing retention membership."""
-        for lane in lanes:
+        for lane in (lanes if candidates is None else candidates):
             if terminal_lane_ready_for_retention(lane):
                 _compact_terminal_lane_state(lane)
 
@@ -8583,16 +8634,14 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 _result_consumption_checkpoint("after_derived_task_registration")
             for task in deferred_tasks:
                 task_id = str(task["task_id"])
-                if not any(
-                    str(existing.get("task_id") or "") == task_id
-                    for existing in tasks
-                ):
+                if task_id not in task_ids_in_tasks:
                     tasks.append(task)
-                lane = next(
-                    candidate
-                    for candidate in lanes
-                    if candidate.lane_id == str(task.get("lane_id") or "")
-                )
+                    task_ids_in_tasks.add(task_id)
+                lane = lanes_by_id.get(str(task.get("lane_id") or ""))
+                if lane is None:
+                    raise DurableExecutionError(
+                        f"derived task references unknown lane: {task_id}"
+                    )
                 lanes_by_task[task_id] = lane
             for lane in touched_lanes.values():
                 _write_lane_metadata(
@@ -8602,7 +8651,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     status=lane_run_status(lane),
                     started_at=started_at,
                 )
-            compact_terminal_lane_payloads()
+            compact_terminal_lane_payloads(touched_lanes.values())
             persist_campaign_state()
             if defer_enqueues:
                 _result_consumption_checkpoint("before_result_ack")
@@ -8628,7 +8677,7 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                 )
         if not defer_enqueues:
             create_and_enqueue_more()
-        prune_terminal_lane_history()
+        prune_terminal_lane_history(touched_lanes.values())
         return deferred_tasks
 
     if runtime.resume:

@@ -163,6 +163,24 @@ def test_journal_applies_registrations_and_completions_with_one_append(
     assert appends == 1
 
 
+def test_private_task_mapping_tracks_warm_updates_without_snapshot_copy(tmp_path: Path) -> None:
+    journal = DurableExecutionJournal(
+        tmp_path / "journal.json",
+        execution_id="plan-1",
+        lineage={"cutoff": "A"},
+    )
+    journal.load(create=True)
+    tasks = journal._task_mapping()
+
+    journal.apply_batch(registrations=[("task-1", {"value": 1})])
+    assert tasks["task-1"]["status"] == "pending"
+    with pytest.raises(TypeError):
+        tasks["task-2"] = {"status": "pending"}  # type: ignore[index]
+
+    journal.apply_batch(completions=[("task-1", {"status": "calculated"})])
+    assert tasks["task-1"]["status"] == "terminal"
+
+
 def test_journal_batch_conflict_does_not_persist_partial_changes(tmp_path: Path) -> None:
     path = tmp_path / "journal.json"
     journal = DurableExecutionJournal(

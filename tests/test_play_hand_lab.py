@@ -4,7 +4,7 @@ import copy
 import json
 import random
 import threading
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1363,6 +1363,10 @@ def test_compact_terminal_lane_state_drops_heavy_payloads(tmp_path: Path) -> Non
     lane.phase_results["baseline"] = [{"result": 1}]
     lane.last_sweep_payload = {"large": "sweep"}
     lane.instrument_scout_result = {"large": "scout"}
+    lane.policy_assignment = {"large": "canonical-policy"}
+    lane.phase_lifecycle_events.append(
+        {"event": "policy_lane_exhausted", "policy_assignment": {"large": "duplicate"}}
+    )
     lane.best_score = 77.0
 
     lab._compact_terminal_lane_state(lane)
@@ -1374,8 +1378,40 @@ def test_compact_terminal_lane_state_drops_heavy_payloads(tmp_path: Path) -> Non
     assert lane.task_specs == {}
     assert lane.phase_rows == []
     assert lane.phase_results == {}
+    assert lane.policy_assignment == {"large": "canonical-policy"}
+    assert lane.phase_lifecycle_events == [{"event": "policy_lane_exhausted"}]
     assert lane.best_score == 77.0
     assert lane.task_ids == ["task-1"]
+
+
+def test_lane_state_payload_matches_legacy_projection_without_deep_copy(
+    tmp_path: Path,
+) -> None:
+    lane = lab.LabLaneState(
+        lane_id="lane_001",
+        lane_index=1,
+        run_id="run-1",
+        run_dir=tmp_path / "run",
+        profile_path=tmp_path / "profile.json",
+        profile_payload={"large": ["profile"]},
+        incumbent_profile_path=tmp_path / "incumbent.json",
+        incumbent_profile_payload={"large": ["incumbent"]},
+        phase_lifecycle_events=[{"event": "baseline"}],
+    )
+    lane.completed_task_ids.add("task-1")
+    lane.task_specs["task-1"] = {"payload": "omitted"}
+
+    expected = asdict(lane)
+    for key in ("run_dir", "profile_path", "incumbent_profile_path"):
+        value = expected.get(key)
+        expected[key] = str(value) if value is not None else None
+    for key in ("completed_task_ids", "failed_task_ids"):
+        expected[key] = sorted(getattr(lane, key))
+    expected["profile_payload"] = None
+    expected["incumbent_profile_payload"] = None
+    expected["task_specs"] = {}
+
+    assert lab._lane_state_payload(lane) == expected
 
 
 def test_lab_failure_notice_includes_lane_task_phase_and_reason() -> None:
