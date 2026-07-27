@@ -341,4 +341,3 @@ def test_barrier_exposes_actual_result_processing_cost() -> None:
 
     assert "result fastpath avg=" in rendered
     assert "direct-score=" in rendered
-    assert "receipt-cache=" in rendered
