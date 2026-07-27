@@ -27,6 +27,8 @@ _INSTALLED = False
 
 _ORIGINAL_JOURNAL_LOAD_FROM_DISK: Any = None
 _ORIGINAL_HYDRATE_UNRESOLVED_TASK_SPECS: Any = None
+_ORIGINAL_RECOMPUTE_POLICY_STATE: Any = None
+_ORIGINAL_LOAD_RUN_METADATA: Any = None
 _ORIGINAL_WRITE_CAMPAIGN_STATE: Any = None
 _ORIGINAL_FORMAT_BARRIER: Any = None
 
@@ -502,7 +504,37 @@ def _load_campaign_state_fast(
     )
 
 
-def _recompute_policy_state_fast(
+class _LanePolicyTaskSpecs(Mapping[str, dict[str, Any]]):
+    """Present one immutable lane assignment for every historical task ID."""
+
+    def __init__(
+        self,
+        task_ids: Iterable[str],
+        assignment: Mapping[str, Any],
+    ) -> None:
+        self._task_ids = frozenset(str(item) for item in task_ids)
+        self._spec = {"policy_assignment": dict(assignment)}
+
+    def __getitem__(self, key: str) -> dict[str, Any]:
+        if str(key) not in self._task_ids:
+            raise KeyError(key)
+        return self._spec
+
+    def get(
+        self,
+        key: str,
+        default: Any = None,
+    ) -> dict[str, Any] | Any:
+        return self._spec if str(key) in self._task_ids else default
+
+    def __iter__(self):
+        return iter(self._task_ids)
+
+    def __len__(self) -> int:
+        return len(self._task_ids)
+
+
+def _recompute_policy_state_without_terminal_io(
     play_hand_lab: Any,
     policy_state: dict[str, Any],
     *,
@@ -511,180 +543,53 @@ def _recompute_policy_state_fast(
     durable_tasks_by_id: Mapping[str, Any],
     pruned_lane_count: int,
 ) -> dict[str, Any]:
-    """Rebuild policy accounting from lanes without reopening terminal payloads."""
-
-    if pruned_lane_count:
-        raise DurableExecutionError(
-            "policy-honest resume cannot verify pruned lane assignments"
-        )
-
-    # The static policy identity is immutable and only read below. Replacing the
-    # mutable accounting maps avoids copying the complete finite lane plan.
-    rebuilt = dict(policy_state)
-    lane_plan = rebuilt.get("lane_plan")
-    planned = rebuilt.get("planned_lane_counts")
-    if not isinstance(lane_plan, list) or not isinstance(planned, dict):
-        raise DurableExecutionError("policy state has no durable lane allocation")
-    dimensions = ("family", "recipe", "instrument", "timeframe", "indicator")
-    rebuilt["assigned_lane_counts"] = {lane: 0 for lane in planned}
-    rebuilt["used_lane_counts"] = {lane: 0 for lane in planned}
-    rebuilt["exhausted_lane_counts"] = {lane: 0 for lane in planned}
-    rebuilt["accounting"] = {dimension: {} for dimension in dimensions}
-    rebuilt["exhaustion_outcomes"] = {}
+    """Reuse the canonical verifier without reopening terminal payloads or metadata."""
 
     durable_task_ids = set(durable_tasks_by_id)
-    lanes_by_task: dict[str, Any] = {}
-    seen_lane_indices: set[int] = set()
-    for lane in sorted(lanes, key=lambda item: item.lane_index):
-        if lane.lane_index in seen_lane_indices:
+    original_specs: list[tuple[Any, Any]] = []
+    metadata_by_run_dir: dict[str, dict[str, Any]] = {}
+    task_count = 0
+    for lane in lanes:
+        task_ids = [str(item) for item in lane.task_ids]
+        missing = [task_id for task_id in task_ids if task_id not in durable_task_ids]
+        if missing:
             raise DurableExecutionError(
-                f"duplicate durable policy lane index: {lane.lane_index}"
+                f"durable policy lane has no task: {missing[0]}"
             )
-        seen_lane_indices.add(lane.lane_index)
-        expected_lane = play_hand_lab._policy_lane_for_index(
-            rebuilt,
-            lane.lane_index,
+        task_count += len(task_ids)
+        original_specs.append((lane, lane.task_specs))
+        lane.task_specs = _LanePolicyTaskSpecs(
+            task_ids,
+            lane.policy_assignment,
         )
-        assignment = lane.policy_assignment
-        if not isinstance(assignment, dict) or not assignment:
-            raise DurableExecutionError(
-                f"durable policy lane has no assignment: {lane.lane_id}"
-            )
-        if (
-            assignment.get("policy_lane") != expected_lane
-            or assignment.get("policy_manifest_sha256")
-            != rebuilt.get("policy_manifest_sha256")
-        ):
-            raise DurableExecutionError(
-                f"durable policy lane assignment mismatch: {lane.lane_id}"
-            )
-        execution = rebuilt.get("execution")
-        expected_allocation = {
-            "lane_index": lane.lane_index,
-            "planned_lane_count": planned.get(expected_lane),
-            "algorithm": (execution or {}).get("allocation_algorithm"),
-            "algorithm_version": (execution or {}).get(
-                "allocation_algorithm_version"
-            ),
-            "lane_tie_break_order": (execution or {}).get(
-                "lane_tie_break_order"
-            ),
-            "candidate_tie_break_order": (execution or {}).get(
-                "candidate_tie_break_order"
-            ),
+        metadata_by_run_dir[_path_key(lane.run_dir)] = {
+            "policy_assignment": lane.policy_assignment
         }
-        if (
-            not isinstance(execution, dict)
-            or assignment.get("allocation") != expected_allocation
-        ):
-            raise DurableExecutionError(
-                f"durable policy lane allocation mismatch: {lane.lane_id}"
-            )
-        if assignment.get("negative_prior_runtime") != rebuilt.get(
-            "negative_prior_runtime"
-        ):
-            raise DurableExecutionError(
-                f"durable policy negative-prior binding mismatch: {lane.lane_id}"
-            )
 
-        outcome = str(assignment.get("policy_outcome_type") or "")
-        cap_decision = assignment.get("cap_decision")
-        if outcome == "policy_lane_selected":
-            attributes = assignment.get("candidate_attributes")
-            if not isinstance(attributes, dict) or not isinstance(
-                cap_decision, dict
-            ):
-                raise DurableExecutionError(
-                    "durable selected policy lane has incomplete accounting: "
-                    f"{lane.lane_id}"
-                )
-            observed_cap = play_hand_lab._policy_cap_decision(
-                rebuilt,
-                attributes,
-            )
-            if (
-                observed_cap.get("outcome") != "accepted"
-                or observed_cap != cap_decision
-            ):
-                raise DurableExecutionError(
-                    f"durable policy cap decision mismatch: {lane.lane_id}"
-                )
-            play_hand_lab._record_policy_assignment(
-                rebuilt,
-                lane=expected_lane,
-                cap_decision=observed_cap,
-            )
-        elif outcome in {
-            play_hand_lab.POLICY_EXHAUSTION_OUTCOME,
-            "policy_cap_exhausted",
-        }:
-            if cap_decision is not None or lane.task_ids or not lane.terminal:
-                raise DurableExecutionError(
-                    f"durable exhausted policy lane is contradictory: {lane.lane_id}"
-                )
-            play_hand_lab._record_policy_assignment(
-                rebuilt,
-                lane=expected_lane,
-                cap_decision=None,
-                exhaustion_outcome=outcome,
-            )
-        else:
-            raise DurableExecutionError(
-                f"durable policy lane has unsupported outcome: {lane.lane_id}"
-            )
-        if int(rebuilt["assigned_lane_counts"].get(expected_lane) or 0) > int(
-            planned.get(expected_lane) or 0
-        ):
-            raise DurableExecutionError(
-                f"durable policy lane quota exceeded: {expected_lane}"
-            )
+    def cached_load_run_metadata(run_dir: Path) -> dict[str, Any]:
+        cached = metadata_by_run_dir.get(_path_key(run_dir))
+        if cached is not None:
+            return cached
+        return _ORIGINAL_LOAD_RUN_METADATA(run_dir)
 
-        for task_id in lane.task_ids:
-            task_key = str(task_id)
-            if task_key not in durable_task_ids:
-                raise DurableExecutionError(
-                    f"durable policy lane has no task: {task_key}"
-                )
-            if task_key in lanes_by_task:
-                raise DurableExecutionError(
-                    f"duplicate durable policy task id: {task_key}"
-                )
-            lanes_by_task[task_key] = lane
-
-    # Only unresolved tasks can still affect future work. Their complete envelopes
-    # remain in memory, so verify their exact assignment. Terminal tasks were
-    # already checked before their sealed completion was appended; rereading every
-    # historical register record here duplicated the journal scan and random I/O.
-    for task in unresolved_tasks:
-        task_id = str(task.get("task_id") or "")
-        lane = lanes_by_task.get(task_id)
-        if (
-            lane is None
-            or play_hand_lab._durable_task_policy_assignment(task)
-            != lane.policy_assignment
-        ):
-            raise DurableExecutionError(
-                "durable journal task policy assignment mismatch: "
-                f"{task_id or '<missing>'}"
-            )
-
-    mutable_fields = (
-        "assigned_lane_counts",
-        "used_lane_counts",
-        "exhausted_lane_counts",
-        "accounting",
-        "exhaustion_outcomes",
-    )
-    if any(
-        policy_state.get(field) != rebuilt.get(field)
-        for field in mutable_fields
-    ):
-        raise DurableExecutionError(
-            "durable campaign policy counters do not match persisted lane assignments"
+    original_loader = play_hand_lab.load_run_metadata
+    play_hand_lab.load_run_metadata = cached_load_run_metadata
+    try:
+        rebuilt = _ORIGINAL_RECOMPUTE_POLICY_STATE(
+            policy_state,
+            lanes=lanes,
+            unresolved_tasks=unresolved_tasks,
+            durable_tasks_by_id=durable_tasks_by_id,
+            pruned_lane_count=pruned_lane_count,
         )
+    finally:
+        play_hand_lab.load_run_metadata = original_loader
+        for lane, task_specs in original_specs:
+            lane.task_specs = task_specs
+
     with _LOCK:
         _DIAGNOSTICS["policy_task_payload_reads_avoided"] = max(
-            len(lanes_by_task) - len(unresolved_tasks),
+            task_count - len(unresolved_tasks),
             0,
         )
         _DIAGNOSTICS["policy_metadata_reads_avoided"] = len(lanes)
@@ -697,6 +602,8 @@ def install_play_hand_startup_bounds() -> None:
     global _INSTALLED
     global _ORIGINAL_JOURNAL_LOAD_FROM_DISK
     global _ORIGINAL_HYDRATE_UNRESOLVED_TASK_SPECS
+    global _ORIGINAL_RECOMPUTE_POLICY_STATE
+    global _ORIGINAL_LOAD_RUN_METADATA
     global _ORIGINAL_WRITE_CAMPAIGN_STATE
     global _ORIGINAL_FORMAT_BARRIER
 
@@ -713,6 +620,10 @@ def install_play_hand_startup_bounds() -> None:
         _ORIGINAL_HYDRATE_UNRESOLVED_TASK_SPECS = (
             play_hand_lab._hydrate_unresolved_lane_task_specs
         )
+        _ORIGINAL_RECOMPUTE_POLICY_STATE = (
+            play_hand_lab._recompute_campaign_policy_state_from_durable_lanes
+        )
+        _ORIGINAL_LOAD_RUN_METADATA = play_hand_lab.load_run_metadata
         _ORIGINAL_WRITE_CAMPAIGN_STATE = play_hand_lab._write_campaign_state
         _ORIGINAL_FORMAT_BARRIER = play_hand_lab._format_lab_barrier_snapshot
 
@@ -791,7 +702,7 @@ def install_play_hand_startup_bounds() -> None:
             durable_tasks_by_id: Mapping[str, Any],
             pruned_lane_count: int,
         ) -> dict[str, Any]:
-            return _recompute_policy_state_fast(
+            return _recompute_policy_state_without_terminal_io(
                 play_hand_lab,
                 policy_state,
                 lanes=lanes,
