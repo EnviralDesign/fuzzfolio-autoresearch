@@ -54,7 +54,7 @@ jobs:
             tests/test_play_hand_lab_startup.py \
             tests/test_play_hand_lab_throughput.py \
             tests/test_play_hand_lab_result_fastpath.py \
-            tests/test_play_hand_lab_memory_deep.py 2>&1 | tee focused-tests.log
+            tests/test_play_hand_lab_deep_memory.py 2>&1 | tee focused-tests.log
       - name: Upload focused test log
         if: always()
         uses: actions/upload-artifact@v4
