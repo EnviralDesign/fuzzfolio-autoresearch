@@ -10,6 +10,7 @@ name: PlayHand resilience regression tests
       - "autoresearch/play_hand_lab_gateway_runtime.py"
       - "autoresearch/play_hand_lab_memory.py"
       - "autoresearch/play_hand_lab_memory_deep.py"
+      - "autoresearch/play_hand_lab_result_fastpath.py"
       - "autoresearch/play_hand_lab_startup.py"
       - "autoresearch/play_hand_lab_throughput.py"
       - "autoresearch/play_hand_lab_duplicate_results.py"
@@ -22,6 +23,7 @@ name: PlayHand resilience regression tests
       - "tests/test_play_hand_lab_gateway_runtime.py"
       - "tests/test_play_hand_lab_memory_diagnostics.py"
       - "tests/test_play_hand_lab_memory_installation.py"
+      - "tests/test_play_hand_lab_result_fastpath.py"
       - "tests/test_play_hand_lab_startup.py"
       - "tests/test_play_hand_lab_streaming_journal_memory.py"
       - "tests/test_play_hand_lab_sweep_spec_memory.py"
@@ -43,6 +45,7 @@ name: PlayHand resilience regression tests
       - "autoresearch/play_hand_lab_gateway_runtime.py"
       - "autoresearch/play_hand_lab_memory.py"
       - "autoresearch/play_hand_lab_memory_deep.py"
+      - "autoresearch/play_hand_lab_result_fastpath.py"
       - "autoresearch/play_hand_lab_startup.py"
       - "autoresearch/play_hand_lab_throughput.py"
       - "autoresearch/play_hand_lab_duplicate_results.py"
@@ -55,6 +58,7 @@ name: PlayHand resilience regression tests
       - "tests/test_play_hand_lab_gateway_runtime.py"
       - "tests/test_play_hand_lab_memory_diagnostics.py"
       - "tests/test_play_hand_lab_memory_installation.py"
+      - "tests/test_play_hand_lab_result_fastpath.py"
       - "tests/test_play_hand_lab_startup.py"
       - "tests/test_play_hand_lab_streaming_journal_memory.py"
       - "tests/test_play_hand_lab_sweep_spec_memory.py"
@@ -111,3 +115,4 @@ jobs:
           python -m pytest -q
           tests/test_play_hand_lab_gateway_runtime.py
           tests/test_play_hand_lab_throughput.py
+          tests/test_play_hand_lab_result_fastpath.py
