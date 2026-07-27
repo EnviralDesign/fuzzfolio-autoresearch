@@ -5,11 +5,13 @@ name: Apply final PlayHand drain reductions
     branches: [agent/playhand-drain-final]
     paths:
       - "tools/apply_playhand_final.py"
+      - "tools/run_apply_playhand_final.py"
       - ".github/workflows/apply-playhand-drain-final.yml"
   pull_request:
     branches: [master]
     paths:
       - "tools/apply_playhand_final.py"
+      - "tools/run_apply_playhand_final.py"
       - ".github/workflows/apply-playhand-drain-final.yml"
 
 permissions:
@@ -31,7 +33,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          python tools/apply_playhand_final.py 2>&1 | tee apply-playhand.log
+          python tools/run_apply_playhand_final.py 2>&1 | tee apply-playhand.log
       - name: Upload apply log
         if: always()
         uses: actions/upload-artifact@v4
