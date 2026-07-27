@@ -44,6 +44,9 @@ _DIAGNOSTICS: dict[str, Any] = {
     "policy_task_payload_reads_avoided": 0,
     "policy_metadata_reads_avoided": 0,
     "initial_state_rewrites_skipped": 0,
+    "campaign_state_stream_peak_bytes": 0,
+    "terminal_policy_assignments_compacted": 0,
+    "terminal_event_assignments_dropped": 0,
 }
 _SHA256_BYTES = rb"sha256:[0-9a-f]{64}"
 _REGISTER_SUFFIX_RE = re.compile(
@@ -96,6 +99,137 @@ def _fast_read_json_object(path: Path) -> dict[str, Any]:
         raise DurableExecutionError(f"JSON state must be an object: {path}")
     return payload
 
+
+
+class _IncrementalJsonReader:
+    _READ_CHARS = 1024 * 1024
+    _COMPACT_AT = 4 * 1024 * 1024
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self.handle = self.path.open("r", encoding="utf-8")
+        self.decoder = json.JSONDecoder()
+        self.buffer = ""
+        self.pos = 0
+        self.eof = False
+        self.peak_buffer_chars = 0
+
+    def __enter__(self) -> "_IncrementalJsonReader":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.handle.close()
+
+    def _compact(self) -> None:
+        if self.pos and (
+            self.pos >= self._COMPACT_AT or self.pos >= len(self.buffer) // 2
+        ):
+            self.buffer = self.buffer[self.pos :]
+            self.pos = 0
+
+    def _fill(self) -> bool:
+        self._compact()
+        chunk = self.handle.read(self._READ_CHARS)
+        if not chunk:
+            self.eof = True
+            return False
+        self.buffer += chunk
+        self.peak_buffer_chars = max(self.peak_buffer_chars, len(self.buffer))
+        return True
+
+    def _ensure(self) -> bool:
+        while self.pos >= len(self.buffer) and not self.eof:
+            if not self._fill():
+                break
+        return self.pos < len(self.buffer)
+
+    def skip_whitespace(self) -> None:
+        while True:
+            while self.pos < len(self.buffer) and self.buffer[self.pos].isspace():
+                self.pos += 1
+            if self.pos < len(self.buffer) or self.eof:
+                return
+            self._fill()
+
+    def peek(self) -> str:
+        self.skip_whitespace()
+        return self.buffer[self.pos] if self._ensure() else ""
+
+    def expect(self, token: str) -> None:
+        self.skip_whitespace()
+        if not self._ensure() or self.buffer[self.pos] != token:
+            raise DurableExecutionError(
+                f"PlayHand durable state is malformed near byte {self.pos}: {self.path}"
+            )
+        self.pos += 1
+
+    def decode_value(self) -> Any:
+        while True:
+            self.skip_whitespace()
+            try:
+                value, end = self.decoder.raw_decode(self.buffer, self.pos)
+            except json.JSONDecodeError as exc:
+                if self.eof:
+                    raise DurableExecutionError(
+                        f"PlayHand durable state is unreadable: {self.path}"
+                    ) from exc
+                self._fill()
+                continue
+            self.pos = end
+            return value
+
+
+def _stream_campaign_state(
+    path: Path,
+    *,
+    lane_loader: Any,
+) -> tuple[dict[str, Any], list[Any], bool, int]:
+    metadata: dict[str, Any] = {}
+    lanes: list[Any] = []
+    legacy_heavy = False
+    with _IncrementalJsonReader(path) as reader:
+        reader.expect("{")
+        first_field = True
+        while True:
+            if reader.peek() == "}":
+                reader.expect("}")
+                break
+            if not first_field:
+                reader.expect(",")
+            key = reader.decode_value()
+            if not isinstance(key, str):
+                raise DurableExecutionError(
+                    f"PlayHand durable state has a non-string key: {path}"
+                )
+            reader.expect(":")
+            if key != "lanes":
+                metadata[key] = reader.decode_value()
+            else:
+                reader.expect("[")
+                first_lane = True
+                while True:
+                    if reader.peek() == "]":
+                        reader.expect("]")
+                        break
+                    if not first_lane:
+                        reader.expect(",")
+                    item = reader.decode_value()
+                    if not isinstance(item, dict):
+                        raise DurableExecutionError(
+                            f"PlayHand durable state lane is malformed: {path}"
+                        )
+                    lane, was_heavy = lane_loader(item)
+                    lanes.append(lane)
+                    legacy_heavy = legacy_heavy or was_heavy
+                    first_lane = False
+            first_field = False
+        if reader.peek():
+            raise DurableExecutionError(
+                f"PlayHand durable state has trailing data: {path}"
+            )
+        # Campaign state is canonical ensure_ascii JSON, so chars == UTF-8 bytes.
+        peak_bytes = reader.peak_buffer_chars
+    return metadata, lanes, legacy_heavy, peak_bytes
 
 def _load_play_hand_journal_frontier(
     journal: DurableExecutionJournal,
@@ -320,12 +454,30 @@ def _lane_state_from_payload(
     play_hand_lab: Any,
     payload: dict[str, Any],
 ) -> tuple[Any, bool]:
-    values = dict(payload)
+    values = payload
+    assignment = values.get("policy_assignment")
+    events = values.get("phase_lifecycle_events")
+    terminal_policy_heavy = bool(
+        isinstance(assignment, dict)
+        and any(
+            key in assignment
+            for key in play_hand_lab._TERMINAL_POLICY_ASSIGNMENT_AUDIT_KEYS
+        )
+    )
+    terminal_event_heavy = bool(
+        isinstance(events, list)
+        and any(
+            isinstance(event, dict) and "policy_assignment" in event
+            for event in events
+        )
+    )
     legacy_heavy = bool(
         values.get("profile_payload")
         or values.get("incumbent_profile_payload")
         or values.get("task_specs")
         or values.get("last_sweep_payload")
+        or terminal_policy_heavy
+        or terminal_event_heavy
     )
 
     values["run_dir"] = Path(str(values["run_dir"])).resolve(strict=False)
@@ -344,8 +496,6 @@ def _lane_state_from_payload(
         values["incumbent_profile_payload"] = None
         values["phase_results"] = {}
     else:
-        # The profile file is already the durable source. Do not deserialize an
-        # embedded legacy copy and then retain a second copy of the same profile.
         if values.get("profile_path") and values["profile_path"].is_file():
             values["profile_payload"] = None
         if (
@@ -366,11 +516,16 @@ def _lane_state_from_payload(
                 compacted[str(phase)] = compacted_rows
             values["phase_results"] = compacted
 
-    # The execution journal is the task-payload authority. Only unfinished task
-    # specs are rebuilt after the lanes and journal have both loaded.
     values["task_specs"] = {}
     values["last_sweep_payload"] = None
-    return play_hand_lab.LabLaneState(**values), legacy_heavy
+    lane = play_hand_lab.LabLaneState(**values)
+    if terminal:
+        play_hand_lab._compact_terminal_lane_state(lane)
+        if terminal_policy_heavy:
+            _increment_diagnostic("terminal_policy_assignments_compacted")
+        if terminal_event_heavy:
+            _increment_diagnostic("terminal_event_assignments_dropped")
+    return lane, legacy_heavy
 
 
 def _hydrate_lane_profiles(play_hand_lab: Any, lane: Any) -> None:
@@ -426,7 +581,10 @@ def _load_campaign_state_fast(
     campaign_id: str,
 ) -> tuple[list[Any], Any, int, list[int], int]:
     started = time.monotonic()
-    payload = _fast_read_json_object(path)
+    payload, lanes, legacy_heavy, stream_peak_bytes = _stream_campaign_state(
+        path,
+        lane_loader=lambda item: _lane_state_from_payload(play_hand_lab, item),
+    )
     if payload.get("schema_version") != "play-hand-lab-durable-state-v1":
         raise DurableExecutionError("PlayHand durable state schema mismatch")
     if payload.get("lineage") != play_hand_lab._campaign_state_lineage(
@@ -434,15 +592,6 @@ def _load_campaign_state_fast(
         campaign_id,
     ):
         raise DurableExecutionError("PlayHand durable state lineage mismatch")
-
-    lanes: list[Any] = []
-    legacy_heavy = False
-    for item in payload.get("lanes") or []:
-        if not isinstance(item, dict):
-            continue
-        lane, was_heavy = _lane_state_from_payload(play_hand_lab, dict(item))
-        lanes.append(lane)
-        legacy_heavy = legacy_heavy or was_heavy
 
     # Terminal lanes never execute or transition again. Historically loading both
     # profile files for every retained terminal lane made startup scale with total
@@ -495,6 +644,7 @@ def _load_campaign_state_fast(
         _DIAGNOSTICS["terminal_profiles_skipped"] = (
             len(lanes) - len(active_lanes)
         )
+        _DIAGNOSTICS["campaign_state_stream_peak_bytes"] = stream_peak_bytes
     return (
         lanes,
         history,

@@ -36,6 +36,7 @@ from .durable_execution import (
     DurableExecutionJournal,
     artifact_receipt,
     atomic_write_json,
+    atomic_write_json_streaming,
     validate_artifact_receipt,
 )
 from .ledger import (
@@ -878,7 +879,7 @@ def _write_campaign_state(
 ) -> None:
     history_payload = asdict(history)
     policy_state = history_payload.pop("campaign_policy_state", None)
-    atomic_write_json(
+    atomic_write_json_streaming(
         path,
         {
             "schema_version": "play-hand-lab-durable-state-v1",
@@ -5233,7 +5234,13 @@ def _legacy_phase3_receipt_recorded_result(
         "policy_assignment": recovered_row.get("policy_assignment"),
     }
     for key, value in expected.items():
-        if recorded.get(key) != value:
+        observed = recorded.get(key)
+        if key == "policy_assignment" and (
+            _compact_policy_assignment_snapshot(observed)
+            == _compact_policy_assignment_snapshot(value)
+        ):
+            continue
+        if observed != value:
             raise DurableExecutionError(
                 f"legacy Phase 3 receipt evidence conflicts for task {task_id}: {key}"
             )
@@ -6891,6 +6898,28 @@ def _lane_history_totals(
     }
 
 
+
+_TERMINAL_POLICY_ASSIGNMENT_AUDIT_KEYS = frozenset(
+    {"candidate_fallback_decisions", "negative_prior_decisions"}
+)
+
+
+def _compact_policy_assignment_snapshot(assignment: Any) -> dict[str, Any]:
+    if not isinstance(assignment, Mapping):
+        return {}
+    return {
+        key: copy.deepcopy(value)
+        for key, value in assignment.items()
+        if key not in _TERMINAL_POLICY_ASSIGNMENT_AUDIT_KEYS
+    }
+
+
+def _compact_policy_assignment_in_place(assignment: Any) -> None:
+    if not isinstance(assignment, dict):
+        return
+    for key in _TERMINAL_POLICY_ASSIGNMENT_AUDIT_KEYS:
+        assignment.pop(key, None)
+
 def _compact_terminal_lane_state(lane: LabLaneState) -> None:
     terminal_task_count = len(lane.completed_task_ids) + len(lane.failed_task_ids)
     if not lane.terminal and (not lane.task_ids or terminal_task_count < len(lane.task_ids)):
@@ -6902,6 +6931,7 @@ def _compact_terminal_lane_state(lane: LabLaneState) -> None:
     lane.task_specs.clear()
     lane.phase_rows.clear()
     lane.phase_results.clear()
+    _compact_policy_assignment_in_place(lane.policy_assignment)
     # The canonical lane-level assignment remains required for strict resume.
     # Lifecycle events are audit narration and previously retained another full
     # copy of that assignment for every terminal lane.
@@ -7650,16 +7680,22 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
         )
         for lane in lanes:
             lanes_by_id[lane.lane_id] = lane
-            lane_cli = FuzzfolioCli(config.fuzzfolio)
-            lane_ctx = _new_context(
-                config=config,
-                cli=lane_cli,
-                run_id=lane.run_id,
-                run_dir=lane.run_dir,
-                runtime=runtime,
+            lane_has_unresolved_task = any(
+                isinstance(durable_tasks_by_id.get(task_id), dict)
+                and durable_tasks_by_id[task_id].get("status") != "terminal"
+                for task_id in lane.task_ids
             )
-            _configure_lab_event_output(lane_ctx, runtime)
-            lane_contexts[lane.run_id] = lane_ctx
+            if not lane.terminal or lane_has_unresolved_task:
+                lane_cli = FuzzfolioCli(config.fuzzfolio)
+                lane_ctx = _new_context(
+                    config=config,
+                    cli=lane_cli,
+                    run_id=lane.run_id,
+                    run_dir=lane.run_dir,
+                    runtime=runtime,
+                )
+                _configure_lab_event_output(lane_ctx, runtime)
+                lane_contexts[lane.run_id] = lane_ctx
             for task_id in lane.task_ids:
                 lanes_by_task[task_id] = lane
         _recover_unresolved_journal_task_graph(lanes, durable_tasks_by_id)

@@ -1,0 +1,85 @@
+name: Apply final PlayHand drain reductions
+
+"on":
+  push:
+    branches: [agent/playhand-drain-final]
+    paths:
+      - "tools/apply_playhand_final.py"
+      - "tools/run_apply_playhand_final.py"
+      - "tools/apply_playhand_fixups.py"
+      - ".github/workflows/apply-playhand-drain-final.yml"
+  pull_request:
+    branches: [master]
+    paths:
+      - "tools/apply_playhand_final.py"
+      - "tools/run_apply_playhand_final.py"
+      - "tools/apply_playhand_fixups.py"
+      - ".github/workflows/apply-playhand-drain-final.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/playhand-drain-final
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Apply reductions
+        shell: bash
+        run: |
+          set -o pipefail
+          {
+            python tools/run_apply_playhand_final.py
+            python tools/apply_playhand_fixups.py
+          } 2>&1 | tee apply-playhand.log
+      - name: Upload apply log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apply-playhand-log
+          path: apply-playhand.log
+      - name: Install project
+        run: python -m pip install -e . pytest
+      - name: Compile package and tests
+        run: python -m compileall -q autoresearch tests
+      - name: Run focused regressions
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q \
+            tests/test_play_hand_lab_result_drain_final.py \
+            tests/test_durable_execution.py \
+            tests/test_play_hand_lab_startup.py \
+            tests/test_play_hand_lab_throughput.py \
+            tests/test_play_hand_lab_result_fastpath.py \
+            tests/test_play_hand_lab_deep_memory.py 2>&1 | tee focused-tests.log
+      - name: Upload focused test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-tests-log
+          path: focused-tests.log
+      - name: Package reviewed source
+        if: always()
+        run: tar -czf reviewed-source.tar.gz autoresearch tests pyproject.toml uv.lock
+      - name: Upload reviewed source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reviewed-source
+          path: reviewed-source.tar.gz
+      - name: Commit generated patch
+        if: github.event_name == 'push'
+        run: |
+          git config user.name "OpenAI"
+          git config user.email "noreply@openai.com"
+          git add autoresearch tests
+          git commit -m "Finish PlayHand result drain memory and throughput bounds"
+          git push origin HEAD:agent/playhand-drain-final
