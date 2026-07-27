@@ -5,6 +5,7 @@ import json
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -99,6 +100,30 @@ def _mapping_at_path(payload: Any, path: tuple[str, ...]) -> dict[str, Any] | No
     return dict(current) if isinstance(current, dict) else None
 
 
+
+def _compact_score_summary(summary: Any) -> dict[str, Any]:
+    if not isinstance(summary, Mapping):
+        return {}
+    keep = (
+        "score_lab",
+        "score_lab_payload",
+        "quality_score",
+        "quality_score_version",
+        "quality_score_belief_basis",
+        "best_cell",
+        "best_cell_path_metrics",
+        "dsr",
+        "psr",
+        "k_ratio",
+        "sharpe_r",
+        "terminal_result",
+    )
+    return {
+        key: copy.deepcopy(summary[key])
+        for key in keep
+        if key in summary and summary[key] not in (None, "", [], {})
+    }
+
 def _score_from_sensitivity(play_hand_lab: Any, payload: Mapping[str, Any]) -> Any | None:
     data = payload.get("data")
     if not isinstance(data, dict):
@@ -121,7 +146,7 @@ def _score_from_sensitivity(play_hand_lab: Any, payload: Mapping[str, Any]) -> A
         return None
     if not basis.startswith(play_hand_lab.CANONICAL_SCORE_LAB_VERSION + ":"):
         return None
-    return score
+    return replace(score, best_summary=_compact_score_summary(score.best_summary))
 
 
 def _compact_analysis_result(payload: Any) -> Any:

@@ -9,6 +9,11 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Mapping
 
+try:
+    import orjson as _orjson
+except Exception:  # pragma: no cover
+    _orjson = None
+
 
 _LOCK = threading.RLock()
 _INSTALLED = False
@@ -24,14 +29,17 @@ _ORIGINAL_WRITE_LANE_METADATA: Any = None
 _ORIGINAL_RENDER_LANE_PROGRESS: Any = None
 _ORIGINAL_FORMAT_BARRIER: Any = None
 
-# Attempt ledgers can be tens of megabytes each. The coordinator needs recent
-# active ledgers, not the complete historical corpus in RAM.
-_ATTEMPT_CACHE_MAX_ENTRIES = 32
-_ATTEMPT_CACHE_MAX_SOURCE_BYTES = 128 * 1024 * 1024
-# path -> ((mtime_ns, size), parsed rows, source bytes)
+# The coordinator needs counts and duplicate-recovery fields, not every nested
+# audit payload from multi-gigabyte attempts ledgers. Cache a compact projection.
+_ATTEMPT_CACHE_MAX_ENTRIES = 128
+# The cache stores compact projections for Phase 3, so original file size is
+# diagnostic rather than a useful production memory proxy. Keep the legacy
+# budget seam for compatibility and tests; the entry cap bounds live objects.
+_ATTEMPT_CACHE_MAX_SOURCE_BYTES = 1 << 60
 _ATTEMPT_CACHE: OrderedDict[
-    str, tuple[tuple[int, int], list[dict[str, Any]], int]
+    str, tuple[tuple[int, int], list[dict[str, Any]]]
 ] = OrderedDict()
+_ATTEMPT_CACHE_ROWS = 0
 _ATTEMPT_CACHE_SOURCE_BYTES = 0
 _STATE_LAST_WRITE_AT: dict[str, float] = {}
 _STATE_LAST_SHAPE: dict[str, tuple[int, tuple[int, ...], int]] = {}
@@ -40,6 +48,8 @@ _COUNTERS: dict[str, int] = {
     "attempt_cache_hits": 0,
     "attempt_cache_misses": 0,
     "attempt_cache_evictions": 0,
+    "attempt_rows_projected": 0,
+    "attempt_policy_assignments_compacted": 0,
     "campaign_state_writes": 0,
     "campaign_state_writes_skipped": 0,
     "lane_metadata_writes": 0,
@@ -47,6 +57,72 @@ _COUNTERS: dict[str, int] = {
     "progress_renders_skipped": 0,
     "sweep_receipts_compacted": 0,
 }
+
+_PHASE3_ATTEMPT_PROJECTION_KEYS = (
+    "attempt_id",
+    "sequence",
+    "created_at",
+    "run_id",
+    "candidate_name",
+    "artifact_dir",
+    "profile_ref",
+    "profile_path",
+    "primary_score",
+    "composite_score",
+    "score_basis",
+    "metrics",
+    "best_summary",
+    "sensitivity_snapshot_path",
+    "note",
+    "requested_horizon_months",
+    "effective_window_months",
+    "requested_timeframe",
+    "effective_timeframe",
+    "max_reward_r",
+    "reward_step_r",
+    "reward_columns",
+    "effective_max_reward_r",
+    "validation_outcome",
+    "coverage_status",
+    "job_status",
+    "resolved_trades",
+    "trades_per_month",
+    "positive_cell_ratio",
+    "effective_window_source",
+    "signal_coverage_ratio",
+    "bars_per_signal",
+    "max_consecutive_signal_run",
+    "trigger_indicator_count",
+    "runner",
+    "attempt_role",
+    "attempt_decision",
+    "attempt_decision_reasons",
+    "strategy_family_id",
+    "canonical_attempt_id",
+    "is_canonical_attempt",
+    "is_canonical_playhand_attempt",
+    "play_hand_role",
+    "play_hand_stage",
+    "play_hand_instrument",
+    "play_hand_selected_instruments",
+    "generated_by_runner",
+    "lab_campaign_task_id",
+    "lab_lane_id",
+    "lab_task_kind",
+    "play_hand_phase",
+    "analysis_window_start",
+    "analysis_window_end",
+    "evidence_plan_id",
+    "evidence_role",
+    "worker_id",
+    "worker_lease_id",
+    "lab_worker_result_sha256",
+    "run_status",
+    "lab_scoring_warning",
+    "lab_terminal_outcome",
+    "lab_failure",
+    "policy_assignment",
+)
 
 
 def _path_key(path: Path | str) -> str:
@@ -61,13 +137,68 @@ def _file_signature(path: Path | str) -> tuple[int, int]:
     return (int(stat.st_mtime_ns), int(stat.st_size))
 
 
+def _phase3_attempt_path(path: Path) -> bool:
+    parent = path.parent.name
+    return (
+        path.name == "attempts.jsonl"
+        and parent.startswith("phase3-")
+        and "-lane-" in parent
+    )
+
+
+def _compact_policy_assignment(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return value
+    from . import play_hand_lab
+
+    return play_hand_lab._compact_policy_assignment_snapshot(value)
+
+
+def _project_phase3_attempt_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    projected = {
+        key: row.get(key)
+        for key in _PHASE3_ATTEMPT_PROJECTION_KEYS
+        if row.get(key) is not None
+    }
+    if "policy_assignment" in projected:
+        projected["policy_assignment"] = _compact_policy_assignment(
+            projected["policy_assignment"]
+        )
+    if "best_summary" in projected:
+        from .play_hand_lab_result_fastpath import _compact_score_summary
+
+        projected["best_summary"] = _compact_score_summary(
+            projected["best_summary"]
+        )
+    return projected
+
+
+def _decode_attempt_line(raw: bytes) -> dict[str, Any]:
+    payload = _orjson.loads(raw) if _orjson is not None else json.loads(raw)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_compact_phase3_attempts(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    with path.open("rb") as handle:
+        for raw in handle:
+            if not raw.strip() or not raw.strip(b"\x00").strip():
+                continue
+            rows.append(_project_phase3_attempt_row(_decode_attempt_line(raw)))
+    return rows
+
+
 def _remove_attempt_cache_entry(key: str) -> None:
+    global _ATTEMPT_CACHE_ROWS
     global _ATTEMPT_CACHE_SOURCE_BYTES
     removed = _ATTEMPT_CACHE.pop(key, None)
     if removed is not None:
+        _ATTEMPT_CACHE_ROWS = max(0, _ATTEMPT_CACHE_ROWS - len(removed[1]))
         _ATTEMPT_CACHE_SOURCE_BYTES = max(
             0,
-            _ATTEMPT_CACHE_SOURCE_BYTES - int(removed[2]),
+            _ATTEMPT_CACHE_SOURCE_BYTES - int(removed[0][1]),
         )
 
 
@@ -76,19 +207,21 @@ def _store_attempt_cache_entry(
     signature: tuple[int, int],
     rows: list[dict[str, Any]],
 ) -> None:
+    global _ATTEMPT_CACHE_ROWS
     global _ATTEMPT_CACHE_SOURCE_BYTES
     _remove_attempt_cache_entry(key)
-    source_bytes = max(int(signature[1]), 0)
-    _ATTEMPT_CACHE[key] = (signature, rows, source_bytes)
-    _ATTEMPT_CACHE_SOURCE_BYTES += source_bytes
-    while _ATTEMPT_CACHE and (
+    _ATTEMPT_CACHE[key] = (signature, rows)
+    _ATTEMPT_CACHE_ROWS += len(rows)
+    _ATTEMPT_CACHE_SOURCE_BYTES += int(signature[1])
+    while (
         len(_ATTEMPT_CACHE) > _ATTEMPT_CACHE_MAX_ENTRIES
         or _ATTEMPT_CACHE_SOURCE_BYTES > _ATTEMPT_CACHE_MAX_SOURCE_BYTES
     ):
         _evicted_key, entry = _ATTEMPT_CACHE.popitem(last=False)
+        _ATTEMPT_CACHE_ROWS = max(0, _ATTEMPT_CACHE_ROWS - len(entry[1]))
         _ATTEMPT_CACHE_SOURCE_BYTES = max(
             0,
-            _ATTEMPT_CACHE_SOURCE_BYTES - int(entry[2]),
+            _ATTEMPT_CACHE_SOURCE_BYTES - int(entry[0][1]),
         )
         _COUNTERS["attempt_cache_evictions"] += 1
 
@@ -102,6 +235,7 @@ def throughput_diagnostics() -> dict[str, int]:
     with _LOCK:
         diagnostics = dict(_COUNTERS)
         diagnostics["attempt_cache_entries"] = len(_ATTEMPT_CACHE)
+        diagnostics["attempt_cache_rows"] = _ATTEMPT_CACHE_ROWS
         diagnostics["attempt_cache_source_bytes"] = _ATTEMPT_CACHE_SOURCE_BYTES
         return diagnostics
 
@@ -161,27 +295,43 @@ def _cached_load_attempts(path: Path) -> list[dict[str, Any]]:
             return [dict(row) for row in cached[1]]
         if cached is not None:
             _remove_attempt_cache_entry(key)
-    rows = _ORIGINAL_LOAD_ATTEMPTS(path)
-    snapshot = [dict(row) for row in rows]
+    phase3 = _phase3_attempt_path(path)
+    rows = (
+        _read_compact_phase3_attempts(path)
+        if phase3
+        else _ORIGINAL_LOAD_ATTEMPTS(path)
+    )
     with _LOCK:
-        _store_attempt_cache_entry(key, signature, snapshot)
+        _store_attempt_cache_entry(key, signature, rows)
         _COUNTERS["attempt_cache_misses"] += 1
-    return [dict(row) for row in snapshot]
+        if phase3:
+            _COUNTERS["attempt_rows_projected"] += len(rows)
+    return [dict(row) for row in rows]
 
 
 def _cached_append_attempt_row(path: Path, row: Mapping[str, Any]) -> None:
+    persisted = dict(row)
+    phase3 = _phase3_attempt_path(path)
+    if phase3 and isinstance(persisted.get("policy_assignment"), Mapping):
+        compact = _compact_policy_assignment(persisted["policy_assignment"])
+        if compact != persisted["policy_assignment"]:
+            persisted["policy_assignment"] = compact
+            _counter("attempt_policy_assignments_compacted")
     key = _path_key(path)
     before = _file_signature(path)
-    _ORIGINAL_APPEND_ATTEMPT_ROW(path, row)
+    _ORIGINAL_APPEND_ATTEMPT_ROW(path, persisted)
     after = _file_signature(path)
     with _LOCK:
         cached = _ATTEMPT_CACHE.get(key)
         if cached is not None and cached[0] == before:
-            cached[1].append(dict(row))
+            cached[1].append(
+                _project_phase3_attempt_row(persisted)
+                if phase3
+                else persisted
+            )
             _store_attempt_cache_entry(key, after, cached[1])
         else:
             _remove_attempt_cache_entry(key)
-
 
 def _without_ranked_alias(payload: Mapping[str, Any]) -> dict[str, Any]:
     compact = dict(payload)
@@ -411,8 +561,9 @@ def install_play_hand_throughput_bounds() -> None:
                 f"{diagnostics['lane_metadata_writes_skipped']} plot-skips="
                 f"{diagnostics['progress_renders_skipped']} compact-sweeps="
                 f"{diagnostics['sweep_receipts_compacted']} attempt-cache="
-                f"{diagnostics['attempt_cache_entries']}@"
-                f"{diagnostics['attempt_cache_source_bytes'] // (1024 * 1024)}MB"
+                f"{diagnostics['attempt_cache_entries']}/"
+                f"{diagnostics['attempt_cache_rows']}rows policy-compacts="
+                f"{diagnostics['attempt_policy_assignments_compacted']}"
             )
             lines = rendered.splitlines()
             if lines:

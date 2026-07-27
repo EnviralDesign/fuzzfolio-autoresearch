@@ -71,6 +71,64 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+
+def atomic_write_json_streaming(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    buffer_bytes: int = 1024 * 1024,
+) -> None:
+    """Atomically write canonical JSON with bounded serialization memory.
+
+    ``JSONEncoder.iterencode`` uses the same canonical options as
+    :func:`canonical_json`; buffering encoded chunks keeps the exact on-disk
+    bytes while avoiding a campaign-sized temporary string and bytes object.
+    """
+
+    target = Path(path).resolve(strict=False)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=target.name + ".", suffix=".tmp", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    encoder = json.JSONEncoder(
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    flush_at = max(int(buffer_bytes), 64 * 1024)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            chunks: list[bytes] = []
+            buffered = 0
+            for text in encoder.iterencode(dict(payload)):
+                encoded = text.encode("utf-8")
+                chunks.append(encoded)
+                buffered += len(encoded)
+                if buffered >= flush_at:
+                    handle.write(b"".join(chunks))
+                    chunks.clear()
+                    buffered = 0
+            if chunks:
+                handle.write(b"".join(chunks))
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(ATOMIC_REPLACE_ATTEMPTS):
+            try:
+                os.replace(temporary, target)
+                break
+            except PermissionError:
+                if attempt + 1 >= ATOMIC_REPLACE_ATTEMPTS:
+                    raise
+                time.sleep(
+                    min(
+                        ATOMIC_REPLACE_RETRY_SECONDS * (2**attempt),
+                        ATOMIC_REPLACE_MAX_RETRY_SECONDS,
+                    )
+                )
+    finally:
+        temporary.unlink(missing_ok=True)
+
 def _file_sha256(path: Path) -> str:
     import hashlib
 
