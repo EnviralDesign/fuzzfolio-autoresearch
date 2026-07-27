@@ -20,7 +20,7 @@ def _reset_fastpath_state() -> None:
             fastpath._COUNTERS[key] = 0.0 if "seconds" in key else 0
 
 
-def test_phase3_runtime_uses_a_larger_default_result_drain() -> None:
+def test_phase3_runtime_preserves_the_configured_drain_transaction_size() -> None:
     runtime = play_hand_lab.PlayHandLabRuntimeConfig(
         formal_authority_kind="phase3",
         result_batch_size=25,
@@ -30,9 +30,11 @@ def test_phase3_runtime_uses_a_larger_default_result_drain() -> None:
 
     normalized = play_hand_lab._normalize_runtime(runtime)
 
-    assert normalized.result_batch_size == 64
-    assert normalized.max_results_per_cycle == 2048
-    assert normalized.max_drain_seconds == 5.0
+    # The fast path should make each result cheaper, not silently turn one durable
+    # transaction into a much larger 64-result acknowledgement stall.
+    assert normalized.result_batch_size == 25
+    assert normalized.max_results_per_cycle == 200
+    assert normalized.max_drain_seconds == 0.5
 
     larger = play_hand_lab._normalize_runtime(
         play_hand_lab.PlayHandLabRuntimeConfig(
@@ -151,7 +153,7 @@ def test_deep_replay_job_artifact_keeps_summary_not_the_duplicate_full_result() 
     assert compact["full_result_omitted"] is True
 
 
-def test_fresh_receipt_is_not_rehashed_twice_in_the_same_result_transaction(
+def test_fresh_receipt_handoff_is_one_shot_and_not_rehashed_immediately(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -178,19 +180,83 @@ def test_fresh_receipt_is_not_rehashed_twice_in_the_same_result_transaction(
         },
     )
 
+    calls = 0
+
+    def original(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return {"validated_from_disk": True}
+
     monkeypatch.setattr(
         fastpath,
         "_ORIGINAL_VALIDATE_TASK_RESULT_RECEIPT",
-        lambda *_args, **_kwargs: pytest.fail("hot receipt should not rehash artifacts"),
+        original,
     )
-    validated = play_hand_lab._validate_task_result_receipt(
+    first = play_hand_lab._validate_task_result_receipt(
+        receipt_path,
+        task_id=task_id,
+        worker_result_sha256=worker_sha,
+    )
+    second = play_hand_lab._validate_task_result_receipt(
         receipt_path,
         task_id=task_id,
         worker_result_sha256=worker_sha,
     )
 
-    assert validated == written
-    assert fastpath.result_fastpath_diagnostics()["receipt_cache_hits"] == 1
+    assert first == written
+    assert second == {"validated_from_disk": True}
+    assert calls == 1
+    diagnostics = fastpath.result_fastpath_diagnostics()
+    assert diagnostics["receipt_cache_hits"] == 1
+    assert diagnostics["receipt_cache_entries"] == 0
+
+
+def test_receipt_with_derived_task_graph_is_never_retained_in_cache(
+    tmp_path: Path,
+) -> None:
+    _reset_fastpath_state()
+    artifact_dir = tmp_path / "derived"
+    artifact_dir.mkdir()
+    (artifact_dir / "sensitivity-response.json").write_text(
+        json.dumps({"data": {"aggregate": {"score": 1}}}),
+        encoding="utf-8",
+    )
+    task_id = "task-derived"
+    worker_sha = "sha256:" + "d" * 64
+    receipt_path = artifact_dir / "task-result-receipt.json"
+    base = play_hand_lab._write_task_result_receipt(
+        receipt_path,
+        task_id=task_id,
+        worker_result_sha256=worker_sha,
+        recorded_result={
+            "task_id": task_id,
+            "artifact_dir": str(artifact_dir),
+            "status": "success",
+            "task_kind": "deep_replay",
+        },
+    )
+    payload = dict(base)
+    payload["derived_tasks"] = [
+        {
+            "task_id": "follow-on-1",
+            "lane_id": "lane-1",
+            "payload": {
+                "inline_profile_snapshot": {"large": "x" * 1_000_000},
+            },
+        }
+    ]
+
+    updated = play_hand_lab._persist_task_result_receipt(
+        receipt_path,
+        payload,
+        task_id=task_id,
+        worker_result_sha256=worker_sha,
+    )
+
+    assert updated["derived_tasks"][0]["task_id"] == "follow-on-1"
+    diagnostics = fastpath.result_fastpath_diagnostics()
+    assert diagnostics["receipt_cache_entries"] == 0
+    assert diagnostics["receipt_cache_skipped_derived"] == 1
 
 
 def test_sweep_receipt_is_compact_on_the_first_write(tmp_path: Path) -> None:
@@ -275,3 +341,4 @@ def test_barrier_exposes_actual_result_processing_cost() -> None:
 
     assert "result fastpath avg=" in rendered
     assert "direct-score=" in rendered
+    assert "receipt-cache=" in rendered
