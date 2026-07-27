@@ -1,0 +1,46 @@
+name: Apply final PlayHand drain reductions
+
+"on":
+  push:
+    branches: [agent/playhand-drain-final]
+    paths:
+      - "tools/apply_playhand_final.py"
+      - ".github/workflows/apply-playhand-drain-final.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/playhand-drain-final
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Apply reductions
+        run: python tools/apply_playhand_final.py
+      - name: Install project
+        run: python -m pip install -e . pytest
+      - name: Compile package and tests
+        run: python -m compileall -q autoresearch tests
+      - name: Run focused regressions
+        run: >-
+          python -m pytest -q
+          tests/test_play_hand_lab_result_drain_final.py
+          tests/test_durable_execution.py
+          tests/test_play_hand_lab_startup.py
+          tests/test_play_hand_lab_throughput.py
+          tests/test_play_hand_lab_result_fastpath.py
+          tests/test_play_hand_lab_memory_deep.py
+      - name: Commit generated patch
+        run: |
+          git config user.name "OpenAI"
+          git config user.email "noreply@openai.com"
+          git add autoresearch tests
+          git commit -m "Finish PlayHand result drain memory and throughput bounds"
+          git push origin HEAD:agent/playhand-drain-final
