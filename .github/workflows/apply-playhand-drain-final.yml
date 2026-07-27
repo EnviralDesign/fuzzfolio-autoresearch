@@ -45,14 +45,22 @@ jobs:
       - name: Compile package and tests
         run: python -m compileall -q autoresearch tests
       - name: Run focused regressions
-        run: >-
-          python -m pytest -q
-          tests/test_play_hand_lab_result_drain_final.py
-          tests/test_durable_execution.py
-          tests/test_play_hand_lab_startup.py
-          tests/test_play_hand_lab_throughput.py
-          tests/test_play_hand_lab_result_fastpath.py
-          tests/test_play_hand_lab_memory_deep.py
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q \
+            tests/test_play_hand_lab_result_drain_final.py \
+            tests/test_durable_execution.py \
+            tests/test_play_hand_lab_startup.py \
+            tests/test_play_hand_lab_throughput.py \
+            tests/test_play_hand_lab_result_fastpath.py \
+            tests/test_play_hand_lab_memory_deep.py 2>&1 | tee focused-tests.log
+      - name: Upload focused test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: focused-tests-log
+          path: focused-tests.log
       - name: Commit generated patch
         if: github.event_name == 'push'
         run: |
