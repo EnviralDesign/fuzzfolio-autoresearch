@@ -66,6 +66,15 @@ jobs:
         with:
           name: focused-tests-log
           path: focused-tests.log
+      - name: Package reviewed source
+        if: always()
+        run: tar -czf reviewed-source.tar.gz autoresearch tests pyproject.toml uv.lock
+      - name: Upload reviewed source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reviewed-source
+          path: reviewed-source.tar.gz
       - name: Commit generated patch
         if: github.event_name == 'push'
         run: |
