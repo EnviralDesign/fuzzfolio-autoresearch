@@ -136,6 +136,60 @@ def test_policy_recompute_reads_compact_terminal_task_evidence_without_rehydrati
     assert "payload" not in durable_tasks[task_id]
 
 
+def test_policy_recompute_restores_proof_for_a_compacted_terminal_shard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assignment = {
+        "policy_lane": "guided",
+        "policy_manifest_sha256": "sha256:" + "a" * 64,
+    }
+    _reader, durable_tasks, task_id = _load_compacted_terminal_task(
+        tmp_path,
+        assignment=assignment,
+    )
+    lane = _lane(tmp_path, task_id=task_id, assignment=assignment)
+    # The deep-memory reducer keeps the shard's merge fields but drops this
+    # potentially large assignment. The resume wrapper must retrieve only the
+    # sealed assignment proof from the register record.
+    lane.task_specs[task_id] = {
+        "phase": "coarse_expand",
+        "task_kind": "sweep_shard",
+        "sweep_id": "coarse-expand-001",
+    }
+    observed: dict[str, Any] = {}
+
+    def fake_recompute(
+        policy_state: dict[str, Any],
+        *,
+        lanes: list[Any],
+        unresolved_tasks: list[dict[str, Any]],
+        durable_tasks_by_id: Mapping[str, Any],
+        pruned_lane_count: int,
+    ) -> dict[str, Any]:
+        payload = durable_tasks_by_id[task_id]["payload"]
+        assert payload["policy_assignment"] == assignment
+        observed["called"] = True
+        return {"status": "verified"}
+
+    monkeypatch.setattr(
+        play_hand_lab_policy_resume,
+        "_ORIGINAL_RECOMPUTE_POLICY_STATE",
+        fake_recompute,
+    )
+    result = play_hand_lab._recompute_campaign_policy_state_from_durable_lanes(
+        {"schema_version": "test"},
+        lanes=[lane],
+        unresolved_tasks=[],
+        durable_tasks_by_id=durable_tasks,
+        pruned_lane_count=0,
+    )
+
+    assert result == {"status": "verified"}
+    assert observed == {"called": True}
+    assert "payload" not in durable_tasks[task_id]
+
+
 def test_policy_resume_rejects_terminal_task_assignment_conflict(tmp_path: Path) -> None:
     journal_assignment = {
         "policy_lane": "guided",

@@ -1455,7 +1455,16 @@ def _recompute_campaign_policy_state_from_durable_lanes(
 
         for task_id in lane.task_ids:
             task_spec = lane.task_specs.get(task_id)
-            if not isinstance(task_spec, dict):
+            task_assignment = (
+                _durable_task_policy_assignment(task_spec)
+                if isinstance(task_spec, dict)
+                else None
+            )
+            # The deep-memory resume path intentionally compacts completed sweep
+            # shards from an unfinished phase.  Those stubs omit the potentially
+            # large assignment; the sealed journal payload remains authoritative.
+            # An explicit assignment still has to match exactly.
+            if not isinstance(task_spec, dict) or task_assignment is None:
                 durable_task = durable_tasks_by_id.get(task_id)
                 if not isinstance(durable_task, dict):
                     raise DurableExecutionError(
@@ -1470,11 +1479,8 @@ def _recompute_campaign_policy_state_from_durable_lanes(
                     raise DurableExecutionError(
                         f"durable policy lane has no task spec: {task_id}"
                     )
-            if not isinstance(task_spec, dict):
-                raise DurableExecutionError(
-                    f"durable policy lane has no task spec: {task_id}"
-                )
-            if _durable_task_policy_assignment(task_spec) != assignment:
+                task_assignment = _durable_task_policy_assignment(task_spec)
+            if task_assignment != assignment:
                 raise DurableExecutionError(
                     f"durable task policy assignment mismatch: {task_id}"
                 )

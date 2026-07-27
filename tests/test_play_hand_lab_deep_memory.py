@@ -6,6 +6,7 @@ from typing import Any
 
 from autoresearch import play_hand_lab
 from autoresearch import play_hand_lab_enqueue
+from autoresearch import play_hand_lab_memory_deep
 from autoresearch.durable_execution import DurableExecutionJournal
 
 
@@ -187,3 +188,24 @@ def test_summary_samples_do_not_retain_full_sweep_payloads() -> None:
     }
     assert recorded["sweep_payload"] is sweep_payload
     assert len(json.dumps(samples[0])) < source_size // 10
+
+
+def test_compacted_terminal_sweep_spec_omits_policy_assignment() -> None:
+    policy_assignment = {
+        "policy_lane": "guided",
+        "policy_manifest_sha256": "sha256:" + "a" * 64,
+    }
+    spec = {
+        "phase": "coarse_expand",
+        "task_kind": "sweep_shard",
+        "sweep_id": "coarse-expand-001",
+        "params_by_index": {"0": {"period": 14}},
+        "policy_assignment": policy_assignment,
+        "large_transient_payload": "x" * 10_000,
+    }
+
+    play_hand_lab_memory_deep._compact_sweep_task_spec(spec)
+
+    assert "policy_assignment" not in spec
+    assert "params_by_index" not in spec
+    assert "large_transient_payload" not in spec

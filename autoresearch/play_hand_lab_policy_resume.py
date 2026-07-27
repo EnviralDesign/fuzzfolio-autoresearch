@@ -60,13 +60,16 @@ def _terminal_tasks_needing_policy_payload(
         task_specs = getattr(lane, "task_specs", {})
         for task_id in getattr(lane, "task_ids", ()):
             task_key = str(task_id)
-            if isinstance(task_specs, dict) and isinstance(task_specs.get(task_key), dict):
-                continue
+            task_spec = task_specs.get(task_key) if isinstance(task_specs, dict) else None
             durable_task = durable_tasks_by_id.get(task_key)
             if (
                 isinstance(durable_task, dict)
                 and durable_task.get("status") == "terminal"
                 and not isinstance(durable_task.get("payload"), dict)
+                and (
+                    not isinstance(task_spec, dict)
+                    or not isinstance(task_spec.get("policy_assignment"), dict)
+                )
             ):
                 needed[task_key] = lane
     return needed
