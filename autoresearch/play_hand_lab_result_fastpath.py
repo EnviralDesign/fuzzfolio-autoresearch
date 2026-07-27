@@ -5,21 +5,22 @@ import json
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
 
 _LOCK = threading.RLock()
 _INSTALLED = False
-_CACHE_LIMIT = 4096
+_IDENTITY_CACHE_LIMIT = 4096
+_SCORE_CACHE_LIMIT = 512
+# A receipt is cached only between its write and the immediately following
+# validation. Keep this deliberately tiny and consume entries once.
+_RECEIPT_CACHE_LIMIT = 128
 
-_ORIGINAL_NORMALIZE_RUNTIME: Any = None
 _ORIGINAL_WORKER_RESULT_IDENTITY: Any = None
 _ORIGINAL_WRITE_JSON: Any = None
 _ORIGINAL_SCORE_LAB_ARTIFACT: Any = None
 _ORIGINAL_WRITE_TASK_RESULT_RECEIPT: Any = None
-_ORIGINAL_PERSIST_TASK_RESULT_RECEIPT: Any = None
 _ORIGINAL_VALIDATE_TASK_RESULT_RECEIPT: Any = None
 _ORIGINAL_RECORD_LAB_RESULT: Any = None
 _ORIGINAL_FORMAT_BARRIER: Any = None
@@ -39,6 +40,8 @@ _COUNTERS: dict[str, float | int] = {
     "identity_cache_misses": 0,
     "receipt_cache_hits": 0,
     "receipt_cache_misses": 0,
+    "receipt_cache_skipped_derived": 0,
+    "receipt_cache_peak_entries": 0,
     "compact_job_artifacts": 0,
     "compact_sweep_artifacts": 0,
 }
@@ -46,7 +49,11 @@ _COUNTERS: dict[str, float | int] = {
 
 def result_fastpath_diagnostics() -> dict[str, float | int]:
     with _LOCK:
-        return dict(_COUNTERS)
+        snapshot = dict(_COUNTERS)
+        snapshot["identity_cache_entries"] = len(_IDENTITY_CACHE)
+        snapshot["score_cache_entries"] = len(_SCORE_CACHE)
+        snapshot["receipt_cache_entries"] = len(_RECEIPT_CACHE)
+        return snapshot
 
 
 def _counter(name: str, amount: float | int = 1) -> None:
@@ -54,11 +61,17 @@ def _counter(name: str, amount: float | int = 1) -> None:
         _COUNTERS[name] = _COUNTERS.get(name, 0) + amount
 
 
-def _bounded_put(cache: OrderedDict[Any, Any], key: Any, value: Any) -> None:
+def _bounded_put(
+    cache: OrderedDict[Any, Any],
+    key: Any,
+    value: Any,
+    *,
+    limit: int,
+) -> None:
     with _LOCK:
         cache[key] = value
         cache.move_to_end(key)
-        while len(cache) > _CACHE_LIMIT:
+        while len(cache) > max(int(limit), 1):
             cache.popitem(last=False)
 
 
@@ -172,12 +185,10 @@ def install_play_hand_result_fastpath() -> None:
     """Install the default single-process result drain optimized for large worker pools."""
 
     global _INSTALLED
-    global _ORIGINAL_NORMALIZE_RUNTIME
     global _ORIGINAL_WORKER_RESULT_IDENTITY
     global _ORIGINAL_WRITE_JSON
     global _ORIGINAL_SCORE_LAB_ARTIFACT
     global _ORIGINAL_WRITE_TASK_RESULT_RECEIPT
-    global _ORIGINAL_PERSIST_TASK_RESULT_RECEIPT
     global _ORIGINAL_VALIDATE_TASK_RESULT_RECEIPT
     global _ORIGINAL_RECORD_LAB_RESULT
     global _ORIGINAL_FORMAT_BARRIER
@@ -190,33 +201,14 @@ def install_play_hand_result_fastpath() -> None:
         from . import play_hand_lab
         from . import play_hand_lab_throughput as throughput
 
-        _ORIGINAL_NORMALIZE_RUNTIME = play_hand_lab._normalize_runtime
         _ORIGINAL_WORKER_RESULT_IDENTITY = play_hand_lab._worker_result_identity
         _ORIGINAL_WRITE_JSON = play_hand_lab._write_json
         _ORIGINAL_SCORE_LAB_ARTIFACT = play_hand_lab._score_lab_artifact
         _ORIGINAL_WRITE_TASK_RESULT_RECEIPT = play_hand_lab._write_task_result_receipt
-        _ORIGINAL_PERSIST_TASK_RESULT_RECEIPT = play_hand_lab._persist_task_result_receipt
         _ORIGINAL_VALIDATE_TASK_RESULT_RECEIPT = play_hand_lab._validate_task_result_receipt
         _ORIGINAL_RECORD_LAB_RESULT = play_hand_lab._record_lab_result
         _ORIGINAL_FORMAT_BARRIER = play_hand_lab._format_lab_barrier_snapshot
         _ORIGINAL_THROUGHPUT_COMPACT_SWEEP = throughput._compact_pending_sweep_receipt
-
-        def normalize_runtime(runtime: Any) -> Any:
-            normalized = _ORIGINAL_NORMALIZE_RUNTIME(runtime)
-            if str(getattr(normalized, "formal_authority_kind", "") or "").lower() != "phase3":
-                return normalized
-            batch_size = max(int(getattr(normalized, "result_batch_size", 0) or 0), 64)
-            max_cycle = max(
-                int(getattr(normalized, "max_results_per_cycle", 0) or 0),
-                batch_size * 32,
-            )
-            drain_seconds = max(float(getattr(normalized, "max_drain_seconds", 0.0) or 0.0), 5.0)
-            return replace(
-                normalized,
-                result_batch_size=batch_size,
-                max_results_per_cycle=max_cycle,
-                max_drain_seconds=drain_seconds,
-            )
 
         def worker_result_identity(lab_result: dict[str, Any]) -> str:
             key = _identity_cache_key(lab_result)
@@ -230,7 +222,12 @@ def install_play_hand_result_fastpath() -> None:
                     return cached
             identity = _ORIGINAL_WORKER_RESULT_IDENTITY(lab_result)
             _counter("identity_cache_misses")
-            _bounded_put(_IDENTITY_CACHE, key, identity)
+            _bounded_put(
+                _IDENTITY_CACHE,
+                key,
+                identity,
+                limit=_IDENTITY_CACHE_LIMIT,
+            )
             return identity
 
         def write_json(path: Path, payload: Any) -> Any:
@@ -240,7 +237,12 @@ def install_play_hand_result_fastpath() -> None:
                 score = _score_from_sensitivity(play_hand_lab, payload)
                 result = _ORIGINAL_WRITE_JSON(target, payload)
                 if score is not None:
-                    _bounded_put(_SCORE_CACHE, _path_key(target.parent), score)
+                    _bounded_put(
+                        _SCORE_CACHE,
+                        _path_key(target.parent),
+                        score,
+                        limit=_SCORE_CACHE_LIMIT,
+                    )
                 return result
             if target.name == "deep-replay-job.json" and isinstance(payload, dict):
                 output = _compact_deep_replay_job_payload(payload)
@@ -280,20 +282,38 @@ def install_play_hand_result_fastpath() -> None:
                     f"task result receipt conflicts for task {task_id}"
                 )
             play_hand_lab.atomic_write_json(path, sealed)
-            stat = _receipt_stat(Path(path))
+            key = _path_key(path)
+            with _LOCK:
+                _RECEIPT_CACHE.pop(key, None)
+            # Receipts containing derived task graphs may include full profile
+            # snapshots and sweep definitions. They are returned directly to the
+            # journal and must never become a multi-result cache.
+            cacheable = (
+                "derived_tasks" not in sealed
+                and "compatibility_migration" not in sealed
+            )
+            stat = _receipt_stat(Path(path)) if cacheable else None
             if stat is not None:
                 _bounded_put(
                     _RECEIPT_CACHE,
-                    _path_key(path),
+                    key,
                     (
                         stat[0],
                         stat[1],
                         task_id,
                         worker_result_sha256,
-                        copy.deepcopy(sealed),
+                        sealed,
                     ),
+                    limit=_RECEIPT_CACHE_LIMIT,
                 )
-            return copy.deepcopy(sealed)
+                with _LOCK:
+                    _COUNTERS["receipt_cache_peak_entries"] = max(
+                        int(_COUNTERS["receipt_cache_peak_entries"]),
+                        len(_RECEIPT_CACHE),
+                    )
+            elif not cacheable:
+                _counter("receipt_cache_skipped_derived")
+            return sealed
 
         def validate_task_result_receipt(
             path: Path,
@@ -304,17 +324,18 @@ def install_play_hand_result_fastpath() -> None:
             key = _path_key(path)
             stat = _receipt_stat(Path(path))
             with _LOCK:
-                cached = _RECEIPT_CACHE.get(key)
+                # This is a transaction-local handoff, not a historical receipt
+                # cache. Consume it once so completed task graphs cannot accumulate.
+                cached = _RECEIPT_CACHE.pop(key, None)
                 if cached is not None and stat == (cached[0], cached[1]):
                     if cached[2] == task_id and (
                         worker_result_sha256 is None
                         or cached[3] == worker_result_sha256
                     ):
-                        _RECEIPT_CACHE.move_to_end(key)
                         _COUNTERS["receipt_cache_hits"] = int(
                             _COUNTERS["receipt_cache_hits"]
                         ) + 1
-                        return copy.deepcopy(cached[4])
+                        return cached[4]
             _counter("receipt_cache_misses")
             return _ORIGINAL_VALIDATE_TASK_RESULT_RECEIPT(
                 path,
@@ -350,7 +371,10 @@ def install_play_hand_result_fastpath() -> None:
             runtime: Any,
         ) -> dict[str, Any]:
             compact = _compact_recorded_sweep(recorded)
-            receipt_path = Path(str(recorded.get("artifact_dir") or "")) / "task-result-receipt.json"
+            receipt_path = (
+                Path(str(recorded.get("artifact_dir") or ""))
+                / "task-result-receipt.json"
+            )
             if receipt_path.is_file():
                 return compact
             return _ORIGINAL_THROUGHPUT_COMPACT_SWEEP(
@@ -394,6 +418,9 @@ def install_play_hand_result_fastpath() -> None:
                 f"cli-fallback={int(diagnostics['cli_score_fallbacks'])} "
                 f"identity-hits={int(diagnostics['identity_cache_hits'])} "
                 f"receipt-hits={int(diagnostics['receipt_cache_hits'])} "
+                f"receipt-cache={int(diagnostics['receipt_cache_entries'])}/"
+                f"{int(diagnostics['receipt_cache_peak_entries'])} "
+                f"derived-cache-skips={int(diagnostics['receipt_cache_skipped_derived'])} "
                 f"compact-jobs={int(diagnostics['compact_job_artifacts'])}"
             )
             lines = rendered.splitlines()
@@ -402,7 +429,6 @@ def install_play_hand_result_fastpath() -> None:
             return "\n".join(lines)
 
         throughput._compact_pending_sweep_receipt = compact_pending_sweep_receipt
-        play_hand_lab._normalize_runtime = normalize_runtime
         play_hand_lab._worker_result_identity = worker_result_identity
         play_hand_lab._write_json = write_json
         play_hand_lab._score_lab_artifact = score_lab_artifact
