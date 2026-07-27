@@ -345,7 +345,7 @@ def test_policy_resume_uses_lane_accounting_and_only_checks_live_task_payloads(
     }
     unresolved = [dict(durable_tasks["task-pending"]["payload"])]
 
-    rebuilt = play_hand_lab_startup._recompute_policy_state_fast(
+    rebuilt = play_hand_lab_startup._recompute_policy_state_without_terminal_io(
         play_hand_lab,
         policy_state,
         lanes=[lane],
@@ -395,7 +395,7 @@ def test_policy_resume_still_rejects_a_live_task_assignment_conflict(
         DurableExecutionError,
         match="durable journal task policy assignment mismatch",
     ):
-        play_hand_lab_startup._recompute_policy_state_fast(
+        play_hand_lab_startup._recompute_policy_state_without_terminal_io(
             play_hand_lab,
             policy_state,
             lanes=[lane],
