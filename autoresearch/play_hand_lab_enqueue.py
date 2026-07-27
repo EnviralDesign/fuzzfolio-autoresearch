@@ -167,15 +167,19 @@ def install_bounded_gateway_enqueue() -> None:
     )
     from .play_hand_lab_memory import install_play_hand_lab_memory_bounds
     from .play_hand_lab_memory_deep import install_play_hand_lab_deep_memory_bounds
+    from .play_hand_lab_result_fastpath import install_play_hand_result_fastpath
     from .play_hand_lab_startup import install_play_hand_startup_bounds
     from .play_hand_lab_throughput import install_play_hand_throughput_bounds
+    from .scoring import CANONICAL_SCORE_LAB_VERSION
 
+    play_hand_lab.CANONICAL_SCORE_LAB_VERSION = CANONICAL_SCORE_LAB_VERSION
     play_hand_lab._enqueue_gateway_tasks_with_retries = enqueue_gateway_tasks_with_retries
     install_play_hand_lab_memory_bounds()
     install_play_hand_lab_duplicate_result_recovery()
     install_play_hand_lab_deep_memory_bounds()
     install_play_hand_throughput_bounds()
     install_play_hand_startup_bounds()
+    install_play_hand_result_fastpath()
     install_play_hand_gateway_runtime_bounds()
 
 
