@@ -877,6 +877,7 @@ def _write_campaign_state(
     recorded_result_count: int,
     reserved_lane_indices: list[int] | None = None,
 ) -> None:
+    _compact_terminal_lane_payloads(lanes)
     history_payload = asdict(history)
     policy_state = history_payload.pop("campaign_policy_state", None)
     atomic_write_json_streaming(
@@ -6940,6 +6941,11 @@ def _compact_terminal_lane_state(lane: LabLaneState) -> None:
             event.pop("policy_assignment", None)
 
 
+def _compact_terminal_lane_payloads(lanes: Iterable[LabLaneState]) -> None:
+    for lane in lanes:
+        _compact_terminal_lane_state(lane)
+
+
 def _release_completed_phase_payload(lane: LabLaneState, phase: str) -> None:
     """Drop replay payload copies once their phase transition is durable."""
     if not _phase_terminal(lane, phase):
@@ -8425,14 +8431,6 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
             lanes_by_task.pop(task_id, None)
         task_ids_in_tasks.difference_update(pruned_task_ids)
 
-    def compact_terminal_lane_payloads(
-        candidates: Iterable[LabLaneState] | None = None,
-    ) -> None:
-        """Shrink terminal lane payloads without changing retention membership."""
-        for lane in (lanes if candidates is None else candidates):
-            if terminal_lane_ready_for_retention(lane):
-                _compact_terminal_lane_state(lane)
-
     def emit_barrier_snapshot(*, force: bool = False, status: str | None = None) -> None:
         nonlocal barrier_index, last_barrier_at
         if runtime.log_mode != "barrier":
@@ -8687,7 +8685,6 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
                     status=lane_run_status(lane),
                     started_at=started_at,
                 )
-            compact_terminal_lane_payloads(touched_lanes.values())
             persist_campaign_state()
             if defer_enqueues:
                 _result_consumption_checkpoint("before_result_ack")
@@ -8719,7 +8716,6 @@ def cmd_play_hand_lab(runtime: PlayHandLabRuntimeConfig | None = None) -> int:
     if runtime.resume:
         # Rewrite the legacy, oversized state projection before draining retained
         # gateway results.  The journal remains the source of task payload truth.
-        compact_terminal_lane_payloads()
         persist_campaign_state()
 
     if runtime.resume and _is_phase3_formal_runtime(runtime):

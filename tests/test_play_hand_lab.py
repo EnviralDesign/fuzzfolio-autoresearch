@@ -1384,6 +1384,53 @@ def test_compact_terminal_lane_state_drops_heavy_payloads(tmp_path: Path) -> Non
     assert lane.task_ids == ["task-1"]
 
 
+def test_campaign_state_write_compacts_zero_task_terminal_lane(
+    tmp_path: Path,
+) -> None:
+    runtime = lab.PlayHandLabRuntimeConfig(
+        campaign_id="zero-task-terminal",
+        target_runs=1,
+    )
+    lane = lab.LabLaneState(
+        lane_id="lane_001",
+        lane_index=1,
+        run_id="run-1",
+        run_dir=tmp_path,
+        terminal=True,
+        current_phase="policy_lane_exhausted",
+        policy_assignment={
+            "policy_lane": "guided",
+            "candidate_fallback_decisions": [{"large": "duplicate"}],
+        },
+        phase_lifecycle_events=[
+            {
+                "event": "policy_lane_exhausted",
+                "policy_assignment": {"large": "duplicate"},
+            }
+        ],
+    )
+
+    state_path = tmp_path / "state.json"
+    lab._write_campaign_state(
+        state_path,
+        runtime=runtime,
+        campaign_id="zero-task-terminal",
+        lanes=[lane],
+        history=lab.LabCampaignHistory(),
+        next_lane_index=1,
+        recorded_result_count=0,
+    )
+
+    assert lane.task_ids == []
+    assert lane.policy_assignment == {"policy_lane": "guided"}
+    assert lane.phase_lifecycle_events == [{"event": "policy_lane_exhausted"}]
+    stored_lane = json.loads(state_path.read_text(encoding="utf-8"))["lanes"][0]
+    assert stored_lane["policy_assignment"] == {"policy_lane": "guided"}
+    assert stored_lane["phase_lifecycle_events"] == [
+        {"event": "policy_lane_exhausted"}
+    ]
+
+
 def test_lane_state_payload_matches_legacy_projection_without_deep_copy(
     tmp_path: Path,
 ) -> None:
