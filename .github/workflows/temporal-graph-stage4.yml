@@ -5,6 +5,7 @@ on:
     branches: [master]
     paths:
       - "autoresearch/temporal_graph_lab.py"
+      - "autoresearch/temporal_graph_lab_core.py"
       - "autoresearch/temporal_graph_lab_coordinator.py"
       - "autoresearch/temporal_graph_lab_cli.py"
       - "autoresearch/temporal_graph_lab_evidence_cli.py"
@@ -13,6 +14,7 @@ on:
       - "autoresearch/temporal_graph_lab_native_probe_preflight.py"
       - "autoresearch/temporal_graph_lab_native_probe_finish.py"
       - "tests/test_temporal_graph_lab.py"
+      - "tests/test_temporal_graph_lab_public_api.py"
       - "tests/test_temporal_graph_lab_evidence_cli.py"
       - "tests/test_temporal_graph_lab_native_probe.py"
       - "pyproject.toml"
@@ -20,6 +22,7 @@ on:
   pull_request:
     paths:
       - "autoresearch/temporal_graph_lab.py"
+      - "autoresearch/temporal_graph_lab_core.py"
       - "autoresearch/temporal_graph_lab_coordinator.py"
       - "autoresearch/temporal_graph_lab_cli.py"
       - "autoresearch/temporal_graph_lab_evidence_cli.py"
@@ -28,6 +31,7 @@ on:
       - "autoresearch/temporal_graph_lab_native_probe_preflight.py"
       - "autoresearch/temporal_graph_lab_native_probe_finish.py"
       - "tests/test_temporal_graph_lab.py"
+      - "tests/test_temporal_graph_lab_public_api.py"
       - "tests/test_temporal_graph_lab_evidence_cli.py"
       - "tests/test_temporal_graph_lab_native_probe.py"
       - "pyproject.toml"
@@ -66,6 +70,7 @@ jobs:
         run: >-
           uv run python -m py_compile
           autoresearch/temporal_graph_lab.py
+          autoresearch/temporal_graph_lab_core.py
           autoresearch/temporal_graph_lab_coordinator.py
           autoresearch/temporal_graph_lab_cli.py
           autoresearch/temporal_graph_lab_evidence_cli.py
@@ -78,6 +83,7 @@ jobs:
         run: >-
           uv run pytest -q
           tests/test_temporal_graph_lab.py
+          tests/test_temporal_graph_lab_public_api.py
           tests/test_temporal_graph_lab_evidence_cli.py
           tests/test_temporal_graph_lab_native_probe.py
           tests/test_play_hand_lab_gateway.py
