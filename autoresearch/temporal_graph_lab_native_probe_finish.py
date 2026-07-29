@@ -53,6 +53,30 @@ def _cross_check_local_evidence(
     ):
         raise RuntimeError("local/worker observation count mismatch")
     verified["observationCount"] = int(local.get("observationCount") or 0)
+
+    local_execution = local.get("executionEvidence")
+    worker_execution = material.get("execution_evidence")
+    if not isinstance(local_execution, Mapping) or not isinstance(worker_execution, Mapping):
+        raise RuntimeError("local/worker execution evidence is missing")
+    stable_execution_keys = (
+        "expected_window_semantic_sha256",
+        "observed_window_semantic_sha256",
+        "semantic_contract_id",
+        "lake_window_request",
+        "expected_attestation_sha256",
+        "observed_attestation_sha256",
+    )
+    execution_verified: dict[str, Any] = {}
+    for key in stable_execution_keys:
+        local_value = local_execution.get(key)
+        worker_value = worker_execution.get(key)
+        if local_value != worker_value:
+            raise RuntimeError(
+                f"local/worker execution evidence mismatch for {key}: "
+                f"{local_value!r} != {worker_value!r}"
+            )
+        execution_verified[key] = local_value
+    verified["executionEvidence"] = execution_verified
     return verified
 
 

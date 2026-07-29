@@ -52,6 +52,15 @@ def test_local_worker_parity_cross_checks_all_material_identities() -> None:
         "finalCheckpointSha256": "sha256:" + "6" * 64,
         "observationCount": 120,
     }
+    execution_evidence = {
+        "expected_window_semantic_sha256": "sha256:" + "7" * 64,
+        "observed_window_semantic_sha256": "sha256:" + "7" * 64,
+        "semantic_contract_id": "lake_window_semantic_digest_v2",
+        "lake_window_request": {"pairs": ["EURUSD"], "timeframes": ["M5"]},
+        "expected_attestation_sha256": "sha256:" + "8" * 64,
+        "observed_attestation_sha256": "sha256:" + "8" * 64,
+    }
+    local["executionEvidence"] = execution_evidence
     material = {
         "source_profile_snapshot_sha256": local["sourceProfileSnapshotSha256"],
         "resolved_profile_snapshot_sha256": local["resolvedProfileSnapshotSha256"],
@@ -60,11 +69,16 @@ def test_local_worker_parity_cross_checks_all_material_identities() -> None:
         "replay_result_sha256": local["resultSha256"],
         "final_checkpoint_sha256": local["finalCheckpointSha256"],
         "observation_summary": {"observation_count": 120},
+        "execution_evidence": dict(execution_evidence),
     }
 
     verified = probe._cross_check_local_evidence(local, material)
     assert verified["resultSha256"] == local["resultSha256"]
     assert verified["observationCount"] == 120
+    assert (
+        verified["executionEvidence"]["observed_attestation_sha256"]
+        == execution_evidence["observed_attestation_sha256"]
+    )
 
 
 def test_preflight_proves_both_incompatible_worker_exclusions(
