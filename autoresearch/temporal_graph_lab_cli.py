@@ -7,10 +7,8 @@ import sys
 from typing import Any
 
 from .play_hand_lab import LabGatewayClient
-from .temporal_graph_lab import (
-    build_temporal_graph_lab_task,
-    run_temporal_graph_lab_tasks,
-)
+from .temporal_graph_lab import build_temporal_graph_lab_task
+from .temporal_graph_lab_coordinator import run_temporal_graph_lab_tasks
 
 
 PREPARATION_SCHEMA = "temporal_graph_lab_preparation_v1"
