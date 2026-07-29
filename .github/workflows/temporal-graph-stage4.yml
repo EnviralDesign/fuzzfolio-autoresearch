@@ -1,0 +1,52 @@
+name: Temporal graph Stage 4 coordinator
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "autoresearch/temporal_graph_lab.py"
+      - "tests/test_temporal_graph_lab.py"
+      - ".github/workflows/temporal-graph-stage4.yml"
+  pull_request:
+    paths:
+      - "autoresearch/temporal_graph_lab.py"
+      - "tests/test_temporal_graph_lab.py"
+      - ".github/workflows/temporal-graph-stage4.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporal-graph-stage4-coordinator-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coordinator:
+    name: Task builder, gateway routing, validation, and immutable artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Sync AutoResearch
+        run: uv sync --all-groups
+
+      - name: Compile temporal coordinator
+        run: uv run python -m py_compile autoresearch/temporal_graph_lab.py
+
+      - name: Run temporal coordinator and gateway regression tests
+        run: >-
+          uv run pytest -q
+          tests/test_temporal_graph_lab.py
+          tests/test_play_hand_lab_gateway.py
