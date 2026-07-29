@@ -57,3 +57,6 @@ wheels/
 # Rust build output
 /rust/catalog-indexer/target/
 /scripts/Process Manager logs
+
+# Generated native temporal verification evidence
+/temporal-stage4-verification/
