@@ -13,9 +13,9 @@ from autoresearch.temporal_graph_lab import (
     build_temporal_graph_lab_task,
     canonical_sha256,
     materialize_temporal_graph_lab_result,
-    run_temporal_graph_lab_tasks,
     validate_temporal_graph_lab_result,
 )
+from autoresearch.temporal_graph_lab_coordinator import run_temporal_graph_lab_tasks
 
 
 HASH_A = "sha256:" + "a" * 64
@@ -43,9 +43,7 @@ def _profile() -> dict:
         "directionMode": "long",
         "isActive": False,
         "indicators": [],
-        "executionConfig": {
-            "exitPolicy": {"selectedCell": _cell()},
-        },
+        "executionConfig": {"exitPolicy": {"selectedCell": _cell()}},
         "graph": {
             "kind": "temporal_graph_v1",
             "semanticPolicy": "temporal_graph_semantics_v1",
@@ -301,23 +299,24 @@ def test_result_validator_rejects_worker_and_parity_drift() -> None:
 
 
 class FakeClient:
-    def __init__(self, completion: dict) -> None:
+    def __init__(self, completion: dict, *, preexisting: bool = False) -> None:
         self.completion = completion
+        self.preexisting = preexisting
         self.enqueued = False
+        self.enqueue_calls = 0
         self.acked: list[str] = []
-        self.read_calls = 0
 
     def enqueue_tasks(self, tasks):
+        self.enqueue_calls += 1
         self.enqueued = True
         return {"enqueued": len(tasks)}
 
     def read_results(self, *, limit):
-        self.read_calls += 1
-        if not self.enqueued:
-            return []
         if self.acked:
             return []
-        return [self.completion]
+        if self.preexisting or self.enqueued:
+            return [self.completion]
+        return []
 
     def ack_results(self, lease_ids):
         self.acked.extend(lease_ids)
@@ -337,6 +336,7 @@ def test_coordinator_acks_only_after_successful_materialization(tmp_path: Path) 
     )
 
     assert len(artifacts) == 1
+    assert client.enqueue_calls == 1
     assert client.acked == ["lease-stage4"]
 
     invalid = _completion(task)
@@ -353,3 +353,45 @@ def test_coordinator_acks_only_after_successful_materialization(tmp_path: Path) 
             poll_interval_seconds=0.01,
         )
     assert invalid_client.acked == []
+
+
+def test_coordinator_resumes_preexisting_unacked_result_without_reenqueue(
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    client = FakeClient(_completion(task), preexisting=True)
+
+    artifacts = run_temporal_graph_lab_tasks(
+        client,
+        [task],
+        output_root=tmp_path,
+        timeout_seconds=1.0,
+        poll_interval_seconds=0.01,
+    )
+
+    assert len(artifacts) == 1
+    assert client.enqueue_calls == 0
+    assert client.acked == ["lease-stage4"]
+
+
+def test_coordinator_rejects_outer_status_and_worker_attribution_drift(
+    tmp_path: Path,
+) -> None:
+    task = _task()
+    failed = _completion(task)
+    failed["status"] = "failed"
+    with pytest.raises(TemporalGraphLabContractError, match="not successful"):
+        run_temporal_graph_lab_tasks(
+            FakeClient(failed, preexisting=True),
+            [task],
+            output_root=tmp_path / "failed",
+        )
+
+    wrong_worker = _completion(task)
+    wrong_worker["worker_id"] = "different-worker"
+    with pytest.raises(TemporalGraphLabContractError, match="worker attribution"):
+        run_temporal_graph_lab_tasks(
+            FakeClient(wrong_worker, preexisting=True),
+            [task],
+            output_root=tmp_path / "worker",
+        )
