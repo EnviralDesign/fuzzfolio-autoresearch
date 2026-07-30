@@ -64,7 +64,7 @@ def _cross_check_local_evidence(
         "semantic_contract_id",
         "lake_window_request",
         "expected_attestation_sha256",
-        "observed_attestation_sha256",
+        "attestation_identity_role",
     )
     execution_verified: dict[str, Any] = {}
     for key in stable_execution_keys:
@@ -76,6 +76,41 @@ def _cross_check_local_evidence(
                 f"{local_value!r} != {worker_value!r}"
             )
         execution_verified[key] = local_value
+
+    local_attestation = str(
+        local_execution.get("observed_attestation_sha256") or ""
+    ).strip()
+    worker_attestation = str(
+        worker_execution.get("observed_attestation_sha256") or ""
+    ).strip()
+    if not local_attestation or not worker_attestation:
+        raise RuntimeError(
+            "local/worker execution evidence is missing a current attestation receipt"
+        )
+    for label, evidence in (
+        ("local", local_execution),
+        ("worker", worker_execution),
+    ):
+        diagnostic = evidence.get("attestation_provenance_matches_freeze")
+        if not isinstance(diagnostic, bool):
+            raise RuntimeError(
+                f"{label} execution evidence is missing the attestation provenance diagnostic"
+            )
+    execution_verified.update(
+        {
+            "localObservedAttestationSha256": local_attestation,
+            "workerObservedAttestationSha256": worker_attestation,
+            "observedAttestationMatchesAcrossLocalWorker": (
+                local_attestation == worker_attestation
+            ),
+            "localAttestationProvenanceMatchesFreeze": local_execution[
+                "attestation_provenance_matches_freeze"
+            ],
+            "workerAttestationProvenanceMatchesFreeze": worker_execution[
+                "attestation_provenance_matches_freeze"
+            ],
+        }
+    )
     verified["executionEvidence"] = execution_verified
     return verified
 

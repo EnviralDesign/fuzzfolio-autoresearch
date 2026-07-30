@@ -59,6 +59,8 @@ def test_local_worker_parity_cross_checks_all_material_identities() -> None:
         "lake_window_request": {"pairs": ["EURUSD"], "timeframes": ["M5"]},
         "expected_attestation_sha256": "sha256:" + "8" * 64,
         "observed_attestation_sha256": "sha256:" + "8" * 64,
+        "attestation_provenance_matches_freeze": True,
+        "attestation_identity_role": "provenance_receipt_not_execution_authority",
     }
     local["executionEvidence"] = execution_evidence
     material = {
@@ -76,8 +78,67 @@ def test_local_worker_parity_cross_checks_all_material_identities() -> None:
     assert verified["resultSha256"] == local["resultSha256"]
     assert verified["observationCount"] == 120
     assert (
-        verified["executionEvidence"]["observed_attestation_sha256"]
+        verified["executionEvidence"]["localObservedAttestationSha256"]
         == execution_evidence["observed_attestation_sha256"]
+    )
+    assert (
+        verified["executionEvidence"]["workerObservedAttestationSha256"]
+        == execution_evidence["observed_attestation_sha256"]
+    )
+    assert (
+        verified["executionEvidence"]["observedAttestationMatchesAcrossLocalWorker"]
+        is True
+    )
+
+
+def test_local_worker_parity_allows_receipt_provenance_rotation() -> None:
+    local = {
+        "sourceProfileSnapshotSha256": "sha256:" + "1" * 64,
+        "resolvedProfileSnapshotSha256": "sha256:" + "2" * 64,
+        "programSha256": "sha256:" + "3" * 64,
+        "streamSha256": "sha256:" + "4" * 64,
+        "resultSha256": "sha256:" + "5" * 64,
+        "finalCheckpointSha256": "sha256:" + "6" * 64,
+        "observationCount": 120,
+        "executionEvidence": {
+            "expected_window_semantic_sha256": "sha256:" + "7" * 64,
+            "observed_window_semantic_sha256": "sha256:" + "7" * 64,
+            "semantic_contract_id": "lake_window_semantic_digest_v2",
+            "lake_window_request": {"pairs": ["EURUSD"], "timeframes": ["M5"]},
+            "expected_attestation_sha256": "sha256:" + "8" * 64,
+            "observed_attestation_sha256": "sha256:" + "9" * 64,
+            "attestation_provenance_matches_freeze": False,
+            "attestation_identity_role": (
+                "provenance_receipt_not_execution_authority"
+            ),
+        },
+    }
+    worker_execution = dict(local["executionEvidence"])
+    worker_execution["observed_attestation_sha256"] = "sha256:" + "a" * 64
+    material = {
+        "source_profile_snapshot_sha256": local["sourceProfileSnapshotSha256"],
+        "resolved_profile_snapshot_sha256": local["resolvedProfileSnapshotSha256"],
+        "program_sha256": local["programSha256"],
+        "stream_sha256": local["streamSha256"],
+        "replay_result_sha256": local["resultSha256"],
+        "final_checkpoint_sha256": local["finalCheckpointSha256"],
+        "observation_summary": {"observation_count": 120},
+        "execution_evidence": worker_execution,
+    }
+
+    verified = probe._cross_check_local_evidence(local, material)
+
+    assert (
+        verified["executionEvidence"]["observedAttestationMatchesAcrossLocalWorker"]
+        is False
+    )
+    assert (
+        verified["executionEvidence"]["localAttestationProvenanceMatchesFreeze"]
+        is False
+    )
+    assert (
+        verified["executionEvidence"]["workerAttestationProvenanceMatchesFreeze"]
+        is False
     )
 
 
