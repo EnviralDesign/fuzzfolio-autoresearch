@@ -1,0 +1,39 @@
+name: Temporal search discovery controller
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "autoresearch/temporal_discovery*.py"
+      - "tests/test_temporal_discovery.py"
+      - "tests/test_temporal_discovery_prepare.py"
+      - ".github/workflows/temporal-search-discovery.yml"
+  pull_request:
+    paths:
+      - "autoresearch/temporal_discovery*.py"
+      - "tests/test_temporal_discovery.py"
+      - "tests/test_temporal_discovery_prepare.py"
+      - ".github/workflows/temporal-search-discovery.yml"
+
+jobs:
+  discovery-controller:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Sync frozen environment
+        run: uv sync --frozen
+      - name: Compile discovery controller
+        run: |
+          uv run python -m py_compile \
+            autoresearch/temporal_discovery*.py \
+            tests/test_temporal_discovery.py \
+            tests/test_temporal_discovery_prepare.py
+      - name: Run deterministic discovery regressions
+        run: >-
+          uv run --with pytest python -m pytest -q
+          tests/test_temporal_discovery.py
+          tests/test_temporal_discovery_prepare.py
+          tests/test_temporal_search.py
+          tests/test_temporal_search_preflight.py
