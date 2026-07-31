@@ -188,6 +188,65 @@ def test_controller_materializes_both_cost_results_from_one_stream(tmp_path: Pat
     assert len(gateway.enqueued) == 1
 
 
+def test_resume_waits_for_explicitly_duplicate_live_pending_task(tmp_path: Path) -> None:
+    authority = build_authority(_preparation())
+    task = build_task_matrix(authority)[0]
+    gateway = _Gateway(task)
+
+    def reject_existing(tasks: list[dict]) -> dict:
+        gateway.enqueued.extend(tasks)
+        return {
+            "status": "accepted",
+            "submitted": len(tasks),
+            "enqueued": 0,
+            "rejected": len(tasks),
+        }
+
+    gateway.enqueue_tasks = reject_existing  # type: ignore[method-assign]
+
+    result = run_temporal_search_tasks(
+        gateway,
+        authority,
+        output_root=tmp_path,
+        timeout_seconds=1,
+        resume=True,
+    )
+
+    assert result["completedTaskCount"] == 1
+    assert gateway.acks == ["lease-1"]
+
+
+@pytest.mark.parametrize(
+    ("resume", "reported_rejected"),
+    [(False, 1), (True, 0)],
+)
+def test_controller_rejects_incomplete_or_ambiguous_enqueue_receipt(
+    tmp_path: Path,
+    resume: bool,
+    reported_rejected: int,
+) -> None:
+    authority = build_authority(_preparation())
+    task = build_task_matrix(authority)[0]
+    gateway = _Gateway(task)
+    gateway.enqueue_tasks = lambda tasks: {  # type: ignore[method-assign]
+        "submitted": len(tasks),
+        "enqueued": 0,
+        "rejected": reported_rejected,
+    }
+
+    with pytest.raises(
+        TemporalSearchContractError,
+        match="exact pending task set",
+    ):
+        run_temporal_search_tasks(
+            gateway,
+            authority,
+            output_root=tmp_path,
+            timeout_seconds=1,
+            resume=resume,
+        )
+
+
 def test_result_rejects_different_cost_observation_streams(tmp_path: Path) -> None:
     authority = build_authority(_preparation()); task = build_task_matrix(authority)[0]; gateway = _Gateway(task)
     original = gateway.read_results

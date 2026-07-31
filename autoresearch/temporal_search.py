@@ -451,7 +451,28 @@ def run_temporal_search_tasks(client: LabGatewayClientProtocol, authority: Mappi
     pending = [task for task_id, task in tasks.items() if task_id not in completed]
     if pending:
         receipt = client.enqueue_tasks(pending)
-        if int(receipt.get("enqueued") or 0) != len(pending): raise TemporalSearchContractError("gateway did not enqueue the exact pending task set")
+        expected = len(pending)
+        enqueued = int(receipt.get("enqueued") or 0)
+        if enqueued != expected:
+            # After a controller timeout, Resume may find pending tasks that the
+            # Gateway still owns as queued, leased, or recently completed.  The
+            # Gateway reports those exact task identities as explicit duplicate
+            # rejections; they must not be evaluated a second time.  Fresh keeps
+            # the stricter all-new enqueue contract.
+            submitted = receipt.get("submitted")
+            rejected = receipt.get("rejected")
+            resume_duplicates_are_explicit = (
+                resume
+                and submitted is not None
+                and rejected is not None
+                and int(submitted) == expected
+                and int(rejected) == expected - enqueued
+                and 0 <= enqueued <= expected
+            )
+            if not resume_duplicates_are_explicit:
+                raise TemporalSearchContractError(
+                    "gateway did not enqueue the exact pending task set"
+                )
     deadline = time.monotonic() + max(float(timeout_seconds), 1.0)
     while pending:
         if time.monotonic() >= deadline: raise TemporalSearchTimeout("timed out waiting for temporal search results")
