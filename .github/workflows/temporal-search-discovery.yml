@@ -7,12 +7,16 @@ on:
       - "autoresearch/temporal_discovery*.py"
       - "tests/test_temporal_discovery.py"
       - "tests/test_temporal_discovery_prepare.py"
+      - "tests/test_temporal_search.py"
+      - "tests/test_temporal_search_preflight.py"
       - ".github/workflows/temporal-search-discovery.yml"
   pull_request:
     paths:
       - "autoresearch/temporal_discovery*.py"
       - "tests/test_temporal_discovery.py"
       - "tests/test_temporal_discovery_prepare.py"
+      - "tests/test_temporal_search.py"
+      - "tests/test_temporal_search_preflight.py"
       - ".github/workflows/temporal-search-discovery.yml"
 
 jobs:

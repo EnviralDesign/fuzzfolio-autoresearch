@@ -170,7 +170,10 @@ def test_result_rejects_different_cost_observation_streams(tmp_path: Path) -> No
 
 def test_procman_normal_operations_is_temporal_search_topology() -> None:
     root = Path(__file__).resolve().parents[1]
-    config = json.loads((root / "scripts" / "processes.json").read_text(encoding="utf-8"))
+    config_path = root / "scripts" / "processes.json"
+    if not config_path.is_file():
+        pytest.skip("local Procman configuration is intentionally untracked")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
     processes = {item["id"]: item for item in config["processes"]}
     normal = next(item for item in config["groups"] if item["name"] == "Normal Operations")
     names = {processes[item]["name"] for item in normal["process_ids"]}
