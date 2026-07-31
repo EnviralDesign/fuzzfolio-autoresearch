@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 import random
+import subprocess
+import sys
 
 import pytest
+
+import autoresearch.temporal_discovery_results as discovery_results
 
 from autoresearch.temporal_discovery import (
     TEMPORAL_DISCOVERY_PREPARATION_SCHEMA,
@@ -578,6 +583,7 @@ def test_evidence_plan_rotation_binds_legacy_execution_cell() -> None:
 
 def test_progressive_selection_is_order_independent_and_finalizes(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     discovery_root = tmp_path / "discovery"
     generate_discovery(
@@ -618,6 +624,36 @@ def test_progressive_selection_is_order_independent_and_finalizes(
     assert len(selection_payload["noveltyArchive"]) == 5
     assert len(selection_payload["confirmationCandidateIds"]) == 7
 
+    selection_bytes = (
+        discovery_root / "screening" / "initial-selection.json"
+    ).read_bytes()
+    original_result_files = discovery_results._result_files
+    for mode in ("reverse", "shuffle-1", "shuffle-2", "shuffle-3"):
+        def reordered_result_files(
+            result_root: Path | str,
+            *,
+            selected_mode: str = mode,
+        ) -> list[Path]:
+            files = original_result_files(result_root)
+            if selected_mode == "reverse":
+                return list(reversed(files))
+            random.Random(selected_mode).shuffle(files)
+            return files
+
+        monkeypatch.setattr(
+            discovery_results,
+            "_result_files",
+            reordered_result_files,
+        )
+        replay = select_confirmation_stage(
+            discovery_root,
+            initial_result_root=initial_root,
+        )
+        assert replay["selectionSha256"] == selection["selectionSha256"]
+        assert (
+            discovery_root / "screening" / "initial-selection.json"
+        ).read_bytes() == selection_bytes
+
     confirmation_authority = json.loads(
         (discovery_root / "confirmation" / "authority.json").read_text(
             encoding="utf-8"
@@ -647,6 +683,33 @@ def test_progressive_selection_is_order_independent_and_finalizes(
     assert report["funnel"]["initialTaskCount"] == 24
     assert report["funnel"]["confirmationTaskCount"] == 14
     assert audit_discovery(discovery_root)["ok"] is True
+
+
+def test_distribution_distance_is_hash_seed_independent() -> None:
+    script = "\n".join(
+        (
+            "from autoresearch.temporal_discovery_results import "
+            "_l1_distribution_distance",
+            "left = {f'k{i}': 0.0 for i in range(400)}",
+            "right = {",
+            "    f'k{i}': (1e16 if i == 0 else 1.0)",
+            "    for i in range(400)",
+            "}",
+            "print(_l1_distribution_distance(left, right).hex())",
+        )
+    )
+    outputs = []
+    for hash_seed in ("1", "2", "3", "4"):
+        environment = dict(os.environ)
+        environment["PYTHONHASHSEED"] = hash_seed
+        outputs.append(
+            subprocess.check_output(
+                [sys.executable, "-c", script],
+                env=environment,
+                text=True,
+            ).strip()
+        )
+    assert len(set(outputs)) == 1
 
 
 def test_pareto_and_novelty_are_distinct_transparent_paths() -> None:

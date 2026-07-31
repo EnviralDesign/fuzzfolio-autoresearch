@@ -222,20 +222,23 @@ def _result_set_sha256(
 def _distribution(counts: Mapping[str, Any]) -> dict[str, float]:
     values = {
         str(key): max(0.0, float(value))
-        for key, value in counts.items()
+        for key, value in sorted(
+            counts.items(),
+            key=lambda item: str(item[0]),
+        )
     }
-    total = sum(values.values())
+    total = math.fsum(values[key] for key in sorted(values))
     if total <= 0.0:
         return {}
-    return {key: value / total for key, value in values.items()}
+    return {key: values[key] / total for key in sorted(values)}
 
 
 def _l1_distribution_distance(
     left: Mapping[str, float],
     right: Mapping[str, float],
 ) -> float:
-    keys = set(left) | set(right)
-    return 0.5 * sum(
+    keys = sorted(set(left) | set(right))
+    return 0.5 * math.fsum(
         abs(float(left.get(key, 0.0)) - float(right.get(key, 0.0)))
         for key in keys
     )
@@ -453,7 +456,7 @@ def fingerprint_distance(
             abs(float(left["averageMaeR"])),
             abs(float(right["averageMaeR"])),
         ),
-        sum(
+        math.fsum(
             abs(float(a) - float(b))
             for a, b in zip(left["equityShape"], right["equityShape"])
         )
@@ -477,7 +480,7 @@ def fingerprint_distance(
     ]
     left_complexity = left["complexity"]
     right_complexity = right["complexity"]
-    complexity_delta = sum(
+    complexity_delta = math.fsum(
         _log_distance(
             float(left_complexity[key]),
             float(right_complexity[key]),
@@ -485,7 +488,7 @@ def fingerprint_distance(
         for key in sorted(left_complexity)
     ) / max(1, len(left_complexity))
     dimensions.append(complexity_delta)
-    return sum(dimensions) / len(dimensions)
+    return math.fsum(dimensions) / len(dimensions)
 
 
 _ECONOMIC_OBJECTIVES = (
@@ -584,11 +587,14 @@ def select_novelty_archive(
     archive_size: int,
     minimum_total_trades: int,
 ) -> list[dict[str, Any]]:
-    eligible = [
-        dict(candidate)
-        for candidate in candidates
-        if int(candidate["totalTrades"]) >= minimum_total_trades
-    ]
+    eligible = sorted(
+        [
+            dict(candidate)
+            for candidate in candidates
+            if int(candidate["totalTrades"]) >= minimum_total_trades
+        ],
+        key=lambda candidate: candidate["candidateId"],
+    )
     if not eligible:
         return []
     pair_distance: dict[tuple[str, str], float] = {}
@@ -607,7 +613,7 @@ def select_novelty_archive(
     first = max(
         eligible,
         key=lambda candidate: (
-            sum(
+            math.fsum(
                 distance(candidate, other)
                 for other in eligible
                 if other["candidateId"] != candidate["candidateId"]
@@ -627,7 +633,10 @@ def select_novelty_archive(
             remaining,
             key=lambda candidate: (
                 min(distance(candidate, chosen) for chosen in selected),
-                sum(distance(candidate, chosen) for chosen in selected)
+                math.fsum(
+                    distance(candidate, chosen)
+                    for chosen in selected
+                )
                 / len(selected),
                 candidate["candidateId"],
             ),
