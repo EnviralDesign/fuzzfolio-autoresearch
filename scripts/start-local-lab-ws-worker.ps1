@@ -18,6 +18,7 @@ $env:FUZZFOLIO_LAB_GATEWAY_URL = $GatewayUrl
 $env:FUZZFOLIO_LAB_GATEWAY_TOKEN = $token
 $env:FUZZFOLIO_WORKER_ID = $WorkerId
 $env:FUZZFOLIO_WORKER_POOL = $Pool
+$env:FUZZFOLIO_WORKER_LAUNCHER_PID = [string]$PID
 
 Set-Location "C:\repos\Trading-Dashboard\compute-service"
-& "C:\repos\Trading-Dashboard\compute-service\.venv\Scripts\python.exe" -c "from app.cli import sim_worker_replay; sim_worker_replay()"
+& "C:\repos\Trading-Dashboard\compute-service\.venv\Scripts\sim-worker-replay.exe"

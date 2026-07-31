@@ -9,21 +9,10 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPOSITORY_ROOT / "scripts" / "processes.json"
 VENV_PREFIX = "C:\\repos\\fuzzfolio-autoresearch\\.venv\\Scripts\\"
-AUTHORITY_PATH = (
-    "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\phase3-authorities\\"
-    "phase3-darwin-rich-ab-v2\\phase3-playhand-authority.json"
+TEMPORAL_AUTHORITY_PATH = (
+    "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\temporal-search-authorities\\"
+    "stage5d-preflight\\temporal-search-authority.json"
 )
-CAPSULE_PATH = (
-    "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\phase2-atlas-capsules\\"
-    "phase2-atlas-authority-capsule-20260721"
-)
-POLICY_PATH = "C:\\repos\\fuzzfolio-autoresearch\\configs\\phase3-campaign-policy.json"
-EPHEMERAL_AUTHORITY_PATH = (
-    "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\phase3-authorities\\"
-    "phase3-darwin-rich-ab-v3\\phase3-playhand-authority.json"
-)
-
-
 def _config() -> dict[str, object]:
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
@@ -59,7 +48,6 @@ def test_process_manager_groups_reference_unique_processes() -> None:
         "Safe Maintenance Preview",
         "Historical Evidence (Advanced)",
         "Atlas Manual (Advanced)",
-        "Ephemeral Workers (Manual)",
     }
 
 
@@ -71,52 +59,40 @@ def test_normal_operations_are_authority_bound_and_semantically_closed() -> None
 
     assert [process["name"] for process in normal_processes] == [
         "Lab Gateway",
-        "Phase 3 PlayHand - Fresh",
-        "Phase 3 PlayHand - Resume",
+        "Temporal Graph Local Worker",
+        "Temporal Search - Fresh",
+        "Temporal Search - Resume",
         "AutoResearch Dashboard",
-        "Phase 3 Authority Audit",
+        "Temporal Search Authority Audit",
     ]
-    assert all(
-        str(process["command"]).startswith(VENV_PREFIX)
-        for process in normal_processes
+    assert "start-local-lab-ws-worker.ps1" in str(normal_processes[1]["command"])
+    worker_launcher = (REPOSITORY_ROOT / "scripts" / "start-local-lab-ws-worker.ps1").read_text(
+        encoding="utf-8"
     )
+    assert "sim-worker-replay.exe" in worker_launcher
+    assert "from app.cli import sim_worker_replay" not in worker_launcher
+    assert "FUZZFOLIO_WORKER_LAUNCHER_PID" in worker_launcher
 
-    fresh = normal_processes[1]
-    resume = normal_processes[2]
+    fresh = normal_processes[2]
+    resume = normal_processes[3]
     for process, lifecycle_flag in ((fresh, "--fresh"), (resume, "--resume")):
         command = str(process["command"])
-        assert "phase3-playhand.exe" in command
+        assert "uv run temporal-search" in command
         assert lifecycle_flag in command
         assert "--gateway-url http://127.0.0.1:8799" in command
-        assert "--active-runs 128" in command
-        assert "--trading-dashboard-root C:\\repos\\Trading-Dashboard" in command
-        assert AUTHORITY_PATH in command
-        assert CAPSULE_PATH in command
-        assert POLICY_PATH in command
+        assert "--timeout-seconds 900" in command
+        assert TEMPORAL_AUTHORITY_PATH in command
         assert process["auto_restart"] is False
-
-        for forbidden_override in (
-            "--target-runs",
-            "--campaign-id",
-            "--as-of-date",
-            "--seed",
-            "--instrument",
-            "--timeframe",
-            "--lookback-months",
-            "--policy-manifest-sha256",
-        ):
-            assert forbidden_override not in command
+        assert "--plan-only" not in command
 
     assert "--fresh" not in str(resume["command"])
     assert "--resume" not in str(fresh["command"])
 
-    authority_audit = normal_processes[4]
+    authority_audit = normal_processes[5]
     audit_command = str(authority_audit["command"])
-    assert "phase3-playhand-authority.exe" in audit_command
+    assert "uv run temporal-search-authority" in audit_command
     assert "--audit" in audit_command
-    assert AUTHORITY_PATH in audit_command
-    assert CAPSULE_PATH in audit_command
-    assert POLICY_PATH in audit_command
+    assert TEMPORAL_AUTHORITY_PATH in audit_command
 
 
 def test_legacy_level_c_and_destructive_apply_controls_are_absent() -> None:
@@ -139,52 +115,16 @@ def test_all_configured_commands_use_direct_venv_wrappers() -> None:
 
     for process in config["processes"]:
         command = str(process["command"])
-        if command.startswith("uv run "):
+        if command.startswith(("uv run ", "powershell ", "pwsh ")):
             continue
         assert command.startswith(VENV_PREFIX)
         assert "uv run" not in command
 
 
-def test_ephemeral_worker_generator_entries_are_safe_smoke_commands() -> None:
+def test_retired_phase3_ephemeral_worker_entries_are_absent() -> None:
     config = _config()
-    processes = _processes(config)
-    ephemeral = _group(config, "Ephemeral Workers (Manual)")
-    ephemeral_processes = [
-        processes[process_id] for process_id in ephemeral["process_ids"]
-    ]
+    group_names = {str(group["name"]) for group in config["groups"]}
+    process_names = {str(process["name"]) for process in config["processes"]}
 
-    assert [process["name"] for process in ephemeral_processes] == [
-        "Generate Ephemeral Windows Workers - 3m Smoke",
-        "Generate Ephemeral Windows Workers - 5m Smoke",
-        "Generate Ephemeral Windows Workers - 2h",
-        "Generate Ephemeral Windows Workers - Local Smoke File",
-    ]
-
-    for process in ephemeral_processes:
-        command = str(process["command"])
-        assert command.startswith("uv run generate-ephemeral-worker-command ")
-        assert "--copy" in command
-        assert "--json-redacted" in command
-        assert "--print-command" not in command
-        assert EPHEMERAL_AUTHORITY_PATH in command
-        assert Path(EPHEMERAL_AUTHORITY_PATH).is_file()
-        assert process["auto_restart"] is False
-        assert process["respond_to_start_all"] is False
-        assert process["respond_to_stop_all"] is False
-        lowered = command.lower()
-        assert "bearer " not in lowered
-        assert "enrollmenttoken" not in lowered.replace("-", "").replace("_", "")
-        assert "gatewaytoken" not in lowered.replace("-", "").replace("_", "")
-
-    wan_commands = [
-        str(process["command"])
-        for process in ephemeral_processes
-        if "Local Smoke File" not in str(process["name"])
-    ]
-    assert all("--local-smoke" not in command for command in wan_commands)
-    local_cmd = next(
-        str(p["command"])
-        for p in ephemeral_processes
-        if p["name"] == "Generate Ephemeral Windows Workers - Local Smoke File"
-    )
-    assert "--local-smoke" in local_cmd
+    assert "Ephemeral Workers (Manual)" not in group_names
+    assert not any(name.startswith("Generate Ephemeral Windows Workers") for name in process_names)
