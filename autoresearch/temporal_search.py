@@ -160,6 +160,11 @@ def _candidate_window_input(raw: Mapping[str, Any], *, name: str, candidate: Map
     plan_id = _sha(plan.get("plan_id") or plan.get("planId"), name=f"{name}.evidencePlan.planId")
     if plan.get("schema_version") != "fuzzfolio.replay-evidence-plan.v2":
         raise TemporalSearchContractError(f"{name} requires replay evidence plan v2")
+    if "execution_cell_sha256" not in plan:
+        raise TemporalSearchContractError(
+            f"{name} v2 evidence plan must explicitly declare "
+            "execution_cell_sha256"
+        )
     plan_identity = dict(plan)
     plan_identity.pop("plan_id", None)
     plan_identity.pop("lake_manifest_sha256", None)
@@ -182,7 +187,12 @@ def _candidate_window_input(raw: Mapping[str, Any], *, name: str, candidate: Map
         raise TemporalSearchContractError(f"{name} lake binding does not cover candidate instrument/timeframe")
     execution_config = _mapping(candidate["sourceProfile"].get("executionConfig"), name=f"{name}.sourceProfile.executionConfig")
     management_library = execution_config.get("managementLibrary")
-    evidence_cell_sha256 = plan.get("execution_cell_sha256") or plan.get("executionCellSha256")
+    evidence_cell_sha256 = plan["execution_cell_sha256"]
+    if evidence_cell_sha256 is not None:
+        evidence_cell_sha256 = _sha(
+            evidence_cell_sha256,
+            name=f"{name}.evidencePlan.execution_cell_sha256",
+        )
     if management_library is not None:
         if not isinstance(management_library, Mapping):
             raise TemporalSearchContractError(f"{name} managementLibrary must be an object")

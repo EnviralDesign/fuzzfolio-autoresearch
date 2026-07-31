@@ -102,6 +102,38 @@ def test_scalar_management_task_binds_complete_execution_config_without_legacy_c
     assert payload["evidence_plan"]["execution_cell_sha256"] is None
 
 
+def test_authority_rejects_sparse_scalar_management_evidence_plan() -> None:
+    preparation = _preparation()
+    profile = preparation["candidates"][0]["sourceProfile"]
+    profile["executionConfig"] = {
+        "managementLibrary": {
+            "stopDefinitions": [],
+            "targetDefinitions": [],
+            "trailingDefinitions": [],
+            "scalarBindings": [],
+        },
+        "initialProtection": {"stopId": None, "targetId": None},
+        "sizingPolicy": {"mode": "inherit_global"},
+    }
+    preparation["candidates"][0]["sourceProfileSha256"] = canonical_sha256(
+        profile
+    )
+    start = preparation["developmentWindows"][0]["analysisWindowStart"]
+    end = preparation["developmentWindows"][0]["analysisWindowEnd"]
+    plan = _plan(profile, start, end)
+    plan.pop("execution_cell_sha256")
+    identity = dict(plan)
+    identity.pop("plan_id")
+    plan["plan_id"] = canonical_sha256(identity)
+    preparation["candidates"][0]["windowInputs"][0]["evidencePlan"] = plan
+
+    with pytest.raises(
+        TemporalSearchContractError,
+        match="must explicitly declare execution_cell_sha256",
+    ):
+        build_authority(preparation)
+
+
 def test_authority_rejects_reserved_overlap_and_profile_plan_mismatch() -> None:
     preparation = _preparation()
     preparation["developmentWindows"][0]["analysisWindowEnd"] = "2024-06-15T00:00:00Z"
