@@ -9,6 +9,7 @@ import pytest
 
 from autoresearch.temporal_discovery import (
     TEMPORAL_DISCOVERY_PREPARATION_SCHEMA,
+    _rotate_evidence_plan,
     audit_discovery,
     finalize_discovery,
     fingerprint_distance,
@@ -528,7 +529,51 @@ def test_generation_is_deterministic_and_program_deduplicated(
     assert len(
         {item["programSha256"] for item in left_population["candidates"]}
     ) == 12
+    initial_authority = json.loads(
+        (left_root / "initial" / "authority.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    for candidate in initial_authority["candidates"]:
+        for window_input in candidate["windowInputs"]:
+            plan = window_input["evidencePlan"]
+            assert "execution_cell_sha256" in plan
+            assert plan["execution_cell_sha256"] is None
+            identity = dict(plan)
+            identity.pop("plan_id")
+            identity.pop("lake_manifest_sha256", None)
+            assert plan["plan_id"] == canonical_sha256(identity)
     assert audit_discovery(left_root)["ok"] is True
+
+
+def test_evidence_plan_rotation_binds_legacy_execution_cell() -> None:
+    profile = _seed_profile("legacy", 55.0)
+    selected_cell = {
+        "stopLossPercent": 0.75,
+        "rewardMultiple": 2.0,
+    }
+    profile["executionConfig"] = {
+        "exitPolicy": {"selectedCell": selected_cell}
+    }
+    template = _plan(
+        {
+            "analysisWindowStart": "2021-01-01T00:00:00Z",
+            "analysisWindowEnd": "2021-02-01T00:00:00Z",
+        },
+        canonical_sha256(profile),
+    )
+
+    rotated = _rotate_evidence_plan(
+        template,
+        raw_source_profile_sha256=canonical_sha256(profile),
+        source_profile=profile,
+    )
+
+    assert rotated["execution_cell_sha256"] == canonical_sha256(selected_cell)
+    identity = dict(rotated)
+    identity.pop("plan_id")
+    identity.pop("lake_manifest_sha256", None)
+    assert rotated["plan_id"] == canonical_sha256(identity)
 
 
 def test_progressive_selection_is_order_independent_and_finalizes(

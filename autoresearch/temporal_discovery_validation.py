@@ -537,10 +537,34 @@ def _rotate_evidence_plan(
     template: Mapping[str, Any],
     *,
     raw_source_profile_sha256: str,
+    source_profile: Mapping[str, Any],
 ) -> dict[str, Any]:
     plan = _mapping(template, name="evidence plan template")
+    profile = _mapping(source_profile, name="source profile")
+    execution_config = _mapping(
+        profile.get("executionConfig"),
+        name="source profile executionConfig",
+    )
+    management_library = execution_config.get("managementLibrary")
+    if management_library is not None:
+        _mapping(
+            management_library,
+            name="source profile managementLibrary",
+        )
+        execution_cell_sha256 = None
+    else:
+        exit_policy = _mapping(
+            execution_config.get("exitPolicy"),
+            name="source profile exitPolicy",
+        )
+        selected_cell = _mapping(
+            exit_policy.get("selectedCell"),
+            name="source profile selectedCell",
+        )
+        execution_cell_sha256 = canonical_sha256(selected_cell)
+
     plan["profile_snapshot_sha256"] = raw_source_profile_sha256
-    plan.pop("execution_cell_sha256", None)
+    plan["execution_cell_sha256"] = execution_cell_sha256
     plan.pop("plan_id", None)
     identity = dict(plan)
     identity.pop("lake_manifest_sha256", None)
@@ -589,6 +613,7 @@ def _finite_preparation(
                         "evidencePlan": _rotate_evidence_plan(
                             template_map[window_id],
                             raw_source_profile_sha256=raw_sha,
+                            source_profile=source_profile,
                         ),
                     }
                     for window_id in window_ids
