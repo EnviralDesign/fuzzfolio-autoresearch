@@ -47,6 +47,7 @@ temporal-graph-lab-native-probe = "autoresearch.temporal_graph_lab_native_probe:
 temporal-search-authority = "autoresearch.temporal_search_cli:authority_main"
 temporal-search = "autoresearch.temporal_search_cli:search_main"
 temporal-search-prepare-preflight = "autoresearch.temporal_search_preflight_cli:main"
+temporal-search-quality = "autoresearch.temporal_search_quality_cli:main"
 atlas-lab = "autoresearch.__main__:main"
 build-indicator-atlas = "autoresearch.__main__:main"
 build-signal-atlas = "autoresearch.__main__:main"
