@@ -26,6 +26,16 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     manifest = json.loads(args.task_manifest.read_text(encoding="utf-8"))
+    authority_path = args.task_manifest.parent / "authority.json"
+    authority = json.loads(authority_path.read_text(encoding="utf-8"))
+    if authority.get("authorityId") != manifest.get("authorityId"):
+        raise ValueError("native manifest/authority identity mismatch")
+    window_id_by_bounds = {
+        (row["analysisWindowStart"], row["analysisWindowEnd"]): row["windowId"]
+        for row in authority.get("developmentWindows") or []
+    }
+    if len(window_id_by_bounds) != 2:
+        raise ValueError("Stage 5E-3 screening authority requires exactly two windows")
     tasks = list(manifest.get("tasks") or [])
     if len(tasks) != 256:
         raise ValueError("Stage 5E-3 native validation requires exactly 256 tasks")
@@ -40,7 +50,12 @@ def main() -> None:
         plan_ids.add(plan.plan_id)
         job_ids.add(job.job_id)
         candidates.add(job.candidate_id)
-        windows[job.window_id] = windows.get(job.window_id, 0) + 1
+        window_id = window_id_by_bounds.get(
+            (job.analysis_window_start, job.analysis_window_end)
+        )
+        if window_id is None:
+            raise ValueError("candidate-window job is outside the screening authority")
+        windows[window_id] = windows.get(window_id, 0) + 1
     if len(job_ids) != 256 or len(plan_ids) != 256 or len(candidates) != 128:
         raise ValueError("native validation identities are not one candidate/window job each")
     task_matrix_sha256 = canonical_sha256(tasks)

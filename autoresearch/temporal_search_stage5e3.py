@@ -538,7 +538,20 @@ def prepare_screening_prelaunch(
     tasks = build_task_matrix(authority)
     if len(tasks) != 256:
         raise TemporalDiscoveryContractError("Stage 5E-3 screening matrix is not 256 tasks")
-    if {task["payload"]["window_id"] for task in tasks} != {
+    window_id_by_bounds = {
+        (window["analysisWindowStart"], window["analysisWindowEnd"]): window["windowId"]
+        for window in authority["developmentWindows"]
+    }
+    task_window_ids = [
+        window_id_by_bounds.get(
+            (
+                task["payload"]["analysis_window_start"],
+                task["payload"]["analysis_window_end"],
+            )
+        )
+        for task in tasks
+    ]
+    if None in task_window_ids or set(task_window_ids) != {
         window_id_by_label[label] for label in SCREENING_LABELS
     }:
         raise TemporalDiscoveryContractError("G/H leaked into screening matrix")
@@ -563,8 +576,8 @@ def prepare_screening_prelaunch(
         "manifestTaskMatrixSha256": plan_manifest["taskMatrixSha256"],
         "exact": canonical_sha256(tasks) == plan_manifest["taskMatrixSha256"],
         "windowTaskCounts": {
-            window_id: sum(task["payload"]["window_id"] == window_id for task in tasks)
-            for window_id in sorted({task["payload"]["window_id"] for task in tasks})
+            window_id: task_window_ids.count(window_id)
+            for window_id in sorted(set(task_window_ids))
         },
         "confirmationWindowResultPathAccessible": False,
         "gatewayContacted": False,
