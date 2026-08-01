@@ -6,9 +6,17 @@ on:
     paths:
       - "autoresearch/temporal_discovery*.py"
       - "autoresearch/temporal_search_quality*.py"
+      - "autoresearch/temporal_search_activation*.py"
+      - "autoresearch/temporal_search_policy_v2*.py"
+      - "autoresearch/temporal_search_selector_v2*.py"
+      - "autoresearch/temporal_search_generator_v2*.py"
+      - "scripts/temporal_policy_v2_native_witness.py"
       - "tests/test_temporal_discovery.py"
       - "tests/test_temporal_discovery_prepare.py"
       - "tests/test_temporal_search_quality.py"
+      - "tests/test_temporal_search_activation.py"
+      - "tests/test_temporal_search_policy_v2.py"
+      - "tests/test_temporal_search_selector_v2.py"
       - "tests/test_temporal_search.py"
       - "tests/test_temporal_search_preflight.py"
       - "pyproject.toml"
@@ -17,9 +25,17 @@ on:
     paths:
       - "autoresearch/temporal_discovery*.py"
       - "autoresearch/temporal_search_quality*.py"
+      - "autoresearch/temporal_search_activation*.py"
+      - "autoresearch/temporal_search_policy_v2*.py"
+      - "autoresearch/temporal_search_selector_v2*.py"
+      - "autoresearch/temporal_search_generator_v2*.py"
+      - "scripts/temporal_policy_v2_native_witness.py"
       - "tests/test_temporal_discovery.py"
       - "tests/test_temporal_discovery_prepare.py"
       - "tests/test_temporal_search_quality.py"
+      - "tests/test_temporal_search_activation.py"
+      - "tests/test_temporal_search_policy_v2.py"
+      - "tests/test_temporal_search_selector_v2.py"
       - "tests/test_temporal_search.py"
       - "tests/test_temporal_search_preflight.py"
       - "pyproject.toml"
@@ -39,9 +55,17 @@ jobs:
           uv run python -m py_compile \
             autoresearch/temporal_discovery*.py \
             autoresearch/temporal_search_quality*.py \
+            autoresearch/temporal_search_activation*.py \
+            autoresearch/temporal_search_policy_v2*.py \
+            autoresearch/temporal_search_selector_v2*.py \
+            autoresearch/temporal_search_generator_v2*.py \
+            scripts/temporal_policy_v2_native_witness.py \
             tests/test_temporal_discovery.py \
             tests/test_temporal_discovery_prepare.py \
-            tests/test_temporal_search_quality.py
+            tests/test_temporal_search_quality.py \
+            tests/test_temporal_search_activation.py \
+            tests/test_temporal_search_policy_v2.py \
+            tests/test_temporal_search_selector_v2.py
       - name: Run deterministic discovery regressions
         run: >-
           uv run --with pytest python -m pytest -q
@@ -50,3 +74,6 @@ jobs:
           tests/test_temporal_search.py
           tests/test_temporal_search_preflight.py
           tests/test_temporal_search_quality.py
+          tests/test_temporal_search_activation.py
+          tests/test_temporal_search_policy_v2.py
+          tests/test_temporal_search_selector_v2.py

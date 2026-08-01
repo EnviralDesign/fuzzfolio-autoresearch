@@ -268,6 +268,27 @@ def test_procman_normal_operations_is_temporal_search_topology() -> None:
     processes = {item["id"]: item for item in config["processes"]}
     normal = next(item for item in config["groups"] if item["name"] == "Normal Operations")
     names = {processes[item]["name"] for item in normal["process_ids"]}
-    assert names == {"Lab Gateway", "Temporal Graph Local Worker", "Temporal Search - Fresh", "Temporal Search - Resume", "Temporal Search Authority Audit", "AutoResearch Dashboard"}
+    required = {
+        "Lab Gateway",
+        "Temporal Search - Fresh",
+        "Temporal Search - Resume",
+        "Temporal Search Authority Audit",
+        "AutoResearch Dashboard",
+    }
+    assert required <= names
+    assert names - required in (
+        {"Temporal Graph Local Worker"},
+        {"Temporal Graph Frozen Worker (b69e)"},
+    )
     assert not any(item["name"].startswith("Phase 3 ") for item in processes.values())
-    assert "start-local-lab-ws-worker.ps1" in processes[next(item for item in normal["process_ids"] if processes[item]["name"] == "Temporal Graph Local Worker")]["command"]
+    worker = next(
+        processes[item]
+        for item in normal["process_ids"]
+        if processes[item]["name"]
+        in {"Temporal Graph Local Worker", "Temporal Graph Frozen Worker (b69e)"}
+    )
+    if worker["name"] == "Temporal Graph Local Worker":
+        assert "start-local-lab-ws-worker.ps1" in worker["command"]
+    else:
+        assert worker["process_type"] == "Docker"
+        assert worker["command"] == "fuzzfolio-stage5e0-containment-worker"
