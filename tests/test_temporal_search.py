@@ -524,27 +524,17 @@ def test_procman_normal_operations_is_temporal_search_topology() -> None:
         item for item in config["groups"] if item["name"] == "Normal Operations"
     )
     names = {processes[item]["name"] for item in normal["process_ids"]}
-    required = {
+    assert names == {
         "Lab Gateway",
-        "Temporal Search - Fresh",
-        "Temporal Search - Resume",
-        "Temporal Search Authority Audit",
+        "Temporal QD Broad Search (10k)",
         "AutoResearch Dashboard",
     }
-    assert required <= names
-    assert names - required in (
-        {"Temporal Graph Local Worker"},
-        {"Temporal Graph Frozen Worker (b69e)"},
-    )
     assert not any(item["name"].startswith("Phase 3 ") for item in processes.values())
-    worker = next(
+    supervisor = next(
         processes[item]
         for item in normal["process_ids"]
-        if processes[item]["name"]
-        in {"Temporal Graph Local Worker", "Temporal Graph Frozen Worker (b69e)"}
+        if processes[item]["name"] == "Temporal QD Broad Search (10k)"
     )
-    if worker["name"] == "Temporal Graph Local Worker":
-        assert "start-local-lab-ws-worker.ps1" in worker["command"]
-    else:
-        assert worker["process_type"] == "Docker"
-        assert worker["command"] == "fuzzfolio-stage5e0-containment-worker"
+    assert "temporal-qd-supervisor" in supervisor["command"]
+    assert "--generation-count 4" in supervisor["command"]
+    assert "--broad-admission" in supervisor["command"]
