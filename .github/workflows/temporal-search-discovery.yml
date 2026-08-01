@@ -10,6 +10,7 @@ on:
       - "autoresearch/temporal_search_policy_v2*.py"
       - "autoresearch/temporal_search_selector_v2*.py"
       - "autoresearch/temporal_search_generator_v2*.py"
+      - "autoresearch/temporal_search_stage5e2*.py"
       - "scripts/temporal_policy_v2_native_witness.py"
       - "tests/test_temporal_discovery.py"
       - "tests/test_temporal_discovery_prepare.py"
@@ -29,6 +30,7 @@ on:
       - "autoresearch/temporal_search_policy_v2*.py"
       - "autoresearch/temporal_search_selector_v2*.py"
       - "autoresearch/temporal_search_generator_v2*.py"
+      - "autoresearch/temporal_search_stage5e2*.py"
       - "scripts/temporal_policy_v2_native_witness.py"
       - "tests/test_temporal_discovery.py"
       - "tests/test_temporal_discovery_prepare.py"
@@ -59,6 +61,7 @@ jobs:
             autoresearch/temporal_search_policy_v2*.py \
             autoresearch/temporal_search_selector_v2*.py \
             autoresearch/temporal_search_generator_v2*.py \
+            autoresearch/temporal_search_stage5e2*.py \
             scripts/temporal_policy_v2_native_witness.py \
             tests/test_temporal_discovery.py \
             tests/test_temporal_discovery_prepare.py \
