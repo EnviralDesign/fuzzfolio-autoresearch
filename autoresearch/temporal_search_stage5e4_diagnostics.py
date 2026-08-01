@@ -844,6 +844,7 @@ def _build_cost_audit(
             count = len(group)
             gross = math.fsum(float(row["grossR"]) for row in group)
             net = math.fsum(float(row["conservativeNetR"]) for row in group)
+            cost = gross - net
             output.append(
                 {
                     "value": value,
@@ -851,8 +852,10 @@ def _build_cost_audit(
                     "tradeShare": _ratio(count, trade_count),
                     "grossR": gross,
                     "conservativeNetR": net,
+                    "costDragR": cost,
                     "grossExpectancyPerTrade": _ratio(gross, count),
                     "conservativeExpectancyPerTrade": _ratio(net, count),
+                    "costDragPerTrade": _ratio(cost, count),
                     "holdingBars": _numeric_summary(row["holdingBars"] for row in group),
                     "maximumFavorableExcursionR": _numeric_summary(
                         row["maximumFavorableExcursionR"] for row in group
