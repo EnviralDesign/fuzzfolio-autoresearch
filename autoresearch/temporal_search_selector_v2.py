@@ -132,12 +132,12 @@ def _normalize_aggregate(value: Mapping[str, Any]) -> dict[str, Any]:
     row["costDragPerTrade"] = (
         row["costDragR"] / row["totalTrades"]
         if row["totalTrades"] > 0
-        else math.inf
+        else 0.0
     )
     row["rejectedIntentRate"] = (
         row["rejectedIntentCount"] / row["totalTrades"]
         if row["totalTrades"] > 0
-        else math.inf
+        else 0.0
     )
     return row
 
@@ -258,12 +258,14 @@ def _public_row(row: Mapping[str, Any], *, rank: int, archive: str) -> dict[str,
     }
 
 
-def select_policy_v2(
+def evaluate_policy_v2_envelope(
     *,
     population_candidates: Sequence[Mapping[str, Any]],
     screening_aggregates: Sequence[Mapping[str, Any]],
     parameters: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Evaluate the frozen robust envelope without relaxing its minimum size."""
+
     config = _clone(parameters or SELECTOR_V2_PARAMETERS, name="selector v2 parameters")
     if config != SELECTOR_V2_PARAMETERS:
         raise TemporalDiscoveryContractError(
@@ -345,6 +347,35 @@ def select_policy_v2(
         )
         if is_eligible:
             eligible.append(item)
+    return {
+        "parameters": config,
+        "population": population,
+        "aggregates": aggregates,
+        "active": active,
+        "thresholds": thresholds,
+        "eligibility": eligibility,
+        "eligible": eligible,
+    }
+
+
+def select_policy_v2(
+    *,
+    population_candidates: Sequence[Mapping[str, Any]],
+    screening_aggregates: Sequence[Mapping[str, Any]],
+    parameters: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    envelope = evaluate_policy_v2_envelope(
+        population_candidates=population_candidates,
+        screening_aggregates=screening_aggregates,
+        parameters=parameters,
+    )
+    config = envelope["parameters"]
+    population = envelope["population"]
+    aggregates = envelope["aggregates"]
+    active = envelope["active"]
+    thresholds = envelope["thresholds"]
+    eligibility = envelope["eligibility"]
+    eligible = envelope["eligible"]
     if len(eligible) < int(config["minimumEligibleCandidates"]):
         raise TemporalDiscoveryContractError(
             "selector v2 robust envelope is too small; refusing to relax thresholds: "
@@ -492,6 +523,7 @@ def freeze_policy_v2_selection(
 __all__ = [
     "SELECTOR_V2_PARAMETERS",
     "SELECTOR_V2_VERSION",
+    "evaluate_policy_v2_envelope",
     "freeze_policy_v2_selection",
     "select_policy_v2",
 ]

@@ -5,7 +5,10 @@ import random
 import pytest
 
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
-from autoresearch.temporal_search_selector_v2 import select_policy_v2
+from autoresearch.temporal_search_selector_v2 import (
+    evaluate_policy_v2_envelope,
+    select_policy_v2,
+)
 from autoresearch.temporal_search_selector_v2_admission import _synthetic_aggregate
 
 
@@ -87,6 +90,31 @@ def test_selector_v2_fails_closed_when_robust_envelope_is_too_small() -> None:
             population_candidates=population,
             screening_aggregates=aggregates,
         )
+
+
+def test_selector_v2_envelope_reports_inactive_candidates_without_nonfinite_values() -> None:
+    population = _population()
+    aggregates = [_synthetic_aggregate(item) for item in population]
+    aggregates[0]["tradeCountsByWindow"] = [0, 0]
+    aggregates[0]["totalTrades"] = 0
+    aggregates[0]["costDragR"] = 0.0
+    aggregates[0]["rejectedIntentCount"] = 0
+
+    envelope = evaluate_policy_v2_envelope(
+        population_candidates=population,
+        screening_aggregates=aggregates,
+    )
+
+    inactive = next(
+        row
+        for row in envelope["aggregates"]
+        if row["candidateId"] == population[0]["candidateId"]
+    )
+    assert inactive["costDragPerTrade"] == 0.0
+    assert inactive["rejectedIntentRate"] == 0.0
+    assert population[0]["candidateId"] not in {
+        row["candidateId"] for row in envelope["active"]
+    }
 
 
 def test_management_activity_is_not_an_eligibility_gate() -> None:

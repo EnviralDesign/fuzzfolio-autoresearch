@@ -23,6 +23,7 @@ on:
       - "tests/test_temporal_search.py"
       - "tests/test_temporal_search_preflight.py"
       - "tests/test_temporal_search_stage5e3.py"
+      - "tests/test_temporal_search_stage5e3_midpoint.py"
       - "pyproject.toml"
       - ".github/workflows/temporal-search-discovery.yml"
   pull_request:
@@ -46,6 +47,7 @@ on:
       - "tests/test_temporal_search.py"
       - "tests/test_temporal_search_preflight.py"
       - "tests/test_temporal_search_stage5e3.py"
+      - "tests/test_temporal_search_stage5e3_midpoint.py"
       - "pyproject.toml"
       - ".github/workflows/temporal-search-discovery.yml"
 
@@ -77,7 +79,8 @@ jobs:
             tests/test_temporal_search_activation.py \
             tests/test_temporal_search_policy_v2.py \
             tests/test_temporal_search_selector_v2.py \
-            tests/test_temporal_search_stage5e3.py
+            tests/test_temporal_search_stage5e3.py \
+            tests/test_temporal_search_stage5e3_midpoint.py
       - name: Run deterministic discovery regressions
         run: >-
           uv run --with pytest python -m pytest -q
@@ -90,3 +93,4 @@ jobs:
           tests/test_temporal_search_policy_v2.py
           tests/test_temporal_search_selector_v2.py
           tests/test_temporal_search_stage5e3.py
+          tests/test_temporal_search_stage5e3_midpoint.py
