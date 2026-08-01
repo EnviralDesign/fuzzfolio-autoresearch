@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPOSITORY_ROOT / "scripts" / "processes.json"
 VENV_PREFIX = "C:\\repos\\fuzzfolio-autoresearch\\.venv\\Scripts\\"
-TEMPORAL_AUTHORITY_PATH = (
-    "C:\\repos\\fuzzfolio-autoresearch\\runs\\derived\\temporal-search-authorities\\"
-    "stage5d-preflight\\temporal-search-authority.json"
-)
+
+
+def _command_argument(command: str, name: str) -> str:
+    match = re.search(rf"(?:^|\s){re.escape(name)}\s+(?:\"([^\"]+)\"|(\S+))", command)
+    assert match is not None, f"missing {name}"
+    return match.group(1) or match.group(2)
 def _config() -> dict[str, object]:
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
@@ -57,42 +60,57 @@ def test_normal_operations_are_authority_bound_and_semantically_closed() -> None
     normal = _group(config, "Normal Operations")
     normal_processes = [processes[process_id] for process_id in normal["process_ids"]]
 
-    assert [process["name"] for process in normal_processes] == [
-        "Lab Gateway",
-        "Temporal Graph Local Worker",
+    assert [process["name"] for process in normal_processes[2:]] == [
         "Temporal Search - Fresh",
         "Temporal Search - Resume",
         "AutoResearch Dashboard",
         "Temporal Search Authority Audit",
     ]
-    assert "start-local-lab-ws-worker.ps1" in str(normal_processes[1]["command"])
-    worker_launcher = (REPOSITORY_ROOT / "scripts" / "start-local-lab-ws-worker.ps1").read_text(
-        encoding="utf-8"
-    )
-    assert "sim-worker-replay.exe" in worker_launcher
-    assert "from app.cli import sim_worker_replay" not in worker_launcher
-    assert "FUZZFOLIO_WORKER_LAUNCHER_PID" in worker_launcher
+    assert normal_processes[0]["name"] == "Lab Gateway"
+    worker = normal_processes[1]
+    assert worker["name"] in {
+        "Temporal Graph Local Worker",
+        "Temporal Graph Frozen Worker (b69e)",
+    }
+    if worker["name"] == "Temporal Graph Local Worker":
+        assert "start-local-lab-ws-worker.ps1" in str(worker["command"])
+        worker_launcher = (
+            REPOSITORY_ROOT / "scripts" / "start-local-lab-ws-worker.ps1"
+        ).read_text(encoding="utf-8")
+        assert "sim-worker-replay.exe" in worker_launcher
+        assert "from app.cli import sim_worker_replay" not in worker_launcher
+        assert "FUZZFOLIO_WORKER_LAUNCHER_PID" in worker_launcher
+    else:
+        assert worker["process_type"] == "Docker"
+        assert worker["command"] == "fuzzfolio-stage5e0-containment-worker"
 
     fresh = normal_processes[2]
     resume = normal_processes[3]
+    authority_paths = set()
+    output_roots = set()
     for process, lifecycle_flag in ((fresh, "--fresh"), (resume, "--resume")):
         command = str(process["command"])
         assert "uv run temporal-search" in command
         assert lifecycle_flag in command
         assert "--gateway-url http://127.0.0.1:8799" in command
         assert "--timeout-seconds 900" in command
-        assert TEMPORAL_AUTHORITY_PATH in command
+        authority_paths.add(_command_argument(command, "--authority-path"))
+        output_roots.add(_command_argument(command, "--output-root"))
         assert process["auto_restart"] is False
         assert "--plan-only" not in command
 
     assert "--fresh" not in str(resume["command"])
     assert "--resume" not in str(fresh["command"])
+    assert len(authority_paths) == 1
+    assert len(output_roots) == 1
+    authority_path = next(iter(authority_paths))
+    assert authority_path.lower().endswith("authority.json")
 
     authority_audit = normal_processes[5]
     audit_command = str(authority_audit["command"])
     assert "uv run temporal-search-authority" in audit_command
     assert "--audit" in audit_command
-    assert TEMPORAL_AUTHORITY_PATH in audit_command
+    assert _command_argument(audit_command, "--authority-path") == authority_path
 
 
 def test_legacy_level_c_and_destructive_apply_controls_are_absent() -> None:
@@ -115,6 +133,9 @@ def test_all_configured_commands_use_direct_venv_wrappers() -> None:
 
     for process in config["processes"]:
         command = str(process["command"])
+        if process.get("process_type") == "Docker":
+            assert command.strip()
+            continue
         if command.startswith(("uv run ", "powershell ", "pwsh ")):
             continue
         assert command.startswith(VENV_PREFIX)

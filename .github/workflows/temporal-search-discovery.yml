@@ -11,7 +11,9 @@ on:
       - "autoresearch/temporal_search_selector_v2*.py"
       - "autoresearch/temporal_search_generator_v2*.py"
       - "autoresearch/temporal_search_stage5e2*.py"
+      - "autoresearch/temporal_search_stage5e3*.py"
       - "scripts/temporal_policy_v2_native_witness.py"
+      - "scripts/temporal_stage5e3_native_validation.py"
       - "tests/test_temporal_discovery.py"
       - "tests/test_temporal_discovery_prepare.py"
       - "tests/test_temporal_search_quality.py"
@@ -20,6 +22,8 @@ on:
       - "tests/test_temporal_search_selector_v2.py"
       - "tests/test_temporal_search.py"
       - "tests/test_temporal_search_preflight.py"
+      - "tests/test_temporal_search_stage5e3.py"
+      - "tests/test_processes_config.py"
       - "pyproject.toml"
       - ".github/workflows/temporal-search-discovery.yml"
   pull_request:
@@ -31,7 +35,9 @@ on:
       - "autoresearch/temporal_search_selector_v2*.py"
       - "autoresearch/temporal_search_generator_v2*.py"
       - "autoresearch/temporal_search_stage5e2*.py"
+      - "autoresearch/temporal_search_stage5e3*.py"
       - "scripts/temporal_policy_v2_native_witness.py"
+      - "scripts/temporal_stage5e3_native_validation.py"
       - "tests/test_temporal_discovery.py"
       - "tests/test_temporal_discovery_prepare.py"
       - "tests/test_temporal_search_quality.py"
@@ -40,6 +46,8 @@ on:
       - "tests/test_temporal_search_selector_v2.py"
       - "tests/test_temporal_search.py"
       - "tests/test_temporal_search_preflight.py"
+      - "tests/test_temporal_search_stage5e3.py"
+      - "tests/test_processes_config.py"
       - "pyproject.toml"
       - ".github/workflows/temporal-search-discovery.yml"
 
@@ -62,13 +70,17 @@ jobs:
             autoresearch/temporal_search_selector_v2*.py \
             autoresearch/temporal_search_generator_v2*.py \
             autoresearch/temporal_search_stage5e2*.py \
+            autoresearch/temporal_search_stage5e3*.py \
             scripts/temporal_policy_v2_native_witness.py \
+            scripts/temporal_stage5e3_native_validation.py \
             tests/test_temporal_discovery.py \
             tests/test_temporal_discovery_prepare.py \
             tests/test_temporal_search_quality.py \
             tests/test_temporal_search_activation.py \
             tests/test_temporal_search_policy_v2.py \
-            tests/test_temporal_search_selector_v2.py
+            tests/test_temporal_search_selector_v2.py \
+            tests/test_temporal_search_stage5e3.py \
+            tests/test_processes_config.py
       - name: Run deterministic discovery regressions
         run: >-
           uv run --with pytest python -m pytest -q
@@ -80,3 +92,5 @@ jobs:
           tests/test_temporal_search_activation.py
           tests/test_temporal_search_policy_v2.py
           tests/test_temporal_search_selector_v2.py
+          tests/test_temporal_search_stage5e3.py
+          tests/test_processes_config.py

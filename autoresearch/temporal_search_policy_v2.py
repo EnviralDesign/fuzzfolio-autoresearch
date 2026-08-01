@@ -59,6 +59,36 @@ GENERATOR_V2_PARAMETERS: dict[str, Any] = {
     "causalCoverageMinimum": 0.8,
 }
 
+# Stage 5E-3 reuses the admitted generator-v2 algorithm and repair policy with a
+# smaller, predeclared campaign envelope.  Keeping the campaign profile beside
+# the admission profile makes the only permitted parameter difference explicit
+# and prevents callers from inventing ad-hoc generator settings.
+GENERATOR_V2_STAGE5E3_PARAMETERS: dict[str, Any] = {
+    **GENERATOR_V2_PARAMETERS,
+    "targetUniquePrograms": 128,
+    "sourceModeCounts": {
+        "broad_seed_mutation": 64,
+        "seed_derived": 64,
+    },
+}
+
+GENERATOR_V2_PARAMETER_PROFILES: dict[str, dict[str, Any]] = {
+    "stage5e2_synthetic_admission": GENERATOR_V2_PARAMETERS,
+    "stage5e3_modest_policy_validation": GENERATOR_V2_STAGE5E3_PARAMETERS,
+}
+
+
+def generator_v2_parameter_profile(parameters: Mapping[str, Any]) -> str:
+    """Return the repository-admitted profile name for exact parameters."""
+
+    value = _clone(parameters, name="generator v2 parameters")
+    for name, admitted in GENERATOR_V2_PARAMETER_PROFILES.items():
+        if value == admitted:
+            return name
+    raise TemporalDiscoveryContractError(
+        "generator v2 parameters do not match a repository-admitted profile"
+    )
+
 
 def _encoded(value: Mapping[str, Any]) -> str:
     return json.dumps(
@@ -717,10 +747,7 @@ def generate_policy_v2_population(
         parameters or GENERATOR_V2_PARAMETERS,
         name="generator v2 parameters",
     )
-    if config != GENERATOR_V2_PARAMETERS:
-        raise TemporalDiscoveryContractError(
-            "Stage 5E-2 generator parameters must equal the admitted repository constant"
-        )
+    parameter_profile = generator_v2_parameter_profile(config)
     coverage = _causal_coverage(Path(causality_root))
     if coverage["coverageRatio"] < float(config["causalCoverageMinimum"]):
         raise TemporalDiscoveryContractError(
@@ -859,6 +886,7 @@ def generate_policy_v2_population(
         "sourceGeneratorVersion": normalized["generator"]["version"],
         "causalCoverage": coverage,
         "parameters": config,
+        "parameterProfile": parameter_profile,
         "marketEvidenceRead": False,
         "gatewayContacted": False,
     }
@@ -911,6 +939,14 @@ def audit_policy_v2_population(output_root: Path | str) -> dict[str, Any]:
     supplied_config = str(config.pop("configSha256", ""))
     if canonical_sha256(config) != supplied_config:
         raise TemporalDiscoveryContractError("generator v2 config identity mismatch")
+    if config.get("schemaVersion") != GENERATOR_V2_CONFIG_SCHEMA:
+        raise TemporalDiscoveryContractError("unknown generator v2 config schema")
+    if config.get("generatorVersion") != GENERATOR_V2_VERSION:
+        raise TemporalDiscoveryContractError("generator v2 version mismatch")
+    parameters = _mapping(config.get("parameters"), name="generator v2 parameters")
+    parameter_profile = generator_v2_parameter_profile(parameters)
+    if config.get("parameterProfile") != parameter_profile:
+        raise TemporalDiscoveryContractError("generator v2 parameter profile mismatch")
     population = _read(root / "population.json", name="generator v2 population")
     supplied_population = str(population.pop("populationSha256", ""))
     if canonical_sha256(population) != supplied_population:
@@ -944,8 +980,17 @@ def audit_policy_v2_population(output_root: Path | str) -> dict[str, Any]:
     if actual != expected:
         raise TemporalDiscoveryContractError("generator v2 artifact inventory drift")
     candidates = population.get("candidates") or []
-    if len(candidates) != 256 or len({item["programSha256"] for item in candidates}) != 256:
-        raise TemporalDiscoveryContractError("generator v2 population is not 256 unique programs")
+    target = int(parameters["targetUniquePrograms"])
+    if (
+        len(candidates) != target
+        or len({item["programSha256"] for item in candidates}) != target
+        or population.get("targetUniquePrograms") != target
+        or population.get("candidateCount") != target
+        or population.get("sourceModeCounts") != parameters["sourceModeCounts"]
+    ):
+        raise TemporalDiscoveryContractError(
+            "generator v2 population does not match its admitted parameter profile"
+        )
     if any(item["managementReachability"]["acceptable"] is not True for item in candidates):
         raise TemporalDiscoveryContractError("generator v2 population has reachability defects")
     return {
@@ -956,6 +1001,7 @@ def audit_policy_v2_population(output_root: Path | str) -> dict[str, Any]:
         "journalSha256": supplied_journal,
         "manifestSha256": supplied_manifest,
         "candidateCount": len(candidates),
+        "parameterProfile": parameter_profile,
     }
 
 

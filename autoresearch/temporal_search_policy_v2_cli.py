@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .temporal_discovery_validation import SubprocessCandidateValidator
 from .temporal_search_policy_v2 import (
+    GENERATOR_V2_PARAMETER_PROFILES,
     audit_management_witnesses,
     audit_policy_v2_population,
     generate_policy_v2_population,
@@ -34,6 +35,11 @@ def _parser() -> argparse.ArgumentParser:
     generate.add_argument("--output-root", type=Path, required=True)
     generate.add_argument("--validator-command-file", type=Path, required=True)
     generate.add_argument("--validator-timeout-seconds", type=float, default=30.0)
+    generate.add_argument(
+        "--parameter-profile",
+        choices=sorted(GENERATOR_V2_PARAMETER_PROFILES),
+        default="stage5e2_synthetic_admission",
+    )
 
     audit = commands.add_parser("audit-generator", help="Audit generator v2 artifacts.")
     audit.add_argument("--output-root", type=Path, required=True)
@@ -60,6 +66,7 @@ def main() -> None:
             ),
             causality_root=args.causality_root,
             output_root=args.output_root,
+            parameters=GENERATOR_V2_PARAMETER_PROFILES[args.parameter_profile],
         )
     elif args.command == "audit-generator":
         result = audit_policy_v2_population(args.output_root)

@@ -77,12 +77,14 @@ def _probe(
     native_generator_root: Path,
 ) -> dict[str, Any]:
     journal = _read(native_generator_root / "generation-journal.json")
+    parameters = _read(native_generator_root / "config.json")["parameters"]
     with tempfile.TemporaryDirectory(prefix="temporal-generator-v2-replay-") as temporary:
         return generate_policy_v2_population(
             _read(source_preparation),
             validator=_LedgerValidator(journal),
             causality_root=causality_root,
             output_root=temporary,
+            parameters=parameters,
         )
 
 

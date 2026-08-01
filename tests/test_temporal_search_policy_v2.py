@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from autoresearch.temporal_search_policy_v2 import (
     GENERATOR_V2_PARAMETERS,
+    GENERATOR_V2_STAGE5E3_PARAMETERS,
     _repair_profile,
+    generator_v2_parameter_profile,
     inspect_management_reachability,
 )
+from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
+import pytest
 
 
 def _profile() -> dict:
@@ -165,3 +169,27 @@ def test_reachability_rejects_orphan_management_plan() -> None:
     report = inspect_management_reachability(profile)
     assert report["acceptable"] is False
     assert report["issueCounts"] == {"explicit_trailing_missing_activation_action": 1, "orphan_management_plan": 1}
+
+
+def test_generator_v2_campaign_profile_changes_only_the_bounded_allocation() -> None:
+    assert generator_v2_parameter_profile(GENERATOR_V2_PARAMETERS) == (
+        "stage5e2_synthetic_admission"
+    )
+    assert generator_v2_parameter_profile(GENERATOR_V2_STAGE5E3_PARAMETERS) == (
+        "stage5e3_modest_policy_validation"
+    )
+    differing = {
+        key
+        for key in GENERATOR_V2_PARAMETERS
+        if GENERATOR_V2_PARAMETERS[key] != GENERATOR_V2_STAGE5E3_PARAMETERS[key]
+    }
+    assert differing == {"targetUniquePrograms", "sourceModeCounts"}
+    assert GENERATOR_V2_STAGE5E3_PARAMETERS["targetUniquePrograms"] == 128
+    assert GENERATOR_V2_STAGE5E3_PARAMETERS["sourceModeCounts"] == {
+        "broad_seed_mutation": 64,
+        "seed_derived": 64,
+    }
+    with pytest.raises(TemporalDiscoveryContractError, match="repository-admitted"):
+        generator_v2_parameter_profile(
+            {**GENERATOR_V2_STAGE5E3_PARAMETERS, "seed": 123}
+        )

@@ -666,8 +666,16 @@ def _capabilities(candidate: Mapping[str, Any]):
 def build_witness_set(population_path: Path, output_root: Path) -> dict[str, Any]:
     population = _read(population_path)
     candidates = list(population.get("candidates") or [])
-    if len(candidates) != 256:
-        raise ValueError("witness batch requires exact 256-candidate population")
+    expected_count = int(population.get("targetUniquePrograms") or 0)
+    if (
+        expected_count not in {128, 256}
+        or len(candidates) != expected_count
+        or int(population.get("candidateCount") or 0) != expected_count
+        or len({item.get("candidateId") for item in candidates}) != expected_count
+    ):
+        raise ValueError(
+            "witness batch requires an admitted exact 128- or 256-candidate population"
+        )
     summaries = []
     positive_counts: Counter[str] = Counter()
     for candidate in sorted(candidates, key=lambda item: item["candidateId"]):
