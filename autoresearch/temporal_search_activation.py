@@ -469,8 +469,22 @@ def _break_even_window(
         if row.get("status") == "rejected"
     )
     trades = list(replay.get("trades") or [])
-    be_trades = [row for row in trades if row.get("breakEvenApplied") is True]
-    changed_closure = [row for row in be_trades if row.get("closeReason") == "break_even_stop"]
+    applied_position_ids = {
+        str(row.get("positionId"))
+        for row in execution
+        if row.get("status") == "applied" and row.get("positionId")
+    }
+    be_trades = [
+        row
+        for row in trades
+        if row.get("breakEvenApplied") is True
+        and str(row.get("positionId") or "") in applied_position_ids
+    ]
+    changed_closure = [
+        row
+        for row in be_trades
+        if row.get("closeReason") in {"break_even_stop", "break_even_gap"}
+    ]
     occupancy = int((metrics.get("stateOccupancy") or {}).get(source_state) or 0)
     if changed_closure:
         deepest = "activated_and_changed_trade_closure"

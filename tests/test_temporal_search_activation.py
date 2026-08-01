@@ -117,6 +117,73 @@ def test_break_even_counts_only_rejected_reason_codes() -> None:
     assert result["positionEligibleCount"] == 1
 
 
+def test_break_even_trade_is_attributed_only_to_its_exact_transition() -> None:
+    candidate = _candidate()
+    candidate["sourceProfile"]["graph"]["transitions"].append(
+        {
+            "id": "protect_alternate",
+            "sourceStateId": "alternate_open",
+            "destinationStateId": "protected",
+            "eventClass": "decision",
+            "priority": 0,
+            "guard": {"kind": "unrealized_r_at_least", "value": 1.0},
+            "actions": [{"kind": "move_stop_to_break_even_next_open"}],
+        }
+    )
+    primary, alternate, _trailing = _authored_instances(candidate)
+    replay = {
+        "metrics": {
+            "positionsOpened": 1,
+            "stateOccupancy": {"open": 2, "alternate_open": 2},
+        },
+        "graphTraces": [
+            {"transitionId": "protect", "intentIds": ["intent"]}
+        ],
+        "executionTraces": [
+            {
+                "actionKind": "move_stop_to_break_even_next_open",
+                "intentId": "intent",
+                "positionId": "position",
+                "status": "scheduled",
+                "reasonCode": "intent_scheduled",
+            },
+            {
+                "actionKind": "move_stop_to_break_even_next_open",
+                "intentId": "intent",
+                "positionId": "position",
+                "status": "applied",
+                "reasonCode": "break_even_applied",
+            },
+        ],
+        "trades": [
+            {
+                "positionId": "position",
+                "breakEvenApplied": True,
+                "closeReason": "break_even_stop",
+                "maxFavorableExcursionR": 1.5,
+                "holdingBars": 3,
+            }
+        ],
+    }
+
+    primary_result = _break_even_window(primary, _payload(replay))
+    alternate_result = _break_even_window(alternate, _payload(replay))
+    replay["trades"][0]["closeReason"] = "break_even_gap"
+    primary_gap_result = _break_even_window(primary, _payload(replay))
+
+    assert primary_result["breakEvenTradeCount"] == 1
+    assert primary_result["deepestReachedState"] == (
+        "activated_and_changed_trade_closure"
+    )
+    assert primary_gap_result["deepestReachedState"] == (
+        "activated_and_changed_trade_closure"
+    )
+    assert alternate_result["breakEvenTradeCount"] == 0
+    assert alternate_result["deepestReachedState"] == (
+        "guard_evaluated_but_never_true"
+    )
+
+
 def test_immediate_trailing_is_activated_atomically_at_entry() -> None:
     trailing = _authored_instances(_candidate())[1]
     position_id = "position"
