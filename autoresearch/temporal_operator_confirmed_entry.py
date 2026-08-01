@@ -761,6 +761,11 @@ class ConfirmedEntryStructuralOperator:
     def enumerate_plans(self, profile: Mapping[str, Any]) -> list[dict[str, Any]]:
         return enumerate_confirmed_entry_plans(profile)
 
+    def preview(
+        self, profile: Mapping[str, Any], plan: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        return preview_confirmed_entry_plan(profile, plan)
+
     def apply(
         self,
         profile: Mapping[str, Any],

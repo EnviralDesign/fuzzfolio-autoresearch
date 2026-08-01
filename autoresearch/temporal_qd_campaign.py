@@ -1,0 +1,282 @@
+"""Freeze a QD generation into the existing immutable worker task contract."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
+from .temporal_discovery_base import (
+    TemporalDiscoveryContractError,
+    _clone,
+    canonical_sha256,
+)
+from .temporal_discovery_validation import _rotate_evidence_plan
+from .temporal_qd_evolution import QD_POPULATION_SCHEMA, _load_population, _read
+from .temporal_search import (
+    TEMPORAL_SEARCH_PREPARATION_SCHEMA,
+    build_authority,
+    materialize_plan,
+)
+
+QD_CAMPAIGN_SCHEMA = "temporal_qd_screening_campaign_v2"
+INITIAL_POPULATION_SCHEMA = "temporal_discovery_population_v2"
+
+
+def _write_once(path: Path, value: Mapping[str, Any]) -> None:
+    encoded = (
+        json.dumps(
+            dict(value), indent=2, sort_keys=True, ensure_ascii=True, allow_nan=False
+        )
+        + "\n"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_text(encoding="utf-8") != encoded:
+        raise TemporalDiscoveryContractError(
+            f"refusing to overwrite divergent QD campaign file: {path}"
+        )
+    path.write_text(encoded, encoding="utf-8")
+
+
+def freeze_qd_screening_campaign(
+    *,
+    population_path: Path | str,
+    template_preparation_path: Path | str,
+    output_root: Path | str,
+    execution_engine_commit: str,
+    worker_contract_sha256: str | None = None,
+) -> dict[str, Any]:
+    population_file = Path(population_path)
+    population_payload = _read(population_file, name="QD generation population")
+    population_schema = population_payload.get("schemaVersion")
+    if population_schema not in {QD_POPULATION_SCHEMA, INITIAL_POPULATION_SCHEMA}:
+        raise TemporalDiscoveryContractError("unknown QD generation population schema")
+    candidates, population_sha = _load_population(population_file)
+    normalized_commit = execution_engine_commit.strip().lower()
+    if len(normalized_commit) != 40 or any(
+        value not in "0123456789abcdef" for value in normalized_commit
+    ):
+        raise TemporalDiscoveryContractError(
+            "QD execution engine commit must be a full 40-character Git SHA"
+        )
+    template = _read(
+        Path(template_preparation_path), name="QD screening template preparation"
+    )
+    if template.get("schemaVersion") != TEMPORAL_SEARCH_PREPARATION_SCHEMA:
+        raise TemporalDiscoveryContractError(
+            "QD screening template is not a finite temporal preparation"
+        )
+    source_candidates = template.get("candidates") or []
+    windows = template.get("developmentWindows") or []
+    if not source_candidates or not windows:
+        raise TemporalDiscoveryContractError(
+            "QD screening template requires candidates and windows"
+        )
+    worker_contract = _clone(template["workerContract"], name="QD worker contract")
+    if worker_contract_sha256 is not None:
+        normalized_worker_contract = worker_contract_sha256.strip().lower()
+        if (
+            not normalized_worker_contract.startswith("sha256:")
+            or len(normalized_worker_contract) != 71
+            or any(
+                value not in "0123456789abcdef"
+                for value in normalized_worker_contract[7:]
+            )
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD worker contract must be a canonical sha256 digest"
+            )
+        worker_contract["workerContractSha256"] = normalized_worker_contract
+    exemplar = source_candidates[0]
+    input_map = {
+        str(item["windowId"]): item["evidencePlan"]
+        for item in exemplar.get("windowInputs") or []
+    }
+    window_ids = [str(item["windowId"]) for item in windows]
+    if set(input_map) != set(window_ids):
+        raise TemporalDiscoveryContractError(
+            "QD screening template does not bind every window"
+        )
+    finite_candidates = []
+    for candidate in candidates:
+        profile = candidate["sourceProfile"]
+        source_sha = candidate["sourceProfileSha256"]
+        finite_candidates.append(
+            {
+                "candidateId": candidate["candidateId"],
+                "sourceProfile": profile,
+                "sourceProfileSha256": source_sha,
+                "instrument": exemplar["instrument"],
+                "timeframe": exemplar["timeframe"],
+                "barLimit": exemplar["barLimit"],
+                "windowInputs": [
+                    {
+                        "windowId": window_id,
+                        "evidencePlan": _rotate_evidence_plan(
+                            input_map[window_id],
+                            raw_source_profile_sha256=source_sha,
+                            source_profile=profile,
+                        ),
+                    }
+                    for window_id in window_ids
+                ],
+            }
+        )
+    task_count = len(finite_candidates) * len(windows)
+    generation_index = (
+        int(population_payload["generationIndex"])
+        if population_schema == QD_POPULATION_SCHEMA
+        else 0
+    )
+    preparation = {
+        "schemaVersion": TEMPORAL_SEARCH_PREPARATION_SCHEMA,
+        "authorityLabel": (
+            str(template["authorityLabel"]) + f"-qd-generation-{generation_index}"
+        ),
+        "workerContract": worker_contract,
+        "candidates": finite_candidates,
+        "developmentWindows": _clone(windows, name="QD development windows"),
+        "prohibitedEvidence": _clone(
+            template["prohibitedEvidence"], name="QD prohibited evidence"
+        ),
+        "bounds": {
+            "maxCandidates": len(finite_candidates),
+            "maxDevelopmentWindows": len(windows),
+            "maxTasks": task_count,
+            "maxAttempts": int(template["bounds"]["maxAttempts"]),
+            "deadlineSeconds": float(template["bounds"]["deadlineSeconds"]),
+        },
+    }
+    authority = build_authority(preparation)
+    candidate_identity_map = {
+        str(item["candidateId"]): item.get("candidateIdentitySha256")
+        for item in candidates
+    }
+    evaluation_candidates = []
+    for candidate in finite_candidates:
+        profile = candidate["sourceProfile"]
+        plans = [item["evidencePlan"] for item in candidate["windowInputs"]]
+        evaluation_candidates.append(
+            {
+                "candidateId": candidate["candidateId"],
+                "candidateIdentitySha256": candidate_identity_map[
+                    str(candidate["candidateId"])
+                ],
+                "sourceProfileSha256": candidate["sourceProfileSha256"],
+                "canonicalGraphSha256": canonical_sha256(profile["graph"]),
+                "executionConfigSha256": canonical_sha256(
+                    profile.get("executionConfig") or {}
+                ),
+                "instrument": candidate["instrument"],
+                "timeframe": candidate["timeframe"],
+                "barLimit": candidate["barLimit"],
+                "windowPlans": [
+                    {
+                        "planId": plan["plan_id"],
+                        "analysisWindowStart": plan["analysis_window_start"],
+                        "analysisWindowEnd": plan["analysis_window_end"],
+                        "coveragePolicy": plan["coverage_policy"],
+                        "windowSemanticSha256": plan["lake_window_binding"][
+                            "window_semantic_sha256"
+                        ],
+                        "request": plan["lake_window_binding"]["request"],
+                        "profileSnapshotSha256": plan["profile_snapshot_sha256"],
+                    }
+                    for plan in plans
+                ],
+            }
+        )
+    evaluation_identity = {
+        "schemaVersion": "temporal_qd_evaluation_identity_v1",
+        "populationSha256": population_sha,
+        "templatePreparationSha256": canonical_sha256(template),
+        "workerContract": _clone(worker_contract, name="evaluation worker contract"),
+        "executionEngineCommit": normalized_commit,
+        "costViews": {
+            "none": {
+                "spreadBps": 0.0,
+                "slippageBps": 0.0,
+                "commissionBps": 0.0,
+            },
+            "research_conservative": {
+                "spreadBps": 2.0,
+                "slippageBps": 1.0,
+                "commissionBps": 0.5,
+            },
+        },
+        "warmupAndEligibilityPolicy": {
+            "coveragePolicy": "require_complete",
+            "barLimitBoundPerCandidate": True,
+            "workerContractOwnsIndicatorWarmup": True,
+            "reservedEvidencePermitted": False,
+        },
+        "evaluationSeeds": [],
+        "candidates": evaluation_candidates,
+    }
+    evaluation_identity["evaluationIdentitySha256"] = canonical_sha256(
+        evaluation_identity
+    )
+    root = Path(output_root)
+    _write_once(root / "preparation.json", preparation)
+    _write_once(root / "authority.json", authority)
+    _write_once(root / "evaluation-identity.json", evaluation_identity)
+    manifest = materialize_plan(authority, root / "screening-run")
+    campaign = {
+        "schemaVersion": QD_CAMPAIGN_SCHEMA,
+        "generationIndex": generation_index,
+        "populationSha256": population_sha,
+        "preparationSha256": canonical_sha256(preparation),
+        "authorityId": authority["authorityId"],
+        "taskMatrixSha256": manifest["taskMatrixSha256"],
+        "candidateCount": len(finite_candidates),
+        "windowCount": len(windows),
+        "taskCount": task_count,
+        "evaluationIdentitySha256": evaluation_identity["evaluationIdentitySha256"],
+        "marketEvidenceScope": "predeclared_development_windows_only",
+        "reservedEvidencePermitted": False,
+    }
+    campaign["campaignSha256"] = canonical_sha256(campaign)
+    _write_once(root / "campaign.json", campaign)
+    return {
+        "schemaVersion": "temporal_qd_screening_campaign_result_v2",
+        "campaignSha256": campaign["campaignSha256"],
+        "authorityId": authority["authorityId"],
+        "taskMatrixSha256": manifest["taskMatrixSha256"],
+        "candidateCount": len(finite_candidates),
+        "windowCount": len(windows),
+        "taskCount": task_count,
+        "evaluationIdentitySha256": evaluation_identity["evaluationIdentitySha256"],
+        "outputRoot": str(root.resolve()),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--population", type=Path, required=True)
+    parser.add_argument("--template-preparation", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--execution-engine-commit", required=True)
+    parser.add_argument("--worker-contract-sha256")
+    args = parser.parse_args()
+    print(
+        json.dumps(
+            freeze_qd_screening_campaign(
+                population_path=args.population,
+                template_preparation_path=args.template_preparation,
+                output_root=args.output_root,
+                execution_engine_commit=args.execution_engine_commit,
+                worker_contract_sha256=args.worker_contract_sha256,
+            ),
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+
+__all__ = ["freeze_qd_screening_campaign"]

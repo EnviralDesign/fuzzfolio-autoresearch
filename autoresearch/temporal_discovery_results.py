@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import random
 import re
+import statistics
 import subprocess
 import tempfile
 from typing import Any, Protocol
@@ -89,6 +90,7 @@ def _window_record(result: Mapping[str, Any]) -> dict[str, Any]:
     entry_hours: dict[str, int] = {}
     mfe_values: list[float] = []
     mae_values: list[float] = []
+    holding_bars: list[int] = []
     for trade in trade_rows:
         if not isinstance(trade, Mapping):
             continue
@@ -108,6 +110,9 @@ def _window_record(result: Mapping[str, Any]) -> dict[str, Any]:
             mfe_values.append(float(mfe))
         if isinstance(mae, (int, float)) and not isinstance(mae, bool):
             mae_values.append(float(mae))
+        holding = trade.get("holdingBars")
+        if isinstance(holding, int) and not isinstance(holding, bool) and holding >= 0:
+            holding_bars.append(holding)
 
     return {
         "candidateId": str(result.get("candidate_id") or ""),
@@ -139,6 +144,10 @@ def _window_record(result: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "averageHoldingBars": conservative_metrics.get(
             "averageHoldingBars"
+        ),
+        "holdingBars": holding_bars,
+        "medianHoldingBars": (
+            float(statistics.median(holding_bars)) if holding_bars else None
         ),
         "exposureRatio": float(
             conservative_metrics.get("exposureRatio") or 0.0
@@ -306,6 +315,11 @@ def _aggregate_candidate(
         for window in windows
         if window["averageHoldingBars"] is not None
     ]
+    holding_bars = [
+        int(value)
+        for window in windows
+        for value in window.get("holdingBars") or []
+    ]
     win_rates = [
         float(window["winRate"])
         for window in windows
@@ -375,6 +389,9 @@ def _aggregate_candidate(
         / len(windows),
         "averageHoldingBars": (
             sum(holds) / len(holds) if holds else 0.0
+        ),
+        "medianHoldingBars": (
+            float(statistics.median(holding_bars)) if holding_bars else 0.0
         ),
         "averageWinRate": (
             sum(win_rates) / len(win_rates) if win_rates else 0.0

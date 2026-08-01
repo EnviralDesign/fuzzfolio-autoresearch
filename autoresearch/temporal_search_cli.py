@@ -75,6 +75,7 @@ def search_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gateway-token")
     parser.add_argument("--timeout-seconds", type=float, default=900.0)
     parser.add_argument("--poll-interval-seconds", type=float, default=0.25)
+    parser.add_argument("--enqueue-batch-size", type=int, default=128)
     parser.add_argument("--plan-only", action="store_true", help="Validate and materialize the immutable task matrix without gateway I/O.")
     args = parser.parse_args(argv)
     client: LabGatewayClient | None = None
@@ -92,7 +93,7 @@ def search_main(argv: list[str] | None = None) -> int:
         health = client.health()
         if health.get("ok") is not True:
             raise RuntimeError("Lab Gateway health check did not return ok=true")
-        result = run_temporal_search_tasks(client, authority, output_root=args.output_root, timeout_seconds=args.timeout_seconds, poll_interval_seconds=args.poll_interval_seconds, resume=args.resume)
+        result = run_temporal_search_tasks(client, authority, output_root=args.output_root, timeout_seconds=args.timeout_seconds, poll_interval_seconds=args.poll_interval_seconds, resume=args.resume, enqueue_batch_size=args.enqueue_batch_size)
         _emit({"gateway": health, **result})
         return 0
     except Exception as exc:
