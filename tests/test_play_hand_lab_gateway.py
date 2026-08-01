@@ -7,22 +7,25 @@ from pathlib import Path
 import pytest
 import requests
 from websockets.asyncio.client import connect as websocket_connect
+
 from autoresearch.__main__ import build_parser
+from autoresearch.play_hand_lab import _worker_result_identity
 from autoresearch.play_hand_lab_gateway import (
+    DEFAULT_MAX_BODY_BYTES,
+    HttpSaturationSimulationConfig,
     LabGatewayConfig,
     LabTask,
     PlayHandLabGateway,
     SaturationSimulationConfig,
     WebSocketSaturationSimulationConfig,
+    _start_uvicorn_gateway_thread,
     build_lab_gateway_http_server,
     cmd_play_hand_lab_gateway,
-    _start_uvicorn_gateway_thread,
     run_http_saturation_simulation_sync,
     run_saturation_simulation,
-    HttpSaturationSimulationConfig,
     run_websocket_saturation_simulation_sync,
+    serve_lab_gateway,
 )
-from autoresearch.play_hand_lab import _worker_result_identity
 
 
 def test_lab_gateway_defaults_are_cloud_tolerant() -> None:
@@ -1171,6 +1174,39 @@ def test_lab_gateway_asgi_rejects_oversized_body() -> None:
 
     sent = asyncio.run(run())
     assert sent[0]["status"] == 413
+
+
+def test_lab_gateway_uvicorn_websocket_limit_matches_application_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    def fake_run(app, **kwargs) -> None:
+        captured["app"] = app
+        captured.update(kwargs)
+
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    serve_lab_gateway(host="127.0.0.1", port=8799)
+
+    assert captured["ws_max_size"] == DEFAULT_MAX_BODY_BYTES
+    assert captured["app"].max_body_bytes == DEFAULT_MAX_BODY_BYTES
+
+
+def test_lab_gateway_thread_websocket_limit_matches_application_limit() -> None:
+    gateway = PlayHandLabGateway()
+    configured_limit = 32 * 1024 * 1024
+    server, thread, _ = _start_uvicorn_gateway_thread(
+        gateway,
+        token="secret",
+        max_body_bytes=configured_limit,
+    )
+    try:
+        assert server.config.ws_max_size == configured_limit
+        assert server.config.app.max_body_bytes == configured_limit
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
 
 
 def test_lab_gateway_cli_uses_token_file_for_non_loopback_bind(

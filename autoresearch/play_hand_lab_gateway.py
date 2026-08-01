@@ -2140,13 +2140,19 @@ def _start_uvicorn_gateway_thread(
     token: str | None,
     host: str = "127.0.0.1",
     port: int | None = None,
+    max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
     ws_ping_interval_seconds: float | None = None,
     ws_ping_timeout_seconds: float | None = None,
 ) -> tuple[Any, threading.Thread, str]:
     import uvicorn
 
     selected_port = _find_free_tcp_port() if port is None else int(port)
-    app = create_lab_gateway_app(gateway, token=token)
+    effective_max_body_bytes = max(int(max_body_bytes), 1024)
+    app = create_lab_gateway_app(
+        gateway,
+        token=token,
+        max_body_bytes=effective_max_body_bytes,
+    )
     config = uvicorn.Config(
         app,
         host=host,
@@ -2157,6 +2163,7 @@ def _start_uvicorn_gateway_thread(
         http="httptools",
         backlog=4096,
         timeout_keep_alive=60,
+        ws_max_size=effective_max_body_bytes,
         ws_ping_interval=(
             DEFAULT_LAB_WS_PING_INTERVAL_SECONDS
             if ws_ping_interval_seconds is None
@@ -2225,7 +2232,12 @@ def serve_lab_gateway(
             lake_timeout_retry_after_seconds=max(float(lake_timeout_retry_after_seconds), 0.0),
         )
     )
-    app = create_lab_gateway_app(gateway, token=token, max_body_bytes=max_body_bytes)
+    effective_max_body_bytes = max(int(max_body_bytes), 1024)
+    app = create_lab_gateway_app(
+        gateway,
+        token=token,
+        max_body_bytes=effective_max_body_bytes,
+    )
     uvicorn.run(
         app,
         host=host,
@@ -2235,6 +2247,9 @@ def serve_lab_gateway(
         http="httptools",
         backlog=4096,
         timeout_keep_alive=60,
+        # Uvicorn otherwise closes messages above its 16 MiB default before the
+        # gateway can enforce its own explicit application-level bound.
+        ws_max_size=effective_max_body_bytes,
         ws_ping_interval=(
             _env_float(
                 "PLAYHAND_LAB_WS_PING_INTERVAL_SECONDS",
