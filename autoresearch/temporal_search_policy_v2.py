@@ -943,7 +943,7 @@ def audit_policy_v2_population(output_root: Path | str) -> dict[str, Any]:
         raise TemporalDiscoveryContractError("unknown generator v2 config schema")
     if config.get("generatorVersion") != GENERATOR_V2_VERSION:
         raise TemporalDiscoveryContractError("generator v2 version mismatch")
-    parameters = _mapping(config.get("parameters"), name="generator v2 parameters")
+    parameters = _clone(config.get("parameters"), name="generator v2 parameters")
     parameter_profile = generator_v2_parameter_profile(parameters)
     if config.get("parameterProfile") != parameter_profile:
         raise TemporalDiscoveryContractError("generator v2 parameter profile mismatch")
