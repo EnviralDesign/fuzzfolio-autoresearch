@@ -138,7 +138,9 @@ def _graph_bound_instance_ids(profile: Mapping[str, Any]) -> set[str]:
     return bound
 
 
-def _reachable_profiles(member: Mapping[str, Any], *, catalog_timeframes: Sequence[str]) -> list[dict[str, Any]]:
+def _reachable_profiles(
+    member: Mapping[str, Any], *, catalog_timeframes: Sequence[str], admitted_timeframes: Sequence[str]
+) -> list[dict[str, Any]]:
     """Return the parent plus every one-step reachable graph-timeframe child.
 
     Only graph-bound instances are eligible, matching the enabled v3
@@ -166,7 +168,9 @@ def _reachable_profiles(member: Mapping[str, Any], *, catalog_timeframes: Sequen
             continue
         if not current or current not in catalog_timeframes:
             raise TemporalDiscoveryContractError("graph-bound indicator timeframe is absent from frozen catalog")
-        for replacement in catalog_timeframes:
+        if current not in admitted_timeframes:
+            raise TemporalDiscoveryContractError("graph-bound indicator timeframe is outside the admitted evidence allowlist")
+        for replacement in admitted_timeframes:
             if replacement == current:
                 continue
             child = copy.deepcopy(parent)
@@ -187,6 +191,7 @@ def _window_envelope_request(
     instrument: str,
     base_timeframe: str,
     frozen_catalog: Mapping[str, Any],
+    admitted_timeframes: Sequence[str],
 ) -> tuple[LakeWindowRequest, list[dict[str, Any]]]:
     plan = dict(template_plan)
     try:
@@ -217,6 +222,8 @@ def _window_envelope_request(
     first = parsed[0]
     if any(item.dataset != first.dataset or item.pairs != first.pairs or item.data_end != first.data_end or item.coverage_policy != first.coverage_policy for item in parsed):
         raise TemporalDiscoveryContractError("member lake requests do not share one instrument/calendar contract")
+    if any(not set(item.timeframes).issubset(admitted_timeframes) for item in parsed):
+        raise TemporalDiscoveryContractError("member lake request requires a timeframe outside the admitted evidence allowlist")
     starts = [parse_utc_timestamp(item.data_start, field_name="member request data_start") for item in parsed]
     envelope = LakeWindowRequest(
         dataset=first.dataset,
@@ -284,6 +291,7 @@ def build_broad_evidence_envelope(
     output_root: Path | str,
     worker_contract_sha256: str,
     worker_contract_schema: str,
+    admitted_timeframes: Sequence[str],
     attestor: _Attestor = resolve_lake_window_binding,
 ) -> dict[str, Any]:
     """Freeze one broad v2-binding preparation and immutable evidence manifest."""
@@ -301,11 +309,18 @@ def build_broad_evidence_envelope(
     population = _read(population_path, name="seed population")
     seed_members, population_sha = _population_members(population)
     catalog, catalog_timeframes = _catalog(_read(catalog_path, name="frozen construction catalog"))
+    if isinstance(admitted_timeframes, (str, bytes)):
+        raise TemporalDiscoveryContractError("admitted_timeframes must be a non-empty sequence of timeframe tokens")
+    admitted = tuple(sorted({str(value).strip().upper() for value in admitted_timeframes if str(value).strip()}))
+    if not admitted:
+        raise TemporalDiscoveryContractError("admitted_timeframes must be non-empty")
+    if not set(admitted).issubset(catalog_timeframes):
+        raise TemporalDiscoveryContractError("admitted_timeframes contains a timeframe absent from frozen catalog")
 
     members = seed_members + _template_members(source)
     variants: list[dict[str, Any]] = []
     for member in members:
-        for item in _reachable_profiles(member, catalog_timeframes=catalog_timeframes):
+        for item in _reachable_profiles(member, catalog_timeframes=catalog_timeframes, admitted_timeframes=admitted):
             variants.append({
                 "memberId": member["memberId"], "memberOrigin": member["memberOrigin"],
                 "sourceProfileSha256": member["sourceProfileSha256"], "variantId": item["variantId"],
@@ -316,6 +331,8 @@ def build_broad_evidence_envelope(
         raise TemporalDiscoveryContractError("evidence-envelope variant identities collide")
 
     exemplar = source_authority["candidates"][0]
+    if any(candidate["timeframe"] not in admitted for candidate in source_authority["candidates"]):
+        raise TemporalDiscoveryContractError("source template decision timeframe is outside the admitted evidence allowlist")
     expected_instruments = [exemplar["instrument"]]
     for member in members:
         if member["sourceProfile"].get("instruments") != expected_instruments:
@@ -332,7 +349,7 @@ def build_broad_evidence_envelope(
         envelope, requests = _window_envelope_request(
             member_variants=variants,
             template_plan=exemplar_inputs[window_id], instrument=exemplar["instrument"],
-            base_timeframe=exemplar["timeframe"], frozen_catalog=catalog,
+            base_timeframe=exemplar["timeframe"], frozen_catalog=catalog, admitted_timeframes=admitted,
         )
         legacy = LakeWindowBinding.model_validate(exemplar_inputs[window_id]["lake_window_binding"]).legacy_selection_manifest_sha256
         binding = attestor(envelope, legacy_selection_manifest_sha256=legacy)
@@ -370,7 +387,8 @@ def build_broad_evidence_envelope(
         "schemaVersion": EVIDENCE_ENVELOPE_MANIFEST_SCHEMA,
         "sourcePreparation": {"path": str(source_path), "preparationSha256": source_sha, "authorityId": source_authority["authorityId"]},
         "outputPreparation": {"preparationSha256": canonical_sha256(preparation), "authorityId": output_authority["authorityId"]},
-        "constructionCatalog": {"path": str(catalog_path), "catalogSha256": catalog_sha, "timeframes": list(catalog_timeframes)},
+        "constructionCatalog": {"path": str(catalog_path), "catalogSha256": catalog_sha, "catalogTimeframes": list(catalog_timeframes)},
+        "admittedEvidenceTimeframes": list(admitted),
         # This envelope is catalog/evidence authority only.  The existing
         # panel bridge and QD supervisor independently reopen and verify their
         # own frozen construction catalog and generator/QD policy at launch.
@@ -404,6 +422,8 @@ def build_broad_evidence_envelope(
         "windowCount": len(windows),
         "memberCount": len(members),
         "memberVariantCount": len(variants),
+        "catalogTimeframes": list(catalog_timeframes),
+        "admittedEvidenceTimeframes": list(admitted),
     }
     _write_once(root / "source-preparation.json", source)
     _write_once(root / "seed-population.json", population)
@@ -422,6 +442,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--construction-catalog", type=Path, required=True)
     parser.add_argument("--worker-contract-sha256", required=True)
     parser.add_argument("--worker-contract-schema", required=True)
+    parser.add_argument("--admitted-timeframe", action="append", required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     return parser
 
@@ -429,7 +450,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
-        print(json.dumps(build_broad_evidence_envelope(source_preparation_path=args.source_preparation, seed_population_path=args.seed_population, construction_catalog_path=args.construction_catalog, output_root=args.output_root, worker_contract_sha256=args.worker_contract_sha256, worker_contract_schema=args.worker_contract_schema), indent=2, sort_keys=True, ensure_ascii=True))
+        print(json.dumps(build_broad_evidence_envelope(source_preparation_path=args.source_preparation, seed_population_path=args.seed_population, construction_catalog_path=args.construction_catalog, output_root=args.output_root, worker_contract_sha256=args.worker_contract_sha256, worker_contract_schema=args.worker_contract_schema, admitted_timeframes=args.admitted_timeframe), indent=2, sort_keys=True, ensure_ascii=True))
         return 0
     except Exception as exc:
         print(json.dumps({"schemaVersion": "stage5e7_v3_broad_evidence_envelope_error_v1", "errorType": type(exc).__name__, "message": str(exc)}, indent=2, sort_keys=True), flush=True)

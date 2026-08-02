@@ -97,6 +97,9 @@ def _population(profile: dict) -> dict:
     return payload
 
 
+_ALL_TIMEFRAMES = ["M1", "M5", "M15", "M30", "H1", "H4", "D1"]
+
+
 def test_broad_envelope_remotely_attests_catalog_hydrated_all_timeframe_scope(tmp_path: Path) -> None:
     template = _write(tmp_path / "template.json", _template())
     profile = _profile()
@@ -112,11 +115,11 @@ def test_broad_envelope_remotely_attests_catalog_hydrated_all_timeframe_scope(tm
     root = tmp_path / "external-envelope"
     first = build_broad_evidence_envelope(
         source_preparation_path=template, seed_population_path=population,
-        construction_catalog_path=catalog, output_root=root, worker_contract_sha256="sha256:" + "f" * 64, worker_contract_schema="replay-worker-contract-v1", attestor=fake_attestor,
+        construction_catalog_path=catalog, output_root=root, worker_contract_sha256="sha256:" + "f" * 64, worker_contract_schema="replay-worker-contract-v1", admitted_timeframes=_ALL_TIMEFRAMES, attestor=fake_attestor,
     )
     second = build_broad_evidence_envelope(
         source_preparation_path=template, seed_population_path=population,
-        construction_catalog_path=catalog, output_root=root, worker_contract_sha256="sha256:" + "f" * 64, worker_contract_schema="replay-worker-contract-v1", attestor=fake_attestor,
+        construction_catalog_path=catalog, output_root=root, worker_contract_sha256="sha256:" + "f" * 64, worker_contract_schema="replay-worker-contract-v1", admitted_timeframes=_ALL_TIMEFRAMES, attestor=fake_attestor,
     )
     assert first == second
     assert len(observed) == 2
@@ -128,6 +131,9 @@ def test_broad_envelope_remotely_attests_catalog_hydrated_all_timeframe_scope(tm
     assert request.data_start == "2023-04-23T00:00:00Z"
     manifest = json.loads((root / "evidence-envelope-manifest.json").read_text(encoding="utf-8"))
     assert manifest["constructionCatalog"]["catalogSha256"] == canonical_sha256(_catalog())
+    assert manifest["constructionCatalog"]["catalogTimeframes"] == ["D1", "H1", "H4", "M1", "M15", "M30", "M5"]
+    assert manifest["admittedEvidenceTimeframes"] == ["D1", "H1", "H4", "M1", "M15", "M30", "M5"]
+    assert first["admittedEvidenceTimeframes"] == ["D1", "H1", "H4", "M1", "M15", "M30", "M5"]
     assert manifest["outputPreparation"]["preparationSha256"] == first["preparationSha256"]
     assert {row["variantId"].split("->")[-1] for row in manifest["memberVariants"] if row["variantId"] != "parent"} == {"M1", "M5", "M15", "M30", "H4", "D1"}
     output = json.loads((root / "preparation.json").read_text(encoding="utf-8"))
@@ -146,7 +152,7 @@ def test_broad_envelope_rejects_unsupported_graph_timeframe(tmp_path: Path) -> N
     with pytest.raises(TemporalDiscoveryContractError, match="absent from frozen catalog"):
         build_broad_evidence_envelope(
             source_preparation_path=template, seed_population_path=population,
-            construction_catalog_path=catalog, output_root=tmp_path / "external", worker_contract_sha256="sha256:" + "f" * 64, worker_contract_schema="replay-worker-contract-v1",
+            construction_catalog_path=catalog, output_root=tmp_path / "external", worker_contract_sha256="sha256:" + "f" * 64, worker_contract_schema="replay-worker-contract-v1", admitted_timeframes=_ALL_TIMEFRAMES,
             attestor=lambda request, **_: _binding(request),
         )
 
@@ -165,7 +171,7 @@ def test_broad_envelope_rejects_forged_attestation_request(tmp_path: Path) -> No
     with pytest.raises(TemporalDiscoveryContractError, match="forged or mismatched"):
         build_broad_evidence_envelope(
             source_preparation_path=template, seed_population_path=population,
-            construction_catalog_path=catalog, output_root=tmp_path / "external", worker_contract_sha256="sha256:" + "f" * 64, worker_contract_schema="replay-worker-contract-v1",
+            construction_catalog_path=catalog, output_root=tmp_path / "external", worker_contract_sha256="sha256:" + "f" * 64, worker_contract_schema="replay-worker-contract-v1", admitted_timeframes=_ALL_TIMEFRAMES,
             attestor=forged,
         )
 
@@ -185,7 +191,7 @@ def test_broad_envelope_rejects_unattested_or_legacy_mismatched_remote_binding(t
     kwargs = {
         "source_preparation_path": template, "seed_population_path": population,
         "construction_catalog_path": catalog, "worker_contract_sha256": "sha256:" + "f" * 64,
-        "worker_contract_schema": "replay-worker-contract-v1",
+        "worker_contract_schema": "replay-worker-contract-v1", "admitted_timeframes": _ALL_TIMEFRAMES,
     }
     with pytest.raises(TemporalDiscoveryContractError, match="omitted canonical attestation"):
         build_broad_evidence_envelope(
@@ -207,6 +213,40 @@ def test_broad_envelope_requires_explicit_worker_contract_schema(tmp_path: Path)
         build_broad_evidence_envelope(
             source_preparation_path=template, seed_population_path=population,
             construction_catalog_path=catalog, output_root=tmp_path / "external",
-            worker_contract_sha256="sha256:" + "f" * 64, worker_contract_schema="",
+            worker_contract_sha256="sha256:" + "f" * 64, worker_contract_schema="", admitted_timeframes=_ALL_TIMEFRAMES,
+            attestor=lambda request, **_: _binding(request),
+        )
+
+
+@pytest.mark.parametrize(
+    ("admitted", "message"),
+    [([], "admitted_timeframes must be non-empty"), (["M5", "H8"], "absent from frozen catalog")],
+)
+def test_broad_envelope_rejects_empty_or_out_of_catalog_allowlist(
+    tmp_path: Path, admitted: list[str], message: str
+) -> None:
+    template = _write(tmp_path / "template.json", _template())
+    population = _write(tmp_path / "population.json", _population(_profile()))
+    catalog = _write(tmp_path / "catalog.json", _catalog())
+    with pytest.raises(TemporalDiscoveryContractError, match=message):
+        build_broad_evidence_envelope(
+            source_preparation_path=template, seed_population_path=population,
+            construction_catalog_path=catalog, output_root=tmp_path / "external",
+            worker_contract_sha256="sha256:" + "f" * 64,
+            worker_contract_schema="replay-worker-contract-v1", admitted_timeframes=admitted,
+            attestor=lambda request, **_: _binding(request),
+        )
+
+
+def test_broad_envelope_rejects_current_graph_parent_outside_admitted_subset(tmp_path: Path) -> None:
+    template = _write(tmp_path / "template.json", _template())
+    population = _write(tmp_path / "population.json", _population(_profile()))
+    catalog = _write(tmp_path / "catalog.json", _catalog())
+    with pytest.raises(TemporalDiscoveryContractError, match="outside the admitted evidence allowlist"):
+        build_broad_evidence_envelope(
+            source_preparation_path=template, seed_population_path=population,
+            construction_catalog_path=catalog, output_root=tmp_path / "external",
+            worker_contract_sha256="sha256:" + "f" * 64,
+            worker_contract_schema="replay-worker-contract-v1", admitted_timeframes=["M1", "M5", "M15", "M30"],
             attestor=lambda request, **_: _binding(request),
         )

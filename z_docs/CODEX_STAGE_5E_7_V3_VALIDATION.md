@@ -24,6 +24,11 @@ inherited from the source template. Use the current exact contract digest
 `sha256:3dd2b7b3e2315b0e49c0ab8e9da3f3816bd0ec65c23cd6c09a03dffea6f9e3a6`)
 when making the new template.
 
+The timeframes are also an explicit evidence admission, not an implicit
+catalog default. Current remote coverage across both development windows
+admits `M1`, `M5`, `M15`, `M30`, and `H1`; `H4` and `D1` remain catalog
+capabilities but are not attested for the 2021 development window.
+
 ```powershell
 stage5e7-v3-evidence-envelope `
   --source-preparation <old-narrow-preparation.json> `
@@ -31,6 +36,8 @@ stage5e7-v3-evidence-envelope `
   --construction-catalog C:\repos\Trading-Dashboard\shared\constants\indicators.json `
   --worker-contract-sha256 sha256:3dd2b7b3e2315b0e49c0ab8e9da3f3816bd0ec65c23cd6c09a03dffea6f9e3a6 `
   --worker-contract-schema replay-worker-contract-v1 `
+  --admitted-timeframe M1 --admitted-timeframe M5 --admitted-timeframe M15 `
+  --admitted-timeframe M30 --admitted-timeframe H1 `
   --output-root <external-broad-envelope-root>
 ```
 
@@ -43,6 +50,10 @@ was requested). Use its `preparation.json` as the template input for
 the existing panel bridge and QD supervisor. A catalog omission, unsupported
 timeframe, different instrument/calendar, non-containing binding, forged
 attestation, or divergent rerun fails closed.
+
+QD's existing predeclared lake-scope filter consumes this admitted envelope;
+therefore `H4` and `D1` constructions are ineligible for this campaign without
+changing or misrepresenting the canonical indicator catalog.
 
 This is evidence/catalog authority only. It does not claim to bind an operator
 or QD policy: the panel bridge and QD supervisor separately reopen and verify
