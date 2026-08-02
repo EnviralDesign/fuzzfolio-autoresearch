@@ -44,6 +44,10 @@ def generate_discovery(
     journal: list[dict[str, Any]] = []
     programs: set[str] = set()
     mode_counts = {"de_novo": 0, "seed_derived": 0}
+    authored_provenance = validator_provenance(
+        validator,
+        validation_contract=normalized["validation"],
+    )
 
     for ordinal in range(normalized["generator"]["maxProposalAttempts"]):
         if len(accepted) >= target:
@@ -149,7 +153,21 @@ def generate_discovery(
             ),
             "mutationTrace": mutation_trace,
         }
+        candidate["authoredValidationBinding"] = build_authored_validation_binding(
+            raw_source_profile_sha256=raw_sha,
+            validation=report,
+            provenance=authored_provenance,
+        )
+        candidate["authoredValidationBindingSha256"] = candidate[
+            "authoredValidationBinding"
+        ]["authoredValidationBindingSha256"]
+        candidate["authoredValidationBinding"].pop(
+            "authoredValidationBindingSha256"
+        )
         accepted.append(candidate)
+        entry["authoredValidationBindingSha256"] = candidate[
+            "authoredValidationBindingSha256"
+        ]
         entry["candidateId"] = candidate_id
         entry["disposition"] = "accepted"
         journal.append(entry)
@@ -174,6 +192,7 @@ def generate_discovery(
         "deNovoCount": mode_counts["de_novo"],
         "seedDerivedCount": mode_counts["seed_derived"],
         "candidateCount": len(accepted),
+        "authoredValidationBindingRequired": True,
         "candidates": accepted,
     }
     population["populationSha256"] = canonical_sha256(population)

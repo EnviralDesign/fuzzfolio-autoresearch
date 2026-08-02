@@ -20,6 +20,10 @@ _START = "2024-01-01T00:00:00Z"
 _END = "2024-02-01T00:00:00Z"
 _LAST = "2024-01-31T23:55:00Z"
 _POSITION_ID = "sha256:" + "1" * 64
+_SOURCE_PROFILE = "sha256:" + "b" * 64
+_RESOLVED_PROFILE = "sha256:" + "c" * 64
+_RESOLVED_PROGRAM = "sha256:" + "a" * 64
+_AUTHORED_PROGRAM = "sha256:" + "d" * 64
 
 
 def _path_sha() -> str:
@@ -160,7 +164,9 @@ def _v3_result(
         "candidate_id": candidate_id,
         "analysis_window_start": _START,
         "analysis_window_end": _END,
-        "program_sha256": "sha256:" + "a" * 64,
+        "source_profile_snapshot_sha256": _SOURCE_PROFILE,
+        "resolved_profile_snapshot_sha256": _RESOLVED_PROFILE,
+        "program_sha256": _RESOLVED_PROGRAM,
         "observation_stream_sha256": stream,
         "observation_summary": {
             "observation_count": 10,
@@ -174,6 +180,8 @@ def _v3_result(
                 "observation_stream_sha256": stream,
                 "replay_result": {
                     "streamSha256": stream,
+                    "profileSnapshotSha256": _RESOLVED_PROFILE,
+                    "programSha256": _RESOLVED_PROGRAM,
                     "graphTraces": [],
                     "executionTraces": [],
                     "trades": [],
@@ -185,6 +193,8 @@ def _v3_result(
                 "observation_stream_sha256": stream,
                 "replay_result": {
                     "streamSha256": stream,
+                    "profileSnapshotSha256": _RESOLVED_PROFILE,
+                    "programSha256": _RESOLVED_PROGRAM,
                     "graphTraces": [],
                     "executionTraces": [],
                     "trades": [],
@@ -215,7 +225,9 @@ def _candidate(candidate_id: str) -> dict:
         "candidateId": candidate_id,
         "sourceMode": "fixture",
         "seedId": "fixture-seed",
-        "sourceProfileSha256": "sha256:" + "b" * 64,
+        "sourceProfileSha256": _SOURCE_PROFILE,
+        "profileSnapshotSha256": _SOURCE_PROFILE,
+        "programSha256": _AUTHORED_PROGRAM,
         "sourceProfile": {"graph": {}, "indicators": [], "executionConfig": {}},
     }
 
@@ -293,6 +305,80 @@ def test_v3_completed_no_position_uses_explicit_zero_terminal_valuation() -> Non
     assert record["terminalAdjustedConservativeNetR"] == 0.9
     assert record["terminalAdjustedNoCostNetR"] == 1.0
     assert record["noCostNetR"] - record["conservativeNetR"] == pytest.approx(0.1)
+
+
+def test_v3_aggregate_keeps_authored_and_resolved_identities_distinct() -> None:
+    record = _window_record(
+        _v3_result("dual_identity", conservative_raw_net_r=0.9, no_cost_raw_net_r=1.0)
+    )
+
+    aggregate = _aggregate_candidate(_candidate("dual_identity"), [record])
+
+    assert aggregate["authoredProgramSha256"] == _AUTHORED_PROGRAM
+    assert aggregate["sourceProfileSnapshotSha256"] == _SOURCE_PROFILE
+    assert aggregate["resolvedProfileSnapshotSha256"] == _RESOLVED_PROFILE
+    assert aggregate["resolvedProgramSha256"] == _RESOLVED_PROGRAM
+    assert aggregate["programSha256"] == _RESOLVED_PROGRAM
+    assert aggregate["authoredProgramSha256"] != aggregate["resolvedProgramSha256"]
+
+
+def test_v3_aggregate_rejects_source_or_resolved_execution_drift() -> None:
+    first = _window_record(
+        _v3_result("identity_drift", conservative_raw_net_r=0.0, no_cost_raw_net_r=0.0)
+    )
+    second = dict(first)
+    second["windowId"] = "2024-02-01T00:00:00Z/2024-03-01T00:00:00Z"
+    candidate = _candidate("identity_drift")
+
+    source_mismatch = dict(second)
+    source_mismatch["sourceProfileSnapshotSha256"] = "sha256:" + "e" * 64
+    with pytest.raises(TemporalDiscoveryContractError, match="source profile snapshot identity"):
+        _aggregate_candidate(candidate, [first, source_mismatch])
+
+    profile_drift = dict(second)
+    profile_drift["resolvedProfileSnapshotSha256"] = "sha256:" + "e" * 64
+    with pytest.raises(TemporalDiscoveryContractError, match="resolved profile snapshot identity changed"):
+        _aggregate_candidate(candidate, [first, profile_drift])
+
+    program_drift = dict(second)
+    program_drift["resolvedProgramSha256"] = "sha256:" + "e" * 64
+    program_drift["programSha256"] = program_drift["resolvedProgramSha256"]
+    with pytest.raises(TemporalDiscoveryContractError, match="resolved program identity changed"):
+        _aggregate_candidate(candidate, [first, program_drift])
+
+
+def test_v3_validator_requires_source_identity_and_replay_execution_identity() -> None:
+    missing_source = _v3_result(
+        "missing_source", conservative_raw_net_r=0.0, no_cost_raw_net_r=0.0
+    )
+    missing_source.pop("source_profile_snapshot_sha256")
+    with pytest.raises(TemporalDiscoveryContractError, match="invalid Stage 5E7-v3"):
+        _window_record(missing_source)
+
+    replay_drift = _v3_result(
+        "replay_drift", conservative_raw_net_r=0.0, no_cost_raw_net_r=0.0
+    )
+    replay_drift["cost_view_results"]["none"]["replay_result"][
+        "programSha256"
+    ] = "sha256:" + "e" * 64
+    with pytest.raises(TemporalDiscoveryContractError, match="invalid Stage 5E7-v3"):
+        _window_record(replay_drift)
+
+
+def test_v3_noop_authored_equals_resolved_execution_is_valid() -> None:
+    result = _v3_result(
+        "noop", conservative_raw_net_r=0.0, no_cost_raw_net_r=0.0
+    )
+    result["resolved_profile_snapshot_sha256"] = _SOURCE_PROFILE
+    for cost_view in result["cost_view_results"].values():
+        cost_view["replay_result"]["profileSnapshotSha256"] = _SOURCE_PROFILE
+    candidate = _candidate("noop")
+    candidate["programSha256"] = _RESOLVED_PROGRAM
+
+    aggregate = _aggregate_candidate(candidate, [_window_record(result)])
+
+    assert aggregate["authoredProgramSha256"] == aggregate["resolvedProgramSha256"]
+    assert aggregate["sourceProfileSnapshotSha256"] == aggregate["resolvedProfileSnapshotSha256"]
 
 
 @pytest.mark.parametrize(

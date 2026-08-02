@@ -35,11 +35,17 @@ from .temporal_discovery_mutation import (
 )
 from .temporal_discovery_results import (
     _aggregate_candidate,
-    _require_candidate_program_identity,
+    _require_candidate_execution_binding,
     _result_set_sha256,
     load_stage_results,
 )
-from .temporal_discovery_validation import SubprocessCandidateValidator
+from .temporal_discovery_validation import (
+    SubprocessCandidateValidator,
+    build_authored_validation_binding,
+    validate_authored_validation_binding,
+    validate_legacy_reference_admission_binding,
+    validator_provenance,
+)
 from .result_codec import fsync_directory
 from .lake_window import (
     LakeWindowBinding,
@@ -103,6 +109,19 @@ QD_POLICY = {
         "sourceProfile": "reject_same_evidence_repeat",
         "program": "allow_only_for_different_canonical_evidence",
         "canonicalEvidence": "candidate_program_ordered_window_semantic_cost_execution",
+    },
+    "resolvedExecutionDeduplication": {
+        "required": True,
+        "stage": "before_archive_reduction",
+        "identity": "aggregate.resolvedProgramSha256",
+        "representativeOrdering": [
+            {"field": "finiteDataValidity.validForQuality", "direction": "max"},
+            {"field": "objectives.worstWindowConservativeNetR", "direction": "max"},
+            {"field": "cappedTradeSupport", "direction": "max"},
+            {"field": "objectives.maximumDrawdownR", "direction": "min"},
+            {"field": "objectives.structuralComplexity", "direction": "min"},
+            {"field": "candidateId", "direction": "min"},
+        ],
     },
 }
 QD_POLICY_SHA256 = canonical_sha256(QD_POLICY)
@@ -272,6 +291,14 @@ def _load_population(path: Path) -> tuple[list[dict[str, Any]], str]:
         )
     if not isinstance(values, list) or int(expected or -1) != len(values):
         raise TemporalDiscoveryContractError("QD source population count mismatch")
+    require_authored_binding = payload.get("authoredValidationBindingRequired") is True
+    require_legacy_binding = (
+        payload.get("legacyReferenceAdmissionBindingRequired") is True
+    )
+    if require_authored_binding and require_legacy_binding:
+        raise TemporalDiscoveryContractError(
+            "QD source population cannot require both authored and legacy admission bindings"
+        )
     candidates = []
     for raw in values:
         if not isinstance(raw, Mapping):
@@ -288,6 +315,20 @@ def _load_population(path: Path) -> tuple[list[dict[str, Any]], str]:
                 "QD candidate profile identity mismatch"
             )
         _sha(candidate.get("programSha256"), name="QD candidate program SHA-256")
+        if require_authored_binding:
+            validate_authored_validation_binding(candidate)
+        elif (
+            "authoredValidationBinding" in candidate
+            or "authoredValidationBindingSha256" in candidate
+        ):
+            validate_authored_validation_binding(candidate)
+        if require_legacy_binding:
+            validate_legacy_reference_admission_binding(candidate)
+        elif (
+            "legacyReferenceAdmissionBinding" in candidate
+            or "legacyReferenceAdmissionBindingSha256" in candidate
+        ):
+            validate_legacy_reference_admission_binding(candidate)
         candidates.append(candidate)
     candidates.sort(key=lambda item: str(item["candidateId"]))
     if len({item["candidateId"] for item in candidates}) != len(candidates):
@@ -666,6 +707,78 @@ def _observational_order(member: Mapping[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def resolved_execution_program_sha256(member: Mapping[str, Any]) -> str:
+    """Return the execution program identity used for archive diversity.
+
+    New-policy archive reduction accepts only the explicit resolved identity,
+    which is intentionally distinct from the candidate's authored program.
+    """
+    aggregate = member.get("aggregate")
+    if not isinstance(aggregate, Mapping):
+        raise TemporalDiscoveryContractError("QD archive member lacks an aggregate")
+    return _sha(
+        aggregate.get("resolvedProgramSha256"),
+        name="QD archive member resolved program SHA-256",
+    )
+
+
+def _resolved_execution_representative_key(
+    member: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    """Deterministic pre-reduction winner for identical execution programs."""
+    validity = member.get("finiteDataValidity") or {}
+    objectives = member.get("objectives") or {}
+    return (
+        -(validity.get("validForQuality") is True),
+        -float(objectives.get("worstWindowConservativeNetR", 0.0)),
+        -_capped_trade_support(member),
+        float(objectives.get("maximumDrawdownR", 0.0)),
+        float(objectives.get("structuralComplexity", 0.0)),
+        str(member["candidateId"]),
+    )
+
+
+def deduplicate_resolved_execution_members(
+    members: Sequence[Mapping[str, Any]],
+    *,
+    representative_key: Any | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Keep one deterministic member per resolved program before reduction.
+
+    The result preserves authored candidates in the provenance record while
+    ensuring execution-equivalent rows cannot consume multiple archive slots
+    or become duplicate breeding parents.
+    """
+    groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for member in members:
+        groups[resolved_execution_program_sha256(member)].append(member)
+    key = representative_key or _resolved_execution_representative_key
+    retained: list[dict[str, Any]] = []
+    provenance: list[dict[str, Any]] = []
+    for resolved_program_sha256 in sorted(groups):
+        group = groups[resolved_program_sha256]
+        winner = min(group, key=key)
+        winner_id = str(winner["candidateId"])
+        discarded_ids = sorted(
+            str(row["candidateId"])
+            for row in group
+            if str(row["candidateId"]) != winner_id
+        )
+        row = _clone(winner, name="resolved execution deduplicated member")
+        if discarded_ids:
+            row["resolvedExecutionDuplicateCandidateIds"] = discarded_ids
+            provenance.append(
+                {
+                    "resolvedProgramSha256": resolved_program_sha256,
+                    "retainedCandidateId": winner_id,
+                    "discardedCandidateIds": discarded_ids,
+                }
+            )
+        retained.append(row)
+    retained.sort(key=lambda item: str(item["candidateId"]))
+    return retained, provenance
+
+
 def select_qd_archive(
     members: Sequence[Mapping[str, Any]], *, cell_capacity: int = 4
 ) -> list[dict[str, Any]]:
@@ -795,15 +908,26 @@ def build_qd_archive(
     for candidate_id in sorted(candidate_map):
         candidate = candidate_map[candidate_id]
         windows = results[candidate_id]
-        expected_program = _require_candidate_program_identity(candidate, windows)
+        execution_binding = _require_candidate_execution_binding(candidate, windows)
         if any(window.get("v3Admissible") is not True for window in windows):
             raise TemporalDiscoveryContractError(
                 "QD v3 archive requires terminal-adjusted Stage 5E7-v3 result evidence"
             )
         aggregate = _aggregate_candidate(candidate, windows)
-        if aggregate.get("programSha256") != expected_program:
+        if (
+            aggregate.get("authoredProgramSha256")
+            != execution_binding["authoredProgramSha256"]
+            or aggregate.get("sourceProfileSnapshotSha256")
+            != execution_binding["sourceProfileSnapshotSha256"]
+            or aggregate.get("resolvedProfileSnapshotSha256")
+            != execution_binding["resolvedProfileSnapshotSha256"]
+            or aggregate.get("resolvedProgramSha256")
+            != execution_binding["resolvedProgramSha256"]
+            or aggregate.get("programSha256")
+            != execution_binding["resolvedProgramSha256"]
+        ):
             raise TemporalDiscoveryContractError(
-                "QD aggregate program identity does not match candidate program identity"
+                "QD aggregate execution identity does not match result execution binding"
             )
         if aggregate.get("v3Admissible") is not True:
             raise TemporalDiscoveryContractError(
@@ -827,7 +951,13 @@ def build_qd_archive(
                 min(max(0, int(aggregate.get("totalTrades") or 0)), cap_trades)
             ),
         }
-    cells = select_qd_archive(list(members.values()), cell_capacity=cell_capacity)
+    members_before_resolved_deduplication = list(members.values())
+    reduced_members, resolved_duplicate_provenance = (
+        deduplicate_resolved_execution_members(
+            members_before_resolved_deduplication
+        )
+    )
+    cells = select_qd_archive(reduced_members, cell_capacity=cell_capacity)
     generation_accounting: dict[str, Any] = {}
     if generation_journal_path is not None:
         journal = _read(Path(generation_journal_path), name="QD generation journal")
@@ -881,6 +1011,17 @@ def build_qd_archive(
                 if isinstance(item, Mapping) and item.get("operatorId")
             }:
                 family_survivors[operator_id] += 1
+    authored_programs_seen = {
+        str(
+            member["aggregate"].get("authoredProgramSha256")
+            or member["candidate"].get("programSha256")
+        )
+        for member in members_before_resolved_deduplication
+    }
+    resolved_programs_seen = {
+        resolved_execution_program_sha256(member)
+        for member in members_before_resolved_deduplication
+    }
     archive = {
         "schemaVersion": QD_ARCHIVE_SCHEMA,
         "qdVersion": QD_VERSION,
@@ -909,6 +1050,28 @@ def build_qd_archive(
         ],
         "candidateCountSeen": prior_candidate_count_seen + len(candidate_map),
         "candidateCountReducedThisGeneration": len(candidate_map),
+        "authoredCandidateCountBeforeResolvedDeduplication": len(
+            members_before_resolved_deduplication
+        ),
+        "authoredProgramCountBeforeResolvedDeduplication": len(
+            authored_programs_seen
+        ),
+        "resolvedProgramCountBeforeReduction": len(resolved_programs_seen),
+        "resolvedProgramDuplicateCount": sum(
+            len(row["discardedCandidateIds"])
+            for row in resolved_duplicate_provenance
+        ),
+        "resolvedExecutionDeduplication": {
+            "schemaVersion": "temporal_qd_resolved_execution_deduplication_v1",
+            "stage": "before_archive_reduction",
+            "frozenPolicy": _clone(
+                QD_POLICY["resolvedExecutionDeduplication"],
+                name="resolved execution deduplication policy",
+            ),
+            "inputMemberCount": len(members_before_resolved_deduplication),
+            "uniqueResolvedProgramCount": len(reduced_members),
+            "duplicates": resolved_duplicate_provenance,
+        },
         "occupiedCellCount": len(cells),
         "newCellCount": len(
             {str(cell["cellId"]) for cell in cells} - previous_cell_ids
@@ -1223,6 +1386,7 @@ def _load_archive(path: Path) -> tuple[dict[str, Any], str]:
         or archive.get("qdVersion") != QD_VERSION
         or archive.get("policyName") != QD_POLICY_NAME
         or archive.get("policySha256") != QD_POLICY_SHA256
+        or archive.get("frozenPolicy") != QD_POLICY
     ):
         raise TemporalDiscoveryContractError("unknown QD archive schema")
     return archive, archive_sha
@@ -2314,6 +2478,11 @@ def _accepted_state(
             + str(candidate["candidateIdentitySha256"]).removeprefix("sha256:")[:28]
         ):
             raise TemporalDiscoveryContractError("QD candidate ID is not content-bound")
+        if (
+            "authoredValidationBinding" in candidate
+            or "authoredValidationBindingSha256" in candidate
+        ):
+            validate_authored_validation_binding(candidate)
         identities.add(candidate_id)
         counts[str(entry["originKind"])] += 1
         accepted.append(candidate)
@@ -2387,6 +2556,7 @@ def _accepted_candidate(
     birth_ordinal: int,
     proposal_ordinal: int,
     evidence_context: Mapping[str, Any],
+    authored_validator_provenance: Mapping[str, Any],
 ) -> dict[str, Any]:
     source_sha = canonical_sha256(profile)
     program_sha = _sha(validation.get("programSha256"), name="QD program SHA-256")
@@ -2466,6 +2636,15 @@ def _accepted_candidate(
     candidate["canonicalEvidenceIdentitySha256"] = qd_canonical_evidence_identity(
         candidate, evidence_context
     )
+    authored_binding = build_authored_validation_binding(
+        raw_source_profile_sha256=source_sha,
+        validation=validation,
+        provenance=authored_validator_provenance,
+    )
+    candidate["authoredValidationBindingSha256"] = authored_binding.pop(
+        "authoredValidationBindingSha256"
+    )
+    candidate["authoredValidationBinding"] = authored_binding
     return candidate
 
 
@@ -2742,6 +2921,13 @@ def generate_qd_generation(
     validator = SubprocessCandidateValidator(
         validator_command, timeout_seconds=validator_timeout_seconds
     )
+    authored_validator_provenance = validator_provenance(
+        validator,
+        validation_contract={
+            "schemaVersion": "temporal_qd_validator_contract_v1",
+            "validatorSchema": "temporal_search_candidate_validation_v1",
+        },
+    )
     plan_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     new_proposals = 0
     while (
@@ -2851,6 +3037,7 @@ def generate_qd_generation(
                             birth_ordinal=len(accepted),
                             proposal_ordinal=ordinal,
                             evidence_context=context,
+                            authored_validator_provenance=authored_validator_provenance,
                         )
                         duplicate_reason, identity_checks = _ledger_duplicate_check(
                             ledger, candidate
@@ -2930,6 +3117,11 @@ def generate_qd_generation(
         "proposalOrderCandidateIds": proposal_order,
         "candidateCount": len(accepted),
         "candidates": accepted,
+        "authoredValidationBindingRequired": all(
+            "authoredValidationBinding" in candidate
+            and "authoredValidationBindingSha256" in candidate
+            for candidate in accepted
+        ),
         "predeclaredEvidenceContextSha256": context_sha,
         **(
             {"constructionOperatorPolicySha256": construction_policy["policySha256"]}

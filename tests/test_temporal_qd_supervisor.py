@@ -25,6 +25,7 @@ def _inputs(tmp_path: Path) -> dict:
         "qdVersion": supervisor.QD_VERSION,
         "policyName": supervisor.QD_POLICY_NAME,
         "policySha256": supervisor.QD_POLICY_SHA256,
+        "frozenPolicy": supervisor.QD_POLICY,
         "generationIndex": 0,
         "populationSha256": canonical_sha256({"population": 0}),
         "resultSetSha256": canonical_sha256({"results": 0}),

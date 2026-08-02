@@ -531,6 +531,7 @@ def test_generation_is_deterministic_and_program_deduplicated(
     )
     assert left_population == right_population
     assert left_population["candidateCount"] == 12
+    assert left_population["authoredValidationBindingRequired"] is True
     assert left_population["deNovoCount"] == round(12 * 0.67)
     assert len(
         {item["programSha256"] for item in left_population["candidates"]}
@@ -550,6 +551,30 @@ def test_generation_is_deterministic_and_program_deduplicated(
             identity.pop("lake_manifest_sha256", None)
             assert plan["plan_id"] == canonical_sha256(identity)
     assert audit_discovery(left_root)["ok"] is True
+
+
+def test_selection_rejects_falsified_authored_program_binding(tmp_path: Path) -> None:
+    discovery_root = tmp_path / "discovery"
+    generate_discovery(
+        _preparation(), validator=FakeValidator(), output_root=discovery_root
+    )
+    population_path = discovery_root / "population.json"
+    population = json.loads(population_path.read_text(encoding="utf-8"))
+    population["candidates"][0]["programSha256"] = canonical_sha256(
+        {"falsified": "authored program"}
+    )
+    population_path.write_text(
+        json.dumps(population, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="authored validation binding diverges from candidate programSha256",
+    ):
+        select_confirmation_stage(
+            discovery_root, initial_result_root=tmp_path / "unreached-results"
+        )
 
 
 def test_evidence_plan_rotation_binds_legacy_execution_cell() -> None:

@@ -620,6 +620,22 @@ def validate_v3_candidate_window_result(
         if start != _stamp(task_payload.get("analysis_window_start"), name="task analysis_window_start") or end != _stamp(task_payload.get("analysis_window_end"), name="task analysis_window_end"):
             raise TemporalSearchContractError("candidate-window result interval does not match task")
 
+    # Keep authored input distinct from execution resolution.  The source
+    # snapshot identifies the normalized authored profile passed into replay;
+    # resolved profile/program identify the evaluator's actual executable.
+    source_profile_snapshot = _sha(
+        material.get("source_profile_snapshot_sha256"),
+        name="worker material source_profile_snapshot_sha256",
+    )
+    resolved_profile_snapshot = _sha(
+        material.get("resolved_profile_snapshot_sha256"),
+        name="worker material resolved_profile_snapshot_sha256",
+    )
+    resolved_program = _sha(
+        material.get("program_sha256"),
+        name="worker material program_sha256",
+    )
+
     requested = _nonnegative_integer(
         evidence.get("requested_bar_limit"), name="evidence requested_bar_limit", minimum=1
     )
@@ -695,6 +711,20 @@ def validate_v3_candidate_window_result(
         replay = _mapping(item.get("replay_result"), name=f"{cost_view} replay result")
         if _sha(replay.get("streamSha256"), name=f"{cost_view} replay stream") != root_stream:
             raise TemporalSearchContractError("candidate-window replay observation identity mismatch")
+        if _sha(
+            replay.get("profileSnapshotSha256"),
+            name=f"{cost_view} replay profile snapshot",
+        ) != resolved_profile_snapshot:
+            raise TemporalSearchContractError(
+                "candidate-window replay resolved profile identity mismatch"
+            )
+        if _sha(
+            replay.get("programSha256"),
+            name=f"{cost_view} replay program",
+        ) != resolved_program:
+            raise TemporalSearchContractError(
+                "candidate-window replay program identity mismatch"
+            )
         metrics = _mapping(replay.get("metrics"), name=f"{cost_view} metrics")
         if _nonnegative_integer(
             metrics.get("observationsProcessed"), name=f"{cost_view} observationsProcessed"

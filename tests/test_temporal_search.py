@@ -499,6 +499,9 @@ class _Gateway:
         self.delivered = True
         job = self.task["payload"]
         stream = "sha256:" + "e" * 64
+        source_profile_snapshot = canonical_sha256(job["inline_profile_snapshot"])
+        resolved_profile_snapshot = "sha256:" + "d" * 64
+        resolved_program = "sha256:" + "f" * 64
         last_bar_start = "2024-02-29T23:55:00Z"
         path_sha = canonical_sha256(
             {
@@ -560,6 +563,8 @@ class _Gateway:
         def replay(*, total_net_r: float, total_cost_percent: float) -> dict:
             return {
                 "streamSha256": stream,
+                "profileSnapshotSha256": resolved_profile_snapshot,
+                "programSha256": resolved_program,
                 "graphTraces": [],
                 "executionTraces": [],
                 "trades": [],
@@ -580,6 +585,9 @@ class _Gateway:
             "shared_observation_stream_id": job["shared_observation_stream_id"],
             "analysis_window_start": job["analysis_window_start"],
             "analysis_window_end": job["analysis_window_end"],
+            "source_profile_snapshot_sha256": source_profile_snapshot,
+            "resolved_profile_snapshot_sha256": resolved_profile_snapshot,
+            "program_sha256": resolved_program,
             "observation_stream_sha256": stream,
             "observation_summary": {
                 "observation_count": 10,

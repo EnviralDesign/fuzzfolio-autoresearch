@@ -140,6 +140,7 @@ def _write_v3_results(
     if authority is not None and len(planned_tasks) != len(candidates) * 2:
         raise AssertionError("fixture authority must contain exactly two windows per candidate")
     _write_results(root, candidates, overrides)
+    candidates_by_id = {item["candidateId"]: item for item in candidates}
     path_sha = _sha({"schema_version": "temporal_graph_cost_view_path_v3", "graph_path": [], "execution_path": [], "trade_path": [], "final_execution_state": None})
     result_paths = sorted((root / "results").glob("*.json"), key=lambda path: path.name)
     for ordinal, path in enumerate(result_paths):
@@ -158,10 +159,14 @@ def _write_v3_results(
                     "evidence_plan_id": job["evidence_plan"]["plan_id"],
                     "lake_window_semantic_sha256": job["lake_window_semantic_sha256"],
                     "shared_observation_stream_id": job["shared_observation_stream_id"],
+                    "worker_attribution": {
+                        "worker_contract_hash": job["required_worker_contract_hash"]
+                    },
                 }
             )
         start, end = payload["analysis_window_start"], payload["analysis_window_end"]
         stream = payload["observation_stream_sha256"]
+        candidate = candidates_by_id[payload["candidate_id"]]
         evidence = {
             "schema_version": "temporal_graph_candidate_window_evidence_contract_v1",
             "analysis_window_start": start, "analysis_window_end": end,
@@ -175,13 +180,15 @@ def _write_v3_results(
         }
         payload.update({
             "task_kind": "temporal_graph_candidate_window", "evidence_contract": evidence,
+            "source_profile_snapshot_sha256": candidate["profileSnapshotSha256"],
+            "resolved_profile_snapshot_sha256": candidate["profileSnapshotSha256"],
             "observation_summary": {"observation_count": 1000, "first_bar_start": start, "last_bar_start": start},
             "diagnostics": {"observation_count": 1000, "requested_bar_limit": 100, "effective_bar_limit": 100, "warmup_sufficient": True, "warmup_sufficiency": evidence["warmup_sufficiency"], "first_admitted_observation_timestamp": start, "last_admitted_observation_timestamp": start, "excluded_provisional_count": 0, "excluded_outside_analysis_window_count": 0, "cost_view_decision_path_sha256": path_sha, "cost_view_path_parity": "matched", "cost_view_count": 2, "shared_stream_required": True},
         })
         for cost_view in payload["cost_view_results"].values():
             cost_view.update({"cost_view": "research_conservative" if cost_view is payload["cost_view_results"]["research_conservative"] else "none", "observation_stream_sha256": stream})
             replay = cost_view["replay_result"]
-            replay.update({"graphTraces": [], "executionTraces": [], "trades": []})
+            replay.update({"graphTraces": [], "executionTraces": [], "trades": [], "profileSnapshotSha256": candidate["profileSnapshotSha256"], "programSha256": payload["program_sha256"]})
             metrics = replay["metrics"]
             net = float(metrics["totalNetR"])
             metrics.update({
@@ -321,9 +328,30 @@ def _replace_result_program(root: Path, candidate_id: str, value: object) -> Non
         if payload.get("candidate_id") != candidate_id:
             continue
         payload["program_sha256"] = value
+        for cost_view in (payload.get("cost_view_results") or {}).values():
+            replay = cost_view.get("replay_result")
+            if isinstance(replay, dict):
+                replay["programSha256"] = value
         _dump(path, payload)
         changed = True
+        break
     assert changed
+
+
+def _replace_all_result_programs(root: Path, candidate_id: str, value: object) -> None:
+    changed = 0
+    for path in (root / "results").glob("*.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload.get("candidate_id") != candidate_id:
+            continue
+        payload["program_sha256"] = value
+        for cost_view in (payload.get("cost_view_results") or {}).values():
+            replay = cost_view.get("replay_result")
+            if isinstance(replay, dict):
+                replay["programSha256"] = value
+        _dump(path, payload)
+        changed += 1
+    assert changed == 2
 
 
 def _old_inputs(tmp_path: Path, *, source_version: str = "v3") -> tuple[Path, Path, Path, Path]:
@@ -659,7 +687,7 @@ def test_policy_ab_analysis_reduces_one_shared_v3_population_and_result_set(tmp_
     assert report["interpretation"].endswith("no_search_or_breeding")
 
     _replace_result_program(results, population["candidates"][0]["candidateId"], "sha256:" + "0" * 64)
-    with pytest.raises(TemporalDiscoveryContractError, match="program identity does not match"):
+    with pytest.raises(TemporalDiscoveryContractError, match="resolved program identity changed"):
         analyze_policy_ab(
             policy_root=policy_root,
             corrected_result_root=results,
@@ -667,8 +695,9 @@ def test_policy_ab_analysis_reduces_one_shared_v3_population_and_result_set(tmp_
             output_root=tmp_path / "wrong-program-output",
             version="fixture-v1",
         )
+    _write_bound_v3_results(results, population["candidates"], bridge_root)
     _replace_result_program(results, population["candidates"][0]["candidateId"], None)
-    with pytest.raises(TemporalDiscoveryContractError, match="program identity"):
+    with pytest.raises(TemporalDiscoveryContractError, match="invalid Stage 5E7-v3"):
         analyze_policy_ab(
             policy_root=policy_root,
             corrected_result_root=results,
@@ -676,6 +705,56 @@ def test_policy_ab_analysis_reduces_one_shared_v3_population_and_result_set(tmp_
             output_root=tmp_path / "missing-program-output",
             version="fixture-v1",
         )
+
+
+def test_policy_ab_deduplicates_distinct_authored_candidates_by_resolved_program(
+    tmp_path: Path,
+) -> None:
+    repair, external = _repair(tmp_path)
+    policy = build_policy_ab(
+        reference_root=repair["outputRoot"], output_root=external, version="fixture-v1", seed=7
+    )
+    policy_root = Path(policy["outputRoot"])
+    population = json.loads((policy_root / "population.json").read_text(encoding="utf-8"))
+    bridge_root = _freeze_bridge(
+        Path(repair["outputRoot"]) / "reference-population.json",
+        tmp_path / "repair-bridge",
+    )
+    results = tmp_path / "shared-policy-results"
+    _write_bound_v3_results(results, population["candidates"], bridge_root)
+    first, second = population["candidates"][:2]
+    assert first["programSha256"] != second["programSha256"]
+    _replace_all_result_programs(
+        results, second["candidateId"], first["programSha256"]
+    )
+
+    analyze_policy_ab(
+        policy_root=policy_root,
+        corrected_result_root=results,
+        panel_bridge_root=bridge_root,
+        output_root=external,
+        version="fixture-v1",
+    )
+
+    report = json.loads(
+        (
+            external
+            / "stage5e7-v3-validation-fixture-v1"
+            / "policy-ab-analysis"
+            / "policy-ab-analysis.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert report["reducedCandidateCount"] == 64
+    assert report["resolvedProgramCount"] == 63
+    for policy_name in ("policyA", "policyB"):
+        dedupe = report[policy_name]["resolvedExecutionDeduplication"]
+        assert dedupe["inputMemberCount"] == 64
+        assert dedupe["uniqueResolvedProgramCount"] == 63
+        assert dedupe["duplicateCount"] == 1
+        assert len(dedupe["duplicates"]) == 1
+        assert set(dedupe["duplicates"][0]["discardedCandidateIds"]) | {
+            dedupe["duplicates"][0]["retainedCandidateId"]
+        } == {first["candidateId"], second["candidateId"]}
 
 
 def test_policy_analysis_rejects_missing_or_wrong_authority_calendar_and_task_coverage(
@@ -729,10 +808,52 @@ def test_policy_analysis_rejects_missing_or_wrong_authority_calendar_and_task_co
         authority = json.loads((root / "authority.json").read_text(encoding="utf-8"))
         _dump(root / "authority.json", _authority_with_label(authority, "wrong-panel-authority"))
 
+    def wrong_worker_contract(root: Path) -> None:
+        path = next((root / "results").glob("*.json"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["worker_attribution"]["worker_contract_hash"] = "sha256:" + "0" * 64
+        _dump(path, payload)
+
+    def wrong_evidence_plan(root: Path) -> None:
+        path = next((root / "results").glob("*.json"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["evidence_plan_id"] = "sha256:" + "1" * 64
+        _dump(path, payload)
+
+    def wrong_lake_binding(root: Path) -> None:
+        path = next((root / "results").glob("*.json"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["lake_window_semantic_sha256"] = "sha256:" + "2" * 64
+        _dump(path, payload)
+
+    def wrong_shared_stream(root: Path) -> None:
+        path = next((root / "results").glob("*.json"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["shared_observation_stream_id"] = "wrong-shared-stream"
+        _dump(path, payload)
+
+    def unexpected_task(root: Path) -> None:
+        path = next((root / "results").glob("*.json"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["job_id"] = "temporal-search-unexpected-task"
+        _dump(path, payload)
+
+    def wrong_task_kind(root: Path) -> None:
+        path = next((root / "results").glob("*.json"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["task_kind"] = "unexpected_task_kind"
+        _dump(path, payload)
+
     reject("missing-window", "do not cover every intended candidate", remove_one_window)
     reject("wrong-calendar", "does not bind to its exact frozen authority task", wrong_calendar)
     reject("extra-task", "exact frozen bridge authority/task matrix", add_extra_task)
     reject("wrong-authority", "exact frozen bridge authority/task matrix", wrong_authority)
+    reject("wrong-worker-contract", "worker contract attribution", wrong_worker_contract)
+    reject("wrong-evidence-plan", "does not bind to its exact frozen authority task", wrong_evidence_plan)
+    reject("wrong-lake-binding", "does not bind to its exact frozen authority task", wrong_lake_binding)
+    reject("wrong-shared-stream", "does not bind to its exact frozen authority task", wrong_shared_stream)
+    reject("unexpected-task", "unexpected or duplicate authority task", unexpected_task)
+    reject("wrong-task-kind", "does not bind to its exact frozen authority task", wrong_task_kind)
 
 
 def test_operator_builder_caps_and_suppresses_invalid_depth_one_children(tmp_path: Path) -> None:
@@ -801,7 +922,7 @@ def test_operator_analysis_enforces_noop_equality_and_pairs(tmp_path: Path) -> N
 
     assert analysis["analysisSha256"].startswith("sha256:")
     _replace_result_program(parent_results, "parent_a", "sha256:" + "f" * 64)
-    with pytest.raises(TemporalDiscoveryContractError, match="program identity does not match"):
+    with pytest.raises(TemporalDiscoveryContractError, match="resolved program identity changed"):
         analyze_operator_panel(
             operator_root=operator_root,
             corrected_result_root=paired_results,
@@ -813,7 +934,7 @@ def test_operator_analysis_enforces_noop_equality_and_pairs(tmp_path: Path) -> N
         )
     _write_bound_v3_results(parent_results, [parent], parent_bridge_root, {"parent_a": (1.0, 3, 10.0)})
     _replace_result_program(paired_results, "control_a", "sha256:" + "e" * 64)
-    with pytest.raises(TemporalDiscoveryContractError, match="program identity does not match"):
+    with pytest.raises(TemporalDiscoveryContractError, match="resolved program identity changed"):
         analyze_operator_panel(
             operator_root=operator_root,
             corrected_result_root=paired_results,

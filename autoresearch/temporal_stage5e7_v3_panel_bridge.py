@@ -18,8 +18,19 @@ from pathlib import Path
 from typing import Any
 
 from .temporal_discovery_base import TemporalDiscoveryContractError, _clone, canonical_sha256
-from .temporal_discovery_results import _aggregate_candidate, _result_set_sha256, load_stage_results
-from .temporal_discovery_validation import _rotate_evidence_plan
+from .temporal_discovery_results import (
+    _aggregate_candidate,
+    _require_candidate_execution_binding,
+    _result_set_sha256,
+)
+from .temporal_discovery_validation import (
+    _rotate_evidence_plan,
+    build_legacy_reference_admission_binding,
+)
+from .temporal_stage5e7_v3_validation import (
+    _exact_task_manifest,
+    load_authority_bound_panel_results,
+)
 from .temporal_qd_evolution import (
     QD_POLICY_NAME,
     QD_POLICY_SHA256,
@@ -348,20 +359,6 @@ def _load_repair_bridge_preparation(
     return preparation, authority, campaign, evaluation
 
 
-def _validate_result_authority(
-    *, result_root: Path | str, authority: Mapping[str, Any], campaign: Mapping[str, Any]
-) -> None:
-    root = Path(result_root)
-    result_authority = validate_authority(_read(root / "authority.json", name="corrected-result authority"))
-    manifest = _read(root / "task-manifest.json", name="corrected-result task manifest")
-    if (
-        result_authority != authority
-        or manifest.get("authorityId") != authority["authorityId"]
-        or manifest.get("taskMatrixSha256") != campaign.get("taskMatrixSha256")
-    ):
-        raise TemporalDiscoveryContractError("corrected results are not materialized from the exact bridge authority/task matrix")
-
-
 def admit_repair_reference_seed(
     *, reference_population_path: Path | str, result_root: Path | str, panel_preparation_path: Path | str, output_root: Path | str
 ) -> dict[str, Any]:
@@ -375,7 +372,14 @@ def admit_repair_reference_seed(
         source_candidates=source_candidates,
         source_sha=source_sha,
     )
-    _validate_result_authority(result_root=result_root, authority=authority, campaign=bridge_campaign)
+    expected_manifest = _exact_task_manifest(authority)
+    if (
+        bridge_campaign.get("taskMatrixSha256")
+        != expected_manifest["taskMatrixSha256"]
+    ):
+        raise TemporalDiscoveryContractError(
+            "bridge campaign task matrix diverges from repaired authority"
+        )
     catalog_identity = evaluation.get("constructionCatalog")
     catalog_payload = None
     catalog_path = None
@@ -394,7 +398,12 @@ def admit_repair_reference_seed(
         construction_catalog=catalog_payload,
         construction_catalog_path=catalog_path,
     )
-    results = load_stage_results(result_root)
+    results = load_authority_bound_panel_results(
+        authority=authority,
+        expected_manifest=expected_manifest,
+        result_root=result_root,
+    )
+    corrected_result_set_sha256 = _result_set_sha256(results)
     source_by_id = {str(item["candidateId"]): item for item in source_candidates}
     if set(results) != set(source_by_id):
         raise TemporalDiscoveryContractError("seed admission requires exact repaired-reference candidate result coverage")
@@ -410,14 +419,40 @@ def admit_repair_reference_seed(
         if (
             {(str(row.get("analysisWindowStart")), str(row.get("analysisWindowEnd"))) for row in candidate_windows} != expected_windows
             or len(candidate_windows) != len(expected_windows)
-            or any(row.get("programSha256") != source["programSha256"] for row in candidate_windows)
         ):
             raise TemporalDiscoveryContractError("corrected candidate results diverge from repaired reference/authority bindings")
+        execution_binding = _require_candidate_execution_binding(
+            source, candidate_windows
+        )
         aggregate = _aggregate_candidate(source, candidate_windows)
-        if aggregate.get("v3Admissible") is not True:
+        if (
+            aggregate.get("v3Admissible") is not True
+            or aggregate.get("authoredProgramSha256")
+            != execution_binding["authoredProgramSha256"]
+            or aggregate.get("sourceProfileSnapshotSha256")
+            != execution_binding["sourceProfileSnapshotSha256"]
+            or aggregate.get("resolvedProfileSnapshotSha256")
+            != execution_binding["resolvedProfileSnapshotSha256"]
+            or aggregate.get("resolvedProgramSha256")
+            != execution_binding["resolvedProgramSha256"]
+            or aggregate.get("programSha256")
+            != execution_binding["resolvedProgramSha256"]
+        ):
             raise TemporalDiscoveryContractError("seed admission requires v3Admissible corrected aggregates for every reference candidate")
         candidate = _clone(source, name="reference candidate for explicit QD admission")
         candidate.update({"sourceMode": "qd_stage5e7_v3_reference_seed_admitted", "generationIndex": 0, "birthOrdinal": len(admitted), "proposalOrdinal": len(admitted)})
+        legacy_binding = build_legacy_reference_admission_binding(
+            candidate=candidate,
+            execution_binding=execution_binding,
+            source_reference_population_sha256=source_sha,
+            authority_id=authority["authorityId"],
+            worker_contract_sha256=authority["workerContract"]["workerContractSha256"],
+            corrected_result_set_sha256=corrected_result_set_sha256,
+        )
+        candidate["legacyReferenceAdmissionBindingSha256"] = legacy_binding.pop(
+            "legacyReferenceAdmissionBindingSha256"
+        )
+        candidate["legacyReferenceAdmissionBinding"] = legacy_binding
         identity_material = {"schemaVersion": "stage5e7_v3_reference_seed_candidate_identity_v1", "referencePopulationSha256": source_sha, "sourceCandidateId": candidate_id, "sourceCandidateSha256": canonical_sha256(source), "programSha256": candidate["programSha256"], "predeclaredEvidenceContextSha256": context["predeclaredEvidenceContextSha256"], "authorityId": authority["authorityId"]}
         candidate["candidateIdentityMaterial"] = identity_material
         candidate["candidateIdentitySha256"] = canonical_sha256(identity_material)
@@ -440,13 +475,14 @@ def admit_repair_reference_seed(
         "originCounts": {"stage5e7_v3_reference_seed_admission": 64}, "proposalOrderCandidateIds": [item["candidateId"] for item in admitted],
         "candidateCount": 64, "candidates": admitted, "predeclaredEvidenceContextSha256": context["predeclaredEvidenceContextSha256"],
         "stage5e7V3SeedAdmissionContext": seed_context,
+        "legacyReferenceAdmissionBindingRequired": True,
         "proposalSlots": {"targetUniqueCandidates": 64, "acceptedUniqueCandidates": 64, "proposalAttempts": 64, "remainingUniqueCandidateSlots": 0},
     }
     seed_population["populationSha256"] = canonical_sha256(seed_population)
     root = _external_root(output_root)
     admission = {
         "schemaVersion": ADMISSION_SCHEMA, "sourceReferencePopulationSha256": source_sha,
-        "resultRoot": str(Path(result_root).resolve()), "resultSetSha256": _result_set_sha256(results),
+        "resultRoot": str(Path(result_root).resolve()), "resultSetSha256": corrected_result_set_sha256,
         "candidateCount": 64, "exactResultCoverage": True, "allCorrectedAggregatesV3Admissible": True,
         "qdVersion": QD_VERSION, "policyName": QD_POLICY_NAME, "policySha256": QD_POLICY_SHA256,
         "predeclaredEvidenceContext": context, "predeclaredEvidenceContextSha256": context["predeclaredEvidenceContextSha256"],

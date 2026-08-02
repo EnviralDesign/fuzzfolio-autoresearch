@@ -304,6 +304,18 @@ def _window_record(result: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "analysisWindowStart": result.get("analysis_window_start"),
         "analysisWindowEnd": result.get("analysis_window_end"),
+        # These are intentionally distinct identities.  The source snapshot is
+        # the normalized authored profile selected by the candidate validator;
+        # resolved profile/program are what the evaluator actually executed.
+        "sourceProfileSnapshotSha256": result.get(
+            "source_profile_snapshot_sha256"
+        ),
+        "resolvedProfileSnapshotSha256": result.get(
+            "resolved_profile_snapshot_sha256"
+        ),
+        "resolvedProgramSha256": result.get("program_sha256"),
+        # Retain the historic window name for generic consumers.  It is an
+        # execution identity, never an assertion about the authored program.
         "programSha256": result.get("program_sha256"),
         "observationStreamSha256": result.get(
             "observation_stream_sha256"
@@ -512,35 +524,85 @@ def _equity_shape(curve: Sequence[float], points: int = 12) -> list[float]:
     return output
 
 
+def _require_candidate_execution_binding(
+    candidate: Mapping[str, Any],
+    windows: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    """Bind v3 windows to authored input and one resolved execution.
+
+    A candidate's ``sourceProfileSha256`` identifies exact raw authored JSON,
+    while ``profileSnapshotSha256`` is its normalized authored replay input.
+    A worker must echo the latter.  The profile/program it resolves for
+    execution are intentionally separate from authored lineage, but must stay
+    exact and stable for every window of the candidate.
+    """
+    authored_program = _sha(
+        candidate.get("programSha256"),
+        name="candidate authored program SHA-256",
+    )
+    source_profile_snapshot = _sha(
+        candidate.get("profileSnapshotSha256"),
+        name="candidate profile snapshot SHA-256",
+    )
+    if not windows:
+        raise TemporalDiscoveryContractError(
+            "candidate execution binding requires at least one result window"
+        )
+    resolved_profile_snapshot: str | None = None
+    resolved_program: str | None = None
+    for index, window in enumerate(windows):
+        source_actual = _sha(
+            window.get("sourceProfileSnapshotSha256"),
+            name=f"result window {index} source profile snapshot SHA-256",
+        )
+        if source_actual != source_profile_snapshot:
+            raise TemporalDiscoveryContractError(
+                "result window source profile snapshot identity does not match "
+                "candidate profile snapshot identity"
+            )
+        profile_actual = _sha(
+            window.get("resolvedProfileSnapshotSha256"),
+            name=f"result window {index} resolved profile snapshot SHA-256",
+        )
+        program_actual = _sha(
+            window.get("resolvedProgramSha256"),
+            name=f"result window {index} program SHA-256",
+        )
+        if (
+            resolved_profile_snapshot is not None
+            and profile_actual != resolved_profile_snapshot
+        ):
+            raise TemporalDiscoveryContractError(
+                "result window resolved profile snapshot identity changed across windows"
+            )
+        if resolved_program is not None and program_actual != resolved_program:
+            raise TemporalDiscoveryContractError(
+                "result window resolved program identity changed across windows"
+            )
+        resolved_profile_snapshot = profile_actual
+        resolved_program = program_actual
+    assert resolved_profile_snapshot is not None
+    assert resolved_program is not None
+    return {
+        "authoredProgramSha256": authored_program,
+        "sourceProfileSnapshotSha256": source_profile_snapshot,
+        "resolvedProfileSnapshotSha256": resolved_profile_snapshot,
+        "resolvedProgramSha256": resolved_program,
+    }
+
+
 def _require_candidate_program_identity(
     candidate: Mapping[str, Any],
     windows: Sequence[Mapping[str, Any]],
 ) -> str:
-    """Require every reduced result window to execute the candidate program.
+    """Compatibility wrapper returning the resolved execution program.
 
-    The general result loader deliberately preserves legacy evidence for
-    comparison-only reports.  QD archive construction instead needs an exact
-    executable identity: it must not treat a result produced by a different
-    program (or a missing program identity) as a result of this candidate.
+    New callers should use :func:`_require_candidate_execution_binding` so
+    they cannot accidentally compare authored lineage to resolved execution.
     """
-    expected = _sha(
-        candidate.get("programSha256"),
-        name="candidate program SHA-256",
-    )
-    if not windows:
-        raise TemporalDiscoveryContractError(
-            "candidate program identity requires at least one result window"
-        )
-    for index, window in enumerate(windows):
-        actual = _sha(
-            window.get("programSha256"),
-            name=f"result window {index} program SHA-256",
-        )
-        if actual != expected:
-            raise TemporalDiscoveryContractError(
-                "result window program identity does not match candidate program identity"
-            )
-    return expected
+    return _require_candidate_execution_binding(candidate, windows)[
+        "resolvedProgramSha256"
+    ]
 
 
 def _aggregate_candidate(
@@ -557,6 +619,11 @@ def _aggregate_candidate(
             "candidate aggregate must not mix legacy closed-trade and v3 terminal-adjusted windows"
         )
     v3_admissible = v3_flags == {True}
+    execution_binding = (
+        _require_candidate_execution_binding(candidate, windows)
+        if v3_admissible
+        else None
+    )
     economics_basis = (
         "stage5e7_v3_terminal_adjusted"
         if v3_admissible
@@ -597,7 +664,8 @@ def _aggregate_candidate(
         if window["winRate"] is not None
     ]
     program_ids = {
-        str(window["programSha256"]) for window in windows
+        str(window.get("resolvedProgramSha256", window.get("programSha256")))
+        for window in windows
     }
     if len(program_ids) != 1:
         raise TemporalDiscoveryContractError(
@@ -702,6 +770,24 @@ def _aggregate_candidate(
         "sourceMode": candidate["sourceMode"],
         "seedId": candidate["seedId"],
         "sourceProfileSha256": candidate["sourceProfileSha256"],
+        "authoredProgramSha256": (
+            execution_binding["authoredProgramSha256"]
+            if execution_binding is not None
+            else candidate.get("programSha256")
+        ),
+        "sourceProfileSnapshotSha256": (
+            execution_binding["sourceProfileSnapshotSha256"]
+            if execution_binding is not None
+            else candidate.get("profileSnapshotSha256")
+        ),
+        "resolvedProfileSnapshotSha256": (
+            execution_binding["resolvedProfileSnapshotSha256"]
+            if execution_binding is not None
+            else None
+        ),
+        "resolvedProgramSha256": next(iter(program_ids)),
+        # Compatibility alias: aggregate program identity describes the
+        # program which produced the measured result.
         "programSha256": next(iter(program_ids)),
         "windowCount": len(windows),
         "economicsBasis": economics_basis,
@@ -1072,10 +1158,10 @@ def _deduplicate_resolved_programs(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     by_program: dict[str, list[dict[str, Any]]] = {}
     for aggregate in aggregates:
-        by_program.setdefault(
-            str(aggregate["programSha256"]),
-            [],
-        ).append(dict(aggregate))
+        resolved_program = str(
+            aggregate.get("resolvedProgramSha256", aggregate["programSha256"])
+        )
+        by_program.setdefault(resolved_program, []).append(dict(aggregate))
     unique: list[dict[str, Any]] = []
     duplicates: list[dict[str, Any]] = []
     for program_sha256 in sorted(by_program):
@@ -1145,4 +1231,4 @@ def _confirmation_union(
 
 
 
-__all__ = ['_result_files', '_metric', '_window_record', 'load_stage_results', '_result_set_sha256', '_distribution', '_l1_distribution_distance', '_log_distance', '_equity_shape', '_aggregate_candidate', 'fingerprint_distance', '_ECONOMIC_OBJECTIVES', '_dominates', 'pareto_fronts', 'select_economic_archive', 'select_novelty_archive', '_deduplicate_resolved_programs', '_confirmation_union']
+__all__ = ['_result_files', '_metric', '_window_record', 'load_stage_results', '_result_set_sha256', '_distribution', '_l1_distribution_distance', '_log_distance', '_equity_shape', '_require_candidate_execution_binding', '_require_candidate_program_identity', '_aggregate_candidate', 'fingerprint_distance', '_ECONOMIC_OBJECTIVES', '_dominates', 'pareto_fronts', 'select_economic_archive', 'select_novelty_archive', '_deduplicate_resolved_programs', '_confirmation_union']

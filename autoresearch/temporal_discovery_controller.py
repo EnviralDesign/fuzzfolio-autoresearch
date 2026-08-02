@@ -34,9 +34,15 @@ def _population_map(discovery_root: Path) -> dict[str, dict[str, Any]]:
     )
     if population.get("schemaVersion") != TEMPORAL_DISCOVERY_POPULATION_SCHEMA:
         raise TemporalDiscoveryContractError("unknown population schema")
+    candidates = population.get("candidates") or []
+    if population.get("authoredValidationBindingRequired") is True:
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                raise TemporalDiscoveryContractError("discovery population candidate must be an object")
+            validate_authored_validation_binding(candidate)
     return {
         item["candidateId"]: item
-        for item in population.get("candidates") or []
+        for item in candidates
     }
 
 

@@ -4,8 +4,13 @@ import json
 import random
 from pathlib import Path
 
+import pytest
+
 import autoresearch.temporal_qd_evolution as qd_module
-from autoresearch.temporal_discovery_base import canonical_sha256
+from autoresearch.temporal_discovery_base import (
+    TemporalDiscoveryContractError,
+    canonical_sha256,
+)
 from autoresearch.temporal_qd_evolution import select_qd_archive
 from autoresearch.temporal_search_policy_v2 import (
     GENERATOR_V2_PARAMETERS,
@@ -420,6 +425,43 @@ def test_qd_default_cell_capacity_is_four() -> None:
     assert qd_module.DEFAULT_QD_PARAMETERS["cellCapacity"] == 4
 
 
+def test_qd_policy_requires_resolved_execution_pre_reduction_deduplication(
+    tmp_path: Path,
+) -> None:
+    deduplication = qd_module.QD_POLICY["resolvedExecutionDeduplication"]
+    assert deduplication == {
+        "required": True,
+        "stage": "before_archive_reduction",
+        "identity": "aggregate.resolvedProgramSha256",
+        "representativeOrdering": [
+            {"field": "finiteDataValidity.validForQuality", "direction": "max"},
+            {"field": "objectives.worstWindowConservativeNetR", "direction": "max"},
+            {"field": "cappedTradeSupport", "direction": "max"},
+            {"field": "objectives.maximumDrawdownR", "direction": "min"},
+            {"field": "objectives.structuralComplexity", "direction": "min"},
+            {"field": "candidateId", "direction": "min"},
+        ],
+    }
+    old_policy = dict(qd_module.QD_POLICY)
+    old_policy.pop("resolvedExecutionDeduplication")
+    old_archive = {
+        "schemaVersion": qd_module.QD_ARCHIVE_SCHEMA,
+        "qdVersion": qd_module.QD_VERSION,
+        "policyName": qd_module.QD_POLICY_NAME,
+        "policySha256": canonical_sha256(old_policy),
+        "frozenPolicy": old_policy,
+    }
+    old_archive["archiveSha256"] = canonical_sha256(old_archive)
+    path = tmp_path / "old-policy-archive.json"
+    path.write_text(
+        json.dumps(old_archive, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TemporalDiscoveryContractError, match="unknown QD archive schema"):
+        qd_module._load_archive(path)
+
+
 def test_qd_global_ledger_rejects_evicted_exact_evaluation_and_reports_counts(
     tmp_path: Path,
 ) -> None:
@@ -694,6 +736,7 @@ def test_qd_generation_is_exact_across_full_and_sliced_restart(
         "previousArchiveSha256": None,
         "policyName": qd_module.QD_POLICY_NAME,
         "policySha256": qd_module.QD_POLICY_SHA256,
+        "frozenPolicy": qd_module.QD_POLICY,
         "cellCapacity": 4,
         "objectives": [],
         "candidateCountSeen": 1,

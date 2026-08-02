@@ -29,6 +29,29 @@ from .lake_window import (
 from .temporal_discovery_base import *
 from .temporal_discovery_mutation import *
 
+AUTHORED_VALIDATION_BINDING_SCHEMA = "temporal_authored_validation_binding_v1"
+AUTHORED_VALIDATOR_PROVENANCE_SCHEMA = "temporal_authored_validator_provenance_v1"
+_AUTHORED_VALIDATION_BINDING_FIELDS = {
+    "schemaVersion",
+    "rawSourceProfileSha256",
+    "profileSnapshotSha256",
+    "programSha256",
+    "validationReportSha256",
+    "validatorProvenance",
+}
+_AUTHORED_VALIDATOR_PROVENANCE_FIELDS = {
+    "schemaVersion",
+    "validationContractSha256",
+    "validatorSchema",
+    "fuzzfolioCommit",
+    "validatorCommandSha256",
+    "commandProvenance",
+}
+_VALIDATOR_COMMAND_PROVENANCE = {
+    "declared_subprocess_command",
+    "protocol_command_unavailable",
+}
+
 class SubprocessCandidateValidator:
     """Call the FuzzFolio-owned validator without duplicating its grammar."""
 
@@ -115,6 +138,264 @@ class SubprocessCandidateValidator:
                 "validator rejection exit code and report disagree"
             )
         return report
+
+
+def validator_provenance(
+    validator: CandidateValidatorProtocol,
+    *,
+    validation_contract: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Describe validator inputs for content binding, not authenticity claims."""
+    command = getattr(validator, "command", None)
+    has_command = isinstance(command, (tuple, list)) and bool(command) and all(
+        isinstance(item, str) and item.strip() for item in command
+    )
+    contract = _clone(
+        validation_contract or {}, name="validator contract provenance"
+    )
+    return {
+        "schemaVersion": AUTHORED_VALIDATOR_PROVENANCE_SCHEMA,
+        "validationContractSha256": canonical_sha256(contract),
+        "validatorSchema": contract.get("validatorSchema"),
+        "fuzzfolioCommit": contract.get("fuzzfolioCommit"),
+        "validatorCommandSha256": (
+            canonical_sha256(list(command)) if has_command else None
+        ),
+        "commandProvenance": (
+            "declared_subprocess_command" if has_command else "protocol_command_unavailable"
+        ),
+    }
+
+
+def build_authored_validation_binding(
+    *,
+    raw_source_profile_sha256: str,
+    validation: Mapping[str, Any],
+    provenance: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Content-bind a candidate's authored lineage to its validator output."""
+    material = {
+        "schemaVersion": AUTHORED_VALIDATION_BINDING_SCHEMA,
+        "rawSourceProfileSha256": _sha(
+            raw_source_profile_sha256,
+            name="authored validation raw source profile SHA-256",
+        ),
+        "profileSnapshotSha256": _sha(
+            validation.get("profileSnapshotSha256"),
+            name="authored validation profile snapshot SHA-256",
+        ),
+        "programSha256": _sha(
+            validation.get("programSha256"),
+            name="authored validation program SHA-256",
+        ),
+        "validationReportSha256": _sha(
+            validation.get("validationReportSha256"),
+            name="authored validation report SHA-256",
+        ),
+        "validatorProvenance": _clone(
+            provenance, name="authored validation validator provenance"
+        ),
+    }
+    return {
+        **material,
+        "authoredValidationBindingSha256": canonical_sha256(material),
+    }
+
+
+def validate_authored_validation_binding(candidate: Mapping[str, Any]) -> None:
+    """Verify the candidate has not drifted from its authored validation."""
+    binding = _mapping(
+        candidate.get("authoredValidationBinding"),
+        name="candidate authored validation binding",
+    )
+    supplied = _sha(
+        candidate.get("authoredValidationBindingSha256"),
+        name="candidate authored validation binding SHA-256",
+    )
+    material = _clone(binding, name="candidate authored validation binding")
+    observed = material.pop("authoredValidationBindingSha256", None)
+    if observed is not None:
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation binding material must not embed its hash"
+        )
+    if canonical_sha256(material) != supplied:
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation binding identity mismatch"
+        )
+    if set(material) != _AUTHORED_VALIDATION_BINDING_FIELDS:
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation binding schema fields are not exact"
+        )
+    if material.get("schemaVersion") != AUTHORED_VALIDATION_BINDING_SCHEMA:
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation binding has an unknown schema"
+        )
+    expected = {
+        "rawSourceProfileSha256": candidate.get("sourceProfileSha256"),
+        "profileSnapshotSha256": candidate.get("profileSnapshotSha256"),
+        "programSha256": candidate.get("programSha256"),
+        "validationReportSha256": candidate.get("validationReportSha256"),
+    }
+    for key, value in expected.items():
+        if material.get(key) != value:
+            raise TemporalDiscoveryContractError(
+                "candidate authored validation binding diverges from candidate " + key
+            )
+    provenance = material.get("validatorProvenance")
+    if not isinstance(provenance, Mapping):
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation binding lacks validator provenance"
+        )
+    if set(provenance) != _AUTHORED_VALIDATOR_PROVENANCE_FIELDS:
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation validator provenance fields are not exact"
+        )
+    if provenance.get("schemaVersion") != AUTHORED_VALIDATOR_PROVENANCE_SCHEMA:
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation validator provenance has an unknown schema"
+        )
+    validator_schema = provenance.get("validatorSchema")
+    if (
+        not isinstance(validator_schema, str)
+        or validator_schema != validator_schema.strip()
+        or not _SAFE.fullmatch(validator_schema)
+    ):
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation validator provenance validator schema must be a nonempty canonical string"
+        )
+    fuzzfolio_commit = provenance.get("fuzzfolioCommit")
+    if fuzzfolio_commit is not None and (
+        not isinstance(fuzzfolio_commit, str)
+        or not re.fullmatch(r"[0-9a-f]{40}", fuzzfolio_commit)
+    ):
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation validator provenance fuzzfolio commit must be None or an exact lowercase commit SHA"
+        )
+    _sha(
+        provenance.get("validationContractSha256"),
+        name="candidate authored validation validator provenance validation contract SHA-256",
+    )
+    command_sha = provenance.get("validatorCommandSha256")
+    if command_sha is not None:
+        _sha(
+            command_sha,
+            name="candidate authored validation validator provenance command SHA-256",
+        )
+    command_provenance = provenance.get("commandProvenance")
+    if command_provenance not in _VALIDATOR_COMMAND_PROVENANCE:
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation validator provenance command provenance is unknown"
+        )
+    if (
+        command_provenance == "declared_subprocess_command"
+        and command_sha is None
+    ) or (
+        command_provenance == "protocol_command_unavailable"
+        and command_sha is not None
+    ):
+        raise TemporalDiscoveryContractError(
+            "candidate authored validation validator provenance command presence is inconsistent"
+        )
+
+
+def build_legacy_reference_admission_binding(
+    *,
+    candidate: Mapping[str, Any],
+    execution_binding: Mapping[str, Any],
+    source_reference_population_sha256: str,
+    authority_id: str,
+    worker_contract_sha256: str,
+    corrected_result_set_sha256: str,
+) -> dict[str, Any]:
+    """Bind an evaluated legacy reference to the exact admission evidence.
+
+    A frozen reference predates fresh-generation authored validator bindings.
+    It is therefore deliberately labelled as a reference admission binding,
+    rather than being represented as newly-authored validator provenance.
+    """
+    material = {
+        "schemaVersion": "stage5e7_v3_legacy_reference_admission_binding_v1",
+        "admissionKind": "legacy_reference_result_attested",
+        "rawSourceProfileSha256": _sha(
+            candidate.get("sourceProfileSha256"),
+            name="legacy reference source profile SHA-256",
+        ),
+        "profileSnapshotSha256": _sha(
+            candidate.get("profileSnapshotSha256"),
+            name="legacy reference profile snapshot SHA-256",
+        ),
+        "programSha256": _sha(
+            candidate.get("programSha256"),
+            name="legacy reference authored program SHA-256",
+        ),
+        "resolvedProfileSnapshotSha256": _sha(
+            execution_binding.get("resolvedProfileSnapshotSha256"),
+            name="legacy reference resolved profile snapshot SHA-256",
+        ),
+        "resolvedProgramSha256": _sha(
+            execution_binding.get("resolvedProgramSha256"),
+            name="legacy reference resolved program SHA-256",
+        ),
+        "sourceReferencePopulationSha256": _sha(
+            source_reference_population_sha256,
+            name="legacy reference population SHA-256",
+        ),
+        "authorityId": _sha(authority_id, name="legacy reference authority ID"),
+        "workerContractSha256": _sha(
+            worker_contract_sha256,
+            name="legacy reference worker contract SHA-256",
+        ),
+        "correctedResultSetSha256": _sha(
+            corrected_result_set_sha256,
+            name="legacy reference corrected result set SHA-256",
+        ),
+    }
+    return {
+        **material,
+        "legacyReferenceAdmissionBindingSha256": canonical_sha256(material),
+    }
+
+
+def validate_legacy_reference_admission_binding(
+    candidate: Mapping[str, Any]
+) -> None:
+    """Verify a labelled legacy admission did not drift after result attestation."""
+    binding = _mapping(
+        candidate.get("legacyReferenceAdmissionBinding"),
+        name="candidate legacy reference admission binding",
+    )
+    supplied = _sha(
+        candidate.get("legacyReferenceAdmissionBindingSha256"),
+        name="candidate legacy reference admission binding SHA-256",
+    )
+    material = _clone(binding, name="candidate legacy reference admission binding")
+    if material.pop("legacyReferenceAdmissionBindingSha256", None) is not None:
+        raise TemporalDiscoveryContractError(
+            "candidate legacy reference admission binding material must not embed its hash"
+        )
+    if canonical_sha256(material) != supplied:
+        raise TemporalDiscoveryContractError(
+            "candidate legacy reference admission binding identity mismatch"
+        )
+    expected = {
+        "rawSourceProfileSha256": candidate.get("sourceProfileSha256"),
+        "profileSnapshotSha256": candidate.get("profileSnapshotSha256"),
+        "programSha256": candidate.get("programSha256"),
+    }
+    for key, value in expected.items():
+        if material.get(key) != value:
+            raise TemporalDiscoveryContractError(
+                "candidate legacy reference admission binding diverges from candidate "
+                + key
+            )
+    if (
+        material.get("schemaVersion")
+        != "stage5e7_v3_legacy_reference_admission_binding_v1"
+        or material.get("admissionKind") != "legacy_reference_result_attested"
+    ):
+        raise TemporalDiscoveryContractError(
+            "candidate legacy reference admission binding has an unknown schema"
+        )
 
 
 def _normalize_preparation(raw: Mapping[str, Any]) -> dict[str, Any]:
@@ -698,4 +979,14 @@ def _finite_preparation(
 
 
 
-__all__ = ['SubprocessCandidateValidator', '_normalize_preparation', '_rotate_evidence_plan', '_finite_preparation']
+__all__ = [
+    "SubprocessCandidateValidator",
+    "validator_provenance",
+    "build_authored_validation_binding",
+    "validate_authored_validation_binding",
+    "build_legacy_reference_admission_binding",
+    "validate_legacy_reference_admission_binding",
+    "_normalize_preparation",
+    "_rotate_evidence_plan",
+    "_finite_preparation",
+]

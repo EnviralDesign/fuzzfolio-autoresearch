@@ -126,14 +126,39 @@ def test_seed_admission_requires_exact_coverage_and_is_explicit(tmp_path: Path, 
     result_root = tmp_path / "results"
     _write(result_root / "authority.json", json.loads((bridge_root / "authority.json").read_text(encoding="utf-8")))
     _write(result_root / "task-manifest.json", json.loads((bridge_root / "task-matrix" / "task-manifest.json").read_text(encoding="utf-8")))
-    monkeypatch.setattr(bridge, "load_stage_results", lambda _root: {})
+    monkeypatch.setattr(bridge, "load_authority_bound_panel_results", lambda **_kwargs: {})
     with pytest.raises(TemporalDiscoveryContractError, match="exact repaired-reference"):
         bridge.admit_repair_reference_seed(reference_population_path=population, result_root=result_root, panel_preparation_path=bridge_root / "preparation.json", output_root=tmp_path / "seed-empty")
 
     candidates = json.loads(population.read_text(encoding="utf-8"))["candidates"]
-    results = {item["candidateId"]: [{"analysisWindowStart": "2024-02-01T00:00:00Z", "analysisWindowEnd": "2024-03-01T00:00:00Z", "programSha256": item["programSha256"]}] for item in candidates}
-    monkeypatch.setattr(bridge, "load_stage_results", lambda _root: results)
-    monkeypatch.setattr(bridge, "_aggregate_candidate", lambda _candidate, _windows: {"v3Admissible": True})
+    resolved_profile = "sha256:" + "e" * 64
+    resolved_program = "sha256:" + "f" * 64
+    results = {
+        item["candidateId"]: [{
+            "analysisWindowStart": "2024-02-01T00:00:00Z",
+            "analysisWindowEnd": "2024-03-01T00:00:00Z",
+            "sourceProfileSnapshotSha256": item["profileSnapshotSha256"],
+            "resolvedProfileSnapshotSha256": resolved_profile,
+            "resolvedProgramSha256": resolved_program,
+            "programSha256": resolved_program,
+        }]
+        for item in candidates
+    }
+    monkeypatch.setattr(
+        bridge, "load_authority_bound_panel_results", lambda **_kwargs: results
+    )
+    monkeypatch.setattr(
+        bridge,
+        "_aggregate_candidate",
+        lambda candidate, _windows: {
+            "v3Admissible": True,
+            "authoredProgramSha256": candidate["programSha256"],
+            "sourceProfileSnapshotSha256": candidate["profileSnapshotSha256"],
+            "resolvedProfileSnapshotSha256": resolved_profile,
+            "resolvedProgramSha256": resolved_program,
+            "programSha256": resolved_program,
+        },
+    )
     observed: dict[str, object] = {}
     def reduce(**kwargs: object) -> dict:
         observed.update(kwargs)
@@ -143,7 +168,13 @@ def test_seed_admission_requires_exact_coverage_and_is_explicit(tmp_path: Path, 
     seed = json.loads((Path(result["outputRoot"]) / "seed-population.json").read_text(encoding="utf-8"))
     admission = json.loads((Path(result["outputRoot"]) / "admission.json").read_text(encoding="utf-8"))
     assert seed["qdVersion"] == "temporal_qd_evolution_v3"
+    assert seed["legacyReferenceAdmissionBindingRequired"] is True
     assert all(item["sourceMode"] == "qd_stage5e7_v3_reference_seed_admitted" for item in seed["candidates"])
+    assert all(
+        item["legacyReferenceAdmissionBinding"]["admissionKind"]
+        == "legacy_reference_result_attested"
+        for item in seed["candidates"]
+    )
     assert admission["v2ArchiveRanksUsed"] is False
     assert admission["effectiveWorkerContract"]["workerContractSha256"] == "sha256:" + "d" * 64
     assert seed["stage5e7V3SeedAdmissionContext"]["authorityId"] == frozen["authorityId"]

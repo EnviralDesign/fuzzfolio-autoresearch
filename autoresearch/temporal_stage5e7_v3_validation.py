@@ -33,6 +33,7 @@ from .temporal_discovery_base import (
 )
 from .temporal_discovery_results import (
     _aggregate_candidate,
+    _require_candidate_execution_binding,
     _result_files,
     _result_set_sha256,
     load_stage_results,
@@ -52,6 +53,7 @@ from .temporal_qd_evolution import (
     _finite_data_validity,
     _objective_row,
     _load_population,
+    deduplicate_resolved_execution_members,
     qd_behavior_descriptor,
     select_qd_archive,
 )
@@ -1295,6 +1297,110 @@ def _exact_task_manifest(authority: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def load_authority_bound_panel_results(
+    *,
+    authority: Mapping[str, Any],
+    expected_manifest: Mapping[str, Any],
+    result_root: Path | str,
+) -> dict[str, list[dict[str, Any]]]:
+    """Load v3 panel results only after exact authority/task verification.
+
+    This is intentionally independent of a particular bridge layout so the
+    repair-seed admission and the operator/policy analysis cannot drift into
+    subtly different raw-result acceptance rules.
+    """
+    if expected_manifest != _exact_task_manifest(authority):
+        raise TemporalDiscoveryContractError(
+            "panel result task manifest is not the exact frozen authority matrix"
+        )
+    root = Path(result_root).resolve()
+    result_authority = _read_object(
+        root / "authority.json", name="panel result authority"
+    )
+    result_manifest = _read_object(
+        root / "task-manifest.json", name="panel result task manifest"
+    )
+    try:
+        validated_result_authority = validate_authority(result_authority)
+    except TemporalSearchContractError as exc:
+        raise TemporalDiscoveryContractError("panel result authority is invalid") from exc
+    if validated_result_authority != authority or result_manifest != expected_manifest:
+        raise TemporalDiscoveryContractError(
+            "panel results are not materialized from the exact frozen bridge authority/task matrix"
+        )
+
+    expected_by_task_id = {
+        str(task["task_id"]): task for task in expected_manifest["tasks"]
+    }
+    worker_contract = authority["workerContract"]["workerContractSha256"]
+    raw_by_task_id: dict[str, dict[str, Any]] = {}
+    for path in _result_files(root):
+        material = _read_json(path, name="panel candidate/window result")
+        task_id = str(material.get("job_id") or "")
+        task = expected_by_task_id.get(task_id)
+        if task is None or task_id in raw_by_task_id:
+            raise TemporalDiscoveryContractError(
+                "panel results contain an unexpected or duplicate authority task"
+            )
+        payload = task["payload"]
+        required = {
+            "task_kind": task["task_kind"],
+            "job_id": payload["job_id"],
+            "authority_id": payload["authority_id"],
+            "candidate_id": payload["candidate_id"],
+            "analysis_window_start": payload["analysis_window_start"],
+            "analysis_window_end": payload["analysis_window_end"],
+            "evidence_plan_id": payload["evidence_plan"]["plan_id"],
+            "lake_window_semantic_sha256": payload["lake_window_semantic_sha256"],
+            "shared_observation_stream_id": payload["shared_observation_stream_id"],
+        }
+        if any(material.get(key) != value for key, value in required.items()):
+            raise TemporalDiscoveryContractError(
+                "panel result does not bind to its exact frozen authority task"
+            )
+        worker_attribution = material.get("worker_attribution")
+        if (
+            not isinstance(worker_attribution, Mapping)
+            or worker_attribution.get("worker_contract_hash") != worker_contract
+        ):
+            raise TemporalDiscoveryContractError(
+                "panel result worker contract attribution diverges from frozen authority"
+            )
+        raw_by_task_id[task_id] = material
+    if set(raw_by_task_id) != set(expected_by_task_id):
+        raise TemporalDiscoveryContractError(
+            "panel results do not cover every intended candidate by ordered development window"
+        )
+
+    grouped = load_stage_results(root)
+    expected_windows = [
+        (str(item["analysisWindowStart"]), str(item["analysisWindowEnd"]))
+        for item in authority["developmentWindows"]
+    ]
+    expected_candidates = {
+        str(item["candidateId"]) for item in authority["candidates"]
+    }
+    if set(grouped) != expected_candidates:
+        raise TemporalDiscoveryContractError(
+            "panel result candidate coverage diverges from its exact authority"
+        )
+    for candidate_id, windows in grouped.items():
+        by_window = {
+            (
+                str(item.get("analysisWindowStart")),
+                str(item.get("analysisWindowEnd")),
+            ): item
+            for item in windows
+        }
+        if len(by_window) != len(windows) or set(by_window) != set(expected_windows):
+            raise TemporalDiscoveryContractError(
+                "panel result calendar coverage diverges from the frozen development windows: "
+                + candidate_id
+            )
+        grouped[candidate_id] = [by_window[key] for key in expected_windows]
+    return grouped
+
+
 def _audit_bridge_manifest(root: Path) -> None:
     """Verify the bridge's immutable inventory before trusting its identities."""
 
@@ -1477,71 +1583,11 @@ def _load_bound_panel_results(
         expected_panel_kind=expected_panel_kind,
     )
     expected_manifest = _exact_task_manifest(authority)
-    root = Path(result_root).resolve()
-    result_authority = _read_object(root / "authority.json", name="panel result authority")
-    result_manifest = _read_object(root / "task-manifest.json", name="panel result task manifest")
-    try:
-        validated_result_authority = validate_authority(result_authority)
-    except TemporalSearchContractError as exc:
-        raise TemporalDiscoveryContractError("panel result authority is invalid") from exc
-    if validated_result_authority != authority or result_manifest != expected_manifest:
-        raise TemporalDiscoveryContractError(
-            "panel results are not materialized from the exact frozen bridge authority/task matrix"
-        )
-
-    expected_by_task_id = {
-        str(task["task_id"]): task for task in expected_manifest["tasks"]
-    }
-    raw_by_task_id: dict[str, dict[str, Any]] = {}
-    for path in _result_files(root):
-        material = _read_json(path, name="panel candidate/window result")
-        task_id = str(material.get("job_id") or "")
-        task = expected_by_task_id.get(task_id)
-        if task is None or task_id in raw_by_task_id:
-            raise TemporalDiscoveryContractError("panel results contain an unexpected or duplicate authority task")
-        payload = task["payload"]
-        required = {
-            "task_kind": task["task_kind"],
-            "job_id": payload["job_id"],
-            "authority_id": payload["authority_id"],
-            "candidate_id": payload["candidate_id"],
-            "analysis_window_start": payload["analysis_window_start"],
-            "analysis_window_end": payload["analysis_window_end"],
-            "evidence_plan_id": payload["evidence_plan"]["plan_id"],
-            "lake_window_semantic_sha256": payload["lake_window_semantic_sha256"],
-            "shared_observation_stream_id": payload["shared_observation_stream_id"],
-        }
-        if any(material.get(key) != value for key, value in required.items()):
-            raise TemporalDiscoveryContractError(
-                "panel result does not bind to its exact frozen authority task"
-            )
-        raw_by_task_id[task_id] = material
-    if set(raw_by_task_id) != set(expected_by_task_id):
-        raise TemporalDiscoveryContractError(
-            "panel results do not cover every intended candidate by ordered development window"
-        )
-
-    grouped = load_stage_results(root)
-    expected_windows = [
-        (str(item["analysisWindowStart"]), str(item["analysisWindowEnd"]))
-        for item in authority["developmentWindows"]
-    ]
-    if set(grouped) != {str(item["candidateId"]) for item in authority["candidates"]}:
-        raise TemporalDiscoveryContractError("panel result candidate coverage diverges from its exact authority")
-    for candidate_id, windows in grouped.items():
-        by_window = {
-            (str(item.get("analysisWindowStart")), str(item.get("analysisWindowEnd"))): item
-            for item in windows
-        }
-        if len(by_window) != len(windows) or set(by_window) != set(expected_windows):
-            raise TemporalDiscoveryContractError(
-                "panel result calendar coverage diverges from the frozen development windows: "
-                + candidate_id
-            )
-        # ``load_stage_results`` sorts on timestamps for generic consumers.
-        # Stage5E7-v3 policy support is bound to the frozen authority order, so
-        # restore that order only after proving an exact one-to-one calendar map.
-        grouped[candidate_id] = [by_window[key] for key in expected_windows]
+    grouped = load_authority_bound_panel_results(
+        authority=authority,
+        expected_manifest=expected_manifest,
+        result_root=result_root,
+    )
     return grouped, bridge_binding
 
 
@@ -1574,9 +1620,8 @@ def _result_aggregate_by_candidate(
     aggregates: dict[str, dict[str, Any]] = {}
     for candidate_id in sorted(candidates):
         candidate = candidates[candidate_id]
-        expected_program = _required_sha256(
-            candidate.get("programSha256"),
-            name=f"panel candidate {candidate_id} program identity",
+        execution_binding = _require_candidate_execution_binding(
+            candidate, grouped[candidate_id]
         )
         for index, window in enumerate(grouped[candidate_id]):
             if window.get("v3Admissible") is not True:
@@ -1584,22 +1629,22 @@ def _result_aggregate_by_candidate(
                     "operator/policy analysis requires v3-admissible corrected results for every candidate/window: "
                     f"{candidate_id}[{index}]"
                 )
-            observed_program = _required_sha256(
-                window.get("programSha256"),
-                name=f"corrected result {candidate_id}[{index}] program identity",
-            )
-            if observed_program != expected_program:
-                raise TemporalDiscoveryContractError(
-                    "corrected result program identity does not match its panel candidate: "
-                    f"{candidate_id}[{index}]"
-                )
         aggregate = _aggregate_candidate(candidate, grouped[candidate_id])
         if (
             aggregate.get("v3Admissible") is not True
-            or aggregate.get("programSha256") != expected_program
+            or aggregate.get("authoredProgramSha256")
+            != execution_binding["authoredProgramSha256"]
+            or aggregate.get("sourceProfileSnapshotSha256")
+            != execution_binding["sourceProfileSnapshotSha256"]
+            or aggregate.get("resolvedProfileSnapshotSha256")
+            != execution_binding["resolvedProfileSnapshotSha256"]
+            or aggregate.get("resolvedProgramSha256")
+            != execution_binding["resolvedProgramSha256"]
+            or aggregate.get("programSha256")
+            != execution_binding["resolvedProgramSha256"]
         ):
             raise TemporalDiscoveryContractError(
-                "corrected result aggregate diverges from its v3 panel program binding: "
+                "corrected result aggregate diverges from its v3 panel execution binding: "
                 f"{candidate_id}"
             )
         aggregates[candidate_id] = aggregate
@@ -1743,6 +1788,20 @@ def _a_objectives(member: Mapping[str, Any]) -> tuple[float, float, float, float
     return (terminal_return / (1.0 + drawdown), drawdown, float(aggregate["totalTrades"]), float(member["objectives"]["structuralComplexity"]))
 
 
+def _policy_a_resolved_representative_key(
+    member: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    terminal_return, drawdown, trades, complexity = _a_objectives(member)
+    return (
+        -_a_is_eligible(member),
+        -terminal_return,
+        drawdown,
+        -trades,
+        complexity,
+        str(member["candidateId"]),
+    )
+
+
 def _a_dominates(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     left_values, right_values = _a_objectives(left), _a_objectives(right)
     no_worse = left_values[0] >= right_values[0] and left_values[1] <= right_values[1] and left_values[2] >= right_values[2] and left_values[3] <= right_values[3]
@@ -1778,7 +1837,13 @@ def _reduce_policy_b(members: Sequence[Mapping[str, Any]]) -> list[dict[str, Any
     return select_qd_archive([_clone(member, name="policy B archive member") for member in members], cell_capacity=4)
 
 
-def _policy_summary(*, policy_name: str, policy_sha256: str, cells: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _policy_summary(
+    *,
+    policy_name: str,
+    policy_sha256: str,
+    cells: Sequence[Mapping[str, Any]],
+    resolved_deduplication: Mapping[str, Any],
+) -> dict[str, Any]:
     retained = [member for cell in cells for member in cell.get("members") or []]
     candidate_ids = sorted(str(member["candidateId"]) for member in retained)
     robust_positive = [member for member in retained if float(member["aggregate"]["worstWindowConservativeNetR"]) > 0.0]
@@ -1786,7 +1851,14 @@ def _policy_summary(*, policy_name: str, policy_sha256: str, cells: Sequence[Map
     supports = [int(member["aggregate"]["totalTrades"]) for member in retained]
     drawdowns = [float(member["aggregate"]["maxWindowDrawdownR"]) for member in retained]
     behavior = {str(member["aggregate"]["fingerprintSha256"]) for member in retained}
-    programs = {str(member["candidate"]["programSha256"]) for member in retained}
+    authored_programs = {str(member["candidate"]["programSha256"]) for member in retained}
+    resolved_programs = {
+        str(
+            member["aggregate"].get("resolvedProgramSha256")
+            or member["aggregate"].get("programSha256")
+        )
+        for member in retained
+    }
     evidence = {str(window.get("observationStreamSha256")) for member in retained for window in member["aggregate"].get("windowRecords") or []}
     count = len(retained)
     return {
@@ -1800,7 +1872,17 @@ def _policy_summary(*, policy_name: str, policy_sha256: str, cells: Sequence[Map
         "negativeRetainedShare": len(negative) / count if count else None,
         "support": {"rawTotalTrades": sum(supports), "minimumRawTrades": min(supports, default=None), "medianRawTrades": statistics.median(supports) if supports else None},
         "drawdown": {"maximumR": max(drawdowns, default=None), "meanR": statistics.fmean(drawdowns) if drawdowns else None},
-        "diversity": {"descriptorCellCount": len({str(member["descriptor"]["cellId"]) for member in retained}), "behaviorFingerprintCount": len(behavior), "programCount": len(programs), "evidenceCount": len(evidence)},
+        "diversity": {
+            "descriptorCellCount": len({str(member["descriptor"]["cellId"]) for member in retained}),
+            "behaviorFingerprintCount": len(behavior),
+            "programCount": len(resolved_programs),
+            "authoredProgramCount": len(authored_programs),
+            "resolvedProgramCount": len(resolved_programs),
+            "evidenceCount": len(evidence),
+        },
+        "resolvedExecutionDeduplication": _clone(
+            resolved_deduplication, name="policy resolved deduplication"
+        ),
         "cells": _clone(list(cells), name="policy archive cells"),
     }
 
@@ -1849,11 +1931,33 @@ def analyze_policy_ab(
     _require_v3_corrected_aggregates(aggregates)
     members_a = [_policy_member(candidate, aggregates[str(candidate["candidateId"])], minimum_total_trades=8, minimum_trades_per_window=2, cap_trades=max(1, int(aggregates[str(candidate["candidateId"])].get("totalTrades") or 0))) for candidate in population["candidates"]]
     members_b = [_policy_member(candidate, aggregates[str(candidate["candidateId"])], minimum_total_trades=8, minimum_trades_per_window=4, cap_trades=20) for candidate in population["candidates"]]
-    a = _policy_summary(policy_name=POLICY_A_NAME, policy_sha256=POLICY_A_SHA256, cells=_reduce_policy_a(members_a))
-    b = _policy_summary(policy_name=QD_POLICY_NAME, policy_sha256=QD_POLICY_SHA256, cells=_reduce_policy_b(members_b))
+    reduced_members_a, duplicates_a = deduplicate_resolved_execution_members(
+        members_a, representative_key=_policy_a_resolved_representative_key
+    )
+    reduced_members_b, duplicates_b = deduplicate_resolved_execution_members(
+        members_b
+    )
+    dedupe_summary_a = {
+        "schemaVersion": "temporal_qd_resolved_execution_deduplication_v1",
+        "stage": "before_policy_a_reduction",
+        "inputMemberCount": len(members_a),
+        "uniqueResolvedProgramCount": len(reduced_members_a),
+        "duplicateCount": sum(len(row["discardedCandidateIds"]) for row in duplicates_a),
+        "duplicates": duplicates_a,
+    }
+    dedupe_summary_b = {
+        "schemaVersion": "temporal_qd_resolved_execution_deduplication_v1",
+        "stage": "before_policy_b_reduction",
+        "inputMemberCount": len(members_b),
+        "uniqueResolvedProgramCount": len(reduced_members_b),
+        "duplicateCount": sum(len(row["discardedCandidateIds"]) for row in duplicates_b),
+        "duplicates": duplicates_b,
+    }
+    a = _policy_summary(policy_name=POLICY_A_NAME, policy_sha256=POLICY_A_SHA256, cells=_reduce_policy_a(reduced_members_a), resolved_deduplication=dedupe_summary_a)
+    b = _policy_summary(policy_name=QD_POLICY_NAME, policy_sha256=QD_POLICY_SHA256, cells=_reduce_policy_b(reduced_members_b), resolved_deduplication=dedupe_summary_b)
     a_ids, b_ids = set(a["retainedCandidateIds"]), set(b["retainedCandidateIds"])
     overlap = {"retainedIntersectionCount": len(a_ids & b_ids), "retainedUnionCount": len(a_ids | b_ids), "jaccardShare": len(a_ids & b_ids) / len(a_ids | b_ids) if a_ids | b_ids else None, "onlyPolicyA": sorted(a_ids - b_ids), "onlyPolicyB": sorted(b_ids - a_ids)}
-    report = {"schemaVersion": "stage5e7_v3_policy_ab_analysis_v2", "comparisonSha256": comparison_sha, "reducedPopulationSha256": population_sha, "reducedCandidateCount": len(population["candidates"]), "correctedResultRoot": str(Path(corrected_result_root).resolve()), "correctedResultAuthorityBinding": result_binding, "correctedResultSetSha256": _result_set_sha256(load_stage_results(corrected_result_root)), "policyA": a, "policyB": b, "overlap": overlap, "differenceBMinusA": {"retainedCount": b["retainedCount"] - a["retainedCount"], "retainedCellCount": b["retainedCellCount"] - a["retainedCellCount"], "robustPositiveRetainedCount": b["robustPositiveRetainedCount"] - a["robustPositiveRetainedCount"], "robustPositiveRetainedShare": b["robustPositiveRetainedShare"] - a["robustPositiveRetainedShare"], "negativeRetainedShare": b["negativeRetainedShare"] - a["negativeRetainedShare"], "maximumDrawdownR": b["drawdown"]["maximumR"] - a["drawdown"]["maximumR"] if a["drawdown"]["maximumR"] is not None and b["drawdown"]["maximumR"] is not None else None}, "prohibitedEvidence": {"start": PROHIBITED_INTERVAL_START, "reservedEvidencePermitted": False}, "interpretation": "descriptive_same_candidate_same_corrected_result_set_offline_archive_policy_comparison_no_search_or_breeding"}
+    report = {"schemaVersion": "stage5e7_v3_policy_ab_analysis_v2", "comparisonSha256": comparison_sha, "reducedPopulationSha256": population_sha, "reducedCandidateCount": len(population["candidates"]), "resolvedProgramCount": len(reduced_members_b), "correctedResultRoot": str(Path(corrected_result_root).resolve()), "correctedResultAuthorityBinding": result_binding, "correctedResultSetSha256": _result_set_sha256(load_stage_results(corrected_result_root)), "policyA": a, "policyB": b, "overlap": overlap, "differenceBMinusA": {"retainedCount": b["retainedCount"] - a["retainedCount"], "retainedCellCount": b["retainedCellCount"] - a["retainedCellCount"], "robustPositiveRetainedCount": b["robustPositiveRetainedCount"] - a["robustPositiveRetainedCount"], "robustPositiveRetainedShare": b["robustPositiveRetainedShare"] - a["robustPositiveRetainedShare"], "negativeRetainedShare": b["negativeRetainedShare"] - a["negativeRetainedShare"], "maximumDrawdownR": b["drawdown"]["maximumR"] - a["drawdown"]["maximumR"] if a["drawdown"]["maximumR"] is not None and b["drawdown"]["maximumR"] is not None else None}, "prohibitedEvidence": {"start": PROHIBITED_INTERVAL_START, "reservedEvidencePermitted": False}, "interpretation": "execution_equivalent_candidates_deduplicated_before_both_reducers; descriptive_same_candidate_same_corrected_result_set_offline_archive_policy_comparison_no_search_or_breeding"}
     report["analysisSha256"] = canonical_sha256(report)
     output = _external_component_root(output_root, version, "policy-ab-analysis")
     _write_immutable(output / "policy-ab-analysis.json", report)
