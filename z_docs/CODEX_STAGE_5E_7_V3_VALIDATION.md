@@ -21,8 +21,10 @@ lake semantic hash locally or starts a replay.
 The worker contract digest *and schema* are deliberately required rather than
 inherited from the source template. Use the current exact contract digest
 (currently
-`sha256:3dd2b7b3e2315b0e49c0ab8e9da3f3816bd0ec65c23cd6c09a03dffea6f9e3a6`)
-when making the new template.
+`sha256:6c47c1d5b94a65af16e6bb4a7c7f516b33fbac8145154e8b302d31c47830f2e0`)
+when making the new template. After any contract-hashed scoring or worker
+change, operators must recompute and use the image-advertised current digest
+rather than copying a stale example.
 
 The timeframes are also an explicit evidence admission, not an implicit
 catalog default. Current remote coverage across both development windows
@@ -34,7 +36,7 @@ stage5e7-v3-evidence-envelope `
   --source-preparation <old-narrow-preparation.json> `
   --seed-population <frozen-seed-population.json> `
   --construction-catalog C:\repos\Trading-Dashboard\shared\constants\indicators.json `
-  --worker-contract-sha256 sha256:3dd2b7b3e2315b0e49c0ab8e9da3f3816bd0ec65c23cd6c09a03dffea6f9e3a6 `
+  --worker-contract-sha256 sha256:6c47c1d5b94a65af16e6bb4a7c7f516b33fbac8145154e8b302d31c47830f2e0 `
   --worker-contract-schema replay-worker-contract-v1 `
   --admitted-timeframe M1 --admitted-timeframe M5 --admitted-timeframe M15 `
   --admitted-timeframe M30 --admitted-timeframe H1 `
