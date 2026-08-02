@@ -435,3 +435,48 @@ def test_supervisor_refuses_mid_run_policy_change(tmp_path: Path, monkeypatch) -
         assert "frozen broad-run input" in str(exc)
     else:
         raise AssertionError("changed search policy was not rejected")
+
+
+def test_supervisor_forwards_broad_admission_to_empty_quality_bootstrap(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class FakeContinuation:
+        def __init__(self, **kwargs):
+            self.source_identity = {
+                "sourceIdentitySha256": canonical_sha256({"source": "fixture"})
+            }
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    seen: list[bool] = []
+
+    def fake_generate(**kwargs):
+        seen.append(bool(kwargs["allow_empty_quality_bootstrap"]))
+        raise RuntimeError("stop after generation input capture")
+
+    monkeypatch.setattr(supervisor, "ExactGeneratorV2Continuation", FakeContinuation)
+    monkeypatch.setattr(supervisor, "LabGatewayClient", FakeClient)
+    monkeypatch.setattr(supervisor, "generate_qd_generation", fake_generate)
+    inputs = _inputs(tmp_path)
+    inputs["generation_count"] = 4
+    inputs["parameters"] = {
+        **inputs["parameters"],
+        "targetUniqueCandidates": 2500,
+        "maxProposalAttempts": 2500,
+    }
+    with pytest.raises(RuntimeError, match="input capture"):
+        supervisor.run_qd_supervisor(
+            run_root=tmp_path / "broad", broad_admission=True, **inputs
+        )
+    assert seen == [True]
+    config = json.loads((tmp_path / "broad" / "config.json").read_text())
+    assert config["emptyQualityBootstrapPolicy"] == {
+        "activation": "only_when_generation_starts_without_quality_parent_cells",
+        "enabledByBroadAdmission": True,
+        "originSchedule": "generator_v2_random_immigrants_only",
+    }

@@ -825,6 +825,11 @@ def _frozen_config(
         "policySha256": QD_POLICY_SHA256,
         "frozenPolicy": _clone(QD_POLICY, name="frozen QD policy"),
         "broadAdmission": bool(broad_admission),
+        "emptyQualityBootstrapPolicy": {
+            "enabledByBroadAdmission": bool(broad_admission),
+            "activation": "only_when_generation_starts_without_quality_parent_cells",
+            "originSchedule": "generator_v2_random_immigrants_only",
+        },
         "repositories": {
             "autoresearchCommit": _git_sha(
                 autoresearch_commit, name="AutoResearch commit"
@@ -1085,6 +1090,7 @@ def run_qd_supervisor(
                 output_root=proposal_root,
                 generation_index=generation_index,
                 immigrant_continuation_start=immigrant_cursor,
+                allow_empty_quality_bootstrap=bool(config["broadAdmission"]),
                 parameters=config["frozenSearchPolicy"],
                 evidence_identity_context=config["evaluation"][
                     "predeclaredEvidenceContext"

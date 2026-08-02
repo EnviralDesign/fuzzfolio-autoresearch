@@ -1392,7 +1392,9 @@ def _load_archive(path: Path) -> tuple[dict[str, Any], str]:
     return archive, archive_sha
 
 
-def _reproduction_cells(archive: Mapping[str, Any]) -> list[dict[str, Any]]:
+def _reproduction_cells(
+    archive: Mapping[str, Any], *, allow_empty_quality_bootstrap: bool = False
+) -> list[dict[str, Any]]:
     eligible = []
     for cell in archive.get("cells") or []:
         members = [
@@ -1404,7 +1406,7 @@ def _reproduction_cells(archive: Mapping[str, Any]) -> list[dict[str, Any]]:
             filtered = _clone(cell, name="eligible QD reproduction cell")
             filtered["members"] = members
             eligible.append(filtered)
-    if not eligible:
+    if not eligible and not allow_empty_quality_bootstrap:
         raise TemporalDiscoveryContractError(
             "QD archive has no quality-eligible reproduction members"
         )
@@ -1446,15 +1448,26 @@ def _proposal_rng(seed_sha: str) -> random.Random:
     return random.Random(int(seed_sha.removeprefix("sha256:"), 16))
 
 
-def _origin_kind(proposal_ordinal: int) -> str:
+def _origin_kind(
+    proposal_ordinal: int, *, random_immigrant_only: bool = False
+) -> str:
+    if random_immigrant_only:
+        return "random_immigrant"
     # One exact immigrant slot in every five proposals.  Accepted composition is
     # intentionally not quota-forced; both raw and accepted counts are reported.
     return "random_immigrant" if proposal_ordinal % 5 == 4 else "structural_offspring"
 
 
-def _negative_novelty_slot(proposal_ordinal: int) -> bool:
+def _negative_novelty_slot(
+    proposal_ordinal: int, *, random_immigrant_only: bool = False
+) -> bool:
     """Reserve at most one in ten structural parent selections for the lane."""
-    if _origin_kind(proposal_ordinal) != "structural_offspring":
+    if (
+        _origin_kind(
+            proposal_ordinal, random_immigrant_only=random_immigrant_only
+        )
+        != "structural_offspring"
+    ):
         return False
     structural_selection_count = (proposal_ordinal + 1) - (
         (proposal_ordinal + 1) // 5
@@ -2368,10 +2381,13 @@ def _proposal(
     evidence_context: Mapping[str, Any] | None = None,
     frozen_construction_catalog: Mapping[str, Any] | None = None,
     replay_steps: Sequence[Mapping[str, Any]] | None = None,
+    random_immigrant_only: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     seed_sha = _proposal_seed(config_sha, generation_index, proposal_ordinal)
     rng = _proposal_rng(seed_sha)
-    origin = _origin_kind(proposal_ordinal)
+    origin = _origin_kind(
+        proposal_ordinal, random_immigrant_only=random_immigrant_only
+    )
     if origin == "random_immigrant":
         profile, metadata = _immigrant_proposal(
             immigrant_source=immigrant_source,
@@ -2381,7 +2397,9 @@ def _proposal(
             rng=rng,
             cells=cells,
             negative_novelty_cells=negative_novelty_cells,
-            negative_novelty_slot=_negative_novelty_slot(proposal_ordinal),
+            negative_novelty_slot=_negative_novelty_slot(
+                proposal_ordinal, random_immigrant_only=random_immigrant_only
+            ),
             operators=operators,
             max_depth=int(parameters["maxCumulativeStructuralDepth"]),
             plan_cache=plan_cache,
@@ -2502,6 +2520,7 @@ def _replay_entries(
     selection_state: dict[str, dict[str, int]],
     evidence_context: Mapping[str, Any] | None = None,
     frozen_construction_catalog: Mapping[str, Any] | None = None,
+    random_immigrant_only: bool = False,
 ) -> None:
     plan_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for ordinal, entry in enumerate(entries):
@@ -2530,12 +2549,15 @@ def _replay_entries(
             evidence_context=evidence_context,
             frozen_construction_catalog=frozen_construction_catalog,
             replay_steps=replay_steps,
+            random_immigrant_only=random_immigrant_only,
         )
         if metadata["proposalMaterial"] != entry.get("proposal"):
             raise TemporalDiscoveryContractError(
                 f"QD exact proposal replay diverged at ordinal {ordinal}"
             )
-        if str(entry.get("originKind")) != _origin_kind(ordinal):
+        if str(entry.get("originKind")) != _origin_kind(
+            ordinal, random_immigrant_only=random_immigrant_only
+        ):
             raise TemporalDiscoveryContractError("QD replay origin schedule diverged")
         if entry.get("disposition") == "accepted":
             candidate = entry.get("candidate")
@@ -2671,7 +2693,13 @@ def _manifest(root: Path, *, population_sha: str) -> dict[str, Any]:
     return manifest
 
 
-def _proposal_accounting(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _proposal_accounting(
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    random_immigrant_only: bool = False,
+    allow_empty_quality_bootstrap: bool = False,
+    quality_parent_cell_count_at_generation_start: int | None = None,
+) -> dict[str, Any]:
     origin_proposals: Counter[str] = Counter()
     origin_accepted: Counter[str] = Counter()
     selection_modes: Counter[str] = Counter()
@@ -2711,6 +2739,10 @@ def _proposal_accounting(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]
                 family_applications[operator_id] += 1
                 if operator_id in CONSTRUCTION_OPERATOR_IDS:
                     construction_family_applications[operator_id] += 1
+    if random_immigrant_only and origin_proposals["structural_offspring"]:
+        raise TemporalDiscoveryContractError(
+            "QD empty-quality bootstrap emitted a structural offspring proposal"
+        )
     structural_parent_selections = sum(parent_lanes.values())
     negative_novelty_selections = parent_lanes["negative_novelty"]
     if negative_novelty_selections > structural_parent_selections // 10:
@@ -2718,6 +2750,25 @@ def _proposal_accounting(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]
             "QD negative-novelty parent lane exceeded its ten-percent bound"
         )
     return {
+        "originScheduling": {
+            "policy": "empty_quality_bootstrap_generator_v2_random_immigrants_only",
+            "activeMode": (
+                "generator_v2_random_immigrants_only"
+                if random_immigrant_only
+                else "four_archive_offspring_then_one_generator_v2_immigrant"
+            ),
+            "allowEmptyQualityBootstrap": allow_empty_quality_bootstrap,
+            "emptyQualityBootstrapActive": random_immigrant_only,
+            **(
+                {
+                    "qualityParentCellCountAtGenerationStart": (
+                        quality_parent_cell_count_at_generation_start
+                    )
+                }
+                if quality_parent_cell_count_at_generation_start is not None
+                else {}
+            ),
+        },
         "originProposalCounts": dict(sorted(origin_proposals.items())),
         "originAcceptedCounts": dict(sorted(origin_accepted.items())),
         "parentSelectionModeCounts": dict(sorted(selection_modes.items())),
@@ -2755,6 +2806,7 @@ def generate_qd_generation(
     output_root: Path | str,
     generation_index: int,
     immigrant_continuation_start: int = 0,
+    allow_empty_quality_bootstrap: bool = False,
     parameters: Mapping[str, Any] | None = None,
     evidence_identity_context: Mapping[str, Any] | None = None,
     identity_ledger_path: Path | str | None = None,
@@ -2768,6 +2820,11 @@ def generate_qd_generation(
         raise TemporalDiscoveryContractError("immigrant continuation start is negative")
     root = Path(output_root)
     archive, archive_sha = _load_archive(Path(parent_archive_path))
+    cells = _reproduction_cells(
+        archive, allow_empty_quality_bootstrap=allow_empty_quality_bootstrap
+    )
+    random_immigrant_only = bool(allow_empty_quality_bootstrap and not cells)
+    negative_novelty_cells = _negative_novelty_cells(archive)
     config_parameters = _normalize_parameters(parameters)
     context = _clone(
         evidence_identity_context
@@ -2848,7 +2905,23 @@ def generate_qd_generation(
             else {}
         ),
         "selectionPolicy": {
-            "originSchedule": "four_archive_offspring_then_one_generator_v2_immigrant",
+            "originSchedule": (
+                "generator_v2_random_immigrants_only"
+                if random_immigrant_only
+                else "four_archive_offspring_then_one_generator_v2_immigrant"
+            ),
+            "originScheduling": {
+                "emptyQualityBootstrapPolicy": (
+                    "allow_only_when_explicitly_enabled_at_generation_start"
+                ),
+                "allowEmptyQualityBootstrap": bool(allow_empty_quality_bootstrap),
+                "emptyQualityBootstrapActive": random_immigrant_only,
+                "qualityParentCellCountAtGenerationStart": len(cells),
+                "bootstrapOriginSchedule": "generator_v2_random_immigrants_only",
+                "normalOriginSchedule": (
+                    "four_archive_offspring_then_one_generator_v2_immigrant"
+                ),
+            },
             "parentCellMixture": {
                 "uniformOccupiedCell": 0.50,
                 "lowVisitCell": 0.30,
@@ -2878,8 +2951,6 @@ def generate_qd_generation(
     _write_once(root / "config.json", config)
 
     target = int(config_parameters["targetUniqueCandidates"])
-    cells = _reproduction_cells(archive)
-    negative_novelty_cells = _negative_novelty_cells(archive)
     selection_state = _initial_selection_state([*cells, *negative_novelty_cells])
     entries = _load_entries(root)
     _replay_entries(
@@ -2894,6 +2965,7 @@ def generate_qd_generation(
         selection_state=selection_state,
         evidence_context=context,
         frozen_construction_catalog=frozen_construction_catalog,
+        random_immigrant_only=random_immigrant_only,
     )
     accepted, accepted_counts, _seen_programs, _seen_identities = _accepted_state(
         entries, archive
@@ -2950,6 +3022,7 @@ def generate_qd_generation(
             validator=validator,
             evidence_context=context,
             frozen_construction_catalog=frozen_construction_catalog,
+            random_immigrant_only=random_immigrant_only,
         )
         proposal = metadata["proposalMaterial"]
         entry: dict[str, Any] = {
@@ -3059,7 +3132,12 @@ def generate_qd_generation(
         entries.append(entry)
         new_proposals += 1
         _save_identity_ledger(ledger_file, ledger)
-        accounting = _proposal_accounting(entries)
+        accounting = _proposal_accounting(
+            entries,
+            random_immigrant_only=random_immigrant_only,
+            allow_empty_quality_bootstrap=allow_empty_quality_bootstrap,
+            quality_parent_cell_count_at_generation_start=len(cells),
+        )
         checkpoint = {
             "schemaVersion": QD_CHECKPOINT_SCHEMA,
             "configSha256": config["configSha256"],
@@ -3104,7 +3182,12 @@ def generate_qd_generation(
         if entry.get("disposition") == "accepted"
     ]
     accepted.sort(key=lambda item: str(item["candidateId"]))
-    accounting = _proposal_accounting(entries)
+    accounting = _proposal_accounting(
+        entries,
+        random_immigrant_only=random_immigrant_only,
+        allow_empty_quality_bootstrap=allow_empty_quality_bootstrap,
+        quality_parent_cell_count_at_generation_start=len(cells),
+    )
     population = {
         "schemaVersion": QD_POPULATION_SCHEMA,
         "qdVersion": QD_VERSION,
@@ -3235,6 +3318,7 @@ def main() -> None:
     generate.add_argument("--base-generator-root", type=Path, required=True)
     generate.add_argument("--confirmed-entry-admission-root", type=Path, required=True)
     generate.add_argument("--immigrant-continuation-start", type=int, default=0)
+    generate.add_argument("--allow-empty-quality-bootstrap", action="store_true")
     generate.add_argument("--validator-command-file", type=Path, required=True)
     generate.add_argument("--output-root", type=Path, required=True)
     generate.add_argument("--generation-index", type=int, required=True)
@@ -3276,6 +3360,7 @@ def main() -> None:
             base_generator_root=args.base_generator_root,
             confirmed_entry_admission_root=args.confirmed_entry_admission_root,
             immigrant_continuation_start=args.immigrant_continuation_start,
+            allow_empty_quality_bootstrap=args.allow_empty_quality_bootstrap,
             validator_command=command,
             output_root=args.output_root,
             generation_index=args.generation_index,

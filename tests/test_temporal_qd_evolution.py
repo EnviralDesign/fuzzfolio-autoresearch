@@ -877,4 +877,189 @@ def test_qd_generation_is_exact_across_full_and_sliced_restart(
     assert full["populationSha256"] == resumed["populationSha256"]
     assert full["journalSha256"] == resumed["journalSha256"]
     assert sum(full["originAcceptedCounts"].values()) == 5
-    assert full["originProposalCounts"]["random_immigrant"] >= 1
+    assert full["originProposalCounts"] == {
+        "random_immigrant": 1,
+        "structural_offspring": 4,
+    }
+    assert (
+        json.loads((tmp_path / "full" / "config.json").read_text())["selectionPolicy"]
+        ["originSchedule"]
+        == "four_archive_offspring_then_one_generator_v2_immigrant"
+    )
+
+
+def test_empty_quality_bootstrap_is_immigrant_only_and_restart_exact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    observational = _member(
+        "candidate_observational", -2.0, 1.0, valid_for_quality=False
+    )
+    observational["archiveLane"] = "observational"
+    negative_novelty = _member("candidate_negative_novelty", -1.0, 1.0)
+    negative_novelty["archiveLane"] = "negative_novelty"
+    archive = {
+        "schemaVersion": qd_module.QD_ARCHIVE_SCHEMA,
+        "qdVersion": qd_module.QD_VERSION,
+        "generationIndex": 0,
+        "populationSha256": canonical_sha256({"population": "empty-quality"}),
+        "resultSetSha256": canonical_sha256({"results": "empty-quality"}),
+        "previousArchiveSha256": None,
+        "policyName": qd_module.QD_POLICY_NAME,
+        "policySha256": qd_module.QD_POLICY_SHA256,
+        "frozenPolicy": qd_module.QD_POLICY,
+        "cellCapacity": 4,
+        "objectives": [],
+        "candidateCountSeen": 2,
+        "occupiedCellCount": 1,
+        "memberCount": 2,
+        "qualityMemberCount": 0,
+        "observationalMemberCount": 1,
+        "negativeNoveltyMemberCount": 1,
+        "cells": [
+            {
+                "cellId": "one-cell",
+                "descriptor": observational["descriptor"],
+                "candidateCountBeforeCapacity": 2,
+                "qualityEligibleCountBeforeCapacity": 0,
+                "negativeNoveltyEligibleCountBeforeCapacity": 1,
+                "observationalCountBeforeCapacity": 1,
+                "breedingEligibleMemberCount": 0,
+                "negativeNoveltyMemberCount": 1,
+                "selectionVisitCount": 0,
+                "offspringAttemptCount": 0,
+                "members": [observational, negative_novelty],
+            }
+        ],
+    }
+    archive["archiveSha256"] = canonical_sha256(archive)
+    archive_path = tmp_path / "empty-quality-archive.json"
+    archive_path.write_text(
+        json.dumps(archive, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="no quality-eligible reproduction members",
+    ):
+        qd_module._reproduction_cells(archive)
+    assert qd_module._reproduction_cells(
+        archive, allow_empty_quality_bootstrap=True
+    ) == []
+
+    class FakeValidator:
+        def __init__(self, command, *, timeout_seconds):
+            assert command == ["fake-validator"]
+            assert timeout_seconds == 60.0
+
+        def validate(
+            self,
+            *,
+            candidate_id,
+            source_profile,
+            expected_raw_source_profile_sha256,
+        ):
+            assert canonical_sha256(source_profile) == expected_raw_source_profile_sha256
+            program_sha = canonical_sha256({"program": source_profile})
+            snapshot_sha = canonical_sha256({"snapshot": source_profile})
+            return {
+                "candidateAcceptable": True,
+                "status": "valid_evaluable",
+                "programSha256": program_sha,
+                "profileSnapshotSha256": snapshot_sha,
+                "validationReportSha256": canonical_sha256(
+                    {"candidateId": candidate_id, "programSha256": program_sha}
+                ),
+                "issues": [],
+            }
+
+    class FakeContinuation:
+        def __init__(self, **kwargs):
+            self._next = int(kwargs["start_continuation_ordinal"])
+            self.source_identity = {
+                "schemaVersion": "fixture_source_v1",
+                "sourceIdentitySha256": canonical_sha256({"fixture": "source"}),
+            }
+
+        @property
+        def next_continuation_ordinal(self):
+            return self._next
+
+        def next_proposal(self):
+            ordinal = self._next
+            self._next += 1
+            profile, _ = _repair_profile(_profile(), parameters=GENERATOR_V2_PARAMETERS)
+            profile["name"] = f"bootstrap_immigrant_{ordinal}"
+            profile["description"] = f"bootstrap immigrant fixture {ordinal}"
+            value = {
+                "schemaVersion": "temporal_generator_v2_qd_immigrant_proposal_v1",
+                "sourceIdentitySha256": self.source_identity["sourceIdentitySha256"],
+                "continuationOrdinal": ordinal,
+                "generatorProposalOrdinal": 1000 + ordinal,
+                "sourceMode": "seed_derived",
+                "seedId": "fixture_seed",
+                "rawSourceProfile": profile,
+                "rawSourceProfileSha256": canonical_sha256(profile),
+                "mutations": [{"family": "fixture", "ordinal": ordinal}],
+                "activationAwareRepairs": [],
+                "managementReachability": inspect_management_reachability(profile),
+            }
+            value["immigrantProposalSha256"] = canonical_sha256(value)
+            return value
+
+    monkeypatch.setattr(qd_module, "SubprocessCandidateValidator", FakeValidator)
+    monkeypatch.setattr(qd_module, "ExactGeneratorV2Continuation", FakeContinuation)
+    parameters = {
+        **qd_module.DEFAULT_QD_PARAMETERS,
+        "targetUniqueCandidates": 3,
+        "maxProposalAttempts": 64,
+    }
+    common = {
+        "parent_archive_path": archive_path,
+        "source_preparation_path": tmp_path / "source.json",
+        "base_generator_root": tmp_path / "base",
+        "confirmed_entry_admission_root": tmp_path / "admission",
+        "validator_command": ["fake-validator"],
+        "generation_index": 1,
+        "parameters": parameters,
+        "allow_empty_quality_bootstrap": True,
+    }
+    full = qd_module.generate_qd_generation(
+        output_root=tmp_path / "full", **common
+    )
+    partial = qd_module.generate_qd_generation(
+        output_root=tmp_path / "resumed", max_new_proposals=1, **common
+    )
+    assert partial["completed"] is False
+    resumed = qd_module.generate_qd_generation(
+        output_root=tmp_path / "resumed", **common
+    )
+    assert full["populationSha256"] == resumed["populationSha256"]
+    assert full["journalSha256"] == resumed["journalSha256"]
+    assert full["originProposalCounts"] == {"random_immigrant": 3}
+    config = json.loads((tmp_path / "full" / "config.json").read_text())
+    assert config["policySha256"] == qd_module.QD_POLICY_SHA256
+    assert config["selectionPolicy"]["originScheduling"] == {
+        "allowEmptyQualityBootstrap": True,
+        "bootstrapOriginSchedule": "generator_v2_random_immigrants_only",
+        "emptyQualityBootstrapActive": True,
+        "emptyQualityBootstrapPolicy": "allow_only_when_explicitly_enabled_at_generation_start",
+        "normalOriginSchedule": "four_archive_offspring_then_one_generator_v2_immigrant",
+        "qualityParentCellCountAtGenerationStart": 0,
+    }
+    journal = json.loads((tmp_path / "full" / "generation-journal.json").read_text())
+    assert journal["originScheduling"] == {
+        "activeMode": "generator_v2_random_immigrants_only",
+        "allowEmptyQualityBootstrap": True,
+        "emptyQualityBootstrapActive": True,
+        "policy": "empty_quality_bootstrap_generator_v2_random_immigrants_only",
+        "qualityParentCellCountAtGenerationStart": 0,
+    }
+    assert journal["parentLaneCounts"] == {}
+    assert journal["parentCellSelectionCounts"] == {}
+    assert journal["parentCellOffspringAttemptCounts"] == {}
+    assert journal["negativeNoveltyParentSelectionCount"] == 0
+    entries = [
+        json.loads(path.read_text())
+        for path in sorted((tmp_path / "full" / "proposal-journal").glob("*.json"))
+    ]
+    assert all(entry["originKind"] == "random_immigrant" for entry in entries)
+    assert all("parentCandidateId" not in entry["proposal"] for entry in entries)
