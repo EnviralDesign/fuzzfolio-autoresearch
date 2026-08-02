@@ -14,6 +14,7 @@ from .temporal_discovery_controller import audit_discovery
 from .temporal_discovery_results import (
     _aggregate_candidate,
     _equity_shape,
+    _result_files,
     _result_set_sha256,
     fingerprint_distance,
     load_stage_results,
@@ -24,6 +25,7 @@ from .temporal_discovery_validation import (
     _finite_preparation,
     _normalize_preparation,
 )
+from .result_codec import ResultCodecError, read_json_object as _read_codec_json_object
 from .temporal_search import build_authority, canonical_sha256, validate_authority
 
 
@@ -42,11 +44,9 @@ class TemporalSearchQualityError(RuntimeError):
 
 def _read_json(path: Path, *, name: str) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value, _ = _read_codec_json_object(path)
+    except ResultCodecError as exc:
         raise TemporalSearchQualityError(f"unable to read {name}: {path}") from exc
-    if not isinstance(value, dict):
-        raise TemporalSearchQualityError(f"{name} must be a JSON object")
     return value
 
 
@@ -561,11 +561,12 @@ def _structural_coverage(
 def _raw_stage_results(result_root: Path) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     seen: set[tuple[str, str, str]] = set()
-    files = sorted((result_root / "results").glob("*.json"))
-    if not files:
+    try:
+        files = _result_files(result_root)
+    except Exception as exc:
         raise TemporalSearchQualityError(
             f"no materialized results found under {result_root}"
-        )
+        ) from exc
     for path in files:
         payload = _read_json(path, name="candidate/window result")
         if payload.get("schema_version") != "temporal_graph_candidate_window_result_v1":

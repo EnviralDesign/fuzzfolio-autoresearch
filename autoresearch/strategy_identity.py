@@ -128,7 +128,16 @@ def derive_strategy_identity(row: Mapping[str, Any]) -> dict[str, Any]:
                 else None
             ),
         }
-    profile = _load_profile(row.get("profile_path"))
+    # Temporal/QD population artifacts carry their immutable profile inline,
+    # rather than as a filesystem reference.  Prefer that authoritative shape
+    # when it is present so family identity does not degrade to an opaque
+    # candidate fallback during artifact-only analysis.
+    inline_profile = row.get("sourceProfile")
+    profile = (
+        dict(inline_profile)
+        if isinstance(inline_profile, Mapping)
+        else _load_profile(row.get("profile_path"))
+    )
     signature = structural_family_signature(profile or {})
     if signature is not None:
         structural_family_id = f"sf2:{_sha256(signature)}"

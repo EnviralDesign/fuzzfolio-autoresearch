@@ -35,28 +35,81 @@ from .temporal_discovery_mutation import (
 )
 from .temporal_discovery_results import (
     _aggregate_candidate,
+    _require_candidate_program_identity,
     _result_set_sha256,
     load_stage_results,
 )
 from .temporal_discovery_validation import SubprocessCandidateValidator
+from .result_codec import fsync_directory
+from .lake_window import (
+    LakeWindowBinding,
+    lake_window_request_contains,
+    resolve_replay_lake_window_request,
+)
 from .temporal_generator_v2_continuation import ExactGeneratorV2Continuation
 from .temporal_operator_confirmed_entry import ConfirmedEntryStructuralOperator
+from .temporal_operator_construction_v3 import (
+    DIRECTION_FLIP,
+    GRAPH_BOUND_TIMEFRAME,
+    MANAGEMENT_PLAN,
+    SCALAR_DYNAMIC_MANAGEMENT,
+    GeneratorV3ConstructionRegistry,
+    inspect_construction_reachability,
+)
 from .temporal_operator_expansion import expanded_structural_operators
 from .temporal_search_policy_v2 import inspect_management_reachability
 
-QD_VERSION = "temporal_qd_evolution_v2"
-QD_ARCHIVE_SCHEMA = "temporal_qd_archive_v2"
-QD_CONFIG_SCHEMA = "temporal_qd_generation_config_v2"
-QD_ENTRY_SCHEMA = "temporal_qd_proposal_entry_v2"
-QD_CHECKPOINT_SCHEMA = "temporal_qd_generation_checkpoint_v2"
-QD_POPULATION_SCHEMA = "temporal_qd_generation_population_v2"
-QD_JOURNAL_SCHEMA = "temporal_qd_generation_journal_v2"
-QD_MANIFEST_SCHEMA = "temporal_qd_generation_manifest_v2"
+QD_VERSION = "temporal_qd_evolution_v3"
+QD_ARCHIVE_SCHEMA = "temporal_qd_archive_v3"
+QD_CONFIG_SCHEMA = "temporal_qd_generation_config_v3"
+QD_ENTRY_SCHEMA = "temporal_qd_proposal_entry_v3"
+QD_CHECKPOINT_SCHEMA = "temporal_qd_generation_checkpoint_v3"
+QD_POPULATION_SCHEMA = "temporal_qd_generation_population_v3"
+QD_JOURNAL_SCHEMA = "temporal_qd_generation_journal_v3"
+QD_MANIFEST_SCHEMA = "temporal_qd_generation_manifest_v3"
+QD_IDENTITY_LEDGER_SCHEMA = "temporal_qd_identity_ledger_v3"
+
+QD_POLICY_NAME = "stage5e7_v3_robust_quality_archive"
+QD_POLICY = {
+    "schemaVersion": "temporal_qd_policy_v3",
+    "policyName": QD_POLICY_NAME,
+    "economicObjectives": [
+        {"name": "worstWindowConservativeNetR", "direction": "max"},
+        {"name": "maximumDrawdownR", "direction": "min"},
+        {"name": "structuralComplexity", "direction": "min"},
+    ],
+    "tradeSupport": {
+        "minimumTotalTrades": 8,
+        "minimumTradesPerWindow": 4,
+        "capTrades": 20,
+        "role": "eligibility_then_capped_tie_break",
+    },
+    "archive": {
+        "defaultCellCapacity": 4,
+        "lanes": {
+            "quality": "finite_support_and_nonnegative_robust_return",
+            "observational": "retained_without_quality_breeding_rights",
+            "negativeNovelty": "finite_supported_negative_robust_return",
+        },
+        "negativeNoveltyMaxMembersPerCell": 1,
+    },
+    "parentSelection": {
+        "quality": "pareto_front_then_crowding_then_robust_return_then_capped_support_then_complexity",
+        "negativeNoveltyMaxFraction": 0.10,
+        "negativeNoveltySchedule": "every_tenth_structural_parent_selection",
+    },
+    "identity": {
+        "candidateIdentity": "reject_exact_repeat",
+        "sourceProfile": "reject_same_evidence_repeat",
+        "program": "allow_only_for_different_canonical_evidence",
+        "canonicalEvidence": "candidate_program_ordered_window_semantic_cost_execution",
+    },
+}
+QD_POLICY_SHA256 = canonical_sha256(QD_POLICY)
 
 QD_OBJECTIVES = (
-    ("riskAdjustedReturn", "max"),
+    ("worstWindowConservativeNetR", "max"),
     ("maximumDrawdownR", "min"),
-    ("evidenceSupport", "max"),
     ("structuralComplexity", "min"),
 )
 
@@ -79,6 +132,16 @@ PARAMETRIC_OPERATOR_SPECS = {
     for source_family, family_id in PARAMETRIC_FAMILY_IDS.items()
 }
 
+CONSTRUCTION_OPERATOR_IDS = frozenset(
+    {
+        SCALAR_DYNAMIC_MANAGEMENT,
+        MANAGEMENT_PLAN,
+        DIRECTION_FLIP,
+        GRAPH_BOUND_TIMEFRAME,
+    }
+)
+QD_CONSTRUCTION_POLICY_SCHEMA = "temporal_qd_construction_operator_policy_v1"
+
 DEFAULT_QD_PARAMETERS: dict[str, Any] = {
     "version": QD_VERSION,
     "seed": 2026080101,
@@ -88,8 +151,9 @@ DEFAULT_QD_PARAMETERS: dict[str, Any] = {
     "maxCumulativeStructuralDepth": 16,
     "maxProposalAttempts": 20000,
     "minimumTotalTrades": 8,
-    "minimumTradesPerWindow": 2,
-    "cellCapacity": 8,
+    "minimumTradesPerWindow": 4,
+    "capTrades": 20,
+    "cellCapacity": 4,
 }
 
 
@@ -135,9 +199,22 @@ def _write_once(path: Path, value: Mapping[str, Any]) -> None:
         delete=False,
     ) as handle:
         handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
         temporary = Path(handle.name)
     try:
-        os.replace(temporary, path)
+        try:
+            # Hard-link publication preserves write-once semantics when a
+            # concurrent process wins the name between our initial existence
+            # check and publication.
+            os.link(temporary, path)
+        except FileExistsError:
+            if path.read_text(encoding="utf-8") != encoded:
+                raise TemporalDiscoveryContractError(
+                    f"refusing to overwrite divergent immutable file: {path}"
+                )
+        else:
+            fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -155,9 +232,12 @@ def _replace(path: Path, value: Mapping[str, Any]) -> None:
         delete=False,
     ) as handle:
         handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
         temporary = Path(handle.name)
     try:
         os.replace(temporary, path)
+        fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -383,16 +463,20 @@ def qd_behavior_descriptor(
 def _objective_row(
     candidate: Mapping[str, Any], aggregate: Mapping[str, Any]
 ) -> dict[str, float]:
-    trades = int(aggregate.get("totalTrades") or 0)
-    drawdown = max(
-        0.0,
-        _finite(aggregate.get("maxWindowDrawdownR"), name="drawdown R"),
-    )
-    total_return = _finite(aggregate.get("totalConservativeNetR"), name="total net R")
+    # Invalid observations remain auditable in the broad archive.  Use neutral
+    # finite placeholders here and let finiteDataValidity deny them all quality
+    # retention and reproduction rights rather than serializing NaN/Infinity.
+    def finite_or_neutral(value: Any) -> float:
+        try:
+            return _finite(value, name="QD economic objective")
+        except TemporalDiscoveryContractError:
+            return 0.0
+
+    drawdown = max(0.0, finite_or_neutral(aggregate.get("maxWindowDrawdownR")))
+    robust_return = finite_or_neutral(aggregate.get("worstWindowConservativeNetR"))
     return {
-        "riskAdjustedReturn": total_return / max(1.0, drawdown),
+        "worstWindowConservativeNetR": robust_return,
         "maximumDrawdownR": drawdown,
-        "evidenceSupport": float(trades),
         "structuralComplexity": float(
             _graph_structure(candidate)["structuralComplexity"]
         ),
@@ -404,22 +488,43 @@ def _finite_data_validity(
     *,
     minimum_total_trades: int,
     minimum_trades_per_window: int,
+    cap_trades: int = 20,
 ) -> dict[str, Any]:
-    counts = [int(value) for value in aggregate.get("tradeCountsByWindow") or []]
-    total = int(aggregate.get("totalTrades") or 0)
+    try:
+        counts = [int(value) for value in aggregate.get("tradeCountsByWindow") or []]
+        total = int(aggregate.get("totalTrades") or 0)
+        observations = int(aggregate.get("totalObservations") or 0)
+        finite_economics = all(
+            math.isfinite(float(aggregate.get(key)))
+            for key in ("worstWindowConservativeNetR", "maxWindowDrawdownR")
+        )
+    except (TypeError, ValueError):
+        counts = []
+        total = 0
+        observations = 0
+        finite_economics = False
     checks = {
         "minimumTotalTrades": total >= minimum_total_trades,
         "minimumTradesEveryWindow": bool(counts)
         and all(value >= minimum_trades_per_window for value in counts),
-        "positiveObservationSupport": int(aggregate.get("totalObservations") or 0) > 0,
+        "positiveObservationSupport": observations > 0,
+        "finiteEconomicMetrics": finite_economics,
     }
+    passes_support_gate = (
+        checks["minimumTotalTrades"]
+        and checks["minimumTradesEveryWindow"]
+        and checks["positiveObservationSupport"]
+    )
     return {
         "minimumTotalTrades": minimum_total_trades,
         "minimumTradesPerWindow": minimum_trades_per_window,
+        "capTrades": cap_trades,
         "tradeCountsByWindow": counts,
         "totalTrades": total,
         "checks": checks,
-        "validForPareto": all(checks.values()),
+        "isFiniteData": finite_economics,
+        "passesSupportGate": passes_support_gate,
+        "validForQuality": finite_economics and passes_support_gate,
     }
 
 
@@ -460,7 +565,21 @@ def _pareto_fronts(rows: Sequence[Mapping[str, Any]]) -> list[list[dict[str, Any
 
 def _crowding_order(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     if len(rows) <= 2:
-        return sorted(rows, key=lambda item: str(item["candidateId"]))
+        return [
+            {
+                **_clone(item, name="crowding member"),
+                "crowdingDistance": None,
+            }
+            for item in sorted(
+                rows,
+                key=lambda item: (
+                    -float(item["objectives"]["worstWindowConservativeNetR"]),
+                    -_capped_trade_support(item),
+                    float(item["objectives"]["structuralComplexity"]),
+                    str(item["candidateId"]),
+                ),
+            )
+        ]
     distances = {str(item["candidateId"]): 0.0 for item in rows}
     for key, direction in QD_OBJECTIVES:
         ordered = sorted(
@@ -485,16 +604,70 @@ def _crowding_order(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
             after = float(ordered[index + 1]["objectives"][key])
             distances[candidate_id] += abs(after - before) / scale
     return sorted(
-        (_clone(item, name="crowding member") for item in rows),
+        (
+            {
+                **_clone(item, name="crowding member"),
+                "crowdingDistance": (
+                    None
+                    if math.isinf(distances[str(item["candidateId"])])
+                    else distances[str(item["candidateId"])]
+                ),
+            }
+            for item in rows
+        ),
         key=lambda item: (
             -distances[str(item["candidateId"])],
+            -float(item["objectives"]["worstWindowConservativeNetR"]),
+            -_capped_trade_support(item),
+            float(item["objectives"]["structuralComplexity"]),
             str(item["candidateId"]),
         ),
     )
 
 
+def _capped_trade_support(member: Mapping[str, Any]) -> float:
+    value = member.get("cappedTradeSupport")
+    if value is not None:
+        return float(value)
+    validity = member.get("finiteDataValidity") or {}
+    cap = int(validity.get("capTrades") or QD_POLICY["tradeSupport"]["capTrades"])
+    return float(min(max(0, int(validity.get("totalTrades") or 0)), cap))
+
+
+def _quality_member(member: Mapping[str, Any]) -> bool:
+    validity = member.get("finiteDataValidity") or {}
+    return (
+        validity.get("isFiniteData") is True
+        and validity.get("passesSupportGate") is True
+        and validity.get("validForQuality") is True
+        and float(member["objectives"]["worstWindowConservativeNetR"]) >= 0.0
+    )
+
+
+def _negative_novelty_member(member: Mapping[str, Any]) -> bool:
+    validity = member.get("finiteDataValidity") or {}
+    return (
+        validity.get("isFiniteData") is True
+        and validity.get("passesSupportGate") is True
+        and validity.get("validForQuality") is True
+        and float(member["objectives"]["worstWindowConservativeNetR"]) < 0.0
+    )
+
+
+def _observational_order(member: Mapping[str, Any]) -> tuple[Any, ...]:
+    validity = member.get("finiteDataValidity") or {}
+    return (
+        -(validity.get("isFiniteData") is True),
+        -(validity.get("passesSupportGate") is True),
+        -float(member["objectives"]["worstWindowConservativeNetR"]),
+        -_capped_trade_support(member),
+        float(member["objectives"]["structuralComplexity"]),
+        str(member["candidateId"]),
+    )
+
+
 def select_qd_archive(
-    members: Sequence[Mapping[str, Any]], *, cell_capacity: int = 8
+    members: Sequence[Mapping[str, Any]], *, cell_capacity: int = 4
 ) -> list[dict[str, Any]]:
     if not 1 <= cell_capacity <= 32:
         raise TemporalDiscoveryContractError("QD cell capacity must be 1..32")
@@ -504,42 +677,64 @@ def select_qd_archive(
     cells = []
     for cell_id in sorted(groups):
         selected: list[dict[str, Any]] = []
-        eligible = [
+        quality = [row for row in groups[cell_id] if _quality_member(row)]
+        negative_novelty = [
+            row for row in groups[cell_id] if _negative_novelty_member(row)
+        ]
+        observational = [
             row
             for row in groups[cell_id]
-            if row.get("finiteDataValidity", {}).get("validForPareto") is True
+            if row not in quality and row not in negative_novelty
         ]
-        if eligible:
-            fronts = _pareto_fronts(eligible)
+        if quality:
+            fronts = _pareto_fronts(quality)
             for front_index, front in enumerate(fronts):
                 ranked = _crowding_order(front)
                 remaining = cell_capacity - len(selected)
                 for row in ranked[:remaining]:
                     row["paretoFront"] = front_index
-                    row["retentionReason"] = "finite_data_pareto"
+                    row["archiveLane"] = "quality"
+                    row["retentionReason"] = "quality_pareto"
                     selected.append(row)
                 if len(selected) == cell_capacity:
                     break
-        else:
-            fallback = sorted(
-                groups[cell_id],
-                key=lambda row: (
-                    -float(row["objectives"]["evidenceSupport"]),
-                    float(row["objectives"]["structuralComplexity"]),
-                    str(row["candidateId"]),
-                ),
-            )[: min(2, cell_capacity)]
-            for row in fallback:
-                row = _clone(row, name="finite-data fallback")
-                row["paretoFront"] = None
-                row["retentionReason"] = "finite_data_fallback"
-                selected.append(row)
+        if len(selected) < cell_capacity and negative_novelty:
+            row = sorted(negative_novelty, key=_observational_order)[0]
+            selected.append(
+                {
+                    **_clone(row, name="negative novelty archive member"),
+                    "paretoFront": None,
+                    "crowdingDistance": None,
+                    "archiveLane": "negative_novelty",
+                    "retentionReason": "negative_novelty_exploration",
+                }
+            )
+        for row in sorted(observational, key=_observational_order)[
+            : max(0, cell_capacity - len(selected))
+        ]:
+            selected.append(
+                {
+                    **_clone(row, name="observational archive member"),
+                    "paretoFront": None,
+                    "crowdingDistance": None,
+                    "archiveLane": "observational",
+                    "retentionReason": "observational_retention",
+                }
+            )
         cells.append(
             {
                 "cellId": cell_id,
                 "descriptor": _clone(selected[0]["descriptor"], name="QD descriptor"),
                 "candidateCountBeforeCapacity": len(groups[cell_id]),
-                "finiteDataEligibleCountBeforeCapacity": len(eligible),
+                "qualityEligibleCountBeforeCapacity": len(quality),
+                "negativeNoveltyEligibleCountBeforeCapacity": len(negative_novelty),
+                "observationalCountBeforeCapacity": len(observational),
+                "breedingEligibleMemberCount": sum(
+                    item.get("archiveLane") == "quality" for item in selected
+                ),
+                "negativeNoveltyMemberCount": sum(
+                    item.get("archiveLane") == "negative_novelty" for item in selected
+                ),
                 "members": sorted(selected, key=lambda item: str(item["candidateId"])),
             }
         )
@@ -554,12 +749,21 @@ def build_qd_archive(
     generation_index: int,
     previous_archive_path: Path | str | None = None,
     generation_journal_path: Path | str | None = None,
-    cell_capacity: int = 8,
+    cell_capacity: int = 4,
     minimum_total_trades: int = 8,
-    minimum_trades_per_window: int = 2,
+    minimum_trades_per_window: int = 4,
+    cap_trades: int = 20,
 ) -> dict[str, Any]:
     if generation_index < 0:
         raise TemporalDiscoveryContractError("QD generation index must be nonnegative")
+    if (
+        minimum_total_trades != 8
+        or minimum_trades_per_window != 4
+        or cap_trades != 20
+    ):
+        raise TemporalDiscoveryContractError(
+            "QD archive must use the frozen Stage 5E7-v3 trade-support policy"
+        )
     candidates, population_sha = _load_population(Path(population_path))
     candidate_map = {item["candidateId"]: item for item in candidates}
     results = load_stage_results(result_root)
@@ -574,10 +778,7 @@ def build_qd_archive(
     prior_candidate_count_seen = 0
     previous_member_ids: set[str] = set()
     if previous_archive_path is not None:
-        previous = _read(Path(previous_archive_path), name="previous QD archive")
-        previous_sha = _identity_payload(
-            previous, "archiveSha256", name="previous QD archive"
-        )
+        previous, previous_sha = _load_archive(Path(previous_archive_path))
         prior_candidate_count_seen = int(previous.get("candidateCountSeen") or 0)
         for cell in previous.get("cells") or []:
             cell_id = str(cell["cellId"])
@@ -593,7 +794,21 @@ def build_qd_archive(
                 )
     for candidate_id in sorted(candidate_map):
         candidate = candidate_map[candidate_id]
-        aggregate = _aggregate_candidate(candidate, results[candidate_id])
+        windows = results[candidate_id]
+        expected_program = _require_candidate_program_identity(candidate, windows)
+        if any(window.get("v3Admissible") is not True for window in windows):
+            raise TemporalDiscoveryContractError(
+                "QD v3 archive requires terminal-adjusted Stage 5E7-v3 result evidence"
+            )
+        aggregate = _aggregate_candidate(candidate, windows)
+        if aggregate.get("programSha256") != expected_program:
+            raise TemporalDiscoveryContractError(
+                "QD aggregate program identity does not match candidate program identity"
+            )
+        if aggregate.get("v3Admissible") is not True:
+            raise TemporalDiscoveryContractError(
+                "QD v3 archive requires terminal-adjusted Stage 5E7-v3 result evidence"
+            )
         descriptor = qd_behavior_descriptor(candidate, aggregate)
         members[candidate_id] = {
             "candidateId": candidate_id,
@@ -606,6 +821,10 @@ def build_qd_archive(
                 aggregate,
                 minimum_total_trades=minimum_total_trades,
                 minimum_trades_per_window=minimum_trades_per_window,
+                cap_trades=cap_trades,
+            ),
+            "cappedTradeSupport": float(
+                min(max(0, int(aggregate.get("totalTrades") or 0)), cap_trades)
             ),
         }
     cells = select_qd_archive(list(members.values()), cell_capacity=cell_capacity)
@@ -619,6 +838,11 @@ def build_qd_archive(
                 "originProposalCounts",
                 "originAcceptedCounts",
                 "parentSelectionModeCounts",
+                "parentLaneCounts",
+                "parentLaneReasonCounts",
+                "negativeNoveltyParentSelectionCount",
+                "structuralParentSelectionCount",
+                "negativeNoveltyParentSelectionFraction",
                 "parentCellSelectionCounts",
                 "parentCellOffspringAttemptCounts",
                 "operatorFamilyAttemptCounts",
@@ -660,16 +884,26 @@ def build_qd_archive(
     archive = {
         "schemaVersion": QD_ARCHIVE_SCHEMA,
         "qdVersion": QD_VERSION,
+        "policyName": QD_POLICY_NAME,
+        "policySha256": QD_POLICY_SHA256,
+        "frozenPolicy": _clone(QD_POLICY, name="frozen QD policy"),
         "generationIndex": generation_index,
         "populationSha256": population_sha,
         "resultSetSha256": _result_set_sha256(results),
         "previousArchiveSha256": previous_sha,
         "cellCapacity": cell_capacity,
-        "finiteDataPolicy": {
+        "qualityEligibilityPolicy": {
             "minimumTotalTrades": minimum_total_trades,
             "minimumTradesPerWindow": minimum_trades_per_window,
-            "invalidCandidatesParticipateInPareto": False,
+            "capTrades": cap_trades,
+            "qualityRequiresFiniteData": True,
+            "qualityRequiresNonnegativeRobustReturn": True,
+            "undersupportedRetainedOnlyInObservationalLane": True,
         },
+        "archiveRetentionPolicy": _clone(QD_POLICY["archive"], name="QD archive policy"),
+        "parentSelectionPolicy": _clone(
+            QD_POLICY["parentSelection"], name="QD parent policy"
+        ),
         "objectives": [
             {"name": name, "direction": direction} for name, direction in QD_OBJECTIVES
         ],
@@ -680,8 +914,18 @@ def build_qd_archive(
             {str(cell["cellId"]) for cell in cells} - previous_cell_ids
         ),
         "memberCount": sum(len(cell["members"]) for cell in cells),
-        "paretoEligibleMemberCount": sum(
-            member["finiteDataValidity"]["validForPareto"] is True
+        "qualityMemberCount": sum(
+            member.get("archiveLane") == "quality"
+            for cell in cells
+            for member in cell["members"]
+        ),
+        "observationalMemberCount": sum(
+            member.get("archiveLane") == "observational"
+            for cell in cells
+            for member in cell["members"]
+        ),
+        "negativeNoveltyMemberCount": sum(
+            member.get("archiveLane") == "negative_novelty"
             for cell in cells
             for member in cell["members"]
         ),
@@ -694,12 +938,14 @@ def build_qd_archive(
     archive["archiveSha256"] = canonical_sha256(archive)
     _write_once(Path(output_path), archive)
     return {
-        "schemaVersion": "temporal_qd_archive_result_v1",
+        "schemaVersion": "temporal_qd_archive_result_v3",
         "archiveSha256": archive["archiveSha256"],
         "candidateCountSeen": archive["candidateCountSeen"],
         "occupiedCellCount": archive["occupiedCellCount"],
         "memberCount": archive["memberCount"],
-        "paretoEligibleMemberCount": archive["paretoEligibleMemberCount"],
+        "qualityMemberCount": archive["qualityMemberCount"],
+        "observationalMemberCount": archive["observationalMemberCount"],
+        "negativeNoveltyMemberCount": archive["negativeNoveltyMemberCount"],
         "newCellCount": archive["newCellCount"],
         "paretoAdmissionCount": archive["paretoAdmissionCount"],
         "paretoEvictionCount": archive["paretoEvictionCount"],
@@ -718,6 +964,7 @@ def _normalize_parameters(parameters: Mapping[str, Any] | None) -> dict[str, Any
         "maxProposalAttempts",
         "minimumTotalTrades",
         "minimumTradesPerWindow",
+        "capTrades",
         "cellCapacity",
     }
     if set(value) != required or value["version"] != QD_VERSION:
@@ -731,6 +978,7 @@ def _normalize_parameters(parameters: Mapping[str, Any] | None) -> dict[str, Any
     value["maxProposalAttempts"] = int(value["maxProposalAttempts"])
     value["minimumTotalTrades"] = int(value["minimumTotalTrades"])
     value["minimumTradesPerWindow"] = int(value["minimumTradesPerWindow"])
+    value["capTrades"] = int(value["capTrades"])
     value["cellCapacity"] = int(value["cellCapacity"])
     probabilities = value["mutationDepthProbabilities"]
     if not isinstance(probabilities, Mapping) or set(probabilities) != {"1", "2", "3"}:
@@ -759,6 +1007,14 @@ def _normalize_parameters(parameters: Mapping[str, Any] | None) -> dict[str, Any
         )
     if value["maxProposalAttempts"] < value["targetUniqueCandidates"]:
         raise TemporalDiscoveryContractError("QD proposal ceiling is below its target")
+    if (
+        value["minimumTotalTrades"] != 8
+        or value["minimumTradesPerWindow"] != 4
+        or value["capTrades"] != 20
+    ):
+        raise TemporalDiscoveryContractError(
+            "the Stage 5E7-v3 trade-support policy is frozen at 8 total / 4 per window / cap 20"
+        )
     if value["minimumTotalTrades"] < 1 or value["minimumTradesPerWindow"] < 1:
         raise TemporalDiscoveryContractError("QD finite-data floors must be positive")
     if not 1 <= value["cellCapacity"] <= 32:
@@ -766,42 +1022,248 @@ def _normalize_parameters(parameters: Mapping[str, Any] | None) -> dict[str, Any
     return value
 
 
-def _operators() -> dict[str, Any]:
+def qd_construction_operator_policy(
+    construction_catalog_path: Path | str | None,
+) -> tuple[dict[str, Any], GeneratorV3ConstructionRegistry | None]:
+    """Load the opt-in v3 construction registry as frozen QD input.
+
+    A missing catalog intentionally retains the pre-construction QD operator
+    set for already-frozen runs.  New supervisor invocations require a catalog
+    at the CLI boundary, so the live QD path always records this policy.
+    """
+
+    if construction_catalog_path is None:
+        policy: dict[str, Any] = {
+            "schemaVersion": QD_CONSTRUCTION_POLICY_SCHEMA,
+            "enabled": False,
+            "catalog": None,
+            "enabledOperatorIds": [],
+            "deferredOperators": [],
+            "disabledReason": "no_construction_catalog_supplied",
+        }
+        policy["policySha256"] = canonical_sha256(policy)
+        return policy, None
+    catalog_path = Path(construction_catalog_path).resolve()
+    catalog = _read(catalog_path, name="QD construction catalog")
+    registry = GeneratorV3ConstructionRegistry(catalog)
+    policy = {
+        "schemaVersion": QD_CONSTRUCTION_POLICY_SCHEMA,
+        "enabled": True,
+        "catalog": {
+            "path": str(catalog_path),
+            "catalogSha256": registry.catalog.catalog_sha256,
+        },
+        "enabledOperatorIds": list(registry.enabled_operator_ids),
+        "conditionalOperatorEligibility": [
+            {
+                "operatorId": GRAPH_BOUND_TIMEFRAME,
+                "eligibility": (
+                    "candidate_derived_request_is_contained_by_every_"
+                    "immutable_pre_attested_window_binding"
+                ),
+                "outOfScopeDisposition": "predeclared_lake_scope_rejected",
+                "bindingPolicy": "reuse_only_no_local_semantic_rehash",
+            }
+        ],
+        "deferredOperators": _clone(
+            registry.policy["deferredOperators"], name="deferred construction operators"
+        ),
+        "registryPolicy": _clone(registry.policy, name="construction registry policy"),
+    }
+    policy["policySha256"] = canonical_sha256(policy)
+    return policy, registry
+
+
+def _operators(
+    construction_registry: GeneratorV3ConstructionRegistry | None = None,
+    *,
+    construction_operator_ids: Sequence[str] | None = None,
+) -> dict[str, Any]:
     values = [ConfirmedEntryStructuralOperator(), *expanded_structural_operators()]
-    return {item.operator_id: item for item in values}
+    if construction_registry is not None:
+        allowed = (
+            tuple(construction_operator_ids)
+            if construction_operator_ids is not None
+            else construction_registry.enabled_operator_ids
+        )
+        values.extend(
+            construction_registry.get(operator_id)
+            for operator_id in allowed
+        )
+    result = {item.operator_id: item for item in values}
+    if len(result) != len(values):
+        raise TemporalDiscoveryContractError("QD operator registry has duplicate IDs")
+    return result
+
+
+def _static_reachability(
+    profile: Mapping[str, Any], *, operator_id: str | None = None
+) -> dict[str, Any]:
+    """Use the v3 closure checker for construction transactions only."""
+
+    if operator_id in CONSTRUCTION_OPERATOR_IDS:
+        return inspect_construction_reachability(profile)
+    return inspect_management_reachability(profile)
+
+
+def _construction_evidence_scope(steps: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Make evidence/lake invalidation explicit in candidate lineage."""
+
+    timeframe_steps = [
+        step
+        for step in steps
+        if step.get("operatorId") == GRAPH_BOUND_TIMEFRAME
+        and step.get("disposition") == "applied"
+    ]
+    scope = {
+        "schemaVersion": "temporal_qd_construction_evidence_scope_v1",
+        "evidencePlanRotationRequired": bool(timeframe_steps),
+        "lakeScopeRegenerationRequired": bool(timeframe_steps),
+        "reasons": (
+            ["graph_bound_indicator_timeframe_changed"] if timeframe_steps else []
+        ),
+        "timeframeMutationTraceSha256s": [
+            canonical_sha256(step.get("mutationTrace") or [])
+            for step in timeframe_steps
+        ],
+    }
+    scope["evidenceScopeSha256"] = canonical_sha256(scope)
+    return scope
+
+
+def _predeclared_lake_scope_report(
+    profile: Mapping[str, Any],
+    evidence_context: Mapping[str, Any] | None,
+    *,
+    frozen_construction_catalog: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Prove that frozen evidence can evaluate a constructed profile.
+
+    The window semantic digest is a remote attestation, so this check never
+    mutates a binding or synthesizes one.  A graph-bound timeframe construction
+    is eligible only when its canonical request is contained by *every*
+    pre-attested development-window request.
+    """
+
+    if not isinstance(evidence_context, Mapping):
+        return {
+            "acceptable": False,
+            "reason": "predeclared_lake_scope_absent",
+            "windows": [],
+        }
+    base_timeframe = str(
+        evidence_context.get("baseDecisionTimeframe") or ""
+    ).strip().upper()
+    pairs = profile.get("instruments")
+    windows = evidence_context.get("orderedWindowPlanSemantic")
+    if not base_timeframe or not isinstance(pairs, list) or not pairs or not isinstance(windows, list) or not windows:
+        return {
+            "acceptable": False,
+            "reason": "predeclared_lake_scope_context_incomplete",
+            "windows": [],
+        }
+
+    reports: list[dict[str, Any]] = []
+    for raw_window in windows:
+        if not isinstance(raw_window, Mapping):
+            return {
+                "acceptable": False,
+                "reason": "predeclared_lake_scope_context_malformed",
+                "windows": reports,
+            }
+        window_id = str(raw_window.get("windowId") or "")
+        window = raw_window.get("window")
+        plan = raw_window.get("evidencePlanSemantic")
+        if not window_id or not isinstance(window, Mapping) or not isinstance(plan, Mapping):
+            return {
+                "acceptable": False,
+                "reason": "predeclared_lake_scope_context_malformed",
+                "windows": reports,
+            }
+        try:
+            binding = LakeWindowBinding.model_validate(plan.get("lake_window_binding"))
+            required = resolve_replay_lake_window_request(
+                pairs=[str(pair) for pair in pairs],
+                base_timeframe=base_timeframe,
+                profile_snapshot=profile,
+                analysis_window_start=str(window.get("analysisWindowStart") or ""),
+                analysis_window_end=str(window.get("analysisWindowEnd") or ""),
+                frozen_catalog=frozen_construction_catalog,
+            )
+        except (TypeError, ValueError):
+            return {
+                "acceptable": False,
+                "reason": "predeclared_lake_scope_context_malformed",
+                "windows": reports,
+            }
+        contained = lake_window_request_contains(binding.request, required)
+        reports.append(
+            {
+                "windowId": window_id,
+                "contained": contained,
+                "requiredRequest": required.canonical_payload(),
+                "frozenWindowSemanticSha256": binding.window_semantic_sha256,
+            }
+        )
+        if not contained:
+            return {
+                "acceptable": False,
+                "reason": "candidate_derived_request_outside_pre_attested_scope",
+                "windows": reports,
+            }
+    return {"acceptable": True, "reason": None, "windows": reports}
 
 
 def _load_archive(path: Path) -> tuple[dict[str, Any], str]:
     archive = _read(path, name="QD parent archive")
     archive_sha = _identity_payload(archive, "archiveSha256", name="QD parent archive")
     archive["archiveSha256"] = archive_sha
-    if archive.get("schemaVersion") != QD_ARCHIVE_SCHEMA:
+    if (
+        archive.get("schemaVersion") != QD_ARCHIVE_SCHEMA
+        or archive.get("qdVersion") != QD_VERSION
+        or archive.get("policyName") != QD_POLICY_NAME
+        or archive.get("policySha256") != QD_POLICY_SHA256
+    ):
         raise TemporalDiscoveryContractError("unknown QD archive schema")
     return archive, archive_sha
 
 
 def _reproduction_cells(archive: Mapping[str, Any]) -> list[dict[str, Any]]:
     eligible = []
-    all_cells = []
     for cell in archive.get("cells") or []:
-        members = list(cell.get("members") or [])
-        if not members:
-            continue
-        all_cells.append(_clone(cell, name="QD reproduction cell"))
-        if any(
-            member.get("finiteDataValidity", {}).get("validForPareto")
-            for member in members
-        ):
+        members = [
+            member
+            for member in cell.get("members") or []
+            if member.get("archiveLane") == "quality" and _quality_member(member)
+        ]
+        if members:
             filtered = _clone(cell, name="eligible QD reproduction cell")
-            filtered["members"] = [
-                member
-                for member in filtered["members"]
-                if member.get("finiteDataValidity", {}).get("validForPareto") is True
-            ]
+            filtered["members"] = members
             eligible.append(filtered)
-    cells = eligible or all_cells
-    if not cells:
-        raise TemporalDiscoveryContractError("QD archive has no reproduction members")
+    if not eligible:
+        raise TemporalDiscoveryContractError(
+            "QD archive has no quality-eligible reproduction members"
+        )
+    return sorted(eligible, key=lambda item: str(item["cellId"]))
+
+
+def _negative_novelty_cells(archive: Mapping[str, Any]) -> list[dict[str, Any]]:
+    cells = []
+    for cell in archive.get("cells") or []:
+        members = [
+            member
+            for member in cell.get("members") or []
+            if member.get("archiveLane") == "negative_novelty"
+            and _negative_novelty_member(member)
+        ]
+        if len(members) > 1:
+            raise TemporalDiscoveryContractError(
+                "QD negative-novelty lane exceeds one member per cell"
+            )
+        if members:
+            copied = _clone(cell, name="negative novelty reproduction cell")
+            copied["members"] = members
+            cells.append(copied)
     return sorted(cells, key=lambda item: str(item["cellId"]))
 
 
@@ -824,6 +1286,16 @@ def _origin_kind(proposal_ordinal: int) -> str:
     # One exact immigrant slot in every five proposals.  Accepted composition is
     # intentionally not quota-forced; both raw and accepted counts are reported.
     return "random_immigrant" if proposal_ordinal % 5 == 4 else "structural_offspring"
+
+
+def _negative_novelty_slot(proposal_ordinal: int) -> bool:
+    """Reserve at most one in ten structural parent selections for the lane."""
+    if _origin_kind(proposal_ordinal) != "structural_offspring":
+        return False
+    structural_selection_count = (proposal_ordinal + 1) - (
+        (proposal_ordinal + 1) // 5
+    )
+    return structural_selection_count % 10 == 0
 
 
 def _descriptor_coordinates(cell: Mapping[str, Any]) -> tuple[str, ...]:
@@ -867,12 +1339,55 @@ def _initial_selection_state(
     }
 
 
+def _parent_member_order(member: Mapping[str, Any]) -> tuple[Any, ...]:
+    crowding = member.get("crowdingDistance")
+    crowding_value = float(crowding) if crowding is not None else math.inf
+    return (
+        int(member.get("paretoFront") or 0),
+        -crowding_value,
+        -float(member["objectives"]["worstWindowConservativeNetR"]),
+        -_capped_trade_support(member),
+        float(member["objectives"]["structuralComplexity"]),
+        str(member["candidateId"]),
+    )
+
+
+def _rank_aware_parent_member(
+    members: Sequence[Mapping[str, Any]], *, rng: random.Random
+) -> dict[str, Any]:
+    ordered = sorted(members, key=_parent_member_order)
+    # Descending rank weights retain seeded exploration without letting a flat
+    # uniform draw erase front/crowding/support ordering.
+    weights = list(range(len(ordered), 0, -1))
+    draw = rng.randrange(sum(weights))
+    for member, weight in zip(ordered, weights, strict=True):
+        if draw < weight:
+            return member
+        draw -= weight
+    raise AssertionError("rank-aware parent draw exhausted")
+
+
 def _select_parent(
     *,
     rng: random.Random,
     cells: Sequence[Mapping[str, Any]],
+    negative_novelty_cells: Sequence[Mapping[str, Any]],
     selection_state: dict[str, dict[str, int]],
-) -> tuple[dict[str, Any], dict[str, Any], str]:
+    negative_novelty_slot: bool,
+) -> tuple[dict[str, Any], dict[str, Any], str, str, str]:
+    if negative_novelty_slot and negative_novelty_cells:
+        cell = negative_novelty_cells[rng.randrange(len(negative_novelty_cells))]
+        cell_id = str(cell["cellId"])
+        member = _rank_aware_parent_member(cell["members"], rng=rng)
+        selection_state[cell_id]["selectionVisitCount"] += 1
+        selection_state[cell_id]["offspringAttemptCount"] += 1
+        return (
+            cell,
+            member,
+            "negative_novelty_exploration",
+            "negative_novelty",
+            "scheduled_every_tenth_structural_parent_selection",
+        )
     draw = rng.random()
     if draw < 0.50:
         mode = "uniform_occupied_cell"
@@ -894,11 +1409,20 @@ def _select_parent(
         pool = [cell for cell in cells if str(cell["cellId"]) in boundary]
     cell = pool[rng.randrange(len(pool))]
     cell_id = str(cell["cellId"])
-    members = sorted(cell["members"], key=lambda item: str(item["candidateId"]))
-    member = members[rng.randrange(len(members))]
+    member = _rank_aware_parent_member(cell["members"], rng=rng)
     selection_state[cell_id]["selectionVisitCount"] += 1
     selection_state[cell_id]["offspringAttemptCount"] += 1
-    return cell, member, mode
+    return (
+        cell,
+        member,
+        mode,
+        "quality",
+        (
+            "negative_novelty_slot_unavailable_quality_fallback"
+            if negative_novelty_slot
+            else "quality_eligible_parent"
+        ),
+    )
 
 
 def _mutation_depth(rng: random.Random) -> int:
@@ -997,19 +1521,337 @@ def _candidate_identity(
     return material, identity_sha, "qd_" + identity_sha.removeprefix("sha256:")[:28]
 
 
+def qd_predeclared_evidence_context(
+    template: Mapping[str, Any],
+    *,
+    worker_contract_sha256: str | None = None,
+    construction_catalog: Mapping[str, Any] | None = None,
+    construction_catalog_path: Path | str | None = None,
+) -> dict[str, Any]:
+    """Return the candidate-independent, frozen part of QD evaluation evidence."""
+    windows = list(template.get("developmentWindows") or [])
+    candidates = list(template.get("candidates") or [])
+    base_timeframes = {
+        str(item.get("timeframe") or "").strip().upper()
+        for item in candidates
+        if isinstance(item, Mapping) and str(item.get("timeframe") or "").strip()
+    }
+    if len(base_timeframes) > 1:
+        raise TemporalDiscoveryContractError(
+            "QD predeclared evidence requires one base decision timeframe"
+        )
+    base_decision_timeframe = next(iter(base_timeframes), None)
+    input_map: dict[str, Mapping[str, Any]] = {}
+    if candidates:
+        for item in candidates[0].get("windowInputs") or []:
+            if isinstance(item, Mapping) and isinstance(item.get("evidencePlan"), Mapping):
+                input_map[str(item.get("windowId"))] = item["evidencePlan"]
+    ordered_windows = []
+    for window in windows:
+        if not isinstance(window, Mapping):
+            raise TemporalDiscoveryContractError("QD development window must be an object")
+        window_id = str(window.get("windowId") or "")
+        plan = _clone(input_map.get(window_id) or {}, name="QD evidence-plan template")
+        # These rotate for each source profile and therefore cannot identify the
+        # predeclared semantic/cost contract by themselves.
+        for key in (
+            "plan_id",
+            "planId",
+            "profile_snapshot_sha256",
+            "profileSnapshotSha256",
+            "execution_cell_sha256",
+            "executionCellSha256",
+            "lake_manifest_sha256",
+            "lakeManifestSha256",
+        ):
+            plan.pop(key, None)
+        ordered_windows.append(
+            {
+                "windowId": window_id,
+                "window": _clone(window, name="QD development window"),
+                "evidencePlanSemantic": plan,
+            }
+        )
+    if construction_catalog is not None and construction_catalog_path is None:
+        raise TemporalDiscoveryContractError(
+            "frozen construction catalog identity requires its source path"
+        )
+    construction_catalog_identity = (
+        {
+            "path": str(Path(construction_catalog_path).resolve()),
+            "catalogSha256": canonical_sha256(construction_catalog),
+        }
+        if construction_catalog is not None
+        else None
+    )
+    context = {
+        "schemaVersion": "temporal_qd_predeclared_evidence_context_v3",
+        "baseDecisionTimeframe": base_decision_timeframe,
+        "orderedWindowPlanSemantic": ordered_windows,
+        "workerContractSha256": worker_contract_sha256
+        or (template.get("workerContract") or {}).get("workerContractSha256"),
+        "constructionCatalog": construction_catalog_identity,
+        "costViews": {
+            "none": {"spreadBps": 0.0, "slippageBps": 0.0, "commissionBps": 0.0},
+            "research_conservative": {
+                "spreadBps": 2.0,
+                "slippageBps": 1.0,
+                "commissionBps": 0.5,
+            },
+        },
+    }
+    context["predeclaredEvidenceContextSha256"] = canonical_sha256(context)
+    return context
+
+
+def qd_canonical_evidence_identity(
+    candidate: Mapping[str, Any], evidence_context: Mapping[str, Any]
+) -> str:
+    """Canonical identity of the actual evaluation material, not a proposal slot."""
+    context = _clone(evidence_context, name="QD predeclared evidence context")
+    supplied_context_sha = context.pop("predeclaredEvidenceContextSha256", None)
+    if supplied_context_sha is not None and _sha(
+        supplied_context_sha, name="QD predeclared evidence context identity"
+    ) != canonical_sha256(context):
+        raise TemporalDiscoveryContractError("QD predeclared evidence context diverged")
+    program_sha = _sha(candidate.get("programSha256"), name="QD evidence program SHA-256")
+    source_sha = _sha(
+        candidate.get("sourceProfileSha256"), name="QD evidence source-profile SHA-256"
+    )
+    snapshot_sha = _sha(
+        candidate.get("profileSnapshotSha256") or source_sha,
+        name="QD evidence profile-snapshot SHA-256",
+    )
+    profile = candidate.get("sourceProfile") or {}
+    if not isinstance(profile, Mapping):
+        raise TemporalDiscoveryContractError("QD evidence source profile must be an object")
+    return canonical_sha256(
+        {
+            "schemaVersion": "temporal_qd_canonical_evidence_identity_v3",
+            # Program, rather than proposal/candidate ID, keeps a semantically
+            # identical executable program from being evaluated twice.
+            "programSha256": program_sha,
+            "sourceProfileSha256": source_sha,
+            "profileSnapshotSha256": snapshot_sha,
+            "orderedWindowPlanSemantic": context.get("orderedWindowPlanSemantic"),
+            "costViews": context.get("costViews"),
+            "workerContractSha256": context.get("workerContractSha256"),
+            "executionConfigSha256": canonical_sha256(
+                profile.get("executionConfig") or {}
+            ),
+        }
+    )
+
+
+def _empty_identity_ledger() -> dict[str, Any]:
+    ledger = {
+        "schemaVersion": QD_IDENTITY_LEDGER_SCHEMA,
+        "qdVersion": QD_VERSION,
+        "policyName": QD_POLICY_NAME,
+        "policySha256": QD_POLICY_SHA256,
+        "identityPolicy": _clone(QD_POLICY["identity"], name="QD identity policy"),
+        "records": [],
+        "uniqueCounts": {
+            "candidateIdentity": 0,
+            "program": 0,
+            "sourceProfile": 0,
+            "profileSnapshot": 0,
+            "canonicalEvidence": 0,
+        },
+        "duplicateCounters": {
+            "candidateIdentity": 0,
+            "program": 0,
+            "sourceProfile": 0,
+            "profileSnapshot": 0,
+            "canonicalEvidence": 0,
+            "programDifferentEvidenceAllowed": 0,
+        },
+        "proposalSlotCounters": {
+            "proposalsObserved": 0,
+            "acceptedUniqueProposalSlots": 0,
+            "duplicateRejections": 0,
+        },
+    }
+    ledger["ledgerSha256"] = canonical_sha256(ledger)
+    return ledger
+
+
+def _ledger_identity(ledger: Mapping[str, Any]) -> str:
+    material = _clone(ledger, name="QD identity ledger")
+    supplied = _sha(material.pop("ledgerSha256", None), name="QD identity ledger SHA-256")
+    if canonical_sha256(material) != supplied:
+        raise TemporalDiscoveryContractError("QD identity ledger identity mismatch")
+    return supplied
+
+
+def _save_identity_ledger(path: Path, ledger: dict[str, Any]) -> None:
+    ledger.pop("ledgerSha256", None)
+    ledger["ledgerSha256"] = canonical_sha256(ledger)
+    _replace(path, ledger)
+
+
+def _load_identity_ledger(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        ledger = _empty_identity_ledger()
+        _write_once(path, ledger)
+        return ledger
+    ledger = _read(path, name="QD identity ledger")
+    _ledger_identity(ledger)
+    if (
+        ledger.get("schemaVersion") != QD_IDENTITY_LEDGER_SCHEMA
+        or ledger.get("qdVersion") != QD_VERSION
+        or ledger.get("policyName") != QD_POLICY_NAME
+        or ledger.get("policySha256") != QD_POLICY_SHA256
+        or ledger.get("identityPolicy") != QD_POLICY["identity"]
+    ):
+        raise TemporalDiscoveryContractError("QD identity ledger is bound to another policy")
+    return ledger
+
+
+def _ledger_record(candidate: Mapping[str, Any]) -> dict[str, str]:
+    return {
+        "candidateIdentitySha256": _sha(
+            candidate.get("candidateIdentitySha256"), name="QD ledger candidate identity"
+        ),
+        "programSha256": _sha(candidate.get("programSha256"), name="QD ledger program"),
+        "sourceProfileSha256": _sha(
+            candidate.get("sourceProfileSha256"), name="QD ledger source profile"
+        ),
+        "profileSnapshotSha256": _sha(
+            candidate.get("profileSnapshotSha256"), name="QD ledger profile snapshot"
+        ),
+        "canonicalEvidenceIdentitySha256": _sha(
+            candidate.get("canonicalEvidenceIdentitySha256"),
+            name="QD ledger canonical evidence identity",
+        ),
+    }
+
+
+def _ledger_refresh_counts(ledger: dict[str, Any]) -> None:
+    records = ledger["records"]
+    mapping = {
+        "candidateIdentity": "candidateIdentitySha256",
+        "program": "programSha256",
+        "sourceProfile": "sourceProfileSha256",
+        "profileSnapshot": "profileSnapshotSha256",
+        "canonicalEvidence": "canonicalEvidenceIdentitySha256",
+    }
+    ledger["uniqueCounts"] = {
+        name: len({str(record[key]) for record in records})
+        for name, key in mapping.items()
+    }
+
+
+def _ledger_bootstrap_archive(
+    ledger: dict[str, Any],
+    archive: Mapping[str, Any],
+    evidence_context: Mapping[str, Any],
+) -> None:
+    existing = {
+        str(record["candidateIdentitySha256"])
+        for record in ledger.get("records") or []
+    }
+    changed = False
+    for cell in archive.get("cells") or []:
+        for member in cell.get("members") or []:
+            candidate = member.get("candidate")
+            if not isinstance(candidate, Mapping):
+                continue
+            candidate = _clone(candidate, name="QD ledger archive candidate")
+            if not candidate.get("candidateIdentitySha256"):
+                # Imported v3 roots still need a stable identity before becoming
+                # parents; this is intentionally not a v2 compatibility path.
+                identity = _root_candidate_identity(candidate)
+                candidate["candidateIdentitySha256"] = identity
+            candidate.setdefault(
+                "profileSnapshotSha256", candidate.get("sourceProfileSha256")
+            )
+            candidate["canonicalEvidenceIdentitySha256"] = qd_canonical_evidence_identity(
+                candidate, evidence_context
+            )
+            record = _ledger_record(candidate)
+            if record["candidateIdentitySha256"] not in existing:
+                ledger["records"].append(record)
+                existing.add(record["candidateIdentitySha256"])
+                changed = True
+    if changed:
+        _ledger_refresh_counts(ledger)
+
+
+def _ledger_duplicate_check(
+    ledger: dict[str, Any], candidate: Mapping[str, Any]
+) -> tuple[str | None, dict[str, bool]]:
+    record = _ledger_record(candidate)
+    records = ledger.get("records") or []
+    keys = {
+        "candidateIdentity": "candidateIdentitySha256",
+        "program": "programSha256",
+        "sourceProfile": "sourceProfileSha256",
+        "profileSnapshot": "profileSnapshotSha256",
+        "canonicalEvidence": "canonicalEvidenceIdentitySha256",
+    }
+    checks = {
+        name: any(existing.get(key) == record[key] for existing in records)
+        for name, key in keys.items()
+    }
+    for name, duplicate in checks.items():
+        if duplicate:
+            ledger["duplicateCounters"][name] += 1
+    if checks["program"] and not checks["canonicalEvidence"]:
+        ledger["duplicateCounters"]["programDifferentEvidenceAllowed"] += 1
+    if checks["candidateIdentity"]:
+        ledger["proposalSlotCounters"]["duplicateRejections"] += 1
+        return "duplicate_candidate_identity_global", checks
+    if checks["canonicalEvidence"]:
+        ledger["proposalSlotCounters"]["duplicateRejections"] += 1
+        return "duplicate_canonical_evidence_global", checks
+    return None, checks
+
+
+def _ledger_accept(ledger: dict[str, Any], candidate: Mapping[str, Any]) -> None:
+    ledger["records"].append(_ledger_record(candidate))
+    ledger["proposalSlotCounters"]["acceptedUniqueProposalSlots"] += 1
+    _ledger_refresh_counts(ledger)
+
+
+def _ledger_public_counts(ledger: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "uniqueIdentityCounts": _clone(
+            ledger.get("uniqueCounts") or {}, name="QD ledger unique counts"
+        ),
+        "duplicateCounters": _clone(
+            ledger.get("duplicateCounters") or {}, name="QD ledger duplicate counts"
+        ),
+        "proposalSlotCounters": _clone(
+            ledger.get("proposalSlotCounters") or {}, name="QD proposal slot counts"
+        ),
+        "identityLedgerSha256": _sha(
+            ledger.get("ledgerSha256"), name="QD identity ledger SHA-256"
+        ),
+    }
+
+
 def _structural_proposal(
     *,
     rng: random.Random,
     cells: Sequence[Mapping[str, Any]],
+    negative_novelty_cells: Sequence[Mapping[str, Any]],
+    negative_novelty_slot: bool,
     operators: Mapping[str, Any],
     max_depth: int,
     plan_cache: dict[tuple[str, str], list[dict[str, Any]]],
     selection_state: dict[str, dict[str, int]],
     validator: Any | None,
+    evidence_context: Mapping[str, Any] | None = None,
+    frozen_construction_catalog: Mapping[str, Any] | None = None,
     replay_steps: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
-    cell, parent_member, selection_mode = _select_parent(
-        rng=rng, cells=cells, selection_state=selection_state
+    cell, parent_member, selection_mode, parent_lane, parent_lane_reason = _select_parent(
+        rng=rng,
+        cells=cells,
+        negative_novelty_cells=negative_novelty_cells,
+        selection_state=selection_state,
+        negative_novelty_slot=negative_novelty_slot,
     )
     parent = parent_member["candidate"]
     parent_id = str(parent["candidateId"])
@@ -1026,6 +1868,8 @@ def _structural_proposal(
         "parentProgramSha256": parent["programSha256"],
         "parentStructuralDepth": depth,
         "parentSelectionMode": selection_mode,
+        "parentLane": parent_lane,
+        "parentLaneReason": parent_lane_reason,
         "desiredMutationDepth": desired_depth,
         "parent": parent,
     }
@@ -1041,8 +1885,22 @@ def _structural_proposal(
             key = (profile_sha, operator_id)
             if key not in plan_cache:
                 plan_cache[key] = operator.enumerate_plans(current_profile)
-            if plan_cache[key]:
-                eligible.append((operator_id, "structural", plan_cache[key]))
+            plans = plan_cache[key]
+            if operator_id == GRAPH_BOUND_TIMEFRAME:
+                # Do this before the family/occurrence draw.  Out-of-scope
+                # substitutions are not viable candidates; they never reach a
+                # validator, evidence-plan rotation, or worker task.
+                plans = [
+                    plan
+                    for plan in plans
+                    if _predeclared_lake_scope_report(
+                        operator.preview(current_profile, plan),
+                        evidence_context,
+                        frozen_construction_catalog=frozen_construction_catalog,
+                    )["acceptable"]
+                ]
+            if plans:
+                eligible.append((operator_id, "structural", plans))
         for source_family, options in sorted(
             _available_mutations(current_profile).items()
         ):
@@ -1098,7 +1956,7 @@ def _structural_proposal(
             operator_version = PARAMETRIC_OPERATOR_VERSION
             operator_spec_sha = PARAMETRIC_OPERATOR_SPECS[operator_id]
             child = _apply_option(current_profile, selected_plan)
-        reachability = inspect_management_reachability(child)
+        reachability = _static_reachability(child, operator_id=operator_id)
         step: dict[str, Any] = {
             "stepIndex": step_index,
             "operatorId": operator_id,
@@ -1180,6 +2038,20 @@ def _structural_proposal(
                 raise TemporalDiscoveryContractError(
                     "QD intermediate structural audit failed"
                 )
+            # Construction applications are transactions, not abstract family
+            # labels.  Persist their exact trace and evidence invalidation so a
+            # resumed proposal can replay and downstream evaluation can rotate
+            # profile-bound lake evidence when a graph-bound timeframe changes.
+            if operator_id in CONSTRUCTION_OPERATOR_IDS:
+                step["mutationTrace"] = _clone(
+                    application["mutationTrace"], name="construction mutation trace"
+                )
+                step["evidenceScope"] = _clone(
+                    application["evidenceScope"], name="construction evidence scope"
+                )
+                step["staticInvariantReportSha256"] = application[
+                    "staticInvariantReport"
+                ]["auditSha256"]
         else:
             rebound = _apply_option(current_profile, selected_plan)
             application = {
@@ -1193,6 +2065,23 @@ def _structural_proposal(
                 "childSourceProfileSha256": canonical_sha256(child),
                 "parentProgramSha256": current_program,
                 "childProgramSha256": child_program,
+                **(
+                    {
+                        "mutationTrace": _clone(
+                            application["mutationTrace"],
+                            name="construction history mutation trace",
+                        ),
+                        "evidenceScope": _clone(
+                            application["evidenceScope"],
+                            name="construction history evidence scope",
+                        ),
+                        "staticInvariantReportSha256": application[
+                            "staticInvariantReport"
+                        ]["auditSha256"],
+                    }
+                    if operator_id in CONSTRUCTION_OPERATOR_IDS
+                    else {}
+                ),
             }
             application["applicationSha256"] = canonical_sha256(application)
             audit = {
@@ -1253,6 +2142,7 @@ def _structural_proposal(
         **base,
         "steps": steps,
         "completeStructuralOperatorHistory": history,
+        "evidenceScope": _construction_evidence_scope(steps),
         "finalValidation": steps[-1]["validation"],
         "candidateIdentityMaterial": identity_material,
         "candidateIdentitySha256": identity_sha,
@@ -1304,12 +2194,15 @@ def _proposal(
     generation_index: int,
     proposal_ordinal: int,
     cells: Sequence[Mapping[str, Any]],
+    negative_novelty_cells: Sequence[Mapping[str, Any]],
     immigrant_source: ExactGeneratorV2Continuation,
     operators: Mapping[str, Any],
     parameters: Mapping[str, Any],
     plan_cache: dict[tuple[str, str], list[dict[str, Any]]],
     selection_state: dict[str, dict[str, int]],
     validator: Any | None,
+    evidence_context: Mapping[str, Any] | None = None,
+    frozen_construction_catalog: Mapping[str, Any] | None = None,
     replay_steps: Sequence[Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     seed_sha = _proposal_seed(config_sha, generation_index, proposal_ordinal)
@@ -1323,11 +2216,15 @@ def _proposal(
         profile, metadata = _structural_proposal(
             rng=rng,
             cells=cells,
+            negative_novelty_cells=negative_novelty_cells,
+            negative_novelty_slot=_negative_novelty_slot(proposal_ordinal),
             operators=operators,
             max_depth=int(parameters["maxCumulativeStructuralDepth"]),
             plan_cache=plan_cache,
             selection_state=selection_state,
             validator=validator,
+            evidence_context=evidence_context,
+            frozen_construction_catalog=frozen_construction_catalog,
             replay_steps=replay_steps,
         )
     public_metadata = {
@@ -1377,16 +2274,9 @@ def _accepted_state(
 ) -> tuple[list[dict[str, Any]], Counter[str], set[str], set[str]]:
     accepted = []
     counts: Counter[str] = Counter()
-    programs = {
-        str(member["candidate"]["programSha256"])
-        for cell in archive["cells"]
-        for member in cell["members"]
-    }
-    identities = {
-        str(member["candidate"]["candidateId"])
-        for cell in archive["cells"]
-        for member in cell["members"]
-    }
+    del archive
+    programs: set[str] = set()
+    identities: set[str] = set()
     for entry in entries:
         if entry.get("disposition") != "accepted":
             continue
@@ -1399,8 +2289,6 @@ def _accepted_state(
             raise TemporalDiscoveryContractError(
                 "QD accepted candidate identity is duplicated"
             )
-        if candidate["programSha256"] in programs:
-            raise TemporalDiscoveryContractError("QD accepted program is duplicated")
         if (
             canonical_sha256(candidate["sourceProfile"])
             != candidate["sourceProfileSha256"]
@@ -1409,6 +2297,10 @@ def _accepted_state(
                 "QD accepted profile identity mismatch"
             )
         programs.add(candidate["programSha256"])
+        _sha(
+            candidate.get("canonicalEvidenceIdentitySha256"),
+            name="QD accepted canonical evidence identity",
+        )
         identity_material = candidate.get("candidateIdentityMaterial")
         if not isinstance(identity_material, Mapping) or canonical_sha256(
             identity_material
@@ -1434,10 +2326,13 @@ def _replay_entries(
     config_sha: str,
     generation_index: int,
     cells: Sequence[Mapping[str, Any]],
+    negative_novelty_cells: Sequence[Mapping[str, Any]],
     immigrant_source: ExactGeneratorV2Continuation,
     operators: Mapping[str, Any],
     parameters: Mapping[str, Any],
     selection_state: dict[str, dict[str, int]],
+    evidence_context: Mapping[str, Any] | None = None,
+    frozen_construction_catalog: Mapping[str, Any] | None = None,
 ) -> None:
     plan_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for ordinal, entry in enumerate(entries):
@@ -1456,12 +2351,15 @@ def _replay_entries(
             generation_index=generation_index,
             proposal_ordinal=ordinal,
             cells=cells,
+            negative_novelty_cells=negative_novelty_cells,
             immigrant_source=immigrant_source,
             operators=operators,
             parameters=parameters,
             plan_cache=plan_cache,
             selection_state=selection_state,
             validator=None,
+            evidence_context=evidence_context,
+            frozen_construction_catalog=frozen_construction_catalog,
             replay_steps=replay_steps,
         )
         if metadata["proposalMaterial"] != entry.get("proposal"):
@@ -1488,6 +2386,7 @@ def _accepted_candidate(
     generation_index: int,
     birth_ordinal: int,
     proposal_ordinal: int,
+    evidence_context: Mapping[str, Any],
 ) -> dict[str, Any]:
     source_sha = canonical_sha256(profile)
     program_sha = _sha(validation.get("programSha256"), name="QD program SHA-256")
@@ -1512,6 +2411,10 @@ def _accepted_candidate(
         seed_id = str(metadata["parent"].get("seedId") or "qd_parent")
         parent_ids = [metadata["parentCandidateId"]]
         parent_programs = [metadata["parentProgramSha256"]]
+        evidence_scope = _clone(
+            metadata.get("evidenceScope") or _construction_evidence_scope([]),
+            name="structural construction evidence scope",
+        )
     else:
         immigrant = metadata["immigrantProposal"]
         structural_history = []
@@ -1520,8 +2423,9 @@ def _accepted_candidate(
         seed_id = str(immigrant["seedId"])
         parent_ids = []
         parent_programs = []
+        evidence_scope = _construction_evidence_scope([])
     lineage = {
-        "schemaVersion": "temporal_qd_candidate_lineage_v2",
+        "schemaVersion": "temporal_qd_candidate_lineage_v3",
         "candidateId": candidate_id,
         "candidateIdentitySha256": identity_sha,
         "candidateSourceProfileSha256": source_sha,
@@ -1534,7 +2438,7 @@ def _accepted_candidate(
         "parentProgramSha256s": parent_programs,
     }
     lineage["lineageSha256"] = canonical_sha256(lineage)
-    return {
+    candidate = {
         "candidateId": candidate_id,
         "sourceMode": "qd_" + metadata["originKind"],
         "seedId": seed_id,
@@ -1556,8 +2460,13 @@ def _accepted_candidate(
         "structuralOperatorHistory": structural_history,
         "mutationTrace": mutation_trace,
         "activationAwareRepairs": repairs,
+        "constructionEvidenceScope": evidence_scope,
         "lineage": lineage,
     }
+    candidate["canonicalEvidenceIdentitySha256"] = qd_canonical_evidence_identity(
+        candidate, evidence_context
+    )
+    return candidate
 
 
 def _manifest(root: Path, *, population_sha: str) -> dict[str, Any]:
@@ -1587,10 +2496,14 @@ def _proposal_accounting(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]
     origin_proposals: Counter[str] = Counter()
     origin_accepted: Counter[str] = Counter()
     selection_modes: Counter[str] = Counter()
+    parent_lanes: Counter[str] = Counter()
+    parent_lane_reasons: Counter[str] = Counter()
     selected_cells: Counter[str] = Counter()
     offspring_attempts: Counter[str] = Counter()
     family_attempts: Counter[str] = Counter()
     family_applications: Counter[str] = Counter()
+    construction_family_attempts: Counter[str] = Counter()
+    construction_family_applications: Counter[str] = Counter()
     mutation_depths: Counter[str] = Counter()
     dispositions: Counter[str] = Counter()
     for entry in entries:
@@ -1604,6 +2517,8 @@ def _proposal_accounting(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]
             continue
         proposal = entry.get("proposal") or {}
         selection_modes[str(proposal.get("parentSelectionMode") or "unknown")] += 1
+        parent_lanes[str(proposal.get("parentLane") or "unknown")] += 1
+        parent_lane_reasons[str(proposal.get("parentLaneReason") or "unknown")] += 1
         cell_id = str(proposal.get("parentCellId") or "unknown")
         selected_cells[cell_id] += 1
         offspring_attempts[cell_id] += 1
@@ -1611,16 +2526,41 @@ def _proposal_accounting(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]
         for step in proposal.get("steps") or []:
             operator_id = str(step.get("operatorId") or "unknown")
             family_attempts[operator_id] += 1
+            if operator_id in CONSTRUCTION_OPERATOR_IDS:
+                construction_family_attempts[operator_id] += 1
             if step.get("disposition") == "applied":
                 family_applications[operator_id] += 1
+                if operator_id in CONSTRUCTION_OPERATOR_IDS:
+                    construction_family_applications[operator_id] += 1
+    structural_parent_selections = sum(parent_lanes.values())
+    negative_novelty_selections = parent_lanes["negative_novelty"]
+    if negative_novelty_selections > structural_parent_selections // 10:
+        raise TemporalDiscoveryContractError(
+            "QD negative-novelty parent lane exceeded its ten-percent bound"
+        )
     return {
         "originProposalCounts": dict(sorted(origin_proposals.items())),
         "originAcceptedCounts": dict(sorted(origin_accepted.items())),
         "parentSelectionModeCounts": dict(sorted(selection_modes.items())),
+        "parentLaneCounts": dict(sorted(parent_lanes.items())),
+        "parentLaneReasonCounts": dict(sorted(parent_lane_reasons.items())),
+        "negativeNoveltyParentSelectionCount": negative_novelty_selections,
+        "structuralParentSelectionCount": structural_parent_selections,
+        "negativeNoveltyParentSelectionFraction": (
+            negative_novelty_selections / structural_parent_selections
+            if structural_parent_selections
+            else 0.0
+        ),
         "parentCellSelectionCounts": dict(sorted(selected_cells.items())),
         "parentCellOffspringAttemptCounts": dict(sorted(offspring_attempts.items())),
         "operatorFamilyAttemptCounts": dict(sorted(family_attempts.items())),
         "operatorFamilyApplicationCounts": dict(sorted(family_applications.items())),
+        "constructionOperatorFamilyAttemptCounts": dict(
+            sorted(construction_family_attempts.items())
+        ),
+        "constructionOperatorFamilyApplicationCounts": dict(
+            sorted(construction_family_applications.items())
+        ),
         "mutationDepthAttemptCounts": dict(sorted(mutation_depths.items())),
         "dispositionCounts": dict(sorted(dispositions.items())),
     }
@@ -1637,8 +2577,11 @@ def generate_qd_generation(
     generation_index: int,
     immigrant_continuation_start: int = 0,
     parameters: Mapping[str, Any] | None = None,
+    evidence_identity_context: Mapping[str, Any] | None = None,
+    identity_ledger_path: Path | str | None = None,
     validator_timeout_seconds: float = 60.0,
     max_new_proposals: int | None = None,
+    construction_catalog_path: Path | str | None = None,
 ) -> dict[str, Any]:
     if generation_index < 1:
         raise TemporalDiscoveryContractError("evolved QD generations begin at index 1")
@@ -1647,7 +2590,47 @@ def generate_qd_generation(
     root = Path(output_root)
     archive, archive_sha = _load_archive(Path(parent_archive_path))
     config_parameters = _normalize_parameters(parameters)
-    operators = _operators()
+    context = _clone(
+        evidence_identity_context
+        or {
+            "schemaVersion": "temporal_qd_predeclared_evidence_context_v3",
+            "orderedWindowPlanSemantic": [],
+            "workerContractSha256": None,
+            "costViews": qd_predeclared_evidence_context({})["costViews"],
+        },
+        name="QD evidence identity context",
+    )
+    context.setdefault("predeclaredEvidenceContextSha256", canonical_sha256(context))
+    context_sha = _sha(
+        context["predeclaredEvidenceContextSha256"],
+        name="QD predeclared evidence context identity",
+    )
+    if canonical_sha256(
+        {key: value for key, value in context.items() if key != "predeclaredEvidenceContextSha256"}
+    ) != context_sha:
+        raise TemporalDiscoveryContractError("QD evidence identity context mismatch")
+    ledger_file = Path(identity_ledger_path) if identity_ledger_path is not None else root / "identity-ledger.json"
+    ledger = _load_identity_ledger(ledger_file)
+    _ledger_bootstrap_archive(ledger, archive, context)
+    _save_identity_ledger(ledger_file, ledger)
+    construction_policy, construction_registry = qd_construction_operator_policy(
+        construction_catalog_path
+    )
+    frozen_construction_catalog = (
+        construction_registry.catalog.payload
+        if construction_registry is not None
+        else None
+    )
+    if frozen_construction_catalog is not None:
+        expected_catalog_identity = construction_policy["catalog"]
+        if context.get("constructionCatalog") != expected_catalog_identity:
+            raise TemporalDiscoveryContractError(
+                "QD predeclared evidence does not bind the frozen construction catalog"
+            )
+    operators = _operators(
+        construction_registry,
+        construction_operator_ids=construction_policy["enabledOperatorIds"],
+    )
     operator_specs = [
         {
             "operatorId": operator_id,
@@ -1672,11 +2655,19 @@ def generate_qd_generation(
     config = {
         "schemaVersion": QD_CONFIG_SCHEMA,
         "qdVersion": QD_VERSION,
+        "policyName": QD_POLICY_NAME,
+        "policySha256": QD_POLICY_SHA256,
+        "frozenPolicy": _clone(QD_POLICY, name="frozen QD policy"),
         "generationIndex": generation_index,
         "parentArchiveSha256": archive_sha,
         "immigrantSourceIdentity": immigrant_source.source_identity,
         "immigrantContinuationStart": immigrant_continuation_start,
         "operatorRegistry": operator_specs,
+        **(
+            {"constructionOperatorPolicy": construction_policy}
+            if construction_policy["enabled"]
+            else {}
+        ),
         "selectionPolicy": {
             "originSchedule": "four_archive_offspring_then_one_generator_v2_immigrant",
             "parentCellMixture": {
@@ -1684,11 +2675,23 @@ def generate_qd_generation(
                 "lowVisitCell": 0.30,
                 "sparseDescriptorBoundary": 0.20,
             },
-            "parentWithinCell": "uniform_pareto_member",
+            "parentWithinCell": "seeded_rank_weighted_front_crowding_robust_return_capped_support_complexity",
+            "negativeNoveltyLane": {
+                "maxMembersPerCell": 1,
+                "maxParentSelectionFraction": 0.10,
+                "schedule": "every_tenth_structural_parent_selection",
+            },
             "operator": "uniform_eligible_family_then_uniform_occurrence_then_uniform_parameter_plan",
             "mutationDepth": {"one": 0.70, "two": 0.25, "three": 0.05},
         },
         "parameters": config_parameters,
+        "predeclaredEvidenceContext": context,
+        "predeclaredEvidenceContextSha256": context_sha,
+        "globalIdentityLedger": {
+            "schemaVersion": QD_IDENTITY_LEDGER_SCHEMA,
+            "policySha256": QD_POLICY_SHA256,
+            "locationPolicy": "caller_supplied_generation_global_ledger",
+        },
         "marketEvidenceReadDuringGeneration": False,
         "gatewayContactedDuringGeneration": False,
     }
@@ -1697,21 +2700,45 @@ def generate_qd_generation(
 
     target = int(config_parameters["targetUniqueCandidates"])
     cells = _reproduction_cells(archive)
-    selection_state = _initial_selection_state(cells)
+    negative_novelty_cells = _negative_novelty_cells(archive)
+    selection_state = _initial_selection_state([*cells, *negative_novelty_cells])
     entries = _load_entries(root)
     _replay_entries(
         entries=entries,
         config_sha=config["configSha256"],
         generation_index=generation_index,
         cells=cells,
+        negative_novelty_cells=negative_novelty_cells,
         immigrant_source=immigrant_source,
         operators=operators,
         parameters=config_parameters,
         selection_state=selection_state,
+        evidence_context=context,
+        frozen_construction_catalog=frozen_construction_catalog,
     )
-    accepted, accepted_counts, seen_programs, seen_identities = _accepted_state(
+    accepted, accepted_counts, _seen_programs, _seen_identities = _accepted_state(
         entries, archive
     )
+    ledger_identities = {
+        str(record["candidateIdentitySha256"])
+        for record in ledger.get("records") or []
+    }
+    recovered_proposal_slots = 0
+    for candidate in accepted:
+        record = _ledger_record(candidate)
+        if record["candidateIdentitySha256"] not in ledger_identities:
+            ledger["records"].append(record)
+            ledger_identities.add(record["candidateIdentitySha256"])
+            recovered_proposal_slots += 1
+    ledger["proposalSlotCounters"]["acceptedUniqueProposalSlots"] += (
+        recovered_proposal_slots
+    )
+    _ledger_refresh_counts(ledger)
+    ledger["proposalSlotCounters"]["proposalsObserved"] = max(
+        int(ledger["proposalSlotCounters"].get("proposalsObserved") or 0),
+        len(entries),
+    )
+    _save_identity_ledger(ledger_file, ledger)
     validator = SubprocessCandidateValidator(
         validator_command, timeout_seconds=validator_timeout_seconds
     )
@@ -1728,12 +2755,15 @@ def generate_qd_generation(
             generation_index=generation_index,
             proposal_ordinal=ordinal,
             cells=cells,
+            negative_novelty_cells=negative_novelty_cells,
             immigrant_source=immigrant_source,
             operators=operators,
             parameters=config_parameters,
             plan_cache=plan_cache,
             selection_state=selection_state,
             validator=validator,
+            evidence_context=context,
+            frozen_construction_catalog=frozen_construction_catalog,
         )
         proposal = metadata["proposalMaterial"]
         entry: dict[str, Any] = {
@@ -1744,51 +2774,74 @@ def generate_qd_generation(
             "originKind": metadata["originKind"],
             "proposal": proposal,
         }
+        ledger["proposalSlotCounters"]["proposalsObserved"] += 1
         if profile is None:
             entry["disposition"] = str(metadata["proposalIssue"])
-        elif str(metadata["candidateId"]) in seen_identities:
-            entry["disposition"] = "duplicate_candidate_identity"
         else:
-            reachability = inspect_management_reachability(profile)
+            structural_steps = metadata.get("steps") or []
+            construction_operator_id = next(
+                (
+                    str(step["operatorId"])
+                    for step in reversed(structural_steps)
+                    if isinstance(step, Mapping)
+                    and step.get("operatorId") in CONSTRUCTION_OPERATOR_IDS
+                ),
+                None,
+            )
+            reachability = _static_reachability(
+                profile,
+                operator_id=construction_operator_id,
+            )
             entry["managementReachabilitySha256"] = reachability["reachabilitySha256"]
             entry["managementReachabilityIssueCounts"] = reachability["issueCounts"]
             if reachability["acceptable"] is not True:
                 entry["disposition"] = "static_reachability_rejected"
             else:
-                if metadata["originKind"] == "structural_offspring":
-                    validation_record = _clone(
-                        metadata["finalValidation"], name="final structural validation"
+                scoped = (
+                    _predeclared_lake_scope_report(
+                        profile,
+                        context,
+                        frozen_construction_catalog=frozen_construction_catalog,
                     )
-                else:
-                    source_sha = canonical_sha256(profile)
-                    validation_record = _validation_record(
-                        validator.validate(
-                            candidate_id=str(metadata["candidateId"]),
-                            source_profile=profile,
-                            expected_raw_source_profile_sha256=source_sha,
-                        )
-                    )
-                entry.update(
-                    {
-                        "validationStatus": validation_record.get("status"),
-                        "validationReportSha256": validation_record.get(
-                            "validationReportSha256"
-                        ),
-                        "validatedProgramSha256": validation_record.get(
-                            "programSha256"
-                        ),
-                        "issueCodes": validation_record.get("issueCodes") or [],
-                    }
+                    if context.get("orderedWindowPlanSemantic")
+                    else None
                 )
-                if validation_record.get("candidateAcceptable") is not True:
-                    entry["disposition"] = "native_validator_rejected"
+                if scoped is not None:
+                    entry["predeclaredLakeScope"] = scoped
+                if scoped is not None and scoped["acceptable"] is not True:
+                    # This covers all origins, including an immigrant whose
+                    # generator lineage changed a timeframe.  No out-of-scope
+                    # profile may become a QD population member and later
+                    # poison an otherwise immutable campaign freeze.
+                    entry["disposition"] = "predeclared_lake_scope_rejected"
                 else:
-                    program_sha = _sha(
-                        validation_record.get("programSha256"),
-                        name="QD program SHA-256",
+                    if metadata["originKind"] == "structural_offspring":
+                        validation_record = _clone(
+                            metadata["finalValidation"], name="final structural validation"
+                        )
+                    else:
+                        source_sha = canonical_sha256(profile)
+                        validation_record = _validation_record(
+                            validator.validate(
+                                candidate_id=str(metadata["candidateId"]),
+                                source_profile=profile,
+                                expected_raw_source_profile_sha256=source_sha,
+                            )
+                        )
+                    entry.update(
+                        {
+                            "validationStatus": validation_record.get("status"),
+                            "validationReportSha256": validation_record.get(
+                                "validationReportSha256"
+                            ),
+                            "validatedProgramSha256": validation_record.get(
+                                "programSha256"
+                            ),
+                            "issueCodes": validation_record.get("issueCodes") or [],
+                        }
                     )
-                    if program_sha in seen_programs:
-                        entry["disposition"] = "duplicate_program"
+                    if validation_record.get("candidateAcceptable") is not True:
+                        entry["disposition"] = "native_validator_rejected"
                     else:
                         candidate = _accepted_candidate(
                             profile=profile,
@@ -1797,17 +2850,28 @@ def generate_qd_generation(
                             generation_index=generation_index,
                             birth_ordinal=len(accepted),
                             proposal_ordinal=ordinal,
+                            evidence_context=context,
                         )
-                        entry["candidate"] = candidate
-                        entry["disposition"] = "accepted"
-                        accepted.append(candidate)
-                        accepted_counts[metadata["originKind"]] += 1
-                        seen_programs.add(program_sha)
-                        seen_identities.add(str(candidate["candidateId"]))
+                        duplicate_reason, identity_checks = _ledger_duplicate_check(
+                            ledger, candidate
+                        )
+                        entry["identityChecks"] = identity_checks
+                        entry["canonicalEvidenceIdentitySha256"] = candidate[
+                            "canonicalEvidenceIdentitySha256"
+                        ]
+                        if duplicate_reason is not None:
+                            entry["disposition"] = duplicate_reason
+                        else:
+                            entry["candidate"] = candidate
+                            entry["disposition"] = "accepted"
+                            accepted.append(candidate)
+                            accepted_counts[metadata["originKind"]] += 1
+                            _ledger_accept(ledger, candidate)
         entry["entrySha256"] = canonical_sha256(entry)
         _write_once(_entry_path(root, ordinal), entry)
         entries.append(entry)
         new_proposals += 1
+        _save_identity_ledger(ledger_file, ledger)
         accounting = _proposal_accounting(entries)
         checkpoint = {
             "schemaVersion": QD_CHECKPOINT_SCHEMA,
@@ -1824,6 +2888,7 @@ def generate_qd_generation(
             "acceptedCount": len(accepted),
             "acceptedOriginCounts": dict(sorted(accepted_counts.items())),
             "proposalAccounting": accounting,
+            **_ledger_public_counts(ledger),
             "completed": False,
         }
         checkpoint["checkpointSha256"] = canonical_sha256(checkpoint)
@@ -1832,13 +2897,14 @@ def generate_qd_generation(
     if len(accepted) < target:
         if max_new_proposals is not None and new_proposals >= max_new_proposals:
             return {
-                "schemaVersion": "temporal_qd_generation_progress_v2",
+                "schemaVersion": "temporal_qd_generation_progress_v3",
                 "configSha256": config["configSha256"],
                 "generationIndex": generation_index,
                 "proposalCount": len(entries),
                 "acceptedCount": len(accepted),
                 "targetUniqueCandidates": target,
                 "nextImmigrantContinuationOrdinal": immigrant_source.next_continuation_ordinal,
+                **_ledger_public_counts(ledger),
                 "completed": False,
             }
         raise TemporalDiscoveryGenerationExhausted(
@@ -1855,6 +2921,8 @@ def generate_qd_generation(
     population = {
         "schemaVersion": QD_POPULATION_SCHEMA,
         "qdVersion": QD_VERSION,
+        "policyName": QD_POLICY_NAME,
+        "policySha256": QD_POLICY_SHA256,
         "configSha256": config["configSha256"],
         "generationIndex": generation_index,
         "targetUniqueCandidates": target,
@@ -1862,16 +2930,44 @@ def generate_qd_generation(
         "proposalOrderCandidateIds": proposal_order,
         "candidateCount": len(accepted),
         "candidates": accepted,
+        "predeclaredEvidenceContextSha256": context_sha,
+        **(
+            {"constructionOperatorPolicySha256": construction_policy["policySha256"]}
+            if construction_policy["enabled"]
+            else {}
+        ),
+        "proposalSlots": {
+            "targetUniqueCandidates": target,
+            "acceptedUniqueCandidates": len(accepted),
+            "proposalAttempts": len(entries),
+            "remainingUniqueCandidateSlots": max(0, target - len(accepted)),
+        },
+        **_ledger_public_counts(ledger),
     }
     population["populationSha256"] = canonical_sha256(population)
     journal = {
         "schemaVersion": QD_JOURNAL_SCHEMA,
+        "qdVersion": QD_VERSION,
+        "policyName": QD_POLICY_NAME,
+        "policySha256": QD_POLICY_SHA256,
         "configSha256": config["configSha256"],
         "generationIndex": generation_index,
         "proposalCount": len(entries),
         "acceptedCount": len(accepted),
         "nextImmigrantContinuationOrdinal": immigrant_source.next_continuation_ordinal,
+        **(
+            {"constructionOperatorPolicySha256": construction_policy["policySha256"]}
+            if construction_policy["enabled"]
+            else {}
+        ),
         **accounting,
+        "proposalSlots": {
+            "targetUniqueCandidates": target,
+            "acceptedUniqueCandidates": len(accepted),
+            "proposalAttempts": len(entries),
+            "remainingUniqueCandidateSlots": max(0, target - len(accepted)),
+        },
+        **_ledger_public_counts(ledger),
         "entrySha256s": [item["entrySha256"] for item in entries],
     }
     journal["journalSha256"] = canonical_sha256(journal)
@@ -1892,6 +2988,13 @@ def generate_qd_generation(
         "acceptedCount": len(accepted),
         "acceptedOriginCounts": accounting["originAcceptedCounts"],
         "proposalAccounting": accounting,
+        "proposalSlots": {
+            "targetUniqueCandidates": target,
+            "acceptedUniqueCandidates": len(accepted),
+            "proposalAttempts": len(entries),
+            "remainingUniqueCandidateSlots": max(0, target - len(accepted)),
+        },
+        **_ledger_public_counts(ledger),
         "completed": True,
         "populationSha256": population["populationSha256"],
         "journalSha256": journal["journalSha256"],
@@ -1900,7 +3003,7 @@ def generate_qd_generation(
     _replace(root / "checkpoint.json", checkpoint)
     manifest = _manifest(root, population_sha=population["populationSha256"])
     return {
-        "schemaVersion": "temporal_qd_generation_result_v2",
+        "schemaVersion": "temporal_qd_generation_result_v3",
         "configSha256": config["configSha256"],
         "generationIndex": generation_index,
         "populationSha256": population["populationSha256"],
@@ -1910,6 +3013,8 @@ def generate_qd_generation(
         "candidateCount": len(accepted),
         "originProposalCounts": accounting["originProposalCounts"],
         "originAcceptedCounts": accounting["originAcceptedCounts"],
+        "proposalSlots": population["proposalSlots"],
+        **_ledger_public_counts(ledger),
         "nextImmigrantContinuationOrdinal": immigrant_source.next_continuation_ordinal,
         "completed": True,
         "marketEvidenceReadDuringGeneration": False,
@@ -1927,9 +3032,10 @@ def main() -> None:
     archive.add_argument("--generation-index", type=int, required=True)
     archive.add_argument("--previous-archive", type=Path)
     archive.add_argument("--generation-journal", type=Path)
-    archive.add_argument("--cell-capacity", type=int, default=8)
+    archive.add_argument("--cell-capacity", type=int, default=4)
     archive.add_argument("--minimum-total-trades", type=int, default=8)
-    archive.add_argument("--minimum-trades-per-window", type=int, default=2)
+    archive.add_argument("--minimum-trades-per-window", type=int, default=4)
+    archive.add_argument("--cap-trades", type=int, default=20)
 
     generate = subparsers.add_parser("generate")
     generate.add_argument("--parent-archive", type=Path, required=True)
@@ -1941,6 +3047,7 @@ def main() -> None:
     generate.add_argument("--output-root", type=Path, required=True)
     generate.add_argument("--generation-index", type=int, required=True)
     generate.add_argument("--parameters", type=Path)
+    generate.add_argument("--construction-catalog", type=Path)
     generate.add_argument("--validator-timeout-seconds", type=float, default=60.0)
     generate.add_argument("--max-new-proposals", type=int)
     args = parser.parse_args()
@@ -1956,6 +3063,7 @@ def main() -> None:
             cell_capacity=args.cell_capacity,
             minimum_total_trades=args.minimum_total_trades,
             minimum_trades_per_window=args.minimum_trades_per_window,
+            cap_trades=args.cap_trades,
         )
     else:
         command = json.loads(args.validator_command_file.read_text(encoding="utf-8"))
@@ -1982,6 +3090,7 @@ def main() -> None:
             parameters=parameters,
             validator_timeout_seconds=args.validator_timeout_seconds,
             max_new_proposals=args.max_new_proposals,
+            construction_catalog_path=args.construction_catalog,
         )
     print(json.dumps(result, indent=2, sort_keys=True))
 
@@ -1992,9 +3101,15 @@ if __name__ == "__main__":
 
 __all__ = [
     "DEFAULT_QD_PARAMETERS",
+    "QD_POLICY",
+    "QD_POLICY_NAME",
+    "QD_POLICY_SHA256",
     "QD_VERSION",
     "build_qd_archive",
     "generate_qd_generation",
     "qd_behavior_descriptor",
+    "qd_canonical_evidence_identity",
+    "qd_construction_operator_policy",
+    "qd_predeclared_evidence_context",
     "select_qd_archive",
 ]

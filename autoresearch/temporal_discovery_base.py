@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 from typing import Any, Protocol
 
+from .result_codec import ResultCodecError, read_json_object as _read_codec_json_object
 from .temporal_search import (
     TEMPORAL_SEARCH_PREPARATION_SCHEMA,
     TemporalSearchContractError,
@@ -206,8 +207,8 @@ def _write_immutable(path: Path, payload: Mapping[str, Any]) -> None:
 
 def _read_json(path: Path, *, name: str) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        payload, _ = _read_codec_json_object(path)
+    except ResultCodecError as exc:
         raise TemporalDiscoveryContractError(
             f"could not read {name}: {path}"
         ) from exc

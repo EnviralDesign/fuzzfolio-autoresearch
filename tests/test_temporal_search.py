@@ -12,6 +12,7 @@ from autoresearch.temporal_search import (
     TEMPORAL_SEARCH_TASK_KIND,
     TemporalSearchContractError,
     TemporalSearchTimeout,
+    _cost_view_path_sha256,
     build_authority,
     build_task_matrix,
     canonical_sha256,
@@ -148,6 +149,120 @@ def test_authority_freezes_one_candidate_window_to_one_two_cost_task() -> None:
     assert "management.action.dynamic" in task["required_worker_capabilities"]
 
 
+def test_cost_view_path_attestation_matches_worker_non_cost_field_names() -> None:
+    replay = {
+        "graphTraces": [
+            {
+                "eventSequence": 3,
+                "eventClass": "decision",
+                "priorStateId": "prior",
+                "nextStateId": "next",
+                "transitionId": "route",
+                "reasonCode": "fixture",
+                "intentIds": ["intent-a"],
+            }
+        ],
+        "executionTraces": [
+            {
+                "eventSequence": 3,
+                "clockIndex": 7,
+                "marketBarId": "bar-a",
+                "phase": "open",
+                "effectKind": "entry",
+                "status": "filled",
+                "effectId": "effect-a",
+                "intentId": "intent-a",
+                "actionKind": "open_position",
+                "reasonCode": "fixture",
+                "price": 1.2,
+                "positionId": "position-a",
+                "tradeId": "trade-a",
+            }
+        ],
+        "trades": [
+            {
+                "tradeId": "trade-a",
+                "positionId": "position-a",
+                "openingIntentId": "intent-a",
+                "openingEffectId": "effect-a",
+                "closingIntentId": "intent-b",
+                "closingEffectId": "effect-b",
+                "entryBarId": "bar-a",
+                "exitBarId": "bar-b",
+                "entryPhase": "open",
+                "exitPhase": "interval",
+                "entryTime": "2024-01-01T00:00:00Z",
+                "exitTime": "2024-01-01T00:05:00Z",
+                "entryClockIndex": 7,
+                "exitClockIndex": 8,
+                "entryPrice": 1.2,
+                "exitPrice": 1.3,
+                "closeReason": "target",
+                "holdingBars": 1,
+                "holdingHours": 0.1,
+            }
+        ],
+    }
+    expected = canonical_sha256(
+        {
+            "schema_version": "temporal_graph_cost_view_path_v1",
+            "graph_path": [
+                {
+                    "event_sequence": 3,
+                    "event_class": "decision",
+                    "prior_state_id": "prior",
+                    "next_state_id": "next",
+                    "transition_id": "route",
+                    "reason_code": "fixture",
+                    "intent_ids": ["intent-a"],
+                }
+            ],
+            "execution_path": [
+                {
+                    "event_sequence": 3,
+                    "clock_index": 7,
+                    "market_bar_id": "bar-a",
+                    "phase": "open",
+                    "effect_kind": "entry",
+                    "status": "filled",
+                    "effect_id": "effect-a",
+                    "intent_id": "intent-a",
+                    "action_kind": "open_position",
+                    "reason_code": "fixture",
+                    "price": 1.2,
+                    "position_id": "position-a",
+                    "trade_id": "trade-a",
+                }
+            ],
+            "trade_path": [
+                {
+                    "trade_id": "trade-a",
+                    "position_id": "position-a",
+                    "opening_intent_id": "intent-a",
+                    "opening_effect_id": "effect-a",
+                    "closing_intent_id": "intent-b",
+                    "closing_effect_id": "effect-b",
+                    "entry_bar_id": "bar-a",
+                    "exit_bar_id": "bar-b",
+                    "entry_phase": "open",
+                    "exit_phase": "interval",
+                    "entry_time": "2024-01-01T00:00:00Z",
+                    "exit_time": "2024-01-01T00:05:00Z",
+                    "entry_clock_index": 7,
+                    "exit_clock_index": 8,
+                    "entry_price": 1.2,
+                    "exit_price": 1.3,
+                    "close_reason": "target",
+                    "holding_bars": 1,
+                    "holding_hours": 0.1,
+                }
+            ],
+        }
+    )
+
+    assert _cost_view_path_sha256(replay, name="fixture") == expected
+
+
 def test_scalar_management_task_binds_complete_execution_config_without_legacy_cell() -> (
     None
 ):
@@ -259,6 +374,75 @@ class _Gateway:
         self.delivered = True
         job = self.task["payload"]
         stream = "sha256:" + "e" * 64
+        last_bar_start = "2024-02-29T23:55:00Z"
+        path_sha = canonical_sha256(
+            {
+                "schema_version": "temporal_graph_cost_view_path_v1",
+                "graph_path": [],
+                "execution_path": [],
+                "trade_path": [],
+            }
+        )
+
+        def metrics(*, total_net_r: float, total_cost_percent: float) -> dict:
+            return {
+                "observationsProcessed": 10,
+                "tradesClosed": 1,
+                "unresolvedPosition": False,
+                "unresolvedPendingEffect": False,
+                "totalGrossR": 1.0,
+                "totalNetR": total_net_r,
+                "totalExecutionCostPercent": total_cost_percent,
+                "maxDrawdownR": 0.0,
+                "equityCurveR": [total_net_r],
+                "terminalValuation": {
+                    "schemaVersion": "temporal_terminal_valuation_v1",
+                    "policy": "leave_open_mark_to_market_v1",
+                    "positionStatus": "no_open_position",
+                    "lastCompletedBarId": "bar-2024-02-29T23:55:00Z",
+                    "lastCompletedBarStart": last_bar_start,
+                    "lastCompletedBarClose": last_bar_start,
+                    "markPrice": 1.2,
+                    "exitCostPercent": 0.0,
+                    "pendingEffectStatus": "none",
+                    "pendingEffectCancellationTreatment": "not_applicable",
+                    "closedTradeCountDelta": 0,
+                },
+                "terminalAdjustedTotalGrossR": 1.0,
+                "terminalAdjustedTotalNetR": total_net_r,
+                "terminalAdjustedTotalExecutionCostPercent": total_cost_percent,
+                "terminalAdjustedEquityCurveR": [total_net_r],
+                "terminalAdjustedMaxDrawdownR": 0.0,
+            }
+
+        evidence = {
+            "schema_version": "temporal_graph_candidate_window_evidence_contract_v1",
+            "analysis_window_start": job["analysis_window_start"],
+            "analysis_window_end": job["analysis_window_end"],
+            "analysis_window_end_exclusive": True,
+            "requested_bar_limit": job["bar_limit"],
+            "effective_bar_limit": job["bar_limit"] + 1,
+            "observation_count": 10,
+            "first_admitted_observation_timestamp": job["analysis_window_start"],
+            "last_admitted_observation_timestamp": last_bar_start,
+            "warmup_sufficient": True,
+            "warmup_sufficiency": {"sufficient": True, "source": "aligned_scoring"},
+            "excluded_provisional_count": 1,
+            "excluded_outside_analysis_window_count": 2,
+        }
+
+        def replay(*, total_net_r: float, total_cost_percent: float) -> dict:
+            return {
+                "streamSha256": stream,
+                "graphTraces": [],
+                "executionTraces": [],
+                "trades": [],
+                "metrics": metrics(
+                    total_net_r=total_net_r,
+                    total_cost_percent=total_cost_percent,
+                ),
+            }
+
         result = {
             "schema_version": TEMPORAL_SEARCH_RESULT_SCHEMA,
             "task_kind": TEMPORAL_SEARCH_TASK_KIND,
@@ -268,14 +452,46 @@ class _Gateway:
             "evidence_plan_id": job["evidence_plan"]["plan_id"],
             "lake_window_semantic_sha256": job["lake_window_semantic_sha256"],
             "shared_observation_stream_id": job["shared_observation_stream_id"],
+            "analysis_window_start": job["analysis_window_start"],
+            "analysis_window_end": job["analysis_window_end"],
+            "observation_stream_sha256": stream,
+            "observation_summary": {
+                "observation_count": 10,
+                "first_bar_start": job["analysis_window_start"],
+                "last_bar_start": last_bar_start,
+            },
+            "evidence_contract": evidence,
             "cost_view_results": {
                 "research_conservative": {
                     "cost_view": "research_conservative",
                     "observation_stream_sha256": stream,
+                    "replay_result": replay(total_net_r=0.9, total_cost_percent=0.1),
                 },
-                "none": {"cost_view": "none", "observation_stream_sha256": stream},
+                "none": {
+                    "cost_view": "none",
+                    "observation_stream_sha256": stream,
+                    "replay_result": replay(total_net_r=1.0, total_cost_percent=0.0),
+                },
             },
-            "diagnostics": {},
+            "diagnostics": {
+                "observation_count": 10,
+                "requested_bar_limit": evidence["requested_bar_limit"],
+                "effective_bar_limit": evidence["effective_bar_limit"],
+                "warmup_sufficient": True,
+                "warmup_sufficiency": evidence["warmup_sufficiency"],
+                "first_admitted_observation_timestamp": evidence[
+                    "first_admitted_observation_timestamp"
+                ],
+                "last_admitted_observation_timestamp": evidence[
+                    "last_admitted_observation_timestamp"
+                ],
+                "excluded_provisional_count": 1,
+                "excluded_outside_analysis_window_count": 2,
+                "cost_view_decision_path_sha256": path_sha,
+                "cost_view_path_parity": "matched",
+                "cost_view_count": 2,
+                "shared_stream_required": True,
+            },
             "selection_score": 1.0,
         }
         result["artifact_sha256"] = canonical_sha256(result)
@@ -327,6 +543,47 @@ def test_controller_materializes_both_cost_results_from_one_stream(
     assert result["completedTaskCount"] == 1
     assert gateway.acks == ["lease-1"]
     assert len(gateway.enqueued) == 1
+    checkpoint = json.loads((tmp_path / "checkpoint.json").read_text(encoding="utf-8"))
+    record = checkpoint["completed"][task["task_id"]]
+    assert record["resultPath"].endswith(".json.gz")
+    assert (tmp_path / "results" / f"{task['task_id']}.json.gz").is_file()
+    assert not (tmp_path / "results" / f"{task['task_id']}.json").exists()
+    assert record["resultSha256"] == record["resultSemanticSha256"]
+    assert record["resultBlobSizeBytes"] < record["resultUncompressedSizeBytes"]
+    journal = checkpoint["journal"]
+    assert journal == [{"taskId": task["task_id"], **record}]
+
+    resumed = run_temporal_search_tasks(
+        gateway,
+        authority,
+        output_root=tmp_path,
+        timeout_seconds=1,
+        resume=True,
+    )
+    assert resumed == result
+    assert len(gateway.enqueued) == 1
+
+
+def test_resume_rejects_checkpoint_without_result_path(tmp_path: Path) -> None:
+    authority = build_authority(_preparation())
+    task = build_task_matrix(authority)[0]
+    gateway = _Gateway(task)
+    run_temporal_search_tasks(gateway, authority, output_root=tmp_path, timeout_seconds=1)
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    checkpoint["completed"][task["task_id"]]["resultPath"] = ""
+    checkpoint_path.write_text(json.dumps(checkpoint), encoding="utf-8")
+
+    with pytest.raises(
+        TemporalSearchContractError, match="checkpoint result path is required"
+    ):
+        run_temporal_search_tasks(
+            gateway,
+            authority,
+            output_root=tmp_path,
+            timeout_seconds=1,
+            resume=True,
+        )
 
 
 def test_controller_enqueues_large_matrices_in_bounded_batches(tmp_path: Path) -> None:
@@ -455,6 +712,86 @@ def test_result_rejects_different_cost_observation_streams(tmp_path: Path) -> No
     with pytest.raises(
         TemporalSearchContractError, match="identical observation stream"
     ):
+        run_temporal_search_tasks(
+            gateway, authority, output_root=tmp_path, timeout_seconds=1
+        )
+
+
+@pytest.mark.parametrize(
+    ("defect", "message"),
+    (
+        ("requested_limit", "requested bar limit does not match task"),
+        ("effective_diagnostic", "diagnostics effective_bar_limit"),
+        ("observation_count", "actual observation evidence"),
+        ("warmup", "strict warmup evidence"),
+        ("prebuilt_warmup", "must be measured"),
+        ("endpoint", "half-open evidence"),
+        ("exclusion_count", "diagnostics excluded_provisional_count"),
+        ("terminal", "terminalValuation must be an object"),
+        ("path_parity", "diverged in non-cost route/path evidence"),
+    ),
+)
+def test_controller_fails_closed_on_v3_evidence_and_terminal_contract_drift(
+    tmp_path: Path,
+    defect: str,
+    message: str,
+) -> None:
+    authority = build_authority(_preparation())
+    task = build_task_matrix(authority)[0]
+    gateway = _Gateway(task)
+    original = gateway.read_results
+
+    def broken(*, limit: int):
+        rows = original(limit=limit)
+        if not rows:
+            return rows
+        result = rows[0]["result"]["result"]
+        evidence = result["evidence_contract"]
+        diagnostics = result["diagnostics"]
+        if defect == "requested_limit":
+            evidence["requested_bar_limit"] += 1
+        elif defect == "effective_diagnostic":
+            diagnostics["effective_bar_limit"] += 1
+        elif defect == "observation_count":
+            result["observation_summary"]["observation_count"] += 1
+        elif defect == "warmup":
+            evidence["warmup_sufficient"] = False
+        elif defect == "prebuilt_warmup":
+            evidence["warmup_sufficiency"] = {
+                "sufficient": True,
+                "source": "prebuilt_stream",
+            }
+            diagnostics["warmup_sufficiency"] = evidence["warmup_sufficiency"]
+        elif defect == "endpoint":
+            evidence["last_admitted_observation_timestamp"] = evidence[
+                "analysis_window_end"
+            ]
+        elif defect == "exclusion_count":
+            diagnostics.pop("excluded_provisional_count")
+        elif defect == "terminal":
+            metrics = result["cost_view_results"]["research_conservative"][
+                "replay_result"
+            ]["metrics"]
+            metrics["unresolvedPosition"] = True
+            metrics.pop("terminalValuation")
+        else:
+            result["cost_view_results"]["none"]["replay_result"][
+                "graphTraces"
+            ] = [
+                {
+                    "eventSequence": 0,
+                    "eventClass": "decision",
+                    "priorStateId": "start",
+                    "nextStateId": "next",
+                    "transitionId": "transition",
+                    "reasonCode": "fixture",
+                    "intentIds": [],
+                }
+            ]
+        return rows
+
+    gateway.read_results = broken  # type: ignore[method-assign]
+    with pytest.raises(TemporalSearchContractError, match=message):
         run_temporal_search_tasks(
             gateway, authority, output_root=tmp_path, timeout_seconds=1
         )

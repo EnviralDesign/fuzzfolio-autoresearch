@@ -1,0 +1,20 @@
+{
+  "timeframes": {
+    "M5": {"value": "M5"},
+    "M15": {"value": "M15"}
+  },
+  "indicators": [
+    {
+      "meta": {
+        "id": "ATR_VOLATILITY_FILTER",
+        "managementScalarOutputs": [
+          {
+            "outputKey": "atr_raw",
+            "valueKind": "price_distance",
+            "unit": "price_distance"
+          }
+        ]
+      }
+    }
+  ]
+}

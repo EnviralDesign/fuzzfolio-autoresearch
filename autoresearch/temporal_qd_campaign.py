@@ -14,14 +14,22 @@ from .temporal_discovery_base import (
     canonical_sha256,
 )
 from .temporal_discovery_validation import _rotate_evidence_plan
-from .temporal_qd_evolution import QD_POPULATION_SCHEMA, _load_population, _read
+from .temporal_qd_evolution import (
+    QD_POLICY_NAME,
+    QD_POLICY_SHA256,
+    QD_POPULATION_SCHEMA,
+    _load_population,
+    _read,
+    qd_canonical_evidence_identity,
+    qd_predeclared_evidence_context,
+)
 from .temporal_search import (
     TEMPORAL_SEARCH_PREPARATION_SCHEMA,
     build_authority,
     materialize_plan,
 )
 
-QD_CAMPAIGN_SCHEMA = "temporal_qd_screening_campaign_v2"
+QD_CAMPAIGN_SCHEMA = "temporal_qd_screening_campaign_v3"
 INITIAL_POPULATION_SCHEMA = "temporal_discovery_population_v2"
 
 
@@ -37,6 +45,8 @@ def _write_once(path: Path, value: Mapping[str, Any]) -> None:
         raise TemporalDiscoveryContractError(
             f"refusing to overwrite divergent QD campaign file: {path}"
         )
+    if path.exists():
+        return
     path.write_text(encoded, encoding="utf-8")
 
 
@@ -47,6 +57,7 @@ def freeze_qd_screening_campaign(
     output_root: Path | str,
     execution_engine_commit: str,
     worker_contract_sha256: str | None = None,
+    construction_catalog_path: Path | str | None = None,
 ) -> dict[str, Any]:
     population_file = Path(population_path)
     population_payload = _read(population_file, name="QD generation population")
@@ -54,6 +65,27 @@ def freeze_qd_screening_campaign(
     if population_schema not in {QD_POPULATION_SCHEMA, INITIAL_POPULATION_SCHEMA}:
         raise TemporalDiscoveryContractError("unknown QD generation population schema")
     candidates, population_sha = _load_population(population_file)
+    frozen_construction_catalog = (
+        _read(Path(construction_catalog_path), name="frozen QD construction catalog")
+        if construction_catalog_path is not None
+        else None
+    )
+    construction_catalog_identity = (
+        {
+            "path": str(Path(construction_catalog_path).resolve()),
+            "catalogSha256": canonical_sha256(frozen_construction_catalog),
+        }
+        if frozen_construction_catalog is not None
+        else None
+    )
+    if any(
+        isinstance(candidate.get("sourceProfile"), Mapping)
+        and bool(candidate["sourceProfile"].get("indicators"))
+        for candidate in candidates
+    ) and frozen_construction_catalog is None:
+        raise TemporalDiscoveryContractError(
+            "QD campaign with indicators requires a frozen construction catalog for lake scope"
+        )
     normalized_commit = execution_engine_commit.strip().lower()
     if len(normalized_commit) != 40 or any(
         value not in "0123456789abcdef" for value in normalized_commit
@@ -68,6 +100,24 @@ def freeze_qd_screening_campaign(
         raise TemporalDiscoveryContractError(
             "QD screening template is not a finite temporal preparation"
         )
+    evidence_context = qd_predeclared_evidence_context(
+        template,
+        worker_contract_sha256=worker_contract_sha256,
+        construction_catalog=frozen_construction_catalog,
+        construction_catalog_path=construction_catalog_path,
+    )
+    if population_schema == QD_POPULATION_SCHEMA:
+        if population_payload.get("policyName") != QD_POLICY_NAME or (
+            population_payload.get("policySha256") != QD_POLICY_SHA256
+        ):
+            raise TemporalDiscoveryContractError("QD v3 population policy mismatch")
+        if (
+            population_payload.get("predeclaredEvidenceContextSha256")
+            != evidence_context["predeclaredEvidenceContextSha256"]
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD population was generated for different predeclared evidence"
+            )
     source_candidates = template.get("candidates") or []
     windows = template.get("developmentWindows") or []
     if not source_candidates or not windows:
@@ -118,6 +168,8 @@ def freeze_qd_screening_campaign(
                             input_map[window_id],
                             raw_source_profile_sha256=source_sha,
                             source_profile=profile,
+                            base_decision_timeframe=exemplar["timeframe"],
+                            frozen_construction_catalog=frozen_construction_catalog,
                         ),
                     }
                     for window_id in window_ids
@@ -154,16 +206,32 @@ def freeze_qd_screening_campaign(
         str(item["candidateId"]): item.get("candidateIdentitySha256")
         for item in candidates
     }
+    candidate_map = {str(item["candidateId"]): item for item in candidates}
     evaluation_candidates = []
     for candidate in finite_candidates:
         profile = candidate["sourceProfile"]
         plans = [item["evidencePlan"] for item in candidate["windowInputs"]]
+        source_candidate = candidate_map[str(candidate["candidateId"])]
+        canonical_evidence_identity = None
+        if population_schema == QD_POPULATION_SCHEMA:
+            canonical_evidence_identity = qd_canonical_evidence_identity(
+                source_candidate, evidence_context
+            )
+            if (
+                source_candidate.get("canonicalEvidenceIdentitySha256")
+                != canonical_evidence_identity
+            ):
+                raise TemporalDiscoveryContractError(
+                    "QD candidate canonical evidence identity diverged before evaluation"
+                )
         evaluation_candidates.append(
             {
                 "candidateId": candidate["candidateId"],
                 "candidateIdentitySha256": candidate_identity_map[
                     str(candidate["candidateId"])
                 ],
+                "programSha256": source_candidate.get("programSha256"),
+                "canonicalEvidenceIdentitySha256": canonical_evidence_identity,
                 "sourceProfileSha256": candidate["sourceProfileSha256"],
                 "canonicalGraphSha256": canonical_sha256(profile["graph"]),
                 "executionConfigSha256": canonical_sha256(
@@ -189,8 +257,11 @@ def freeze_qd_screening_campaign(
             }
         )
     evaluation_identity = {
-        "schemaVersion": "temporal_qd_evaluation_identity_v1",
+        "schemaVersion": "temporal_qd_evaluation_identity_v3",
+        "policyName": QD_POLICY_NAME,
+        "policySha256": QD_POLICY_SHA256,
         "populationSha256": population_sha,
+        "constructionCatalog": construction_catalog_identity,
         "templatePreparationSha256": canonical_sha256(template),
         "workerContract": _clone(worker_contract, name="evaluation worker contract"),
         "executionEngineCommit": normalized_commit,
@@ -206,6 +277,10 @@ def freeze_qd_screening_campaign(
                 "commissionBps": 0.5,
             },
         },
+        "predeclaredEvidenceContext": evidence_context,
+        "predeclaredEvidenceContextSha256": evidence_context[
+            "predeclaredEvidenceContextSha256"
+        ],
         "warmupAndEligibilityPolicy": {
             "coveragePolicy": "require_complete",
             "barLimitBoundPerCandidate": True,
@@ -227,6 +302,7 @@ def freeze_qd_screening_campaign(
         "schemaVersion": QD_CAMPAIGN_SCHEMA,
         "generationIndex": generation_index,
         "populationSha256": population_sha,
+        "constructionCatalog": construction_catalog_identity,
         "preparationSha256": canonical_sha256(preparation),
         "authorityId": authority["authorityId"],
         "taskMatrixSha256": manifest["taskMatrixSha256"],
@@ -240,7 +316,7 @@ def freeze_qd_screening_campaign(
     campaign["campaignSha256"] = canonical_sha256(campaign)
     _write_once(root / "campaign.json", campaign)
     return {
-        "schemaVersion": "temporal_qd_screening_campaign_result_v2",
+        "schemaVersion": "temporal_qd_screening_campaign_result_v3",
         "campaignSha256": campaign["campaignSha256"],
         "authorityId": authority["authorityId"],
         "taskMatrixSha256": manifest["taskMatrixSha256"],
@@ -259,6 +335,7 @@ def main() -> None:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--execution-engine-commit", required=True)
     parser.add_argument("--worker-contract-sha256")
+    parser.add_argument("--construction-catalog", type=Path)
     args = parser.parse_args()
     print(
         json.dumps(
@@ -268,6 +345,7 @@ def main() -> None:
                 output_root=args.output_root,
                 execution_engine_commit=args.execution_engine_commit,
                 worker_contract_sha256=args.worker_contract_sha256,
+                construction_catalog_path=args.construction_catalog,
             ),
             indent=2,
             sort_keys=True,

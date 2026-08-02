@@ -20,6 +20,11 @@ from .temporal_search import (
     canonical_sha256,
     validate_authority,
 )
+from .lake_window import (
+    LakeWindowBinding,
+    lake_window_request_contains,
+    resolve_replay_lake_window_request,
+)
 
 from .temporal_discovery_base import *
 from .temporal_discovery_mutation import *
@@ -538,9 +543,60 @@ def _rotate_evidence_plan(
     *,
     raw_source_profile_sha256: str,
     source_profile: Mapping[str, Any],
+    base_decision_timeframe: str,
+    frozen_construction_catalog: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """Rotate only profile-bound evidence fields under an immutable lake binding.
+
+    A v2 plan's semantic digest is an attestation over the full lake request.
+    Therefore a candidate may reuse a frozen binding only when the canonical
+    dependency request derived from its actual profile is contained by that
+    binding.  This is intentionally not a local binding rehash: a wider scope
+    must be attested before a campaign is frozen.
+    """
+
     plan = _mapping(template, name="evidence plan template")
     profile = _mapping(source_profile, name="source profile")
+    if plan.get("schema_version") != "fuzzfolio.replay-evidence-plan.v2":
+        raise TemporalDiscoveryContractError(
+            "evidence-plan rotation requires replay evidence plan v2"
+        )
+    timeframe = str(base_decision_timeframe or "").strip().upper()
+    if not timeframe:
+        raise TemporalDiscoveryContractError(
+            "evidence-plan rotation requires a base decision timeframe"
+        )
+    pairs = profile.get("instruments")
+    if not isinstance(pairs, list) or not pairs:
+        raise TemporalDiscoveryContractError(
+            "candidate source profile requires instruments for lake-scope rotation"
+        )
+    try:
+        frozen_binding = LakeWindowBinding.model_validate(
+            plan.get("lake_window_binding")
+        )
+        required_request = resolve_replay_lake_window_request(
+            pairs=[str(pair) for pair in pairs],
+            base_timeframe=timeframe,
+            profile_snapshot=profile,
+            analysis_window_start=str(plan.get("analysis_window_start") or ""),
+            analysis_window_end=str(plan.get("analysis_window_end") or ""),
+            frozen_catalog=frozen_construction_catalog,
+        )
+    except (TypeError, ValueError) as exc:
+        raise TemporalDiscoveryContractError(
+            "candidate evidence-plan lake scope is malformed"
+        ) from exc
+    if not lake_window_request_contains(frozen_binding.request, required_request):
+        raise TemporalDiscoveryContractError(
+            "candidate-derived lake scope is outside the immutable pre-attested "
+            "evidence binding; timeframe construction is not admissible"
+        )
+
+    # Emit the canonical existing binding exactly.  It remains authoritative;
+    # profile/execution identity and the enclosing evidence-plan identity rotate
+    # below, but the remote-attested lake semantic identity never does.
+    plan["lake_window_binding"] = frozen_binding.model_dump(mode="json")
     execution_config = _mapping(
         profile.get("executionConfig"),
         name="source profile executionConfig",
@@ -614,6 +670,7 @@ def _finite_preparation(
                             template_map[window_id],
                             raw_source_profile_sha256=raw_sha,
                             source_profile=source_profile,
+                            base_decision_timeframe=normalized["timeframe"],
                         ),
                     }
                     for window_id in window_ids

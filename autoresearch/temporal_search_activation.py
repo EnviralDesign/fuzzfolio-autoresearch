@@ -17,6 +17,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+from .result_codec import ResultCodecError, read_json_object as _read_codec_json_object
 from .temporal_search import canonical_sha256
 
 
@@ -58,11 +59,9 @@ def _clone(value: Any) -> Any:
 
 def _read(path: Path, *, name: str) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value, _ = _read_codec_json_object(path)
+    except ResultCodecError as exc:
         raise TemporalSearchActivationError(f"could not read {name}: {path}") from exc
-    if not isinstance(value, dict):
-        raise TemporalSearchActivationError(f"{name} root must be an object")
     return _clone(value)
 
 
@@ -140,9 +139,21 @@ def _window_id(payload: Mapping[str, Any]) -> str:
 
 
 def _load_result_stage(root: Path, *, stage: str) -> list[dict[str, Any]]:
-    files = sorted((root / "results").glob("*.json"))
+    result_dir = root / "results"
+    files = sorted(
+        [*result_dir.glob("*.json"), *result_dir.glob("*.json.gz")],
+        key=lambda path: path.name,
+    )
     if not files:
         raise TemporalSearchActivationError(f"no {stage} results under {root}")
+    stems: set[str] = set()
+    for path in files:
+        stem = path.name.removesuffix(".gz").removesuffix(".json")
+        if stem in stems:
+            raise TemporalSearchActivationError(
+                f"ambiguous duplicate result representations: {stem}"
+            )
+        stems.add(stem)
     output = []
     seen: set[tuple[str, str]] = set()
     for path in files:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import datetime, time, timedelta, timezone
 from typing import Any, Literal, Mapping, Sequence
 
@@ -83,6 +84,55 @@ class LakeWindowRequest(BaseModel):
         return self.model_dump(mode="json")
 
 
+def canonicalize_lake_window_request(
+    request: LakeWindowRequest | Mapping[str, Any],
+) -> LakeWindowRequest:
+    """Return a validated canonical request.
+
+    Keep this mirror of the shared-core contract deliberately small: callers
+    use it to prove that an immutable, attested request already contains a
+    candidate's replay dependency.  It never manufactures a new lake identity.
+    """
+
+    if isinstance(request, LakeWindowRequest):
+        return LakeWindowRequest.model_validate(request.model_dump())
+    return LakeWindowRequest.model_validate(dict(request))
+
+
+def lake_window_request_contains(
+    frozen_request: LakeWindowRequest | Mapping[str, Any],
+    derived_request: LakeWindowRequest | Mapping[str, Any],
+) -> bool:
+    """Return whether a frozen lake request safely contains a dependency.
+
+    This is intentionally the shared-core containment rule: a pre-attested
+    request can safely carry extra timeframes and earlier warmup, but it cannot
+    change the dataset, instrument universe, coverage policy, or end boundary.
+    """
+
+    frozen = canonicalize_lake_window_request(frozen_request)
+    derived = canonicalize_lake_window_request(derived_request)
+    if frozen.schema_version != derived.schema_version:
+        return False
+    if frozen.dataset != derived.dataset:
+        return False
+    if frozen.pairs != derived.pairs:
+        return False
+    if frozen.coverage_policy != derived.coverage_policy:
+        return False
+    if frozen.data_end != derived.data_end:
+        return False
+    if not set(derived.timeframes).issubset(frozen.timeframes):
+        return False
+    frozen_start = parse_utc_timestamp(
+        frozen.data_start, field_name="frozen_request.data_start"
+    )
+    derived_start = parse_utc_timestamp(
+        derived.data_start, field_name="derived_request.data_start"
+    )
+    return frozen_start <= derived_start
+
+
 class LakeWindowBinding(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -122,6 +172,192 @@ def _indicator_value(indicator: Any, area: str, key: str, default: Any = None) -
     return getattr(nested, key, default) if nested is not None else default
 
 
+def _deep_merge_catalog_config(
+    base: Mapping[str, Any], overlay: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Match the catalog/default merge used by temporal profile hydration."""
+
+    merged = deepcopy(dict(base))
+    for key, value in overlay.items():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _deep_merge_catalog_config(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+    return merged
+
+
+def _catalog_indicator_items(catalog: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return the only catalog view accepted for hydrated lake scope.
+
+    This is deliberately stricter than construction-plan enumeration.  The
+    latter can operate on the metadata it needs for an operator, while an
+    evidence request must prove the complete active indicator dependency used
+    by the canonical FuzzFolio hydration boundary.
+    """
+
+    raw_items = catalog.get("indicators")
+    if not isinstance(raw_items, list):
+        raise ValueError("frozen construction catalog requires an indicators array")
+    items: dict[str, dict[str, Any]] = {}
+    for raw in raw_items:
+        if not isinstance(raw, Mapping):
+            raise ValueError("frozen construction catalog indicator is malformed")
+        meta = raw.get("meta")
+        config = raw.get("config")
+        if not isinstance(meta, Mapping) or not isinstance(config, Mapping):
+            raise ValueError(
+                "frozen construction catalog indicator requires meta and config"
+            )
+        indicator_id = str(meta.get("id") or "").strip()
+        if not indicator_id or indicator_id in items:
+            raise ValueError(
+                "frozen construction catalog indicator IDs must be non-empty and unique"
+            )
+        items[indicator_id] = {
+            "meta": deepcopy(dict(meta)),
+            "config": deepcopy(dict(config)),
+        }
+    if not items:
+        raise ValueError("frozen construction catalog has no indicators")
+    return items
+
+
+def hydrate_profile_for_lake_scope(
+    profile_snapshot: Any,
+    *,
+    frozen_catalog: Mapping[str, Any] | None,
+) -> Any:
+    """Catalog-hydrate replay dependencies before deriving a lake request.
+
+    FuzzFolio's canonical worker first calls
+    ``hydrate_temporal_profile_from_catalog`` and only then derives the lake
+    scope.  AutoResearch cannot treat abbreviated authored metadata as an
+    alternate authority: doing so lets an omitted ``requiredPaddingBars``
+    shrink a pre-attested window.  This small transport-safe mirror therefore
+    uses only the supplied, identity-bound construction catalog for the
+    dependency fields consumed by the shared lake resolver.
+
+    It intentionally does *not* mint a resolved profile/program identity or a
+    lake semantic hash.  The authoritative worker still performs complete
+    profile hydration at execution; this helper only makes the freeze-time
+    containment calculation conservatively match that same catalog boundary.
+    """
+
+    if isinstance(profile_snapshot, Mapping):
+        profile = deepcopy(dict(profile_snapshot))
+        raw_indicators = profile.get("indicators")
+    else:
+        # Existing non-mapping callers are retained only for profile objects
+        # that already carry fully resolved indicator objects.  New QD/panel
+        # callers are JSON mappings and must supply a frozen catalog below.
+        raw_indicators = getattr(profile_snapshot, "indicators", None)
+        if raw_indicators is None:
+            return profile_snapshot
+        profile = {"indicators": list(raw_indicators)}
+
+    if raw_indicators is None:
+        return profile
+    if not isinstance(raw_indicators, list):
+        raise ValueError("source profile indicators must be an array")
+
+    # A no-indicator profile has no catalog-backed warmup dependency.  This
+    # preserves valid pre-construction fixtures without providing a backdoor
+    # for any active indicator to receive a synthetic zero padding value.
+    if not raw_indicators:
+        return profile
+    if frozen_catalog is None:
+        raise ValueError(
+            "active indicator lake scope requires an identity-bound frozen construction catalog"
+        )
+    catalog_items = _catalog_indicator_items(frozen_catalog)
+    raw_timeframes = frozen_catalog.get("timeframes")
+    if not isinstance(raw_timeframes, Mapping) or not raw_timeframes:
+        raise ValueError("frozen construction catalog requires timeframes")
+    catalog_timeframes = {
+        str(value).strip().upper() for value in raw_timeframes if str(value).strip()
+    }
+    if not catalog_timeframes:
+        raise ValueError("frozen construction catalog timeframes are malformed")
+    resolved: list[dict[str, Any]] = []
+    for index, raw_indicator in enumerate(raw_indicators):
+        if not isinstance(raw_indicator, Mapping):
+            raise ValueError(f"source profile indicator {index} is malformed")
+        authored_meta = raw_indicator.get("meta")
+        authored_config = raw_indicator.get("config")
+        if not isinstance(authored_meta, Mapping) or not isinstance(authored_config, Mapping):
+            raise ValueError(
+                f"source profile indicator {index} requires meta and config for catalog hydration"
+            )
+        indicator_id = str(authored_meta.get("id") or "").strip()
+        if not indicator_id:
+            raise ValueError(f"source profile indicator {index} lacks a catalog ID")
+        catalog_item = catalog_items.get(indicator_id)
+        if catalog_item is None:
+            raise ValueError(
+                f"source profile indicator {indicator_id!r} is absent from the frozen construction catalog"
+            )
+        catalog_meta = catalog_item["meta"]
+        for key, authored_value in authored_meta.items():
+            if key in {"instanceId", "instance_id"}:
+                continue
+            if key not in catalog_meta:
+                raise ValueError(
+                    f"source profile indicator {indicator_id!r} has unknown catalog metadata {key!r}"
+                )
+            if authored_value != catalog_meta[key]:
+                raise ValueError(
+                    f"source profile indicator {indicator_id!r} catalog metadata mismatch for {key!r}"
+                )
+        if "requiredPaddingBars" not in catalog_meta:
+            raise ValueError(
+                f"frozen construction catalog indicator {indicator_id!r} lacks requiredPaddingBars"
+            )
+        try:
+            required_padding = int(catalog_meta["requiredPaddingBars"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"frozen construction catalog indicator {indicator_id!r} has invalid requiredPaddingBars"
+            ) from exc
+        if required_padding < 0:
+            raise ValueError(
+                f"frozen construction catalog indicator {indicator_id!r} has negative requiredPaddingBars"
+            )
+
+        # The canonical hydrator overlays authored config onto catalog defaults
+        # and forces the complete resolved snapshot active.  Preserve that
+        # dependency behavior here so an abbreviated source cannot omit its
+        # timeframe or lookback from evidence containment.
+        config = _deep_merge_catalog_config(catalog_item["config"], authored_config)
+        config["isActive"] = True
+        timeframe = str(config.get("timeframe") or "").strip().upper()
+        if not timeframe:
+            raise ValueError(
+                f"catalog-hydrated indicator {indicator_id!r} lacks a timeframe"
+            )
+        if timeframe not in catalog_timeframes:
+            raise ValueError(
+                f"catalog-hydrated indicator {indicator_id!r} uses a timeframe absent from the frozen construction catalog"
+            )
+        try:
+            lookback = int(config.get("lookbackBars"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"catalog-hydrated indicator {indicator_id!r} has invalid lookbackBars"
+            ) from exc
+        if lookback < 0:
+            raise ValueError(
+                f"catalog-hydrated indicator {indicator_id!r} has negative lookbackBars"
+            )
+        meta = deepcopy(catalog_meta)
+        meta["requiredPaddingBars"] = required_padding
+        instance_id = authored_meta.get("instanceId", authored_meta.get("instance_id"))
+        if instance_id is not None:
+            meta["instanceId"] = deepcopy(instance_id)
+        resolved.append({"meta": meta, "config": config})
+    profile["indicators"] = resolved
+    return profile
+
+
 def _timeframe_minutes(value: str) -> int:
     token = str(value).strip().upper()
     if token.startswith("M"):
@@ -140,16 +376,31 @@ def resolve_replay_lake_window_request(
     profile_snapshot: Any,
     analysis_window_start: str | datetime,
     analysis_window_end: str | datetime,
+    frozen_catalog: Mapping[str, Any] | None = None,
 ) -> LakeWindowRequest:
-    """Mirror the replay worker's exact day-aligned data dependency scope."""
+    """Mirror the replay worker's exact day-aligned data dependency scope.
+
+    When a frozen catalog is supplied, resolve the profile's evidence
+    dependencies through that catalog before inspecting any indicator field.
+    This is required for new QD/panel work: authored indicator metadata is an
+    abbreviation, not authority for warmup or timeframe defaults.
+    """
 
     base_tf = str(base_timeframe or "").strip().upper()
     if not base_tf:
         raise ValueError("base_timeframe is required")
+    scope_profile = (
+        hydrate_profile_for_lake_scope(
+            profile_snapshot,
+            frozen_catalog=frozen_catalog,
+        )
+        if frozen_catalog is not None
+        else profile_snapshot
+    )
     indicators = (
-        list(profile_snapshot.get("indicators") or [])
-        if isinstance(profile_snapshot, Mapping)
-        else list(getattr(profile_snapshot, "indicators", None) or [])
+        list(scope_profile.get("indicators") or [])
+        if isinstance(scope_profile, Mapping)
+        else list(getattr(scope_profile, "indicators", None) or [])
     )
     timeframes = [base_tf]
     warmup_minutes = 0

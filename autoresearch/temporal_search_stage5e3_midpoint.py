@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 
+from .result_codec import ResultCodecError, read_json_object as _read_codec_json_object
 from .play_hand_lab_auth import load_lab_gateway_token
 from .temporal_discovery_base import TemporalDiscoveryContractError
 from .temporal_discovery_results import (
@@ -63,11 +64,9 @@ _SHA40 = re.compile(r"[0-9a-f]{40}")
 
 def _read(path: Path, *, name: str) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        value, _ = _read_codec_json_object(path)
+    except ResultCodecError as exc:
         raise TemporalDiscoveryContractError(f"could not read {name}: {path}") from exc
-    if not isinstance(value, dict):
-        raise TemporalDiscoveryContractError(f"{name} root must be an object")
     return value
 
 
@@ -293,13 +292,59 @@ def _result_integrity(
     result_files = []
     for task_id in sorted(task_ids):
         row = completed[task_id]
+        if not isinstance(row, Mapping):
+            raise TemporalDiscoveryContractError("screening completion is invalid")
         path = Path(str(row.get("resultPath") or ""))
         try:
             path.resolve().relative_to((run_root / "results").resolve())
         except ValueError as exc:
             raise TemporalDiscoveryContractError("result escaped screening root") from exc
-        payload = _read(path, name=f"screening result {task_id}")
-        if canonical_sha256(payload) != row.get("resultSha256"):
+        try:
+            payload, representation = _read_codec_json_object(path)
+        except ResultCodecError as exc:
+            raise TemporalDiscoveryContractError(
+                f"could not read screening result {task_id}: {path}"
+            ) from exc
+        representation_fields = (
+            "resultCodec",
+            "resultSemanticSha256",
+            "resultSemanticSizeBytes",
+            "resultUncompressedSha256",
+            "resultUncompressedSizeBytes",
+            "resultBlobSha256",
+            "resultBlobSizeBytes",
+        )
+        present_representation_fields = [
+            key for key in representation_fields if key in row
+        ]
+        if (
+            present_representation_fields
+            and len(present_representation_fields) != len(representation_fields)
+        ):
+            raise TemporalDiscoveryContractError(
+                f"screening result representation is incomplete: {task_id}"
+            )
+        expected_representation = {
+            metadata_key: row[row_key]
+            for metadata_key, row_key in (
+                ("codec", "resultCodec"),
+                ("semanticSha256", "resultSemanticSha256"),
+                ("semanticSizeBytes", "resultSemanticSizeBytes"),
+                ("uncompressedSha256", "resultUncompressedSha256"),
+                ("uncompressedSizeBytes", "resultUncompressedSizeBytes"),
+                ("blobSha256", "resultBlobSha256"),
+                ("blobSizeBytes", "resultBlobSizeBytes"),
+            )
+            if row_key in row
+        }
+        if any(
+            representation[key] != value
+            for key, value in expected_representation.items()
+        ):
+            raise TemporalDiscoveryContractError(
+                f"screening result representation drift: {task_id}"
+            )
+        if representation["semanticSha256"] != row.get("resultSha256"):
             raise TemporalDiscoveryContractError(f"screening result hash drift: {task_id}")
         bounds = (
             str(payload.get("analysis_window_start") or ""),
@@ -324,15 +369,27 @@ def _result_integrity(
         raw_by_candidate[candidate_id].append(payload)
         pool_counts[str(worker.get("worker_pool") or "unknown")] += 1
         window_counts[label] += 1
-        result_files.append(
-            {
-                "taskId": task_id,
-                "candidateId": candidate_id,
-                "windowLabel": label,
-                "resultSha256": row["resultSha256"],
-                "fileSha256": _file_sha256(path),
-            }
-        )
+        inventory = {
+            "taskId": task_id,
+            "candidateId": candidate_id,
+            "windowLabel": label,
+            "resultSha256": row["resultSha256"],
+        }
+        if row.get("resultCodec") is None:
+            # Preserve v2's inventory material exactly for historical audits.
+            inventory["fileSha256"] = _file_sha256(path)
+        else:
+            inventory.update(
+                {
+                    "resultCodec": representation["codec"],
+                    "semanticSizeBytes": representation["semanticSizeBytes"],
+                    "uncompressedSha256": representation["uncompressedSha256"],
+                    "uncompressedSizeBytes": representation["uncompressedSizeBytes"],
+                    "blobSha256": representation["blobSha256"],
+                    "blobSizeBytes": representation["blobSizeBytes"],
+                }
+            )
+        result_files.append(inventory)
     if (
         set(raw_by_candidate) != population_ids
         or any(len(rows) != 2 for rows in raw_by_candidate.values())

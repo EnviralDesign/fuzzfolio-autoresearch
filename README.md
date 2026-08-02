@@ -97,6 +97,8 @@ Deep-replay worker completions must also be scoreable. If the coordinator cannot
 
 By default v2 writes only canonical scoreable artifacts and compact JSON. It does not retain the verbose `lab-result.json`, `lab-worker-result.json`, or `sweep-shard-result.json` debug envelopes unless `--retain-raw-lab-artifacts` is set.
 
+Temporal candidate/window controllers persist new completed results as verified deterministic `results/*.json.gz` blobs and retain the uncompressed semantic hash in their checkpoint. This reduces local run-disk use only: gateway result transport still has its existing 64 MiB bound, and this phase does not add shared-path or content-addressed chunk transport.
+
 Coordinator stdout defaults to `--log-mode barrier`: bounded ASCII snapshots of gateway pressure and lane state, with explicit failure notices between snapshots. Use `--log-mode stream` when every JSONL event should also be printed with lane/task context, or `--log-mode quiet` when stdout should stay minimal.
 
 Safe starting point:

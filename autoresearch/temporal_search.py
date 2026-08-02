@@ -10,14 +10,21 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
-import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import tempfile
 import time
 from typing import Any, Protocol
+
+from .result_codec import (
+    ResultCodecError,
+    read_json_object as _read_codec_json_object,
+    semantic_sha256 as _semantic_sha256,
+    write_gzip_json_once,
+)
 
 
 TEMPORAL_SEARCH_AUTHORITY_SCHEMA = "temporal_graph_candidate_window_authority_v1"
@@ -78,18 +85,7 @@ def _clone(value: Any, *, name: str) -> Any:
 
 
 def canonical_sha256(value: Any) -> str:
-    return (
-        "sha256:"
-        + hashlib.sha256(
-            json.dumps(
-                value,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-                allow_nan=False,
-            ).encode("utf-8")
-        ).hexdigest()
-    )
+    return _semantic_sha256(value)
 
 
 def _mapping(value: Any, *, name: str) -> dict[str, Any]:
@@ -136,6 +132,473 @@ def _stamp(value: Any, *, name: str) -> str:
 
 def _time(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _finite_number(value: Any, *, name: str) -> float:
+    if isinstance(value, bool):
+        raise TemporalSearchContractError(f"{name} must be numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TemporalSearchContractError(f"{name} must be numeric") from exc
+    if not math.isfinite(number):
+        raise TemporalSearchContractError(f"{name} must be finite")
+    return number
+
+
+def _nonnegative_integer(value: Any, *, name: str, minimum: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise TemporalSearchContractError(
+            f"{name} must be an integer greater than or equal to {minimum}"
+        )
+    return value
+
+
+def _same_number(left: float, right: float, *, name: str) -> None:
+    if not math.isclose(left, right, abs_tol=1e-9, rel_tol=1e-9):
+        raise TemporalSearchContractError(f"{name} is inconsistent")
+
+
+def _candidate_window_is_v3(material: Mapping[str, Any]) -> bool:
+    """Return whether a result claims any Stage 5E7-v3-only economics/evidence."""
+    if "evidence_contract" in material:
+        return True
+    cost_views = material.get("cost_view_results")
+    if not isinstance(cost_views, Mapping):
+        return False
+    for item in cost_views.values():
+        if not isinstance(item, Mapping):
+            continue
+        replay = item.get("replay_result")
+        if not isinstance(replay, Mapping):
+            continue
+        metrics = replay.get("metrics")
+        if isinstance(metrics, Mapping) and any(
+            key in metrics
+            for key in (
+                "terminalValuation",
+                "terminalAdjustedTotalGrossR",
+                "terminalAdjustedTotalNetR",
+                "terminalAdjustedTotalExecutionCostPercent",
+                "terminalAdjustedEquityCurveR",
+                "terminalAdjustedMaxDrawdownR",
+            )
+        ):
+            return True
+    return False
+
+
+def is_v3_candidate_window_result(material: Mapping[str, Any]) -> bool:
+    """Public, side-effect-free v3 discriminator for historical result readers."""
+    return _candidate_window_is_v3(material)
+
+
+def _path_rows(
+    rows: Any,
+    *,
+    name: str,
+    keys: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    if not isinstance(rows, list):
+        raise TemporalSearchContractError(f"{name} must be an array")
+    material: list[dict[str, Any]] = []
+    for index, item in enumerate(rows):
+        row = _mapping(item, name=f"{name}[{index}]")
+        if any(key not in row for key in keys):
+            raise TemporalSearchContractError(
+                f"{name}[{index}] is missing non-cost path evidence"
+            )
+        if "intentIds" in keys and not isinstance(row["intentIds"], list):
+            raise TemporalSearchContractError(
+                f"{name}[{index}].intentIds must be an array"
+            )
+        material.append({key: row[key] for key in keys})
+    return material
+
+
+def _cost_view_path_sha256(replay: Mapping[str, Any], *, name: str) -> str:
+    """Reproduce the worker's cost-neutral path attestation exactly."""
+    graph_rows = _path_rows(
+        replay.get("graphTraces"),
+        name=f"{name}.graphTraces",
+        keys=(
+            "eventSequence",
+            "eventClass",
+            "priorStateId",
+            "nextStateId",
+            "transitionId",
+            "reasonCode",
+            "intentIds",
+        ),
+    )
+    execution_rows = _path_rows(
+        replay.get("executionTraces"),
+        name=f"{name}.executionTraces",
+        keys=(
+            "eventSequence",
+            "clockIndex",
+            "marketBarId",
+            "phase",
+            "effectKind",
+            "status",
+            "effectId",
+            "intentId",
+            "actionKind",
+            "reasonCode",
+            "price",
+            "positionId",
+            "tradeId",
+        ),
+    )
+    trade_rows = _path_rows(
+        replay.get("trades"),
+        name=f"{name}.trades",
+        keys=(
+            "tradeId",
+            "positionId",
+            "openingIntentId",
+            "openingEffectId",
+            "closingIntentId",
+            "closingEffectId",
+            "entryBarId",
+            "exitBarId",
+            "entryPhase",
+            "exitPhase",
+            "entryTime",
+            "exitTime",
+            "entryClockIndex",
+            "exitClockIndex",
+            "entryPrice",
+            "exitPrice",
+            "closeReason",
+            "holdingBars",
+            "holdingHours",
+        ),
+    )
+    graph_path = [
+        {
+            "event_sequence": row["eventSequence"],
+            "event_class": row["eventClass"],
+            "prior_state_id": row["priorStateId"],
+            "next_state_id": row["nextStateId"],
+            "transition_id": row["transitionId"],
+            "reason_code": row["reasonCode"],
+            "intent_ids": list(row["intentIds"]),
+        }
+        for row in graph_rows
+    ]
+    execution_path = [
+        {
+            "event_sequence": row["eventSequence"],
+            "clock_index": row["clockIndex"],
+            "market_bar_id": row["marketBarId"],
+            "phase": row["phase"],
+            "effect_kind": row["effectKind"],
+            "status": row["status"],
+            "effect_id": row["effectId"],
+            "intent_id": row["intentId"],
+            "action_kind": row["actionKind"],
+            "reason_code": row["reasonCode"],
+            "price": row["price"],
+            "position_id": row["positionId"],
+            "trade_id": row["tradeId"],
+        }
+        for row in execution_rows
+    ]
+    trade_path = [
+        {
+            "trade_id": row["tradeId"],
+            "position_id": row["positionId"],
+            "opening_intent_id": row["openingIntentId"],
+            "opening_effect_id": row["openingEffectId"],
+            "closing_intent_id": row["closingIntentId"],
+            "closing_effect_id": row["closingEffectId"],
+            "entry_bar_id": row["entryBarId"],
+            "exit_bar_id": row["exitBarId"],
+            "entry_phase": row["entryPhase"],
+            "exit_phase": row["exitPhase"],
+            "entry_time": row["entryTime"],
+            "exit_time": row["exitTime"],
+            "entry_clock_index": row["entryClockIndex"],
+            "exit_clock_index": row["exitClockIndex"],
+            "entry_price": row["entryPrice"],
+            "exit_price": row["exitPrice"],
+            "close_reason": row["closeReason"],
+            "holding_bars": row["holdingBars"],
+            "holding_hours": row["holdingHours"],
+        }
+        for row in trade_rows
+    ]
+    return canonical_sha256(
+        {
+            "schema_version": "temporal_graph_cost_view_path_v1",
+            "graph_path": graph_path,
+            "execution_path": execution_path,
+            "trade_path": trade_path,
+        }
+    )
+
+
+def _max_drawdown(curve: list[float]) -> float:
+    peak = 0.0
+    drawdown = 0.0
+    for value in curve:
+        peak = max(peak, value)
+        drawdown = max(drawdown, peak - value)
+    return drawdown
+
+
+def _validate_terminal_metrics(
+    metrics: Mapping[str, Any],
+    *,
+    name: str,
+    expected_last_bar_start: str,
+) -> None:
+    """Verify the leave-open terminal economics supplied by the replay worker."""
+    terminal = _mapping(metrics.get("terminalValuation"), name=f"{name}.terminalValuation")
+    if terminal.get("schemaVersion") != "temporal_terminal_valuation_v1":
+        raise TemporalSearchContractError(f"{name} terminal valuation schema is required")
+    if terminal.get("policy") != "leave_open_mark_to_market_v1":
+        raise TemporalSearchContractError(f"{name} terminal valuation policy is required")
+    for key in (
+        "lastCompletedBarId",
+        "lastCompletedBarStart",
+        "lastCompletedBarClose",
+    ):
+        if not isinstance(terminal.get(key), str) or not terminal[key].strip():
+            raise TemporalSearchContractError(f"{name} terminal valuation {key} is required")
+    if _stamp(
+        terminal["lastCompletedBarStart"], name=f"{name}.terminalValuation.lastCompletedBarStart"
+    ) != expected_last_bar_start:
+        raise TemporalSearchContractError(f"{name} terminal valuation endpoint disagrees with evidence")
+    _stamp(
+        terminal["lastCompletedBarClose"], name=f"{name}.terminalValuation.lastCompletedBarClose"
+    )
+    if terminal.get("positionStatus") not in {"no_open_position", "open_position_marked"}:
+        raise TemporalSearchContractError(f"{name} terminal position status is invalid")
+    if terminal.get("pendingEffectStatus") not in {"none", "unresolved"}:
+        raise TemporalSearchContractError(f"{name} terminal pending-effect status is invalid")
+    if terminal.get("closedTradeCountDelta") != 0:
+        raise TemporalSearchContractError(f"{name} terminal valuation must not add closed trades")
+    mark_price = _finite_number(
+        terminal.get("markPrice"), name=f"{name}.terminalValuation.markPrice"
+    )
+    if mark_price <= 0.0:
+        raise TemporalSearchContractError(f"{name} terminal mark price must be positive")
+
+    unresolved_position = metrics.get("unresolvedPosition")
+    unresolved_pending = metrics.get("unresolvedPendingEffect")
+    if not isinstance(unresolved_position, bool) or not isinstance(unresolved_pending, bool):
+        raise TemporalSearchContractError(f"{name} unresolved status flags are required")
+    has_position = terminal["positionStatus"] == "open_position_marked"
+    if unresolved_position != has_position:
+        raise TemporalSearchContractError(f"{name} terminal position status disagrees with replay")
+    pending_unresolved = terminal["pendingEffectStatus"] == "unresolved"
+    if unresolved_pending != pending_unresolved:
+        raise TemporalSearchContractError(f"{name} terminal pending status disagrees with replay")
+    expected_treatment = (
+        "canceled_for_terminal_valuation_only"
+        if pending_unresolved
+        else "not_applicable"
+    )
+    if terminal.get("pendingEffectCancellationTreatment") != expected_treatment:
+        raise TemporalSearchContractError(f"{name} terminal pending treatment is inconsistent")
+
+    raw_gross = _finite_number(metrics.get("totalGrossR"), name=f"{name}.totalGrossR")
+    raw_net = _finite_number(metrics.get("totalNetR"), name=f"{name}.totalNetR")
+    raw_cost = _finite_number(
+        metrics.get("totalExecutionCostPercent"), name=f"{name}.totalExecutionCostPercent"
+    )
+    adjusted_gross = _finite_number(
+        metrics.get("terminalAdjustedTotalGrossR"),
+        name=f"{name}.terminalAdjustedTotalGrossR",
+    )
+    adjusted_net = _finite_number(
+        metrics.get("terminalAdjustedTotalNetR"),
+        name=f"{name}.terminalAdjustedTotalNetR",
+    )
+    adjusted_cost = _finite_number(
+        metrics.get("terminalAdjustedTotalExecutionCostPercent"),
+        name=f"{name}.terminalAdjustedTotalExecutionCostPercent",
+    )
+    adjusted_drawdown = _finite_number(
+        metrics.get("terminalAdjustedMaxDrawdownR"),
+        name=f"{name}.terminalAdjustedMaxDrawdownR",
+    )
+    if raw_cost < 0.0 or adjusted_cost < 0.0 or adjusted_drawdown < 0.0:
+        raise TemporalSearchContractError(f"{name} terminal economics must be nonnegative where required")
+    curve_raw = metrics.get("terminalAdjustedEquityCurveR")
+    if not isinstance(curve_raw, list):
+        raise TemporalSearchContractError(f"{name}.terminalAdjustedEquityCurveR must be an array")
+    curve = [
+        _finite_number(value, name=f"{name}.terminalAdjustedEquityCurveR[{index}]")
+        for index, value in enumerate(curve_raw)
+    ]
+    if not curve:
+        raise TemporalSearchContractError(
+            f"{name}.terminalAdjustedEquityCurveR must be a nonempty array"
+        )
+    _same_number(curve[-1], adjusted_net, name=f"{name} terminal adjusted equity end")
+    _same_number(
+        _max_drawdown(curve), adjusted_drawdown, name=f"{name} terminal adjusted drawdown"
+    )
+
+    if has_position:
+        for key in ("positionId", "direction", "grossR", "netR"):
+            if terminal.get(key) is None:
+                raise TemporalSearchContractError(f"{name} terminal open position is incomplete")
+        _sha(terminal["positionId"], name=f"{name}.terminalValuation.positionId")
+        if terminal["direction"] not in {"long", "short"}:
+            raise TemporalSearchContractError(f"{name} terminal direction is invalid")
+        terminal_gross = _finite_number(terminal["grossR"], name=f"{name}.terminalValuation.grossR")
+        terminal_net = _finite_number(terminal["netR"], name=f"{name}.terminalValuation.netR")
+        exit_cost = _finite_number(
+            terminal.get("exitCostPercent"), name=f"{name}.terminalValuation.exitCostPercent"
+        )
+    else:
+        if any(
+            terminal.get(key) is not None
+            for key in ("positionId", "direction", "grossR", "netR")
+        ):
+            raise TemporalSearchContractError(f"{name} no-position terminal valuation must be zero")
+        terminal_gross = 0.0
+        terminal_net = 0.0
+        exit_cost = _finite_number(
+            terminal.get("exitCostPercent"), name=f"{name}.terminalValuation.exitCostPercent"
+        )
+        if exit_cost != 0.0:
+            raise TemporalSearchContractError(f"{name} no-position terminal valuation must not charge exit cost")
+    if exit_cost < 0.0:
+        raise TemporalSearchContractError(f"{name} terminal exit cost must be nonnegative")
+    _same_number(raw_gross + terminal_gross, adjusted_gross, name=f"{name} terminal gross total")
+    _same_number(raw_net + terminal_net, adjusted_net, name=f"{name} terminal net total")
+    _same_number(raw_cost + exit_cost, adjusted_cost, name=f"{name} terminal cost total")
+
+
+def validate_v3_candidate_window_result(
+    material: Mapping[str, Any],
+    *,
+    task_payload: Mapping[str, Any] | None = None,
+) -> None:
+    """Fail closed on the Stage 5E7-v3 evidence and terminal-economics contract.
+
+    Legacy v1 artifacts intentionally do not enter this function.  They remain
+    readable for audit, but cannot impersonate a v3 candidate/window result.
+    """
+    if not _candidate_window_is_v3(material):
+        raise TemporalSearchContractError("candidate-window result is not Stage 5E7-v3 evidence")
+    evidence = _mapping(material.get("evidence_contract"), name="worker material evidence_contract")
+    if evidence.get("schema_version") != "temporal_graph_candidate_window_evidence_contract_v1":
+        raise TemporalSearchContractError("candidate-window v3 evidence contract schema is required")
+    start = _stamp(material.get("analysis_window_start"), name="worker material analysis_window_start")
+    end = _stamp(material.get("analysis_window_end"), name="worker material analysis_window_end")
+    if not _time(start) < _time(end):
+        raise TemporalSearchContractError("candidate-window analysis interval must be half-open and nonempty")
+    if (
+        _stamp(evidence.get("analysis_window_start"), name="evidence analysis_window_start") != start
+        or _stamp(evidence.get("analysis_window_end"), name="evidence analysis_window_end") != end
+        or evidence.get("analysis_window_end_exclusive") is not True
+    ):
+        raise TemporalSearchContractError("candidate-window evidence interval is incomplete or inconsistent")
+    if task_payload is not None:
+        if start != _stamp(task_payload.get("analysis_window_start"), name="task analysis_window_start") or end != _stamp(task_payload.get("analysis_window_end"), name="task analysis_window_end"):
+            raise TemporalSearchContractError("candidate-window result interval does not match task")
+
+    requested = _nonnegative_integer(
+        evidence.get("requested_bar_limit"), name="evidence requested_bar_limit", minimum=1
+    )
+    effective = _nonnegative_integer(
+        evidence.get("effective_bar_limit"), name="evidence effective_bar_limit", minimum=1
+    )
+    if effective < requested:
+        raise TemporalSearchContractError("candidate-window effective bar limit is below requested limit")
+    if task_payload is not None and requested != _nonnegative_integer(
+        task_payload.get("bar_limit"), name="task bar_limit", minimum=1
+    ):
+        raise TemporalSearchContractError("candidate-window requested bar limit does not match task")
+    observation_count = _nonnegative_integer(
+        evidence.get("observation_count"), name="evidence observation_count", minimum=1
+    )
+    first = _stamp(
+        evidence.get("first_admitted_observation_timestamp"), name="evidence first observation"
+    )
+    last = _stamp(
+        evidence.get("last_admitted_observation_timestamp"), name="evidence last observation"
+    )
+    if not (_time(start) <= _time(first) <= _time(last) < _time(end)):
+        raise TemporalSearchContractError("candidate-window admitted observation endpoints are not complete half-open evidence")
+    warmup = _mapping(evidence.get("warmup_sufficiency"), name="evidence warmup_sufficiency")
+    if evidence.get("warmup_sufficient") is not True or warmup.get("sufficient") is not True:
+        raise TemporalSearchContractError("candidate-window strict warmup evidence is insufficient")
+    if warmup.get("source") == "prebuilt_stream":
+        raise TemporalSearchContractError(
+            "candidate-window strict warmup evidence must be measured, not a prebuilt-stream fallback"
+        )
+    excluded_provisional = _nonnegative_integer(
+        evidence.get("excluded_provisional_count"), name="evidence excluded_provisional_count"
+    )
+    excluded_outside = _nonnegative_integer(
+        evidence.get("excluded_outside_analysis_window_count"),
+        name="evidence excluded_outside_analysis_window_count",
+    )
+    summary = _mapping(material.get("observation_summary"), name="worker material observation_summary")
+    if (
+        _nonnegative_integer(summary.get("observation_count"), name="observation summary count", minimum=1) != observation_count
+        or _stamp(summary.get("first_bar_start"), name="observation summary first") != first
+        or _stamp(summary.get("last_bar_start"), name="observation summary last") != last
+    ):
+        raise TemporalSearchContractError("candidate-window actual observation evidence disagrees with contract")
+
+    diagnostics = _mapping(material.get("diagnostics"), name="worker material diagnostics")
+    diagnostic_bindings = {
+        "observation_count": observation_count,
+        "requested_bar_limit": requested,
+        "effective_bar_limit": effective,
+        "warmup_sufficient": True,
+        "warmup_sufficiency": warmup,
+        "first_admitted_observation_timestamp": first,
+        "last_admitted_observation_timestamp": last,
+        "excluded_provisional_count": excluded_provisional,
+        "excluded_outside_analysis_window_count": excluded_outside,
+    }
+    for key, expected in diagnostic_bindings.items():
+        if diagnostics.get(key) != expected:
+            raise TemporalSearchContractError(f"candidate-window diagnostics {key} does not match evidence contract")
+
+    root_stream = _sha(material.get("observation_stream_sha256"), name="worker material observation_stream_sha256")
+    cost_results = _mapping(material.get("cost_view_results"), name="worker material cost_view_results")
+    if set(cost_results) != set(_COST_VIEWS):
+        raise TemporalSearchContractError("candidate-window v3 result requires both cost views")
+    path_hashes: list[str] = []
+    for cost_view in _COST_VIEWS:
+        item = _mapping(cost_results[cost_view], name=f"worker {cost_view} cost view")
+        if item.get("cost_view") not in (None, cost_view):
+            raise TemporalSearchContractError(f"candidate-window {cost_view} cost view label is inconsistent")
+        if _sha(item.get("observation_stream_sha256"), name=f"{cost_view} cost-view stream") != root_stream:
+            raise TemporalSearchContractError("candidate-window cost view observation identity mismatch")
+        replay = _mapping(item.get("replay_result"), name=f"{cost_view} replay result")
+        if _sha(replay.get("streamSha256"), name=f"{cost_view} replay stream") != root_stream:
+            raise TemporalSearchContractError("candidate-window replay observation identity mismatch")
+        metrics = _mapping(replay.get("metrics"), name=f"{cost_view} metrics")
+        if _nonnegative_integer(
+            metrics.get("observationsProcessed"), name=f"{cost_view} observationsProcessed"
+        ) != observation_count:
+            raise TemporalSearchContractError("candidate-window replay observation count disagrees with evidence")
+        _validate_terminal_metrics(
+            metrics,
+            name=f"{cost_view} metrics",
+            expected_last_bar_start=last,
+        )
+        path_hashes.append(_cost_view_path_sha256(replay, name=f"{cost_view} replay"))
+    if path_hashes[0] != path_hashes[1]:
+        raise TemporalSearchContractError("candidate-window cost views diverged in non-cost route/path evidence")
+    if (
+        diagnostics.get("cost_view_decision_path_sha256") != path_hashes[0]
+        or diagnostics.get("cost_view_path_parity") != "matched"
+        or diagnostics.get("cost_view_count") != len(_COST_VIEWS)
+        or diagnostics.get("shared_stream_required") is not True
+    ):
+        raise TemporalSearchContractError("candidate-window cost-view parity diagnostics are incomplete or inconsistent")
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -844,6 +1307,7 @@ def _result_material(
         raise TemporalSearchContractError(
             "both cost views must be evaluated from the identical observation stream"
         )
+    validate_v3_candidate_window_result(material, task_payload=job)
     artifact_sha256 = _sha(
         material.get("artifact_sha256"), name="worker material artifact_sha256"
     )
@@ -882,6 +1346,67 @@ def _result_material(
     if canonical_sha256(artifact_identity) != artifact_sha256:
         raise TemporalSearchContractError("worker material artifact identity mismatch")
     return material
+
+
+def _result_codec_fields(metadata: Mapping[str, Any]) -> dict[str, Any]:
+    """Checkpoint names stay explicit about semantic and blob identities."""
+    return {
+        "resultCodec": metadata["codec"],
+        "resultSemanticSha256": metadata["semanticSha256"],
+        "resultSemanticSizeBytes": metadata["semanticSizeBytes"],
+        "resultUncompressedSha256": metadata["uncompressedSha256"],
+        "resultUncompressedSizeBytes": metadata["uncompressedSizeBytes"],
+        "resultBlobSha256": metadata["blobSha256"],
+        "resultBlobSizeBytes": metadata["blobSizeBytes"],
+    }
+
+
+def _result_codec_expected(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        metadata_key: record[record_key]
+        for metadata_key, record_key in (
+            ("codec", "resultCodec"),
+            ("semanticSha256", "resultSemanticSha256"),
+            ("semanticSizeBytes", "resultSemanticSizeBytes"),
+            ("uncompressedSha256", "resultUncompressedSha256"),
+            ("uncompressedSizeBytes", "resultUncompressedSizeBytes"),
+            ("blobSha256", "resultBlobSha256"),
+            ("blobSizeBytes", "resultBlobSizeBytes"),
+        )
+        if record_key in record
+    }
+
+
+def _read_checkpoint_result(record: Mapping[str, Any]) -> dict[str, Any]:
+    raw_path = record.get("resultPath")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise TemporalSearchContractError("checkpoint result path is required")
+    path = Path(raw_path)
+    codec_fields = (
+        "resultCodec",
+        "resultSemanticSha256",
+        "resultSemanticSizeBytes",
+        "resultUncompressedSha256",
+        "resultUncompressedSizeBytes",
+        "resultBlobSha256",
+        "resultBlobSizeBytes",
+    )
+    present_codec_fields = [key for key in codec_fields if key in record]
+    if present_codec_fields and len(present_codec_fields) != len(codec_fields):
+        raise TemporalSearchContractError(
+            "checkpoint result representation metadata is incomplete"
+        )
+    try:
+        payload, metadata = _read_codec_json_object(
+            path,
+            expected=_result_codec_expected(record),
+        )
+    except ResultCodecError as exc:
+        raise TemporalSearchContractError(f"invalid materialized temporal result: {path}") from exc
+    expected_sha = record.get("resultSha256")
+    if expected_sha is not None and metadata["semanticSha256"] != expected_sha:
+        raise TemporalSearchContractError(f"materialized temporal result hash drift: {path}")
+    return payload
 
 
 def run_temporal_search_tasks(
@@ -937,25 +1462,38 @@ def run_temporal_search_tasks(
             )
         material = _result_material(task, completion)
         lease = _safe(completion.get("lease_id"), name="completion.lease_id")
-        result_path = root / "results" / f"{task_id}.json"
-        # Materialize before acknowledgement.  A redelivery of the same immutable
-        # material is harmless; a different result for the task fails closed.
-        _write_json(result_path, material)
         digest = canonical_sha256(material)
         prior = completed.get(task_id)
-        if prior is not None and prior.get("resultSha256") != digest:
-            raise TemporalSearchContractError(
-                "conflicting duplicate temporal search result"
-            )
+        if prior is not None:
+            if not isinstance(prior, Mapping) or prior.get("resultSha256") != digest:
+                raise TemporalSearchContractError(
+                    "conflicting duplicate temporal search result"
+                )
+            persisted = _read_checkpoint_result(prior)
+            if canonical_sha256(persisted) != digest:
+                raise TemporalSearchContractError(
+                    "conflicting duplicate temporal search result"
+                )
         if prior is None:
-            completed[task_id] = {
+            result_path = root / "results" / f"{task_id}.json.gz"
+            # The immutable representation is fully fsynced, decoded, and
+            # hash-verified before its checkpoint record can make it durable.
+            try:
+                metadata = write_gzip_json_once(result_path, material)
+            except ResultCodecError as exc:
+                raise TemporalSearchContractError(
+                    f"could not materialize compressed temporal result: {result_path}"
+                ) from exc
+            record = {
                 "resultSha256": digest,
                 "resultPath": str(result_path),
                 "candidateId": task["payload"]["candidate_id"],
+                **_result_codec_fields(metadata),
             }
+            completed[task_id] = record
             checkpoint["completed"] = completed
             checkpoint["journal"] = list(checkpoint.get("journal") or []) + [
-                {"taskId": task_id, "resultSha256": digest}
+                {"taskId": task_id, **record}
             ]
             _write_checkpoint(checkpoint_path, checkpoint)
         if client.ack_results([lease]) != 1:
@@ -1023,7 +1561,9 @@ def run_temporal_search_tasks(
     # Basic selection is intentionally transparent and optional: rank finite numeric score only.
     rows = []
     for task_id, item in completed.items():
-        result = json.loads(Path(item["resultPath"]).read_text(encoding="utf-8"))
+        if not isinstance(item, Mapping):
+            raise TemporalSearchContractError("checkpoint completion must be an object")
+        result = _read_checkpoint_result(item)
         score = result.get("selection_score")
         if isinstance(score, (int, float)) and not isinstance(score, bool):
             rows.append(

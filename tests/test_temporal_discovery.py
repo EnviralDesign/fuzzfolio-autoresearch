@@ -22,6 +22,7 @@ from autoresearch.temporal_discovery import (
     pareto_fronts,
     select_confirmation_stage,
 )
+from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
 from autoresearch.temporal_search import canonical_sha256
 
 
@@ -256,7 +257,7 @@ def _plan(window: dict, profile_sha: str) -> dict:
     }
     binding = {
         "schema_version": "fuzzfolio.market-data-window-binding.v1",
-        "semantic_contract_id": "test.semantic.v1",
+        "semantic_contract_id": "fuzzfolio.canonical-bars.semantic-digest.v2",
         "window_semantic_sha256": canonical_sha256(request),
         "request": request,
         "attestation_sha256": "sha256:" + "2" * 64,
@@ -572,13 +573,54 @@ def test_evidence_plan_rotation_binds_legacy_execution_cell() -> None:
         template,
         raw_source_profile_sha256=canonical_sha256(profile),
         source_profile=profile,
+        base_decision_timeframe="M5",
     )
 
     assert rotated["execution_cell_sha256"] == canonical_sha256(selected_cell)
+    assert rotated["lake_window_binding"] == template["lake_window_binding"]
     identity = dict(rotated)
     identity.pop("plan_id")
     identity.pop("lake_manifest_sha256", None)
     assert rotated["plan_id"] == canonical_sha256(identity)
+
+
+@pytest.mark.parametrize("replacement", ["M1", "M30"])
+def test_evidence_plan_rotation_rejects_unattested_timeframe_scope(
+    replacement: str,
+) -> None:
+    profile = _seed_profile("scope", 55.0)
+    profile["indicators"] = [
+        {
+            "meta": {
+                "id": "FAKE_SCORE",
+                "instanceId": "score",
+                "requiredPaddingBars": 10,
+            },
+            "config": {
+                "isActive": True,
+                "timeframe": replacement,
+                "lookbackBars": 14,
+            },
+        }
+    ]
+    template = _plan(
+        {
+            "analysisWindowStart": "2021-01-01T00:00:00Z",
+            "analysisWindowEnd": "2021-02-01T00:00:00Z",
+        },
+        canonical_sha256(profile),
+    )
+
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="outside the immutable pre-attested evidence binding",
+    ):
+        _rotate_evidence_plan(
+            template,
+            raw_source_profile_sha256=canonical_sha256(profile),
+            source_profile=profile,
+            base_decision_timeframe="M5",
+        )
 
 
 def test_progressive_selection_is_order_independent_and_finalizes(
