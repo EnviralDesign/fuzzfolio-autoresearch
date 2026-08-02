@@ -140,7 +140,7 @@ def _write_v3_results(
     if authority is not None and len(planned_tasks) != len(candidates) * 2:
         raise AssertionError("fixture authority must contain exactly two windows per candidate")
     _write_results(root, candidates, overrides)
-    path_sha = _sha({"schema_version": "temporal_graph_cost_view_path_v1", "graph_path": [], "execution_path": [], "trade_path": []})
+    path_sha = _sha({"schema_version": "temporal_graph_cost_view_path_v3", "graph_path": [], "execution_path": [], "trade_path": [], "final_execution_state": None})
     result_paths = sorted((root / "results").glob("*.json"), key=lambda path: path.name)
     for ordinal, path in enumerate(result_paths):
         payload = json.loads(path.read_text(encoding="utf-8"))

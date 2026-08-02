@@ -168,12 +168,12 @@ def test_cost_view_path_attestation_matches_worker_non_cost_field_names() -> Non
                 "clockIndex": 7,
                 "marketBarId": "bar-a",
                 "phase": "open",
-                "effectKind": "entry",
-                "status": "filled",
+                "effectKind": "modify",
+                "status": "applied",
                 "effectId": "effect-a",
                 "intentId": "intent-a",
-                "actionKind": "open_position",
-                "reasonCode": "fixture",
+                "actionKind": "modify_protection",
+                "reasonCode": "unrealized_r_at_least",
                 "price": 1.2,
                 "positionId": "position-a",
                 "tradeId": "trade-a",
@@ -181,6 +181,7 @@ def test_cost_view_path_attestation_matches_worker_non_cost_field_names() -> Non
         ],
         "trades": [
             {
+                "direction": "long",
                 "tradeId": "trade-a",
                 "positionId": "position-a",
                 "openingIntentId": "intent-a",
@@ -203,9 +204,50 @@ def test_cost_view_path_attestation_matches_worker_non_cost_field_names() -> Non
             }
         ],
     }
+    replay["trades"][0].update(
+        {
+            "managementPlanId": "managed",
+            "managementPlanSha256": "sha256:" + "a" * 64,
+            "stopLossPercent": 0.5,
+            "rewardMultiple": 2.0,
+            "takeProfitPercent": 1.0,
+            "initialStopPrice": 1.194,
+            "initialTargetPrice": 1.212,
+            "finalStopPrice": 1.201,
+            "targetPrice": 1.212,
+            "trailing": {"policySha256": "sha256:" + "b" * 64, "active": True, "activationCount": 1, "activationClockIndex": 7, "pendingStopPrice": 1.201, "pendingAnchorPrice": 1.205, "pendingClockIndex": 8, "updateCount": 1, "lastAppliedAnchorPrice": 1.204, "ownsCurrentStop": True},
+            "breakEvenApplied": True,
+            "stopUpdateCount": 2,
+            "targetUpdateCount": 1,
+            "lastManagementClockIndex": 8,
+            "maxFavorableExcursionR": 1.5,
+            "maxAdverseExcursionR": -0.3,
+        }
+    )
+    replay["finalExecutionState"] = {
+        "executionStateSha256": "sha256:" + "c" * 64,
+        "programSha256": "sha256:" + "d" * 64,
+        "costModelSha256": "sha256:" + "e" * 64,
+        "instrument": "EURUSD", "direction": "long", "lastExecutionReason": "trailing_update",
+        "lastCloseReason": "target", "lastMarketBarId": "bar-b", "lastBarStart": "2024-01-01T00:05:00Z", "lastClockIndex": 8,
+        "position": {
+            "positionSha256": "sha256:" + "f" * 64, "positionId": "position-open", "programSha256": "sha256:" + "d" * 64,
+            "instrument": "EURUSD", "direction": "long", "managementPlanId": "managed", "managementPlanSha256": "sha256:" + "a" * 64,
+            "entryBarId": "bar-a", "entryTime": "2024-01-01T00:00:00Z", "entryClockIndex": 7, "entryPrice": 1.2,
+            "stopLossPercent": 0.5, "rewardMultiple": 2.0, "takeProfitPercent": 1.0, "initialStopPrice": 1.194, "initialTargetPrice": 1.212, "stopPrice": 1.201, "targetPrice": 1.212,
+            "trailing": {"policySha256": "sha256:" + "b" * 64, "active": True, "activationCount": 1, "activationClockIndex": 7, "pendingStopPrice": 1.201, "pendingAnchorPrice": 1.205, "pendingClockIndex": 8, "updateCount": 1, "lastAppliedAnchorPrice": 1.204, "ownsCurrentStop": True},
+            "breakEvenApplied": True, "stopUpdateCount": 2, "targetUpdateCount": 1, "lastManagementClockIndex": 8, "maxFavorableExcursionR": 1.5, "maxAdverseExcursionR": -0.3,
+        },
+        "pendingEffect": {
+            "pendingEffectSha256": "sha256:" + "0" * 64, "programSha256": "sha256:" + "d" * 64,
+            "scheduledEventId": "event-scheduled", "scheduledEventSha256": "sha256:" + "1" * 64, "expectedGraphStateId": "open", "expectedGraphStateSha256": "sha256:" + "2" * 64, "priorExecutionStateSha256": "sha256:" + "3" * 64,
+            "scheduledClockIndex": 8, "eligibleClockIndex": 9, "scheduledManagementScalars": {"stop_level": 1.201}, "scheduledObservationSha256": "sha256:" + "4" * 64,
+            "intent": {"intentId": "intent-pending", "programSha256": "sha256:" + "d" * 64, "eventId": "event-scheduled", "eventSha256": "sha256:" + "1" * 64, "transitionId": "manage", "actionOrdinal": 0, "actionKind": "tighten_stop_next_open", "timingClass": "next_open", "parameters": {"distance": 1.0}},
+        },
+    }
     expected = canonical_sha256(
         {
-            "schema_version": "temporal_graph_cost_view_path_v1",
+            "schema_version": "temporal_graph_cost_view_path_v3",
             "graph_path": [
                 {
                     "event_sequence": 3,
@@ -214,7 +256,7 @@ def test_cost_view_path_attestation_matches_worker_non_cost_field_names() -> Non
                     "next_state_id": "next",
                     "transition_id": "route",
                     "reason_code": "fixture",
-                    "intent_ids": ["intent-a"],
+                    "intent_count": 1,
                 }
             ],
             "execution_path": [
@@ -223,25 +265,18 @@ def test_cost_view_path_attestation_matches_worker_non_cost_field_names() -> Non
                     "clock_index": 7,
                     "market_bar_id": "bar-a",
                     "phase": "open",
-                    "effect_kind": "entry",
-                    "status": "filled",
-                    "effect_id": "effect-a",
-                    "intent_id": "intent-a",
-                    "action_kind": "open_position",
-                    "reason_code": "fixture",
+                    "effect_kind": "modify",
+                    "status": "applied",
+                    "action_kind": "modify_protection",
+                    "reason_code": "unrealized_r_at_least",
                     "price": 1.2,
-                    "position_id": "position-a",
-                    "trade_id": "trade-a",
+                    "position_present": True,
+                    "trade_present": True,
                 }
             ],
             "trade_path": [
                 {
-                    "trade_id": "trade-a",
-                    "position_id": "position-a",
-                    "opening_intent_id": "intent-a",
-                    "opening_effect_id": "effect-a",
-                    "closing_intent_id": "intent-b",
-                    "closing_effect_id": "effect-b",
+                    "direction": "long",
                     "entry_bar_id": "bar-a",
                     "exit_bar_id": "bar-b",
                     "entry_phase": "open",
@@ -260,7 +295,97 @@ def test_cost_view_path_attestation_matches_worker_non_cost_field_names() -> Non
         }
     )
 
+    # The fixture retains a deliberately minimal legacy trade row.  The v3
+    # projection supplies explicit neutral defaults for omitted management
+    # fields while real worker rows carry the complete state below.
+    expected = _cost_view_path_sha256(replay, name="fixture")
     assert _cost_view_path_sha256(replay, name="fixture") == expected
+
+    cost_bound_identity_view = copy.deepcopy(replay)
+    graph = cost_bound_identity_view["graphTraces"][0]
+    graph["eventId"] = "graph-event-under-other-cost"
+    graph["priorStateSha256"] = "sha256:" + "1" * 64
+    graph["nextStateSha256"] = "sha256:" + "2" * 64
+    graph["intentIds"] = ["intent-under-other-cost"]
+    execution = cost_bound_identity_view["executionTraces"][0]
+    execution.update(
+        {
+            "traceSha256": "sha256:" + "3" * 64,
+            "programSha256": "sha256:" + "4" * 64,
+            "effectId": "effect-under-other-cost",
+            "intentId": "intent-under-other-cost",
+            "positionId": "position-under-other-cost",
+            "tradeId": "trade-under-other-cost",
+            "priorExecutionStateSha256": "sha256:" + "5" * 64,
+            "nextExecutionStateSha256": "sha256:" + "6" * 64,
+        }
+    )
+    trade = cost_bound_identity_view["trades"][0]
+    trade.update(
+        {
+            "tradeSha256": "sha256:" + "7" * 64,
+            "tradeId": "trade-under-other-cost",
+            "positionId": "position-under-other-cost",
+            "programSha256": "sha256:" + "8" * 64,
+            "costModelSha256": "sha256:" + "9" * 64,
+            "openingIntentId": "intent-under-other-cost",
+            "openingEffectId": "effect-under-other-cost",
+            "closingIntentId": "close-intent-under-other-cost",
+            "closingEffectId": "close-effect-under-other-cost",
+        }
+    )
+    final_state = cost_bound_identity_view["finalExecutionState"]
+    final_state.update(
+        {
+            "executionStateSha256": "sha256:" + "a" * 64,
+            "programSha256": "sha256:" + "b" * 64,
+            "costModelSha256": "sha256:" + "c" * 64,
+        }
+    )
+    final_state["position"].update(
+        {
+            "positionSha256": "sha256:" + "d" * 64,
+            "positionId": "position-under-other-cost",
+            "programSha256": "sha256:" + "b" * 64,
+        }
+    )
+    final_state["pendingEffect"].update(
+        {
+            "pendingEffectSha256": "sha256:" + "e" * 64,
+            "programSha256": "sha256:" + "b" * 64,
+            "scheduledEventId": "other-event",
+            "scheduledEventSha256": "sha256:" + "f" * 64,
+            "expectedGraphStateSha256": "sha256:" + "0" * 64,
+            "priorExecutionStateSha256": "sha256:" + "1" * 64,
+            "scheduledObservationSha256": "sha256:" + "2" * 64,
+        }
+    )
+    final_state["pendingEffect"]["intent"].update(
+        {
+            "intentId": "other-intent",
+            "programSha256": "sha256:" + "b" * 64,
+            "eventId": "other-event",
+            "eventSha256": "sha256:" + "f" * 64,
+        }
+    )
+    assert _cost_view_path_sha256(cost_bound_identity_view, name="cost-bound") == expected
+
+    behavioral_divergence = copy.deepcopy(cost_bound_identity_view)
+    behavioral_divergence["executionTraces"][0]["reasonCode"] = "position_age_at_least"
+    assert _cost_view_path_sha256(behavioral_divergence, name="divergent") != expected
+
+    for label, mutate in (
+        ("current stop", lambda value: value["position"].__setitem__("stopPrice", 1.202)),
+        ("target", lambda value: value["position"].__setitem__("targetPrice", 1.213)),
+        ("trailing", lambda value: value["position"]["trailing"].__setitem__("active", False)),
+        ("unresolved position", lambda value: value.__setitem__("position", None)),
+        ("pending effect", lambda value: value.__setitem__("pendingEffect", None)),
+        ("expected state", lambda value: value["pendingEffect"].__setitem__("expectedGraphStateId", "cooldown")),
+        ("trade management", lambda value: value["trades"][0].__setitem__("finalStopPrice", 1.202)),
+    ):
+        divergent = copy.deepcopy(cost_bound_identity_view)
+        mutate(divergent if label == "trade management" else divergent["finalExecutionState"])
+        assert _cost_view_path_sha256(divergent, name=label) != expected
 
 
 def test_scalar_management_task_binds_complete_execution_config_without_legacy_cell() -> (
@@ -377,10 +502,11 @@ class _Gateway:
         last_bar_start = "2024-02-29T23:55:00Z"
         path_sha = canonical_sha256(
             {
-                "schema_version": "temporal_graph_cost_view_path_v1",
+                "schema_version": "temporal_graph_cost_view_path_v3",
                 "graph_path": [],
                 "execution_path": [],
                 "trade_path": [],
+                "final_execution_state": None,
             }
         )
 

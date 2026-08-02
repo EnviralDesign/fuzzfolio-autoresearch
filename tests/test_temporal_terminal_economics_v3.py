@@ -25,10 +25,11 @@ _POSITION_ID = "sha256:" + "1" * 64
 def _path_sha() -> str:
     return canonical_sha256(
         {
-            "schema_version": "temporal_graph_cost_view_path_v1",
+            "schema_version": "temporal_graph_cost_view_path_v3",
             "graph_path": [],
             "execution_path": [],
             "trade_path": [],
+            "final_execution_state": None,
         }
     )
 

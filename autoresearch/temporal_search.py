@@ -198,6 +198,7 @@ def _path_rows(
     *,
     name: str,
     keys: tuple[str, ...],
+    optional_keys: tuple[str, ...] = (),
 ) -> list[dict[str, Any]]:
     if not isinstance(rows, list):
         raise TemporalSearchContractError(f"{name} must be an array")
@@ -212,12 +213,104 @@ def _path_rows(
             raise TemporalSearchContractError(
                 f"{name}[{index}].intentIds must be an array"
             )
-        material.append({key: row[key] for key in keys})
+        material.append(
+            {
+                **{key: row[key] for key in keys},
+                **{key: row[key] for key in optional_keys if key in row},
+            }
+        )
     return material
 
 
+def _cost_view_trailing_projection(trailing: Any) -> dict[str, Any] | None:
+    if trailing is None:
+        return None
+    row = _mapping(trailing, name="trailing state")
+    return {
+        "policy_sha256": row.get("policySha256"),
+        "active": row.get("active", False),
+        "suspended": row.get("suspended", False),
+        "activation_count": row.get("activationCount", 0),
+        "activation_clock_index": row.get("activationClockIndex"),
+        "deactivation_count": row.get("deactivationCount", 0),
+        "pending_stop_price": row.get("pendingStopPrice"),
+        "pending_anchor_price": row.get("pendingAnchorPrice"),
+        "pending_clock_index": row.get("pendingClockIndex"),
+        "update_count": row.get("updateCount", 0),
+        "last_applied_anchor_price": row.get("lastAppliedAnchorPrice"),
+        "owns_current_stop": row.get("ownsCurrentStop", False),
+    }
+
+
+def _cost_view_position_projection(position: Any) -> dict[str, Any] | None:
+    if position is None:
+        return None
+    row = _mapping(position, name="final execution position")
+    return {
+        "instrument": row.get("instrument"),
+        "direction": row.get("direction"),
+        "management_plan_id": row.get("managementPlanId"),
+        "management_plan_sha256": row.get("managementPlanSha256"),
+        "entry_bar_id": row.get("entryBarId"),
+        "entry_time": row.get("entryTime"),
+        "entry_clock_index": row.get("entryClockIndex"),
+        "entry_price": row.get("entryPrice"),
+        "stop_loss_percent": row.get("stopLossPercent"),
+        "reward_multiple": row.get("rewardMultiple"),
+        "take_profit_percent": row.get("takeProfitPercent"),
+        "initial_stop_price": row.get("initialStopPrice"),
+        "initial_target_price": row.get("initialTargetPrice"),
+        "stop_price": row.get("stopPrice"),
+        "target_price": row.get("targetPrice"),
+        "trailing": _cost_view_trailing_projection(row.get("trailing")),
+        "break_even_applied": row.get("breakEvenApplied", False),
+        "stop_update_count": row.get("stopUpdateCount", 0),
+        "target_update_count": row.get("targetUpdateCount", 0),
+        "last_management_clock_index": row.get("lastManagementClockIndex"),
+        "max_favorable_excursion_r": row.get("maxFavorableExcursionR", 0.0),
+        "max_adverse_excursion_r": row.get("maxAdverseExcursionR", 0.0),
+    }
+
+
+def _cost_view_pending_effect_projection(effect: Any) -> dict[str, Any] | None:
+    if effect is None:
+        return None
+    row = _mapping(effect, name="final pending effect")
+    intent = _mapping(row.get("intent"), name="final pending effect intent")
+    return {
+        "transition_id": intent.get("transitionId"),
+        "action_ordinal": intent.get("actionOrdinal"),
+        "action_kind": intent.get("actionKind"),
+        "timing_class": intent.get("timingClass"),
+        "parameters": dict(_mapping(intent.get("parameters", {}), name="pending intent parameters")),
+        "scheduled_clock_index": row.get("scheduledClockIndex"),
+        "eligible_clock_index": row.get("eligibleClockIndex"),
+        "expected_graph_state_id": row.get("expectedGraphStateId"),
+        "scheduled_management_scalars": dict(
+            _mapping(row.get("scheduledManagementScalars", {}), name="pending scalar snapshot")
+        ),
+    }
+
+
+def _cost_view_final_execution_projection(state: Any) -> dict[str, Any] | None:
+    if state is None:
+        return None
+    row = _mapping(state, name="final execution state")
+    return {
+        "instrument": row.get("instrument"),
+        "direction": row.get("direction"),
+        "last_execution_reason": row.get("lastExecutionReason"),
+        "last_close_reason": row.get("lastCloseReason"),
+        "last_market_bar_id": row.get("lastMarketBarId"),
+        "last_bar_start": row.get("lastBarStart"),
+        "last_clock_index": row.get("lastClockIndex"),
+        "position": _cost_view_position_projection(row.get("position")),
+        "pending_effect": _cost_view_pending_effect_projection(row.get("pendingEffect")),
+    }
+
+
 def _cost_view_path_sha256(replay: Mapping[str, Any], *, name: str) -> str:
-    """Reproduce the worker's cost-neutral path attestation exactly."""
+    """Reproduce the worker's cost-invariant behavioral attestation exactly."""
     graph_rows = _path_rows(
         replay.get("graphTraces"),
         name=f"{name}.graphTraces",
@@ -241,8 +334,6 @@ def _cost_view_path_sha256(replay: Mapping[str, Any], *, name: str) -> str:
             "phase",
             "effectKind",
             "status",
-            "effectId",
-            "intentId",
             "actionKind",
             "reasonCode",
             "price",
@@ -254,12 +345,7 @@ def _cost_view_path_sha256(replay: Mapping[str, Any], *, name: str) -> str:
         replay.get("trades"),
         name=f"{name}.trades",
         keys=(
-            "tradeId",
-            "positionId",
-            "openingIntentId",
-            "openingEffectId",
-            "closingIntentId",
-            "closingEffectId",
+            "direction",
             "entryBarId",
             "exitBarId",
             "entryPhase",
@@ -274,6 +360,24 @@ def _cost_view_path_sha256(replay: Mapping[str, Any], *, name: str) -> str:
             "holdingBars",
             "holdingHours",
         ),
+        optional_keys=(
+            "managementPlanId",
+            "managementPlanSha256",
+            "stopLossPercent",
+            "rewardMultiple",
+            "takeProfitPercent",
+            "initialStopPrice",
+            "initialTargetPrice",
+            "finalStopPrice",
+            "targetPrice",
+            "trailing",
+            "breakEvenApplied",
+            "stopUpdateCount",
+            "targetUpdateCount",
+            "lastManagementClockIndex",
+            "maxFavorableExcursionR",
+            "maxAdverseExcursionR",
+        ),
     )
     graph_path = [
         {
@@ -283,7 +387,7 @@ def _cost_view_path_sha256(replay: Mapping[str, Any], *, name: str) -> str:
             "next_state_id": row["nextStateId"],
             "transition_id": row["transitionId"],
             "reason_code": row["reasonCode"],
-            "intent_ids": list(row["intentIds"]),
+            "intent_count": len(row.get("intentIds") or ()),
         }
         for row in graph_rows
     ]
@@ -295,24 +399,19 @@ def _cost_view_path_sha256(replay: Mapping[str, Any], *, name: str) -> str:
             "phase": row["phase"],
             "effect_kind": row["effectKind"],
             "status": row["status"],
-            "effect_id": row["effectId"],
-            "intent_id": row["intentId"],
             "action_kind": row["actionKind"],
             "reason_code": row["reasonCode"],
             "price": row["price"],
-            "position_id": row["positionId"],
-            "trade_id": row["tradeId"],
+            "position_present": row.get("positionId") is not None,
+            "trade_present": row.get("tradeId") is not None,
         }
         for row in execution_rows
     ]
     trade_path = [
         {
-            "trade_id": row["tradeId"],
-            "position_id": row["positionId"],
-            "opening_intent_id": row["openingIntentId"],
-            "opening_effect_id": row["openingEffectId"],
-            "closing_intent_id": row["closingIntentId"],
-            "closing_effect_id": row["closingEffectId"],
+            "direction": row["direction"],
+            "management_plan_id": row.get("managementPlanId"),
+            "management_plan_sha256": row.get("managementPlanSha256"),
             "entry_bar_id": row["entryBarId"],
             "exit_bar_id": row["exitBarId"],
             "entry_phase": row["entryPhase"],
@@ -323,6 +422,20 @@ def _cost_view_path_sha256(replay: Mapping[str, Any], *, name: str) -> str:
             "exit_clock_index": row["exitClockIndex"],
             "entry_price": row["entryPrice"],
             "exit_price": row["exitPrice"],
+            "stop_loss_percent": row.get("stopLossPercent"),
+            "reward_multiple": row.get("rewardMultiple"),
+            "take_profit_percent": row.get("takeProfitPercent"),
+            "initial_stop_price": row.get("initialStopPrice"),
+            "initial_target_price": row.get("initialTargetPrice"),
+            "final_stop_price": row.get("finalStopPrice"),
+            "target_price": row.get("targetPrice"),
+            "trailing": _cost_view_trailing_projection(row.get("trailing")),
+            "break_even_applied": row.get("breakEvenApplied", False),
+            "stop_update_count": row.get("stopUpdateCount", 0),
+            "target_update_count": row.get("targetUpdateCount", 0),
+            "last_management_clock_index": row.get("lastManagementClockIndex"),
+            "max_favorable_excursion_r": row.get("maxFavorableExcursionR", 0.0),
+            "max_adverse_excursion_r": row.get("maxAdverseExcursionR", 0.0),
             "close_reason": row["closeReason"],
             "holding_bars": row["holdingBars"],
             "holding_hours": row["holdingHours"],
@@ -331,10 +444,13 @@ def _cost_view_path_sha256(replay: Mapping[str, Any], *, name: str) -> str:
     ]
     return canonical_sha256(
         {
-            "schema_version": "temporal_graph_cost_view_path_v1",
+            "schema_version": "temporal_graph_cost_view_path_v3",
             "graph_path": graph_path,
             "execution_path": execution_path,
             "trade_path": trade_path,
+            "final_execution_state": _cost_view_final_execution_projection(
+                replay.get("finalExecutionState")
+            ),
         }
     )
 
