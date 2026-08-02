@@ -55,6 +55,7 @@ temporal-search-generator-v2-admission = "autoresearch.temporal_search_generator
 temporal-search-generator-v3-canary = "autoresearch.temporal_generator_v3_reachability_canary:main"
 stage5e7-v3-validation = "autoresearch.temporal_stage5e7_v3_validation:main"
 stage5e7-v3-panel-bridge = "autoresearch.temporal_stage5e7_v3_panel_bridge:main"
+stage5e7-v3-evidence-envelope = "autoresearch.temporal_stage5e7_v3_evidence_envelope:main"
 temporal-search-stage5e2-checkpoint = "autoresearch.temporal_search_stage5e2_checkpoint_cli:main"
 temporal-search-stage5e3 = "autoresearch.temporal_search_stage5e3_cli:main"
 temporal-search-stage5e3-midpoint = "autoresearch.temporal_search_stage5e3_midpoint_cli:main"

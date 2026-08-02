@@ -8,6 +8,46 @@ windows, or writes under this repository. Every generated artifact is placed in
 The prohibited interval starts at `2024-06-29T00:00:00Z`; reserved evidence is
 always disallowed by the manifests.
 
+## Broad catalog-hydrated evidence envelope
+
+Before a panel or QD run can use graph-bound timeframe construction, replace
+the old narrow template with a fresh envelope. `stage5e7-v3-evidence-envelope`
+is a preparation-only command: it reads the frozen source template, a frozen
+seed population, and the canonical construction catalog; derives the parent
+and every one-step graph-bound timeframe child; and remotely attests one
+conservative v2 lake request per development window. It never fabricates a
+lake semantic hash locally or starts a replay.
+
+The worker contract digest *and schema* are deliberately required rather than
+inherited from the source template. Use the current exact contract digest
+(currently
+`sha256:3dd2b7b3e2315b0e49c0ab8e9da3f3816bd0ec65c23cd6c09a03dffea6f9e3a6`)
+when making the new template.
+
+```powershell
+stage5e7-v3-evidence-envelope `
+  --source-preparation <old-narrow-preparation.json> `
+  --seed-population <frozen-seed-population.json> `
+  --construction-catalog C:\repos\Trading-Dashboard\shared\constants\indicators.json `
+  --worker-contract-sha256 sha256:3dd2b7b3e2315b0e49c0ab8e9da3f3816bd0ec65c23cd6c09a03dffea6f9e3a6 `
+  --worker-contract-schema replay-worker-contract-v1 `
+  --output-root <external-broad-envelope-root>
+```
+
+The output root is immutable and contains `preparation.json`, `authority.json`,
+and `evidence-envelope-manifest.json`. The manifest binds the source/output
+preparations, catalog path/content identity, population/member/variant
+identities, every derived member request, each compacted envelope request, and
+its remote attestation (including the exact legacy-selection binding when one
+was requested). Use its `preparation.json` as the template input for
+the existing panel bridge and QD supervisor. A catalog omission, unsupported
+timeframe, different instrument/calendar, non-containing binding, forged
+attestation, or divergent rerun fails closed.
+
+This is evidence/catalog authority only. It does not claim to bind an operator
+or QD policy: the panel bridge and QD supervisor separately reopen and verify
+their frozen construction catalog and policy identities before they launch.
+
 ## Repair panel
 
 The repair builder reads one old Stage5E7 gen4 archive, the matching population,
