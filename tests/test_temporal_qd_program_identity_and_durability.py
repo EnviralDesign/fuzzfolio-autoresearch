@@ -27,6 +27,21 @@ def _candidate() -> dict[str, object]:
     }
 
 
+def _write_population_envelope(path: Path) -> None:
+    """Keep archive tests behind the immutable population-envelope boundary."""
+    payload: dict[str, object] = {
+        "schemaVersion": "temporal_qd_generation_population_v3",
+        "qdVersion": qd.QD_VERSION,
+        "policyName": qd.QD_POLICY_NAME,
+        "policySha256": qd.QD_POLICY_SHA256,
+        "generationIndex": 0,
+        "candidateCount": 0,
+        "candidates": [],
+    }
+    payload["populationSha256"] = canonical_sha256(payload)
+    path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+
+
 def _window(
     candidate: dict[str, object],
     *,
@@ -129,6 +144,7 @@ def test_qd_archive_rejects_unbound_or_drifted_window_program_identity(
         "load_stage_results",
         lambda _root: {"candidate_a": complete_windows},
     )
+    _write_population_envelope(tmp_path / "population.json")
 
     with pytest.raises(TemporalDiscoveryContractError, match=match):
         qd.build_qd_archive(
@@ -154,6 +170,7 @@ def test_qd_archive_keeps_v3_admissibility_gate_after_program_binding(
             ]
         },
     )
+    _write_population_envelope(tmp_path / "population.json")
 
     with pytest.raises(TemporalDiscoveryContractError, match="requires terminal-adjusted"):
         qd.build_qd_archive(
@@ -203,6 +220,7 @@ def test_qd_archive_accepts_authored_vs_resolved_execution_identity(
         "select_qd_archive",
         lambda members, **_kwargs: [{"cellId": "fixture", "members": members}],
     )
+    _write_population_envelope(tmp_path / "population.json")
 
     qd.build_qd_archive(
         population_path=tmp_path / "population.json",
@@ -288,6 +306,7 @@ def test_qd_archive_deduplicates_distinct_authored_candidates_with_one_resolved_
             {"cellId": "fixture", "members": list(members)}
         ],
     )
+    _write_population_envelope(tmp_path / "population.json")
 
     qd.build_qd_archive(
         population_path=tmp_path / "population.json",

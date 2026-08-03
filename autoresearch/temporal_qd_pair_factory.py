@@ -242,10 +242,23 @@ class PairAuthorityBundle:
         template = FrozenModule.freeze  # keeps the actual construction below visually local
         grammar = TypedFragmentGrammar(GrammarContext(instrument=side["context"]["instrument"], indicators=tuple(side["context"]["indicators"]), evidence_groups=tuple(side["context"]["groups"]), event_bindings=tuple(side["context"]["events"]), execution_config=side["context"]["executionConfig"], budgets=side["context"]["budgets"]), native_authority=self.validator)
         names = side["seedNames"]
-        name = names[int(canonical_sha256({"seed": str(proposal_seed), "side": direction})[-2:], 16) % len(names)]
-        compiled = grammar.compile_module(grammar.seed(direction=direction, name=name), candidate_id="qd_pair_module_" + canonical_sha256({"seed": str(proposal_seed), "side": direction})[7:35])
+        selector = canonical_sha256({"seed": str(proposal_seed), "side": direction})[7:]
+        name = names[int(selector[0:8], 16) % len(names)]
+        group_id = side["context"]["groups"][int(selector[8:16], 16) % len(side["context"]["groups"])]["id"]
+        event_id = side["context"]["events"][int(selector[16:24], 16) % len(side["context"]["events"])]["id"]
+        plan_id = side["context"]["plans"][int(selector[24:32], 16) % len(side["context"]["plans"])]
+        compiled = grammar.compile_module(
+            grammar.seed(
+                direction=direction,
+                name=name,
+                group_id=group_id,
+                event_id=event_id,
+                plan_id=plan_id,
+            ),
+            candidate_id="qd_pair_module_" + selector[:28],
+        )
         del template
-        return FrozenModule.freeze(program=compiled.program, profile=compiled.profile, grammar_context=context_id, catalog=catalog_id, policy=policy_id, native_authority=self.native_identity, native_report=compiled.native_report, lineage=[{"operation": "typed_seed", "side": direction, "seedName": name, "proposalSeed": str(proposal_seed)}])
+        return FrozenModule.freeze(program=compiled.program, profile=compiled.profile, grammar_context=context_id, catalog=catalog_id, policy=policy_id, native_authority=self.native_identity, native_report=compiled.native_report, lineage=[{"operation": "typed_seed", "side": direction, "seedName": name, "groupId": group_id, "eventId": event_id, "planId": plan_id, "proposalSeed": str(proposal_seed)}])
 
 
 def pair_policy_from_config(frozen: Mapping[str, Any]) -> dict[str, Any]:

@@ -67,6 +67,16 @@ def test_one_pair_build_runs_native_canary_and_is_deterministic(tmp_path: Path) 
     payload = json.loads(first.read_text(encoding="utf-8"))
     pair = payload["pairs"][0]
     assert {row["expectedOutcome"] for row in pair["scenarios"]} == {"long", "short", "neither", "conflict_abstention"}
+    long_stream = next(row["observationStream"] for row in pair["scenarios"] if row["expectedOutcome"] == "long")
+    long_observations = long_stream["observations"]
+    facts = [observation["event"]["facts"] for observation in long_observations]
+    assert facts[1]["freshEvents"]
+    assert max(facts[1]["evidenceScores"].values()) == 100.0
+    assert max(facts[2]["evidenceScores"].values()) == 0.0
+    # A fresh-event arm plus gate-delay enters its next watch state on the
+    # low reset.  It must still receive high evidence afterward so an
+    # enter_on_level fragment is satisfiable.
+    assert max(facts[3]["evidenceScores"].values()) == 100.0
     assert all(len(row["observationStream"]["observations"]) <= MAX_OBSERVATIONS for row in pair["scenarios"])
     assert len(pair["productionClaims"]) == sum(len(pair[key]["program"]["fragments"]) for key in ("longModule", "shortModule"))
     result = run_canary(first, tmp_path / "run")

@@ -238,6 +238,13 @@ class _PairFactory:
         return _pair(lineage=({"operation": "factory", "side": "long", "proposalSeed": proposal_seed},))
 
 
+class _DuplicatePairFactory:
+    def create_pair(self, *, proposal_seed: str) -> FrozenPair:
+        # Provenance differs, while both executable module profiles remain
+        # identical.  Unique proposal slots must follow the latter.
+        return _pair(lineage=({"operation": "factory", "side": "long", "proposalSeed": proposal_seed},))
+
+
 class _PairOps:
     def __init__(self, *, enabled: bool = True) -> None:
         self.enabled = enabled
@@ -349,3 +356,47 @@ def test_pair_population_journal_is_restart_safe_and_never_emits_v2_tasks(tmp_pa
     population = json.loads((tmp_path / "population.json").read_text(encoding="utf-8"))
     assert population["candidates"][0]["sourceProfile"]["version"] == "v3"
     assert population["candidates"][0]["sourceProfile"]["directionMode"] == "both"
+
+
+def test_pair_resume_rejects_provenance_distinct_duplicate_executable_semantics(tmp_path) -> None:
+    pair = _pair()
+    policy = {"schemaVersion": "temporal_qd_bidirectional_pair_policy_v1", "enabled": True, "compilerAuthority": pair.pair_compiler.canonical_payload()}
+    args = dict(output_root=tmp_path, generation_index=1, target_unique_candidates=1, run_config={"seed": "duplicate-semantics"}, pair_policy=policy, pair_factory=_PairFactory(), module_authority=_PairOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(), operator_implementation_identity={"schemaVersion": "test_pair_operator_v1", "grammar": "frozen", "indicator": "frozen", "hold": "frozen"})
+    first = generate_pair_population(**args)
+    assert first["candidateCount"] == 1
+    import json
+    original = json.loads((tmp_path / "proposal-journal" / "00000000.json").read_text(encoding="utf-8"))
+    duplicate_pair, duplicate_proposal = propose_pair(proposal_seed="provenance-distinct", parent=None, pair_factory=_PairFactory(), module_authority=_PairOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler())
+    assert duplicate_pair is not None
+    duplicate_candidate = materialize_pair_candidate(pair=duplicate_pair, proposal=duplicate_proposal, pair_policy=policy, generation_index=1, birth_ordinal=1, proposal_ordinal=1)
+    assert duplicate_candidate["candidateIdentitySha256"] != original["candidate"]["candidateIdentitySha256"]
+    duplicate_entry = {"schemaVersion": "temporal_qd_proposal_entry_v3", "configSha256": original["configSha256"], "generationIndex": 1, "proposalOrdinal": 1, "originKind": "random_immigrant", "proposal": duplicate_proposal, "operatorImplementationSha256": original["operatorImplementationSha256"], "disposition": "accepted", "candidate": duplicate_candidate}
+    duplicate_entry["entrySha256"] = canonical_sha256(duplicate_entry)
+    (tmp_path / "proposal-journal" / "00000001.json").write_text(json.dumps(duplicate_entry, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    assert FrozenPair.from_payload(original["candidate"]["bidirectionalGenome"]).identity_sha256 != duplicate_pair.identity_sha256
+    with pytest.raises(Exception, match="duplicate executable pair semantics"):
+        generate_pair_population(**args)
+
+
+def test_pair_population_does_not_spend_unique_slots_on_duplicate_genomes(tmp_path) -> None:
+    pair = _pair()
+    policy = {"schemaVersion": "temporal_qd_bidirectional_pair_policy_v1", "enabled": True, "compilerAuthority": pair.pair_compiler.canonical_payload()}
+    result = generate_pair_population(
+        output_root=tmp_path,
+        generation_index=1,
+        target_unique_candidates=2,
+        run_config={"seed": "duplicate-pair-run"},
+        pair_policy=policy,
+        pair_factory=_DuplicatePairFactory(),
+        module_authority=_PairOps(),
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+        operator_implementation_identity={"schemaVersion": "test_pair_operator_v1", "grammar": "frozen", "indicator": "frozen", "hold": "frozen"},
+        max_new_proposals=2,
+    )
+    assert result["completed"] is False
+    entries = sorted((tmp_path / "proposal-journal").glob("*.json"))
+    assert len(entries) == 2
+    import json
+    rows = [json.loads(path.read_text(encoding="utf-8")) for path in entries]
+    assert [row["disposition"] for row in rows] == ["accepted", "duplicate_pair_genome"]

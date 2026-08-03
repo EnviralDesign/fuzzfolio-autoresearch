@@ -161,7 +161,10 @@ def main(pair):
   for i,(scores,fresh) in enumerate(steps):
    # +/-0.75R exercises real management guards without touching the 1R stop
    # or 2R target of the sealed base plan.  Only its own scenario marks a side.
-   mark=(99.5 if name=='long' else 100.5) if needs_loss and name in ('long','short') and i==4 else (101.0 if name=='long' else 99.0) if needs_profit and name in ('long','short') and i==4 else 99.25 if name=='short' and i==4 else 100.75 if name=='long' and i==4 else 100.0
+   # A single late pulse exercises R-based management/exit guards.  Returning
+   # to flat prices matters: a newly applied 1R target must not pre-empt the
+   # following exit_on_age witness in the registry set-target canary.
+   mark=(99.5 if name=='long' else 100.5) if needs_loss and name in ('long','short') and i==10 else (101.0 if name=='long' else 99.0) if needs_profit and name in ('long','short') and i==10 else 99.25 if name=='short' and i==10 else 100.75 if name=='long' and i==10 else 100.0
    high=max(100.75 if name!='short' else 100.25,mark); low=min(99.25 if name!='long' else 99.75,mark)
    o=build_completed_bar_observation(program_sha256=program,instrument='EURUSD',timeframe='M5',bar_id=name+'-'+str(i),bar_start=start+timedelta(minutes=5*i),bar_close=start+timedelta(minutes=5*(i+1)),sequence=i,clock_index=i,open_price=100.0,high_price=high,low_price=low,close_price=mark,evidence_scores=scores,fresh_events=fresh)
    out.append(o)
@@ -171,8 +174,13 @@ def main(pair):
  # These paths use only current facts.  Pending orders, positions, age, and
  # fill/close execution events are all produced by the replay engine.
  scenarios={
-  'long': stream('long',[(z,[]),(hi('long'),[]),(gate('long'),fe('long')),(hi('long'),fe('long')),(hi('long') if edge or streak else z,[]),(z,fe('long')),(z,[]),(z,[]),(z,[]),(z,[]),(z,[]),(z,[])]),
-  'short': stream('short',[(z,[]),(hi('short'),[]),(gate('short'),fe('short')),(hi('short'),fe('short')),(hi('short') if edge or streak else z,[]),(z,fe('short')),(z,[]),(z,[]),(z,[]),(z,[]),(z,[]),(z,[])]),
+  # One high+event arm, one low reset, then a bounded high+event runway
+  # satisfies every named root and the finite gate vocabulary.  In
+  # particular, a fresh-event arm followed by gate_delay still receives a
+  # later high bar for enter_on_level; the former fixed four-bar prelude did
+  # not provide that combination.
+  'long': stream('long',[(z,[]),(hi('long'),fe('long')),(lo('long'),fe('long')),*[(hi('long'),fe('long')) for _ in range(10)],(z,fe('long')),*[(z,[]) for _ in range(8)]]),
+  'short': stream('short',[(z,[]),(hi('short'),fe('short')),(lo('short'),fe('short')),*[(hi('short'),fe('short')) for _ in range(10)],(z,fe('short')),*[(z,[]) for _ in range(8)]]),
   'neither': stream('neither',[(z,[]),(z,[]),(z,[]),(z,[])]),
   'conflict_abstention': stream('conflict',[(z,[]),({key:100.0 for key in groups.values() if key},fe('long')+fe('short')),(z,[]),(z,[])])}
  results={k:dump(run_temporal_replay(p, __import__('fuzzfolio_core.temporal_graph.observation_models',fromlist=['TemporalObservationStream']).TemporalObservationStream.model_validate(v), cost_model={'mode':'research_conservative'})) for k,v in scenarios.items()}

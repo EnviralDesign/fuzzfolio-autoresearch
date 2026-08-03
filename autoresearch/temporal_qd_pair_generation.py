@@ -33,6 +33,26 @@ PAIR_GENERATION_SCHEMA = "temporal_qd_pair_generation_v1"
 PAIR_PROPOSAL_SCHEMA = "temporal_qd_pair_proposal_v1"
 
 
+def _pair_genome_semantic_sha256(pair: FrozenPair) -> str:
+    """Identity of executable authored modules, excluding proposal lineage.
+
+    ``FrozenPair.identity_sha256`` intentionally includes lineage, while the
+    compiled v3 raw profile includes its pair compilation candidate ID.  Both
+    therefore differ when two proposal seeds select the same two modules.  A
+    unique QD proposal slot is semantic: bind the exact long/short v2 module
+    profiles, which include topology, resources, indicators, and management
+    but not proposal provenance.
+    """
+
+    return canonical_sha256(
+        {
+            "schemaVersion": "temporal_qd_pair_genome_semantics_v1",
+            "longProfileSha256": pair.long.profile_sha256,
+            "shortProfileSha256": pair.short.profile_sha256,
+        }
+    )
+
+
 class TypedPairFactory(Protocol):
     """Finite deterministic factory; it must return both frozen sides."""
 
@@ -392,7 +412,29 @@ def generate_pair_population(
                 raise TemporalDiscoveryContractError("pair accepted proposal resume material diverged")
         entries.append(row)
     accepted = [_clone(entry["candidate"]) for entry in entries if entry.get("disposition") == "accepted"]
+    # Pair identity intentionally includes lineage/provenance.  Unique QD slots
+    # must additionally be protected against a pre-patch journal containing
+    # distinct provenance wrappers for the exact same executable long/short
+    # module profiles.
+    semantic_pairs: dict[str, str] = {}
+    for entry in entries:
+        if entry.get("disposition") != "accepted":
+            continue
+        candidate = entry.get("candidate")
+        if not isinstance(candidate, Mapping):
+            raise TemporalDiscoveryContractError("pair accepted proposal lacks candidate")
+        pair = FrozenPair.from_payload(candidate.get("bidirectionalGenome"))
+        semantic_sha = canonical_sha256({"longModuleProfileSha256": pair.long.profile_sha256, "shortModuleProfileSha256": pair.short.profile_sha256})
+        existing = semantic_pairs.get(semantic_sha)
+        candidate_id = str(candidate.get("candidateId") or "")
+        if existing is not None:
+            raise TemporalDiscoveryContractError("pair generation journal has duplicate executable pair semantics")
+        semantic_pairs[semantic_sha] = candidate_id
     seen = {str(row["candidateIdentitySha256"]) for row in accepted}
+    seen_pair_genomes = {
+        _pair_genome_semantic_sha256(FrozenPair.from_payload(row["bidirectionalGenome"]))
+        for row in accepted
+    }
     parents = sorted((FrozenPair.from_payload(item.canonical_payload()) for item in parent_pairs), key=lambda item: item.identity_sha256)
     made = 0
     while len(accepted) < target_unique_candidates and (max_new_proposals is None or made < max_new_proposals):
@@ -418,10 +460,13 @@ def generate_pair_population(
             if evidence_identity_context is not None:
                 from .temporal_qd_evolution import qd_canonical_evidence_identity
                 candidate["canonicalEvidenceIdentitySha256"] = qd_canonical_evidence_identity(candidate, evidence_identity_context)
-            if candidate["candidateIdentitySha256"] in seen:
+            pair_genome_sha256 = _pair_genome_semantic_sha256(pair)
+            if pair_genome_sha256 in seen_pair_genomes:
+                entry["disposition"] = "duplicate_pair_genome"
+            elif candidate["candidateIdentitySha256"] in seen:
                 entry["disposition"] = "duplicate_candidate_identity"
             else:
-                entry["disposition"] = "accepted"; entry["candidate"] = candidate; accepted.append(candidate); seen.add(candidate["candidateIdentitySha256"])
+                entry["disposition"] = "accepted"; entry["candidate"] = candidate; accepted.append(candidate); seen.add(candidate["candidateIdentitySha256"]); seen_pair_genomes.add(pair_genome_sha256)
         if proposal.get("disposition") == "materialized" and entry["disposition"] == "accepted":
             pair_payload = proposal.get("pair") or proposal.get("factoryPair")
             if not isinstance(pair_payload, Mapping):
@@ -450,7 +495,7 @@ def generate_pair_population(
     # Origin counts participate in the population identity.
     population["populationSha256"] = canonical_sha256(population)
     _write_once(root / "population.json", population)
-    journal = {"schemaVersion": "temporal_qd_generation_journal_v3", "qdVersion": "temporal_qd_evolution_v3", "policyName": "stage5e7_v3_robust_quality_archive", "policySha256": population["policySha256"], "configSha256": config["configSha256"], "generationIndex": generation_index, "proposalCount": len(entries), "acceptedCount": len(accepted), "nextImmigrantContinuationOrdinal": 0, "originProposalCounts": {origin: sum(1 for entry in entries if entry["originKind"] == origin) for origin in sorted({str(entry["originKind"]) for entry in entries})}, "originAcceptedCounts": dict(sorted(origin_counts.items())), "dispositionCounts": dict(sorted(disposition_counts.items())), "proposalSlots": population["proposalSlots"], "uniqueIdentityCounts": {"candidateIdentity": len(accepted)}, "duplicateCounters": {"candidateIdentity": disposition_counts.get("duplicate_candidate_identity", 0)}, "proposalSlotCounters": {"proposalsObserved": len(entries)}, "entrySha256s": [entry["entrySha256"] for entry in entries], "operatorImplementation": _clone(operator_implementation_identity), "populationSha256": population["populationSha256"]}
+    journal = {"schemaVersion": "temporal_qd_generation_journal_v3", "qdVersion": "temporal_qd_evolution_v3", "policyName": "stage5e7_v3_robust_quality_archive", "policySha256": population["policySha256"], "configSha256": config["configSha256"], "generationIndex": generation_index, "proposalCount": len(entries), "acceptedCount": len(accepted), "nextImmigrantContinuationOrdinal": 0, "originProposalCounts": {origin: sum(1 for entry in entries if entry["originKind"] == origin) for origin in sorted({str(entry["originKind"]) for entry in entries})}, "originAcceptedCounts": dict(sorted(origin_counts.items())), "dispositionCounts": dict(sorted(disposition_counts.items())), "proposalSlots": population["proposalSlots"], "uniqueIdentityCounts": {"candidateIdentity": len(accepted), "pairGenome": len(seen_pair_genomes)}, "duplicateCounters": {"candidateIdentity": disposition_counts.get("duplicate_candidate_identity", 0), "pairGenome": disposition_counts.get("duplicate_pair_genome", 0)}, "proposalSlotCounters": {"proposalsObserved": len(entries)}, "entrySha256s": [entry["entrySha256"] for entry in entries], "operatorImplementation": _clone(operator_implementation_identity), "populationSha256": population["populationSha256"]}
     journal["journalSha256"] = canonical_sha256(journal)
     _write_once(root / "generation-journal.json", journal)
     return {"schemaVersion": "temporal_qd_pair_generation_result_v1", "configSha256": config["configSha256"], "populationSha256": population["populationSha256"], "journalSha256": journal["journalSha256"], "proposalCount": len(entries), "candidateCount": len(accepted), "originProposalCounts": journal["originProposalCounts"], "originAcceptedCounts": journal["originAcceptedCounts"], "proposalSlots": journal["proposalSlots"], "uniqueIdentityCounts": journal["uniqueIdentityCounts"], "duplicateCounters": journal["duplicateCounters"], "proposalSlotCounters": journal["proposalSlotCounters"], "nextImmigrantContinuationOrdinal": 0, "completed": True}

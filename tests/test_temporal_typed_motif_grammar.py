@@ -79,6 +79,23 @@ def test_fragments_are_composed_generically_and_never_emit_program_metadata_into
     assert module_signatures(mean_to_program(mean))["programShapeSha256"] != module_signatures(mean_to_program(breakout))["programShapeSha256"]
 
 
+def test_registry_seed_binds_explicit_frozen_resources_without_archetype_guessing() -> None:
+    grammar = TypedFragmentGrammar(_context(), native_authority=object())
+    program = grammar.seed(
+        direction="long",
+        name="trend",
+        group_id="g_volume",
+        event_id="e_rsi",
+        plan_id="base",
+    )
+    resources = [fragment.resources for fragment in program.fragments]
+    assert any(resource.get("group") == "g_volume" for resource in resources)
+    assert any(resource.get("event") == "e_rsi" for resource in resources)
+    assert any(resource.get("plan") == "base" for resource in resources)
+    with pytest.raises(GrammarError, match="outside the frozen context"):
+        grammar.seed(direction="long", name="trend", group_id="missing")
+
+
 def mean_to_program(compiled):
     from autoresearch.temporal_typed_motif_grammar import Fragment, ModuleProgram
     return ModuleProgram(compiled.program["direction"], tuple(Fragment(f"read_{index}", item["productionId"], item["resources"], item["choices"]) for index, item in enumerate(compiled.program["fragments"])))

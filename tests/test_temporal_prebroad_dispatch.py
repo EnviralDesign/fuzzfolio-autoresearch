@@ -28,6 +28,17 @@ from autoresearch.temporal_search import (
 SHA = "sha256:" + "a" * 64
 
 
+def _catalog_resolution(profile_sha: str) -> dict:
+    material = {
+        "schemaVersion": "temporal_prebroad_catalog_resolution_v1",
+        "rawSourceProfileSha256": profile_sha,
+        "resolvedProfileSnapshotSha256": SHA,
+        "resolvedProgramSha256": SHA,
+        "indicatorCatalogSha256": SHA,
+    }
+    return {**material, "catalogResolutionSha256": canonical_sha256(material)}
+
+
 def _plan(profile_sha: str, window_id: str, start: str, end: str) -> dict:
     plan = {
         "schema_version": "fuzzfolio.replay-evidence-plan.v2",
@@ -96,6 +107,7 @@ def _inputs(tmp_path: Path) -> tuple[dict, dict]:
                 "candidateId": candidate_id,
                 "profile": profile,
                 "profileSha256": profile_sha,
+                "catalogResolution": _catalog_resolution(profile_sha),
                 "validation": validation,
                 "timeframe": "M5",
                 "barLimit": 500,
@@ -106,7 +118,7 @@ def _inputs(tmp_path: Path) -> tuple[dict, dict]:
             }
         )
     accepted = {
-        "schemaVersion": "temporal_prebroad_accepted_pairs_v1",
+        "schemaVersion": "temporal_prebroad_accepted_pairs_v2",
         "workerContract": {"workerContractSha256": SHA, "workerContractSchema": "replay-worker-contract-v1"},
         "pairs": pairs,
     }
@@ -171,7 +183,7 @@ def test_dispatch_rejects_a_worker_contract_schema_the_worker_cannot_admit(
 ) -> None:
     authority, reports = _inputs(tmp_path / "source")
     accepted = {
-        "schemaVersion": "temporal_prebroad_accepted_pairs_v1",
+        "schemaVersion": "temporal_prebroad_accepted_pairs_v2",
         "workerContract": {
             "workerContractSha256": SHA,
             "workerContractSchema": "invented-worker-contract-v9",

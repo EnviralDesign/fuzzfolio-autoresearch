@@ -11,6 +11,8 @@ import argparse
 from copy import deepcopy
 import json
 from pathlib import Path
+import subprocess
+import tempfile
 from typing import Any, Mapping
 
 from .lake_window import LakeWindowBinding, lake_window_request_contains, resolve_replay_lake_window_request
@@ -24,6 +26,7 @@ from .temporal_search import TemporalSearchContractError, canonical_sha256
 
 
 _WORKER_SCHEMA = "replay-worker-contract-v1"
+_CATALOG_RESOLUTION_SCHEMA = "temporal_prebroad_catalog_resolution_v1"
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -147,6 +150,160 @@ def _rotate_plan(template: Mapping[str, Any], *, profile: Mapping[str, Any], pro
     return plan
 
 
+def _dashboard_catalog_hydration_reports(
+    pairs: list[dict[str, Any]], dashboard_python: Path
+) -> dict[str, dict[str, Any]]:
+    """Hydrate every active indicator through the current Dashboard catalog.
+
+    Candidate semantic validation intentionally operates on abbreviated source
+    profiles, so it cannot prove that every authored indicator ID exists in the
+    currently deployed catalog.  This pre-market gate uses the same frozen
+    Dashboard Python as native candidate validation and invokes the canonical
+    hydrator without constructing an evidence plan, opening a lake, or
+    rewriting the authored source profile.
+    """
+
+    requested = [
+        {
+            "candidateId": pair["candidateId"],
+            "profile": pair["profile"],
+        }
+        for pair in pairs
+    ]
+    if not dashboard_python.is_file():
+        raise TemporalSearchContractError(
+            f"Dashboard compute Python is unavailable: {dashboard_python}"
+        )
+    code = """import json,sys
+from fuzzfolio_core.temporal_graph.graph_models import TemporalGraphProfile
+from fuzzfolio_core.temporal_graph.identity import build_profile_snapshot_sha256, build_program_sha256, canonical_sha256
+from fuzzfolio_core.models.common import INDICATORS_CONFIG
+from fuzzfolio_core.temporal_graph.observation_adapter import hydrate_temporal_profile_from_catalog
+p=json.load(open(sys.argv[1], encoding='utf-8'))
+catalog_sha=canonical_sha256(dict(INDICATORS_CONFIG))
+reports=[]
+for item in p:
+    candidate_id=item['candidateId']
+    source=item['profile']
+    raw_sha=canonical_sha256(source)
+    try:
+        resolved=hydrate_temporal_profile_from_catalog(TemporalGraphProfile.model_validate(source))
+        if catalog_sha != canonical_sha256(dict(INDICATORS_CONFIG)):
+            raise RuntimeError('indicator catalog changed during pre-broad catalog resolution')
+        material={'schemaVersion':'temporal_prebroad_catalog_resolution_v1','rawSourceProfileSha256':raw_sha,'resolvedProfileSnapshotSha256':build_profile_snapshot_sha256(resolved),'resolvedProgramSha256':build_program_sha256(resolved),'indicatorCatalogSha256':catalog_sha}
+        reports.append({'candidateId':candidate_id,'catalogResolution':{**material,'catalogResolutionSha256':canonical_sha256(material)}})
+    except Exception as exc:
+        reports.append({'candidateId':candidate_id,'catalogResolution':None,'errorType':type(exc).__name__,'message':str(exc)})
+print(json.dumps({'reports':reports}, sort_keys=True, ensure_ascii=True, allow_nan=False))
+"""
+    with tempfile.TemporaryDirectory(prefix="temporal-prebroad-catalog-") as root:
+        source = Path(root) / "pairs.json"
+        source.write_text(
+            json.dumps(requested, sort_keys=True, ensure_ascii=True, allow_nan=False),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [str(dashboard_python), "-c", code, str(source)],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+    if result.returncode != 0:
+        raise TemporalSearchContractError(
+            "Dashboard catalog hydration validation failed: "
+            f"{result.stderr.strip()[:1000]}"
+        )
+    try:
+        raw_reports = json.loads(result.stdout)["reports"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise TemporalSearchContractError(
+            "Dashboard catalog hydration validation returned invalid JSON"
+        ) from exc
+    if not isinstance(raw_reports, list):
+        raise TemporalSearchContractError(
+            "Dashboard catalog hydration validation returned malformed reports"
+        )
+    return {
+        str(report.get("candidateId")): dict(report)
+        for report in raw_reports
+        if isinstance(report, Mapping)
+    }
+
+
+def _catalog_resolution_material(
+    value: Mapping[str, Any], *, candidate_id: str, profile_sha: str
+) -> dict[str, Any]:
+    required = {
+        "schemaVersion",
+        "rawSourceProfileSha256",
+        "resolvedProfileSnapshotSha256",
+        "resolvedProgramSha256",
+        "indicatorCatalogSha256",
+        "catalogResolutionSha256",
+    }
+    if set(value) != required or value.get("schemaVersion") != _CATALOG_RESOLUTION_SCHEMA:
+        raise TemporalSearchContractError(
+            f"{candidate_id} Dashboard catalog resolution has an unknown schema"
+        )
+    if value.get("rawSourceProfileSha256") != profile_sha:
+        raise TemporalSearchContractError(
+            f"{candidate_id} Dashboard catalog resolution source profile identity drifted"
+        )
+    material = {
+        key: value[key]
+        for key in required
+        if key != "catalogResolutionSha256"
+    }
+    for key, name in (
+        ("resolvedProfileSnapshotSha256", "catalog-resolved profile snapshot"),
+        ("resolvedProgramSha256", "catalog-resolved program"),
+        ("indicatorCatalogSha256", "indicator catalog"),
+    ):
+        _sha(material.get(key), name=f"{candidate_id} {name} SHA-256")
+    if _sha(
+        value.get("catalogResolutionSha256"),
+        name=f"{candidate_id} catalog resolution SHA-256",
+    ) != canonical_sha256(material):
+        raise TemporalSearchContractError(
+            f"{candidate_id} Dashboard catalog resolution identity mismatch"
+        )
+    return deepcopy(dict(value))
+
+
+def _catalog_resolutions(
+    pairs: list[dict[str, Any]], dashboard_python: Path
+) -> dict[str, dict[str, Any]]:
+    reports = _dashboard_catalog_hydration_reports(pairs, dashboard_python)
+    resolutions: dict[str, dict[str, Any]] = {}
+    for pair in pairs:
+        candidate_id = pair["candidateId"]
+        report = reports.get(candidate_id)
+        if (
+            not isinstance(report, Mapping)
+            or set(report) not in (
+                {"candidateId", "catalogResolution"},
+                {"candidateId", "catalogResolution", "errorType", "message"},
+            )
+            or report.get("candidateId") != candidate_id
+        ):
+            raise TemporalSearchContractError(
+                f"{candidate_id} Dashboard catalog resolution was omitted or malformed"
+            )
+        resolution = report.get("catalogResolution")
+        if not isinstance(resolution, Mapping):
+            message = str(report.get("message") or "catalog resolution rejected")
+            raise TemporalSearchContractError(
+                f"{candidate_id} current Dashboard catalog resolution rejected: {message}"
+            )
+        resolutions[candidate_id] = _catalog_resolution_material(
+            resolution,
+            candidate_id=candidate_id,
+            profile_sha=pair["profileSha256"],
+        )
+    return resolutions
+
+
 def build_accepted_pairs(
     population: Mapping[str, Any],
     preparation: Mapping[str, Any],
@@ -176,17 +333,31 @@ def build_accepted_pairs(
             "candidateId": candidate_id,
             "profile": deepcopy(dict(profile)),
             "profileSha256": profile_sha,
+            "catalogResolution": {},
             "validation": {},
             "timeframe": "M5",
             "barLimit": 5000,
-            "windowInputs": [
-                {"windowId": window[0], "evidencePlan": _rotate_plan(templates[window[0]], profile=profile, profile_sha=profile_sha, timeframe="M5", window=window)}
-                for window in WINDOWS
-            ],
+            "windowInputs": [],
         })
     if len({pair["candidateId"] for pair in pairs}) != 8:
         raise TemporalSearchContractError("QD population candidates must have distinct identities")
     pairs.sort(key=lambda pair: pair["candidateId"])
+    catalog_resolutions = _catalog_resolutions(pairs, dashboard_python)
+    for pair in pairs:
+        pair["catalogResolution"] = catalog_resolutions[pair["candidateId"]]
+        pair["windowInputs"] = [
+            {
+                "windowId": window[0],
+                "evidencePlan": _rotate_plan(
+                    templates[window[0]],
+                    profile=pair["profile"],
+                    profile_sha=pair["profileSha256"],
+                    timeframe="M5",
+                    window=window,
+                ),
+            }
+            for window in WINDOWS
+        ]
     reports = native_reports if native_reports is not None else _dashboard_native_reports(pairs, dashboard_python)
     for pair in pairs:
         report = reports.get(pair["candidateId"])

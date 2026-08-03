@@ -14,6 +14,17 @@ from autoresearch.temporal_search import TemporalSearchContractError, canonical_
 SHA = "sha256:" + "a" * 64
 
 
+def _catalog_resolution(profile_sha: str) -> dict:
+    material = {
+        "schemaVersion": "temporal_prebroad_catalog_resolution_v1",
+        "rawSourceProfileSha256": profile_sha,
+        "resolvedProfileSnapshotSha256": SHA,
+        "resolvedProgramSha256": SHA,
+        "indicatorCatalogSha256": SHA,
+    }
+    return {**material, "catalogResolutionSha256": canonical_sha256(material)}
+
+
 def _plan(profile_sha: str, window_id: str, start: str, end: str) -> dict:
     plan = {
         "schema_version": "fuzzfolio.replay-evidence-plan.v2",
@@ -64,6 +75,7 @@ def _accepted_pairs() -> dict:
                 "candidateId": candidate,
                 "profile": profile,
                 "profileSha256": profile_sha,
+                "catalogResolution": _catalog_resolution(profile_sha),
                 "validation": {
                     "candidateId": candidate,
                     "candidateAcceptable": True,
@@ -83,7 +95,7 @@ def _accepted_pairs() -> dict:
             }
         )
     return {
-        "schemaVersion": "temporal_prebroad_accepted_pairs_v1",
+        "schemaVersion": "temporal_prebroad_accepted_pairs_v2",
         "workerContract": {"workerContractSha256": SHA, "workerContractSchema": "replay-worker-contract-v1"},
         "pairs": pairs,
     }

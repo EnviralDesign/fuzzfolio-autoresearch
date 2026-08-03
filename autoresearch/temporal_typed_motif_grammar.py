@@ -416,7 +416,15 @@ class TypedFragmentGrammar:
         if spec is None: raise GrammarError("unsealed fragment production")
         return Fragment(uid, production_id, dict(resources or {}), dict(choices or {key: values[0] for key, values in spec.choice_domains.items()}))
 
-    def seed(self, *, direction: str, name: str) -> ModuleProgram:
+    def seed(
+        self,
+        *,
+        direction: str,
+        name: str,
+        group_id: str | None = None,
+        event_id: str | None = None,
+        plan_id: str | None = None,
+    ) -> ModuleProgram:
         # Named legacy roots use the same registry, never a special graph path.
         recipes = {
             "mean_reversion": ("arm_level", "gate_event_window", "enter_on_level_and_event", "exit_on_age"),
@@ -424,7 +432,14 @@ class TypedFragmentGrammar:
             "trend": ("arm_level", "gate_below", "enter_on_event", "exit_on_signal"),
         }
         if name not in recipes: raise GrammarError("unknown registry seed")
-        groups, events, plan = self.context["groups"][0]["id"], self.context["events"][0]["id"], self.context["plans"][0]
+        group_ids = [str(item["id"]) for item in self.context["groups"]]
+        event_ids = [str(item["id"]) for item in self.context["events"]]
+        plan_ids = [str(item) for item in self.context["plans"]]
+        groups = str(group_id) if group_id is not None else group_ids[0]
+        events = str(event_id) if event_id is not None else event_ids[0]
+        plan = str(plan_id) if plan_id is not None else plan_ids[0]
+        if groups not in group_ids or events not in event_ids or plan not in plan_ids:
+            raise GrammarError("registry seed resource binding is outside the frozen context")
         fragments = []
         for index, production in enumerate(recipes[name]):
             spec = REGISTRY[production]; resources = {slot: {"group": groups, "event": events, "plan": plan}[slot] for slot in spec.resource_slots}

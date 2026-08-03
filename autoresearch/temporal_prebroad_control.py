@@ -22,7 +22,8 @@ from .temporal_search import TemporalSearchContractError, canonical_sha256
 SCHEMA = "temporal_prebroad_authority_v1"
 PREPARATION_SCHEMA = "temporal_prebroad_preparation_v1"
 MANIFEST_SCHEMA = "temporal_prebroad_task_manifest_v1"
-ACCEPTED_PAIRS_SCHEMA = "temporal_prebroad_accepted_pairs_v1"
+ACCEPTED_PAIRS_SCHEMA = "temporal_prebroad_accepted_pairs_v2"
+CATALOG_RESOLUTION_SCHEMA = "temporal_prebroad_catalog_resolution_v1"
 WINDOWS = (
     ("window_e_2023_10", "2023-10-01T00:00:00Z", "2023-11-01T00:00:00Z"),
     ("window_f_2021_07", "2021-07-01T00:00:00Z", "2021-08-01T00:00:00Z"),
@@ -75,7 +76,7 @@ def _pair_rows(accepted: Mapping[str, Any]) -> list[dict[str, Any]]:
         raise TemporalSearchContractError("pre-broad admission requires exactly eight accepted pairs")
     output: list[dict[str, Any]] = []
     for index, raw in enumerate(pairs):
-        if not isinstance(raw, Mapping) or set(raw) != {"candidateId", "profile", "profileSha256", "validation", "timeframe", "barLimit", "windowInputs"}:
+        if not isinstance(raw, Mapping) or set(raw) != {"candidateId", "profile", "profileSha256", "catalogResolution", "validation", "timeframe", "barLimit", "windowInputs"}:
             raise TemporalSearchContractError(f"accepted pair {index} has a closed schema")
         candidate_id = str(raw["candidateId"] or "").strip().lower().replace("-", "_")
         profile = raw["profile"]
@@ -88,6 +89,17 @@ def _pair_rows(accepted: Mapping[str, Any]) -> list[dict[str, Any]]:
             raise TemporalSearchContractError(f"pair {candidate_id} profile identity mismatch")
         if profile_copy.get("version") != "v3" or profile_copy.get("directionMode") != "both" or profile_copy.get("instruments") != ["EURUSD"]:
             raise TemporalSearchContractError(f"pair {candidate_id} must be an accepted v3/both EURUSD profile")
+        catalog_resolution = raw["catalogResolution"]
+        required_resolution = {"schemaVersion", "rawSourceProfileSha256", "resolvedProfileSnapshotSha256", "resolvedProgramSha256", "indicatorCatalogSha256", "catalogResolutionSha256"}
+        if not isinstance(catalog_resolution, Mapping) or set(catalog_resolution) != required_resolution or catalog_resolution.get("schemaVersion") != CATALOG_RESOLUTION_SCHEMA:
+            raise TemporalSearchContractError(f"pair {candidate_id} catalog resolution has a closed schema")
+        if catalog_resolution.get("rawSourceProfileSha256") != profile_sha:
+            raise TemporalSearchContractError(f"pair {candidate_id} catalog resolution source profile identity mismatch")
+        resolution_identity = {key: catalog_resolution[key] for key in required_resolution if key != "catalogResolutionSha256"}
+        for key in ("resolvedProfileSnapshotSha256", "resolvedProgramSha256", "indicatorCatalogSha256"):
+            _sha(resolution_identity[key], name=f"pair {candidate_id} catalog resolution {key}")
+        if _sha(catalog_resolution.get("catalogResolutionSha256"), name=f"pair {candidate_id} catalogResolutionSha256") != canonical_sha256(resolution_identity):
+            raise TemporalSearchContractError(f"pair {candidate_id} catalog resolution identity mismatch")
         if validation.get("candidateId") != candidate_id or validation.get("candidateAcceptable") is not True or validation.get("status") != "valid_evaluable":
             raise TemporalSearchContractError(f"pair {candidate_id} lacks accepted native validation")
         _sha(validation.get("programSha256"), name=f"pair {candidate_id} validation programSha256")
@@ -144,7 +156,7 @@ def _pair_rows(accepted: Mapping[str, Any]) -> list[dict[str, Any]]:
             if _sha(supplied, name=f"pair {candidate_id}/{window_id} planId") != canonical_sha256(identity):
                 raise TemporalSearchContractError(f"pair {candidate_id}/{window_id} evidence plan identity mismatch")
             normal_inputs.append({"windowId": window_id, "evidencePlan": plan})
-        output.append({"candidateId": candidate_id, "profile": profile_copy, "profileSha256": profile_sha, "validation": dict(validation), "timeframe": str(raw["timeframe"]).upper(), "barLimit": bar_limit, "windowInputs": normal_inputs})
+        output.append({"candidateId": candidate_id, "profile": profile_copy, "profileSha256": profile_sha, "catalogResolution": dict(catalog_resolution), "validation": dict(validation), "timeframe": str(raw["timeframe"]).upper(), "barLimit": bar_limit, "windowInputs": normal_inputs})
     if len({row["candidateId"] for row in output}) != 8:
         raise TemporalSearchContractError("pre-broad candidates must have eight distinct identities")
     return sorted(output, key=lambda row: row["candidateId"])
