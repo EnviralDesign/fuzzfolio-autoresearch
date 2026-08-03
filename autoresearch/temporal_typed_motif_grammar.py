@@ -594,6 +594,7 @@ class TypedFragmentGrammar:
         variants = list(product(roots, gates, managements, exits, range(5), range(4)))
         variants.sort(key=lambda item: canonical_sha256({"seed": seed, "variant": item}))
         output = []
+        seen_programs: set[str] = set()
         quotas = {"long": count // 2 + count % 2, "short": count // 2}; used = Counter()
         for (direction, name), gate_kind, management_kind, exit_kind, cooldown_count, choice_index in variants:
             if len(output) >= count: break
@@ -607,6 +608,14 @@ class TypedFragmentGrammar:
                 if choices: program = self.apply(program, choices[0])
             mutations = [item for item in self.enumerate_operations(program) if item["operation"] == "mutate_choice"]
             if mutations: program = self.apply(program, mutations[choice_index % len(mutations)])
+            # Duplicate fragments are canonically sorted and edit UIDs/lineage
+            # are intentionally non-semantic.  Two index-addressed edits may
+            # therefore enumerate the same program; admit that program once
+            # while continuing the finite product traversal.
+            program_sha256 = canonical_sha256(program.canonical())
+            if program_sha256 in seen_programs:
+                continue
+            seen_programs.add(program_sha256)
             output.append(program); used[direction] += 1
         if len(output) != count: raise GrammarError("finite generator has insufficient valid variants")
         return output

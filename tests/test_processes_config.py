@@ -73,9 +73,11 @@ def test_normal_operations_are_authority_bound_and_semantically_closed() -> None
         "Lab Gateway",
         "Temporal Pre-Broad No-Market Activation Canary",
         "Temporal Pre-Broad Prepare 16 Tasks",
-        "Temporal Pre-Broad Fresh 16 Tasks",
-        "Temporal Pre-Broad Resume 16 Tasks",
+        "Temporal Pre-Broad Materialize Fresh Matrix",
+        "Temporal Pre-Broad Materialize Resume Matrix",
         "Temporal Pre-Broad Authority Audit",
+        "Temporal Pre-Broad Dispatch Fresh 16 Tasks",
+        "Temporal Pre-Broad Dispatch Resume 16 Tasks",
         "AutoResearch Dashboard",
     ]
     assert "Temporal QD Broad Search (10k)" not in [
@@ -95,7 +97,7 @@ def test_normal_operations_are_authority_bound_and_semantically_closed() -> None
     assert "temporal_prebroad_canary run" in str(canary["command"])
     assert "--dashboard-python" in str(canary["command"])
 
-    prepare, fresh, resume, audit = normal_processes[2:6]
+    prepare, fresh, resume, audit, dispatch_fresh, dispatch_resume = normal_processes[2:8]
     assert "temporal_prebroad_control prepare" in str(prepare["command"])
     authority_paths = {
         _command_argument(str(process["command"]), "--authority-path")
@@ -109,19 +111,27 @@ def test_normal_operations_are_authority_bound_and_semantically_closed() -> None
     assert "temporal_prebroad_control fresh" in str(fresh["command"])
     assert "temporal_prebroad_control resume" in str(resume["command"])
     assert "temporal_prebroad_control audit" in str(audit["command"])
+    for process, mode in ((dispatch_fresh, "fresh"), (dispatch_resume, "resume")):
+        command = str(process["command"])
+        assert f"temporal_prebroad_dispatch {mode}" in command
+        assert _command_argument(command, "--authority-path") in authority_paths
+        assert _command_argument(command, "--required-authority-id-path") in authority_id_paths
+        assert _command_argument(command, "--manifest-path").endswith("task-manifest.json")
+        assert _command_argument(command, "--gateway-url") == "http://127.0.0.1:8799"
+        assert "--gateway-token" not in command
 
 
 def test_tracked_prebroad_procman_manifest_is_canonical_and_closed() -> None:
     manifest = _manifest()
     assert manifest["schemaVersion"] == "temporal_prebroad_procman_manifest_v1"
-    assert len(manifest["prebroadProcesses"]) == 5
+    assert len(manifest["prebroadProcesses"]) == 7
     assert manifest["requiredSafetyFlags"] == {
         "auto_start": False,
         "auto_restart": False,
         "respond_to_start_all": False,
         "respond_to_restart_all": False,
     }
-    assert manifest["orderedProcessIds"][1:6] == [
+    assert manifest["orderedProcessIds"][1:8] == [
         process["id"] for process in manifest["prebroadProcesses"]
     ]
     assert all("temporal-qd-supervisor" not in process["command"] for process in manifest["prebroadProcesses"])

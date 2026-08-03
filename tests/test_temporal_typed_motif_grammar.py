@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from autoresearch.temporal_search import canonical_sha256
 from autoresearch.temporal_typed_motif_grammar import (
     DashboardNativeAuthority,
     Fragment,
@@ -125,6 +126,7 @@ def test_pair_compilation_uses_canonical_dashboard_compiler_and_archive_boundary
 
 def test_generator_proves_canary_scale_diversity_without_retry_until_valid() -> None:
     grammar = _grammar(); programs = grammar.generate(count=1024, seed=20260803)
+    assert len({canonical_sha256(item.canonical()) for item in programs}) == 1024
     compiled = grammar.compile_generation_native(programs)
     signatures = [module_signatures(item) for item in programs]
     assert sum(item.direction == "long" for item in programs) == 512
