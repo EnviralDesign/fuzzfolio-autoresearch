@@ -6,9 +6,12 @@ import json
 from pathlib import Path
 import re
 
+import pytest
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPOSITORY_ROOT / "scripts" / "processes.json"
+MANIFEST_PATH = REPOSITORY_ROOT / "scripts" / "prebroad-procman-manifest.json"
 VENV_PREFIX = "C:\\repos\\fuzzfolio-autoresearch\\.venv\\Scripts\\"
 
 
@@ -17,7 +20,13 @@ def _command_argument(command: str, name: str) -> str:
     assert match is not None, f"missing {name}"
     return match.group(1) or match.group(2)
 def _config() -> dict[str, object]:
+    if not CONFIG_PATH.exists():
+        pytest.skip("local Procman configuration is intentionally ignored")
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def _manifest() -> dict[str, object]:
+    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
 
 
 def _processes(config: dict[str, object]) -> dict[str, dict[str, object]]:
@@ -60,57 +69,71 @@ def test_normal_operations_are_authority_bound_and_semantically_closed() -> None
     normal = _group(config, "Normal Operations")
     normal_processes = [processes[process_id] for process_id in normal["process_ids"]]
 
-    assert [process["name"] for process in normal_processes[2:]] == [
-        "Temporal Search - Fresh",
-        "Temporal Search - Resume",
+    assert [process["name"] for process in normal_processes] == [
+        "Lab Gateway",
+        "Temporal Pre-Broad No-Market Activation Canary",
+        "Temporal Pre-Broad Prepare 16 Tasks",
+        "Temporal Pre-Broad Fresh 16 Tasks",
+        "Temporal Pre-Broad Resume 16 Tasks",
+        "Temporal Pre-Broad Authority Audit",
         "AutoResearch Dashboard",
-        "Temporal Search Authority Audit",
     ]
-    assert normal_processes[0]["name"] == "Lab Gateway"
-    worker = normal_processes[1]
-    assert worker["name"] in {
-        "Temporal Graph Local Worker",
-        "Temporal Graph Frozen Worker (b69e)",
-    }
-    if worker["name"] == "Temporal Graph Local Worker":
-        assert "start-local-lab-ws-worker.ps1" in str(worker["command"])
-        worker_launcher = (
-            REPOSITORY_ROOT / "scripts" / "start-local-lab-ws-worker.ps1"
-        ).read_text(encoding="utf-8")
-        assert "sim-worker-replay.exe" in worker_launcher
-        assert "from app.cli import sim_worker_replay" not in worker_launcher
-        assert "FUZZFOLIO_WORKER_LAUNCHER_PID" in worker_launcher
-    else:
-        assert worker["process_type"] == "Docker"
-        assert worker["command"] == "fuzzfolio-stage5e0-containment-worker"
-
-    fresh = normal_processes[2]
-    resume = normal_processes[3]
-    authority_paths = set()
-    output_roots = set()
-    for process, lifecycle_flag in ((fresh, "--fresh"), (resume, "--resume")):
-        command = str(process["command"])
-        assert "uv run temporal-search" in command
-        assert lifecycle_flag in command
-        assert "--gateway-url http://127.0.0.1:8799" in command
-        assert "--timeout-seconds 900" in command
-        authority_paths.add(_command_argument(command, "--authority-path"))
-        output_roots.add(_command_argument(command, "--output-root"))
+    assert "Temporal QD Broad Search (10k)" not in [
+        process["name"] for process in processes.values()
+    ]
+    for process in normal_processes:
+        assert process["auto_start"] is False
         assert process["auto_restart"] is False
-        assert "--plan-only" not in command
+        assert process["respond_to_start_all"] is False
+        assert process["respond_to_restart_all"] is False
+        command = str(process["command"])
+        assert "--broad" not in command
+        assert "temporal-qd-supervisor" not in command
+        assert "worker" not in process["name"].lower()
 
-    assert "--fresh" not in str(resume["command"])
-    assert "--resume" not in str(fresh["command"])
-    assert len(authority_paths) == 1
-    assert len(output_roots) == 1
-    authority_path = next(iter(authority_paths))
-    assert authority_path.lower().endswith("authority.json")
+    canary = normal_processes[1]
+    assert "temporal_prebroad_canary run" in str(canary["command"])
+    assert "--dashboard-python" in str(canary["command"])
 
-    authority_audit = normal_processes[5]
-    audit_command = str(authority_audit["command"])
-    assert "uv run temporal-search-authority" in audit_command
-    assert "--audit" in audit_command
-    assert _command_argument(audit_command, "--authority-path") == authority_path
+    prepare, fresh, resume, audit = normal_processes[2:6]
+    assert "temporal_prebroad_control prepare" in str(prepare["command"])
+    authority_paths = {
+        _command_argument(str(process["command"]), "--authority-path")
+        for process in (fresh, resume, audit)
+    }
+    authority_id_paths = {
+        _command_argument(str(process["command"]), "--required-authority-id-path")
+        for process in (fresh, resume, audit)
+    }
+    assert len(authority_paths) == len(authority_id_paths) == 1
+    assert "temporal_prebroad_control fresh" in str(fresh["command"])
+    assert "temporal_prebroad_control resume" in str(resume["command"])
+    assert "temporal_prebroad_control audit" in str(audit["command"])
+
+
+def test_tracked_prebroad_procman_manifest_is_canonical_and_closed() -> None:
+    manifest = _manifest()
+    assert manifest["schemaVersion"] == "temporal_prebroad_procman_manifest_v1"
+    assert len(manifest["prebroadProcesses"]) == 5
+    assert manifest["requiredSafetyFlags"] == {
+        "auto_start": False,
+        "auto_restart": False,
+        "respond_to_start_all": False,
+        "respond_to_restart_all": False,
+    }
+    assert manifest["orderedProcessIds"][1:6] == [
+        process["id"] for process in manifest["prebroadProcesses"]
+    ]
+    assert all("temporal-qd-supervisor" not in process["command"] for process in manifest["prebroadProcesses"])
+    assert all("--broad" not in process["command"] for process in manifest["prebroadProcesses"])
+
+
+def test_local_procman_config_matches_tracked_manifest_when_present() -> None:
+    if not CONFIG_PATH.exists():
+        pytest.skip("local Procman configuration is intentionally ignored")
+    from autoresearch.temporal_prebroad_procman import check
+
+    assert check(CONFIG_PATH)["ok"] is True
 
 
 def test_legacy_level_c_and_destructive_apply_controls_are_absent() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -494,6 +495,37 @@ def test_qd_global_ledger_rejects_evicted_exact_evaluation_and_reports_counts(
     assert counters["proposalSlotCounters"]["duplicateRejections"] == 1
 
 
+def test_qd_ledger_membership_index_matches_authoritative_record_scan() -> None:
+    profile, _ = _repair_profile(_profile(), parameters=GENERATOR_V2_PARAMETERS)
+    candidate = {
+        "candidateIdentitySha256": canonical_sha256({"candidate": "once"}),
+        "programSha256": canonical_sha256({"program": profile}),
+        "sourceProfile": profile,
+        "sourceProfileSha256": canonical_sha256(profile),
+        "profileSnapshotSha256": canonical_sha256(profile),
+    }
+    context = qd_module.qd_predeclared_evidence_context({})
+    candidate["canonicalEvidenceIdentitySha256"] = (
+        qd_module.qd_canonical_evidence_identity(candidate, context)
+    )
+    source = qd_module._empty_identity_ledger()
+    qd_module._ledger_accept(source, candidate)
+    indexed = deepcopy(source)
+    expected_reason, expected_checks = qd_module._ledger_duplicate_check(
+        source, candidate
+    )
+    observed_reason, observed_checks = qd_module._ledger_duplicate_check(
+        indexed,
+        candidate,
+        identity_index=qd_module._ledger_identity_index(indexed),
+    )
+    assert (observed_reason, observed_checks, indexed) == (
+        expected_reason,
+        expected_checks,
+        source,
+    )
+
+
 def test_qd_ledger_allows_same_program_only_for_changed_predeclared_evidence() -> None:
     profile, _ = _repair_profile(_profile(), parameters=GENERATOR_V2_PARAMETERS)
     common = {
@@ -876,6 +908,16 @@ def test_qd_generation_is_exact_across_full_and_sliced_restart(
     )
     assert full["populationSha256"] == resumed["populationSha256"]
     assert full["journalSha256"] == resumed["journalSha256"]
+    assert (tmp_path / "full" / "identity-ledger.json").read_bytes() == (
+        tmp_path / "resumed" / "identity-ledger.json"
+    ).read_bytes()
+    assert (tmp_path / "full" / "checkpoint.json").read_bytes() == (
+        tmp_path / "resumed" / "checkpoint.json"
+    ).read_bytes()
+    assert [path.read_bytes() for path in sorted((tmp_path / "full" / "proposal-journal").glob("*.json"))] == [
+        path.read_bytes()
+        for path in sorted((tmp_path / "resumed" / "proposal-journal").glob("*.json"))
+    ]
     assert sum(full["originAcceptedCounts"].values()) == 5
     assert full["originProposalCounts"] == {
         "random_immigrant": 1,

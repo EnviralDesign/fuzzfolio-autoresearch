@@ -984,7 +984,7 @@ def test_controller_persists_and_acknowledges_failed_completion_before_tripwire(
     assert failure["error"]["type"] == "fixture_failure"
 
 
-def test_procman_normal_operations_is_temporal_search_topology() -> None:
+def test_procman_normal_operations_is_prebroad_admission_topology() -> None:
     root = Path(__file__).resolve().parents[1]
     config_path = root / "scripts" / "processes.json"
     if not config_path.is_file():
@@ -997,15 +997,17 @@ def test_procman_normal_operations_is_temporal_search_topology() -> None:
     names = {processes[item]["name"] for item in normal["process_ids"]}
     assert names == {
         "Lab Gateway",
-        "Temporal QD Broad Search (10k)",
+        "Temporal Pre-Broad No-Market Activation Canary",
+        "Temporal Pre-Broad Prepare 16 Tasks",
+        "Temporal Pre-Broad Fresh 16 Tasks",
+        "Temporal Pre-Broad Resume 16 Tasks",
+        "Temporal Pre-Broad Authority Audit",
         "AutoResearch Dashboard",
     }
     assert not any(item["name"].startswith("Phase 3 ") for item in processes.values())
-    supervisor = next(
-        processes[item]
-        for item in normal["process_ids"]
-        if processes[item]["name"] == "Temporal QD Broad Search (10k)"
-    )
-    assert "temporal-qd-supervisor" in supervisor["command"]
-    assert "--generation-count 4" in supervisor["command"]
-    assert "--broad-admission" in supervisor["command"]
+    assert not any("temporal-qd-supervisor" in item["command"] for item in processes.values())
+    for item in processes.values():
+        assert item["auto_start"] is False
+        assert item["auto_restart"] is False
+        assert item["respond_to_start_all"] is False
+        assert item["respond_to_restart_all"] is False

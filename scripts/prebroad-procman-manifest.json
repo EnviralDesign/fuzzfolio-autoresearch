@@ -1,0 +1,21 @@
+{
+  "schemaVersion": "temporal_prebroad_procman_manifest_v1",
+  "groupName": "Normal Operations",
+  "orderedProcessIds": [
+    "a1634501-c982-47cd-b89e-c10d7c210222",
+    "6cf0ad5d-6255-4d78-83ae-d6a2e5e05001",
+    "e3a4b2d1-70d9-43c6-89c0-000000000001",
+    "e3a4b2d1-70d9-43c6-89c0-000000000002",
+    "e3a4b2d1-70d9-43c6-89c0-000000000003",
+    "e3a4b2d1-70d9-43c6-89c0-000000000004",
+    "eb9d6864-2adb-4219-9da1-4b5210b2aedf"
+  ],
+  "prebroadProcesses": [
+    {"id":"6cf0ad5d-6255-4d78-83ae-d6a2e5e05001","name":"Temporal Pre-Broad No-Market Activation Canary","command":"C:\\repos\\fuzzfolio-autoresearch\\.venv\\Scripts\\python.exe -m autoresearch.temporal_prebroad_canary run --artifacts C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\accepted-canary-artifacts.json --output-root C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\canary --dashboard-python C:\\repos\\Trading-Dashboard\\compute-service\\.venv\\Scripts\\python.exe"},
+    {"id":"e3a4b2d1-70d9-43c6-89c0-000000000001","name":"Temporal Pre-Broad Prepare 16 Tasks","command":"C:\\repos\\fuzzfolio-autoresearch\\.venv\\Scripts\\python.exe -m autoresearch.temporal_prebroad_control prepare --accepted-pairs C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\accepted-pairs.json --output-root C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\authority"},
+    {"id":"e3a4b2d1-70d9-43c6-89c0-000000000002","name":"Temporal Pre-Broad Fresh 16 Tasks","command":"C:\\repos\\fuzzfolio-autoresearch\\.venv\\Scripts\\python.exe -m autoresearch.temporal_prebroad_control fresh --authority-path C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\authority\\authority.json --required-authority-id-path C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\authority\\authority-id.txt --output-root C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\matrix"},
+    {"id":"e3a4b2d1-70d9-43c6-89c0-000000000003","name":"Temporal Pre-Broad Resume 16 Tasks","command":"C:\\repos\\fuzzfolio-autoresearch\\.venv\\Scripts\\python.exe -m autoresearch.temporal_prebroad_control resume --authority-path C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\authority\\authority.json --required-authority-id-path C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\authority\\authority-id.txt --output-root C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\matrix"},
+    {"id":"e3a4b2d1-70d9-43c6-89c0-000000000004","name":"Temporal Pre-Broad Authority Audit","command":"C:\\repos\\fuzzfolio-autoresearch\\.venv\\Scripts\\python.exe -m autoresearch.temporal_prebroad_control audit --authority-path C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\authority\\authority.json --required-authority-id-path C:\\repos\\fuzzfolio-autoresearch\\runs\\prebroad-admission\\authority\\authority-id.txt"}
+  ],
+  "requiredSafetyFlags":{"auto_start":false,"auto_restart":false,"respond_to_start_all":false,"respond_to_restart_all":false}
+}

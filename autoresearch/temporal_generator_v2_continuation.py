@@ -10,7 +10,9 @@ unused proposal.
 from __future__ import annotations
 
 import random
+from copy import deepcopy
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,36 @@ from .temporal_discovery_validation import _normalize_preparation
 from .temporal_search_policy_v2 import GENERATOR_V2_VERSION
 
 IMMIGRANT_SOURCE_VERSION = "temporal_generator_v2_qd_immigrant_stream_v1"
+
+
+@dataclass(frozen=True)
+class _ContinuationRuntimeState:
+    """Ephemeral exact RNG state for one already-verified immigrant source."""
+
+    source_identity: dict[str, Any]
+    parameters: dict[str, Any]
+    targets: dict[str, int]
+    mode_counts: dict[str, int]
+    seeds: list[dict[str, Any]]
+    absolute_start: int
+    next_continuation_ordinal: int
+    rng_state: object
+
+
+# This is intentionally process-local and is never written beside a generation
+# checkpoint.  A cold process always follows the complete replay/audit path.
+# The supervisor invokes consecutive generations in one interpreter, so the
+# cache removes repeated reconstruction of an already audited RNG prefix.
+_CONTINUATION_RUNTIME_CACHE: dict[str, _ContinuationRuntimeState] = {}
+
+
+def _cached_runtime_state(
+    source_identity_sha256: str, *, continuation_ordinal: int
+) -> _ContinuationRuntimeState | None:
+    state = _CONTINUATION_RUNTIME_CACHE.get(source_identity_sha256)
+    if state is None or state.next_continuation_ordinal != continuation_ordinal:
+        return None
+    return state
 
 
 def _verify_identity(
@@ -176,6 +208,28 @@ class ExactGeneratorV2Continuation:
             raise TemporalDiscoveryContractError(
                 "confirmed-entry continuation start mismatch"
             )
+        source_identity = {
+            "schemaVersion": "temporal_generator_v2_qd_immigrant_source_identity_v1",
+            "sourceVersion": IMMIGRANT_SOURCE_VERSION,
+            "generatorVersion": GENERATOR_V2_VERSION,
+            "continuationVersion": CONTINUATION_VERSION,
+            "sourcePreparationSha256": preparation["preparationSha256"],
+            "baseConfigSha256": base_config_sha,
+            "basePopulationSha256": base_population_sha,
+            "baseJournalSha256": base_journal_sha,
+            "baseManifestSha256": base_audit["manifestSha256"],
+            "confirmedEntryConfigSha256": admission_config_sha,
+            "confirmedEntryJournalSha256": admission_journal_sha,
+            "consumedPrefixProposalCount": len(base_entries) + len(consumed),
+        }
+        source_identity["sourceIdentitySha256"] = canonical_sha256(source_identity)
+        cached = _cached_runtime_state(
+            source_identity["sourceIdentitySha256"],
+            continuation_ordinal=start_continuation_ordinal,
+        )
+        if cached is not None:
+            self._restore_runtime_state(cached)
+            return
         for offset, expected in enumerate(consumed):
             if int(expected.get("continuationOrdinal", -1)) != offset:
                 raise TemporalDiscoveryContractError(
@@ -196,22 +250,6 @@ class ExactGeneratorV2Continuation:
                     f"confirmed-entry continuation diverged at offset {offset}"
                 )
 
-        source_identity = {
-            "schemaVersion": "temporal_generator_v2_qd_immigrant_source_identity_v1",
-            "sourceVersion": IMMIGRANT_SOURCE_VERSION,
-            "generatorVersion": GENERATOR_V2_VERSION,
-            "continuationVersion": CONTINUATION_VERSION,
-            "sourcePreparationSha256": preparation["preparationSha256"],
-            "baseConfigSha256": base_config_sha,
-            "basePopulationSha256": base_population_sha,
-            "baseJournalSha256": base_journal_sha,
-            "baseManifestSha256": base_audit["manifestSha256"],
-            "confirmedEntryConfigSha256": admission_config_sha,
-            "confirmedEntryJournalSha256": admission_journal_sha,
-            "consumedPrefixProposalCount": len(base_entries) + len(consumed),
-        }
-        source_identity["sourceIdentitySha256"] = canonical_sha256(source_identity)
-
         self.source_identity = source_identity
         self._rng = rng
         self._parameters = parameters
@@ -222,6 +260,31 @@ class ExactGeneratorV2Continuation:
         self._next_continuation_ordinal = 0
         for _ in range(start_continuation_ordinal):
             self._next_unchecked()
+        self._cache_runtime_state()
+
+    def _restore_runtime_state(self, state: _ContinuationRuntimeState) -> None:
+        self.source_identity = deepcopy(state.source_identity)
+        self._rng = random.Random()
+        self._rng.setstate(deepcopy(state.rng_state))
+        self._parameters = deepcopy(state.parameters)
+        self._targets = deepcopy(state.targets)
+        self._mode_counts = deepcopy(state.mode_counts)
+        self._seeds = deepcopy(state.seeds)
+        self._absolute_start = state.absolute_start
+        self._next_continuation_ordinal = state.next_continuation_ordinal
+
+    def _cache_runtime_state(self) -> None:
+        source_sha = str(self.source_identity["sourceIdentitySha256"])
+        _CONTINUATION_RUNTIME_CACHE[source_sha] = _ContinuationRuntimeState(
+            source_identity=deepcopy(self.source_identity),
+            parameters=deepcopy(self._parameters),
+            targets=deepcopy(self._targets),
+            mode_counts=deepcopy(self._mode_counts),
+            seeds=deepcopy(self._seeds),
+            absolute_start=self._absolute_start,
+            next_continuation_ordinal=self._next_continuation_ordinal,
+            rng_state=deepcopy(self._rng.getstate()),
+        )
 
     @property
     def next_continuation_ordinal(self) -> int:
@@ -239,6 +302,7 @@ class ExactGeneratorV2Continuation:
             continuation=True,
         )
         self._next_continuation_ordinal += 1
+        self._cache_runtime_state()
         return proposal
 
     def next_proposal(self) -> dict[str, Any]:

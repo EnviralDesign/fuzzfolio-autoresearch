@@ -64,6 +64,11 @@ from .temporal_operator_construction_v3 import (
 )
 from .temporal_operator_expansion import expanded_structural_operators
 from .temporal_search_policy_v2 import inspect_management_reachability
+from .temporal_bidirectional_genome import (
+    BidirectionalGenomeError,
+    FrozenPair,
+    IdentitySnapshot,
+)
 
 QD_VERSION = "temporal_qd_evolution_v3"
 QD_ARCHIVE_SCHEMA = "temporal_qd_archive_v3"
@@ -74,6 +79,7 @@ QD_POPULATION_SCHEMA = "temporal_qd_generation_population_v3"
 QD_JOURNAL_SCHEMA = "temporal_qd_generation_journal_v3"
 QD_MANIFEST_SCHEMA = "temporal_qd_generation_manifest_v3"
 QD_IDENTITY_LEDGER_SCHEMA = "temporal_qd_identity_ledger_v3"
+BIDIRECTIONAL_QD_POLICY_SCHEMA = "temporal_qd_bidirectional_pair_policy_v1"
 
 QD_POLICY_NAME = "stage5e7_v3_robust_quality_archive"
 QD_POLICY = {
@@ -174,6 +180,132 @@ DEFAULT_QD_PARAMETERS: dict[str, Any] = {
     "capTrades": 20,
     "cellCapacity": 4,
 }
+
+
+def _bidirectional_pair_policy(payload: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Read the explicit opt-in gate; never infer pair mode from v3 profiles."""
+    raw = payload.get("bidirectionalPairPolicy")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping) or set(raw) != {"schemaVersion", "enabled", "compilerAuthority"}:
+        raise TemporalDiscoveryContractError("QD bidirectional pair policy fields are not exact")
+    if raw.get("schemaVersion") != BIDIRECTIONAL_QD_POLICY_SCHEMA or raw.get("enabled") is not True:
+        raise TemporalDiscoveryContractError("QD bidirectional pair policy is not an enabled known version")
+    try:
+        compiler = IdentitySnapshot.from_payload(raw["compilerAuthority"], expected_kind="pairCompiler")
+    except (BidirectionalGenomeError, KeyError, TypeError) as exc:
+        raise TemporalDiscoveryContractError("QD bidirectional compiler authority is invalid") from exc
+    result = {
+        "schemaVersion": BIDIRECTIONAL_QD_POLICY_SCHEMA,
+        "enabled": True,
+        "compilerAuthority": compiler.canonical_payload(),
+    }
+    result["policySha256"] = canonical_sha256(result)
+    return result
+
+
+def _require_bidirectional_candidate(candidate: Mapping[str, Any], policy: Mapping[str, Any]) -> FrozenPair:
+    """Admit only fully materialized, immutable v3/both economic candidates."""
+    raw = candidate.get("bidirectionalGenome")
+    if not isinstance(raw, Mapping):
+        raise TemporalDiscoveryContractError("QD bidirectional candidate lacks frozen pair material")
+    try:
+        pair = FrozenPair.from_payload(raw)
+    except BidirectionalGenomeError as exc:
+        raise TemporalDiscoveryContractError("QD bidirectional pair material is invalid") from exc
+    if pair.pair_compiler.canonical_payload() != policy["compilerAuthority"]:
+        raise TemporalDiscoveryContractError("QD bidirectional pair compiler authority mismatch")
+    profile = candidate.get("sourceProfile")
+    if not isinstance(profile, Mapping) or canonical_sha256(profile) != pair.raw_pair_sha256 or profile.get("version") != "v3" or profile.get("directionMode") != "both":
+        raise TemporalDiscoveryContractError("QD economic candidates must be the exact frozen v3/both pair")
+    if candidate.get("sourceProfileSha256") != pair.raw_pair_sha256 or candidate.get("programSha256") != pair.native_program_sha256:
+        raise TemporalDiscoveryContractError("QD bidirectional candidate compiled identities mismatch")
+    material = candidate.get("candidateIdentityMaterial")
+    if not isinstance(material, Mapping) or material.get("bidirectionalGenomeIdentitySha256") != pair.identity_sha256 or material.get("pairPolicySha256") != policy["policySha256"]:
+        raise TemporalDiscoveryContractError("QD bidirectional candidate identity does not bind frozen pair material")
+    return pair
+
+
+def materialize_bidirectional_qd_candidate(
+    *,
+    pair: FrozenPair,
+    pair_policy: Mapping[str, Any],
+    origin_kind: str,
+    generation_index: int,
+    birth_ordinal: int,
+    proposal_ordinal: int,
+) -> dict[str, Any]:
+    """Convert a frozen pair, never a v2 module, into one economic QD member.
+
+    Factories and structural operators hand QD a fully compiled ``FrozenPair``.
+    This boundary is deliberately small: it has no fallback that can accidentally
+    emit a standalone module task or recover missing opposite-side material.
+    """
+    policy = _bidirectional_pair_policy({"bidirectionalPairPolicy": pair_policy})
+    assert policy is not None
+    if pair.pair_compiler.canonical_payload() != policy["compilerAuthority"]:
+        raise TemporalDiscoveryContractError("bidirectional pair compiler authority does not match policy")
+    if origin_kind not in {"random_immigrant", "structural_offspring"}:
+        raise TemporalDiscoveryContractError("bidirectional QD origin kind is unknown")
+    frozen_pair_payload = pair.canonical_payload()
+    lineage = _clone(
+        frozen_pair_payload["sideTargetedLineage"], name="bidirectional side lineage"
+    )
+    identity_material = {
+        "schemaVersion": "temporal_qd_bidirectional_candidate_identity_v1",
+        "qdEngineVersion": QD_VERSION,
+        "originKind": origin_kind,
+        "bidirectionalGenomeIdentitySha256": pair.identity_sha256,
+        "pairPolicySha256": policy["policySha256"],
+        "longModuleIdentitySha256": pair.long.identity_sha256,
+        "shortModuleIdentitySha256": pair.short.identity_sha256,
+        "longGrammarContextSha256": pair.long.grammar_context.sha256,
+        "shortGrammarContextSha256": pair.short.grammar_context.sha256,
+        "longCatalogSha256": pair.long.catalog.sha256,
+        "shortCatalogSha256": pair.short.catalog.sha256,
+        "longPolicySha256": pair.long.policy.sha256,
+        "shortPolicySha256": pair.short.policy.sha256,
+        "longNativeAuthoritySha256": pair.long.native_authority.sha256,
+        "shortNativeAuthoritySha256": pair.short.native_authority.sha256,
+        "pairCompilerAuthoritySha256": pair.pair_compiler.sha256,
+        "compiledRawPairSha256": pair.raw_pair_sha256,
+        "compiledProfileSha256": pair.profile_sha256,
+        "compiledProgramSha256": pair.native_program_sha256,
+        "compiledValidationReportSha256": pair.native_validation_report_sha256,
+        "orderedSideLineage": lineage,
+    }
+    identity_sha = canonical_sha256(identity_material)
+    candidate_id = "qd_" + identity_sha.removeprefix("sha256:")[:28]
+    candidate = {
+        "candidateId": candidate_id,
+        "sourceMode": "qd_" + origin_kind + "_bidirectional_pair",
+        "seedId": "bidirectional_pair",
+        "generationIndex": generation_index,
+        "birthOrdinal": birth_ordinal,
+        "proposalOrdinal": proposal_ordinal,
+        "sourceProfile": frozen_pair_payload["profile"],
+        "sourceProfileSha256": pair.raw_pair_sha256,
+        "profileSnapshotSha256": pair.profile_sha256,
+        "programSha256": pair.native_program_sha256,
+        "validationReportSha256": pair.native_validation_report_sha256,
+        "candidateIdentityMaterial": identity_material,
+        "candidateIdentitySha256": identity_sha,
+        "structuralDepth": len(lineage),
+        "structuralOperatorHistory": lineage,
+        "mutationTrace": [],
+        "activationAwareRepairs": [],
+        "constructionEvidenceScope": _construction_evidence_scope([]),
+        "bidirectionalGenome": frozen_pair_payload,
+        "lineage": {
+            "schemaVersion": "temporal_qd_bidirectional_candidate_lineage_v1",
+            "candidateId": candidate_id,
+            "candidateIdentitySha256": identity_sha,
+            "pairIdentitySha256": pair.identity_sha256,
+            "orderedSideLineage": lineage,
+        },
+    }
+    _require_bidirectional_candidate(candidate, policy)
+    return candidate
 
 
 def _read(path: Path, *, name: str) -> dict[str, Any]:
@@ -299,6 +431,7 @@ def _load_population(path: Path) -> tuple[list[dict[str, Any]], str]:
         raise TemporalDiscoveryContractError(
             "QD source population cannot require both authored and legacy admission bindings"
         )
+    bidirectional_policy = _bidirectional_pair_policy(payload)
     candidates = []
     for raw in values:
         if not isinstance(raw, Mapping):
@@ -315,6 +448,8 @@ def _load_population(path: Path) -> tuple[list[dict[str, Any]], str]:
                 "QD candidate profile identity mismatch"
             )
         _sha(candidate.get("programSha256"), name="QD candidate program SHA-256")
+        if bidirectional_policy is not None:
+            _require_bidirectional_candidate(candidate, bidirectional_policy)
         if require_authored_binding:
             validate_authored_validation_binding(candidate)
         elif (
@@ -877,6 +1012,8 @@ def build_qd_archive(
         raise TemporalDiscoveryContractError(
             "QD archive must use the frozen Stage 5E7-v3 trade-support policy"
         )
+    population_payload = _read(Path(population_path), name="QD source population")
+    bidirectional_policy = _bidirectional_pair_policy(population_payload)
     candidates, population_sha = _load_population(Path(population_path))
     candidate_map = {item["candidateId"]: item for item in candidates}
     results = load_stage_results(result_root)
@@ -892,6 +1029,8 @@ def build_qd_archive(
     previous_member_ids: set[str] = set()
     if previous_archive_path is not None:
         previous, previous_sha = _load_archive(Path(previous_archive_path))
+        if _bidirectional_pair_policy(previous) != bidirectional_policy:
+            raise TemporalDiscoveryContractError("QD archive cannot mix bidirectional and legacy candidate policies")
         prior_candidate_count_seen = int(previous.get("candidateCountSeen") or 0)
         for cell in previous.get("cells") or []:
             cell_id = str(cell["cellId"])
@@ -1072,6 +1211,7 @@ def build_qd_archive(
             "uniqueResolvedProgramCount": len(reduced_members),
             "duplicates": resolved_duplicate_provenance,
         },
+        **({"bidirectionalPairPolicy": {key: value for key, value in bidirectional_policy.items() if key != "policySha256"}} if bidirectional_policy is not None else {}),
         "occupiedCellCount": len(cells),
         "newCellCount": len(
             {str(cell["cellId"]) for cell in cells} - previous_cell_ids
@@ -1389,6 +1529,15 @@ def _load_archive(path: Path) -> tuple[dict[str, Any], str]:
         or archive.get("frozenPolicy") != QD_POLICY
     ):
         raise TemporalDiscoveryContractError("unknown QD archive schema")
+    bidirectional_policy = _bidirectional_pair_policy(archive)
+    if bidirectional_policy is not None:
+        for cell in archive.get("cells") or []:
+            if not isinstance(cell, Mapping):
+                raise TemporalDiscoveryContractError("QD bidirectional archive cell is invalid")
+            for member in cell.get("members") or []:
+                if not isinstance(member, Mapping) or not isinstance(member.get("candidate"), Mapping):
+                    raise TemporalDiscoveryContractError("QD bidirectional archive member lacks candidate")
+                _require_bidirectional_candidate(member["candidate"], bidirectional_policy)
     return archive, archive_sha
 
 
@@ -1906,17 +2055,40 @@ def _ledger_record(candidate: Mapping[str, Any]) -> dict[str, str]:
 
 def _ledger_refresh_counts(ledger: dict[str, Any]) -> None:
     records = ledger["records"]
-    mapping = {
-        "candidateIdentity": "candidateIdentitySha256",
-        "program": "programSha256",
-        "sourceProfile": "sourceProfileSha256",
-        "profileSnapshot": "profileSnapshotSha256",
-        "canonicalEvidence": "canonicalEvidenceIdentitySha256",
-    }
     ledger["uniqueCounts"] = {
         name: len({str(record[key]) for record in records})
-        for name, key in mapping.items()
+        for name, key in _LEDGER_IDENTITY_FIELDS.items()
     }
+
+
+_LEDGER_IDENTITY_FIELDS = {
+    "candidateIdentity": "candidateIdentitySha256",
+    "program": "programSha256",
+    "sourceProfile": "sourceProfileSha256",
+    "profileSnapshot": "profileSnapshotSha256",
+    "canonicalEvidence": "canonicalEvidenceIdentitySha256",
+}
+
+
+def _ledger_identity_index(ledger: Mapping[str, Any]) -> dict[str, set[str]]:
+    """Build an ephemeral membership index for one generation invocation.
+
+    The ledger remains the sole persisted authority.  This derived index only
+    removes repeated O(records) scans while proposals are being made; it is
+    deliberately never serialized and is rebuilt on every resume.
+    """
+    records = ledger.get("records") or []
+    return {
+        name: {str(record[key]) for record in records}
+        for name, key in _LEDGER_IDENTITY_FIELDS.items()
+    }
+
+
+def _ledger_index_add(
+    index: dict[str, set[str]], record: Mapping[str, str]
+) -> None:
+    for name, key in _LEDGER_IDENTITY_FIELDS.items():
+        index[name].add(str(record[key]))
 
 
 def _ledger_bootstrap_archive(
@@ -1956,21 +2128,23 @@ def _ledger_bootstrap_archive(
 
 
 def _ledger_duplicate_check(
-    ledger: dict[str, Any], candidate: Mapping[str, Any]
+    ledger: dict[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    identity_index: Mapping[str, set[str]] | None = None,
 ) -> tuple[str | None, dict[str, bool]]:
     record = _ledger_record(candidate)
-    records = ledger.get("records") or []
-    keys = {
-        "candidateIdentity": "candidateIdentitySha256",
-        "program": "programSha256",
-        "sourceProfile": "sourceProfileSha256",
-        "profileSnapshot": "profileSnapshotSha256",
-        "canonicalEvidence": "canonicalEvidenceIdentitySha256",
-    }
-    checks = {
-        name: any(existing.get(key) == record[key] for existing in records)
-        for name, key in keys.items()
-    }
+    if identity_index is None:
+        records = ledger.get("records") or []
+        checks = {
+            name: any(existing.get(key) == record[key] for existing in records)
+            for name, key in _LEDGER_IDENTITY_FIELDS.items()
+        }
+    else:
+        checks = {
+            name: str(record[key]) in identity_index[name]
+            for name, key in _LEDGER_IDENTITY_FIELDS.items()
+        }
     for name, duplicate in checks.items():
         if duplicate:
             ledger["duplicateCounters"][name] += 1
@@ -1985,8 +2159,16 @@ def _ledger_duplicate_check(
     return None, checks
 
 
-def _ledger_accept(ledger: dict[str, Any], candidate: Mapping[str, Any]) -> None:
-    ledger["records"].append(_ledger_record(candidate))
+def _ledger_accept(
+    ledger: dict[str, Any],
+    candidate: Mapping[str, Any],
+    *,
+    identity_index: dict[str, set[str]] | None = None,
+) -> None:
+    record = _ledger_record(candidate)
+    ledger["records"].append(record)
+    if identity_index is not None:
+        _ledger_index_add(identity_index, record)
     ledger["proposalSlotCounters"]["acceptedUniqueProposalSlots"] += 1
     _ledger_refresh_counts(ledger)
 
@@ -2813,6 +2995,13 @@ def generate_qd_generation(
     validator_timeout_seconds: float = 60.0,
     max_new_proposals: int | None = None,
     construction_catalog_path: Path | str | None = None,
+    generation_funnel_enabled: bool = False,
+    bidirectional_pair_policy: Mapping[str, Any] | None = None,
+    bidirectional_pair_factory: Any | None = None,
+    bidirectional_module_authority: Any | None = None,
+    bidirectional_native_validator: Any | None = None,
+    bidirectional_pair_compiler: Any | None = None,
+    bidirectional_operator_implementation_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     if generation_index < 1:
         raise TemporalDiscoveryContractError("evolved QD generations begin at index 1")
@@ -2820,6 +3009,41 @@ def generate_qd_generation(
         raise TemporalDiscoveryContractError("immigrant continuation start is negative")
     root = Path(output_root)
     archive, archive_sha = _load_archive(Path(parent_archive_path))
+    archive_pair_policy = _bidirectional_pair_policy(archive)
+    supplied_pair_policy = (
+        _bidirectional_pair_policy({"bidirectionalPairPolicy": bidirectional_pair_policy})
+        if bidirectional_pair_policy is not None
+        else None
+    )
+    if archive_pair_policy is not None and supplied_pair_policy is not None and archive_pair_policy != supplied_pair_policy:
+        raise TemporalDiscoveryContractError("bidirectional QD generation policy differs from parent archive")
+    pair_policy = archive_pair_policy or supplied_pair_policy
+    if pair_policy is not None:
+        if any(value is None for value in (bidirectional_pair_factory, bidirectional_module_authority, bidirectional_native_validator, bidirectional_pair_compiler, bidirectional_operator_implementation_identity)):
+            raise TemporalDiscoveryContractError("bidirectional QD generation requires explicit frozen pair factory and native authorities")
+        from .temporal_qd_pair_generation import generate_pair_population
+
+        parents = []
+        for cell in archive.get("cells") or []:
+            for member in cell.get("members") or []:
+                candidate = member.get("candidate") if isinstance(member, Mapping) else None
+                if isinstance(candidate, Mapping):
+                    parents.append(FrozenPair.from_payload(candidate["bidirectionalGenome"]))
+        return generate_pair_population(
+            output_root=root,
+            generation_index=generation_index,
+            target_unique_candidates=int(_normalize_parameters(parameters)["targetUniqueCandidates"]),
+            run_config={"parentArchiveSha256": archive_sha, "parameters": _normalize_parameters(parameters), "evidenceIdentityContext": _clone(evidence_identity_context or {}, name="pair QD evidence identity context")},
+            pair_policy={key: value for key, value in pair_policy.items() if key != "policySha256"},
+            parent_pairs=parents,
+            pair_factory=bidirectional_pair_factory,
+            module_authority=bidirectional_module_authority,
+            native_validator=bidirectional_native_validator,
+            pair_compiler=bidirectional_pair_compiler,
+            evidence_identity_context=evidence_identity_context,
+            operator_implementation_identity=bidirectional_operator_implementation_identity,
+            max_new_proposals=max_new_proposals,
+        )
     cells = _reproduction_cells(
         archive, allow_empty_quality_bootstrap=allow_empty_quality_bootstrap
     )
@@ -2946,6 +3170,16 @@ def generate_qd_generation(
         },
         "marketEvidenceReadDuringGeneration": False,
         "gatewayContactedDuringGeneration": False,
+        **(
+            {
+                "generationFunnel": {
+                    "enabled": True,
+                    "stageSchemaVersion": "temporal_qd_proposal_funnel_stage_v1",
+                }
+            }
+            if generation_funnel_enabled
+            else {}
+        ),
     }
     config["configSha256"] = canonical_sha256(config)
     _write_once(root / "config.json", config)
@@ -2990,6 +3224,7 @@ def generate_qd_generation(
         len(entries),
     )
     _save_identity_ledger(ledger_file, ledger)
+    identity_index = _ledger_identity_index(ledger)
     validator = SubprocessCandidateValidator(
         validator_command, timeout_seconds=validator_timeout_seconds
     )
@@ -3096,6 +3331,15 @@ def generate_qd_generation(
                             "validatedProgramSha256": validation_record.get(
                                 "programSha256"
                             ),
+                            **(
+                                {
+                                    "validatedProfileSnapshotSha256": validation_record.get(
+                                        "profileSnapshotSha256"
+                                    )
+                                }
+                                if generation_funnel_enabled
+                                else {}
+                            ),
                             "issueCodes": validation_record.get("issueCodes") or [],
                         }
                     )
@@ -3113,7 +3357,7 @@ def generate_qd_generation(
                             authored_validator_provenance=authored_validator_provenance,
                         )
                         duplicate_reason, identity_checks = _ledger_duplicate_check(
-                            ledger, candidate
+                            ledger, candidate, identity_index=identity_index
                         )
                         entry["identityChecks"] = identity_checks
                         entry["canonicalEvidenceIdentitySha256"] = candidate[
@@ -3126,7 +3370,57 @@ def generate_qd_generation(
                             entry["disposition"] = "accepted"
                             accepted.append(candidate)
                             accepted_counts[metadata["originKind"]] += 1
-                            _ledger_accept(ledger, candidate)
+                            _ledger_accept(
+                                ledger, candidate, identity_index=identity_index
+                            )
+        # This is deliberately opt-in: historical QD generation identities stay
+        # byte-for-byte stable unless the immutable funnel was frozen at run
+        # creation.  The journal is still the sole attempt authority; this
+        # compact stage projection makes each materialized proposal's native
+        # boundary explicit instead of requiring a later success to imply it.
+        if generation_funnel_enabled and profile is not None:
+            funnel_candidate = {
+                "schemaVersion": "temporal_qd_proposal_funnel_stage_v1",
+                "candidateId": str(metadata["candidateId"]),
+                "rawSourceProfileSha256": canonical_sha256(profile),
+            }
+            disposition = str(entry["disposition"])
+            static_rejected = disposition in {
+                "static_reachability_rejected",
+                "predeclared_lake_scope_rejected",
+            }
+            funnel_candidate["staticReachability"] = {
+                "outcome": "rejected" if static_rejected else "reachable",
+                "reasons": [disposition] if static_rejected else [],
+            }
+            if not static_rejected:
+                native_rejected = disposition == "native_validator_rejected"
+                native = {
+                    "outcome": "rejected" if native_rejected else "valid",
+                    "reasons": [disposition] if native_rejected else [],
+                    "resolvedProfileSha256": entry.get(
+                        "validatedProfileSnapshotSha256"
+                    ),
+                    "programSha256": entry.get("validatedProgramSha256"),
+                    "validationReportSha256": entry.get("validationReportSha256"),
+                }
+                funnel_candidate["nativeValidation"] = native
+                if not native_rejected:
+                    duplicate = disposition != "accepted"
+                    funnel_candidate["admission"] = {
+                        "outcome": "rejected_duplicate" if duplicate else "admitted",
+                        "reasons": [disposition] if duplicate else [],
+                        **(
+                            {
+                                "canonicalEvidenceIdentitySha256": entry.get(
+                                    "canonicalEvidenceIdentitySha256"
+                                )
+                            }
+                            if not duplicate
+                            else {}
+                        ),
+                    }
+            entry["funnelCandidate"] = funnel_candidate
         entry["entrySha256"] = canonical_sha256(entry)
         _write_once(_entry_path(root, ordinal), entry)
         entries.append(entry)
@@ -3314,18 +3608,19 @@ def main() -> None:
 
     generate = subparsers.add_parser("generate")
     generate.add_argument("--parent-archive", type=Path, required=True)
-    generate.add_argument("--source-preparation", type=Path, required=True)
-    generate.add_argument("--base-generator-root", type=Path, required=True)
-    generate.add_argument("--confirmed-entry-admission-root", type=Path, required=True)
+    generate.add_argument("--source-preparation", type=Path)
+    generate.add_argument("--base-generator-root", type=Path)
+    generate.add_argument("--confirmed-entry-admission-root", type=Path)
     generate.add_argument("--immigrant-continuation-start", type=int, default=0)
     generate.add_argument("--allow-empty-quality-bootstrap", action="store_true")
-    generate.add_argument("--validator-command-file", type=Path, required=True)
+    generate.add_argument("--validator-command-file", type=Path)
     generate.add_argument("--output-root", type=Path, required=True)
     generate.add_argument("--generation-index", type=int, required=True)
     generate.add_argument("--parameters", type=Path)
     generate.add_argument("--construction-catalog", type=Path)
     generate.add_argument("--validator-timeout-seconds", type=float, default=60.0)
     generate.add_argument("--max-new-proposals", type=int)
+    generate.add_argument("--bidirectional-pair-config", type=Path, help="closed pair authority JSON; disables the v2 continuation path")
     args = parser.parse_args()
 
     if args.command == "archive":
@@ -3342,23 +3637,21 @@ def main() -> None:
             cap_trades=args.cap_trades,
         )
     else:
-        command = json.loads(args.validator_command_file.read_text(encoding="utf-8"))
-        if not isinstance(command, list) or not all(
-            isinstance(value, str) for value in command
-        ):
-            raise TemporalDiscoveryContractError(
-                "validator command file must contain a string array"
-            )
+        if args.bidirectional_pair_config is None and any(value is None for value in (args.source_preparation, args.base_generator_root, args.confirmed_entry_admission_root, args.validator_command_file)):
+            parser.error("legacy generation requires v2 source paths and --validator-command-file")
+        command = json.loads(args.validator_command_file.read_text(encoding="utf-8")) if args.validator_command_file is not None else []
+        if not isinstance(command, list) or not all(isinstance(value, str) for value in command):
+            raise TemporalDiscoveryContractError("validator command file must contain a string array")
         parameters = (
             _read(args.parameters, name="QD parameter file")
             if args.parameters is not None
             else None
         )
-        result = generate_qd_generation(
+        generation_kwargs = dict(
             parent_archive_path=args.parent_archive,
-            source_preparation_path=args.source_preparation,
-            base_generator_root=args.base_generator_root,
-            confirmed_entry_admission_root=args.confirmed_entry_admission_root,
+            source_preparation_path=args.source_preparation or args.output_root / ".pair-mode-unused-source.json",
+            base_generator_root=args.base_generator_root or args.output_root / ".pair-mode-unused-generator",
+            confirmed_entry_admission_root=args.confirmed_entry_admission_root or args.output_root / ".pair-mode-unused-admission",
             immigrant_continuation_start=args.immigrant_continuation_start,
             allow_empty_quality_bootstrap=args.allow_empty_quality_bootstrap,
             validator_command=command,
@@ -3369,6 +3662,21 @@ def main() -> None:
             max_new_proposals=args.max_new_proposals,
             construction_catalog_path=args.construction_catalog,
         )
+        if args.bidirectional_pair_config is None:
+            result = generate_qd_generation(**generation_kwargs)
+        else:
+            from .temporal_qd_pair_factory import PairAuthorityBundle, freeze_pair_run_config, pair_policy_from_config
+            frozen = freeze_pair_run_config(_read(args.bidirectional_pair_config, name="bidirectional pair run config"))
+            with PairAuthorityBundle(frozen) as authority:
+                result = generate_qd_generation(
+                    **generation_kwargs,
+                    bidirectional_pair_policy=pair_policy_from_config(frozen),
+                    bidirectional_pair_factory=authority.factory,
+                    bidirectional_module_authority=authority.operator,
+                    bidirectional_native_validator=authority.validator,
+                    bidirectional_pair_compiler=authority.compiler,
+                    bidirectional_operator_implementation_identity=frozen["operatorImplementation"],
+                )
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

@@ -24,6 +24,7 @@ from .play_hand_lab import LabGatewayClient
 from .play_hand_lab_auth import load_lab_gateway_token
 from .temporal_discovery_base import TemporalDiscoveryContractError, canonical_sha256
 from .temporal_generator_v2_continuation import ExactGeneratorV2Continuation
+from .temporal_qd_pair_factory import PairAuthorityBundle, freeze_pair_run_config, pair_policy_from_config
 from .temporal_qd_campaign import freeze_qd_screening_campaign
 from .temporal_qd_evolution import (
     QD_IDENTITY_LEDGER_SCHEMA,
@@ -33,12 +34,19 @@ from .temporal_qd_evolution import (
     QD_VERSION,
     _identity_payload,
     _load_archive,
+    _load_entries,
     _normalize_parameters,
     _read,
     build_qd_archive,
     generate_qd_generation,
     qd_construction_operator_policy,
     qd_predeclared_evidence_context,
+)
+from .temporal_qd_funnel_adapter import build_qd_generation_funnel
+from .temporal_generation_funnel import (
+    GenerationFunnelContractError,
+    supervisor_funnel_snapshot,
+    write_generation_funnel_artifact,
 )
 from .temporal_search import run_temporal_search_tasks
 from .result_codec import ResultCodecError, read_json_object
@@ -405,7 +413,7 @@ def _results_descriptor(
 
 
 def _capture_generation_artifacts(
-    *, root: Path, generation_index: int
+    *, root: Path, generation_index: int, generation_funnel_enabled: bool = False
 ) -> dict[str, Any]:
     generation_root = root / "generations" / f"generation-{generation_index:04d}"
     proposal_root = generation_root / "proposal"
@@ -491,7 +499,7 @@ def _capture_generation_artifacts(
         checkpoint=checkpoint,
         task_manifest=task_manifest,
     )
-    return {
+    output = {
         "schemaVersion": "temporal_qd_supervisor_generation_artifacts_v1",
         "population": _self_hashed_descriptor(
             population_path,
@@ -541,6 +549,24 @@ def _capture_generation_artifacts(
         "summary": _artifact_descriptor(summary_path, summary),
         "results": results,
     }
+    if generation_funnel_enabled:
+        funnel_path = generation_root / "generation-funnel.json"
+        funnel = _canonical_file(funnel_path, name="QD generation funnel")
+        try:
+            snapshot = supervisor_funnel_snapshot(funnel)
+        except GenerationFunnelContractError as exc:
+            raise TemporalDiscoveryContractError("QD generation funnel identity is invalid") from exc
+        output["generationFunnel"] = _self_hashed_descriptor(
+            funnel_path,
+            funnel,
+            field="artifactSha256",
+            name="QD generation funnel",
+        )
+        output["generationFunnelSnapshot"] = {
+            **snapshot,
+            "snapshotSha256": snapshot["snapshotSha256"],
+        }
+    return output
 
 
 def _validate_generation_artifacts(
@@ -556,7 +582,12 @@ def _validate_generation_artifacts(
         raise TemporalDiscoveryContractError(
             "completed generation lacks its immutable artifact ledger"
         )
-    current = _capture_generation_artifacts(root=root, generation_index=generation_index)
+    funnel_enabled = bool((config.get("generationFunnel") or {}).get("enabled"))
+    current = _capture_generation_artifacts(
+        root=root,
+        generation_index=generation_index,
+        generation_funnel_enabled=funnel_enabled,
+    )
     if _clone(current, name="completed generation artifacts") != _clone(
         recorded, name="recorded completed generation artifacts"
     ):
@@ -618,6 +649,14 @@ def _validate_generation_artifacts(
         raise TemporalDiscoveryContractError(
             "completed generation task count disagrees with immutable task manifest"
         )
+    if funnel_enabled:
+        snapshot = current["generationFunnelSnapshot"]
+        if generation_record.get("generationFunnelArtifactSha256") != current[
+            "generationFunnel"
+        ]["artifactSha256"] or generation_record.get("generationFunnelSnapshotSha256") != snapshot["snapshotSha256"]:
+            raise TemporalDiscoveryContractError(
+                "completed generation funnel identity disagrees with supervisor record"
+            )
 
 
 def _validate_completed_generations(
@@ -679,30 +718,34 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
     ):
         raise TemporalDiscoveryContractError("QD supervisor initial archive drifted")
 
-    source_binding = config.get("immigrantSource")
-    if not isinstance(source_binding, Mapping):
-        raise TemporalDiscoveryContractError("QD supervisor immigrant source binding is invalid")
-    source = ExactGeneratorV2Continuation(
-        source_preparation_path=Path(str(source_binding.get("sourcePreparationPath") or "")),
-        base_generator_root=Path(str(source_binding.get("baseGeneratorRoot") or "")),
-        confirmed_entry_admission_root=Path(
-            str(source_binding.get("confirmedEntryAdmissionRoot") or "")
-        ),
-        start_continuation_ordinal=0,
-    )
-    if _clone(source.source_identity, name="reopened immigrant source") != _clone(
-        source_binding.get("sourceIdentity"), name="frozen immigrant source"
-    ):
-        raise TemporalDiscoveryContractError("QD supervisor immigrant source drifted")
+    pair_config = config.get("bidirectionalPairGeneration")
+    if pair_config is None:
+        source_binding = config.get("immigrantSource")
+        if not isinstance(source_binding, Mapping):
+            raise TemporalDiscoveryContractError("QD supervisor immigrant source binding is invalid")
+        source = ExactGeneratorV2Continuation(
+            source_preparation_path=Path(str(source_binding.get("sourcePreparationPath") or "")),
+            base_generator_root=Path(str(source_binding.get("baseGeneratorRoot") or "")),
+            confirmed_entry_admission_root=Path(str(source_binding.get("confirmedEntryAdmissionRoot") or "")),
+            start_continuation_ordinal=0,
+        )
+        if _clone(source.source_identity, name="reopened immigrant source") != _clone(source_binding.get("sourceIdentity"), name="frozen immigrant source"):
+            raise TemporalDiscoveryContractError("QD supervisor immigrant source drifted")
+    else:
+        # Rebuilds the concrete typed/native authorities and validates every
+        # frozen registry/catalog/transport identity before a resume can run.
+        with PairAuthorityBundle(_clone(pair_config, name="frozen pair authority")):
+            pass
 
     validator_binding = config.get("validator")
-    if not isinstance(validator_binding, Mapping):
-        raise TemporalDiscoveryContractError("QD supervisor validator binding is invalid")
-    command = _command(Path(str(validator_binding.get("commandFile") or "")))
-    if command != validator_binding.get("command") or canonical_sha256(command) != (
-        validator_binding.get("commandSha256")
-    ):
-        raise TemporalDiscoveryContractError("QD supervisor validator command drifted")
+    if pair_config is None:
+        if not isinstance(validator_binding, Mapping):
+            raise TemporalDiscoveryContractError("QD supervisor validator binding is invalid")
+        command = _command(Path(str(validator_binding.get("commandFile") or "")))
+        if command != validator_binding.get("command") or canonical_sha256(command) != validator_binding.get("commandSha256"):
+            raise TemporalDiscoveryContractError("QD supervisor validator command drifted")
+    else:
+        command = []
 
     evaluation = config.get("evaluation")
     if not isinstance(evaluation, Mapping):
@@ -761,7 +804,7 @@ def _frozen_config(
     base_generator_root: Path,
     confirmed_entry_admission_root: Path,
     template_preparation_path: Path,
-    validator_command_file: Path,
+    validator_command_file: Path | None,
     parameters: Mapping[str, Any],
     generation_count: int,
     first_generation_index: int,
@@ -773,7 +816,9 @@ def _frozen_config(
     evaluation_timeout_seconds: float,
     enqueue_batch_size: int,
     broad_admission: bool,
+    generation_funnel_enabled: bool = False,
     construction_catalog_path: Path | str | None = None,
+    bidirectional_pair_config: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     if generation_count < 1 or first_generation_index < 1:
         raise TemporalDiscoveryContractError(
@@ -810,13 +855,16 @@ def _frozen_config(
         ),
         construction_catalog_path=construction_catalog_path,
     )
-    source = ExactGeneratorV2Continuation(
+    pair_authority = freeze_pair_run_config(bidirectional_pair_config) if bidirectional_pair_config is not None else None
+    source = None if pair_authority is not None else ExactGeneratorV2Continuation(
         source_preparation_path=source_preparation_path,
         base_generator_root=base_generator_root,
         confirmed_entry_admission_root=confirmed_entry_admission_root,
         start_continuation_ordinal=initial_immigrant_continuation_ordinal,
     )
-    validator_command = _command(validator_command_file)
+    if pair_authority is None and validator_command_file is None:
+        raise TemporalDiscoveryContractError("legacy QD supervisor requires a validator command file")
+    validator_command = _command(validator_command_file) if validator_command_file is not None else []
     config = {
         "schemaVersion": SUPERVISOR_CONFIG_SCHEMA,
         "supervisorVersion": SUPERVISOR_VERSION,
@@ -855,21 +903,14 @@ def _frozen_config(
             "generationIndex": int(initial_archive["generationIndex"]),
             "resultSetSha256": initial_archive["resultSetSha256"],
         },
-        "immigrantSource": {
-            "sourcePreparationPath": str(source_preparation_path.resolve()),
-            "baseGeneratorRoot": str(base_generator_root.resolve()),
-            "confirmedEntryAdmissionRoot": str(
-                confirmed_entry_admission_root.resolve()
-            ),
-            "sourceIdentity": source.source_identity,
-            "initialContinuationOrdinal": initial_immigrant_continuation_ordinal,
-        },
-        "validator": {
-            "commandFile": str(validator_command_file.resolve()),
-            "command": validator_command,
-            "commandSha256": canonical_sha256(validator_command),
-            "timeoutSeconds": 60.0,
-        },
+        **({
+            "immigrantSource": {
+                "sourcePreparationPath": str(source_preparation_path.resolve()), "baseGeneratorRoot": str(base_generator_root.resolve()),
+                "confirmedEntryAdmissionRoot": str(confirmed_entry_admission_root.resolve()), "sourceIdentity": source.source_identity,
+                "initialContinuationOrdinal": initial_immigrant_continuation_ordinal,
+            }
+        } if source is not None else {"bidirectionalPairGeneration": pair_authority}),
+        **({"validator": {"commandFile": str(validator_command_file.resolve()), "command": validator_command, "commandSha256": canonical_sha256(validator_command), "timeoutSeconds": 60.0}} if pair_authority is None else {}),
         "evaluation": {
             "templatePreparationPath": str(template_preparation_path.resolve()),
             "templatePreparationSha256": canonical_sha256(template),
@@ -915,6 +956,18 @@ def _frozen_config(
             "weak_early_operator_family",
             "early_immigrant_dominance",
         ],
+        **(
+            {
+                "generationFunnel": {
+                    "enabled": True,
+                    "schemaVersion": "temporal_qd_generation_funnel_integration_v1",
+                    "publication": "after_evaluation_activation_and_archive_before_generation_record",
+                    "selectionInput": False,
+                }
+            }
+            if generation_funnel_enabled
+            else {}
+        ),
     }
     config["configSha256"] = canonical_sha256(config)
     return config, validator_command
@@ -924,11 +977,11 @@ def run_qd_supervisor(
     *,
     run_root: Path | str,
     initial_archive_path: Path | str,
-    source_preparation_path: Path | str,
-    base_generator_root: Path | str,
-    confirmed_entry_admission_root: Path | str,
+    source_preparation_path: Path | str | None,
+    base_generator_root: Path | str | None,
+    confirmed_entry_admission_root: Path | str | None,
     template_preparation_path: Path | str,
-    validator_command_file: Path | str,
+    validator_command_file: Path | str | None,
     parameters: Mapping[str, Any],
     generation_count: int,
     autoresearch_commit: str,
@@ -943,15 +996,19 @@ def run_qd_supervisor(
     broad_admission: bool = False,
     stop_after_generation: int | None = None,
     construction_catalog_path: Path | str | None = None,
+    generation_funnel_enabled: bool = False,
+    bidirectional_pair_config: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = Path(run_root)
     root.mkdir(parents=True, exist_ok=True)
     initial_archive_file = Path(initial_archive_path)
-    source_preparation_file = Path(source_preparation_path)
-    base_generator_dir = Path(base_generator_root)
-    confirmed_entry_dir = Path(confirmed_entry_admission_root)
+    # Pair mode never constructs a v2 continuation.  These placeholders are
+    # deliberately not persisted or opened in that mode.
+    source_preparation_file = Path(source_preparation_path) if source_preparation_path is not None else root / ".pair-mode-unused-source.json"
+    base_generator_dir = Path(base_generator_root) if base_generator_root is not None else root / ".pair-mode-unused-generator"
+    confirmed_entry_dir = Path(confirmed_entry_admission_root) if confirmed_entry_admission_root is not None else root / ".pair-mode-unused-admission"
     template_preparation_file = Path(template_preparation_path)
-    validator_file = Path(validator_command_file)
+    validator_file = Path(validator_command_file) if validator_command_file is not None else None
     config, validator_command = _frozen_config(
         initial_archive_path=initial_archive_file,
         source_preparation_path=source_preparation_file,
@@ -970,7 +1027,9 @@ def run_qd_supervisor(
         evaluation_timeout_seconds=evaluation_timeout_seconds,
         enqueue_batch_size=enqueue_batch_size,
         broad_admission=broad_admission,
+        generation_funnel_enabled=generation_funnel_enabled,
         construction_catalog_path=construction_catalog_path,
+        bidirectional_pair_config=bidirectional_pair_config,
     )
     config_path = root / "config.json"
     state_path = root / "state.json"
@@ -1081,28 +1140,29 @@ def run_qd_supervisor(
             # Do not let a file-backed source change while an earlier
             # generation is running and then silently feed a later phase.
             validator_command = _validate_frozen_sources(config)
-            generation_result = generate_qd_generation(
-                parent_archive_path=parent_archive_path,
-                source_preparation_path=source_preparation_file,
-                base_generator_root=base_generator_dir,
-                confirmed_entry_admission_root=confirmed_entry_dir,
-                validator_command=validator_command,
-                output_root=proposal_root,
-                generation_index=generation_index,
-                immigrant_continuation_start=immigrant_cursor,
-                allow_empty_quality_bootstrap=bool(config["broadAdmission"]),
-                parameters=config["frozenSearchPolicy"],
-                evidence_identity_context=config["evaluation"][
-                    "predeclaredEvidenceContext"
-                ],
-                identity_ledger_path=root / "identity-ledger.json",
-                validator_timeout_seconds=float(config["validator"]["timeoutSeconds"]),
-                construction_catalog_path=(
-                    (config.get("constructionOperatorPolicy") or {})
-                    .get("catalog", {})
-                    .get("path")
-                ),
+            generation_kwargs = dict(
+                parent_archive_path=parent_archive_path, source_preparation_path=source_preparation_file,
+                base_generator_root=base_generator_dir, confirmed_entry_admission_root=confirmed_entry_dir,
+                validator_command=validator_command, output_root=proposal_root, generation_index=generation_index,
+                immigrant_continuation_start=immigrant_cursor, allow_empty_quality_bootstrap=bool(config["broadAdmission"]),
+                parameters=config["frozenSearchPolicy"], evidence_identity_context=config["evaluation"]["predeclaredEvidenceContext"],
+                identity_ledger_path=root / "identity-ledger.json", validator_timeout_seconds=float(config["validator"]["timeoutSeconds"]),
+                construction_catalog_path=((config.get("constructionOperatorPolicy") or {}).get("catalog", {}).get("path")),
+                generation_funnel_enabled=bool((config.get("generationFunnel") or {}).get("enabled")),
             )
+            if config.get("bidirectionalPairGeneration") is None:
+                generation_result = generate_qd_generation(**generation_kwargs)
+            else:
+                with PairAuthorityBundle(config["bidirectionalPairGeneration"]) as pair_authority:
+                    generation_result = generate_qd_generation(
+                        **generation_kwargs,
+                        bidirectional_pair_policy=pair_policy_from_config(config["bidirectionalPairGeneration"]),
+                        bidirectional_pair_factory=pair_authority.factory,
+                        bidirectional_module_authority=pair_authority.operator,
+                        bidirectional_native_validator=pair_authority.validator,
+                        bidirectional_pair_compiler=pair_authority.compiler,
+                        bidirectional_operator_implementation_identity=config["bidirectionalPairGeneration"]["operatorImplementation"],
+                    )
             if generation_result.get("completed") is not True:
                 raise TemporalDiscoveryContractError(
                     "QD generation proposal manifest did not complete"
@@ -1221,8 +1281,39 @@ def run_qd_supervisor(
                 ),
                 cap_trades=int(config["frozenSearchPolicy"]["capTrades"]),
             )
+            funnel_enabled = bool((config.get("generationFunnel") or {}).get("enabled"))
+            if funnel_enabled:
+                # _load_entries is the proposal-journal authority: it verifies
+                # filename ordinal continuity, entry schema, and each entry's
+                # self-hash before the funnel can consume a single stage row.
+                entries = _load_entries(proposal_root)
+                funnel = build_qd_generation_funnel(
+                    proposal_entries=entries,
+                    proposal_accounting=_canonical_file(
+                        proposal_root / "generation-journal.json",
+                        name="QD generation journal",
+                    ),
+                    population=_canonical_file(
+                        proposal_root / "population.json",
+                        name="QD generation population",
+                    ),
+                    authority=_canonical_file(campaign_root / "authority.json", name="QD authority"),
+                    task_manifest=_canonical_file(result_root / "task-manifest.json", name="QD task manifest"),
+                    checkpoint=_canonical_file(result_root / "checkpoint.json", name="QD evaluation checkpoint"),
+                    archive=_canonical_file(archive_path, name="QD generation archive"),
+                    minimum_total_trades=int(config["frozenSearchPolicy"]["minimumTotalTrades"]),
+                    minimum_trades_per_window=int(config["frozenSearchPolicy"]["minimumTradesPerWindow"]),
+                )
+                try:
+                    write_generation_funnel_artifact(
+                        generation_root / "generation-funnel.json", funnel
+                    )
+                except GenerationFunnelContractError as exc:
+                    raise TemporalDiscoveryContractError("could not publish QD generation funnel") from exc
             artifacts = _capture_generation_artifacts(
-                root=root, generation_index=generation_index
+                root=root,
+                generation_index=generation_index,
+                generation_funnel_enabled=funnel_enabled,
             )
             if (
                 artifacts["population"]["populationSha256"]
@@ -1282,6 +1373,14 @@ def run_qd_supervisor(
                 "nextImmigrantContinuationOrdinal": generation_result[
                     "nextImmigrantContinuationOrdinal"
                 ],
+                **(
+                    {
+                        "generationFunnelArtifactSha256": artifacts["generationFunnel"]["artifactSha256"],
+                        "generationFunnelSnapshotSha256": artifacts["generationFunnelSnapshot"]["snapshotSha256"],
+                    }
+                    if funnel_enabled
+                    else {}
+                ),
                 "artifacts": artifacts,
                 "completedAt": _utc_now(),
             }
@@ -1384,11 +1483,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--initial-archive", type=Path, required=True)
-    parser.add_argument("--source-preparation", type=Path, required=True)
-    parser.add_argument("--base-generator-root", type=Path, required=True)
-    parser.add_argument("--confirmed-entry-admission-root", type=Path, required=True)
+    parser.add_argument("--source-preparation", type=Path)
+    parser.add_argument("--base-generator-root", type=Path)
+    parser.add_argument("--confirmed-entry-admission-root", type=Path)
     parser.add_argument("--template-preparation", type=Path, required=True)
-    parser.add_argument("--validator-command-file", type=Path, required=True)
+    parser.add_argument("--validator-command-file", type=Path)
     parser.add_argument("--parameters", type=Path, required=True)
     parser.add_argument(
         "--construction-catalog",
@@ -1407,8 +1506,12 @@ def main() -> None:
     parser.add_argument("--evaluation-timeout-seconds", type=float, default=86_400.0)
     parser.add_argument("--enqueue-batch-size", type=int, default=128)
     parser.add_argument("--broad-admission", action="store_true")
+    parser.add_argument("--generation-funnel-enabled", action="store_true")
     parser.add_argument("--stop-after-generation", type=int)
+    parser.add_argument("--bidirectional-pair-config", type=Path, help="closed temporal_qd_bidirectional_pair_run_config_v1 JSON; opt-in only")
     args = parser.parse_args()
+    if args.bidirectional_pair_config is None and any(value is None for value in (args.source_preparation, args.base_generator_root, args.confirmed_entry_admission_root, args.validator_command_file)):
+        parser.error("legacy mode requires --source-preparation, --base-generator-root, --confirmed-entry-admission-root, and --validator-command-file")
     parameters = _read(args.parameters, name="QD supervisor parameters")
     result = run_qd_supervisor(
         run_root=args.run_root,
@@ -1432,6 +1535,11 @@ def main() -> None:
         broad_admission=args.broad_admission,
         stop_after_generation=args.stop_after_generation,
         construction_catalog_path=args.construction_catalog,
+        generation_funnel_enabled=args.generation_funnel_enabled,
+        bidirectional_pair_config=(
+            _read(args.bidirectional_pair_config, name="bidirectional pair run config")
+            if args.bidirectional_pair_config is not None else None
+        ),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 

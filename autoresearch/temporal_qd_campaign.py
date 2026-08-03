@@ -18,6 +18,7 @@ from .temporal_qd_evolution import (
     QD_POLICY_NAME,
     QD_POLICY_SHA256,
     QD_POPULATION_SCHEMA,
+    _bidirectional_pair_policy,
     _load_population,
     _read,
     qd_canonical_evidence_identity,
@@ -65,6 +66,7 @@ def freeze_qd_screening_campaign(
     if population_schema not in {QD_POPULATION_SCHEMA, INITIAL_POPULATION_SCHEMA}:
         raise TemporalDiscoveryContractError("unknown QD generation population schema")
     candidates, population_sha = _load_population(population_file)
+    bidirectional_policy = _bidirectional_pair_policy(population_payload)
     frozen_construction_catalog = (
         _read(Path(construction_catalog_path), name="frozen QD construction catalog")
         if construction_catalog_path is not None
@@ -152,6 +154,12 @@ def freeze_qd_screening_campaign(
     finite_candidates = []
     for candidate in candidates:
         profile = candidate["sourceProfile"]
+        if bidirectional_policy is not None and (
+            profile.get("version") != "v3" or profile.get("directionMode") != "both"
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD bidirectional campaign refuses standalone v2 module tasks"
+            )
         source_sha = candidate["sourceProfileSha256"]
         finite_candidates.append(
             {
@@ -289,6 +297,7 @@ def freeze_qd_screening_campaign(
         },
         "evaluationSeeds": [],
         "candidates": evaluation_candidates,
+        **({"bidirectionalPairPolicy": {key: value for key, value in bidirectional_policy.items() if key != "policySha256"}} if bidirectional_policy is not None else {}),
     }
     evaluation_identity["evaluationIdentitySha256"] = canonical_sha256(
         evaluation_identity
@@ -309,6 +318,7 @@ def freeze_qd_screening_campaign(
         "candidateCount": len(finite_candidates),
         "windowCount": len(windows),
         "taskCount": task_count,
+        **({"bidirectionalPairPolicy": {key: value for key, value in bidirectional_policy.items() if key != "policySha256"}} if bidirectional_policy is not None else {}),
         "evaluationIdentitySha256": evaluation_identity["evaluationIdentitySha256"],
         "marketEvidenceScope": "predeclared_development_windows_only",
         "reservedEvidencePermitted": False,
