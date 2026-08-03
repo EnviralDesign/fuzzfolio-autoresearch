@@ -6,8 +6,10 @@ start, so a resumed run cannot inherit a mutable catalog or a Python object.
 """
 from __future__ import annotations
 
+import argparse
 from collections.abc import Mapping, Sequence
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -254,4 +256,92 @@ def pair_policy_from_config(frozen: Mapping[str, Any]) -> dict[str, Any]:
     return {"schemaVersion": "temporal_qd_bidirectional_pair_policy_v1", "enabled": True, "compilerAuthority": data["pairCompilerAuthority"]}
 
 
-__all__ = ["PAIR_RUN_CONFIG_SCHEMA", "PairAuthorityBundle", "freeze_pair_run_config", "pair_policy_from_config"]
+def refresh_pair_run_config(template: Mapping[str, Any]) -> dict[str, Any]:
+    """Re-freeze a self-valid template against the current local authority.
+
+    Only authored inputs are carried forward.  Every derived registry, catalog,
+    operator, interpreter, script, environment, and Dashboard source identity is
+    recomputed by :func:`freeze_pair_run_config`.
+    """
+
+    frozen = _mapping(template, name="pair run config template")
+    authored_fields = {"schemaVersion", "longModule", "shortModule", "nativeJsonlAuthority", "holdOperatorPolicy"}
+    if set(frozen) == authored_fields:
+        return freeze_pair_run_config(frozen)
+    supplied = frozen.pop("pairRunConfigSha256", None)
+    if supplied != canonical_sha256(frozen) or frozen.get("schemaVersion") != PAIR_RUN_CONFIG_SCHEMA:
+        raise TemporalDiscoveryContractError("pair run config template identity/schema mismatch")
+
+    def authored_side(direction: str) -> dict[str, Any]:
+        side = _mapping(frozen.get(f"{direction}Module"), name=f"frozen {direction} module")
+        context = _mapping(side.get("context"), name=f"frozen {direction} grammar context")
+        required_context = {"instrument", "indicators", "groups", "events", "executionConfig", "plans", "budgets"}
+        if set(context) != required_context:
+            raise TemporalDiscoveryContractError("frozen pair grammar context is not the normalized closed schema")
+        return {
+            "seedNames": side.get("seedNames"),
+            "context": {
+                "instrument": context["instrument"],
+                "indicators": context["indicators"],
+                "evidenceGroups": context["groups"],
+                "eventBindings": context["events"],
+                "executionConfig": context["executionConfig"],
+                "budgets": context["budgets"],
+            },
+            "catalog": side.get("catalog"),
+            "policy": side.get("policy"),
+        }
+
+    transport = _mapping(frozen.get("nativeJsonlAuthority"), name="frozen pair native authority")
+    transport.pop("authorityContent", None)
+    raw = {
+        "schemaVersion": PAIR_RUN_CONFIG_SCHEMA,
+        "longModule": authored_side("long"),
+        "shortModule": authored_side("short"),
+        "nativeJsonlAuthority": transport,
+        "holdOperatorPolicy": frozen.get("holdOperatorPolicy"),
+    }
+    return freeze_pair_run_config(raw)
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise TemporalDiscoveryContractError(f"could not read pair run config: {path}") from exc
+    return _mapping(value, name="pair run config JSON")
+
+
+def _write_immutable(path: Path, value: Mapping[str, Any]) -> None:
+    encoded = json.dumps(dict(value), indent=2, sort_keys=True, ensure_ascii=True, allow_nan=False) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_text(encoding="utf-8") != encoded:
+        raise TemporalDiscoveryContractError(f"refusing to overwrite divergent pair run config: {path}")
+    path.write_text(encoded, encoding="utf-8")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Refresh or audit the frozen bidirectional QD pair authority.")
+    commands = parser.add_subparsers(dest="command", required=True)
+    refresh = commands.add_parser("refresh")
+    refresh.add_argument("--template", type=Path, required=True)
+    refresh.add_argument("--output", type=Path, required=True)
+    audit = commands.add_parser("audit")
+    audit.add_argument("--config", type=Path, required=True)
+    args = parser.parse_args(argv)
+    if args.command == "refresh":
+        value = refresh_pair_run_config(_read_json(args.template))
+        _write_immutable(args.output, value)
+    else:
+        value = _read_json(args.config)
+        with PairAuthorityBundle(value):
+            pass
+    print(json.dumps({"ok": True, "pairRunConfigSha256": value["pairRunConfigSha256"]}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = ["PAIR_RUN_CONFIG_SCHEMA", "PairAuthorityBundle", "freeze_pair_run_config", "pair_policy_from_config", "refresh_pair_run_config"]
