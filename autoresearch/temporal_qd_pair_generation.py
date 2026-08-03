@@ -21,6 +21,7 @@ from .temporal_bidirectional_genome import (
     IdentitySnapshot,
     NativeModuleValidator,
     apply_pair_hold_mutation,
+    canonical_hold,
     canonical_json,
     canonical_sha256,
     deterministic_same_side_crossover,
@@ -66,6 +67,7 @@ class PairModuleOperator(Protocol):
     def apply_grammar(self, module: FrozenModule, plan: Mapping[str, Any], *, candidate_id: str) -> tuple[FrozenModule, Mapping[str, Any]]: ...
     def indicator_plans(self, module: FrozenModule) -> Sequence[Mapping[str, Any]]: ...
     def apply_indicator(self, module: FrozenModule, plan: Mapping[str, Any], *, candidate_id: str) -> tuple[FrozenModule, Mapping[str, Any]]: ...
+    def hold_policy_choices(self, module: FrozenModule) -> Sequence[Mapping[str, Any]]: ...
     def crossover(self, left_program: Mapping[str, Any], right_program: Mapping[str, Any], *, direction: str, proposal_seed: str) -> Mapping[str, Any]: ...
     def compile_program(self, template: FrozenModule, program: Mapping[str, Any], *, candidate_id: str) -> FrozenModule: ...
 
@@ -78,10 +80,15 @@ class TypedGrammarPairOperator:
     is likewise constructed from the already frozen catalog payload.
     """
 
-    def __init__(self, *, grammar_factory: Callable[[FrozenModule], Any], native_validator: NativeModuleValidator, indicator_registry: Any | None = None) -> None:
+    def __init__(self, *, grammar_factory: Callable[[FrozenModule], Any], native_validator: NativeModuleValidator, indicator_registry: Any | None = None, hold_operator_policy: Mapping[str, Any]) -> None:
         self._grammar_factory = grammar_factory
         self._native_validator = native_validator
         self._indicator_registry = indicator_registry
+        policy = _clone(hold_operator_policy)
+        choices = policy.get("choices") if isinstance(policy, Mapping) else None
+        if not isinstance(choices, list):
+            raise TemporalDiscoveryContractError("typed pair hold operator requires a frozen choices policy")
+        self._hold_operator_choices = tuple(_clone(choice) for choice in choices)
 
     @staticmethod
     def _program(module: FrozenModule, program: Mapping[str, Any] | None = None) -> Any:
@@ -140,6 +147,12 @@ class TypedGrammarPairOperator:
         audit["auditSha256"] = canonical_sha256(audit)
         return frozen, audit
 
+    def hold_policy_choices(self, module: FrozenModule) -> Sequence[Mapping[str, Any]]:
+        """Return the run-frozen native values, never a generated range."""
+
+        del module
+        return tuple(_clone(choice) for choice in self._hold_operator_choices)
+
     def crossover(self, left_program: Mapping[str, Any], right_program: Mapping[str, Any], *, direction: str, proposal_seed: str) -> Mapping[str, Any]:
         raise TemporalDiscoveryContractError("typed crossover must be bound to frozen side modules")
 
@@ -165,14 +178,19 @@ def _sorted(plans: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return sorted((_clone(dict(plan)) for plan in plans), key=canonical_sha256)
 
 
-def _hold_plans(module: FrozenModule) -> list[dict[str, Any]]:
+def _hold_plans(module: FrozenModule, authority: PairModuleOperator) -> list[dict[str, Any]]:
     plans = (((module.profile.get("executionConfig") or {}).get("managementLibrary") or {}).get("plans") or [])
     output = []
+    choices = _sorted(authority.hold_policy_choices(module))
     for plan in plans:
         if not isinstance(plan, Mapping) or not isinstance(plan.get("id"), str):
             continue
-        # Bounded vocabulary is enforced again by HoldMutationPlan.create.
-        output.append({"kind": "hold", "planId": plan["id"], "newHold": {"kind": "market_bars", "bars": 1 + int(canonical_sha256({"module": module.identity_sha256, "plan": plan["id"]})[-2:], 16) % 32}})
+        old = canonical_hold(plan.get("holdPolicy"))
+        for choice in choices:
+            # ``none`` is represented in mutation identity but applies by
+            # removing the optional native field.  Do not schedule a no-op.
+            if canonical_hold(choice) != old:
+                output.append({"kind": "hold", "planId": plan["id"], "newHold": choice})
     return _sorted(output)
 
 
@@ -180,7 +198,7 @@ def _operation_choices(module: FrozenModule, authority: PairModuleOperator) -> l
     rows = []
     rows.extend({"kind": "typed_grammar", "plan": plan} for plan in _sorted(authority.grammar_plans(module)))
     rows.extend({"kind": "indicator_learning", "plan": plan} for plan in _sorted(authority.indicator_plans(module)))
-    rows.extend(_hold_plans(module))
+    rows.extend(_hold_plans(module, authority))
     return _sorted(rows)
 
 

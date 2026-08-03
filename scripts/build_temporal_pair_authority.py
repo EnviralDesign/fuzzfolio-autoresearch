@@ -14,9 +14,9 @@ import json
 from pathlib import Path
 
 from autoresearch.temporal_qd_pair_factory import (
-    PAIR_HOLD_POLICY_SCHEMA,
     PAIR_RUN_CONFIG_SCHEMA,
     _write_immutable,
+    default_hold_operator_policy,
     freeze_pair_run_config,
 )
 
@@ -158,11 +158,7 @@ def main() -> int:
                 "dashboardSourceRoot": str(dashboard_root),
                 "environment": {"PYTHONPATH": [str((dashboard_root / "shared" / "python").resolve())]},
             },
-            "holdOperatorPolicy": {
-                "schemaVersion": PAIR_HOLD_POLICY_SCHEMA,
-                "enabled": True,
-                "allowedKinds": ["none", "market_bars", "elapsed_calendar"],
-            },
+            "holdOperatorPolicy": default_hold_operator_policy(),
         }
     )
     _write_immutable(args.output.resolve(), frozen)

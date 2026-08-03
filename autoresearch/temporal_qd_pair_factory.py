@@ -15,7 +15,7 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
-from .temporal_bidirectional_genome import FrozenModule, FrozenPair, IdentitySnapshot, canonical_json, canonical_sha256
+from .temporal_bidirectional_genome import FrozenModule, FrozenPair, IdentitySnapshot, canonical_hold, canonical_json, canonical_sha256
 from .temporal_discovery_base import TemporalDiscoveryContractError
 from .temporal_discovery_validation import DashboardBidirectionalPairCompiler, DashboardV2ModuleValidator, SubprocessCandidateValidator
 from .temporal_indicator_learning_v1 import IndicatorLearningRegistry
@@ -23,7 +23,54 @@ from .temporal_qd_pair_generation import TypedGrammarPairOperator
 from .temporal_typed_motif_grammar import GRAMMAR_SCHEMA, GRAMMAR_VERSION, REGISTRY, GrammarContext, TypedFragmentGrammar
 
 PAIR_RUN_CONFIG_SCHEMA = "temporal_qd_bidirectional_pair_run_config_v1"
-PAIR_HOLD_POLICY_SCHEMA = "temporal_qd_pair_hold_operator_policy_v1"
+PAIR_HOLD_POLICY_SCHEMA = "temporal_qd_pair_hold_operator_policy_v2"
+
+# The QD operator vocabulary is intentionally finite and M5-specific.  The
+# largest market-bar and elapsed-calendar alternatives each cover one week;
+# this is a search exposure, not a global validity cap for native seed plans.
+_HOLD_OPERATOR_CHOICES = (
+    {"kind": "none"},
+    {"kind": "market_bars", "bars": 1, "timeframe": "M5"},
+    {"kind": "market_bars", "bars": 3, "timeframe": "M5"},
+    {"kind": "market_bars", "bars": 6, "timeframe": "M5"},
+    {"kind": "market_bars", "bars": 12, "timeframe": "M5"},
+    {"kind": "market_bars", "bars": 24, "timeframe": "M5"},
+    {"kind": "market_bars", "bars": 48, "timeframe": "M5"},
+    {"kind": "market_bars", "bars": 96, "timeframe": "M5"},
+    {"kind": "market_bars", "bars": 288, "timeframe": "M5"},
+    {"kind": "market_bars", "bars": 576, "timeframe": "M5"},
+    {"kind": "market_bars", "bars": 2016, "timeframe": "M5"},
+    {"kind": "elapsed_calendar", "hours": 1.0},
+    {"kind": "elapsed_calendar", "hours": 4.0},
+    {"kind": "elapsed_calendar", "hours": 8.0},
+    {"kind": "elapsed_calendar", "hours": 24.0},
+    {"kind": "elapsed_calendar", "hours": 48.0},
+    {"kind": "elapsed_calendar", "hours": 72.0},
+    {"kind": "elapsed_calendar", "hours": 168.0},
+)
+
+
+def default_hold_operator_policy() -> dict[str, Any]:
+    """The only hold mutation vocabulary admitted for a frozen pair run."""
+
+    return {
+        "schemaVersion": PAIR_HOLD_POLICY_SCHEMA,
+        "enabled": True,
+        "allowedKinds": ["none", "market_bars", "elapsed_calendar"],
+        "choices": [_clone(choice, name="default hold operator choice") for choice in _HOLD_OPERATOR_CHOICES],
+    }
+
+
+def _hold_operator_policy(value: Mapping[str, Any]) -> dict[str, Any]:
+    raw = _mapping(value, name="pair hold operator policy")
+    expected = default_hold_operator_policy()
+    if raw != expected:
+        raise TemporalDiscoveryContractError("pair hold operator policy is not the closed admitted policy")
+    # Keep the native type seam local and fail closed if a future edit changes
+    # a choice without matching the Dashboard hold-policy schema.
+    if [canonical_hold(choice) for choice in raw["choices"]] != raw["choices"]:
+        raise TemporalDiscoveryContractError("pair hold operator policy choices are not canonical Dashboard hold policies")
+    return raw
 
 
 def _clone(value: Any, *, name: str) -> Any:
@@ -138,9 +185,7 @@ def freeze_pair_run_config(raw: Mapping[str, Any]) -> dict[str, Any]:
     required = {"schemaVersion", "longModule", "shortModule", "nativeJsonlAuthority", "holdOperatorPolicy"}
     if set(value) != required or value.get("schemaVersion") != PAIR_RUN_CONFIG_SCHEMA:
         raise TemporalDiscoveryContractError("bidirectional pair run config fields/schema are not exact")
-    hold = _mapping(value["holdOperatorPolicy"], name="pair hold operator policy")
-    if hold.get("schemaVersion") != PAIR_HOLD_POLICY_SCHEMA or hold.get("enabled") is not True or hold.get("allowedKinds") != ["none", "market_bars", "elapsed_calendar"]:
-        raise TemporalDiscoveryContractError("pair hold operator policy is not the closed admitted policy")
+    hold = _hold_operator_policy(_mapping(value["holdOperatorPolicy"], name="pair hold operator policy"))
     transport = _bound_transport(_mapping(value["nativeJsonlAuthority"], name="pair native JSONL authority"))
     native_snapshot = IdentitySnapshot.create(kind="nativeAuthority", schema_version="temporal_dashboard_jsonl_native_authority_v1", payload=transport)
     compiler_snapshot = IdentitySnapshot.create(kind="pairCompiler", schema_version="temporal_dashboard_jsonl_pair_compiler_v1", payload=transport)
@@ -181,6 +226,9 @@ class PairAuthorityBundle:
         supplied = data.pop("pairRunConfigSha256", None)
         if supplied != canonical_sha256(data) or data.get("schemaVersion") != PAIR_RUN_CONFIG_SCHEMA:
             raise TemporalDiscoveryContractError("pair run config identity/schema mismatch")
+        data["holdOperatorPolicy"] = _hold_operator_policy(
+            _mapping(data.get("holdOperatorPolicy"), name="frozen pair hold operator policy")
+        )
         if data.get("grammarRegistry") != _registry_identity():
             raise TemporalDiscoveryContractError("frozen typed grammar registry implementation drifted")
         for direction in ("long", "short"):
@@ -213,7 +261,12 @@ class PairAuthorityBundle:
         self.native_identity = IdentitySnapshot.from_payload(data["nativeAuthority"], expected_kind="nativeAuthority")
         self.compiler_identity = IdentitySnapshot.from_payload(data["pairCompilerAuthority"], expected_kind="pairCompiler")
         self.factory = _Factory(self)
-        self.operator = TypedGrammarPairOperator(grammar_factory=self.grammar_for, native_validator=self.validator, indicator_registry=self.indicator_for)
+        self.operator = TypedGrammarPairOperator(
+            grammar_factory=self.grammar_for,
+            native_validator=self.validator,
+            indicator_registry=self.indicator_for,
+            hold_operator_policy=data["holdOperatorPolicy"],
+        )
 
     def close(self) -> None: self.client.close()
     def __enter__(self) -> "PairAuthorityBundle": return self
@@ -369,4 +422,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["PAIR_RUN_CONFIG_SCHEMA", "PairAuthorityBundle", "freeze_pair_run_config", "load_pair_run_config", "pair_policy_from_config", "refresh_pair_run_config"]
+__all__ = ["PAIR_HOLD_POLICY_SCHEMA", "PAIR_RUN_CONFIG_SCHEMA", "PairAuthorityBundle", "default_hold_operator_policy", "freeze_pair_run_config", "load_pair_run_config", "pair_policy_from_config", "refresh_pair_run_config"]

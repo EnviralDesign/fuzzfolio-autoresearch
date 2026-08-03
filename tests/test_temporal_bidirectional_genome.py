@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import copy
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +12,7 @@ from autoresearch.temporal_bidirectional_genome import (
     FrozenPair,
     HoldMutationPlan,
     IdentitySnapshot,
+    apply_hold_mutation,
     apply_pair_hold_mutation,
     canonical_sha256,
     deterministic_same_side_crossover,
@@ -29,6 +32,9 @@ from autoresearch.temporal_qd_pair_generation import (
     propose_same_side_crossover,
     replay_pair_proposal,
 )
+from autoresearch.temporal_qd_pair_factory import default_hold_operator_policy
+from autoresearch.temporal_qd_pair_generation import _hold_plans
+from autoresearch.temporal_discovery_validation import DashboardV2ModuleValidator, SubprocessCandidateValidator
 
 
 class FakeNativeValidator:
@@ -96,9 +102,13 @@ def _program(side: str, marker: str = "base") -> dict:
 
 
 def _profile(side: str, *, hold=None) -> dict:
-    plan = {"id": "base", "initialStop": {"kind": "fixed_percent", "percent": 1.0}}
+    plan = {
+        "id": "base",
+        "initialStop": {"kind": "fixed_percent", "percent": 1.0},
+        "initialTarget": {"kind": "reward_multiple", "multiple": 2.0},
+    }
     if hold is not None:
-        plan["hold"] = hold
+        plan["holdPolicy"] = hold
     return {
         "version": "v2",
         "directionMode": side,
@@ -152,7 +162,7 @@ def test_pair_identity_binds_both_modules_context_hold_catalog_authority_and_lin
         _pair(_module("long", authority=_snapshot("nativeAuthority", "authority-b")), _module("short")),
         _pair(_module("long", lineage=({"operation": "typed_edit", "side": "long"},)), _module("short")),
     ]
-    hold_plan = HoldMutationPlan.create(baseline.long, plan_id="base", new_hold={"kind": "market_bars", "bars": 13})
+    hold_plan = HoldMutationPlan.create(baseline.long, plan_id="base", new_hold={"kind": "market_bars", "bars": 13, "timeframe": "M5"})
     changed.append(apply_pair_hold_mutation(baseline, hold_plan, native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(), candidate_id="pair_held"))
     assert all(pair.identity_sha256 != baseline.identity_sha256 for pair in changed)
 
@@ -193,18 +203,71 @@ def test_v2_only_or_same_side_economic_candidates_are_rejected() -> None:
         _pair(long, long)
 
 
-def test_hold_operator_is_bounded_per_plan_and_preserves_asymmetric_modules_without_v3_top_level_hold() -> None:
-    pair = _pair(_module("long", hold={"kind": "market_bars", "bars": 5}), _module("short", hold={"kind": "elapsed_calendar", "minutes": 30}))
+def test_hold_operator_uses_native_hold_policy_and_preserves_asymmetric_modules_without_v3_top_level_hold() -> None:
+    pair = _pair(_module("long", hold={"kind": "market_bars", "bars": 5, "timeframe": "M5"}), _module("short", hold={"kind": "elapsed_calendar", "hours": 0.5}))
     plan = HoldMutationPlan.create(pair.long, plan_id="base", new_hold={"kind": "none"})
-    assert plan.old_hold_sha256 == canonical_sha256({"kind": "market_bars", "bars": 5})
+    assert plan.old_hold_sha256 == canonical_sha256({"kind": "market_bars", "bars": 5, "timeframe": "M5"})
     assert plan.new_hold_sha256 == canonical_sha256({"kind": "none"})
     assert HoldMutationPlan.from_payload(plan.canonical_payload()).canonical_payload() == plan.canonical_payload()
     changed = apply_pair_hold_mutation(pair, plan, native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(), candidate_id="pair_asymmetric_hold")
-    assert changed.long.profile["executionConfig"]["managementLibrary"]["plans"][0]["hold"] == {"kind": "none"}
-    assert changed.short.profile["executionConfig"]["managementLibrary"]["plans"][0]["hold"] == {"kind": "elapsed_calendar", "minutes": 30}
-    assert "hold" not in changed.profile
-    with pytest.raises(BidirectionalGenomeError, match="1..512"):
-        HoldMutationPlan.create(pair.long, plan_id="base", new_hold={"kind": "market_bars", "bars": 513})
+    assert "holdPolicy" not in changed.long.profile["executionConfig"]["managementLibrary"]["plans"][0]
+    assert changed.short.profile["executionConfig"]["managementLibrary"]["plans"][0]["holdPolicy"] == {"kind": "elapsed_calendar", "hours": 0.5}
+    assert "holdPolicy" not in changed.profile
+    # The QD one-week cap is in its frozen choices, not a global cap on a
+    # pre-existing Dashboard-native seed policy.
+    assert HoldMutationPlan.create(pair.long, plan_id="base", new_hold={"kind": "market_bars", "bars": 2017, "timeframe": "M5"}).new_hold["bars"] == 2017
+
+
+def test_hold_plans_are_frozen_finite_native_choices_and_skip_noops() -> None:
+    ops = _PairOps()
+    empty = _module("long")
+    first = _hold_plans(empty, ops)
+    assert first == _hold_plans(empty, ops)
+    assert len(first) == len(default_hold_operator_policy()["choices"]) - 1
+    assert {item["newHold"]["kind"] for item in first} == {"market_bars", "elapsed_calendar"}
+
+    one_bar = _module("long", hold={"kind": "market_bars", "bars": 1, "timeframe": "M5"})
+    choices = _hold_plans(one_bar, ops)
+    assert {"kind": "hold", "planId": "base", "newHold": {"kind": "none"}} in choices
+    assert {"kind": "hold", "planId": "base", "newHold": {"kind": "market_bars", "bars": 1, "timeframe": "M5"}} not in choices
+    assert max(item["newHold"].get("bars", 0) for item in choices) == 2016
+    assert max(item["newHold"].get("hours", 0.0) for item in choices) == 168.0
+
+
+def test_hold_mutations_are_admitted_by_dashboard_native_management_validator() -> None:
+    dashboard_root = Path("C:/repos/Trading-Dashboard")
+    fixture = dashboard_root / "shared/python/fuzzfolio_core/tests/test_temporal_search_candidate_validation.py"
+    tree = ast.parse(fixture.read_text(encoding="utf-8"))
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"_transition", "_candidate_profile"}
+    ]
+    namespace: dict[str, object] = {}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), str(fixture), "exec"), namespace)
+    source = FrozenModule.validate_native(
+        program=_program("long"),
+        profile=namespace["_candidate_profile"](),  # type: ignore[operator]
+        grammar_context=_snapshot("grammarContext", "dashboard-hold-context"),
+        catalog=_snapshot("catalog", "dashboard-hold-catalog"),
+        policy=_snapshot("policy", "dashboard-hold-policy"),
+        native_authority_identity=_snapshot("nativeAuthority", "dashboard-hold-authority"),
+        native_validator=FakeNativeValidator(),
+        candidate_id="dashboard_native_hold_source",
+    )
+    client = SubprocessCandidateValidator(
+        [str(dashboard_root / "compute-service/.venv/Scripts/python.exe"), str(dashboard_root / "scripts/temporal_search_validate_candidate.py")],
+        timeout_seconds=10,
+    )
+    native_validator = DashboardV2ModuleValidator(client)
+    for hold in (
+        {"kind": "market_bars", "bars": 12, "timeframe": "M5"},
+        {"kind": "elapsed_calendar", "hours": 24.0},
+    ):
+        mutation = HoldMutationPlan.create(source, plan_id="core_plan", new_hold=hold)
+        changed = apply_hold_mutation(source, mutation, native_validator=native_validator, candidate_id=f"dashboard_native_{hold['kind']}")
+        report = native_validator.validate_v2(profile=changed.canonical_payload()["profile"], candidate_id=f"dashboard_recheck_{hold['kind']}")
+        assert report["candidateAcceptable"] is True
+        assert changed.canonical_payload()["profile"]["executionConfig"]["managementLibrary"]["plans"][0]["holdPolicy"] == hold
 
 
 def test_qd_economic_candidate_requires_exact_frozen_v3_pair_and_policy_binding() -> None:
@@ -259,6 +322,10 @@ class _PairOps:
     def indicator_plans(self, module: FrozenModule):
         return [{"op": "indicator", "side": module.direction}] if self.enabled else []
 
+    def hold_policy_choices(self, module: FrozenModule):
+        del module
+        return copy.deepcopy(default_hold_operator_policy()["choices"])
+
     def apply_indicator(self, module: FrozenModule, plan, *, candidate_id: str):
         changed = _module(module.direction, marker="second", lineage=({"operation": "indicator", "side": module.direction},))
         return changed, {"schemaVersion": "audit", "kind": "indicator", "candidateId": candidate_id}
@@ -311,17 +378,17 @@ def test_pair_generation_immigrant_side_mutation_replay_and_no_eligible_are_exac
     hold_seed = "seed-hold"
     hold_side = proposal_side(hold_seed)
     hold_target = parent.long if hold_side == "long" else parent.short
-    hold_bars = 1 + int(canonical_sha256({"module": hold_target.identity_sha256, "plan": "base"})[-2:], 16) % 32
+    hold = {"kind": "market_bars", "bars": 1, "timeframe": "M5"}
     hold_pair, hold_entry = propose_pair(
         proposal_seed=hold_seed, parent=parent, pair_factory=None, module_authority=ops,
         native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(),
-        replay_operation={"kind": "hold", "planId": "base", "newHold": {"kind": "market_bars", "bars": hold_bars}},
+        replay_operation={"kind": "hold", "planId": "base", "newHold": hold},
     )
     assert hold_pair is not None and hold_entry["holdMutationPlan"]["side"] == hold_side
     changed_module = hold_pair.long if hold_side == "long" else hold_pair.short
     untouched_module = hold_pair.short if hold_side == "long" else hold_pair.long
-    assert changed_module.profile["executionConfig"]["managementLibrary"]["plans"][0]["hold"] == {"kind": "market_bars", "bars": hold_bars}
-    assert "hold" not in untouched_module.profile["executionConfig"]["managementLibrary"]["plans"][0]
+    assert changed_module.profile["executionConfig"]["managementLibrary"]["plans"][0]["holdPolicy"] == hold
+    assert "holdPolicy" not in untouched_module.profile["executionConfig"]["managementLibrary"]["plans"][0]
 
     no_hold_parent = _pair(
         _module("long", profile={"version": "v2", "directionMode": "long", "graph": {}}),

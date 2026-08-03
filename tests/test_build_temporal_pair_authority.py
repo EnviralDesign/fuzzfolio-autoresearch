@@ -8,9 +8,10 @@ import pytest
 
 from scripts import build_temporal_pair_authority as authority
 from autoresearch import temporal_qd_pair_factory
+from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
 from autoresearch.temporal_qd_pair_factory import (
-    PAIR_HOLD_POLICY_SCHEMA,
     PAIR_RUN_CONFIG_SCHEMA,
+    default_hold_operator_policy,
     freeze_pair_run_config,
 )
 
@@ -118,11 +119,7 @@ def test_catalog_context_and_freeze_are_catalog_bound(tmp_path, monkeypatch):
             "longModule": side,
             "shortModule": copy.deepcopy(side),
             "nativeJsonlAuthority": fake_transport,
-            "holdOperatorPolicy": {
-                "schemaVersion": PAIR_HOLD_POLICY_SCHEMA,
-                "enabled": True,
-                "allowedKinds": ["none", "market_bars", "elapsed_calendar"],
-            },
+            "holdOperatorPolicy": default_hold_operator_policy(),
         }
     )
 
@@ -132,6 +129,20 @@ def test_catalog_context_and_freeze_are_catalog_bound(tmp_path, monkeypatch):
     assert frozen["longModule"]["context"]["indicators"] == context["indicators"]
     assert frozen["schemaVersion"] == PAIR_RUN_CONFIG_SCHEMA
     assert frozen["pairRunConfigSha256"].startswith("sha256:")
+    assert frozen["holdOperatorPolicy"] == default_hold_operator_policy()
+
+    rejected_policy = default_hold_operator_policy()
+    rejected_policy["choices"][-1]["hours"] = 169.0
+    with pytest.raises(TemporalDiscoveryContractError, match="closed admitted policy"):
+        freeze_pair_run_config(
+            {
+                "schemaVersion": PAIR_RUN_CONFIG_SCHEMA,
+                "longModule": side,
+                "shortModule": copy.deepcopy(side),
+                "nativeJsonlAuthority": fake_transport,
+                "holdOperatorPolicy": rejected_policy,
+            }
+        )
 
 
 def test_builder_requires_dashboard_runtime_catalog_path(tmp_path, monkeypatch):

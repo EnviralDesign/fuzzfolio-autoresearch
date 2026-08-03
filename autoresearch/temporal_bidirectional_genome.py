@@ -14,6 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import re
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -414,23 +415,36 @@ def deterministic_same_side_crossover(
 
 
 def canonical_hold(value: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Small, explicit hold vocabulary.  It carries no evaluator semantics."""
+    """Canonical Dashboard-native ``holdPolicy`` value for a management plan.
+
+    ``none`` is the mutation vocabulary's representation of an absent optional
+    ``holdPolicy`` field.  It is deliberately not written into a Dashboard
+    management plan; :func:`apply_hold_mutation` removes the field instead.
+    Bounds beyond the Dashboard type contract belong to a frozen operator
+    policy, not this loader, so existing native seed profiles are not globally
+    constrained by the QD search vocabulary.
+    """
 
     raw = {"kind": "none"} if value is None else _mapping(value, name="management-plan hold")
     kind = str(raw.get("kind") or "").strip()
     if kind == "none" and set(raw) == {"kind"}:
         return {"kind": "none"}
-    if kind == "market_bars" and set(raw) == {"kind", "bars"}:
+    if kind == "market_bars" and set(raw) in ({"kind", "bars", "timeframe"}, {"kind", "bars", "timeframe", "onBreach"}):
         bars = raw["bars"]
-        if isinstance(bars, bool) or not isinstance(bars, int) or not 1 <= bars <= 512:
-            raise BidirectionalGenomeError("market_bars hold requires bars in 1..512")
-        return {"kind": kind, "bars": bars}
-    if kind == "elapsed_calendar" and set(raw) == {"kind", "minutes"}:
-        minutes = raw["minutes"]
-        if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= 43_200:
-            raise BidirectionalGenomeError("elapsed_calendar hold requires minutes in 1..43200")
-        return {"kind": kind, "minutes": minutes}
-    raise BidirectionalGenomeError("hold must be none, market_bars, or elapsed_calendar with bounded fields")
+        timeframe = str(raw["timeframe"] or "").strip().upper()
+        if isinstance(bars, bool) or not isinstance(bars, int) or bars < 1 or not timeframe or len(timeframe) > 32:
+            raise BidirectionalGenomeError("market_bars holdPolicy requires positive bars and a timeframe")
+        if "onBreach" in raw and raw["onBreach"] != "exit_next_open":
+            raise BidirectionalGenomeError("market_bars holdPolicy onBreach must be exit_next_open")
+        return {"kind": kind, "bars": bars, "timeframe": timeframe}
+    if kind == "elapsed_calendar" and set(raw) in ({"kind", "hours"}, {"kind", "hours", "onBreach"}):
+        hours = raw["hours"]
+        if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not math.isfinite(float(hours)) or hours <= 0:
+            raise BidirectionalGenomeError("elapsed_calendar holdPolicy requires positive hours")
+        if "onBreach" in raw and raw["onBreach"] != "exit_next_open":
+            raise BidirectionalGenomeError("elapsed_calendar holdPolicy onBreach must be exit_next_open")
+        return {"kind": kind, "hours": float(hours)}
+    raise BidirectionalGenomeError("holdPolicy must be none, market_bars (bars/timeframe), or elapsed_calendar (hours)")
 
 
 @dataclass(frozen=True)
@@ -451,7 +465,7 @@ class HoldMutationPlan:
         selected = [item for item in plans if isinstance(item, Mapping) and item.get("id") == plan_id]
         if len(selected) != 1:
             raise BidirectionalGenomeError("hold mutation requires one existing management plan id")
-        old = canonical_hold(selected[0].get("hold"))
+        old = canonical_hold(selected[0].get("holdPolicy"))
         new = canonical_hold(new_hold)
         if old == new:
             raise BidirectionalGenomeError("hold mutation must change the selected management plan")
@@ -511,9 +525,13 @@ def apply_hold_mutation(
     profile = _thaw(module.profile)
     plans = (((profile.get("executionConfig") or {}).get("managementLibrary") or {}).get("plans") or [])
     selected = [item for item in plans if isinstance(item, Mapping) and item.get("id") == plan.plan_id]
-    if len(selected) != 1 or canonical_sha256(canonical_hold(selected[0].get("hold"))) != plan.old_hold_sha256:
+    if len(selected) != 1 or canonical_sha256(canonical_hold(selected[0].get("holdPolicy"))) != plan.old_hold_sha256:
         raise BidirectionalGenomeError("hold mutation source plan no longer matches its recorded hold")
-    selected[0]["hold"] = _thaw(plan.new_hold)
+    new_hold = _thaw(plan.new_hold)
+    if new_hold["kind"] == "none":
+        selected[0].pop("holdPolicy", None)
+    else:
+        selected[0]["holdPolicy"] = new_hold
     return FrozenModule.validate_native(
         program=_thaw(module.program),
         profile=profile,

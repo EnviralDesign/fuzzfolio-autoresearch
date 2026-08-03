@@ -14,6 +14,10 @@ from autoresearch.temporal_prebroad_canary_artifacts import (
     build_artifacts,
     greedy_set_cover,
 )
+from autoresearch.temporal_qd_pair_factory import (
+    default_hold_operator_policy,
+    freeze_pair_run_config,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,8 +64,16 @@ def test_public_context_accepts_the_frozen_normalized_spelling() -> None:
 
 def test_one_pair_build_runs_native_canary_and_is_deterministic(tmp_path: Path) -> None:
     first = tmp_path / "first.json"; second = tmp_path / "second.json"
-    one = build_artifacts(POPULATION, CONFIG, first, candidate_ids=[CANDIDATE])
-    two = build_artifacts(POPULATION, CONFIG, second, candidate_ids=[CANDIDATE])
+    stale_config = json.loads(CONFIG.read_text(encoding="utf-8"))
+    stale_config.pop("pairRunConfigSha256", None)
+    stale_config["holdOperatorPolicy"] = default_hold_operator_policy()
+    config = tmp_path / "pair-config-v2.json"
+    config.write_text(
+        json.dumps(freeze_pair_run_config(stale_config), sort_keys=True),
+        encoding="utf-8",
+    )
+    one = build_artifacts(POPULATION, config, first, candidate_ids=[CANDIDATE])
+    two = build_artifacts(POPULATION, config, second, candidate_ids=[CANDIDATE])
     assert one["inputSha256"] == two["inputSha256"]
     assert first.read_bytes() == second.read_bytes()
     payload = json.loads(first.read_text(encoding="utf-8"))
