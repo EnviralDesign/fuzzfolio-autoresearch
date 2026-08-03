@@ -23,7 +23,6 @@ from .temporal_prebroad_control import (
 from .temporal_search import TemporalSearchContractError, canonical_sha256
 
 
-WORKER_CONTRACT_SHA256 = "sha256:6c47c1d5b94a65af16e6bb4a7c7f516b33fbac8145154e8b302d31c47830f2e0"
 _WORKER_SCHEMA = "replay-worker-contract-v1"
 
 
@@ -52,13 +51,24 @@ def _sha(value: Any, *, name: str) -> str:
     return token
 
 
-def _templates(preparation: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+def _templates(
+    preparation: Mapping[str, Any], *, worker_contract_sha256: str
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    required_worker_sha = _sha(
+        worker_contract_sha256, name="required worker contract SHA-256"
+    )
     worker = preparation.get("workerContract")
-    if not isinstance(worker, Mapping) or dict(worker) != {
-        "workerContractSha256": WORKER_CONTRACT_SHA256,
-        "workerContractSchema": _WORKER_SCHEMA,
-    }:
-        raise TemporalSearchContractError("trusted preparation does not bind the required worker contract")
+    if (
+        not isinstance(worker, Mapping)
+        or worker.get("workerContractSchema") != _WORKER_SCHEMA
+    ):
+        raise TemporalSearchContractError(
+            "trusted preparation does not bind the supported worker contract schema"
+        )
+    _sha(
+        worker.get("workerContractSha256"),
+        name="trusted preparation worker contract SHA-256",
+    )
     windows = preparation.get("developmentWindows")
     if not isinstance(windows, list) or [
         (item.get("windowId"), item.get("analysisWindowStart"), item.get("analysisWindowEnd"))
@@ -66,6 +76,11 @@ def _templates(preparation: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str
     ] != list(WINDOWS):
         raise TemporalSearchContractError("trusted preparation does not bind the fixed development windows")
     candidates = preparation.get("candidates")
+    if not isinstance(candidates, list):
+        # A prior pre-broad control preparation contains the same immutable
+        # evidence templates under ``pairs``. Accept it as a safe deployment
+        # rollover source so a worker image update never requires a lake read.
+        candidates = preparation.get("pairs")
     if not isinstance(candidates, list) or not candidates:
         raise TemporalSearchContractError("trusted preparation has no evidence-plan templates")
     first = candidates[0]
@@ -74,8 +89,8 @@ def _templates(preparation: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str
     by_window = {str(row.get("windowId") or ""): row.get("evidencePlan") for row in first["windowInputs"] if isinstance(row, Mapping)}
     if set(by_window) != {row[0] for row in WINDOWS} or not all(isinstance(item, Mapping) for item in by_window.values()):
         raise TemporalSearchContractError("trusted preparation must provide both evidence-plan templates")
-    # The source preparation is a broad envelope.  Every listed candidate must
-    # reference exactly the same attested binding for each fixed window.
+    # Every listed candidate/pair must reference exactly the same attested
+    # binding for each fixed window.
     for candidate in candidates:
         if not isinstance(candidate, Mapping) or not isinstance(candidate.get("windowInputs"), list):
             raise TemporalSearchContractError("trusted preparation candidate window inputs are malformed")
@@ -86,7 +101,16 @@ def _templates(preparation: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str
             current = inputs[window_id]
             if not isinstance(current, Mapping) or current.get("lake_window_binding") != template.get("lake_window_binding"):
                 raise TemporalSearchContractError("trusted preparation attested lake binding drifted")
-    return dict(worker), {key: deepcopy(dict(value)) for key, value in by_window.items()}
+    # A worker rollout does not change market-evidence authority. Rebind only
+    # the exact execution contract while preserving every remotely attested
+    # lake request and binding byte-for-byte.
+    rebound_worker = {
+        "workerContractSha256": required_worker_sha,
+        "workerContractSchema": _WORKER_SCHEMA,
+    }
+    return rebound_worker, {
+        key: deepcopy(dict(value)) for key, value in by_window.items()
+    }
 
 
 def _rotate_plan(template: Mapping[str, Any], *, profile: Mapping[str, Any], profile_sha: str, timeframe: str, window: tuple[str, str, str]) -> dict[str, Any]:
@@ -123,8 +147,17 @@ def _rotate_plan(template: Mapping[str, Any], *, profile: Mapping[str, Any], pro
     return plan
 
 
-def build_accepted_pairs(population: Mapping[str, Any], preparation: Mapping[str, Any], *, native_reports: Mapping[str, Mapping[str, Any]] | None = None, dashboard_python: Path = DEFAULT_DASHBOARD_PYTHON) -> dict[str, Any]:
-    worker, templates = _templates(preparation)
+def build_accepted_pairs(
+    population: Mapping[str, Any],
+    preparation: Mapping[str, Any],
+    *,
+    worker_contract_sha256: str,
+    native_reports: Mapping[str, Mapping[str, Any]] | None = None,
+    dashboard_python: Path = DEFAULT_DASHBOARD_PYTHON,
+) -> dict[str, Any]:
+    worker, templates = _templates(
+        preparation, worker_contract_sha256=worker_contract_sha256
+    )
     candidates = population.get("candidates")
     if not isinstance(candidates, list) or len(candidates) != 8:
         raise TemporalSearchContractError("QD population must contain exactly eight candidates")
@@ -170,6 +203,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--population", type=Path, required=True)
     parser.add_argument("--preparation", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--worker-contract-sha256", required=True)
     parser.add_argument("--dashboard-python", type=Path, default=DEFAULT_DASHBOARD_PYTHON)
     return parser
 
@@ -177,7 +211,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        accepted = build_accepted_pairs(_read(args.population), _read(args.preparation), dashboard_python=args.dashboard_python)
+        accepted = build_accepted_pairs(
+            _read(args.population),
+            _read(args.preparation),
+            worker_contract_sha256=args.worker_contract_sha256,
+            dashboard_python=args.dashboard_python,
+        )
         _immutable_write(args.output, accepted)
         print(json.dumps({"schemaVersion": "temporal_prebroad_accepted_pairs_result_v1", "candidateCount": 8, "taskCount": 16, "acceptedPairsSha256": canonical_sha256(accepted), "taskDispatchPermitted": False, "marketEvidenceRead": False, "gatewayContacted": False}, indent=2, sort_keys=True))
         return 0

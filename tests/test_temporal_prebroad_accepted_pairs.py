@@ -6,12 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from autoresearch.temporal_prebroad_accepted_pairs import (
-    WORKER_CONTRACT_SHA256,
-    build_accepted_pairs,
-)
+from autoresearch.temporal_prebroad_accepted_pairs import build_accepted_pairs
 from autoresearch.temporal_prebroad_control import WINDOWS, build_prebroad_authority
 from autoresearch.temporal_search import TemporalSearchContractError, canonical_sha256
+
+
+SOURCE_WORKER_SHA256 = "sha256:" + "1" * 64
+TARGET_WORKER_SHA256 = "sha256:" + "2" * 64
 
 
 def _profile(index: int) -> dict:
@@ -86,7 +87,7 @@ def _inputs() -> tuple[dict, dict, dict]:
         reports[candidate_id] = report
     template_inputs = [{"windowId": window_id, "evidencePlan": _plan(window_id, start, end)} for window_id, start, end in WINDOWS]
     preparation = {
-        "workerContract": {"workerContractSha256": WORKER_CONTRACT_SHA256, "workerContractSchema": "replay-worker-contract-v1"},
+        "workerContract": {"workerContractSha256": SOURCE_WORKER_SHA256, "workerContractSchema": "replay-worker-contract-v1"},
         "developmentWindows": [{"windowId": window_id, "analysisWindowStart": start, "analysisWindowEnd": end} for window_id, start, end in WINDOWS],
         "candidates": [{"windowInputs": deepcopy(template_inputs)}],
     }
@@ -95,7 +96,16 @@ def _inputs() -> tuple[dict, dict, dict]:
 
 def test_adapter_preserves_attested_request_and_uses_raw_source_profile_hash() -> None:
     population, preparation, reports = _inputs()
-    accepted = build_accepted_pairs(population, preparation, native_reports=reports)
+    accepted = build_accepted_pairs(
+        population,
+        preparation,
+        worker_contract_sha256=TARGET_WORKER_SHA256,
+        native_reports=reports,
+    )
+    assert accepted["workerContract"] == {
+        "workerContractSha256": TARGET_WORKER_SHA256,
+        "workerContractSchema": "replay-worker-contract-v1",
+    }
     assert [item["candidateId"] for item in accepted["pairs"]] == sorted(reports)
     assert all(item["timeframe"] == "M5" and item["barLimit"] == 5000 for item in accepted["pairs"])
     for pair in accepted["pairs"]:
@@ -109,26 +119,76 @@ def test_adapter_preserves_attested_request_and_uses_raw_source_profile_hash() -
     assert build_prebroad_authority(accepted, native_reports=reports)["taskCount"] == 16
 
 
+def test_adapter_rebinds_from_prior_control_preparation_without_lake_changes() -> None:
+    population, preparation, reports = _inputs()
+    preparation["pairs"] = preparation.pop("candidates")
+
+    accepted = build_accepted_pairs(
+        population,
+        preparation,
+        worker_contract_sha256=TARGET_WORKER_SHA256,
+        native_reports=reports,
+    )
+
+    assert accepted["workerContract"]["workerContractSha256"] == TARGET_WORKER_SHA256
+    assert all(
+        pair["windowInputs"][0]["evidencePlan"]["lake_window_binding"]
+        == preparation["pairs"][0]["windowInputs"][0]["evidencePlan"][
+            "lake_window_binding"
+        ]
+        for pair in accepted["pairs"]
+    )
+
+
 def test_adapter_rejects_tampered_attested_binding_and_native_forgery() -> None:
     population, preparation, reports = _inputs()
     preparation["candidates"][0]["windowInputs"][0]["evidencePlan"]["lake_window_binding"]["request"]["data_start"] = "2023-10-02T00:00:00Z"
     with pytest.raises(TemporalSearchContractError, match="outside the immutable"):
-        build_accepted_pairs(population, preparation, native_reports=reports)
+        build_accepted_pairs(
+            population,
+            preparation,
+            worker_contract_sha256=TARGET_WORKER_SHA256,
+            native_reports=reports,
+        )
 
     population, preparation, reports = _inputs()
     reports["qd_candidate_0"]["rawSourceProfileSha256"] = "sha256:" + "f" * 64
     with pytest.raises(TemporalSearchContractError, match="source profile identity drifted"):
-        build_accepted_pairs(population, preparation, native_reports=reports)
+        build_accepted_pairs(
+            population,
+            preparation,
+            worker_contract_sha256=TARGET_WORKER_SHA256,
+            native_reports=reports,
+        )
 
 
 def test_adapter_rejects_worker_contract_drift_and_protected_window_overlap() -> None:
     population, preparation, reports = _inputs()
-    preparation["workerContract"]["workerContractSha256"] = "sha256:" + "f" * 64
+    preparation["workerContract"]["workerContractSha256"] = "not-a-sha"
+    with pytest.raises(TemporalSearchContractError, match="trusted preparation worker"):
+        build_accepted_pairs(
+            population,
+            preparation,
+            worker_contract_sha256=TARGET_WORKER_SHA256,
+            native_reports=reports,
+        )
+
+    population, preparation, reports = _inputs()
     with pytest.raises(TemporalSearchContractError, match="required worker contract"):
-        build_accepted_pairs(population, preparation, native_reports=reports)
+        build_accepted_pairs(
+            population,
+            preparation,
+            worker_contract_sha256="not-a-sha",
+            native_reports=reports,
+        )
 
     population, preparation, reports = _inputs()
     plan = preparation["candidates"][0]["windowInputs"][0]["evidencePlan"]
     plan["analysis_window_start"] = "2024-06-29T00:00:00Z"
     with pytest.raises(TemporalSearchContractError, match="fixed month"):
-        build_accepted_pairs(population, preparation, native_reports=reports)
+        build_accepted_pairs(
+            population,
+            preparation,
+            worker_contract_sha256=TARGET_WORKER_SHA256,
+            native_reports=reports,
+        )

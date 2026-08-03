@@ -17,6 +17,7 @@ from autoresearch.temporal_prebroad_dispatch import (
     run_prebroad_dispatch,
 )
 from autoresearch.temporal_search import (
+    TEMPORAL_BIDIRECTIONAL_REPLAY_CAPABILITY,
     TEMPORAL_SEARCH_CAPABILITY,
     TEMPORAL_SEARCH_TASK_KIND,
     TemporalSearchContractError,
@@ -136,6 +137,11 @@ def test_dispatch_builds_only_the_exact_v3_both_labtask_matrix(tmp_path: Path) -
     assert {task["task_kind"] for task in tasks} == {TEMPORAL_SEARCH_TASK_KIND}
     assert all(task["max_attempts"] == 1 for task in tasks)
     assert all(TEMPORAL_SEARCH_CAPABILITY in task["required_worker_capabilities"] for task in tasks)
+    assert all(
+        TEMPORAL_BIDIRECTIONAL_REPLAY_CAPABILITY
+        in task["required_worker_capabilities"]
+        for task in tasks
+    )
     for task in tasks:
         job = task["payload"]
         assert job["authority_id"] == authority["authorityId"]

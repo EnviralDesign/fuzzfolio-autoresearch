@@ -999,9 +999,11 @@ def test_procman_normal_operations_is_prebroad_admission_topology() -> None:
         "Lab Gateway",
         "Temporal Pre-Broad No-Market Activation Canary",
         "Temporal Pre-Broad Prepare 16 Tasks",
-        "Temporal Pre-Broad Fresh 16 Tasks",
-        "Temporal Pre-Broad Resume 16 Tasks",
+        "Temporal Pre-Broad Materialize Fresh Matrix",
+        "Temporal Pre-Broad Materialize Resume Matrix",
         "Temporal Pre-Broad Authority Audit",
+        "Temporal Pre-Broad Dispatch Fresh 16 Tasks",
+        "Temporal Pre-Broad Dispatch Resume 16 Tasks",
         "AutoResearch Dashboard",
     }
     assert not any(item["name"].startswith("Phase 3 ") for item in processes.values())

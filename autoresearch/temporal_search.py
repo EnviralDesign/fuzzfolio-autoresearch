@@ -32,6 +32,9 @@ TEMPORAL_SEARCH_PREPARATION_SCHEMA = "temporal_graph_candidate_window_preparatio
 TEMPORAL_SEARCH_TASK_KIND = "temporal_graph_candidate_window"
 TEMPORAL_SEARCH_JOB_SCHEMA = "temporal_graph_candidate_window_job_v1"
 TEMPORAL_SEARCH_CAPABILITY = "temporal_graph_candidate_window_v1"
+TEMPORAL_BIDIRECTIONAL_REPLAY_CAPABILITY = (
+    "temporal_graph_bidirectional_replay_v1"
+)
 TEMPORAL_SEARCH_RESULT_SCHEMA = "temporal_graph_candidate_window_result_v1"
 TEMPORAL_SEARCH_CHECKPOINT_SCHEMA = "temporal_graph_candidate_window_checkpoint_v1"
 TEMPORAL_SEARCH_MANIFEST_SCHEMA = "temporal_graph_candidate_window_manifest_v1"
@@ -40,6 +43,7 @@ _SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 _COST_VIEWS = ("research_conservative", "none")
 _REQUIRED_WORKER_CAPABILITIES = (
     TEMPORAL_SEARCH_CAPABILITY,
+    TEMPORAL_BIDIRECTIONAL_REPLAY_CAPABILITY,
     "temporal_graph_replay_v1",
     "management.scalar.price_level.completed_bar",
     "management.scalar.price_distance.completed_bar",
