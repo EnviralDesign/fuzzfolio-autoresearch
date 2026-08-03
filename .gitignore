@@ -60,3 +60,4 @@ wheels/
 
 # Generated native temporal verification evidence
 /temporal-stage4-verification/
+/temporal-stage5b-distributed-verification/
