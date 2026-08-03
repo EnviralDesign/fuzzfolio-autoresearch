@@ -13,7 +13,7 @@ from pathlib import Path
 import time
 
 import autoresearch.temporal_qd_evolution as qd
-from autoresearch.temporal_qd_pair_factory import PairAuthorityBundle, freeze_pair_run_config, pair_policy_from_config
+from autoresearch.temporal_qd_pair_factory import PairAuthorityBundle, load_pair_run_config, pair_policy_from_config
 
 
 def _timed_wrapper(timings: dict[str, dict[str, float]], name: str, function):
@@ -114,7 +114,7 @@ def main() -> None:
         if args.bidirectional_pair_config is None:
             result = qd.generate_qd_generation(**generation_kwargs)
         else:
-            frozen = freeze_pair_run_config(json.loads(args.bidirectional_pair_config.read_text(encoding="utf-8")))
+            frozen = load_pair_run_config(json.loads(args.bidirectional_pair_config.read_text(encoding="utf-8")))
             with PairAuthorityBundle(frozen) as authority:
                 result = qd.generate_qd_generation(
                     **generation_kwargs,

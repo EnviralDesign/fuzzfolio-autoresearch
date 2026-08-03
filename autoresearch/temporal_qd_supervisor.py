@@ -24,7 +24,7 @@ from .play_hand_lab import LabGatewayClient
 from .play_hand_lab_auth import load_lab_gateway_token
 from .temporal_discovery_base import TemporalDiscoveryContractError, canonical_sha256
 from .temporal_generator_v2_continuation import ExactGeneratorV2Continuation
-from .temporal_qd_pair_factory import PairAuthorityBundle, freeze_pair_run_config, pair_policy_from_config
+from .temporal_qd_pair_factory import PairAuthorityBundle, load_pair_run_config, pair_policy_from_config
 from .temporal_qd_campaign import freeze_qd_screening_campaign
 from .temporal_qd_evolution import (
     QD_IDENTITY_LEDGER_SCHEMA,
@@ -855,7 +855,7 @@ def _frozen_config(
         ),
         construction_catalog_path=construction_catalog_path,
     )
-    pair_authority = freeze_pair_run_config(bidirectional_pair_config) if bidirectional_pair_config is not None else None
+    pair_authority = load_pair_run_config(bidirectional_pair_config) if bidirectional_pair_config is not None else None
     source = None if pair_authority is not None else ExactGeneratorV2Continuation(
         source_preparation_path=source_preparation_path,
         base_generator_root=base_generator_root,

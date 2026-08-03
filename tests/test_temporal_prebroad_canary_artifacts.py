@@ -10,6 +10,7 @@ from autoresearch.temporal_prebroad_canary_artifacts import (
     CanaryArtifactError,
     GuardSatisfier,
     MAX_OBSERVATIONS,
+    _public_context,
     build_artifacts,
     greedy_set_cover,
 )
@@ -36,6 +37,25 @@ def test_greedy_cover_is_stable_and_bounded() -> None:
     assert greedy_set_cover({"b": {"x"}, "a": {"x", "y"}, "c": {"y"}}, {"x", "y"}) == ["a"]
     with pytest.raises(CanaryArtifactError, match="incomplete"):
         greedy_set_cover({"a": {"x"}}, {"x", "missing"})
+
+
+def test_public_context_accepts_the_frozen_normalized_spelling() -> None:
+    normalized = {
+        "instrument": "EURUSD",
+        "indicators": [{"id": "indicator"}],
+        "groups": [{"id": "group"}],
+        "events": [{"id": "event"}],
+        "executionConfig": {"managementPlans": []},
+        "budgets": {"maxStates": 32},
+    }
+    assert _public_context(normalized) == {
+        "instrument": "EURUSD",
+        "indicators": [{"id": "indicator"}],
+        "evidenceGroups": [{"id": "group"}],
+        "eventBindings": [{"id": "event"}],
+        "executionConfig": {"managementPlans": []},
+        "budgets": {"maxStates": 32},
+    }
 
 
 def test_one_pair_build_runs_native_canary_and_is_deterministic(tmp_path: Path) -> None:

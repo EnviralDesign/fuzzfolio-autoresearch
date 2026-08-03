@@ -1541,6 +1541,42 @@ def _load_archive(path: Path) -> tuple[dict[str, Any], str]:
     return archive, archive_sha
 
 
+def initialize_empty_bidirectional_archive(
+    template: Mapping[str, Any], pair_policy: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Bind a verified empty generation-zero archive to one pair authority."""
+
+    archive = _clone(template, name="empty QD archive template")
+    supplied = archive.pop("archiveSha256", None)
+    if supplied != canonical_sha256(archive):
+        raise TemporalDiscoveryContractError("empty QD archive template identity mismatch")
+    if (
+        archive.get("schemaVersion") != QD_ARCHIVE_SCHEMA
+        or archive.get("qdVersion") != QD_VERSION
+        or archive.get("policyName") != QD_POLICY_NAME
+        or archive.get("policySha256") != QD_POLICY_SHA256
+        or archive.get("frozenPolicy") != QD_POLICY
+    ):
+        raise TemporalDiscoveryContractError("unknown empty QD archive template schema")
+    if (
+        archive.get("generationIndex") != 0
+        or archive.get("candidateCountSeen") != 0
+        or archive.get("occupiedCellCount") != 0
+        or archive.get("memberCount") != 0
+        or archive.get("qualityMemberCount") != 0
+        or archive.get("observationalMemberCount") != 0
+        or archive.get("negativeNoveltyMemberCount") != 0
+        or archive.get("cells") != []
+    ):
+        raise TemporalDiscoveryContractError("pair archive initialization requires an exact empty generation-zero template")
+    policy = _clone(pair_policy, name="bidirectional pair policy")
+    if _bidirectional_pair_policy({"bidirectionalPairPolicy": policy}) is None:
+        raise TemporalDiscoveryContractError("pair archive initialization requires an enabled pair policy")
+    archive["bidirectionalPairPolicy"] = policy
+    archive["archiveSha256"] = canonical_sha256(archive)
+    return archive
+
+
 def _reproduction_cells(
     archive: Mapping[str, Any], *, allow_empty_quality_bootstrap: bool = False
 ) -> list[dict[str, Any]]:
@@ -3665,8 +3701,8 @@ def main() -> None:
         if args.bidirectional_pair_config is None:
             result = generate_qd_generation(**generation_kwargs)
         else:
-            from .temporal_qd_pair_factory import PairAuthorityBundle, freeze_pair_run_config, pair_policy_from_config
-            frozen = freeze_pair_run_config(_read(args.bidirectional_pair_config, name="bidirectional pair run config"))
+            from .temporal_qd_pair_factory import PairAuthorityBundle, load_pair_run_config, pair_policy_from_config
+            frozen = load_pair_run_config(_read(args.bidirectional_pair_config, name="bidirectional pair run config"))
             with PairAuthorityBundle(frozen) as authority:
                 result = generate_qd_generation(
                     **generation_kwargs,

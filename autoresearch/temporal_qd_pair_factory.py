@@ -304,6 +304,18 @@ def refresh_pair_run_config(template: Mapping[str, Any]) -> dict[str, Any]:
     return freeze_pair_run_config(raw)
 
 
+def load_pair_run_config(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Load authored input or verify an already-frozen runtime authority."""
+
+    data = _mapping(value, name="pair run config")
+    authored_fields = {"schemaVersion", "longModule", "shortModule", "nativeJsonlAuthority", "holdOperatorPolicy"}
+    if set(data) == authored_fields:
+        return freeze_pair_run_config(data)
+    with PairAuthorityBundle(data):
+        pass
+    return data
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -344,4 +356,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["PAIR_RUN_CONFIG_SCHEMA", "PairAuthorityBundle", "freeze_pair_run_config", "pair_policy_from_config", "refresh_pair_run_config"]
+__all__ = ["PAIR_RUN_CONFIG_SCHEMA", "PairAuthorityBundle", "freeze_pair_run_config", "load_pair_run_config", "pair_policy_from_config", "refresh_pair_run_config"]

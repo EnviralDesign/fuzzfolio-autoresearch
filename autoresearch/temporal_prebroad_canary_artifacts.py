@@ -20,6 +20,7 @@ from typing import Any
 
 from .temporal_bidirectional_genome import FrozenModule, FrozenPair
 from .temporal_discovery_validation import SubprocessCandidateValidator
+from .temporal_qd_pair_factory import load_pair_run_config
 from .temporal_search import TemporalSearchContractError, canonical_sha256
 from .temporal_typed_motif_grammar import REGISTRY, Fragment, GrammarContext, ModuleProgram, TypedFragmentGrammar, compiled_graph_signature
 
@@ -226,7 +227,7 @@ def _solve_streams(pairs: Sequence[Mapping[str, Any]], dashboard_python: Path) -
 
 
 def build_artifacts(population_path: Path, config_path: Path, output_path: Path, *, candidate_ids: Sequence[str] | None = None, dashboard_python: Path = Path("C:/repos/Trading-Dashboard/compute-service/.venv/Scripts/python.exe")) -> dict[str, Any]:
-    population, config = _read(population_path), _read(config_path)
+    population, config = _read(population_path), load_pair_run_config(_read(config_path))
     raw_candidates = population.get("candidates")
     if not isinstance(raw_candidates, list): raise CanaryArtifactError("population has no frozen candidates")
     requested = set(candidate_ids or [str(item.get("candidateId")) for item in raw_candidates])
@@ -268,8 +269,23 @@ class _ModuleAuthority:
         return self.client.validate(candidate_id=candidate_id, source_profile=profile, expected_raw_source_profile_sha256=canonical_sha256(profile))
 
 
+def _public_context(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the public grammar-context spelling from authored or frozen input."""
+    groups_key = "evidenceGroups" if "evidenceGroups" in raw else "groups"
+    events_key = "eventBindings" if "eventBindings" in raw else "events"
+    return {
+        "instrument": raw["instrument"],
+        "indicators": raw["indicators"],
+        "evidenceGroups": raw[groups_key],
+        "eventBindings": raw[events_key],
+        "executionConfig": raw["executionConfig"],
+        **({"budgets": raw["budgets"]} if "budgets" in raw else {}),
+    }
+
+
 def _grammar_context(raw: Mapping[str, Any]) -> GrammarContext:
-    return GrammarContext(instrument=raw["instrument"], indicators=tuple(raw["indicators"]), evidence_groups=tuple(raw["evidenceGroups"]), event_bindings=tuple(raw["eventBindings"]), execution_config=raw["executionConfig"])
+    context = _public_context(raw)
+    return GrammarContext(instrument=context["instrument"], indicators=tuple(context["indicators"]), evidence_groups=tuple(context["evidenceGroups"]), event_bindings=tuple(context["eventBindings"]), execution_config=context["executionConfig"])
 
 
 def _registry_program(grammar: TypedFragmentGrammar, direction: str, target: str) -> ModuleProgram:
@@ -301,7 +317,7 @@ def registry_corpus(config_path: Path) -> list[dict[str, Any]]:
     is deferred to the greedy selected set, rather than compiling all 1024
     possible bounded combinations during a runtime canary.
     """
-    config=_read(config_path); output=[]
+    config=load_pair_run_config(_read(config_path)); output=[]
     for target in sorted(REGISTRY):
         row={"productionId": target}
         for side, key in (("long", "longModule"), ("short", "shortModule")):
@@ -320,7 +336,7 @@ def build_registry_artifacts(config_path: Path, output_path: Path, *, dashboard_
     any uncompiled identity.  The replay solver remains the only source of
     execution/position facts.
     """
-    config=_read(config_path); corpus=registry_corpus(config_path)
+    config=load_pair_run_config(_read(config_path)); corpus=registry_corpus(config_path)
     cover={"registry_"+row["productionId"]: {"long:"+row["productionId"], "short:"+row["productionId"]} for row in corpus}
     selected=greedy_set_cover(cover, {side+":"+item for side in ("long", "short") for item in REGISTRY})
     by_id={"registry_"+row["productionId"]: row for row in corpus}; built=[]
@@ -333,7 +349,7 @@ def build_registry_artifacts(config_path: Path, output_path: Path, *, dashboard_
                 raw_context=config[key]["context"]; grammar=TypedFragmentGrammar(_grammar_context(raw_context), native_authority=authority)
                 canonical=row[side]; program=ModuleProgram(side, tuple(Fragment(uid="registry_%d" % index, production_id=item["productionId"], resources=item["resources"], choices=item["choices"]) for index,item in enumerate(canonical["fragments"])))
                 compiled=grammar.compile_module(program,candidate_id=candidate+"_"+side); report=compiled.native_report; profile=dict(compiled.profile); profiles[side]=profile
-                context={"instrument": raw_context["instrument"], "indicators": raw_context["indicators"], "evidenceGroups": raw_context["evidenceGroups"], "eventBindings": raw_context["eventBindings"], "executionConfig": raw_context["executionConfig"]}
+                context=_public_context(raw_context)
                 profile_sha=str(report["rawSourceProfileSha256"]); modules[side+"Module"]={"context":context,"contextSha256":grammar.context_sha256,"program":dict(compiled.program),"programSha256":compiled.identities["programSha256"],"nativeArtifact":{"schemaVersion":"temporal_prebroad_frozen_native_module_artifact_v1","profile":profile,"profileSha256":profile_sha,"validation":dict(report),"identities":{"profileSha256":profile_sha,**dict(compiled.identities)}}}
             result=client.compile_pair(candidate_id=candidate,long_profile=profiles["long"],short_profile=profiles["short"],expected_long_raw_source_profile_sha256=canonical_sha256(profiles["long"]),expected_short_raw_source_profile_sha256=canonical_sha256(profiles["short"]))
             built.append({"candidateId":candidate,**modules,"pair":{"profile":result["profile"],"validation":result["report"]}})
