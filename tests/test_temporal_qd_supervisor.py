@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+import autoresearch.temporal_qd_evolution as qd
+import autoresearch.temporal_qd_pair_generation as pair_generation
 import autoresearch.temporal_qd_supervisor as supervisor
 from autoresearch.temporal_discovery_base import (
     TemporalDiscoveryContractError,
@@ -561,10 +563,20 @@ def test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator(
             pass
 
     captured: dict = {}
+    generation_kwargs: dict = {}
+    pair_policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": {"fixture": True},
+    }
 
-    def fake_generate(**kwargs):
+    def fake_pair_population(**kwargs):
         captured.update(kwargs)
         raise StopAfterPairGeneration
+
+    def real_pair_generation(**kwargs):
+        generation_kwargs.update(kwargs)
+        return qd.generate_qd_generation(**kwargs)
 
     monkeypatch.setattr(
         supervisor, "load_pair_run_config", lambda value: pair_config
@@ -575,10 +587,16 @@ def test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator(
     monkeypatch.setattr(
         supervisor,
         "pair_policy_from_config",
-        lambda frozen: {"schemaVersion": "fixture_pair_policy_v1", "enabled": True},
+        lambda frozen: pair_policy,
     )
+    monkeypatch.setattr(qd, "_bidirectional_pair_policy", lambda _payload: pair_policy)
     monkeypatch.setattr(supervisor, "LabGatewayClient", FakeClient)
-    monkeypatch.setattr(supervisor, "generate_qd_generation", fake_generate)
+    monkeypatch.setattr(pair_generation, "generate_pair_population", fake_pair_population)
+
+    # Keep the supervisor call real through the public generation boundary.
+    # The pair-population stub stops immediately before any market or gateway
+    # work, while proving that pair mode no longer needs legacy source kwargs.
+    monkeypatch.setattr(supervisor, "generate_qd_generation", real_pair_generation)
 
     inputs = _inputs(tmp_path)
     inputs.update(
@@ -600,16 +618,13 @@ def test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator(
         "confirmed_entry_admission_root",
         "validator_command",
         "validator_timeout_seconds",
-    }.isdisjoint(captured)
-    assert captured["bidirectional_pair_policy"] == {
-        "schemaVersion": "fixture_pair_policy_v1",
-        "enabled": True,
-    }
-    assert captured["bidirectional_pair_factory"] is factory
-    assert captured["bidirectional_module_authority"] is operator
-    assert captured["bidirectional_native_validator"] is native_validator
-    assert captured["bidirectional_pair_compiler"] is compiler
-    assert captured["bidirectional_operator_implementation_identity"] == {
+    }.isdisjoint(generation_kwargs)
+    assert captured["pair_policy"] == pair_policy
+    assert captured["pair_factory"] is factory
+    assert captured["module_authority"] is operator
+    assert captured["native_validator"] is native_validator
+    assert captured["pair_compiler"] is compiler
+    assert captured["operator_implementation_identity"] == {
         "implementation": "fixture"
     }
     config = json.loads((tmp_path / "pair" / "config.json").read_text())

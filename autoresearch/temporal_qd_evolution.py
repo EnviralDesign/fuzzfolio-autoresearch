@@ -3063,10 +3063,10 @@ def _proposal_accounting(
 def generate_qd_generation(
     *,
     parent_archive_path: Path | str,
-    source_preparation_path: Path | str,
-    base_generator_root: Path | str,
-    confirmed_entry_admission_root: Path | str,
-    validator_command: Sequence[str],
+    source_preparation_path: Path | str | None = None,
+    base_generator_root: Path | str | None = None,
+    confirmed_entry_admission_root: Path | str | None = None,
+    validator_command: Sequence[str] | None = None,
     output_root: Path | str,
     generation_index: int,
     immigrant_continuation_start: int = 0,
@@ -3143,6 +3143,18 @@ def generate_qd_generation(
                 _normalize_parameters(parameters)["maxProposalAttempts"]
             ),
             max_new_proposals=max_new_proposals,
+        )
+    if any(
+        value is None
+        for value in (
+            source_preparation_path,
+            base_generator_root,
+            confirmed_entry_admission_root,
+            validator_command,
+        )
+    ):
+        raise TemporalDiscoveryContractError(
+            "legacy QD generation requires v2 source paths and validator command"
         )
     cells = _reproduction_cells(
         archive, allow_empty_quality_bootstrap=allow_empty_quality_bootstrap
@@ -3749,12 +3761,8 @@ def main() -> None:
         )
         generation_kwargs = dict(
             parent_archive_path=args.parent_archive,
-            source_preparation_path=args.source_preparation or args.output_root / ".pair-mode-unused-source.json",
-            base_generator_root=args.base_generator_root or args.output_root / ".pair-mode-unused-generator",
-            confirmed_entry_admission_root=args.confirmed_entry_admission_root or args.output_root / ".pair-mode-unused-admission",
             immigrant_continuation_start=args.immigrant_continuation_start,
             allow_empty_quality_bootstrap=args.allow_empty_quality_bootstrap,
-            validator_command=command,
             output_root=args.output_root,
             generation_index=args.generation_index,
             parameters=parameters,
@@ -3763,7 +3771,13 @@ def main() -> None:
             construction_catalog_path=args.construction_catalog,
         )
         if args.bidirectional_pair_config is None:
-            result = generate_qd_generation(**generation_kwargs)
+            result = generate_qd_generation(
+                **generation_kwargs,
+                source_preparation_path=args.source_preparation,
+                base_generator_root=args.base_generator_root,
+                confirmed_entry_admission_root=args.confirmed_entry_admission_root,
+                validator_command=command,
+            )
         else:
             from .temporal_qd_pair_factory import PairAuthorityBundle, load_pair_run_config, pair_policy_from_config
             frozen = load_pair_run_config(_read(args.bidirectional_pair_config, name="bidirectional pair run config"))

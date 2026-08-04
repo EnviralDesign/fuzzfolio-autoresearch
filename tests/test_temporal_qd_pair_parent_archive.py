@@ -23,10 +23,6 @@ def test_live_pair_generation_forwards_the_validated_qd_parent_archive(tmp_path,
     monkeypatch.setattr(pair_generation, "generate_pair_population", fake_population)
     result = qd.generate_qd_generation(
         parent_archive_path=tmp_path / "parent.json",
-        source_preparation_path=tmp_path / "unused-source",
-        base_generator_root=tmp_path / "unused-generator",
-        confirmed_entry_admission_root=tmp_path / "unused-admission",
-        validator_command=[],
         output_root=tmp_path / "out",
         generation_index=1,
         parameters={**qd.DEFAULT_QD_PARAMETERS, "targetUniqueCandidates": 1},
