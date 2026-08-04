@@ -88,6 +88,12 @@ The 64-candidate real-authority comparison is the meaningful scaling sample:
 | generation main-thread CPU | 117.328 s | 111.172 s | -5.2% |
 | harness peak process-tree RSS | 811.4 MiB | 482.1 MiB | -40.6% |
 
+The original 64-candidate harness ran both implementations sequentially in one
+interpreter. Its semantic comparison and wall/CPU result remain valid, but
+Python allocator residue from the legacy run makes the optimized RSS value a
+conservative upper bound rather than a clean-process peak. The later
+production-default 1,024 witness below is the authoritative memory result.
+
 The eight-candidate independent rerun was artifact-exact but 4.3 percent
 slower in optimized mode, with 4.5 percent lower peak RSS. At that size fixed
 startup, sampling, and finalization costs dominate; it is retained as an
@@ -99,13 +105,74 @@ population construction intentionally trades some CPU and disk reads for the
 large reduction in retained and transient memory. Those are later optimization
 targets; they do not justify weakening immutable artifacts or restart checks.
 
+## Full-scale production-default witness
+
+After commit `5996fda094f72ec1bc6027caf1efc07897a4b8e6` was pushed, a fresh
+1,024-candidate construction smoke exercised the optimized production default:
+
+`C:\fuzzfolio-research\rich-immigrant-optimized-1024-20260804`
+
+It completed all construction, streaming population hashing, population
+persistence, generation-journal persistence, and report reduction:
+
+- 1,024 proposals accepted;
+- 1,024 unique candidate identities and pair semantics;
+- zero candidate or pair duplicate dispositions;
+- 2,022.359 seconds generation wall time (33 minutes 42.359 seconds);
+- 1,792.766 seconds main-thread CPU;
+- 148.875 seconds separately attributed telemetry-thread CPU;
+- 208.4 MiB peak process-tree RSS;
+- 144.4 MiB peak coordinator RSS;
+- 31.5 GiB minimum host-available memory;
+- resource guard status `within_limits`.
+
+The previous implementation retained 7.89 GiB after proposal 1,024 and spiked
+to 10.12 GiB while hashing. The optimized run stayed near 0.2 GiB during both
+hashing and persistence, a reduction of approximately 98 percent at the former
+failure seam. It also finished about 10.1 percent sooner than the prior
+2,248.84-second run despite doing the population persistence that the prior run
+never reached.
+
+Full-scale identities and files:
+
+- semantic population:
+  `sha256:d6d35e84abfd578a2fb5843639153d5975bca00152fc6dc7436f5657e6e65d5b`;
+- population file SHA-256:
+  `sha256:a83aaa3375260ab8a676a66b62e66cdaa4992bd1c0ab10fbf5e969dce7bec8cf`;
+- generation journal:
+  `sha256:a964bd990e4cabb3342c573cc30f348a0e11f410b810b349468cd965b5f9d43e`;
+- construction report:
+  `sha256:d7ee17262e58f9be9aae3feae53de5808c3114b6caf50d16e1a53b1974134d1e`;
+- proposal journal: 1,788,130,529 bytes;
+- population: 1,199,513,098 bytes;
+- performance evidence: 63,118,239 bytes.
+
+The report identity was independently recomputed after the run and matched.
+The leading remaining wall-time buckets were indicator-plan enumeration
+(362.71 seconds), streamed population persistence (329.54 seconds), streamed
+population hashing (285.75 seconds), candidate materialization (129.21
+seconds), and immigrant payload construction (125.70 seconds). These provide a
+precise next optimization map without reopening the admitted semantic path.
+
+The reusable A/B harness was then hardened to launch each implementation in a
+fresh interpreter and process tree. A four-candidate isolated harness smoke was
+again result-exact and byte-exact across all seven semantic artifacts:
+
+- benchmark:
+  `sha256:e830ca59cfcb7a2d462a77f65013f543625f43ec4789efb86f1521b7d4591404`;
+- legacy clean-process peak: 207.5 MiB;
+- optimized clean-process peak: 185.3 MiB.
+
+At that tiny size fixed costs dominate timing; this smoke admits measurement
+isolation and semantic consistency, not a throughput conclusion.
+
 ## Admission and remaining proof
 
-The optimized path is admitted as the production default. The legacy oracle
-must remain callable until a fresh 1,024-candidate optimized construction smoke
-and at least one parent/archive generation complete under the normal resource
-guard. This checkpoint does not claim that the previous 1,024-candidate 10.12
-GiB peak has already been measured away at full scale; it proves the semantic
-cutover and a substantial bounded memory reduction without drift.
+The optimized path is admitted as the production default, and the former
+1,024-candidate memory defect is measured closed. The legacy oracle must remain
+callable until at least one parent/archive generation completes under the
+normal resource guard. Parent scheduling, crossover, ledger, and restart bytes
+are already covered by bounded oracle tests; this remaining witness is about
+operational scale rather than a known semantic contradiction.
 
 No broad economic search was launched in this checkpoint.

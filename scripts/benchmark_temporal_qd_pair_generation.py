@@ -15,6 +15,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import threading
 import time
 from typing import Any, Mapping
@@ -300,6 +302,54 @@ def _atomic_write(path: Path, value: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
+def _run_isolated(
+    *,
+    pair_run_config: Path,
+    implementation: str,
+    output_root: Path,
+    target: int,
+    run_label: str,
+    max_proposal_attempt_multiplier: int,
+) -> dict[str, Any]:
+    """Measure one implementation in a fresh interpreter/process tree."""
+
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "--pair-run-config",
+        str(pair_run_config.resolve()),
+        "--output-root",
+        str(output_root.resolve()),
+        "--targets",
+        str(target),
+        "--run-label",
+        run_label,
+        "--max-proposal-attempt-multiplier",
+        str(max_proposal_attempt_multiplier),
+        "--single-implementation",
+        implementation,
+    ]
+    completed = subprocess.run(
+        command,
+        cwd=Path(__file__).resolve().parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()[-4000:]
+        raise TemporalDiscoveryContractError(
+            f"isolated {implementation} benchmark failed: {detail}"
+        )
+    payload = _read_object(output_root / "single-run-report.json")
+    run = payload.get("run")
+    if not isinstance(run, dict):
+        raise TemporalDiscoveryContractError(
+            "isolated benchmark did not return an exact run object"
+        )
+    return run
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pair-run-config", required=True, type=Path)
@@ -307,12 +357,48 @@ def main() -> None:
     parser.add_argument("--targets", default="8,64", type=_parse_targets)
     parser.add_argument("--run-label", default="temporal-qd-generation-benchmark-v1")
     parser.add_argument("--max-proposal-attempt-multiplier", type=int, default=4)
+    parser.add_argument(
+        "--single-implementation",
+        choices=_IMPLEMENTATIONS,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
     if args.max_proposal_attempt_multiplier < 1:
         parser.error("--max-proposal-attempt-multiplier must be positive")
 
     root = _fresh_external_root(args.output_root)
     frozen = load_pair_run_config(_read_object(args.pair_run_config))
+    if args.single_implementation is not None:
+        if len(args.targets) != 1:
+            parser.error("--single-implementation requires exactly one target")
+        target = args.targets[0]
+        run = _run_one(
+            frozen=frozen,
+            implementation=args.single_implementation,
+            output_root=root,
+            target=target,
+            max_proposal_attempts=target * args.max_proposal_attempt_multiplier,
+            run_label=str(args.run_label),
+        )
+        _atomic_write(
+            root / "single-run-report.json",
+            {
+                "schemaVersion": "temporal_qd_pair_generation_single_benchmark_v1",
+                "run": run,
+            },
+        )
+        print(
+            json.dumps(
+                {
+                    "implementation": args.single_implementation,
+                    "targetUniqueCandidates": target,
+                    "completed": run["result"].get("completed"),
+                    "singleRunReport": str(root / "single-run-report.json"),
+                },
+                sort_keys=True,
+            )
+        )
+        return
     report: dict[str, Any] = {
         "schemaVersion": BENCHMARK_SCHEMA,
         "mode": "no_market_no_economic_evidence",
@@ -322,27 +408,29 @@ def main() -> None:
         "telemetryDesign": {
             "mainThreadCpu": "time.thread_time_ns where available",
             "rssMonitor": "0.25 second coordinator-and-children RSS samples",
+            "measurementIsolation": (
+                "one fresh interpreter and process tree per implementation"
+            ),
             "semanticComparison": "all semantic JSON artifact bytes; performance excluded",
         },
         "runs": [],
     }
     for target in args.targets:
-        max_proposals = target * args.max_proposal_attempt_multiplier
-        legacy = _run_one(
-            frozen=frozen,
+        legacy = _run_isolated(
+            pair_run_config=args.pair_run_config,
             implementation=PAIR_GENERATION_IMPLEMENTATION_LEGACY,
             output_root=root / f"target-{target}" / "legacy",
             target=target,
-            max_proposal_attempts=max_proposals,
             run_label=str(args.run_label),
+            max_proposal_attempt_multiplier=args.max_proposal_attempt_multiplier,
         )
-        optimized = _run_one(
-            frozen=frozen,
+        optimized = _run_isolated(
+            pair_run_config=args.pair_run_config,
             implementation=PAIR_GENERATION_IMPLEMENTATION_OPTIMIZED,
             output_root=root / f"target-{target}" / "optimized",
             target=target,
-            max_proposal_attempts=max_proposals,
             run_label=str(args.run_label),
+            max_proposal_attempt_multiplier=args.max_proposal_attempt_multiplier,
         )
         comparison = _compare_runs(legacy, optimized)
         report["runs"].append(
