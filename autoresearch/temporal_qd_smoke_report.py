@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 
 SMOKE_REPORT_SCHEMA = "temporal_qd_construction_smoke_report_v1"
@@ -29,21 +29,156 @@ def _canonical_sha256(value: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
-def _proposal_entries(root: Path) -> list[dict[str, Any]]:
-    journal_root = root / "proposal-journal"
-    if not journal_root.exists():
-        return []
-    return [_read_json(path) for path in sorted(journal_root.glob("*.json"))]
+def _counter_increment(target: dict[str, int], value: Any) -> None:
+    if isinstance(value, (Mapping, list, tuple)):
+        key = json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    else:
+        key = str(value)
+    target[key] = target.get(key, 0) + 1
 
 
-def _entry_diversity(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _empty_side_distribution() -> dict[str, Any]:
+    return {
+        "moduleCount": 0,
+        "seedNameCounts": {},
+        "evidenceGroupCounts": {},
+        "eventBindingCounts": {},
+        "holdKindCounts": {},
+        "plannedGrammarDepthCounts": {},
+        "appliedGrammarDepthCounts": {},
+        "grammarOperationFamilyCounts": {},
+        "plannedIndicatorDepthCounts": {},
+        "appliedIndicatorDepthCounts": {},
+        "indicatorOperatorCounts": {},
+        "indicatorConstructionKindCounts": {},
+        "indicatorCountCounts": {},
+        "evidenceGroupMemberShapeCounts": {},
+    }
+
+
+def _empty_construction_distribution() -> dict[str, Any]:
+    return {
+        "proposalCount": 0,
+        "sides": {
+            "long": _empty_side_distribution(),
+            "short": _empty_side_distribution(),
+        },
+    }
+
+
+def _add_construction_audit(
+    target: dict[str, Any], entry: Mapping[str, Any]
+) -> bool:
+    proposal = entry.get("proposal")
+    audit = (
+        proposal.get("factoryConstructionAudit")
+        if isinstance(proposal, Mapping)
+        else None
+    )
+    modules = audit.get("sides") if isinstance(audit, Mapping) else None
+    if not isinstance(modules, Mapping):
+        return False
+    target["proposalCount"] += 1
+    for direction in ("long", "short"):
+        module = modules.get(direction)
+        if not isinstance(module, Mapping):
+            continue
+        side = target["sides"][direction]
+        side["moduleCount"] += 1
+        selector = (
+            module.get("selector")
+            if isinstance(module.get("selector"), Mapping)
+            else {}
+        )
+        _counter_increment(side["seedNameCounts"], selector.get("seedName"))
+        _counter_increment(side["evidenceGroupCounts"], selector.get("groupId"))
+        _counter_increment(side["eventBindingCounts"], selector.get("eventId"))
+        grammar = (
+            module.get("grammar")
+            if isinstance(module.get("grammar"), Mapping)
+            else {}
+        )
+        indicator = (
+            module.get("indicator")
+            if isinstance(module.get("indicator"), Mapping)
+            else {}
+        )
+        shape = (
+            module.get("profileShape")
+            if isinstance(module.get("profileShape"), Mapping)
+            else {}
+        )
+        _counter_increment(side["holdKindCounts"], shape.get("holdKind"))
+        _counter_increment(
+            side["plannedGrammarDepthCounts"], grammar.get("plannedDepth")
+        )
+        _counter_increment(
+            side["appliedGrammarDepthCounts"], grammar.get("appliedDepth")
+        )
+        for step in grammar.get("steps") or []:
+            if isinstance(step, Mapping):
+                _counter_increment(
+                    side["grammarOperationFamilyCounts"],
+                    step.get("operationFamily"),
+                )
+        _counter_increment(
+            side["plannedIndicatorDepthCounts"], indicator.get("plannedDepth")
+        )
+        _counter_increment(
+            side["appliedIndicatorDepthCounts"], indicator.get("appliedDepth")
+        )
+        for step in indicator.get("steps") or []:
+            if isinstance(step, Mapping):
+                _counter_increment(
+                    side["indicatorOperatorCounts"], step.get("operatorId")
+                )
+                _counter_increment(
+                    side["indicatorConstructionKindCounts"],
+                    step.get("constructionKind"),
+                )
+        _counter_increment(
+            side["indicatorCountCounts"], shape.get("indicatorCount")
+        )
+        _counter_increment(
+            side["evidenceGroupMemberShapeCounts"],
+            shape.get("evidenceGroupMemberCounts") or [],
+        )
+    return True
+
+
+def _sort_construction_distribution(value: dict[str, Any]) -> None:
+    for side in value["sides"].values():
+        for key, counts in list(side.items()):
+            if isinstance(counts, dict):
+                side[key] = dict(sorted(counts.items()))
+
+
+def _entry_diversity(root: Path) -> dict[str, Any]:
     dispositions: dict[str, int] = {}
     candidate_identities: set[str] = set()
     pair_genome_identities: set[str] = set()
     accepted_count = 0
-    for entry in entries:
+    proposal_count = 0
+    attempted_distribution = _empty_construction_distribution()
+    accepted_distribution = _empty_construction_distribution()
+    journal_root = root / "proposal-journal"
+    paths = sorted(journal_root.glob("*.json")) if journal_root.exists() else []
+    for path in paths:
+        entry = _read_json(path)
+        proposal_count += 1
         disposition = str(entry.get("disposition") or "unknown")
         dispositions[disposition] = dispositions.get(disposition, 0) + 1
+        has_construction_audit = _add_construction_audit(
+            attempted_distribution, entry
+        )
+        if has_construction_audit and disposition == "accepted":
+            _add_construction_audit(accepted_distribution, entry)
         if disposition != "accepted":
             continue
         accepted_count += 1
@@ -61,13 +196,12 @@ def _entry_diversity(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             pair_identity = str(identities.get("rawPairSha256") or "")
             if pair_identity:
                 pair_genome_identities.add(pair_identity)
-    proposal_count = len(entries)
     duplicate_count = sum(
         count
         for disposition, count in dispositions.items()
         if disposition.startswith("duplicate_")
     )
-    return {
+    result: dict[str, Any] = {
         "proposalCount": proposal_count,
         "acceptedCount": accepted_count,
         "acceptanceRatio": accepted_count / proposal_count if proposal_count else 0.0,
@@ -77,6 +211,17 @@ def _entry_diversity(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "acceptedUniqueCandidateIdentityCount": len(candidate_identities),
         "acceptedUniquePairGenomeCount": len(pair_genome_identities),
     }
+    if attempted_distribution["proposalCount"]:
+        _sort_construction_distribution(attempted_distribution)
+        _sort_construction_distribution(accepted_distribution)
+        distribution = {
+            "schemaVersion": "temporal_qd_rich_immigrant_distribution_v1",
+            "attempted": attempted_distribution,
+            "accepted": accepted_distribution,
+        }
+        distribution["distributionSha256"] = _canonical_sha256(distribution)
+        result["immigrantConstructionDistribution"] = distribution
+    return result
 
 
 def _top_phases(
@@ -121,8 +266,7 @@ def build_qd_construction_smoke_report(
     if top_phase_limit < 1:
         raise ValueError("top phase limit must be positive")
     summary = _read_json(root / "performance" / "latest-summary.json")
-    entries = _proposal_entries(root)
-    diversity = _entry_diversity(entries)
+    diversity = _entry_diversity(root)
     journal_path = root / "generation-journal.json"
     journal = _read_json(journal_path) if journal_path.exists() else None
     if journal is not None:
