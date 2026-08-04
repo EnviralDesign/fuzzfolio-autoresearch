@@ -41,6 +41,10 @@ TEMPORAL_SEARCH_MANIFEST_SCHEMA = "temporal_graph_candidate_window_manifest_v1"
 _SHA = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SAFE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$")
 _COST_VIEWS = ("research_conservative", "none")
+_BAR_SINGLE_POSITION_EVALUATOR_ID = "bar_single_position_execution_v1"
+_BAR_BIDIRECTIONAL_SINGLE_POSITION_EVALUATOR_ID = (
+    "bar_bidirectional_single_position_execution_v2"
+)
 _REQUIRED_WORKER_CAPABILITIES = (
     TEMPORAL_SEARCH_CAPABILITY,
     TEMPORAL_BIDIRECTIONAL_REPLAY_CAPABILITY,
@@ -112,6 +116,21 @@ def _candidate_id(value: Any, *, name: str) -> str:
             f"{name} must be a stable candidate identifier"
         )
     return token
+
+
+def _evaluator_id_for_profile(profile: Mapping[str, Any]) -> str:
+    """Select the worker evaluator from the already-admitted profile version.
+
+    The candidate-window worker validates this independently.  Keeping the
+    mapping at task construction prevents a v3/both snapshot from silently
+    inheriting the legacy v2 evaluator default.
+    """
+
+    return (
+        _BAR_BIDIRECTIONAL_SINGLE_POSITION_EVALUATOR_ID
+        if profile.get("version") == "v3"
+        else _BAR_SINGLE_POSITION_EVALUATOR_ID
+    )
 
 
 def _sha(value: Any, *, name: str) -> str:
@@ -1330,6 +1349,7 @@ def build_task_matrix(authority: Mapping[str, Any]) -> list[dict[str, Any]]:
                 "instruments": [candidate["instrument"]],
                 "timeframe": candidate["timeframe"],
                 "bar_limit": candidate["barLimit"],
+                "evaluator_id": _evaluator_id_for_profile(profile),
                 "analysis_window_start": window["analysisWindowStart"],
                 "analysis_window_end": window["analysisWindowEnd"],
                 "evidence_plan": evidence["evidencePlan"],

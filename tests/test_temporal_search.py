@@ -132,6 +132,7 @@ def test_authority_freezes_one_candidate_window_to_one_two_cost_task() -> None:
     assert task["task_kind"] == TEMPORAL_SEARCH_TASK_KIND
     assert task["payload"]["candidate_id"] == "candidate_a"
     assert task["payload"]["profile_id"] == "candidate_a"
+    assert task["payload"]["evaluator_id"] == "bar_single_position_execution_v1"
     assert task["payload"]["inline_profile_snapshot"] == _profile()
     assert task["payload"]["instruments"] == ["EURUSD"]
     assert (
@@ -147,6 +148,30 @@ def test_authority_freezes_one_candidate_window_to_one_two_cost_task() -> None:
         in task["required_worker_capabilities"]
     )
     assert "management.action.dynamic" in task["required_worker_capabilities"]
+
+
+def test_v3_candidate_window_task_uses_the_worker_required_bidirectional_evaluator() -> None:
+    """A v3/both snapshot must not inherit the candidate-job v2 default."""
+
+    preparation = _preparation()
+    profile = preparation["candidates"][0]["sourceProfile"]
+    profile["version"] = "v3"
+    profile["directionMode"] = "both"
+    preparation["candidates"][0]["sourceProfileSha256"] = canonical_sha256(profile)
+    start = preparation["developmentWindows"][0]["analysisWindowStart"]
+    end = preparation["developmentWindows"][0]["analysisWindowEnd"]
+    preparation["candidates"][0]["windowInputs"][0]["evidencePlan"] = _plan(
+        profile, start, end
+    )
+
+    payload = build_task_matrix(build_authority(preparation))[0]["payload"]
+
+    # This exact ID is independently enforced by Dashboard's
+    # TemporalGraphCandidateWindowJob for profile.version == "v3".
+    assert (
+        payload["evaluator_id"]
+        == "bar_bidirectional_single_position_execution_v2"
+    )
 
 
 def test_cost_view_path_attestation_matches_worker_non_cost_field_names() -> None:
