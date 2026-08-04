@@ -25,6 +25,7 @@ from .temporal_qd_pair_generation import TypedGrammarPairOperator
 from .temporal_typed_motif_grammar import (
     ENTRY_ROUTE_DECISION_INDICATOR_CAP,
     ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION,
+    EntryRouteDecisionIndicatorCapError,
     GRAMMAR_SCHEMA,
     GRAMMAR_VERSION,
     REGISTRY,
@@ -37,7 +38,11 @@ from .temporal_typed_motif_grammar import (
 PAIR_RUN_CONFIG_SCHEMA = "temporal_qd_bidirectional_pair_run_config_v1"
 PAIR_HOLD_POLICY_SCHEMA = "temporal_qd_pair_hold_operator_policy_v2"
 PAIR_IMMIGRANT_POLICY_SCHEMA = "temporal_qd_rich_immigrant_construction_policy_v1"
-PAIR_IMMIGRANT_BUILDER_VERSION = "temporal_qd_rich_immigrant_builder_v1"
+# v2 closes a composition-order hole: an indicator plan is now admitted only
+# after it has passed the entry-route decision-indicator cap.  This must bind
+# the selector stream and frozen operator identity so a resume never silently
+# reinterprets a v1 authority under the stricter construction semantics.
+PAIR_IMMIGRANT_BUILDER_VERSION = "temporal_qd_rich_immigrant_builder_v2"
 
 _DEPTH_BUCKETS = (0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 4)
 
@@ -97,7 +102,8 @@ def default_immigrant_construction_policy() -> dict[str, Any]:
         "indicatorMutationDepthBuckets": list(_DEPTH_BUCKETS),
         "indicatorSelection": "uniform_available_operator_then_plan_v1",
         "holdSelection": "uniform_frozen_hold_choice_v1",
-        "nativeAdmission": "compose_then_validate_once_per_side_v1",
+        "nativeAdmission": "compose_then_validate_once_per_side_v2",
+        "entryRouteCapPlanAdmission": "reject_invalid_indicator_preview_then_continue_v1",
         "capacityAdmission": {
             "selectorProbeSampleCount": 8192,
             "minimumUniqueSelectorFingerprints": 4096,
@@ -633,7 +639,7 @@ class _Factory:
         profile: Mapping[str, Any],
         *,
         side_seed: str,
-    ) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+    ) -> tuple[dict[str, Any], list[dict[str, Any]], int, dict[str, Any]]:
         with timed_span("immigrant.indicator.select_depth") as span:
             depth = int(
                 _selector_value(
@@ -651,6 +657,7 @@ class _Factory:
             )
             trace: list[dict[str, Any]] = []
             seen = {canonical_sha256(current)}
+            cap_rejected_plan_rows: list[dict[str, Any]] = []
         for step in range(depth):
             with timing_scope(indicatorStep=step):
                 with timed_span("immigrant.indicator.enumerate_plans") as span:
@@ -695,6 +702,29 @@ class _Factory:
                             child = operator.preview(current, plan)
                     except TemporalDiscoveryContractError:
                         continue
+                    # A raw event/trigger can otherwise turn a route with
+                    # three fuzzy members into an illegal four-indicator
+                    # conjunction.  Test the preview before admitting it as
+                    # the next parent so a deterministic later plan remains
+                    # eligible.  The final module-level check below remains
+                    # the fail-closed backstop for every composition seam.
+                    try:
+                        with timed_span(
+                            "immigrant.indicator.validate_entry_route_cap",
+                            indicatorStep=step,
+                            operatorId=operator_id,
+                            planSha256=plan["planSha256"],
+                        ):
+                            validate_entry_route_decision_indicator_cap(child)
+                    except EntryRouteDecisionIndicatorCapError:
+                        cap_rejected_plan_rows.append(
+                            {
+                                "step": step,
+                                "operatorId": operator_id,
+                                "planSha256": plan["planSha256"],
+                            }
+                        )
+                        continue
                     with timed_span(
                         "immigrant.indicator.hash_child",
                         indicatorStep=step,
@@ -725,7 +755,11 @@ class _Factory:
                     break
             if not applied:
                 break
-        return current, trace, depth
+        cap_rejections = {
+            "count": len(cap_rejected_plan_rows),
+            "rowsSha256": canonical_sha256(cap_rejected_plan_rows),
+        }
+        return current, trace, depth, cap_rejections
 
     @staticmethod
     def _apply_hold(
@@ -839,7 +873,12 @@ class _Factory:
                 if runtime is not None
                 else IndicatorLearningRegistry(side["catalog"])
             )
-        profile, indicator_trace, planned_indicator_depth = self._apply_indicator_steps(
+        (
+            profile,
+            indicator_trace,
+            planned_indicator_depth,
+            indicator_cap_rejections,
+        ) = self._apply_indicator_steps(
             registry, profile, side_seed=side_seed
         )
         with timed_span("immigrant.hold.apply"):
@@ -852,7 +891,7 @@ class _Factory:
         # Indicator and hold operations occur after grammar materialization.
         # Recheck the entry-route cap before this path can freeze a module.
         with timed_span("immigrant.entry_route_indicator_cap.validate"):
-            validate_entry_route_decision_indicator_cap(profile)
+            entry_route_cap_report = validate_entry_route_decision_indicator_cap(profile)
         with timed_span("immigrant.side.build_construction_audit"):
             graph = profile.get("graph") if isinstance(profile.get("graph"), Mapping) else {}
             groups = graph.get("evidenceGroups") if isinstance(graph, Mapping) else []
@@ -871,7 +910,16 @@ class _Factory:
                     "plannedDepth": planned_indicator_depth,
                     "appliedDepth": len(indicator_trace),
                     "steps": indicator_trace,
+                    "entryRouteCapRejectedPlanCount": indicator_cap_rejections[
+                        "count"
+                    ],
+                    "entryRouteCapRejectedPlanRowsSha256": indicator_cap_rejections[
+                        "rowsSha256"
+                    ],
                 },
+                "entryRouteDecisionIndicatorReportSha256": canonical_sha256(
+                    entry_route_cap_report
+                ),
                 "profileShape": {
                     "fragmentCount": len(program.fragments),
                     "indicatorCount": len(profile.get("indicators") or []),

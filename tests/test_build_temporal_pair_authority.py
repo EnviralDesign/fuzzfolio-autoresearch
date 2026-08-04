@@ -140,7 +140,7 @@ def test_catalog_context_and_freeze_are_catalog_bound(tmp_path, monkeypatch):
         "temporal_qd_pair_operator_implementation_v3"
     )
     assert frozen["operatorImplementation"]["richImmigrantBuilderVersion"] == (
-        "temporal_qd_rich_immigrant_builder_v1"
+        "temporal_qd_rich_immigrant_builder_v2"
     )
 
     rejected_policy = default_hold_operator_policy()

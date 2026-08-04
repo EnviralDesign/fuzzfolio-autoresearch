@@ -37,6 +37,12 @@ class GrammarError(TemporalDiscoveryContractError):
     pass
 
 
+class EntryRouteDecisionIndicatorCapError(GrammarError):
+    """A candidate route conjunctively depends on more than the admitted cap."""
+
+    pass
+
+
 class Port(str, Enum):
     READY = "ready"
     WATCH = "watch"
@@ -479,7 +485,7 @@ def entry_route_decision_indicator_report(profile: Mapping[str, Any]) -> dict[st
             ):
                 combined = current | requirement
                 if len(combined) > ENTRY_ROUTE_DECISION_INDICATOR_CAP:
-                    raise GrammarError(
+                    raise EntryRouteDecisionIndicatorCapError(
                         "entry decision route exceeds the distinct decision-indicator cap"
                     )
                 if is_entry:
@@ -530,7 +536,7 @@ def validate_entry_route_decision_indicator_cap(profile: Mapping[str, Any]) -> d
         report["observedMaximumDistinctDecisionIndicatorInstances"]
         > ENTRY_ROUTE_DECISION_INDICATOR_CAP
     ):
-        raise GrammarError(
+        raise EntryRouteDecisionIndicatorCapError(
             "entry decision route exceeds the distinct decision-indicator cap"
         )
     return report
@@ -974,4 +980,4 @@ def inspect_module(profile: Mapping[str, Any]) -> dict[str, Any]:
     return {"schemaVersion": GRAMMAR_SCHEMA, "diagnosticOnly": True, "stateCount": len(states), "transitionCount": len(transitions), "referenceClosure": refs_ok, "profileSha256": canonical_sha256(profile)}
 
 
-__all__ = ["DashboardNativeAuthority", "ENTRY_ROUTE_DECISION_INDICATOR_CAP", "ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION", "Fragment", "FragmentSpec", "GRAMMAR_SCHEMA", "GRAMMAR_VERSION", "GrammarContext", "GrammarError", "ModuleProgram", "NativeValidator", "PairCompiler", "Port", "REGISTRY", "TypedFragmentGrammar", "CompiledModule", "compiled_graph_signature", "entry_route_decision_indicator_report", "inspect_module", "module_signatures", "validate_entry_route_decision_indicator_cap"]
+__all__ = ["DashboardNativeAuthority", "ENTRY_ROUTE_DECISION_INDICATOR_CAP", "ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION", "EntryRouteDecisionIndicatorCapError", "Fragment", "FragmentSpec", "GRAMMAR_SCHEMA", "GRAMMAR_VERSION", "GrammarContext", "GrammarError", "ModuleProgram", "NativeValidator", "PairCompiler", "Port", "REGISTRY", "TypedFragmentGrammar", "CompiledModule", "compiled_graph_signature", "entry_route_decision_indicator_report", "inspect_module", "module_signatures", "validate_entry_route_decision_indicator_cap"]
