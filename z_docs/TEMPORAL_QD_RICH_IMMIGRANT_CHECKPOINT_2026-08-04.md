@@ -100,14 +100,57 @@ Verification results:
   legacy `play_hand_lab` gateway/sweep/durability tests;
 - syntax compilation and `git diff --check`: passed.
 
+## Construction observability gate
+
+The next 1,024-immigrant construction smoke is also a performance and
+workstation-pressure witness.  Observability is deliberately outside every
+candidate, proposal, config, journal, and population identity.  Each generation
+root now records:
+
+- nested inclusive and exclusive wall time and coordinator CPU by construction,
+  native transport, validation, hashing, materialization, audit, and persistence
+  phase;
+- recursive process-tree RSS, private, virtual, and pagefile bytes, child roles,
+  CPU, and I/O at 500 ms cadence;
+- host available memory, memory percentage, and pagefile/swap use;
+- the active phase path, proposal ordinal, origin, side, and operator context at
+  each resource sample and at each recorded peak;
+- a sealed session summary plus a compact combined diversity/CPU/RAM smoke
+  report.
+
+The workstation guard is frozen at 8 GiB maximum process-tree RSS and 12 GiB
+minimum host-available memory.  A breach stops after the current proposal and
+preserves the proposal journal, span log, resource samples, and error summary.
+It does not attempt an invented continuation or silently continue into paging.
+
+A final eight-immigrant native calibration completed 8/8 with no duplicate
+candidate or pair-genome identities.  It used 16.06 seconds wall time and 15.23
+seconds of coordinator CPU, peaked at 248,532,992 bytes process-tree RSS and
+210,194,432 bytes private memory, and retained at least 36,205,322,240 bytes of
+host-available memory.  The guard remained within limits and all 26 resource
+samples succeeded.  The compact report is:
+
+`sha256:e5c6b9ccdf75fbeab72cd476cfb3200d724559e823ef0763860cc9b5b9c9d6bd`.
+
+The largest exclusive coordinator costs in that calibration were candidate
+materialization, funnel-audit construction, indicator-plan enumeration, and
+immigrant payload construction.  This is diagnostic evidence only; no
+candidate-generation optimization has begun.
+
+The canonical post-run report command is:
+
+```text
+python scripts/report_qd_construction_smoke.py --generation-root <root>
+```
+
 ## Operational state and next seam
 
 - The doomed broad supervisor was stopped and its artifacts were preserved.
 - The paid Vast instance was destroyed; no paid worker is running.
 - The Lab Gateway remains available locally.
 - No replacement broad search has been launched.
+- No 1,024-candidate construction smoke has been launched yet.
 - Candidate-generation performance optimization was not started.  It remains
   a separate follow-up to inspect jointly before another paid run.
 - A fresh pair authority and worker image must be built from the checkpointed
   repository heads before the next search launch.
-

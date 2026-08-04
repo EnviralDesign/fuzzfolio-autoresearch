@@ -31,6 +31,7 @@ from .lake_window import (
 
 from .temporal_discovery_base import *
 from .temporal_discovery_mutation import *
+from .temporal_qd_observability import timed_span
 
 AUTHORED_VALIDATION_BINDING_SCHEMA = "temporal_authored_validation_binding_v1"
 AUTHORED_VALIDATOR_PROVENANCE_SCHEMA = "temporal_authored_validator_provenance_v1"
@@ -128,27 +129,29 @@ class _PersistentJsonlValidator:
         self._stderr = bytearray()
         self._responses: queue.Queue[bytes | None] = queue.Queue()
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        self._process = subprocess.Popen(
-            [*command, "--jsonl-server", "--jsonl-max-line-bytes", str(max_line_bytes)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            env={**dict(os.environ), **dict(environment or {})},
-            creationflags=creationflags,
-        )
-        self._stdout_thread = threading.Thread(
-            target=self._drain_stdout,
-            name="temporal-validator-jsonl-stdout",
-            daemon=True,
-        )
-        self._stderr_thread = threading.Thread(
-            target=self._drain_stderr,
-            name="temporal-validator-jsonl-stderr",
-            daemon=True,
-        )
-        self._stdout_thread.start()
-        self._stderr_thread.start()
+        with timed_span("native.transport.spawn_process"):
+            self._process = subprocess.Popen(
+                [*command, "--jsonl-server", "--jsonl-max-line-bytes", str(max_line_bytes)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                env={**dict(os.environ), **dict(environment or {})},
+                creationflags=creationflags,
+            )
+        with timed_span("native.transport.start_reader_threads"):
+            self._stdout_thread = threading.Thread(
+                target=self._drain_stdout,
+                name="temporal-validator-jsonl-stdout",
+                daemon=True,
+            )
+            self._stderr_thread = threading.Thread(
+                target=self._drain_stderr,
+                name="temporal-validator-jsonl-stderr",
+                daemon=True,
+            )
+            self._stdout_thread.start()
+            self._stderr_thread.start()
 
     def _drain_stdout(self) -> None:
         assert self._process.stdout is not None
@@ -211,48 +214,53 @@ class _PersistentJsonlValidator:
             raise self._fail(
                 "persistent candidate validator exited before request dispatch"
             )
-        request_id = uuid.uuid4().hex
-        request = {
-            "schemaVersion": _JSONL_REQUEST_SCHEMA,
-            "operation": _JSONL_VALIDATE_CANDIDATE_OPERATION,
-            "requestId": request_id,
-            "candidateId": candidate_id,
-            "expectedRawSourceProfileSha256": expected_raw_source_profile_sha256,
-            "sourceProfile": dict(source_profile),
-        }
-        try:
-            encoded = (
-                json.dumps(
-                    request,
-                    sort_keys=True,
-                    ensure_ascii=True,
-                    allow_nan=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                + b"\n"
-            )
-        except (TypeError, ValueError) as exc:
-            raise TemporalDiscoveryContractError(
-                "candidate validator request cannot be represented as finite JSON"
-            ) from exc
+        with timed_span("native.validate.encode_request") as span:
+            request_id = uuid.uuid4().hex
+            request = {
+                "schemaVersion": _JSONL_REQUEST_SCHEMA,
+                "operation": _JSONL_VALIDATE_CANDIDATE_OPERATION,
+                "requestId": request_id,
+                "candidateId": candidate_id,
+                "expectedRawSourceProfileSha256": expected_raw_source_profile_sha256,
+                "sourceProfile": dict(source_profile),
+            }
+            try:
+                encoded = (
+                    json.dumps(
+                        request,
+                        sort_keys=True,
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
+            except (TypeError, ValueError) as exc:
+                raise TemporalDiscoveryContractError(
+                    "candidate validator request cannot be represented as finite JSON"
+                ) from exc
+            span.annotate(requestBytes=len(encoded))
         if len(encoded) > self._max_line_bytes:
             raise TemporalDiscoveryContractError(
                 "candidate validator request exceeds persistent JSONL line limit"
             )
-        try:
-            assert self._process.stdin is not None
-            self._process.stdin.write(encoded)
-            self._process.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError) as exc:
-            raise self._fail(
-                "persistent candidate validator failed while dispatching request"
-            ) from exc
-        try:
-            line = self._responses.get(timeout=self._timeout_seconds)
-        except queue.Empty as exc:
-            raise self._fail(
-                "persistent candidate validator timed out; request outcome is ambiguous"
-            ) from exc
+        with timed_span("native.validate.dispatch_request", requestBytes=len(encoded)):
+            try:
+                assert self._process.stdin is not None
+                self._process.stdin.write(encoded)
+                self._process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                raise self._fail(
+                    "persistent candidate validator failed while dispatching request"
+                ) from exc
+        with timed_span("native.validate.wait_response") as span:
+            try:
+                line = self._responses.get(timeout=self._timeout_seconds)
+            except queue.Empty as exc:
+                raise self._fail(
+                    "persistent candidate validator timed out; request outcome is ambiguous"
+                ) from exc
+            span.annotate(responseBytes=len(line) if line is not None else 0)
         if line is None:
             raise self._fail(
                 "persistent candidate validator exited before responding"
@@ -261,14 +269,15 @@ class _PersistentJsonlValidator:
             raise self._fail(
                 "persistent candidate validator response exceeds JSONL line limit"
             )
-        try:
-            response = json.loads(
-                line.decode("utf-8"), parse_constant=_reject_non_finite_json
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            raise self._fail(
-                "persistent candidate validator returned malformed JSONL response"
-            ) from exc
+        with timed_span("native.validate.decode_response", responseBytes=len(line)):
+            try:
+                response = json.loads(
+                    line.decode("utf-8"), parse_constant=_reject_non_finite_json
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise self._fail(
+                    "persistent candidate validator returned malformed JSONL response"
+                ) from exc
         if not isinstance(response, Mapping):
             raise self._fail(
                 "persistent candidate validator response must be an object"
@@ -325,31 +334,37 @@ class _PersistentJsonlValidator:
         short_sha = _sha(expected_short_raw_source_profile_sha256, name="expected short raw source profile SHA-256")
         if canonical_sha256(long_profile) != long_sha or canonical_sha256(short_profile) != short_sha:
             raise TemporalDiscoveryContractError("bidirectional compiler request profile identity mismatch")
-        request_id = uuid.uuid4().hex
-        request = {"schemaVersion": _JSONL_COMPILE_BIDIRECTIONAL_REQUEST_SCHEMA, "operation": _JSONL_COMPILE_BIDIRECTIONAL_OPERATION, "requestId": request_id, "candidateId": candidate, "longProfile": dict(long_profile), "shortProfile": dict(short_profile), "expectedLongRawSourceProfileSha256": long_sha, "expectedShortRawSourceProfileSha256": short_sha}
-        try:
-            encoded = json.dumps(request, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("utf-8") + b"\n"
-        except (TypeError, ValueError) as exc:
-            raise TemporalDiscoveryContractError("bidirectional compiler request cannot be represented as finite JSON") from exc
+        with timed_span("native.compile_pair.encode_request") as span:
+            request_id = uuid.uuid4().hex
+            request = {"schemaVersion": _JSONL_COMPILE_BIDIRECTIONAL_REQUEST_SCHEMA, "operation": _JSONL_COMPILE_BIDIRECTIONAL_OPERATION, "requestId": request_id, "candidateId": candidate, "longProfile": dict(long_profile), "shortProfile": dict(short_profile), "expectedLongRawSourceProfileSha256": long_sha, "expectedShortRawSourceProfileSha256": short_sha}
+            try:
+                encoded = json.dumps(request, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("utf-8") + b"\n"
+            except (TypeError, ValueError) as exc:
+                raise TemporalDiscoveryContractError("bidirectional compiler request cannot be represented as finite JSON") from exc
+            span.annotate(requestBytes=len(encoded))
         if len(encoded) > self._max_line_bytes:
             raise TemporalDiscoveryContractError("bidirectional compiler request exceeds persistent JSONL line limit")
-        try:
-            assert self._process.stdin is not None
-            self._process.stdin.write(encoded); self._process.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError) as exc:
-            raise self._fail("persistent bidirectional compiler failed while dispatching request") from exc
-        try:
-            line = self._responses.get(timeout=self._timeout_seconds)
-        except queue.Empty as exc:
-            raise self._fail("persistent bidirectional compiler timed out; request outcome is ambiguous") from exc
+        with timed_span("native.compile_pair.dispatch_request", requestBytes=len(encoded)):
+            try:
+                assert self._process.stdin is not None
+                self._process.stdin.write(encoded); self._process.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                raise self._fail("persistent bidirectional compiler failed while dispatching request") from exc
+        with timed_span("native.compile_pair.wait_response") as span:
+            try:
+                line = self._responses.get(timeout=self._timeout_seconds)
+            except queue.Empty as exc:
+                raise self._fail("persistent bidirectional compiler timed out; request outcome is ambiguous") from exc
+            span.annotate(responseBytes=len(line) if line is not None else 0)
         if line is None:
             raise self._fail("persistent bidirectional compiler exited before responding")
         if len(line) > self._max_line_bytes or not line.endswith(b"\n"):
             raise self._fail("persistent bidirectional compiler response exceeds JSONL line limit")
-        try:
-            response = json.loads(line.decode("utf-8"), parse_constant=_reject_non_finite_json)
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            raise self._fail("persistent bidirectional compiler returned malformed JSONL response") from exc
+        with timed_span("native.compile_pair.decode_response", responseBytes=len(line)):
+            try:
+                response = json.loads(line.decode("utf-8"), parse_constant=_reject_non_finite_json)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                raise self._fail("persistent bidirectional compiler returned malformed JSONL response") from exc
         if not isinstance(response, Mapping) or response.get("requestId") != request_id:
             raise self._fail("persistent bidirectional compiler response request ID mismatch")
         if response.get("schemaVersion") != _JSONL_COMPILE_BIDIRECTIONAL_RESPONSE_SCHEMA or response.get("operation") != _JSONL_COMPILE_BIDIRECTIONAL_OPERATION:
@@ -453,20 +468,22 @@ class SubprocessCandidateValidator:
         expected_raw_source_profile_sha256: str,
     ) -> dict[str, Any]:
         if self._persistent_transport is None:
-            self._persistent_transport = _PersistentJsonlValidator(
-                self.command,
-                timeout_seconds=self.timeout_seconds,
-                max_line_bytes=self.persistent_max_line_bytes,
-                stderr_limit_bytes=self.persistent_stderr_limit_bytes,
-                environment=self.persistent_environment,
-            )
+            with timed_span("native.transport.initialize_persistent_validator"):
+                self._persistent_transport = _PersistentJsonlValidator(
+                    self.command,
+                    timeout_seconds=self.timeout_seconds,
+                    max_line_bytes=self.persistent_max_line_bytes,
+                    stderr_limit_bytes=self.persistent_stderr_limit_bytes,
+                    environment=self.persistent_environment,
+                )
         transport = self._persistent_transport
         try:
-            return transport.validate(
-                candidate_id=candidate_id,
-                source_profile=source_profile,
-                expected_raw_source_profile_sha256=expected_raw_source_profile_sha256,
-            )
+            with timed_span("native.transport.validate_round_trip"):
+                return transport.validate(
+                    candidate_id=candidate_id,
+                    source_profile=source_profile,
+                    expected_raw_source_profile_sha256=expected_raw_source_profile_sha256,
+                )
         except Exception:
             # A dispatch that timed out/crashed/protocol-mismatched is never
             # retried.  Discard it so a distinct later request can start clean.
@@ -479,10 +496,12 @@ class SubprocessCandidateValidator:
         if not self.persistent_jsonl:
             raise TemporalDiscoveryContractError("bidirectional compilation requires persistent JSONL validator mode")
         if self._persistent_transport is None:
-            self._persistent_transport = _PersistentJsonlValidator(self.command, timeout_seconds=self.timeout_seconds, max_line_bytes=self.persistent_max_line_bytes, stderr_limit_bytes=self.persistent_stderr_limit_bytes, environment=self.persistent_environment)
+            with timed_span("native.transport.initialize_persistent_validator"):
+                self._persistent_transport = _PersistentJsonlValidator(self.command, timeout_seconds=self.timeout_seconds, max_line_bytes=self.persistent_max_line_bytes, stderr_limit_bytes=self.persistent_stderr_limit_bytes, environment=self.persistent_environment)
         transport = self._persistent_transport
         try:
-            return transport.compile_pair(candidate_id=candidate_id, long_profile=long_profile, short_profile=short_profile, expected_long_raw_source_profile_sha256=expected_long_raw_source_profile_sha256, expected_short_raw_source_profile_sha256=expected_short_raw_source_profile_sha256)
+            with timed_span("native.transport.compile_pair_round_trip"):
+                return transport.compile_pair(candidate_id=candidate_id, long_profile=long_profile, short_profile=short_profile, expected_long_raw_source_profile_sha256=expected_long_raw_source_profile_sha256, expected_short_raw_source_profile_sha256=expected_short_raw_source_profile_sha256)
         except Exception:
             self._persistent_transport = None
             transport.close()
@@ -579,17 +598,22 @@ class DashboardBidirectionalPairCompiler:
         short_profile: Mapping[str, Any],
         candidate_id: str,
     ) -> dict[str, Any]:
-        result = self._client.compile_pair(
-            candidate_id=candidate_id,
-            long_profile=long_profile,
-            short_profile=short_profile,
-            expected_long_raw_source_profile_sha256=canonical_sha256(long_profile),
-            expected_short_raw_source_profile_sha256=canonical_sha256(short_profile),
-        )
-        return {
-            "profile": _clone(result["profile"], name="compiled bidirectional profile"),
-            "validation": _clone(result["report"], name="compiled bidirectional validation"),
-        }
+        with timed_span("native.compile_pair.compute_source_identities"):
+            long_sha = canonical_sha256(long_profile)
+            short_sha = canonical_sha256(short_profile)
+        with timed_span("native.compile_pair.client_round_trip"):
+            result = self._client.compile_pair(
+                candidate_id=candidate_id,
+                long_profile=long_profile,
+                short_profile=short_profile,
+                expected_long_raw_source_profile_sha256=long_sha,
+                expected_short_raw_source_profile_sha256=short_sha,
+            )
+        with timed_span("native.compile_pair.clone_result"):
+            return {
+                "profile": _clone(result["profile"], name="compiled bidirectional profile"),
+                "validation": _clone(result["report"], name="compiled bidirectional validation"),
+            }
 
 
 class DashboardV2ModuleValidator:
@@ -601,12 +625,14 @@ class DashboardV2ModuleValidator:
     def validate_v2(self, *, profile: Mapping[str, Any], candidate_id: str) -> dict[str, Any]:
         if profile.get("version") != "v2" or profile.get("directionMode") not in {"long", "short"}:
             raise TemporalDiscoveryContractError("native module validator was asked to validate a non-v2 side module")
-        result = self._client.validate(
-            candidate_id=candidate_id,
-            source_profile=profile,
-            expected_raw_source_profile_sha256=canonical_sha256(profile),
-        )
-        return result
+        with timed_span("native.validate_v2.compute_source_identity"):
+            source_sha = canonical_sha256(profile)
+        with timed_span("native.validate_v2.client_round_trip"):
+            return self._client.validate(
+                candidate_id=candidate_id,
+                source_profile=profile,
+                expected_raw_source_profile_sha256=source_sha,
+            )
 
 
 def validator_provenance(

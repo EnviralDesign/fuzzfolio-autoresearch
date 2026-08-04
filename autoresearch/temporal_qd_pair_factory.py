@@ -19,6 +19,7 @@ from .temporal_bidirectional_genome import FrozenModule, FrozenPair, IdentitySna
 from .temporal_discovery_base import TemporalDiscoveryContractError
 from .temporal_discovery_validation import DashboardBidirectionalPairCompiler, DashboardV2ModuleValidator, SubprocessCandidateValidator
 from .temporal_indicator_learning_v1 import IndicatorLearningRegistry
+from .temporal_qd_observability import timed_span, timing_scope
 from .temporal_qd_pair_generation import TypedGrammarPairOperator
 from .temporal_typed_motif_grammar import GRAMMAR_SCHEMA, GRAMMAR_VERSION, REGISTRY, GrammarContext, GrammarError, TypedFragmentGrammar
 
@@ -501,35 +502,60 @@ class _Factory:
     def _apply_grammar_steps(
         self, grammar: TypedFragmentGrammar, program: Any, *, side_seed: str
     ) -> tuple[Any, list[dict[str, Any]], int]:
-        depth = int(
-            _selector_value(
-                side_seed,
-                axis="grammar_mutation_depth",
-                values=self.construction_policy["grammarMutationDepthBuckets"],
+        with timed_span("immigrant.grammar.select_depth") as span:
+            depth = int(
+                _selector_value(
+                    side_seed,
+                    axis="grammar_mutation_depth",
+                    values=self.construction_policy["grammarMutationDepthBuckets"],
+                )
             )
-        )
-        trace: list[dict[str, Any]] = []
-        seen = {canonical_sha256(program.canonical())}
+            span.annotate(plannedDepth=depth)
+        with timed_span("immigrant.grammar.initialize_tracking"):
+            trace: list[dict[str, Any]] = []
+            seen = {canonical_sha256(program.canonical())}
         for step in range(depth):
-            plans = [dict(item) for item in grammar.enumerate_operations(program)]
-            families = self._seeded_order(
-                sorted({str(item["operation"]) for item in plans}),
-                seed=side_seed,
-                axis=f"grammar_family_{step}",
-            )
+            with timing_scope(grammarStep=step):
+                with timed_span("immigrant.grammar.enumerate_operations") as span:
+                    plans = [dict(item) for item in grammar.enumerate_operations(program)]
+                    span.annotate(planCount=len(plans))
+                with timed_span("immigrant.grammar.order_operation_families") as span:
+                    families = self._seeded_order(
+                        sorted({str(item["operation"]) for item in plans}),
+                        seed=side_seed,
+                        axis=f"grammar_family_{step}",
+                    )
+                    span.annotate(familyCount=len(families))
             applied = False
             for family in families:
-                family_plans = self._seeded_order(
-                    [item for item in plans if item["operation"] == family],
-                    seed=side_seed,
-                    axis=f"grammar_plan_{step}_{family}",
-                )
+                with timed_span(
+                    "immigrant.grammar.order_family_plans",
+                    grammarStep=step,
+                    operationFamily=family,
+                ) as span:
+                    family_plans = self._seeded_order(
+                        [item for item in plans if item["operation"] == family],
+                        seed=side_seed,
+                        axis=f"grammar_plan_{step}_{family}",
+                    )
+                    span.annotate(planCount=len(family_plans))
                 for plan in family_plans:
                     try:
-                        child = grammar.apply(program, plan)
+                        with timed_span(
+                            "immigrant.grammar.apply_plan",
+                            grammarStep=step,
+                            operationFamily=family,
+                            planSha256=canonical_sha256(plan),
+                        ):
+                            child = grammar.apply(program, plan)
                     except GrammarError:
                         continue
-                    child_sha = canonical_sha256(child.canonical())
+                    with timed_span(
+                        "immigrant.grammar.hash_child",
+                        grammarStep=step,
+                        operationFamily=family,
+                    ):
+                        child_sha = canonical_sha256(child.canonical())
                     if child_sha in seen:
                         continue
                     program = child
@@ -558,37 +584,62 @@ class _Factory:
         *,
         side_seed: str,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
-        depth = int(
-            _selector_value(
-                side_seed,
-                axis="indicator_mutation_depth",
-                values=self.construction_policy["indicatorMutationDepthBuckets"],
+        with timed_span("immigrant.indicator.select_depth") as span:
+            depth = int(
+                _selector_value(
+                    side_seed,
+                    axis="indicator_mutation_depth",
+                    values=self.construction_policy["indicatorMutationDepthBuckets"],
+                )
             )
-        )
-        current = _clone(profile, name="rich immigrant indicator parent")
-        trace: list[dict[str, Any]] = []
-        seen = {canonical_sha256(current)}
+            span.annotate(plannedDepth=depth)
+        with timed_span("immigrant.indicator.initialize_tracking"):
+            current = _clone(profile, name="rich immigrant indicator parent")
+            trace: list[dict[str, Any]] = []
+            seen = {canonical_sha256(current)}
         for step in range(depth):
-            plans = [dict(item) for item in registry.enumerate_plans(current)]
-            operators = self._seeded_order(
-                sorted({str(item["operatorId"]) for item in plans}),
-                seed=side_seed,
-                axis=f"indicator_operator_{step}",
-            )
+            with timing_scope(indicatorStep=step):
+                with timed_span("immigrant.indicator.enumerate_plans") as span:
+                    plans = [dict(item) for item in registry.enumerate_plans(current)]
+                    span.annotate(planCount=len(plans))
+                with timed_span("immigrant.indicator.order_operators") as span:
+                    operators = self._seeded_order(
+                        sorted({str(item["operatorId"]) for item in plans}),
+                        seed=side_seed,
+                        axis=f"indicator_operator_{step}",
+                    )
+                    span.annotate(operatorCount=len(operators))
             applied = False
             for operator_id in operators:
-                operator = registry.get(operator_id)
-                operator_plans = self._seeded_order(
-                    [item for item in plans if item["operatorId"] == operator_id],
-                    seed=side_seed,
-                    axis=f"indicator_plan_{step}_{operator_id}",
-                )
+                with timed_span(
+                    "immigrant.indicator.resolve_and_order_operator_plans",
+                    indicatorStep=step,
+                    operatorId=operator_id,
+                ) as span:
+                    operator = registry.get(operator_id)
+                    operator_plans = self._seeded_order(
+                        [item for item in plans if item["operatorId"] == operator_id],
+                        seed=side_seed,
+                        axis=f"indicator_plan_{step}_{operator_id}",
+                    )
+                    span.annotate(planCount=len(operator_plans))
                 for plan in operator_plans:
                     try:
-                        child = operator.preview(current, plan)
+                        with timed_span(
+                            "immigrant.indicator.preview_plan",
+                            indicatorStep=step,
+                            operatorId=operator_id,
+                            planSha256=plan["planSha256"],
+                        ):
+                            child = operator.preview(current, plan)
                     except TemporalDiscoveryContractError:
                         continue
-                    child_sha = canonical_sha256(child)
+                    with timed_span(
+                        "immigrant.indicator.hash_child",
+                        indicatorStep=step,
+                        operatorId=operator_id,
+                    ):
+                        child_sha = canonical_sha256(child)
                     if child_sha in seen:
                         continue
                     current = child
@@ -640,181 +691,198 @@ class _Factory:
         *,
         selector: Mapping[str, Any],
     ) -> FrozenModule:
-        side = self.bundle._side(direction)
-        side_seed = canonical_sha256(
-            {
-                "schemaVersion": PAIR_IMMIGRANT_BUILDER_VERSION,
-                "proposalSeed": str(proposal_seed),
-                "side": direction,
-            }
-        )
-        context_id = IdentitySnapshot.create(
-            kind="grammarContext",
-            schema_version="temporal_typed_grammar_context_v1",
-            payload=side["context"],
-        )
-        catalog_id = IdentitySnapshot.create(
-            kind="catalog",
-            schema_version="temporal_indicator_learning_catalog_v1",
-            payload={"catalog": side["catalog"], "catalogSha256": side["catalogSha256"]},
-        )
-        policy_id = IdentitySnapshot.create(
-            kind="policy",
-            schema_version="temporal_qd_pair_module_policy_v1",
-            payload={
-                "modulePolicy": side["policy"],
-                "indicatorPolicy": side["indicatorPolicy"],
-                "holdOperatorPolicy": self.bundle.config["holdOperatorPolicy"],
-                "immigrantConstructionPolicy": self.construction_policy,
-            },
-        )
-        grammar = TypedFragmentGrammar(
-            GrammarContext(
-                instrument=side["context"]["instrument"],
-                indicators=tuple(side["context"]["indicators"]),
-                evidence_groups=tuple(side["context"]["groups"]),
-                event_bindings=tuple(side["context"]["events"]),
-                execution_config=side["context"]["executionConfig"],
-                budgets=side["context"]["budgets"],
-            ),
-            native_authority=self.bundle.validator,
-        )
-        program = grammar.seed(
-            direction=direction,
-            name=str(selector["seedName"]),
-            group_id=str(selector["groupId"]),
-            event_id=str(selector["eventId"]),
-            plan_id=str(selector["planId"]),
-        )
+        with timed_span("immigrant.side.resolve_authority"):
+            side = self.bundle._side(direction)
+            side_seed = canonical_sha256(
+                {
+                    "schemaVersion": PAIR_IMMIGRANT_BUILDER_VERSION,
+                    "proposalSeed": str(proposal_seed),
+                    "side": direction,
+                }
+            )
+        with timed_span("immigrant.side.identity_snapshots"):
+            context_id = IdentitySnapshot.create(
+                kind="grammarContext",
+                schema_version="temporal_typed_grammar_context_v1",
+                payload=side["context"],
+            )
+            catalog_id = IdentitySnapshot.create(
+                kind="catalog",
+                schema_version="temporal_indicator_learning_catalog_v1",
+                payload={"catalog": side["catalog"], "catalogSha256": side["catalogSha256"]},
+            )
+            policy_id = IdentitySnapshot.create(
+                kind="policy",
+                schema_version="temporal_qd_pair_module_policy_v1",
+                payload={
+                    "modulePolicy": side["policy"],
+                    "indicatorPolicy": side["indicatorPolicy"],
+                    "holdOperatorPolicy": self.bundle.config["holdOperatorPolicy"],
+                    "immigrantConstructionPolicy": self.construction_policy,
+                },
+            )
+        with timed_span("immigrant.grammar.initialize"):
+            grammar = TypedFragmentGrammar(
+                GrammarContext(
+                    instrument=side["context"]["instrument"],
+                    indicators=tuple(side["context"]["indicators"]),
+                    evidence_groups=tuple(side["context"]["groups"]),
+                    event_bindings=tuple(side["context"]["events"]),
+                    execution_config=side["context"]["executionConfig"],
+                    budgets=side["context"]["budgets"],
+                ),
+                native_authority=self.bundle.validator,
+            )
+        with timed_span("immigrant.grammar.seed"):
+            program = grammar.seed(
+                direction=direction,
+                name=str(selector["seedName"]),
+                group_id=str(selector["groupId"]),
+                event_id=str(selector["eventId"]),
+                plan_id=str(selector["planId"]),
+            )
         program, grammar_trace, planned_grammar_depth = self._apply_grammar_steps(
             grammar, program, side_seed=side_seed
         )
-        profile = grammar.materialize_profile(program)
-        registry = IndicatorLearningRegistry(side["catalog"])
+        with timed_span("immigrant.grammar.materialize_profile"):
+            profile = grammar.materialize_profile(program)
+        with timed_span("immigrant.indicator.initialize_registry"):
+            registry = IndicatorLearningRegistry(side["catalog"])
         profile, indicator_trace, planned_indicator_depth = self._apply_indicator_steps(
             registry, profile, side_seed=side_seed
         )
-        profile = self._apply_hold(
-            profile,
-            plan_id=str(selector["planId"]),
-            hold=_mapping(selector["hold"], name="rich immigrant selected hold"),
-        )
-        graph = profile.get("graph") if isinstance(profile.get("graph"), Mapping) else {}
-        groups = graph.get("evidenceGroups") if isinstance(graph, Mapping) else []
-        audit = {
-            "schemaVersion": "temporal_qd_rich_immigrant_module_construction_v1",
-            "builderVersion": PAIR_IMMIGRANT_BUILDER_VERSION,
-            "side": direction,
-            "proposalSeed": str(proposal_seed),
-            "selector": _clone(selector, name="rich immigrant selector"),
-            "grammar": {
-                "plannedDepth": planned_grammar_depth,
-                "appliedDepth": len(grammar_trace),
-                "steps": grammar_trace,
-            },
-            "indicator": {
-                "plannedDepth": planned_indicator_depth,
-                "appliedDepth": len(indicator_trace),
-                "steps": indicator_trace,
-            },
-            "profileShape": {
-                "fragmentCount": len(program.fragments),
-                "indicatorCount": len(profile.get("indicators") or []),
-                "evidenceGroupMemberCounts": sorted(
-                    len(item.get("indicatorInstanceIds") or [])
-                    for item in (groups or [])
-                    if isinstance(item, Mapping)
-                ),
-                "holdKind": canonical_hold(selector["hold"])["kind"],
-            },
-        }
-        audit["auditSha256"] = canonical_sha256(audit)
-        return FrozenModule.validate_native(
-            program=program.canonical(),
-            profile=profile,
-            grammar_context=context_id,
-            catalog=catalog_id,
-            policy=policy_id,
-            native_authority_identity=self.bundle.native_identity,
-            native_validator=self.bundle.validator,
-            candidate_id="qd_rich_module_" + side_seed[7:35],
-            lineage=[
-                {
-                    "operation": "typed_seed",
-                    "side": direction,
-                    "seedName": selector["seedName"],
-                    "groupId": selector["groupId"],
-                    "eventId": selector["eventId"],
-                    "planId": selector["planId"],
-                    "proposalSeed": str(proposal_seed),
+        with timed_span("immigrant.hold.apply"):
+            profile = self._apply_hold(
+                profile,
+                plan_id=str(selector["planId"]),
+                hold=_mapping(selector["hold"], name="rich immigrant selected hold"),
+            )
+        with timed_span("immigrant.side.build_construction_audit"):
+            graph = profile.get("graph") if isinstance(profile.get("graph"), Mapping) else {}
+            groups = graph.get("evidenceGroups") if isinstance(graph, Mapping) else []
+            audit = {
+                "schemaVersion": "temporal_qd_rich_immigrant_module_construction_v1",
+                "builderVersion": PAIR_IMMIGRANT_BUILDER_VERSION,
+                "side": direction,
+                "proposalSeed": str(proposal_seed),
+                "selector": _clone(selector, name="rich immigrant selector"),
+                "grammar": {
+                    "plannedDepth": planned_grammar_depth,
+                    "appliedDepth": len(grammar_trace),
+                    "steps": grammar_trace,
                 },
-                {
-                    "operation": "rich_immigrant_construction",
-                    "side": direction,
-                    "audit": audit,
+                "indicator": {
+                    "plannedDepth": planned_indicator_depth,
+                    "appliedDepth": len(indicator_trace),
+                    "steps": indicator_trace,
                 },
-            ],
-        )
+                "profileShape": {
+                    "fragmentCount": len(program.fragments),
+                    "indicatorCount": len(profile.get("indicators") or []),
+                    "evidenceGroupMemberCounts": sorted(
+                        len(item.get("indicatorInstanceIds") or [])
+                        for item in (groups or [])
+                        if isinstance(item, Mapping)
+                    ),
+                    "holdKind": canonical_hold(selector["hold"])["kind"],
+                },
+            }
+            audit["auditSha256"] = canonical_sha256(audit)
+        with timed_span("immigrant.side.native_validate_and_freeze"):
+            return FrozenModule.validate_native(
+                program=program.canonical(),
+                profile=profile,
+                grammar_context=context_id,
+                catalog=catalog_id,
+                policy=policy_id,
+                native_authority_identity=self.bundle.native_identity,
+                native_validator=self.bundle.validator,
+                candidate_id="qd_rich_module_" + side_seed[7:35],
+                lineage=[
+                    {
+                        "operation": "typed_seed",
+                        "side": direction,
+                        "seedName": selector["seedName"],
+                        "groupId": selector["groupId"],
+                        "eventId": selector["eventId"],
+                        "planId": selector["planId"],
+                        "proposalSeed": str(proposal_seed),
+                    },
+                    {
+                        "operation": "rich_immigrant_construction",
+                        "side": direction,
+                        "audit": audit,
+                    },
+                ],
+            )
 
     def create_pair(self, *, proposal_seed: str) -> FrozenPair:
-        selectors = _selector_fingerprint_from_axes(
-            self._selector_axes, proposal_seed
-        )
-        long = self._construct_module(
-            "long", proposal_seed, selector=selectors["long"]
-        )
-        short = self._construct_module(
-            "short", proposal_seed, selector=selectors["short"]
-        )
-        lineage = []
-        for module in (long, short):
-            construction = next(
-                item
-                for item in reversed(module.lineage)
-                if item.get("operation") == "rich_immigrant_construction"
+        with timed_span("immigrant.pair.select_axes"):
+            selectors = _selector_fingerprint_from_axes(
+                self._selector_axes, proposal_seed
             )
-            lineage.append(
-                {
-                    "operation": "rich_immigrant_construction",
-                    "side": module.direction,
-                    "proposalSeed": str(proposal_seed),
-                    "constructionAuditSha256": construction["audit"]["auditSha256"],
-                }
-            )
-        return FrozenPair.compile(
-            long=long,
-            short=short,
-            pair_compiler_identity=self.bundle.compiler_identity,
-            pair_compiler=self.bundle.compiler,
-            candidate_id="qd_rich_pair_" + canonical_sha256({"seed": proposal_seed})[7:35],
-            side_targeted_lineage=lineage,
-        )
-
-    def audit_pair(self, pair: FrozenPair) -> dict[str, Any]:
-        sides: dict[str, Any] = {}
-        for module in (pair.long, pair.short):
-            construction = next(
-                (
-                    item.get("audit")
+        with timing_scope(side="long"):
+            with timed_span("immigrant.side.total"):
+                long = self._construct_module(
+                    "long", proposal_seed, selector=selectors["long"]
+                )
+        with timing_scope(side="short"):
+            with timed_span("immigrant.side.total"):
+                short = self._construct_module(
+                    "short", proposal_seed, selector=selectors["short"]
+                )
+        with timed_span("immigrant.pair.build_lineage"):
+            lineage = []
+            for module in (long, short):
+                construction = next(
+                    item
                     for item in reversed(module.lineage)
                     if item.get("operation") == "rich_immigrant_construction"
-                ),
-                None,
-            )
-            if not isinstance(construction, Mapping):
-                raise TemporalDiscoveryContractError(
-                    "rich immigrant pair lacks a module construction audit"
                 )
-            sides[module.direction] = _clone(
-                construction, name="rich immigrant module construction audit"
+                lineage.append(
+                    {
+                        "operation": "rich_immigrant_construction",
+                        "side": module.direction,
+                        "proposalSeed": str(proposal_seed),
+                        "constructionAuditSha256": construction["audit"]["auditSha256"],
+                    }
+                )
+        with timed_span("immigrant.pair.native_compile_and_freeze"):
+            return FrozenPair.compile(
+                long=long,
+                short=short,
+                pair_compiler_identity=self.bundle.compiler_identity,
+                pair_compiler=self.bundle.compiler,
+                candidate_id="qd_rich_pair_" + canonical_sha256({"seed": proposal_seed})[7:35],
+                side_targeted_lineage=lineage,
             )
-        audit = {
-            "schemaVersion": "temporal_qd_rich_immigrant_pair_construction_v1",
-            "pairIdentitySha256": pair.identity_sha256,
-            "sides": sides,
-        }
-        audit["auditSha256"] = canonical_sha256(audit)
-        return audit
+
+    def audit_pair(self, pair: FrozenPair) -> dict[str, Any]:
+        with timed_span("immigrant.pair.audit_construction"):
+            sides: dict[str, Any] = {}
+            for module in (pair.long, pair.short):
+                construction = next(
+                    (
+                        item.get("audit")
+                        for item in reversed(module.lineage)
+                        if item.get("operation") == "rich_immigrant_construction"
+                    ),
+                    None,
+                )
+                if not isinstance(construction, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "rich immigrant pair lacks a module construction audit"
+                    )
+                sides[module.direction] = _clone(
+                    construction, name="rich immigrant module construction audit"
+                )
+            audit = {
+                "schemaVersion": "temporal_qd_rich_immigrant_pair_construction_v1",
+                "pairIdentitySha256": pair.identity_sha256,
+                "sides": sides,
+            }
+            audit["auditSha256"] = canonical_sha256(audit)
+            return audit
 
 
 class PairAuthorityBundle:
