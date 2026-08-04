@@ -13,6 +13,20 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPOSITORY_ROOT / "scripts" / "processes.json"
 MANIFEST_PATH = REPOSITORY_ROOT / "scripts" / "prebroad-procman-manifest.json"
 VENV_PREFIX = "C:\\repos\\fuzzfolio-autoresearch\\.venv\\Scripts\\"
+BASELINE_GROUP_NAMES = {
+    "Normal Operations",
+    "Corpus Maintenance (Manual)",
+    "Safe Maintenance Preview",
+    "Historical Evidence (Advanced)",
+    "Atlas Manual (Advanced)",
+}
+TEMPORAL_QD_MANUAL_GROUP_NAME = "Temporal QD (Manual)"
+MANUAL_SAFETY_FLAGS = {
+    "auto_start": False,
+    "auto_restart": False,
+    "respond_to_start_all": False,
+    "respond_to_restart_all": False,
+}
 
 
 def _command_argument(command: str, name: str) -> str:
@@ -43,6 +57,36 @@ def _group(config: dict[str, object], name: str) -> dict[str, object]:
     return next(group for group in groups if group["name"] == name)
 
 
+def _optional_temporal_qd_manual_process(
+    config: dict[str, object],
+    processes: dict[str, dict[str, object]],
+) -> dict[str, object] | None:
+    groups = config["groups"]
+    assert isinstance(groups, list)
+    manual_groups = [
+        group for group in groups if group["name"] == TEMPORAL_QD_MANUAL_GROUP_NAME
+    ]
+    assert len(manual_groups) <= 1
+    if not manual_groups:
+        return None
+
+    manual_group = manual_groups[0]
+    process_ids = manual_group["process_ids"]
+    assert isinstance(process_ids, list)
+    assert len(process_ids) == 1
+    process_id = str(process_ids[0])
+    assert process_id in processes
+
+    normal = _group(config, "Normal Operations")
+    assert process_id not in normal["process_ids"]
+
+    process = processes[process_id]
+    assert "temporal-qd-supervisor" in str(process["command"])
+    for field, expected in MANUAL_SAFETY_FLAGS.items():
+        assert process[field] is expected
+    return process
+
+
 def test_process_manager_groups_reference_unique_processes() -> None:
     config = _config()
     processes = _processes(config)
@@ -54,13 +98,13 @@ def test_process_manager_groups_reference_unique_processes() -> None:
 
     assert len(grouped_ids) == len(set(grouped_ids))
     assert set(grouped_ids) == set(processes)
-    assert set(group["name"] for group in config["groups"]) == {
-        "Normal Operations",
-        "Corpus Maintenance (Manual)",
-        "Safe Maintenance Preview",
-        "Historical Evidence (Advanced)",
-        "Atlas Manual (Advanced)",
-    }
+    group_names = [str(group["name"]) for group in config["groups"]]
+    assert set(group_names) in (
+        BASELINE_GROUP_NAMES,
+        BASELINE_GROUP_NAMES | {TEMPORAL_QD_MANUAL_GROUP_NAME},
+    )
+    assert all(group_names.count(name) == 1 for name in group_names)
+    _optional_temporal_qd_manual_process(config, processes)
 
 
 def test_normal_operations_are_authority_bound_and_semantically_closed() -> None:
@@ -80,9 +124,6 @@ def test_normal_operations_are_authority_bound_and_semantically_closed() -> None
         "Temporal Pre-Broad Dispatch Resume 16 Tasks",
         "AutoResearch Dashboard",
     ]
-    assert "Temporal QD Broad Search (10k)" not in [
-        process["name"] for process in processes.values()
-    ]
     for process in normal_processes:
         assert process["auto_start"] is False
         assert process["auto_restart"] is False
@@ -92,6 +133,11 @@ def test_normal_operations_are_authority_bound_and_semantically_closed() -> None
         assert "--broad" not in command
         assert "temporal-qd-supervisor" not in command
         assert "worker" not in process["name"].lower()
+
+    assert not any(
+        "temporal-qd-supervisor" in str(process["command"])
+        for process in normal_processes
+    )
 
     canary = normal_processes[1]
     assert "temporal_prebroad_canary run" in str(canary["command"])

@@ -140,6 +140,10 @@ def main() -> int:
         "policy": {
             "schemaVersion": "temporal_pair_catalog_seed_policy_v1",
             "resourceRoles": RESOURCE_ROLES,
+            # These catalog labels select deterministic seed resources only.
+            # Indicator-learning eligibility is derived from technical output
+            # contracts in the frozen catalog, never from a role label.
+            "resourceRoleDisposition": "seed_priors_only_v1",
         },
     }
     frozen = freeze_pair_run_config(

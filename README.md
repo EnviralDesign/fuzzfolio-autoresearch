@@ -67,6 +67,76 @@ Set `AUTORESEARCH_CODEX_HOME` only if you want a different dedicated home. Set `
 
 See [cli.md](cli.md) for arguments.
 
+## Temporal QD pre-broad campaign
+
+The temporal QD broad system is implemented as a frozen, diagnostic authority.
+Each broad run still requires fresh native, no-market, and current-worker
+admission against its exact committed inputs before launch.
+The only broad admission shape is exactly four generations of 1,024 unique
+bidirectional-v3 candidates: 4,096 candidate evaluations and 12,288 discovery
+worker tasks over the same three deterministic, separated one-month windows.
+Conservative costs control quality and reproduction; the no-cost view is
+diagnostic only.
+
+First materialize the immutable 3m/12m/36m evidence ladder. It binds three
+discovery months, a disjoint 12-month validation for at most 128 diverse
+survivors, and a disjoint 36-month scrutiny for at most 32 finalists; the
+post-`2024-06-29T00:00:00Z` tail remains untouched.
+
+```powershell
+uv run temporal-qd-materialize-evidence-ladder `
+  --evidence-ladder-input <ladder-input.json> `
+  --seed-population <frozen-seed-population.json> `
+  --construction-catalog <construction-catalog.json> `
+  --worker-contract-sha256 <sha256:...> `
+  --worker-contract-schema <schema> `
+  --base-timeframe <timeframe> `
+  --output-root <ladder-root>
+```
+
+Run the broad supervisor only with the materialized/frozen authority,
+`--broad-admission`, `--generation-count 4`, and parameters whose
+`targetUniqueCandidates` is `1024`. Supply the frozen archive, preparation,
+construction catalog, commits, worker contract, bidirectional pair config, and
+the ladder config through `temporal-qd-supervisor`; it fails closed if that exact
+admission shape is not present.
+
+Continuations are never automatic. After reviewing the completed immutable
+1–4 authority, an operator may start a separate contiguous 5–8 authority with
+the same frozen arguments and this continuation form (and may later do the same
+for 9–12):
+
+```powershell
+uv run temporal-qd-supervisor `
+  --run-root <new-contiguous-run-root> `
+  --continue-from <completed-run-root> `
+  --generation-count 4 `
+  --broad-admission `
+  <the same frozen authority arguments>
+```
+
+Do not pass `--initial-archive` with `--continue-from`, and do not treat
+continuation as a promotion decision or as evidence that the pending admissions
+have passed.
+
+### Local no-market pair admission
+
+For a bounded reproducibility check of the frozen pair authority and current
+catalog, run the local-only admission harness. Its output root must be outside
+this repository. The summary explicitly contains no market or economic evidence
+and is not an archive or promotion artifact.
+
+```powershell
+uv run python scripts/admit_no_market_pair_generation.py `
+  --pair-config <frozen-pair-config.json> `
+  --construction-catalog <dashboard-repo>\shared\constants\indicators.json `
+  --output-root <external-no-market-output-root>
+```
+
+To initialize a canonical empty gen-0 pair archive, `--template` is now
+optional; omit it to derive the exact empty template from the current QD
+constants. Existing `--template` invocations remain supported.
+
 ## Two Paths
 
 ### Path A: Auto Build

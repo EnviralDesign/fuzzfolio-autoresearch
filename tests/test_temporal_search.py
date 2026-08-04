@@ -1007,8 +1007,11 @@ def test_procman_normal_operations_is_prebroad_admission_topology() -> None:
         "AutoResearch Dashboard",
     }
     assert not any(item["name"].startswith("Phase 3 ") for item in processes.values())
-    assert not any("temporal-qd-supervisor" in item["command"] for item in processes.values())
-    for item in processes.values():
+    assert not any(
+        "temporal-qd-supervisor" in str(processes[process_id]["command"])
+        for process_id in normal["process_ids"]
+    )
+    for item in (processes[process_id] for process_id in normal["process_ids"]):
         assert item["auto_start"] is False
         assert item["auto_restart"] is False
         assert item["respond_to_start_all"] is False

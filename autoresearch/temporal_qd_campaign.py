@@ -24,6 +24,7 @@ from .temporal_qd_evolution import (
     qd_canonical_evidence_identity,
     qd_predeclared_evidence_context,
 )
+from .temporal_qd_evidence_ladder import validate_template_discovery_windows
 from .temporal_search import (
     TEMPORAL_SEARCH_PREPARATION_SCHEMA,
     build_authority,
@@ -59,6 +60,7 @@ def freeze_qd_screening_campaign(
     execution_engine_commit: str,
     worker_contract_sha256: str | None = None,
     construction_catalog_path: Path | str | None = None,
+    evidence_ladder: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     population_file = Path(population_path)
     population_payload = _read(population_file, name="QD generation population")
@@ -126,6 +128,8 @@ def freeze_qd_screening_campaign(
         raise TemporalDiscoveryContractError(
             "QD screening template requires candidates and windows"
         )
+    if evidence_ladder is not None:
+        validate_template_discovery_windows(template, evidence_ladder)
     worker_contract = _clone(template["workerContract"], name="QD worker contract")
     if worker_contract_sha256 is not None:
         normalized_worker_contract = worker_contract_sha256.strip().lower()
@@ -296,6 +300,7 @@ def freeze_qd_screening_campaign(
             "reservedEvidencePermitted": False,
         },
         "evaluationSeeds": [],
+        **({"evidenceLadder": _clone(evidence_ladder, name="QD evidence ladder")} if evidence_ladder is not None else {}),
         "candidates": evaluation_candidates,
         **({"bidirectionalPairPolicy": {key: value for key, value in bidirectional_policy.items() if key != "policySha256"}} if bidirectional_policy is not None else {}),
     }
@@ -322,6 +327,7 @@ def freeze_qd_screening_campaign(
         "evaluationIdentitySha256": evaluation_identity["evaluationIdentitySha256"],
         "marketEvidenceScope": "predeclared_development_windows_only",
         "reservedEvidencePermitted": False,
+        **({"evidenceLadderSha256": evidence_ladder["evidenceLadderSha256"]} if evidence_ladder is not None else {}),
     }
     campaign["campaignSha256"] = canonical_sha256(campaign)
     _write_once(root / "campaign.json", campaign)

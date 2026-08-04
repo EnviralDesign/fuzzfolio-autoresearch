@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import autoresearch.temporal_qd_evolution as qd_module
 from autoresearch.result_codec import write_gzip_json_once
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
 from autoresearch.temporal_discovery_results import (
@@ -48,6 +49,7 @@ def _metrics(
     terminal_exit_cost_percent: float = 0.0,
     unresolved_position: bool = False,
     unresolved_pending_effect: bool = False,
+    trades_closed: int = 3,
 ) -> dict:
     terminal: dict = {
         "schemaVersion": "temporal_terminal_valuation_v1",
@@ -81,9 +83,9 @@ def _metrics(
     adjusted_curve = [adjusted_net_r]
     return {
         "observationsProcessed": 10,
-        "tradesClosed": 3,
-        "wins": 2,
-        "losses": 1,
+        "tradesClosed": trades_closed,
+        "wins": trades_closed,
+        "losses": 0,
         "flatTrades": 0,
         "unresolvedPosition": unresolved_position,
         "unresolvedPendingEffect": unresolved_pending_effect,
@@ -94,7 +96,7 @@ def _metrics(
         "averageHoldingBars": 4.0,
         "exposureRatio": 0.2,
         "transitionEntropy": 0.3,
-        "winRate": 2.0 / 3.0,
+        "winRate": 1.0 if trades_closed else 0.0,
         "profitFactor": 2.0,
         "equityCurveR": [raw_net_r],
         "actionCounts": {},
@@ -121,6 +123,7 @@ def _v3_result(
     no_cost_terminal_net_r: float = 0.0,
     unresolved_position: bool = False,
     unresolved_pending_effect: bool = False,
+    trades_closed: int = 3,
 ) -> dict:
     stream = canonical_sha256({"candidate": candidate_id, "stream": "shared"})
     conservative_exit_cost = 0.2 if unresolved_position else 0.0
@@ -133,6 +136,7 @@ def _v3_result(
         terminal_exit_cost_percent=conservative_exit_cost,
         unresolved_position=unresolved_position,
         unresolved_pending_effect=unresolved_pending_effect,
+        trades_closed=trades_closed,
     )
     no_cost = _metrics(
         raw_net_r=no_cost_raw_net_r,
@@ -142,6 +146,7 @@ def _v3_result(
         terminal_net_r=no_cost_terminal_net_r,
         unresolved_position=unresolved_position,
         unresolved_pending_effect=unresolved_pending_effect,
+        trades_closed=trades_closed,
     )
     evidence = {
         "schema_version": "temporal_graph_candidate_window_evidence_contract_v1",
@@ -288,6 +293,51 @@ def test_v3_gzip_unresolved_winner_is_terminal_adjusted_before_ranking(
         minimum_trades_per_window=1,
     )
     assert ranked[0]["candidateId"] == "stable"
+
+
+def test_qd_uses_conservative_cost_view_for_quality_while_retaining_no_cost_diagnostics() -> None:
+    candidate = _candidate("cost_drag")
+    record = _window_record(
+        _v3_result(
+            "cost_drag",
+            conservative_raw_net_r=-0.25,
+            no_cost_raw_net_r=1.0,
+            trades_closed=8,
+        )
+    )
+    aggregate = _aggregate_candidate(candidate, [record])
+    objectives = qd_module._objective_row(candidate, aggregate)
+    member = {
+        "candidateId": "cost_drag",
+        "candidate": candidate,
+        "aggregate": aggregate,
+        "descriptor": qd_module.qd_behavior_descriptor(candidate, aggregate),
+        "objectives": objectives,
+        "finiteDataValidity": qd_module._finite_data_validity(
+            aggregate,
+            minimum_total_trades=8,
+            minimum_trades_per_window=4,
+        ),
+        "cappedTradeSupport": 8.0,
+    }
+
+    # The optimistic view remains available to diagnostics, but selection is
+    # governed exclusively by terminal-adjusted research-conservative metrics.
+    assert record["noCostNetR"] == pytest.approx(1.0)
+    assert aggregate["totalNoCostNetR"] == pytest.approx(1.0)
+    assert aggregate["windowRecords"][0]["noCostNetR"] == pytest.approx(1.0)
+    assert aggregate["worstWindowConservativeNetR"] == pytest.approx(-0.25)
+    assert objectives["worstWindowConservativeNetR"] == pytest.approx(-0.25)
+    assert member["finiteDataValidity"]["validForQuality"] is True
+
+    cells = qd_module.select_qd_archive([member])
+    assert cells[0]["qualityEligibleCountBeforeCapacity"] == 0
+    assert cells[0]["members"][0]["archiveLane"] == "negative_novelty"
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="no quality-eligible reproduction members",
+    ):
+        qd_module._reproduction_cells({"cells": cells})
 
 
 def test_v3_completed_no_position_uses_explicit_zero_terminal_valuation() -> None:

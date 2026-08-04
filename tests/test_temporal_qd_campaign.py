@@ -9,7 +9,9 @@ from autoresearch.temporal_discovery_base import (
     TemporalDiscoveryContractError,
     canonical_sha256,
 )
+from autoresearch.lake_window import LakeWindowBinding
 from autoresearch.temporal_qd_campaign import freeze_qd_screening_campaign
+from autoresearch.temporal_search import TemporalSearchContractError, build_authority, materialize_plan
 
 
 def _write(path: Path, value: dict) -> None:
@@ -155,8 +157,13 @@ def test_qd_campaign_refuses_timeframe_child_outside_pre_attested_scope(
     population_path = tmp_path / "population.json"
     template_path = tmp_path / "template.json"
     catalog_path = tmp_path / "catalog.json"
+    template = _template()
+    template["candidates"][0]["windowInputs"][0]["evidencePlan"]["coverage_policy"] = "require_complete"
+    template["candidates"][0]["windowInputs"][0]["evidencePlan"]["plan_id"] = canonical_sha256(
+        template["candidates"][0]["windowInputs"][0]["evidencePlan"]
+    )
     _write(population_path, population)
-    _write(template_path, _template())
+    _write(template_path, template)
     _write(catalog_path, _catalog())
 
     with pytest.raises(
@@ -224,3 +231,70 @@ def test_qd_campaign_rejects_abbreviated_profile_when_catalog_padding_exceeds_bi
             execution_engine_commit="a" * 40,
             construction_catalog_path=catalog_path,
         )
+
+
+def test_qd_campaign_materializes_native_v3_bidirectional_candidate_without_weakening_evidence(
+    tmp_path: Path,
+) -> None:
+    """The generic task authority transports, but does not reinterpret, v3."""
+
+    profile = _profile()
+    profile["version"] = "v3"
+    profile["directionMode"] = "both"
+    profile["graph"] = {
+        "entryArbitration": {
+            "modules": [
+                {"direction": "long", "sourceProfileSnapshotSha256": "sha256:" + "a" * 64},
+                {"direction": "short", "sourceProfileSnapshotSha256": "sha256:" + "b" * 64},
+            ]
+        }
+    }
+    population = {
+        "schemaVersion": "temporal_discovery_population_v2",
+        "candidateCount": 1,
+        "candidates": [{
+            "candidateId": "native-v3-both",
+            "sourceProfile": profile,
+            "sourceProfileSha256": canonical_sha256(profile),
+            "programSha256": "sha256:" + "c" * 64,
+        }],
+    }
+    population["populationSha256"] = canonical_sha256(population)
+    population_path = tmp_path / "population.json"
+    template_path = tmp_path / "template.json"
+    catalog_path = tmp_path / "catalog.json"
+    template = _template()
+    template["candidates"][0]["windowInputs"][0]["evidencePlan"]["coverage_policy"] = "require_complete"
+    template["candidates"][0]["windowInputs"][0]["evidencePlan"]["plan_id"] = canonical_sha256(
+        template["candidates"][0]["windowInputs"][0]["evidencePlan"]
+    )
+    _write(population_path, population)
+    _write(template_path, template)
+    _write(catalog_path, _catalog())
+
+    result = freeze_qd_screening_campaign(
+        population_path=population_path,
+        template_preparation_path=template_path,
+        output_root=tmp_path / "campaign",
+        execution_engine_commit="a" * 40,
+        construction_catalog_path=catalog_path,
+    )
+    preparation_payload = json.loads((tmp_path / "campaign" / "preparation.json").read_text(encoding="utf-8"))
+    authority = build_authority(preparation_payload)
+    manifest = materialize_plan(authority, tmp_path / "materialized")
+    assert manifest["authorityId"] == result["authorityId"]
+    task = manifest["tasks"][0]["payload"]
+    assert task["inline_profile_snapshot"] == profile
+    assert task["required_worker_contract_hash"] == template["workerContract"]["workerContractSha256"]
+    assert LakeWindowBinding.model_validate(task["evidence_plan"]["lake_window_binding"]) == LakeWindowBinding.model_validate(
+        template["candidates"][0]["windowInputs"][0]["evidencePlan"]["lake_window_binding"]
+    )
+
+    rejected = json.loads((tmp_path / "campaign" / "preparation.json").read_text(encoding="utf-8"))
+    for direction in ("long", None):
+        bad = json.loads(json.dumps(rejected))
+        candidate = bad["candidates"][0]
+        candidate["sourceProfile"]["directionMode"] = direction
+        candidate["sourceProfileSha256"] = canonical_sha256(candidate["sourceProfile"])
+        with pytest.raises(TemporalSearchContractError, match="v3 source profile must use directionMode=both"):
+            build_authority(bad)

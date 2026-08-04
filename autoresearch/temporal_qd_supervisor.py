@@ -31,18 +31,27 @@ from .temporal_qd_evolution import (
     QD_POLICY,
     QD_POLICY_NAME,
     QD_POLICY_SHA256,
+    QD_POPULATION_SCHEMA,
     QD_VERSION,
     _identity_payload,
     _load_archive,
     _load_entries,
+    _parent_member_order,
+    _quality_member,
     _normalize_parameters,
     _read,
     build_qd_archive,
     generate_qd_generation,
     qd_construction_operator_policy,
     qd_predeclared_evidence_context,
+    qd_canonical_evidence_identity,
 )
 from .temporal_qd_funnel_adapter import build_qd_generation_funnel
+from .temporal_qd_evidence_ladder import (
+    build_evidence_ladder,
+    validate_template_discovery_windows,
+    validate_template_stage_window,
+)
 from .temporal_generation_funnel import (
     GenerationFunnelContractError,
     supervisor_funnel_snapshot,
@@ -412,16 +421,17 @@ def _results_descriptor(
     return descriptor
 
 
-def _capture_generation_artifacts(
-    *, root: Path, generation_index: int, generation_funnel_enabled: bool = False
+def _capture_screening_artifacts(
+    *,
+    population_path: Path,
+    archive_path: Path,
+    campaign_root: Path,
+    generation_index: int,
+    label: str,
 ) -> dict[str, Any]:
-    generation_root = root / "generations" / f"generation-{generation_index:04d}"
-    proposal_root = generation_root / "proposal"
-    campaign_root = generation_root / "campaign"
+    """Reopen the immutable outputs common to every frozen screening campaign."""
+
     result_root = campaign_root / "screening-run"
-    population_path = proposal_root / "population.json"
-    journal_path = proposal_root / "generation-journal.json"
-    archive_path = generation_root / "archive.json"
     preparation_path = campaign_root / "preparation.json"
     authority_path = campaign_root / "authority.json"
     identity_path = campaign_root / "evaluation-identity.json"
@@ -431,29 +441,29 @@ def _capture_generation_artifacts(
     checkpoint_path = result_root / "checkpoint.json"
     summary_path = result_root / "summary.json"
 
-    population = _canonical_file(population_path, name="QD generation population")
-    journal = _canonical_file(journal_path, name="QD generation journal")
-    archive = _canonical_file(archive_path, name="QD generation archive")
-    preparation = _canonical_file(preparation_path, name="QD campaign preparation")
-    authority = _canonical_file(authority_path, name="QD campaign authority")
-    evaluation_identity = _canonical_file(identity_path, name="QD evaluation identity")
-    campaign = _canonical_file(campaign_path, name="QD campaign")
-    task_manifest = _canonical_file(task_manifest_path, name="QD task manifest")
-    result_authority = _canonical_file(result_authority_path, name="QD result authority")
-    checkpoint = _canonical_file(checkpoint_path, name="QD evaluation checkpoint")
-    summary = _canonical_file(summary_path, name="QD evaluation summary")
+    population = _canonical_file(population_path, name=f"{label} population")
+    archive = _canonical_file(archive_path, name=f"{label} archive")
+    preparation = _canonical_file(preparation_path, name=f"{label} preparation")
+    authority = _canonical_file(authority_path, name=f"{label} authority")
+    evaluation_identity = _canonical_file(identity_path, name=f"{label} evaluation identity")
+    campaign = _canonical_file(campaign_path, name=f"{label} campaign")
+    task_manifest = _canonical_file(task_manifest_path, name=f"{label} task manifest")
+    result_authority = _canonical_file(result_authority_path, name=f"{label} result authority")
+    checkpoint = _canonical_file(checkpoint_path, name=f"{label} checkpoint")
+    summary = _canonical_file(
+        summary_path,
+        name="QD evaluation summary" if label == "QD generation" else f"{label} summary",
+    )
 
     if int(population.get("generationIndex", -1)) != generation_index:
-        raise TemporalDiscoveryContractError("generation population index mismatch")
-    if int(journal.get("generationIndex", -1)) != generation_index:
-        raise TemporalDiscoveryContractError("generation journal index mismatch")
+        raise TemporalDiscoveryContractError(f"{label} population index mismatch")
     if int(archive.get("generationIndex", -1)) != generation_index:
-        raise TemporalDiscoveryContractError("generation archive index mismatch")
+        raise TemporalDiscoveryContractError(f"{label} archive index mismatch")
     if int(campaign.get("generationIndex", -1)) != generation_index:
-        raise TemporalDiscoveryContractError("generation campaign index mismatch")
+        raise TemporalDiscoveryContractError(f"{label} campaign index mismatch")
 
     population_sha = _identity_payload(
-        population, "populationSha256", name="QD generation population"
+        population, "populationSha256", name=f"{label} population"
     )
     if campaign.get("populationSha256") != population_sha:
         raise TemporalDiscoveryContractError("QD campaign population binding mismatch")
@@ -505,50 +515,72 @@ def _capture_generation_artifacts(
             population_path,
             population,
             field="populationSha256",
-            name="QD generation population",
-        ),
-        "journal": _self_hashed_descriptor(
-            journal_path,
-            journal,
-            field="journalSha256",
-            name="QD generation journal",
+            name=f"{label} population",
         ),
         "archive": _self_hashed_descriptor(
             archive_path,
             archive,
             field="archiveSha256",
-            name="QD generation archive",
+            name=f"{label} archive",
         ),
         "preparation": _artifact_descriptor(preparation_path, preparation),
         "authority": _self_hashed_descriptor(
             authority_path,
             authority,
             field="authorityId",
-            name="QD campaign authority",
+            name=f"{label} authority",
         ),
         "evaluationIdentity": _self_hashed_descriptor(
             identity_path,
             evaluation_identity,
             field="evaluationIdentitySha256",
-            name="QD evaluation identity",
+            name=f"{label} evaluation identity",
         ),
         "campaign": _self_hashed_descriptor(
             campaign_path,
             campaign,
             field="campaignSha256",
-            name="QD campaign",
+            name=f"{label} campaign",
         ),
         "taskManifest": _artifact_descriptor(task_manifest_path, task_manifest),
         "resultAuthority": _self_hashed_descriptor(
             result_authority_path,
             result_authority,
             field="authorityId",
-            name="QD result authority",
+            name=f"{label} result authority",
         ),
         "checkpoint": _artifact_descriptor(checkpoint_path, checkpoint),
         "summary": _artifact_descriptor(summary_path, summary),
         "results": results,
     }
+    return output
+
+
+def _capture_generation_artifacts(
+    *, root: Path, generation_index: int, generation_funnel_enabled: bool = False
+) -> dict[str, Any]:
+    generation_root = root / "generations" / f"generation-{generation_index:04d}"
+    proposal_root = generation_root / "proposal"
+    campaign_root = generation_root / "campaign"
+    population_path = proposal_root / "population.json"
+    journal_path = proposal_root / "generation-journal.json"
+    archive_path = generation_root / "archive.json"
+    output = _capture_screening_artifacts(
+        population_path=population_path,
+        archive_path=archive_path,
+        campaign_root=campaign_root,
+        generation_index=generation_index,
+        label="QD generation",
+    )
+    journal = _canonical_file(journal_path, name="QD generation journal")
+    if int(journal.get("generationIndex", -1)) != generation_index:
+        raise TemporalDiscoveryContractError("generation journal index mismatch")
+    output["journal"] = _self_hashed_descriptor(
+        journal_path,
+        journal,
+        field="journalSha256",
+        name="QD generation journal",
+    )
     if generation_funnel_enabled:
         funnel_path = generation_root / "generation-funnel.json"
         funnel = _canonical_file(funnel_path, name="QD generation funnel")
@@ -614,6 +646,12 @@ def _validate_generation_artifacts(
     ):
         raise TemporalDiscoveryContractError(
             "completed generation evaluation identity drifted from frozen config"
+        )
+    if config.get("evidenceLadder") is not None and evaluation_identity.get(
+        "evidenceLadder"
+    ) != config.get("evidenceLadder"):
+        raise TemporalDiscoveryContractError(
+            "completed generation evidence ladder drifted from frozen config"
         )
     for field, identity in (
         ("population", "populationSha256"),
@@ -700,6 +738,196 @@ def _validate_completed_generations(
     return records
 
 
+def _validate_evidence_ladder_execution(
+    *, root: Path, state: Mapping[str, Any], config: Mapping[str, Any]
+) -> None:
+    """Reopen the immutable 12m/36m result bundle of a completed ladder run."""
+
+    ladder = config.get("evidenceLadder")
+    if ladder is None:
+        if state.get("evidenceLadderExecution") is not None:
+            raise TemporalDiscoveryContractError(
+                "completed QD supervisor state has an unexpected evidence ladder execution"
+            )
+        return
+    if not isinstance(ladder, Mapping):
+        raise TemporalDiscoveryContractError("QD evidence ladder is invalid")
+    recorded = state.get("evidenceLadderExecution")
+    if not isinstance(recorded, Mapping):
+        raise TemporalDiscoveryContractError(
+            "completed QD supervisor state lacks evidence ladder execution"
+        )
+    execution_path = root / "evidence-ladder" / "execution.json"
+    execution = _canonical_file(execution_path, name="QD evidence ladder execution")
+    if _clone(execution, name="QD evidence ladder execution") != _clone(
+        recorded, name="completed QD evidence ladder execution"
+    ):
+        raise TemporalDiscoveryContractError(
+            "completed QD evidence ladder execution disagrees with state"
+        )
+    supplied_execution_sha = _sha256(
+        execution.get("executionSha256"), name="QD evidence ladder execution"
+    )
+    material = _clone(execution, name="QD evidence ladder execution")
+    material.pop("executionSha256", None)
+    if canonical_sha256(material) != supplied_execution_sha:
+        raise TemporalDiscoveryContractError("QD evidence ladder execution identity mismatch")
+    if execution.get("schemaVersion") != "temporal_qd_evidence_ladder_execution_result_v1":
+        raise TemporalDiscoveryContractError("QD evidence ladder execution schema is invalid")
+    if execution.get("evidenceLadderSha256") != ladder.get("evidenceLadderSha256"):
+        raise TemporalDiscoveryContractError("QD evidence ladder execution binding drifted")
+    if _clone(execution.get("outerTail"), name="QD evidence ladder execution tail") != _clone(
+        ladder.get("outerTail"), name="frozen QD evidence ladder tail"
+    ):
+        raise TemporalDiscoveryContractError("QD evidence ladder outer-tail binding drifted")
+
+    for stage in ("validation", "scrutiny"):
+        stage_record = execution.get(stage)
+        if not isinstance(stage_record, Mapping):
+            raise TemporalDiscoveryContractError(
+                f"QD evidence ladder {stage} stage record is invalid"
+            )
+        stage_root = root / "evidence-ladder" / stage
+        expected_paths = {
+            "populationPath": stage_root / "population.json",
+            "campaignPath": stage_root / "campaign" / "campaign.json",
+            "archivePath": stage_root / "archive.json",
+        }
+        for field, expected_path in expected_paths.items():
+            supplied_path = Path(str(stage_record.get(field) or ""))
+            if supplied_path.resolve() != expected_path.resolve():
+                raise TemporalDiscoveryContractError(
+                    f"QD evidence ladder {stage} {field} is not bound to its run root"
+                )
+        recorded_artifacts = stage_record.get("artifacts")
+        if not isinstance(recorded_artifacts, Mapping):
+            raise TemporalDiscoveryContractError(
+                f"QD evidence ladder {stage} lacks its immutable artifact ledger"
+            )
+        current_artifacts = _capture_screening_artifacts(
+            population_path=expected_paths["populationPath"],
+            archive_path=expected_paths["archivePath"],
+            campaign_root=stage_root / "campaign",
+            generation_index=0,
+            label=f"QD {stage} ladder",
+        )
+        if _clone(current_artifacts, name=f"QD {stage} ladder artifacts") != _clone(
+            recorded_artifacts, name=f"recorded QD {stage} ladder artifacts"
+        ):
+            raise TemporalDiscoveryContractError(
+                f"QD evidence ladder {stage} artifact ledger drifted from immutable outputs"
+            )
+        population = _canonical_file(
+            expected_paths["populationPath"], name=f"QD {stage} ladder population"
+        )
+        campaign = _canonical_file(
+            expected_paths["campaignPath"], name=f"QD {stage} ladder campaign"
+        )
+        archive = _canonical_file(
+            expected_paths["archivePath"], name=f"QD {stage} ladder archive"
+        )
+        population_sha = _identity_payload(
+            population, "populationSha256", name=f"QD {stage} ladder population"
+        )
+        campaign_sha = _identity_payload(
+            campaign, "campaignSha256", name=f"QD {stage} ladder campaign"
+        )
+        archive_sha = _identity_payload(
+            archive, "archiveSha256", name=f"QD {stage} ladder archive"
+        )
+        if (
+            stage_record.get("populationSha256") != population_sha
+            or stage_record.get("campaignSha256") != campaign_sha
+            or stage_record.get("archiveSha256") != archive_sha
+        ):
+            raise TemporalDiscoveryContractError(
+                f"QD evidence ladder {stage} artifact identity drifted"
+            )
+        if (
+            campaign.get("populationSha256") != population_sha
+            or archive.get("populationSha256") != population_sha
+        ):
+            raise TemporalDiscoveryContractError(
+                f"QD evidence ladder {stage} population binding drifted"
+            )
+        candidate_count = int(stage_record.get("candidateCount") or -1)
+        if (
+            candidate_count < 1
+            or candidate_count != int(population.get("candidateCount") or -1)
+            or candidate_count != int(campaign.get("candidateCount") or -1)
+        ):
+            raise TemporalDiscoveryContractError(
+                f"QD evidence ladder {stage} candidate count drifted"
+            )
+
+
+def _continuation_binding(
+    source_run_root: Path | str, *, _seen_roots: frozenset[Path] = frozenset()
+) -> dict[str, Any]:
+    """Read a completed four-generation source without changing its state."""
+
+    root = Path(source_run_root).resolve()
+    if root in _seen_roots:
+        raise TemporalDiscoveryContractError("QD continuation chain contains a cycle")
+    config = _canonical_file(root / "config.json", name="QD continuation source config")
+    config_sha = _sha256(config.get("configSha256"), name="QD continuation source config")
+    material = _clone(config, name="QD continuation source config")
+    material.pop("configSha256", None)
+    if canonical_sha256(material) != config_sha:
+        raise TemporalDiscoveryContractError("QD continuation source config identity mismatch")
+    plan = config.get("generationPlan") or {}
+    source_first = int(plan.get("firstGenerationIndex") or -1)
+    source_count = int(plan.get("generationCount") or -1)
+    if source_first < 1 or source_count != 4:
+        raise TemporalDiscoveryContractError("QD continuation source must be a completed four-generation campaign")
+    source_last = source_first + source_count - 1
+    state = _load_state(root / "state.json", config_sha256=config_sha)
+    if state.get("status") != "completed":
+        raise TemporalDiscoveryContractError("QD continuation source campaign is not completed")
+    completed = _validate_completed_generations(root=root, state=state, config=config)
+    _validate_evidence_ladder_execution(root=root, state=state, config=config)
+    expected_generations = set(range(source_first, source_last + 1))
+    if set(completed) != expected_generations:
+        raise TemporalDiscoveryContractError(
+            "QD continuation source lacks its immutable contiguous four-generation campaign"
+        )
+    latest = completed[source_last]
+    archive_path = Path(str(latest.get("archivePath") or ""))
+    if not archive_path.is_file():
+        raise TemporalDiscoveryContractError("QD continuation source archive is missing")
+    prior = config.get("continuationFrom")
+    prior_binding: dict[str, Any] | None = None
+    if prior is not None:
+        if not isinstance(prior, Mapping):
+            raise TemporalDiscoveryContractError("QD continuation prior-chain binding is invalid")
+        prior_binding = _continuation_binding(
+            str(prior.get("sourceRunRoot") or ""),
+            _seen_roots=_seen_roots | frozenset({root}),
+        )
+        if _clone(prior_binding, name="reopened prior QD continuation binding") != _clone(
+            prior, name="frozen prior QD continuation binding"
+        ):
+            raise TemporalDiscoveryContractError("QD continuation prior chain drifted")
+    return {
+        "schemaVersion": "temporal_qd_generation_continuation_v1",
+        "sourceRunRoot": str(root),
+        "sourceConfigSha256": config_sha,
+        "sourceStateSha256": state["stateSha256"],
+        "sourceFirstGenerationIndex": source_first,
+        "sourceLastGenerationIndex": source_last,
+        "sourceArchivePath": str(archive_path.resolve()),
+        "sourceArchiveSha256": latest["archiveSha256"],
+        "nextImmigrantContinuationOrdinal": latest["nextImmigrantContinuationOrdinal"],
+        **(
+            {
+                "priorContinuationFrom": prior_binding
+            }
+            if prior_binding is not None
+            else {}
+        ),
+    }
+
+
 def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
     """Reopen every path-backed source before each phase can consume it."""
 
@@ -708,6 +936,13 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
     material.pop("configSha256", None)
     if canonical_sha256(material) != expected_config_sha:
         raise TemporalDiscoveryContractError("QD supervisor frozen config identity mismatch")
+    continuation = config.get("continuationFrom")
+    if continuation is not None:
+        if not isinstance(continuation, Mapping) or _clone(
+            _continuation_binding(str(continuation.get("sourceRunRoot") or "")),
+            name="reopened QD continuation binding",
+        ) != _clone(continuation, name="frozen QD continuation binding"):
+            raise TemporalDiscoveryContractError("QD continuation source drifted")
 
     archive_binding = config.get("initialArchive")
     if not isinstance(archive_binding, Mapping):
@@ -793,6 +1028,20 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
         raise TemporalDiscoveryContractError(
             "QD supervisor predeclared evidence identity drifted"
         )
+    ladder = config.get("evidenceLadder")
+    ladder_execution = config.get("evidenceLadderExecution")
+    if ladder is not None:
+        validate_template_discovery_windows(template, ladder)
+        if not isinstance(ladder_execution, Mapping):
+            raise TemporalDiscoveryContractError("QD evidence ladder execution binding is invalid")
+        for stage in ("validation", "scrutiny"):
+            binding = ladder_execution.get(stage + "Template")
+            if not isinstance(binding, Mapping):
+                raise TemporalDiscoveryContractError(f"QD {stage} ladder template binding is invalid")
+            stage_template = _canonical_file(Path(str(binding.get("path") or "")), name=f"QD {stage} ladder template")
+            if canonical_sha256(stage_template) != binding.get("sha256"):
+                raise TemporalDiscoveryContractError(f"QD {stage} ladder template drifted")
+            validate_template_stage_window(stage_template, ladder, stage=stage)
 
     return command
 
@@ -819,6 +1068,8 @@ def _frozen_config(
     generation_funnel_enabled: bool = False,
     construction_catalog_path: Path | str | None = None,
     bidirectional_pair_config: Mapping[str, Any] | None = None,
+    evidence_ladder_config: Mapping[str, Any] | None = None,
+    continuation_from: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     if generation_count < 1 or first_generation_index < 1:
         raise TemporalDiscoveryContractError(
@@ -836,12 +1087,38 @@ def _frozen_config(
     evaluation_target = generation_count * int(
         normalized_parameters["targetUniqueCandidates"]
     )
-    if broad_admission and (generation_count < 4 or evaluation_target < 10_000):
+    if broad_admission and (
+        generation_count != 4
+        or int(normalized_parameters["targetUniqueCandidates"]) != 1024
+        or evidence_ladder_config is None
+    ):
         raise TemporalDiscoveryContractError(
-            "broad admission requires at least four generations and 10,000 unique evaluations"
+            "broad admission requires a frozen evidence ladder and the frozen four-generation x 1,024-candidate contract"
         )
     initial_archive, initial_archive_sha = _load_archive(initial_archive_path)
     template = _read(template_preparation_path, name="QD template preparation")
+    evidence_ladder = (
+        build_evidence_ladder(evidence_ladder_config)
+        if evidence_ladder_config is not None
+        else None
+    )
+    if broad_admission:
+        if evidence_ladder is None:
+            raise TemporalDiscoveryContractError("broad admission requires a frozen evidence ladder")
+        validate_template_discovery_windows(template, evidence_ladder)
+    ladder_execution: dict[str, Any] | None = None
+    if evidence_ladder is not None:
+        validation_path = Path(str(evidence_ladder_config.get("validationTemplatePreparationPath") or ""))
+        scrutiny_path = Path(str(evidence_ladder_config.get("scrutinyTemplatePreparationPath") or ""))
+        validation_template = _read(validation_path, name="QD validation ladder template")
+        scrutiny_template = _read(scrutiny_path, name="QD scrutiny ladder template")
+        validate_template_stage_window(validation_template, evidence_ladder, stage="validation")
+        validate_template_stage_window(scrutiny_template, evidence_ladder, stage="scrutiny")
+        ladder_execution = {
+            "schemaVersion": "temporal_qd_evidence_ladder_execution_v1",
+            "validationTemplate": {"path": str(validation_path.resolve()), "sha256": canonical_sha256(validation_template)},
+            "scrutinyTemplate": {"path": str(scrutiny_path.resolve()), "sha256": canonical_sha256(scrutiny_template)},
+        }
     construction_policy, _construction_registry = qd_construction_operator_policy(
         construction_catalog_path
     )
@@ -873,6 +1150,20 @@ def _frozen_config(
         "policySha256": QD_POLICY_SHA256,
         "frozenPolicy": _clone(QD_POLICY, name="frozen QD policy"),
         "broadAdmission": bool(broad_admission),
+        **(
+            {
+                "broadAdmissionContract": {
+                    "schemaVersion": "temporal_qd_broad_admission_contract_v1",
+                    "generationCount": 4,
+                    "candidatesPerGeneration": 1024,
+                    "candidateEvaluations": 4096,
+                    "discoveryWindowsPerCandidate": 3,
+                    "discoveryWorkerTasks": 12288,
+                }
+            }
+            if broad_admission
+            else {}
+        ),
         "emptyQualityBootstrapPolicy": {
             "enabledByBroadAdmission": bool(broad_admission),
             "activation": "only_when_generation_starts_without_quality_parent_cells",
@@ -903,6 +1194,7 @@ def _frozen_config(
             "generationIndex": int(initial_archive["generationIndex"]),
             "resultSetSha256": initial_archive["resultSetSha256"],
         },
+        **({"continuationFrom": _clone(continuation_from, name="QD continuation binding")} if continuation_from is not None else {}),
         **({
             "immigrantSource": {
                 "sourcePreparationPath": str(source_preparation_path.resolve()), "baseGeneratorRoot": str(base_generator_root.resolve()),
@@ -930,6 +1222,8 @@ def _frozen_config(
                 },
             },
         },
+        **({"evidenceLadder": evidence_ladder} if evidence_ladder is not None else {}),
+        **({"evidenceLadderExecution": ladder_execution} if ladder_execution is not None else {}),
         "generationPlan": {
             "firstGenerationIndex": first_generation_index,
             "generationCount": generation_count,
@@ -998,6 +1292,8 @@ def run_qd_supervisor(
     construction_catalog_path: Path | str | None = None,
     generation_funnel_enabled: bool = False,
     bidirectional_pair_config: Mapping[str, Any] | None = None,
+    evidence_ladder_config: Mapping[str, Any] | None = None,
+    continuation_from: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     root = Path(run_root)
     root.mkdir(parents=True, exist_ok=True)
@@ -1030,10 +1326,14 @@ def run_qd_supervisor(
         generation_funnel_enabled=generation_funnel_enabled,
         construction_catalog_path=construction_catalog_path,
         bidirectional_pair_config=bidirectional_pair_config,
+        evidence_ladder_config=evidence_ladder_config,
+        continuation_from=continuation_from,
     )
     config_path = root / "config.json"
     state_path = root / "state.json"
     _write_once(config_path, config)
+    if config.get("evidenceLadder") is not None:
+        _write_once(root / "evidence-ladder.json", config["evidenceLadder"])
     if state_path.exists():
         state = _load_state(state_path, config_sha256=config["configSha256"])
     else:
@@ -1075,6 +1375,7 @@ def run_qd_supervisor(
             raise TemporalDiscoveryContractError(
                 "completed QD supervisor state misses its frozen evaluation target"
             )
+        _validate_evidence_ladder_execution(root=root, state=state, config=config)
         return {
             "schemaVersion": "temporal_qd_supervisor_result_v3",
             "status": "completed",
@@ -1141,16 +1442,36 @@ def run_qd_supervisor(
             # generation is running and then silently feed a later phase.
             validator_command = _validate_frozen_sources(config)
             generation_kwargs = dict(
-                parent_archive_path=parent_archive_path, source_preparation_path=source_preparation_file,
-                base_generator_root=base_generator_dir, confirmed_entry_admission_root=confirmed_entry_dir,
-                validator_command=validator_command, output_root=proposal_root, generation_index=generation_index,
-                immigrant_continuation_start=immigrant_cursor, allow_empty_quality_bootstrap=bool(config["broadAdmission"]),
-                parameters=config["frozenSearchPolicy"], evidence_identity_context=config["evaluation"]["predeclaredEvidenceContext"],
-                identity_ledger_path=root / "identity-ledger.json", validator_timeout_seconds=float(config["validator"]["timeoutSeconds"]),
-                construction_catalog_path=((config.get("constructionOperatorPolicy") or {}).get("catalog", {}).get("path")),
-                generation_funnel_enabled=bool((config.get("generationFunnel") or {}).get("enabled")),
+                parent_archive_path=parent_archive_path,
+                output_root=proposal_root,
+                generation_index=generation_index,
+                immigrant_continuation_start=immigrant_cursor,
+                allow_empty_quality_bootstrap=bool(config["broadAdmission"]),
+                parameters=config["frozenSearchPolicy"],
+                evidence_identity_context=config["evaluation"]["predeclaredEvidenceContext"],
+                identity_ledger_path=root / "identity-ledger.json",
+                construction_catalog_path=(
+                    (config.get("constructionOperatorPolicy") or {})
+                    .get("catalog", {})
+                    .get("path")
+                ),
+                generation_funnel_enabled=bool(
+                    (config.get("generationFunnel") or {}).get("enabled")
+                ),
             )
             if config.get("bidirectionalPairGeneration") is None:
+                # Legacy generation owns the file-backed source and command
+                # validator contract.  Pair mode has a distinct native
+                # authority and intentionally carries no legacy validator.
+                generation_kwargs.update(
+                    source_preparation_path=source_preparation_file,
+                    base_generator_root=base_generator_dir,
+                    confirmed_entry_admission_root=confirmed_entry_dir,
+                    validator_command=validator_command,
+                    validator_timeout_seconds=float(
+                        config["validator"]["timeoutSeconds"]
+                    ),
+                )
                 generation_result = generate_qd_generation(**generation_kwargs)
             else:
                 with PairAuthorityBundle(config["bidirectionalPairGeneration"]) as pair_authority:
@@ -1182,6 +1503,7 @@ def run_qd_supervisor(
                     .get("catalog", {})
                     .get("path")
                 ),
+                evidence_ladder=config.get("evidenceLadder"),
             )
             evaluation_identity = _read(
                 campaign_root / "evaluation-identity.json",
@@ -1439,6 +1761,17 @@ def run_qd_supervisor(
             raise TemporalDiscoveryContractError(
                 "completed supervisor run does not meet its frozen evaluation target"
             )
+        if config.get("evidenceLadder") is not None:
+            state["stage"] = "evidence_ladder"
+            _save_state(state_path, state)
+            final_archive = Path(
+                completed_by_index[int(config["generationPlan"]["lastGenerationIndex"])][
+                    "archivePath"
+                ]
+            )
+            state["evidenceLadderExecution"] = _run_evidence_ladder(
+                root=root, config=config, client=client, final_archive_path=final_archive
+            )
         state["status"] = "completed"
         state["stage"] = "completed"
         state["completedAt"] = _utc_now()
@@ -1479,10 +1812,174 @@ def run_qd_supervisor(
         client.close()
 
 
+def run_qd_continuation(
+    *,
+    source_run_root: Path | str,
+    run_root: Path | str,
+    generation_count: int = 4,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Seed the next immutable four-generation campaign from a completed source.
+
+    The source is reopened and validated on every new-run resume.  The new
+    campaign has a distinct root/config/state, so it cannot rewrite source
+    generation artifacts even if it is interrupted repeatedly.
+    """
+
+    if generation_count != 4:
+        raise TemporalDiscoveryContractError(
+            "QD continuation requires exactly four generations"
+        )
+    binding = _continuation_binding(source_run_root)
+    return run_qd_supervisor(
+        run_root=run_root,
+        initial_archive_path=binding["sourceArchivePath"],
+        first_generation_index=int(binding["sourceLastGenerationIndex"]) + 1,
+        initial_immigrant_continuation_ordinal=int(
+            binding["nextImmigrantContinuationOrdinal"]
+        ),
+        generation_count=4,
+        continuation_from=binding,
+        **kwargs,
+    )
+
+
+def _ladder_cohort(archive: Mapping[str, Any], *, limit: int) -> list[dict[str, Any]]:
+    """Round-robin quality survivors, retaining each cell's Pareto rank order."""
+
+    buckets = [
+        [
+            _clone(member.get("candidate"), name="QD archive cohort candidate")
+            for member in sorted(
+                (
+                    member
+                    for member in cell.get("members") or []
+                    if isinstance(member, Mapping)
+                    and member.get("archiveLane") == "quality"
+                    and _quality_member(member)
+                    and isinstance(member.get("candidate"), Mapping)
+                ),
+                key=_parent_member_order,
+            )
+        ]
+        for cell in sorted(archive.get("cells") or [], key=lambda item: str(item.get("cellId")))
+        if isinstance(cell, Mapping)
+    ]
+    selected: list[dict[str, Any]] = []
+    while len(selected) < limit and any(buckets):
+        for bucket in buckets:
+            if bucket and len(selected) < limit:
+                selected.append(bucket.pop(0))
+    return selected
+
+
+def _ladder_population(
+    *, candidates: list[dict[str, Any]], template: Mapping[str, Any], config: Mapping[str, Any]
+) -> dict[str, Any]:
+    construction = config.get("constructionOperatorPolicy") or {}
+    catalog_path = construction.get("catalog", {}).get("path")
+    catalog = _read(Path(str(catalog_path)), name="QD ladder construction catalog") if catalog_path else None
+    context = qd_predeclared_evidence_context(
+        template,
+        worker_contract_sha256=config["workerContractSha256"],
+        construction_catalog=catalog,
+        construction_catalog_path=catalog_path,
+    )
+    rebound = []
+    for candidate in candidates:
+        row = _clone(candidate, name="QD ladder candidate")
+        row["canonicalEvidenceIdentitySha256"] = qd_canonical_evidence_identity(row, context)
+        rebound.append(row)
+    output = {
+        "schemaVersion": QD_POPULATION_SCHEMA,
+        "qdVersion": QD_VERSION,
+        "policyName": QD_POLICY_NAME,
+        "policySha256": QD_POLICY_SHA256,
+        "frozenPolicy": _clone(QD_POLICY, name="QD policy"),
+        "generationIndex": 0,
+        "targetUniqueCandidates": len(rebound),
+        "candidateCount": len(rebound),
+        "candidates": sorted(rebound, key=lambda item: str(item["candidateId"])),
+        "authoredValidationBindingRequired": True,
+        "predeclaredEvidenceContextSha256": context["predeclaredEvidenceContextSha256"],
+    }
+    output["populationSha256"] = canonical_sha256(output)
+    return output
+
+
+def _run_evidence_ladder(
+    *, root: Path, config: Mapping[str, Any], client: LabGatewayClient, final_archive_path: Path
+) -> dict[str, Any] | None:
+    ladder = config.get("evidenceLadder")
+    execution = config.get("evidenceLadderExecution")
+    if ladder is None:
+        return None
+    if not isinstance(ladder, Mapping) or not isinstance(execution, Mapping):
+        raise TemporalDiscoveryContractError("QD evidence ladder execution binding is missing")
+    final_archive = _canonical_file(final_archive_path, name="QD discovery archive")
+    ladder_root = root / "evidence-ladder"
+    stages: dict[str, Any] = {"schemaVersion": "temporal_qd_evidence_ladder_execution_result_v1", "evidenceLadderSha256": ladder["evidenceLadderSha256"]}
+    current_candidates = _ladder_cohort(final_archive, limit=int(ladder["validation"]["maxDiverseSurvivorCount"]))
+    if not current_candidates:
+        raise TemporalDiscoveryContractError("QD evidence ladder has no diverse discovery survivors for validation")
+    for stage, limit in (("validation", int(ladder["validation"]["maxDiverseSurvivorCount"])), ("scrutiny", int(ladder["scrutiny"]["maxFinalistCount"]))):
+        template_binding = execution[stage + "Template"]
+        template_path = Path(str(template_binding.get("path") or ""))
+        template = _canonical_file(template_path, name=f"QD {stage} template")
+        if canonical_sha256(template) != template_binding.get("sha256"):
+            raise TemporalDiscoveryContractError(f"QD {stage} template drifted")
+        validate_template_stage_window(template, ladder, stage=stage)
+        candidates = current_candidates[:limit]
+        population = _ladder_population(candidates=candidates, template=template, config=config)
+        stage_root = ladder_root / stage
+        population_path = stage_root / "population.json"
+        _write_once(population_path, population)
+        campaign = freeze_qd_screening_campaign(
+            population_path=population_path,
+            template_preparation_path=template_path,
+            output_root=stage_root / "campaign",
+            execution_engine_commit=config["repositories"]["executionEngineCommit"],
+            worker_contract_sha256=config["workerContractSha256"],
+            construction_catalog_path=(config.get("constructionOperatorPolicy") or {}).get("catalog", {}).get("path"),
+        )
+        authority = _canonical_file(stage_root / "campaign" / "authority.json", name=f"QD {stage} authority")
+        result_root = stage_root / "campaign" / "screening-run"
+        result = run_temporal_search_tasks(client, authority, output_root=result_root, timeout_seconds=float(config["evaluation"]["timeoutSecondsPerGeneration"]), resume=True, enqueue_batch_size=int(config["evaluation"]["enqueueBatchSize"]))
+        if result["completedTaskCount"] != campaign["taskCount"]:
+            raise TemporalDiscoveryContractError(f"QD {stage} evaluation did not complete")
+        archive_path = stage_root / "archive.json"
+        archive_result = build_qd_archive(population_path=population_path, result_root=result_root, output_path=archive_path, generation_index=0, cell_capacity=int(config["frozenSearchPolicy"]["cellCapacity"]), minimum_total_trades=int(config["frozenSearchPolicy"]["minimumTotalTrades"]), minimum_trades_per_window=int(config["frozenSearchPolicy"]["minimumTradesPerWindow"]), cap_trades=int(config["frozenSearchPolicy"]["capTrades"]))
+        artifacts = _capture_screening_artifacts(
+            population_path=population_path,
+            archive_path=archive_path,
+            campaign_root=stage_root / "campaign",
+            generation_index=0,
+            label=f"QD {stage} ladder",
+        )
+        stages[stage] = {
+            "candidateCount": len(candidates),
+            "populationPath": str(population_path.resolve()),
+            "populationSha256": population["populationSha256"],
+            "campaignPath": str((stage_root / "campaign" / "campaign.json").resolve()),
+            "campaignSha256": campaign["campaignSha256"],
+            "archivePath": str(archive_path.resolve()),
+            "archiveSha256": archive_result["archiveSha256"],
+            "artifacts": artifacts,
+        }
+        current_candidates = _ladder_cohort(_canonical_file(archive_path, name=f"QD {stage} archive"), limit=(int(ladder["scrutiny"]["maxFinalistCount"]) if stage == "validation" else limit))
+        if stage == "validation" and not current_candidates:
+            raise TemporalDiscoveryContractError("QD evidence ladder has no validation finalists for scrutiny")
+    stages["outerTail"] = _clone(ladder["outerTail"], name="QD outer tail")
+    stages["executionSha256"] = canonical_sha256(stages)
+    _write_once(ladder_root / "execution.json", stages)
+    return stages
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", type=Path, required=True)
-    parser.add_argument("--initial-archive", type=Path, required=True)
+    parser.add_argument("--initial-archive", type=Path)
+    parser.add_argument("--continue-from", type=Path, help="completed immutable four-generation run root; creates the next separate contiguous four-generation run")
     parser.add_argument("--source-preparation", type=Path)
     parser.add_argument("--base-generator-root", type=Path)
     parser.add_argument("--confirmed-entry-admission-root", type=Path)
@@ -1507,12 +2004,54 @@ def main() -> None:
     parser.add_argument("--enqueue-batch-size", type=int, default=128)
     parser.add_argument("--broad-admission", action="store_true")
     parser.add_argument("--generation-funnel-enabled", action="store_true")
+    parser.add_argument(
+        "--evidence-ladder-config",
+        type=Path,
+        help="closed temporal_qd_evidence_ladder_input_v1 JSON; enables frozen 3m/12m/36m evidence gates",
+    )
     parser.add_argument("--stop-after-generation", type=int)
     parser.add_argument("--bidirectional-pair-config", type=Path, help="closed temporal_qd_bidirectional_pair_run_config_v1 JSON; opt-in only")
     args = parser.parse_args()
     if args.bidirectional_pair_config is None and any(value is None for value in (args.source_preparation, args.base_generator_root, args.confirmed_entry_admission_root, args.validator_command_file)):
         parser.error("legacy mode requires --source-preparation, --base-generator-root, --confirmed-entry-admission-root, and --validator-command-file")
     parameters = _read(args.parameters, name="QD supervisor parameters")
+    if args.continue_from is not None:
+        if args.initial_archive is not None:
+            parser.error("--continue-from derives the source campaign's immutable final archive; do not also pass --initial-archive")
+        result = run_qd_continuation(
+            source_run_root=args.continue_from,
+            run_root=args.run_root,
+            generation_count=args.generation_count,
+            source_preparation_path=args.source_preparation,
+            base_generator_root=args.base_generator_root,
+            confirmed_entry_admission_root=args.confirmed_entry_admission_root,
+            template_preparation_path=args.template_preparation,
+            validator_command_file=args.validator_command_file,
+            parameters=parameters,
+            autoresearch_commit=args.autoresearch_commit,
+            execution_engine_commit=args.execution_engine_commit,
+            worker_contract_sha256=args.worker_contract_sha256,
+            gateway_url=args.gateway_url,
+            gateway_token=args.gateway_token or load_lab_gateway_token(create=False),
+            evaluation_timeout_seconds=args.evaluation_timeout_seconds,
+            enqueue_batch_size=args.enqueue_batch_size,
+            broad_admission=args.broad_admission,
+            stop_after_generation=args.stop_after_generation,
+            construction_catalog_path=args.construction_catalog,
+            generation_funnel_enabled=args.generation_funnel_enabled,
+            bidirectional_pair_config=(
+                _read(args.bidirectional_pair_config, name="bidirectional pair run config")
+                if args.bidirectional_pair_config is not None else None
+            ),
+            evidence_ladder_config=(
+                _read(args.evidence_ladder_config, name="QD evidence ladder config")
+                if args.evidence_ladder_config is not None else None
+            ),
+        )
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return
+    if args.initial_archive is None:
+        parser.error("--initial-archive is required unless --continue-from is used")
     result = run_qd_supervisor(
         run_root=args.run_root,
         initial_archive_path=args.initial_archive,
@@ -1540,6 +2079,11 @@ def main() -> None:
             _read(args.bidirectional_pair_config, name="bidirectional pair run config")
             if args.bidirectional_pair_config is not None else None
         ),
+        evidence_ladder_config=(
+            _read(args.evidence_ladder_config, name="QD evidence ladder config")
+            if args.evidence_ladder_config is not None
+            else None
+        ),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
@@ -1548,4 +2092,4 @@ if __name__ == "__main__":
     main()
 
 
-__all__ = ["run_qd_supervisor"]
+__all__ = ["run_qd_continuation", "run_qd_supervisor"]

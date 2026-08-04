@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+import random
 from typing import Any, Protocol
 
 from .temporal_bidirectional_genome import (
@@ -32,6 +33,34 @@ from .temporal_discovery_base import TemporalDiscoveryContractError
 
 PAIR_GENERATION_SCHEMA = "temporal_qd_pair_generation_v1"
 PAIR_PROPOSAL_SCHEMA = "temporal_qd_pair_proposal_v1"
+CROSSOVER_PROPOSAL_KIND = "temporal_qd_same_side_crossover_v1"
+PAIR_EXECUTABLE_SEMANTIC_RECORD_SCHEMA = "temporal_qd_pair_executable_semantic_record_v1"
+DEFAULT_MAX_PROPOSAL_ATTEMPTS = 20_000
+
+
+def _unbiased_choice(seed: str, *, size: int) -> int:
+    """Hash/rejection-sample a uniform finite bucket without modulo bias."""
+
+    if size < 1:
+        raise TemporalDiscoveryContractError("pair selection bucket size must be positive")
+    limit = (1 << 256) - ((1 << 256) % size)
+    attempt = 0
+    while True:
+        value = int(canonical_sha256({"seed": seed, "attempt": attempt})[7:], 16)
+        if value < limit:
+            return value % size
+        attempt += 1
+
+
+def _mutation_depth_from_bucket(bucket: int) -> int:
+    if not 0 <= bucket < 20:
+        raise TemporalDiscoveryContractError("pair mutation depth bucket is outside 0..19")
+    return 1 if bucket < 14 else 2 if bucket < 19 else 3
+
+
+def _mutation_depth_for_seed(seed: str) -> int:
+    # Twenty equiprobable buckets encode exactly 14/5/1 = 70/25/5.
+    return _mutation_depth_from_bucket(_unbiased_choice(seed, size=20))
 
 
 def _pair_genome_semantic_sha256(pair: FrozenPair) -> str:
@@ -94,7 +123,9 @@ class TypedGrammarPairOperator:
     def _program(module: FrozenModule, program: Mapping[str, Any] | None = None) -> Any:
         from .temporal_typed_motif_grammar import Fragment, ModuleProgram
 
-        raw = dict(program or module.program)
+        # FrozenModule intentionally stores recursive MappingProxy/tuple
+        # values.  Grammar construction needs ordinary JSON containers.
+        raw = _mutable(program) if program is not None else module.canonical_payload()["program"]
         if raw.get("direction") != module.direction or not isinstance(raw.get("fragments"), list):
             raise TemporalDiscoveryContractError("typed pair module program is not exact")
         fragments = tuple(Fragment(f"replay_{index}", str(item["productionId"]), dict(item["resources"]), dict(item["choices"])) for index, item in enumerate(raw["fragments"]))
@@ -110,7 +141,20 @@ class TypedGrammarPairOperator:
 
     @staticmethod
     def _freeze(template: FrozenModule, *, program: Mapping[str, Any], profile: Mapping[str, Any], report: Mapping[str, Any], lineage: Sequence[Mapping[str, Any]]) -> FrozenModule:
-        return FrozenModule.freeze(program=program, profile=profile, grammar_context=template.grammar_context, catalog=template.catalog, policy=template.policy, native_authority=template.native_authority, native_report=report, lineage=lineage)
+        # Side-local indicator operations preserve the parent's typed program.
+        # That program is stored frozen, while ``FrozenModule.freeze`` accepts
+        # canonical JSON containers only.  Thaw all boundary values so a
+        # frozen snapshot can be safely rebound after native validation.
+        return FrozenModule.freeze(
+            program=_mutable(program),
+            profile=_mutable(profile),
+            grammar_context=template.grammar_context,
+            catalog=template.catalog,
+            policy=template.policy,
+            native_authority=template.native_authority,
+            native_report=_mutable(report),
+            lineage=_mutable(lineage),
+        )
 
     def grammar_plans(self, module: FrozenModule) -> Sequence[Mapping[str, Any]]:
         return self._grammar(module).enumerate_operations(self._program(module))
@@ -129,17 +173,18 @@ class TypedGrammarPairOperator:
 
     def indicator_plans(self, module: FrozenModule) -> Sequence[Mapping[str, Any]]:
         registry = self._registry(module)
-        return [] if registry is None else registry.enumerate_plans(module.profile)
+        return [] if registry is None else registry.enumerate_plans(module.canonical_payload()["profile"])
 
     def apply_indicator(self, module: FrozenModule, plan: Mapping[str, Any], *, candidate_id: str) -> tuple[FrozenModule, Mapping[str, Any]]:
         registry = self._registry(module)
         if registry is None:
             raise TemporalDiscoveryContractError("indicator learning registry is not frozen for this pair run")
         operator = registry.get(str(plan.get("operatorId") or ""))
-        preview = operator.preview(module.profile, plan)
+        source_profile = module.canonical_payload()["profile"]
+        preview = operator.preview(source_profile, plan)
         report = self._native_validator.validate_v2(profile=preview, candidate_id=candidate_id)
         child_program = report.get("programSha256")
-        child, application = operator.apply(module.profile, plan, parent_validated_program_sha256=module.native_program_sha256, child_validated_program_sha256=child_program)
+        child, application = operator.apply(source_profile, plan, parent_validated_program_sha256=module.native_program_sha256, child_validated_program_sha256=child_program)
         if child != preview:
             raise TemporalDiscoveryContractError("indicator-learning preview/application diverged")
         frozen = self._freeze(module, program=module.program, profile=child, report=report, lineage=[*[_clone(item) for item in module.lineage], {"operation": "indicator_learning", "side": module.direction, "plan": _clone(plan), "planSha256": plan.get("planSha256"), "application": _clone(application)}])
@@ -171,7 +216,21 @@ class TypedGrammarPairOperator:
 
 
 def _clone(value: Any) -> Any:
-    return __import__("json").loads(canonical_json(value))
+    # ``FrozenModule`` deliberately stores its persisted material as recursive
+    # MappingProxyType/tuple values.  Proposal operators extend that immutable
+    # lineage, so cloning must first thaw the snapshot representation without
+    # changing its canonical JSON identity.
+    return __import__("json").loads(canonical_json(_mutable(value)))
+
+
+def _mutable(value: Any) -> Any:
+    """Recursively thaw frozen snapshot containers without changing identity."""
+
+    if isinstance(value, Mapping):
+        return {str(key): _mutable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_mutable(item) for item in value]
+    return value
 
 
 def _sorted(plans: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -299,6 +358,69 @@ def propose_pair(
         return None, payload
 
 
+def _propose_pair_sequence(
+    *,
+    proposal_seed: str,
+    parent: FrozenPair,
+    mutation_depth: int,
+    module_authority: PairModuleOperator,
+    native_validator: NativeModuleValidator,
+    pair_compiler: CanonicalPairCompiler,
+    parent_selection: Mapping[str, Any] | None = None,
+    replay_steps: Sequence[Mapping[str, Any]] | None = None,
+) -> tuple[FrozenPair | None, dict[str, Any]]:
+    """Apply 1..3 side-local operations as one replayable offspring."""
+
+    if mutation_depth not in (1, 2, 3):
+        raise TemporalDiscoveryContractError("pair mutation depth must be 1, 2, or 3")
+    if replay_steps is not None:
+        if not replay_steps:
+            raise TemporalDiscoveryContractError("pair multi-operation replay has no stored steps")
+        if len(replay_steps) > mutation_depth:
+            raise TemporalDiscoveryContractError("pair multi-operation replay has more steps than its planned mutation depth")
+    root = FrozenPair.from_payload(parent.canonical_payload())
+    current = root
+    steps: list[dict[str, Any]] = []
+    step_count = len(replay_steps) if replay_steps is not None else mutation_depth
+    for index in range(step_count):
+        step_seed = canonical_sha256({"proposalSeed": proposal_seed, "mutationStep": index, "parentPairIdentitySha256": current.identity_sha256})
+        if replay_steps is not None and not isinstance(replay_steps[index], Mapping):
+            raise TemporalDiscoveryContractError("pair multi-operation replay step is not an object")
+        operation = None if replay_steps is None else replay_steps[index].get("operation")
+        child, step = propose_pair(
+            proposal_seed=step_seed,
+            parent=current,
+            pair_factory=None,
+            module_authority=module_authority,
+            native_validator=native_validator,
+            pair_compiler=pair_compiler,
+            replay_operation=operation,
+        )
+        steps.append(step)
+        if child is None:
+            if replay_steps is not None and index + 1 != step_count:
+                raise TemporalDiscoveryContractError("pair multi-operation replay has stored steps after a terminal disposition")
+            payload = {"schemaVersion": PAIR_PROPOSAL_SCHEMA, "proposalSeed": proposal_seed, "originKind": "structural_offspring", "side": step["side"], "parentPair": root.canonical_payload(), "parentPairIdentitySha256": root.identity_sha256, "mutationDepth": mutation_depth, "mutationSteps": steps, "disposition": "operation_rejected", **({"parentSelection": _clone(parent_selection)} if parent_selection is not None else {})}
+            payload["proposalSha256"] = canonical_sha256(payload)
+            return None, payload
+        if _pair_genome_semantic_sha256(child) == _pair_genome_semantic_sha256(current):
+            if replay_steps is not None and index + 1 != step_count:
+                raise TemporalDiscoveryContractError("pair multi-operation replay has stored steps after a terminal disposition")
+            payload = {"schemaVersion": PAIR_PROPOSAL_SCHEMA, "proposalSeed": proposal_seed, "originKind": "structural_offspring", "side": step["side"], "parentPair": root.canonical_payload(), "parentPairIdentitySha256": root.identity_sha256, "mutationDepth": mutation_depth, "mutationSteps": steps, "disposition": "no_op_proposal", **({"parentSelection": _clone(parent_selection)} if parent_selection is not None else {})}
+            payload["proposalSha256"] = canonical_sha256(payload)
+            return None, payload
+        current = child
+    if replay_steps is not None and step_count < mutation_depth:
+        raise TemporalDiscoveryContractError("pair multi-operation replay is truncated before a terminal disposition")
+    if _pair_genome_semantic_sha256(current) == _pair_genome_semantic_sha256(root):
+        payload = {"schemaVersion": PAIR_PROPOSAL_SCHEMA, "proposalSeed": proposal_seed, "originKind": "structural_offspring", "side": steps[-1]["side"], "parentPair": root.canonical_payload(), "parentPairIdentitySha256": root.identity_sha256, "mutationDepth": mutation_depth, "mutationSteps": steps, "disposition": "no_op_proposal", **({"parentSelection": _clone(parent_selection)} if parent_selection is not None else {})}
+        payload["proposalSha256"] = canonical_sha256(payload)
+        return None, payload
+    payload = {"schemaVersion": PAIR_PROPOSAL_SCHEMA, "proposalSeed": proposal_seed, "originKind": "structural_offspring", "side": steps[-1]["side"], "parentPair": root.canonical_payload(), "parentPairIdentitySha256": root.identity_sha256, "mutationDepth": mutation_depth, "mutationSteps": steps, "disposition": "materialized", "pair": current.canonical_payload(), "pairIdentitySha256": current.identity_sha256, **({"parentSelection": _clone(parent_selection)} if parent_selection is not None else {})}
+    payload["proposalSha256"] = canonical_sha256(payload)
+    return current, payload
+
+
 def propose_same_side_crossover(*, proposal_seed: str, parent: FrozenPair, mate: FrozenPair, module_authority: PairModuleOperator, pair_compiler: CanonicalPairCompiler) -> tuple[FrozenPair, dict[str, Any]]:
     """Cross only matching long↔long or short↔short modules, deterministically."""
     seed, side = str(proposal_seed), proposal_side(proposal_seed)
@@ -322,6 +444,74 @@ def propose_same_side_crossover(*, proposal_seed: str, parent: FrozenPair, mate:
     return pair, audit
 
 
+def _propose_crossover(
+    *,
+    proposal_seed: str,
+    parent: FrozenPair,
+    mate: FrozenPair,
+    module_authority: PairModuleOperator,
+    pair_compiler: CanonicalPairCompiler,
+    parent_selection: Mapping[str, Any] | None,
+    mate_selection: Mapping[str, Any] | None,
+    mate_selection_attempts: Sequence[Mapping[str, Any] | None],
+) -> tuple[FrozenPair | None, dict[str, Any]]:
+    """Build every crossover disposition from the same replayable operator kind."""
+
+    base = {
+        "schemaVersion": PAIR_PROPOSAL_SCHEMA,
+        "proposalKind": CROSSOVER_PROPOSAL_KIND,
+        "proposalSeed": proposal_seed,
+        "originKind": "structural_offspring",
+        "side": proposal_side(proposal_seed),
+        "parentPair": parent.canonical_payload(),
+        "parentPairIdentitySha256": parent.identity_sha256,
+        "matePair": mate.canonical_payload(),
+        "matePairIdentitySha256": mate.identity_sha256,
+        "parentSelection": _clone(parent_selection) if parent_selection is not None else None,
+        "mateSelection": _clone(mate_selection) if mate_selection is not None else None,
+        "mateSelectionAttempts": [_clone(item) if item is not None else None for item in mate_selection_attempts],
+    }
+    try:
+        pair, audit = propose_same_side_crossover(
+            proposal_seed=proposal_seed,
+            parent=parent,
+            mate=mate,
+            module_authority=module_authority,
+            pair_compiler=pair_compiler,
+        )
+    except (BidirectionalGenomeError, TemporalDiscoveryContractError) as exc:
+        payload = {
+            **base,
+            "disposition": "operation_rejected",
+            "rejection": {
+                "schemaVersion": "temporal_qd_pair_rejection_audit_v1",
+                "reasonCode": "crossover_rejected",
+                "exceptionType": type(exc).__name__,
+            },
+        }
+        payload["proposalSha256"] = canonical_sha256(payload)
+        return None, payload
+
+    disposition = (
+        "no_op_proposal"
+        if _pair_genome_semantic_sha256(pair) == _pair_genome_semantic_sha256(parent)
+        else "materialized"
+    )
+    payload = {
+        **base,
+        "side": audit["side"],
+        "disposition": disposition,
+        "crossoverAudit": audit,
+        **(
+            {"pair": pair.canonical_payload(), "pairIdentitySha256": pair.identity_sha256}
+            if disposition == "materialized"
+            else {}
+        ),
+    }
+    payload["proposalSha256"] = canonical_sha256(payload)
+    return (pair if disposition == "materialized" else None), payload
+
+
 def replay_pair_proposal(*, payload: Mapping[str, Any], module_authority: PairModuleOperator, native_validator: NativeModuleValidator, pair_compiler: CanonicalPairCompiler) -> FrozenPair | None:
     """Replay only persisted material; factories/catalog aliases are never read."""
     data = _clone(payload)
@@ -333,7 +523,36 @@ def replay_pair_proposal(*, payload: Mapping[str, Any], module_authority: PairMo
         if pair.identity_sha256 != data.get("pairIdentitySha256"):
             raise TemporalDiscoveryContractError("pair immigrant journal identity mismatch")
         return pair
+    if "mutationSteps" in data:
+        parent = FrozenPair.from_payload(data["parentPair"])
+        pair, replayed = _propose_pair_sequence(
+            proposal_seed=data["proposalSeed"], parent=parent,
+            mutation_depth=int(data["mutationDepth"]), module_authority=module_authority,
+            native_validator=native_validator, pair_compiler=pair_compiler,
+            parent_selection=data.get("parentSelection"), replay_steps=data["mutationSteps"],
+        )
+        if replayed != {**data, "proposalSha256": supplied}:
+            raise TemporalDiscoveryContractError("pair multi-operation proposal replay diverged")
+        return pair
+    if data.get("proposalKind") == CROSSOVER_PROPOSAL_KIND:
+        parent = FrozenPair.from_payload(data["parentPair"])
+        mate = FrozenPair.from_payload(data["matePair"])
+        pair, replayed = _propose_crossover(
+            proposal_seed=data["proposalSeed"],
+            parent=parent,
+            mate=mate,
+            module_authority=module_authority,
+            pair_compiler=pair_compiler,
+            parent_selection=data.get("parentSelection"),
+            mate_selection=data.get("mateSelection"),
+            mate_selection_attempts=data.get("mateSelectionAttempts") or [],
+        )
+        if replayed != {**data, "proposalSha256": supplied}:
+            raise TemporalDiscoveryContractError("pair crossover proposal replay diverged")
+        return pair
     if data.get("originKind") == "structural_offspring" and "crossoverAudit" in data:
+        if data.get("disposition") != "materialized":
+            return None
         parent = FrozenPair.from_payload(data["parentPair"])
         mate = FrozenPair.from_payload(data["matePair"])
         pair, audit = propose_same_side_crossover(proposal_seed=data["proposalSeed"], parent=parent, mate=mate, module_authority=module_authority, pair_compiler=pair_compiler)
@@ -382,6 +601,235 @@ def _write_once(path: Path, value: Mapping[str, Any]) -> None:
     path.write_text(encoded, encoding="utf-8")
 
 
+def _explicit_parent_draw_count(entries: Sequence[Mapping[str, Any]]) -> int:
+    """Rebuild the selection cursor for the non-archive parent ring.
+
+    The ring has no archive-cell audit.  Its persisted proposal shape is
+    therefore closed: a side-local mutation consumes one draw and a
+    same-side crossover consumes its parent, mate, and any recorded mate
+    retries.  Reject an archive-shaped or incomplete entry rather than
+    silently deriving a different restart cursor.
+    """
+
+    draws = 0
+    for entry in entries:
+        if entry.get("originKind") != "structural_offspring":
+            continue
+        proposal = entry.get("proposal")
+        if not isinstance(proposal, Mapping):
+            raise TemporalDiscoveryContractError(
+                "explicit-parent structural proposal is not an object"
+            )
+        selection_keys = {
+            "parentSelection",
+            "mateSelection",
+            "mateSelectionAttempts",
+        }
+        if proposal.get("proposalKind") != CROSSOVER_PROPOSAL_KIND:
+            if selection_keys.intersection(proposal):
+                raise TemporalDiscoveryContractError(
+                    "explicit-parent mutation proposal has unexpected selection audit"
+                )
+            draws += 1
+            continue
+        if not selection_keys.issubset(proposal):
+            raise TemporalDiscoveryContractError(
+                "explicit-parent crossover proposal lacks closed selection fields"
+            )
+        if proposal["parentSelection"] is not None or proposal["mateSelection"] is not None:
+            raise TemporalDiscoveryContractError(
+                "explicit-parent crossover proposal contains archive selection audit"
+            )
+        retries = proposal["mateSelectionAttempts"]
+        if not isinstance(retries, list) or any(item is not None for item in retries):
+            raise TemporalDiscoveryContractError(
+                "explicit-parent crossover mate retries are not closed null records"
+            )
+        draws += 2 + len(retries)
+    return draws
+
+
+def _pair_semantic_ledger_records(ledger: dict[str, Any]) -> list[dict[str, str]]:
+    """Return the persisted pair-semantic extension of the QD identity ledger.
+
+    The base QD ledger deliberately knows only generic candidate/program/evidence
+    identities.  A pair candidate's provenance can change its compiled wrapper
+    while leaving its two executable module profiles unchanged, so pair mode
+    additionally records that executable semantic identity in the *same*
+    campaign ledger.  Keeping this as an additive, versioned record lets old
+    empty/general ledgers remain readable while making pair runs fail closed on
+    malformed historical material.
+    """
+
+    raw = ledger.setdefault("pairExecutableSemantics", [])
+    duplicate_counter = ledger.setdefault(
+        "pairExecutableSemanticDuplicateRejections", 0
+    )
+    if not isinstance(duplicate_counter, int) or duplicate_counter < 0:
+        raise TemporalDiscoveryContractError(
+            "QD identity ledger pair executable semantic duplicate counter is invalid"
+        )
+    if not isinstance(raw, list):
+        raise TemporalDiscoveryContractError(
+            "QD identity ledger pair executable semantics are not a list"
+        )
+    seen_semantics: dict[str, str] = {}
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != {
+            "schemaVersion",
+            "pairGenomeSemanticSha256",
+            "candidateIdentitySha256",
+        }:
+            raise TemporalDiscoveryContractError(
+                "QD identity ledger pair executable semantic record is malformed"
+            )
+        if item.get("schemaVersion") != PAIR_EXECUTABLE_SEMANTIC_RECORD_SCHEMA:
+            raise TemporalDiscoveryContractError(
+                "QD identity ledger pair executable semantic record has an unknown schema"
+            )
+        semantic = str(item.get("pairGenomeSemanticSha256") or "")
+        candidate_identity = str(item.get("candidateIdentitySha256") or "")
+        if not semantic.startswith("sha256:") or len(semantic) != 71 or not candidate_identity.startswith("sha256:") or len(candidate_identity) != 71:
+            raise TemporalDiscoveryContractError(
+                "QD identity ledger pair executable semantic identity is invalid"
+            )
+        prior = seen_semantics.get(semantic)
+        if prior is not None and prior != candidate_identity:
+            raise TemporalDiscoveryContractError(
+                "QD identity ledger has duplicate executable pair semantics"
+            )
+        if prior is not None:
+            raise TemporalDiscoveryContractError(
+                "QD identity ledger repeats an executable pair semantic record"
+            )
+        seen_semantics[semantic] = candidate_identity
+    # Return the actual persisted list, not a normalized copy: callers append
+    # the next immutable semantic record before the ledger hash is checkpointed.
+    return raw
+
+
+def _pair_ledger_semantic_index(ledger: dict[str, Any]) -> dict[str, str]:
+    return {
+        record["pairGenomeSemanticSha256"]: record["candidateIdentitySha256"]
+        for record in _pair_semantic_ledger_records(ledger)
+    }
+
+
+def _pair_ledger_accept_semantic(
+    ledger: dict[str, Any],
+    *,
+    semantic_sha256: str,
+    candidate_identity_sha256: str,
+    semantic_index: dict[str, str],
+) -> None:
+    existing = semantic_index.get(semantic_sha256)
+    if existing is not None:
+        if existing != candidate_identity_sha256:
+            raise TemporalDiscoveryContractError(
+                "QD identity ledger has duplicate executable pair semantics"
+            )
+        return
+    _pair_semantic_ledger_records(ledger).append(
+        {
+            "schemaVersion": PAIR_EXECUTABLE_SEMANTIC_RECORD_SCHEMA,
+            "pairGenomeSemanticSha256": semantic_sha256,
+            "candidateIdentitySha256": candidate_identity_sha256,
+        }
+    )
+    semantic_index[semantic_sha256] = candidate_identity_sha256
+
+
+def _pair_ledger_bootstrap_archive(
+    ledger: dict[str, Any],
+    archive: Mapping[str, Any] | None,
+    *,
+    evidence_identity_context: Mapping[str, Any],
+) -> None:
+    """Recover parent-archive pair semantics into the global identity ledger."""
+
+    if archive is None:
+        return
+    from .temporal_qd_evolution import _ledger_accept, _ledger_identity_index, _ledger_record, qd_canonical_evidence_identity
+
+    identity_index = _ledger_identity_index(ledger)
+    semantic_index = _pair_ledger_semantic_index(ledger)
+    for cell in archive.get("cells") or []:
+        if not isinstance(cell, Mapping):
+            raise TemporalDiscoveryContractError("pair parent archive cell is invalid")
+        for member in cell.get("members") or []:
+            candidate = member.get("candidate") if isinstance(member, Mapping) else None
+            if not isinstance(candidate, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "pair parent archive member lacks candidate"
+                )
+            restored = _clone(candidate)
+            pair = FrozenPair.from_payload(restored.get("bidirectionalGenome"))
+            restored["canonicalEvidenceIdentitySha256"] = qd_canonical_evidence_identity(
+                restored, evidence_identity_context
+            )
+            record = _ledger_record(restored)
+            if record["candidateIdentitySha256"] not in identity_index["candidateIdentity"]:
+                _ledger_accept(ledger, restored, identity_index=identity_index)
+            _pair_ledger_accept_semantic(
+                ledger,
+                semantic_sha256=_pair_genome_semantic_sha256(pair),
+                candidate_identity_sha256=record["candidateIdentitySha256"],
+                semantic_index=semantic_index,
+            )
+
+
+def _pair_ledger_recover_accepted_entries(
+    ledger: dict[str, Any],
+    entries: Sequence[Mapping[str, Any]],
+    *,
+    evidence_identity_context: Mapping[str, Any],
+) -> None:
+    """Make an interrupted pair journal and its ledger mutually complete.
+
+    A proposal is written before the ledger checkpoint can be flushed.  On
+    restart, recover that exact accepted record.  Conversely, a semantic owned
+    by a different candidate is a cross-generation contradiction and must not
+    be reinterpreted as a local duplicate.
+    """
+
+    from .temporal_qd_evolution import _ledger_accept, _ledger_identity_index, _ledger_record, qd_canonical_evidence_identity
+
+    identity_index = _ledger_identity_index(ledger)
+    semantic_index = _pair_ledger_semantic_index(ledger)
+    for entry in entries:
+        if entry.get("disposition") != "accepted":
+            continue
+        candidate = entry.get("candidate")
+        if not isinstance(candidate, Mapping):
+            raise TemporalDiscoveryContractError("pair accepted proposal lacks candidate")
+        restored = _clone(candidate)
+        pair = FrozenPair.from_payload(restored.get("bidirectionalGenome"))
+        canonical_evidence = qd_canonical_evidence_identity(
+            restored, evidence_identity_context
+        )
+        supplied = restored.get("canonicalEvidenceIdentitySha256")
+        if supplied is not None and supplied != canonical_evidence:
+            raise TemporalDiscoveryContractError(
+                "pair accepted proposal canonical evidence identity diverged"
+            )
+        restored["canonicalEvidenceIdentitySha256"] = canonical_evidence
+        record = _ledger_record(restored)
+        if record["candidateIdentitySha256"] not in identity_index["candidateIdentity"]:
+            _ledger_accept(ledger, restored, identity_index=identity_index)
+        semantic_sha = _pair_genome_semantic_sha256(pair)
+        existing = semantic_index.get(semantic_sha)
+        if existing is not None and existing != record["candidateIdentitySha256"]:
+            raise TemporalDiscoveryContractError(
+                "pair accepted proposal duplicates a global executable pair semantic"
+            )
+        _pair_ledger_accept_semantic(
+            ledger,
+            semantic_sha256=semantic_sha,
+            candidate_identity_sha256=record["candidateIdentitySha256"],
+            semantic_index=semantic_index,
+        )
+
+
 def generate_pair_population(
     *,
     output_root: Path | str,
@@ -390,12 +838,15 @@ def generate_pair_population(
     run_config: Mapping[str, Any],
     pair_policy: Mapping[str, Any],
     parent_pairs: Sequence[FrozenPair] = (),
+    parent_archive: Mapping[str, Any] | None = None,
     pair_factory: TypedPairFactory | None = None,
     module_authority: PairModuleOperator,
     native_validator: NativeModuleValidator,
     pair_compiler: CanonicalPairCompiler,
     evidence_identity_context: Mapping[str, Any] | None = None,
     operator_implementation_identity: Mapping[str, Any] | None = None,
+    identity_ledger_path: Path | str | None = None,
+    max_proposal_attempts: int = DEFAULT_MAX_PROPOSAL_ATTEMPTS,
     max_new_proposals: int | None = None,
 ) -> dict[str, Any]:
     """Small operational pair-QD journal/population path with exact restart.
@@ -406,11 +857,41 @@ def generate_pair_population(
     """
     if generation_index < 0 or target_unique_candidates < 1:
         raise TemporalDiscoveryContractError("pair generation index/target is invalid")
+    max_proposal_attempts = int(max_proposal_attempts)
+    if max_proposal_attempts < target_unique_candidates:
+        raise TemporalDiscoveryContractError(
+            "pair generation proposal ceiling is below its target"
+        )
+    if max_new_proposals is not None and int(max_new_proposals) < 0:
+        raise TemporalDiscoveryContractError("pair generation new proposal limit is negative")
+    if identity_ledger_path is not None and evidence_identity_context is None:
+        raise TemporalDiscoveryContractError(
+            "pair generation global identity ledger requires a predeclared evidence context"
+        )
     root = Path(output_root)
     policy = _clone(pair_policy)
     if operator_implementation_identity is None:
         raise TemporalDiscoveryContractError("pair generation requires a frozen operator implementation identity")
-    config = {"schemaVersion": PAIR_GENERATION_SCHEMA, "generationIndex": generation_index, "targetUniqueCandidates": target_unique_candidates, "runConfig": _clone(run_config), "pairPolicy": policy, "operatorImplementation": _clone(operator_implementation_identity)}
+    config = {
+        "schemaVersion": PAIR_GENERATION_SCHEMA,
+        "generationIndex": generation_index,
+        "targetUniqueCandidates": target_unique_candidates,
+        "maxProposalAttempts": max_proposal_attempts,
+        "runConfig": _clone(run_config),
+        "pairPolicy": policy,
+        "operatorImplementation": _clone(operator_implementation_identity),
+        "mutationDepthProbabilities": {"1": 0.70, "2": 0.25, "3": 0.05},
+        **(
+            {
+                "globalIdentityLedger": {
+                    "schemaVersion": "temporal_qd_identity_ledger_v3",
+                    "locationPolicy": "caller_supplied_generation_global_ledger",
+                }
+            }
+            if identity_ledger_path is not None
+            else {}
+        ),
+    }
     config["configSha256"] = canonical_sha256(config)
     _write_once(root / "pair-config.json", config)
     entries: list[dict[str, Any]] = []
@@ -453,24 +934,124 @@ def generate_pair_population(
         _pair_genome_semantic_sha256(FrozenPair.from_payload(row["bidirectionalGenome"]))
         for row in accepted
     }
+    ledger = None
+    identity_index = None
+    global_pair_semantics: dict[str, str] = {}
+    if identity_ledger_path is not None:
+        from .temporal_qd_evolution import (
+            _ledger_bootstrap_archive,
+            _ledger_identity_index,
+            _load_identity_ledger,
+            _save_identity_ledger,
+            qd_canonical_evidence_identity,
+        )
+
+        ledger = _load_identity_ledger(Path(identity_ledger_path))
+        # Retain the base ledger's archive recovery for all ordinary QD
+        # identities, then add pair semantics absent from the generic schema.
+        _ledger_bootstrap_archive(ledger, parent_archive or {"cells": []}, evidence_identity_context)
+        _pair_ledger_bootstrap_archive(
+            ledger,
+            parent_archive,
+            evidence_identity_context=evidence_identity_context,
+        )
+        _pair_ledger_recover_accepted_entries(
+            ledger,
+            entries,
+            evidence_identity_context=evidence_identity_context,
+        )
+        ledger["proposalSlotCounters"]["proposalsObserved"] = max(
+            int(ledger["proposalSlotCounters"].get("proposalsObserved") or 0),
+            len(entries),
+        )
+        _save_identity_ledger(Path(identity_ledger_path), ledger)
+        identity_index = _ledger_identity_index(ledger)
+        global_pair_semantics = _pair_ledger_semantic_index(ledger)
     parents = sorted((FrozenPair.from_payload(item.canonical_payload()) for item in parent_pairs), key=lambda item: item.identity_sha256)
+    archive_cells: list[dict[str, Any]] = []
+    negative_cells: list[dict[str, Any]] = []
+    selection_state: dict[str, dict[str, int]] = {}
+    if parent_archive is not None:
+        from .temporal_qd_evolution import _initial_selection_state, _negative_novelty_cells, _reproduction_cells
+        archive_cells = _reproduction_cells(parent_archive, allow_empty_quality_bootstrap=True)
+        negative_cells = _negative_novelty_cells(parent_archive)
+        selection_state = _initial_selection_state(archive_cells + negative_cells)
+        parents = []
+        # Rebuild the mutable visit/offspring counters from immutable audits so
+        # an interrupted generation makes exactly the same next draw.
+        for entry in entries:
+            proposal = entry.get("proposal")
+            if not isinstance(proposal, Mapping):
+                continue
+            audits = [proposal.get("parentSelection"), proposal.get("mateSelection")]
+            audits.extend(proposal.get("mateSelectionAttempts") or [])
+            for audit in audits:
+                if not isinstance(audit, Mapping) or audit.get("parentCellId") is None:
+                    continue
+                cell_id = str(audit["parentCellId"])
+                if cell_id not in selection_state:
+                    raise TemporalDiscoveryContractError("persisted pair parent selection references an unavailable archive cell")
+                selection_state[cell_id]["selectionVisitCount"] += 1
+                selection_state[cell_id]["offspringAttemptCount"] += 1
+    if archive_cells:
+        structural_parent_selections = sum(
+            1
+            for entry in entries
+            for audit in (
+                [entry.get("proposal", {}).get("parentSelection"), entry.get("proposal", {}).get("mateSelection"), *(entry.get("proposal", {}).get("mateSelectionAttempts") or [])]
+                if isinstance(entry.get("proposal"), Mapping) else []
+            )
+            if isinstance(audit, Mapping) and audit.get("parentCellId") is not None
+        )
+    else:
+        structural_parent_selections = _explicit_parent_draw_count(entries)
+    def select_parent(label: str) -> tuple[FrozenPair, dict[str, Any] | None]:
+        nonlocal structural_parent_selections
+        if archive_cells:
+            from .temporal_qd_evolution import _select_parent
+            rng = random.Random(int(canonical_sha256({"generationSeed": config["configSha256"], "selectionOrdinal": structural_parent_selections, "label": label})[7:23], 16))
+            cell, member, mode, lane, reason = _select_parent(rng=rng, cells=archive_cells, negative_novelty_cells=negative_cells, selection_state=selection_state, negative_novelty_slot=(structural_parent_selections + 1) % 10 == 0)
+            structural_parent_selections += 1
+            return FrozenPair.from_payload(member["candidate"]["bidirectionalGenome"]), {"schemaVersion": "temporal_qd_pair_parent_selection_v1", "parentCellId": cell["cellId"], "parentCandidateId": member["candidateId"], "selectionMode": mode, "parentLane": lane, "parentLaneReason": reason, "paretoFront": member.get("paretoFront"), "crowdingDistance": member.get("crowdingDistance")}
+        parent = parents[structural_parent_selections % len(parents)]
+        structural_parent_selections += 1
+        return parent, None
     made = 0
-    while len(accepted) < target_unique_candidates and (max_new_proposals is None or made < max_new_proposals):
+    while (
+        len(accepted) < target_unique_candidates
+        and len(entries) < max_proposal_attempts
+        and (max_new_proposals is None or made < max_new_proposals)
+    ):
         ordinal = len(entries)
         seed = canonical_sha256({"schemaVersion": PAIR_GENERATION_SCHEMA, "configSha256": config["configSha256"], "proposalOrdinal": ordinal})
-        use_immigrant = not parents or ordinal % 5 == 4
+        use_immigrant = not (archive_cells or parents) or ordinal % 5 == 4
         if use_immigrant:
             pair, proposal = propose_pair(proposal_seed=seed, parent=None, pair_factory=pair_factory, module_authority=module_authority, native_validator=native_validator, pair_compiler=pair_compiler)
-        elif len(parents) > 1 and ordinal % 7 == 6:
-            parent = parents[ordinal % len(parents)]
-            mate = parents[(ordinal + 1) % len(parents)]
-            pair, audit = propose_same_side_crossover(proposal_seed=seed, parent=parent, mate=mate, module_authority=module_authority, pair_compiler=pair_compiler)
-            proposal = {"schemaVersion": PAIR_PROPOSAL_SCHEMA, "proposalSeed": seed, "originKind": "structural_offspring", "side": audit["side"], "parentPair": parent.canonical_payload(), "parentPairIdentitySha256": parent.identity_sha256, "matePair": mate.canonical_payload(), "matePairIdentitySha256": mate.identity_sha256, "disposition": "materialized", "crossoverAudit": audit, "pair": pair.canonical_payload(), "pairIdentitySha256": pair.identity_sha256}
-            proposal["proposalSha256"] = canonical_sha256(proposal)
+        elif ordinal % 7 == 6 and (len(archive_cells) > 1 or len(parents) > 1):
+            parent, parent_selection = select_parent("crossover_parent")
+            mate, mate_selection = select_parent("crossover_mate")
+            mate_attempts: list[dict[str, Any] | None] = []
+            eligible_count = sum(len(cell.get("members") or []) for cell in archive_cells) if archive_cells else len(parents)
+            while mate.identity_sha256 == parent.identity_sha256 and eligible_count > 1:
+                mate_attempts.append(mate_selection)
+                mate, mate_selection = select_parent(f"crossover_mate_retry_{len(mate_attempts)}")
+            pair, proposal = _propose_crossover(
+                proposal_seed=seed,
+                parent=parent,
+                mate=mate,
+                module_authority=module_authority,
+                pair_compiler=pair_compiler,
+                parent_selection=parent_selection,
+                mate_selection=mate_selection,
+                mate_selection_attempts=mate_attempts,
+            )
         else:
-            parent = parents[ordinal % len(parents)]
-            pair, proposal = propose_pair(proposal_seed=seed, parent=parent, pair_factory=None, module_authority=module_authority, native_validator=native_validator, pair_compiler=pair_compiler)
+            parent, selection = select_parent("mutation")
+            depth = _mutation_depth_for_seed(seed)
+            pair, proposal = _propose_pair_sequence(proposal_seed=seed, parent=parent, mutation_depth=depth, module_authority=module_authority, native_validator=native_validator, pair_compiler=pair_compiler, parent_selection=selection)
         entry: dict[str, Any] = {"schemaVersion": "temporal_qd_proposal_entry_v3", "configSha256": config["configSha256"], "generationIndex": generation_index, "proposalOrdinal": ordinal, "originKind": proposal["originKind"], "proposal": proposal, "operatorImplementationSha256": canonical_sha256(operator_implementation_identity)}
+        if ledger is not None:
+            ledger["proposalSlotCounters"]["proposalsObserved"] += 1
         if pair is None:
             entry["disposition"] = proposal["disposition"]
         else:
@@ -484,7 +1065,36 @@ def generate_pair_population(
             elif candidate["candidateIdentitySha256"] in seen:
                 entry["disposition"] = "duplicate_candidate_identity"
             else:
-                entry["disposition"] = "accepted"; entry["candidate"] = candidate; accepted.append(candidate); seen.add(candidate["candidateIdentitySha256"]); seen_pair_genomes.add(pair_genome_sha256)
+                if ledger is not None:
+                    from .temporal_qd_evolution import _ledger_accept, _ledger_duplicate_check
+
+                    candidate["canonicalEvidenceIdentitySha256"] = qd_canonical_evidence_identity(
+                        candidate, evidence_identity_context
+                    )
+                    duplicate_reason, identity_checks = _ledger_duplicate_check(
+                        ledger, candidate, identity_index=identity_index
+                    )
+                    entry["identityChecks"] = identity_checks
+                    if pair_genome_sha256 in global_pair_semantics:
+                        entry["disposition"] = "duplicate_pair_genome_global"
+                        ledger["pairExecutableSemanticDuplicateRejections"] += 1
+                    elif duplicate_reason is not None:
+                        entry["disposition"] = duplicate_reason
+                    else:
+                        entry["disposition"] = "accepted"
+                        entry["candidate"] = candidate
+                        accepted.append(candidate)
+                        seen.add(candidate["candidateIdentitySha256"])
+                        seen_pair_genomes.add(pair_genome_sha256)
+                        _ledger_accept(ledger, candidate, identity_index=identity_index)
+                        _pair_ledger_accept_semantic(
+                            ledger,
+                            semantic_sha256=pair_genome_sha256,
+                            candidate_identity_sha256=str(candidate["candidateIdentitySha256"]),
+                            semantic_index=global_pair_semantics,
+                        )
+                else:
+                    entry["disposition"] = "accepted"; entry["candidate"] = candidate; accepted.append(candidate); seen.add(candidate["candidateIdentitySha256"]); seen_pair_genomes.add(pair_genome_sha256)
         if proposal.get("disposition") == "materialized" and entry["disposition"] == "accepted":
             pair_payload = proposal.get("pair") or proposal.get("factoryPair")
             if not isinstance(pair_payload, Mapping):
@@ -495,10 +1105,19 @@ def generate_pair_population(
         entry["entrySha256"] = canonical_sha256(entry)
         _write_once(root / "proposal-journal" / f"{ordinal:08d}.json", entry)
         entries.append(entry); made += 1
+        if ledger is not None:
+            from .temporal_qd_evolution import _save_identity_ledger
+
+            _save_identity_ledger(Path(identity_ledger_path), ledger)
     if len(accepted) < target_unique_candidates:
-        return {"schemaVersion": "temporal_qd_pair_generation_progress_v1", "configSha256": config["configSha256"], "proposalCount": len(entries), "acceptedCount": len(accepted), "completed": False}
+        reason = (
+            "max_proposal_attempts_reached"
+            if len(entries) >= max_proposal_attempts
+            else "max_new_proposals_reached"
+        )
+        return {"schemaVersion": "temporal_qd_pair_generation_progress_v1", "configSha256": config["configSha256"], "proposalCount": len(entries), "acceptedCount": len(accepted), "maxProposalAttempts": max_proposal_attempts, "terminationReason": reason, "completed": False}
     accepted.sort(key=lambda item: item["candidateId"])
-    population = {"schemaVersion": "temporal_qd_generation_population_v3", "qdVersion": "temporal_qd_evolution_v3", "policyName": "stage5e7_v3_robust_quality_archive", "policySha256": "__resolved_by_qd_hook__", "configSha256": config["configSha256"], "generationIndex": generation_index, "targetUniqueCandidates": target_unique_candidates, "originCounts": {}, "proposalOrderCandidateIds": [row["candidateId"] for row in accepted], "candidateCount": len(accepted), "candidates": accepted, "authoredValidationBindingRequired": False, "bidirectionalPairPolicy": policy, "pairGenerationConfigSha256": config["configSha256"], "proposalAttempts": len(entries), "proposalSlots": {"targetUniqueCandidates": target_unique_candidates, "acceptedUniqueCandidates": len(accepted), "proposalAttempts": len(entries), "remainingUniqueCandidateSlots": max(0, target_unique_candidates-len(accepted))}, **({"predeclaredEvidenceContextSha256": evidence_identity_context.get("predeclaredEvidenceContextSha256")} if evidence_identity_context is not None else {})}
+    population = {"schemaVersion": "temporal_qd_generation_population_v3", "qdVersion": "temporal_qd_evolution_v3", "policyName": "stage5e7_v3_robust_quality_archive", "policySha256": "__resolved_by_qd_hook__", "configSha256": config["configSha256"], "generationIndex": generation_index, "targetUniqueCandidates": target_unique_candidates, "maxProposalAttempts": max_proposal_attempts, "originCounts": {}, "proposalOrderCandidateIds": [row["candidateId"] for row in accepted], "candidateCount": len(accepted), "candidates": accepted, "authoredValidationBindingRequired": False, "bidirectionalPairPolicy": policy, "pairGenerationConfigSha256": config["configSha256"], "proposalAttempts": len(entries), "proposalSlots": {"targetUniqueCandidates": target_unique_candidates, "acceptedUniqueCandidates": len(accepted), "proposalAttempts": len(entries), "maxProposalAttempts": max_proposal_attempts, "remainingUniqueCandidateSlots": max(0, target_unique_candidates-len(accepted))}, **({"predeclaredEvidenceContextSha256": evidence_identity_context.get("predeclaredEvidenceContextSha256")} if evidence_identity_context is not None else {})}
     # Reuse the exact frozen legacy policy token only at the boundary, without
     # importing its generator or changing opt-in-disabled payload identities.
     from .temporal_qd_evolution import QD_POLICY_SHA256
@@ -513,7 +1132,7 @@ def generate_pair_population(
     # Origin counts participate in the population identity.
     population["populationSha256"] = canonical_sha256(population)
     _write_once(root / "population.json", population)
-    journal = {"schemaVersion": "temporal_qd_generation_journal_v3", "qdVersion": "temporal_qd_evolution_v3", "policyName": "stage5e7_v3_robust_quality_archive", "policySha256": population["policySha256"], "configSha256": config["configSha256"], "generationIndex": generation_index, "proposalCount": len(entries), "acceptedCount": len(accepted), "nextImmigrantContinuationOrdinal": 0, "originProposalCounts": {origin: sum(1 for entry in entries if entry["originKind"] == origin) for origin in sorted({str(entry["originKind"]) for entry in entries})}, "originAcceptedCounts": dict(sorted(origin_counts.items())), "dispositionCounts": dict(sorted(disposition_counts.items())), "proposalSlots": population["proposalSlots"], "uniqueIdentityCounts": {"candidateIdentity": len(accepted), "pairGenome": len(seen_pair_genomes)}, "duplicateCounters": {"candidateIdentity": disposition_counts.get("duplicate_candidate_identity", 0), "pairGenome": disposition_counts.get("duplicate_pair_genome", 0)}, "proposalSlotCounters": {"proposalsObserved": len(entries)}, "entrySha256s": [entry["entrySha256"] for entry in entries], "operatorImplementation": _clone(operator_implementation_identity), "populationSha256": population["populationSha256"]}
+    journal = {"schemaVersion": "temporal_qd_generation_journal_v3", "qdVersion": "temporal_qd_evolution_v3", "policyName": "stage5e7_v3_robust_quality_archive", "policySha256": population["policySha256"], "configSha256": config["configSha256"], "generationIndex": generation_index, "proposalCount": len(entries), "acceptedCount": len(accepted), "maxProposalAttempts": max_proposal_attempts, "nextImmigrantContinuationOrdinal": 0, "originProposalCounts": {origin: sum(1 for entry in entries if entry["originKind"] == origin) for origin in sorted({str(entry["originKind"]) for entry in entries})}, "originAcceptedCounts": dict(sorted(origin_counts.items())), "dispositionCounts": dict(sorted(disposition_counts.items())), "proposalSlots": population["proposalSlots"], "uniqueIdentityCounts": {"candidateIdentity": len(accepted), "pairGenome": len(seen_pair_genomes)}, "duplicateCounters": {"candidateIdentity": disposition_counts.get("duplicate_candidate_identity", 0), "pairGenome": disposition_counts.get("duplicate_pair_genome", 0), "pairGenomeGlobal": disposition_counts.get("duplicate_pair_genome_global", 0)}, "proposalSlotCounters": {"proposalsObserved": len(entries), "maxProposalAttempts": max_proposal_attempts}, "entrySha256s": [entry["entrySha256"] for entry in entries], "operatorImplementation": _clone(operator_implementation_identity), "populationSha256": population["populationSha256"], **({"globalIdentityLedger": {"pairExecutableSemanticCount": len(global_pair_semantics), "pairExecutableSemanticDuplicateRejections": int(ledger["pairExecutableSemanticDuplicateRejections"]), "identityLedgerSha256": ledger["ledgerSha256"]}} if ledger is not None else {})}
     journal["journalSha256"] = canonical_sha256(journal)
     _write_once(root / "generation-journal.json", journal)
     return {"schemaVersion": "temporal_qd_pair_generation_result_v1", "configSha256": config["configSha256"], "populationSha256": population["populationSha256"], "journalSha256": journal["journalSha256"], "proposalCount": len(entries), "candidateCount": len(accepted), "originProposalCounts": journal["originProposalCounts"], "originAcceptedCounts": journal["originAcceptedCounts"], "proposalSlots": journal["proposalSlots"], "uniqueIdentityCounts": journal["uniqueIdentityCounts"], "duplicateCounters": journal["duplicateCounters"], "proposalSlotCounters": journal["proposalSlotCounters"], "nextImmigrantContinuationOrdinal": 0, "completed": True}

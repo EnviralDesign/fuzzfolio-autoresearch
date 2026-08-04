@@ -174,6 +174,7 @@ def _quality_disposition(
 ) -> tuple[str, list[str]]:
     trades = [int(row["tradeCloseCount"]) for row in behaviors]
     finite_economics = True
+    conservative_net_returns: list[float] = []
     for result in raw_results:
         try:
             metrics = _mapping(
@@ -187,6 +188,13 @@ def _quality_disposition(
                 value = metrics.get(field)
                 if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                     finite_economics = False
+            conservative_net_r = metrics.get("terminalAdjustedTotalNetR")
+            if (
+                not isinstance(conservative_net_r, bool)
+                and isinstance(conservative_net_r, (int, float))
+                and math.isfinite(float(conservative_net_r))
+            ):
+                conservative_net_returns.append(float(conservative_net_r))
         except TemporalDiscoveryContractError:
             finite_economics = False
     reasons: list[str] = []
@@ -196,6 +204,11 @@ def _quality_disposition(
         reasons.append("minimum_trades_per_window")
     if not finite_economics:
         reasons.append("finite_economics")
+    # Match the QD archive's worst-window conservative objective.  The no-cost
+    # view remains diagnostic evidence only; it must never qualify a candidate
+    # whose conservative execution economics are negative in any window.
+    if conservative_net_returns and min(conservative_net_returns) < 0.0:
+        reasons.append("nonnegative_worst_window_conservative_net_r")
     return ("eligible" if not reasons else "not_eligible"), reasons
 
 
@@ -304,10 +317,11 @@ def build_qd_generation_funnel(
         raw_results = [observed[window][1] for window in candidate_windows]
         quality, reasons = _quality_disposition(behaviors, raw_results, minimum_total_trades=minimum_total_trades, minimum_trades_per_window=minimum_trades_per_window)
         evidence = {"schemaVersion": QD_FUNNEL_ADAPTER_SCHEMA, "candidateId": candidate_id, "windows": behaviors}
+        activation_outcome = "recorded" if quality == "eligible" else "quality_rejected"
         activation.append({
             **base,
             "canonicalEvidenceIdentitySha256": canonical_identity,
-            "outcome": "recorded",
+            "outcome": activation_outcome,
             "qualityDisposition": quality,
             "reasons": reasons,
             "actualActivationCount": sum(int(row["activationCount"]) for row in behaviors),
@@ -318,14 +332,30 @@ def build_qd_generation_funnel(
             "neverActivated": all(bool(row["neverActivated"]) for row in behaviors),
             "activationEvidenceSha256": canonical_sha256(evidence),
         })
-        member = archive_members.get(candidate_id)
-        retention.append({
-            **base,
-            "canonicalEvidenceIdentitySha256": canonical_identity,
-            "outcome": "retained" if member is not None else "not_retained",
-            "reasons": ([] if member is not None else (["resolved_execution_duplicate"] if candidate_id in duplicate_ids else ["not_selected_by_archive"])),
-            **({"archiveMemberIdentitySha256": canonical_sha256(member)} if member is not None else {}),
-        })
+        # A non-quality candidate may appear in the bounded negative-novelty
+        # exploration lane. Preserve that fact explicitly without allowing the
+        # generic funnel to treat it as a quality/promotion retention.
+        if activation_outcome == "recorded":
+            member = archive_members.get(candidate_id)
+            retention.append({
+                **base,
+                "canonicalEvidenceIdentitySha256": canonical_identity,
+                "outcome": "retained" if member is not None else "not_retained",
+                "reasons": ([] if member is not None else (["resolved_execution_duplicate"] if candidate_id in duplicate_ids else ["not_selected_by_archive"])),
+                **({"archiveMemberIdentitySha256": canonical_sha256(member)} if member is not None else {}),
+            })
+        else:
+            member = archive_members.get(candidate_id)
+            if member is not None and member.get("archiveLane") == "negative_novelty":
+                retention.append({
+                    **base,
+                    "canonicalEvidenceIdentitySha256": canonical_identity,
+                    "outcome": "retained",
+                    "reasons": ["non_promotable_scheduled_negative_novelty_exploration"],
+                    "archiveLane": "negative_novelty",
+                    "retentionClassification": "non_promotable_scheduled_exploration",
+                    "archiveMemberIdentitySha256": canonical_sha256(member),
+                })
     try:
         return build_generation_funnel_artifact(
             proposal_attempt_ledger=attempts,

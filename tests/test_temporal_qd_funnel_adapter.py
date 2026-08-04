@@ -55,7 +55,12 @@ def _entry(ordinal: int, candidate_id: str | None, stage: str) -> dict:
     return row
 
 
-def _result(candidate_id: str, *, statuses: list[str] | None = None) -> dict:
+def _result(
+    candidate_id: str,
+    *,
+    statuses: list[str] | None = None,
+    conservative_terminal_net_r: float = 1.0,
+) -> dict:
     return {
         "candidate_id": candidate_id,
         "cost_view_results": {
@@ -67,7 +72,7 @@ def _result(candidate_id: str, *, statuses: list[str] | None = None) -> dict:
                     ],
                     "trades": [{"id": "one"}],
                     "metrics": {
-                        "terminalAdjustedTotalNetR": 1.0,
+                        "terminalAdjustedTotalNetR": conservative_terminal_net_r,
                         "terminalAdjustedMaxDrawdownR": 0.5,
                     },
                 }
@@ -200,6 +205,36 @@ def test_adapter_counts_canceled_trace_as_activation_and_rejected_attrition(tmp_
     row = next(item for item in artifact["candidates"] if item["candidateId"] == "qd_retained")
     assert row["stages"]["activationQuality"]["outcome"] == "recorded"
     assert row["stages"]["activationQuality"]["qualityDisposition"] == "eligible"
+
+
+def test_adapter_negative_conservative_candidate_is_quality_rejected_not_promoted(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    record = inputs["checkpoint"]["completed"]["task-qd_retained"]
+    material = _result("qd_retained", conservative_terminal_net_r=-0.25)
+    Path(record["resultPath"]).write_text(json.dumps(material), encoding="utf-8")
+    record["resultSha256"] = canonical_sha256(material)
+    # The archive may retain one negative row only for bounded novelty
+    # exploration.  That must never cross the quality/promotion boundary.
+    inputs["archive"]["cells"][0]["members"][0]["archiveLane"] = "negative_novelty"
+
+    artifact = build_qd_generation_funnel(**inputs)
+
+    row = next(item for item in artifact["candidates"] if item["candidateId"] == "qd_retained")
+    assert row["stages"]["activationQuality"] == {
+        "outcome": "quality_rejected",
+        "reasons": ["nonnegative_worst_window_conservative_net_r"],
+        "qualityDisposition": "not_eligible",
+    }
+    assert "archiveRetention" not in row["stages"]
+    assert row["stages"]["exploratoryRetention"] == {
+        "outcome": "retained_for_scheduled_negative_novelty_exploration",
+        "reasons": ["non_promotable_scheduled_negative_novelty_exploration"],
+        "archiveLane": "negative_novelty",
+        "promotionEligible": False,
+    }
+    assert row["terminalDisposition"] == "activation_quality_rejected"
 
 
 def test_adapter_refuses_stripped_materialized_stage_projection(tmp_path: Path) -> None:

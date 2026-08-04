@@ -11,6 +11,7 @@ from autoresearch.temporal_indicator_learning_v1 import (
     EVIDENCE_WEIGHT,
     FAMILY_SUBSTITUTION,
     GRAPH_BOUND_TIMEFRAME,
+    INDICATOR_INSTANCE,
     SEMANTIC_RANGE,
     TA_PERIOD,
     IndicatorLearningRegistry,
@@ -82,7 +83,7 @@ def _first(registry: IndicatorLearningRegistry, profile: dict, operator_id: str)
 def test_catalog_bound_timeframe_period_and_range_plans_are_deterministic_and_auditable() -> None:
     catalog, profile = _catalog(), _profile()
     registry = IndicatorLearningRegistry(catalog)
-    assert set(registry.operator_ids) == {GRAPH_BOUND_TIMEFRAME, EVIDENCE_LOOKBACK, TA_PERIOD, SEMANTIC_RANGE, EVIDENCE_WEIGHT, EVIDENCE_MEMBERSHIP, FAMILY_SUBSTITUTION}
+    assert set(registry.operator_ids) == {GRAPH_BOUND_TIMEFRAME, EVIDENCE_LOOKBACK, TA_PERIOD, SEMANTIC_RANGE, EVIDENCE_WEIGHT, EVIDENCE_MEMBERSHIP, INDICATOR_INSTANCE, FAMILY_SUBSTITUTION}
     for operator_id in (GRAPH_BOUND_TIMEFRAME, TA_PERIOD, SEMANTIC_RANGE):
         operator = registry.get(operator_id)
         plan = _first(registry, profile, operator_id)
@@ -128,6 +129,38 @@ def test_family_substitution_is_strict_and_never_rebinds_event_or_scalar_instanc
     assert IndicatorLearningRegistry(incompatible).get(FAMILY_SUBSTITUTION).enumerate_plans(profile) == []
 
 
+def test_directional_event_contract_does_not_require_obsolete_normalization_scale() -> None:
+    catalog, profile = _catalog(), _profile()
+    source = next(item for item in catalog["indicators"] if item["meta"]["id"] == "EVENT_A")
+    source["meta"]["familySubstitution"] = {
+        "substitutionClass": "directional_event_v1",
+        "polarity": "bidirectional",
+        "scoreUnit": "binary_0_1",
+        "rawUnit": "directional_boolean_outputs",
+        "persistenceCompatibility": "event-with-lookback",
+        "eventOutputSchema": {
+            "kind": "directional_tokens",
+            "longOutput": "bullish",
+            "shortOutput": "bearish",
+        },
+    }
+    replacement = copy.deepcopy(source)
+    replacement["meta"]["id"] = "EVENT_B"
+    catalog["indicators"].append(replacement)
+    profile["indicators"][1]["meta"] = copy.deepcopy(source["meta"])
+    profile["indicators"][1]["meta"]["instanceId"] = "event"
+
+    plans = IndicatorLearningRegistry(catalog).get(FAMILY_SUBSTITUTION).enumerate_plans(profile)
+    event_plan = next(
+        item
+        for item in plans
+        if item["construction"]["indicatorInstanceId"] == "event"
+    )
+    assert event_plan["construction"]["afterIndicatorId"] == "EVENT_B"
+    assert event_plan["construction"]["eventBound"] is True
+    assert "normalizationScale" not in event_plan["construction"]["capabilityContract"]
+
+
 def test_graph_bound_timeframe_covers_evidence_event_and_scalar_only_instances() -> None:
     profile = _profile()
     # The scalar is no longer evidence-bound; all three binding kinds must
@@ -137,13 +170,15 @@ def test_graph_bound_timeframe_covers_evidence_event_and_scalar_only_instances()
     assert {item["construction"]["indicatorInstanceId"] for item in plans} == {"state", "event", "scalar"}
 
 
-def test_substitution_and_period_mutations_fail_closed_on_missing_or_unrepresentable_catalog_metadata() -> None:
+def test_substitution_and_period_mutations_fail_closed_on_catalog_drift_or_unrepresentable_output_types() -> None:
     catalog, profile = _catalog(), _profile()
     next(item for item in catalog["indicators"] if item["meta"]["id"] == "RSI_A")["meta"].pop("inputs")
     registry = IndicatorLearningRegistry(catalog)
     assert registry.get(FAMILY_SUBSTITUTION).enumerate_plans(profile) == []
     dispositions = registry.deferred_dispositions(profile)
-    assert dispositions[0] == {"indicatorIndex": 0, "indicatorId": "RSI_A", "disposition": "deferred", "reason": "source_compatibility_metadata_missing", "missing": ["inputs"]}
+    # Input-field labels do not decide eligibility; the stale hydrated source
+    # still cannot mutate because exact catalog provenance has drifted.
+    assert all(row["indicatorId"] != "RSI_A" for row in dispositions)
     assert {row["reason"] for row in dispositions} >= {"event_output_schema_metadata_not_admitted", "management_scalar_binding_replacement_not_admitted"}
 
     catalog = _catalog(); profile = _profile()
@@ -224,13 +259,19 @@ def test_declared_but_unsafe_family_pairs_never_substitute() -> None:
     assert IndicatorLearningRegistry(catalog).get(FAMILY_SUBSTITUTION).enumerate_plans(profile) == []
 
 
-def test_evidence_weight_is_quantized_reachable_and_excludes_event_scalar_and_unbound() -> None:
+def test_evidence_weight_is_quantized_reachable_and_excludes_singleton_event_scalar_and_unbound() -> None:
     catalog, profile = _catalog(), _profile()
     profile["indicators"].append(_instance(catalog, "CCI_A", "unbound"))
     profile["graph"]["evidenceGroups"].append(
         {"id": "unused_context", "indicatorInstanceIds": ["unbound"]}
     )
     registry = IndicatorLearningRegistry(catalog)
+    plans = registry.get(EVIDENCE_WEIGHT).enumerate_plans(profile)
+    assert plans == []
+
+    # Relative weights become meaningful only after the group has multiple
+    # fuzzy evidence members.
+    profile["graph"]["evidenceGroups"][0]["indicatorInstanceIds"] = ["state", "unbound"]
     plans = registry.get(EVIDENCE_WEIGHT).enumerate_plans(profile)
     assert plans and {plan["construction"]["indicatorInstanceId"] for plan in plans} == {"state"}
     assert {plan["construction"]["after"] for plan in plans} == {0.25, 0.5, 1.0}
@@ -245,6 +286,78 @@ def test_evidence_weight_is_quantized_reachable_and_excludes_event_scalar_and_un
         plan["construction"]["indicatorInstanceId"]
         for plan in registry.get(EVIDENCE_WEIGHT).enumerate_plans(below)
     } == {"state"}
+
+
+def test_instance_insert_remove_and_three_member_fuzzy_cap_are_canonical() -> None:
+    catalog, profile = _catalog(), _profile()
+    third = _meta("MFI_A", role="trend")
+    catalog["indicators"].append({"meta": third, "config": _config(period=20)})
+    registry = IndicatorLearningRegistry(catalog)
+
+    inserts = registry.get(INDICATOR_INSTANCE).enumerate_plans(profile)
+    cci_insert = next(plan for plan in inserts if plan["construction"]["indicatorId"] == "CCI_A")
+    two, application = registry.get(INDICATOR_INSTANCE).apply(profile, cci_insert, parent_validated_program_sha256=SHA_A, child_validated_program_sha256=SHA_B)
+    assert two["graph"]["evidenceGroups"][0]["indicatorInstanceIds"] == ["fz_cci_a_1", "state"]
+    assert registry.get(INDICATOR_INSTANCE).audit(profile, two, application)["allChecksPassed"] is True
+
+    mfi_insert = next(plan for plan in registry.get(INDICATOR_INSTANCE).enumerate_plans(two) if plan["construction"]["indicatorId"] == "MFI_A")
+    three = registry.get(INDICATOR_INSTANCE).preview(two, mfi_insert)
+    assert len(three["graph"]["evidenceGroups"][0]["indicatorInstanceIds"]) == 3
+    assert registry.get(INDICATOR_INSTANCE).enumerate_plans(three) == [
+        plan for plan in registry.get(INDICATOR_INSTANCE).enumerate_plans(three)
+        if plan["construction"]["kind"] == "remove_fuzzy_indicator_instance"
+    ]
+
+    removal = next(plan for plan in registry.get(INDICATOR_INSTANCE).enumerate_plans(two) if plan["construction"].get("indicatorInstanceId") == "fz_cci_a_1")
+    restored = registry.get(INDICATOR_INSTANCE).preview(two, removal)
+    assert restored["graph"]["evidenceGroups"][0]["indicatorInstanceIds"] == ["state"]
+    assert {item["meta"]["instanceId"] for item in restored["indicators"]} == {"state", "event", "scalar"}
+
+
+def test_identity_substitution_uses_capability_not_role_labels_and_rejects_event_scalar_crossing() -> None:
+    catalog, profile = _catalog(), _profile()
+    cci = next(item for item in catalog["indicators"] if item["meta"]["id"] == "CCI_A")
+    cci["meta"]["strategyRole"] = "trend"
+    cci["meta"]["signalRole"] = "context"
+    plans = IndicatorLearningRegistry(catalog).get(FAMILY_SUBSTITUTION).enumerate_plans(profile)
+    plan = next(item for item in plans if item["construction"]["afterIndicatorId"] == "CCI_A")
+    assert plan["construction"]["softRolePrior"] == {
+        "beforeStrategyRole": "mean-reversion", "afterStrategyRole": "trend",
+        "beforeSignalRole": "setup", "afterSignalRole": "context",
+    }
+    assert plan["construction"]["eventBound"] is False
+    assert plan["construction"]["scalarBound"] is False
+    assert all(item["construction"]["indicatorInstanceId"] != "event" for item in plans)
+
+
+def test_bidirectional_fuzzy_cap_is_enforced_per_owned_direction() -> None:
+    catalog = _catalog()
+    indicators = [
+        _instance(catalog, "RSI_A", instance_id)
+        for instance_id in ("long_a", "long_b", "long_c", "long_d", "short_a")
+    ]
+    profile = {
+        "directionMode": "both",
+        "indicators": indicators,
+        "executionConfig": {"managementLibrary": {"scalarBindings": []}},
+        "graph": {
+            "initialStateId": "flat",
+            "evidenceGroups": [
+                {"id": "long_first", "indicatorInstanceIds": ["long_a", "long_b", "long_c"]},
+                {"id": "long_second", "indicatorInstanceIds": ["long_d"]},
+                {"id": "short_context", "indicatorInstanceIds": ["short_a"]},
+            ],
+            "eventBindings": [],
+            "transitions": [
+                {"id": "uses_long", "sourceStateId": "flat", "destinationStateId": "flat", "guard": {"kind": "evidence_at_least", "groupId": "long_first", "thresholdPercent": 50}},
+            ],
+            "entryArbitration": {"modules": [
+                {"direction": "long", "evidenceGroupIds": ["long_first", "long_second"], "indicatorIds": ["long_a", "long_b", "long_c", "long_d"]},
+                {"direction": "short", "evidenceGroupIds": ["short_context"], "indicatorIds": ["short_a"]},
+            ]},
+        },
+    }
+    assert IndicatorLearningRegistry(catalog).enumerate_plans(profile) == []
 
 
 def test_evidence_membership_add_remove_last_member_cap_and_cross_module_rejection() -> None:

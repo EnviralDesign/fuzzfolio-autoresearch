@@ -29,10 +29,12 @@ SEMANTIC_RANGE = "indicator_semantic_range_v1"
 FAMILY_SUBSTITUTION = "indicator_family_substitution_v1"
 EVIDENCE_WEIGHT = "evidence_contribution_weight_v1"
 EVIDENCE_MEMBERSHIP = "evidence_group_membership_v1"
+INDICATOR_INSTANCE = "indicator_instance_structure_v1"
 
 _WEIGHT_MULTIPLIERS = (0.5, 0.75, 1.25, 1.5)
 _MAX_WEIGHT = 10.0
-_MAX_EVIDENCE_GROUP_MEMBERS = 16
+_MAX_EVIDENCE_GROUP_MEMBERS = 3
+_MAX_BOUND_INDICATOR_INSTANCES_PER_DIRECTION = 3
 
 
 def _items(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -58,6 +60,11 @@ def _catalog_equivalent_meta(value: Mapping[str, Any]) -> dict[str, Any]:
     """Instance identity is authored at hydration time, not catalog authority."""
     result = _clone(value, name="indicator metadata")
     result.pop("instanceId", None)
+    # The pair-authority builder intentionally removes catalog documentation
+    # before a module grammar snapshots profile material.  Documentation never
+    # alters output capability and must not make a real catalog instance look
+    # stale to the learning surface.
+    result.pop("docs", None)
     return result
 
 
@@ -70,7 +77,7 @@ def _strip_model_only_nulls(value: Any, catalog_shape: Any) -> Any:
     """
     if isinstance(value, Mapping) and isinstance(catalog_shape, Mapping):
         return {
-            key: _strip_model_only_nulls(item, catalog_shape[key])
+            key: _strip_model_only_nulls(item, catalog_shape[key]) if key in catalog_shape else item
             for key, item in value.items()
             if key in catalog_shape or item is not None
         }
@@ -91,7 +98,8 @@ def _normalize_model_numbers(value: Any) -> Any:
 
 
 def _catalog_meta_matches(authored: Mapping[str, Any], catalog: Mapping[str, Any]) -> bool:
-    return _signature(_normalize_model_numbers(_strip_model_only_nulls(_catalog_equivalent_meta(authored), catalog))) == _signature(_normalize_model_numbers(catalog))
+    catalog_meta = _catalog_equivalent_meta(catalog)
+    return _signature(_normalize_model_numbers(_strip_model_only_nulls(_catalog_equivalent_meta(authored), catalog_meta))) == _signature(_normalize_model_numbers(catalog_meta))
 
 
 class IndicatorLearningCatalog:
@@ -115,10 +123,8 @@ class IndicatorLearningCatalog:
         return _clone(value, name="catalog indicator entry") if value is not None else None
 
     def deferred_substitution_dispositions(self, profile: Mapping[str, Any]) -> list[dict[str, Any]]:
-        """Explain why a family replacement is unavailable without weakening it."""
+        """Explain unavailable typed replacement without weakening contracts."""
         result: list[dict[str, Any]] = []
-        _evidence, events = _bound_instances(profile)
-        scalar_bound = _scalar_bound_instances(profile)
         for index, indicator in enumerate(profile.get("indicators") or []):
             if not isinstance(indicator, Mapping) or not isinstance(indicator.get("meta"), Mapping):
                 continue
@@ -131,15 +137,27 @@ class IndicatorLearningCatalog:
             if missing:
                 result.append({"indicatorIndex": index, "indicatorId": indicator_id, "disposition": "deferred", "reason": "source_compatibility_metadata_missing", "missing": missing})
                 continue
-            contract_missing = _substitution_contract_missing(source["meta"])
-            if _substitution_contract(source["meta"]) is None:
-                result.append({"indicatorIndex": index, "indicatorId": indicator_id, "disposition": "deferred", "reason": "family_substitution_contract_not_admitted", "missing": contract_missing})
-                continue
             instance_id = str(indicator["meta"].get("instanceId") or "")
-            if instance_id in events:
+            fuzzy, event, scalar = _instance_binding_shape(profile, instance_id)
+            if not (fuzzy or event or scalar):
+                continue
+            contract = _binding_contract(source["meta"], fuzzy=fuzzy, event=event, scalar=scalar)
+            if contract is not None:
+                peers = [
+                    replacement_id
+                    for replacement_id, replacement in self.indicators.items()
+                    if replacement_id != indicator_id
+                    and not _compatibility_missing(replacement["meta"])
+                    and _binding_contract(replacement["meta"], fuzzy=fuzzy, event=event, scalar=scalar) == contract
+                ]
+                if peers:
+                    continue
+            if event:
                 result.append({"indicatorIndex": index, "indicatorId": indicator_id, "disposition": "deferred", "reason": "event_output_schema_metadata_not_admitted"})
-            elif instance_id in scalar_bound:
+            elif scalar:
                 result.append({"indicatorIndex": index, "indicatorId": indicator_id, "disposition": "deferred", "reason": "management_scalar_binding_replacement_not_admitted"})
+            elif fuzzy:
+                result.append({"indicatorIndex": index, "indicatorId": indicator_id, "disposition": "deferred", "reason": "fuzzy_evidence_capability_not_admitted"})
         return result
 
 
@@ -234,13 +252,16 @@ def _range_choices(meta: Mapping[str, Any], config: Mapping[str, Any]) -> Iterab
 
 
 def _compatibility_missing(meta: Mapping[str, Any]) -> list[str]:
-    required = ("strategyRole", "signalRole", "signalPersistence", "valueRange", "inputs", "requiredPaddingBars")
+    # ``strategyRole`` and ``signalRole`` remain useful priors for analysis,
+    # but are deliberately not a hard search eligibility boundary.  A role
+    # label is not an output-type contract.
+    required = ("signalPersistence", "valueRange", "requiredPaddingBars")
     return [key for key in required if key not in meta]
 
 
 _SUBSTITUTION_KEYS = (
     "substitutionClass", "polarity", "scoreUnit", "rawUnit",
-    "eventOutputSchema", "normalizationScale", "persistenceCompatibility",
+    "eventOutputSchema", "persistenceCompatibility",
 )
 
 
@@ -263,16 +284,112 @@ def _substitution_contract_missing(meta: Mapping[str, Any]) -> list[str]:
     return [key for key in _SUBSTITUTION_KEYS if key not in value]
 
 
-def _family_signature(meta: Mapping[str, Any]) -> str:
+def _numeric_range(meta: Mapping[str, Any]) -> dict[str, float] | None:
+    value = meta.get("valueRange")
+    if not isinstance(value, Mapping):
+        return None
+    try:
+        minimum, maximum, step, width = (float(value[key]) for key in ("min", "max", "step", "minRange"))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(item) for item in (minimum, maximum, step, width)) or step <= 0.0 or width <= 0.0 or maximum - minimum < width:
+        return None
+    return {"min": minimum, "max": maximum, "step": step, "minRange": width}
+
+
+def _scalar_output_contract(meta: Mapping[str, Any]) -> list[dict[str, str]] | None:
+    rows = meta.get("managementScalarOutputs")
+    if not isinstance(rows, list) or not rows:
+        return None
+    normalized: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            return None
+        output_key, value_kind, unit = (str(row.get(key) or "").strip() for key in ("outputKey", "valueKind", "unit"))
+        if not output_key or value_kind not in {"price_level", "price_distance"}:
+            return None
+        expected_unit = "price" if value_kind == "price_level" else "price_distance"
+        if unit != expected_unit:
+            return None
+        normalized.append({"outputKey": output_key, "valueKind": value_kind, "unit": unit})
+    if len({(row["outputKey"], row["valueKind"], row["unit"]) for row in normalized}) != len(normalized):
+        return None
+    return sorted(normalized, key=lambda row: (row["outputKey"], row["valueKind"], row["unit"]))
+
+
+def _fuzzy_evidence_contract(meta: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the contract for a score that can join a fuzzy evidence group.
+
+    This is intentionally capability-based: state persistence plus an
+    authored numeric score range is the Dashboard's actual fuzzy-input
+    surface.  Strategy and signal-role labels are retained in plans as priors,
+    never compared to decide eligibility.
+    """
+    if meta.get("signalPersistence") != "state" or meta.get("usesRangeConfiguration") is not True:
+        return None
+    numeric_range = _numeric_range(meta)
+    if numeric_range is None:
+        return None
+    explicit = meta.get("familySubstitution")
+    scalar_outputs = _scalar_output_contract(meta)
+    scalar_shape: dict[str, Any] = {"scalarOutputs": scalar_outputs} if scalar_outputs is not None else {"scalarOutputs": []}
+    if explicit is None:
+        return {"kind": "fuzzy_evidence", "schema": "derived_ranged_state_score_v1", **scalar_shape}
     contract = _substitution_contract(meta)
-    if contract is None:
-        return ""
-    return _signature({
-        "strategyRole": meta["strategyRole"], "signalRole": meta["signalRole"], "signalPersistence": meta["signalPersistence"],
-        "valueRange": meta["valueRange"], "usesRangeConfiguration": bool(meta.get("usesRangeConfiguration")),
-        "inputs": meta["inputs"], "managementScalarOutputs": meta.get("managementScalarOutputs", []),
-        "familySubstitution": contract,
-    })
+    if contract is None or not isinstance(contract.get("eventOutputSchema"), Mapping):
+        return None
+    # A catalog that supplies an explicit contract owns its compatibility
+    # declaration.  Include every technical field but no taxonomy labels.
+    return {"kind": "fuzzy_evidence", "schema": "explicit_family_substitution_v1", "contract": contract, **scalar_shape}
+
+
+def _event_contract(meta: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Admit raw-event replacement only with concrete directional tokens."""
+    contract = _substitution_contract(meta)
+    schema = contract.get("eventOutputSchema") if contract is not None else None
+    if meta.get("signalPersistence") not in {"event", "event-with-lookback"} or not isinstance(schema, Mapping):
+        return None
+    if schema.get("kind") != "directional_tokens":
+        return None
+    long_output, short_output = (str(schema.get(key) or "").strip() for key in ("longOutput", "shortOutput"))
+    if not long_output or not short_output or long_output == short_output:
+        return None
+    return {"kind": "raw_event", "signalPersistence": meta["signalPersistence"], "eventOutputSchema": {"kind": "directional_tokens", "longOutput": long_output, "shortOutput": short_output}}
+
+
+def _management_scalar_contract(meta: Mapping[str, Any]) -> dict[str, Any] | None:
+    outputs = _scalar_output_contract(meta)
+    if outputs is None or meta.get("signalPersistence") != "state":
+        return None
+    return {"kind": "scalar_management", "outputs": outputs}
+
+
+def _binding_contract(meta: Mapping[str, Any], *, fuzzy: bool, event: bool, scalar: bool) -> dict[str, Any] | None:
+    """Construct the exact technical capability contract required by bindings."""
+    if event and (fuzzy or scalar):
+        return None
+    required: list[dict[str, Any]] = []
+    if fuzzy:
+        value = _fuzzy_evidence_contract(meta)
+        if value is None:
+            return None
+        required.append(value)
+    if event:
+        value = _event_contract(meta)
+        if value is None:
+            return None
+        required.append(value)
+    if scalar:
+        value = _management_scalar_contract(meta)
+        if value is None:
+            return None
+        required.append(value)
+    return {"schemaVersion": "temporal_indicator_binding_contract_v1", "capabilities": required} if required else None
+
+
+def _range_signature(meta: Mapping[str, Any]) -> str:
+    numeric_range = _numeric_range(meta)
+    return _signature(numeric_range) if numeric_range is not None else ""
 
 
 def _range_sides(profile: Mapping[str, Any], instance_id: str) -> set[str]:
@@ -365,9 +482,10 @@ def _evidence_weight_eligible(profile: Mapping[str, Any], instance_id: str) -> b
     except (TypeError, ValueError): return False
     reachable_groups = _reachable_evidence_groups(profile)
     graph = profile.get("graph") if isinstance(profile.get("graph"), Mapping) else {}
-    contributes_to_reachable_group = any(
+    contributes_to_non_singleton_reachable_group = any(
         isinstance(group, Mapping)
         and str(group.get("id") or "") in reachable_groups
+        and len(group.get("indicatorInstanceIds") or []) > 1
         and instance_id in {
             str(value) for value in group.get("indicatorInstanceIds") or []
         }
@@ -376,8 +494,74 @@ def _evidence_weight_eligible(profile: Mapping[str, Any], instance_id: str) -> b
     return (
         math.isfinite(weight)
         and 0.0 < weight <= _MAX_WEIGHT
-        and contributes_to_reachable_group
+        # A singleton group has no relative evidence contribution, so weight
+        # changes are observational no-ops and must not consume search budget.
+        and contributes_to_non_singleton_reachable_group
     )
+
+
+def _bound_count_by_direction(profile: Mapping[str, Any]) -> dict[str, int] | None:
+    """Count fuzzy-evidence instances without weakening the v3 boundary.
+
+    Event and management bindings have incompatible execution/output semantics,
+    and are governed by their own closed contracts.  The three-instance budget
+    limits the mutable fuzzy evidence surface, allowing a 1/2/3-member group
+    to coexist with the module's raw event trigger.
+    """
+    evidence, events = _bound_instances(profile)
+    bound = evidence
+    direction = str(profile.get("directionMode") or "")
+    if direction in {"long", "short"}:
+        return {direction: len(bound)}
+    if direction != "both":
+        return None
+    graph = profile.get("graph") if isinstance(profile.get("graph"), Mapping) else {}
+    arbitration = graph.get("entryArbitration") if isinstance(graph, Mapping) else None
+    modules = arbitration.get("modules") if isinstance(arbitration, Mapping) else None
+    if not isinstance(modules, list):
+        return None
+    ownership: dict[str, str] = {}
+    for module in modules:
+        if not isinstance(module, Mapping):
+            return None
+        side = str(module.get("direction") or "")
+        ids = module.get("indicatorIds")
+        if side not in {"long", "short"} or not isinstance(ids, list):
+            return None
+        for instance in ids:
+            token = str(instance or "")
+            if not token or token in ownership:
+                return None
+            ownership[token] = side
+    if not bound.issubset(ownership):
+        return None
+    return {side: sum(1 for instance in bound if ownership[instance] == side) for side in ("long", "short")}
+
+
+def _bound_instance_cap_ok(profile: Mapping[str, Any]) -> bool:
+    counts = _bound_count_by_direction(profile)
+    # Partial composite fixtures do not expose ownership manifests; no
+    # instance-structural operation is admitted there, but legacy per-field
+    # mutations remain independently auditable.
+    return counts is None or all(value <= _MAX_BOUND_INDICATOR_INSTANCES_PER_DIRECTION for value in counts.values())
+
+
+def _instance_binding_shape(profile: Mapping[str, Any], instance_id: str) -> tuple[bool, bool, bool]:
+    evidence, events = _bound_instances(profile)
+    scalar = _scalar_bound_instances(profile)
+    return instance_id in evidence, instance_id in events, instance_id in scalar
+
+
+def _fuzzy_group_member_eligible(profile: Mapping[str, Any], item: Mapping[str, Any]) -> bool:
+    meta, config = item.get("meta"), item.get("config")
+    if not isinstance(meta, Mapping) or not isinstance(config, Mapping):
+        return False
+    instance = str(meta.get("instanceId") or "")
+    fuzzy, event, scalar = _instance_binding_shape(profile, instance)
+    # Evidence membership is never allowed to smuggle an event or an execution
+    # scalar into a fuzzy group.  A pre-existing scalar+fuzzy dual-use instance
+    # is left untouched, but no new dual-use topology is constructed here.
+    return fuzzy and not event and not scalar and _binding_contract(meta, fuzzy=True, event=False, scalar=False) is not None and config.get("isActive") is True and config.get("useFormingBar") is False
 
 
 def _profile_invariants(profile: Mapping[str, Any]) -> dict[str, bool]:
@@ -398,6 +582,7 @@ def _profile_invariants(profile: Mapping[str, Any]) -> dict[str, bool]:
         "event_bound_lookback_is_one": all(event_lookback_is_one(instance) for instance in events),
         "bound_instances_exist": all(instance in by_instance for instance in evidence | events | scalar),
         "scalar_bindings_do_not_overlap_event_persistence": not bool(events & scalar),
+        "event_bindings_do_not_overlap_fuzzy_evidence": not bool(events & evidence),
         "evidence_group_membership_is_closed": all(
             isinstance(group.get("indicatorInstanceIds"), list)
             and 1 <= len(group["indicatorInstanceIds"]) <= _MAX_EVIDENCE_GROUP_MEMBERS
@@ -405,6 +590,8 @@ def _profile_invariants(profile: Mapping[str, Any]) -> dict[str, bool]:
             and all(str(value) in by_instance for value in group["indicatorInstanceIds"])
             for group in groups
         ),
+        "bound_indicator_instances_within_direction_cap": _bound_instance_cap_ok(profile),
+        "indicator_instance_ids_are_unique": len(by_instance) == len(indicators) and "" not in by_instance,
     }
 
 
@@ -616,16 +803,34 @@ class EvidenceGroupMembershipOperator(_IndicatorOperator):
             if not isinstance(group, Mapping): continue
             group_id = str(group.get("id") or ""); members = [str(value) for value in group.get("indicatorInstanceIds") or []]
             if group_id not in reachable or not members or len(set(members)) != len(members): continue
-            signatures = {_aligned_score_signature(indicators[member]) for member in members if member in indicators}
-            if len(signatures) != 1 or None in signatures: continue
-            signature = next(iter(signatures))
+            if any(
+                member not in indicators
+                or not _fuzzy_group_member_eligible(profile, indicators[member])
+                for member in members
+            ):
+                continue
+            member_contracts = {
+                _fuzzy_evidence_contract(indicators[member]["meta"])
+                and _signature(_fuzzy_evidence_contract(indicators[member]["meta"]))
+                for member in members
+            }
+            if len(member_contracts) != 1:
+                continue
+            member_contract = next(iter(member_contracts))
             for member in members:
                 if len(members) > 1 and member not in events and member not in scalar and self._group_owner_ok(profile, group_id, member):
                     yield {"kind": "remove_evidence_member", "groupIndex": group_index, "groupId": group_id, "indicatorInstanceId": member, "beforeMembers": members}
             if len(members) >= _MAX_EVIDENCE_GROUP_MEMBERS: continue
             for candidate_id, candidate in sorted(indicators.items()):
                 if candidate_id in members or candidate_id in events or candidate_id in scalar: continue
-                if _aligned_score_signature(candidate) != signature or not self._group_owner_ok(profile, group_id, candidate_id): continue
+                meta, config = candidate.get("meta"), candidate.get("config")
+                if not isinstance(meta, Mapping) or not isinstance(config, Mapping):
+                    continue
+                # This is fuzzy evidence construction, not a role-family
+                # match.  Differently ranged state scores can coexist; each
+                # retains its own catalog-backed semantic range.
+                if _binding_contract(meta, fuzzy=True, event=False, scalar=False) is None or _signature(_fuzzy_evidence_contract(meta)) != member_contract or config.get("isActive") is not True or config.get("useFormingBar") is not False or not self._group_owner_ok(profile, group_id, candidate_id):
+                    continue
                 yield {"kind": "add_evidence_member", "groupIndex": group_index, "groupId": group_id, "indicatorInstanceId": candidate_id, "beforeMembers": members}
     def _transform(self, profile, construction):
         child = copy.deepcopy(profile); group = child["graph"]["evidenceGroups"][construction["groupIndex"]]
@@ -654,19 +859,30 @@ class FamilySubstitutionOperator(_IndicatorOperator):
         for index, item in enumerate(profile.get("indicators") or []):
             if not isinstance(item, Mapping) or not isinstance(item.get("meta"), Mapping) or not isinstance(item.get("config"), Mapping): continue
             source_id, instance = str(item["meta"].get("id") or ""), str(item["meta"].get("instanceId") or "")
-            evidence, events = _bound_instances(profile)
             if instance not in evidence | events | scalar_bound: continue
             source = self.catalog.entry(source_id)
-            if source is None or _compatibility_missing(source["meta"]) or _substitution_contract(source["meta"]) is None or not _catalog_meta_matches(item["meta"], source["meta"]) or instance in scalar_bound: continue
-            # Event output schemas are not present in the current catalog.  An
-            # event-bound replacement therefore remains deferred rather than
-            # pretending range equality proves event-token compatibility.
-            if instance in events: continue
+            if source is None or _compatibility_missing(source["meta"]) or not _catalog_meta_matches(item["meta"], source["meta"]): continue
+            fuzzy, event, scalar = _instance_binding_shape(profile, instance)
+            contract = _binding_contract(source["meta"], fuzzy=fuzzy, event=event, scalar=scalar)
+            if contract is None: continue
             for replacement_id, replacement in sorted(self.catalog.indicators.items()):
                 meta = replacement["meta"]
-                if replacement_id == source_id or _compatibility_missing(meta) or _substitution_contract(meta) is None or _family_signature(meta) != _family_signature(source["meta"]): continue
-                if int(meta["requiredPaddingBars"]) > int(source["meta"]["requiredPaddingBars"]): continue
-                yield {"kind": "family_substitution", "indicatorIndex": index, "indicatorInstanceId": instance, "beforeIndicatorId": source_id, "afterIndicatorId": replacement_id, "compatibilitySignature": _family_signature(meta), "eventBound": instance in events, "evidenceBound": instance in evidence}
+                if replacement_id == source_id or _compatibility_missing(meta): continue
+                if _binding_contract(meta, fuzzy=fuzzy, event=event, scalar=scalar) != contract: continue
+                yield {
+                    "kind": "family_substitution", "indicatorIndex": index,
+                    "indicatorInstanceId": instance, "beforeIndicatorId": source_id,
+                    "afterIndicatorId": replacement_id, "capabilityContract": contract,
+                    "eventBound": event, "evidenceBound": fuzzy, "scalarBound": scalar,
+                    # Labels are visible to selection/analysis but never used
+                    # above as an eligibility predicate.
+                    "softRolePrior": {
+                        "beforeStrategyRole": source["meta"].get("strategyRole"),
+                        "afterStrategyRole": meta.get("strategyRole"),
+                        "beforeSignalRole": source["meta"].get("signalRole"),
+                        "afterSignalRole": meta.get("signalRole"),
+                    },
+                }
     def _transform(self, profile, construction):
         child = copy.deepcopy(profile); item = child["indicators"][construction["indicatorIndex"]]
         if item["meta"].get("instanceId") != construction["indicatorInstanceId"] or item["meta"].get("id") != construction["beforeIndicatorId"]: raise TemporalDiscoveryContractError("family parent drift")
@@ -681,22 +897,183 @@ class FamilySubstitutionOperator(_IndicatorOperator):
         # family-specific TA configuration and its catalog metadata.
         for key in ("isActive", "useFormingBar", "timeframe", "lookbackBars", "weight"):
             if key in old_config: new_config[key] = old_config[key]
-        if _family_signature(replacement["meta"]) == _family_signature(item["meta"]):
+        # Thresholds only retain their prior meaning under the same numeric
+        # semantic range.  Otherwise the replacement's catalog defaults are
+        # intentionally used and the range operator can evolve them later.
+        if _range_signature(replacement["meta"]) == _range_signature(item["meta"]):
             if "ranges" in old_config:
                 new_config["ranges"] = copy.deepcopy(old_config["ranges"])
         item["meta"], item["config"] = new_meta, new_config
-        return child, [{"operation": "substitute_indicator_family", "indicatorInstanceId": construction["indicatorInstanceId"], "beforeIndicatorId": construction["beforeIndicatorId"], "afterIndicatorId": construction["afterIndicatorId"], "compatibilitySignature": construction["compatibilitySignature"]}]
+        return child, [{"operation": "substitute_indicator_family", "indicatorInstanceId": construction["indicatorInstanceId"], "beforeIndicatorId": construction["beforeIndicatorId"], "afterIndicatorId": construction["afterIndicatorId"], "capabilityContract": construction["capabilityContract"], "softRolePrior": construction["softRolePrior"]}]
     def _construction_relevant(self, profile, construction):
         evidence, events = _bound_instances(profile)
         return construction.get("indicatorInstanceId") in evidence | events | _scalar_bound_instances(profile)
 
 
+def _new_instance_id(indicator_id: str, existing: set[str]) -> str:
+    base = "fz_" + "".join(char.lower() if char.isalnum() else "_" for char in indicator_id).strip("_")
+    base = base[:58] or "fz_indicator"
+    ordinal = 1
+    while True:
+        candidate = f"{base}_{ordinal}"
+        if candidate not in existing:
+            return candidate
+        ordinal += 1
+
+
+class IndicatorInstanceOperator(_IndicatorOperator):
+    """Atomically insert or remove a fuzzy-evidence indicator instance.
+
+    Insertion also binds the new instance into a reachable fuzzy group, while
+    removal deletes every fuzzy membership for the instance.  This prevents
+    dead unbound inventory from accumulating and keeps every mutation useful.
+    """
+
+    operator_id = INDICATOR_INSTANCE
+
+    def _constructions(self, profile):
+        graph = profile.get("graph") if isinstance(profile.get("graph"), Mapping) else {}
+        groups = graph.get("evidenceGroups") or []
+        indicators = [item for item in profile.get("indicators") or [] if isinstance(item, Mapping)]
+        by_instance = {
+            str((item.get("meta") or {}).get("instanceId") or ""): item
+            for item in indicators
+        }
+        existing = set(by_instance)
+        evidence, events = _bound_instances(profile)
+        scalar = _scalar_bound_instances(profile)
+        reachable = _reachable_evidence_groups(profile)
+        counts = _bound_count_by_direction(profile)
+        if counts is None:
+            return
+        # A v2 module has one direction.  A v3 composite must have explicit
+        # ownership and cannot borrow a candidate from the other module.
+        direction = str(profile.get("directionMode") or "")
+        for group_index, group in enumerate(groups):
+            if not isinstance(group, Mapping):
+                continue
+            group_id = str(group.get("id") or "")
+            members = [str(value) for value in group.get("indicatorInstanceIds") or []]
+            if group_id not in reachable or not members or len(members) >= _MAX_EVIDENCE_GROUP_MEMBERS:
+                continue
+            if any(member not in by_instance or not _fuzzy_group_member_eligible(profile, by_instance[member]) for member in members):
+                continue
+            member_contracts = {
+                _signature(_fuzzy_evidence_contract(by_instance[member]["meta"]))
+                for member in members
+            }
+            if len(member_contracts) != 1:
+                continue
+            member_contract = next(iter(member_contracts))
+            owner = _module_owner(profile, group_id=group_id)
+            if direction == "both":
+                if owner is None or counts.get(owner, _MAX_BOUND_INDICATOR_INSTANCES_PER_DIRECTION) >= _MAX_BOUND_INDICATOR_INSTANCES_PER_DIRECTION:
+                    continue
+            elif counts.get(direction, _MAX_BOUND_INDICATOR_INSTANCES_PER_DIRECTION) >= _MAX_BOUND_INDICATOR_INSTANCES_PER_DIRECTION:
+                continue
+            existing_identity = {
+                str((by_instance[member].get("meta") or {}).get("id") or "")
+                for member in members
+            }
+            for indicator_id, entry in sorted(self.catalog.indicators.items()):
+                meta, config = entry["meta"], entry["config"]
+                if indicator_id in existing_identity or _fuzzy_evidence_contract(meta) is None or _signature(_fuzzy_evidence_contract(meta)) != member_contract:
+                    continue
+                if not isinstance(config, Mapping) or config.get("isActive") is not True:
+                    continue
+                instance_id = _new_instance_id(indicator_id, existing)
+                yield {
+                    "kind": "insert_fuzzy_indicator_instance", "groupIndex": group_index,
+                    "groupId": group_id, "indicatorId": indicator_id,
+                    "indicatorInstanceId": instance_id, "beforeMembers": members,
+                    "softRolePrior": {"strategyRole": meta.get("strategyRole"), "signalRole": meta.get("signalRole")},
+                }
+
+        # Delete only a pure fuzzy instance, and only when every affected
+        # group remains non-empty.  Raw event and scalar-management identities
+        # are deliberately immutable on this surface.
+        for instance_id, item in sorted(by_instance.items()):
+            if not instance_id or instance_id in events or instance_id in scalar or instance_id not in evidence:
+                continue
+            fuzzy, event, scalar_binding = _instance_binding_shape(profile, instance_id)
+            meta = item.get("meta") if isinstance(item.get("meta"), Mapping) else {}
+            if not fuzzy or event or scalar_binding or _binding_contract(meta, fuzzy=True, event=False, scalar=False) is None:
+                continue
+            affected = [
+                (index, group)
+                for index, group in enumerate(groups)
+                if isinstance(group, Mapping) and instance_id in {str(value) for value in group.get("indicatorInstanceIds") or []}
+            ]
+            if not affected or any(len(group.get("indicatorInstanceIds") or []) <= 1 for _index, group in affected):
+                continue
+            if not any(str(group.get("id") or "") in reachable for _index, group in affected):
+                continue
+            if direction == "both" and _module_owner(profile, instance_id=instance_id) is None:
+                continue
+            yield {
+                "kind": "remove_fuzzy_indicator_instance", "indicatorInstanceId": instance_id,
+                "indicatorId": str(meta.get("id") or ""),
+                "affectedGroups": [
+                    {"groupIndex": index, "groupId": str(group.get("id") or ""), "beforeMembers": [str(value) for value in group.get("indicatorInstanceIds") or []]}
+                    for index, group in affected
+                ],
+            }
+
+    def _transform(self, profile, construction):
+        child = copy.deepcopy(profile)
+        graph = child.get("graph") if isinstance(child.get("graph"), Mapping) else None
+        if not isinstance(graph, dict) or not isinstance(child.get("indicators"), list):
+            raise TemporalDiscoveryContractError("indicator instance parent shape is invalid")
+        kind = construction.get("kind")
+        if kind == "insert_fuzzy_indicator_instance":
+            group = graph.get("evidenceGroups", [])[construction["groupIndex"]]
+            if not isinstance(group, dict) or group.get("id") != construction["groupId"] or [str(value) for value in group.get("indicatorInstanceIds") or []] != construction["beforeMembers"]:
+                raise TemporalDiscoveryContractError("indicator insertion parent drift")
+            if any(str((item.get("meta") or {}).get("instanceId") or "") == construction["indicatorInstanceId"] for item in child["indicators"] if isinstance(item, Mapping)):
+                raise TemporalDiscoveryContractError("indicator insertion instance id already exists")
+            entry = self.catalog.entry(str(construction["indicatorId"]))
+            if entry is None or _fuzzy_evidence_contract(entry["meta"]) is None:
+                raise TemporalDiscoveryContractError("indicator insertion catalog capability disappeared")
+            item = {"meta": copy.deepcopy(entry["meta"]), "config": copy.deepcopy(entry["config"])}
+            item["meta"]["instanceId"] = construction["indicatorInstanceId"]
+            # Catalog defaults omit this runtime-only safety field.  Every
+            # constructed fuzzy score is explicitly closed-bar based.
+            item["config"]["useFormingBar"] = False
+            child["indicators"].append(item)
+            group["indicatorInstanceIds"] = sorted([*group["indicatorInstanceIds"], construction["indicatorInstanceId"]])
+            return child, [{"operation": "insert_fuzzy_indicator_instance", "indicatorInstanceId": construction["indicatorInstanceId"], "indicatorId": construction["indicatorId"], "groupId": construction["groupId"], "beforeMembers": construction["beforeMembers"], "afterMembers": group["indicatorInstanceIds"], "softRolePrior": construction["softRolePrior"]}]
+        if kind == "remove_fuzzy_indicator_instance":
+            instance_id = construction["indicatorInstanceId"]
+            target = [item for item in child["indicators"] if isinstance(item, Mapping) and str((item.get("meta") or {}).get("instanceId") or "") == instance_id]
+            if len(target) != 1 or str((target[0].get("meta") or {}).get("id") or "") != construction["indicatorId"]:
+                raise TemporalDiscoveryContractError("indicator removal parent drift")
+            traces = []
+            for affected in construction["affectedGroups"]:
+                group = graph.get("evidenceGroups", [])[affected["groupIndex"]]
+                if not isinstance(group, dict) or group.get("id") != affected["groupId"] or [str(value) for value in group.get("indicatorInstanceIds") or []] != affected["beforeMembers"]:
+                    raise TemporalDiscoveryContractError("indicator removal group drift")
+                group["indicatorInstanceIds"] = [value for value in group["indicatorInstanceIds"] if value != instance_id]
+                traces.append({"groupId": affected["groupId"], "beforeMembers": affected["beforeMembers"], "afterMembers": group["indicatorInstanceIds"]})
+            child["indicators"] = [item for item in child["indicators"] if item not in target]
+            return child, [{"operation": "remove_fuzzy_indicator_instance", "indicatorInstanceId": instance_id, "indicatorId": construction["indicatorId"], "affectedGroups": traces}]
+        raise TemporalDiscoveryContractError("unknown indicator instance construction")
+
+    def _construction_relevant(self, profile, construction):
+        # Re-enumeration is the canonical, drift-safe relevance proof.  This
+        # lightweight check excludes stale group references before transform.
+        if construction.get("kind") == "insert_fuzzy_indicator_instance":
+            return str(construction.get("groupId") or "") in _reachable_evidence_groups(profile)
+        if construction.get("kind") == "remove_fuzzy_indicator_instance":
+            return any(str(item.get("groupId") or "") in _reachable_evidence_groups(profile) for item in construction.get("affectedGroups") or [] if isinstance(item, Mapping))
+        return False
+
+
 class IndicatorLearningRegistry:
     def __init__(self, catalog: Mapping[str, Any] | IndicatorLearningCatalog, *, timeframe_policy: Sequence[str] = TIMEFRAME_POLICY_DEFAULT) -> None:
         self.catalog = catalog if isinstance(catalog, IndicatorLearningCatalog) else IndicatorLearningCatalog(catalog, timeframe_policy=timeframe_policy)
-        self._operators = (GraphBoundTimeframeOperator(self.catalog), EvidenceLookbackOperator(self.catalog), TaPeriodOperator(self.catalog), SemanticRangeOperator(self.catalog), EvidenceContributionWeightOperator(self.catalog), EvidenceGroupMembershipOperator(self.catalog), FamilySubstitutionOperator(self.catalog))
+        self._operators = (GraphBoundTimeframeOperator(self.catalog), EvidenceLookbackOperator(self.catalog), TaPeriodOperator(self.catalog), SemanticRangeOperator(self.catalog), EvidenceContributionWeightOperator(self.catalog), EvidenceGroupMembershipOperator(self.catalog), IndicatorInstanceOperator(self.catalog), FamilySubstitutionOperator(self.catalog))
         self.structural_registry = StructuralOperatorRegistry(self._operators)
-        self.policy = {"schemaVersion": "temporal_indicator_learning_policy_v1", "learningVersion": INDICATOR_LEARNING_VERSION, "catalogSha256": self.catalog.catalog_sha256, "timeframePolicy": list(self.catalog.timeframe_policy), "evidenceLookbackChoices": list(EVIDENCE_LOOKBACK_CHOICES), "operatorIds": list(self.operator_ids)}
+        self.policy = {"schemaVersion": "temporal_indicator_learning_policy_v1", "learningVersion": INDICATOR_LEARNING_VERSION, "catalogSha256": self.catalog.catalog_sha256, "timeframePolicy": list(self.catalog.timeframe_policy), "evidenceLookbackChoices": list(EVIDENCE_LOOKBACK_CHOICES), "maxBoundFuzzyInstancesPerDirection": _MAX_BOUND_INDICATOR_INSTANCES_PER_DIRECTION, "maxEvidenceGroupMembers": _MAX_EVIDENCE_GROUP_MEMBERS, "operatorIds": list(self.operator_ids)}
         self.policy["policySha256"] = canonical_sha256(self.policy)
     @property
     def operator_ids(self) -> tuple[str, ...]: return self.structural_registry.operator_ids
@@ -705,4 +1082,4 @@ class IndicatorLearningRegistry:
     def deferred_dispositions(self, profile: Mapping[str, Any]) -> list[dict[str, Any]]: return self.catalog.deferred_substitution_dispositions(profile)
 
 
-__all__ = ["EVIDENCE_LOOKBACK", "EVIDENCE_LOOKBACK_CHOICES", "EVIDENCE_MEMBERSHIP", "EVIDENCE_WEIGHT", "FAMILY_SUBSTITUTION", "GRAPH_BOUND_TIMEFRAME", "INDICATOR_LEARNING_OPERATOR_VERSION", "INDICATOR_LEARNING_VERSION", "IndicatorLearningCatalog", "IndicatorLearningRegistry", "SEMANTIC_RANGE", "TA_PERIOD", "TIMEFRAME_POLICY_DEFAULT"]
+__all__ = ["EVIDENCE_LOOKBACK", "EVIDENCE_LOOKBACK_CHOICES", "EVIDENCE_MEMBERSHIP", "EVIDENCE_WEIGHT", "FAMILY_SUBSTITUTION", "GRAPH_BOUND_TIMEFRAME", "INDICATOR_INSTANCE", "INDICATOR_LEARNING_OPERATOR_VERSION", "INDICATOR_LEARNING_VERSION", "IndicatorLearningCatalog", "IndicatorLearningRegistry", "SEMANTIC_RANGE", "TA_PERIOD", "TIMEFRAME_POLICY_DEFAULT"]

@@ -45,7 +45,7 @@ DEFAULT_COMPLETENESS_POLICY: dict[str, Any] = {
     },
     "evaluation": "uniquely admitted candidates require an explicit plan/disposition",
     "activationQuality": "evaluated candidates require one explicit activation/quality record",
-    "archiveRetention": "evaluated candidates require one explicit retained/not_retained decision",
+    "archiveRetention": "quality-recorded candidates require one explicit retained/not_retained decision; quality-rejected candidates may record only non-promotable scheduled negative-novelty exploration retention",
     "identity": "records may omit unavailable fields but may never contradict an available binding",
     "attemptLedger": "every generation attempt is recorded independently; attempts without a materialized candidate remain attempt-only",
 }
@@ -610,6 +610,50 @@ def build_generation_funnel_artifact(
                 terminal = retention_outcome
             else:
                 terminal = "activation_" + activation_outcome
+                retention = archive_rows.get(candidate_id)
+                if retention is not None:
+                    _merge_identity(binding, retention, source="archive retention")
+                    retention_outcome = _outcome(
+                        retention,
+                        source="archive retention",
+                        allowed={"retained"},
+                    )
+                    archive_lane = _string(
+                        _field(retention, "archiveLane", "archive_lane"),
+                        name="archive retention.archiveLane",
+                        required=True,
+                    )
+                    retention_classification = _string(
+                        _field(
+                            retention,
+                            "retentionClassification",
+                            "retention_classification",
+                        ),
+                        name="archive retention.retentionClassification",
+                        required=True,
+                    )
+                    if (
+                        activation_outcome != "quality_rejected"
+                        or quality == "eligible"
+                        or archive_lane != "negative_novelty"
+                        or retention_classification
+                        != "non_promotable_scheduled_exploration"
+                    ):
+                        raise GenerationFunnelContractError(
+                            "archive retention after non-recorded activation must be non-promotable negative-novelty exploration"
+                        )
+                    if not _identity_from(
+                        retention, source="archive retention"
+                    )["archiveMemberIdentitySha256"]:
+                        raise GenerationFunnelContractError(
+                            f"exploratory-retained candidate {candidate_id} lacks archive member identity"
+                        )
+                    stages["exploratoryRetention"] = _stage_row(
+                        "retained_for_scheduled_negative_novelty_exploration",
+                        _reasons(retention, source="archive retention"),
+                    )
+                    stages["exploratoryRetention"]["archiveLane"] = archive_lane
+                    stages["exploratoryRetention"]["promotionEligible"] = False
 
         # Completeness is also exclusivity.  A terminal row may not be padded
         # with evidence from a stage that was never authorized to run; that is
@@ -626,6 +670,8 @@ def build_generation_funnel_artifact(
         if "activationQuality" in stages:
             allowed_sources.add("activation quality")
         if "archiveRetention" in stages:
+            allowed_sources.add("archive retention")
+        if "exploratoryRetention" in stages:
             allowed_sources.add("archive retention")
         present_sources = {
             source

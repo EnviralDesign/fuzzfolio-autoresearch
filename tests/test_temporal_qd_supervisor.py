@@ -466,8 +466,40 @@ def test_supervisor_forwards_broad_admission_to_empty_quality_bootstrap(
     inputs["generation_count"] = 4
     inputs["parameters"] = {
         **inputs["parameters"],
-        "targetUniqueCandidates": 2500,
-        "maxProposalAttempts": 2500,
+        "targetUniqueCandidates": 1024,
+        "maxProposalAttempts": 1024,
+    }
+    ladder_input = {
+        "schemaVersion": "temporal_qd_evidence_ladder_input_v1",
+        "frozenSeed": "broad-fixture",
+        "historicalMonthStarts": [
+            "2020-01-01T00:00:00Z",
+            "2020-03-01T00:00:00Z",
+            "2020-06-01T00:00:00Z",
+            "2020-09-01T00:00:00Z",
+        ],
+        "validationWindow": {
+            "analysisWindowStart": "2021-01-01T00:00:00Z",
+            "analysisWindowEnd": "2022-01-01T00:00:00Z",
+        },
+        "scrutinyWindow": {
+            "analysisWindowStart": "2016-01-01T00:00:00Z",
+            "analysisWindowEnd": "2019-01-01T00:00:00Z",
+        },
+    }
+    ladder = supervisor.build_evidence_ladder(ladder_input)
+    _write(
+        inputs["template_preparation_path"],
+        {"developmentWindows": ladder["discovery"]["windows"]},
+    )
+    validation_template = tmp_path / "validation-template.json"
+    scrutiny_template = tmp_path / "scrutiny-template.json"
+    _write(validation_template, {"developmentWindows": [ladder["validation"]["window"]]})
+    _write(scrutiny_template, {"developmentWindows": [ladder["scrutiny"]["window"]]})
+    inputs["evidence_ladder_config"] = {
+        **ladder_input,
+        "validationTemplatePreparationPath": str(validation_template),
+        "scrutinyTemplatePreparationPath": str(scrutiny_template),
     }
     with pytest.raises(RuntimeError, match="input capture"):
         supervisor.run_qd_supervisor(
@@ -480,3 +512,427 @@ def test_supervisor_forwards_broad_admission_to_empty_quality_bootstrap(
         "enabledByBroadAdmission": True,
         "originSchedule": "generator_v2_random_immigrants_only",
     }
+    assert config["broadAdmissionContract"] == {
+        "schemaVersion": "temporal_qd_broad_admission_contract_v1",
+        "generationCount": 4,
+        "candidatesPerGeneration": 1024,
+        "candidateEvaluations": 4096,
+        "discoveryWindowsPerCandidate": 3,
+        "discoveryWorkerTasks": 12288,
+    }
+
+
+def test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Pair generation must use only its frozen native authority contract."""
+
+    class StopAfterPairGeneration(Exception):
+        pass
+
+    factory = object()
+    operator = object()
+    native_validator = object()
+    compiler = object()
+    pair_config = {
+        "schemaVersion": "fixture_pair_run_config_v1",
+        "operatorImplementation": {"implementation": "fixture"},
+    }
+
+    class FakePairAuthorityBundle:
+        def __init__(self, frozen):
+            assert frozen == pair_config
+            self.factory = factory
+            self.operator = operator
+            self.validator = native_validator
+            self.compiler = compiler
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def close(self):
+            pass
+
+    captured: dict = {}
+
+    def fake_generate(**kwargs):
+        captured.update(kwargs)
+        raise StopAfterPairGeneration
+
+    monkeypatch.setattr(
+        supervisor, "load_pair_run_config", lambda value: pair_config
+    )
+    monkeypatch.setattr(
+        supervisor, "PairAuthorityBundle", FakePairAuthorityBundle
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "pair_policy_from_config",
+        lambda frozen: {"schemaVersion": "fixture_pair_policy_v1", "enabled": True},
+    )
+    monkeypatch.setattr(supervisor, "LabGatewayClient", FakeClient)
+    monkeypatch.setattr(supervisor, "generate_qd_generation", fake_generate)
+
+    inputs = _inputs(tmp_path)
+    inputs.update(
+        {
+            "generation_count": 1,
+            "source_preparation_path": None,
+            "base_generator_root": None,
+            "confirmed_entry_admission_root": None,
+            "validator_command_file": None,
+            "bidirectional_pair_config": pair_config,
+        }
+    )
+    with pytest.raises(StopAfterPairGeneration):
+        supervisor.run_qd_supervisor(run_root=tmp_path / "pair", **inputs)
+
+    assert {
+        "source_preparation_path",
+        "base_generator_root",
+        "confirmed_entry_admission_root",
+        "validator_command",
+        "validator_timeout_seconds",
+    }.isdisjoint(captured)
+    assert captured["bidirectional_pair_policy"] == {
+        "schemaVersion": "fixture_pair_policy_v1",
+        "enabled": True,
+    }
+    assert captured["bidirectional_pair_factory"] is factory
+    assert captured["bidirectional_module_authority"] is operator
+    assert captured["bidirectional_native_validator"] is native_validator
+    assert captured["bidirectional_pair_compiler"] is compiler
+    assert captured["bidirectional_operator_implementation_identity"] == {
+        "implementation": "fixture"
+    }
+    config = json.loads((tmp_path / "pair" / "config.json").read_text())
+    assert "validator" not in config
+
+
+def test_broad_admission_refuses_missing_frozen_evidence_ladder(tmp_path: Path) -> None:
+    inputs = _inputs(tmp_path)
+    inputs["generation_count"] = 4
+    inputs["parameters"] = {
+        **inputs["parameters"],
+        "targetUniqueCandidates": 1024,
+        "maxProposalAttempts": 1024,
+    }
+    with pytest.raises(TemporalDiscoveryContractError, match="frozen evidence ladder"):
+        supervisor.run_qd_supervisor(
+            run_root=tmp_path / "missing-ladder", broad_admission=True, **inputs
+        )
+
+
+def test_broad_admission_refuses_template_not_bound_to_three_discovery_windows(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    inputs["generation_count"] = 4
+    inputs["parameters"] = {
+        **inputs["parameters"],
+        "targetUniqueCandidates": 1024,
+        "maxProposalAttempts": 1024,
+    }
+    validation_template = tmp_path / "validation-template.json"
+    scrutiny_template = tmp_path / "scrutiny-template.json"
+    ladder_input = {
+        "schemaVersion": "temporal_qd_evidence_ladder_input_v1",
+        "frozenSeed": "template-binding-fixture",
+        "historicalMonthStarts": [
+            "2020-01-01T00:00:00Z",
+            "2020-03-01T00:00:00Z",
+            "2020-06-01T00:00:00Z",
+            "2020-09-01T00:00:00Z",
+        ],
+        "validationWindow": {
+            "analysisWindowStart": "2021-01-01T00:00:00Z",
+            "analysisWindowEnd": "2022-01-01T00:00:00Z",
+        },
+        "scrutinyWindow": {
+            "analysisWindowStart": "2016-01-01T00:00:00Z",
+            "analysisWindowEnd": "2019-01-01T00:00:00Z",
+        },
+        "validationTemplatePreparationPath": str(validation_template),
+        "scrutinyTemplatePreparationPath": str(scrutiny_template),
+    }
+    ladder = supervisor.build_evidence_ladder(ladder_input)
+    _write(validation_template, {"developmentWindows": [ladder["validation"]["window"]]})
+    _write(scrutiny_template, {"developmentWindows": [ladder["scrutiny"]["window"]]})
+    with pytest.raises(TemporalDiscoveryContractError, match="exactly bind"):
+        supervisor.run_qd_supervisor(
+            run_root=tmp_path / "wrong-discovery-template",
+            broad_admission=True,
+            evidence_ladder_config=ladder_input,
+            **inputs,
+        )
+
+
+def test_ladder_cohort_uses_only_ranked_quality_survivors_round_robin() -> None:
+    def member(
+        candidate_id: str, *, lane: str, front: int | None, crowding: float | None,
+        quality: bool, net_r: float,
+    ) -> dict:
+        return {
+            "candidateId": candidate_id,
+            "candidate": {"candidateId": candidate_id},
+            "archiveLane": lane,
+            "paretoFront": front,
+            "crowdingDistance": crowding,
+            "finiteDataValidity": {
+                "isFiniteData": True,
+                "passesSupportGate": True,
+                "validForQuality": quality,
+            },
+            "objectives": {
+                "worstWindowConservativeNetR": net_r,
+                "structuralComplexity": 1.0,
+            },
+        }
+
+    archive = {
+        "cells": [
+            {
+                "cellId": "cell-a",
+                "members": [
+                    # Candidate-ID ordering would put this ahead of z-first;
+                    # archive Pareto/rank ordering must not.
+                    member("a-later", lane="quality", front=1, crowding=0.0, quality=True, net_r=1.0),
+                    member("z-first", lane="quality", front=0, crowding=0.0, quality=True, net_r=1.0),
+                    member("negative", lane="negative_novelty", front=None, crowding=None, quality=True, net_r=-1.0),
+                    member("observational", lane="observational", front=None, crowding=None, quality=False, net_r=2.0),
+                ],
+            },
+            {
+                "cellId": "cell-b",
+                "members": [
+                    member("b-first", lane="quality", front=0, crowding=0.0, quality=True, net_r=1.0),
+                ],
+            },
+        ]
+    }
+
+    assert [row["candidateId"] for row in supervisor._ladder_cohort(archive, limit=4)] == [
+        "z-first",
+        "b-first",
+        "a-later",
+    ]
+
+
+def test_evidence_ladder_fails_closed_without_quality_survivors(tmp_path: Path) -> None:
+    archive_path = tmp_path / "archive.json"
+    _write(
+        archive_path,
+        {
+            "cells": [
+                {
+                    "cellId": "only-cell",
+                    "members": [
+                        {
+                            "candidateId": "negative",
+                            "candidate": {"candidateId": "negative"},
+                            "archiveLane": "negative_novelty",
+                            "finiteDataValidity": {
+                                "isFiniteData": True,
+                                "passesSupportGate": True,
+                                "validForQuality": True,
+                            },
+                            "objectives": {
+                                "worstWindowConservativeNetR": -1.0,
+                                "structuralComplexity": 1.0,
+                            },
+                        },
+                        {
+                            "candidateId": "observational",
+                            "candidate": {"candidateId": "observational"},
+                            "archiveLane": "observational",
+                            "finiteDataValidity": {
+                                "isFiniteData": True,
+                                "passesSupportGate": True,
+                                "validForQuality": False,
+                            },
+                            "objectives": {
+                                "worstWindowConservativeNetR": 1.0,
+                                "structuralComplexity": 1.0,
+                            },
+                        },
+                    ],
+                }
+            ]
+        },
+    )
+    with pytest.raises(TemporalDiscoveryContractError, match="no diverse discovery survivors"):
+        supervisor._run_evidence_ladder(
+            root=tmp_path,
+            config={
+                "evidenceLadder": {
+                    "evidenceLadderSha256": canonical_sha256({"ladder": "fixture"}),
+                    "validation": {"maxDiverseSurvivorCount": 2},
+                },
+                "evidenceLadderExecution": {},
+            },
+            client=None,
+            final_archive_path=archive_path,
+        )
+
+
+def test_completed_ladder_execution_reopens_all_stage_artifacts(tmp_path: Path) -> None:
+    root = tmp_path / "completed"
+    ladder = {
+        "evidenceLadderSha256": canonical_sha256({"ladder": "fixture"}),
+        "outerTail": {"analysisWindowStart": "2024-01-01T00:00:00Z"},
+    }
+    execution = {
+        "schemaVersion": "temporal_qd_evidence_ladder_execution_result_v1",
+        "evidenceLadderSha256": ladder["evidenceLadderSha256"],
+        "outerTail": ladder["outerTail"],
+    }
+    for stage in ("validation", "scrutiny"):
+        stage_root = root / "evidence-ladder" / stage
+        campaign_root = stage_root / "campaign"
+        result_root = campaign_root / "screening-run"
+        population = {"generationIndex": 0, "candidateCount": 2}
+        population["populationSha256"] = canonical_sha256(population)
+        preparation = {"schemaVersion": "fixture_preparation_v1"}
+        authority = {"schemaVersion": "fixture_authority_v1"}
+        authority["authorityId"] = canonical_sha256(authority)
+        tasks = [
+            {
+                "task_id": f"{stage}-task-{index}",
+                "payload": {"candidate_id": f"{stage}-candidate-{index}"},
+            }
+            for index in range(2)
+        ]
+        task_manifest = {
+            "authorityId": authority["authorityId"],
+            "tasks": tasks,
+            "taskMatrixSha256": canonical_sha256(tasks),
+        }
+        evaluation_identity = {
+            "populationSha256": population["populationSha256"],
+            "templatePreparationSha256": canonical_sha256({"template": stage}),
+        }
+        evaluation_identity["evaluationIdentitySha256"] = canonical_sha256(
+            evaluation_identity
+        )
+        campaign = {
+            "generationIndex": 0,
+            "candidateCount": 2,
+            "populationSha256": population["populationSha256"],
+            "preparationSha256": canonical_sha256(preparation),
+            "authorityId": authority["authorityId"],
+            "taskMatrixSha256": task_manifest["taskMatrixSha256"],
+        }
+        campaign["campaignSha256"] = canonical_sha256(campaign)
+        archive = {"generationIndex": 0, "populationSha256": population["populationSha256"]}
+        archive["archiveSha256"] = canonical_sha256(archive)
+        _write(stage_root / "population.json", population)
+        _write(campaign_root / "preparation.json", preparation)
+        _write(campaign_root / "authority.json", authority)
+        _write(campaign_root / "evaluation-identity.json", evaluation_identity)
+        _write(campaign_root / "campaign.json", campaign)
+        _write(result_root / "authority.json", authority)
+        _write(result_root / "task-manifest.json", task_manifest)
+        completed = {}
+        for task in tasks:
+            result = {"taskId": task["task_id"], "candidateId": task["payload"]["candidate_id"]}
+            result_path = result_root / "results" / f"{task['task_id']}.json"
+            _write(result_path, result)
+            completed[task["task_id"]] = {
+                "candidateId": task["payload"]["candidate_id"],
+                "resultPath": str(result_path.resolve()),
+                "resultSha256": canonical_sha256(result),
+            }
+        _write(
+            result_root / "checkpoint.json",
+            {
+                "authorityId": authority["authorityId"],
+                "taskMatrixSha256": task_manifest["taskMatrixSha256"],
+                "completed": completed,
+            },
+        )
+        _write(
+            result_root / "summary.json",
+            {
+                "authorityId": authority["authorityId"],
+                "taskCount": len(tasks),
+                "completedTaskCount": len(tasks),
+            },
+        )
+        _write(stage_root / "archive.json", archive)
+        artifacts = supervisor._capture_screening_artifacts(
+            population_path=stage_root / "population.json",
+            archive_path=stage_root / "archive.json",
+            campaign_root=campaign_root,
+            generation_index=0,
+            label=f"QD {stage} ladder",
+        )
+        execution[stage] = {
+            "candidateCount": 2,
+            "populationPath": str((stage_root / "population.json").resolve()),
+            "populationSha256": population["populationSha256"],
+            "campaignPath": str((stage_root / "campaign" / "campaign.json").resolve()),
+            "campaignSha256": campaign["campaignSha256"],
+            "archivePath": str((stage_root / "archive.json").resolve()),
+            "archiveSha256": archive["archiveSha256"],
+            "artifacts": artifacts,
+        }
+    execution["executionSha256"] = canonical_sha256(execution)
+    execution_path = root / "evidence-ladder" / "execution.json"
+    _write(execution_path, execution)
+    state = {"evidenceLadderExecution": execution}
+    config = {"evidenceLadder": ladder}
+
+    supervisor._validate_evidence_ladder_execution(root=root, state=state, config=config)
+
+    validation_result_root = root / "evidence-ladder" / "validation" / "campaign" / "screening-run"
+    immutable_outputs = [
+        root / "evidence-ladder" / "validation" / "campaign" / "preparation.json",
+        root / "evidence-ladder" / "validation" / "campaign" / "authority.json",
+        root / "evidence-ladder" / "validation" / "campaign" / "evaluation-identity.json",
+        validation_result_root / "task-manifest.json",
+        validation_result_root / "checkpoint.json",
+        validation_result_root / "summary.json",
+        validation_result_root / "results" / "validation-task-0.json",
+    ]
+    for artifact_path in immutable_outputs:
+        original = artifact_path.read_text(encoding="utf-8")
+        artifact_path.unlink()
+        with pytest.raises(TemporalDiscoveryContractError):
+            supervisor._validate_evidence_ladder_execution(
+                root=root, state=state, config=config
+            )
+        artifact_path.write_text(original, encoding="utf-8")
+        _write(artifact_path, {"drifted": True})
+        with pytest.raises(TemporalDiscoveryContractError):
+            supervisor._validate_evidence_ladder_execution(
+                root=root, state=state, config=config
+            )
+        artifact_path.write_text(original, encoding="utf-8")
+
+    execution_path.unlink()
+    with pytest.raises(TemporalDiscoveryContractError, match="missing QD evidence ladder execution"):
+        supervisor._validate_evidence_ladder_execution(root=root, state=state, config=config)
+    _write(execution_path, execution)
+    state["evidenceLadderExecution"] = {**execution, "outerTail": {"drifted": True}}
+    with pytest.raises(TemporalDiscoveryContractError, match="disagrees with state"):
+        supervisor._validate_evidence_ladder_execution(root=root, state=state, config=config)
+    invalid_execution = {
+        **execution,
+        "executionSha256": canonical_sha256({"invalid": "execution"}),
+    }
+    _write(execution_path, invalid_execution)
+    state["evidenceLadderExecution"] = invalid_execution
+    with pytest.raises(TemporalDiscoveryContractError, match="execution identity mismatch"):
+        supervisor._validate_evidence_ladder_execution(root=root, state=state, config=config)
+    _write(execution_path, execution)
+    state["evidenceLadderExecution"] = execution
+    (root / "evidence-ladder" / "scrutiny" / "archive.json").unlink()
+    with pytest.raises(TemporalDiscoveryContractError, match="missing QD scrutiny ladder archive"):
+        supervisor._validate_evidence_ladder_execution(root=root, state=state, config=config)

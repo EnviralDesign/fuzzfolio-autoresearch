@@ -5,7 +5,10 @@ import json
 from pathlib import Path
 
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
-from autoresearch.temporal_qd_evolution import initialize_empty_bidirectional_archive
+from autoresearch.temporal_qd_evolution import (
+    canonical_empty_bidirectional_archive_template,
+    initialize_empty_bidirectional_archive,
+)
 from autoresearch.temporal_qd_pair_factory import load_pair_run_config, pair_policy_from_config
 
 
@@ -29,12 +32,21 @@ def _write_immutable(path: Path, value: dict) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Initialize an empty QD archive for one frozen bidirectional pair authority.")
-    parser.add_argument("--template", type=Path, required=True)
+    parser.add_argument(
+        "--template",
+        type=Path,
+        help="legacy exact empty archive template; omit to use the current canonical empty template",
+    )
     parser.add_argument("--pair-config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     config = load_pair_run_config(_read(args.pair_config))
-    archive = initialize_empty_bidirectional_archive(_read(args.template), pair_policy_from_config(config))
+    template = (
+        _read(args.template)
+        if args.template is not None
+        else canonical_empty_bidirectional_archive_template()
+    )
+    archive = initialize_empty_bidirectional_archive(template, pair_policy_from_config(config))
     _write_immutable(args.output, archive)
     print(json.dumps({"ok": True, "archiveSha256": archive["archiveSha256"], "pairRunConfigSha256": config["pairRunConfigSha256"]}, sort_keys=True))
     return 0

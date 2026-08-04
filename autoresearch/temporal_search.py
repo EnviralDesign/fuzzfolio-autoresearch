@@ -959,15 +959,26 @@ def _normalized_candidate(
     )
     if canonical_sha256(profile) != profile_sha:
         raise TemporalSearchContractError(f"{name} source profile identity mismatch")
-    if (
-        profile.get("version") != "v2"
-        or _mapping(profile.get("graph"), name=f"{name}.sourceProfile.graph").get(
-            "kind"
-        )
-        != "temporal_graph_v1"
-    ):
+    profile_version = profile.get("version")
+    if profile_version == "v2":
+        if _mapping(
+            profile.get("graph"), name=f"{name}.sourceProfile.graph"
+        ).get("kind") != "temporal_graph_v1":
+            raise TemporalSearchContractError(
+                f"{name} must be a v2 temporal_graph_v1 profile"
+            )
+    elif profile_version == "v3":
+        # A v3 profile is the native compiler's one-position bidirectional
+        # snapshot.  Do not reinterpret its graph here: that would create a
+        # second compiler.  Its frozen byte snapshot and evidence plan remain
+        # subject to every existing candidate/window check below.
+        if profile.get("directionMode") != "both":
+            raise TemporalSearchContractError(
+                f"{name} v3 source profile must use directionMode=both"
+            )
+    else:
         raise TemporalSearchContractError(
-            f"{name} must be a v2 temporal_graph_v1 profile"
+            f"{name} must be a v2 temporal_graph_v1 profile or a v3 bidirectional profile"
         )
     instruments = profile.get("instruments")
     instrument = str(candidate["instrument"] or "").strip().upper()

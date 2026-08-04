@@ -170,7 +170,7 @@ QD_CONSTRUCTION_POLICY_SCHEMA = "temporal_qd_construction_operator_policy_v1"
 DEFAULT_QD_PARAMETERS: dict[str, Any] = {
     "version": QD_VERSION,
     "seed": 2026080101,
-    "targetUniqueCandidates": 2500,
+    "targetUniqueCandidates": 1024,
     "immigrantProposalFraction": 0.20,
     "mutationDepthProbabilities": {"1": 0.70, "2": 0.25, "3": 0.05},
     "maxCumulativeStructuralDepth": 16,
@@ -1573,6 +1573,52 @@ def initialize_empty_bidirectional_archive(
     if _bidirectional_pair_policy({"bidirectionalPairPolicy": policy}) is None:
         raise TemporalDiscoveryContractError("pair archive initialization requires an enabled pair policy")
     archive["bidirectionalPairPolicy"] = policy
+    archive["archiveSha256"] = canonical_sha256(archive)
+    return archive
+
+
+def canonical_empty_bidirectional_archive_template() -> dict[str, Any]:
+    """Return the canonical, unbound generation-zero QD archive template.
+
+    This deliberately contains no candidate, result, quality, or archive-lane
+    material.  The two content hashes identify canonical empty inputs rather
+    than pretending that an evaluator ran.  ``initialize_empty_bidirectional_archive``
+    supplies the only run-specific value: the closed pair compiler authority.
+    """
+
+    empty_population = {
+        "schemaVersion": QD_POPULATION_SCHEMA,
+        "qdVersion": QD_VERSION,
+        "policyName": QD_POLICY_NAME,
+        "policySha256": QD_POLICY_SHA256,
+        "generationIndex": 0,
+        "candidateCount": 0,
+        "candidates": [],
+    }
+    empty_results = {
+        "schemaVersion": "temporal_qd_empty_result_set_v1",
+        "generationIndex": 0,
+        "results": [],
+    }
+    archive = {
+        "schemaVersion": QD_ARCHIVE_SCHEMA,
+        "qdVersion": QD_VERSION,
+        "policyName": QD_POLICY_NAME,
+        "policySha256": QD_POLICY_SHA256,
+        "frozenPolicy": _clone(QD_POLICY, name="frozen QD policy"),
+        "generationIndex": 0,
+        "populationSha256": canonical_sha256(empty_population),
+        "resultSetSha256": canonical_sha256(empty_results),
+        "previousArchiveSha256": None,
+        "cellCapacity": int(QD_POLICY["archive"]["defaultCellCapacity"]),
+        "candidateCountSeen": 0,
+        "occupiedCellCount": 0,
+        "memberCount": 0,
+        "qualityMemberCount": 0,
+        "observationalMemberCount": 0,
+        "negativeNoveltyMemberCount": 0,
+        "cells": [],
+    }
     archive["archiveSha256"] = canonical_sha256(archive)
     return archive
 
@@ -3065,19 +3111,37 @@ def generate_qd_generation(
                 candidate = member.get("candidate") if isinstance(member, Mapping) else None
                 if isinstance(candidate, Mapping):
                     parents.append(FrozenPair.from_payload(candidate["bidirectionalGenome"]))
+        pair_ledger_file = (
+            Path(identity_ledger_path)
+            if identity_ledger_path is not None
+            else root / "identity-ledger.json"
+        )
+        pair_evidence_context = _clone(
+            evidence_identity_context or qd_predeclared_evidence_context({}),
+            name="pair QD evidence identity context",
+        )
         return generate_pair_population(
             output_root=root,
             generation_index=generation_index,
             target_unique_candidates=int(_normalize_parameters(parameters)["targetUniqueCandidates"]),
-            run_config={"parentArchiveSha256": archive_sha, "parameters": _normalize_parameters(parameters), "evidenceIdentityContext": _clone(evidence_identity_context or {}, name="pair QD evidence identity context")},
+            run_config={"parentArchiveSha256": archive_sha, "parameters": _normalize_parameters(parameters), "evidenceIdentityContext": pair_evidence_context},
             pair_policy={key: value for key, value in pair_policy.items() if key != "policySha256"},
             parent_pairs=parents,
             pair_factory=bidirectional_pair_factory,
             module_authority=bidirectional_module_authority,
             native_validator=bidirectional_native_validator,
             pair_compiler=bidirectional_pair_compiler,
-            evidence_identity_context=evidence_identity_context,
+            evidence_identity_context=pair_evidence_context,
             operator_implementation_identity=bidirectional_operator_implementation_identity,
+            parent_archive=archive,
+            # Pair mode is a first-class QD generation mode.  It must consume
+            # the same campaign-wide identity ledger and frozen proposal
+            # budget as the legacy proposal loop, rather than silently owning
+            # an unbounded side journal.
+            identity_ledger_path=pair_ledger_file,
+            max_proposal_attempts=int(
+                _normalize_parameters(parameters)["maxProposalAttempts"]
+            ),
             max_new_proposals=max_new_proposals,
         )
     cells = _reproduction_cells(

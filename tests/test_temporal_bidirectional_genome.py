@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from autoresearch.temporal_qd_evolution import (
 )
 from autoresearch.temporal_qd_pair_generation import (
     PairModuleOperator,
+    TypedGrammarPairOperator,
     TypedPairFactory,
     generate_pair_population,
     materialize_pair_candidate,
@@ -34,6 +36,11 @@ from autoresearch.temporal_qd_pair_generation import (
 )
 from autoresearch.temporal_qd_pair_factory import default_hold_operator_policy
 from autoresearch.temporal_qd_pair_generation import _hold_plans
+from autoresearch.temporal_qd_pair_generation import _propose_crossover
+from autoresearch.temporal_qd_pair_generation import _propose_pair_sequence
+from autoresearch.temporal_qd_pair_generation import _mutation_depth_from_bucket
+from autoresearch.temporal_qd_pair_generation import _explicit_parent_draw_count
+from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
 from autoresearch.temporal_discovery_validation import DashboardV2ModuleValidator, SubprocessCandidateValidator
 
 
@@ -338,6 +345,65 @@ class _PairOps:
         return _module(template.direction, marker="first", lineage=({"operation": "crossover", "side": template.direction},))
 
 
+class _RejectingCrossoverPairOps(_PairOps):
+    """Reject only crossover compilation; ordinary side mutation remains valid."""
+
+    def compile_program(self, template: FrozenModule, program, *, candidate_id: str):
+        del template, program, candidate_id
+        raise TemporalDiscoveryContractError("expected test crossover rejection")
+
+
+class _MaterializingCrossoverPairOps(_PairOps):
+    def compile_program(self, template: FrozenModule, program, *, candidate_id: str):
+        del program, candidate_id
+        return _module(
+            template.direction,
+            marker="crossover-materialized",
+            profile={"version": "v2", "directionMode": template.direction, "graph": {"crossover": "materialized"}},
+            lineage=({"operation": "crossover", "side": template.direction},),
+        )
+
+
+class _EarlyRejectingSequenceOps(_PairOps):
+    """One eligible mutation which deterministically rejects at its first step."""
+
+    def indicator_plans(self, module: FrozenModule):
+        del module
+        return []
+
+    def hold_policy_choices(self, module: FrozenModule):
+        del module
+        return []
+
+    def apply_grammar(self, module: FrozenModule, plan, *, candidate_id: str):
+        del module, plan, candidate_id
+        raise TemporalDiscoveryContractError("expected test sequence rejection")
+
+
+class _EarlyNoopSequenceOps(_PairOps):
+    """One eligible mutation which canonically leaves executable profiles unchanged."""
+
+    def indicator_plans(self, module: FrozenModule):
+        del module
+        return []
+
+    def hold_policy_choices(self, module: FrozenModule):
+        del module
+        return []
+
+
+class _MaterializingSequenceOps(_EarlyNoopSequenceOps):
+    def apply_grammar(self, module: FrozenModule, plan, *, candidate_id: str):
+        del plan
+        changed = _module(
+            module.direction,
+            marker="sequence-materialized",
+            profile={"version": "v2", "directionMode": module.direction, "graph": {"candidateId": candidate_id}},
+            lineage=({"operation": "grammar", "side": module.direction},),
+        )
+        return changed, {"schemaVersion": "audit", "kind": "grammar", "candidateId": candidate_id}
+
+
 def test_pair_generation_immigrant_side_mutation_replay_and_no_eligible_are_exact() -> None:
     ops = _PairOps()
     immigrant, immigrant_entry = propose_pair(
@@ -412,6 +478,271 @@ def test_pair_generation_same_side_crossover_never_crosses_modules() -> None:
     assert (pair.short if side == "long" else pair.long).identity_sha256 == (parent.short if side == "long" else parent.long).identity_sha256
 
 
+def test_crossover_materialized_and_noop_proposals_use_the_versioned_kind() -> None:
+    first = _pair(_module("long", marker="first"), _module("short", marker="first"))
+    second = _pair(_module("long", marker="second"), _module("short", marker="second"))
+    common = dict(
+        proposal_seed="seed-cross-disposition",
+        pair_compiler=FakePairCompiler(),
+        parent_selection=None,
+        mate_selection=None,
+        mate_selection_attempts=[],
+    )
+    materialized, materialized_proposal = _propose_crossover(parent=second, mate=first, module_authority=_MaterializingCrossoverPairOps(), **common)
+    noop, noop_proposal = _propose_crossover(parent=first, mate=second, module_authority=_PairOps(), **common)
+
+    assert materialized is not None and materialized_proposal["disposition"] == "materialized"
+    assert noop is None and noop_proposal["disposition"] == "no_op_proposal"
+    for proposal, expected, authority in ((materialized_proposal, materialized, _MaterializingCrossoverPairOps()), (noop_proposal, None, _PairOps())):
+        assert proposal["proposalKind"] == "temporal_qd_same_side_crossover_v1"
+        replayed = replay_pair_proposal(
+            payload=proposal,
+            module_authority=authority,
+            native_validator=FakeNativeValidator(),
+            pair_compiler=FakePairCompiler(),
+        )
+        assert (replayed.canonical_payload() if replayed is not None else None) == (expected.canonical_payload() if expected is not None else None)
+
+
+def test_pair_multi_operation_mutation_is_replayable_and_records_each_step() -> None:
+    parent = _pair()
+    child, proposal = _propose_pair_sequence(
+        proposal_seed="depth-two",
+        parent=parent,
+        mutation_depth=2,
+        module_authority=_PairOps(),
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+    )
+    assert child is not None
+    assert proposal["mutationDepth"] == 2
+    assert len(proposal["mutationSteps"]) == 2
+    assert replay_pair_proposal(
+        payload=proposal,
+        module_authority=_PairOps(),
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+    ).canonical_payload() == child.canonical_payload()
+
+
+@pytest.mark.parametrize(
+    ("mutation_depth", "authority_type", "terminal_disposition"),
+    [
+        (2, _EarlyRejectingSequenceOps, "operation_rejected"),
+        (3, _EarlyRejectingSequenceOps, "operation_rejected"),
+        (2, _EarlyNoopSequenceOps, "no_op_proposal"),
+        (3, _EarlyNoopSequenceOps, "no_op_proposal"),
+    ],
+)
+def test_early_terminal_sequence_resume_matches_uninterrupted(
+    tmp_path, monkeypatch, mutation_depth, authority_type, terminal_disposition,
+) -> None:
+    monkeypatch.setattr(
+        "autoresearch.temporal_qd_pair_generation._mutation_depth_for_seed",
+        lambda seed: mutation_depth,
+    )
+    parent = _pair()
+    policy = {"schemaVersion": "temporal_qd_bidirectional_pair_policy_v1", "enabled": True, "compilerAuthority": parent.pair_compiler.canonical_payload()}
+    common = dict(
+        generation_index=1,
+        target_unique_candidates=1,
+        run_config={"seed": f"early-terminal-{mutation_depth}-{terminal_disposition}"},
+        pair_policy=policy,
+        parent_pairs=[parent],
+        pair_factory=_PairFactory(),
+        module_authority=authority_type(),
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+        operator_implementation_identity={"schemaVersion": "test_pair_operator_v1", "grammar": "frozen", "indicator": "frozen", "hold": "frozen"},
+    )
+
+    generate_pair_population(output_root=tmp_path / "split", max_new_proposals=1, **common)
+    generate_pair_population(output_root=tmp_path / "split", max_new_proposals=2, **common)
+    generate_pair_population(output_root=tmp_path / "full", max_new_proposals=3, **common)
+
+    import json
+
+    split = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((tmp_path / "split/proposal-journal").glob("*.json"))]
+    full = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((tmp_path / "full/proposal-journal").glob("*.json"))]
+    assert [row["entrySha256"] for row in split] == [row["entrySha256"] for row in full]
+    assert all(row["proposal"]["mutationDepth"] == mutation_depth for row in split)
+    assert all(len(row["proposal"]["mutationSteps"]) == 1 for row in split)
+    assert all(row["proposal"]["disposition"] == terminal_disposition for row in split)
+
+
+def test_sequence_replay_rejects_truncated_or_tampered_terminal_prefixes() -> None:
+    parent = _pair()
+    materialized, complete = _propose_pair_sequence(
+        proposal_seed="complete-materialized-sequence",
+        parent=parent,
+        mutation_depth=2,
+        module_authority=_MaterializingSequenceOps(),
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+    )
+    assert materialized is not None and complete["disposition"] == "materialized"
+
+    truncated = copy.deepcopy(complete)
+    truncated["mutationSteps"] = truncated["mutationSteps"][:1]
+    truncated.pop("proposalSha256")
+    truncated["proposalSha256"] = canonical_sha256(truncated)
+    with pytest.raises(TemporalDiscoveryContractError, match="truncated before a terminal disposition"):
+        replay_pair_proposal(payload=truncated, module_authority=_MaterializingSequenceOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler())
+
+    extra = copy.deepcopy(complete)
+    extra["mutationSteps"].append(copy.deepcopy(extra["mutationSteps"][-1]))
+    extra.pop("proposalSha256")
+    extra["proposalSha256"] = canonical_sha256(extra)
+    with pytest.raises(TemporalDiscoveryContractError, match="more steps than its planned mutation depth"):
+        replay_pair_proposal(payload=extra, module_authority=_MaterializingSequenceOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler())
+
+    _, rejected = _propose_pair_sequence(
+        proposal_seed="early-rejected-sequence",
+        parent=parent,
+        mutation_depth=2,
+        module_authority=_EarlyRejectingSequenceOps(),
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+    )
+    after_terminal = copy.deepcopy(rejected)
+    after_terminal["mutationSteps"].append(copy.deepcopy(after_terminal["mutationSteps"][0]))
+    after_terminal.pop("proposalSha256")
+    after_terminal["proposalSha256"] = canonical_sha256(after_terminal)
+    with pytest.raises(TemporalDiscoveryContractError, match="stored steps after a terminal disposition"):
+        replay_pair_proposal(payload=after_terminal, module_authority=_EarlyRejectingSequenceOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler())
+
+    tampered = copy.deepcopy(rejected)
+    tampered["mutationSteps"][0]["operation"]["plan"]["op"] = "not-the-frozen-operation"
+    tampered.pop("proposalSha256")
+    tampered["proposalSha256"] = canonical_sha256(tampered)
+    with pytest.raises(TemporalDiscoveryContractError, match="stored pair proposal operation is no longer exact/canonical"):
+        replay_pair_proposal(payload=tampered, module_authority=_EarlyRejectingSequenceOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler())
+
+
+def test_pair_mutation_depth_buckets_prove_exact_frozen_70_25_5_schedule() -> None:
+    depths = [_mutation_depth_from_bucket(bucket) for bucket in range(20)]
+    assert {depth: depths.count(depth) for depth in (1, 2, 3)} == {1: 14, 2: 5, 3: 1}
+
+
+def test_archive_parent_selection_resume_matches_uninterrupted_across_crossover(tmp_path) -> None:
+    first, second = _pair(_module("long", marker="first"), _module("short", marker="first")), _pair(_module("long", marker="second"), _module("short", marker="second"))
+    def member(pair, candidate_id):
+        return {"candidateId": candidate_id, "candidate": {"candidateId": candidate_id, "bidirectionalGenome": pair.canonical_payload()}, "archiveLane": "quality", "finiteDataValidity": {"isFiniteData": True, "passesSupportGate": True, "validForQuality": True}, "objectives": {"worstWindowConservativeNetR": 1.0, "maximumDrawdownR": 1.0, "structuralComplexity": 1.0}, "paretoFront": 0, "crowdingDistance": 1.0}
+    archive = {"cells": [{"cellId": "cell-a", "members": [member(first, "archive-a")]}, {"cellId": "cell-b", "members": [member(second, "archive-b")]}]}
+    policy = {"schemaVersion": "temporal_qd_bidirectional_pair_policy_v1", "enabled": True, "compilerAuthority": first.pair_compiler.canonical_payload()}
+    common = dict(generation_index=1, target_unique_candidates=100, run_config={"seed": "archive-resume"}, pair_policy=policy, parent_archive=archive, pair_factory=_PairFactory(), module_authority=_PairOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(), operator_implementation_identity={"schemaVersion": "test_pair_operator_v1", "grammar": "frozen", "indicator": "frozen", "hold": "frozen"})
+    generate_pair_population(output_root=tmp_path / "split", max_new_proposals=7, **common)
+    generate_pair_population(output_root=tmp_path / "split", max_new_proposals=7, **common)
+    generate_pair_population(output_root=tmp_path / "full", max_new_proposals=14, **common)
+    import json
+    split = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((tmp_path / "split/proposal-journal").glob("*.json"))]
+    full = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((tmp_path / "full/proposal-journal").glob("*.json"))]
+    assert [row["entrySha256"] for row in split] == [row["entrySha256"] for row in full]
+    assert split[6]["proposal"].get("crossoverAudit") is not None
+
+
+def test_explicit_parent_ring_resume_matches_uninterrupted_after_twelve_proposals(tmp_path) -> None:
+    """The non-archive parent cursor must survive the ordinal-12 split."""
+
+    def source_pair(label: str) -> FrozenPair:
+        return _pair(
+            _module(
+                "long",
+                marker=f"{label}-long",
+                profile={"version": "v2", "directionMode": "long", "graph": {"source": label}},
+            ),
+            _module(
+                "short",
+                marker=f"{label}-short",
+                profile={"version": "v2", "directionMode": "short", "graph": {"source": label}},
+            ),
+        )
+
+    first, second = source_pair("first"), source_pair("second")
+    policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": first.pair_compiler.canonical_payload(),
+    }
+    common = dict(
+        generation_index=1,
+        target_unique_candidates=64,
+        run_config={"seed": "explicit-parent-ring-resume"},
+        pair_policy=policy,
+        parent_pairs=[first, second],
+        pair_factory=_PairFactory(),
+        module_authority=_PairOps(),
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+        operator_implementation_identity={
+            "schemaVersion": "test_pair_operator_v1",
+            "grammar": "frozen",
+            "indicator": "frozen",
+            "hold": "frozen",
+        },
+    )
+
+    generate_pair_population(output_root=tmp_path / "split", max_new_proposals=12, **common)
+    generate_pair_population(output_root=tmp_path / "split", max_new_proposals=1, **common)
+    generate_pair_population(output_root=tmp_path / "full", max_new_proposals=13, **common)
+
+    split = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((tmp_path / "split/proposal-journal").glob("*.json"))
+    ]
+    full = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((tmp_path / "full/proposal-journal").glob("*.json"))
+    ]
+    assert len(split) == len(full) == 13
+    assert [row["entrySha256"] for row in split] == [row["entrySha256"] for row in full]
+    assert split[6]["proposal"]["proposalKind"] == "temporal_qd_same_side_crossover_v1"
+    assert split[12]["proposal"]["parentPairIdentitySha256"] == full[12]["proposal"]["parentPairIdentitySha256"]
+    assert _explicit_parent_draw_count(split[:12]) == 11
+
+    malformed = copy.deepcopy(split[:7])
+    malformed[6]["proposal"]["mateSelectionAttempts"] = [{"unexpected": "archive-audit"}]
+    with pytest.raises(TemporalDiscoveryContractError, match="mate retries"):
+        _explicit_parent_draw_count(malformed)
+
+
+def test_rejected_crossover_resume_matches_uninterrupted_and_replays_exactly(tmp_path) -> None:
+    first = _pair(_module("long", marker="first"), _module("short", marker="first"))
+    second = _pair(_module("long", marker="second"), _module("short", marker="second"))
+
+    def member(pair, candidate_id):
+        return {"candidateId": candidate_id, "candidate": {"candidateId": candidate_id, "bidirectionalGenome": pair.canonical_payload()}, "archiveLane": "quality", "finiteDataValidity": {"isFiniteData": True, "passesSupportGate": True, "validForQuality": True}, "objectives": {"worstWindowConservativeNetR": 1.0, "maximumDrawdownR": 1.0, "structuralComplexity": 1.0}, "paretoFront": 0, "crowdingDistance": 1.0}
+
+    archive = {"cells": [{"cellId": "cell-a", "members": [member(first, "archive-a")]}, {"cellId": "cell-b", "members": [member(second, "archive-b")]}]}
+    policy = {"schemaVersion": "temporal_qd_bidirectional_pair_policy_v1", "enabled": True, "compilerAuthority": first.pair_compiler.canonical_payload()}
+    common = dict(generation_index=1, target_unique_candidates=100, run_config={"seed": "rejected-crossover-resume"}, pair_policy=policy, parent_archive=archive, pair_factory=_PairFactory(), module_authority=_RejectingCrossoverPairOps(), native_validator=FakeNativeValidator(), pair_compiler=FakePairCompiler(), operator_implementation_identity={"schemaVersion": "test_pair_operator_v1", "grammar": "frozen", "indicator": "frozen", "hold": "frozen"})
+
+    generate_pair_population(output_root=tmp_path / "split", max_new_proposals=7, **common)
+    generate_pair_population(output_root=tmp_path / "split", max_new_proposals=7, **common)
+    generate_pair_population(output_root=tmp_path / "full", max_new_proposals=14, **common)
+
+    import json
+
+    split = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((tmp_path / "split/proposal-journal").glob("*.json"))]
+    full = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((tmp_path / "full/proposal-journal").glob("*.json"))]
+    rejected = split[6]["proposal"]
+    assert rejected["proposalKind"] == "temporal_qd_same_side_crossover_v1"
+    assert rejected["disposition"] == "operation_rejected"
+    assert rejected["rejection"]["reasonCode"] == "crossover_rejected"
+    tampered = copy.deepcopy(rejected)
+    tampered["rejection"]["exceptionType"] = "ValueError"
+    tampered.pop("proposalSha256")
+    tampered["proposalSha256"] = canonical_sha256(tampered)
+    with pytest.raises(TemporalDiscoveryContractError, match="crossover proposal replay diverged"):
+        replay_pair_proposal(
+            payload=tampered,
+            module_authority=_RejectingCrossoverPairOps(),
+            native_validator=FakeNativeValidator(),
+            pair_compiler=FakePairCompiler(),
+        )
+    assert [row["entrySha256"] for row in split] == [row["entrySha256"] for row in full]
+
+
 def test_pair_population_journal_is_restart_safe_and_never_emits_v2_tasks(tmp_path) -> None:
     pair = _pair()
     policy = {"schemaVersion": "temporal_qd_bidirectional_pair_policy_v1", "enabled": True, "compilerAuthority": pair.pair_compiler.canonical_payload()}
@@ -467,3 +798,200 @@ def test_pair_population_does_not_spend_unique_slots_on_duplicate_genomes(tmp_pa
     import json
     rows = [json.loads(path.read_text(encoding="utf-8")) for path in entries]
     assert [row["disposition"] for row in rows] == ["accepted", "duplicate_pair_genome"]
+
+
+def test_pair_generation_global_ledger_blocks_prior_executable_semantics_and_cap_is_restart_safe(tmp_path) -> None:
+    """A later generation must not spend a slot on an already-evaluated pair.
+
+    Pair candidate identity includes frozen proposal provenance, so this checks
+    the separate executable long/short semantic binding as well as the shared
+    QD candidate ledger.  Split/restarted proposal production is byte-identical
+    to uninterrupted production when the immutable attempt ceiling is reached.
+    """
+
+    pair = _pair()
+    policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": pair.pair_compiler.canonical_payload(),
+    }
+    evidence_context = {
+        "schemaVersion": "temporal_qd_predeclared_evidence_context_v3",
+        "baseDecisionTimeframe": "M5",
+        "orderedWindowPlanSemantic": [],
+        "workerContractSha256": None,
+        "constructionCatalog": None,
+        "costViews": {
+            "none": {"spreadBps": 0.0, "slippageBps": 0.0, "commissionBps": 0.0},
+            "research_conservative": {
+                "spreadBps": 2.0,
+                "slippageBps": 1.0,
+                "commissionBps": 0.5,
+            },
+        },
+    }
+    common = dict(
+        target_unique_candidates=1,
+        run_config={"seed": "global-semantic-ledger"},
+        pair_policy=policy,
+        pair_factory=_PairFactory(),
+        module_authority=_PairOps(),
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+        evidence_identity_context=evidence_context,
+        operator_implementation_identity={
+            "schemaVersion": "test_pair_operator_v1",
+            "grammar": "frozen",
+            "indicator": "frozen",
+            "hold": "frozen",
+        },
+        max_proposal_attempts=2,
+    )
+
+    def seed_campaign(root: Path) -> None:
+        first = generate_pair_population(
+            output_root=root / "generation-1",
+            generation_index=1,
+            identity_ledger_path=root / "identity-ledger.json",
+            **common,
+        )
+        assert first["completed"] is True
+
+    split_root, full_root = tmp_path / "split", tmp_path / "full"
+    seed_campaign(split_root)
+    seed_campaign(full_root)
+    split_args = dict(
+        output_root=split_root / "generation-2",
+        generation_index=2,
+        identity_ledger_path=split_root / "identity-ledger.json",
+        **common,
+    )
+    full_args = dict(
+        output_root=full_root / "generation-2",
+        generation_index=2,
+        identity_ledger_path=full_root / "identity-ledger.json",
+        **common,
+    )
+    first_split = generate_pair_population(max_new_proposals=1, **split_args)
+    second_split = generate_pair_population(max_new_proposals=1, **split_args)
+    full = generate_pair_population(**full_args)
+
+    for result in (first_split, second_split, full):
+        assert result["completed"] is False
+    assert second_split["terminationReason"] == "max_proposal_attempts_reached"
+    assert second_split["proposalCount"] == 2
+    assert second_split["acceptedCount"] == 0
+    assert second_split["maxProposalAttempts"] == 2
+
+    split_rows = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((split_root / "generation-2" / "proposal-journal").glob("*.json"))
+    ]
+    full_rows = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((full_root / "generation-2" / "proposal-journal").glob("*.json"))
+    ]
+    assert [row["entrySha256"] for row in split_rows] == [row["entrySha256"] for row in full_rows]
+    assert [row["disposition"] for row in split_rows] == [
+        "duplicate_pair_genome_global",
+        "duplicate_pair_genome_global",
+    ]
+    assert json.loads(
+        (split_root / "generation-2" / "pair-config.json").read_text(encoding="utf-8")
+    )["maxProposalAttempts"] == 2
+    assert (split_root / "identity-ledger.json").read_bytes() == (
+        full_root / "identity-ledger.json"
+    ).read_bytes()
+    ledger = json.loads((split_root / "identity-ledger.json").read_text(encoding="utf-8"))
+    assert len(ledger["records"]) == 1
+    assert len(ledger["pairExecutableSemantics"]) == 1
+    assert ledger["pairExecutableSemanticDuplicateRejections"] == 2
+    assert ledger["proposalSlotCounters"]["proposalsObserved"] == 3
+
+
+def test_typed_pair_operator_rebinds_recursive_frozen_program_and_lineage() -> None:
+    """Operator boundaries must thaw FrozenModule's mappingproxy/tuple state."""
+
+    source = _module(
+        "long",
+        lineage=(
+            {
+                "operation": "typed_seed",
+                "side": "long",
+                "nested": {"immutable": ["program", "lineage"]},
+            },
+        ),
+    )
+    validator = FakeNativeValidator()
+
+    class Grammar:
+        context_sha256 = source.grammar_context.sha256
+
+        def apply(self, program, plan):
+            del plan
+            return program
+
+        def compile_module(self, program, *, candidate_id):
+            profile = source.canonical_payload()["profile"]
+            profile["graph"]["grammarRebound"] = candidate_id
+            return type(
+                "CompiledModule",
+                (),
+                {
+                    "program": program.canonical(),
+                    "profile": profile,
+                    "native_report": validator.validate_v2(
+                        profile=profile, candidate_id=candidate_id
+                    ),
+                },
+            )()
+
+    class Indicator:
+        def preview(self, profile, plan):
+            value = copy.deepcopy(profile)
+            value["graph"]["indicatorRebound"] = plan["operatorId"]
+            return value
+
+        def apply(
+            self,
+            profile,
+            plan,
+            *,
+            parent_validated_program_sha256,
+            child_validated_program_sha256,
+        ):
+            del parent_validated_program_sha256, child_validated_program_sha256
+            child = self.preview(profile, plan)
+            application = {"applicationSha256": canonical_sha256({"plan": plan})}
+            return child, application
+
+    class Registry:
+        def get(self, operator_id):
+            assert operator_id == "portable_indicator_rebind"
+            return Indicator()
+
+    operator = TypedGrammarPairOperator(
+        grammar_factory=lambda module: Grammar(),
+        native_validator=validator,
+        indicator_registry=Registry(),
+        hold_operator_policy=default_hold_operator_policy(),
+    )
+
+    grammar_child, _ = operator.apply_grammar(
+        source, {"kind": "portable_grammar_rebind"}, candidate_id="grammar_rebind"
+    )
+    indicator_child, _ = operator.apply_indicator(
+        source,
+        {
+            "operatorId": "portable_indicator_rebind",
+            "planSha256": canonical_sha256({"operator": "portable_indicator_rebind"}),
+        },
+        candidate_id="indicator_rebind",
+    )
+
+    for child in (grammar_child, indicator_child):
+        payload = child.canonical_payload()
+        assert FrozenModule.from_payload(payload).canonical_payload() == payload
+        assert child.program["fragments"][0]["resources"]["group"] == "g"
+        assert child.lineage[0]["nested"]["immutable"] == ("program", "lineage")
+        assert len(child.lineage) == 2
