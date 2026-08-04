@@ -41,7 +41,7 @@ def test_evidence_ladder_is_seed_deterministic_disjoint_and_outer_tail_free() ->
     assert first["validation"]["maxDiverseSurvivorCount"] == 128
     assert first["scrutiny"]["maxFinalistCount"] == 32
     assert first["outerTail"] == {
-        "analysisWindowStart": "2025-08-01T00:00:00Z",
+        "analysisWindowStart": "2026-01-01T00:00:00Z",
         "selectionInput": False,
         "touched": False,
     }
@@ -56,8 +56,8 @@ def test_evidence_ladder_fails_closed_when_template_or_outer_tail_would_leak() -
         validate_template_discovery_windows(wrong, ladder)
     leaked = _input()
     leaked["validationWindow"] = {
-        "analysisWindowStart": "2025-08-01T00:00:00Z",
-        "analysisWindowEnd": "2026-08-01T00:00:00Z",
+        "analysisWindowStart": "2026-01-01T00:00:00Z",
+        "analysisWindowEnd": "2027-01-01T00:00:00Z",
     }
     with pytest.raises(TemporalDiscoveryContractError, match="outer tail"):
         build_evidence_ladder(leaked)

@@ -81,7 +81,7 @@ diagnostic only.
 First materialize the immutable 3m/12m/36m evidence ladder. It binds three
 discovery months, a disjoint 12-month validation for at most 128 diverse
 survivors, and a disjoint 36-month scrutiny for at most 32 finalists; the
-post-`2025-08-01T00:00:00Z` tail remains untouched.
+post-`2026-01-01T00:00:00Z` tail remains untouched.
 
 ```powershell
 uv run temporal-qd-materialize-evidence-ladder `

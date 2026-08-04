@@ -491,7 +491,7 @@ def materialize_qd_evidence_ladder(
         "scrutiny": [{"windowId": "scrutiny-36m", **ladder["scrutiny"]["window"]}],
     }
     # Keep this check local so a future ladder implementation cannot silently
-    # widen an evidence request into the protected post-2025-08-01 tail.
+    # widen an evidence request into the protected post-2026-01-01 tail.
     if any(window["analysisWindowEnd"] > OUTER_TAIL_START for rows in stages.values() for window in rows):
         raise TemporalDiscoveryContractError("QD evidence materialization would touch the untouched outer tail")
 
