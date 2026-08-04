@@ -111,9 +111,57 @@ construction witness down to approximately 1,423.607 seconds (23 minutes
 the committed Rust-default checkpoint is the final operational measurement;
 this projection is not substituted for that witness.
 
+## Fresh production-default 1,024 witness
+
+The final operational measurement completed from committed checkpoint
+`214283c3897da1fb7180ce60315b951dd2e0f1f9` under:
+
+`C:\fuzzfolio-research\rich-immigrant-rust-finalizer-1024-20260804-v4`
+
+The normal optimized generator defaulted to the Rust finalizer; Python was not
+selected and no fallback occurred. The run froze the actual operational build
+used by that root:
+
+- contract: `temporal_qd_population_finalizer_v1`;
+- source SHA:
+  `sha256:db088950a0a00b4ebc7fd9158e81cd4e69769e3de5d6cc5a2c61435717c7a0bd`;
+- executable SHA:
+  `sha256:dfe98303e5ab2b53b2ccdc21c8eb5bc86f35d290a3e36afd0c552912a9de8626`.
+
+The executable identity is deliberately per-root authority; the contract and
+source identity match the admitted parity implementation, and the root cannot
+resume under a different executable identity.
+
+The fresh run produced:
+
+| Measurement | Result |
+| --- | ---: |
+| Completed candidates / proposals | 1,024 / 1,024 |
+| Unique candidate identities | 1,024 |
+| Unique pair genomes | 1,024 |
+| Duplicates | 0 |
+| Acceptance ratio | 1.0 |
+| End-to-end wall time | 1,448.433 seconds (24m 08.433s) |
+| Rust population finalization | 12.678 seconds |
+| Peak recursive process-tree RSS | 240.84 MiB |
+| Peak coordinator RSS | 143.99 MiB |
+| Peak process-tree CPU | 1.198 core equivalents |
+| Minimum host-available memory | 24.30 GiB |
+| Resource guard | within limits |
+
+Against the 2,022.359-second Python-default production witness, the actual
+fresh run removed 573.926 seconds (9m 33.926s), improved end-to-end wall time
+by 28.4 percent, and ran 1.40x as fast. Normal variance in the unchanged
+construction phases accounts for the difference from the controlled 29.6
+percent projection. The finalizer itself is no longer a material generation
+bottleneck.
+
 ## Admission
 
 The narrow Rust finalizer is admitted as the optimized production default.
 Python remains the exact selectable oracle. Broader Rust ports remain deferred
 until separately profiled and admitted; this checkpoint does not authorize a
 semantic rewrite of proposal construction.
+
+The fresh operational witness is complete. Further optimization should target
+measured proposal construction phases rather than this finalization seam.
