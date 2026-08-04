@@ -823,6 +823,7 @@ def test_optimized_pair_generation_is_exactly_equivalent_to_legacy_and_restart_s
 
     legacy_root = tmp_path / "legacy"
     optimized_root = tmp_path / "optimized"
+    rust_root = tmp_path / "optimized-rust-finalizer"
     legacy = generate_pair_population(
         output_root=legacy_root,
         implementation="legacy",
@@ -831,9 +832,17 @@ def test_optimized_pair_generation_is_exactly_equivalent_to_legacy_and_restart_s
     optimized = generate_pair_population(
         output_root=optimized_root,
         implementation="optimized",
+        population_finalizer="python",
+        **common,
+    )
+    rust_finalized = generate_pair_population(
+        output_root=rust_root,
+        implementation="optimized",
+        population_finalizer="rust",
         **common,
     )
     assert optimized == legacy
+    assert rust_finalized == legacy
 
     def semantic_files(root: Path) -> dict[str, bytes]:
         files = {
@@ -851,6 +860,23 @@ def test_optimized_pair_generation_is_exactly_equivalent_to_legacy_and_restart_s
         return result
 
     assert semantic_files(optimized_root) == semantic_files(legacy_root)
+    assert semantic_files(rust_root) == semantic_files(legacy_root)
+
+    # Either implementation can resume/verify the other's population.  The
+    # finalizer selector is operational evidence, never semantic identity.
+    assert generate_pair_population(
+        output_root=optimized_root,
+        implementation="optimized",
+        population_finalizer="rust",
+        **common,
+    ) == legacy
+    assert generate_pair_population(
+        output_root=rust_root,
+        implementation="optimized",
+        population_finalizer="python",
+        **common,
+    ) == legacy
+    assert semantic_files(optimized_root) == semantic_files(rust_root)
     legacy_rows = [
         json.loads(path.read_text(encoding="utf-8"))
         for path in sorted((legacy_root / "proposal-journal").glob("*.json"))
@@ -918,6 +944,9 @@ def test_optimized_pair_generation_is_exactly_equivalent_to_legacy_and_restart_s
     )
     assert default_result == optimized
     assert semantic_files(default_root) == semantic_files(optimized_root)
+    assert (
+        default_root / "performance" / "population-finalizer" / "authority.json"
+    ).exists()
 
     tripwire_common = {
         **common,

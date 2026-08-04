@@ -43,6 +43,12 @@ from .temporal_qd_observability import (
     timed_span,
     timing_scope,
 )
+from .temporal_qd_population_finalizer import (
+    POPULATION_FINALIZER_PYTHON,
+    POPULATION_FINALIZER_RUST,
+    POPULATION_FINALIZERS,
+    finalize_population_with_rust,
+)
 
 
 PAIR_GENERATION_SCHEMA = "temporal_qd_pair_generation_v1"
@@ -58,6 +64,7 @@ _PAIR_GENERATION_IMPLEMENTATIONS = frozenset(
         PAIR_GENERATION_IMPLEMENTATION_OPTIMIZED,
     )
 )
+DEFAULT_POPULATION_FINALIZER = POPULATION_FINALIZER_RUST
 
 
 def _unbiased_choice(seed: str, *, size: int) -> int:
@@ -2017,6 +2024,7 @@ def _generate_pair_population_optimized_impl(
     identity_ledger_path: Path | str | None = None,
     max_proposal_attempts: int = DEFAULT_MAX_PROPOSAL_ATTEMPTS,
     max_new_proposals: int | None = None,
+    population_finalizer: str = DEFAULT_POPULATION_FINALIZER,
 ) -> dict[str, Any]:
     """Memory-bounded equivalent of the preserved legacy implementation.
 
@@ -2602,19 +2610,57 @@ def _generate_pair_population_optimized_impl(
         population["originCounts"] = dict(
             sorted(state.origin_accepted_counts.items())
         )
-    # This hashes the exact legacy canonical document *without* its derived
-    # populationSha256 field.  Candidate bytes are replayed one at a time from
-    # durable entries instead of constructing a second population-sized string.
-    with timed_span("generation.finalize.hash_population"):
-        population_sha256 = _stream_canonical_sha256(population)
-    population["populationSha256"] = population_sha256
-    assert_performance_resource_guard()
-    with timed_span("generation.finalize.persist_population") as span:
-        span.annotate(
-            encodedBytes=_write_canonical_stream_once(
-                root / "population.json", population
+    if population_finalizer == POPULATION_FINALIZER_PYTHON:
+        # The Python implementation remains the exact semantic oracle.  It
+        # replays candidates from immutable entries without retaining a second
+        # population-sized value.
+        with timed_span("generation.finalize.hash_population"):
+            population_sha256 = _stream_canonical_sha256(population)
+        population["populationSha256"] = population_sha256
+        assert_performance_resource_guard()
+        with timed_span("generation.finalize.persist_population") as span:
+            span.annotate(
+                encodedBytes=_write_canonical_stream_once(
+                    root / "population.json", population
+                ),
+                populationFinalizer=POPULATION_FINALIZER_PYTHON,
             )
-        )
+    else:
+        # Rust is deliberately narrower than proposal construction.  Python
+        # authors the canonical shell and exact journal identity manifest;
+        # native code validates and splices those existing candidate bytes.
+        with timed_span(
+            "generation.finalize.rust_population",
+            populationFinalizer=POPULATION_FINALIZER_RUST,
+        ) as span:
+            native_result = finalize_population_with_rust(
+                output_root=root,
+                population_without_sha=population,
+                expected_entry_sha256s=state.entry_sha256s,
+                accepted_candidates=[
+                    {
+                        "proposalOrdinal": reference.proposal_ordinal,
+                        "candidateId": reference.candidate_id,
+                        "candidateIdentitySha256": (
+                            reference.candidate_identity_sha256
+                        ),
+                    }
+                    for reference in accepted_references
+                ],
+            )
+            span.annotate(
+                encodedBytes=native_result["encodedBytes"],
+                nativeTotalMs=native_result["totalMs"],
+                nativeJournalScanAndVerifyMs=native_result[
+                    "journalScanAndVerifyMs"
+                ],
+                nativeAssemblyMs=native_result["assemblyMs"],
+                existingArtifactVerified=native_result[
+                    "existingArtifactVerified"
+                ],
+            )
+            population_sha256 = str(native_result["populationSha256"])
+        population["populationSha256"] = population_sha256
     assert_performance_resource_guard()
     with timed_span("generation.finalize.build_journal"):
         journal = {
@@ -2721,13 +2767,15 @@ def generate_pair_population(
     max_proposal_attempts: int = DEFAULT_MAX_PROPOSAL_ATTEMPTS,
     max_new_proposals: int | None = None,
     implementation: str = PAIR_GENERATION_IMPLEMENTATION_OPTIMIZED,
+    population_finalizer: str = DEFAULT_POPULATION_FINALIZER,
 ) -> dict[str, Any]:
     """Generate a pair population with identity-excluded performance evidence.
 
     ``optimized`` is the production path after byte-exact oracle admission. It
-    retains only compact journal state and streams the final population.
-    ``legacy`` remains an explicit reference oracle during the bounded
-    deprecation window.
+    retains only compact journal state and uses the journal-backed Rust
+    finalizer by default.  ``population_finalizer="python"`` preserves the
+    exact streaming oracle, while ``legacy`` remains the original reference
+    implementation during the bounded deprecation window.
     """
 
     implementation = str(implementation).strip().lower()
@@ -2735,6 +2783,16 @@ def generate_pair_population(
         raise TemporalDiscoveryContractError(
             "pair generation implementation must be legacy or optimized"
         )
+    population_finalizer = str(population_finalizer).strip().lower()
+    if population_finalizer not in POPULATION_FINALIZERS:
+        raise TemporalDiscoveryContractError(
+            "population finalizer must be python or rust"
+        )
+    effective_population_finalizer = (
+        POPULATION_FINALIZER_PYTHON
+        if implementation == PAIR_GENERATION_IMPLEMENTATION_LEGACY
+        else population_finalizer
+    )
     implementation_function = (
         _generate_pair_population_legacy_impl
         if implementation == PAIR_GENERATION_IMPLEMENTATION_LEGACY
@@ -2760,25 +2818,33 @@ def generate_pair_population(
                 hasParentArchive=parent_archive is not None,
                 hasIdentityLedger=identity_ledger_path is not None,
                 generationImplementation=implementation,
+                populationFinalizer=effective_population_finalizer,
             ):
-                result = implementation_function(
-                    output_root=output_root,
-                    generation_index=generation_index,
-                    target_unique_candidates=target_unique_candidates,
-                    run_config=run_config,
-                    pair_policy=pair_policy,
-                    parent_pairs=parent_pairs,
-                    parent_archive=parent_archive,
-                    pair_factory=pair_factory,
-                    module_authority=module_authority,
-                    native_validator=native_validator,
-                    pair_compiler=pair_compiler,
-                    evidence_identity_context=evidence_identity_context,
-                    operator_implementation_identity=operator_implementation_identity,
-                    identity_ledger_path=identity_ledger_path,
-                    max_proposal_attempts=max_proposal_attempts,
-                    max_new_proposals=max_new_proposals,
-                )
+                implementation_arguments = {
+                    "output_root": output_root,
+                    "generation_index": generation_index,
+                    "target_unique_candidates": target_unique_candidates,
+                    "run_config": run_config,
+                    "pair_policy": pair_policy,
+                    "parent_pairs": parent_pairs,
+                    "parent_archive": parent_archive,
+                    "pair_factory": pair_factory,
+                    "module_authority": module_authority,
+                    "native_validator": native_validator,
+                    "pair_compiler": pair_compiler,
+                    "evidence_identity_context": evidence_identity_context,
+                    "operator_implementation_identity": (
+                        operator_implementation_identity
+                    ),
+                    "identity_ledger_path": identity_ledger_path,
+                    "max_proposal_attempts": max_proposal_attempts,
+                    "max_new_proposals": max_new_proposals,
+                }
+                if implementation == PAIR_GENERATION_IMPLEMENTATION_OPTIMIZED:
+                    implementation_arguments["population_finalizer"] = (
+                        effective_population_finalizer
+                    )
+                result = implementation_function(**implementation_arguments)
                 trace.set_result(result)
             flush_performance_events()
         outcome = "completed" if result.get("completed") is True else "progress"
@@ -2790,4 +2856,4 @@ def generate_pair_population(
         trace.close(outcome=outcome, error_type=error_type)
 
 
-__all__ = ["PAIR_GENERATION_IMPLEMENTATION_LEGACY", "PAIR_GENERATION_IMPLEMENTATION_OPTIMIZED", "PAIR_GENERATION_SCHEMA", "PAIR_PROPOSAL_SCHEMA", "PairModuleOperator", "TypedGrammarPairOperator", "TypedPairFactory", "generate_pair_population", "materialize_pair_candidate", "propose_pair", "propose_same_side_crossover", "replay_pair_proposal"]
+__all__ = ["DEFAULT_POPULATION_FINALIZER", "PAIR_GENERATION_IMPLEMENTATION_LEGACY", "PAIR_GENERATION_IMPLEMENTATION_OPTIMIZED", "PAIR_GENERATION_SCHEMA", "PAIR_PROPOSAL_SCHEMA", "POPULATION_FINALIZER_PYTHON", "POPULATION_FINALIZER_RUST", "PairModuleOperator", "TypedGrammarPairOperator", "TypedPairFactory", "generate_pair_population", "materialize_pair_candidate", "propose_pair", "propose_same_side_crossover", "replay_pair_proposal"]
