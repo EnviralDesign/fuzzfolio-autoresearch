@@ -46,9 +46,16 @@ EXPECTED_DIRECTIONAL_EVENT_SUBSTITUTIONS = 21
 EXPECTED_FUZZY_STATE_RANGE_INDICATORS = 62
 DEFAULT_TARGET_UNIQUE_CANDIDATES = 64
 DEFAULT_INTERRUPT_AFTER = 12
-DEPTH_PROBE_SCHEMA = "temporal_qd_no_market_pair_depth_probe_v1"
-_DEPTH_PROBE_BUCKETS = (0, 14, 19)
-_DEPTH_PROBE_MAX_BUCKET_ATTEMPTS = 16
+DEPTH_PROBE_SCHEMA = "temporal_qd_no_market_pair_depth_probe_v2"
+# The probe is an admission witness, not an evolutionary policy.  Each
+# bucket's intended sequence depth is explicit so future changes to the
+# production weighted depth schedule cannot silently weaken this proof.
+_DEPTH_PROBE_BUCKET_DEPTHS = {0: 1, 14: 2, 19: 3}
+_DEPTH_PROBE_BUCKETS = tuple(_DEPTH_PROBE_BUCKET_DEPTHS)
+# A cap-invalid operation may reject one otherwise deterministic sequence.
+# Search a fixed finite number of candidates in the same bucket namespace;
+# this remains reproducible and fails closed when no legal witness exists.
+_DEPTH_PROBE_MAX_BUCKET_ATTEMPTS = 128
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -225,19 +232,31 @@ def _depth_probe_seed(bucket: int, search_ordinal: int) -> str:
 def probe_structural_mutation_depths(
     authority: PairAuthorityBundle, parent: FrozenPair
 ) -> dict[str, Any]:
-    """Native-materialize and replay one exact 1/2/3-depth structural probe."""
+    """Find and replay one legal native witness for each exact 1/2/3 depth.
+
+    Individual proposal sequences may now correctly reject a cap-invalid
+    intermediate operation.  Probe selection therefore walks a closed seed
+    namespace until it finds the first materialized sequence for the intended
+    depth, preserving every bound and the applied-step proof in the artifact.
+    """
 
     root = FrozenPair.from_payload(parent.canonical_payload())
     probes = []
     for bucket in _DEPTH_PROBE_BUCKETS:
+        requested_depth = _DEPTH_PROBE_BUCKET_DEPTHS[bucket]
         selected: tuple[str, int, int, FrozenPair, dict[str, Any]] | None = None
         bucket_attempt = 0
+        rejection_dispositions: Counter[str] = Counter()
         for search_ordinal in range(10_000):
             seed = _depth_probe_seed(bucket, search_ordinal)
             if _unbiased_choice(seed, size=20) != bucket:
                 continue
             bucket_attempt += 1
             depth = _mutation_depth_for_seed(seed)
+            if depth != requested_depth:
+                raise TemporalDiscoveryContractError(
+                    "depth probe bucket no longer maps to its admitted requested depth"
+                )
             pair, proposal = _propose_pair_sequence(
                 proposal_seed=seed,
                 parent=root,
@@ -249,13 +268,21 @@ def probe_structural_mutation_depths(
             if proposal.get("mutationDepth") != depth:
                 raise TemporalDiscoveryContractError("depth probe proposal does not bind its exact depth")
             if pair is not None:
+                steps = proposal.get("mutationSteps")
+                if not isinstance(steps, list) or len(steps) != requested_depth:
+                    raise TemporalDiscoveryContractError(
+                        "depth probe materialized proposal does not apply its exact requested depth"
+                    )
                 selected = (seed, search_ordinal, bucket_attempt, pair, proposal)
                 break
+            rejection_dispositions[str(proposal.get("disposition") or "unknown")] += 1
             if bucket_attempt >= _DEPTH_PROBE_MAX_BUCKET_ATTEMPTS:
                 break
         if selected is None:
             raise TemporalDiscoveryContractError(
-                f"depth probe did not materialize a native v3/both offspring at depth bucket {bucket}"
+                "depth probe did not materialize a native v3/both offspring "
+                f"at depth bucket {bucket} after {_DEPTH_PROBE_MAX_BUCKET_ATTEMPTS} "
+                "matching-bucket attempts"
             )
         seed, search_ordinal, bucket_attempt, pair, proposal = selected
         replayed = replay_pair_proposal(
@@ -280,18 +307,32 @@ def probe_structural_mutation_depths(
                 "proposalSeed": seed,
                 "selectionSearchOrdinal": search_ordinal,
                 "matchingBucketAttempt": bucket_attempt,
-                "mutationDepth": _mutation_depth_for_seed(seed),
+                "matchingBucketAttemptLimit": _DEPTH_PROBE_MAX_BUCKET_ATTEMPTS,
+                "requestedMutationDepth": requested_depth,
+                "appliedMutationDepth": len(proposal["mutationSteps"]),
+                # Retained for backward-readable dashboards; requested and
+                # applied are the actual admission proof above.
+                "mutationDepth": requested_depth,
+                "priorRejectionDispositionCounts": dict(
+                    sorted(rejection_dispositions.items())
+                ),
                 "proposalSha256": proposal["proposalSha256"],
                 "pairIdentitySha256": pair.identity_sha256,
                 "nativeProfileShape": "v3/both",
             }
         )
-    if {item["mutationDepth"] for item in probes} != {1, 2, 3}:
-        raise TemporalDiscoveryContractError("depth probe did not cover exact 1/2/3 depths")
+    if {
+        (item["requestedMutationDepth"], item["appliedMutationDepth"])
+        for item in probes
+    } != {(1, 1), (2, 2), (3, 3)}:
+        raise TemporalDiscoveryContractError(
+            "depth probe did not cover exact requested/applied 1/2/3 depths"
+        )
     return {
         "schemaVersion": DEPTH_PROBE_SCHEMA,
         "parentPairIdentitySha256": root.identity_sha256,
         "exactBucketSchedule": {"1": 14, "2": 5, "3": 1},
+        "matchingBucketAttemptLimit": _DEPTH_PROBE_MAX_BUCKET_ATTEMPTS,
         "probes": probes,
     }
 

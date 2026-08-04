@@ -200,6 +200,7 @@ def test_depth_probe_selects_exact_buckets_and_replays_materialized_pairs(monkey
         seed = kwargs["proposal_seed"]
         proposal = {
             "mutationDepth": depth,
+            "mutationSteps": [{} for _ in range(depth)],
             "proposalSha256": f"sha256:{depth:064x}",
         }
         return parent, proposal
@@ -211,9 +212,56 @@ def test_depth_probe_selects_exact_buckets_and_replays_materialized_pairs(monkey
     probe = admission.probe_structural_mutation_depths(authority, parent)
 
     assert [item["mutationDepth"] for item in probe["probes"]] == [1, 2, 3]
+    assert [item["requestedMutationDepth"] for item in probe["probes"]] == [1, 2, 3]
+    assert [item["appliedMutationDepth"] for item in probe["probes"]] == [1, 2, 3]
     assert [item["bucket"] for item in probe["probes"]] == [0, 14, 19]
     assert all(
         admission._unbiased_choice(item["proposalSeed"], size=20) == item["bucket"]
         for item in probe["probes"]
     )
     assert len(seen) == 3
+
+
+def test_depth_probe_retries_cap_rejected_sequences_within_its_fixed_bound(
+    monkeypatch,
+) -> None:
+    class Pair:
+        identity_sha256 = "sha256:" + "b" * 64
+        profile = {"version": "v3", "directionMode": "both"}
+        validation = {"candidateAcceptable": True}
+
+        def canonical_payload(self):
+            return {"pair": self.identity_sha256}
+
+    parent = Pair()
+    depth_three_attempts = 0
+    monkeypatch.setattr(admission.FrozenPair, "from_payload", lambda payload: parent)
+
+    def propose(**kwargs):
+        nonlocal depth_three_attempts
+        depth = kwargs["mutation_depth"]
+        if depth == 3:
+            depth_three_attempts += 1
+            if depth_three_attempts < 3:
+                return None, {
+                    "mutationDepth": depth,
+                    "mutationSteps": [{}],
+                    "disposition": "operation_rejected",
+                    "proposalSha256": f"sha256:rejected{depth_three_attempts}",
+                }
+        return parent, {
+            "mutationDepth": depth,
+            "mutationSteps": [{} for _ in range(depth)],
+            "proposalSha256": f"sha256:accepted{depth}",
+        }
+
+    monkeypatch.setattr(admission, "_propose_pair_sequence", propose)
+    monkeypatch.setattr(admission, "replay_pair_proposal", lambda **kwargs: parent)
+    authority = type("Authority", (), {"operator": object(), "validator": object(), "compiler": object()})()
+
+    probe = admission.probe_structural_mutation_depths(authority, parent)
+    depth_three = next(item for item in probe["probes"] if item["requestedMutationDepth"] == 3)
+
+    assert depth_three["matchingBucketAttempt"] == 3
+    assert depth_three["appliedMutationDepth"] == 3
+    assert depth_three["priorRejectionDispositionCounts"] == {"operation_rejected": 2}
