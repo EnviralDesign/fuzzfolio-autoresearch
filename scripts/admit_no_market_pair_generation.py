@@ -38,6 +38,7 @@ from autoresearch.temporal_qd_pair_generation import (
     _unbiased_choice,
     replay_pair_proposal,
 )
+from autoresearch.temporal_qd_supervisor import FRESH_BROAD_CANDIDATE_EVALUATIONS
 
 
 SUMMARY_SCHEMA = "temporal_qd_no_market_pair_admission_summary_v1"
@@ -392,7 +393,7 @@ def run_admission(*, pair_config_path: Path, construction_catalog_path: Path, ou
     catalog = _read(construction_catalog_path)
     catalog_audit = audit_construction_catalog(catalog, frozen)
     capacity_audit = immigrant_capacity_audit(
-        frozen, required_unique_candidates=4096
+        frozen, required_unique_candidates=FRESH_BROAD_CANDIDATE_EVALUATIONS
     )
     with PairAuthorityBundle(frozen) as authority:
         event_reachability_audit = audit_fresh_event_substitution_reachability(

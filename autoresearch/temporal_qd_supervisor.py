@@ -71,6 +71,51 @@ SUPERVISOR_STATE_SCHEMA = "temporal_qd_supervisor_state_v3"
 _SHA256_LENGTH = 71
 _GIT_SHA_LENGTH = 40
 
+# Fresh broad campaigns and legacy continuations intentionally have different
+# shapes.  Keep the derived totals here so every admission surface freezes the
+# same authority rather than restating campaign arithmetic at call sites.
+FRESH_BROAD_GENERATION_COUNT = 5
+FRESH_BROAD_CANDIDATES_PER_GENERATION = 1_024
+FRESH_BROAD_DISCOVERY_WINDOWS_PER_CANDIDATE = 3
+FRESH_BROAD_CANDIDATE_EVALUATIONS = (
+    FRESH_BROAD_GENERATION_COUNT * FRESH_BROAD_CANDIDATES_PER_GENERATION
+)
+FRESH_BROAD_DISCOVERY_WORKER_TASKS = (
+    FRESH_BROAD_CANDIDATE_EVALUATIONS
+    * FRESH_BROAD_DISCOVERY_WINDOWS_PER_CANDIDATE
+)
+LEGACY_CONTINUATION_GENERATION_COUNT = 4
+LEGACY_CONTINUATION_CANDIDATE_EVALUATIONS = (
+    LEGACY_CONTINUATION_GENERATION_COUNT
+    * FRESH_BROAD_CANDIDATES_PER_GENERATION
+)
+LEGACY_CONTINUATION_DISCOVERY_WORKER_TASKS = (
+    LEGACY_CONTINUATION_CANDIDATE_EVALUATIONS
+    * FRESH_BROAD_DISCOVERY_WINDOWS_PER_CANDIDATE
+)
+
+
+def _broad_admission_contract_values(generation_count: int) -> dict[str, int]:
+    """Return the exact frozen values for an admissible broad-run block."""
+
+    if generation_count == FRESH_BROAD_GENERATION_COUNT:
+        candidate_evaluations = FRESH_BROAD_CANDIDATE_EVALUATIONS
+        discovery_worker_tasks = FRESH_BROAD_DISCOVERY_WORKER_TASKS
+    elif generation_count == LEGACY_CONTINUATION_GENERATION_COUNT:
+        candidate_evaluations = LEGACY_CONTINUATION_CANDIDATE_EVALUATIONS
+        discovery_worker_tasks = LEGACY_CONTINUATION_DISCOVERY_WORKER_TASKS
+    else:
+        raise TemporalDiscoveryContractError(
+            "broad admission contract has an unsupported generation count"
+        )
+    return {
+        "generationCount": generation_count,
+        "candidatesPerGeneration": FRESH_BROAD_CANDIDATES_PER_GENERATION,
+        "candidateEvaluations": candidate_evaluations,
+        "discoveryWindowsPerCandidate": FRESH_BROAD_DISCOVERY_WINDOWS_PER_CANDIDATE,
+        "discoveryWorkerTasks": discovery_worker_tasks,
+    }
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -869,7 +914,7 @@ def _validate_evidence_ladder_execution(
 def _continuation_binding(
     source_run_root: Path | str, *, _seen_roots: frozenset[Path] = frozenset()
 ) -> dict[str, Any]:
-    """Read a completed four-generation source without changing its state."""
+    """Read a completed fresh-five or legacy-four source without changing it."""
 
     root = Path(source_run_root).resolve()
     if root in _seen_roots:
@@ -883,8 +928,29 @@ def _continuation_binding(
     plan = config.get("generationPlan") or {}
     source_first = int(plan.get("firstGenerationIndex") or -1)
     source_count = int(plan.get("generationCount") or -1)
-    if source_first < 1 or source_count != 4:
-        raise TemporalDiscoveryContractError("QD continuation source must be a completed four-generation campaign")
+    if source_first < 1 or source_count not in {
+        FRESH_BROAD_GENERATION_COUNT,
+        LEGACY_CONTINUATION_GENERATION_COUNT,
+    }:
+        raise TemporalDiscoveryContractError(
+            "QD continuation source must be a completed fresh five-generation or legacy four-generation campaign"
+        )
+    if config.get("broadAdmission") is not True:
+        raise TemporalDiscoveryContractError(
+            "QD continuation source was not admitted as a broad campaign"
+        )
+    contract = config.get("broadAdmissionContract")
+    expected_contract = _broad_admission_contract_values(source_count)
+    if not isinstance(contract, Mapping) or contract.get(
+        "schemaVersion"
+    ) != "temporal_qd_broad_admission_contract_v1":
+        raise TemporalDiscoveryContractError(
+            "QD continuation source broad admission contract is unavailable"
+        )
+    if any(contract.get(key) != value for key, value in expected_contract.items()):
+        raise TemporalDiscoveryContractError(
+            "QD continuation source broad admission contract does not match its generation plan"
+        )
     source_last = source_first + source_count - 1
     state = _load_state(root / "state.json", config_sha256=config_sha)
     if state.get("status") != "completed":
@@ -894,7 +960,7 @@ def _continuation_binding(
     expected_generations = set(range(source_first, source_last + 1))
     if set(completed) != expected_generations:
         raise TemporalDiscoveryContractError(
-            "QD continuation source lacks its immutable contiguous four-generation campaign"
+            "QD continuation source lacks its immutable contiguous fresh five-generation or legacy four-generation campaign"
         )
     latest = completed[source_last]
     archive_path = Path(str(latest.get("archivePath") or ""))
@@ -902,7 +968,16 @@ def _continuation_binding(
         raise TemporalDiscoveryContractError("QD continuation source archive is missing")
     prior = config.get("continuationFrom")
     prior_binding: dict[str, Any] | None = None
-    if prior is not None:
+    if prior is None:
+        if source_first != 1:
+            raise TemporalDiscoveryContractError(
+                "QD root continuation source must begin at generation 1"
+            )
+    else:
+        if source_count != LEGACY_CONTINUATION_GENERATION_COUNT:
+            raise TemporalDiscoveryContractError(
+                "QD fresh five-generation source cannot be a chained continuation"
+            )
         if not isinstance(prior, Mapping):
             raise TemporalDiscoveryContractError("QD continuation prior-chain binding is invalid")
         prior_binding = _continuation_binding(
@@ -913,6 +988,10 @@ def _continuation_binding(
             prior, name="frozen prior QD continuation binding"
         ):
             raise TemporalDiscoveryContractError("QD continuation prior chain drifted")
+        if source_first != int(prior_binding["sourceLastGenerationIndex"]) + 1:
+            raise TemporalDiscoveryContractError(
+                "QD continuation source does not begin immediately after its prior source"
+            )
     return {
         "schemaVersion": "temporal_qd_generation_continuation_v1",
         "sourceRunRoot": str(root),
@@ -1111,13 +1190,20 @@ def _frozen_config(
     evaluation_target = generation_count * int(
         normalized_parameters["targetUniqueCandidates"]
     )
+    is_continuation = continuation_from is not None
+    expected_broad_generation_count = (
+        LEGACY_CONTINUATION_GENERATION_COUNT
+        if is_continuation
+        else FRESH_BROAD_GENERATION_COUNT
+    )
     if broad_admission and (
-        generation_count != 4
-        or int(normalized_parameters["targetUniqueCandidates"]) != 1024
+        generation_count != expected_broad_generation_count
+        or int(normalized_parameters["targetUniqueCandidates"])
+        != FRESH_BROAD_CANDIDATES_PER_GENERATION
         or evidence_ladder_config is None
     ):
         raise TemporalDiscoveryContractError(
-            "broad admission requires a frozen evidence ladder and the frozen four-generation x 1,024-candidate contract"
+            "fresh broad admission requires a frozen evidence ladder and the frozen five-generation x 1,024-candidate contract; a continuation requires exactly four generations"
         )
     initial_archive, initial_archive_sha = _load_archive(initial_archive_path)
     template = _read(template_preparation_path, name="QD template preparation")
@@ -1184,11 +1270,9 @@ def _frozen_config(
             {
                 "broadAdmissionContract": {
                     "schemaVersion": "temporal_qd_broad_admission_contract_v1",
-                    "generationCount": 4,
-                    "candidatesPerGeneration": 1024,
-                    "candidateEvaluations": 4096,
-                    "discoveryWindowsPerCandidate": 3,
-                    "discoveryWorkerTasks": 12288,
+                    **_broad_admission_contract_values(
+                        expected_broad_generation_count
+                    ),
                     **(
                         {"immigrantConstructionCapacity": pair_capacity_audit}
                         if pair_capacity_audit is not None
@@ -1855,7 +1939,7 @@ def run_qd_continuation(
     *,
     source_run_root: Path | str,
     run_root: Path | str,
-    generation_count: int = 4,
+    generation_count: int = LEGACY_CONTINUATION_GENERATION_COUNT,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Seed the next immutable four-generation campaign from a completed source.
@@ -1865,7 +1949,7 @@ def run_qd_continuation(
     generation artifacts even if it is interrupted repeatedly.
     """
 
-    if generation_count != 4:
+    if generation_count != LEGACY_CONTINUATION_GENERATION_COUNT:
         raise TemporalDiscoveryContractError(
             "QD continuation requires exactly four generations"
         )
@@ -1877,7 +1961,7 @@ def run_qd_continuation(
         initial_immigrant_continuation_ordinal=int(
             binding["nextImmigrantContinuationOrdinal"]
         ),
-        generation_count=4,
+        generation_count=LEGACY_CONTINUATION_GENERATION_COUNT,
         continuation_from=binding,
         **kwargs,
     )
@@ -2018,7 +2102,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--initial-archive", type=Path)
-    parser.add_argument("--continue-from", type=Path, help="completed immutable four-generation run root; creates the next separate contiguous four-generation run")
+    parser.add_argument(
+        "--continue-from",
+        type=Path,
+        help=(
+            "completed immutable fresh-five or legacy-four run root; creates "
+            "the next separate contiguous four-generation run"
+        ),
+    )
     parser.add_argument("--source-preparation", type=Path)
     parser.add_argument("--base-generator-root", type=Path)
     parser.add_argument("--confirmed-entry-admission-root", type=Path)

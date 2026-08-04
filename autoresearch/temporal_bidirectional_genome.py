@@ -229,8 +229,17 @@ class FrozenModule:
         native_authority = IdentitySnapshot.from_payload(native_authority.canonical_payload(), expected_kind="nativeAuthority")
         canonical_program = _mapping(program, name="v2 module program")
         canonical_profile = _mapping(profile, name="hydrated v2 module profile")
+        # Every route that can become a frozen v2 module, including direct
+        # factory output and later operator output, must obey the current
+        # search-language entry-decision cap.  The import stays local so this
+        # immutable genome layer does not own the grammar implementation.
+        from .temporal_typed_motif_grammar import (
+            validate_entry_route_decision_indicator_cap,
+        )
+
+        validate_entry_route_decision_indicator_cap(canonical_profile)
         direction = _side(canonical_program.get("direction"), name="module program direction")
-        if set(canonical_program) != {"schemaVersion", "grammarVersion", "direction", "fragments"} or canonical_program.get("schemaVersion") != "temporal_typed_fragment_grammar_v2" or canonical_program.get("grammarVersion") != "2" or not isinstance(canonical_program.get("fragments"), list):
+        if set(canonical_program) != {"schemaVersion", "grammarVersion", "direction", "fragments"} or canonical_program.get("schemaVersion") != "temporal_typed_fragment_grammar_v2" or canonical_program.get("grammarVersion") != "3" or not isinstance(canonical_program.get("fragments"), list):
             raise BidirectionalGenomeError("module program is not a canonical typed v2 program")
         if canonical_profile.get("version") != "v2" or _side(canonical_profile.get("directionMode"), name="v2 profile direction") != direction:
             raise BidirectionalGenomeError("hydrated profile is not the matching v2 module")
@@ -402,7 +411,7 @@ def deterministic_same_side_crossover(
     )
     if _side(child.get("direction"), name="crossover child direction") != left.direction:
         raise BidirectionalGenomeError("same-side crossover emitted a cross-side child")
-    if child.get("schemaVersion") != "temporal_typed_fragment_grammar_v2" or child.get("grammarVersion") != "2":
+    if child.get("schemaVersion") != "temporal_typed_fragment_grammar_v2" or child.get("grammarVersion") != "3":
         raise BidirectionalGenomeError("same-side crossover emitted a noncanonical v2 program")
     record = {
         "operation": "same_side_crossover",

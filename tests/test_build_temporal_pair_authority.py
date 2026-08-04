@@ -137,7 +137,7 @@ def test_catalog_context_and_freeze_are_catalog_bound(tmp_path, monkeypatch):
         == default_immigrant_construction_policy()
     )
     assert frozen["operatorImplementation"]["schemaVersion"] == (
-        "temporal_qd_pair_operator_implementation_v2"
+        "temporal_qd_pair_operator_implementation_v3"
     )
     assert frozen["operatorImplementation"]["richImmigrantBuilderVersion"] == (
         "temporal_qd_rich_immigrant_builder_v1"

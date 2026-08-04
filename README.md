@@ -72,8 +72,8 @@ See [cli.md](cli.md) for arguments.
 The temporal QD broad system is implemented as a frozen, diagnostic authority.
 Each broad run still requires fresh native, no-market, and current-worker
 admission against its exact committed inputs before launch.
-The only broad admission shape is exactly four generations of 1,024 unique
-bidirectional-v3 candidates: 4,096 candidate evaluations and 12,288 discovery
+The only fresh broad admission shape is exactly five generations of 1,024 unique
+bidirectional-v3 candidates: 5,120 candidate evaluations and 15,360 discovery
 worker tasks over the same three deterministic, separated one-month windows.
 Conservative costs control quality and reproduction; the no-cost view is
 diagnostic only.
@@ -95,16 +95,16 @@ uv run temporal-qd-materialize-evidence-ladder `
 ```
 
 Run the broad supervisor only with the materialized/frozen authority,
-`--broad-admission`, `--generation-count 4`, and parameters whose
+`--broad-admission`, `--generation-count 5`, and parameters whose
 `targetUniqueCandidates` is `1024`. Supply the frozen archive, preparation,
 construction catalog, commits, worker contract, bidirectional pair config, and
 the ladder config through `temporal-qd-supervisor`; it fails closed if that exact
 admission shape is not present.
 
-Continuations are never automatic. After reviewing the completed immutable
-1–4 authority, an operator may start a separate contiguous 5–8 authority with
-the same frozen arguments and this continuation form (and may later do the same
-for 9–12):
+Continuations are never automatic. A completed fresh 1–5 broad authority may
+continue as a separate legacy-compatible four-generation 6–9 block (and later
+10–13). Existing completed legacy 1–4 blocks continue as 5–8. Every requested
+continuation remains an exact contiguous four-generation block.
 
 ```powershell
 uv run temporal-qd-supervisor `

@@ -7,6 +7,7 @@ import pytest
 from autoresearch.temporal_discovery_base import canonical_sha256
 from autoresearch.temporal_bidirectional_genome import IdentitySnapshot
 from autoresearch.temporal_indicator_learning_v1 import IndicatorLearningRegistry
+from autoresearch.temporal_qd_pair_factory import default_immigrant_construction_policy
 from autoresearch.temporal_qd_evolution import (
     canonical_empty_bidirectional_archive_template,
     initialize_empty_bidirectional_archive,
@@ -78,6 +79,43 @@ def test_catalog_audit_proves_current_directional_and_fuzzy_surface() -> None:
     assert audit["fuzzyStateRangeCapableIndicatorCount"] == 62
     assert audit["roles"] == "seed_priors_only_not_eligibility"
     assert audit["fuzzyCap"] == {"perSide": 3, "perEvidenceGroup": 3}
+
+
+def test_no_market_admission_uses_fresh_broad_capacity_without_changing_probe_floor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, int] = {}
+    frozen = {"pairRunConfigSha256": "sha256:fixture"}
+
+    monkeypatch.setattr(admission, "load_pair_run_config", lambda _value: frozen)
+    monkeypatch.setattr(admission, "_read", lambda _path: {"fixture": True})
+    monkeypatch.setattr(
+        admission, "audit_construction_catalog", lambda *_args: {"catalog": "ok"}
+    )
+
+    def capture_capacity(_frozen, *, required_unique_candidates: int):
+        captured["requiredUniqueCandidates"] = required_unique_candidates
+        raise RuntimeError("stop after capacity admission")
+
+    monkeypatch.setattr(admission, "immigrant_capacity_audit", capture_capacity)
+
+    with pytest.raises(RuntimeError, match="stop after capacity admission"):
+        admission.run_admission(
+            pair_config_path=tmp_path / "pair-config.json",
+            construction_catalog_path=tmp_path / "catalog.json",
+            output_root=tmp_path / "external-output",
+        )
+
+    assert captured == {
+        "requiredUniqueCandidates": admission.FRESH_BROAD_CANDIDATE_EVALUATIONS
+    }
+    assert admission.DEFAULT_TARGET_UNIQUE_CANDIDATES == 64
+    assert (
+        default_immigrant_construction_policy()["capacityAdmission"][
+            "minimumUniqueSelectorFingerprints"
+        ]
+        == 4096
+    )
 
 
 def test_offspring_audit_requires_exact_four_to_one_schedule(tmp_path: Path) -> None:

@@ -211,6 +211,11 @@ class TypedGrammarPairOperator:
         operator = registry.get(str(plan.get("operatorId") or ""))
         source_profile = module.canonical_payload()["profile"]
         preview = operator.preview(source_profile, plan)
+        from .temporal_typed_motif_grammar import (
+            validate_entry_route_decision_indicator_cap,
+        )
+
+        validate_entry_route_decision_indicator_cap(preview)
         report = self._native_validator.validate_v2(profile=preview, candidate_id=candidate_id)
         child_program = report.get("programSha256")
         child, application = operator.apply(source_profile, plan, parent_validated_program_sha256=module.native_program_sha256, child_validated_program_sha256=child_program)

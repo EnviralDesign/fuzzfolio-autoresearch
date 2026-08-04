@@ -8,7 +8,7 @@ compiled by the Dashboard's canonical authority.
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -25,10 +25,12 @@ from .temporal_search import canonical_sha256
 
 
 GRAMMAR_SCHEMA = "temporal_typed_fragment_grammar_v2"
-GRAMMAR_VERSION = "2"
+GRAMMAR_VERSION = "3"
 MODULE_SCHEMA = "temporal_typed_fragment_module_v2"
 WITNESS_SCHEMA = "temporal_typed_fragment_activation_recipe_v1"
 DEFAULT_BUDGETS = {"states": 16, "transitions": 63, "groups": 4, "events": 8, "indicators": 16, "guardDepth": 4}
+ENTRY_ROUTE_DECISION_INDICATOR_CAP = 3
+ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION = "temporal_entry_route_decision_indicator_cap_v1"
 
 
 class GrammarError(TemporalDiscoveryContractError):
@@ -239,6 +241,299 @@ def _guard_depth(value: Mapping[str, Any]) -> int:
     if value.get("kind") in {"predicate_edge", "consecutive_true"}:
         return 1 + _guard_depth(value["predicate"])
     return 1
+
+
+def _deduplicate_indicator_paths(
+    paths: Sequence[frozenset[str]],
+) -> tuple[frozenset[str], ...]:
+    """Canonicalize finite conjunctive decision-indicator alternatives."""
+
+    return tuple(
+        sorted(set(paths), key=lambda item: (len(item), tuple(sorted(item))))
+    )
+
+
+def _guard_decision_indicator_paths(
+    guard: Mapping[str, Any],
+    *,
+    groups: Mapping[str, frozenset[str]],
+    events: Mapping[str, str],
+    known_indicator_ids: frozenset[str],
+    negated: bool = False,
+) -> tuple[frozenset[str], ...]:
+    """Return each feasible conjunctive indicator set for a guard.
+
+    ``all`` combines requirements; ``any`` preserves alternatives rather than
+    accidentally treating every branch as simultaneously required.  This
+    representation remains exact when a later ``all`` combines an ``any``
+    branch with another predicate.
+    """
+
+    kind = str(guard.get("kind") or "")
+    if kind == "not":
+        nested = guard.get("guard")
+        if not isinstance(nested, Mapping):
+            raise GrammarError("not decision guard is not closed")
+        return _guard_decision_indicator_paths(
+            nested,
+            groups=groups,
+            events=events,
+            known_indicator_ids=known_indicator_ids,
+            negated=not negated,
+        )
+    if kind in {"all", "any"}:
+        children = guard.get("guards")
+        if not isinstance(children, list) or not all(
+            isinstance(item, Mapping) for item in children
+        ):
+            raise GrammarError("compound decision guard is not closed")
+        child_paths = [
+            _guard_decision_indicator_paths(
+                item,
+                groups=groups,
+                events=events,
+                known_indicator_ids=known_indicator_ids,
+                negated=negated,
+            )
+            for item in children
+        ]
+        effective_kind = kind if not negated else ("all" if kind == "any" else "any")
+        if effective_kind == "any":
+            return _deduplicate_indicator_paths(
+                [path for paths in child_paths for path in paths]
+            ) or (frozenset(),)
+        paths: tuple[frozenset[str], ...] = (frozenset(),)
+        for alternatives in child_paths:
+            paths = _deduplicate_indicator_paths(
+                [left | right for left in paths for right in alternatives]
+            )
+        return paths
+    if kind in {"predicate_edge", "consecutive_true"}:
+        nested = guard.get("predicate")
+        if not isinstance(nested, Mapping):
+            raise GrammarError("predicate-edge decision guard is not closed")
+        return _guard_decision_indicator_paths(
+            nested,
+            groups=groups,
+            events=events,
+            known_indicator_ids=known_indicator_ids,
+            negated=negated,
+        )
+
+    identifiers: set[str] = set()
+    if "groupId" in guard:
+        group_id = str(guard.get("groupId") or "")
+        if group_id not in groups:
+            raise GrammarError("decision guard references an unknown evidence group")
+        identifiers.update(groups[group_id])
+    if "eventId" in guard:
+        event_id = str(guard.get("eventId") or "")
+        if event_id not in events:
+            raise GrammarError("decision guard references an unknown event binding")
+        identifiers.add(events[event_id])
+    if not identifiers:
+        return (frozenset(),)
+    if not identifiers.issubset(known_indicator_ids):
+        raise GrammarError("decision guard indicator closure is incomplete")
+    return (frozenset(identifiers),)
+
+
+def entry_route_decision_indicator_report(profile: Mapping[str, Any]) -> dict[str, Any]:
+    """Describe the per-entry-route decision-indicator cardinality.
+
+    Only paths composed of decision transitions before an ``enter_next_open``
+    action participate.  Position, economic, runtime, and management guards
+    either lie outside that pre-entry route or carry no group/event binding and
+    therefore do not consume this search-language budget.
+    """
+
+    graph = profile.get("graph")
+    if not isinstance(graph, Mapping):
+        raise GrammarError("entry route indicator cap requires a graph")
+    transitions_raw = graph.get("transitions", [])
+    if not isinstance(transitions_raw, list):
+        raise GrammarError("entry route indicator cap transition set is malformed")
+    transitions = [item for item in transitions_raw if isinstance(item, Mapping)]
+    if len(transitions) != len(transitions_raw):
+        raise GrammarError("entry route indicator cap transition is malformed")
+    entry_transitions = [
+        item
+        for item in transitions
+        if item.get("eventClass") == "decision"
+        and any(
+            isinstance(action, Mapping) and action.get("kind") == "enter_next_open"
+            for action in (item.get("actions") or [])
+        )
+    ]
+    if not entry_transitions:
+        return {
+            "schemaVersion": "temporal_entry_route_decision_indicator_report_v1",
+            "policyVersion": ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION,
+            "maxDistinctDecisionIndicatorInstances": ENTRY_ROUTE_DECISION_INDICATOR_CAP,
+            "entryTransitions": [],
+            "reachableStateIndicatorSetCount": 0,
+            "observedMaximumDistinctDecisionIndicatorInstances": 0,
+        }
+    indicators = profile.get("indicators")
+    groups_raw = graph.get("evidenceGroups")
+    events_raw = graph.get("eventBindings")
+    if not all(isinstance(value, list) for value in (indicators, groups_raw, events_raw)):
+        raise GrammarError("entry route indicator cap requires closed graph resources")
+    known_indicator_ids = frozenset(
+        str((item.get("meta") or {}).get("instanceId") or "")
+        for item in indicators
+        if isinstance(item, Mapping)
+    )
+    if "" in known_indicator_ids or len(known_indicator_ids) != len(indicators):
+        raise GrammarError("entry route indicator cap requires unique indicator instances")
+    if len(known_indicator_ids) > DEFAULT_BUDGETS["indicators"]:
+        raise GrammarError("entry route indicator cap exceeds the per-side resource budget")
+    groups: dict[str, frozenset[str]] = {}
+    for item in groups_raw:
+        if not isinstance(item, Mapping):
+            raise GrammarError("entry route indicator cap evidence group is malformed")
+        group_id = str(item.get("id") or "")
+        members = item.get("indicatorInstanceIds")
+        if not group_id or group_id in groups or not isinstance(members, list) or not members:
+            raise GrammarError("entry route indicator cap evidence group is malformed")
+        groups[group_id] = frozenset(str(member) for member in members)
+    events: dict[str, str] = {}
+    for item in events_raw:
+        if not isinstance(item, Mapping):
+            raise GrammarError("entry route indicator cap event binding is malformed")
+        event_id = str(item.get("id") or "")
+        member = str(item.get("indicatorInstanceId") or "")
+        if not event_id or event_id in events or not member:
+            raise GrammarError("entry route indicator cap event binding is malformed")
+        events[event_id] = member
+
+    initial_state = str(graph.get("initialStateId") or "")
+    if not initial_state:
+        raise GrammarError("entry route indicator cap requires an initial state")
+    entry_indexes = {
+        index
+        for index, item in enumerate(transitions)
+        if item in entry_transitions
+    }
+    for entry in entry_transitions:
+        source = str(entry.get("sourceStateId") or "")
+        guard = entry.get("guard")
+        if not source or not isinstance(guard, Mapping):
+            raise GrammarError("entry decision route is not closed")
+
+    # Restrict propagation to decision states that can still reach an entry.
+    # This keeps unrelated position/exit branches outside the entry language.
+    reverse_decision_edges: dict[str, set[str]] = {}
+    for index, edge in enumerate(transitions):
+        if index in entry_indexes or edge.get("eventClass") != "decision":
+            continue
+        source = str(edge.get("sourceStateId") or "")
+        destination = str(edge.get("destinationStateId") or "")
+        if source and destination:
+            reverse_decision_edges.setdefault(destination, set()).add(source)
+    entry_sources = {
+        str(edge.get("sourceStateId") or "") for edge in entry_transitions
+    }
+    relevant_states = set(entry_sources)
+    pending_states = deque(sorted(entry_sources))
+    while pending_states:
+        state = pending_states.popleft()
+        for predecessor in sorted(reverse_decision_edges.get(state, ())):
+            if predecessor not in relevant_states:
+                relevant_states.add(predecessor)
+                pending_states.append(predecessor)
+
+    outgoing: dict[str, list[tuple[int, Mapping[str, Any]]]] = {}
+    for index, edge in enumerate(transitions):
+        if edge.get("eventClass") != "decision":
+            continue
+        source = str(edge.get("sourceStateId") or "")
+        if source:
+            outgoing.setdefault(source, []).append((index, edge))
+    for edges in outgoing.values():
+        edges.sort(key=lambda item: item[0])
+
+    # The worklist has a finite fixed point: each side has at most sixteen
+    # resource-closed indicators and only sets of up to the cap are retained.
+    # It therefore avoids materializing exponentially many simple graph paths.
+    worklist = deque([(initial_state, frozenset())])
+    seen_state_sets = {(initial_state, frozenset())}
+    entry_sets: dict[int, set[frozenset[str]]] = {
+        index: set() for index in entry_indexes
+    }
+    while worklist:
+        state, current = worklist.popleft()
+        for index, edge in outgoing.get(state, ()):
+            is_entry = index in entry_indexes
+            destination = str(edge.get("destinationStateId") or "")
+            if not is_entry and (not destination or destination not in relevant_states):
+                continue
+            edge_guard = edge.get("guard")
+            if not isinstance(edge_guard, Mapping):
+                raise GrammarError("entry decision route guard is not closed")
+            for requirement in _guard_decision_indicator_paths(
+                edge_guard,
+                groups=groups,
+                events=events,
+                known_indicator_ids=known_indicator_ids,
+            ):
+                combined = current | requirement
+                if len(combined) > ENTRY_ROUTE_DECISION_INDICATOR_CAP:
+                    raise GrammarError(
+                        "entry decision route exceeds the distinct decision-indicator cap"
+                    )
+                if is_entry:
+                    entry_sets[index].add(combined)
+                    continue
+                state_set = (destination, combined)
+                if state_set not in seen_state_sets:
+                    seen_state_sets.add(state_set)
+                    worklist.append(state_set)
+
+    entry_reports = []
+    for index, entry in enumerate(transitions):
+        if index not in entry_indexes:
+            continue
+        route_sets = entry_sets[index]
+        entry_reports.append(
+            {
+                "transitionId": str(entry.get("id") or ""),
+                "routeCount": len(route_sets),
+                "routeDistinctDecisionIndicatorCounts": sorted(
+                    {len(item) for item in route_sets}
+                ),
+                "maxDistinctDecisionIndicatorInstances": max(
+                    (len(item) for item in route_sets), default=0
+                ),
+            }
+        )
+    report = {
+        "schemaVersion": "temporal_entry_route_decision_indicator_report_v1",
+        "policyVersion": ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION,
+        "maxDistinctDecisionIndicatorInstances": ENTRY_ROUTE_DECISION_INDICATOR_CAP,
+        "entryTransitions": entry_reports,
+        "reachableStateIndicatorSetCount": len(seen_state_sets),
+    }
+    report["observedMaximumDistinctDecisionIndicatorInstances"] = max(
+        (
+            int(item["maxDistinctDecisionIndicatorInstances"])
+            for item in entry_reports
+        ),
+        default=0,
+    )
+    return report
+
+
+def validate_entry_route_decision_indicator_cap(profile: Mapping[str, Any]) -> dict[str, Any]:
+    report = entry_route_decision_indicator_report(profile)
+    if (
+        report["observedMaximumDistinctDecisionIndicatorInstances"]
+        > ENTRY_ROUTE_DECISION_INDICATOR_CAP
+    ):
+        raise GrammarError(
+            "entry decision route exceeds the distinct decision-indicator cap"
+        )
+    return report
 
 
 def _binding_ids(value: Any) -> set[str]:
@@ -487,6 +782,17 @@ class TypedFragmentGrammar:
         if len(built["states"]) > self.context["budgets"]["states"] or len(built["transitions"]) > self.context["budgets"]["transitions"]: raise GrammarError("module exceeds per-side graph budget")
         if len(self.context["groups"]) > self.context["budgets"]["groups"] or len(self.context["events"]) > self.context["budgets"]["events"] or len(self.context["indicators"]) > self.context["budgets"]["indicators"]: raise GrammarError("context exceeds per-side resource budget")
         if any(_guard_depth(item["guard"]) > self.context["budgets"]["guardDepth"] for item in built["transitions"]): raise GrammarError("fragment guard depth exceeds budget")
+        validate_entry_route_decision_indicator_cap(
+            {
+                "indicators": self.context["indicators"],
+                "graph": {
+                    "initialStateId": "ready",
+                    "evidenceGroups": self.context["groups"],
+                    "eventBindings": self.context["events"],
+                    "transitions": built["transitions"],
+                },
+            }
+        )
 
     def _profile_payload(self, program: ModuleProgram) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         self.validate(program)
@@ -668,4 +974,4 @@ def inspect_module(profile: Mapping[str, Any]) -> dict[str, Any]:
     return {"schemaVersion": GRAMMAR_SCHEMA, "diagnosticOnly": True, "stateCount": len(states), "transitionCount": len(transitions), "referenceClosure": refs_ok, "profileSha256": canonical_sha256(profile)}
 
 
-__all__ = ["DashboardNativeAuthority", "Fragment", "FragmentSpec", "GRAMMAR_SCHEMA", "GRAMMAR_VERSION", "GrammarContext", "GrammarError", "ModuleProgram", "NativeValidator", "PairCompiler", "Port", "REGISTRY", "TypedFragmentGrammar", "CompiledModule", "compiled_graph_signature", "inspect_module", "module_signatures"]
+__all__ = ["DashboardNativeAuthority", "ENTRY_ROUTE_DECISION_INDICATOR_CAP", "ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION", "Fragment", "FragmentSpec", "GRAMMAR_SCHEMA", "GRAMMAR_VERSION", "GrammarContext", "GrammarError", "ModuleProgram", "NativeValidator", "PairCompiler", "Port", "REGISTRY", "TypedFragmentGrammar", "CompiledModule", "compiled_graph_signature", "entry_route_decision_indicator_report", "inspect_module", "module_signatures", "validate_entry_route_decision_indicator_cap"]

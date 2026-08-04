@@ -102,7 +102,7 @@ def _program(side: str, marker: str = "base") -> dict:
     threshold = {"base": 35.0, "first": 50.0, "second": 65.0}.get(marker, 75.0)
     return {
         "schemaVersion": "temporal_typed_fragment_grammar_v2",
-        "grammarVersion": "2",
+        "grammarVersion": "3",
         "direction": side,
         "fragments": [{"productionId": "arm_level", "resources": {"group": "g"}, "choices": {"threshold": threshold}}],
     }

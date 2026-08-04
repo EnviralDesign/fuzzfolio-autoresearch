@@ -465,10 +465,10 @@ def test_supervisor_forwards_broad_admission_to_empty_quality_bootstrap(
     monkeypatch.setattr(supervisor, "LabGatewayClient", FakeClient)
     monkeypatch.setattr(supervisor, "generate_qd_generation", fake_generate)
     inputs = _inputs(tmp_path)
-    inputs["generation_count"] = 4
+    inputs["generation_count"] = supervisor.FRESH_BROAD_GENERATION_COUNT
     inputs["parameters"] = {
         **inputs["parameters"],
-        "targetUniqueCandidates": 1024,
+        "targetUniqueCandidates": supervisor.FRESH_BROAD_CANDIDATES_PER_GENERATION,
         "maxProposalAttempts": 1024,
     }
     ladder_input = {
@@ -516,12 +516,31 @@ def test_supervisor_forwards_broad_admission_to_empty_quality_bootstrap(
     }
     assert config["broadAdmissionContract"] == {
         "schemaVersion": "temporal_qd_broad_admission_contract_v1",
-        "generationCount": 4,
-        "candidatesPerGeneration": 1024,
-        "candidateEvaluations": 4096,
-        "discoveryWindowsPerCandidate": 3,
-        "discoveryWorkerTasks": 12288,
+        "generationCount": supervisor.FRESH_BROAD_GENERATION_COUNT,
+        "candidatesPerGeneration": supervisor.FRESH_BROAD_CANDIDATES_PER_GENERATION,
+        "candidateEvaluations": supervisor.FRESH_BROAD_CANDIDATE_EVALUATIONS,
+        "discoveryWindowsPerCandidate": supervisor.FRESH_BROAD_DISCOVERY_WINDOWS_PER_CANDIDATE,
+        "discoveryWorkerTasks": supervisor.FRESH_BROAD_DISCOVERY_WORKER_TASKS,
     }
+
+
+def test_fresh_broad_admission_rejects_legacy_four_generation_shape(
+    tmp_path: Path,
+) -> None:
+    inputs = _inputs(tmp_path)
+    inputs["generation_count"] = supervisor.LEGACY_CONTINUATION_GENERATION_COUNT
+    inputs["parameters"] = {
+        **inputs["parameters"],
+        "targetUniqueCandidates": supervisor.FRESH_BROAD_CANDIDATES_PER_GENERATION,
+        "maxProposalAttempts": 1024,
+    }
+
+    with pytest.raises(TemporalDiscoveryContractError, match="five-generation"):
+        supervisor.run_qd_supervisor(
+            run_root=tmp_path / "legacy-shape-is-not-fresh-broad",
+            broad_admission=True,
+            **inputs,
+        )
 
 
 def test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator(
@@ -633,10 +652,10 @@ def test_pair_supervisor_generation_never_reads_or_forwards_legacy_validator(
 
 def test_broad_admission_refuses_missing_frozen_evidence_ladder(tmp_path: Path) -> None:
     inputs = _inputs(tmp_path)
-    inputs["generation_count"] = 4
+    inputs["generation_count"] = supervisor.FRESH_BROAD_GENERATION_COUNT
     inputs["parameters"] = {
         **inputs["parameters"],
-        "targetUniqueCandidates": 1024,
+        "targetUniqueCandidates": supervisor.FRESH_BROAD_CANDIDATES_PER_GENERATION,
         "maxProposalAttempts": 1024,
     }
     with pytest.raises(TemporalDiscoveryContractError, match="frozen evidence ladder"):
@@ -649,10 +668,10 @@ def test_broad_admission_refuses_template_not_bound_to_three_discovery_windows(
     tmp_path: Path,
 ) -> None:
     inputs = _inputs(tmp_path)
-    inputs["generation_count"] = 4
+    inputs["generation_count"] = supervisor.FRESH_BROAD_GENERATION_COUNT
     inputs["parameters"] = {
         **inputs["parameters"],
-        "targetUniqueCandidates": 1024,
+        "targetUniqueCandidates": supervisor.FRESH_BROAD_CANDIDATES_PER_GENERATION,
         "maxProposalAttempts": 1024,
     }
     validation_template = tmp_path / "validation-template.json"

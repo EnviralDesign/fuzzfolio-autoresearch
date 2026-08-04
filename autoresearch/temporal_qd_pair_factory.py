@@ -22,7 +22,17 @@ from .temporal_discovery_validation import DashboardBidirectionalPairCompiler, D
 from .temporal_indicator_learning_v1 import IndicatorLearningRegistry
 from .temporal_qd_observability import timed_span, timing_scope
 from .temporal_qd_pair_generation import TypedGrammarPairOperator
-from .temporal_typed_motif_grammar import GRAMMAR_SCHEMA, GRAMMAR_VERSION, REGISTRY, GrammarContext, GrammarError, TypedFragmentGrammar
+from .temporal_typed_motif_grammar import (
+    ENTRY_ROUTE_DECISION_INDICATOR_CAP,
+    ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION,
+    GRAMMAR_SCHEMA,
+    GRAMMAR_VERSION,
+    REGISTRY,
+    GrammarContext,
+    GrammarError,
+    TypedFragmentGrammar,
+    validate_entry_route_decision_indicator_cap,
+)
 
 PAIR_RUN_CONFIG_SCHEMA = "temporal_qd_bidirectional_pair_run_config_v1"
 PAIR_HOLD_POLICY_SCHEMA = "temporal_qd_pair_hold_operator_policy_v2"
@@ -241,7 +251,16 @@ def _registry_identity() -> dict[str, Any]:
     rows = []
     for production_id, spec in sorted(REGISTRY.items()):
         rows.append({"productionId": production_id, "family": spec.family, "consumes": spec.consumes.value, "produces": spec.produces.value, "resourceSlots": list(spec.resource_slots), "choiceDomains": _clone(spec.choice_domains, name="grammar choice domains")})
-    result = {"schemaVersion": "temporal_typed_fragment_registry_identity_v1", "grammarSchema": GRAMMAR_SCHEMA, "grammarVersion": GRAMMAR_VERSION, "productions": rows}
+    result = {
+        "schemaVersion": "temporal_typed_fragment_registry_identity_v1",
+        "grammarSchema": GRAMMAR_SCHEMA,
+        "grammarVersion": GRAMMAR_VERSION,
+        "entryRouteDecisionIndicatorPolicy": {
+            "semanticVersion": ENTRY_ROUTE_DECISION_INDICATOR_POLICY_VERSION,
+            "maxDistinctDecisionIndicatorInstances": ENTRY_ROUTE_DECISION_INDICATOR_CAP,
+        },
+        "productions": rows,
+    }
     result["registrySha256"] = canonical_sha256(result)
     return result
 
@@ -462,13 +481,17 @@ def freeze_pair_run_config(raw: Mapping[str, Any]) -> dict[str, Any]:
         "pairCompilerAuthority": compiler_snapshot.canonical_payload(),
     }
     result["operatorImplementation"] = {
-        "schemaVersion": "temporal_qd_pair_operator_implementation_v2",
+        "schemaVersion": "temporal_qd_pair_operator_implementation_v3",
         "typedGrammarRegistrySha256": result["grammarRegistry"]["registrySha256"],
         "longIndicatorPolicySha256": result["longModule"]["indicatorPolicy"]["policySha256"],
         "shortIndicatorPolicySha256": result["shortModule"]["indicatorPolicy"]["policySha256"],
         "holdOperatorPolicySha256": canonical_sha256(hold),
         "richImmigrantBuilderVersion": PAIR_IMMIGRANT_BUILDER_VERSION,
         "richImmigrantConstructionPolicySha256": canonical_sha256(result["immigrantConstructionPolicy"]),
+        "entryRouteDecisionIndicatorPolicy": _clone(
+            result["grammarRegistry"]["entryRouteDecisionIndicatorPolicy"],
+            name="entry route decision-indicator policy",
+        ),
         "nativeAuthoritySha256": native_snapshot.sha256,
         "pairCompilerAuthoritySha256": compiler_snapshot.sha256,
     }
@@ -826,6 +849,10 @@ class _Factory:
                 hold=_mapping(selector["hold"], name="rich immigrant selected hold"),
                 copy_profile=runtime is None,
             )
+        # Indicator and hold operations occur after grammar materialization.
+        # Recheck the entry-route cap before this path can freeze a module.
+        with timed_span("immigrant.entry_route_indicator_cap.validate"):
+            validate_entry_route_decision_indicator_cap(profile)
         with timed_span("immigrant.side.build_construction_audit"):
             graph = profile.get("graph") if isinstance(profile.get("graph"), Mapping) else {}
             groups = graph.get("evidenceGroups") if isinstance(graph, Mapping) else []
@@ -995,7 +1022,7 @@ class PairAuthorityBundle:
         if _bound_transport(raw_transport) != stored_transport:
             raise TemporalDiscoveryContractError("frozen pair native authority content drifted")
         expected_operator = {
-            "schemaVersion": "temporal_qd_pair_operator_implementation_v2",
+            "schemaVersion": "temporal_qd_pair_operator_implementation_v3",
             "typedGrammarRegistrySha256": data["grammarRegistry"]["registrySha256"],
             "longIndicatorPolicySha256": data["longModule"]["indicatorPolicy"]["policySha256"],
             "shortIndicatorPolicySha256": data["shortModule"]["indicatorPolicy"]["policySha256"],
@@ -1003,6 +1030,10 @@ class PairAuthorityBundle:
             "richImmigrantBuilderVersion": PAIR_IMMIGRANT_BUILDER_VERSION,
             "richImmigrantConstructionPolicySha256": canonical_sha256(
                 data["immigrantConstructionPolicy"]
+            ),
+            "entryRouteDecisionIndicatorPolicy": _clone(
+                data["grammarRegistry"]["entryRouteDecisionIndicatorPolicy"],
+                name="frozen entry route decision-indicator policy",
             ),
             "nativeAuthoritySha256": IdentitySnapshot.from_payload(data["nativeAuthority"], expected_kind="nativeAuthority").sha256,
             "pairCompilerAuthoritySha256": IdentitySnapshot.from_payload(data["pairCompilerAuthority"], expected_kind="pairCompiler").sha256,
