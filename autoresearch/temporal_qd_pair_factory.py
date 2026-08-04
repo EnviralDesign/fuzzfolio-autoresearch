@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -476,12 +477,31 @@ def freeze_pair_run_config(raw: Mapping[str, Any]) -> dict[str, Any]:
 
 
 class _Factory:
-    def __init__(self, bundle: "PairAuthorityBundle") -> None:
+    def __init__(
+        self,
+        bundle: "PairAuthorityBundle",
+        *,
+        cache_immutable_runtime: bool = False,
+    ) -> None:
         self.bundle = bundle
+        self._cache_immutable_runtime = cache_immutable_runtime
         self.construction_policy = _immigrant_construction_policy(
             bundle.config["immigrantConstructionPolicy"]
         )
         self._selector_axes = _immigrant_selector_axes(bundle.config)
+
+    def optimized_runtime_view(self) -> "_Factory":
+        """Return an equivalent factory that reuses sealed side authority.
+
+        The public bundle factory remains the reference path.  This view is
+        selected only by the optimized generator and caches objects keyed by
+        the complete frozen pair-run authority; it never caches generated
+        profiles, plans, or mutable candidate material.
+        """
+
+        if self._cache_immutable_runtime:
+            return self
+        return _Factory(self.bundle, cache_immutable_runtime=True)
 
     @staticmethod
     def _seeded_order(
@@ -517,7 +537,14 @@ class _Factory:
         for step in range(depth):
             with timing_scope(grammarStep=step):
                 with timed_span("immigrant.grammar.enumerate_operations") as span:
-                    plans = [dict(item) for item in grammar.enumerate_operations(program)]
+                    plans = (
+                        grammar.enumerate_operations(program)
+                        if self._cache_immutable_runtime
+                        else [
+                            dict(item)
+                            for item in grammar.enumerate_operations(program)
+                        ]
+                    )
                     span.annotate(planCount=len(plans))
                 with timed_span("immigrant.grammar.order_operation_families") as span:
                     families = self._seeded_order(
@@ -594,13 +621,24 @@ class _Factory:
             )
             span.annotate(plannedDepth=depth)
         with timed_span("immigrant.indicator.initialize_tracking"):
-            current = _clone(profile, name="rich immigrant indicator parent")
+            current = (
+                profile
+                if self._cache_immutable_runtime
+                else _clone(profile, name="rich immigrant indicator parent")
+            )
             trace: list[dict[str, Any]] = []
             seen = {canonical_sha256(current)}
         for step in range(depth):
             with timing_scope(indicatorStep=step):
                 with timed_span("immigrant.indicator.enumerate_plans") as span:
-                    plans = [dict(item) for item in registry.enumerate_plans(current)]
+                    plans = (
+                        registry.enumerate_plans(current)
+                        if self._cache_immutable_runtime
+                        else [
+                            dict(item)
+                            for item in registry.enumerate_plans(current)
+                        ]
+                    )
                     span.annotate(planCount=len(plans))
                 with timed_span("immigrant.indicator.order_operators") as span:
                     operators = self._seeded_order(
@@ -668,9 +706,21 @@ class _Factory:
 
     @staticmethod
     def _apply_hold(
-        profile: Mapping[str, Any], *, plan_id: str, hold: Mapping[str, Any]
+        profile: Mapping[str, Any],
+        *,
+        plan_id: str,
+        hold: Mapping[str, Any],
+        copy_profile: bool = True,
     ) -> dict[str, Any]:
-        child = _clone(profile, name="rich immigrant hold parent")
+        child = (
+            _clone(profile, name="rich immigrant hold parent")
+            if copy_profile
+            else profile
+        )
+        if not isinstance(child, dict):
+            raise TemporalDiscoveryContractError(
+                "rich immigrant hold parent must be an owned JSON object"
+            )
         plans = (((child.get("executionConfig") or {}).get("managementLibrary") or {}).get("plans") or [])
         selected = [item for item in plans if isinstance(item, Mapping) and item.get("id") == plan_id]
         if len(selected) != 1:
@@ -692,7 +742,12 @@ class _Factory:
         selector: Mapping[str, Any],
     ) -> FrozenModule:
         with timed_span("immigrant.side.resolve_authority"):
-            side = self.bundle._side(direction)
+            runtime = (
+                self.bundle.immigrant_runtime(direction)
+                if self._cache_immutable_runtime
+                else None
+            )
+            side = runtime.side if runtime is not None else self.bundle._side(direction)
             side_seed = canonical_sha256(
                 {
                     "schemaVersion": PAIR_IMMIGRANT_BUILDER_VERSION,
@@ -701,37 +756,46 @@ class _Factory:
                 }
             )
         with timed_span("immigrant.side.identity_snapshots"):
-            context_id = IdentitySnapshot.create(
-                kind="grammarContext",
-                schema_version="temporal_typed_grammar_context_v1",
-                payload=side["context"],
-            )
-            catalog_id = IdentitySnapshot.create(
-                kind="catalog",
-                schema_version="temporal_indicator_learning_catalog_v1",
-                payload={"catalog": side["catalog"], "catalogSha256": side["catalogSha256"]},
-            )
-            policy_id = IdentitySnapshot.create(
-                kind="policy",
-                schema_version="temporal_qd_pair_module_policy_v1",
-                payload={
-                    "modulePolicy": side["policy"],
-                    "indicatorPolicy": side["indicatorPolicy"],
-                    "holdOperatorPolicy": self.bundle.config["holdOperatorPolicy"],
-                    "immigrantConstructionPolicy": self.construction_policy,
-                },
-            )
+            if runtime is not None:
+                context_id = runtime.grammar_context
+                catalog_id = runtime.catalog
+                policy_id = runtime.policy
+            else:
+                context_id = IdentitySnapshot.create(
+                    kind="grammarContext",
+                    schema_version="temporal_typed_grammar_context_v1",
+                    payload=side["context"],
+                )
+                catalog_id = IdentitySnapshot.create(
+                    kind="catalog",
+                    schema_version="temporal_indicator_learning_catalog_v1",
+                    payload={"catalog": side["catalog"], "catalogSha256": side["catalogSha256"]},
+                )
+                policy_id = IdentitySnapshot.create(
+                    kind="policy",
+                    schema_version="temporal_qd_pair_module_policy_v1",
+                    payload={
+                        "modulePolicy": side["policy"],
+                        "indicatorPolicy": side["indicatorPolicy"],
+                        "holdOperatorPolicy": self.bundle.config["holdOperatorPolicy"],
+                        "immigrantConstructionPolicy": self.construction_policy,
+                    },
+                )
         with timed_span("immigrant.grammar.initialize"):
-            grammar = TypedFragmentGrammar(
-                GrammarContext(
-                    instrument=side["context"]["instrument"],
-                    indicators=tuple(side["context"]["indicators"]),
-                    evidence_groups=tuple(side["context"]["groups"]),
-                    event_bindings=tuple(side["context"]["events"]),
-                    execution_config=side["context"]["executionConfig"],
-                    budgets=side["context"]["budgets"],
-                ),
-                native_authority=self.bundle.validator,
+            grammar = (
+                runtime.grammar
+                if runtime is not None
+                else TypedFragmentGrammar(
+                    GrammarContext(
+                        instrument=side["context"]["instrument"],
+                        indicators=tuple(side["context"]["indicators"]),
+                        evidence_groups=tuple(side["context"]["groups"]),
+                        event_bindings=tuple(side["context"]["events"]),
+                        execution_config=side["context"]["executionConfig"],
+                        budgets=side["context"]["budgets"],
+                    ),
+                    native_authority=self.bundle.validator,
+                )
             )
         with timed_span("immigrant.grammar.seed"):
             program = grammar.seed(
@@ -747,7 +811,11 @@ class _Factory:
         with timed_span("immigrant.grammar.materialize_profile"):
             profile = grammar.materialize_profile(program)
         with timed_span("immigrant.indicator.initialize_registry"):
-            registry = IndicatorLearningRegistry(side["catalog"])
+            registry = (
+                runtime.registry
+                if runtime is not None
+                else IndicatorLearningRegistry(side["catalog"])
+            )
         profile, indicator_trace, planned_indicator_depth = self._apply_indicator_steps(
             registry, profile, side_seed=side_seed
         )
@@ -756,6 +824,7 @@ class _Factory:
                 profile,
                 plan_id=str(selector["planId"]),
                 hold=_mapping(selector["hold"], name="rich immigrant selected hold"),
+                copy_profile=runtime is None,
             )
         with timed_span("immigrant.side.build_construction_audit"):
             graph = profile.get("graph") if isinstance(profile.get("graph"), Mapping) else {}
@@ -885,6 +954,19 @@ class _Factory:
             return audit
 
 
+@dataclass(frozen=True)
+class _ImmigrantSideRuntime:
+    """Reusable, immutable side authority for optimized immigrants only."""
+
+    authority_key: str
+    side: Mapping[str, Any]
+    grammar_context: IdentitySnapshot
+    catalog: IdentitySnapshot
+    policy: IdentitySnapshot
+    grammar: TypedFragmentGrammar
+    registry: IndicatorLearningRegistry
+
+
 class PairAuthorityBundle:
     def __init__(self, frozen: Mapping[str, Any]) -> None:
         data = _mapping(frozen, name="frozen pair run config")
@@ -935,6 +1017,7 @@ class PairAuthorityBundle:
         self.compiler = DashboardBidirectionalPairCompiler(self.client)
         self.native_identity = IdentitySnapshot.from_payload(data["nativeAuthority"], expected_kind="nativeAuthority")
         self.compiler_identity = IdentitySnapshot.from_payload(data["pairCompilerAuthority"], expected_kind="pairCompiler")
+        self._immigrant_runtime_cache: dict[str, _ImmigrantSideRuntime] = {}
         self.factory = _Factory(self)
         self.operator = TypedGrammarPairOperator(
             grammar_factory=self.grammar_for,
@@ -948,6 +1031,78 @@ class PairAuthorityBundle:
     def __exit__(self, *_: object) -> None: self.close()
 
     def _side(self, direction: str) -> Mapping[str, Any]: return self.config[f"{direction}Module"]
+
+    def immigrant_runtime(self, direction: str) -> _ImmigrantSideRuntime:
+        """Return cached immutable construction authority for one frozen side.
+
+        The pair-run config SHA closes every context/catalog/policy/native
+        input.  Direction is included to keep long and short authorities
+        distinct even when their catalog bytes happen to match.
+        """
+
+        side_name = str(direction)
+        if side_name not in {"long", "short"}:
+            raise TemporalDiscoveryContractError("pair immigrant side is unknown")
+        authority_key = canonical_sha256(
+            {
+                "schemaVersion": "temporal_qd_immigrant_runtime_authority_v1",
+                "pairRunConfigSha256": self.config["pairRunConfigSha256"],
+                "direction": side_name,
+            }
+        )
+        cached = self._immigrant_runtime_cache.get(authority_key)
+        if cached is not None:
+            return cached
+        side = self._side(side_name)
+        context = side["context"]
+        context_id = IdentitySnapshot.create(
+            kind="grammarContext",
+            schema_version="temporal_typed_grammar_context_v1",
+            payload=context,
+        )
+        catalog_id = IdentitySnapshot.create(
+            kind="catalog",
+            schema_version="temporal_indicator_learning_catalog_v1",
+            payload={
+                "catalog": side["catalog"],
+                "catalogSha256": side["catalogSha256"],
+            },
+        )
+        policy_id = IdentitySnapshot.create(
+            kind="policy",
+            schema_version="temporal_qd_pair_module_policy_v1",
+            payload={
+                "modulePolicy": side["policy"],
+                "indicatorPolicy": side["indicatorPolicy"],
+                "holdOperatorPolicy": self.config["holdOperatorPolicy"],
+                "immigrantConstructionPolicy": self.config[
+                    "immigrantConstructionPolicy"
+                ],
+            },
+        )
+        grammar = TypedFragmentGrammar(
+            GrammarContext(
+                instrument=context["instrument"],
+                indicators=tuple(context["indicators"]),
+                evidence_groups=tuple(context["groups"]),
+                event_bindings=tuple(context["events"]),
+                execution_config=context["executionConfig"],
+                budgets=context["budgets"],
+            ),
+            native_authority=self.validator,
+        )
+        runtime = _ImmigrantSideRuntime(
+            authority_key=authority_key,
+            side=side,
+            grammar_context=context_id,
+            catalog=catalog_id,
+            policy=policy_id,
+            grammar=grammar,
+            registry=IndicatorLearningRegistry(side["catalog"]),
+        )
+        self._immigrant_runtime_cache[authority_key] = runtime
+        return runtime
+
     def grammar_for(self, module: FrozenModule) -> TypedFragmentGrammar:
         side = self._side(module.direction)
         expected_context = IdentitySnapshot.create(kind="grammarContext", schema_version="temporal_typed_grammar_context_v1", payload=side["context"])

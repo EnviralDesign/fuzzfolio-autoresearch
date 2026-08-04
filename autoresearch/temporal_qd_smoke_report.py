@@ -320,8 +320,9 @@ def build_qd_construction_smoke_report(
                 limit=top_phase_limit,
             ),
             "cpuAttribution": (
-                "coordinator spans use exact process CPU; recursive child CPU and "
-                "host pressure are sampled with the active phase context"
+                "coordinator spans use exact main-thread CPU; recursive process-tree "
+                "CPU and host pressure are sampled with the active phase context, "
+                "and telemetry CPU is reported separately"
             ),
         },
         "resources": summary.get("resources") or {},

@@ -325,6 +325,28 @@ class _TripwireDuplicatePairFactory(_DuplicatePairFactory):
     }
 
 
+class _UniquePairFactory:
+    """Small deterministic authority used by old/new artifact equivalence."""
+
+    def create_pair(self, *, proposal_seed: str) -> FrozenPair:
+        def profile(side: str) -> dict:
+            value = _profile(side)
+            value["graph"]["proposalSeed"] = proposal_seed
+            return value
+
+        return _pair(
+            _module("long", profile=profile("long")),
+            _module("short", profile=profile("short")),
+            lineage=(
+                {
+                    "operation": "factory",
+                    "side": "long",
+                    "proposalSeed": proposal_seed,
+                },
+            ),
+        )
+
+
 class _PairOps:
     def __init__(self, *, enabled: bool = True) -> None:
         self.enabled = enabled
@@ -765,6 +787,307 @@ def test_pair_population_journal_is_restart_safe_and_never_emits_v2_tasks(tmp_pa
     assert population["candidates"][0]["sourceProfile"]["version"] == "v3"
     assert population["candidates"][0]["sourceProfile"]["directionMode"] == "both"
 
+
+def test_optimized_pair_generation_is_exactly_equivalent_to_legacy_and_restart_safe(
+    tmp_path,
+) -> None:
+    """The compact path is a storage implementation, not a new authority.
+
+    Performance files deliberately differ because their clock/sampling spans
+    describe the implementation.  Every semantic artifact below must remain
+    byte-identical, including a resumed optimized run and the collision guard.
+    """
+
+    pair = _pair()
+    policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": pair.pair_compiler.canonical_payload(),
+    }
+    common = {
+        "generation_index": 1,
+        "target_unique_candidates": 4,
+        "run_config": {"seed": "old-new-equivalence"},
+        "pair_policy": policy,
+        "pair_factory": _UniquePairFactory(),
+        "module_authority": _PairOps(),
+        "native_validator": FakeNativeValidator(),
+        "pair_compiler": FakePairCompiler(),
+        "operator_implementation_identity": {
+            "schemaVersion": "test_pair_operator_v1",
+            "grammar": "frozen",
+            "indicator": "frozen",
+            "hold": "frozen",
+        },
+    }
+
+    legacy_root = tmp_path / "legacy"
+    optimized_root = tmp_path / "optimized"
+    legacy = generate_pair_population(
+        output_root=legacy_root,
+        implementation="legacy",
+        **common,
+    )
+    optimized = generate_pair_population(
+        output_root=optimized_root,
+        implementation="optimized",
+        **common,
+    )
+    assert optimized == legacy
+
+    def semantic_files(root: Path) -> dict[str, bytes]:
+        files = {
+            "pair-config.json",
+            "population.json",
+            "generation-journal.json",
+        }
+        result = {name: (root / name).read_bytes() for name in files}
+        result.update(
+            {
+                f"proposal-journal/{path.name}": path.read_bytes()
+                for path in sorted((root / "proposal-journal").glob("*.json"))
+            }
+        )
+        return result
+
+    assert semantic_files(optimized_root) == semantic_files(legacy_root)
+    legacy_rows = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((legacy_root / "proposal-journal").glob("*.json"))
+    ]
+    optimized_rows = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted((optimized_root / "proposal-journal").glob("*.json"))
+    ]
+    assert [row["disposition"] for row in optimized_rows] == [
+        row["disposition"] for row in legacy_rows
+    ]
+    assert [row["entrySha256"] for row in optimized_rows] == [
+        row["entrySha256"] for row in legacy_rows
+    ]
+    assert [row["candidate"]["candidateId"] for row in optimized_rows] == [
+        row["candidate"]["candidateId"] for row in legacy_rows
+    ]
+    assert [row["candidate"]["candidateIdentitySha256"] for row in optimized_rows] == [
+        row["candidate"]["candidateIdentitySha256"] for row in legacy_rows
+    ]
+    assert [
+        row["candidate"]["bidirectionalGenome"]["validation"]
+        for row in optimized_rows
+    ] == [
+        row["candidate"]["bidirectionalGenome"]["validation"]
+        for row in legacy_rows
+    ]
+
+    resumed_root = tmp_path / "optimized-resumed"
+    progress = generate_pair_population(
+        output_root=resumed_root,
+        implementation="optimized",
+        max_new_proposals=2,
+        **common,
+    )
+    resumed = generate_pair_population(
+        output_root=resumed_root,
+        implementation="optimized",
+        **common,
+    )
+    assert progress["completed"] is False
+    assert resumed == legacy
+    assert semantic_files(resumed_root) == semantic_files(legacy_root)
+
+    cutover_root = tmp_path / "legacy-to-optimized-resumed"
+    legacy_progress = generate_pair_population(
+        output_root=cutover_root,
+        implementation="legacy",
+        max_new_proposals=2,
+        **common,
+    )
+    cutover_resumed = generate_pair_population(
+        output_root=cutover_root,
+        implementation="optimized",
+        **common,
+    )
+    assert legacy_progress["completed"] is False
+    assert cutover_resumed == legacy
+    assert semantic_files(cutover_root) == semantic_files(legacy_root)
+
+    default_root = tmp_path / "optimized-default"
+    default_result = generate_pair_population(
+        output_root=default_root,
+        **common,
+    )
+    assert default_result == optimized
+    assert semantic_files(default_root) == semantic_files(optimized_root)
+
+    tripwire_common = {
+        **common,
+        "target_unique_candidates": 2,
+        "pair_factory": _TripwireDuplicatePairFactory(),
+        "max_proposal_attempts": 3,
+    }
+    tripwire_roots = {}
+    for implementation in ("legacy", "optimized"):
+        root = tmp_path / f"tripwire-{implementation}"
+        with pytest.raises(
+            TemporalDiscoveryContractError, match="semantic acceptance collapsed"
+        ):
+            generate_pair_population(
+                output_root=root,
+                implementation=implementation,
+                **tripwire_common,
+            )
+        tripwire_roots[implementation] = root
+    for relative in (
+        "pair-config.json",
+        "proposal-journal/00000000.json",
+        "proposal-journal/00000001.json",
+        "immigrant-collision-tripwire.json",
+    ):
+        assert (tripwire_roots["optimized"] / relative).read_bytes() == (
+            tripwire_roots["legacy"] / relative
+        ).read_bytes()
+    assert (
+        tripwire_roots["optimized"] / "immigrant-collision-tripwire.json"
+    ).read_bytes() == (
+        tripwire_roots["legacy"] / "immigrant-collision-tripwire.json"
+    ).read_bytes()
+
+
+def test_optimized_pair_generation_matches_legacy_with_global_ledger(tmp_path) -> None:
+    """Production pair generation always binds the campaign identity ledger."""
+
+    pair = _pair()
+    policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": pair.pair_compiler.canonical_payload(),
+    }
+    evidence_context = {
+        "schemaVersion": "temporal_qd_predeclared_evidence_context_v3",
+        "baseDecisionTimeframe": "M5",
+        "orderedWindowPlanSemantic": [],
+        "workerContractSha256": None,
+        "constructionCatalog": None,
+        "costViews": {
+            "none": {
+                "spreadBps": 0.0,
+                "slippageBps": 0.0,
+                "commissionBps": 0.0,
+            },
+            "research_conservative": {
+                "spreadBps": 2.0,
+                "slippageBps": 1.0,
+                "commissionBps": 0.5,
+            },
+        },
+    }
+    common = {
+        "generation_index": 1,
+        "target_unique_candidates": 4,
+        "run_config": {"seed": "old-new-ledger-equivalence"},
+        "pair_policy": policy,
+        "pair_factory": _UniquePairFactory(),
+        "module_authority": _PairOps(),
+        "native_validator": FakeNativeValidator(),
+        "pair_compiler": FakePairCompiler(),
+        "evidence_identity_context": evidence_context,
+        "operator_implementation_identity": {
+            "schemaVersion": "test_pair_operator_v1",
+            "grammar": "frozen",
+            "indicator": "frozen",
+            "hold": "frozen",
+        },
+    }
+    roots: dict[str, Path] = {}
+    results: dict[str, dict] = {}
+    for implementation in ("legacy", "optimized"):
+        root = tmp_path / implementation
+        roots[implementation] = root
+        results[implementation] = generate_pair_population(
+            output_root=root / "generation-1",
+            identity_ledger_path=root / "identity-ledger.json",
+            implementation=implementation,
+            **common,
+        )
+
+    assert results["optimized"] == results["legacy"]
+    for relative in (
+        "generation-1/pair-config.json",
+        "generation-1/population.json",
+        "generation-1/generation-journal.json",
+        "identity-ledger.json",
+    ):
+        assert (roots["optimized"] / relative).read_bytes() == (
+            roots["legacy"] / relative
+        ).read_bytes()
+    legacy_entries = sorted(
+        (roots["legacy"] / "generation-1/proposal-journal").glob("*.json")
+    )
+    optimized_entries = sorted(
+        (roots["optimized"] / "generation-1/proposal-journal").glob("*.json")
+    )
+    assert [path.read_bytes() for path in optimized_entries] == [
+        path.read_bytes() for path in legacy_entries
+    ]
+
+
+def test_optimized_parent_and_crossover_path_matches_legacy(tmp_path) -> None:
+    """The compact loop must preserve evolved-generation proposal scheduling."""
+
+    first = _pair(
+        _module("long", marker="first"),
+        _module("short", marker="first"),
+    )
+    second = _pair(
+        _module("long", marker="second"),
+        _module("short", marker="second"),
+    )
+    policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": first.pair_compiler.canonical_payload(),
+    }
+    common = {
+        "generation_index": 2,
+        "target_unique_candidates": 100,
+        "run_config": {"seed": "old-new-parent-equivalence"},
+        "pair_policy": policy,
+        "parent_pairs": [first, second],
+        "pair_factory": _UniquePairFactory(),
+        "module_authority": _PairOps(),
+        "native_validator": FakeNativeValidator(),
+        "pair_compiler": FakePairCompiler(),
+        "operator_implementation_identity": {
+            "schemaVersion": "test_pair_operator_v1",
+            "grammar": "frozen",
+            "indicator": "frozen",
+            "hold": "frozen",
+        },
+        "max_new_proposals": 7,
+    }
+    roots: dict[str, Path] = {}
+    results: dict[str, dict] = {}
+    for implementation in ("legacy", "optimized"):
+        root = tmp_path / implementation
+        roots[implementation] = root
+        results[implementation] = generate_pair_population(
+            output_root=root,
+            implementation=implementation,
+            **common,
+        )
+
+    assert results["optimized"] == results["legacy"]
+    legacy_entries = sorted((roots["legacy"] / "proposal-journal").glob("*.json"))
+    optimized_entries = sorted(
+        (roots["optimized"] / "proposal-journal").glob("*.json")
+    )
+    assert [path.read_bytes() for path in optimized_entries] == [
+        path.read_bytes() for path in legacy_entries
+    ]
+    crossover = json.loads(optimized_entries[6].read_text(encoding="utf-8"))
+    assert crossover["proposal"]["proposalKind"] == (
+        "temporal_qd_same_side_crossover_v1"
+    )
 
 def test_pair_resume_rejects_provenance_distinct_duplicate_executable_semantics(tmp_path) -> None:
     pair = _pair()

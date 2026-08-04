@@ -394,7 +394,12 @@ class _PersistentJsonlValidator:
                 raise self._fail("persistent bidirectional compiler report identities mismatch")
         if report.get("candidateAcceptable") is not True or report.get("status") != "valid_evaluable":
             raise self._fail("persistent bidirectional compiler did not admit its pair")
-        return _clone(result, name="bidirectional compiler result")
+        # ``result`` was just decoded from one response line and has passed the
+        # complete closed-schema/identity validation above.  It is request
+        # owned (never cached or shared with another caller), so returning the
+        # outer mapping directly avoids a full JSON clone before the immutable
+        # genome boundary performs its required freeze.
+        return dict(result)
 
 class SubprocessCandidateValidator:
     """Call the FuzzFolio-owned validator without duplicating its grammar."""
@@ -609,10 +614,13 @@ class DashboardBidirectionalPairCompiler:
                 expected_long_raw_source_profile_sha256=long_sha,
                 expected_short_raw_source_profile_sha256=short_sha,
             )
-        with timed_span("native.compile_pair.clone_result"):
+        with timed_span("native.compile_pair.prepare_result"):
             return {
-                "profile": _clone(result["profile"], name="compiled bidirectional profile"),
-                "validation": _clone(result["report"], name="compiled bidirectional validation"),
+                # FrozenPair.compile owns the next boundary and clones/freezes
+                # these request-scoped decoded objects.  Do not serialize them
+                # once here only to serialize them again there.
+                "profile": result["profile"],
+                "validation": result["report"],
             }
 
 

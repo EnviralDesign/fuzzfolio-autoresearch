@@ -167,3 +167,56 @@ def test_process_tree_memory_guard_fails_closed_and_preserves_summary(tmp_path) 
     assert guard["status"] == "breached"
     assert guard["breach"]["reasonCodes"] == ["maximum_tree_rss_exceeded"]
     assert guard["breach"]["treeRssBytes"] > 1
+
+
+def test_watchdog_is_lightweight_and_telemetry_cpu_is_separate(tmp_path) -> None:
+    trace = PerformanceTrace(
+        output_root=tmp_path,
+        generation_index=2,
+        sample_interval_seconds=2.0,
+        watchdog_interval_seconds=0.05,
+        maximum_tree_rss_bytes=1024**4,
+        minimum_host_available_bytes=1,
+    )
+    with trace._lock:
+        # Force a cooperative proposal-boundary check without waiting for the
+        # periodic sampler.  The check produces no detailed JSONL line.
+        trace._last_watchdog_perf_ns = 0
+        watchdog_before = trace._resource_watchdog_count
+    trace.assert_resource_guard()
+    with trace._lock:
+        assert trace._resource_watchdog_count >= watchdog_before + 1
+    trace.close(outcome="completed")
+
+    summary = json.loads(trace.summary_path.read_text(encoding="utf-8"))
+    assert summary["policy"]["spanCpuClock"] == (
+        "coordinator_main_thread_time_ns"
+    )
+    assert summary["policy"]["sampleIntervalSeconds"] == 2.0
+    assert summary["policy"]["watchdogIntervalSeconds"] == 0.05
+    assert summary["resources"]["sampleCount"] == 2  # startup and shutdown
+    assert summary["resources"]["watchdogCheckCount"] >= 1
+    instrumentation = summary["instrumentation"]
+    assert instrumentation["resourceWatchdogTelemetryCount"] >= 1
+    assert instrumentation["resourceTelemetryCpuNs"] == (
+        instrumentation["resourceDetailedSampleTelemetryCpuNs"]
+        + instrumentation["resourceWatchdogTelemetryCpuNs"]
+    )
+
+
+def test_new_observability_policy_does_not_block_historical_restart(tmp_path) -> None:
+    legacy_policy = tmp_path / "performance" / "observability-policy.json"
+    legacy_policy.parent.mkdir(parents=True)
+    legacy_policy.write_text('{"schemaVersion":"legacy"}\n', encoding="utf-8")
+
+    trace = PerformanceTrace(
+        output_root=tmp_path,
+        generation_index=0,
+        maximum_tree_rss_bytes=1024**4,
+        minimum_host_available_bytes=1,
+    )
+    assert trace.policy_path.name == "observability-policy-v2.json"
+    assert legacy_policy.read_text(encoding="utf-8") == (
+        '{"schemaVersion":"legacy"}\n'
+    )
+    trace.close(outcome="completed")
