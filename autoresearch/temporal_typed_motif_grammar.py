@@ -494,6 +494,19 @@ class TypedFragmentGrammar:
         profile = {"version": "v2", "name": f"typed fragment {program.direction} module", "description": "sealed typed fragment module; not an economic candidate", "instruments": [self.context["instrument"]], "directionMode": program.direction, "isActive": False, "indicators": _clone(closure["indicators"], name="module indicators"), "executionConfig": _clone(closure["executionConfig"], name="module execution"), "graph": {"kind": "temporal_graph_v1", "semanticPolicy": "temporal_graph_semantics_v1", "eventSchema": "temporal_event_v1", "factLibrary": "temporal_market_facts_v1", "guardLibrary": "temporal_guards_v1", "actionLibrary": "temporal_market_actions_v1", "clockRequirement": "clock.completed_bar", "fidelityRequirements": ["data.completed_ohlc"], "initialStateId": "ready", "states": built["states"], "evidenceGroups": _clone(closure["groups"], name="module groups"), "eventBindings": _clone(closure["events"], name="module events"), "transitions": built["transitions"]}}
         return canonical, built, profile
 
+    def materialize_profile(self, program: ModuleProgram) -> dict[str, Any]:
+        """Build the authored v2 profile without invoking native validation.
+
+        Rich immigrant construction composes several already-sealed grammar
+        and indicator operations before paying the native admission cost.  The
+        resulting profile is still admitted exactly once before it can become
+        a :class:`FrozenModule`; this method is only the pure construction
+        half of that boundary.
+        """
+
+        _canonical, _built, profile = self._profile_payload(program)
+        return _clone(profile, name="materialized typed fragment profile")
+
     def _compiled(self, program: ModuleProgram, canonical: Mapping[str, Any], profile: Mapping[str, Any], report: Mapping[str, Any], *, candidate_id: str) -> CompiledModule:
         report = _clone(dict(report), name="native validator report")
         raw_sha = canonical_sha256(profile)

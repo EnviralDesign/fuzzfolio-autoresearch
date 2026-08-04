@@ -27,6 +27,7 @@ from autoresearch.temporal_indicator_learning_v1 import (
 )
 from autoresearch.temporal_qd_pair_factory import (
     PairAuthorityBundle,
+    immigrant_capacity_audit,
     load_pair_run_config,
     pair_policy_from_config,
 )
@@ -390,6 +391,9 @@ def run_admission(*, pair_config_path: Path, construction_catalog_path: Path, ou
     frozen = load_pair_run_config(_read(pair_config_path))
     catalog = _read(construction_catalog_path)
     catalog_audit = audit_construction_catalog(catalog, frozen)
+    capacity_audit = immigrant_capacity_audit(
+        frozen, required_unique_candidates=4096
+    )
     with PairAuthorityBundle(frozen) as authority:
         event_reachability_audit = audit_fresh_event_substitution_reachability(
             authority, catalog_audit["directionalEventSubstitutionIds"]
@@ -442,6 +446,7 @@ def run_admission(*, pair_config_path: Path, construction_catalog_path: Path, ou
         "economicMetricsProduced": False,
         "archiveLanesProduced": False,
         "pairRunConfigSha256": frozen["pairRunConfigSha256"],
+        "immigrantConstructionCapacity": capacity_audit,
         "catalogAudit": catalog_audit,
         "freshNativeEventSubstitutionAudit": event_reachability_audit,
         "seedPopulation": {

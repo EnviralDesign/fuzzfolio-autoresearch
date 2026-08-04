@@ -24,7 +24,12 @@ from .play_hand_lab import LabGatewayClient
 from .play_hand_lab_auth import load_lab_gateway_token
 from .temporal_discovery_base import TemporalDiscoveryContractError, canonical_sha256
 from .temporal_generator_v2_continuation import ExactGeneratorV2Continuation
-from .temporal_qd_pair_factory import PairAuthorityBundle, load_pair_run_config, pair_policy_from_config
+from .temporal_qd_pair_factory import (
+    PairAuthorityBundle,
+    immigrant_capacity_audit,
+    load_pair_run_config,
+    pair_policy_from_config,
+)
 from .temporal_qd_campaign import freeze_qd_screening_campaign
 from .temporal_qd_evolution import (
     QD_IDENTITY_LEDGER_SCHEMA,
@@ -971,6 +976,25 @@ def _validate_frozen_sources(config: Mapping[str, Any]) -> list[str]:
         # frozen registry/catalog/transport identity before a resume can run.
         with PairAuthorityBundle(_clone(pair_config, name="frozen pair authority")):
             pass
+        if config.get("broadAdmission") is True:
+            contract = config.get("broadAdmissionContract")
+            if not isinstance(contract, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "QD broad admission contract is unavailable"
+                )
+            current_capacity = immigrant_capacity_audit(
+                pair_config,
+                required_unique_candidates=int(contract["candidateEvaluations"]),
+            )
+            if _clone(
+                current_capacity, name="reopened pair immigrant capacity audit"
+            ) != _clone(
+                contract.get("immigrantConstructionCapacity"),
+                name="frozen pair immigrant capacity audit",
+            ):
+                raise TemporalDiscoveryContractError(
+                    "QD broad immigrant construction capacity audit drifted"
+                )
 
     validator_binding = config.get("validator")
     if pair_config is None:
@@ -1133,6 +1157,12 @@ def _frozen_config(
         construction_catalog_path=construction_catalog_path,
     )
     pair_authority = load_pair_run_config(bidirectional_pair_config) if bidirectional_pair_config is not None else None
+    pair_capacity_audit = None
+    if broad_admission and pair_authority is not None:
+        pair_capacity_audit = immigrant_capacity_audit(
+            pair_authority,
+            required_unique_candidates=evaluation_target,
+        )
     source = None if pair_authority is not None else ExactGeneratorV2Continuation(
         source_preparation_path=source_preparation_path,
         base_generator_root=base_generator_root,
@@ -1159,6 +1189,11 @@ def _frozen_config(
                     "candidateEvaluations": 4096,
                     "discoveryWindowsPerCandidate": 3,
                     "discoveryWorkerTasks": 12288,
+                    **(
+                        {"immigrantConstructionCapacity": pair_capacity_audit}
+                        if pair_capacity_audit is not None
+                        else {}
+                    ),
                 }
             }
             if broad_admission
@@ -1167,7 +1202,11 @@ def _frozen_config(
         "emptyQualityBootstrapPolicy": {
             "enabledByBroadAdmission": bool(broad_admission),
             "activation": "only_when_generation_starts_without_quality_parent_cells",
-            "originSchedule": "generator_v2_random_immigrants_only",
+            "originSchedule": (
+                "rich_bidirectional_random_immigrants_only_v1"
+                if pair_authority is not None
+                else "generator_v2_random_immigrants_only"
+            ),
         },
         "repositories": {
             "autoresearchCommit": _git_sha(

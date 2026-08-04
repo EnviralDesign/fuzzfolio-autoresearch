@@ -315,6 +315,16 @@ class _DuplicatePairFactory:
         return _pair(lineage=({"operation": "factory", "side": "long", "proposalSeed": proposal_seed},))
 
 
+class _TripwireDuplicatePairFactory(_DuplicatePairFactory):
+    construction_policy = {
+        "schemaVersion": "test_rich_immigrant_policy_v1",
+        "collisionTripwire": {
+            "minimumImmigrantAttempts": 2,
+            "minimumAcceptedRatio": 0.75,
+        },
+    }
+
+
 class _PairOps:
     def __init__(self, *, enabled: bool = True) -> None:
         self.enabled = enabled
@@ -798,6 +808,46 @@ def test_pair_population_does_not_spend_unique_slots_on_duplicate_genomes(tmp_pa
     import json
     rows = [json.loads(path.read_text(encoding="utf-8")) for path in entries]
     assert [row["disposition"] for row in rows] == ["accepted", "duplicate_pair_genome"]
+
+
+def test_pair_population_stops_when_rich_immigrant_acceptance_collapses(tmp_path) -> None:
+    pair = _pair()
+    policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": pair.pair_compiler.canonical_payload(),
+    }
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="semantic acceptance collapsed",
+    ):
+        generate_pair_population(
+            output_root=tmp_path,
+            generation_index=1,
+            target_unique_candidates=2,
+            run_config={"seed": "tripwire-pair-run"},
+            pair_policy=policy,
+            pair_factory=_TripwireDuplicatePairFactory(),
+            module_authority=_PairOps(),
+            native_validator=FakeNativeValidator(),
+            pair_compiler=FakePairCompiler(),
+            operator_implementation_identity={
+                "schemaVersion": "test_pair_operator_v1"
+            },
+            max_proposal_attempts=3,
+        )
+    tripwire = json.loads(
+        (tmp_path / "immigrant-collision-tripwire.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert tripwire["immigrantAttempts"] == 2
+    assert tripwire["immigrantAccepted"] == 1
+    assert tripwire["acceptedRatio"] == 0.5
+    assert tripwire["dispositionCounts"] == {
+        "accepted": 1,
+        "duplicate_pair_genome": 1,
+    }
 
 
 def test_pair_generation_global_ledger_blocks_prior_executable_semantics_and_cap_is_restart_safe(tmp_path) -> None:

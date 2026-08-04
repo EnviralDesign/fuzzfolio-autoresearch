@@ -11,8 +11,10 @@ from autoresearch import temporal_qd_pair_factory
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
 from autoresearch.temporal_qd_pair_factory import (
     PAIR_RUN_CONFIG_SCHEMA,
+    default_immigrant_construction_policy,
     default_hold_operator_policy,
     freeze_pair_run_config,
+    immigrant_capacity_audit,
 )
 
 
@@ -130,6 +132,16 @@ def test_catalog_context_and_freeze_are_catalog_bound(tmp_path, monkeypatch):
     assert frozen["schemaVersion"] == PAIR_RUN_CONFIG_SCHEMA
     assert frozen["pairRunConfigSha256"].startswith("sha256:")
     assert frozen["holdOperatorPolicy"] == default_hold_operator_policy()
+    assert (
+        frozen["immigrantConstructionPolicy"]
+        == default_immigrant_construction_policy()
+    )
+    assert frozen["operatorImplementation"]["schemaVersion"] == (
+        "temporal_qd_pair_operator_implementation_v2"
+    )
+    assert frozen["operatorImplementation"]["richImmigrantBuilderVersion"] == (
+        "temporal_qd_rich_immigrant_builder_v1"
+    )
 
     rejected_policy = default_hold_operator_policy()
     rejected_policy["choices"][-1]["hours"] = 169.0
@@ -190,3 +202,37 @@ def test_builder_requires_dashboard_runtime_catalog_path(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="must resolve to <dashboard-root>"):
         invoke(alternate_path)
     assert invoke(canonical_path) == 0
+
+
+def test_rich_immigrant_capacity_and_selector_entropy_cover_broad_campaign() -> None:
+    side = {
+        "seedNames": ["breakout", "mean_reversion", "trend"],
+        "context": {
+            "groups": [{"id": f"g_{index}"} for index in range(4)],
+            "events": [{"id": f"e_{index}"} for index in range(4)],
+            "plans": ["base"],
+        },
+    }
+    frozen = {
+        "pairRunConfigSha256": "sha256:" + "a" * 64,
+        "longModule": side,
+        "shortModule": copy.deepcopy(side),
+        "holdOperatorPolicy": default_hold_operator_policy(),
+        "immigrantConstructionPolicy": default_immigrant_construction_policy(),
+    }
+    audit = immigrant_capacity_audit(
+        frozen, required_unique_candidates=4096
+    )
+    assert audit["pairExpressibleCapacityFloor"] == 746_496
+    assert audit["uniqueSelectorFingerprintCount"] >= 4096
+    assert audit["grammarAndIndicatorEntropyIncludedInCapacityFloor"] is False
+
+    collapsed = copy.deepcopy(frozen)
+    collapsed["holdOperatorPolicy"]["choices"] = [{"kind": "none"}]
+    with pytest.raises(
+        TemporalDiscoveryContractError,
+        match="expressible capacity",
+    ):
+        immigrant_capacity_audit(
+            collapsed, required_unique_candidates=4096
+        )

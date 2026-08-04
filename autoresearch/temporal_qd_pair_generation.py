@@ -292,6 +292,14 @@ def propose_pair(
         pair = pair_factory.create_pair(proposal_seed=seed)
         if not isinstance(pair, FrozenPair):
             raise TemporalDiscoveryContractError("pair immigrant factory must return FrozenPair")
+        factory_audit = None
+        audit_pair = getattr(pair_factory, "audit_pair", None)
+        if callable(audit_pair):
+            factory_audit = audit_pair(pair)
+            if not isinstance(factory_audit, Mapping):
+                raise TemporalDiscoveryContractError(
+                    "pair immigrant factory audit must be an object"
+                )
         payload = {
             "schemaVersion": PAIR_PROPOSAL_SCHEMA,
             "proposalSeed": seed,
@@ -300,6 +308,11 @@ def propose_pair(
             "factoryPair": pair.canonical_payload(),
             "pairIdentitySha256": pair.identity_sha256,
             "disposition": "materialized",
+            **(
+                {"factoryConstructionAudit": _clone(factory_audit)}
+                if factory_audit is not None
+                else {}
+            ),
         }
         payload["proposalSha256"] = canonical_sha256(payload)
         return pair, payload
@@ -601,6 +614,96 @@ def _write_once(path: Path, value: Mapping[str, Any]) -> None:
     path.write_text(encoded, encoding="utf-8")
 
 
+def _counter_increment(target: dict[str, int], value: Any) -> None:
+    key = canonical_json(value) if isinstance(value, (Mapping, list, tuple)) else str(value)
+    target[key] = target.get(key, 0) + 1
+
+
+def _rich_immigrant_distribution(
+    entries: Sequence[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Summarize actual constructor breadth from persisted proposal audits."""
+
+    def empty_side() -> dict[str, Any]:
+        return {
+            "moduleCount": 0,
+            "seedNameCounts": {},
+            "evidenceGroupCounts": {},
+            "eventBindingCounts": {},
+            "holdKindCounts": {},
+            "plannedGrammarDepthCounts": {},
+            "appliedGrammarDepthCounts": {},
+            "grammarOperationFamilyCounts": {},
+            "plannedIndicatorDepthCounts": {},
+            "appliedIndicatorDepthCounts": {},
+            "indicatorOperatorCounts": {},
+            "indicatorConstructionKindCounts": {},
+            "indicatorCountCounts": {},
+            "evidenceGroupMemberShapeCounts": {},
+        }
+
+    def summarize(selected: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        sides = {"long": empty_side(), "short": empty_side()}
+        proposal_count = 0
+        for entry in selected:
+            proposal = entry.get("proposal")
+            audit = proposal.get("factoryConstructionAudit") if isinstance(proposal, Mapping) else None
+            modules = audit.get("sides") if isinstance(audit, Mapping) else None
+            if not isinstance(modules, Mapping):
+                continue
+            proposal_count += 1
+            for direction in ("long", "short"):
+                module = modules.get(direction)
+                if not isinstance(module, Mapping):
+                    continue
+                side = sides[direction]
+                side["moduleCount"] += 1
+                selector = module.get("selector") if isinstance(module.get("selector"), Mapping) else {}
+                _counter_increment(side["seedNameCounts"], selector.get("seedName"))
+                _counter_increment(side["evidenceGroupCounts"], selector.get("groupId"))
+                _counter_increment(side["eventBindingCounts"], selector.get("eventId"))
+                grammar = module.get("grammar") if isinstance(module.get("grammar"), Mapping) else {}
+                indicator = module.get("indicator") if isinstance(module.get("indicator"), Mapping) else {}
+                shape = module.get("profileShape") if isinstance(module.get("profileShape"), Mapping) else {}
+                _counter_increment(side["holdKindCounts"], shape.get("holdKind"))
+                _counter_increment(side["plannedGrammarDepthCounts"], grammar.get("plannedDepth"))
+                _counter_increment(side["appliedGrammarDepthCounts"], grammar.get("appliedDepth"))
+                for step in grammar.get("steps") or []:
+                    if isinstance(step, Mapping):
+                        _counter_increment(side["grammarOperationFamilyCounts"], step.get("operationFamily"))
+                _counter_increment(side["plannedIndicatorDepthCounts"], indicator.get("plannedDepth"))
+                _counter_increment(side["appliedIndicatorDepthCounts"], indicator.get("appliedDepth"))
+                for step in indicator.get("steps") or []:
+                    if isinstance(step, Mapping):
+                        _counter_increment(side["indicatorOperatorCounts"], step.get("operatorId"))
+                        _counter_increment(side["indicatorConstructionKindCounts"], step.get("constructionKind"))
+                _counter_increment(side["indicatorCountCounts"], shape.get("indicatorCount"))
+                _counter_increment(side["evidenceGroupMemberShapeCounts"], shape.get("evidenceGroupMemberCounts") or [])
+        for side in sides.values():
+            for key, value in list(side.items()):
+                if isinstance(value, dict):
+                    side[key] = dict(sorted(value.items()))
+        return {"proposalCount": proposal_count, "sides": sides}
+
+    rich_entries = [
+        entry
+        for entry in entries
+        if isinstance(entry.get("proposal"), Mapping)
+        and isinstance(entry["proposal"].get("factoryConstructionAudit"), Mapping)
+    ]
+    if not rich_entries:
+        return None
+    result = {
+        "schemaVersion": "temporal_qd_rich_immigrant_distribution_v1",
+        "attempted": summarize(rich_entries),
+        "accepted": summarize(
+            [entry for entry in rich_entries if entry.get("disposition") == "accepted"]
+        ),
+    }
+    result["distributionSha256"] = canonical_sha256(result)
+    return result
+
+
 def _explicit_parent_draw_count(entries: Sequence[Mapping[str, Any]]) -> int:
     """Rebuild the selection cursor for the non-archive parent ring.
 
@@ -872,6 +975,28 @@ def generate_pair_population(
     policy = _clone(pair_policy)
     if operator_implementation_identity is None:
         raise TemporalDiscoveryContractError("pair generation requires a frozen operator implementation identity")
+    factory_construction_policy = (
+        getattr(pair_factory, "construction_policy", None)
+        if pair_factory is not None
+        else None
+    )
+    if factory_construction_policy is not None:
+        if not isinstance(factory_construction_policy, Mapping):
+            raise TemporalDiscoveryContractError(
+                "pair immigrant factory construction policy must be an object"
+            )
+        factory_construction_policy = _clone(factory_construction_policy)
+        tripwire = factory_construction_policy.get("collisionTripwire")
+        if (
+            not isinstance(tripwire, Mapping)
+            or isinstance(tripwire.get("minimumImmigrantAttempts"), bool)
+            or int(tripwire.get("minimumImmigrantAttempts") or 0) < 1
+            or isinstance(tripwire.get("minimumAcceptedRatio"), bool)
+            or not 0.0 < float(tripwire.get("minimumAcceptedRatio") or 0.0) <= 1.0
+        ):
+            raise TemporalDiscoveryContractError(
+                "pair immigrant collision tripwire policy is invalid"
+            )
     config = {
         "schemaVersion": PAIR_GENERATION_SCHEMA,
         "generationIndex": generation_index,
@@ -881,6 +1006,11 @@ def generate_pair_population(
         "pairPolicy": policy,
         "operatorImplementation": _clone(operator_implementation_identity),
         "mutationDepthProbabilities": {"1": 0.70, "2": 0.25, "3": 0.05},
+        **(
+            {"immigrantConstructionPolicy": factory_construction_policy}
+            if factory_construction_policy is not None
+            else {}
+        ),
         **(
             {
                 "globalIdentityLedger": {
@@ -993,6 +1123,7 @@ def generate_pair_population(
                     raise TemporalDiscoveryContractError("persisted pair parent selection references an unavailable archive cell")
                 selection_state[cell_id]["selectionVisitCount"] += 1
                 selection_state[cell_id]["offspringAttemptCount"] += 1
+    immigrant_only_bootstrap = not archive_cells and not parents
     if archive_cells:
         structural_parent_selections = sum(
             1
@@ -1109,6 +1240,47 @@ def generate_pair_population(
             from .temporal_qd_evolution import _save_identity_ledger
 
             _save_identity_ledger(Path(identity_ledger_path), ledger)
+        if factory_construction_policy is not None and immigrant_only_bootstrap:
+            tripwire = factory_construction_policy["collisionTripwire"]
+            minimum_attempts = int(tripwire["minimumImmigrantAttempts"])
+            immigrant_attempts = sum(
+                1 for item in entries if item.get("originKind") == "random_immigrant"
+            )
+            immigrant_accepted = sum(
+                1
+                for item in entries
+                if item.get("originKind") == "random_immigrant"
+                and item.get("disposition") == "accepted"
+            )
+            accepted_ratio = (
+                immigrant_accepted / immigrant_attempts if immigrant_attempts else 0.0
+            )
+            if (
+                immigrant_attempts >= minimum_attempts
+                and accepted_ratio < float(tripwire["minimumAcceptedRatio"])
+            ):
+                dispositions: dict[str, int] = {}
+                for item in entries:
+                    key = str(item.get("disposition") or "unknown")
+                    dispositions[key] = dispositions.get(key, 0) + 1
+                failure = {
+                    "schemaVersion": "temporal_qd_immigrant_collision_tripwire_v1",
+                    "configSha256": config["configSha256"],
+                    "generationIndex": generation_index,
+                    "immigrantAttempts": immigrant_attempts,
+                    "immigrantAccepted": immigrant_accepted,
+                    "acceptedRatio": accepted_ratio,
+                    "minimumAcceptedRatio": float(tripwire["minimumAcceptedRatio"]),
+                    "minimumImmigrantAttempts": minimum_attempts,
+                    "dispositionCounts": dict(sorted(dispositions.items())),
+                    "globalPairSemanticCount": len(global_pair_semantics),
+                    "reason": "rich_immigrant_semantic_acceptance_collapsed",
+                }
+                failure["tripwireSha256"] = canonical_sha256(failure)
+                _write_once(root / "immigrant-collision-tripwire.json", failure)
+                raise TemporalDiscoveryContractError(
+                    "rich immigrant semantic acceptance collapsed below the frozen collision tripwire"
+                )
     if len(accepted) < target_unique_candidates:
         reason = (
             "max_proposal_attempts_reached"
@@ -1117,7 +1289,10 @@ def generate_pair_population(
         )
         return {"schemaVersion": "temporal_qd_pair_generation_progress_v1", "configSha256": config["configSha256"], "proposalCount": len(entries), "acceptedCount": len(accepted), "maxProposalAttempts": max_proposal_attempts, "terminationReason": reason, "completed": False}
     accepted.sort(key=lambda item: item["candidateId"])
+    immigrant_distribution = _rich_immigrant_distribution(entries)
     population = {"schemaVersion": "temporal_qd_generation_population_v3", "qdVersion": "temporal_qd_evolution_v3", "policyName": "stage5e7_v3_robust_quality_archive", "policySha256": "__resolved_by_qd_hook__", "configSha256": config["configSha256"], "generationIndex": generation_index, "targetUniqueCandidates": target_unique_candidates, "maxProposalAttempts": max_proposal_attempts, "originCounts": {}, "proposalOrderCandidateIds": [row["candidateId"] for row in accepted], "candidateCount": len(accepted), "candidates": accepted, "authoredValidationBindingRequired": False, "bidirectionalPairPolicy": policy, "pairGenerationConfigSha256": config["configSha256"], "proposalAttempts": len(entries), "proposalSlots": {"targetUniqueCandidates": target_unique_candidates, "acceptedUniqueCandidates": len(accepted), "proposalAttempts": len(entries), "maxProposalAttempts": max_proposal_attempts, "remainingUniqueCandidateSlots": max(0, target_unique_candidates-len(accepted))}, **({"predeclaredEvidenceContextSha256": evidence_identity_context.get("predeclaredEvidenceContextSha256")} if evidence_identity_context is not None else {})}
+    if immigrant_distribution is not None:
+        population["immigrantConstructionDistribution"] = immigrant_distribution
     # Reuse the exact frozen legacy policy token only at the boundary, without
     # importing its generator or changing opt-in-disabled payload identities.
     from .temporal_qd_evolution import QD_POLICY_SHA256
@@ -1133,9 +1308,11 @@ def generate_pair_population(
     population["populationSha256"] = canonical_sha256(population)
     _write_once(root / "population.json", population)
     journal = {"schemaVersion": "temporal_qd_generation_journal_v3", "qdVersion": "temporal_qd_evolution_v3", "policyName": "stage5e7_v3_robust_quality_archive", "policySha256": population["policySha256"], "configSha256": config["configSha256"], "generationIndex": generation_index, "proposalCount": len(entries), "acceptedCount": len(accepted), "maxProposalAttempts": max_proposal_attempts, "nextImmigrantContinuationOrdinal": 0, "originProposalCounts": {origin: sum(1 for entry in entries if entry["originKind"] == origin) for origin in sorted({str(entry["originKind"]) for entry in entries})}, "originAcceptedCounts": dict(sorted(origin_counts.items())), "dispositionCounts": dict(sorted(disposition_counts.items())), "proposalSlots": population["proposalSlots"], "uniqueIdentityCounts": {"candidateIdentity": len(accepted), "pairGenome": len(seen_pair_genomes)}, "duplicateCounters": {"candidateIdentity": disposition_counts.get("duplicate_candidate_identity", 0), "pairGenome": disposition_counts.get("duplicate_pair_genome", 0), "pairGenomeGlobal": disposition_counts.get("duplicate_pair_genome_global", 0)}, "proposalSlotCounters": {"proposalsObserved": len(entries), "maxProposalAttempts": max_proposal_attempts}, "entrySha256s": [entry["entrySha256"] for entry in entries], "operatorImplementation": _clone(operator_implementation_identity), "populationSha256": population["populationSha256"], **({"globalIdentityLedger": {"pairExecutableSemanticCount": len(global_pair_semantics), "pairExecutableSemanticDuplicateRejections": int(ledger["pairExecutableSemanticDuplicateRejections"]), "identityLedgerSha256": ledger["ledgerSha256"]}} if ledger is not None else {})}
+    if immigrant_distribution is not None:
+        journal["immigrantConstructionDistribution"] = immigrant_distribution
     journal["journalSha256"] = canonical_sha256(journal)
     _write_once(root / "generation-journal.json", journal)
-    return {"schemaVersion": "temporal_qd_pair_generation_result_v1", "configSha256": config["configSha256"], "populationSha256": population["populationSha256"], "journalSha256": journal["journalSha256"], "proposalCount": len(entries), "candidateCount": len(accepted), "originProposalCounts": journal["originProposalCounts"], "originAcceptedCounts": journal["originAcceptedCounts"], "proposalSlots": journal["proposalSlots"], "uniqueIdentityCounts": journal["uniqueIdentityCounts"], "duplicateCounters": journal["duplicateCounters"], "proposalSlotCounters": journal["proposalSlotCounters"], "nextImmigrantContinuationOrdinal": 0, "completed": True}
+    return {"schemaVersion": "temporal_qd_pair_generation_result_v1", "configSha256": config["configSha256"], "populationSha256": population["populationSha256"], "journalSha256": journal["journalSha256"], "proposalCount": len(entries), "candidateCount": len(accepted), "originProposalCounts": journal["originProposalCounts"], "originAcceptedCounts": journal["originAcceptedCounts"], "proposalSlots": journal["proposalSlots"], "uniqueIdentityCounts": journal["uniqueIdentityCounts"], "duplicateCounters": journal["duplicateCounters"], "proposalSlotCounters": journal["proposalSlotCounters"], **({"immigrantConstructionDistribution": immigrant_distribution} if immigrant_distribution is not None else {}), "nextImmigrantContinuationOrdinal": 0, "completed": True}
 
 
 __all__ = ["PAIR_GENERATION_SCHEMA", "PAIR_PROPOSAL_SCHEMA", "PairModuleOperator", "TypedGrammarPairOperator", "TypedPairFactory", "generate_pair_population", "materialize_pair_candidate", "propose_pair", "propose_same_side_crossover", "replay_pair_proposal"]
