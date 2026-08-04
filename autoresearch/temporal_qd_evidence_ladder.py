@@ -11,7 +11,7 @@ from .temporal_discovery_base import TemporalDiscoveryContractError, _clone, can
 
 EVIDENCE_LADDER_INPUT_SCHEMA = "temporal_qd_evidence_ladder_input_v1"
 EVIDENCE_LADDER_SCHEMA = "temporal_qd_evidence_ladder_v1"
-OUTER_TAIL_START = "2024-06-29T00:00:00Z"
+OUTER_TAIL_START = "2025-08-01T00:00:00Z"
 MATERIALIZED_LADDER_SCHEMA = "temporal_qd_evidence_ladder_materialization_v1"
 _SHA = re.compile(r"^sha256:[0-9a-f]{64}$")
 _BASE_INPUT_FIELDS = {
@@ -85,7 +85,7 @@ def build_evidence_ladder(config: Mapping[str, Any]) -> dict[str, Any]:
         raise TemporalDiscoveryContractError("QD evidence ladder frozenSeed is required")
     tail = _stamp(source.get("outerTailStart", OUTER_TAIL_START), name="QD outer tail start")
     if _iso(tail) != OUTER_TAIL_START:
-        raise TemporalDiscoveryContractError("QD outer tail must begin at 2024-06-29T00:00:00Z")
+        raise TemporalDiscoveryContractError("QD outer tail must begin at 2025-08-01T00:00:00Z")
     starts_raw = source.get("historicalMonthStarts")
     if not isinstance(starts_raw, list) or len(starts_raw) < 3:
         raise TemporalDiscoveryContractError("QD evidence ladder requires at least three historical month starts")
