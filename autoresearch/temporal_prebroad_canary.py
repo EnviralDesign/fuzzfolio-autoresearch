@@ -175,8 +175,10 @@ def _validate_input(payload: Mapping[str, Any]) -> dict[str, Any]:
             legacy_module_fields = {"context", "contextSha256", "program", "programSha256", "nativeArtifact"}
             if not isinstance(module, Mapping) or (set(module) != legacy_module_fields and set(module) != {*legacy_module_fields, "transitionAliases"}):
                 raise TemporalSearchContractError(f"{candidate} {side} has a closed schema")
-            context, program, native, aliases = module["context"], module["program"], module["nativeArtifact"], module.get("transitionAliases")
-            if not isinstance(context, Mapping) or not isinstance(program, Mapping) or not isinstance(native, Mapping) or (aliases is not None and not isinstance(aliases, Mapping)):
+            has_transition_aliases = "transitionAliases" in module
+            context, program, native = module["context"], module["program"], module["nativeArtifact"]
+            aliases = module["transitionAliases"] if has_transition_aliases else None
+            if not isinstance(context, Mapping) or not isinstance(program, Mapping) or not isinstance(native, Mapping) or (has_transition_aliases and not isinstance(aliases, Mapping)):
                 raise TemporalSearchContractError(f"{candidate} {side} is incomplete")
             expected_direction = "long" if side == "longModule" else "short"
             if set(program) != {"schemaVersion", "grammarVersion", "direction", "fragments"} or program.get("direction") != expected_direction:
@@ -196,7 +198,7 @@ def _validate_input(payload: Mapping[str, Any]) -> dict[str, Any]:
             if set(native) != {"schemaVersion", "profile", "profileSha256", "validation", "identities"} or not isinstance(native.get("profile"), Mapping) or not isinstance(native.get("validation"), Mapping) or not isinstance(native.get("identities"), Mapping):
                 raise TemporalSearchContractError(f"{candidate} {side} native artifact has a closed schema")
             normalized_module = {"context": dict(context), "contextSha256": str(module["contextSha256"]), "program": dict(program), "programSha256": str(module["programSha256"]), "nativeArtifact": dict(native)}
-            if aliases is not None:
+            if has_transition_aliases:
                 alias_material = {
                     "schemaVersion": aliases.get("schemaVersion"),
                     "profileSha256": aliases.get("profileSha256"),

@@ -24,9 +24,7 @@ def test_canary_input_schema_is_closed() -> None:
         _validate_input(payload)
 
 
-def test_canary_accepts_immutable_v1_input_without_transition_aliases() -> None:
-    """New aliases are optional for previously written v1 artifacts."""
-
+def _legacy_v1_input_without_transition_aliases() -> dict:
     def module(direction: str, marker: str) -> dict:
         return {
             "context": {},
@@ -56,7 +54,7 @@ def test_canary_accepts_immutable_v1_input_without_transition_aliases() -> None:
         }
         for outcome in ("long", "short", "neither", "conflict_abstention")
     ]
-    payload = {
+    return {
         "schemaVersion": "temporal_prebroad_activation_canary_input_v1",
         "pairs": [
             {
@@ -98,9 +96,24 @@ def test_canary_accepts_immutable_v1_input_without_transition_aliases() -> None:
         ],
     }
 
+
+def test_canary_accepts_immutable_v1_input_without_transition_aliases() -> None:
+    """New aliases are optional for previously written v1 artifacts."""
+
+    payload = _legacy_v1_input_without_transition_aliases()
+
     validated = _validate_input(payload)
     assert "transitionAliases" not in validated["pairs"][0]["longModule"]
     assert "transitionAliases" not in validated["pairs"][0]["shortModule"]
+
+
+@pytest.mark.parametrize("invalid_aliases", [None, []])
+def test_canary_rejects_present_non_mapping_transition_aliases(invalid_aliases: object) -> None:
+    payload = _legacy_v1_input_without_transition_aliases()
+    payload["pairs"][0]["longModule"]["transitionAliases"] = invalid_aliases
+
+    with pytest.raises(TemporalSearchContractError, match="incomplete"):
+        _validate_input(payload)
 
 
 def test_canary_audit_rejects_self_consistent_but_open_report(tmp_path) -> None:
