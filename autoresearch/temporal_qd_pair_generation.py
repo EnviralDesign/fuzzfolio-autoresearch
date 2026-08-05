@@ -225,7 +225,16 @@ class TypedGrammarPairOperator:
         if raw.get("direction") != module.direction or not isinstance(raw.get("fragments"), list):
             raise TemporalDiscoveryContractError("typed pair module program is not exact")
         fragments = tuple(Fragment(f"replay_{index}", str(item["productionId"]), dict(item["resources"]), dict(item["choices"])) for index, item in enumerate(raw["fragments"]))
-        return ModuleProgram(module.direction, fragments, tuple(module.lineage))
+        # A transition-repaired module has a nested deduplication report in
+        # its frozen lineage.  Deep-clone it at the immutable->grammar
+        # boundary rather than handing MappingProxy values to the grammar's
+        # canonical JSON validator.  ``_clone`` also preserves the existing
+        # finite-JSON validation contract.
+        return ModuleProgram(
+            module.direction,
+            fragments,
+            tuple(_clone(item) for item in module.lineage),
+        )
 
     def _grammar(self, module: FrozenModule) -> Any:
         grammar = self._grammar_factory(module)

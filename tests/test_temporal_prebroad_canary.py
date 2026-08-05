@@ -24,6 +24,85 @@ def test_canary_input_schema_is_closed() -> None:
         _validate_input(payload)
 
 
+def test_canary_accepts_immutable_v1_input_without_transition_aliases() -> None:
+    """New aliases are optional for previously written v1 artifacts."""
+
+    def module(direction: str, marker: str) -> dict:
+        return {
+            "context": {},
+            "contextSha256": _sha(marker),
+            "program": {
+                "schemaVersion": "temporal_typed_fragment_grammar_v2",
+                "grammarVersion": "3",
+                "direction": direction,
+                "fragments": [{"productionId": "arm_level"}],
+            },
+            "programSha256": _sha(marker.upper()),
+            "nativeArtifact": {
+                "schemaVersion": "temporal_prebroad_frozen_native_module_artifact_v1",
+                "profile": {},
+                "profileSha256": _sha("c"),
+                "validation": {},
+                "identities": {},
+            },
+        }
+
+    scenarios = [
+        {
+            "scenarioId": outcome,
+            "expectedOutcome": outcome,
+            "restartAfterObservations": 1,
+            "observationStream": {"observations": [{}, {}]},
+        }
+        for outcome in ("long", "short", "neither", "conflict_abstention")
+    ]
+    payload = {
+        "schemaVersion": "temporal_prebroad_activation_canary_input_v1",
+        "pairs": [
+            {
+                "candidateId": "legacy_v1_alias_compatibility",
+                "longModule": module("long", "a"),
+                "shortModule": module("short", "b"),
+                "pair": {
+                    "profile": {
+                        "version": "v3",
+                        "directionMode": "both",
+                        "instruments": ["EURUSD"],
+                    },
+                    "validation": {
+                        "candidateId": "legacy_v1_alias_compatibility",
+                        "candidateAcceptable": True,
+                        "status": "valid_evaluable",
+                        "programSha256": _sha("d"),
+                        "validationReportSha256": _sha("e"),
+                    },
+                },
+                "scenarios": scenarios,
+                "productionClaims": [
+                    {
+                        "moduleDirection": "long",
+                        "fragmentIndex": 0,
+                        "scenarioId": "long",
+                        "lifecycle": "armed",
+                        "outcome": "transition_selected",
+                    },
+                    {
+                        "moduleDirection": "short",
+                        "fragmentIndex": 0,
+                        "scenarioId": "short",
+                        "lifecycle": "armed",
+                        "outcome": "transition_selected",
+                    },
+                ],
+            }
+        ],
+    }
+
+    validated = _validate_input(payload)
+    assert "transitionAliases" not in validated["pairs"][0]["longModule"]
+    assert "transitionAliases" not in validated["pairs"][0]["shortModule"]
+
+
 def test_canary_audit_rejects_self_consistent_but_open_report(tmp_path) -> None:
     report = {"schemaVersion": "temporal_prebroad_activation_canary_report_v1"}
     report["reportSha256"] = canonical_sha256(report)

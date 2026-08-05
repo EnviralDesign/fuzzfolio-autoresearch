@@ -183,17 +183,79 @@ def _module_transition_aliases(
     profile: Mapping[str, Any],
     profile_sha256: str,
 ) -> dict[str, Any]:
-    reports = [
-        item["deduplication"]
-        for item in module.lineage
-        if isinstance(item, Mapping)
-        and item.get("operation") == "deduplicate_behaviorally_redundant_transitions"
-        and isinstance(item.get("deduplication"), Mapping)
-    ]
+    """Reconstruct aliases for the current program, never historic lineage.
+
+    A grammar descendant retains its parent's immutable lineage for audit, but
+    that history may name a removed fragment or contain an earlier instance of
+    an otherwise identical repair.  The artifact instead derives the sole
+    current deduplication report from the module's canonical typed program and
+    proves that its normalized transitions exactly match the frozen profile.
+    """
+
+    try:
+        context = _context(module)
+        grammar = TypedFragmentGrammar(
+            GrammarContext(
+                instrument=context["instrument"],
+                indicators=tuple(context["indicators"]),
+                evidence_groups=tuple(context["evidenceGroups"]),
+                event_bindings=tuple(context["eventBindings"]),
+                execution_config=context["executionConfig"],
+                budgets=context.get("budgets"),
+            ),
+            native_authority=object(),
+        )
+        program_payload = _plain(module.program)
+        if not isinstance(program_payload, Mapping):
+            raise CanaryArtifactError("frozen module program is not an object")
+        fragments = program_payload.get("fragments")
+        if not isinstance(fragments, list):
+            raise CanaryArtifactError("frozen module program lacks typed fragments")
+        program = ModuleProgram(
+            module.direction,
+            tuple(
+                Fragment(
+                    uid=f"artifact_{index}",
+                    production_id=str(item["productionId"]),
+                    resources=dict(item["resources"]),
+                    choices=dict(item["choices"]),
+                )
+                for index, item in enumerate(fragments)
+                if isinstance(item, Mapping)
+            ),
+        )
+        if len(program.fragments) != len(fragments):
+            raise CanaryArtifactError("frozen module program contains a malformed fragment")
+        canonical, _built, authored_profile = grammar._profile_payload(program)
+        if canonical != program_payload:
+            raise CanaryArtifactError("frozen module program cannot be reconstructed canonically")
+        normalized_profile, report = normalize_behaviorally_redundant_transitions(
+            authored_profile
+        )
+    except CanaryArtifactError:
+        raise
+    except (KeyError, TypeError, ValueError, TemporalSearchContractError) as exc:
+        raise CanaryArtifactError(
+            "could not reconstruct current typed transition aliases"
+        ) from exc
+
+    current_profile = _plain(profile)
+    current_transitions = (
+        ((current_profile.get("graph") or {}).get("transitions") or [])
+        if isinstance(current_profile, Mapping)
+        else []
+    )
+    normalized_transitions = (
+        ((normalized_profile.get("graph") or {}).get("transitions") or [])
+    )
+    if not isinstance(current_transitions, (list, tuple)) or current_transitions != normalized_transitions:
+        raise CanaryArtifactError(
+            "frozen module transitions do not bind the current canonical typed program"
+        )
     return _transition_alias_manifest(
         profile=profile,
         profile_sha256=profile_sha256,
-        deduplication_reports=reports,
+        deduplication_reports=[report],
     )
 
 
@@ -344,6 +406,27 @@ def _solve_streams(pairs: Sequence[Mapping[str, Any]], dashboard_python: Path) -
     return list(value["pairs"])
 
 
+def _published_pair_artifact(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop transient solver aliases to preserve the immutable v1 wire shape.
+
+    The bounded solver needs exact current aliases while constructing its
+    proof, but the v1 canary driver recomputes that mapping from the canonical
+    program and validates the final profile itself.  Publishing the transient
+    field would alter existing immutable v1 artifact bytes without a schema
+    bump and make restart compatibility needlessly brittle.
+    """
+
+    pair = _plain(value)
+    if not isinstance(pair, dict):
+        raise CanaryArtifactError("canary artifact pair is not an object")
+    for key in ("longModule", "shortModule"):
+        module = pair.get(key)
+        if not isinstance(module, dict):
+            raise CanaryArtifactError("canary artifact module is not an object")
+        module.pop("transitionAliases", None)
+    return pair
+
+
 def build_artifacts(population_path: Path, config_path: Path, output_path: Path, *, candidate_ids: Sequence[str] | None = None, dashboard_python: Path = Path("C:/repos/Trading-Dashboard/compute-service/.venv/Scripts/python.exe")) -> dict[str, Any]:
     population, config = _read(population_path), load_pair_run_config(_read(config_path))
     raw_candidates = population.get("candidates")
@@ -361,7 +444,10 @@ def build_artifacts(population_path: Path, config_path: Path, output_path: Path,
         built = [_revalidate(pair, candidate, authority) for candidate, pair in sorted(frozen)]
     solved = _solve_streams(built, dashboard_python)
     for artifact, proof in zip(built, solved, strict=True): artifact.update({"scenarios": proof["scenarios"], "productionClaims": proof["productionClaims"]})
-    payload = {"schemaVersion": ARTIFACT_SCHEMA, "pairs": built}
+    payload = {
+        "schemaVersion": ARTIFACT_SCHEMA,
+        "pairs": [_published_pair_artifact(item) for item in built],
+    }
     output_path.parent.mkdir(parents=True, exist_ok=True); output_path.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=True) + "\n", encoding="utf-8")
     return {"schemaVersion": BUILD_REPORT_SCHEMA, "inputSha256": canonical_sha256(payload), "artifactPath": str(output_path), "pairCount": len(built), "scenarioCount": 4 * len(built), "maxObservations": MAX_OBSERVATIONS, "marketEvidenceRead": False, "lakeRead": False, "gatewayContacted": False}
 
@@ -476,7 +562,7 @@ def build_registry_artifacts(config_path: Path, output_path: Path, *, dashboard_
             built.append({"candidateId":candidate,**modules,"pair":{"profile":result["profile"],"validation":result["report"]}})
     solved=_solve_streams(built,dashboard_python)
     for artifact,proof in zip(built,solved,strict=True): artifact.update({"scenarios":proof["scenarios"],"productionClaims":proof["productionClaims"]})
-    payload={"schemaVersion":ARTIFACT_SCHEMA,"pairs":built}; output_path.parent.mkdir(parents=True,exist_ok=True); output_path.write_text(json.dumps(payload,indent=2,sort_keys=True,ensure_ascii=True)+"\n",encoding="utf-8")
+    payload={"schemaVersion":ARTIFACT_SCHEMA,"pairs":[_published_pair_artifact(item) for item in built]}; output_path.parent.mkdir(parents=True,exist_ok=True); output_path.write_text(json.dumps(payload,indent=2,sort_keys=True,ensure_ascii=True)+"\n",encoding="utf-8")
     return {"schemaVersion":BUILD_REPORT_SCHEMA,"mode":"registry_cover","inputSha256":canonical_sha256(payload),"artifactPath":str(output_path),"pairCount":len(built),"structuralCorpusCount":len(corpus),"marketEvidenceRead":False,"lakeRead":False,"gatewayContacted":False}
 
 

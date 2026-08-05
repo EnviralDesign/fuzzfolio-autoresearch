@@ -45,6 +45,12 @@ from autoresearch.temporal_qd_pair_generation import _mutation_depth_from_bucket
 from autoresearch.temporal_qd_pair_generation import _explicit_parent_draw_count
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
 from autoresearch.temporal_discovery_validation import DashboardV2ModuleValidator, SubprocessCandidateValidator
+from autoresearch.temporal_typed_motif_grammar import (
+    Fragment,
+    GrammarContext,
+    ModuleProgram,
+    TypedFragmentGrammar,
+)
 
 
 class FakeNativeValidator:
@@ -244,6 +250,98 @@ def _legacy_duplicate_pair() -> FrozenPair:
         native_program_sha256=validation["programSha256"],
         native_validation_report_sha256=validation["validationReportSha256"],
     )
+
+
+def _typed_duplicate_signal_exit_module(
+    *,
+    entry_threshold: float = 45.0,
+    include_exit_on_age: bool = False,
+) -> tuple[TypedFragmentGrammar, FrozenModule]:
+    """Produce a repaired typed module with nested frozen dedupe lineage."""
+
+    context = GrammarContext(
+        instrument="EURUSD",
+        indicators=(
+            {
+                "meta": {"id": "I_RSI", "instanceId": "rsi"},
+                "config": {
+                    "isActive": True,
+                    "useFormingBar": False,
+                    "timeframe": "M5",
+                },
+            },
+        ),
+        evidence_groups=({"id": "g_rsi", "indicatorInstanceIds": ["rsi"]},),
+        event_bindings=(
+            {
+                "id": "e_rsi",
+                "indicatorInstanceId": "rsi",
+                "longOutput": "bullish",
+                "shortOutput": "bearish",
+            },
+        ),
+        execution_config={
+            "managementLibrary": {
+                "version": "temporal_management_v1",
+                "defaultPlanId": "base",
+                "plans": [
+                    {
+                        "id": "base",
+                        "initialStop": {"kind": "fixed_percent", "percent": 1.0},
+                        "initialTarget": {
+                            "kind": "reward_multiple",
+                            "multiple": 2.0,
+                        },
+                    }
+                ],
+            }
+        },
+    )
+
+    class GrammarNativeValidator(FakeNativeValidator):
+        def validate_v2(self, *, profile, candidate_id):
+            return {
+                **super().validate_v2(profile=profile, candidate_id=candidate_id),
+                "evaluatorId": "test-typed-grammar-authority",
+            }
+
+    validator = GrammarNativeValidator()
+    grammar = TypedFragmentGrammar(context, native_authority=validator)
+    fragments = [
+        Fragment("arm", "arm_level", {"group": "g_rsi"}, {"threshold": 35.0}),
+        Fragment(
+            "entry",
+            "enter_on_level",
+            {"group": "g_rsi", "plan": "base"},
+            {"threshold": entry_threshold},
+        ),
+        Fragment("exit_one", "exit_on_signal", {"event": "e_rsi"}, {}),
+        Fragment("exit_two", "exit_on_signal", {"event": "e_rsi"}, {}),
+    ]
+    if include_exit_on_age:
+        fragments.append(Fragment("exit_age", "exit_on_age", {}, {"bars": 8}))
+    program = ModuleProgram("long", tuple(fragments))
+    canonical, _built, profile = grammar._profile_payload(program)
+    module = FrozenModule.validate_native(
+        program=canonical,
+        profile=profile,
+        grammar_context=IdentitySnapshot.create(
+            kind="grammarContext",
+            schema_version="typed_grammar_context_v1",
+            payload=grammar.context,
+        ),
+        catalog=_snapshot("catalog", "typed-duplicate-catalog"),
+        policy=_snapshot("policy", "typed-duplicate-policy"),
+        native_authority_identity=_snapshot(
+            "nativeAuthority", "typed-duplicate-authority"
+        ),
+        native_validator=validator,
+        candidate_id="typed_duplicate_signal_exit",
+    )
+    assert module.lineage[-1]["operation"] == (
+        "deduplicate_behaviorally_redundant_transitions"
+    )
+    return grammar, module
 
 
 def _module(
@@ -518,6 +616,131 @@ def test_indicator_application_rebinds_a_duplicate_parent_before_planning_and_ap
         child.canonical_payload()["profile"]
     )
     assert application["childValidatedProgramSha256"] == child.native_program_sha256
+
+
+def test_typed_grammar_mutation_replays_from_a_repaired_duplicate_side() -> None:
+    grammar, repaired = _typed_duplicate_signal_exit_module()
+    operator = TypedGrammarPairOperator(
+        grammar_factory=lambda _module: grammar,
+        native_validator=FakeNativeValidator(),
+        indicator_registry=None,
+        hold_operator_policy=default_hold_operator_policy(),
+    )
+    remove_branch = next(
+        plan
+        for plan in operator.grammar_plans(repaired)
+        if plan["operation"] == "remove_branch"
+    )
+
+    direct, _audit = operator.apply_grammar(
+        repaired,
+        remove_branch,
+        candidate_id="typed_repaired_remove_branch_direct",
+    )
+    assert direct.program["fragments"]
+
+    parent = _pair(long=repaired, short=_module("short"))
+    seed = next(
+        f"typed-repaired-remove-branch-{index}"
+        for index in range(100)
+        if proposal_side(f"typed-repaired-remove-branch-{index}") == "long"
+    )
+    child, proposal = propose_pair(
+        proposal_seed=seed,
+        parent=parent,
+        pair_factory=None,
+        module_authority=operator,
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+        replay_operation={"kind": "typed_grammar", "plan": remove_branch},
+    )
+    assert child is not None
+    replayed = replay_pair_proposal(
+        payload=proposal,
+        module_authority=operator,
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+    )
+    assert replayed is not None
+    assert replayed.canonical_payload() == child.canonical_payload()
+
+    from autoresearch.temporal_prebroad_canary_artifacts import (
+        _module_transition_aliases,
+    )
+
+    aliases = _module_transition_aliases(
+        child.long,
+        profile=child.long.profile,
+        profile_sha256=child.long.native_report["rawSourceProfileSha256"],
+    )
+    # The ancestor's f3 alias is historical once remove_branch has removed
+    # that authored fragment; no stale alias may enter the descendant artifact.
+    assert aliases["aliases"] == []
+
+
+def test_typed_crossover_replay_deep_thaws_repaired_lineage_and_dedupes_once() -> None:
+    grammar, parent_module = _typed_duplicate_signal_exit_module()
+    _mate_grammar, mate_module = _typed_duplicate_signal_exit_module(
+        entry_threshold=60.0,
+        include_exit_on_age=True,
+    )
+    operator = TypedGrammarPairOperator(
+        grammar_factory=lambda _module: grammar,
+        native_validator=FakeNativeValidator(),
+        indicator_registry=None,
+        hold_operator_policy=default_hold_operator_policy(),
+    )
+    parent = _pair(long=parent_module, short=_module("short"))
+    mate = _pair(long=mate_module, short=_module("short", marker="second"))
+    seed = next(
+        f"typed-repaired-crossover-{index}"
+        for index in range(100)
+        if proposal_side(f"typed-repaired-crossover-{index}") == "long"
+    )
+    child, proposal = _propose_crossover(
+        proposal_seed=seed,
+        parent=parent,
+        mate=mate,
+        module_authority=operator,
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+        parent_selection=None,
+        mate_selection=None,
+        mate_selection_attempts=[],
+    )
+    assert child is not None
+    replayed = replay_pair_proposal(
+        payload=proposal,
+        module_authority=operator,
+        native_validator=FakeNativeValidator(),
+        pair_compiler=FakePairCompiler(),
+    )
+    assert replayed is not None
+    assert replayed.canonical_payload() == child.canonical_payload()
+
+    from autoresearch.temporal_prebroad_canary_artifacts import (
+        _module_transition_aliases,
+    )
+
+    current_reports = [
+        item
+        for item in child.long.lineage
+        if item.get("operation") == "deduplicate_behaviorally_redundant_transitions"
+    ]
+    assert len(current_reports) == 2
+    aliases = _module_transition_aliases(
+        child.long,
+        profile=child.long.profile,
+        profile_sha256=child.long.native_report["rawSourceProfileSha256"],
+    )
+    assert aliases["aliases"] == [
+        {
+            "removedTransitionId": "f3_exit_on_signal_exit",
+            "survivorTransitionId": "f2_exit_on_signal_exit",
+            "semanticTransitionSha256": current_reports[-1]["deduplication"]
+            ["groups"][0]["semanticTransitionSha256"],
+        }
+    ]
 
 
 def test_mutation_normalizes_legacy_parent_and_replays_to_the_same_identity() -> None:

@@ -77,7 +77,7 @@ def module(module, side, candidate):
     profile,deduplication=normalize_behaviorally_redundant_transitions(authored_profile)
     report=Authority().validate_v2(profile=profile,candidate_id=candidate+'_'+side)
     compiled=grammar._compiled(program, canonical_program, profile, report, candidate_id=candidate+'_'+side)
-    artifact=module['nativeArtifact']; aliases=module['transitionAliases']
+    artifact=module['nativeArtifact']; aliases=module.get('transitionAliases')
     exact={'profileSha256':canonical_sha256(profile), **compiled.identities}
     identity_drift=[k for k,v in exact.items() if artifact['identities'].get(k) != v]
     expected_aliases=[]
@@ -85,7 +85,7 @@ def module(module, side, candidate):
         for removed in group['removedTransitionIds']:
             expected_aliases.append({'removedTransitionId':removed,'survivorTransitionId':group['survivorTransitionId'],'semanticTransitionSha256':group['semanticTransitionSha256']})
     expected_aliases.sort(key=lambda row:(row['removedTransitionId'],row['survivorTransitionId'],row['semanticTransitionSha256']))
-    if canonical_sha256(profile) != artifact['profileSha256'] or profile != artifact['profile'] or identity_drift or artifact['validation'] != compiled.native_report or aliases.get('schemaVersion') != 'temporal_prebroad_transition_aliases_v1' or aliases.get('profileSha256') != canonical_sha256(profile) or aliases.get('aliases') != expected_aliases:
+    if canonical_sha256(profile) != artifact['profileSha256'] or profile != artifact['profile'] or identity_drift or artifact['validation'] != compiled.native_report or (aliases is not None and (aliases.get('schemaVersion') != 'temporal_prebroad_transition_aliases_v1' or aliases.get('profileSha256') != canonical_sha256(profile) or aliases.get('aliases') != expected_aliases)):
         raise ValueError('content-bound native module artifact identity drifted: profile=%s identities=%s report=%s' % (profile != artifact['profile'], identity_drift, artifact['validation'] != compiled.native_report))
     mapping=[]
     transitions_by_id={row['id']:row for row in profile['graph']['transitions']}
@@ -172,10 +172,11 @@ def _validate_input(payload: Mapping[str, Any]) -> dict[str, Any]:
         supplied_productions: set[tuple[str, int, str]] = set()
         for side in ("longModule", "shortModule"):
             module = raw[side]
-            if not isinstance(module, Mapping) or set(module) != {"context", "contextSha256", "program", "programSha256", "nativeArtifact", "transitionAliases"}:
+            legacy_module_fields = {"context", "contextSha256", "program", "programSha256", "nativeArtifact"}
+            if not isinstance(module, Mapping) or (set(module) != legacy_module_fields and set(module) != {*legacy_module_fields, "transitionAliases"}):
                 raise TemporalSearchContractError(f"{candidate} {side} has a closed schema")
-            context, program, native, aliases = module["context"], module["program"], module["nativeArtifact"], module["transitionAliases"]
-            if not isinstance(context, Mapping) or not isinstance(program, Mapping) or not isinstance(native, Mapping) or not isinstance(aliases, Mapping):
+            context, program, native, aliases = module["context"], module["program"], module["nativeArtifact"], module.get("transitionAliases")
+            if not isinstance(context, Mapping) or not isinstance(program, Mapping) or not isinstance(native, Mapping) or (aliases is not None and not isinstance(aliases, Mapping)):
                 raise TemporalSearchContractError(f"{candidate} {side} is incomplete")
             expected_direction = "long" if side == "longModule" else "short"
             if set(program) != {"schemaVersion", "grammarVersion", "direction", "fragments"} or program.get("direction") != expected_direction:
@@ -194,17 +195,20 @@ def _validate_input(payload: Mapping[str, Any]) -> dict[str, Any]:
                 supplied_productions.add((expected_direction, fragment_index, production))
             if set(native) != {"schemaVersion", "profile", "profileSha256", "validation", "identities"} or not isinstance(native.get("profile"), Mapping) or not isinstance(native.get("validation"), Mapping) or not isinstance(native.get("identities"), Mapping):
                 raise TemporalSearchContractError(f"{candidate} {side} native artifact has a closed schema")
-            alias_material = {
-                "schemaVersion": aliases.get("schemaVersion"),
-                "profileSha256": aliases.get("profileSha256"),
-                "aliases": aliases.get("aliases"),
-            }
-            if set(aliases) != {"schemaVersion", "profileSha256", "aliases", "manifestSha256"} or aliases.get("schemaVersion") != "temporal_prebroad_transition_aliases_v1" or aliases.get("profileSha256") != native.get("profileSha256") or not isinstance(aliases.get("aliases"), list) or aliases.get("manifestSha256") != canonical_sha256(alias_material):
-                raise TemporalSearchContractError(f"{candidate} {side} transition aliases are unbound or malformed")
-            for alias in aliases["aliases"]:
-                if not isinstance(alias, Mapping) or set(alias) != {"removedTransitionId", "survivorTransitionId", "semanticTransitionSha256"} or not all(isinstance(alias.get(field), str) and alias[field] for field in ("removedTransitionId", "survivorTransitionId", "semanticTransitionSha256")):
-                    raise TemporalSearchContractError(f"{candidate} {side} transition alias is malformed")
-            modules[side] = {"context": dict(context), "contextSha256": str(module["contextSha256"]), "program": dict(program), "programSha256": str(module["programSha256"]), "nativeArtifact": dict(native), "transitionAliases": dict(aliases)}
+            normalized_module = {"context": dict(context), "contextSha256": str(module["contextSha256"]), "program": dict(program), "programSha256": str(module["programSha256"]), "nativeArtifact": dict(native)}
+            if aliases is not None:
+                alias_material = {
+                    "schemaVersion": aliases.get("schemaVersion"),
+                    "profileSha256": aliases.get("profileSha256"),
+                    "aliases": aliases.get("aliases"),
+                }
+                if set(aliases) != {"schemaVersion", "profileSha256", "aliases", "manifestSha256"} or aliases.get("schemaVersion") != "temporal_prebroad_transition_aliases_v1" or aliases.get("profileSha256") != native.get("profileSha256") or not isinstance(aliases.get("aliases"), list) or aliases.get("manifestSha256") != canonical_sha256(alias_material):
+                    raise TemporalSearchContractError(f"{candidate} {side} transition aliases are unbound or malformed")
+                for alias in aliases["aliases"]:
+                    if not isinstance(alias, Mapping) or set(alias) != {"removedTransitionId", "survivorTransitionId", "semanticTransitionSha256"} or not all(isinstance(alias.get(field), str) and alias[field] for field in ("removedTransitionId", "survivorTransitionId", "semanticTransitionSha256")):
+                        raise TemporalSearchContractError(f"{candidate} {side} transition alias is malformed")
+                normalized_module["transitionAliases"] = dict(aliases)
+            modules[side] = normalized_module
         pair = raw["pair"]
         if not isinstance(pair, Mapping) or set(pair) != {"profile", "validation"} or not isinstance(pair["profile"], Mapping) or not isinstance(pair["validation"], Mapping):
             raise TemporalSearchContractError(f"{candidate} pair artifact is incomplete")

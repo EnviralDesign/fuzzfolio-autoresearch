@@ -10,6 +10,7 @@ from autoresearch.temporal_prebroad_canary_artifacts import (
     CanaryArtifactError,
     GuardSatisfier,
     MAX_OBSERVATIONS,
+    _published_pair_artifact,
     _public_context,
     build_artifacts,
     greedy_set_cover,
@@ -60,6 +61,24 @@ def test_public_context_accepts_the_frozen_normalized_spelling() -> None:
         "executionConfig": {"managementPlans": []},
         "budgets": {"maxStates": 32},
     }
+
+
+def test_published_v1_artifact_omits_transient_transition_aliases() -> None:
+    pair = {
+        "candidateId": "candidate",
+        "longModule": {
+            "nativeArtifact": {},
+            "transitionAliases": {"aliases": ["transient"]},
+        },
+        "shortModule": {
+            "nativeArtifact": {},
+            "transitionAliases": {"aliases": ["transient"]},
+        },
+    }
+    published = _published_pair_artifact(pair)
+    assert "transitionAliases" not in published["longModule"]
+    assert "transitionAliases" not in published["shortModule"]
+    assert "transitionAliases" in pair["longModule"]
 
 
 def test_one_pair_build_runs_native_canary_and_is_deterministic(tmp_path: Path) -> None:
