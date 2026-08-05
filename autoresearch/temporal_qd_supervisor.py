@@ -40,7 +40,6 @@ from .temporal_qd_evolution import (
     QD_VERSION,
     _identity_payload,
     _load_archive,
-    _load_entries,
     _parent_member_order,
     _quality_member,
     _normalize_parameters,
@@ -56,6 +55,10 @@ from .temporal_qd_evidence_ladder import (
     build_evidence_ladder,
     validate_template_discovery_windows,
     validate_template_stage_window,
+)
+from .temporal_qd_evaluation_population import (
+    evaluation_population_path,
+    load_evaluation_population,
 )
 from .temporal_generation_funnel import (
     GenerationFunnelContractError,
@@ -478,6 +481,7 @@ def _capture_screening_artifacts(
     campaign_root: Path,
     generation_index: int,
     label: str,
+    generation_journal_path: Path | None = None,
 ) -> dict[str, Any]:
     """Reopen the immutable outputs common to every frozen screening campaign."""
 
@@ -491,7 +495,16 @@ def _capture_screening_artifacts(
     checkpoint_path = result_root / "checkpoint.json"
     summary_path = result_root / "summary.json"
 
-    population = _canonical_file(population_path, name=f"{label} population")
+    evaluation_population_path_value = evaluation_population_path(population_path)
+    evaluation_population: Mapping[str, Any] | None = None
+    if evaluation_population_path_value.is_file():
+        evaluation_population = load_evaluation_population(
+            population_path=population_path,
+            journal_path=generation_journal_path,
+        )
+        population = evaluation_population
+    else:
+        population = _canonical_file(population_path, name=f"{label} population")
     archive = _canonical_file(archive_path, name=f"{label} archive")
     preparation = _canonical_file(preparation_path, name=f"{label} preparation")
     authority = _canonical_file(authority_path, name=f"{label} authority")
@@ -513,14 +526,27 @@ def _capture_screening_artifacts(
         raise TemporalDiscoveryContractError(f"{label} campaign index mismatch")
 
     population_sha = _identity_payload(
+        population, "evaluationPopulationSha256", name=f"{label} evaluation population"
+    ) if evaluation_population is not None else _identity_payload(
         population, "populationSha256", name=f"{label} population"
     )
+    if evaluation_population is not None:
+        population_sha = str(evaluation_population["populationSha256"])
     if campaign.get("populationSha256") != population_sha:
         raise TemporalDiscoveryContractError("QD campaign population binding mismatch")
     if evaluation_identity.get("populationSha256") != population_sha:
         raise TemporalDiscoveryContractError(
             "QD evaluation identity population binding mismatch"
         )
+    if evaluation_population is not None:
+        projection_sha = evaluation_population["evaluationPopulationSha256"]
+        if (
+            campaign.get("evaluationPopulationSha256") != projection_sha
+            or evaluation_identity.get("evaluationPopulationSha256") != projection_sha
+        ):
+            raise TemporalDiscoveryContractError(
+                "QD campaign evaluation-population binding mismatch"
+            )
     preparation_sha = canonical_sha256(preparation)
     if campaign.get("preparationSha256") != preparation_sha:
         raise TemporalDiscoveryContractError("QD campaign preparation binding mismatch")
@@ -561,11 +587,19 @@ def _capture_screening_artifacts(
     )
     output = {
         "schemaVersion": "temporal_qd_supervisor_generation_artifacts_v1",
-        "population": _self_hashed_descriptor(
-            population_path,
-            population,
-            field="populationSha256",
-            name=f"{label} population",
+        "population": (
+            {
+                "path": str(population_path.resolve()),
+                "sha256": evaluation_population["populationFileSha256"],
+                "populationSha256": population_sha,
+            }
+            if evaluation_population is not None
+            else _self_hashed_descriptor(
+                population_path,
+                population,
+                field="populationSha256",
+                name=f"{label} population",
+            )
         ),
         "archive": _self_hashed_descriptor(
             archive_path,
@@ -602,6 +636,18 @@ def _capture_screening_artifacts(
         "checkpoint": _artifact_descriptor(checkpoint_path, checkpoint),
         "summary": _artifact_descriptor(summary_path, summary),
         "results": results,
+        **(
+            {
+                "evaluationPopulation": _self_hashed_descriptor(
+                    evaluation_population_path_value,
+                    evaluation_population,
+                    field="evaluationPopulationSha256",
+                    name=f"{label} evaluation population",
+                )
+            }
+            if evaluation_population is not None
+            else {}
+        ),
     }
     return output
 
@@ -621,6 +667,7 @@ def _capture_generation_artifacts(
         campaign_root=campaign_root,
         generation_index=generation_index,
         label="QD generation",
+        generation_journal_path=journal_path,
     )
     journal = _canonical_file(journal_path, name="QD generation journal")
     if int(journal.get("generationIndex", -1)) != generation_index:
@@ -714,6 +761,12 @@ def _validate_generation_artifacts(
             raise TemporalDiscoveryContractError(
                 f"completed generation {field} identity disagrees with supervisor record"
             )
+    if "evaluationPopulation" in current and generation_record.get(
+        "evaluationPopulationSha256"
+    ) != current["evaluationPopulation"]["evaluationPopulationSha256"]:
+        raise TemporalDiscoveryContractError(
+            "completed generation evaluation population identity disagrees with supervisor record"
+        )
     archive = _canonical_file(
         Path(current["archive"]["path"]), name="QD generation archive"
     )
@@ -1728,20 +1781,17 @@ def run_qd_supervisor(
             )
             funnel_enabled = bool((config.get("generationFunnel") or {}).get("enabled"))
             if funnel_enabled:
-                # _load_entries is the proposal-journal authority: it verifies
-                # filename ordinal continuity, entry schema, and each entry's
-                # self-hash before the funnel can consume a single stage row.
-                entries = _load_entries(proposal_root)
+                evaluation_population = load_evaluation_population(
+                    population_path=proposal_root / "population.json",
+                    journal_path=proposal_root / "generation-journal.json",
+                )
                 funnel = build_qd_generation_funnel(
-                    proposal_entries=entries,
+                    proposal_entries=evaluation_population["funnelEntries"],
                     proposal_accounting=_canonical_file(
                         proposal_root / "generation-journal.json",
                         name="QD generation journal",
                     ),
-                    population=_canonical_file(
-                        proposal_root / "population.json",
-                        name="QD generation population",
-                    ),
+                    population=evaluation_population,
                     authority=_canonical_file(campaign_root / "authority.json", name="QD authority"),
                     task_manifest=_canonical_file(result_root / "task-manifest.json", name="QD task manifest"),
                     checkpoint=_canonical_file(result_root / "checkpoint.json", name="QD evaluation checkpoint"),
@@ -1771,6 +1821,11 @@ def run_qd_supervisor(
                 != campaign_result["evaluationIdentitySha256"]
                 or artifacts["archive"]["archiveSha256"]
                 != archive_result["archiveSha256"]
+                or (
+                    "evaluationPopulation" in artifacts
+                    and artifacts["evaluationPopulation"]["evaluationPopulationSha256"]
+                    != generation_result.get("evaluationPopulationSha256")
+                )
             ):
                 raise TemporalDiscoveryContractError(
                     "completed QD generation artifact identities disagree with phase output"
@@ -1785,6 +1840,15 @@ def run_qd_supervisor(
             generation_record = {
                 "generationIndex": generation_index,
                 "populationSha256": generation_result["populationSha256"],
+                **(
+                    {
+                        "evaluationPopulationSha256": generation_result[
+                            "evaluationPopulationSha256"
+                        ]
+                    }
+                    if generation_result.get("evaluationPopulationSha256") is not None
+                    else {}
+                ),
                 "journalSha256": journal_sha,
                 "proposalCount": generation_result["proposalCount"],
                 "candidateCount": generation_result["candidateCount"],

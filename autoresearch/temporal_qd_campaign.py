@@ -25,6 +25,11 @@ from .temporal_qd_evolution import (
     qd_predeclared_evidence_context,
 )
 from .temporal_qd_evidence_ladder import validate_template_discovery_windows
+from .temporal_qd_evaluation_population import (
+    evaluation_population_path,
+    is_optimized_pair_population,
+    load_evaluation_population,
+)
 from .temporal_search import (
     TEMPORAL_SEARCH_PREPARATION_SCHEMA,
     build_authority,
@@ -33,6 +38,7 @@ from .temporal_search import (
 
 QD_CAMPAIGN_SCHEMA = "temporal_qd_screening_campaign_v3"
 INITIAL_POPULATION_SCHEMA = "temporal_discovery_population_v2"
+_SMALL_POPULATION_FALLBACK_BYTES = 16 * 1024 * 1024
 
 
 def _write_once(path: Path, value: Mapping[str, Any]) -> None:
@@ -63,12 +69,37 @@ def freeze_qd_screening_campaign(
     evidence_ladder: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     population_file = Path(population_path)
-    population_payload = _read(population_file, name="QD generation population")
-    population_schema = population_payload.get("schemaVersion")
-    if population_schema not in {QD_POPULATION_SCHEMA, INITIAL_POPULATION_SCHEMA}:
-        raise TemporalDiscoveryContractError("unknown QD generation population schema")
-    candidates, population_sha = _load_population(population_file)
-    bidirectional_policy = _bidirectional_pair_policy(population_payload)
+    projection_file = evaluation_population_path(population_file)
+    evaluation_population_sha256: str | None = None
+    if projection_file.is_file():
+        population_payload = load_evaluation_population(
+            population_path=population_file,
+            journal_path=population_file.with_name("generation-journal.json"),
+        )
+        population_schema = QD_POPULATION_SCHEMA
+        candidates = list(population_payload["candidates"])
+        population_sha = str(population_payload["populationSha256"])
+        evaluation_population_sha256 = str(
+            population_payload["evaluationPopulationSha256"]
+        )
+        bidirectional_policy = _bidirectional_pair_policy(
+            {"bidirectionalPairPolicy": population_payload["bidirectionalPairPolicy"]}
+        )
+    else:
+        if population_file.stat().st_size > _SMALL_POPULATION_FALLBACK_BYTES:
+            raise TemporalDiscoveryContractError(
+                "optimized pre-sidecar QD pair population requires a fresh truthful root"
+            )
+        population_payload = _read(population_file, name="QD generation population")
+        population_schema = population_payload.get("schemaVersion")
+        if population_schema not in {QD_POPULATION_SCHEMA, INITIAL_POPULATION_SCHEMA}:
+            raise TemporalDiscoveryContractError("unknown QD generation population schema")
+        if is_optimized_pair_population(population_payload):
+            raise TemporalDiscoveryContractError(
+                "optimized pre-sidecar QD pair population requires a fresh truthful root"
+            )
+        candidates, population_sha = _load_population(population_file)
+        bidirectional_policy = _bidirectional_pair_policy(population_payload)
     frozen_construction_catalog = (
         _read(Path(construction_catalog_path), name="frozen QD construction catalog")
         if construction_catalog_path is not None
@@ -273,6 +304,7 @@ def freeze_qd_screening_campaign(
         "policyName": QD_POLICY_NAME,
         "policySha256": QD_POLICY_SHA256,
         "populationSha256": population_sha,
+        **({"evaluationPopulationSha256": evaluation_population_sha256} if evaluation_population_sha256 is not None else {}),
         "constructionCatalog": construction_catalog_identity,
         "templatePreparationSha256": canonical_sha256(template),
         "workerContract": _clone(worker_contract, name="evaluation worker contract"),
@@ -316,6 +348,7 @@ def freeze_qd_screening_campaign(
         "schemaVersion": QD_CAMPAIGN_SCHEMA,
         "generationIndex": generation_index,
         "populationSha256": population_sha,
+        **({"evaluationPopulationSha256": evaluation_population_sha256} if evaluation_population_sha256 is not None else {}),
         "constructionCatalog": construction_catalog_identity,
         "preparationSha256": canonical_sha256(preparation),
         "authorityId": authority["authorityId"],
@@ -340,6 +373,7 @@ def freeze_qd_screening_campaign(
         "windowCount": len(windows),
         "taskCount": task_count,
         "evaluationIdentitySha256": evaluation_identity["evaluationIdentitySha256"],
+        **({"evaluationPopulationSha256": evaluation_population_sha256} if evaluation_population_sha256 is not None else {}),
         "outputRoot": str(root.resolve()),
     }
 

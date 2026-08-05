@@ -1286,6 +1286,12 @@ def validate_authority(authority: Mapping[str, Any]) -> dict[str, Any]:
 
 def build_task_matrix(authority: Mapping[str, Any]) -> list[dict[str, Any]]:
     frozen = validate_authority(authority)
+    return _build_task_matrix_validated(frozen)
+
+
+def _build_task_matrix_validated(frozen: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Build worker tasks from an authority already validated by this module."""
+
     tasks: list[dict[str, Any]] = []
     for candidate in frozen["candidates"]:
         for window in frozen["developmentWindows"]:
@@ -1387,7 +1393,7 @@ def materialize_plan(
     authority: Mapping[str, Any], output_root: Path | str
 ) -> dict[str, Any]:
     frozen = validate_authority(authority)
-    tasks = build_task_matrix(frozen)
+    tasks = _build_task_matrix_validated(frozen)
     root = Path(output_root)
     manifest = {
         "schemaVersion": TEMPORAL_SEARCH_MANIFEST_SCHEMA,

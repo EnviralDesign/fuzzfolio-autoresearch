@@ -46,6 +46,11 @@ from .temporal_discovery_validation import (
     validate_legacy_reference_admission_binding,
     validator_provenance,
 )
+from .temporal_qd_evaluation_population import (
+    evaluation_population_path,
+    is_optimized_pair_population,
+    load_evaluation_population,
+)
 from .result_codec import fsync_directory
 from .lake_window import (
     LakeWindowBinding,
@@ -72,6 +77,7 @@ from .temporal_bidirectional_genome import (
 
 QD_VERSION = "temporal_qd_evolution_v3"
 QD_ARCHIVE_SCHEMA = "temporal_qd_archive_v3"
+_SMALL_POPULATION_FALLBACK_BYTES = 16 * 1024 * 1024
 QD_CONFIG_SCHEMA = "temporal_qd_generation_config_v3"
 QD_ENTRY_SCHEMA = "temporal_qd_proposal_entry_v3"
 QD_CHECKPOINT_SCHEMA = "temporal_qd_generation_checkpoint_v3"
@@ -989,6 +995,89 @@ def select_qd_archive(
     return cells
 
 
+def _hydrate_selected_pair_members(
+    *,
+    cells: Sequence[dict[str, Any]],
+    projection: Mapping[str, Any],
+    generation_journal_path: Path,
+    pair_policy: Mapping[str, Any],
+) -> None:
+    """Restore rich pair provenance only for archive survivors.
+
+    The compact evaluation sidecar owns reduction.  The append-only proposal
+    journal remains the source of full pair lineage and is read one selected
+    member at a time here.
+    """
+
+    by_id = {
+        str(row["candidateId"]): row
+        for row in projection.get("candidates") or []
+        if isinstance(row, Mapping)
+    }
+    proposal_root = generation_journal_path.parent / "proposal-journal"
+    for cell in cells:
+        for member in cell["members"]:
+            candidate_id = str(member["candidateId"])
+            compact = by_id.get(candidate_id)
+            if compact is None:
+                existing = member.get("candidate")
+                if not isinstance(existing, Mapping):
+                    raise TemporalDiscoveryContractError(
+                        "selected QD member is absent from evaluation population"
+                    )
+                # Previous-archive survivors were already hydrated from their
+                # own immutable generation journal.  They must remain rich
+                # provenance, but are deliberately absent from this generation's
+                # compact evaluation population.
+                _require_bidirectional_candidate(existing, pair_policy)
+                continue
+            ordinal = compact.get("proposalOrdinal")
+            if not isinstance(ordinal, int) or ordinal < 0:
+                raise TemporalDiscoveryContractError(
+                    "selected QD member proposal reference is invalid"
+                )
+            path = proposal_root / f"{ordinal:08d}.json"
+            try:
+                entry = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise TemporalDiscoveryContractError(
+                    f"could not read selected pair proposal journal entry: {path}"
+                ) from exc
+            if not isinstance(entry, Mapping) or entry.get("entrySha256") != compact.get(
+                "proposalEntrySha256"
+            ):
+                raise TemporalDiscoveryContractError(
+                    "selected QD member journal identity mismatch"
+                )
+            if canonical_sha256(
+                {key: value for key, value in entry.items() if key != "entrySha256"}
+            ) != entry.get("entrySha256"):
+                raise TemporalDiscoveryContractError(
+                    "selected QD member journal entry identity mismatch"
+                )
+            candidate = entry.get("candidate")
+            if not isinstance(candidate, Mapping) or any(
+                candidate.get(field) != compact.get(field)
+                for field in (
+                    "candidateId",
+                    "candidateIdentitySha256",
+                    "programSha256",
+                    "sourceProfileSha256",
+                    "profileSnapshotSha256",
+                    "canonicalEvidenceIdentitySha256",
+                )
+            ):
+                raise TemporalDiscoveryContractError(
+                    "selected QD member rich provenance identity mismatch"
+                )
+            if candidate.get("sourceProfile") != compact.get("sourceProfile"):
+                raise TemporalDiscoveryContractError(
+                    "selected QD member rich provenance profile mismatch"
+                )
+            _require_bidirectional_candidate(candidate, pair_policy)
+            member["candidate"] = _clone(candidate, name="selected pair candidate")
+
+
 def build_qd_archive(
     *,
     population_path: Path | str,
@@ -1012,9 +1101,38 @@ def build_qd_archive(
         raise TemporalDiscoveryContractError(
             "QD archive must use the frozen Stage 5E7-v3 trade-support policy"
         )
-    population_payload = _read(Path(population_path), name="QD source population")
-    bidirectional_policy = _bidirectional_pair_policy(population_payload)
-    candidates, population_sha = _load_population(Path(population_path))
+    population_file = Path(population_path)
+    projection_file = evaluation_population_path(population_file)
+    evaluation_population: Mapping[str, Any] | None = None
+    if projection_file.is_file():
+        if generation_journal_path is None:
+            raise TemporalDiscoveryContractError(
+                "optimized QD pair archive requires its generation journal"
+            )
+        evaluation_population = load_evaluation_population(
+            population_path=population_file,
+            journal_path=Path(generation_journal_path),
+        )
+        bidirectional_policy = _bidirectional_pair_policy(
+            {"bidirectionalPairPolicy": evaluation_population["bidirectionalPairPolicy"]}
+        )
+        candidates = [
+            _clone(row, name="QD evaluation population candidate")
+            for row in evaluation_population["candidates"]
+        ]
+        population_sha = str(evaluation_population["populationSha256"])
+    else:
+        if population_file.stat().st_size > _SMALL_POPULATION_FALLBACK_BYTES:
+            raise TemporalDiscoveryContractError(
+                "optimized pre-sidecar QD pair population requires a fresh truthful root"
+            )
+        population_payload = _read(population_file, name="QD source population")
+        if is_optimized_pair_population(population_payload):
+            raise TemporalDiscoveryContractError(
+                "optimized pre-sidecar QD pair population requires a fresh truthful root"
+            )
+        bidirectional_policy = _bidirectional_pair_policy(population_payload)
+        candidates, population_sha = _load_population(population_file)
     candidate_map = {item["candidateId"]: item for item in candidates}
     results = load_stage_results(result_root)
     if set(results) != set(candidate_map):
@@ -1097,6 +1215,14 @@ def build_qd_archive(
         )
     )
     cells = select_qd_archive(reduced_members, cell_capacity=cell_capacity)
+    if evaluation_population is not None:
+        assert generation_journal_path is not None and bidirectional_policy is not None
+        _hydrate_selected_pair_members(
+            cells=cells,
+            projection=evaluation_population,
+            generation_journal_path=Path(generation_journal_path),
+            pair_policy=bidirectional_policy,
+        )
     generation_accounting: dict[str, Any] = {}
     if generation_journal_path is not None:
         journal = _read(Path(generation_journal_path), name="QD generation journal")
@@ -1169,6 +1295,11 @@ def build_qd_archive(
         "frozenPolicy": _clone(QD_POLICY, name="frozen QD policy"),
         "generationIndex": generation_index,
         "populationSha256": population_sha,
+        **(
+            {"evaluationPopulationSha256": evaluation_population["evaluationPopulationSha256"]}
+            if evaluation_population is not None
+            else {}
+        ),
         "resultSetSha256": _result_set_sha256(results),
         "previousArchiveSha256": previous_sha,
         "cellCapacity": cell_capacity,

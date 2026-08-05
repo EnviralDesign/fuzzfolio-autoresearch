@@ -49,6 +49,10 @@ from .temporal_qd_population_finalizer import (
     POPULATION_FINALIZERS,
     finalize_population_with_rust,
 )
+from .temporal_qd_evaluation_population import (
+    EVALUATION_POPULATION_SCHEMA,
+    raw_file_sha256,
+)
 
 
 PAIR_GENERATION_SCHEMA = "temporal_qd_pair_generation_v1"
@@ -65,6 +69,68 @@ _PAIR_GENERATION_IMPLEMENTATIONS = frozenset(
     )
 )
 DEFAULT_POPULATION_FINALIZER = POPULATION_FINALIZER_RUST
+
+
+def _frozen_catalog_for_predeclared_scope(
+    evidence_context: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    """Load the catalog bound by predeclared evidence exactly once.
+
+    A context without window semantics deliberately keeps the historical
+    optional API path.  Once a catalog identity is bound, however, falling
+    back to profile metadata would make the scope check non-reproducible.
+    """
+
+    if not isinstance(evidence_context, Mapping) or not evidence_context.get(
+        "orderedWindowPlanSemantic"
+    ):
+        return None
+    identity = evidence_context.get("constructionCatalog")
+    if identity is None:
+        return None
+    if not isinstance(identity, Mapping):
+        raise TemporalDiscoveryContractError(
+            "predeclared construction catalog identity is invalid"
+        )
+    path = identity.get("path")
+    expected = identity.get("catalogSha256")
+    if not isinstance(path, str) or not isinstance(expected, str):
+        raise TemporalDiscoveryContractError(
+            "predeclared construction catalog identity is incomplete"
+        )
+    try:
+        catalog = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise TemporalDiscoveryContractError(
+            "could not read predeclared construction catalog"
+        ) from exc
+    if not isinstance(catalog, Mapping) or canonical_sha256(catalog) != expected:
+        raise TemporalDiscoveryContractError(
+            "predeclared construction catalog identity mismatch"
+        )
+    return _clone(catalog)
+
+
+def _pair_predeclared_lake_scope_report(
+    candidate: Mapping[str, Any],
+    evidence_context: Mapping[str, Any] | None,
+    *,
+    frozen_construction_catalog: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not isinstance(evidence_context, Mapping) or not evidence_context.get(
+        "orderedWindowPlanSemantic"
+    ):
+        return None
+    from .temporal_qd_evolution import _predeclared_lake_scope_report
+
+    profile = candidate.get("sourceProfile")
+    if not isinstance(profile, Mapping):
+        raise TemporalDiscoveryContractError("pair candidate lacks source profile")
+    return _predeclared_lake_scope_report(
+        profile,
+        evidence_context,
+        frozen_construction_catalog=frozen_construction_catalog,
+    )
 
 
 def _unbiased_choice(seed: str, *, size: int) -> int:
@@ -1289,6 +1355,108 @@ def _write_canonical_stream_once(path: Path, value: Any) -> int:
         raise
 
 
+def _write_evaluation_population(
+    *,
+    root: Path,
+    population: Mapping[str, Any],
+    population_sha256: str,
+    journal_paths: tuple[Path, ...],
+    operator_implementation_identity: Mapping[str, Any],
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """Publish a journal-backed, compact evaluation view after population bytes exist."""
+
+    population_file = root / "population.json"
+    # Read every rich entry at most once.  The resulting compact records are
+    # intentionally bounded (profiles plus funnel accounting), then serve as
+    # the repeatable hash/write source without replaying the rich journals.
+    candidates: list[dict[str, Any]] = []
+    funnel_entries: list[dict[str, Any]] = []
+    for ordinal, path in enumerate(journal_paths):
+        entry = _load_pair_proposal_entry(path, ordinal=ordinal)
+        candidate = entry.get("candidate")
+        proposal = entry.get("proposal")
+        funnel_entries.append(
+            {
+                "entrySha256": entry["entrySha256"],
+                "proposalOrdinal": entry["proposalOrdinal"],
+                "originKind": entry["originKind"],
+                "disposition": entry["disposition"],
+                **(
+                    {"candidate": {key: candidate[key] for key in ("candidateId", "sourceProfileSha256") if candidate.get(key) is not None}}
+                    if isinstance(candidate, Mapping)
+                    else {}
+                ),
+                **(
+                    {"proposal": {key: proposal[key] for key in ("candidateId", "rawSourceProfileSha256") if proposal.get(key) is not None}}
+                    if isinstance(proposal, Mapping)
+                    else {}
+                ),
+                **({"funnelCandidate": _clone(entry["funnelCandidate"])} if isinstance(entry.get("funnelCandidate"), Mapping) else {}),
+            }
+        )
+        if entry.get("disposition") != "accepted":
+            continue
+        if not isinstance(candidate, Mapping) or not isinstance(candidate.get("sourceProfile"), Mapping):
+            raise TemporalDiscoveryContractError("accepted pair proposal lacks executable material")
+        required = ("candidateId", "candidateIdentitySha256", "programSha256", "sourceProfileSha256")
+        if any(not isinstance(candidate.get(field), str) for field in required):
+            raise TemporalDiscoveryContractError("accepted pair proposal lacks evaluation identity material")
+        candidates.append(
+            {
+                "candidateId": candidate["candidateId"],
+                "candidateIdentitySha256": candidate["candidateIdentitySha256"],
+                "programSha256": candidate["programSha256"],
+                "sourceProfile": _clone(candidate["sourceProfile"]),
+                "sourceProfileSha256": candidate["sourceProfileSha256"],
+                **({"profileSnapshotSha256": candidate["profileSnapshotSha256"]} if candidate.get("profileSnapshotSha256") is not None else {}),
+                **({"canonicalEvidenceIdentitySha256": candidate["canonicalEvidenceIdentitySha256"]} if candidate.get("canonicalEvidenceIdentitySha256") is not None else {}),
+                "structuralOperatorHistory": _clone(candidate.get("structuralOperatorHistory") or []),
+                "proposalOrdinal": ordinal,
+                "proposalEntrySha256": entry["entrySha256"],
+            }
+        )
+    candidates.sort(key=lambda row: str(row["candidateId"]))
+    if len(candidates) != int(population["candidateCount"]):
+        raise TemporalDiscoveryContractError("evaluation population accepted candidate count diverged")
+    projection: dict[str, Any] = {
+        "schemaVersion": EVALUATION_POPULATION_SCHEMA,
+        "generationIndex": population["generationIndex"],
+        "candidateCount": population["candidateCount"],
+        "populationSha256": population_sha256,
+        "populationFileSha256": raw_file_sha256(population_file),
+        "pairGenerationConfigSha256": population["pairGenerationConfigSha256"],
+        "policyName": population["policyName"],
+        "policySha256": population["policySha256"],
+        "bidirectionalPairPolicy": _clone(population["bidirectionalPairPolicy"]),
+        "pairPolicySha256": canonical_sha256(population["bidirectionalPairPolicy"]),
+        "operatorImplementationSha256": canonical_sha256(
+            operator_implementation_identity
+        ),
+        "predeclaredEvidenceContextSha256": population.get(
+            "predeclaredEvidenceContextSha256"
+        ),
+        "candidates": candidates,
+        "proposalAttempts": len(journal_paths),
+        "funnelEntries": funnel_entries,
+    }
+    projection["evaluationPopulationSha256"] = _stream_canonical_sha256(projection)
+    _write_canonical_stream_once(root / "evaluation-population.json", projection)
+    bindings = [
+        {
+            "candidateId": row["candidateId"],
+            "proposalOrdinal": row["proposalOrdinal"],
+            "proposalEntrySha256": row["proposalEntrySha256"],
+            "candidateProjectionSha256": canonical_sha256(row),
+        }
+        for row in candidates
+    ]
+    return (
+        str(projection["evaluationPopulationSha256"]),
+        str(projection["populationFileSha256"]),
+        bindings,
+    )
+
+
 def _materialize_pair_candidate_optimized(
     *,
     pair: FrozenPair,
@@ -1566,6 +1734,9 @@ def _generate_pair_population_legacy_impl(
     with timed_span("generation.resolve_runtime_inputs"):
         root = Path(output_root)
         policy = _clone(pair_policy)
+        frozen_construction_catalog = _frozen_catalog_for_predeclared_scope(
+            evidence_identity_context
+        )
         factory_construction_policy = (
             getattr(pair_factory, "construction_policy", None)
             if pair_factory is not None
@@ -1830,6 +2001,13 @@ def _generate_pair_population_legacy_impl(
                     proposalOrdinal=ordinal,
                 ):
                     candidate["canonicalEvidenceIdentitySha256"] = qd_canonical_evidence_identity(candidate, evidence_identity_context)
+            scoped = _pair_predeclared_lake_scope_report(
+                candidate,
+                evidence_identity_context,
+                frozen_construction_catalog=frozen_construction_catalog,
+            )
+            if scoped is not None:
+                entry["predeclaredLakeScope"] = scoped
             with timed_span(
                 "proposal.compute_executable_semantic_identity",
                 proposalOrdinal=ordinal,
@@ -1845,7 +2023,9 @@ def _generate_pair_population_legacy_impl(
                     duplicatePairGenome=duplicate_pair,
                     duplicateCandidateIdentity=duplicate_candidate,
                 )
-            if duplicate_pair:
+            if scoped is not None and scoped["acceptable"] is not True:
+                entry["disposition"] = "predeclared_lake_scope_rejected"
+            elif duplicate_pair:
                 entry["disposition"] = "duplicate_pair_genome"
             elif duplicate_candidate:
                 entry["disposition"] = "duplicate_candidate_identity"
@@ -1999,8 +2179,21 @@ def _generate_pair_population_legacy_impl(
     with timed_span("generation.finalize.persist_population"):
         _write_once(root / "population.json", population)
     assert_performance_resource_guard()
+    with timed_span("generation.finalize.build_evaluation_population"):
+        evaluation_population_sha256, population_file_sha256, evaluation_candidate_bindings = (
+            _write_evaluation_population(
+                root=root,
+                population=population,
+                population_sha256=population["populationSha256"],
+                journal_paths=tuple(
+                    root / "proposal-journal" / f"{ordinal:08d}.json"
+                    for ordinal in range(len(entries))
+                ),
+                operator_implementation_identity=operator_implementation_identity,
+            )
+        )
     with timed_span("generation.finalize.build_journal"):
-        journal = {"schemaVersion": "temporal_qd_generation_journal_v3", "qdVersion": "temporal_qd_evolution_v3", "policyName": "stage5e7_v3_robust_quality_archive", "policySha256": population["policySha256"], "configSha256": config["configSha256"], "generationIndex": generation_index, "proposalCount": len(entries), "acceptedCount": len(accepted), "maxProposalAttempts": max_proposal_attempts, "nextImmigrantContinuationOrdinal": 0, "originProposalCounts": {origin: sum(1 for entry in entries if entry["originKind"] == origin) for origin in sorted({str(entry["originKind"]) for entry in entries})}, "originAcceptedCounts": dict(sorted(origin_counts.items())), "dispositionCounts": dict(sorted(disposition_counts.items())), "proposalSlots": population["proposalSlots"], "uniqueIdentityCounts": {"candidateIdentity": len(accepted), "pairGenome": len(seen_pair_genomes)}, "duplicateCounters": {"candidateIdentity": disposition_counts.get("duplicate_candidate_identity", 0), "pairGenome": disposition_counts.get("duplicate_pair_genome", 0), "pairGenomeGlobal": disposition_counts.get("duplicate_pair_genome_global", 0)}, "proposalSlotCounters": {"proposalsObserved": len(entries), "maxProposalAttempts": max_proposal_attempts}, "entrySha256s": [entry["entrySha256"] for entry in entries], "operatorImplementation": _clone(operator_implementation_identity), "populationSha256": population["populationSha256"], **({"globalIdentityLedger": {"pairExecutableSemanticCount": len(global_pair_semantics), "pairExecutableSemanticDuplicateRejections": int(ledger["pairExecutableSemanticDuplicateRejections"]), "identityLedgerSha256": ledger["ledgerSha256"]}} if ledger is not None else {})}
+        journal = {"schemaVersion": "temporal_qd_generation_journal_v3", "qdVersion": "temporal_qd_evolution_v3", "policyName": "stage5e7_v3_robust_quality_archive", "policySha256": population["policySha256"], "configSha256": config["configSha256"], "generationIndex": generation_index, "proposalCount": len(entries), "acceptedCount": len(accepted), "maxProposalAttempts": max_proposal_attempts, "nextImmigrantContinuationOrdinal": 0, "originProposalCounts": {origin: sum(1 for entry in entries if entry["originKind"] == origin) for origin in sorted({str(entry["originKind"]) for entry in entries})}, "originAcceptedCounts": dict(sorted(origin_counts.items())), "dispositionCounts": dict(sorted(disposition_counts.items())), "proposalSlots": population["proposalSlots"], "uniqueIdentityCounts": {"candidateIdentity": len(accepted), "pairGenome": len(seen_pair_genomes)}, "duplicateCounters": {"candidateIdentity": disposition_counts.get("duplicate_candidate_identity", 0), "pairGenome": disposition_counts.get("duplicate_pair_genome", 0), "pairGenomeGlobal": disposition_counts.get("duplicate_pair_genome_global", 0)}, "proposalSlotCounters": {"proposalsObserved": len(entries), "maxProposalAttempts": max_proposal_attempts}, "entrySha256s": [entry["entrySha256"] for entry in entries], "evaluationCandidateBindings": evaluation_candidate_bindings, "operatorImplementation": _clone(operator_implementation_identity), "populationSha256": population["populationSha256"], "populationFileSha256": population_file_sha256, "evaluationPopulationSha256": evaluation_population_sha256, "predeclaredEvidenceContextSha256": population.get("predeclaredEvidenceContextSha256"), **({"globalIdentityLedger": {"pairExecutableSemanticCount": len(global_pair_semantics), "pairExecutableSemanticDuplicateRejections": int(ledger["pairExecutableSemanticDuplicateRejections"]), "identityLedgerSha256": ledger["ledgerSha256"]}} if ledger is not None else {})}
     if immigrant_distribution is not None:
         journal["immigrantConstructionDistribution"] = immigrant_distribution
     with timed_span("generation.finalize.hash_journal"):
@@ -2008,7 +2201,7 @@ def _generate_pair_population_legacy_impl(
     with timed_span("generation.finalize.persist_journal"):
         _write_once(root / "generation-journal.json", journal)
     with timed_span("generation.finalize.build_result"):
-        return {"schemaVersion": "temporal_qd_pair_generation_result_v1", "configSha256": config["configSha256"], "populationSha256": population["populationSha256"], "journalSha256": journal["journalSha256"], "proposalCount": len(entries), "candidateCount": len(accepted), "originProposalCounts": journal["originProposalCounts"], "originAcceptedCounts": journal["originAcceptedCounts"], "proposalSlots": journal["proposalSlots"], "uniqueIdentityCounts": journal["uniqueIdentityCounts"], "duplicateCounters": journal["duplicateCounters"], "proposalSlotCounters": journal["proposalSlotCounters"], **({"immigrantConstructionDistribution": immigrant_distribution} if immigrant_distribution is not None else {}), "nextImmigrantContinuationOrdinal": 0, "completed": True}
+        return {"schemaVersion": "temporal_qd_pair_generation_result_v1", "configSha256": config["configSha256"], "populationSha256": population["populationSha256"], "evaluationPopulationSha256": evaluation_population_sha256, "journalSha256": journal["journalSha256"], "proposalCount": len(entries), "candidateCount": len(accepted), "originProposalCounts": journal["originProposalCounts"], "originAcceptedCounts": journal["originAcceptedCounts"], "proposalSlots": journal["proposalSlots"], "uniqueIdentityCounts": journal["uniqueIdentityCounts"], "duplicateCounters": journal["duplicateCounters"], "proposalSlotCounters": journal["proposalSlotCounters"], **({"immigrantConstructionDistribution": immigrant_distribution} if immigrant_distribution is not None else {}), "nextImmigrantContinuationOrdinal": 0, "completed": True}
 
 
 def _generate_pair_population_optimized_impl(
@@ -2062,6 +2255,9 @@ def _generate_pair_population_optimized_impl(
     with timed_span("generation.resolve_runtime_inputs"):
         root = Path(output_root)
         policy = _clone(pair_policy)
+        frozen_construction_catalog = _frozen_catalog_for_predeclared_scope(
+            evidence_identity_context
+        )
         factory_construction_policy = (
             getattr(pair_factory, "construction_policy", None)
             if pair_factory is not None
@@ -2409,6 +2605,13 @@ def _generate_pair_population_optimized_impl(
                             candidate, evidence_identity_context
                         )
                     )
+            scoped = _pair_predeclared_lake_scope_report(
+                candidate,
+                evidence_identity_context,
+                frozen_construction_catalog=frozen_construction_catalog,
+            )
+            if scoped is not None:
+                entry["predeclaredLakeScope"] = scoped
             with timed_span(
                 "proposal.compute_executable_semantic_identity",
                 proposalOrdinal=ordinal,
@@ -2427,7 +2630,9 @@ def _generate_pair_population_optimized_impl(
                     duplicatePairGenome=duplicate_pair,
                     duplicateCandidateIdentity=duplicate_candidate,
                 )
-            if duplicate_pair:
+            if scoped is not None and scoped["acceptable"] is not True:
+                entry["disposition"] = "predeclared_lake_scope_rejected"
+            elif duplicate_pair:
                 entry["disposition"] = "duplicate_pair_genome"
             elif duplicate_candidate:
                 entry["disposition"] = "duplicate_candidate_identity"
@@ -2667,6 +2872,16 @@ def _generate_pair_population_optimized_impl(
             population_sha256 = str(native_result["populationSha256"])
         population["populationSha256"] = population_sha256
     assert_performance_resource_guard()
+    with timed_span("generation.finalize.build_evaluation_population"):
+        evaluation_population_sha256, population_file_sha256, evaluation_candidate_bindings = (
+            _write_evaluation_population(
+                root=root,
+                population=population,
+                population_sha256=population_sha256,
+                journal_paths=tuple(journal_paths),
+                operator_implementation_identity=operator_implementation_identity,
+            )
+        )
     with timed_span("generation.finalize.build_journal"):
         journal = {
             "schemaVersion": "temporal_qd_generation_journal_v3",
@@ -2707,8 +2922,14 @@ def _generate_pair_population_optimized_impl(
                 "maxProposalAttempts": max_proposal_attempts,
             },
             "entrySha256s": state.entry_sha256s,
+            "evaluationCandidateBindings": evaluation_candidate_bindings,
             "operatorImplementation": _clone(operator_implementation_identity),
             "populationSha256": population_sha256,
+            "populationFileSha256": population_file_sha256,
+            "evaluationPopulationSha256": evaluation_population_sha256,
+            "predeclaredEvidenceContextSha256": population.get(
+                "predeclaredEvidenceContextSha256"
+            ),
             **(
                 {
                     "globalIdentityLedger": {
@@ -2734,6 +2955,7 @@ def _generate_pair_population_optimized_impl(
             "schemaVersion": "temporal_qd_pair_generation_result_v1",
             "configSha256": config["configSha256"],
             "populationSha256": population_sha256,
+            "evaluationPopulationSha256": evaluation_population_sha256,
             "journalSha256": journal["journalSha256"],
             "proposalCount": state.proposal_count,
             "candidateCount": len(accepted_references),

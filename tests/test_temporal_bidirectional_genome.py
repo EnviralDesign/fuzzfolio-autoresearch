@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+import autoresearch.temporal_qd_pair_generation as pair_generation_module
+
 from autoresearch.temporal_bidirectional_genome import (
     BidirectionalGenomeError,
     FrozenModule,
@@ -980,6 +982,116 @@ def test_optimized_pair_generation_is_exactly_equivalent_to_legacy_and_restart_s
     ).read_bytes() == (
         tripwire_roots["legacy"] / "immigrant-collision-tripwire.json"
     ).read_bytes()
+
+
+def test_pair_scope_rejection_resamples_with_legacy_optimized_restart_parity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Scope rejection is a journaled admission outcome, not a campaign surprise."""
+
+    pair = _pair()
+    policy = {
+        "schemaVersion": "temporal_qd_bidirectional_pair_policy_v1",
+        "enabled": True,
+        "compilerAuthority": pair.pair_compiler.canonical_payload(),
+    }
+    evidence_context = {
+        "schemaVersion": "temporal_qd_predeclared_evidence_context_v3",
+        "orderedWindowPlanSemantic": [{"fixture": "scope-present"}],
+    }
+    evidence_context["predeclaredEvidenceContextSha256"] = canonical_sha256(
+        evidence_context
+    )
+
+    scope_calls = {"count": 0}
+
+    def scope(candidate, _context, **_kwargs):
+        ordinal = scope_calls["count"]
+        scope_calls["count"] += 1
+        return {
+            "acceptable": ordinal != 0,
+            "reason": (
+                None
+                if ordinal != 0
+                else "candidate_derived_request_outside_pre_attested_scope"
+            ),
+            "windows": [{"windowId": "development", "contained": ordinal != 0}],
+        }
+
+    monkeypatch.setattr(pair_generation_module, "_pair_predeclared_lake_scope_report", scope)
+    common = {
+        "generation_index": 1,
+        "target_unique_candidates": 1,
+        "run_config": {"seed": "scope-resample"},
+        "pair_policy": policy,
+        "pair_factory": _UniquePairFactory(),
+        "module_authority": _PairOps(),
+        "native_validator": FakeNativeValidator(),
+        "pair_compiler": FakePairCompiler(),
+        "operator_implementation_identity": {
+            "schemaVersion": "test_pair_operator_v1",
+            "grammar": "frozen",
+            "indicator": "frozen",
+            "hold": "frozen",
+        },
+        "evidence_identity_context": evidence_context,
+    }
+
+    legacy_root = tmp_path / "legacy"
+    optimized_root = tmp_path / "optimized"
+    resumed_root = tmp_path / "resumed"
+    scope_calls["count"] = 0
+    legacy = generate_pair_population(
+        output_root=legacy_root, implementation="legacy", **common
+    )
+    scope_calls["count"] = 0
+    optimized = generate_pair_population(
+        output_root=optimized_root,
+        implementation="optimized",
+        population_finalizer="python",
+        **common,
+    )
+    scope_calls["count"] = 0
+    progress = generate_pair_population(
+        output_root=resumed_root,
+        implementation="optimized",
+        max_new_proposals=1,
+        **common,
+    )
+    resumed = generate_pair_population(
+        output_root=resumed_root,
+        implementation="optimized",
+        population_finalizer="python",
+        **common,
+    )
+    assert progress["completed"] is False
+    assert legacy == optimized == resumed
+
+    def journal(root: Path) -> list[dict]:
+        return [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted((root / "proposal-journal").glob("*.json"))
+        ]
+
+    legacy_rows = journal(legacy_root)
+    assert [row["disposition"] for row in legacy_rows] == [
+        "predeclared_lake_scope_rejected",
+        "accepted",
+    ]
+    rejected = legacy_rows[0]
+    assert rejected["predeclaredLakeScope"]["acceptable"] is False
+    assert rejected["predeclaredLakeScope"]["reason"] == (
+        "candidate_derived_request_outside_pre_attested_scope"
+    )
+    assert "candidate" not in rejected and "identityChecks" not in rejected
+    assert legacy["candidateCount"] == 1
+    assert json.loads((legacy_root / "generation-journal.json").read_text())["dispositionCounts"]["predeclared_lake_scope_rejected"] == 1
+    for name in ("population.json", "evaluation-population.json", "generation-journal.json"):
+        assert (legacy_root / name).read_bytes() == (optimized_root / name).read_bytes()
+        assert (legacy_root / name).read_bytes() == (resumed_root / name).read_bytes()
+    assert [row["entrySha256"] for row in journal(optimized_root)] == [
+        row["entrySha256"] for row in legacy_rows
+    ]
 
 
 def test_optimized_pair_generation_matches_legacy_with_global_ledger(tmp_path) -> None:

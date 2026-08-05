@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from autoresearch import temporal_qd_pair_factory as pair_factory_module
 from autoresearch.temporal_bidirectional_genome import canonical_sha256
+from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
+from autoresearch.temporal_qd_pair_generation import _frozen_catalog_for_predeclared_scope
 from autoresearch.temporal_typed_motif_grammar import (
     EntryRouteDecisionIndicatorCapError,
 )
@@ -144,3 +150,20 @@ def test_indicator_construction_keeps_legal_parent_when_cap_exhausts_step(
     assert trace == []
     assert planned_depth == 1
     assert rejections["count"] == 1
+
+
+def test_pair_predeclared_scope_catalog_drift_fails_closed(tmp_path) -> None:
+    catalog_path = tmp_path / "catalog.json"
+    catalog = {"timeframes": {"M5": {}, "M30": {}}}
+    catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    context = {
+        "orderedWindowPlanSemantic": [{"windowId": "development"}],
+        "constructionCatalog": {
+            "path": str(catalog_path),
+            "catalogSha256": canonical_sha256(catalog),
+        },
+    }
+    assert _frozen_catalog_for_predeclared_scope(context) == catalog
+    catalog_path.write_text('{"timeframes":{"M5":{}}}', encoding="utf-8")
+    with pytest.raises(TemporalDiscoveryContractError, match="catalog identity mismatch"):
+        _frozen_catalog_for_predeclared_scope(context)

@@ -20,6 +20,49 @@ from autoresearch.temporal_search_policy_v2 import (
 )
 
 
+def test_selected_pair_hydration_preserves_prior_archive_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only this generation's compact members are reread from its journal."""
+
+    current = {
+        "candidateId": "current",
+        "candidateIdentitySha256": "sha256:" + "a" * 64,
+        "programSha256": "sha256:" + "b" * 64,
+        "sourceProfileSha256": "sha256:" + "c" * 64,
+        "profileSnapshotSha256": "sha256:" + "c" * 64,
+        "canonicalEvidenceIdentitySha256": "sha256:" + "d" * 64,
+        "sourceProfile": {"fixture": "current"},
+    }
+    entry = {"candidate": current}
+    entry["entrySha256"] = canonical_sha256(entry)
+    proposal_root = tmp_path / "proposal-journal"
+    proposal_root.mkdir()
+    (proposal_root / "00000000.json").write_text(json.dumps(entry), encoding="utf-8")
+    projection = {
+        "candidates": [
+            {
+                **current,
+                "proposalOrdinal": 0,
+                "proposalEntrySha256": entry["entrySha256"],
+            }
+        ]
+    }
+    prior = {"candidateId": "prior", "candidate": {"rich": "prior"}}
+    cells = [{"members": [prior, {"candidateId": "current", "candidate": dict(current)}]}]
+    monkeypatch.setattr(qd_module, "_require_bidirectional_candidate", lambda *_: None)
+
+    qd_module._hydrate_selected_pair_members(
+        cells=cells,
+        projection=projection,
+        generation_journal_path=tmp_path / "generation-journal.json",
+        pair_policy={},
+    )
+
+    assert cells[0]["members"][0]["candidate"] == {"rich": "prior"}
+    assert cells[0]["members"][1]["candidate"] == current
+
+
 def _profile() -> dict:
     return {
         "version": "v2",
@@ -574,7 +617,7 @@ def test_qd_construction_registry_records_exact_trace_and_timeframe_evidence_rot
                     {
                         "meta": {
                             "id": "FIXTURE_INDICATOR",
-                            "requiredPaddingBars": 10,
+                            "requiredPaddingBars": 260,
                         },
                         "config": {
                             "isActive": True,
@@ -613,6 +656,9 @@ def test_qd_construction_registry_records_exact_trace_and_timeframe_evidence_rot
     member = _member("construction-parent", 2.0, 1.0)
     parent = member["candidate"]
     profile = parent["sourceProfile"]
+    profile["version"] = "v3"
+    profile["directionMode"] = "both"
+    profile["instruments"] = ["EURUSD"]
     profile["indicators"] = [
         {
             "meta": {"id": "FIXTURE_INDICATOR", "instanceId": "sig"},
