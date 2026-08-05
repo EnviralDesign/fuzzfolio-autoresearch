@@ -1060,6 +1060,8 @@ def _hydrate_selected_pair_members(
                 candidate.get(field) != compact.get(field)
                 for field in (
                     "candidateId",
+                    "sourceMode",
+                    "seedId",
                     "candidateIdentitySha256",
                     "programSha256",
                     "sourceProfileSha256",

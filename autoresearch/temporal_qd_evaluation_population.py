@@ -88,9 +88,19 @@ def load_evaluation_population(
         if not isinstance(candidate, Mapping):
             raise TemporalDiscoveryContractError("QD evaluation population candidate is invalid")
         candidate_id = candidate.get("candidateId")
+        source_mode = candidate.get("sourceMode")
+        seed_id = candidate.get("seedId")
         profile = candidate.get("sourceProfile")
-        if not isinstance(candidate_id, str) or not isinstance(profile, Mapping):
+        if not isinstance(candidate_id, str) or not candidate_id or not isinstance(profile, Mapping):
             raise TemporalDiscoveryContractError("QD evaluation population candidate lacks executable material")
+        if not isinstance(source_mode, str) or not source_mode.strip():
+            raise TemporalDiscoveryContractError(
+                "QD evaluation population candidate sourceMode is invalid"
+            )
+        if not isinstance(seed_id, str) or not seed_id.strip():
+            raise TemporalDiscoveryContractError(
+                "QD evaluation population candidate seedId is invalid"
+            )
         if candidate_id in seen:
             raise TemporalDiscoveryContractError("QD evaluation population candidate identities are not unique")
         seen.add(candidate_id)

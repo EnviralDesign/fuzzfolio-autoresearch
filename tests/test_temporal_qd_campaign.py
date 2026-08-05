@@ -163,6 +163,8 @@ def _write_pair_evaluation_projection(population_path: Path, template: dict) -> 
     evidence = qd_predeclared_evidence_context(template)
     candidate = {
         "candidateId": "pair-0",
+        "sourceMode": "qd_random_immigrant",
+        "seedId": "fixture-seed",
         "candidateIdentitySha256": "sha256:" + "a" * 64,
         "programSha256": "sha256:" + "b" * 64,
         "sourceProfile": profile,

@@ -8,6 +8,7 @@ import pytest
 import autoresearch.temporal_qd_evolution as qd_module
 from autoresearch.result_codec import write_gzip_json_once
 from autoresearch.temporal_discovery_base import TemporalDiscoveryContractError
+from autoresearch.temporal_qd_evaluation_population import raw_file_sha256
 from autoresearch.temporal_discovery_results import (
     _aggregate_candidate,
     _window_record,
@@ -235,6 +236,222 @@ def _candidate(candidate_id: str) -> dict:
         "programSha256": _AUTHORED_PROGRAM,
         "sourceProfile": {"graph": {}, "indicators": [], "executionConfig": {}},
     }
+
+
+def _write_compact_pair_archive_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a small real sidecar/journal/result set for archive reduction."""
+
+    source_profile = {
+        "graph": {},
+        "indicators": [],
+        "executionConfig": {},
+    }
+    source_profile_sha = canonical_sha256(source_profile)
+    rich_candidate = {
+        "candidateId": "compact_pair",
+        "sourceMode": "qd_random_immigrant",
+        "seedId": "compact-fixture-seed",
+        "candidateIdentitySha256": "sha256:" + "e" * 64,
+        "programSha256": _AUTHORED_PROGRAM,
+        "sourceProfile": source_profile,
+        "sourceProfileSha256": source_profile_sha,
+        "profileSnapshotSha256": source_profile_sha,
+        "structuralOperatorHistory": [],
+    }
+    entry = {"candidate": rich_candidate}
+    entry["entrySha256"] = canonical_sha256(entry)
+    compact_candidate = {
+        **rich_candidate,
+        "proposalOrdinal": 0,
+        "proposalEntrySha256": entry["entrySha256"],
+    }
+    population_path = tmp_path / "population.json"
+    population_path.write_text('{"rich":"provenance"}\n', encoding="utf-8")
+    policy = {"schemaVersion": "fixture_bidirectional_pair_policy_v1"}
+    projection = {
+        "schemaVersion": "temporal_qd_evaluation_population_v1",
+        "generationIndex": 1,
+        "candidateCount": 1,
+        "populationSha256": "sha256:" + "f" * 64,
+        "populationFileSha256": raw_file_sha256(population_path),
+        "pairGenerationConfigSha256": "sha256:" + "0" * 64,
+        "policyName": qd_module.QD_POLICY_NAME,
+        "policySha256": qd_module.QD_POLICY_SHA256,
+        "bidirectionalPairPolicy": policy,
+        "pairPolicySha256": canonical_sha256(policy),
+        "operatorImplementationSha256": canonical_sha256({"fixture": True}),
+        "predeclaredEvidenceContextSha256": None,
+        "candidates": [compact_candidate],
+        "proposalAttempts": 1,
+        "funnelEntries": [
+            {
+                "entrySha256": entry["entrySha256"],
+                "proposalOrdinal": 0,
+                "originKind": "random_immigrant",
+                "disposition": "accepted",
+                "candidate": {
+                    "candidateId": rich_candidate["candidateId"],
+                    "sourceProfileSha256": source_profile_sha,
+                },
+            }
+        ],
+    }
+    projection["evaluationPopulationSha256"] = canonical_sha256(projection)
+    journal = {
+        "schemaVersion": "temporal_qd_generation_journal_v3",
+        "populationSha256": projection["populationSha256"],
+        "configSha256": projection["pairGenerationConfigSha256"],
+        "policyName": projection["policyName"],
+        "policySha256": projection["policySha256"],
+        "generationIndex": projection["generationIndex"],
+        "evaluationPopulationSha256": projection["evaluationPopulationSha256"],
+        "populationFileSha256": projection["populationFileSha256"],
+        "operatorImplementation": {"fixture": True},
+        "predeclaredEvidenceContextSha256": None,
+        "entrySha256s": [entry["entrySha256"]],
+        "proposalCount": 1,
+        "acceptedCount": 1,
+        "evaluationCandidateBindings": [
+            {
+                "candidateId": compact_candidate["candidateId"],
+                "proposalOrdinal": compact_candidate["proposalOrdinal"],
+                "proposalEntrySha256": compact_candidate["proposalEntrySha256"],
+                "candidateProjectionSha256": canonical_sha256(compact_candidate),
+            }
+        ],
+    }
+    journal["journalSha256"] = canonical_sha256(journal)
+    population_path.with_name("evaluation-population.json").write_text(
+        json.dumps(projection, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    journal_path = population_path.with_name("generation-journal.json")
+    journal_path.write_text(json.dumps(journal, sort_keys=True) + "\n", encoding="utf-8")
+    proposal_root = tmp_path / "proposal-journal"
+    proposal_root.mkdir()
+    (proposal_root / "00000000.json").write_text(
+        json.dumps(entry, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    result = _v3_result(
+        rich_candidate["candidateId"],
+        conservative_raw_net_r=1.0,
+        no_cost_raw_net_r=1.2,
+    )
+    result["source_profile_snapshot_sha256"] = source_profile_sha
+    result_root = tmp_path / "result-root"
+    (result_root / "results").mkdir(parents=True)
+    write_gzip_json_once(result_root / "results" / "compact_pair.json.gz", result)
+    return population_path, journal_path
+
+
+def test_compact_evaluation_population_reduces_through_qd_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compact records retain every source field archive aggregation consumes."""
+
+    population_path, journal_path = _write_compact_pair_archive_inputs(tmp_path)
+    # The fixture deliberately isolates the compact archive boundary from the
+    # full pair compiler. Production candidates are validated by that compiler
+    # before their immutable journal exists.
+    monkeypatch.setattr(qd_module, "_bidirectional_pair_policy", lambda _payload: {})
+    monkeypatch.setattr(qd_module, "_require_bidirectional_candidate", lambda *_args: None)
+
+    qd_module.build_qd_archive(
+        population_path=population_path,
+        result_root=tmp_path / "result-root",
+        output_path=tmp_path / "archive.json",
+        generation_index=1,
+        generation_journal_path=journal_path,
+    )
+
+    archive = json.loads((tmp_path / "archive.json").read_text(encoding="utf-8"))
+    member = archive["cells"][0]["members"][0]
+    assert member["aggregate"]["sourceMode"] == "qd_random_immigrant"
+    assert member["aggregate"]["seedId"] == "compact-fixture-seed"
+    assert member["candidate"]["sourceMode"] == "qd_random_immigrant"
+    assert member["candidate"]["seedId"] == "compact-fixture-seed"
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("sourceMode", None),
+        ("seedId", None),
+        ("sourceMode", "   "),
+        ("seedId", "   "),
+    ),
+)
+def test_compact_evaluation_population_rejects_missing_archive_source_field(
+    tmp_path: Path,
+    field: str,
+    invalid_value: str | None,
+) -> None:
+    """A malformed projection cannot defer missing archive provenance to runtime."""
+
+    population_path, journal_path = _write_compact_pair_archive_inputs(tmp_path)
+    projection_path = population_path.with_name("evaluation-population.json")
+    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+    projection.pop("evaluationPopulationSha256")
+    if invalid_value is None:
+        projection["candidates"][0].pop(field)
+    else:
+        projection["candidates"][0][field] = invalid_value
+    projection["evaluationPopulationSha256"] = canonical_sha256(projection)
+    projection_path.write_text(json.dumps(projection, sort_keys=True) + "\n", encoding="utf-8")
+
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal.pop("journalSha256")
+    journal["evaluationPopulationSha256"] = projection["evaluationPopulationSha256"]
+    journal["evaluationCandidateBindings"][0]["candidateProjectionSha256"] = canonical_sha256(
+        projection["candidates"][0]
+    )
+    journal["journalSha256"] = canonical_sha256(journal)
+    journal_path.write_text(json.dumps(journal, sort_keys=True) + "\n", encoding="utf-8")
+
+    with pytest.raises(TemporalDiscoveryContractError, match=field + " is invalid"):
+        qd_module.build_qd_archive(
+            population_path=population_path,
+            result_root=tmp_path / "result-root",
+            output_path=tmp_path / "archive.json",
+            generation_index=1,
+            generation_journal_path=journal_path,
+        )
+
+
+def test_compact_evaluation_population_rejects_rich_source_metadata_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Archive survivors must prove compact source metadata matches their journal."""
+
+    population_path, journal_path = _write_compact_pair_archive_inputs(tmp_path)
+    projection_path = population_path.with_name("evaluation-population.json")
+    projection = json.loads(projection_path.read_text(encoding="utf-8"))
+    projection.pop("evaluationPopulationSha256")
+    projection["candidates"][0]["sourceMode"] = "qd_structural_offspring"
+    projection["evaluationPopulationSha256"] = canonical_sha256(projection)
+    projection_path.write_text(json.dumps(projection, sort_keys=True) + "\n", encoding="utf-8")
+
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal.pop("journalSha256")
+    journal["evaluationPopulationSha256"] = projection["evaluationPopulationSha256"]
+    journal["evaluationCandidateBindings"][0]["candidateProjectionSha256"] = canonical_sha256(
+        projection["candidates"][0]
+    )
+    journal["journalSha256"] = canonical_sha256(journal)
+    journal_path.write_text(json.dumps(journal, sort_keys=True) + "\n", encoding="utf-8")
+
+    monkeypatch.setattr(qd_module, "_bidirectional_pair_policy", lambda _payload: {})
+    monkeypatch.setattr(qd_module, "_require_bidirectional_candidate", lambda *_args: None)
+    with pytest.raises(TemporalDiscoveryContractError, match="rich provenance identity mismatch"):
+        qd_module.build_qd_archive(
+            population_path=population_path,
+            result_root=tmp_path / "result-root",
+            output_path=tmp_path / "archive.json",
+            generation_index=1,
+            generation_journal_path=journal_path,
+        )
 
 
 def test_v3_gzip_unresolved_winner_is_terminal_adjusted_before_ranking(

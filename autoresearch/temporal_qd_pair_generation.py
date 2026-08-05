@@ -1398,12 +1398,25 @@ def _write_evaluation_population(
             continue
         if not isinstance(candidate, Mapping) or not isinstance(candidate.get("sourceProfile"), Mapping):
             raise TemporalDiscoveryContractError("accepted pair proposal lacks executable material")
-        required = ("candidateId", "candidateIdentitySha256", "programSha256", "sourceProfileSha256")
-        if any(not isinstance(candidate.get(field), str) for field in required):
+        required = (
+            "candidateId",
+            "sourceMode",
+            "seedId",
+            "candidateIdentitySha256",
+            "programSha256",
+            "sourceProfileSha256",
+        )
+        if any(
+            not isinstance(candidate.get(field), str)
+            or not str(candidate[field]).strip()
+            for field in required
+        ):
             raise TemporalDiscoveryContractError("accepted pair proposal lacks evaluation identity material")
         candidates.append(
             {
                 "candidateId": candidate["candidateId"],
+                "sourceMode": candidate["sourceMode"],
+                "seedId": candidate["seedId"],
                 "candidateIdentitySha256": candidate["candidateIdentitySha256"],
                 "programSha256": candidate["programSha256"],
                 "sourceProfile": _clone(candidate["sourceProfile"]),
